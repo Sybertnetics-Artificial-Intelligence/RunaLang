@@ -39,12 +39,12 @@ Note: ========== IMPORTS ==========
 Import "compiler/middle/gungnir/mir/mir.runa" as MIR
 Import "compiler/middle/gungnir/mir/mir_nodes.runa" as MIRNodes
 Import "compiler/middle/gungnir/mir/cfg.runa" as CFG
-Import "compiler/middle/gungnir/mir/ssa.runa" as SSA
 Import "compiler/middle/gungnir/mir/dominance.runa" as Dominance
 Import "compiler/frontend/primitives/memory/layout.runa" as Layout
 Import "compiler/frontend/primitives/collections/list.runa" as List
-Import "compiler/frontend/primitives/collections/dictionary.runa" as Dictionary
+Import "compiler/frontend/primitives/collections/ordered_map.runa" as OMap
 Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/internal/string_utils.runa" as StringUtils
 
 Note: ============================================================
 Note: TYPE DEFINITIONS
@@ -59,13 +59,22 @@ The context includes caches for cost calculations and inline candidates to
 avoid redundant analysis. This is critical for large functions with many
 call sites.
 
+The two integer-keyed caches (value_remap keyed by SSA value id and
+cost_cache keyed by MIRFunction pointer) use collections/ordered_map:
+collections/dictionary string-hashes its keys, so integer keys passed to
+it are dereferenced as string pointers and crash at runtime (Wave 3
+finding). The mir_program pointer carries the MIRProgram so direct-call
+callees — function-name string pointers under the canonical MIR_CALL
+contract (task #461) — can be resolved to MIRFunction pointers against
+the program's functions list (OD-4 identity).
+
 Size calculation (64-bit pointers, 8 bytes each):
 - 15 fields * 8 bytes = 120 bytes per context
 @End Reasoning
 
 Type called "InliningContext":
     cfg as Integer                          Note: CFG pointer for current function
-    ssa_ptr as Integer                      Note: SSA information pointer
+    mir_program as Integer                  Note: MIRProgram pointer (callee name resolution)
     dominance_ptr as Integer                Note: Dominance tree pointer
     current_function_ptr as Integer         Note: Pointer to function being optimized
     inlined_calls as Integer                Note: Counter for successful inlines
@@ -73,10 +82,10 @@ Type called "InliningContext":
     total_calls_analyzed as Integer         Note: Total call sites examined
     inline_candidates as Integer            Note: List of InlineCandidate structures
     call_sites as Integer                   Note: List of CallSite structures
-    value_remap as Integer                  Note: Dictionary: old_value_id -> new_value_id
+    value_remap as Integer                  Note: OMap: old_value_id -> new_value_id
     inlining_depth as Integer               Note: Current recursion depth (prevent infinite)
     max_inlining_depth as Integer           Note: Maximum allowed depth (default 4)
-    cost_cache as Integer                   Note: Dictionary: function_ptr -> cost
+    cost_cache as Integer                   Note: OMap: function_ptr -> cost
     blocks_processed as Integer             Note: Number of blocks analyzed
     total_code_size_before as Integer       Note: Instruction count before inlining
 End Type
@@ -167,7 +176,7 @@ collect_call_sites and calculate_inline_cost. Keeping the context per-function
 the same callee appears at multiple call sites.
 @End Performance_Hints
 
-Process called "create_inlining_context" that takes cfg_ptr as Integer returns Integer:
+Process called "create_inlining_context" that takes cfg_ptr as Integer, program_ptr as Integer returns Integer:
     If cfg_ptr is equal to 0:
         Return 0
     End If
@@ -182,9 +191,8 @@ Process called "create_inlining_context" that takes cfg_ptr as Integer returns I
     Note: Store CFG pointer
     proc memory_set_int64 from Layout with context, 0, cfg_ptr
 
-    Note: Initialize SSA pointer
-    Let ssa_ptr be 0
-    proc memory_set_int64 from Layout with context, 8, ssa_ptr
+    Note: Store MIRProgram pointer (callee name resolution, OD-4)
+    proc memory_set_int64 from Layout with context, 8, program_ptr
 
     Note: Initialize dominance pointer
     Let dominance_ptr be 0
@@ -206,16 +214,16 @@ Process called "create_inlining_context" that takes cfg_ptr as Integer returns I
     Let sites be proc create from List
     proc memory_set_int64 from Layout with context, 64, sites
 
-    Note: Create value remap dictionary
-    Let remap be proc create from Dictionary
+    Note: Create value remap (integer-keyed ordered map: old id -> new id)
+    Let remap be proc omap_create from OMap
     proc memory_set_int64 from Layout with context, 72, remap
 
     Note: Initialize inlining depth tracking
     proc memory_set_int64 from Layout with context, 80, 0   Note: current depth
     proc memory_set_int64 from Layout with context, 88, 4   Note: max depth (default 4)
 
-    Note: Create cost cache
-    Let cost_cache be proc create from Dictionary
+    Note: Create cost cache (integer-keyed ordered map: function ptr -> cost)
+    Let cost_cache be proc omap_create from OMap
     proc memory_set_int64 from Layout with context, 96, cost_cache
 
     Note: Initialize statistics
@@ -285,22 +293,22 @@ Process called "destroy_inlining_context" that takes context_ptr as Integer retu
         proc destroy from List with sites
     End If
 
-    Note: Free value remap dictionary
+    Note: Free value remap ordered map
     Let remap be proc memory_get_int64 from Layout with context_ptr, 72
     If remap is not equal to 0:
-        proc destroy from Dictionary with remap
+        proc omap_destroy from OMap with remap
     End If
 
-    Note: Free cost cache
+    Note: Free cost cache ordered map
     Let cost_cache be proc memory_get_int64 from Layout with context_ptr, 96
     If cost_cache is not equal to 0:
-        proc destroy from Dictionary with cost_cache
+        proc omap_destroy from OMap with cost_cache
     End If
 
     Note: Free dominance pointer if allocated
     Let dominance_ptr be proc memory_get_int64 from Layout with context_ptr, 16
     If dominance_ptr is not equal to 0:
-        proc destroy_dominance_tree from Dominance with dominance_ptr
+        proc destroy_dominance_info from Dominance with dominance_ptr
     End If
 
     Note: Free context structure
@@ -320,19 +328,24 @@ Process called "print_inlining_stats" that takes context_ptr as Integer returns 
     Display "========== Function Inlining Statistics =========="
 
     Let inlined_count be proc memory_get_int64 from Layout with context_ptr, 32
-    Display "Calls inlined: " joined with inlined_count
+    Let inlined_str be proc integer_to_string from StringUtils with inlined_count
+    Display "Calls inlined: " joined with inlined_str
 
     Let rejected_count be proc memory_get_int64 from Layout with context_ptr, 40
-    Display "Calls rejected: " joined with rejected_count
+    Let rejected_str be proc integer_to_string from StringUtils with rejected_count
+    Display "Calls rejected: " joined with rejected_str
 
     Let total_analyzed be proc memory_get_int64 from Layout with context_ptr, 48
-    Display "Total call sites analyzed: " joined with total_analyzed
+    Let analyzed_str be proc integer_to_string from StringUtils with total_analyzed
+    Display "Total call sites analyzed: " joined with analyzed_str
 
     Let blocks_processed be proc memory_get_int64 from Layout with context_ptr, 104
-    Display "Basic blocks processed: " joined with blocks_processed
+    Let blocks_str be proc integer_to_string from StringUtils with blocks_processed
+    Display "Basic blocks processed: " joined with blocks_str
 
     Let code_size_before be proc memory_get_int64 from Layout with context_ptr, 112
-    Display "Code size before inlining: " joined with code_size_before joined with " instructions"
+    Let size_str be proc integer_to_string from StringUtils with code_size_before
+    Display "Code size before inlining: " joined with size_str joined with " instructions"
 
     Display "==================================================="
 End Process
@@ -400,12 +413,12 @@ Process called "calculate_inline_cost" that takes callee_ptr as Integer, context
         Return 999999  Note: Infinite cost prevents inlining
     End If
 
-    Note: Check cache first
+    Note: Check cache first (integer-keyed ordered map, function ptr key)
     Let cost_cache be proc memory_get_int64 from Layout with context_ptr, 96
-    Let cached_cost be proc get from Dictionary with cost_cache, callee_ptr
+    Let cache_hit be proc omap_contains from OMap with cost_cache, callee_ptr
 
-    If cached_cost is not equal to 0:
-        Return cached_cost
+    If cache_hit is equal to 1:
+        Return proc omap_get from OMap with cost_cache, callee_ptr
     End If
 
     Note: Get callee CFG (offset 8 in MIRFunction)
@@ -424,8 +437,9 @@ Process called "calculate_inline_cost" that takes callee_ptr as Integer, context
     Let loop_penalty be 0
     Let exception_penalty be 0
 
-    Note: Get all blocks from callee CFG
-    Let blocks be proc get_all_blocks from CFG with callee_cfg
+    Note: Get callee block POINTERS (canonical storage list, borrowed;
+    Note: CFG.get_all_blocks returns IDs and is the wrong primitive here)
+    Let blocks be proc get_mir_cfg_blocks from CFG with callee_cfg
     If blocks is equal to 0:
         Return 999999
     End If
@@ -445,7 +459,7 @@ Process called "calculate_inline_cost" that takes callee_ptr as Integer, context
             End If
 
             Note: Get instructions in this block
-            Let instructions be proc get_block_instructions from CFG with block_ptr
+            Let instructions be proc get_block_instructions from MIR with block_ptr
             If instructions is not equal to 0:
                 Let inst_count be proc length from List with instructions
                 Let inst_idx be 0
@@ -484,8 +498,8 @@ Process called "calculate_inline_cost" that takes callee_ptr as Integer, context
                             Set exception_penalty to exception_penalty plus 100
                         End If
 
-                        Note: Vector operations (20600-20619): weight 4
-                        If opcode is greater than or equal to 20600 and opcode is less than or equal to 20619:
+                        Note: Vector operations (20600-20622): weight 4
+                        If opcode is greater than or equal to 20600 and opcode is less than or equal to 20622:
                             Set total_cost to total_cost plus 4
                         End If
 
@@ -508,7 +522,7 @@ Process called "calculate_inline_cost" that takes callee_ptr as Integer, context
     Set total_cost to total_cost plus exception_penalty
 
     Note: Cache the computed cost
-    proc set from Dictionary with cost_cache, callee_ptr, total_cost
+    proc omap_set from OMap with cost_cache, callee_ptr, total_cost
 
     Return total_cost
 End Process
@@ -660,6 +674,119 @@ Note: CALL SITE ANALYSIS
 Note: ============================================================
 
 @Reasoning
+Resolves a MIR_CALL callee field to a MIRFunction pointer. Under the
+canonical callee contract (task #461) a direct call carries the callee
+FUNCTION-NAME STRING POINTER; defense in depth (mirroring the Wave 1
+optimization.runa resolver) additionally tolerates two legacy forms:
+(1) a value id whose defining instruction is a string MIR_CONST naming
+the callee, and (2) a MIRFunction pointer stored directly. Resolution is
+keyed on the MIRProgram functions list per OD-4 (function identity is
+the MIRFunction POINTER; the name string only matters at boundaries).
+An unresolvable callee is simply not inlinable — the call site is kept
+but never becomes a candidate.
+@End Reasoning
+
+@Implementation
+1. If the callee field's value id has a defining instruction in the
+   caller that is a string MIR_CONST, capture its string payload as a
+   candidate name (legacy form 1).
+2. Walk the program's functions list. A function matches when:
+   a. the function pointer equals the callee field (legacy form 2), or
+   b. the function's interned name pointer equals the callee field
+      (canonical form, pointer-interned names), or
+   c. the function's name string content equals the callee field
+      treated as a name string (canonical form, non-interned), or
+   d. the function's name string content equals the captured
+      string-CONST payload (legacy form 1).
+Returns the resolved MIRFunction pointer or 0.
+@End Implementation
+
+@Security_Scope
+The callee field is never dereferenced except (a) through
+lookup_defining_instruction keyed by value id (a Dictionary probe, safe
+for any integer) and (b) via string_equals against interned function
+names — reached only when the field is a genuine string pointer per the
+producer contract. Null program or caller degrade to pointer/name-less
+matching, returning 0 rather than guessing.
+@End Security_Scope
+
+Process called "resolve_callee_function" that takes callee_field as Integer, caller_fn as Integer, program_ptr as Integer returns Integer:
+    If callee_field is equal to 0:
+        Return 0
+    End If
+    If program_ptr is equal to 0:
+        Return 0
+    End If
+
+    Note: Legacy form 1: value id defined by a string MIR_CONST
+    Let const_name be 0
+    If caller_fn is not equal to 0:
+        Let callee_def be proc lookup_defining_instruction from MIR with caller_fn, callee_field
+        If callee_def is not equal to 0:
+            Let def_opcode be proc get_mir_node_opcode from MIR with callee_def
+            If def_opcode is equal to 20001:
+                Let def_is_string be proc is_const_string from MIRNodes with callee_def
+                If def_is_string is equal to 1:
+                    Set const_name to proc get_const_string from MIRNodes with callee_def
+                End If
+            End If
+        End If
+    End If
+
+    Let functions be proc get_program_functions from MIRNodes with program_ptr
+    If functions is equal to 0:
+        Return 0
+    End If
+
+    Let func_count be proc length from List with functions
+    Let resolved be 0
+    Let scan be 0
+    While scan is less than func_count:
+        Let candidate be proc get from List with functions, scan
+        If candidate is not equal to 0:
+            If candidate is equal to callee_field:
+                Set resolved to candidate
+                Set scan to func_count
+            Otherwise:
+                Let candidate_name be proc memory_get_int64 from Layout with candidate, 0
+                If candidate_name is not equal to 0:
+                    If candidate_name is equal to callee_field:
+                        Set resolved to candidate
+                        Set scan to func_count
+                    Otherwise:
+                        If const_name is not equal to 0:
+                            Let const_match be proc string_equals from StringCore with candidate_name, const_name
+                            If const_match is equal to 1:
+                                Set resolved to candidate
+                                Set scan to func_count
+                            End If
+                        End If
+                        If resolved is equal to 0:
+                            Note: Canonical form: callee field is the name
+                            Note: string pointer. Content comparison is only
+                            Note: attempted when the field is plausibly a
+                            Note: heap pointer (above the 64 KiB unmapped
+                            Note: low region) so a legacy bare value id is
+                            Note: never dereferenced as a string.
+                            If callee_field is greater than 65536:
+                                Let name_match be proc string_equals from StringCore with candidate_name, callee_field
+                                If name_match is equal to 1:
+                                    Set resolved to candidate
+                                    Set scan to func_count
+                                End If
+                            End If
+                        End If
+                    End If
+                End If
+            End If
+        End If
+        Set scan to scan plus 1
+    End While
+
+    Return resolved
+End Process
+
+@Reasoning
 Call site analysis identifies all function calls in the current function
 and creates candidate structures for potential inlining.
 
@@ -696,10 +823,12 @@ Process called "collect_call_sites" that takes context_ptr as Integer returns In
     End If
 
     Let call_sites be proc memory_get_int64 from Layout with context_ptr, 64
+    Let current_func be proc memory_get_int64 from Layout with context_ptr, 24
+    Let program_ptr be proc memory_get_int64 from Layout with context_ptr, 8
     Let site_count be 0
 
-    Note: Get all blocks from CFG
-    Let blocks be proc get_all_blocks from CFG with cfg_ptr
+    Note: Get block POINTERS from the canonical CFG storage list
+    Let blocks be proc get_mir_cfg_blocks from CFG with cfg_ptr
     If blocks is equal to 0:
         Return 0
     End If
@@ -712,7 +841,7 @@ Process called "collect_call_sites" that takes context_ptr as Integer returns In
 
         If block_ptr is not equal to 0:
             Note: Get instructions in this block
-            Let instructions be proc get_block_instructions from CFG with block_ptr
+            Let instructions be proc get_block_instructions from MIR with block_ptr
             If instructions is not equal to 0:
                 Let inst_count be proc length from List with instructions
                 Let inst_idx be 0
@@ -736,25 +865,17 @@ Process called "collect_call_sites" that takes context_ptr as Integer returns In
                                 Note: Set call_block_ptr
                                 proc memory_set_int64 from Layout with site_ptr, 8, block_ptr
 
-                                Note: Get callee (operand 0 of CALL instruction, offset 16)
-                                Let callee_ptr be proc memory_get_int64 from Layout with inst_ptr, 16
-                                proc memory_set_int64 from Layout with site_ptr, 16, callee_ptr
+                                Note: Resolve the canonical callee field
+                                Note: (MIRCall ext offset 80: name string
+                                Note: pointer per task #461) to a MIRFunction
+                                Note: pointer via the program functions list
+                                Let callee_field be proc get_call_callee from MIRNodes with inst_ptr
+                                Let callee_fn be proc resolve_callee_function with callee_field, current_func, program_ptr
+                                proc memory_set_int64 from Layout with site_ptr, 16, callee_fn
 
-                                Note: Count arguments by examining call instruction operands
-                                Let arg_count be 0
-                                Note: Check operands at offsets 16, 24, 32, etc.
-                                Let op1 be proc memory_get_int64 from Layout with inst_ptr, 16
-                                If op1 is not equal to 0:
-                                    Set arg_count to arg_count plus 1
-                                End If
-                                Let op2 be proc memory_get_int64 from Layout with inst_ptr, 24
-                                If op2 is not equal to 0:
-                                    Set arg_count to arg_count plus 1
-                                End If
-                                Let op3 be proc memory_get_int64 from Layout with inst_ptr, 32
-                                If op3 is not equal to 0:
-                                    Set arg_count to arg_count plus 1
-                                End If
+                                Note: Argument count from the canonical
+                                Note: MIRCall record (ext offset 96)
+                                Let arg_count be proc get_call_argument_count from MIRNodes with inst_ptr
                                 proc memory_set_int64 from Layout with site_ptr, 24, arg_count
 
                                 Note: Set is_indirect to false (this is direct call)
@@ -768,14 +889,16 @@ Process called "collect_call_sites" that takes context_ptr as Integer returns In
                                 End If
                                 proc memory_set_int64 from Layout with site_ptr, 40, frequency
 
-                                Note: Find continuation block (successor after call)
-                                Let next_inst be proc memory_get_int64 from Layout with inst_ptr, 48
+                                Note: Continuation block is materialized by
+                                Note: perform_inline_transformation (it splits
+                                Note: the call block); record the current
+                                Note: fallthrough successor for analysis only.
                                 Let continuation be 0
-                                If next_inst is equal to 0:
-                                    Note: Call at end of block, use successor
-                                    Let successors be proc memory_get_int64 from Layout with block_ptr, 48
-                                    Let succ_count be proc memory_get_int64 from Layout with block_ptr, 56
+                                Let successors be proc get_block_successors from MIR with block_ptr
+                                If successors is not equal to 0:
+                                    Let succ_count be proc length from List with successors
                                     If succ_count is greater than 0:
+                                        Note: Successor lists hold BLOCK IDS
                                         Let succ_id be proc get from List with successors, 0
                                         Set continuation to proc get_block_by_id from CFG with cfg_ptr, succ_id
                                     End If
@@ -801,7 +924,8 @@ Process called "collect_call_sites" that takes context_ptr as Integer returns In
                                 proc memory_set_int64 from Layout with site_ptr, 0, inst_ptr
                                 proc memory_set_int64 from Layout with site_ptr, 8, block_ptr
                                 proc memory_set_int64 from Layout with site_ptr, 16, 0  Note: Unknown callee
-                                proc memory_set_int64 from Layout with site_ptr, 24, 0
+                                Let ind_arg_count be proc get_call_argument_count from MIRNodes with inst_ptr
+                                proc memory_set_int64 from Layout with site_ptr, 24, ind_arg_count
                                 proc memory_set_int64 from Layout with site_ptr, 32, 1  Note: is_indirect
                                 proc memory_set_int64 from Layout with site_ptr, 40, 1
                                 proc memory_set_int64 from Layout with site_ptr, 48, 0
@@ -946,48 +1070,255 @@ Note: ============================================================
 @Reasoning
 Function body cloning is the core operation for inlining. We must:
 1. Clone all basic blocks and instructions from callee
-2. Remap SSA value IDs (callee values → new values in caller)
+2. Remap SSA value IDs (callee values to fresh values in the caller)
 3. Substitute parameters with argument values
-4. Adjust phi nodes for merged control flow
+4. Remap intra-body block targets (terminators and phi incoming blocks)
+   to the freshly allocated caller block IDs and recreate the callee's
+   internal CFG edges between the clones
 
-This must maintain SSA correctness and CFG integrity.
+Instruction copies go through MIR.clone_instruction (OD-6): under the
+OD-1 prefix-embedded representation extended records are 72-144 bytes
+with opcode-specific payloads and embedded Lists, so any header-only or
+fixed-size copy is a heap overrun and an aliasing bug. clone_instruction
+sizes the copy from the canonical opcode-band table and deep-copies the
+embedded Lists (phi pairs, call arguments, switch cases, landing-pad
+clauses).
 @End Reasoning
 
 @Implementation
-Clones the body of a function for inlining at a call site.
+Returns a clone rig List on success, 0 on failure:
+  index 0: List of cloned block pointers (callee storage order)
+  index 1: clone of the callee's ENTRY block (jump target for the call
+           block after the split)
+  index 2: OMap old callee block id -> new caller block id (caller
+           destroys it after target rewriting completes)
 
-Algorithm:
-1. Create new blocks for each callee block
-2. Clone instructions with new value IDs
-3. Build value remapping table (old ID → new ID)
-4. Substitute parameters with call arguments
-5. Update phi nodes with remapped values
-6. Return mapping of entry/exit blocks
-
-Returns 1 on success, 0 on failure.
+Passes:
+  1. Reset the context value_remap OMap, then bind parameters: the i-th
+     entry of the callee's parameter value-id List (MIRFunction offset
+     16) maps to the i-th entry of the call's argument List (MIRCall
+     ext offset 88).
+  2. Create one fresh block per callee block (MIR.allocate_block_id on
+     the CALLER cfg), publish it via MIR.add_block_to_cfg, and record
+     the id mapping.
+  3. Clone every instruction via MIR.clone_instruction; allocate a
+     fresh SSA id for every value-producing clone (header value_id and
+     the ext result mirror at 72 via set_instruction_result_id),
+     register it in the caller's value_to_instruction map, record the
+     old-to-new mapping, and append the clone through the canonical
+     CFG.add_instruction_to_block (stamps parent_block). Phi clones are
+     additionally registered in the clone block's phi registry (offset
+     88).
+  4. remap_cloned_values rewrites every value USE in the clones from
+     the remap table; rewrite_clone_block_targets rewrites every block
+     TARGET from the id map; internal CFG edges are recreated through
+     MIR.add_cfg_edge using the mapped ids.
 @End Implementation
 
 @Performance_Hints
-Allocates one new MIR basic block and one new MIR node per source block
+Allocates one MIR basic block and one sized record copy per source block
 and instruction, so memory pressure scales linearly with callee size.
-Cleared value_remap is reused (replaced with a fresh dictionary) rather
-than reset entry-by-entry, which is asymptotically equivalent but avoids
-the cost of a long-lived dictionary's resize history dragging on
-subsequent inlines.
+The remap table is an integer-keyed ordered map: O(1) hash inserts and
+probes with deterministic insertion-order iteration; resetting it per
+inline keeps stale mappings from a previous candidate out of scope.
 @End Performance_Hints
 
 @Security_Scope
 The function verifies callee_cfg before walking it, so a callee with a
 NULL CFG (typically an external or unimplemented function) cannot
-trigger a wild pointer dereference. Each cloned instruction copies only
-the fixed-offset fields (opcode, value_id, operands, type_info); no
-operand chains are followed during cloning, which keeps the clone phase
-free from re-entrancy hazards even when the callee references global or
-shared MIR nodes.
+trigger a wild pointer dereference. All clone writes target freshly
+allocated records; the callee's blocks and instructions are read-only
+throughout, so a mid-clone failure cannot corrupt the callee. The rig
+and its id map are owned by the caller (perform_inline_transformation
+destroys them after wiring).
 @End Security_Scope
 
-Process called "clone_function_body" that takes callee_ptr as Integer, context_ptr as Integer returns Integer:
+Process called "set_instruction_result_id" that takes inst_ptr as Integer, new_value_id as Integer returns Integer:
+    Note: Coherent RESULT-id rewrite for prefix-embedded records (OD-1):
+    Note: value-producing extended records duplicate the result id at ext
+    Note: offset 72, so a header-only write desynchronizes every extended
+    Note: payload reader. Phi nodes route through the canonical
+    Note: set_phi_result_value_id which maintains both views.
+    If inst_ptr is equal to 0:
+        Return 0
+    End If
+
+    Let opcode be proc get_mir_node_opcode from MIR with inst_ptr
+
+    If opcode is equal to 20300:
+        Return proc set_phi_result_value_id from MIRNodes with inst_ptr, new_value_id
+    End If
+
+    proc set_mir_node_value_id from MIR with inst_ptr, new_value_id
+
+    Note: Ext result mirror at offset 72 per the as-built Part 1.1 table:
+    Note: CONST, arithmetic/bitwise band (minus plain-header COPY 20008),
+    Note: comparisons, LOAD, ALLOCA, CALL/CALL_INDIRECT, casts, atomics,
+    Note: vector band, INVOKE, LANDINGPAD. Plain-header value producers
+    Note: (COPY, LOAD_FIELD, ADDRESS_OF, DEREF) carry the id only at
+    Note: header offset 8.
+    Let has_ext_result be 0
+    If opcode is equal to 20001:
+        Set has_ext_result to 1
+    End If
+    If opcode is greater than or equal to 20002 and opcode is less than or equal to 20007:
+        Set has_ext_result to 1
+    End If
+    If opcode is greater than or equal to 20010 and opcode is less than or equal to 20016:
+        Set has_ext_result to 1
+    End If
+    If opcode is greater than or equal to 20100 and opcode is less than or equal to 20105:
+        Set has_ext_result to 1
+    End If
+    If opcode is equal to 20200:
+        Set has_ext_result to 1
+    End If
+    If opcode is equal to 20202:
+        Set has_ext_result to 1
+    End If
+    If opcode is equal to 20304 or opcode is equal to 20305:
+        Set has_ext_result to 1
+    End If
+    If opcode is greater than or equal to 20400 and opcode is less than or equal to 20408:
+        Set has_ext_result to 1
+    End If
+    If opcode is greater than or equal to 20500 and opcode is less than or equal to 20510:
+        Set has_ext_result to 1
+    End If
+    If opcode is greater than or equal to 20600 and opcode is less than or equal to 20622:
+        Set has_ext_result to 1
+    End If
+    If opcode is equal to 20700 or opcode is equal to 20701:
+        Set has_ext_result to 1
+    End If
+
+    If has_ext_result is equal to 1:
+        proc memory_set_int64 from Layout with inst_ptr, 72, new_value_id
+    End If
+
+    Return 1
+End Process
+
+Process called "rewrite_clone_block_targets" that takes inst_ptr as Integer, block_id_map as Integer returns Integer:
+    Note: Rewrites every BLOCK-ID payload of a cloned instruction from the
+    Note: old callee block numbering to the fresh caller numbering. Block
+    Note: ids live ONLY in the extended region (never in header operand
+    Note: slots) per OD-1: JUMP target at 72; BRANCH true/false at 80/88;
+    Note: SWITCH case pairs (value at 2N, block at 2N+1) at 80 plus the
+    Note: default at 96; INVOKE normal/exception at 112/120; LANDINGPAD
+    Note: cleanup at 104; PHI incoming pairs (block at 2N, value at 2N+1)
+    Note: at 80.
+    If inst_ptr is equal to 0:
+        Return 0
+    End If
+    If block_id_map is equal to 0:
+        Return 0
+    End If
+
+    Let opcode be proc get_mir_node_opcode from MIR with inst_ptr
+
+    If opcode is equal to 20302:
+        Let jump_target be proc memory_get_int64 from Layout with inst_ptr, 72
+        Let jump_mapped be proc omap_contains from OMap with block_id_map, jump_target
+        If jump_mapped is equal to 1:
+            Let new_jump_target be proc omap_get from OMap with block_id_map, jump_target
+            proc memory_set_int64 from Layout with inst_ptr, 72, new_jump_target
+        End If
+        Return 1
+    End If
+
+    If opcode is equal to 20301:
+        Let true_target be proc memory_get_int64 from Layout with inst_ptr, 80
+        Let true_mapped be proc omap_contains from OMap with block_id_map, true_target
+        If true_mapped is equal to 1:
+            Let new_true be proc omap_get from OMap with block_id_map, true_target
+            proc memory_set_int64 from Layout with inst_ptr, 80, new_true
+        End If
+        Let false_target be proc memory_get_int64 from Layout with inst_ptr, 88
+        Let false_mapped be proc omap_contains from OMap with block_id_map, false_target
+        If false_mapped is equal to 1:
+            Let new_false be proc omap_get from OMap with block_id_map, false_target
+            proc memory_set_int64 from Layout with inst_ptr, 88, new_false
+        End If
+        Return 1
+    End If
+
+    If opcode is equal to 20306:
+        Let cases be proc memory_get_int64 from Layout with inst_ptr, 80
+        If cases is not equal to 0:
+            Let case_len be proc length from List with cases
+            Let case_idx be 1
+            While case_idx is less than case_len:
+                Let case_block be proc get from List with cases, case_idx
+                Let case_mapped be proc omap_contains from OMap with block_id_map, case_block
+                If case_mapped is equal to 1:
+                    Let new_case_block be proc omap_get from OMap with block_id_map, case_block
+                    proc set from List with cases, case_idx, new_case_block
+                End If
+                Set case_idx to case_idx plus 2
+            End While
+        End If
+        Let default_block be proc memory_get_int64 from Layout with inst_ptr, 96
+        Let default_mapped be proc omap_contains from OMap with block_id_map, default_block
+        If default_mapped is equal to 1:
+            Let new_default be proc omap_get from OMap with block_id_map, default_block
+            proc memory_set_int64 from Layout with inst_ptr, 96, new_default
+        End If
+        Return 1
+    End If
+
+    If opcode is equal to 20700:
+        Let normal_block be proc memory_get_int64 from Layout with inst_ptr, 112
+        Let normal_mapped be proc omap_contains from OMap with block_id_map, normal_block
+        If normal_mapped is equal to 1:
+            Let new_normal be proc omap_get from OMap with block_id_map, normal_block
+            proc memory_set_int64 from Layout with inst_ptr, 112, new_normal
+        End If
+        Let exc_block be proc memory_get_int64 from Layout with inst_ptr, 120
+        Let exc_mapped be proc omap_contains from OMap with block_id_map, exc_block
+        If exc_mapped is equal to 1:
+            Let new_exc be proc omap_get from OMap with block_id_map, exc_block
+            proc memory_set_int64 from Layout with inst_ptr, 120, new_exc
+        End If
+        Return 1
+    End If
+
+    If opcode is equal to 20701:
+        Let cleanup_block be proc memory_get_int64 from Layout with inst_ptr, 104
+        Let cleanup_mapped be proc omap_contains from OMap with block_id_map, cleanup_block
+        If cleanup_mapped is equal to 1:
+            Let new_cleanup be proc omap_get from OMap with block_id_map, cleanup_block
+            proc memory_set_int64 from Layout with inst_ptr, 104, new_cleanup
+        End If
+        Return 1
+    End If
+
+    If opcode is equal to 20300:
+        Let pairs be proc memory_get_int64 from Layout with inst_ptr, 80
+        If pairs is not equal to 0:
+            Let pair_len be proc length from List with pairs
+            Let pair_idx be 0
+            While pair_idx is less than pair_len:
+                Let incoming_block be proc get from List with pairs, pair_idx
+                Let inc_mapped be proc omap_contains from OMap with block_id_map, incoming_block
+                If inc_mapped is equal to 1:
+                    Let new_incoming be proc omap_get from OMap with block_id_map, incoming_block
+                    proc set from List with pairs, pair_idx, new_incoming
+                End If
+                Set pair_idx to pair_idx plus 2
+            End While
+        End If
+        Return 1
+    End If
+
+    Return 1
+End Process
+
+Process called "clone_function_body" that takes callee_ptr as Integer, call_inst_ptr as Integer, context_ptr as Integer returns Integer:
     If callee_ptr is equal to 0 or context_ptr is equal to 0:
+        Return 0
+    End If
+    If call_inst_ptr is equal to 0:
         Return 0
     End If
 
@@ -997,110 +1328,193 @@ Process called "clone_function_body" that takes callee_ptr as Integer, context_p
         Return 0
     End If
 
-    Note: Get value remap dictionary
+    Note: Reset the value remap (integer-keyed ordered map)
     Let value_remap be proc memory_get_int64 from Layout with context_ptr, 72
-
-    Note: Clear previous remapping
-    proc destroy from Dictionary with value_remap
-    Set value_remap to proc create from Dictionary
+    If value_remap is not equal to 0:
+        proc omap_destroy from OMap with value_remap
+    End If
+    Set value_remap to proc omap_create from OMap
     proc memory_set_int64 from Layout with context_ptr, 72, value_remap
 
-    Note: Get caller CFG
+    Note: Get caller CFG and function
     Let caller_cfg be proc memory_get_int64 from Layout with context_ptr, 0
-
-    Note: Get caller function for value ID allocation
     Let caller_func be proc memory_get_int64 from Layout with context_ptr, 24
-    Let next_value_id be proc memory_get_int64 from Layout with caller_func, 56
 
-    Note: Clone all blocks from callee
-    Let callee_blocks be proc get_all_blocks from CFG with callee_cfg
+    Note: Pass 1 - bind parameters to call arguments. The callee parameter
+    Note: List (MIRFunction offset 16) holds parameter VALUE IDS; the call
+    Note: argument List (MIRCall ext offset 88) holds argument VALUE IDS.
+    Let params be proc memory_get_int64 from Layout with callee_ptr, 16
+    Let param_count be proc memory_get_int64 from Layout with callee_ptr, 24
+    Let args be proc get_call_arguments from MIRNodes with call_inst_ptr
+    Let arg_count be proc get_call_argument_count from MIRNodes with call_inst_ptr
+
+    Let bind_count be param_count
+    If arg_count is less than bind_count:
+        Set bind_count to arg_count
+    End If
+
+    If params is not equal to 0 and args is not equal to 0:
+        Let bind_idx be 0
+        While bind_idx is less than bind_count:
+            Let param_vid be proc get from List with params, bind_idx
+            Let arg_vid be proc get from List with args, bind_idx
+            If param_vid is not equal to 0:
+                proc omap_set from OMap with value_remap, param_vid, arg_vid
+            End If
+            Set bind_idx to bind_idx plus 1
+        End While
+    End If
+
+    Note: Pass 2 - create one fresh caller block per callee block
+    Let callee_blocks be proc get_mir_cfg_blocks from CFG with callee_cfg
+    If callee_blocks is equal to 0:
+        Return 0
+    End If
     Let block_count be proc length from List with callee_blocks
-    Let block_idx be 0
 
     Let cloned_blocks be proc create from List
+    Let block_id_map be proc omap_create from OMap
 
+    Let callee_entry be proc get_cfg_entry_block from MIR with callee_cfg
+    Let entry_clone be 0
+
+    Let block_idx be 0
     While block_idx is less than block_count:
         Let orig_block_ptr be proc get from List with callee_blocks, block_idx
 
         If orig_block_ptr is not equal to 0:
-            Note: Generate new block ID
-            Let new_block_id be proc memory_get_int64 from Layout with caller_cfg, 48
-            Let next_block_id be new_block_id plus 1
-            proc memory_set_int64 from Layout with caller_cfg, 48, next_block_id
-
-            Note: Create cloned block
+            Let orig_block_id be proc get_mir_basic_block_id from CFG with orig_block_ptr
+            Let new_block_id be proc allocate_block_id from MIR with caller_cfg
             Let cloned_block be proc create_mir_basic_block from MIR with new_block_id, 0
-
-            If cloned_block is not equal to 0:
-                Note: Clone instructions from original block
-                Let orig_instructions be proc get_block_instructions from CFG with orig_block_ptr
-                Let inst_count be proc length from List with orig_instructions
-                Let inst_idx be 0
-
-                While inst_idx is less than inst_count:
-                    Let orig_inst be proc get from List with orig_instructions, inst_idx
-
-                    If orig_inst is not equal to 0:
-                        Note: Get original instruction opcode
-                        Let opcode be proc memory_get_int64 from Layout with orig_inst, 0
-
-                        Note: Clone instruction
-                        Let cloned_inst be proc create_mir_node from MIR with opcode
-
-                        If cloned_inst is not equal to 0:
-                            Note: Get original value ID
-                            Let orig_value_id be proc memory_get_int64 from Layout with orig_inst, 8
-
-                            Note: Assign new value ID if instruction produces a value
-                            If orig_value_id is not equal to 0:
-                                proc memory_set_int64 from Layout with cloned_inst, 8, next_value_id
-
-                                Note: Record remapping
-                                proc set from Dictionary with value_remap, orig_value_id, next_value_id
-
-                                Set next_value_id to next_value_id plus 1
-                            End If
-
-                            Note: Copy operands (will remap later)
-                            Let operand1 be proc memory_get_int64 from Layout with orig_inst, 16
-                            Let operand2 be proc memory_get_int64 from Layout with orig_inst, 24
-                            Let operand3 be proc memory_get_int64 from Layout with orig_inst, 32
-
-                            proc memory_set_int64 from Layout with cloned_inst, 16, operand1
-                            proc memory_set_int64 from Layout with cloned_inst, 24, operand2
-                            proc memory_set_int64 from Layout with cloned_inst, 32, operand3
-
-                            Note: Copy type info
-                            Let type_info be proc memory_get_int64 from Layout with orig_inst, 40
-                            proc memory_set_int64 from Layout with cloned_inst, 40, type_info
-
-                            Note: Add cloned instruction to block
-                            Let block_instructions be proc memory_get_int64 from Layout with cloned_block, 16
-                            proc append from List with block_instructions, cloned_inst
-
-                            Note: Update instruction count
-                            Let inst_count_field be proc memory_get_int64 from Layout with cloned_block, 24
-                            Set inst_count_field to inst_count_field plus 1
-                            proc memory_set_int64 from Layout with cloned_block, 24, inst_count_field
-                        End If
-                    End If
-
-                    Set inst_idx to inst_idx plus 1
-                End While
-
-                Note: Add cloned block to list
-                proc append from List with cloned_blocks, cloned_block
+            If cloned_block is equal to 0:
+                proc destroy from List with cloned_blocks
+                proc omap_destroy from OMap with block_id_map
+                Return 0
             End If
+
+            proc add_block_to_cfg from MIR with caller_cfg, cloned_block
+            proc omap_set from OMap with block_id_map, orig_block_id, new_block_id
+            proc append from List with cloned_blocks, cloned_block
+
+            If orig_block_ptr is equal to callee_entry:
+                Set entry_clone to cloned_block
+            End If
+        Otherwise:
+            Note: Keep index correspondence between source and clone lists
+            proc append from List with cloned_blocks, 0
         End If
 
         Set block_idx to block_idx plus 1
     End While
 
-    Note: Update caller's next_value_id
-    proc memory_set_int64 from Layout with caller_func, 56, next_value_id
+    Note: First clone is the entry when the callee never set entry_block
+    If entry_clone is equal to 0:
+        Let clone_total be proc length from List with cloned_blocks
+        If clone_total is greater than 0:
+            Set entry_clone to proc get from List with cloned_blocks, 0
+        End If
+    End If
 
-    Note: Successful cloning
-    Return 1
+    Note: Pass 3 - clone instructions via the canonical OD-6 deep copier
+    Set block_idx to 0
+    While block_idx is less than block_count:
+        Let src_block be proc get from List with callee_blocks, block_idx
+        Let dst_block be proc get from List with cloned_blocks, block_idx
+
+        If src_block is not equal to 0 and dst_block is not equal to 0:
+            Let orig_instructions be proc get_block_instructions from MIR with src_block
+            Let inst_count be proc length from List with orig_instructions
+            Let inst_idx be 0
+
+            While inst_idx is less than inst_count:
+                Let orig_inst be proc get from List with orig_instructions, inst_idx
+
+                If orig_inst is not equal to 0:
+                    Let cloned_inst be proc clone_instruction from MIR with orig_inst
+                    If cloned_inst is not equal to 0:
+                        Note: Fresh SSA id for value-producing clones
+                        Let orig_value_id be proc get_mir_node_value_id from MIR with orig_inst
+                        If orig_value_id is not equal to 0:
+                            Let new_value_id be proc allocate_value_id from MIR with caller_func
+                            proc set_instruction_result_id with cloned_inst, new_value_id
+                            proc omap_set from OMap with value_remap, orig_value_id, new_value_id
+                            proc register_value_definition from MIR with caller_func, new_value_id, cloned_inst
+                        End If
+
+                        Note: Canonical append (stamps parent_block, count)
+                        proc add_instruction_to_block from CFG with dst_block, cloned_inst
+
+                        Note: Maintain the block phi registry for phi clones
+                        Let clone_opcode be proc get_mir_node_opcode from MIR with cloned_inst
+                        If clone_opcode is equal to 20300:
+                            Let phi_registry be proc memory_get_int64 from Layout with dst_block, 88
+                            If phi_registry is not equal to 0:
+                                proc append from List with phi_registry, cloned_inst
+                            End If
+                        End If
+                    End If
+                End If
+
+                Set inst_idx to inst_idx plus 1
+            End While
+        End If
+
+        Set block_idx to block_idx plus 1
+    End While
+
+    Note: Pass 4 - rewrite value uses and block targets in every clone
+    proc remap_cloned_values with cloned_blocks, context_ptr
+
+    Set block_idx to 0
+    While block_idx is less than block_count:
+        Let target_block be proc get from List with cloned_blocks, block_idx
+        If target_block is not equal to 0:
+            Let target_insts be proc get_block_instructions from MIR with target_block
+            Let target_count be proc length from List with target_insts
+            Let t_idx be 0
+            While t_idx is less than target_count:
+                Let t_inst be proc get from List with target_insts, t_idx
+                If t_inst is not equal to 0:
+                    proc rewrite_clone_block_targets with t_inst, block_id_map
+                End If
+                Set t_idx to t_idx plus 1
+            End While
+        End If
+        Set block_idx to block_idx plus 1
+    End While
+
+    Note: Pass 5 - recreate the callee's internal CFG edges between clones
+    Set block_idx to 0
+    While block_idx is less than block_count:
+        Let edge_src be proc get from List with callee_blocks, block_idx
+        If edge_src is not equal to 0:
+            Let src_old_id be proc get_mir_basic_block_id from CFG with edge_src
+            Let src_new_id be proc omap_get from OMap with block_id_map, src_old_id
+            Let src_succs be proc get_block_successors from MIR with edge_src
+            If src_succs is not equal to 0:
+                Let succ_count be proc length from List with src_succs
+                Let s_idx be 0
+                While s_idx is less than succ_count:
+                    Let old_succ_id be proc get from List with src_succs, s_idx
+                    Let succ_known be proc omap_contains from OMap with block_id_map, old_succ_id
+                    If succ_known is equal to 1:
+                        Let new_succ_id be proc omap_get from OMap with block_id_map, old_succ_id
+                        proc add_cfg_edge from MIR with caller_cfg, src_new_id, new_succ_id
+                    End If
+                    Set s_idx to s_idx plus 1
+                End While
+            End If
+        End If
+        Set block_idx to block_idx plus 1
+    End While
+
+    Note: Package the clone rig
+    Let rig be proc create from List
+    proc append from List with rig, cloned_blocks
+    proc append from List with rig, entry_clone
+    proc append from List with rig, block_id_map
+
+    Return rig
 End Process
 
 @Reasoning
@@ -1146,7 +1560,7 @@ Process called "remap_cloned_values" that takes cloned_blocks as Integer, contex
         Let block_ptr be proc get from List with cloned_blocks, block_idx
 
         If block_ptr is not equal to 0:
-            Let instructions be proc get_block_instructions from CFG with block_ptr
+            Let instructions be proc get_block_instructions from MIR with block_ptr
             Let inst_count be proc length from List with instructions
             Let inst_idx be 0
 
@@ -1154,30 +1568,76 @@ Process called "remap_cloned_values" that takes cloned_blocks as Integer, contex
                 Let inst_ptr be proc get from List with instructions, inst_idx
 
                 If inst_ptr is not equal to 0:
-                    Note: Remap operand 1
-                    Let operand1 be proc memory_get_int64 from Layout with inst_ptr, 16
-                    If operand1 is not equal to 0:
-                        Let remapped1 be proc get from Dictionary with value_remap, operand1
-                        If remapped1 is not equal to 0:
-                            proc memory_set_int64 from Layout with inst_ptr, 16, remapped1
+                    Note: Header operand slots 1-3 rewritten through the
+                    Note: canonical use mutator so the OD-1 ext mirrors
+                    Note: (binop left/right, load address, store address/
+                    Note: value, branch condition, return value, ...) stay
+                    Note: coherent with the header.
+                    Let slot be 1
+                    While slot is less than 4:
+                        Let operand be proc get_mir_node_operand from MIR with inst_ptr, slot
+                        If operand is not equal to 0:
+                            Let known be proc omap_contains from OMap with value_remap, operand
+                            If known is equal to 1:
+                                Let remapped be proc omap_get from OMap with value_remap, operand
+                                proc set_mir_node_used_value from MIRNodes with inst_ptr, slot, remapped
+                            End If
                         End If
+                        Set slot to slot plus 1
+                    End While
+
+                    Let opcode be proc get_mir_node_opcode from MIR with inst_ptr
+
+                    Note: Phi incoming VALUES (pairs: block at 2N, value at
+                    Note: 2N+1) — header operands are zero for phis
+                    If opcode is equal to 20300:
+                        Let incoming_count be proc get_phi_incoming_count from MIRNodes with inst_ptr
+                        Let inc_idx be 0
+                        While inc_idx is less than incoming_count:
+                            Let inc_value be proc get_phi_incoming_value from MIRNodes with inst_ptr, inc_idx
+                            If inc_value is not equal to 0:
+                                Let inc_known be proc omap_contains from OMap with value_remap, inc_value
+                                If inc_known is equal to 1:
+                                    Let inc_remapped be proc omap_get from OMap with value_remap, inc_value
+                                    proc set_phi_incoming_value from MIRNodes with inst_ptr, inc_idx, inc_remapped
+                                End If
+                            End If
+                            Set inc_idx to inc_idx plus 1
+                        End While
                     End If
 
-                    Note: Remap operand 2
-                    Let operand2 be proc memory_get_int64 from Layout with inst_ptr, 24
-                    If operand2 is not equal to 0:
-                        Let remapped2 be proc get from Dictionary with value_remap, operand2
-                        If remapped2 is not equal to 0:
-                            proc memory_set_int64 from Layout with inst_ptr, 24, remapped2
+                    Note: Call / invoke argument lists hold value-id USES
+                    If opcode is equal to 20304 or opcode is equal to 20305 or opcode is equal to 20700:
+                        Note: An INDIRECT callee (ext offset 80) is itself a
+                        Note: value-id use and must be remapped; a direct
+                        Note: callee is a name string pointer and is left
+                        Note: alone (it can never collide with a small id
+                        Note: present in the remap table).
+                        If opcode is equal to 20305:
+                            Let ind_callee be proc memory_get_int64 from Layout with inst_ptr, 80
+                            If ind_callee is not equal to 0:
+                                Let callee_known be proc omap_contains from OMap with value_remap, ind_callee
+                                If callee_known is equal to 1:
+                                    Let callee_remapped be proc omap_get from OMap with value_remap, ind_callee
+                                    proc memory_set_int64 from Layout with inst_ptr, 80, callee_remapped
+                                End If
+                            End If
                         End If
-                    End If
-
-                    Note: Remap operand 3
-                    Let operand3 be proc memory_get_int64 from Layout with inst_ptr, 32
-                    If operand3 is not equal to 0:
-                        Let remapped3 be proc get from Dictionary with value_remap, operand3
-                        If remapped3 is not equal to 0:
-                            proc memory_set_int64 from Layout with inst_ptr, 32, remapped3
+                        Let call_args be proc get_call_arguments from MIRNodes with inst_ptr
+                        If call_args is not equal to 0:
+                            Let call_arg_count be proc length from List with call_args
+                            Let a_idx be 0
+                            While a_idx is less than call_arg_count:
+                                Let arg_use be proc get from List with call_args, a_idx
+                                If arg_use is not equal to 0:
+                                    Let arg_known be proc omap_contains from OMap with value_remap, arg_use
+                                    If arg_known is equal to 1:
+                                        Let arg_remapped be proc omap_get from OMap with value_remap, arg_use
+                                        proc set from List with call_args, a_idx, arg_remapped
+                                    End If
+                                End If
+                                Set a_idx to a_idx plus 1
+                            End While
                         End If
                     End If
                 End If
@@ -1214,14 +1674,26 @@ This maintains CFG integrity and SSA correctness.
 Performs the actual inlining transformation for a candidate.
 
 Algorithm:
-1. Clone function body
-2. Remap values
-3. Substitute parameters
-4. Split call block
-5. Integrate cloned blocks
-6. Update CFG edges
-7. Remove call instruction
-8. Recompute SSA
+1. Verify the call instruction (opcode MIR_CALL 20304) and locate it in
+   its claimed block — both BEFORE any mutation.
+2. clone_function_body: blocks, instructions (OD-6 clones with fresh
+   SSA ids), parameter binding, use remap, target remap, internal edges.
+3. Split the call block: instructions after the call (including its
+   terminator) move to a fresh continuation block; the call block's
+   successor edges are transferred to the continuation (edge lists,
+   cached counts, edge table via the canonical remove_cfg_edge /
+   add_cfg_edge, phi predecessors via update_phi_predecessor).
+4. Terminate the call block with a jump to the cloned entry block.
+5. Rewrite every cloned MIR_RETURN (20303) into a MIR_JUMP (20302) to
+   the continuation, collecting (returning block id, return value id)
+   pairs.
+6. Substitute the call result: one returning path replaces uses
+   directly; multiple returning paths materialize a phi at the head of
+   the continuation merging the per-path return values.
+7. Invalidate the caller CFG's dominance_computed flag (offset 56) —
+   the topology changed; downstream passes recompute on demand. SSA
+   form is preserved structurally (fresh ids, dominating definitions,
+   merge phi), so no SSA reconstruction is required here.
 
 Returns 1 on success, 0 on failure.
 @End Implementation
@@ -1229,22 +1701,104 @@ Returns 1 on success, 0 on failure.
 @Performance_Hints
 The CFG mutation phase (split call block, wire continuation edges,
 rewrite returns into jumps) is O(I_callee) for the return-rewrite scan
-and O(1) per CFG-edge update. SSA recomputation, when triggered, is the
-dominant cost; batching multiple inlines and recomputing SSA once at the
-end would be faster but requires a context-level dirty bit that this
-single-call entry point does not maintain.
+and O(1) per CFG-edge update. The call-result use replacement is one
+O(I_caller) walk. Dominance recomputation is deferred to the next
+consumer rather than triggered eagerly per inline.
 @End Performance_Hints
 
 @Security_Scope
 The opcode of the call instruction is verified to be MIR_CALL (20304)
-before any transformation; any other opcode reaching this path indicates
-a corrupted candidate and is rejected. If the call instruction cannot be
-located in its claimed block (found_call == 0), the function bails
-without mutating any state, leaving the caller's CFG intact. Cloned
-blocks are only added to the CFG after parameter substitution and value
-remapping succeed, so a mid-transformation failure cannot leave
-half-rewritten blocks dangling in the CFG.
+and the call is located in its claimed block BEFORE the clone phase, so
+a corrupted candidate is rejected without mutating any state. The clone
+rig and block-id map are always destroyed before return on the success
+path; the callee function is never written to.
 @End Security_Scope
+
+Process called "replace_value_uses_in_cfg" that takes cfg_ptr as Integer, old_value_id as Integer, new_value_id as Integer returns Integer:
+    Note: Rewrites every USE of old_value_id across the whole CFG to
+    Note: new_value_id: header operand slots (with their OD-1 ext
+    Note: mirrors via set_mir_node_used_value), phi incoming values, and
+    Note: call/invoke argument lists. MIR.replace_all_uses is unusable
+    Note: here because it walks MIRValue use-lists that SSA never
+    Note: materializes (Wave 4 finding) — an explicit walk is the
+    Note: canonical pattern (mirrors ssa.runa eliminate_trivial_phi_nodes).
+    If cfg_ptr is equal to 0:
+        Return 0
+    End If
+    If old_value_id is equal to 0:
+        Return 0
+    End If
+
+    Let blocks be proc get_mir_cfg_blocks from CFG with cfg_ptr
+    If blocks is equal to 0:
+        Return 0
+    End If
+
+    Let block_count be proc length from List with blocks
+    Let b_idx be 0
+    While b_idx is less than block_count:
+        Let block_ptr be proc get from List with blocks, b_idx
+        If block_ptr is not equal to 0:
+            Let instructions be proc get_block_instructions from MIR with block_ptr
+            If instructions is not equal to 0:
+                Let inst_count be proc length from List with instructions
+                Let i_idx be 0
+                While i_idx is less than inst_count:
+                    Let inst_ptr be proc get from List with instructions, i_idx
+                    If inst_ptr is not equal to 0:
+                        Let slot be 1
+                        While slot is less than 4:
+                            Let operand be proc get_mir_node_operand from MIR with inst_ptr, slot
+                            If operand is equal to old_value_id:
+                                proc set_mir_node_used_value from MIRNodes with inst_ptr, slot, new_value_id
+                            End If
+                            Set slot to slot plus 1
+                        End While
+
+                        Let opcode be proc get_mir_node_opcode from MIR with inst_ptr
+
+                        If opcode is equal to 20300:
+                            Let incoming_count be proc get_phi_incoming_count from MIRNodes with inst_ptr
+                            Let inc_idx be 0
+                            While inc_idx is less than incoming_count:
+                                Let inc_value be proc get_phi_incoming_value from MIRNodes with inst_ptr, inc_idx
+                                If inc_value is equal to old_value_id:
+                                    proc set_phi_incoming_value from MIRNodes with inst_ptr, inc_idx, new_value_id
+                                End If
+                                Set inc_idx to inc_idx plus 1
+                            End While
+                        End If
+
+                        If opcode is equal to 20304 or opcode is equal to 20305 or opcode is equal to 20700:
+                            If opcode is equal to 20305:
+                                Let ind_callee be proc memory_get_int64 from Layout with inst_ptr, 80
+                                If ind_callee is equal to old_value_id:
+                                    proc memory_set_int64 from Layout with inst_ptr, 80, new_value_id
+                                End If
+                            End If
+                            Let call_args be proc get_call_arguments from MIRNodes with inst_ptr
+                            If call_args is not equal to 0:
+                                Let call_arg_count be proc length from List with call_args
+                                Let a_idx be 0
+                                While a_idx is less than call_arg_count:
+                                    Let arg_use be proc get from List with call_args, a_idx
+                                    If arg_use is equal to old_value_id:
+                                        proc set from List with call_args, a_idx, new_value_id
+                                    End If
+                                    Set a_idx to a_idx plus 1
+                                End While
+                            End If
+                        End If
+                    End If
+                    Set i_idx to i_idx plus 1
+                End While
+            End If
+        End If
+        Set b_idx to b_idx plus 1
+    End While
+
+    Return 1
+End Process
 
 Process called "perform_inline_transformation" that takes candidate_ptr as Integer, context_ptr as Integer returns Integer:
     If candidate_ptr is equal to 0 or context_ptr is equal to 0:
@@ -1255,143 +1809,196 @@ Process called "perform_inline_transformation" that takes candidate_ptr as Integ
     Let call_block_ptr be proc memory_get_int64 from Layout with candidate_ptr, 8
     Let callee_ptr be proc memory_get_int64 from Layout with candidate_ptr, 16
 
-    Note: Clone function body
-    Let cloned_blocks be proc clone_function_body with callee_ptr, context_ptr
-    If cloned_blocks is equal to 0:
+    If call_inst_ptr is equal to 0 or call_block_ptr is equal to 0 or callee_ptr is equal to 0:
         Return 0
     End If
 
-    Note: Get value remap table from context
-    Let value_remap be proc memory_get_int64 from Layout with context_ptr, 72
-
-    Note: Get call instruction details
-    Let call_opcode be proc memory_get_int64 from Layout with call_inst_ptr, 0
-    If call_opcode is not equal to 20304:  Note: MIR_CALL
+    Note: Verify the call BEFORE any mutation
+    Let call_opcode be proc get_mir_node_opcode from MIR with call_inst_ptr
+    If call_opcode is not equal to 20304:
         Return 0
     End If
 
-    Note: Get call arguments for parameter substitution
-    Let arg_count be proc memory_get_int64 from Layout with call_inst_ptr, 24
-    Let args_ptr be proc memory_get_int64 from Layout with call_inst_ptr, 32
-
-    Note: Get callee entry block (first cloned block)
-    Let entry_block_ptr be proc memory_get_int64 from Layout with cloned_blocks, 0
-    If entry_block_ptr is equal to 0:
-        Return 0
-    End If
-
-    Note: Substitute parameters with arguments in cloned blocks
-    Let param_idx be 0
-    While param_idx is less than arg_count:
-        Note: Get argument value
-        Let arg_value be proc memory_get_int64 from Layout with args_ptr plus (param_idx multiplied by 8), 0
-
-        Note: Get parameter value ID (callee's param_idx parameter)
-        Let param_value_id be param_idx plus 1000000  Note: Parameter value IDs start at 1000000
-
-        Note: Update value remap: param -> arg
-        proc memory_set_int64 from Layout with value_remap, (param_value_id multiplied by 8), arg_value
-
-        Set param_idx to param_idx plus 1
-    End While
-
-    Note: Remap all values in cloned blocks
-    proc remap_cloned_values with cloned_blocks, context_ptr
-
-    Note: Split call block at call instruction
     Let cfg be proc memory_get_int64 from Layout with context_ptr, 0
+    Let caller_func be proc memory_get_int64 from Layout with context_ptr, 24
 
-    Note: Create continuation block (instructions after call)
+    Note: Locate the call in its claimed block BEFORE cloning
+    Let call_block_insts be proc get_block_instructions from MIR with call_block_ptr
+    If call_block_insts is equal to 0:
+        Return 0
+    End If
+    Let call_inst_idx be proc list_index_of from List with call_block_insts, call_inst_ptr
+    If call_inst_idx is less than 0:
+        Return 0
+    End If
+
+    Note: Clone the callee body (blocks, values, parameters, targets, edges)
+    Let rig be proc clone_function_body with callee_ptr, call_inst_ptr, context_ptr
+    If rig is equal to 0:
+        Return 0
+    End If
+
+    Let cloned_blocks be proc get from List with rig, 0
+    Let entry_block_ptr be proc get from List with rig, 1
+    Let block_id_map be proc get from List with rig, 2
+
+    If entry_block_ptr is equal to 0:
+        proc omap_destroy from OMap with block_id_map
+        proc destroy from List with cloned_blocks
+        proc destroy from List with rig
+        Return 0
+    End If
+
+    Let call_block_id be proc get_mir_basic_block_id from CFG with call_block_ptr
+    Let entry_block_id be proc get_mir_basic_block_id from CFG with entry_block_ptr
+
+    Note: Create the continuation block and publish it
     Let continuation_block be proc create_basic_block from CFG with cfg
     If continuation_block is equal to 0:
+        proc omap_destroy from OMap with block_id_map
+        proc destroy from List with cloned_blocks
+        proc destroy from List with rig
         Return 0
     End If
+    proc add_block_to_function from CFG with cfg, continuation_block
+    Let continuation_id be proc get_mir_basic_block_id from CFG with continuation_block
 
-    Note: Move instructions after call to continuation block
-    Let call_block_insts be proc memory_get_int64 from Layout with call_block_ptr, 16
-    Let inst_count be proc memory_get_int64 from Layout with call_block_ptr, 24
-    Let call_inst_idx be 0
-    Let found_call be 0
-
-    Note: Find call instruction index
-    While call_inst_idx is less than inst_count:
-        Let current_inst be proc memory_get_int64 from Layout with call_block_insts plus (call_inst_idx multiplied by 8), 0
-        If current_inst is equal to call_inst_ptr:
-            Set found_call to 1
-            Break
-        End If
-        Set call_inst_idx to call_inst_idx plus 1
-    End While
-
-    If found_call is equal to 0:
-        Return 0
-    End If
-
-    Note: Move instructions after call to continuation block
+    Note: Move the instructions AFTER the call (including the original
+    Note: terminator) into the continuation, then drop the tail of the
+    Note: call block's list (call instruction included).
+    Let inst_count be proc length from List with call_block_insts
     Let move_idx be call_inst_idx plus 1
     While move_idx is less than inst_count:
-        Let inst_to_move be proc memory_get_int64 from Layout with call_block_insts plus (move_idx multiplied by 8), 0
+        Let inst_to_move be proc get from List with call_block_insts, move_idx
         proc add_instruction_to_block from CFG with continuation_block, inst_to_move
         Set move_idx to move_idx plus 1
     End While
 
-    Note: Update call block instruction count (truncate at call)
-    proc memory_set_int64 from Layout with call_block_ptr, 24, call_inst_idx
+    While proc length from List with call_block_insts is greater than call_inst_idx:
+        Let tail_len be proc length from List with call_block_insts
+        proc list_remove from List with call_block_insts, (tail_len minus 1)
+    End While
+    Let truncated_len be proc length from List with call_block_insts
+    proc memory_set_int64 from Layout with call_block_ptr, 24, truncated_len
 
-    Note: Remove call instruction (truncated by updating count)
+    Note: Transfer the call block's successor edges to the continuation.
+    Note: Successor lists hold BLOCK IDS; copy them first because
+    Note: remove_cfg_edge mutates the list being walked.
+    Let old_succs be proc get_block_successors from MIR with call_block_ptr
+    Let moved_succ_ids be proc create from List
+    If old_succs is not equal to 0:
+        Let old_succ_count be proc length from List with old_succs
+        Let os_idx be 0
+        While os_idx is less than old_succ_count:
+            Let old_succ_id be proc get from List with old_succs, os_idx
+            proc append from List with moved_succ_ids, old_succ_id
+            Set os_idx to os_idx plus 1
+        End While
+    End If
 
-    Note: Wire CFG edges: call_block -> entry_block -> ... -> continuation_block
-    proc add_edge from CFG with call_block_ptr, entry_block_ptr
+    Let moved_count be proc length from List with moved_succ_ids
+    Let ms_idx be 0
+    While ms_idx is less than moved_count:
+        Let succ_id be proc get from List with moved_succ_ids, ms_idx
+        proc remove_cfg_edge from CFG with cfg, call_block_id, succ_id
+        proc add_cfg_edge from MIR with cfg, continuation_id, succ_id
+        proc update_phi_predecessor from CFG with cfg, succ_id, call_block_id, continuation_id
+        Set ms_idx to ms_idx plus 1
+    End While
+    proc destroy from List with moved_succ_ids
 
-    Note: Find all return instructions in cloned blocks and redirect to continuation
-    Let block_idx be 0
-    Let block_count be proc memory_get_int64 from Layout with cloned_blocks, 8
-    While block_idx is less than block_count:
-        Let cloned_block be proc memory_get_int64 from Layout with cloned_blocks plus 16 plus (block_idx multiplied by 8), 0
-        Let block_insts be proc memory_get_int64 from Layout with cloned_block, 16
-        Let block_inst_count be proc memory_get_int64 from Layout with cloned_block, 24
+    Note: Terminate the call block with a jump into the inlined body
+    Let entry_jump be proc create_mir_jump from MIRNodes with entry_block_id
+    proc add_instruction_to_block from CFG with call_block_ptr, entry_jump
+    proc add_cfg_edge from MIR with cfg, call_block_id, entry_block_id
 
-        Note: Check last instruction for return
-        If block_inst_count is greater than 0:
-            Let last_inst be proc memory_get_int64 from Layout with block_insts plus ((block_inst_count minus 1) multiplied by 8), 0
-            Let last_opcode be proc memory_get_int64 from Layout with last_inst, 0
+    Note: Rewrite cloned returns (MIR_RETURN 20303) into jumps to the
+    Note: continuation (MIR_JUMP 20302 — fresh records, not in-place
+    Note: opcode rewrites: an 88-byte return and an 80-byte jump are
+    Note: different record shapes). Collect (block id, return value id).
+    Let return_blocks be proc create from List
+    Let return_values be proc create from List
 
-            If last_opcode is equal to 20306:  Note: MIR_RETURN
-                Note: Get return value
-                Let ret_value be proc memory_get_int64 from Layout with last_inst, 8
+    Let clone_count be proc length from List with cloned_blocks
+    Let cb_idx be 0
+    While cb_idx is less than clone_count:
+        Let cloned_block be proc get from List with cloned_blocks, cb_idx
+        If cloned_block is not equal to 0:
+            Let block_insts be proc get_block_instructions from MIR with cloned_block
+            Let block_inst_count be proc length from List with block_insts
 
-                Note: Replace return with jump to continuation
-                proc memory_set_int64 from Layout with last_inst, 0, 20301  Note: MIR_JMP
-                proc memory_set_int64 from Layout with last_inst, 8, continuation_block
+            If block_inst_count is greater than 0:
+                Let last_inst be proc get from List with block_insts, (block_inst_count minus 1)
+                Let last_opcode be proc get_mir_node_opcode from MIR with last_inst
 
-                Note: Add edge to continuation
-                proc add_edge from CFG with cloned_block, continuation_block
+                If last_opcode is equal to 20303:
+                    Note: Return value id (already remapped) at ext offset 72
+                    Let ret_value be proc memory_get_int64 from Layout with last_inst, 72
+                    Let cloned_block_id be proc get_mir_basic_block_id from CFG with cloned_block
 
-                Note: If call had result, replace uses of result with return value
-                Let call_result_id be proc memory_get_int64 from Layout with call_inst_ptr, 8
-                If call_result_id is not equal to 0:
-                    Note: Update value remap: call_result -> return_value
-                    proc memory_set_int64 from Layout with value_remap, (call_result_id multiplied by 8), ret_value
+                    Let cont_jump be proc create_mir_jump from MIRNodes with continuation_id
+                    proc set from List with block_insts, (block_inst_count minus 1), cont_jump
+                    proc memory_set_int64 from Layout with cont_jump, 56, cloned_block
+
+                    Note: The detached return clone is owned here - free it
+                    proc deallocate from Layout with last_inst
+
+                    proc add_cfg_edge from MIR with cfg, cloned_block_id, continuation_id
+
+                    If ret_value is not equal to 0:
+                        proc append from List with return_blocks, cloned_block_id
+                        proc append from List with return_values, ret_value
+                    End If
                 End If
             End If
         End If
-
-        Set block_idx to block_idx plus 1
+        Set cb_idx to cb_idx plus 1
     End While
 
-    Note: Add cloned blocks to CFG
-    Set block_idx to 0
-    While block_idx is less than block_count:
-        Set cloned_block to proc memory_get_int64 from Layout with cloned_blocks plus 16 plus (block_idx multiplied by 8), 0
-        proc add_block_to_function from CFG with cfg, cloned_block
-        Set block_idx to block_idx plus 1
-    End While
+    Note: Substitute the call result with the inlined return value(s)
+    Let call_result_id be proc get_mir_node_value_id from MIR with call_inst_ptr
+    Let return_count be proc length from List with return_values
 
-    Note: Update SSA form (recompute dominance and SSA after CFG modification)
-    Let ssa_ptr be proc memory_get_int64 from Layout with context_ptr, 8
-    If ssa_ptr is not equal to 0:
-        proc recompute_ssa from SSA with cfg, ssa_ptr
+    If call_result_id is not equal to 0:
+        If return_count is equal to 1:
+            Let single_ret be proc get from List with return_values, 0
+            proc replace_value_uses_in_cfg with cfg, call_result_id, single_ret
+        End If
+        If return_count is greater than 1:
+            Note: Multiple returning paths merge in a continuation phi
+            Let merge_vid be proc allocate_value_id from MIR with caller_func
+            Let call_return_type be proc memory_get_int64 from Layout with call_inst_ptr, 104
+            Let merge_phi be proc create_mir_phi_node from MIRNodes with merge_vid, call_return_type, continuation_block
+
+            Let r_idx be 0
+            While r_idx is less than return_count:
+                Let r_block be proc get from List with return_blocks, r_idx
+                Let r_value be proc get from List with return_values, r_idx
+                proc add_phi_incoming from MIRNodes with merge_phi, r_block, r_value
+                Set r_idx to r_idx plus 1
+            End While
+
+            proc insert_instruction_at_block_start from MIR with continuation_block, merge_phi
+            Let cont_phi_registry be proc memory_get_int64 from Layout with continuation_block, 88
+            If cont_phi_registry is not equal to 0:
+                proc append from List with cont_phi_registry, merge_phi
+            End If
+            proc register_value_definition from MIR with caller_func, merge_vid, merge_phi
+
+            proc replace_value_uses_in_cfg with cfg, call_result_id, merge_vid
+        End If
     End If
+
+    proc destroy from List with return_blocks
+    proc destroy from List with return_values
+
+    Note: Topology changed - invalidate cached dominance (MIRCFG offset 56)
+    proc memory_set_int64 from Layout with cfg, 56, 0
+
+    Note: Release the clone rig (blocks now owned by the caller CFG)
+    proc omap_destroy from OMap with block_id_map
+    proc destroy from List with cloned_blocks
+    proc destroy from List with rig
 
     Note: Increment inlined calls counter
     Let inlined_count be proc memory_get_int64 from Layout with context_ptr, 32
@@ -1472,22 +2079,20 @@ context via destroy_inlining_context; the early-return paths after
 "No calls found" also call destroy_inlining_context to prevent leaks.
 @End Security_Scope
 
-Process called "optimize_function_with_inlining" that takes function_ptr as Integer returns Integer:
+Process called "optimize_function_with_inlining" that takes function_ptr as Integer, program_ptr as Integer returns Integer:
     If function_ptr is equal to 0:
         Return 0
     End If
 
-    Display "Starting function inlining optimization"
-
     Note: Get CFG from function
-    Let cfg_ptr be proc memory_get_int64 from Layout with function_ptr, 8
+    Let cfg_ptr be proc get_mir_function_cfg from MIR with function_ptr
     If cfg_ptr is equal to 0:
         Display "Function has no CFG, skipping inlining"
         Return 0
     End If
 
     Note: Create context
-    Let context_ptr be proc create_inlining_context with cfg_ptr
+    Let context_ptr be proc create_inlining_context with cfg_ptr, program_ptr
     If context_ptr is equal to 0:
         Display "Failed to create inlining context"
         Return 0
@@ -1498,17 +2103,14 @@ Process called "optimize_function_with_inlining" that takes function_ptr as Inte
 
     Note: Collect call sites
     Let call_count be proc collect_call_sites with context_ptr
-    Display "Found " joined with call_count joined with " call sites"
 
     If call_count is equal to 0:
-        Display "No calls found, skipping inlining"
         proc destroy_inlining_context with context_ptr
         Return 1
     End If
 
     Note: Create inline candidates
     Let candidate_count be proc create_inline_candidates with context_ptr
-    Display "Created " joined with candidate_count joined with " inline candidates"
 
     Note: Inline profitable candidates
     Let candidates be proc memory_get_int64 from Layout with context_ptr, 56
@@ -1544,13 +2146,8 @@ Process called "optimize_function_with_inlining" that takes function_ptr as Inte
     Note: Update statistics
     proc memory_set_int64 from Layout with context_ptr, 32, inlined_count
 
-    Note: Print statistics
-    proc print_inlining_stats with context_ptr
-
     Note: Clean up
     proc destroy_inlining_context with context_ptr
-
-    Display "Function inlining optimization complete"
 
     Return 1
 End Process
@@ -1601,15 +2198,13 @@ Process called "run_inlining_pass" that takes program_ptr as Integer returns Int
     Let optimized_count be 0
     Let i be 0
 
-    Display "Running inlining pass on " joined with func_count joined with " functions"
-
     While i is less than func_count:
         Let func_ptr be proc get from List with functions, i
 
         If func_ptr is not equal to 0:
-            Let is_external be proc memory_get_int64 from Layout with func_ptr, 80
+            Let is_external be proc is_external_function from MIR with func_ptr
             If is_external is equal to 0:
-                Let success be proc optimize_function_with_inlining with func_ptr
+                Let success be proc optimize_function_with_inlining with func_ptr, program_ptr
                 If success is equal to 1:
                     Set optimized_count to optimized_count plus 1
                 End If
@@ -1618,8 +2213,6 @@ Process called "run_inlining_pass" that takes program_ptr as Integer returns Int
 
         Set i to i plus 1
     End While
-
-    Display "Inlining completed for " joined with optimized_count joined with " functions"
 
     Return 1
 End Process

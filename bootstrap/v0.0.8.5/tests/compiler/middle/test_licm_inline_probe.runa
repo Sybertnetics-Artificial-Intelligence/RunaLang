@@ -1,0 +1,504 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+LICM + inlining probe (Wave 5a gate of the MIR reconciliation plan).
+
+Three suites, all built by hand through the canonical MIR construction
+API (the same contract the HIR-to-MIR builder uses):
+
+  1. cfg_edge_primitives — the task #460 fixes:
+     - CFG.add_edge(cfg, pred_block, succ_block) wires successor and
+       predecessor ID lists, cached counts, AND the CFG edge table.
+     - CFG.remove_cfg_edge round-trips: cached counts re-synced, edge
+       table pair removed, edge_count decremented.
+     - CFG.remove_instruction_from_block (Wave 5a canonical addition)
+       removes the instruction, re-syncs the cached instruction count,
+       and clears the parent_block back-pointer; a second removal of
+       the same instruction is a membership-checked no-op returning 0.
+
+  2. licm_hoist — a 2-block natural loop (header B1, latch B2; entry
+     B0, exit B3) carrying:
+       inv  = ADD(c10, c10)   loop-invariant   (c10 defined in B0)
+       ld   = LOAD(buf)       address stored to in-loop
+       st   = STORE(buf, var)
+       var  = ADD(ld, c10)    loop-variant
+       cmp  = LT(var, c10)    loop-variant
+     After optimize_function_with_licm: a preheader exists between B0
+     and B1, ONLY inv was hoisted into it (ahead of the preheader's
+     jump terminator), ld/st/var/cmp remain in the loop, and
+     MIRVerifier.verify_mir_function accepts the transformed function.
+
+  3. inline_clone — a one-block callee (c5 = CONST 5; r = ADD(p, c5);
+     RETURN r) inlined into a caller (x = CONST 7; y = CALL callee(x);
+     u = ADD(y, x); RETURN u). The callee is carried as its NAME
+     STRING pointer with is_indirect 0 per the canonical MIR_CALL
+     contract (task #461). After optimize_function_with_inlining:
+     no MIR_CALL remains in the caller, the cloned body carries FRESH
+     value ids with the parameter substituted by the argument, the
+     call result use was rewritten to the clone's return value, the
+     callee's original body is byte-for-byte untouched (and stays
+     untouched when the CLONE is subsequently mutated), and
+     MIRVerifier.verify_mir_function accepts the transformed caller.
+:End Note
+
+Import "tests/test_utils.runa" as T
+Import "compiler/middle/gungnir/mir/mir.runa" as MIR
+Import "compiler/middle/gungnir/mir/mir_nodes.runa" as MIRNodes
+Import "compiler/middle/gungnir/mir/cfg.runa" as CFG
+Import "compiler/middle/gungnir/mir/mir_verifier.runa" as MIRVerifier
+Import "compiler/middle/gungnir/mir/optimizations/licm.runa" as LICM
+Import "compiler/middle/gungnir/mir/optimizations/inlining.runa" as Inliner
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/collections/list.runa" as List
+
+Process called "make_type_info" returns Integer:
+    Note: Shared HIRTypeInfo stand-in: kind at 0, flags at 8, size at 16
+    Let type_info be Layout.allocate(24)
+    If type_info is equal to 0:
+        Return 0
+    End If
+    Layout.memory_set_int64(type_info, 0, 1)
+    Layout.memory_set_int64(type_info, 8, 0)
+    Layout.memory_set_int64(type_info, 16, 8)
+    Return type_info
+End Process
+
+Process called "count_opcode_in_cfg" that takes cfg as Integer, opcode as Integer returns Integer:
+    Let blocks be CFG.get_mir_cfg_blocks(cfg)
+    Let block_count be List.length(blocks)
+    Let found be 0
+    Let i be 0
+    While i is less than block_count:
+        Let block_ptr be List.get(blocks, i)
+        If block_ptr is not equal to 0:
+            Let insts be MIR.get_block_instructions(block_ptr)
+            Let inst_count be List.length(insts)
+            Let j be 0
+            While j is less than inst_count:
+                Let inst be List.get(insts, j)
+                Let op be MIR.get_mir_node_opcode(inst)
+                If op is equal to opcode:
+                    Set found to found plus 1
+                End If
+                Set j to j plus 1
+            End While
+        End If
+        Set i to i plus 1
+    End While
+    Return found
+End Process
+
+Process called "find_opcode_in_cfg" that takes cfg as Integer, opcode as Integer, skip_inst as Integer returns Integer:
+    Note: Returns the first instruction with the given opcode that is
+    Note: not skip_inst, or 0.
+    Let blocks be CFG.get_mir_cfg_blocks(cfg)
+    Let block_count be List.length(blocks)
+    Let i be 0
+    While i is less than block_count:
+        Let block_ptr be List.get(blocks, i)
+        If block_ptr is not equal to 0:
+            Let insts be MIR.get_block_instructions(block_ptr)
+            Let inst_count be List.length(insts)
+            Let j be 0
+            While j is less than inst_count:
+                Let inst be List.get(insts, j)
+                Let op be MIR.get_mir_node_opcode(inst)
+                If op is equal to opcode:
+                    If inst is not equal to skip_inst:
+                        Return inst
+                    End If
+                End If
+                Set j to j plus 1
+            End While
+        End If
+        Set i to i plus 1
+    End While
+    Return 0
+End Process
+
+Process called "run_cfg_edge_primitives" that takes results as Integer returns Integer:
+    T.begin_suite(results, "cfg_edge_primitives")
+
+    Let type_info be make_type_info()
+    Let fn be MIR.create_mir_function("w5a_edge_probe", type_info, 0)
+    T.assert_not_null(results, "edge probe function constructed", fn)
+    Let cfg be MIR.get_mir_function_cfg(fn)
+
+    Let block_a be MIR.create_mir_basic_block(0, 0)
+    Let block_b be MIR.create_mir_basic_block(1, 0)
+    MIR.add_block_to_cfg(cfg, block_a)
+    MIR.add_block_to_cfg(cfg, block_b)
+    MIR.set_cfg_entry_block(cfg, block_a)
+    Layout.memory_set_int64(cfg, 48, 2)
+
+    Note: ---- add_edge wires lists, counts, and the edge table ----
+    Let add_rc be CFG.add_edge(cfg, block_a, block_b)
+    T.assert_equal(results, "add_edge returns 1", add_rc, 1)
+
+    Let a_succs be MIR.get_block_successors(block_a)
+    T.assert_equal(results, "A successor list holds one id", List.length(a_succs), 1)
+    T.assert_equal(results, "A successor id is B", List.get(a_succs, 0), 1)
+    Let a_succ_count be Layout.memory_get_int64(block_a, 56)
+    T.assert_equal(results, "A cached successor count is 1", a_succ_count, 1)
+
+    Let b_preds be MIR.get_block_predecessors(block_b)
+    T.assert_equal(results, "B predecessor list holds one id", List.length(b_preds), 1)
+    T.assert_equal(results, "B predecessor id is A", List.get(b_preds, 0), 0)
+    Let b_pred_count be Layout.memory_get_int64(block_b, 40)
+    T.assert_equal(results, "B cached predecessor count is 1", b_pred_count, 1)
+
+    Let edge_table be Layout.memory_get_int64(cfg, 32)
+    T.assert_equal(results, "edge table holds one pair", List.length(edge_table), 2)
+    Let edge_count be Layout.memory_get_int64(cfg, 40)
+    T.assert_equal(results, "cached edge count is 1", edge_count, 1)
+
+    Note: ---- remove_cfg_edge re-syncs counts and the edge table ----
+    Let remove_rc be CFG.remove_cfg_edge(cfg, 0, 1)
+    T.assert_equal(results, "remove_cfg_edge returns 1", remove_rc, 1)
+
+    T.assert_equal(results, "A successor list emptied", List.length(a_succs), 0)
+    Set a_succ_count to Layout.memory_get_int64(block_a, 56)
+    T.assert_equal(results, "A cached successor count re-synced to 0", a_succ_count, 0)
+    T.assert_equal(results, "B predecessor list emptied", List.length(b_preds), 0)
+    Set b_pred_count to Layout.memory_get_int64(block_b, 40)
+    T.assert_equal(results, "B cached predecessor count re-synced to 0", b_pred_count, 0)
+    T.assert_equal(results, "edge table pair removed", List.length(edge_table), 0)
+    Set edge_count to Layout.memory_get_int64(cfg, 40)
+    T.assert_equal(results, "cached edge count re-synced to 0", edge_count, 0)
+
+    Note: ---- full round trip stays consistent ----
+    MIR.add_cfg_edge(cfg, 0, 1)
+    CFG.remove_cfg_edge(cfg, 0, 1)
+    Set edge_count to Layout.memory_get_int64(cfg, 40)
+    Set a_succ_count to Layout.memory_get_int64(block_a, 56)
+    Set b_pred_count to Layout.memory_get_int64(block_b, 40)
+    Let table_len_after be List.length(edge_table)
+    Let roundtrip_consistent be 0
+    If edge_count is equal to 0:
+        If a_succ_count is equal to 0:
+            If b_pred_count is equal to 0:
+                If table_len_after is equal to 0:
+                    Set roundtrip_consistent to 1
+                End If
+            End If
+        End If
+    End If
+    T.assert_equal(results, "add/remove round trip fully consistent", roundtrip_consistent, 1)
+
+    Note: ---- remove_instruction_from_block removes and re-syncs ----
+    Let type_info2 be make_type_info()
+    Let inst_one be MIRNodes.create_mir_const(700, 1, type_info2, 0, 0)
+    Let inst_two be MIRNodes.create_mir_const(701, 2, type_info2, 0, 0)
+    MIR.add_instruction_to_block(block_a, inst_one)
+    MIR.add_instruction_to_block(block_a, inst_two)
+
+    Let detach_rc be CFG.remove_instruction_from_block(block_a, inst_one)
+    T.assert_equal(results, "remove_instruction_from_block returns 1", detach_rc, 1)
+    Let a_count be MIR.get_block_instruction_count(block_a)
+    T.assert_equal(results, "cached instruction count re-synced to 1", a_count, 1)
+    Let a_insts be MIR.get_block_instructions(block_a)
+    T.assert_equal(results, "instruction list length is 1", List.length(a_insts), 1)
+    T.assert_equal(results, "surviving instruction is the second", List.get(a_insts, 0), inst_two)
+    Let detached_parent be MIR.get_mir_node_parent_block(inst_one)
+    T.assert_equal(results, "detached instruction parent cleared", detached_parent, 0)
+
+    Let detach_again be CFG.remove_instruction_from_block(block_a, inst_one)
+    T.assert_equal(results, "second removal is a checked no-op", detach_again, 0)
+
+    Return 1
+End Process
+
+Process called "run_licm_hoist" that takes results as Integer returns Integer:
+    T.begin_suite(results, "licm_hoist")
+
+    Let type_info be make_type_info()
+    Let fn be MIR.create_mir_function("w5a_licm_probe", type_info, 0)
+    T.assert_not_null(results, "licm probe function constructed", fn)
+    Let cfg be MIR.get_mir_function_cfg(fn)
+
+    Note: B0 entry -> B1 header <-> B2 latch; B1 -> B3 exit
+    Let entry_block be MIR.create_mir_basic_block(0, 0)
+    Let header_block be MIR.create_mir_basic_block(1, 0)
+    Let latch_block be MIR.create_mir_basic_block(2, 0)
+    Let exit_block be MIR.create_mir_basic_block(3, 0)
+    MIR.add_block_to_cfg(cfg, entry_block)
+    MIR.add_block_to_cfg(cfg, header_block)
+    MIR.add_block_to_cfg(cfg, latch_block)
+    MIR.add_block_to_cfg(cfg, exit_block)
+    MIR.set_cfg_entry_block(cfg, entry_block)
+    MIR.set_cfg_exit_block(cfg, exit_block)
+    Layout.memory_set_int64(cfg, 48, 4)
+    Layout.memory_set_int64(fn, 56, 1000)
+
+    MIR.add_cfg_edge(cfg, 0, 1)
+    MIR.add_cfg_edge(cfg, 1, 2)
+    MIR.add_cfg_edge(cfg, 2, 1)
+    MIR.add_cfg_edge(cfg, 1, 3)
+
+    Note: B0: c10 = CONST 10 (vid 100); buf = ALLOCA (vid 102); jump B1
+    Let c10 be MIRNodes.create_mir_const(100, 10, type_info, 0, 0)
+    MIR.add_instruction_to_block(entry_block, c10)
+    MIR.register_value_definition(fn, 100, c10)
+
+    Let buf be MIRNodes.create_mir_alloca(102, type_info, 0, 8)
+    MIR.add_instruction_to_block(entry_block, buf)
+    MIR.register_value_definition(fn, 102, buf)
+
+    Let entry_jump be MIRNodes.create_mir_jump(1)
+    MIR.add_instruction_to_block(entry_block, entry_jump)
+
+    Note: B1: inv = ADD(100, 100) vid 101; ld = LOAD(102) vid 103;
+    Note:     var = ADD(103, 100) vid 104; st = STORE(102, 104);
+    Note:     cmp = LT(104, 100) vid 105; branch(105, B2, B3)
+    Let inv be MIRNodes.create_mir_binary_op(20002, 101, 100, 100, type_info)
+    MIR.add_instruction_to_block(header_block, inv)
+    MIR.register_value_definition(fn, 101, inv)
+
+    Let ld be MIRNodes.create_mir_load(103, 102, 0, type_info, 0)
+    MIR.add_instruction_to_block(header_block, ld)
+    MIR.register_value_definition(fn, 103, ld)
+
+    Let var_add be MIRNodes.create_mir_binary_op(20002, 104, 103, 100, type_info)
+    MIR.add_instruction_to_block(header_block, var_add)
+    MIR.register_value_definition(fn, 104, var_add)
+
+    Let st be MIRNodes.create_mir_store(102, 104, 0, type_info, 0)
+    MIR.add_instruction_to_block(header_block, st)
+
+    Let cmp be MIRNodes.create_mir_binary_op(20102, 105, 104, 100, type_info)
+    MIR.add_instruction_to_block(header_block, cmp)
+    MIR.register_value_definition(fn, 105, cmp)
+
+    Let header_branch be MIRNodes.create_mir_branch(105, 2, 3, 50, 50)
+    MIR.add_instruction_to_block(header_block, header_branch)
+
+    Note: B2: jump B1 (back edge)
+    Let latch_jump be MIRNodes.create_mir_jump(1)
+    MIR.add_instruction_to_block(latch_block, latch_jump)
+
+    Note: B3: return
+    Let exit_return be MIRNodes.create_mir_return(0, 0)
+    MIR.add_instruction_to_block(exit_block, exit_return)
+
+    Note: ---- run the pass ----
+    Let licm_rc be LICM.optimize_function_with_licm(fn)
+    T.assert_equal(results, "LICM pass returns success", licm_rc, 1)
+
+    Note: A preheader now sits between B0 and B1
+    Let block_count be CFG.get_cfg_block_count(cfg)
+    T.assert_equal(results, "preheader block added (5 blocks)", block_count, 5)
+
+    Note: inv was hoisted: its block is no longer the header
+    Let inv_block be MIR.get_mir_node_parent_block(inv)
+    T.assert_not_null(results, "invariant add still resident", inv_block)
+    T.assert_not_equal(results, "invariant add left the header", inv_block, header_block)
+
+    Note: The preheader is B0's sole successor and jumps to B1; the
+    Note: hoisted add sits AHEAD of the preheader's jump terminator
+    Let entry_succs be MIR.get_block_successors(entry_block)
+    T.assert_equal(results, "entry has exactly one successor", List.length(entry_succs), 1)
+    Let preheader_id be List.get(entry_succs, 0)
+    Let preheader_block be CFG.get_block_by_id(cfg, preheader_id)
+    T.assert_equal(results, "invariant add resides in the preheader", inv_block, preheader_block)
+
+    Let preheader_insts be MIR.get_block_instructions(preheader_block)
+    Let preheader_len be List.length(preheader_insts)
+    T.assert_equal(results, "preheader holds add + jump", preheader_len, 2)
+    T.assert_equal(results, "hoisted add ahead of terminator", List.get(preheader_insts, 0), inv)
+    Let preheader_term be List.get(preheader_insts, 1)
+    Let preheader_term_op be MIR.get_mir_node_opcode(preheader_term)
+    T.assert_equal(results, "preheader terminator is a jump", preheader_term_op, 20302)
+    Let preheader_target be Layout.memory_get_int64(preheader_term, 72)
+    T.assert_equal(results, "preheader jumps to the header", preheader_target, 1)
+
+    Note: The loop-variant add, the store-aliased load, the store, and
+    Note: the compare all stayed in the header
+    Let var_block be MIR.get_mir_node_parent_block(var_add)
+    T.assert_equal(results, "loop-variant add NOT hoisted", var_block, header_block)
+    Let ld_block be MIR.get_mir_node_parent_block(ld)
+    T.assert_equal(results, "store-aliased load NOT hoisted", ld_block, header_block)
+    Let st_block be MIR.get_mir_node_parent_block(st)
+    T.assert_equal(results, "store NOT hoisted", st_block, header_block)
+    Let cmp_block be MIR.get_mir_node_parent_block(cmp)
+    T.assert_equal(results, "loop-variant compare NOT hoisted", cmp_block, header_block)
+
+    Note: Header instruction count re-synced after the detach
+    Let header_count be MIR.get_block_instruction_count(header_block)
+    T.assert_equal(results, "header count re-synced after hoist", header_count, 5)
+
+    Note: The verifier accepts the transformed function
+    Let verify_rc be MIRVerifier.verify_mir_function(fn)
+    T.assert_equal(results, "verifier accepts post-LICM function", verify_rc, 1)
+
+    Return 1
+End Process
+
+Process called "run_inline_clone" that takes results as Integer returns Integer:
+    T.begin_suite(results, "inline_clone")
+
+    Let type_info be make_type_info()
+    Let program be MIR.create_mir_program(0)
+    T.assert_not_null(results, "program constructed", program)
+    Let program_functions be MIRNodes.get_program_functions(program)
+
+    Note: ---- callee: c5 = CONST 5 (501); r = ADD(500, 501) (502);
+    Note: ---- RETURN 502 (parameter vid 500)
+    Let callee be MIR.create_mir_function("w5a_inline_callee", type_info, 0)
+    Let callee_cfg be MIR.get_mir_function_cfg(callee)
+    Let callee_entry be MIR.create_mir_basic_block(0, 0)
+    MIR.add_block_to_cfg(callee_cfg, callee_entry)
+    MIR.set_cfg_entry_block(callee_cfg, callee_entry)
+    Layout.memory_set_int64(callee_cfg, 48, 1)
+    Layout.memory_set_int64(callee, 56, 600)
+
+    Let callee_params be Layout.memory_get_int64(callee, 16)
+    List.append(callee_params, 500)
+    Layout.memory_set_int64(callee, 24, 1)
+
+    Let c5 be MIRNodes.create_mir_const(501, 5, type_info, 0, 0)
+    MIR.add_instruction_to_block(callee_entry, c5)
+    MIR.register_value_definition(callee, 501, c5)
+
+    Let callee_add be MIRNodes.create_mir_binary_op(20002, 502, 500, 501, type_info)
+    MIR.add_instruction_to_block(callee_entry, callee_add)
+    MIR.register_value_definition(callee, 502, callee_add)
+
+    Let callee_return be MIRNodes.create_mir_return(502, type_info)
+    MIR.add_instruction_to_block(callee_entry, callee_return)
+
+    List.append(program_functions, callee)
+
+    Note: ---- caller: x = CONST 7 (600); y = CALL callee(x) (601);
+    Note: ---- u = ADD(601, 600) (602); RETURN 602
+    Let caller be MIR.create_mir_function("w5a_inline_caller", type_info, 0)
+    Let caller_cfg be MIR.get_mir_function_cfg(caller)
+    Let caller_entry be MIR.create_mir_basic_block(0, 0)
+    MIR.add_block_to_cfg(caller_cfg, caller_entry)
+    MIR.set_cfg_entry_block(caller_cfg, caller_entry)
+    Layout.memory_set_int64(caller_cfg, 48, 1)
+    Layout.memory_set_int64(caller, 56, 1000)
+
+    Let x_const be MIRNodes.create_mir_const(600, 7, type_info, 0, 0)
+    MIR.add_instruction_to_block(caller_entry, x_const)
+    MIR.register_value_definition(caller, 600, x_const)
+
+    Note: Canonical direct-call contract: callee field is the function
+    Note: NAME STRING pointer with is_indirect 0 (task #461)
+    Let callee_name be Layout.memory_get_int64(callee, 0)
+    Let call_args be List.create()
+    List.append(call_args, 600)
+    Let call_inst be MIRNodes.create_mir_call(601, callee_name, call_args, 1, type_info, 0, 0)
+    MIR.add_instruction_to_block(caller_entry, call_inst)
+    MIR.register_value_definition(caller, 601, call_inst)
+
+    Let use_add be MIRNodes.create_mir_binary_op(20002, 602, 601, 600, type_info)
+    MIR.add_instruction_to_block(caller_entry, use_add)
+    MIR.register_value_definition(caller, 602, use_add)
+
+    Let caller_return be MIRNodes.create_mir_return(602, type_info)
+    MIR.add_instruction_to_block(caller_entry, caller_return)
+
+    List.append(program_functions, caller)
+    Layout.memory_set_int64(program, 8, 2)
+
+    Note: ---- run the pass ----
+    Let inline_rc be Inliner.optimize_function_with_inlining(caller, program)
+    T.assert_equal(results, "inlining pass returns success", inline_rc, 1)
+
+    Note: No direct call survives in the caller
+    Let surviving_calls be count_opcode_in_cfg(caller_cfg, 20304)
+    T.assert_equal(results, "call instruction eliminated", surviving_calls, 0)
+
+    Note: Caller grew: entry + clone + continuation = 3 blocks
+    Let caller_blocks be CFG.get_cfg_block_count(caller_cfg)
+    T.assert_equal(results, "caller has 3 blocks after inline", caller_blocks, 3)
+
+    Note: The cloned body: a SECOND const (the clone of c5) and a
+    Note: SECOND add now live in the caller with FRESH value ids
+    Let clone_const be find_opcode_in_cfg(caller_cfg, 20001, x_const)
+    T.assert_not_null(results, "clone of callee const present", clone_const)
+    Let clone_const_vid be MIR.get_mir_node_value_id(clone_const)
+    T.assert_not_equal(results, "clone const has fresh id (not 501)", clone_const_vid, 501)
+    T.assert_greater_than_or_equal(results, "clone const id from caller pool", clone_const_vid, 1000)
+
+    Let clone_add be find_opcode_in_cfg(caller_cfg, 20002, use_add)
+    T.assert_not_null(results, "clone of callee add present", clone_add)
+    Let clone_add_vid be MIR.get_mir_node_value_id(clone_add)
+    T.assert_not_equal(results, "clone add has fresh id (not 502)", clone_add_vid, 502)
+    T.assert_greater_than_or_equal(results, "clone add id from caller pool", clone_add_vid, 1000)
+
+    Note: Parameter substituted by the call argument; const operand
+    Note: remapped to the fresh clone-const id
+    Let clone_add_op1 be MIR.get_mir_node_operand(clone_add, 1)
+    T.assert_equal(results, "clone add left operand is the argument", clone_add_op1, 600)
+    Let clone_add_op2 be MIR.get_mir_node_operand(clone_add, 2)
+    T.assert_equal(results, "clone add right operand remapped to clone const", clone_add_op2, clone_const_vid)
+    Note: OD-1 ext mirrors stayed coherent with the header slots
+    Let clone_add_ext_left be Layout.memory_get_int64(clone_add, 80)
+    T.assert_equal(results, "clone add ext left mirror coherent", clone_add_ext_left, 600)
+    Let clone_add_ext_right be Layout.memory_get_int64(clone_add, 88)
+    T.assert_equal(results, "clone add ext right mirror coherent", clone_add_ext_right, clone_const_vid)
+
+    Note: The call result use was rewritten to the clone's return value
+    Let use_op1 be MIR.get_mir_node_operand(use_add, 1)
+    T.assert_equal(results, "call-result use rewritten to clone result", use_op1, clone_add_vid)
+
+    Note: The callee's ORIGINAL body is untouched
+    Let orig_add_vid be MIR.get_mir_node_value_id(callee_add)
+    T.assert_equal(results, "callee add keeps its value id", orig_add_vid, 502)
+    Let orig_add_op1 be MIR.get_mir_node_operand(callee_add, 1)
+    T.assert_equal(results, "callee add keeps its param operand", orig_add_op1, 500)
+    Let orig_add_op2 be MIR.get_mir_node_operand(callee_add, 2)
+    T.assert_equal(results, "callee add keeps its const operand", orig_add_op2, 501)
+    Let callee_entry_count be MIR.get_block_instruction_count(callee_entry)
+    T.assert_equal(results, "callee body length unchanged", callee_entry_count, 3)
+    Let callee_last be CFG.get_block_terminator(callee_entry)
+    Let callee_last_op be MIR.get_mir_node_opcode(callee_last)
+    T.assert_equal(results, "callee still ends in RETURN", callee_last_op, 20303)
+
+    Note: Mutating the inlined COPY leaves the original untouched
+    MIRNodes.set_mir_node_used_value(clone_add, 1, 999)
+    Let mutated_clone_op1 be MIR.get_mir_node_operand(clone_add, 1)
+    T.assert_equal(results, "clone mutation landed", mutated_clone_op1, 999)
+    Set orig_add_op1 to MIR.get_mir_node_operand(callee_add, 1)
+    T.assert_equal(results, "callee add unaffected by clone mutation", orig_add_op1, 500)
+    Note: undo the mutation so the verifier sees a defined use
+    MIRNodes.set_mir_node_used_value(clone_add, 1, 600)
+
+    Note: The verifier accepts the transformed caller
+    Let verify_rc be MIRVerifier.verify_mir_function(caller)
+    T.assert_equal(results, "verifier accepts post-inline caller", verify_rc, 1)
+
+    Return 1
+End Process
+
+Process called "main" returns Integer:
+    Let results be T.create_test_results()
+
+    run_cfg_edge_primitives(results)
+    run_licm_hoist(results)
+    run_inline_clone(results)
+
+    T.print_summary(results)
+    Let passed be T.all_passed(results)
+    T.destroy_test_results(results)
+
+    If passed is equal to 1:
+        Return 0
+    End If
+    Return 1
+End Process

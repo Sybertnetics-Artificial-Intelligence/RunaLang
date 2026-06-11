@@ -351,7 +351,15 @@ source order; segment text lands in each literal's value slot. The
 parser's AST children already alternate AST_LITERAL segment carriers and
 hole expressions, so translation is a positional walk through
 translate_expression (the literal path recognises the segment token
-kinds and produces string-kind HIR literals).
+kinds and produces string-kind HIR literals). Hole expressions may carry
+a format spec in their AST metadata slot (offset 40) - the printf-style
+specifier from %d{expr} or the .NET alignment/format suffix from
+{expr,alignment:format}; the translator appends it as the "format_spec"
+metadata property on the translated hole node so backends that format
+can honour it and backends that do not can ignore it. Some hole shapes
+translate to composite records whose standard HIRNode base lives at
+offset 0 (call, lambda, binary expressions); for those the property is
+written on the base node, which is the node metadata consumers visit.
 @End Reasoning
 Process called "translate_interpolated_string" takes translator as Integer, fsharp_node as Integer returns Integer:
     Note: Translate F# interpolated string to HIR interpolated-string node
@@ -366,6 +374,19 @@ Process called "translate_interpolated_string" takes translator as Integer, fsha
         Let part_node be proc list_get from List with children, i
         Let hir_part be proc translate_expression with translator, part_node
         If hir_part is not equal to 0:
+            Note: Carry the hole's format spec (set only on hole expression
+            Note: nodes by the parser; 0 on segment literals) into HIR metadata
+            Let format_spec be proc memory_get_int64 from Layout with part_node, 40
+            If format_spec is not equal to 0:
+                Let spec_target be hir_part
+                Let first_slot be proc memory_get_int64 from Layout with hir_part, 0
+                If first_slot is greater than or equal to 65536:
+                    Note: Composite translator record - its standard HIRNode
+                    Note: base is the metadata-bearing node
+                    Set spec_target to first_slot
+                End If
+                proc hir_set_metadata from HIRNodes with spec_target, "format_spec", format_spec
+            End If
             proc add_hir_node from HIR with hir_node, hir_part
         End If
         Set i to i plus 1
@@ -2046,6 +2067,35 @@ Process called "translate_type_expression" takes translator as Integer, type_nod
         Return generic_node
     End If
 
+    Note: Tuple types (int * string * bool) become the canonical
+    Note: HIR_TUPLE_TYPE node with the element types as ordered children -
+    Note: the exact shape the julia and rust backends' emit_type walks via
+    Note: node_child_count/node_child - built through the dedicated
+    Note: hir_nodes producers (hir_create_tuple_type + hir_add_tuple_element),
+    Note: the same producer surface every other type shape uses.
+    If node_type is equal to AST_TYPE_TUPLE from FSharpAST:
+        Set children to proc memory_get_int64 from Layout with type_node, 16
+        Set child_count to proc memory_get_int64 from Layout with type_node, 24
+
+        Let tuple_node be proc hir_create_tuple_type from HIRNodes
+        If tuple_node is equal to 0:
+            proc set_translation_error with translator, "Tuple type allocation failed"
+            Return 0
+        End If
+
+        Let i be 0
+        While i is less than child_count:
+            Let element_node be proc list_get from List with children, i
+            Let hir_element be proc translate_type_expression with translator, element_node
+            If hir_element is not equal to 0:
+                proc hir_add_tuple_element from HIRNodes with tuple_node, hir_element
+            End If
+            Set i to i plus 1
+        End While
+
+        Return tuple_node
+    End If
+
     proc set_translation_error with translator, "Unsupported F# type expression"
     Return 0
 End Process
@@ -2174,6 +2224,9 @@ Process called "translate_type_body" takes translator as Integer, type_body as I
         Return proc translate_type_expression with translator, type_body
     End If
     If node_type is equal to AST_TYPE_APPLICATION from FSharpAST:
+        Return proc translate_type_expression with translator, type_body
+    End If
+    If node_type is equal to AST_TYPE_TUPLE from FSharpAST:
         Return proc translate_type_expression with translator, type_body
     End If
 

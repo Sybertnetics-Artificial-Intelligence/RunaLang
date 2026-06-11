@@ -33,17 +33,26 @@ This file consists of the following functions/features/operation types:
 - Branch probability computation from profile data
 - Hot function and hot path identification
 - Profile-driven optimization heuristics
+
+Canonical MIR contract (task #468 retarget, per MIR_RECONCILIATION_PLAN.md
+Part 1): MIRFunction name@0/cfg@8; MIRCFG entry_block@0/blocks@16; MIRBasicBlock
+block_id@0/instructions@16/predecessors@32/successors@48 (pred/succ Lists hold
+BLOCK IDS, resolved through CFG.get_block_by_id_from_cfg); MIRNode header
+opcode@0 with extended fields at 72+ (OD-1 prefix embedding); BRANCH = 20301
+with true_block_id@80/false_block_id@88/weight_true@96/weight_false@104;
+CALL = 20304 with callee@80 (name pointer or value-id, task #461 contract);
+function identity is the MIRFunction POINTER (OD-4 - no numeric ids exist).
+All integer-keyed maps use collections/ordered_map (collections/dictionary
+string-hashes its keys, so integer keys segfault at runtime - Wave 3 finding).
 :End Note
 
 Import "compiler/middle/gungnir/mir/mir.runa" as MIR
-Import "compiler/middle/gungnir/mir/mir_builder.runa" as MIRBuilder
+Import "compiler/middle/gungnir/mir/mir_nodes.runa" as MIRNodes
 Import "compiler/middle/gungnir/mir/cfg.runa" as CFG
-Import "compiler/middle/analysis/control_flow.runa" as ControlFlowGraph
 Import "compiler/middle/analysis/call_graph.runa" as CallGraph
 Import "compiler/frontend/primitives/memory/layout.runa" as Layout
-Import "compiler/frontend/primitives/core/memory_core.runa" as MemoryCore
 Import "compiler/frontend/primitives/assembly/syscall.runa" as Syscall
-Import "compiler/frontend/primitives/collections/dictionary.runa" as Dictionary
+Import "compiler/frontend/primitives/collections/ordered_map.runa" as OrderedMap
 Import "compiler/frontend/primitives/collections/list.runa" as List
 Import "compiler/frontend/primitives/collections/set.runa" as Set
 Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
@@ -72,8 +81,14 @@ PGO data sources:
 - **Instrumentation**: Insert counters at blocks/edges (accurate but slower)
 - **Sampling**: Periodic samples of program counter (lower overhead, less precise)
 
-This implementation focuses on using profile data, not collecting it.
-Collection would be done by instrumented runtime or sampling profiler.
+This implementation consumes profile data; collection is performed by the
+instrumented runtime or a sampling profiler and ingested via
+load_profile_data. The pipeline driver is
+optimization.runa:apply_profile_guided_optimizations, which runs the
+analysis passes in dependency order: compute_block_frequencies,
+compute_branch_probabilities, identify_hot_blocks, identify_cold_blocks,
+identify_hot_paths, compute_inline_decisions, then the transform passes
+apply_pgo_hints and optimize_code_layout.
 @End Reasoning
 
 Note: Profile source constants
@@ -81,28 +96,41 @@ Constant PROFILE_SOURCE_INSTRUMENTATION as Integer is 0  Note: Instrumentation-b
 Constant PROFILE_SOURCE_SAMPLING as Integer is 1         Note: Sampling-based profiling
 
 Note: Hot/cold thresholds (percentage of total execution)
-Constant HOT_THRESHOLD_PERCENT as Integer is 90    Note: Top 90% of execution = hot
-Constant COLD_THRESHOLD_PERCENT as Integer is 1    Note: Bottom 1% of execution = cold
+Constant HOT_THRESHOLD_PERCENT as Integer is 90    Note: Blocks covering the top 90% of execution = hot
+Constant COLD_THRESHOLD_PERCENT as Integer is 1    Note: Blocks below 1% of total execution = cold
+
+Note: Edge frequency keys encode (src_block_id, dst_block_id) as a single
+Note: integer: edge_key = src_block_id * 1000000 + dst_block_id. Block ids
+Note: are allocated densely from 0 by MIR.allocate_block_id, so a million-id
+Note: namespace per source block cannot collide for any realistic function.
+Constant EDGE_KEY_BASE as Integer is 1000000
 
 @Implementation
 ProfileData contains all profiling information for a single function.
 Fields:
-- function_id: Function this profile belongs to
-- block_frequencies: Dictionary mapping block_id -> execution_count
-- edge_frequencies: Dictionary mapping edge_id -> edge_count (edge_id = src_block * 1000000 + dst_block)
-- call_site_frequencies: Dictionary mapping call_inst_ptr -> call_count
-- branch_probabilities: Dictionary mapping branch_inst_ptr -> probability (0-100)
-- hot_threshold: Execution count threshold to be considered "hot"
-- cold_threshold: Execution count threshold to be considered "cold"
-- total_samples: Total profile samples collected for this function
+- function_ptr: MIRFunction POINTER this profile belongs to (OD-4 identity)
+- block_frequencies: ordered_map mapping block_id -> execution_count
+- edge_frequencies: ordered_map mapping edge_key -> edge_count
+  (edge_key = src_block_id * EDGE_KEY_BASE + dst_block_id)
+- call_site_frequencies: ordered_map mapping call_inst_ptr -> call_count
+- branch_probabilities: ordered_map mapping branch_inst_ptr -> taken probability (0-100)
+- hot_threshold: execution-count cutoff of the coolest block still classified
+  hot (written by identify_hot_blocks)
+- cold_threshold: execution-count cutoff below which a block is cold
+  (written by identify_cold_blocks)
+- total_samples: total profile samples attributed to this function
 - profile_source: INSTRUMENTATION (0) or SAMPLING (1)
 
+All four maps are collections/ordered_map instances because every key is an
+integer (block id, encoded edge key, or instruction pointer);
+collections/dictionary string-hashes its keys and segfaults on integers.
+
 Memory layout (72 bytes, Tier 3 OWNED HEAP):
-Offset 0: function_id (8 bytes)
-Offset 8: block_frequencies (8 bytes, pointer to Dictionary)
-Offset 16: edge_frequencies (8 bytes, pointer to Dictionary)
-Offset 24: call_site_frequencies (8 bytes, pointer to Dictionary)
-Offset 32: branch_probabilities (8 bytes, pointer to Dictionary)
+Offset 0: function_ptr (8 bytes, MIRFunction pointer)
+Offset 8: block_frequencies (8 bytes, pointer to ordered_map)
+Offset 16: edge_frequencies (8 bytes, pointer to ordered_map)
+Offset 24: call_site_frequencies (8 bytes, pointer to ordered_map)
+Offset 32: branch_probabilities (8 bytes, pointer to ordered_map)
 Offset 40: hot_threshold (8 bytes)
 Offset 48: cold_threshold (8 bytes)
 Offset 56: total_samples (8 bytes)
@@ -110,7 +138,7 @@ Offset 64: profile_source (8 bytes)
 @End Implementation
 
 Type called "ProfileData":
-    function_id as Integer
+    function_ptr as Integer
     block_frequencies as Integer
     edge_frequencies as Integer
     call_site_frequencies as Integer
@@ -126,8 +154,8 @@ HotPath represents a frequently executed sequence of basic blocks.
 Fields:
 - path_id: Unique identifier for this path
 - block_ids: List of block IDs forming this path
-- execution_count: Total multiplied by this path was executed
-- is_hot: Boolean flag indicating if this is a hot path
+- execution_count: Sum of the block frequencies along this path
+- is_hot: Boolean flag indicating if this path passes through a hot block
 - optimization_priority: Priority level for optimization (0-10, higher = more important)
 - path_length: Number of blocks in this path
 
@@ -152,11 +180,11 @@ End Type
 @Implementation
 BranchProbability tracks the probability of a branch instruction.
 Fields:
-- instruction_ptr: Pointer to branch instruction
-- true_count: Number of multiplied by branch was taken (true path)
-- false_count: Number of multiplied by branch was not taken (false path)
-- true_probability: Probability of taking branch * 100 (0-100)
-- false_probability: Probability of not taking branch * 100 (0-100)
+- instruction_ptr: Pointer to branch instruction (canonical MIRBranch record)
+- true_count: Observed executions along the true edge
+- false_count: Observed executions along the false edge
+- true_probability: Probability of taking the true edge * 100 (0-100)
+- false_probability: Probability of taking the false edge * 100 (0-100)
 
 Memory layout (40 bytes, Tier 3 OWNED HEAP):
 Offset 0: instruction_ptr (8 bytes)
@@ -177,16 +205,21 @@ End Type
 @Implementation
 ProfileGuidedAnalysis is the main PGO analysis state.
 Fields:
-- mir_function: Pointer to MIRFunction being analyzed
+- mir_function: Pointer to MIRFunction being analyzed (OD-4 identity)
 - profile_data: Pointer to ProfileData for this function
 - hot_blocks: Set of hot block IDs
 - cold_blocks: Set of cold block IDs
 - hot_paths: List of HotPath structures
-- hot_functions: List of frequently called function IDs (from call graph)
-- cold_functions: List of rarely called function IDs
+- hot_functions: List of frequently called MIRFunction pointers (from call graph)
+- cold_functions: List of rarely called MIRFunction pointers
 - inline_candidates: List of InliningDecision prioritized by profile frequency
-- branch_probs: Dictionary mapping instruction_ptr -> BranchProbability
+- branch_probs: ordered_map mapping branch_inst_ptr -> BranchProbability pointer
 - optimization_decisions: List of PGO-driven optimization decisions
+
+branch_probs is an ordered_map (instruction-pointer keys are integers;
+collections/dictionary string-hashes keys and segfaults on integers).
+The hot/cold Sets take raw integer block ids directly - collections/set
+string-encodes elements internally (Wave 5a finding).
 
 Memory layout (80 bytes, Tier 3 OWNED HEAP):
 Offset 0: mir_function (8 bytes)
@@ -197,7 +230,7 @@ Offset 32: hot_paths (8 bytes, pointer to List)
 Offset 40: hot_functions (8 bytes, pointer to List)
 Offset 48: cold_functions (8 bytes, pointer to List)
 Offset 56: inline_candidates (8 bytes, pointer to List)
-Offset 64: branch_probs (8 bytes, pointer to Dictionary)
+Offset 64: branch_probs (8 bytes, pointer to ordered_map)
 Offset 72: optimization_decisions (8 bytes, pointer to List)
 @End Implementation
 
@@ -217,8 +250,9 @@ End Type
 @Implementation
 InliningDecision represents a profile-guided inlining decision.
 Fields:
-- call_site_inst: Pointer to call instruction
-- callee_function_id: Function ID to potentially inline
+- call_site_inst: Pointer to call instruction (canonical MIRCall record)
+- callee_function: MIRFunction POINTER of the resolved callee (OD-4), or 0
+  when the callee could not be resolved to a function in this program
 - priority: Inlining priority based on frequency (0-100)
 - cost_benefit: Estimated benefit - cost (positive = inline, negative = don't)
 - should_inline: Boolean decision (1 = inline, 0 = don't inline)
@@ -226,7 +260,7 @@ Fields:
 
 Memory layout (48 bytes, Tier 3 OWNED HEAP):
 Offset 0: call_site_inst (8 bytes)
-Offset 8: callee_function_id (8 bytes)
+Offset 8: callee_function (8 bytes, MIRFunction pointer or 0)
 Offset 16: priority (8 bytes)
 Offset 24: cost_benefit (8 bytes)
 Offset 32: should_inline (8 bytes)
@@ -235,7 +269,7 @@ Offset 40: reason (8 bytes, pointer to string)
 
 Type called "InliningDecision":
     call_site_inst as Integer
-    callee_function_id as Integer
+    callee_function as Integer
     priority as Integer
     cost_benefit as Integer
     should_inline as Integer
@@ -244,23 +278,23 @@ End Type
 
 @Reasoning
 create_profile_data initializes a ProfileData structure.
-All dictionaries are initialized as empty, thresholds set to defaults.
+All maps are initialized as empty ordered_maps, thresholds set to defaults.
 @End Reasoning
 
-Process called "create_profile_data" that takes function_id as Integer, profile_source as Integer returns Integer:
+Process called "create_profile_data" that takes function_ptr as Integer, profile_source as Integer returns Integer:
     Note: Allocate ProfileData (72 bytes, Tier 3 OWNED HEAP)
     Let pd be proc allocate from Layout with 72
 
     Note: Initialize fields
-    proc memory_set_int64 from MemoryCore with pd, 0, function_id
-    proc memory_set_int64 from MemoryCore with pd, 8, Dictionary.create( )   Note: block_frequencies
-    proc memory_set_int64 from MemoryCore with pd, 16, Dictionary.create( )  Note: edge_frequencies
-    proc memory_set_int64 from MemoryCore with pd, 24, Dictionary.create( )  Note: call_site_frequencies
-    proc memory_set_int64 from MemoryCore with pd, 32, Dictionary.create( )  Note: branch_probabilities
-    proc memory_set_int64 from MemoryCore with pd, 40, 1000 Note: hot_threshold (default)
-    proc memory_set_int64 from MemoryCore with pd, 48, 10 Note: cold_threshold (default)
-    proc memory_set_int64 from MemoryCore with pd, 56, 0 Note: total_samples
-    proc memory_set_int64 from MemoryCore with pd, 64, profile_source
+    proc memory_set_int64 from Layout with pd, 0, function_ptr
+    proc memory_set_int64 from Layout with pd, 8, OrderedMap.omap_create( )   Note: block_frequencies (integer-keyed)
+    proc memory_set_int64 from Layout with pd, 16, OrderedMap.omap_create( )  Note: edge_frequencies (integer-keyed)
+    proc memory_set_int64 from Layout with pd, 24, OrderedMap.omap_create( )  Note: call_site_frequencies (integer-keyed)
+    proc memory_set_int64 from Layout with pd, 32, OrderedMap.omap_create( )  Note: branch_probabilities (integer-keyed)
+    proc memory_set_int64 from Layout with pd, 40, 1000 Note: hot_threshold (default)
+    proc memory_set_int64 from Layout with pd, 48, 10 Note: cold_threshold (default)
+    proc memory_set_int64 from Layout with pd, 56, 0 Note: total_samples
+    proc memory_set_int64 from Layout with pd, 64, profile_source
 
     Return pd
 End Process
@@ -275,12 +309,12 @@ Process called "create_hot_path" that takes path_id as Integer returns Integer:
     Let hp be proc allocate from Layout with 48
 
     Note: Initialize fields
-    proc memory_set_int64 from MemoryCore with hp, 0, path_id
-    proc memory_set_int64 from MemoryCore with hp, 8, List.create( )  Note: block_ids
-    proc memory_set_int64 from MemoryCore with hp, 16, 0 Note: execution_count
-    proc memory_set_int64 from MemoryCore with hp, 24, 0 Note: is_hot = false
-    proc memory_set_int64 from MemoryCore with hp, 32, 0 Note: optimization_priority
-    proc memory_set_int64 from MemoryCore with hp, 40, 0 Note: path_length
+    proc memory_set_int64 from Layout with hp, 0, path_id
+    proc memory_set_int64 from Layout with hp, 8, List.create( )  Note: block_ids
+    proc memory_set_int64 from Layout with hp, 16, 0 Note: execution_count
+    proc memory_set_int64 from Layout with hp, 24, 0 Note: is_hot = false
+    proc memory_set_int64 from Layout with hp, 32, 0 Note: optimization_priority
+    proc memory_set_int64 from Layout with hp, 40, 0 Note: path_length
 
     Return hp
 End Process
@@ -295,11 +329,11 @@ Process called "create_branch_probability" that takes instruction_ptr as Integer
     Let bp be proc allocate from Layout with 40
 
     Note: Initialize fields
-    proc memory_set_int64 from MemoryCore with bp, 0, instruction_ptr
-    proc memory_set_int64 from MemoryCore with bp, 8, 0 Note: true_count
-    proc memory_set_int64 from MemoryCore with bp, 16, 0 Note: false_count
-    proc memory_set_int64 from MemoryCore with bp, 24, 50 Note: true_probability (default 50%)
-    proc memory_set_int64 from MemoryCore with bp, 32, 50 Note: false_probability (default 50%)
+    proc memory_set_int64 from Layout with bp, 0, instruction_ptr
+    proc memory_set_int64 from Layout with bp, 8, 0 Note: true_count
+    proc memory_set_int64 from Layout with bp, 16, 0 Note: false_count
+    proc memory_set_int64 from Layout with bp, 24, 50 Note: true_probability (default 50%)
+    proc memory_set_int64 from Layout with bp, 32, 50 Note: false_probability (default 50%)
 
     Return bp
 End Process
@@ -314,16 +348,16 @@ Process called "create_profile_guided_analysis" that takes mir_function as Integ
     Let pga be proc allocate from Layout with 80
 
     Note: Initialize fields
-    proc memory_set_int64 from MemoryCore with pga, 0, mir_function
-    proc memory_set_int64 from MemoryCore with pga, 8, profile_data
-    proc memory_set_int64 from MemoryCore with pga, 16, Set.create( )         Note: hot_blocks
-    proc memory_set_int64 from MemoryCore with pga, 24, Set.create( )         Note: cold_blocks
-    proc memory_set_int64 from MemoryCore with pga, 32, List.create( )        Note: hot_paths
-    proc memory_set_int64 from MemoryCore with pga, 40, List.create( )        Note: hot_functions
-    proc memory_set_int64 from MemoryCore with pga, 48, List.create( )        Note: cold_functions
-    proc memory_set_int64 from MemoryCore with pga, 56, List.create( )        Note: inline_candidates
-    proc memory_set_int64 from MemoryCore with pga, 64, Dictionary.create( )  Note: branch_probs
-    proc memory_set_int64 from MemoryCore with pga, 72, List.create( )        Note: optimization_decisions
+    proc memory_set_int64 from Layout with pga, 0, mir_function
+    proc memory_set_int64 from Layout with pga, 8, profile_data
+    proc memory_set_int64 from Layout with pga, 16, Set.create( )         Note: hot_blocks
+    proc memory_set_int64 from Layout with pga, 24, Set.create( )         Note: cold_blocks
+    proc memory_set_int64 from Layout with pga, 32, List.create( )        Note: hot_paths
+    proc memory_set_int64 from Layout with pga, 40, List.create( )        Note: hot_functions
+    proc memory_set_int64 from Layout with pga, 48, List.create( )        Note: cold_functions
+    proc memory_set_int64 from Layout with pga, 56, List.create( )        Note: inline_candidates
+    proc memory_set_int64 from Layout with pga, 64, OrderedMap.omap_create( )  Note: branch_probs (integer-keyed)
+    proc memory_set_int64 from Layout with pga, 72, List.create( )        Note: optimization_decisions
 
     Return pga
 End Process
@@ -331,188 +365,301 @@ End Process
 @Reasoning
 create_inlining_decision initializes an InliningDecision structure.
 Decision defaults to "don't inline" until analysis determines otherwise.
+callee_function is the resolved MIRFunction pointer (OD-4), or 0 when
+the callee did not resolve to a function in the current program.
 @End Reasoning
 
-Process called "create_inlining_decision" that takes call_site_inst as Integer, callee_function_id as Integer returns Integer:
+Process called "create_inlining_decision" that takes call_site_inst as Integer, callee_function as Integer returns Integer:
     Note: Allocate InliningDecision (48 bytes, Tier 3 OWNED HEAP)
     Let id be proc allocate from Layout with 48
 
     Note: Initialize fields
-    proc memory_set_int64 from MemoryCore with id, 0, call_site_inst
-    proc memory_set_int64 from MemoryCore with id, 8, callee_function_id
-    proc memory_set_int64 from MemoryCore with id, 16, 0 Note: priority
-    proc memory_set_int64 from MemoryCore with id, 24, 0 Note: cost_benefit
-    proc memory_set_int64 from MemoryCore with id, 32, 0 Note: should_inline = false
-    proc memory_set_int64 from MemoryCore with id, 40, 0 Note: reason = null
+    proc memory_set_int64 from Layout with id, 0, call_site_inst
+    proc memory_set_int64 from Layout with id, 8, callee_function
+    proc memory_set_int64 from Layout with id, 16, 0 Note: priority
+    proc memory_set_int64 from Layout with id, 24, 0 Note: cost_benefit
+    proc memory_set_int64 from Layout with id, 32, 0 Note: should_inline = false
+    proc memory_set_int64 from Layout with id, 40, 0 Note: reason = null
 
     Return id
 End Process
 
 @Reasoning
-load_profile_data loads profiling data from an external source.
-This could be a file written by instrumented runtime or sampling profiler.
+load_profile_data ingests profiling data from a parsed profile container
+into a fresh ProfileData record for one function.
 
-For this implementation, we assume profile data is provided as a Dictionary
-with the following structure:
-- "blocks": Dictionary of block_id -> execution_count
-- "edges": Dictionary of edge_id -> edge_count
-- "calls": Dictionary of call_inst_ptr -> call_count
+Ingestion contract: profile_map is an ordered_map (integer-keyed) with up
+to three section entries:
+- key 1000 ("blocks" section): ordered_map of block_id -> execution_count
+- key 1001 ("edges" section): ordered_map of edge_key -> edge_count, where
+  edge_key = src_block_id * EDGE_KEY_BASE + dst_block_id
+- key 1002 ("calls" section): ordered_map of call_inst_ptr -> call_count
 
-In a real implementation, this would parse a profile data file format.
+Missing sections are tolerated (the corresponding map stays empty); the
+frequency-propagation pass fills gaps from CFG structure. total_samples is
+seeded with the sum of the ingested block counts so that
+validate_profile_data can run before compute_block_frequencies refines it.
+
+function_ptr is the MIRFunction POINTER (OD-4 - functions have no numeric
+ids; offset 0 of MIRFunction is the name string).
 @End Reasoning
 
-Process called "load_profile_data" that takes function_id as Integer, profile_dict as Integer returns Integer:
-    Let pd be create_profile_data(function_id, 0)
-    Let block_frequencies be proc memory_get_int64 from MemoryCore with pd, 8
-    Let edge_frequencies be proc memory_get_int64 from MemoryCore with pd, 16
-    Let call_site_frequencies be proc memory_get_int64 from MemoryCore with pd, 24
+Process called "load_profile_data" that takes function_ptr as Integer, profile_map as Integer returns Integer:
+    Let pd be create_profile_data(function_ptr, 0)
+    Let block_frequencies be proc memory_get_int64 from Layout with pd, 8
+    Let edge_frequencies be proc memory_get_int64 from Layout with pd, 16
+    Let call_site_frequencies be proc memory_get_int64 from Layout with pd, 24
 
-    Note: Load block frequencies
-    Let blocks_dict be proc get from Dictionary with profile_dict, 1000 Note: "blocks" key
-    If blocks_dict is not equal to 0:
-        Let block_ids be proc keys from Dictionary with blocks_dict
-        Let block_count be proc length from List with block_ids
+    If profile_map is equal to 0:
+        Return pd
+    End If
 
-        Let i be 0
-        While i is less than block_count:
-            Let block_id be proc list_get from List with block_ids, i
-            Let count be proc get from Dictionary with blocks_dict, block_id
-            proc set from Dictionary with block_frequencies, block_id, count
-
-            Set i to i plus 1
+    Note: Load block frequencies (section key 1000), accumulating the total.
+    Let total_ingested be 0
+    Let blocks_map be proc omap_get from OrderedMap with profile_map, 1000
+    If blocks_map is not equal to 0:
+        Let block_entry be proc omap_first from OrderedMap with blocks_map
+        While block_entry is not equal to 0:
+            Let block_id be proc omap_entry_key from OrderedMap with block_entry
+            Let block_count be proc omap_entry_value from OrderedMap with block_entry
+            proc omap_set from OrderedMap with block_frequencies, block_id, block_count
+            Set total_ingested to total_ingested plus block_count
+            Set block_entry to proc omap_entry_next from OrderedMap with block_entry
         End While
     End If
 
-    Note: Load edge frequencies
-    Let edges_dict be proc get from Dictionary with profile_dict, 1001 Note: "edges" key
-    If edges_dict is not equal to 0:
-        Let edge_ids be proc keys from Dictionary with edges_dict
-        Let edge_count be proc length from List with edge_ids
-
-        Set i to 0
-        While i is less than edge_count:
-            Let edge_id be proc list_get from List with edge_ids, i
-            Set count to proc get from Dictionary with edges_dict, edge_id
-            proc set from Dictionary with edge_frequencies, edge_id, count
-
-            Set i to i plus 1
+    Note: Load edge frequencies (section key 1001).
+    Let edges_map be proc omap_get from OrderedMap with profile_map, 1001
+    If edges_map is not equal to 0:
+        Let edge_entry be proc omap_first from OrderedMap with edges_map
+        While edge_entry is not equal to 0:
+            Let edge_key be proc omap_entry_key from OrderedMap with edge_entry
+            Let edge_count be proc omap_entry_value from OrderedMap with edge_entry
+            proc omap_set from OrderedMap with edge_frequencies, edge_key, edge_count
+            Set edge_entry to proc omap_entry_next from OrderedMap with edge_entry
         End While
     End If
 
-    Note: Load call site frequencies
-    Let calls_dict be proc get from Dictionary with profile_dict, 1002 Note: "calls" key
-    If calls_dict is not equal to 0:
-        Let call_ptrs be proc keys from Dictionary with calls_dict
-        Let call_count be proc length from List with call_ptrs
-
-        Set i to 0
-        While i is less than call_count:
-            Let call_ptr be proc list_get from List with call_ptrs, i
-            Set count to proc get from Dictionary with calls_dict, call_ptr
-            proc set from Dictionary with call_site_frequencies, call_ptr, count
-
-            Set i to i plus 1
+    Note: Load call site frequencies (section key 1002).
+    Let calls_map be proc omap_get from OrderedMap with profile_map, 1002
+    If calls_map is not equal to 0:
+        Let call_entry be proc omap_first from OrderedMap with calls_map
+        While call_entry is not equal to 0:
+            Let call_ptr be proc omap_entry_key from OrderedMap with call_entry
+            Let call_count be proc omap_entry_value from OrderedMap with call_entry
+            proc omap_set from OrderedMap with call_site_frequencies, call_ptr, call_count
+            Set call_entry to proc omap_entry_next from OrderedMap with call_entry
         End While
     End If
+
+    Note: Seed total_samples with the ingested block-count sum.
+    proc memory_set_int64 from Layout with pd, 56, total_ingested
 
     Return pd
 End Process
 
 @Reasoning
-integrate_profile_into_mir attaches profile data to MIR structures.
-This annotates blocks and instructions with execution counts for later use.
+integrate_profile_into_mir reconciles the ingested profile against the
+function's actual CFG. Profiles can be stale: blocks recorded in an earlier
+build may no longer exist after transformations, and call-site instruction
+addresses from a prior compilation never match the current in-memory MIR.
+Keeping stale entries would let frequency propagation and inlining
+heuristics act on phantom blocks/instructions.
+
+The pass:
+1. Removes every block_frequencies entry whose block id does not resolve
+   through CFG.get_block_by_id_from_cfg.
+2. Removes every edge_frequencies entry whose source OR destination block
+   id does not resolve.
+3. Removes every call_site_frequencies entry whose key is not a CALL
+   (20304) or CALL_INDIRECT (20305) instruction currently present in this
+   function's CFG.
+
+No MIR field is written: MIRBasicBlock has no spare metadata slot
+(offsets 0-88 are all live canonical fields - the pre-#468 code wrote
+frequencies to block@40, which is predecessor_count, and call counts to
+inst@40, which is the MIRNode type_info pointer - both LIVE clobbers).
+Profile facts live in ProfileData's own maps; the only canonical MIR slots
+that carry profile output are the MIRBranch weight fields, stamped by
+apply_pgo_hints.
+
+Returns the number of profile entries that matched the current MIR
+(blocks + edges + call sites), or 0 when no profile/CFG is available.
 @End Reasoning
 
 Process called "integrate_profile_into_mir" that takes pga as Integer returns Integer:
-    Let mir_function be proc memory_get_int64 from MemoryCore with pga, 0
-    Let profile_data be proc memory_get_int64 from MemoryCore with pga, 8
+    Let mir_function be proc memory_get_int64 from Layout with pga, 0
+    Let profile_data be proc memory_get_int64 from Layout with pga, 8
 
     If profile_data is equal to 0:
         Return 0
     End If
 
-    Let block_frequencies be proc memory_get_int64 from MemoryCore with profile_data, 8
-    Let call_site_frequencies be proc memory_get_int64 from MemoryCore with profile_data, 24
+    Let block_frequencies be proc memory_get_int64 from Layout with profile_data, 8
+    Let edge_frequencies be proc memory_get_int64 from Layout with profile_data, 16
+    Let call_site_frequencies be proc memory_get_int64 from Layout with profile_data, 24
 
-    Note: Get CFG
-    Let cfg be proc memory_get_int64 from MemoryCore with mir_function, 16
+    Note: Canonical MIRFunction: cfg at offset 8 (MIR.get_mir_function_cfg).
+    Let cfg be proc get_mir_function_cfg from MIR with mir_function
     If cfg is equal to 0:
         Return 0
     End If
 
-    Note: Attach block frequencies to blocks
-    Let blocks be proc memory_get_int64 from MemoryCore with cfg, 0
+    Let matched be 0
+
+    Note: Phase 1 - prune block-frequency entries for blocks absent from the CFG.
+    Let stale_blocks be proc list_create from List
+    Let block_entry be proc omap_first from OrderedMap with block_frequencies
+    While block_entry is not equal to 0:
+        Let entry_block_id be proc omap_entry_key from OrderedMap with block_entry
+        Let resolved_block be proc get_block_by_id_from_cfg from CFG with cfg, entry_block_id
+        If resolved_block is equal to 0:
+            proc append from List with stale_blocks, entry_block_id
+        Otherwise:
+            Set matched to matched plus 1
+        End If
+        Set block_entry to proc omap_entry_next from OrderedMap with block_entry
+    End While
+
+    Let stale_block_count be proc length from List with stale_blocks
+    Let sb be 0
+    While sb is less than stale_block_count:
+        Let stale_block_id be proc list_get from List with stale_blocks, sb
+        proc omap_remove from OrderedMap with block_frequencies, stale_block_id
+        Set sb to sb plus 1
+    End While
+    proc list_destroy from List with stale_blocks
+
+    Note: Phase 2 - prune edge-frequency entries whose endpoints are absent.
+    Note: Decode edge_key = src * EDGE_KEY_BASE + dst.
+    Let stale_edges be proc list_create from List
+    Let edge_entry be proc omap_first from OrderedMap with edge_frequencies
+    While edge_entry is not equal to 0:
+        Let edge_key be proc omap_entry_key from OrderedMap with edge_entry
+        Let src_id be edge_key divided by EDGE_KEY_BASE
+        Let dst_id be edge_key minus src_id multiplied by EDGE_KEY_BASE
+        Let src_block be proc get_block_by_id_from_cfg from CFG with cfg, src_id
+        Let dst_block be proc get_block_by_id_from_cfg from CFG with cfg, dst_id
+        If src_block is equal to 0:
+            proc append from List with stale_edges, edge_key
+        Otherwise:
+            If dst_block is equal to 0:
+                proc append from List with stale_edges, edge_key
+            Otherwise:
+                Set matched to matched plus 1
+            End If
+        End If
+        Set edge_entry to proc omap_entry_next from OrderedMap with edge_entry
+    End While
+
+    Let stale_edge_count be proc length from List with stale_edges
+    Let se be 0
+    While se is less than stale_edge_count:
+        Let stale_edge_key be proc list_get from List with stale_edges, se
+        proc omap_remove from OrderedMap with edge_frequencies, stale_edge_key
+        Set se to se plus 1
+    End While
+    proc list_destroy from List with stale_edges
+
+    Note: Phase 3 - prune call-site entries whose instruction pointer is not
+    Note: a call instruction currently in this CFG. Collect the live call
+    Note: instruction pointers first (raw integers; collections/set
+    Note: string-encodes elements internally so pointer values are safe keys).
+    Let live_calls be proc create from Set
+    Let blocks be proc get_mir_cfg_blocks from CFG with cfg
     Let block_count be proc length from List with blocks
 
     Let i be 0
     While i is less than block_count:
         Let block be proc list_get from List with blocks, i
-        Let block_id be proc memory_get_int64 from MemoryCore with block, 0
-
-        Note: Get frequency from profile data
-        Let frequency be proc get from Dictionary with block_frequencies, block_id
-        If frequency is not equal to 0:
-            Note: Store frequency in block metadata (offset 40)
-            proc memory_set_int64 from MemoryCore with block, 40, frequency
-        End If
-
-        Note: Attach call site frequencies to call instructions
-        Let instructions be proc memory_get_int64 from MemoryCore with block, 16
-        Let inst_count be proc length from List with instructions
-
-        Let j be 0
-        While j is less than inst_count:
-            Let inst be proc list_get from List with instructions, j
-            Let opcode be proc memory_get_int64 from MemoryCore with inst, 0
-
-            Note: Check if this is a call instruction (20304)
-            If opcode is equal to 20304:
-                Let call_freq be proc get from Dictionary with call_site_frequencies, inst
-                If call_freq is not equal to 0:
-                    Note: Store frequency in instruction metadata (offset 40)
-                    proc memory_set_int64 from MemoryCore with inst, 40, call_freq
+        Let instructions be proc get_block_instructions from MIR with block
+        If instructions is not equal to 0:
+            Let inst_count be proc length from List with instructions
+            Let j be 0
+            While j is less than inst_count:
+                Let inst be proc list_get from List with instructions, j
+                Let opcode be proc get_mir_node_opcode from MIR with inst
+                If opcode is equal to 20304:
+                    proc add from Set with live_calls, inst
                 End If
-            End If
-
-            Set j to j plus 1
-        End While
-
+                If opcode is equal to 20305:
+                    proc add from Set with live_calls, inst
+                End If
+                Set j to j plus 1
+            End While
+        End If
         Set i to i plus 1
     End While
 
-    Return 1
+    Let stale_calls be proc list_create from List
+    Let call_entry be proc omap_first from OrderedMap with call_site_frequencies
+    While call_entry is not equal to 0:
+        Let call_key be proc omap_entry_key from OrderedMap with call_entry
+        Let is_live be proc contains from Set with live_calls, call_key
+        If is_live is equal to 0:
+            proc append from List with stale_calls, call_key
+        Otherwise:
+            Set matched to matched plus 1
+        End If
+        Set call_entry to proc omap_entry_next from OrderedMap with call_entry
+    End While
+
+    Let stale_call_count be proc length from List with stale_calls
+    Let sc be 0
+    While sc is less than stale_call_count:
+        Let stale_call_key be proc list_get from List with stale_calls, sc
+        proc omap_remove from OrderedMap with call_site_frequencies, stale_call_key
+        Set sc to sc plus 1
+    End While
+    proc list_destroy from List with stale_calls
+    proc destroy from Set with live_calls
+
+    Return matched
 End Process
 
 @Reasoning
-compute_block_frequencies propagates block execution frequencies through CFG.
-Uses profile data as seeds and propagates through control flow edges.
+compute_block_frequencies propagates block execution frequencies through
+the CFG. Profiled blocks seed the computation; unprofiled blocks are
+estimated from their predecessors.
 
-Algorithm:
-1. Start with profiled blocks (known frequencies)
-2. For unprofiled blocks, estimate from predecessors/successors
-3. Use branch probabilities to split frequency at branches
-4. Iterate until convergence
+Estimation rule (per unprofiled block b):
+  freq(b) = sum over predecessors p of:
+    edge_frequency(p -> b)            when the edge was profiled, otherwise
+    freq(p) / successor_count(p)      (p's flow split evenly across its
+                                       successor edges when the edge itself
+                                       was not profiled)
+This is the standard flow-conservation estimate: a block executes once per
+incoming edge traversal, and an unprofiled outgoing edge of p carries an
+even share of p's executions. Iterated to a fixed point (bounded at 20
+iterations - estimates only ever grow from 0 to a positive value once, so
+convergence is reached in at most diameter-of-CFG passes; 20 bounds
+pathological graphs).
 
-This fills in missing profile data using control flow structure.
+Predecessor/successor Lists hold BLOCK IDS (canonical contract); block
+pointers are resolved through CFG.get_block_by_id_from_cfg.
+
+Finally total_samples is recomputed as the sum of all per-block
+frequencies over the CFG.
 @End Reasoning
 
 Process called "compute_block_frequencies" that takes pga as Integer returns Integer:
-    Let mir_function be proc memory_get_int64 from MemoryCore with pga, 0
-    Let profile_data be proc memory_get_int64 from MemoryCore with pga, 8
+    Let mir_function be proc memory_get_int64 from Layout with pga, 0
+    Let profile_data be proc memory_get_int64 from Layout with pga, 8
 
     If profile_data is equal to 0:
         Return 0
     End If
 
-    Let block_frequencies be proc memory_get_int64 from MemoryCore with profile_data, 8
+    Let block_frequencies be proc memory_get_int64 from Layout with profile_data, 8
+    Let edge_frequencies be proc memory_get_int64 from Layout with profile_data, 16
 
-    Note: Get CFG
-    Let cfg be proc memory_get_int64 from MemoryCore with mir_function, 16
+    Note: Canonical MIRFunction: cfg at offset 8; canonical MIRCFG: blocks at 16.
+    Let cfg be proc get_mir_function_cfg from MIR with mir_function
     If cfg is equal to 0:
         Return 0
     End If
 
-    Let blocks be proc memory_get_int64 from MemoryCore with cfg, 0
+    Let blocks be proc get_mir_cfg_blocks from CFG with cfg
     Let block_count be proc length from List with blocks
 
     Note: Fixed-point iteration for frequency propagation
@@ -524,143 +671,180 @@ Process called "compute_block_frequencies" that takes pga as Integer returns Int
         If iteration is greater than or equal to max_iterations:
             Set changed to 0
         Otherwise:
-                Set changed to 0
+            Set changed to 0
 
-                Note: Propagate from predecessors
-                Let i be 0
-                While i is less than block_count:
-                    Let block be proc list_get from List with blocks, i
-                    Let block_id be proc memory_get_int64 from MemoryCore with block, 0
+            Note: Propagate from predecessors
+            Let i be 0
+            While i is less than block_count:
+                Let block be proc list_get from List with blocks, i
+                Let block_id be proc get_mir_basic_block_id from CFG with block
 
-                    Note: Get current frequency
-                    Let current_freq be proc get from Dictionary with block_frequencies, block_id
+                Note: Get current frequency
+                Let current_freq be proc omap_get from OrderedMap with block_frequencies, block_id
 
-                    Note: If not profiled, estimate from predecessors
-                    If current_freq is equal to 0:
-                        Let predecessors be proc memory_get_int64 from MemoryCore with block, 8
-                        Let pred_count be proc length from List with predecessors
-
-                        If pred_count is greater than 0:
-                            Note: Sum predecessor frequencies
-                            Let sum_freq be 0
-                            Let p be 0
-                            While p is less than pred_count:
-                                Let pred_id be proc list_get from List with predecessors, p
-                                Let pred_freq be proc get from Dictionary with block_frequencies, pred_id
-                                Set sum_freq to sum_freq plus pred_freq
-                                Set p to p plus 1
-                            End While
-
-                            Note: Average (simple heuristic)
-                            If sum_freq is greater than 0:
-                                Let estimated_freq be sum_freq divided by pred_count
-                                proc set from Dictionary with block_frequencies, block_id, estimated_freq
-                                Set changed to 1
-                            End If
-                        End If
+                Note: If not profiled, estimate from predecessors
+                If current_freq is equal to 0:
+                    Note: Canonical MIRBasicBlock: predecessors List (of BLOCK
+                    Note: IDS) at offset 32 via MIR.get_block_predecessors.
+                    Let predecessors be proc get_block_predecessors from MIR with block
+                    Let pred_count be 0
+                    If predecessors is not equal to 0:
+                        Set pred_count to proc length from List with predecessors
                     End If
 
-                    Set i to i plus 1
-                End While
+                    If pred_count is greater than 0:
+                        Note: Flow-conservation estimate over incoming edges.
+                        Let estimated_freq be 0
+                        Let p be 0
+                        While p is less than pred_count:
+                            Let pred_id be proc list_get from List with predecessors, p
 
-                Set iteration to iteration plus 1
+                            Note: Prefer the profiled edge frequency.
+                            Let edge_key be pred_id multiplied by EDGE_KEY_BASE plus block_id
+                            Let edge_freq be proc omap_get from OrderedMap with edge_frequencies, edge_key
+                            If edge_freq is greater than 0:
+                                Set estimated_freq to estimated_freq plus edge_freq
+                            Otherwise:
+                                Note: Even split of the predecessor's flow
+                                Note: across its successor edges.
+                                Let pred_freq be proc omap_get from OrderedMap with block_frequencies, pred_id
+                                If pred_freq is greater than 0:
+                                    Let pred_block be proc get_block_by_id_from_cfg from CFG with cfg, pred_id
+                                    If pred_block is not equal to 0:
+                                        Let pred_succs be proc get_block_successors from MIR with pred_block
+                                        Let pred_succ_count be 0
+                                        If pred_succs is not equal to 0:
+                                            Set pred_succ_count to proc length from List with pred_succs
+                                        End If
+                                        If pred_succ_count is greater than 0:
+                                            Set estimated_freq to estimated_freq plus pred_freq divided by pred_succ_count
+                                        End If
+                                    End If
+                                End If
+                            End If
+
+                            Set p to p plus 1
+                        End While
+
+                        If estimated_freq is greater than 0:
+                            proc omap_set from OrderedMap with block_frequencies, block_id, estimated_freq
+                            Set changed to 1
+                        End If
+                    End If
+                End If
+
+                Set i to i plus 1
+            End While
+
+            Set iteration to iteration plus 1
         End If
     End While
 
-    Note: Update total samples
+    Note: Recompute total samples as the sum over the CFG's blocks.
     Let total be 0
-    Set i to 0
-    While i is less than block_count:
-        Set block to proc list_get from List with blocks, i
-        Set block_id to proc memory_get_int64 from MemoryCore with block, 0
-        Let freq be proc get from Dictionary with block_frequencies, block_id
+    Let t be 0
+    While t is less than block_count:
+        Let total_block be proc list_get from List with blocks, t
+        Let total_block_id be proc get_mir_basic_block_id from CFG with total_block
+        Let freq be proc omap_get from OrderedMap with block_frequencies, total_block_id
         Set total to total plus freq
-        Set i to i plus 1
+        Set t to t plus 1
     End While
 
-    proc memory_set_int64 from MemoryCore with profile_data, 56, total
+    proc memory_set_int64 from Layout with profile_data, 56, total
 
     Return 1
 End Process
 
 @Reasoning
 compute_branch_probabilities extracts branch probabilities from profile data.
-For each branch instruction, compute probability based on successor frequencies.
+For each conditional branch (canonical opcode 20301), compute the taken
+probability from the profiled edge frequencies when present, falling back
+to the target blocks' frequencies.
 
-Branch probability = (frequency of true path) / (frequency of true + false paths)
+The true/false targets are read from the MIRBranch extended record
+(true_block_id@80 / false_block_id@88 via the MIRNodes accessors) - NOT
+from the successor list, whose storage order does not encode which edge is
+the true edge.
+
+Branch probability = (flow along true edge) * 100 / (flow along both edges).
+
+Results are recorded in pga.branch_probs (inst -> BranchProbability record)
+and profile_data.branch_probabilities (inst -> true probability 0-100).
+Returns the number of branches resolved.
 @End Reasoning
 
 Process called "compute_branch_probabilities" that takes pga as Integer returns Integer:
-    Let mir_function be proc memory_get_int64 from MemoryCore with pga, 0
-    Let profile_data be proc memory_get_int64 from MemoryCore with pga, 8
-    Let branch_probs be proc memory_get_int64 from MemoryCore with pga, 64
+    Let mir_function be proc memory_get_int64 from Layout with pga, 0
+    Let profile_data be proc memory_get_int64 from Layout with pga, 8
+    Let branch_probs be proc memory_get_int64 from Layout with pga, 64
 
     If profile_data is equal to 0:
         Return 0
     End If
 
-    Let block_frequencies be proc memory_get_int64 from MemoryCore with profile_data, 8
-    Let branch_prob_dict be proc memory_get_int64 from MemoryCore with profile_data, 32
+    Let block_frequencies be proc memory_get_int64 from Layout with profile_data, 8
+    Let edge_frequencies be proc memory_get_int64 from Layout with profile_data, 16
+    Let branch_prob_map be proc memory_get_int64 from Layout with profile_data, 32
 
-    Note: Get CFG
-    Let cfg be proc memory_get_int64 from MemoryCore with mir_function, 16
+    Let cfg be proc get_mir_function_cfg from MIR with mir_function
     If cfg is equal to 0:
         Return 0
     End If
 
-    Let blocks be proc memory_get_int64 from MemoryCore with cfg, 0
+    Let blocks be proc get_mir_cfg_blocks from CFG with cfg
     Let block_count be proc length from List with blocks
 
-    Note: Find all branch instructions
+    Let resolved be 0
     Let i be 0
     While i is less than block_count:
         Let block be proc list_get from List with blocks, i
-        Let block_id be proc memory_get_int64 from MemoryCore with block, 0
+        Let block_id be proc get_mir_basic_block_id from CFG with block
 
-        Note: Get block frequency
-        Let block_freq be proc get from Dictionary with block_frequencies, block_id
+        Note: The conditional branch, when present, is the block terminator.
+        Let terminator be proc get_block_terminator from CFG with block
+        If terminator is not equal to 0:
+            Let opcode be proc get_mir_node_opcode from MIR with terminator
 
-        Note: Get successors
-        Let successors be proc memory_get_int64 from MemoryCore with block, 24
-        Let succ_count be proc length from List with successors
+            Note: Canonical MIR_BRANCH is 20301 (the pre-#468 code tested
+            Note: 20501, which is MIR_ATOMIC_STORE - it never matched).
+            If opcode is equal to 20301:
+                Note: Targets from the MIRBranch extended record.
+                Let true_target_id be proc get_mir_branch_true_block from MIRNodes with terminator
+                Let false_target_id be proc get_mir_branch_false_block from MIRNodes with terminator
 
-        Note: If 2 successors, this is a branch
-        If succ_count is equal to 2:
-            Note: Get last instruction (should be branch)
-            Let instructions be proc memory_get_int64 from MemoryCore with block, 16
-            Let inst_count be proc length from List with instructions
+                Note: Prefer profiled edge frequencies for the two edges.
+                Let true_edge_key be block_id multiplied by EDGE_KEY_BASE plus true_target_id
+                Let false_edge_key be block_id multiplied by EDGE_KEY_BASE plus false_target_id
+                Let true_freq be proc omap_get from OrderedMap with edge_frequencies, true_edge_key
+                Let false_freq be proc omap_get from OrderedMap with edge_frequencies, false_edge_key
 
-            If inst_count is greater than 0:
-                Let branch_inst be proc list_get from List with instructions, inst_count minus 1
-                Let opcode be proc memory_get_int64 from MemoryCore with branch_inst, 0
-
-                Note: MIR_BR (20501) minus conditional branch
-                If opcode is equal to 20501:
-                    Note: Get successor frequencies
-                    Let true_target_id be proc list_get from List with successors, 0
-                    Let false_target_id be proc list_get from List with successors, 1
-
-                    Let true_freq be proc get from Dictionary with block_frequencies, true_target_id
-                    Let false_freq be proc get from Dictionary with block_frequencies, false_target_id
-
-                    Note: Compute probabilities
-                    Let total_freq be true_freq plus false_freq
-
-                    If total_freq is greater than 0:
-                        Let true_prob be true_freq multiplied by 100 divided by total_freq
-                        Let false_prob be false_freq multiplied by 100 divided by total_freq
-
-                        Note: Create BranchProbability
-                        Let bp be create_branch_probability(branch_inst)
-                        proc memory_set_int64 from MemoryCore with bp, 8, true_freq
-                        proc memory_set_int64 from MemoryCore with bp, 16, false_freq
-                        proc memory_set_int64 from MemoryCore with bp, 24, true_prob
-                        proc memory_set_int64 from MemoryCore with bp, 32, false_prob
-
-                        Note: Store in both dictionaries
-                        proc set from Dictionary with branch_probs, branch_inst, bp
-                        proc set from Dictionary with branch_prob_dict, branch_inst, true_prob
+                If true_freq is equal to 0:
+                    If false_freq is equal to 0:
+                        Note: No profiled edges - fall back to target block
+                        Note: frequencies as flow proxies.
+                        Set true_freq to proc omap_get from OrderedMap with block_frequencies, true_target_id
+                        Set false_freq to proc omap_get from OrderedMap with block_frequencies, false_target_id
                     End If
+                End If
+
+                Let total_freq be true_freq plus false_freq
+                If total_freq is greater than 0:
+                    Let true_prob be true_freq multiplied by 100 divided by total_freq
+                    Let false_prob be false_freq multiplied by 100 divided by total_freq
+
+                    Note: Create BranchProbability
+                    Let bp be create_branch_probability(terminator)
+                    proc memory_set_int64 from Layout with bp, 8, true_freq
+                    proc memory_set_int64 from Layout with bp, 16, false_freq
+                    proc memory_set_int64 from Layout with bp, 24, true_prob
+                    proc memory_set_int64 from Layout with bp, 32, false_prob
+
+                    Note: Record in both maps (instruction-pointer keys).
+                    proc omap_set from OrderedMap with branch_probs, terminator, bp
+                    proc omap_set from OrderedMap with branch_prob_map, terminator, true_prob
+
+                    Set resolved to resolved plus 1
                 End If
             End If
         End If
@@ -668,87 +852,318 @@ Process called "compute_branch_probabilities" that takes pga as Integer returns 
         Set i to i plus 1
     End While
 
-    Return 1
+    Return resolved
 End Process
 
 @Reasoning
-identify_hot_paths traces frequently executed paths through the CFG.
-A hot path is a sequence of blocks with high execution frequency.
+identify_hot_blocks classifies blocks as hot using cumulative execution
+coverage: blocks are taken in descending frequency order until together
+they account for HOT_THRESHOLD_PERCENT (90%) of total execution. This is
+the standard PGO hotness definition - "the working set that covers the top
+90% of execution" - and replaces the pre-#468 rule (frequency greater than
+90% of TOTAL samples), which could only ever mark a block that single-
+handedly dominated the whole function and marked nothing in any function
+with more than a couple of active blocks.
 
-Algorithm:
-1. Start from entry block
-2. Follow most frequently taken edges
-3. Continue until reaching loop back-edge or low-frequency edge
-4. Rank paths by total execution frequency
+The frequency of the coolest block still classified hot is recorded as
+hot_threshold (ProfileData offset 40) so downstream passes can compare
+individual counts against the realized hot cutoff.
 
-Hot paths are candidates for aggressive optimization and code layout.
+Returns the number of hot blocks identified.
 @End Reasoning
 
-Process called "identify_hot_paths" that takes pga as Integer, max_paths as Integer returns Integer:
-    Let mir_function be proc memory_get_int64 from MemoryCore with pga, 0
-    Let profile_data be proc memory_get_int64 from MemoryCore with pga, 8
-    Let hot_paths be proc memory_get_int64 from MemoryCore with pga, 32
+Process called "identify_hot_blocks" that takes pga as Integer returns Integer:
+    Let profile_data be proc memory_get_int64 from Layout with pga, 8
+    Let hot_blocks_set be proc memory_get_int64 from Layout with pga, 16
 
     If profile_data is equal to 0:
         Return 0
     End If
 
-    Let block_frequencies be proc memory_get_int64 from MemoryCore with profile_data, 8
+    Let block_frequencies be proc memory_get_int64 from Layout with profile_data, 8
+    Let total_samples be proc memory_get_int64 from Layout with profile_data, 56
 
-    Note: Get CFG
-    Let cfg be proc memory_get_int64 from MemoryCore with mir_function, 16
+    If total_samples is equal to 0:
+        Return 0
+    End If
+
+    Note: Coverage target: HOT_THRESHOLD_PERCENT of total execution.
+    Let coverage_target be total_samples multiplied by HOT_THRESHOLD_PERCENT divided by 100
+
+    Note: Snapshot the (block_id, frequency) pairs into parallel lists.
+    Let ids be proc list_create from List
+    Let freqs be proc list_create from List
+    Let entry be proc omap_first from OrderedMap with block_frequencies
+    While entry is not equal to 0:
+        proc append from List with ids, proc omap_entry_key from OrderedMap with entry
+        proc append from List with freqs, proc omap_entry_value from OrderedMap with entry
+        Set entry to proc omap_entry_next from OrderedMap with entry
+    End While
+    Let n be proc length from List with ids
+
+    Note: Greedy selection in descending frequency order until the target
+    Note: coverage is reached. O(H * N) selection - block counts per
+    Note: function are small and H (hot blocks) is a fraction of N.
+    Let covered be 0
+    Let cutoff be 0
+    Let scanning be 1
+    While scanning is equal to 1:
+        If covered is greater than or equal to coverage_target:
+            Set scanning to 0
+        Otherwise:
+            Let max_freq be 0
+            Let max_idx be 0
+            Let found be 0
+            Let k be 0
+            While k is less than n:
+                Let f be proc list_get from List with freqs, k
+                If f is greater than max_freq:
+                    Set max_freq to f
+                    Set max_idx to k
+                    Set found to 1
+                End If
+                Set k to k plus 1
+            End While
+
+            If found is equal to 0:
+                Set scanning to 0
+            Otherwise:
+                Let hot_id be proc list_get from List with ids, max_idx
+                proc add from Set with hot_blocks_set, hot_id
+                Set covered to covered plus max_freq
+                Set cutoff to max_freq
+                Note: Consume this entry so the next pick finds the runner-up.
+                proc list_set from List with freqs, max_idx, 0
+            End If
+        End If
+    End While
+
+    Note: Record the realized hot cutoff frequency.
+    proc memory_set_int64 from Layout with profile_data, 40, cutoff
+
+    proc list_destroy from List with ids
+    proc list_destroy from List with freqs
+
+    Let hot_count be proc size from Set with hot_blocks_set
+    Return hot_count
+End Process
+
+@Reasoning
+identify_cold_blocks classifies blocks as cold (rarely executed). A block
+is cold when its frequency is below COLD_THRESHOLD_PERCENT (1%) of total
+execution. The walk covers the CFG's actual blocks (not just profiled map
+entries) so never-executed blocks - frequency 0 - are classified cold too.
+Blocks already classified hot are never marked cold (a degenerate tiny
+profile could otherwise place a block in both sets).
+
+The cold cutoff is recorded as cold_threshold (ProfileData offset 48);
+trace_hot_path_from_block uses it as the path-termination floor.
+
+Returns the number of cold blocks identified.
+@End Reasoning
+
+Process called "identify_cold_blocks" that takes pga as Integer returns Integer:
+    Let mir_function be proc memory_get_int64 from Layout with pga, 0
+    Let profile_data be proc memory_get_int64 from Layout with pga, 8
+    Let hot_blocks_set be proc memory_get_int64 from Layout with pga, 16
+    Let cold_blocks_set be proc memory_get_int64 from Layout with pga, 24
+
+    If profile_data is equal to 0:
+        Return 0
+    End If
+
+    Let block_frequencies be proc memory_get_int64 from Layout with profile_data, 8
+    Let total_samples be proc memory_get_int64 from Layout with profile_data, 56
+
+    Note: Calculate cold threshold (COLD_THRESHOLD_PERCENT of total execution)
+    Let cold_threshold be total_samples multiplied by COLD_THRESHOLD_PERCENT divided by 100
+    proc memory_set_int64 from Layout with profile_data, 48, cold_threshold
+
+    Let cfg be proc get_mir_function_cfg from MIR with mir_function
     If cfg is equal to 0:
         Return 0
     End If
 
-    Let blocks be proc memory_get_int64 from MemoryCore with cfg, 0
+    Let blocks be proc get_mir_cfg_blocks from CFG with cfg
     Let block_count be proc length from List with blocks
 
+    Let i be 0
+    While i is less than block_count:
+        Let block be proc list_get from List with blocks, i
+        Let block_id be proc get_mir_basic_block_id from CFG with block
+        Let frequency be proc omap_get from OrderedMap with block_frequencies, block_id
+
+        Note: Below threshold and not hot - mark as cold.
+        If frequency is less than cold_threshold:
+            Let is_hot be proc contains from Set with hot_blocks_set, block_id
+            If is_hot is equal to 0:
+                proc add from Set with cold_blocks_set, block_id
+            End If
+        End If
+
+        Set i to i plus 1
+    End While
+
+    Let cold_count be proc size from Set with cold_blocks_set
+    Return cold_count
+End Process
+
+@Reasoning
+identify_hot_paths traces frequently executed paths through the CFG.
+A hot path is a sequence of blocks linked by the most frequently taken
+edges.
+
+Algorithm:
+1. Trace one path from the CFG entry block (canonical entry pointer at
+   MIRCFG offset 0 via MIR.get_cfg_entry_block; falls back to the first
+   block in the blocks list when the entry pointer is unset).
+2. While fewer than max_paths paths have been traced, seed a new trace
+   from the highest-frequency HOT block not yet covered by an earlier
+   path (the shared visited set keeps paths disjoint).
+3. Each trace follows the most frequent successor until it reaches a
+   visited block (loop closure), a block with no successors, or a
+   successor whose frequency falls below the cold cutoff.
+
+This implements the wiring contract: identify_hot_paths runs AFTER
+identify_hot_blocks (the hot set seeds step 2). The pre-#468 code accepted
+max_paths but ignored it and only ever traced a single path.
+
+Returns the number of paths traced.
+@End Reasoning
+
+Process called "identify_hot_paths" that takes pga as Integer, max_paths as Integer returns Integer:
+    Let mir_function be proc memory_get_int64 from Layout with pga, 0
+    Let profile_data be proc memory_get_int64 from Layout with pga, 8
+    Let hot_blocks_set be proc memory_get_int64 from Layout with pga, 16
+
+    If profile_data is equal to 0:
+        Return 0
+    End If
+
+    If max_paths is less than 1:
+        Return 0
+    End If
+
+    Let block_frequencies be proc memory_get_int64 from Layout with profile_data, 8
+
+    Let cfg be proc get_mir_function_cfg from MIR with mir_function
+    If cfg is equal to 0:
+        Return 0
+    End If
+
+    Let blocks be proc get_mir_cfg_blocks from CFG with cfg
+    Let block_count be proc length from List with blocks
     If block_count is equal to 0:
         Return 0
     End If
 
-    Note: Start from entry block (first block)
-    Let entry_block be proc list_get from List with blocks, 0
+    Note: Canonical entry block pointer (MIRCFG offset 0); fall back to the
+    Note: first stored block when lowering has not set the entry pointer.
+    Let entry_block be proc get_cfg_entry_block from MIR with cfg
+    If entry_block is equal to 0:
+        Set entry_block to proc list_get from List with blocks, 0
+    End If
+
     Let visited be proc create from Set
+    Let paths_found be 0
     Let path_id_counter be 0
 
-    Note: Trace hot paths from entry
-    Let paths_found be trace_hot_path_from_block(pga, entry_block, visited, path_id_counter, max_paths)
+    Note: Path 1 - from the entry block.
+    trace_hot_path_from_block(pga, entry_block, visited, path_id_counter)
+    Set paths_found to paths_found plus 1
+    Set path_id_counter to path_id_counter plus 1
+
+    Note: Additional paths - seed from the hottest uncovered hot block.
+    Let seeding be 1
+    While seeding is equal to 1:
+        If paths_found is greater than or equal to max_paths:
+            Set seeding to 0
+        Otherwise:
+            Let best_block be 0
+            Let best_freq be 0
+            Let i be 0
+            While i is less than block_count:
+                Let block be proc list_get from List with blocks, i
+                Let block_id be proc get_mir_basic_block_id from CFG with block
+                Let is_hot be proc contains from Set with hot_blocks_set, block_id
+                If is_hot is equal to 1:
+                    Let is_visited be proc contains from Set with visited, block_id
+                    If is_visited is equal to 0:
+                        Let freq be proc omap_get from OrderedMap with block_frequencies, block_id
+                        If freq is greater than best_freq:
+                            Set best_freq to freq
+                            Set best_block to block
+                        End If
+                    End If
+                End If
+                Set i to i plus 1
+            End While
+
+            If best_block is equal to 0:
+                Set seeding to 0
+            Otherwise:
+                trace_hot_path_from_block(pga, best_block, visited, path_id_counter)
+                Set paths_found to paths_found plus 1
+                Set path_id_counter to path_id_counter plus 1
+            End If
+        End If
+    End While
+
+    proc destroy from Set with visited
 
     Return paths_found
 End Process
 
 @Reasoning
 trace_hot_path_from_block traces a single hot path starting from a block.
-Follows highest-frequency edges until path ends.
+Follows the highest-frequency successor edge until the path closes on a
+visited block, runs out of successors, or the best continuation falls
+below the profile's cold cutoff (ProfileData offset 48, floored at 1 so a
+zero-frequency successor never extends a path).
+
+Successor Lists hold BLOCK IDS per the canonical contract; the successor
+block pointer is resolved through CFG.get_block_by_id_from_cfg, and a
+failed resolution terminates the trace rather than dereferencing 0.
+
+Path metadata: execution_count is the sum of member-block frequencies;
+is_hot is set when the path passes through at least one block in the
+PGA's hot set; optimization_priority scales the path's share of total
+execution to 0-10 (floored at 1 for hot paths so a hot path in a huge
+function never rounds to "no priority").
+
+The completed HotPath record is appended to pga.hot_paths. Returns 1.
 @End Reasoning
 
-Process called "trace_hot_path_from_block" that takes pga as Integer, start_block as Integer, visited as Integer, path_id as Integer, max_paths as Integer returns Integer:
-    Let mir_function be proc memory_get_int64 from MemoryCore with pga, 0
-    Let profile_data be proc memory_get_int64 from MemoryCore with pga, 8
-    Let hot_paths_list be proc memory_get_int64 from MemoryCore with pga, 32
-    Let block_frequencies be proc memory_get_int64 from MemoryCore with profile_data, 8
+Process called "trace_hot_path_from_block" that takes pga as Integer, start_block as Integer, visited as Integer, path_id as Integer returns Integer:
+    Let mir_function be proc memory_get_int64 from Layout with pga, 0
+    Let profile_data be proc memory_get_int64 from Layout with pga, 8
+    Let hot_paths_list be proc memory_get_int64 from Layout with pga, 32
+    Let hot_blocks_set be proc memory_get_int64 from Layout with pga, 16
+    Let block_frequencies be proc memory_get_int64 from Layout with profile_data, 8
 
-    Note: Derive the CFG once at the top so the trace loop can look up
-    Note: successor blocks by ID without re-reading mir_function each step.
-    Note: CFG lives at offset 16 of MIRFunction per the file's convention
-    Note: (matches identify_hot_paths and the rest of profile_guided.runa).
-    Let cfg be proc memory_get_int64 from MemoryCore with mir_function, 16
+    Note: Canonical MIRFunction: cfg at offset 8.
+    Let cfg be proc get_mir_function_cfg from MIR with mir_function
+
+    Note: Continuation floor: the profile's cold cutoff, minimum 1.
+    Let continuation_floor be proc memory_get_int64 from Layout with profile_data, 48
+    If continuation_floor is less than 1:
+        Set continuation_floor to 1
+    End If
 
     Note: Create new hot path
     Let hot_path be create_hot_path(path_id)
-    Let path_blocks be proc memory_get_int64 from MemoryCore with hot_path, 8
+    Let path_blocks be proc memory_get_int64 from Layout with hot_path, 8
 
     Note: Trace from start block
     Let current_block be start_block
     Let path_execution_count be 0
+    Let contains_hot be 0
     Let continue_trace be 1
 
     While continue_trace is equal to 1:
-        Let block_id be proc memory_get_int64 from MemoryCore with current_block, 0
+        Let block_id be proc get_mir_basic_block_id from CFG with current_block
 
-        Note: Check if already visited (loop)
+        Note: Check if already visited (loop closure or path overlap)
         Let is_visited be proc contains from Set with visited, block_id
         If is_visited is equal to 1:
             Set continue_trace to 0
@@ -757,13 +1172,21 @@ Process called "trace_hot_path_from_block" that takes pga as Integer, start_bloc
             proc append from List with path_blocks, block_id
             proc add from Set with visited, block_id
 
-            Note: Add to execution count
-            Let block_freq be proc get from Dictionary with block_frequencies, block_id
+            Note: Accumulate execution count and hot membership
+            Let block_freq be proc omap_get from OrderedMap with block_frequencies, block_id
             Set path_execution_count to path_execution_count plus block_freq
+            Let block_is_hot be proc contains from Set with hot_blocks_set, block_id
+            If block_is_hot is equal to 1:
+                Set contains_hot to 1
+            End If
 
-            Note: Get successors
-            Let successors be proc memory_get_int64 from MemoryCore with current_block, 24
-            Let succ_count be proc length from List with successors
+            Note: Canonical MIRBasicBlock: successors List (of BLOCK IDS) at
+            Note: offset 48 via MIR.get_block_successors.
+            Let successors be proc get_block_successors from MIR with current_block
+            Let succ_count be 0
+            If successors is not equal to 0:
+                Set succ_count to proc length from List with successors
+            End If
 
             Note: If no successors, end of path
             If succ_count is equal to 0:
@@ -776,7 +1199,7 @@ Process called "trace_hot_path_from_block" that takes pga as Integer, start_bloc
                 Let i be 0
                 While i is less than succ_count:
                     Let succ_id be proc list_get from List with successors, i
-                    Let succ_freq be proc get from Dictionary with block_frequencies, succ_id
+                    Let succ_freq be proc omap_get from OrderedMap with block_frequencies, succ_id
 
                     If succ_freq is greater than max_freq:
                         Set max_freq to succ_freq
@@ -786,18 +1209,10 @@ Process called "trace_hot_path_from_block" that takes pga as Integer, start_bloc
                     Set i to i plus 1
                 End While
 
-                Note: If max frequency is too low, end path
-                If max_freq is less than 100:
+                Note: Stop when the best continuation is below the cold floor.
+                If max_freq is less than continuation_floor:
                     Set continue_trace to 0
                 Otherwise:
-                    Note: Continue to highest frequency successor. Look up the
-                    Note: successor block pointer from the CFG via the canonical
-                    Note: get_block_by_id_from_cfg helper. If the lookup fails
-                    Note: (block not found, CFG missing) terminate the trace
-                    Note: rather than dereferencing a null pointer; the existing
-                    Note: visited-set and max_freq < 100 guards already terminate
-                    Note: on cycles and on cold regions, so a single defensive
-                    Note: lookup here completes the loop's safety story.
                     If cfg is equal to 0:
                         Set continue_trace to 0
                     Otherwise:
@@ -814,211 +1229,244 @@ Process called "trace_hot_path_from_block" that takes pga as Integer, start_bloc
     End While
 
     Note: Set path metadata
-    proc memory_set_int64 from MemoryCore with hot_path, 16, path_execution_count
+    proc memory_set_int64 from Layout with hot_path, 16, path_execution_count
     Let path_length be proc length from List with path_blocks
-    proc memory_set_int64 from MemoryCore with hot_path, 40, path_length
+    proc memory_set_int64 from Layout with hot_path, 40, path_length
 
-    Note: Mark as hot if execution count is high
-    If path_execution_count is greater than 1000:
-        proc memory_set_int64 from MemoryCore with hot_path, 24, 1 Note: is_hot = true
-        proc memory_set_int64 from MemoryCore with hot_path, 32, 8 Note: optimization_priority = 8
+    Note: Priority: the path's share of total execution scaled to 0-10.
+    Let total_samples be proc memory_get_int64 from Layout with profile_data, 56
+    Let priority be 0
+    If total_samples is greater than 0:
+        Set priority to path_execution_count multiplied by 10 divided by total_samples
+        If priority is greater than 10:
+            Set priority to 10
+        End If
     End If
 
-    Note: Add to hot paths list. The previous version of this line had
-    Note: the append call inlined with the Note: prefix, which silently
-    Note: dropped every constructed hot_path because the lexer consumed
-    Note: the entire line as a comment. The call is now on its own line.
+    If contains_hot is equal to 1:
+        proc memory_set_int64 from Layout with hot_path, 24, 1 Note: is_hot = true
+        If priority is less than 1:
+            Set priority to 1
+        End If
+    End If
+    proc memory_set_int64 from Layout with hot_path, 32, priority
+
+    Note: Record the completed path.
     proc append from List with hot_paths_list, hot_path
 
     Return 1
 End Process
 
 @Reasoning
-identify_hot_blocks classifies blocks as hot based on execution frequency.
-Hot blocks are in the top HOT_THRESHOLD_PERCENT of total execution.
-@End Reasoning
-
-Process called "identify_hot_blocks" that takes pga as Integer returns Integer:
-    Let profile_data be proc memory_get_int64 from MemoryCore with pga, 8
-    Let hot_blocks_set be proc memory_get_int64 from MemoryCore with pga, 16
-
-    If profile_data is equal to 0:
-        Return 0
-    End If
-
-    Let block_frequencies be proc memory_get_int64 from MemoryCore with profile_data, 8
-    Let total_samples be proc memory_get_int64 from MemoryCore with profile_data, 56
-
-    Note: Calculate hot threshold (90% of total execution)
-    Let hot_threshold be total_samples multiplied by 90 divided by 100
-    proc memory_set_int64 from MemoryCore with profile_data, 40, hot_threshold
-
-    Note: Identify blocks exceeding threshold
-    Let block_ids be proc keys from Dictionary with block_frequencies
-    Let block_count be proc length from List with block_ids
-
-    Let i be 0
-    While i is less than block_count:
-        Let block_id be proc list_get from List with block_ids, i
-        Let frequency be proc get from Dictionary with block_frequencies, block_id
-
-        Note: If frequency exceeds threshold, mark as hot
-        If frequency is greater than hot_threshold:
-            proc add from Set with hot_blocks_set, block_id
-        End If
-
-        Set i to i plus 1
-    End While
-
-    Let hot_count be proc size from Set with hot_blocks_set
-    Return hot_count
-End Process
-
-@Reasoning
-identify_cold_blocks classifies blocks as cold (rarely executed).
-Cold blocks are in the bottom COLD_THRESHOLD_PERCENT of execution.
-@End Reasoning
-
-Process called "identify_cold_blocks" that takes pga as Integer returns Integer:
-    Let profile_data be proc memory_get_int64 from MemoryCore with pga, 8
-    Let cold_blocks_set be proc memory_get_int64 from MemoryCore with pga, 24
-
-    If profile_data is equal to 0:
-        Return 0
-    End If
-
-    Let block_frequencies be proc memory_get_int64 from MemoryCore with profile_data, 8
-    Let total_samples be proc memory_get_int64 from MemoryCore with profile_data, 56
-
-    Note: Calculate cold threshold (1% of total execution)
-    Let cold_threshold be total_samples multiplied by 1 divided by 100
-    proc memory_set_int64 from MemoryCore with profile_data, 48, cold_threshold
-
-    Note: Identify blocks below threshold
-    Let block_ids be proc keys from Dictionary with block_frequencies
-    Let block_count be proc length from List with block_ids
-
-    Let i be 0
-    While i is less than block_count:
-        Let block_id be proc list_get from List with block_ids, i
-        Let frequency be proc get from Dictionary with block_frequencies, block_id
-
-        Note: If frequency below threshold, mark as cold
-        If frequency is less than cold_threshold:
-            proc add from Set with cold_blocks_set, block_id
-        End If
-
-        Set i to i plus 1
-    End While
-
-    Let cold_count be proc size from Set with cold_blocks_set
-    Return cold_count
-End Process
-
-@Reasoning
 compute_inline_decisions makes profile-guided inlining decisions.
-Uses call site frequencies and callee size to prioritize inlining.
+Uses call site frequencies and real callee sizes to prioritize inlining.
 
 Inlining heuristics:
 1. Hot call sites (high frequency) are prioritized
 2. Cold call sites (low frequency) are deprioritized
-3. Small callees are preferred
-4. Cost-benefit analysis: benefit (saved call overhead) vs cost (code size)
+3. Benefit = call_freq * 10 (the per-call overhead a direct call carries
+   in the bootstrap lowering: argument marshalling, the call/ret pair, and
+   the callee prologue/epilogue - approximately ten instructions saved per
+   dynamic call when the body is spliced inline)
+4. Cost = the callee's real instruction count via
+   CallGraph.get_function_instruction_count (the shared sizing primitive);
+   100 conservative units when the callee is unresolved, external, or
+   bodiless - opaque callees must never be cheap to inline
+5. should_inline requires: a resolved callee, non-recursive (when a call
+   graph is supplied), size within size_threshold, and positive
+   cost_benefit
 
-The fourth parameter `mir` is the MIRProgram pointer used to look up the
-real callee instruction count via CallGraph.get_function_instruction_count.
-The previous version of this Process hardcoded cost = 50 for every
-callee regardless of body size; that produced positive cost_benefit for
-any call frequency > 5, which made the inlining heuristic effectively
-"inline anything that's profiled". With real per-callee sizes, the
-decision is grounded in the actual code-size impact: a one-instruction
-getter has cost 1 and is almost always worth inlining, while a
-thousand-instruction function has cost 1000 and only crosses the
-break-even point at very high call frequencies.
+Callee resolution follows the canonical contract (plan 1.1 + task #461):
+the MIRCall callee slot (extended offset 80, MIRNodes.get_call_callee)
+holds either the callee NAME string pointer (direct-call contract) or the
+SSA value id of the lowered callee expression. Resolution mirrors Wave 1's
+dual-form tolerance in optimization.runa and never dereferences the raw
+slot: (a) value-id form resolves through MIR.lookup_defining_instruction
+to a string CONST naming the callee; (b) the name-pointer form matches by
+pointer identity against each program function's interned name; (c) a
+program-function pointer matches by identity; (d) a CONST-derived name
+string-compares against function names. Function identity is the
+MIRFunction POINTER per OD-4; InliningDecision.callee_function stores it.
+
+Indirect calls (20305) carry unknowable targets and are skipped (points-to
+driven devirtualization owns them); the string-interpolation intrinsic
+convention (direct call with callee slot 0) is also skipped.
+
+The `mir` parameter is the MIRProgram pointer (functions List at offset 0)
+used for name resolution and callee sizing; with mir = 0 every callee is
+unresolved and receives the conservative no-inline treatment. The
+`call_graph` parameter, when non-zero, vetoes recursive callees via
+CallGraph.is_function_recursive (inlining a recursive callee re-exposes
+the same call site and risks unbounded growth).
+
+Returns the total number of decisions recorded on pga.inline_candidates.
 @End Reasoning
 
 Process called "compute_inline_decisions" that takes pga as Integer, call_graph as Integer, size_threshold as Integer, mir as Integer returns Integer:
-    Let mir_function be proc memory_get_int64 from MemoryCore with pga, 0
-    Let profile_data be proc memory_get_int64 from MemoryCore with pga, 8
-    Let inline_candidates_list be proc memory_get_int64 from MemoryCore with pga, 56
+    Let mir_function be proc memory_get_int64 from Layout with pga, 0
+    Let profile_data be proc memory_get_int64 from Layout with pga, 8
+    Let inline_candidates_list be proc memory_get_int64 from Layout with pga, 56
 
     If profile_data is equal to 0:
         Return 0
     End If
 
-    Let call_site_frequencies be proc memory_get_int64 from MemoryCore with profile_data, 24
+    Let call_site_frequencies be proc memory_get_int64 from Layout with profile_data, 24
 
-    Note: Get CFG
-    Let cfg be proc memory_get_int64 from MemoryCore with mir_function, 16
+    Let cfg be proc get_mir_function_cfg from MIR with mir_function
     If cfg is equal to 0:
         Return 0
     End If
 
-    Let blocks be proc memory_get_int64 from MemoryCore with cfg, 0
+    Let blocks be proc get_mir_cfg_blocks from CFG with cfg
     Let block_count be proc length from List with blocks
+
+    Note: Program function table for callee resolution (MIRProgram:
+    Note: functions List at offset 0).
+    Let program_functions be 0
+    Let program_function_count be 0
+    If mir is not equal to 0:
+        Set program_functions to proc memory_get_int64 from Layout with mir, 0
+        If program_functions is not equal to 0:
+            Set program_function_count to proc length from List with program_functions
+        End If
+    End If
 
     Note: Find all call sites and make inlining decisions
     Let i be 0
     While i is less than block_count:
         Let block be proc list_get from List with blocks, i
-        Let instructions be proc memory_get_int64 from MemoryCore with block, 16
-        Let inst_count be proc length from List with instructions
+        Let instructions be proc get_block_instructions from MIR with block
+        Let inst_count be 0
+        If instructions is not equal to 0:
+            Set inst_count to proc length from List with instructions
+        End If
 
         Let j be 0
         While j is less than inst_count:
             Let inst be proc list_get from List with instructions, j
-            Let opcode be proc memory_get_int64 from MemoryCore with inst, 0
+            Let opcode be proc get_mir_node_opcode from MIR with inst
 
-            Note: MIR_CALL (20304) minus potential inline candidate
+            Note: Direct calls only (20304). Indirect calls (20305) have
+            Note: unknowable targets here; devirtualization owns them.
             If opcode is equal to 20304:
-                Let callee_id be proc memory_get_int64 from MemoryCore with inst, 16
+                Let callee_field be proc get_call_callee from MIRNodes with inst
 
-                Note: Get call frequency
-                Let call_freq be proc get from Dictionary with call_site_frequencies, inst
-                If call_freq is equal to 0:
-                    Set call_freq to 1  Note: Default if not profiled
+                Note: callee slot 0 = string-interpolation intrinsic
+                Note: convention (task #461) - not an inlinable call.
+                If callee_field is not equal to 0:
+                    Note: Dual-form callee resolution (Wave 1 pattern).
+                    Let callee_name be 0
+                    Let resolved_callee be 0
+
+                    Let callee_def be proc lookup_defining_instruction from MIR with mir_function, callee_field
+                    If callee_def is not equal to 0:
+                        Let def_opcode be proc get_mir_node_opcode from MIR with callee_def
+                        If def_opcode is equal to 20001:
+                            Let def_is_string be proc is_const_string from MIRNodes with callee_def
+                            If def_is_string is equal to 1:
+                                Set callee_name to proc get_const_string from MIRNodes with callee_def
+                            End If
+                        End If
+                    End If
+
+                    If program_functions is not equal to 0:
+                        Let fscan be 0
+                        While fscan is less than program_function_count:
+                            Let candidate be proc list_get from List with program_functions, fscan
+                            If candidate is not equal to 0:
+                                If candidate is equal to callee_field:
+                                    Set resolved_callee to candidate
+                                    Set fscan to program_function_count
+                                Otherwise:
+                                    Let candidate_name be proc memory_get_int64 from Layout with candidate, 0
+                                    If candidate_name is not equal to 0:
+                                        If candidate_name is equal to callee_field:
+                                            Set resolved_callee to candidate
+                                            Set fscan to program_function_count
+                                        Otherwise:
+                                            If callee_name is not equal to 0:
+                                                Let names_match be proc string_equals from StringCore with candidate_name, callee_name
+                                                If names_match is equal to 1:
+                                                    Set resolved_callee to candidate
+                                                    Set fscan to program_function_count
+                                                End If
+                                            End If
+                                        End If
+                                    End If
+                                End If
+                            End If
+                            Set fscan to fscan plus 1
+                        End While
+                    End If
+
+                    Note: Get call frequency (instruction-pointer key)
+                    Let call_freq be proc omap_get from OrderedMap with call_site_frequencies, inst
+                    If call_freq is equal to 0:
+                        Set call_freq to 1  Note: Default if not profiled
+                    End If
+
+                    Note: Create inlining decision (OD-4: callee POINTER)
+                    Let inline_decision be create_inlining_decision(inst, resolved_callee)
+
+                    Note: Compute priority based on frequency
+                    Let priority be call_freq divided by 10
+                    If priority is greater than 100:
+                        Set priority to 100
+                    End If
+                    proc memory_set_int64 from Layout with inline_decision, 16, priority
+
+                    Note: Cost-benefit model: benefit = call overhead saved
+                    Note: across all dynamic executions; cost = real callee
+                    Note: body size (code growth proxy).
+                    Let benefit be call_freq multiplied by 10
+                    Let cost be 0
+                    If resolved_callee is not equal to 0:
+                        If mir is not equal to 0:
+                            Set cost to proc get_function_instruction_count from CallGraph with mir, resolved_callee
+                        End If
+                    End If
+                    If cost is equal to 0:
+                        Note: Unresolved, external, or bodiless callee -
+                        Note: conservative 100-instruction cost so opaque
+                        Note: callees are never blindly inlined.
+                        Set cost to 100
+                    End If
+                    Let cost_benefit be benefit minus cost
+                    proc memory_set_int64 from Layout with inline_decision, 24, cost_benefit
+
+                    Note: Decision gates, most disqualifying first.
+                    Let should_inline be 0
+                    Let reason be 0
+                    If resolved_callee is equal to 0:
+                        Set reason to proc string_duplicate from StringCore with "Callee not resolvable to a function in this program"
+                    Otherwise:
+                        Let is_recursive be 0
+                        If call_graph is not equal to 0:
+                            Set is_recursive to proc is_function_recursive from CallGraph with call_graph, resolved_callee
+                        End If
+                        If is_recursive is equal to 1:
+                            Set reason to proc string_duplicate from StringCore with "Recursive callee"
+                        Otherwise:
+                            If cost is greater than size_threshold:
+                                Set reason to proc string_duplicate from StringCore with "Callee size exceeds inlining threshold"
+                            Otherwise:
+                                If cost_benefit is greater than 0:
+                                    Set should_inline to 1
+                                    Set reason to proc string_duplicate from StringCore with "Profile-weighted benefit exceeds code-size cost"
+                                Otherwise:
+                                    Set reason to proc string_duplicate from StringCore with "Code-size cost exceeds profile-weighted benefit"
+                                End If
+                            End If
+                        End If
+                    End If
+
+                    proc memory_set_int64 from Layout with inline_decision, 32, should_inline
+                    proc memory_set_int64 from Layout with inline_decision, 40, reason
+
+                    Note: Add to candidates list
+                    proc append from List with inline_candidates_list, inline_decision
                 End If
-
-                Note: Create inlining decision
-                Let inline_decision be create_inlining_decision(inst, callee_id)
-
-                Note: Compute priority based on frequency
-                Let priority be call_freq divided by 10
-                If priority is greater than 100:
-                    Set priority to 100
-                End If
-                proc memory_set_int64 from MemoryCore with inline_decision, 16, priority
-
-                Note: Cost-benefit heuristic
-                Note: Benefit = frequency multiplied by 10 (call overhead saved)
-                Note: Cost = real callee instruction count from MIR.
-                Let benefit be call_freq multiplied by 10
-                Let cost be proc get_function_instruction_count from CallGraph with mir, callee_id
-                If cost is equal to 0:
-                    Note: Function body not present in MIR (external callee,
-                    Note: not-yet-linked module, or virtual/indirect callee
-                    Note: whose target_id we cannot resolve to a definition).
-                    Note: Assume a conservative 100-instruction cost so we
-                    Note: do not blindly inline opaque callees.
-                    Set cost to 100
-                End If
-                Let cost_benefit be benefit minus cost
-
-                proc memory_set_int64 from MemoryCore with inline_decision, 24, cost_benefit
-
-                Note: Make decision based on cost-benefit
-                If cost_benefit is greater than 0:
-                    proc memory_set_int64 from MemoryCore with inline_decision, 32, 1 Note: should_inline = true
-                    Let reason be proc string_duplicate from StringCore with "High frequency call site"
-                    proc memory_set_int64 from MemoryCore with inline_decision, 40, reason
-                Otherwise:
-                    proc memory_set_int64 from MemoryCore with inline_decision, 32, 0 Note: should_inline = false
-                    Set reason to proc string_duplicate from StringCore with "Low frequency call site"
-                    proc memory_set_int64 from MemoryCore with inline_decision, 40, reason
-                End If
-
-                Note: Add to candidates list
-                proc append from List with inline_candidates_list, inline_decision
             End If
 
             Set j to j plus 1
@@ -1033,7 +1481,7 @@ End Process
 
 @Reasoning
 optimize_code_layout reorders basic blocks for better cache locality.
-Hot blocks are placed together, cold blocks moved to end.
+Hot blocks are placed together, cold blocks moved to the end.
 
 Benefits:
 - Better instruction cache utilization
@@ -1041,94 +1489,130 @@ Benefits:
 - Improved sequential execution
 
 Algorithm:
-1. Identify hot blocks
-2. Identify cold blocks
-3. Reorder: hot blocks first, normal blocks middle, cold blocks last
+1. The ENTRY block stays first unconditionally - downstream lowering emits
+   blocks in list order and function entry must be the first emitted block
+   regardless of its temperature.
+2. Hot blocks (excluding entry) next.
+3. Normal (neither hot nor cold) blocks in the middle.
+4. Cold blocks last.
+
+The reorder rewrites the MIRCFG blocks List (canonical offset 16) in
+place via index assignment - every block appears exactly once because the
+hot/normal/cold buckets partition the non-entry blocks (identify_cold_blocks
+never marks a hot block cold). Edges, ids, and terminators are untouched;
+list order is pure layout.
+
+Returns 1 when the order actually changed, 0 when the layout was already
+optimal (so the driver's changed-flag aggregation stays honest).
 @End Reasoning
 
 Process called "optimize_code_layout" that takes pga as Integer returns Integer:
-    Let mir_function be proc memory_get_int64 from MemoryCore with pga, 0
-    Let hot_blocks_set be proc memory_get_int64 from MemoryCore with pga, 16
-    Let cold_blocks_set be proc memory_get_int64 from MemoryCore with pga, 24
+    Let mir_function be proc memory_get_int64 from Layout with pga, 0
+    Let hot_blocks_set be proc memory_get_int64 from Layout with pga, 16
+    Let cold_blocks_set be proc memory_get_int64 from Layout with pga, 24
 
-    Note: Get CFG
-    Let cfg be proc memory_get_int64 from MemoryCore with mir_function, 16
+    Let cfg be proc get_mir_function_cfg from MIR with mir_function
     If cfg is equal to 0:
         Return 0
     End If
 
-    Let blocks be proc memory_get_int64 from MemoryCore with cfg, 0
+    Let blocks be proc get_mir_cfg_blocks from CFG with cfg
     Let block_count be proc length from List with blocks
+    If block_count is equal to 0:
+        Return 0
+    End If
 
-    Note: Create new block ordering
+    Let entry_block be proc get_cfg_entry_block from MIR with cfg
+
+    Note: Build the new ordering: entry, hot, normal, cold.
     Let new_order be proc list_create from List
 
-    Note: Phase 1: Add hot blocks
+    If entry_block is not equal to 0:
+        proc append from List with new_order, entry_block
+    End If
+
+    Note: Phase 1: hot blocks (excluding entry)
     Let i be 0
     While i is less than block_count:
         Let block be proc list_get from List with blocks, i
-        Let block_id be proc memory_get_int64 from MemoryCore with block, 0
-
-        Let is_hot be proc contains from Set with hot_blocks_set, block_id
-        If is_hot is equal to 1:
-            proc append from List with new_order, block
+        If block is not equal to entry_block:
+            Let block_id be proc get_mir_basic_block_id from CFG with block
+            Let is_hot be proc contains from Set with hot_blocks_set, block_id
+            If is_hot is equal to 1:
+                proc append from List with new_order, block
+            End If
         End If
-
         Set i to i plus 1
     End While
 
-    Note: Phase 2: Add normal (non-hot, non-cold) blocks
+    Note: Phase 2: normal (non-hot, non-cold) blocks
     Set i to 0
     While i is less than block_count:
-        Set block to proc list_get from List with blocks, i
-        Set block_id to proc memory_get_int64 from MemoryCore with block, 0
-
-        Set is_hot to proc contains from Set with hot_blocks_set, block_id
-        Let is_cold be proc contains from Set with cold_blocks_set, block_id
-
-        If is_hot is equal to 0 and is_cold is equal to 0:
-            proc append from List with new_order, block
+        Let mid_block be proc list_get from List with blocks, i
+        If mid_block is not equal to entry_block:
+            Let mid_block_id be proc get_mir_basic_block_id from CFG with mid_block
+            Let mid_is_hot be proc contains from Set with hot_blocks_set, mid_block_id
+            Let mid_is_cold be proc contains from Set with cold_blocks_set, mid_block_id
+            If mid_is_hot is equal to 0:
+                If mid_is_cold is equal to 0:
+                    proc append from List with new_order, mid_block
+                End If
+            End If
         End If
-
         Set i to i plus 1
     End While
 
-    Note: Phase 3: Add cold blocks at end
+    Note: Phase 3: cold blocks at the end
     Set i to 0
     While i is less than block_count:
-        Set block to proc list_get from List with blocks, i
-        Set block_id to proc memory_get_int64 from MemoryCore with block, 0
-
-        Set is_cold to proc contains from Set with cold_blocks_set, block_id
-        If is_cold is equal to 1:
-            proc append from List with new_order, block
+        Let cold_block be proc list_get from List with blocks, i
+        If cold_block is not equal to entry_block:
+            Let cold_block_id be proc get_mir_basic_block_id from CFG with cold_block
+            Let end_is_hot be proc contains from Set with hot_blocks_set, cold_block_id
+            Let end_is_cold be proc contains from Set with cold_blocks_set, cold_block_id
+            If end_is_cold is equal to 1:
+                If end_is_hot is equal to 0:
+                    proc append from List with new_order, cold_block
+                End If
+            End If
         End If
-
         Set i to i plus 1
     End While
 
-    Note: Replace CFG block list with new ordering
-    Note: Update the CFG structure to use the new optimized block order    This improves cache locality by placing hot blocks together
-
-    Note: Clear existing blocks list
-    Let old_block_count be proc length from List with blocks
-    Let b be 0
-    While b is less than old_block_count:
-        proc list_remove from List with blocks, 0
-        Set b to b plus 1
-    End While
-
-    Note: Add blocks in new order
+    Note: Partition sanity: the buckets must cover every block exactly once.
+    Note: A count mismatch means the hot/cold sets violated their disjoint-
+    Note: partition invariant; in that case leave the CFG untouched.
     Let new_count be proc length from List with new_order
+    If new_count is not equal to block_count:
+        proc list_destroy from List with new_order
+        Return 0
+    End If
+
+    Note: Detect whether the order actually changes.
+    Let changed be 0
     Set i to 0
-    While i is less than new_count:
-        Set block to proc list_get from List with new_order, i
-        proc append from List with blocks, block
+    While i is less than block_count:
+        Let old_at be proc list_get from List with blocks, i
+        Let new_at be proc list_get from List with new_order, i
+        If old_at is not equal to new_at:
+            Set changed to 1
+        End If
         Set i to i plus 1
     End While
 
-    Note: Block layout has been optimized for better cache locality
-    Return new_count
+    Note: Commit the new ordering in place (same length, index assignment).
+    If changed is equal to 1:
+        Set i to 0
+        While i is less than block_count:
+            Let commit_block be proc list_get from List with new_order, i
+            proc list_set from List with blocks, i, commit_block
+            Set i to i plus 1
+        End While
+    End If
+
+    proc list_destroy from List with new_order
+
+    Return changed
 End Process
 
 @Reasoning
@@ -1196,8 +1680,8 @@ this function.
 @End Security_Scope
 
 Process called "estimate_optimization_benefit" that takes pga as Integer returns Integer:
-    Let profile_data be proc memory_get_int64 from MemoryCore with pga, 8
-    Let inline_candidates_list be proc memory_get_int64 from MemoryCore with pga, 56
+    Let profile_data be proc memory_get_int64 from Layout with pga, 8
+    Let inline_candidates_list be proc memory_get_int64 from Layout with pga, 56
 
     Note: Sum cost_benefit (saved instructions) across all enabled inlines.
     Let total_saved be 0
@@ -1206,9 +1690,9 @@ Process called "estimate_optimization_benefit" that takes pga as Integer returns
     While i is less than candidate_count:
         Let decision be proc list_get from List with inline_candidates_list, i
         If decision is not equal to 0:
-            Let should_inline be proc memory_get_int64 from MemoryCore with decision, 32
+            Let should_inline be proc memory_get_int64 from Layout with decision, 32
             If should_inline is equal to 1:
-                Let cost_benefit be proc memory_get_int64 from MemoryCore with decision, 24
+                Let cost_benefit be proc memory_get_int64 from Layout with decision, 24
                 If cost_benefit is greater than 0:
                     Set total_saved to total_saved plus cost_benefit
                 End If
@@ -1220,12 +1704,12 @@ Process called "estimate_optimization_benefit" that takes pga as Integer returns
     Note: Compute total executed work for normalization.
     Let total_executed be 0
     If profile_data is not equal to 0:
-        Set total_executed to proc memory_get_int64 from MemoryCore with profile_data, 56
+        Set total_executed to proc memory_get_int64 from Layout with profile_data, 56
     End If
 
     If total_executed is equal to 0:
         Note: Fall back to hot_block count as coarse proxy if no samples.
-        Let hot_blocks_set be proc memory_get_int64 from MemoryCore with pga, 16
+        Let hot_blocks_set be proc memory_get_int64 from Layout with pga, 16
         Set total_executed to proc size from Set with hot_blocks_set
         Note: Avoid division-by-zero.
         If total_executed is equal to 0:
@@ -1246,20 +1730,23 @@ End Process
 
 @Reasoning
 validate_profile_data checks profile data for consistency.
-Ensures frequencies are reasonable and consistent with CFG structure.
+Ensures frequencies are reasonable: total_samples must be positive, every
+block frequency must be non-negative, and no single block's frequency may
+exceed the aggregate (total_samples is the sum of all block frequencies,
+so any non-negative entry is bounded by it).
 
 Returns 1 if valid, 0 if inconsistencies detected.
 @End Reasoning
 
 Process called "validate_profile_data" that takes pga as Integer returns Integer:
-    Let profile_data be proc memory_get_int64 from MemoryCore with pga, 8
+    Let profile_data be proc memory_get_int64 from Layout with pga, 8
 
     If profile_data is equal to 0:
         Return 0
     End If
 
-    Let block_frequencies be proc memory_get_int64 from MemoryCore with profile_data, 8
-    Let total_samples be proc memory_get_int64 from MemoryCore with profile_data, 56
+    Let block_frequencies be proc memory_get_int64 from Layout with profile_data, 8
+    Let total_samples be proc memory_get_int64 from Layout with profile_data, 56
 
     Note: Check that total samples > 0
     If total_samples is equal to 0:
@@ -1267,13 +1754,9 @@ Process called "validate_profile_data" that takes pga as Integer returns Integer
     End If
 
     Note: Check that block frequencies are reasonable
-    Let block_ids be proc keys from Dictionary with block_frequencies
-    Let block_count be proc length from List with block_ids
-
-    Let i be 0
-    While i is less than block_count:
-        Let block_id be proc list_get from List with block_ids, i
-        Let frequency be proc get from Dictionary with block_frequencies, block_id
+    Let entry be proc omap_first from OrderedMap with block_frequencies
+    While entry is not equal to 0:
+        Let frequency be proc omap_entry_value from OrderedMap with entry
 
         Note: Frequency should be non-negative
         If frequency is less than 0:
@@ -1285,7 +1768,7 @@ Process called "validate_profile_data" that takes pga as Integer returns Integer
             Return 0
         End If
 
-        Set i to i plus 1
+        Set entry to proc omap_entry_next from OrderedMap with entry
     End While
 
     Note: All checks passed
@@ -1295,14 +1778,12 @@ End Process
 @Reasoning
 print_profile_stats outputs profile statistics for debugging.
 Useful for understanding profile data quality and coverage.
+Integers are converted through StringUtils.integer_to_string before
+concatenation (raw integers must never reach string sinks).
 @End Reasoning
 
 Process called "print_profile_stats" that takes pga as Integer returns Integer:
-    Note: Statistics are stored in ProfileGuidedAnalysis structure:    - profile_data->total_samples (offset 56): total execution samples
-    Note: minus hot_blocks (offset 16): set of hot basic blocks
-    Note: minus cold_blocks (offset 24): set of cold basic blocks
-
-    Let profile_data be proc memory_get_int64 from MemoryCore with pga, 8
+    Let profile_data be proc memory_get_int64 from Layout with pga, 8
 
     If profile_data is equal to 0:
         Let error_msg be proc string_duplicate from StringCore with "Error: No profile data available\n"
@@ -1311,9 +1792,9 @@ Process called "print_profile_stats" that takes pga as Integer returns Integer:
         Return 0
     End If
 
-    Let total_samples be proc memory_get_int64 from MemoryCore with profile_data, 56
-    Let hot_blocks_set be proc memory_get_int64 from MemoryCore with pga, 16
-    Let cold_blocks_set be proc memory_get_int64 from MemoryCore with pga, 24
+    Let total_samples be proc memory_get_int64 from Layout with profile_data, 56
+    Let hot_blocks_set be proc memory_get_int64 from Layout with pga, 16
+    Let cold_blocks_set be proc memory_get_int64 from Layout with pga, 24
 
     Let hot_count be proc size from Set with hot_blocks_set
     Let cold_count be proc size from Set with cold_blocks_set
@@ -1321,8 +1802,8 @@ Process called "print_profile_stats" that takes pga as Integer returns Integer:
     Note: Format statistics as strings
     Let header be proc string_duplicate from StringCore with "Profile-Guided Optimization Statistics:\n"
     Let samples_label be proc string_duplicate from StringCore with "  Total Samples: "
-    Let hot_label be proc string_duplicate from StringCore with "  Hot Blocks (top 90 percent): "
-    Let cold_label be proc string_duplicate from StringCore with "  Cold Blocks (bottom 1 percent): "
+    Let hot_label be proc string_duplicate from StringCore with "  Hot Blocks (top 90 percent coverage): "
+    Let cold_label be proc string_duplicate from StringCore with "  Cold Blocks (below 1 percent): "
     Let newline be proc string_duplicate from StringCore with "\n"
 
     Note: Convert integers to strings
@@ -1341,7 +1822,7 @@ Process called "print_profile_stats" that takes pga as Integer returns Integer:
     Set output to proc string_concat from StringUtils with output, cold_str
     Set output to proc string_concat from StringUtils with output, newline
 
-    Note: Output to stderr (fd 2) using write syscall    Note: Syscall 1 = write, fd 2 = stderr
+    Note: Output to stderr: syscall 1 = write, fd 2 = stderr.
     Let output_len be proc string_length from StringCore with output
     Let result be proc syscall_3 from Syscall with 1, 2, output, output_len
 
@@ -1349,82 +1830,72 @@ Process called "print_profile_stats" that takes pga as Integer returns Integer:
 End Process
 
 @Reasoning
-apply_pgo_hints annotates MIR with profile-guided optimization hints.
-These hints guide later optimization passes:
-- Branch prediction hints (likely/unlikely)
-- Inline hints (always_inline/noinline)
-- Code layout hints (hot/cold)
+apply_pgo_hints writes the profile-derived branch probabilities into the
+canonical MIR slots that carry them: MIRBranch weight_true (extended
+offset 96) and weight_false (extended offset 104), per plan 1.1 and the
+mir_nodes.runa MIRBranch record ("Branch weights live here, not in a side
+table" - the weights travel with the branch). Later passes and the LIR
+layer read these weights for branch-direction and layout decisions.
+
+The pre-#468 version of this pass wrote block hot/cold flags to
+MIRBasicBlock offsets 48/56 - the SUCCESSORS LIST POINTER and the
+successor count, a live CFG clobber - and likely/unlikely flags to MIRNode
+offsets 48/56, the NEXT and PARENT_BLOCK pointers, corrupting the
+instruction chain. MIRBasicBlock has no spare hint slot; block-temperature
+facts live in the PGA's hot_blocks/cold_blocks sets, which
+optimize_code_layout (and any later consumer holding the PGA from
+OptimizationContext offset 128) reads directly.
+
+weight_true/weight_false are written as the 0-100 probabilities computed
+by compute_branch_probabilities, matching the create_mir_branch weight
+convention ("Branch prediction weight (0-100)"). Raw offset writes are
+used because mir_nodes.runa exposes no weight mutator; the offsets are the
+plan 1.1 as-built MIRBranch table entries.
+
+Returns the number of branch instructions annotated.
 @End Reasoning
 
 Process called "apply_pgo_hints" that takes pga as Integer returns Integer:
-    Let mir_function be proc memory_get_int64 from MemoryCore with pga, 0
-    Let profile_data be proc memory_get_int64 from MemoryCore with pga, 8
-    Let branch_probs be proc memory_get_int64 from MemoryCore with pga, 64
-    Let hot_blocks_set be proc memory_get_int64 from MemoryCore with pga, 16
-    Let cold_blocks_set be proc memory_get_int64 from MemoryCore with pga, 24
+    Let mir_function be proc memory_get_int64 from Layout with pga, 0
+    Let branch_probs be proc memory_get_int64 from Layout with pga, 64
 
-    Note: Get CFG
-    Let cfg be proc memory_get_int64 from MemoryCore with mir_function, 16
+    Let cfg be proc get_mir_function_cfg from MIR with mir_function
     If cfg is equal to 0:
         Return 0
     End If
 
-    Let blocks be proc memory_get_int64 from MemoryCore with cfg, 0
+    Let blocks be proc get_mir_cfg_blocks from CFG with cfg
     Let block_count be proc length from List with blocks
 
-    Note: Annotate blocks with hot/cold hints
+    Let annotated be 0
     Let i be 0
     While i is less than block_count:
         Let block be proc list_get from List with blocks, i
-        Let block_id be proc memory_get_int64 from MemoryCore with block, 0
 
-        Note: Check if hot
-        Let is_hot be proc contains from Set with hot_blocks_set, block_id
-        If is_hot is equal to 1:
-            Note: Set hot flag (offset 48)
-            proc memory_set_int64 from MemoryCore with block, 48, 1
-        End If
+        Note: Conditional branches are block terminators.
+        Let terminator be proc get_block_terminator from CFG with block
+        If terminator is not equal to 0:
+            Let opcode be proc get_mir_node_opcode from MIR with terminator
 
-        Note: Check if cold
-        Let is_cold be proc contains from Set with cold_blocks_set, block_id
-        If is_cold is equal to 1:
-            Note: Set cold flag (offset 56)
-            proc memory_set_int64 from MemoryCore with block, 56, 1
-        End If
-
-        Note: Annotate branch instructions with probability hints
-        Let instructions be proc memory_get_int64 from MemoryCore with block, 16
-        Let inst_count be proc length from List with instructions
-
-        Let j be 0
-        While j is less than inst_count:
-            Let inst be proc list_get from List with instructions, j
-            Let opcode be proc memory_get_int64 from MemoryCore with inst, 0
-
-            Note: MIR_BR (20501) minus conditional branch
-            If opcode is equal to 20501:
-                Let bp be proc get from Dictionary with branch_probs, inst
+            Note: Canonical MIR_BRANCH = 20301.
+            If opcode is equal to 20301:
+                Let bp be proc omap_get from OrderedMap with branch_probs, terminator
                 If bp is not equal to 0:
-                    Let true_prob be proc memory_get_int64 from MemoryCore with bp, 24
+                    Let true_prob be proc memory_get_int64 from Layout with bp, 24
+                    Let false_prob be proc memory_get_int64 from Layout with bp, 32
 
-                    Note: If heavily biased, add hint
-                    If true_prob is greater than 90:
-                        Note: Likely taken (offset 48)
-                        proc memory_set_int64 from MemoryCore with inst, 48, 1
-                    End If
+                    Note: MIRBranch extended record (plan 1.1):
+                    Note: weight_true@96, weight_false@104.
+                    proc memory_set_int64 from Layout with terminator, 96, true_prob
+                    proc memory_set_int64 from Layout with terminator, 104, false_prob
 
-                    If true_prob is less than 10:
-                        Note: Unlikely taken (offset 56)
-                        proc memory_set_int64 from MemoryCore with inst, 56, 1
-                    End If
+                    Set annotated to annotated plus 1
                 End If
             End If
-
-            Set j to j plus 1
-        End While
+        End If
 
         Set i to i plus 1
     End While
 
-    Return 1
+    Return annotated
 End Process

@@ -39,6 +39,7 @@ Import "compiler/middle/analysis/call_graph.runa" as CallGraph
 Import "compiler/middle/gungnir/mir/mir.runa" as MIRProgram
 Import "compiler/middle/gungnir/mir/mir.runa" as MIRFunction
 Import "compiler/middle/gungnir/mir/mir.runa" as MIRNode
+Import "compiler/middle/gungnir/mir/mir_nodes.runa" as MIRNodes
 Import "compiler/middle/gungnir/hir/hir.runa" as HIRTypeInfo
 Import "compiler/frontend/primitives/memory/layout.runa" as Layout
 Import "compiler/frontend/primitives/core/memory_core.runa" as MemoryCore
@@ -46,8 +47,40 @@ Import "compiler/frontend/primitives/collections/dictionary.runa" as Dictionary
 Import "compiler/frontend/primitives/collections/list.runa" as List
 Import "compiler/frontend/primitives/collections/set.runa" as Set
 Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/internal/string_utils.runa" as StringUtils
 Import "runtime/io/filesystem/file_operations.runa" as FileOps
 Import "runtime/integration/system_interface/wrappers/environment_manager.runa" as Env
+
+Note:
+MIR reconciliation (task #432, Wave 2, 2026-06-10). Identity and layout
+contract used throughout this file:
+
+OD-4 — function identity is the MIRFunction POINTER. The canonical
+MIRFunction (mir.runa:280-296) has NO numeric id field: offset 0 is the
+NAME string pointer, offset 8 the CFG, 16/24 the parameters List and
+count, 32 the return type, 40/48 local_values/value_count, 56
+next_value_id, 64 the value_to_instruction Dictionary, 72 hir_node,
+80 is_external, 88 metadata, 96/104/112 FFI fields. Every Set in the WPA
+struct stores raw function pointers (the Set primitive stringifies its
+elements internally); every Dictionary keyed by a pointer or other raw
+integer stringifies the key with StringUtils.integer_to_string, because
+the hashtable primitive hashes keys as strings (the same convention
+MIR.register_value_definition uses). Name strings are used only at
+module boundaries: a MIR_CALL's callee slot holds the callee's NAME
+(mir_nodes.runa:843), resolved to a function pointer by content-hashed
+name lookup.
+
+OD-1 — instructions are prefix-embedded records: the canonical 72-byte
+MIRNode header sits at offset 0 (opcode@0, value_id@8, operand1/2/3 at
+16/24/32 as SSA-use slots only) and extended payloads live at 72+.
+Operand payloads (call callee/arguments, load/store addresses, branch
+targets, return values, const payloads) are read through the MIRNodes
+accessors, never through header operand slots.
+
+OD-2 — there is no heap-allocation opcode. Heap allocation appears as a
+direct MIR_CALL whose callee name resolves to the allocator family
+("allocate" / "arena_allocate" / "memory_allocate").
+:End Note
 
 @Reasoning
 Whole-program analysis (WPA) is the foundation of link-time optimization.
@@ -383,9 +416,11 @@ Fields:
 - is_pure: Boolean (1 if pure function, 0 otherwise)
 - is_const: Boolean (1 if const function, 0 otherwise)
 - side_effect_flags: Bitfield of side effect categories
+- escaping_values: lazily-allocated List of SSA value ids proven to escape
+  (flow-sensitive field-escape tracking; 0 until first use)
 
-Memory layout (96 bytes, Tier 3 OWNED HEAP):
-Offset 0: function_id (8 bytes)
+Memory layout (104 bytes, Tier 3 OWNED HEAP):
+Offset 0: function_id (8 bytes, MIRFunction pointer per OD-4)
 Offset 8: escaping_parameters (8 bytes)
 Offset 16: escaping_returns (8 bytes)
 Offset 24: memory_reads (8 bytes)
@@ -397,6 +432,10 @@ Offset 64: throws_exceptions (8 bytes)
 Offset 72: is_pure (8 bytes)
 Offset 80: is_const (8 bytes)
 Offset 88: side_effect_flags (8 bytes)
+Offset 96: escaping_values (8 bytes; before the v0.0.8.5 Wave-2 rework
+the struct was 96 bytes and mark_value_as_escaping wrote this slot
+8 bytes PAST the allocation — a live heap overflow, now fixed by
+growing the record)
 @End Implementation
 
 Type called "InterProceduralInfo":
@@ -412,6 +451,7 @@ Type called "InterProceduralInfo":
     is_pure as Integer
     is_const as Integer
     side_effect_flags as Integer
+    escaping_values as Integer
 End Type
 
 Note: Side effect flag constants
@@ -696,6 +736,10 @@ Process called "destroy_whole_program_analysis" that takes wpa as Integer return
                 If mem_writes is not equal to 0:
                     proc destroy from Set with mem_writes
                 End If
+                Let esc_values be proc memory_get_int64 from MemoryCore with ipa_info, 96
+                If esc_values is not equal to 0:
+                    proc list_destroy from List with esc_values
+                End If
                 proc deallocate from Layout with ipa_info
             End If
             Set fi to fi plus 1
@@ -842,37 +886,36 @@ Process called "identify_entry_points" that takes wpa as Integer, mir as Integer
     Let i be 0
     While i is less than function_count:
         Let mir_func be proc list_get from List with functions, i
-        Let function_id be proc memory_get_int64 from MemoryCore with mir_func, 0
-        Let function_name be proc memory_get_int64 from MemoryCore with mir_func, 8
 
-        Note: Check if function is exported (offset 80 in MIRFunction stores is_external flag)
-        Note: For exported functions, we use a different marker in metadata
-        Let is_exported be 0
+        Note: OD-4: the function's identity is the MIRFunction pointer; the
+        Note: name string lives at offset 0 of the canonical record.
+        Let function_name be proc memory_get_int64 from MemoryCore with mir_func, 0
 
         Note: Check function name for "main" entry point
-        Let main_str be proc string_duplicate from StringCore with "main"
-        Let is_main be proc string_equals from StringCore with function_name, main_str
-        proc deallocate from Layout with main_str
-
-        If is_main is equal to 1:
-            Note: Add main function as entry point
-            proc append from List with entry_functions, function_id
-            proc add from Set with exported_functions, function_id
-            Set is_exported to 1
+        Let is_entry be 0
+        If function_name is not equal to 0:
+            Let is_main be proc string_equals from StringCore with function_name, "main"
+            If is_main is equal to 1:
+                Set is_entry to 1
+            End If
         End If
 
-        Note: Check metadata for export annotation
-        Let metadata be proc memory_get_int64 from MemoryCore with mir_func, 88
-        If metadata is not equal to 0:
-            Note: Check if metadata indicates exported function
-            Note: Metadata structure stores flags at offset 8
-            Let flags be proc memory_get_int64 from MemoryCore with metadata, 8
-            Let export_flag be flags bitwise_and 1
-            If export_flag is equal to 1:
-                proc append from List with entry_functions, function_id
-                proc add from Set with exported_functions, function_id
-                Set is_exported to 1
+        Note: Check metadata for export annotation (metadata at offset 88;
+        Note: metadata flags word at offset 8, export bit = bit 0)
+        If is_entry is equal to 0:
+            Let metadata be proc memory_get_int64 from MemoryCore with mir_func, 88
+            If metadata is not equal to 0:
+                Let flags be proc memory_get_int64 from MemoryCore with metadata, 8
+                Let export_flag be flags bitwise_and 1
+                If export_flag is equal to 1:
+                    Set is_entry to 1
+                End If
             End If
+        End If
+
+        If is_entry is equal to 1:
+            proc append from List with entry_functions, mir_func
+            proc add from Set with exported_functions, mir_func
         End If
 
         Set i to i plus 1
@@ -887,8 +930,9 @@ All fields initialized to safe defaults (no escapes, no side effects).
 @End Reasoning
 
 Process called "create_interprocedural_info" that takes function_id as Integer returns Integer:
-    Note: Allocate InterProceduralInfo (96 bytes)
-    Let ipa_info be proc allocate from Layout with 96
+    Note: Allocate InterProceduralInfo (104 bytes; function_id is the
+    Note: MIRFunction pointer per OD-4)
+    Let ipa_info be proc allocate from Layout with 104
 
     If ipa_info is equal to 0:
         Return 0
@@ -907,6 +951,7 @@ Process called "create_interprocedural_info" that takes function_id as Integer r
     proc memory_set_int64 from MemoryCore with ipa_info, 72, 1 Note: is_pure = true (proven otherwise)
     proc memory_set_int64 from MemoryCore with ipa_info, 80, 1 Note: is_const = true (proven otherwise)
     proc memory_set_int64 from MemoryCore with ipa_info, 88, SIDE_EFFECT_NONE Note: side_effect_flags = none
+    proc memory_set_int64 from MemoryCore with ipa_info, 96, 0 Note: escaping_values (lazily allocated)
 
     Return ipa_info
 End Process
@@ -958,49 +1003,35 @@ Process called "analyze_indirect_calls" that takes wpa as Integer, call_graph as
         Note: Get instruction pointer from call site
         Let inst_ptr be proc memory_get_int64 from MemoryCore with call_site, 0
 
-        Note: Get function pointer operand (operand1 for CALL_INDIRECT)
-        Let func_ptr_value be proc memory_get_int64 from MemoryCore with inst_ptr, 16
+        Note: For MIR_CALL_INDIRECT the callee slot of the prefix-embedded
+        Note: record holds the SSA value id of the function-pointer
+        Note: expression — read it through the accessor, not a header slot.
+        Let func_ptr_value be proc get_call_callee from MIRNodes with inst_ptr
 
-        Note: Get caller function ID
-        Let caller_id be proc memory_get_int64 from MemoryCore with call_site, 8
+        Note: Get caller function pointer (CallSite caller slot at offset 56;
+        Note: offset 8 is the callee slot, which is always 0 for indirect
+        Note: sites and was misread as the caller by the pre-Wave-2 code)
+        Let caller_id be proc memory_get_int64 from MemoryCore with call_site, 56
 
         Note: Trace function pointer to find possible targets
         Let possible_targets be resolve_function_pointer(wpa, mir, func_ptr_value)
         Let target_count be proc length from List with possible_targets
 
-        Note: Add call edges for each resolved target
+        Note: Add a resolved call edge for each possible target through the
+        Note: canonical add_direct_call wiring (CallSite + edge record +
+        Note: caller/callee bookkeeping). The historical code hand-wrote
+        Note: edges against a phantom node layout (callee Set at node
+        Note: offset 8 — that slot is the function NAME) and corrupted the
+        Note: graph; add_direct_call maintains the real CallGraphNode shape.
+        Let site_block_id be proc memory_get_int64 from MemoryCore with call_site, 24
         Let t be 0
         While t is less than target_count:
             Let target_func_id be proc list_get from List with possible_targets, t
-
-            Note: Get or create caller node in call graph
-            Let caller_node be proc get from Dictionary with cg_nodes, caller_id
-            If caller_node is not equal to 0:
-                Note: Add callee to caller's callee list
-                Let callees be proc memory_get_int64 from MemoryCore with caller_node, 8
-                If proc contains from Set with callees, target_func_id is equal to 0:
-                    proc add from Set with callees, target_func_id
-
-                    Note: Increment caller's out-degree
-                    Let out_degree be proc memory_get_int64 from MemoryCore with caller_node, 32
-                    proc memory_set_int64 from MemoryCore with caller_node, 32, out_degree plus 1
+            If target_func_id is not equal to 0:
+                If caller_id is not equal to 0:
+                    proc add_direct_call from CallGraph with call_graph, caller_id, target_func_id, inst_ptr, site_block_id
                 End If
             End If
-
-            Note: Get or create callee node in call graph
-            Let callee_node be proc get from Dictionary with cg_nodes, target_func_id
-            If callee_node is not equal to 0:
-                Note: Add caller to callee's caller list
-                Let callers be proc memory_get_int64 from MemoryCore with callee_node, 16
-                If proc contains from Set with callers, caller_id is equal to 0:
-                    proc add from Set with callers, caller_id
-
-                    Note: Increment callee's in-degree
-                    Let in_degree be proc memory_get_int64 from MemoryCore with callee_node, 40
-                    proc memory_set_int64 from MemoryCore with callee_node, 40, in_degree plus 1
-                End If
-            End If
-
             Set t to t plus 1
         End While
 
@@ -1011,139 +1042,188 @@ Process called "analyze_indirect_calls" that takes wpa as Integer, call_graph as
 End Process
 
 @Reasoning
-resolve_function_pointer performs basic points-to analysis to resolve indirect calls.
-Traces function pointer values through def-use chains to find possible targets.
+resolve_function_pointer traces a function-pointer SSA value to the set
+of MIRFunction POINTERS it can name (OD-4 identity). Decodable sources
+under the canonical lowering contract:
 
-Algorithm:
-1. Get the defining instruction for the function pointer value
-2. If CONST instruction: extract function address, return singleton set
-3. If PHI node: recursively resolve all incoming values
-4. If LOAD: could be from function pointer variable (conservative: return empty)
-5. If parameter: unknown at compile time (conservative: return empty)
-6. Otherwise: return empty set (unresolved)
+1. MIR_CONST (20001) whose header type_info is a function type
+   (HIRTypeInfo.type_kind == HIR_FUNCTION_TYPE, 13004): the constant
+   payload is the resolved HIRSymbolInfo pointer recorded by
+   lower_hir_function_pointer_post (expression_lowering.runa:1529).
+   The symbol's name (HIRSymbolInfo.symbol_name at offset 8) resolves
+   to a MIRFunction by name comparison.
+2. MIR_PHI (20300): union of every incoming value's resolution (the
+   incoming pairs live in the extended record, read via accessors).
+3. MIR_LOAD (20200): the points-to set of the load address.
+4. MIR_ADDRESS_OF (20205, plain header record): the operand1 SSA value
+   is traced transitively.
+
+Values with no defining instruction are checked against every
+function's parameters List; a match defers to inter-procedural
+argument tracing (analyze_parameter_targets).
+
+The traversal is an iterative worklist with a visited Set so phi
+cycles terminate. A CONST whose payload cannot be decoded to a known
+function yields nothing — the call site stays conservatively
+unresolved (reachability must then rely on the P-EXP/P-AT seeds).
 @End Reasoning
 
 Process called "resolve_function_pointer" that takes wpa as Integer, mir as Integer, value_id as Integer returns Integer:
     Note: Create empty result list
     Let result be proc list_create from List
+    If value_id is equal to 0:
+        Return result
+    End If
 
-    Note: Get all functions to find value definition
     Let functions be proc memory_get_int64 from MemoryCore with mir, 0
     Let function_count be proc memory_get_int64 from MemoryCore with mir, 8
 
-    Note: Search all functions for the value definition
-    Let f be 0
-    While f is less than function_count:
-        Let mir_func be proc list_get from List with functions, f
-        Let value_to_inst be proc memory_get_int64 from MemoryCore with mir_func, 64
+    Note: Iterative worklist over SSA value ids with a visited guard so
+    Note: phi cycles cannot recurse forever.
+    Let visited be proc create from Set
+    Let worklist be proc list_create from List
+    proc append from List with worklist, value_id
 
-        Note: Look up defining instruction
-        Let def_inst be proc get from Dictionary with value_to_inst, value_id
+    While proc length from List with worklist is greater than 0:
+        Let wl_size be proc length from List with worklist
+        Let current_value be proc list_get from List with worklist, wl_size minus 1
+        proc list_remove from List with worklist, wl_size minus 1
 
-        If def_inst is not equal to 0:
-            Note: Found defining instruction - check its type
-            Let opcode be proc memory_get_int64 from MemoryCore with def_inst, 0
+        Let seen be proc contains from Set with visited, current_value
+        If current_value is not equal to 0:
+            If seen is equal to 0:
+                proc add from Set with visited, current_value
 
-            Note: Check for CONST (20001) - function address constant
-            If opcode is equal to 20001:
-                Note: operand1 contains the function ID
-                Let target_func_id be proc memory_get_int64 from MemoryCore with def_inst, 16
-                If target_func_id is not equal to 0:
-                    proc append from List with result, target_func_id
-                End If
-            End If
-
-            Note: Check for PHI (20300) - merge point, recursively resolve
-            If opcode is equal to 20300:
-                Note: PHI has multiple incoming values in metadata
-                Note: For simplicity, we extract operands (could have more sophisticated PHI handling)
-                Let incoming1 be proc memory_get_int64 from MemoryCore with def_inst, 16
-                Let incoming2 be proc memory_get_int64 from MemoryCore with def_inst, 24
-                Let incoming3 be proc memory_get_int64 from MemoryCore with def_inst, 32
-
-                If incoming1 is not equal to 0:
-                    Let targets1 be resolve_function_pointer(wpa, mir, incoming1)
-                    Let count1 be proc length from List with targets1
-                    Let k be 0
-                    While k is less than count1:
-                        proc append from List with result, List.get(targets1, k )
-                        Set k to k plus 1
-                    End While
-                End If
-
-                If incoming2 is not equal to 0:
-                    Let targets2 be resolve_function_pointer(wpa, mir, incoming2)
-                    Let count2 be proc length from List with targets2
-                    Set k to 0
-                    While k is less than count2:
-                        proc append from List with result, List.get(targets2, k )
-                        Set k to k plus 1
-                    End While
-                End If
-
-                If incoming3 is not equal to 0:
-                    Let targets3 be resolve_function_pointer(wpa, mir, incoming3)
-                    Let count3 be proc length from List with targets3
-                    Set k to 0
-                    While k is less than count3:
-                        proc append from List with result, List.get(targets3, k )
-                        Set k to k plus 1
-                    End While
-                End If
-            End If
-
-            Note: Handle LOAD (20200) - load from memory location
-            If opcode is equal to 20200:
-                Note: Get memory address being loaded from
-                Let addr_value be proc memory_get_int64 from MemoryCore with def_inst, 16
-
-                Note: Check if loading from global function pointer variable
-                Let points_to_set be get_points_to_set(wpa, addr_value)
-                Let pts_count be proc length from List with points_to_set
-
-                Set k to 0
-                While k is less than pts_count:
-                    Let target be proc list_get from List with points_to_set, k
-                    proc append from List with result, target
-                    Set k to k plus 1
+                Note: Find the defining instruction across all functions via
+                Note: the canonical value map accessor.
+                Let def_inst be 0
+                Let f be 0
+                While f is less than function_count:
+                    Let mir_func be proc list_get from List with functions, f
+                    Let probe be proc lookup_defining_instruction from MIRProgram with mir_func, current_value
+                    If probe is not equal to 0:
+                        Set def_inst to probe
+                        Set f to function_count
+                    End If
+                    Set f to f plus 1
                 End While
-            End If
 
-            Note: Handle ADDRESS_OF (20150) - taking address of function
-            If opcode is equal to 20150:
-                Note: operand1 contains the entity whose address is taken
-                Let target_entity be proc memory_get_int64 from MemoryCore with def_inst, 16
+                If def_inst is not equal to 0:
+                    Let opcode be proc memory_get_int64 from MemoryCore with def_inst, 0
 
-                Note: Check if it's a function address
-                Let entity_type be get_entity_type(mir, target_entity)
-                If entity_type is equal to 1:  Note: Function entity
-                    proc append from List with result, target_entity
+                    Note: CONST (20001) — function-pointer literal
+                    If opcode is equal to 20001:
+                        Let const_type be proc memory_get_int64 from MemoryCore with def_inst, 40
+                        If const_type is not equal to 0:
+                            Let type_kind be proc memory_get_int64 from MemoryCore with const_type, 0
+                            Note: HIR_FUNCTION_TYPE = 13004 (hir.runa:135)
+                            If type_kind is equal to 13004:
+                                Let symbol be proc get_const_value from MIRNodes with def_inst
+                                If symbol is not equal to 0:
+                                    Note: HIRSymbolInfo.symbol_name at offset 8
+                                    Let sym_name be proc memory_get_int64 from MemoryCore with symbol, 8
+                                    If sym_name is not equal to 0:
+                                        Let g be 0
+                                        While g is less than function_count:
+                                            Let cand_func be proc list_get from List with functions, g
+                                            Let cand_name be proc memory_get_int64 from MemoryCore with cand_func, 0
+                                            If cand_name is not equal to 0:
+                                                Let names_match be proc string_equals from StringCore with cand_name, sym_name
+                                                If names_match is equal to 1:
+                                                    proc append from List with result, cand_func
+                                                    Set g to function_count
+                                                End If
+                                            End If
+                                            Set g to g plus 1
+                                        End While
+                                    End If
+                                End If
+                            End If
+                        End If
+                    End If
+
+                    Note: PHI (20300) — push every incoming value
+                    If opcode is equal to 20300:
+                        Let incoming_count be proc get_phi_incoming_count from MIRNodes with def_inst
+                        Let k be 0
+                        While k is less than incoming_count:
+                            Let incoming_value be proc get_phi_incoming_value from MIRNodes with def_inst, k
+                            If incoming_value is not equal to 0:
+                                proc append from List with worklist, incoming_value
+                            End If
+                            Set k to k plus 1
+                        End While
+                    End If
+
+                    Note: LOAD (20200) — consult the points-to set of the address
+                    If opcode is equal to 20200:
+                        Let addr_value be proc get_load_address from MIRNodes with def_inst
+                        Let points_to_set be get_points_to_set(wpa, addr_value)
+                        Let pts_count be proc length from List with points_to_set
+                        Let p be 0
+                        While p is less than pts_count:
+                            Let target be proc list_get from List with points_to_set, p
+                            If target is not equal to 0:
+                                proc append from List with result, target
+                            End If
+                            Set p to p plus 1
+                        End While
+                    End If
+
+                    Note: ADDRESS_OF (20205) — plain-header record; operand1
+                    Note: holds the addressed SSA value, trace it transitively
+                    If opcode is equal to 20205:
+                        Let addressed be proc memory_get_int64 from MemoryCore with def_inst, 16
+                        If addressed is not equal to 0:
+                            proc append from List with worklist, addressed
+                        End If
+                    End If
+                Otherwise:
+                    Note: No defining instruction — check whether the value is a
+                    Note: function parameter (parameters List at MIRFunction
+                    Note: offset 16) and defer to inter-procedural tracing.
+                    Let pf be 0
+                    While pf is less than function_count:
+                        Let param_func be proc list_get from List with functions, pf
+                        Let param_list be proc memory_get_int64 from MemoryCore with param_func, 16
+                        Let param_count be proc memory_get_int64 from MemoryCore with param_func, 24
+                        If param_list is not equal to 0:
+                            Let pi be 0
+                            While pi is less than param_count:
+                                Let param_value be proc list_get from List with param_list, pi
+                                If param_value is equal to current_value:
+                                    Note: param_targets is owned by the WPA
+                                    Note: points-to cache (memoized by
+                                    Note: analyze_parameter_targets) — read
+                                    Note: it, never destroy it here.
+                                    Let param_targets be analyze_parameter_targets(wpa, mir, current_value, pi)
+                                    If param_targets is not equal to 0:
+                                        Let pt_count be proc length from List with param_targets
+                                        Let pt be 0
+                                        While pt is less than pt_count:
+                                            Let pt_target be proc list_get from List with param_targets, pt
+                                            If pt_target is not equal to 0:
+                                                proc append from List with result, pt_target
+                                            End If
+                                            Set pt to pt plus 1
+                                        End While
+                                    End If
+                                    Set pi to param_count
+                                    Set pf to function_count
+                                End If
+                                Set pi to pi plus 1
+                            End While
+                        End If
+                        Set pf to pf plus 1
+                    End While
                 End If
             End If
-
-            Note: Handle PARAMETER (20100) - function parameter
-            If opcode is equal to 20100:
-                Note: Function parameters could point to any function passed as argument
-                Note: Use interprocedural analysis to determine possible values
-                Let param_index be proc memory_get_int64 from MemoryCore with def_inst, 16
-                Let param_targets be analyze_parameter_targets(wpa, mir, value_id, param_index)
-                Let pt_count be proc length from List with param_targets
-
-                Set k to 0
-                While k is less than pt_count:
-                    proc append from List with result, List.get(param_targets, k )
-                    Set k to k plus 1
-                End While
-            End If
-
-            Note: Found definition, stop searching
-            Return result
         End If
-
-        Set f to f plus 1
     End While
 
-    Note: No definition found - return empty set
+    proc destroy from Set with visited
+    proc list_destroy from List with worklist
+
     Return result
 End Process
 
@@ -1294,9 +1374,11 @@ Process called "compute_global_reachability" that takes wpa as Integer returns I
     Let type_hierarchy be proc memory_get_int64 from MemoryCore with wpa, 40
     Let mir be proc memory_get_int64 from MemoryCore with wpa, 0
 
-    Note: Get all functions from call graph
+    Note: Get all functions from call graph (node Dictionary keyed by
+    Note: stringified function pointers; raw pointers recovered at node
+    Note: offset 0 where needed)
     Let cg_nodes be proc memory_get_int64 from MemoryCore with call_graph, 0
-    Let all_function_ids be proc keys from Dictionary with cg_nodes
+    Let all_node_keys be proc keys from Dictionary with cg_nodes
 
     Note: Initialize worklist with entry points
     Let worklist be proc list_create from List
@@ -1354,8 +1436,9 @@ Process called "compute_global_reachability" that takes wpa as Integer returns I
         Note: Mark as reachable
         proc add from Set with reachable, current_id
 
-        Note: Get callees from call graph
-        Let node be proc get from Dictionary with cg_nodes, current_id
+        Note: Get callees from call graph (stringified-pointer key)
+        Let current_node_key be proc integer_to_string from StringUtils with current_id
+        Let node be proc get from Dictionary with cg_nodes, current_node_key
         If node is not equal to 0:
             Let call_sites be proc memory_get_int64 from MemoryCore with node, 16
             Let call_site_count be proc memory_get_int64 from MemoryCore with node, 24
@@ -1400,12 +1483,12 @@ Process called "compute_global_reachability" that takes wpa as Integer returns I
                 If callee_id is equal to 0:
                     Note: P-IND — indirect call edge. Resolve the function-pointer
                     Note: value through points-to analysis and follow every
-                    Note: possible target. The instruction's func_ptr_value lives
-                    Note: at offset 16 of the MIR instruction (same convention
-                    Note: used by compute_devirtualization_candidates).
+                    Note: possible target. The function-pointer SSA value lives
+                    Note: in the MIRCall callee slot of the prefix-embedded
+                    Note: record (read via the MIRNodes accessor).
                     Let inst be proc memory_get_int64 from MemoryCore with call_site, 0
                     If inst is not equal to 0:
-                        Let func_ptr_value be proc memory_get_int64 from MemoryCore with inst, 16
+                        Let func_ptr_value be proc get_call_callee from MIRNodes with inst
                         Let possible_targets be resolve_function_pointer(wpa, mir, func_ptr_value)
                         If possible_targets is not equal to 0:
                             Let ptc be proc length from List with possible_targets
@@ -1429,14 +1512,19 @@ Process called "compute_global_reachability" that takes wpa as Integer returns I
         End If
     End While
 
-    Note: All functions not in reachable set are unreachable
-    Let all_count be proc length from List with all_function_ids
+    Note: All functions not in reachable set are unreachable. Node keys are
+    Note: stringified pointers; the raw pointer is the node's offset-0 slot.
+    Let all_count be proc length from List with all_node_keys
     Set i to 0
     While i is less than all_count:
-        Let function_id be proc list_get from List with all_function_ids, i
-        Let is_reachable be proc contains from Set with reachable, function_id
-        If is_reachable is equal to 0:
-            proc add from Set with unreachable, function_id
+        Let nk be proc list_get from List with all_node_keys, i
+        Let nk_node be proc get from Dictionary with cg_nodes, nk
+        If nk_node is not equal to 0:
+            Let function_ptr be proc memory_get_int64 from MemoryCore with nk_node, 0
+            Let is_reachable be proc contains from Set with reachable, function_ptr
+            If is_reachable is equal to 0:
+                proc add from Set with unreachable, function_ptr
+            End If
         End If
         Set i to i plus 1
     End While
@@ -1489,46 +1577,20 @@ Process called "build_type_hierarchy_graph" that takes wpa as Integer, mir as In
     Note: Update type count
     proc memory_set_int64 from MemoryCore with wpa, 48, type_count
 
-    Note: Phase 2: Build parent-child relationships
-    Set i to 0
-    While i is less than type_count:
-        Set type_id to proc list_get from List with type_ids, i
-        Set type_node to proc get from Dictionary with type_hierarchy, type_id
-        Set type_info to proc memory_get_int64 from MemoryCore with type_node, 8
-
-        Note: Get base types from HIRTypeInfo (offset 72)
-        Let base_types be proc memory_get_int64 from MemoryCore with type_info, 72
-        If base_types is not equal to 0:
-            Let base_count be proc length from List with base_types
-
-            Let j be 0
-            While j is less than base_count:
-                Let base_type_id be proc list_get from List with base_types, j
-
-                Note: Add to parent types
-                Let parent_types be proc memory_get_int64 from MemoryCore with type_node, 16
-                proc append from List with parent_types, base_type_id
-
-                Note: Increment parent count
-                Let parent_count be proc memory_get_int64 from MemoryCore with type_node, 24
-                proc memory_set_int64 from MemoryCore with type_node, 24, parent_count plus 1
-
-                Note: Add this type to parent's child types
-                Let parent_node be proc get from Dictionary with type_hierarchy, base_type_id
-                If parent_node is not equal to 0:
-                    Let child_types be proc memory_get_int64 from MemoryCore with parent_node, 32
-                    proc append from List with child_types, type_id
-
-                    Let child_count be proc memory_get_int64 from MemoryCore with parent_node, 40
-                    proc memory_set_int64 from MemoryCore with parent_node, 40, child_count plus 1
-                End If
-
-                Set j to j plus 1
-            End While
-        End If
-
-        Set i to i plus 1
-    End While
+    Note: Phase 2: Parent-child relationships. The canonical HIRTypeInfo
+    Note: (hir.runa:222, 15 fields) carries NO inheritance information —
+    Note: offset 72 is field_types (component types of records/tuples,
+    Note: which is containment, not subtyping) and offset 80 is the
+    Note: field_count integer. The v0.0.8.5 type system has no subtype
+    Note: declarations, so the hierarchy is flat by construction: every
+    Note: node keeps zero parents and zero children. The traversal
+    Note: machinery downstream (override chains, devirtualization filters)
+    Note: operates correctly over the flat hierarchy and activates without
+    Note: code changes once the type system grows inheritance metadata
+    Note: (v0.0.8.9 traits roadmap) and this phase derives real edges
+    Note: from it. The pre-Wave-2 code read field_types as "base types"
+    Note: and field_count as a method List pointer — fabricated reads
+    Note: against fields that never held that data.
 
     Note: Phase 3: Identify virtual methods
     identify_virtual_methods(wpa, mir)
@@ -1581,6 +1643,19 @@ Algorithm:
 @End Reasoning
 
 Process called "identify_virtual_methods" that takes wpa as Integer, mir as Integer returns Integer:
+    Note: The canonical HIRTypeInfo (hir.runa:222) carries no method table:
+    Note: offset 80 is the field_count INTEGER, which the pre-Wave-2 code
+    Note: dereferenced as a method List pointer (a crash whenever a record
+    Note: type had a non-zero field count). The v0.0.8.5 surface language
+    Note: has no virtual dispatch — MIR carries only CALL/CALL_INDIRECT —
+    Note: so the correct virtual-method registration over the current IR
+    Note: is the empty registration this Process now performs: it verifies
+    Note: every hierarchy node has a live virtual_methods Dictionary and
+    Note: registers nothing into it. compute_override_chains,
+    Note: find_unique_implementations and the P-VIRT reachability arm all
+    Note: iterate these Dictionaries and degrade to sound no-ops on empty
+    Note: data; they activate unchanged when the trait system (v0.0.8.9)
+    Note: introduces real dispatch metadata for this pass to read.
     Let type_hierarchy be proc memory_get_int64 from MemoryCore with wpa, 40
     Let type_ids be proc keys from Dictionary with type_hierarchy
     Let type_count be proc length from List with type_ids
@@ -1589,51 +1664,14 @@ Process called "identify_virtual_methods" that takes wpa as Integer, mir as Inte
     While i is less than type_count:
         Let type_id be proc list_get from List with type_ids, i
         Let type_node be proc get from Dictionary with type_hierarchy, type_id
-        Let type_info be proc memory_get_int64 from MemoryCore with type_node, 8
-
-        Note: Get methods from HIRTypeInfo
-        Note: Methods stored at offset 80 in HIRTypeInfo
-        Let methods be proc memory_get_int64 from MemoryCore with type_info, 80
-        If methods is not equal to 0:
-            Let method_count be proc length from List with methods
-
-            Let j be 0
-            While j is less than method_count:
-                Let method_symbol be proc list_get from List with methods, j
-
-                Note: Check if method is virtual
-                Note: Method flags at offset 16 in method symbol
-                Let method_flags be proc memory_get_int64 from MemoryCore with method_symbol, 16
-                Let is_virtual be method_flags bitwise_and 1
-
-                If is_virtual is equal to 1:
-                    Note: Create MethodInfo
-                    Let method_name be proc memory_get_int64 from MemoryCore with method_symbol, 0
-                    Let method_sig be proc memory_get_int64 from MemoryCore with method_symbol, 8
-
-                    Let method_info be proc allocate from Layout with 64
-                    proc memory_set_int64 from MemoryCore with method_info, 0, method_name
-                    proc memory_set_int64 from MemoryCore with method_info, 8, method_sig
-                    proc memory_set_int64 from MemoryCore with method_info, 16, type_id
-                    proc memory_set_int64 from MemoryCore with method_info, 24, List.create( )  Note: implementations
-                    proc memory_set_int64 from MemoryCore with method_info, 32, 0 Note: implementation_count
-                    proc memory_set_int64 from MemoryCore with method_info, 40, 0 Note: is_final
-                    proc memory_set_int64 from MemoryCore with method_info, 48, 0 Note: is_abstract
-                    proc memory_set_int64 from MemoryCore with method_info, 56, 0 Note: unique_implementation
-
-                    Note: Add to type's virtual methods
-                    Let virtual_methods be proc memory_get_int64 from MemoryCore with type_node, 48
-                    proc set from Dictionary with virtual_methods, method_name, method_info
-
-                    Note: Increment method count
-                    Let vm_count be proc memory_get_int64 from MemoryCore with type_node, 56
-                    proc memory_set_int64 from MemoryCore with type_node, 56, vm_count plus 1
-                End If
-
-                Set j to j plus 1
-            End While
+        If type_node is not equal to 0:
+            Note: Guarantee the virtual_methods Dictionary exists so every
+            Note: downstream consumer can iterate it without a null guard.
+            Let virtual_methods be proc memory_get_int64 from MemoryCore with type_node, 48
+            If virtual_methods is equal to 0:
+                proc memory_set_int64 from MemoryCore with type_node, 48, Dictionary.create( )
+            End If
         End If
-
         Set i to i plus 1
     End While
 
@@ -1733,11 +1771,13 @@ Process called "analyze_method_implementations" that takes wpa as Integer, mir a
     Let i be 0
     While i is less than function_count:
         Let mir_func be proc list_get from List with functions, i
-        Let function_id be proc memory_get_int64 from MemoryCore with mir_func, 0
-        Let function_name be proc memory_get_int64 from MemoryCore with mir_func, 8
+        Note: OD-4: name at offset 0, identity is the pointer itself. The
+        Note: Dictionary is content-keyed on the name string.
+        Let function_name be proc memory_get_int64 from MemoryCore with mir_func, 0
 
-        Note: Add to mapping
-        proc set from Dictionary with method_to_function, function_name, function_id
+        If function_name is not equal to 0:
+            proc set from Dictionary with method_to_function, function_name, mir_func
+        End If
 
         Set i to i plus 1
     End While
@@ -1756,12 +1796,12 @@ Process called "analyze_method_implementations" that takes wpa as Integer, mir a
             Let method_name be proc list_get from List with method_names, j
             Let method_info be proc get from Dictionary with virtual_methods, method_name
 
-            Note: Look up function ID for this method
-            Set function_id to proc get from Dictionary with method_to_function, method_name
-            If function_id is not equal to 0:
+            Note: Look up the implementing function (pointer) for this method
+            Let impl_func be proc get from Dictionary with method_to_function, method_name
+            If impl_func is not equal to 0:
                 Note: Found implementation
                 Let implementations be proc memory_get_int64 from MemoryCore with method_info, 24
-                proc append from List with implementations, function_id
+                proc append from List with implementations, impl_func
 
                 Note: Increment implementation count
                 Let impl_count be proc memory_get_int64 from MemoryCore with method_info, 32
@@ -1773,6 +1813,8 @@ Process called "analyze_method_implementations" that takes wpa as Integer, mir a
 
         Set i to i plus 1
     End While
+
+    proc destroy from Dictionary with method_to_function
 
     Return 1
 End Process
@@ -1841,14 +1883,15 @@ Process called "compute_devirtualization_candidates" that takes wpa as Integer r
     Let functions be proc memory_get_int64 from MemoryCore with mir, 0
     Let function_count be proc memory_get_int64 from MemoryCore with mir, 8
 
-    Note: Scan all functions for virtual calls
+    Note: Scan all functions for indirect calls (canonical layout: cfg at
+    Note: MIRFunction offset 8, blocks List at MIRCFG offset 16)
     Let i be 0
     While i is less than function_count:
         Let mir_func be proc list_get from List with functions, i
-        Let cfg be proc memory_get_int64 from MemoryCore with mir_func, 16
+        Let cfg be proc memory_get_int64 from MemoryCore with mir_func, 8
 
         If cfg is not equal to 0:
-            Let blocks be proc memory_get_int64 from MemoryCore with cfg, 0
+            Let blocks be proc memory_get_int64 from MemoryCore with cfg, 16
             Let block_count be proc memory_get_int64 from MemoryCore with cfg, 24
 
             Let b be 0
@@ -1862,10 +1905,11 @@ Process called "compute_devirtualization_candidates" that takes wpa as Integer r
                     Let inst be proc list_get from List with instructions, j
                     Let opcode be proc memory_get_int64 from MemoryCore with inst, 0
 
-                    Note: Check for virtual calls (MIR_CALL_INDIRECT = 20305)
+                    Note: Check for virtual calls (MIR_CALL_INDIRECT = 20305).
+                    Note: The function-pointer SSA value is the callee slot of
+                    Note: the prefix-embedded MIRCall record.
                     If opcode is equal to 20305:
-                        Note: Use points-to analysis to determine possible targets
-                        Let func_ptr_value be proc memory_get_int64 from MemoryCore with inst, 16
+                        Let func_ptr_value be proc get_call_callee from MIRNodes with inst
 
                         Note: Resolve function pointer to possible targets
                         Let possible_targets be resolve_function_pointer(wpa, mir, func_ptr_value)
@@ -1907,18 +1951,16 @@ Process called "compute_devirtualization_candidates" that takes wpa as Integer r
                         End If
                     End If
 
-                    Note: Check for direct calls to virtual methods
+                    Note: Check for direct calls to virtual methods. The
+                    Note: MIRCall callee slot holds the callee NAME string —
+                    Note: that name doubles as the method lookup key. (The
+                    Note: pre-Wave-2 code Dictionary.get'd the functions LIST
+                    Note: with a phantom id — the functions collection is a
+                    Note: List, not a Dictionary.)
                     If opcode is equal to 20304:
-                        Let callee_id be proc memory_get_int64 from MemoryCore with inst, 16
+                        Let func_name be proc get_call_callee from MIRNodes with inst
 
-                        Note: Look up callee function to get its name
-                        Set functions to proc memory_get_int64 from MemoryCore with mir, 0
-                        Let callee_func be proc get from Dictionary with functions, callee_id
-
-                        If callee_func is not equal to 0:
-                            Note: Get function name (offset 0)
-                            Let func_name be proc memory_get_int64 from MemoryCore with callee_func, 0
-
+                        If func_name is not equal to 0:
                             Note: Search type hierarchy for this method name
                             Let type_ids be proc keys from Dictionary with type_hierarchy
                             Let type_count_local be proc length from List with type_ids
@@ -1991,10 +2033,20 @@ Process called "mark_devirtualizable_calls" that takes wpa as Integer returns In
         Let inst_ptr be proc memory_get_int64 from MemoryCore with candidate, 0
         Let target_func_id be proc memory_get_int64 from MemoryCore with candidate, 8
 
-        Note: Mark instruction with devirtualization metadata.
-        Note: MIRNode metadata field is at offset 64 (8 fields * 8 bytes).
-        Note: Store target_func_id as metadata to indicate devirtualization target.
-        proc memory_set_int64 from MemoryCore with inst_ptr, 64, target_func_id
+        Note: The devirtualization mark lives in the candidate record itself
+        Note: (verified flag at offset 24), NOT in the instruction: the
+        Note: canonical MIRNode metadata slot (offset 64) holds an optional
+        Note: metadata record pointer (variable names / source positions per
+        Note: mir_nodes.runa get_metadata_*), and the pre-Wave-2 write of the
+        Note: raw target id into that slot destroyed debug metadata and made
+        Note: downstream metadata readers dereference a function pointer.
+        Note: CMO's apply_devirt_candidate_* wrappers consume the candidate
+        Note: records directly, so stamping the record is sufficient.
+        If inst_ptr is not equal to 0:
+            If target_func_id is not equal to 0:
+                proc memory_set_int64 from MemoryCore with candidate, 24, 1
+            End If
+        End If
 
         Set i to i plus 1
     End While
@@ -2032,15 +2084,17 @@ Process called "compute_escape_analysis" that takes wpa as Integer returns Integ
     Let functions be proc memory_get_int64 from MemoryCore with mir, 0
     Let function_count be proc memory_get_int64 from MemoryCore with mir, 8
 
-    Note: For each function, create IPA info and analyze escapes
+    Note: For each function, create IPA info and analyze escapes. The
+    Note: side_effect_info Dictionary is keyed by the stringified
+    Note: MIRFunction pointer (OD-4).
     Let i be 0
     While i is less than function_count:
         Let mir_func be proc list_get from List with functions, i
-        Let function_id be proc memory_get_int64 from MemoryCore with mir_func, 0
 
-        Note: Create IPA info for function
-        Let ipa_info be create_interprocedural_info(function_id)
-        proc set from Dictionary with side_effect_info, function_id, ipa_info
+        Note: Create IPA info for function (identity = pointer)
+        Let ipa_info be create_interprocedural_info(mir_func)
+        Let func_key be proc integer_to_string from StringUtils with mir_func
+        proc set from Dictionary with side_effect_info, func_key, ipa_info
 
         Note: Analyze parameter escapes
         analyze_parameter_escape(wpa, mir_func, ipa_info)
@@ -2090,10 +2144,11 @@ Process called "analyze_parameter_escape" that takes wpa as Integer, mir_func as
             Let inst be proc list_get from List with instructions, i
             Let opcode be proc memory_get_int64 from MemoryCore with inst, 0
 
-            Note: Check for STORE operations (20201)
+            Note: Check for STORE operations (20201). The stored value lives
+            Note: in the prefix-embedded MIRStore record (value slot), read
+            Note: via accessor — header operand slots are not populated.
             If opcode is equal to 20201:
-                Note: Store may cause escape
-                Let value_operand be proc memory_get_int64 from MemoryCore with inst, 16
+                Let value_operand be proc get_store_value from MIRNodes with inst
 
                 Note: Check if value is a parameter
                 Let p be 0
@@ -2109,7 +2164,7 @@ Process called "analyze_parameter_escape" that takes wpa as Integer, mir_func as
 
             Note: Check for RETURN operations (20303)
             If opcode is equal to 20303:
-                Let return_value be proc memory_get_int64 from MemoryCore with inst, 16
+                Let return_value be proc get_return_value from MIRNodes with inst
 
                 Set p to 0
                 While p is less than param_count:
@@ -2122,27 +2177,33 @@ Process called "analyze_parameter_escape" that takes wpa as Integer, mir_func as
                 End While
             End If
 
-            Note: Check for CALL operations (20304, 20305)
+            Note: Check for CALL operations (20304/20305). Arguments live in
+            Note: the MIRCall arguments List of the extended record.
+            Let is_call_op be 0
             If opcode is equal to 20304:
-                Note: Check if any parameters match call arguments
-                Let arg1 be proc memory_get_int64 from MemoryCore with inst, 16
-                Let arg2 be proc memory_get_int64 from MemoryCore with inst, 24
-                Let arg3 be proc memory_get_int64 from MemoryCore with inst, 32
-
-                Set p to 0
-                While p is less than param_count:
-                    Set param_value_id to proc list_get from List with parameters, p
-                    If param_value_id is equal to arg1:
-                        proc add from Set with escaping_params, p
-                    End If
-                    If param_value_id is equal to arg2:
-                        proc add from Set with escaping_params, p
-                    End If
-                    If param_value_id is equal to arg3:
-                        proc add from Set with escaping_params, p
-                    End If
-                    Set p to p plus 1
-                End While
+                Set is_call_op to 1
+            End If
+            If opcode is equal to 20305:
+                Set is_call_op to 1
+            End If
+            If is_call_op is equal to 1:
+                Let call_args be proc get_call_arguments from MIRNodes with inst
+                If call_args is not equal to 0:
+                    Let call_arg_count be proc get_call_argument_count from MIRNodes with inst
+                    Let a be 0
+                    While a is less than call_arg_count:
+                        Let arg_value be proc list_get from List with call_args, a
+                        Set p to 0
+                        While p is less than param_count:
+                            Set param_value_id to proc list_get from List with parameters, p
+                            If param_value_id is equal to arg_value:
+                                proc add from Set with escaping_params, p
+                            End If
+                            Set p to p plus 1
+                        End While
+                        Set a to a plus 1
+                    End While
+                End If
             End If
 
             Set i to i plus 1
@@ -2180,9 +2241,10 @@ Process called "analyze_return_escape" that takes wpa as Integer, mir_func as In
             Let inst be proc list_get from List with instructions, i
             Let opcode be proc memory_get_int64 from MemoryCore with inst, 0
 
-            Note: Check for RETURN (20303)
+            Note: Check for RETURN (20303); the returned value id lives in
+            Note: the extended MIRReturn record (accessor read)
             If opcode is equal to 20303:
-                Let return_value be proc memory_get_int64 from MemoryCore with inst, 16
+                Let return_value be proc get_return_value from MIRNodes with inst
                 If return_value is not equal to 0:
                     Note: Function returns a value - mark as escaping
                     proc memory_set_int64 from MemoryCore with ipa_info, 16, 1
@@ -2224,39 +2286,75 @@ Process called "analyze_field_escape" that takes wpa as Integer, mir_func as Int
             Let inst be proc list_get from List with instructions, i
             Let opcode be proc memory_get_int64 from MemoryCore with inst, 0
 
-            Note: Check for STORE_FIELD (20204)
+            Note: Check for STORE_FIELD (20204; plain-header record — the
+            Note: 20203/20204 field band has no extended payload, so the
+            Note: object/value SSA uses occupy the header operand slots)
             If opcode is equal to 20204:
                 Note: Field store - check if object escapes
                 Let object be proc memory_get_int64 from MemoryCore with inst, 16
                 Let value be proc memory_get_int64 from MemoryCore with inst, 24
 
-                Note: Flow-sensitive escape analysis
-                Note: Value escapes if object escapes OR object is heap-allocated global
+                Note: Flow-sensitive escape rule: the stored value escapes if
+                Note: the object it is stored into escapes.
 
-                Note: Check if object is a parameter (parameters escape by definition)
                 Let object_def be get_value_definition(mir_func, object)
                 Let object_opcode be 0
                 If object_def is not equal to 0:
                     Set object_opcode to proc memory_get_int64 from MemoryCore with object_def, 0
                 End If
 
-                Note: If object is parameter (20100) or global (20002), value escapes
-                If object_opcode is equal to 20100:
-                    Note: Storing to parameter - value escapes to caller
-                    mark_value_as_escaping(ipa_info, value)
+                Note: Storing into a PARAMETER-rooted object escapes to the
+                Note: caller. Parameters have no defining instruction in the
+                Note: canonical MIR (there is no parameter opcode — 20100 is
+                Note: the EQ comparison); membership in the function's
+                Note: parameters List is the correct test.
+                If object_def is equal to 0:
+                    Let fe_params be proc memory_get_int64 from MemoryCore with mir_func, 16
+                    Let fe_param_count be proc memory_get_int64 from MemoryCore with mir_func, 24
+                    If fe_params is not equal to 0:
+                        Let fp be 0
+                        While fp is less than fe_param_count:
+                            Let fe_param_value be proc list_get from List with fe_params, fp
+                            If fe_param_value is equal to object:
+                                mark_value_as_escaping(ipa_info, value)
+                                Set fp to fe_param_count
+                            End If
+                            Set fp to fp plus 1
+                        End While
+                    End If
                 End If
 
-                If object_opcode is equal to 20002:
-                    Note: Storing to global - value escapes globally
-                    mark_value_as_escaping(ipa_info, value)
-                End If
-
-                Note: Check if object is allocated on heap (ALLOC instruction)
-                If object_opcode is equal to 20250:
-                    Note: Heap allocation - check if allocation escapes
-                    Let alloc_escapes be check_allocation_escapes(wpa, mir_func, object_def)
-                    If alloc_escapes is equal to 1:
-                        mark_value_as_escaping(ipa_info, value)
+                Note: OD-2: heap allocation is a direct CALL whose callee name
+                Note: resolves to the allocator family — there is no ALLOC
+                Note: opcode (the historical 20250 does not exist in the
+                Note: 20000-band). If the object originates from an allocator
+                Note: call, escape of the allocation taints the stored value.
+                If object_opcode is equal to 20304:
+                    Let alloc_callee_name be proc get_call_callee from MIRNodes with object_def
+                    Let is_allocator_call be 0
+                    If alloc_callee_name is not equal to 0:
+                        Let an_match be proc string_equals from StringCore with alloc_callee_name, "allocate"
+                        If an_match is equal to 1:
+                            Set is_allocator_call to 1
+                        End If
+                        If is_allocator_call is equal to 0:
+                            Set an_match to proc string_equals from StringCore with alloc_callee_name, "arena_allocate"
+                            If an_match is equal to 1:
+                                Set is_allocator_call to 1
+                            End If
+                        End If
+                        If is_allocator_call is equal to 0:
+                            Set an_match to proc string_equals from StringCore with alloc_callee_name, "memory_allocate"
+                            If an_match is equal to 1:
+                                Set is_allocator_call to 1
+                            End If
+                        End If
+                    End If
+                    If is_allocator_call is equal to 1:
+                        Let alloc_escapes be check_allocation_escapes(wpa, mir_func, object_def)
+                        If alloc_escapes is equal to 1:
+                            mark_value_as_escaping(ipa_info, value)
+                        End If
                     End If
                 End If
 
@@ -2305,17 +2403,18 @@ Process called "compute_side_effects" that takes wpa as Integer returns Integer:
     Let functions be proc memory_get_int64 from MemoryCore with mir, 0
     Let function_count be proc memory_get_int64 from MemoryCore with mir, 8
 
-    Note: For each function, analyze side effects
+    Note: For each function, analyze side effects (OD-4 pointer identity;
+    Note: stringified-pointer Dictionary keys)
     Let i be 0
     While i is less than function_count:
         Let mir_func be proc list_get from List with functions, i
-        Let function_id be proc memory_get_int64 from MemoryCore with mir_func, 0
+        Let func_key be proc integer_to_string from StringUtils with mir_func
 
         Note: Get IPA info for function
-        Let ipa_info be proc get from Dictionary with side_effect_info, function_id
+        Let ipa_info be proc get from Dictionary with side_effect_info, func_key
         If ipa_info is equal to 0:
-            Set ipa_info to create_interprocedural_info(function_id)
-            proc set from Dictionary with side_effect_info, function_id, ipa_info
+            Set ipa_info to create_interprocedural_info(mir_func)
+            proc set from Dictionary with side_effect_info, func_key, ipa_info
         End If
 
         Note: Analyze memory effects
@@ -2426,24 +2525,50 @@ Process called "analyze_control_flow_effects" that takes wpa as Integer, mir_fun
                 proc memory_set_int64 from MemoryCore with ipa_info, 88, side_effect_flags
             End If
 
-            Note: Check for CALL to external function (20304)
+            Note: Check for CALL to external function (20304). Two sources of
+            Note: truth: the FFI metadata stamped on the call record itself
+            Note: (callee_is_external, set by mir_call_set_ffi_metadata), and
+            Note: the callee's is_external flag (MIRFunction offset 80) found
+            Note: by resolving the callee NAME to a function. A name that
+            Note: resolves to NO function in the program is itself an
+            Note: external symbol (runtime/libc) and is treated as external.
             If opcode is equal to 20304:
-                Let callee_id be proc memory_get_int64 from MemoryCore with inst, 16
+                Let is_external_call be proc mir_call_get_callee_is_external from MIRNodes with inst
 
-                Note: Look up callee function to check if external
-                Let mir be proc memory_get_int64 from MemoryCore with wpa, 0
-                Let functions be proc memory_get_int64 from MemoryCore with mir, 0
-                Let callee_func be proc get from Dictionary with functions, callee_id
-
-                If callee_func is not equal to 0:
-                    Note: Check is_external field (offset 80)
-                    Let is_external be proc memory_get_int64 from MemoryCore with callee_func, 80
-
-                    If is_external is equal to 1:
-                        Set side_effect_flags to side_effect_flags bitwise_or SIDE_EFFECT_EXTERNAL_CALL
-                        proc memory_set_int64 from MemoryCore with ipa_info, 56, 1 Note: calls_external
-                        proc memory_set_int64 from MemoryCore with ipa_info, 88, side_effect_flags
+                If is_external_call is equal to 0:
+                    Let callee_name be proc get_call_callee from MIRNodes with inst
+                    If callee_name is not equal to 0:
+                        Let mir be proc memory_get_int64 from MemoryCore with wpa, 0
+                        Let functions be proc memory_get_int64 from MemoryCore with mir, 0
+                        Let fn_count be proc memory_get_int64 from MemoryCore with mir, 8
+                        Let resolved be 0
+                        Let cf be 0
+                        While cf is less than fn_count:
+                            Let cand_func be proc list_get from List with functions, cf
+                            Let cand_name be proc memory_get_int64 from MemoryCore with cand_func, 0
+                            If cand_name is not equal to 0:
+                                Let cn_match be proc string_equals from StringCore with cand_name, callee_name
+                                If cn_match is equal to 1:
+                                    Set resolved to 1
+                                    Let callee_is_ext be proc memory_get_int64 from MemoryCore with cand_func, 80
+                                    If callee_is_ext is equal to 1:
+                                        Set is_external_call to 1
+                                    End If
+                                    Set cf to fn_count
+                                End If
+                            End If
+                            Set cf to cf plus 1
+                        End While
+                        If resolved is equal to 0:
+                            Set is_external_call to 1
+                        End If
                     End If
+                End If
+
+                If is_external_call is equal to 1:
+                    Set side_effect_flags to side_effect_flags bitwise_or SIDE_EFFECT_EXTERNAL_CALL
+                    proc memory_set_int64 from MemoryCore with ipa_info, 56, 1 Note: calls_external
+                    proc memory_set_int64 from MemoryCore with ipa_info, 88, side_effect_flags
                 End If
             End If
 
@@ -2473,25 +2598,31 @@ Process called "compute_pure_functions" that takes wpa as Integer returns Intege
     Let pure_functions be proc memory_get_int64 from MemoryCore with wpa, 72
     Let const_functions be proc memory_get_int64 from MemoryCore with wpa, 80
 
-    Note: Get all function IDs
-    Let function_ids be proc keys from Dictionary with side_effect_info
-    Let function_count be proc length from List with function_ids
+    Note: Enumerate IPA records. Dictionary keys are stringified function
+    Note: pointers; the raw pointer is recovered from the record's offset 0
+    Note: because the Sets store raw pointers (OD-4).
+    Let function_keys be proc keys from Dictionary with side_effect_info
+    Let function_count be proc length from List with function_keys
 
     Note: Optimistic initialization: add all functions, then remove impure ones
     Note: This is correct for fixed-point iteration
     Let i be 0
     While i is less than function_count:
-        Let function_id be proc list_get from List with function_ids, i
-        proc add from Set with pure_functions, function_id
-        proc add from Set with const_functions, function_id
+        Let fkey be proc list_get from List with function_keys, i
+        Let seed_ipa be proc get from Dictionary with side_effect_info, fkey
+        If seed_ipa is not equal to 0:
+            Let seed_func be proc memory_get_int64 from MemoryCore with seed_ipa, 0
+            proc add from Set with pure_functions, seed_func
+            proc add from Set with const_functions, seed_func
+        End If
         Set i to i plus 1
     End While
 
     Note: Analyze each function for purity
     Set i to 0
     While i is less than function_count:
-        Set function_id to proc list_get from List with function_ids, i
-        Let ipa_info be proc get from Dictionary with side_effect_info, function_id
+        Set fkey to proc list_get from List with function_keys, i
+        Let ipa_info be proc get from Dictionary with side_effect_info, fkey
 
         analyze_function_purity(wpa, ipa_info)
 
@@ -2566,19 +2697,20 @@ Process called "compute_call_side_effects" that takes wpa as Integer returns Int
     Let call_graph be proc memory_get_int64 from MemoryCore with wpa, 8
     Let side_effect_info be proc memory_get_int64 from MemoryCore with wpa, 64
 
-    Note: Get all functions
-    Let function_ids be proc keys from Dictionary with side_effect_info
-    Let function_count be proc length from List with function_ids
+    Note: Enumerate IPA records (keys are stringified function pointers)
+    Let function_keys be proc keys from Dictionary with side_effect_info
+    Let function_count be proc length from List with function_keys
 
     Note: Propagate side effects through call graph
     Note: If function A calls function B, A inherits B's side effects
     Let i be 0
     While i is less than function_count:
-        Let function_id be proc list_get from List with function_ids, i
-        Let ipa_info be proc get from Dictionary with side_effect_info, function_id
+        Let fkey be proc list_get from List with function_keys, i
+        Let ipa_info be proc get from Dictionary with side_effect_info, fkey
+        Let function_ptr be proc memory_get_int64 from MemoryCore with ipa_info, 0
 
-        Note: Get callees from call graph
-        Let callees be proc get_function_callees from CallGraph with call_graph, function_id
+        Note: Get callees from call graph (call_sites of this function)
+        Let callees be proc get_function_callees from CallGraph with call_graph, function_ptr
         Let callee_count be proc length from List with callees
 
         Let j be 0
@@ -2588,7 +2720,8 @@ Process called "compute_call_side_effects" that takes wpa as Integer returns Int
 
             If callee_id is not equal to 0:
                 Note: Get callee's side effects
-                Let callee_ipa be proc get from Dictionary with side_effect_info, callee_id
+                Let callee_key be proc integer_to_string from StringUtils with callee_id
+                Let callee_ipa be proc get from Dictionary with side_effect_info, callee_key
                 If callee_ipa is not equal to 0:
                     Let callee_flags be proc memory_get_int64 from MemoryCore with callee_ipa, 88
 
@@ -2624,19 +2757,23 @@ Process called "propagate_purity_information" that takes wpa as Integer returns 
     While changed is equal to 1:
         Set changed to 0
 
-        Note: For each function, check if it calls impure functions
-        Let function_ids be proc keys from Dictionary with side_effect_info
-        Let function_count be proc length from List with function_ids
+        Note: For each function, check if it calls impure functions. Keys
+        Note: are stringified pointers; the raw pointer comes from the IPA
+        Note: record's offset 0 (the Sets store raw pointers).
+        Let function_keys be proc keys from Dictionary with side_effect_info
+        Let function_count be proc length from List with function_keys
 
         Let i be 0
         While i is less than function_count:
-            Let function_id be proc list_get from List with function_ids, i
+            Let fkey be proc list_get from List with function_keys, i
+            Let ipa_info be proc get from Dictionary with side_effect_info, fkey
+            Let function_ptr be proc memory_get_int64 from MemoryCore with ipa_info, 0
 
             Note: Check if currently marked as pure
-            Let is_pure be proc contains from Set with pure_functions, function_id
+            Let is_pure be proc contains from Set with pure_functions, function_ptr
             If is_pure is equal to 1:
                 Note: Check all callees
-                Let callees be proc get_function_callees from CallGraph with call_graph, function_id
+                Let callees be proc get_function_callees from CallGraph with call_graph, function_ptr
                 Let callee_count be proc length from List with callees
 
                 Let j be 0
@@ -2649,10 +2786,7 @@ Process called "propagate_purity_information" that takes wpa as Integer returns 
                         Let callee_pure be proc contains from Set with pure_functions, callee_id
                         If callee_pure is equal to 0:
                             Note: Callee is impure, so caller is impure
-                            proc remove from Set with pure_functions, function_id
-
-                            Note: Update IPA info
-                            Let ipa_info be proc get from Dictionary with side_effect_info, function_id
+                            proc remove from Set with pure_functions, function_ptr
                             proc memory_set_int64 from MemoryCore with ipa_info, 72, 0
 
                             Set changed to 1
@@ -2691,17 +2825,19 @@ Process called "identify_const_functions" that takes wpa as Integer returns Inte
     While changed is equal to 1:
         Set changed to 0
 
-        Let function_ids be proc keys from Dictionary with side_effect_info
-        Let function_count be proc length from List with function_ids
+        Let function_keys be proc keys from Dictionary with side_effect_info
+        Let function_count be proc length from List with function_keys
 
         Let i be 0
         While i is less than function_count:
-            Let function_id be proc list_get from List with function_ids, i
+            Let fkey be proc list_get from List with function_keys, i
+            Let ipa_info be proc get from Dictionary with side_effect_info, fkey
+            Let function_ptr be proc memory_get_int64 from MemoryCore with ipa_info, 0
 
-            Let is_const be proc contains from Set with const_functions, function_id
+            Let is_const be proc contains from Set with const_functions, function_ptr
             If is_const is equal to 1:
                 Note: Check all callees
-                Let callees be proc get_function_callees from CallGraph with call_graph, function_id
+                Let callees be proc get_function_callees from CallGraph with call_graph, function_ptr
                 Let callee_count be proc length from List with callees
 
                 Let j be 0
@@ -2713,9 +2849,7 @@ Process called "identify_const_functions" that takes wpa as Integer returns Inte
                         Let callee_const be proc contains from Set with const_functions, callee_id
                         If callee_const is equal to 0:
                             Note: Callee is not const, so caller is not const
-                            proc remove from Set with const_functions, function_id
-
-                            Let ipa_info be proc get from Dictionary with side_effect_info, function_id
+                            proc remove from Set with const_functions, function_ptr
                             proc memory_set_int64 from MemoryCore with ipa_info, 80, 0
 
                             Set changed to 1
@@ -2782,15 +2916,14 @@ Process called "mark_exported_functions" that takes wpa as Integer, mir as Integ
     Let i be 0
     While i is less than function_count:
         Let mir_func be proc list_get from List with functions, i
-        Let function_id be proc memory_get_int64 from MemoryCore with mir_func, 0
 
-        Note: Check metadata for export flag
+        Note: Check metadata for export flag (identity = pointer, OD-4)
         Let metadata be proc memory_get_int64 from MemoryCore with mir_func, 88
         If metadata is not equal to 0:
             Let flags be proc memory_get_int64 from MemoryCore with metadata, 8
             Let is_exported be flags bitwise_and 1
             If is_exported is equal to 1:
-                proc add from Set with exported_functions, function_id
+                proc add from Set with exported_functions, mir_func
             End If
         End If
 
@@ -2838,17 +2971,40 @@ Process called "mark_address_taken_functions" that takes wpa as Integer, mir as 
                     Let inst be proc list_get from List with instructions, j
                     Let opcode be proc memory_get_int64 from MemoryCore with inst, 0
 
-                    Note: Check for ADDRESS_OF (20205)
-                    If opcode is equal to 20205:
-                        Let target_value be proc memory_get_int64 from MemoryCore with inst, 16
-
-                        Note: Use type analysis to determine if target is function
-                        Let entity_type be get_entity_type(mir, target_value)
-
-                        Note: Entity type 1 = function, 2 = variable
-                        If entity_type is equal to 1:
-                            Note: Target is a function - mark as address-taken
-                            proc add from Set with address_taken, target_value
+                    Note: Under the canonical lowering contract a function's
+                    Note: address is materialized as a MIR_CONST whose header
+                    Note: type_info is a function type (HIR_FUNCTION_TYPE,
+                    Note: 13004) and whose payload is the resolved
+                    Note: HIRSymbolInfo (expression_lowering.runa:1529). The
+                    Note: historical ADDRESS_OF arm could never fire: 20205
+                    Note: takes the address of an SSA VALUE, and no producer
+                    Note: emits it for functions.
+                    If opcode is equal to 20001:
+                        Let const_type be proc memory_get_int64 from MemoryCore with inst, 40
+                        If const_type is not equal to 0:
+                            Let type_kind be proc memory_get_int64 from MemoryCore with const_type, 0
+                            If type_kind is equal to 13004:
+                                Let fp_symbol be proc get_const_value from MIRNodes with inst
+                                If fp_symbol is not equal to 0:
+                                    Note: HIRSymbolInfo.symbol_name at offset 8
+                                    Let fp_name be proc memory_get_int64 from MemoryCore with fp_symbol, 8
+                                    If fp_name is not equal to 0:
+                                        Let at_g be 0
+                                        While at_g is less than function_count:
+                                            Let at_func be proc list_get from List with functions, at_g
+                                            Let at_name be proc memory_get_int64 from MemoryCore with at_func, 0
+                                            If at_name is not equal to 0:
+                                                Let at_match be proc string_equals from StringCore with at_name, fp_name
+                                                If at_match is equal to 1:
+                                                    proc add from Set with address_taken, at_func
+                                                    Set at_g to function_count
+                                                End If
+                                            End If
+                                            Set at_g to at_g plus 1
+                                        End While
+                                    End If
+                                End If
+                            End If
                         End If
                     End If
 
@@ -2900,10 +3056,9 @@ Process called "identify_internal_functions" that takes wpa as Integer returns I
     Let i be 0
     While i is less than function_count:
         Let mir_func be proc list_get from List with functions, i
-        Let function_id be proc memory_get_int64 from MemoryCore with mir_func, 0
 
-        Let is_exported be proc contains from Set with exported_functions, function_id
-        Let is_address_taken be proc contains from Set with address_taken, function_id
+        Let is_exported be proc contains from Set with exported_functions, mir_func
+        Let is_address_taken be proc contains from Set with address_taken, mir_func
 
         If is_exported is equal to 0:
             If is_address_taken is equal to 0:
@@ -3000,17 +3155,23 @@ Process called "find_unreachable_functions" that takes wpa as Integer returns In
     Note: Step 1 — clear any prior contents of unreachable_functions for idempotency.
     clear_set(unreachable_functions)
 
-    Note: Step 2 — walk call graph nodes and stamp the complement.
+    Note: Step 2 — walk call graph nodes and stamp the complement. Node
+    Note: keys are stringified pointers; the raw pointer is the node's
+    Note: offset-0 slot (OD-4).
     Let cg_nodes be proc memory_get_int64 from MemoryCore with call_graph, 0
-    Let all_function_ids be proc keys from Dictionary with cg_nodes
-    Let all_count be proc length from List with all_function_ids
+    Let all_node_keys be proc keys from Dictionary with cg_nodes
+    Let all_count be proc length from List with all_node_keys
 
     Let i be 0
     While i is less than all_count:
-        Let function_id be proc list_get from List with all_function_ids, i
-        Let is_reachable be proc contains from Set with reachable_functions, function_id
-        If is_reachable is equal to 0:
-            proc add from Set with unreachable_functions, function_id
+        Let nk be proc list_get from List with all_node_keys, i
+        Let nk_node be proc get from Dictionary with cg_nodes, nk
+        If nk_node is not equal to 0:
+            Let function_ptr be proc memory_get_int64 from MemoryCore with nk_node, 0
+            Let is_reachable be proc contains from Set with reachable_functions, function_ptr
+            If is_reachable is equal to 0:
+                proc add from Set with unreachable_functions, function_ptr
+            End If
         End If
         Set i to i plus 1
     End While
@@ -3091,15 +3252,16 @@ Process called "find_unused_globals" that takes wpa as Integer returns Integer:
                     Let inst be proc list_get from List with instructions, j
                     Let opcode be proc memory_get_int64 from MemoryCore with inst, 0
 
-                    Note: Check for global access instructions
-                    Note: LOAD and STORE to global addresses
+                    Note: Check for global access instructions. LOAD/STORE
+                    Note: addresses live in the extended record slots
+                    Note: (accessor reads, never header operands).
                     If opcode is equal to 20200:
-                        Let address be proc memory_get_int64 from MemoryCore with inst, 16
+                        Let address be proc get_load_address from MIRNodes with inst
                         proc add from Set with accessed_globals, address
                     End If
 
                     If opcode is equal to 20201:
-                        Set address to proc memory_get_int64 from MemoryCore with inst, 16
+                        Set address to proc get_store_address from MIRNodes with inst
                         proc add from Set with accessed_globals, address
                     End If
 
@@ -3130,34 +3292,32 @@ Uses whole-program call graph to find profitable inlining across module boundari
 Process called "identify_cross_module_inlining" that takes wpa as Integer returns Integer:
     Let call_graph be proc memory_get_int64 from MemoryCore with wpa, 8
     Let inlining_candidates be proc memory_get_int64 from MemoryCore with wpa, 112
-
-    Note: Use call graph's identify_inlining_candidates
-    Let candidates be proc identify_inlining_candidates from CallGraph with call_graph, Layout.memory_get_int64(wpa, 0 , 50)
-
-    Note: Filter to cross-module calls only using module information from MIR
     Let mir be proc memory_get_int64 from MemoryCore with wpa, 0
-    Let module_map be proc memory_get_int64 from MemoryCore with mir, 32 Note: Function ID → Module ID map
 
+    Note: Use the call graph's candidate identification (24-byte records:
+    Note: caller ptr@0, callee ptr@8, priority@16; max inline size 50).
+    Let candidates be proc identify_inlining_candidates from CallGraph with call_graph, mir, 50
+
+    Note: The MIRProgram LTO operates on is the single already-merged whole
+    Note: program (the import system merges modules before the middle end
+    Note: runs); per-function module provenance does not exist in the
+    Note: canonical MIRProgram — the slot the historical code read as a
+    Note: "module map" (offset 32) is the string_constants List. Every
+    Note: candidate the call graph produced is therefore an in-scope
+    Note: whole-program inlining opportunity and is adopted unfiltered.
     Let candidate_count be proc length from List with candidates
     Let i be 0
     While i is less than candidate_count:
         Let candidate be proc list_get from List with candidates, i
-
-        Note: Extract caller and callee from candidate
-        Let caller_id be proc memory_get_int64 from MemoryCore with candidate, 0
-        Let callee_id be proc memory_get_int64 from MemoryCore with candidate, 8
-
-        Note: Get module IDs for both functions
-        Let caller_module be proc get from Dictionary with module_map, caller_id
-        Let callee_module be proc get from Dictionary with module_map, callee_id
-
-        Note: Only include if cross-module (different modules)
-        If caller_module is not equal to callee_module:
+        If candidate is not equal to 0:
             proc append from List with inlining_candidates, candidate
         End If
-
         Set i to i plus 1
     End While
+
+    Note: The container List from identify_inlining_candidates is build-local;
+    Note: its records now live in wpa.inlining_candidates.
+    proc list_destroy from List with candidates
 
     Return 1
 End Process
@@ -3179,9 +3339,9 @@ Process called "compute_inlining_benefit" that takes wpa as Integer, caller_id a
     Let i be 0
     While i is less than function_count:
         Let mir_func be proc list_get from List with functions, i
-        Let function_id be proc memory_get_int64 from MemoryCore with mir_func, 0
 
-        If function_id is equal to callee_id:
+        Note: OD-4 pointer identity — the candidate's callee IS the record
+        If mir_func is equal to callee_id:
             Note: Count instructions in function
             Let cfg be proc memory_get_int64 from MemoryCore with mir_func, 8
             If cfg is not equal to 0:
@@ -3234,17 +3394,38 @@ Helper functions for inline benefit calculation.
 @End Reasoning
 
 Process called "get_call_frequency" that takes call_graph as Integer, caller_id as Integer, callee_id as Integer returns Integer:
-    Note: Get edge info from call graph
-    Let edges be proc memory_get_int64 from MemoryCore with call_graph, 8
-    Let edge_key be (caller_id multiplied by 1000000) plus callee_id
-    Let edge_info be proc get from Dictionary with edges, edge_key
-
-    If edge_info is equal to 0:
-        Return 1  Note: Default frequency
+    Note: Static call frequency = the number of (caller, callee) edges the
+    Note: call graph recorded — one per textual call site. The CallGraph
+    Note: edges List lives at offset 16 (offset 8 is node_count); each edge
+    Note: is a 24-byte record (caller@0, callee@8, call_site@16). With no
+    Note: profile data, multiplicity of call sites is the best static
+    Note: frequency proxy; the floor of 1 preserves the historical default
+    Note: for pairs with no recorded edge.
+    Let edges be proc memory_get_int64 from MemoryCore with call_graph, 16
+    If edges is equal to 0:
+        Return 1
     End If
 
-    Note: Extract frequency from edge info
-    Let freq be proc memory_get_int64 from MemoryCore with edge_info, 8
+    Let edge_count be proc length from List with edges
+    Let freq be 0
+    Let i be 0
+    While i is less than edge_count:
+        Let edge be proc list_get from List with edges, i
+        If edge is not equal to 0:
+            Let edge_caller be proc memory_get_int64 from MemoryCore with edge, 0
+            Let edge_callee be proc memory_get_int64 from MemoryCore with edge, 8
+            If edge_caller is equal to caller_id:
+                If edge_callee is equal to callee_id:
+                    Set freq to freq plus 1
+                End If
+            End If
+        End If
+        Set i to i plus 1
+    End While
+
+    If freq is equal to 0:
+        Return 1  Note: Default frequency
+    End If
     Return freq
 End Process
 
@@ -3254,12 +3435,13 @@ Process called "estimate_optimization_potential" that takes mir as Integer, call
 
     Let base_value be 20  Note: Base optimization value
 
-    Note: Check if callee has parameters that could be constant-folded
-    Let functions be proc memory_get_int64 from MemoryCore with mir, 0
-    Let callee_func be proc get from Dictionary with functions, callee_id
+    Note: Check if callee has parameters that could be constant-folded.
+    Note: OD-4: callee_id IS the MIRFunction pointer; parameter_count is
+    Note: the canonical offset-24 slot.
+    Let callee_func be callee_id
 
     If callee_func is not equal to 0:
-        Let param_count be proc memory_get_int64 from MemoryCore with callee_func, 40
+        Let param_count be proc memory_get_int64 from MemoryCore with callee_func, 24
 
         Note: Each parameter is potential constant propagation opportunity
         Set base_value to base_value plus (param_count multiplied by 5)
@@ -3275,9 +3457,10 @@ Process called "estimate_optimization_potential" that takes mir as Integer, call
 End Process
 
 Process called "is_leaf_function" that takes mir as Integer, func_id as Integer returns Integer:
-    Note: Check if function makes no calls (leaf function)
-    Let functions be proc memory_get_int64 from MemoryCore with mir, 0
-    Let func be proc get from Dictionary with functions, func_id
+    Note: Check if function makes no calls (leaf function). OD-4: func_id
+    Note: IS the MIRFunction pointer (the functions collection is a List,
+    Note: not a Dictionary — the historical get-by-key misread it).
+    Let func be func_id
 
     If func is equal to 0:
         Return 0
@@ -3333,7 +3516,11 @@ Process called "function_has_loops" that takes func as Integer returns Integer:
     Let b be 0
     While b is less than block_count:
         Let block be proc list_get from List with blocks, b
-        Let successors be proc memory_get_int64 from MemoryCore with block, 8
+
+        Note: Canonical MIRBasicBlock: block_id at 0, successors List of
+        Note: block IDs at offset 48 (offset 8 is the label pointer).
+        Let block_id be proc memory_get_int64 from MemoryCore with block, 0
+        Let successors be proc memory_get_int64 from MemoryCore with block, 48
 
         If successors is not equal to 0:
             Let succ_count be proc length from List with successors
@@ -3342,8 +3529,10 @@ Process called "function_has_loops" that takes func as Integer returns Integer:
             While s is less than succ_count:
                 Let succ_id be proc list_get from List with successors, s
 
-                Note: Back edge if successor ID <= current block ID
-                If succ_id is less than or equal to b:
+                Note: Back edge if successor block id <= current block id
+                Note: (block ids are allocated in construction order, so a
+                Note: backward id jump indicates a loop edge)
+                If succ_id is less than or equal to block_id:
                     Return 1  Note: Found back edge, has loop
                 End If
 
@@ -3480,24 +3669,28 @@ Process called "identify_global_constants" that takes wpa as Integer, mir as Int
     Let globals be proc memory_get_int64 from MemoryCore with mir, 16
     Let global_count be proc memory_get_int64 from MemoryCore with mir, 24
 
-    Note: Optimistic initialization: add all globals, then remove non-constants
-    Note: Globals written to will be removed in scanning phase
+    Note: Optimistic initialization: add all globals, then remove non-constants.
+    Note: MIRProgram.global_values (offset 16) is a List of global SSA value
+    Note: ids — the entries ARE the ids (mir.runa:315), not pointers to
+    Note: per-global records.
     Let i be 0
     While i is less than global_count:
-        Let global_var be proc list_get from List with globals, i
-        Let global_id be proc memory_get_int64 from MemoryCore with global_var, 0
-        proc add from Set with constant_globals, global_id
+        Let global_id be proc list_get from List with globals, i
+        If global_id is not equal to 0:
+            proc add from Set with constant_globals, global_id
+        End If
         Set i to i plus 1
     End While
 
-    Note: Scan all functions for writes to globals
-    Let function_ids be proc keys from Dictionary with side_effect_info
-    Let function_count be proc length from List with function_ids
+    Note: Scan all functions for writes to globals (IPA records keyed by
+    Note: stringified function pointers)
+    Let function_keys be proc keys from Dictionary with side_effect_info
+    Let function_count be proc length from List with function_keys
 
     Set i to 0
     While i is less than function_count:
-        Let function_id be proc list_get from List with function_ids, i
-        Let ipa_info be proc get from Dictionary with side_effect_info, function_id
+        Let fkey be proc list_get from List with function_keys, i
+        Let ipa_info be proc get from Dictionary with side_effect_info, fkey
 
         Note: Get memory writes
         Let memory_writes be proc memory_get_int64 from MemoryCore with ipa_info, 32
@@ -3633,15 +3826,18 @@ Process called "identify_function_specialization" that takes wpa as Integer retu
         Return 0
     End If
 
-    Note: Scan call graph for frequently called functions with constant arguments.
+    Note: Scan call graph for frequently called functions with constant
+    Note: arguments (node keys are stringified pointers; raw pointer at
+    Note: node offset 0).
     Let cg_nodes be proc memory_get_int64 from MemoryCore with call_graph, 0
-    Let function_ids be proc keys from Dictionary with cg_nodes
-    Let function_count be proc length from List with function_ids
+    Let node_keys be proc keys from Dictionary with cg_nodes
+    Let function_count be proc length from List with node_keys
 
     Let i be 0
     While i is less than function_count:
-        Let function_id be proc list_get from List with function_ids, i
-        Let node be proc get from Dictionary with cg_nodes, function_id
+        Let nk be proc list_get from List with node_keys, i
+        Let node be proc get from Dictionary with cg_nodes, nk
+        Let function_id be proc memory_get_int64 from MemoryCore with node, 0
 
         Note: Read caller_count at offset 40 of CallGraphNode.
         Let caller_count be proc memory_get_int64 from MemoryCore with node, 40
@@ -3683,9 +3879,9 @@ Process called "compute_specialization_benefit" that takes wpa as Integer, funct
     Let i be 0
     While i is less than function_count:
         Let mir_func be proc list_get from List with functions, i
-        Let fid be proc memory_get_int64 from MemoryCore with mir_func, 0
 
-        If fid is equal to function_id:
+        Note: OD-4 pointer identity
+        If mir_func is equal to function_id:
             Note: Count parameter-dependent operations
             Note: More parameter usage = higher specialization benefit
             Let cfg be proc memory_get_int64 from MemoryCore with mir_func, 8
@@ -3899,7 +4095,8 @@ Process called "identify_virtual_call_elimination" that takes wpa as Integer ret
         Let containing_func be 0
         If keep is equal to 1:
             If inst_to_func is not equal to 0:
-                Set containing_func to proc get from Dictionary with inst_to_func, call_site
+                Let cs_key be proc integer_to_string from StringUtils with call_site
+                Set containing_func to proc get from Dictionary with inst_to_func, cs_key
             End If
             If containing_func is equal to 0:
                 Set keep to 0
@@ -4015,7 +4212,8 @@ Process called "compute_optimization_priorities" that takes wpa as Integer retur
             Let cand be proc list_get from List with inlining_candidates, i
             Let score be score_inlining(cand, wpa)
             Let key be (BUCKET_TAG_INLINING multiplied by BUCKET_KEY_SHIFT_MULT) plus i
-            proc set from Dictionary with priorities, key, score
+            Let key_str be proc integer_to_string from StringUtils with key
+            proc set from Dictionary with priorities, key_str, score
             Set i to i plus 1
         End While
     End If
@@ -4035,7 +4233,8 @@ Process called "compute_optimization_priorities" that takes wpa as Integer retur
                 Set dv_bucket to BUCKET_TAG_DEVIRT_SPEC
             End If
             Let dv_key be (dv_bucket multiplied by BUCKET_KEY_SHIFT_MULT) plus j
-            proc set from Dictionary with priorities, dv_key, dv_score
+            Let dv_key_str be proc integer_to_string from StringUtils with dv_key
+            proc set from Dictionary with priorities, dv_key_str, dv_score
             Set j to j plus 1
         End While
     End If
@@ -4051,7 +4250,8 @@ Process called "compute_optimization_priorities" that takes wpa as Integer retur
             While k is less than dead_func_count:
                 Let df_score be score_dce(dce_plan, BUCKET_TAG_DCE_FUNC, k, wpa)
                 Let df_key be (BUCKET_TAG_DCE_FUNC multiplied by BUCKET_KEY_SHIFT_MULT) plus k
-                proc set from Dictionary with priorities, df_key, df_score
+                Let df_key_str be proc integer_to_string from StringUtils with df_key
+                proc set from Dictionary with priorities, df_key_str, df_score
                 Set k to k plus 1
             End While
         End If
@@ -4066,7 +4266,8 @@ Process called "compute_optimization_priorities" that takes wpa as Integer retur
             While g is less than dead_global_count:
                 Let dg_score be score_dce(dce_plan, BUCKET_TAG_DCE_GLOBAL, g, wpa)
                 Let dg_key be (BUCKET_TAG_DCE_GLOBAL multiplied by BUCKET_KEY_SHIFT_MULT) plus g
-                proc set from Dictionary with priorities, dg_key, dg_score
+                Let dg_key_str be proc integer_to_string from StringUtils with dg_key
+                proc set from Dictionary with priorities, dg_key_str, dg_score
                 Set g to g plus 1
             End While
         End If
@@ -4081,7 +4282,8 @@ Process called "compute_optimization_priorities" that takes wpa as Integer retur
             While t is less than dt_count:
                 Let dt_score be score_dce(dce_plan, BUCKET_TAG_DCE_TYPE, t, wpa)
                 Let dt_key be (BUCKET_TAG_DCE_TYPE multiplied by BUCKET_KEY_SHIFT_MULT) plus t
-                proc set from Dictionary with priorities, dt_key, dt_score
+                Let dt_key_str be proc integer_to_string from StringUtils with dt_key
+                proc set from Dictionary with priorities, dt_key_str, dt_score
                 Set t to t plus 1
             End While
         End If
@@ -4098,7 +4300,8 @@ Process called "compute_optimization_priorities" that takes wpa as Integer retur
             Let cp_global_id be proc memory_get_int64 from MemoryCore with cpc, 0
             Let cp_score be score_constant_prop(cp_global_id, wpa)
             Let cp_key be (BUCKET_TAG_CP multiplied by BUCKET_KEY_SHIFT_MULT) plus c
-            proc set from Dictionary with priorities, cp_key, cp_score
+            Let cp_key_str be proc integer_to_string from StringUtils with cp_key
+            proc set from Dictionary with priorities, cp_key_str, cp_score
             Set c to c plus 1
         End While
     End If
@@ -4114,7 +4317,8 @@ Process called "compute_optimization_priorities" that takes wpa as Integer retur
             Let sp_function_id be proc memory_get_int64 from MemoryCore with spc, 0
             Let sp_score be score_specialization(sp_function_id, wpa)
             Let sp_key be (BUCKET_TAG_SPEC multiplied by BUCKET_KEY_SHIFT_MULT) plus s
-            proc set from Dictionary with priorities, sp_key, sp_score
+            Let sp_key_str be proc integer_to_string from StringUtils with sp_key
+            proc set from Dictionary with priorities, sp_key_str, sp_score
             Set s to s plus 1
         End While
     End If
@@ -4241,7 +4445,8 @@ End Process
 
 Process called "does_function_escape" that takes wpa as Integer, function_id as Integer returns Integer:
     Let side_effect_info be proc memory_get_int64 from MemoryCore with wpa, 64
-    Let ipa_info be proc get from Dictionary with side_effect_info, function_id
+    Let func_key be proc integer_to_string from StringUtils with function_id
+    Let ipa_info be proc get from Dictionary with side_effect_info, func_key
 
     If ipa_info is equal to 0:
         Return 0
@@ -4278,14 +4483,18 @@ Process called "get_global_visibility" that takes wpa as Integer returns Integer
         Return 0
     End If
 
-    Note: Return dictionary with visibility information
+    Note: Return dictionary with visibility information (the historical
+    Note: form passed the value INTO string_duplicate and gave the
+    Note: Dictionary.set call only two arguments — the values were lost)
     Let visibility_info be proc create from Dictionary
 
     Let exported_functions be proc memory_get_int64 from MemoryCore with wpa, 88
-    proc set from Dictionary with visibility_info, StringCore.string_duplicate("exported" , exported_functions)
+    Let exported_key be proc string_duplicate from StringCore with "exported"
+    proc set from Dictionary with visibility_info, exported_key, exported_functions
 
     Let address_taken be proc memory_get_int64 from MemoryCore with wpa, 96
-    proc set from Dictionary with visibility_info, StringCore.string_duplicate("address_taken" , address_taken)
+    Let at_key be proc string_duplicate from StringCore with "address_taken"
+    proc set from Dictionary with visibility_info, at_key, address_taken
 
     Return visibility_info
 End Process
@@ -4307,20 +4516,25 @@ Process called "get_optimization_candidates" that takes wpa as Integer returns I
         Return 0
     End If
 
-    Note: Return dictionary with all optimization candidates
+    Note: Return dictionary with all optimization candidates (the historical
+    Note: form passed the value INTO string_duplicate, losing the values)
     Let opt_candidates be proc create from Dictionary
 
     Let inlining be proc memory_get_int64 from MemoryCore with wpa, 112
-    proc set from Dictionary with opt_candidates, StringCore.string_duplicate("inlining" , inlining)
+    Let inlining_key be proc string_duplicate from StringCore with "inlining"
+    proc set from Dictionary with opt_candidates, inlining_key, inlining
 
     Let devirt be proc memory_get_int64 from MemoryCore with wpa, 104
-    proc set from Dictionary with opt_candidates, StringCore.string_duplicate("devirtualization" , devirt)
+    Let devirt_key be proc string_duplicate from StringCore with "devirtualization"
+    proc set from Dictionary with opt_candidates, devirt_key, devirt
 
     Let constants be proc memory_get_int64 from MemoryCore with wpa, 120
-    proc set from Dictionary with opt_candidates, StringCore.string_duplicate("constant_globals" , constants)
+    Let constants_key be proc string_duplicate from StringCore with "constant_globals"
+    proc set from Dictionary with opt_candidates, constants_key, constants
 
     Let unreachable be proc memory_get_int64 from MemoryCore with wpa, 32
-    proc set from Dictionary with opt_candidates, StringCore.string_duplicate("dead_functions" , unreachable)
+    Let dead_key be proc string_duplicate from StringCore with "dead_functions"
+    proc set from Dictionary with opt_candidates, dead_key, unreachable
 
     Return opt_candidates
 End Process
@@ -4345,12 +4559,17 @@ Process called "get_points_to_set" that takes wpa as Integer, value_id as Intege
         proc memory_set_int64 from MemoryCore with wpa, 144, points_to_map
     End If
 
-    Note: Look up points-to set for this value
-    Let pts_set be proc get from Dictionary with points_to_map, value_id
+    Note: Look up points-to set for this value (stringified value-id key)
+    Let pts_key be proc integer_to_string from StringUtils with value_id
+    Let pts_set be proc get from Dictionary with points_to_map, pts_key
 
     If pts_set is equal to 0:
-        Note: Compute points-to set for this value
+        Note: Compute points-to set for this value. The cache entry is
+        Note: installed BEFORE computation so re-entrant queries on the
+        Note: same value (pointer cycles through loads/phis) terminate
+        Note: with the in-progress partial set instead of recursing.
         Set pts_set to proc list_create from List
+        proc set from Dictionary with points_to_map, pts_key, pts_set
 
         Note: Get MIR
         Let mir be proc memory_get_int64 from MemoryCore with wpa, 0
@@ -4358,9 +4577,6 @@ Process called "get_points_to_set" that takes wpa as Integer, value_id as Intege
         Note: Analyze value to determine what it points to
         Note: This uses flow-insensitive analysis (conservative)
         compute_points_to_for_value(mir, value_id, pts_set)
-
-        Note: Cache the result
-        proc set from Dictionary with points_to_map, value_id, pts_set
     End If
 
     Return pts_set
@@ -4372,38 +4588,69 @@ Uses flow-insensitive analysis for efficiency.
 @End Reasoning
 
 Process called "compute_points_to_for_value" that takes mir as Integer, value_id as Integer, result_set as Integer returns Integer:
-    Note: Find the defining instruction
+    Note: Find the defining instruction via the canonical value-map accessor
+    Note: (which handles the stringified value-id keying internally).
     Let functions be proc memory_get_int64 from MemoryCore with mir, 0
     Let function_count be proc memory_get_int64 from MemoryCore with mir, 8
+
+    If value_id is equal to 0:
+        Return 1
+    End If
 
     Let f be 0
     While f is less than function_count:
         Let mir_func be proc list_get from List with functions, f
-        Let value_to_inst be proc memory_get_int64 from MemoryCore with mir_func, 64
-
-        Let def_inst be proc get from Dictionary with value_to_inst, value_id
+        Let def_inst be proc lookup_defining_instruction from MIRProgram with mir_func, value_id
 
         If def_inst is not equal to 0:
             Let opcode be proc memory_get_int64 from MemoryCore with def_inst, 0
 
-            Note: CONST - constant function address
+            Note: CONST — only a function-typed constant names a function
+            Note: target (payload = HIRSymbolInfo, name at symbol offset 8;
+            Note: see resolve_function_pointer for the producer contract)
             If opcode is equal to 20001:
-                Let func_id be proc memory_get_int64 from MemoryCore with def_inst, 16
-                If func_id is not equal to 0:
-                    proc append from List with result_set, func_id
+                Let const_type be proc memory_get_int64 from MemoryCore with def_inst, 40
+                If const_type is not equal to 0:
+                    Let type_kind be proc memory_get_int64 from MemoryCore with const_type, 0
+                    If type_kind is equal to 13004:
+                        Let symbol be proc get_const_value from MIRNodes with def_inst
+                        If symbol is not equal to 0:
+                            Let sym_name be proc memory_get_int64 from MemoryCore with symbol, 8
+                            If sym_name is not equal to 0:
+                                Let g be 0
+                                While g is less than function_count:
+                                    Let cand_func be proc list_get from List with functions, g
+                                    Let cand_name be proc memory_get_int64 from MemoryCore with cand_func, 0
+                                    If cand_name is not equal to 0:
+                                        Let names_match be proc string_equals from StringCore with cand_name, sym_name
+                                        If names_match is equal to 1:
+                                            proc append from List with result_set, cand_func
+                                            Set g to function_count
+                                        End If
+                                    End If
+                                    Set g to g plus 1
+                                End While
+                            End If
+                        End If
+                    End If
                 End If
             End If
 
-            Note: ADDRESS_OF - taking address
-            If opcode is equal to 20150:
+            Note: ADDRESS_OF (20205, plain-header record) — trace the
+            Note: addressed SSA value transitively
+            If opcode is equal to 20205:
                 Let target be proc memory_get_int64 from MemoryCore with def_inst, 16
-                proc append from List with result_set, target
+                If target is not equal to 0:
+                    compute_points_to_for_value(mir, target, result_set)
+                End If
             End If
 
-            Note: LOAD - load from memory, recursively analyze source
+            Note: LOAD - load from memory, recursively analyze the address
             If opcode is equal to 20200:
-                Let addr be proc memory_get_int64 from MemoryCore with def_inst, 16
-                compute_points_to_for_value(mir, addr, result_set)
+                Let addr be proc get_load_address from MIRNodes with def_inst
+                If addr is not equal to 0:
+                    compute_points_to_for_value(mir, addr, result_set)
+                End If
             End If
 
             Return 1
@@ -4421,21 +4668,34 @@ Returns 1 for functions, 2 for global variables, 0 for unknown.
 @End Reasoning
 
 Process called "get_entity_type" that takes mir as Integer, entity_id as Integer returns Integer:
-    Note: Look up entity in function list
+    Note: Both program-level collections are Lists, not Dictionaries:
+    Note: functions (offset 0) holds MIRFunction pointers, global_values
+    Note: (offset 16) holds global SSA value ids. Entity classification is
+    Note: identity membership in either List.
     Let functions be proc memory_get_int64 from MemoryCore with mir, 0
-    Let func_exists be proc get from Dictionary with functions, entity_id
-
-    If func_exists is not equal to 0:
-        Return 1  Note: Function entity
+    If functions is not equal to 0:
+        Let fn_count be proc memory_get_int64 from MemoryCore with mir, 8
+        Let i be 0
+        While i is less than fn_count:
+            Let cand_func be proc list_get from List with functions, i
+            If cand_func is equal to entity_id:
+                Return 1  Note: Function entity
+            End If
+            Set i to i plus 1
+        End While
     End If
 
-    Note: Look up entity in global variables list
     Let globals be proc memory_get_int64 from MemoryCore with mir, 16
     If globals is not equal to 0:
-        Let global_exists be proc get from Dictionary with globals, entity_id
-        If global_exists is not equal to 0:
-            Return 2  Note: Global variable entity
-        End If
+        Let global_count be proc memory_get_int64 from MemoryCore with mir, 24
+        Let g be 0
+        While g is less than global_count:
+            Let cand_global be proc list_get from List with globals, g
+            If cand_global is equal to entity_id:
+                Return 2  Note: Global variable entity
+            End If
+            Set g to g plus 1
+        End While
     End If
 
     Return 0  Note: Unknown entity type
@@ -4451,56 +4711,111 @@ For each call site that passes a function to this parameter, tracks the actual a
 Process called "analyze_parameter_targets" that takes wpa as Integer, mir as Integer, param_value_id as Integer, param_index as Integer returns Integer:
     Let result be proc list_create from List
 
-    Note: Get call graph to find all callers
-    Let call_graph be proc memory_get_int64 from MemoryCore with wpa, 24
+    Note: Cycle guard + memoization: the result List is registered in the
+    Note: WPA points_to_map cache (keyed by the parameter's value id)
+    Note: BEFORE tracing begins. A re-entrant query on the same parameter
+    Note: (mutually recursive callers threading each other's parameters)
+    Note: sees the in-progress entry and terminates with the partial set.
+    Note: Ownership of the List transfers to the cache; the WPA destructor
+    Note: releases it (Step 6b).
+    Let pt_cache be proc memory_get_int64 from MemoryCore with wpa, 144
+    If pt_cache is equal to 0:
+        Set pt_cache to proc create from Dictionary
+        proc memory_set_int64 from MemoryCore with wpa, 144, pt_cache
+    End If
+    Let guard_key be proc integer_to_string from StringUtils with param_value_id
+    Let in_progress be proc get from Dictionary with pt_cache, guard_key
+    If in_progress is not equal to 0:
+        Return in_progress
+    End If
+    proc set from Dictionary with pt_cache, guard_key, result
 
-    Note: Find the function containing this parameter
+    Note: The call graph lives at WPA offset 8 (offset 24 — the slot the
+    Note: historical code read — is the reachable_functions Set). Caller
+    Note: discovery walks every call-graph node's outgoing call_sites and
+    Note: selects the sites whose callee is the parameter's owning
+    Note: function; the argument at param_index of each such site is then
+    Note: traced through resolve_function_pointer.
+    Let call_graph be proc memory_get_int64 from MemoryCore with wpa, 8
+    If call_graph is equal to 0:
+        Return result
+    End If
+
+    Note: Find the function owning this parameter value (parameters List at
+    Note: canonical offset 16, count at 24)
     Let functions be proc memory_get_int64 from MemoryCore with mir, 0
     Let function_count be proc memory_get_int64 from MemoryCore with mir, 8
 
+    Let owner_func be 0
     Let f be 0
     While f is less than function_count:
         Let mir_func be proc list_get from List with functions, f
-        Let params be proc memory_get_int64 from MemoryCore with mir_func, 32
-
-        Note: Check if this function has this parameter
+        Let params be proc memory_get_int64 from MemoryCore with mir_func, 16
+        Let param_count be proc memory_get_int64 from MemoryCore with mir_func, 24
         If params is not equal to 0:
-            Let param_count be proc memory_get_int64 from MemoryCore with mir_func, 40
-
             If param_index is less than param_count:
-                Note: Get function ID
-                Let func_id be proc memory_get_int64 from MemoryCore with mir_func, 0
-
-                Note: Find all call sites to this function
-                Let callers be proc get from Dictionary with call_graph, func_id
-
-                If callers is not equal to 0:
-                    Let caller_count be proc length from List with callers
-
-                    Let c be 0
-                    While c is less than caller_count:
-                        Let call_site be proc list_get from List with callers, c
-
-                        Note: Get the argument passed at this call site for param_index
-                        Let arg_value be get_call_argument(call_site, param_index)
-
-                        Note: Recursively resolve what this argument points to
-                        Let arg_targets be resolve_function_pointer(wpa, mir, arg_value)
-                        Let target_count be proc length from List with arg_targets
-
-                        Let t be 0
-                        While t is less than target_count:
-                            proc append from List with result, List.get(arg_targets, t )
-                            Set t to t plus 1
-                        End While
-
-                        Set c to c plus 1
-                    End While
+                Let probe_param be proc list_get from List with params, param_index
+                If probe_param is equal to param_value_id:
+                    Set owner_func to mir_func
+                    Set f to function_count
                 End If
             End If
         End If
-
         Set f to f plus 1
+    End While
+
+    If owner_func is equal to 0:
+        Return result
+    End If
+
+    Note: Walk every node's call_sites; collect arguments of sites that
+    Note: target owner_func.
+    Let cg_nodes be proc memory_get_int64 from MemoryCore with call_graph, 0
+    If cg_nodes is equal to 0:
+        Return result
+    End If
+
+    Let node_keys be proc keys from Dictionary with cg_nodes
+    Let node_count be proc length from List with node_keys
+
+    Let n be 0
+    While n is less than node_count:
+        Let nk be proc list_get from List with node_keys, n
+        Let node be proc get from Dictionary with cg_nodes, nk
+        If node is not equal to 0:
+            Let call_sites be proc memory_get_int64 from MemoryCore with node, 16
+            Let site_count be proc memory_get_int64 from MemoryCore with node, 24
+            If call_sites is not equal to 0:
+                Let s be 0
+                While s is less than site_count:
+                    Let call_site be proc list_get from List with call_sites, s
+                    If call_site is not equal to 0:
+                        Let site_callee be proc memory_get_int64 from MemoryCore with call_site, 8
+                        If site_callee is equal to owner_func:
+                            Let site_inst be proc memory_get_int64 from MemoryCore with call_site, 0
+                            Let arg_value be get_call_argument(site_inst, param_index)
+                            If arg_value is not equal to 0:
+                                Let arg_targets be resolve_function_pointer(wpa, mir, arg_value)
+                                If arg_targets is not equal to 0:
+                                    Let target_count be proc length from List with arg_targets
+                                    Let t be 0
+                                    While t is less than target_count:
+                                        Let tgt be proc list_get from List with arg_targets, t
+                                        If tgt is not equal to 0:
+                                            proc append from List with result, tgt
+                                        End If
+                                        Set t to t plus 1
+                                    End While
+                                    proc list_destroy from List with arg_targets
+                                End If
+                            End If
+                        End If
+                    End If
+                    Set s to s plus 1
+                End While
+            End If
+        End If
+        Set n to n plus 1
     End While
 
     Return result
@@ -4609,16 +4924,19 @@ Process called "get_total_frequency" that takes profile_data as Integer returns 
 End Process
 
 Process called "get_call_argument" that takes call_site as Integer, arg_index as Integer returns Integer:
-    Note: Get arguments list from call instruction
-    Let args_offset be 24  Note: MIR call instruction args offset
-    Let args be proc memory_get_int64 from MemoryCore with call_site, args_offset
+    Note: call_site is the MIR call INSTRUCTION; the arguments List lives
+    Note: in the prefix-embedded MIRCall record (accessor reads).
+    If call_site is equal to 0:
+        Return 0
+    End If
 
+    Let args be proc get_call_arguments from MIRNodes with call_site
     If args is equal to 0:
         Return 0
     End If
 
-    Note: Get argument at index
-    If arg_index is less than proc length from List with args:
+    Let arg_count be proc get_call_argument_count from MIRNodes with call_site
+    If arg_index is less than arg_count:
         Return proc list_get from List with args, arg_index
     End If
 
@@ -4727,51 +5045,55 @@ Process called "check_allocation_escapes" that takes wpa as Integer, mir_func as
             Let inst be proc list_get from List with instructions, i
             Let opcode be proc memory_get_int64 from MemoryCore with inst, 0
 
-            Note: Check for RETURN (20303)
+            Note: Check for RETURN (20303) — returned allocation escapes
             If opcode is equal to 20303:
-                Let return_value be proc memory_get_int64 from MemoryCore with inst, 16
+                Let return_value be proc get_return_value from MIRNodes with inst
                 If return_value is equal to alloc_result:
-                    Return 1  Note: Allocation returned minus escapes
+                    Return 1  Note: Allocation returned - escapes
                 End If
             End If
 
-            Note: Check for STORE_GLOBAL (20203)
-            If opcode is equal to 20203:
-                Let stored_value be proc memory_get_int64 from MemoryCore with inst, 24
+            Note: Check for STORE (20201) — storing the allocation pointer
+            Note: into ANY memory location conservatively escapes it (the
+            Note: historical arm tested 20203, which is LOAD_FIELD)
+            If opcode is equal to 20201:
+                Let stored_value be proc get_store_value from MIRNodes with inst
                 If stored_value is equal to alloc_result:
-                    Return 1  Note: Stored to global minus escapes
+                    Return 1  Note: Pointer stored to memory - escapes
                 End If
             End If
 
-            Note: Check for CALL/CALL_INDIRECT (20304, 20305)
-            If opcode is equal to 20304:
-                Note: Check if allocation passed as argument
-                Let args be proc memory_get_int64 from MemoryCore with inst, 24
-                Let arg_count be proc length from List with args
-
-                Let k be 0
-                While k is less than arg_count:
-                    Let arg be proc list_get from List with args, k
-                    If arg is equal to alloc_result:
-                        Return 1  Note: Passed to function minus escapes
-                    End If
-                    Set k to k plus 1
-                End While
+            Note: Check for STORE_FIELD (20204, plain-header record:
+            Note: object@16, value@24)
+            If opcode is equal to 20204:
+                Let field_value be proc memory_get_int64 from MemoryCore with inst, 24
+                If field_value is equal to alloc_result:
+                    Return 1  Note: Pointer stored into a field - escapes
+                End If
             End If
 
+            Note: Check for CALL/CALL_INDIRECT (20304, 20305) — the
+            Note: arguments List lives in the extended record
+            Let cae_is_call be 0
+            If opcode is equal to 20304:
+                Set cae_is_call to 1
+            End If
             If opcode is equal to 20305:
-                Note: Indirect call - check arguments
-                Set args to proc memory_get_int64 from MemoryCore with inst, 24
-                Set arg_count to proc length from List with args
-
-                Set k to 0
-                While k is less than arg_count:
-                    Set arg to proc list_get from List with args, k
-                    If arg is equal to alloc_result:
-                        Return 1  Note: Passed to indirect call minus escapes
-                    End If
-                    Set k to k plus 1
-                End While
+                Set cae_is_call to 1
+            End If
+            If cae_is_call is equal to 1:
+                Let args be proc get_call_arguments from MIRNodes with inst
+                If args is not equal to 0:
+                    Let arg_count be proc get_call_argument_count from MIRNodes with inst
+                    Let k be 0
+                    While k is less than arg_count:
+                        Let arg be proc list_get from List with args, k
+                        If arg is equal to alloc_result:
+                            Return 1  Note: Passed to a call - escapes
+                        End If
+                        Set k to k plus 1
+                    End While
+                End If
             End If
 
             Set i to i plus 1
@@ -5523,7 +5845,6 @@ Process called "build_inst_to_function_index" that takes mir as Integer returns 
     While i is less than function_count:
         Let mir_func be proc list_get from List with functions, i
         If mir_func is not equal to 0:
-            Let function_id be proc memory_get_int64 from MemoryCore with mir_func, 0
             Let cfg be proc memory_get_int64 from MemoryCore with mir_func, 8
 
             If cfg is not equal to 0:
@@ -5542,7 +5863,10 @@ Process called "build_inst_to_function_index" that takes mir as Integer returns 
                                 While j is less than inst_count:
                                     Let inst be proc list_get from List with instructions, j
                                     If inst is not equal to 0:
-                                        proc set from Dictionary with result, inst, function_id
+                                        Note: stringified instruction pointer
+                                        Note: key -> containing MIRFunction ptr
+                                        Let inst_key be proc integer_to_string from StringUtils with inst
+                                        proc set from Dictionary with result, inst_key, mir_func
                                     End If
                                     Set j to j plus 1
                                 End While
@@ -5805,18 +6129,21 @@ Process called "compute_reachable_filtered_dead_globals" that takes wpa as Integ
         Return result
     End If
 
-    Note: Build set of accessed-by-reachable globals.
+    Note: Build set of accessed-by-reachable globals. IPA records are
+    Note: keyed by stringified function pointers; the raw pointer (the
+    Note: reachable Set's element type) is the record's offset-0 slot.
     Let reachable_accessed be proc create from Set
     If side_effect_info is not equal to 0:
-        Let func_ids be proc keys from Dictionary with side_effect_info
-        Let fi_count be proc length from List with func_ids
+        Let func_keys be proc keys from Dictionary with side_effect_info
+        Let fi_count be proc length from List with func_keys
         Let i be 0
         While i is less than fi_count:
-            Let function_id be proc list_get from List with func_ids, i
-            Let is_reach be proc contains from Set with reachable, function_id
-            If is_reach is equal to 1:
-                Let ipa be proc get from Dictionary with side_effect_info, function_id
-                If ipa is not equal to 0:
+            Let fkey be proc list_get from List with func_keys, i
+            Let ipa be proc get from Dictionary with side_effect_info, fkey
+            If ipa is not equal to 0:
+                Let function_ptr be proc memory_get_int64 from MemoryCore with ipa, 0
+                Let is_reach be proc contains from Set with reachable, function_ptr
+                If is_reach is equal to 1:
                     Let reads be proc memory_get_int64 from MemoryCore with ipa, 24
                     If reads is not equal to 0:
                         Let reads_list be proc to_list from Set with reads
@@ -5845,15 +6172,15 @@ Process called "compute_reachable_filtered_dead_globals" that takes wpa as Integ
         End While
     End If
 
-    Note: Walk globals; collect those not in reachable_accessed.
+    Note: Walk globals; collect those not in reachable_accessed. The
+    Note: global_values List entries ARE the global value ids.
     Let globals be proc memory_get_int64 from MemoryCore with mir, 16
     Let global_count be proc memory_get_int64 from MemoryCore with mir, 24
     If globals is not equal to 0:
         Let g be 0
         While g is less than global_count:
-            Let global_var be proc list_get from List with globals, g
-            If global_var is not equal to 0:
-                Let global_id be proc memory_get_int64 from MemoryCore with global_var, 0
+            Let global_id be proc list_get from List with globals, g
+            If global_id is not equal to 0:
                 Let is_accessed be proc contains from Set with reachable_accessed, global_id
                 If is_accessed is equal to 0:
                     proc append from List with result, global_id
@@ -5917,6 +6244,15 @@ Process called "compute_dead_types" that takes wpa as Integer, dead_funcs as Int
     Note: Build set of types referenced by reachable functions.
     Let live_types be proc create from Set
 
+    Note: A type is live when any reachable function references its
+    Note: HIRTypeInfo: as the function's return type (MIRFunction offset
+    Note: 32) or as the type_info of any instruction in its body (MIRNode
+    Note: header offset 40). The live set therefore stores HIRTypeInfo
+    Note: POINTERS, and liveness of a hierarchy node is judged on the
+    Note: node's own type_info slot (offset 8) — comparing type-table key
+    Note: tokens against type pointers (the pre-Wave-2 behaviour, which
+    Note: also misread parameter_count as a type List) compared values
+    Note: from two different namespaces and classified everything dead.
     If mir is not equal to 0:
         Let functions be proc memory_get_int64 from MemoryCore with mir, 0
         Let function_count be proc memory_get_int64 from MemoryCore with mir, 8
@@ -5925,26 +6261,43 @@ Process called "compute_dead_types" that takes wpa as Integer, dead_funcs as Int
             While i is less than function_count:
                 Let mir_func be proc list_get from List with functions, i
                 If mir_func is not equal to 0:
-                    Let fid be proc memory_get_int64 from MemoryCore with mir_func, 0
-                    Let is_reach be proc contains from Set with reachable, fid
+                    Let is_reach be proc contains from Set with reachable, mir_func
                     If is_reach is equal to 1:
-                        Note: Parameter types at offset 24 (List of type IDs).
-                        Let param_types be proc memory_get_int64 from MemoryCore with mir_func, 24
-                        If param_types is not equal to 0:
-                            Let pc be proc length from List with param_types
-                            Let p be 0
-                            While p is less than pc:
-                                Let ptype be proc list_get from List with param_types, p
-                                If ptype is not equal to 0:
-                                    proc add from Set with live_types, ptype
-                                End If
-                                Set p to p plus 1
-                            End While
-                        End If
-                        Note: Return type at offset 32.
+                        Note: Return type at offset 32 (HIRTypeInfo pointer)
                         Let ret_type be proc memory_get_int64 from MemoryCore with mir_func, 32
                         If ret_type is not equal to 0:
                             proc add from Set with live_types, ret_type
+                        End If
+
+                        Note: Instruction header type_info at offset 40
+                        Let lt_cfg be proc memory_get_int64 from MemoryCore with mir_func, 8
+                        If lt_cfg is not equal to 0:
+                            Let lt_blocks be proc memory_get_int64 from MemoryCore with lt_cfg, 16
+                            Let lt_block_count be proc memory_get_int64 from MemoryCore with lt_cfg, 24
+                            If lt_blocks is not equal to 0:
+                                Let lb be 0
+                                While lb is less than lt_block_count:
+                                    Let lt_block be proc list_get from List with lt_blocks, lb
+                                    If lt_block is not equal to 0:
+                                        Let lt_insts be proc memory_get_int64 from MemoryCore with lt_block, 16
+                                        Let lt_inst_count be proc memory_get_int64 from MemoryCore with lt_block, 24
+                                        If lt_insts is not equal to 0:
+                                            Let li be 0
+                                            While li is less than lt_inst_count:
+                                                Let lt_inst be proc list_get from List with lt_insts, li
+                                                If lt_inst is not equal to 0:
+                                                    Let inst_type be proc memory_get_int64 from MemoryCore with lt_inst, 40
+                                                    If inst_type is not equal to 0:
+                                                        proc add from Set with live_types, inst_type
+                                                    End If
+                                                End If
+                                                Set li to li plus 1
+                                            End While
+                                        End If
+                                    End If
+                                    Set lb to lb plus 1
+                                End While
+                            End If
                         End If
                     End If
                 End If
@@ -5953,15 +6306,25 @@ Process called "compute_dead_types" that takes wpa as Integer, dead_funcs as Int
         End If
     End If
 
-    Note: Walk type_hierarchy keys; any type not in live_types is dead.
+    Note: Walk type_hierarchy; a node whose HIRTypeInfo pointer is not in
+    Note: the live set is dead. The result carries the hierarchy key
+    Note: tokens (the same tokens the DCE-plan consumers use to address
+    Note: hierarchy and type-table entries).
     Let type_ids be proc keys from Dictionary with type_hierarchy
     Let tc be proc length from List with type_ids
     Let t be 0
     While t is less than tc:
         Let type_id be proc list_get from List with type_ids, t
-        Let is_live be proc contains from Set with live_types, type_id
-        If is_live is equal to 0:
-            proc append from List with result, type_id
+        Let dt_node be proc get from Dictionary with type_hierarchy, type_id
+        If dt_node is not equal to 0:
+            Let dt_type_info be proc memory_get_int64 from MemoryCore with dt_node, 8
+            Let is_live be 0
+            If dt_type_info is not equal to 0:
+                Set is_live to proc contains from Set with live_types, dt_type_info
+            End If
+            If is_live is equal to 0:
+                proc append from List with result, type_id
+            End If
         End If
         Set t to t plus 1
     End While
@@ -6014,8 +6377,8 @@ Process called "count_dead_function_bytes" that takes function_id as Integer, mi
     While i is less than function_count:
         Let mir_func be proc list_get from List with functions, i
         If mir_func is not equal to 0:
-            Let fid be proc memory_get_int64 from MemoryCore with mir_func, 0
-            If fid is equal to function_id:
+            Note: OD-4 pointer identity; the scan validates membership
+            If mir_func is equal to function_id:
                 Let cfg be proc memory_get_int64 from MemoryCore with mir_func, 8
                 If cfg is not equal to 0:
                     Let blocks be proc memory_get_int64 from MemoryCore with cfg, 16
@@ -6368,10 +6731,9 @@ Process called "allocate_cp_candidate" that takes global_id as Integer, mir as I
             While i is less than function_count:
                 Let mir_func be proc list_get from List with functions, i
                 If mir_func is not equal to 0:
-                    Let fid be proc memory_get_int64 from MemoryCore with mir_func, 0
                     Let counts_this_function be 1
                     If reachable is not equal to 0:
-                        Let is_reach be proc contains from Set with reachable, fid
+                        Let is_reach be proc contains from Set with reachable, mir_func
                         If is_reach is equal to 0:
                             Set counts_this_function to 0
                         End If
@@ -6396,7 +6758,7 @@ Process called "allocate_cp_candidate" that takes global_id as Integer, mir as I
                                                 If inst is not equal to 0:
                                                     Let opcode be proc memory_get_int64 from MemoryCore with inst, 0
                                                     If opcode is equal to MIR_OP_LOAD:
-                                                        Let address be proc memory_get_int64 from MemoryCore with inst, 16
+                                                        Let address be proc get_load_address from MIRNodes with inst
                                                         If address is equal to global_id:
                                                             Set use_count to use_count plus 1
                                                         End If
@@ -6504,14 +6866,13 @@ fan-in and arity.
    value_ids in its args List at offset 24 (the same offset
    get_call_argument uses).
 5. Build a per-parameter tally Dictionary mapping param_index ->
-   constant_count. For each matching call site and each parameter
-   index, fetch the argument value_id, walk the wpa[0].value_to_inst
-   maps (offset 64 of each MIR function) to find the defining
-   instruction, and check its opcode at offset 0. Opcodes
-   20001 (CONST), 20002 (CONST_INT/literal), and the MIR LOAD-from-
-   constant-global pattern (LOAD with addr defined by GLOBAL_ADDRESS
-   to a global_id present in wpa.constant_globals) all qualify as
-   "constant" sources.
+   constant_count (stringified-index keys per the hashtable contract).
+   For each matching call site and each parameter index, fetch the
+   argument value_id, find its defining instruction through the
+   canonical value-map accessor, and check its opcode. MIR_CONST
+   (20001) and the LOAD-from-constant-global pattern (LOAD whose
+   address is present in wpa.constant_globals) qualify as "constant"
+   sources; 20002 is ADD and never does.
 6. Track total_call_sites separately. Walk the tally Dictionary; for
    each (param_index, count) the dominance ratio is count /
    total_call_sites. The first index whose ratio meets or exceeds 75%
@@ -6520,7 +6881,7 @@ fan-in and arity.
 
 The algorithm is single-pass-per-call-site with constant-time per-arg
 work; no recursion into helper passes. helper is_constant_arg below
-encapsulates the per-arg-value classification (CONST, CONST_INT, or
+encapsulates the per-arg-value classification (MIR_CONST or
 LOAD-from-constant-global).
 @End Implementation
 
@@ -6557,12 +6918,11 @@ constant (1) or not (0). It is the inner-loop predicate used by
 find_dominant_constant_arg when tallying constants per parameter
 across call sites.
 
-Three sources qualify as "constant":
-  - CONST opcode (20001): a function-address literal or similar
-    immediate produced directly by the lexer/parser. The defining
-    instruction's immediate value sits at offset 16.
-  - CONST_INT/literal opcode (20002): integer/literal constants
-    produced by the constant-folding pipeline.
+Two sources qualify as "constant":
+  - MIR_CONST (20001): the single constant opcode of the canonical
+    band (the historical code also accepted 20002, which is ADD —
+    every addition was classified as a constant). The payload lives
+    in the extended record, read via accessor.
   - LOAD opcode (20200) whose address operand is a global_id present
     in wpa.constant_globals: a load from a global that has been
     proven write-free across the whole program is semantically a
@@ -6579,15 +6939,15 @@ and safe.
 @Implementation
 1. Defensive null/zero guards: mir of 0 or value_id of 0 returns 0.
 2. Iterate the MIR functions List at mir[0] up to function_count at
-   mir[8]. For each function, look up the value_to_inst Dictionary
-   at offset 64; if value_id has a defining instruction there:
+   mir[8]. For each function, query the canonical value map through
+   MIR.lookup_defining_instruction; if value_id has a defining
+   instruction there:
      a. Read the opcode at offset 0 of the instruction.
-     b. Opcode 20001 (CONST) -> return 1.
-     c. Opcode 20002 (CONST_INT/literal) -> return 1.
-     d. Opcode 20200 (LOAD) -> read the address operand at offset 16.
-        If wpa is non-null and constant_globals (wpa[120]) contains
-        the address, return 1.
-     e. Any other opcode reached after finding the definition -> the
+     b. Opcode 20001 (MIR_CONST) -> return 1.
+     c. Opcode 20200 (LOAD) -> read the address through the MIRLoad
+        accessor (extended slot). If wpa is non-null and
+        constant_globals (wpa[120]) contains the address, return 1.
+     d. Any other opcode reached after finding the definition -> the
         value is computed at run time; return 0.
 3. If no defining instruction was found in any function (the loop
    completes without returning), return 0.
@@ -6626,8 +6986,8 @@ but never miscompile.
 
 The LOAD-from-constant-global path depends on constant_globals being
 populated. If this helper is called before Phase 8a runs the
-constant_globals Set will be empty and only CONST/CONST_INT
-classifications will succeed — graceful degradation, never crash.
+constant_globals Set will be empty and only MIR_CONST classifications
+will succeed — graceful degradation, never crash.
 @End Security_Scope
 
 Process called "is_constant_arg" that takes mir as Integer, wpa as Integer, value_id as Integer returns Integer:
@@ -6654,43 +7014,37 @@ Process called "is_constant_arg" that takes mir as Integer, wpa as Integer, valu
     While f is less than function_count:
         Let mir_func be proc list_get from List with functions, f
         If mir_func is not equal to 0:
-            Let value_to_inst be proc memory_get_int64 from MemoryCore with mir_func, 64
-            If value_to_inst is not equal to 0:
-                Let def_inst be proc get from Dictionary with value_to_inst, value_id
-                If def_inst is not equal to 0:
-                    Let opcode be proc memory_get_int64 from MemoryCore with def_inst, 0
+            Let def_inst be proc lookup_defining_instruction from MIRProgram with mir_func, value_id
+            If def_inst is not equal to 0:
+                Let opcode be proc memory_get_int64 from MemoryCore with def_inst, 0
 
-                    Note: MIR CONST (function-address literal) and the integer/
-                    Note: literal CONST opcode both qualify as compile-time
-                    Note: constants for specialization purposes.
-                    If opcode is equal to 20001:
-                        Return 1
-                    End If
-                    If opcode is equal to 20002:
-                        Return 1
-                    End If
+                Note: MIR_CONST (20001) is THE constant opcode (20002 is ADD
+                Note: per the canonical band — the historical 20002 arm
+                Note: classified additions as constants).
+                If opcode is equal to 20001:
+                    Return 1
+                End If
 
-                    Note: LOAD (20200) from a global address whose global_id is
-                    Note: in wpa.constant_globals also qualifies. The LOAD's
-                    Note: address operand sits at offset 16 of the instruction.
-                    If opcode is equal to 20200:
-                        Let load_addr be proc memory_get_int64 from MemoryCore with def_inst, 16
-                        If wpa is not equal to 0:
-                            If load_addr is not equal to 0:
-                                Let constant_globals be proc memory_get_int64 from MemoryCore with wpa, 120
-                                If constant_globals is not equal to 0:
-                                    Let is_const_global be proc contains from Set with constant_globals, load_addr
-                                    If is_const_global is equal to 1:
-                                        Return 1
-                                    End If
+                Note: LOAD (20200) from an address in wpa.constant_globals
+                Note: also qualifies (write-free global). The address lives
+                Note: in the extended MIRLoad record.
+                If opcode is equal to 20200:
+                    Let load_addr be proc get_load_address from MIRNodes with def_inst
+                    If wpa is not equal to 0:
+                        If load_addr is not equal to 0:
+                            Let constant_globals be proc memory_get_int64 from MemoryCore with wpa, 120
+                            If constant_globals is not equal to 0:
+                                Let is_const_global be proc contains from Set with constant_globals, load_addr
+                                If is_const_global is equal to 1:
+                                    Return 1
                                 End If
                             End If
                         End If
                     End If
-
-                    Note: Found the definition (not constant) — stop searching.
-                    Return 0
                 End If
+
+                Note: Found the definition (not constant) — stop searching.
+                Return 0
             End If
         End If
         Set f to f plus 1
@@ -6728,9 +7082,9 @@ Process called "find_dominant_constant_arg" that takes wpa as Integer, function_
     While i is less than function_count:
         Let mir_func be proc list_get from List with functions, i
         If mir_func is not equal to 0:
-            Let fid be proc memory_get_int64 from MemoryCore with mir_func, 0
-            If fid is equal to function_id:
-                Set callee_param_count to proc memory_get_int64 from MemoryCore with mir_func, 40
+            Note: OD-4 pointer identity; canonical parameter_count at offset 24
+            If mir_func is equal to function_id:
+                Set callee_param_count to proc memory_get_int64 from MemoryCore with mir_func, 24
             End If
         End If
         Set i to i plus 1
@@ -6750,7 +7104,8 @@ Process called "find_dominant_constant_arg" that takes wpa as Integer, function_
         Return 0 minus 1
     End If
 
-    Let callee_node be proc get from Dictionary with cg_nodes, function_id
+    Let callee_node_key be proc integer_to_string from StringUtils with function_id
+    Let callee_node be proc get from Dictionary with cg_nodes, callee_node_key
     If callee_node is equal to 0:
         Return 0 minus 1
     End If
@@ -6775,8 +7130,9 @@ Process called "find_dominant_constant_arg" that takes wpa as Integer, function_
         Let caller_id be proc list_get from List with callers, c
 
         Note: Look up the caller's outgoing call sites and pick the ones
-        Note: pointing at function_id.
-        Let caller_node be proc get from Dictionary with cg_nodes, caller_id
+        Note: pointing at function_id (stringified-pointer node key).
+        Let caller_node_key be proc integer_to_string from StringUtils with caller_id
+        Let caller_node be proc get from Dictionary with cg_nodes, caller_node_key
         If caller_node is not equal to 0:
             Let caller_call_sites be proc memory_get_int64 from MemoryCore with caller_node, 16
             Let caller_site_count be proc memory_get_int64 from MemoryCore with caller_node, 24
@@ -6790,14 +7146,14 @@ Process called "find_dominant_constant_arg" that takes wpa as Integer, function_
                         If cs_callee is equal to function_id:
                             Note: This call site targets our candidate. Read its
                             Note: instruction pointer (offset 0 of CallSite) and
-                            Note: walk arguments at offset 24 of the MIR call inst.
+                            Note: walk the MIRCall arguments List (accessors).
                             Let inst_ptr be proc memory_get_int64 from MemoryCore with cs, 0
                             If inst_ptr is not equal to 0:
                                 Set total_call_sites to total_call_sites plus 1
 
-                                Let args be proc memory_get_int64 from MemoryCore with inst_ptr, 24
+                                Let args be proc get_call_arguments from MIRNodes with inst_ptr
                                 If args is not equal to 0:
-                                    Let arg_list_size be proc length from List with args
+                                    Let arg_list_size be proc get_call_argument_count from MIRNodes with inst_ptr
                                     Let limit be callee_param_count
                                     If arg_list_size is less than limit:
                                         Set limit to arg_list_size
@@ -6808,9 +7164,10 @@ Process called "find_dominant_constant_arg" that takes wpa as Integer, function_
                                         Let arg_value_id be proc list_get from List with args, p
                                         Let is_const be is_constant_arg(mir, wpa, arg_value_id)
                                         If is_const is equal to 1:
-                                            Let existing be proc get from Dictionary with tally, p
+                                            Let tkey be proc integer_to_string from StringUtils with p
+                                            Let existing be proc get from Dictionary with tally, tkey
                                             Let new_count be existing plus 1
-                                            proc set from Dictionary with tally, p, new_count
+                                            proc set from Dictionary with tally, tkey, new_count
                                         End If
                                         Set p to p plus 1
                                     End While
@@ -6843,8 +7200,9 @@ Process called "find_dominant_constant_arg" that takes wpa as Integer, function_
 
     Let tk be 0
     While tk is less than tally_size:
-        Let pidx be proc list_get from List with tally_keys, tk
-        Let pcount be proc get from Dictionary with tally, pidx
+        Let pidx_key be proc list_get from List with tally_keys, tk
+        Let pidx be proc string_to_integer from StringUtils with pidx_key
+        Let pcount be proc get from Dictionary with tally, pidx_key
         Let scaled be 4 multiplied by pcount
 
         If scaled is greater than or equal to threshold_num:

@@ -46,6 +46,7 @@ Import "compiler/middle/gungnir/mir/ssa.runa" as SSA
 Import "compiler/middle/gungnir/mir/dominance.runa" as Dominance
 Import "compiler/frontend/primitives/memory/layout.runa" as Layout
 Import "compiler/frontend/primitives/collections/list.runa" as List
+Import "compiler/internal/string_utils.runa" as StringUtils
 
 Note: ============================================================================
 Note: PHASE 3: DATA STRUCTURES - Verification Context
@@ -437,7 +438,8 @@ Process called "verify_ssa_form" that takes context_ptr as Integer, cfg as Integ
     Note: Check if any errors were found
     Let error_count be proc get_error_count with context_ptr
     If error_count is greater than 0:
-        Display "verify_ssa_form: found " joined with error_count joined with " SSA errors"
+        Let error_count_str be proc integer_to_string from StringUtils with error_count
+        Display "verify_ssa_form: found " joined with error_count_str joined with " SSA errors"
         Return 0
     End If
 
@@ -465,16 +467,22 @@ Process called "collect_value_definitions_and_uses" that takes context_ptr as In
 
     @Implementation
     Two nested loops drive a complete walk of the CFG. The outer loop
-    indexes blocks via `proc get_block from CFG`, and the inner loop walks
-    each block's instructions via `proc get_block_instructions from CFG`.
+    walks the canonical block storage (CFG.get_mir_cfg_blocks, a borrowed
+    List of block pointers), and the inner loop walks each block's
+    instructions via `proc get_block_instructions from MIR`.
     Before populating the sets, both `value_defs` (offset 48) and
     `value_uses` (offset 56) are cleared via `proc clear from List` so
     repeated invocations on the same context start from a known state.
-    For each instruction, the result value id (if non-zero) is appended
-    to `value_defs`, and every non-zero operand is appended to
-    `value_uses`. The sets are intentionally stored as Lists (not Sets)
-    because subsequent passes need to distinguish a duplicate definition
-    (an SSA violation) from a single definition used twice.
+    For each instruction, the result value id (read from the canonical
+    header value_id mirror via MIR.get_mir_node_value_id, which covers
+    phi results too) is appended to `value_defs` when non-zero, and every
+    used value id enumerated by CFG.get_instruction_used_values (header
+    operand slots for regular instructions, incoming-pair values for
+    phis) is appended to `value_uses`; the enumerator's freshly allocated
+    List is destroyed after each instruction. The sets are intentionally
+    stored as Lists (not Sets) because subsequent passes need to
+    distinguish a duplicate definition (an SSA violation) from a single
+    definition used twice.
     @End Implementation
 
     @Performance_Hints
@@ -497,39 +505,45 @@ Process called "collect_value_definitions_and_uses" that takes context_ptr as In
     proc clear from List with value_defs
     proc clear from List with value_uses
 
-    Note: Get all blocks
-    Let block_count be proc get_block_count from CFG with cfg
+    Note: Get all blocks (canonical block storage: pointers, borrowed)
+    Let blocks be proc get_mir_cfg_blocks from CFG with cfg
+    Let block_count be proc get_cfg_block_count from CFG with cfg
 
     Let i be 0
     While i is less than block_count:
-        Let block be proc get_block from CFG with cfg, i
-        Let instructions be proc get_block_instructions from CFG with block
+        Let block be proc get from List with blocks, i
+        Let instructions be proc get_block_instructions from MIR with block
         Let inst_count be proc length from List with instructions
 
         Note: Process each instruction
         Let j be 0
         While j is less than inst_count:
             Let inst be proc get from List with instructions, j
-            Let opcode be proc get_instruction_opcode from MIRNodes with inst
 
-            Note: Check if instruction defines a value
-            Let result_value be proc get_instruction_result_value from MIRNodes with inst
+            Note: Check if instruction defines a value (header value_id
+            Note: mirror covers phi results as well)
+            Let result_value be proc get_mir_node_value_id from MIR with inst
             If result_value is not equal to 0:
                 Note: Add to definitions set
                 proc append from List with value_defs, result_value
             End If
 
-            Note: Collect operand uses
-            Let operand_count be proc get_instruction_operand_count from MIRNodes with inst
-            Let k be 0
-            While k is less than operand_count:
-                Let operand be proc get_instruction_operand from MIRNodes with inst, k
-                If operand is not equal to 0:
-                    Note: Add to uses set
-                    proc append from List with value_uses, operand
-                End If
-                Set k to k plus 1
-            End While
+            Note: Collect every used value id - header operand slots for
+            Note: regular instructions, incoming-pair values for phis
+            Let used_values be proc get_instruction_used_values from CFG with inst
+            If used_values is not equal to 0:
+                Let used_count be proc length from List with used_values
+                Let k be 0
+                While k is less than used_count:
+                    Let operand be proc get from List with used_values, k
+                    If operand is not equal to 0:
+                        Note: Add to uses set
+                        proc append from List with value_uses, operand
+                    End If
+                    Set k to k plus 1
+                End While
+                proc destroy from List with used_values
+            End If
 
             Set j to j plus 1
         End While
@@ -581,7 +595,8 @@ Process called "verify_single_assignment" that takes context_ptr as Integer retu
     hash-counted single pass once the runtime exposes a hash-set
     primitive with O(1) lookup. Each duplicate value triggers exactly
     one error report (not one per duplicate occurrence) because the
-    detection fires the first time `occurrences > 1`.
+    prefix scan skips every id whose first occurrence was already
+    processed at a lower index.
     @End Performance_Hints
 
     If context_ptr is equal to 0:
@@ -597,20 +612,35 @@ Process called "verify_single_assignment" that takes context_ptr as Integer retu
     While i is less than def_count:
         Let value_id be proc get from List with value_defs, i
 
-        Note: Count occurrences of this value ID
-        Let occurrences be 0
-        Let j be 0
-        While j is less than def_count:
-            Let other_value be proc get from List with value_defs, j
-            If other_value is equal to value_id:
-                Set occurrences to occurrences plus 1
+        Note: Skip ids already reported at an earlier first occurrence
+        Let seen_earlier be 0
+        Let p be 0
+        While p is less than i:
+            Let earlier_value be proc get from List with value_defs, p
+            If earlier_value is equal to value_id:
+                Set seen_earlier to 1
+                Set p to i
+            Otherwise:
+                Set p to p plus 1
             End If
-            Set j to j plus 1
         End While
 
-        Note: If value is defined more than once, report error
-        If occurrences is greater than 1:
-            proc report_error with context_ptr, "SSA violation: value redefined"
+        If seen_earlier is equal to 0:
+            Note: Count occurrences of this value ID
+            Let occurrences be 0
+            Let j be 0
+            While j is less than def_count:
+                Let other_value be proc get from List with value_defs, j
+                If other_value is equal to value_id:
+                    Set occurrences to occurrences plus 1
+                End If
+                Set j to j plus 1
+            End While
+
+            Note: If value is defined more than once, report error once
+            If occurrences is greater than 1:
+                proc report_error with context_ptr, "SSA violation: value redefined"
+            End If
         End If
 
         Set i to i plus 1
@@ -639,26 +669,36 @@ Process called "verify_dominance_property" that takes context_ptr as Integer, cf
     @End Reasoning
 
     @Implementation
-    1. Build a dominance tree via `proc compute_dominance_tree from
-       Dominance`. A null tree indicates the dominance pass itself failed
-       and the check cannot proceed; this is reported as a hard error.
-    2. For each value id in `value_uses`, find the defining block via
-       `find_defining_block` and the using block via `find_using_block`.
-    3. If a use has no corresponding definition, that is an undefined-
-       value use; report it and continue (a single missing definition
-       must not mask later errors).
-    4. Query `proc does_dominate from Dominance` for each (def, use)
-       pair and emit an error when dominance does not hold.
-    5. Destroy the dominance tree before returning, regardless of how
-       many errors were reported, to keep this pass leak-neutral.
+    1. Build dominance info via `proc compute_dominance_tree from
+       Dominance`. A null result indicates the dominance pass itself
+       failed and the check cannot proceed; this is reported as a hard
+       error. The returned info pointer is held locally and threaded
+       into every `proc dominates from Dominance` query (the canonical
+       dominance API is dominates(info_ptr, dominator_id, block_id)).
+    2. Walk every block's instruction list directly. For a NON-PHI
+       instruction, every used value enumerated from its header operand
+       slots must be defined in a block that dominates the instruction's
+       own block. For a PHI, each incoming value must be defined in a
+       block that dominates the corresponding incoming PREDECESSOR
+       block - the value flows along that edge, not into the phi's
+       block, so checking the phi's own block would be wrong on both
+       sides (false negatives at loop headers, false positives at
+       diamonds).
+    3. A use whose definition cannot be located in the block-level
+       instruction stream is reported as a WARNING, not an error:
+       function parameters and externally seeded constants are defined
+       outside the blocks and are exempt from block dominance.
+    4. Destroy the dominance info via destroy_dominance_info before
+       returning, regardless of how many errors were reported, to keep
+       this pass leak-neutral.
     @End Implementation
 
     @Performance_Hints
-    Dominated by the dominance-tree construction (typically O(blocks^2)
+    Dominated by the dominance construction (typically O(blocks^2)
     in the simple Cooper-Harvey-Kennedy implementation) plus
-    O(uses * (definition_search + dominance_query)) for the use scan.
-    `find_defining_block`/`find_using_block` are themselves linear scans
-    over the CFG, so the total cost is bounded above by
+    O(uses * definition_search + uses * dominance_query) for the walk.
+    `find_defining_block` is itself a linear scan over the CFG, so the
+    total cost is bounded above by
     O(uses * blocks * instructions_per_block). Verifier callers should
     not run this on every IR mutation; run it after structural transforms.
     @End Performance_Hints
@@ -670,49 +710,83 @@ Process called "verify_dominance_property" that takes context_ptr as Integer, cf
         Return 0
     End If
 
-    Note: Build dominance tree
-    Let dom_tree be proc compute_dominance_tree from Dominance with cfg
-    If dom_tree is equal to 0:
+    Note: Build dominance info (threaded into every dominates query below)
+    Let dom_info be proc compute_dominance_tree from Dominance with cfg
+    If dom_info is equal to 0:
         proc report_error with context_ptr, "verify_dominance_property: failed to build dominance tree"
         Return 0
     End If
 
-    Note: Get value definitions and uses
-    Let value_defs be proc memory_get_int64 from Layout with context_ptr, 48
-    Let value_uses be proc memory_get_int64 from Layout with context_ptr, 56
+    Note: Walk every instruction, checking each use against its definition
+    Let blocks be proc get_mir_cfg_blocks from CFG with cfg
+    Let block_count be proc get_cfg_block_count from CFG with cfg
 
-    Note: For each used value, verify its definition dominates the use
-    Let use_count be proc length from List with value_uses
     Let i be 0
-    While i is less than use_count:
-        Let used_value be proc get from List with value_uses, i
+    While i is less than block_count:
+        Let block be proc get from List with blocks, i
+        Let use_block_id be proc get_mir_basic_block_id from CFG with block
+        Let instructions be proc get_block_instructions from MIR with block
+        Let inst_count be proc length from List with instructions
 
-        Note: Find defining block for this value
-        Let def_block be proc find_defining_block with cfg, used_value
-        If def_block is equal to 0:
-            proc report_error with context_ptr, "verify_dominance_property: value used but not defined"
-            Set i to i plus 1
-            Continue
-        End If
+        Let j be 0
+        While j is less than inst_count:
+            Let inst be proc get from List with instructions, j
+            Let opcode be proc get_mir_node_opcode from MIR with inst
 
-        Note: Find using block for this value
-        Let use_block be proc find_using_block with cfg, used_value, i
-        If use_block is equal to 0:
-            Set i to i plus 1
-            Continue
-        End If
+            If opcode is equal to 20300:
+                Note: MIR_PHI: each incoming value must dominate its edge's
+                Note: predecessor block
+                Let incoming_count be proc get_phi_incoming_count from MIRNodes with inst
+                Let k be 0
+                While k is less than incoming_count:
+                    Let incoming_value be proc get_phi_incoming_value from MIRNodes with inst, k
+                    Let predecessor_id be proc get_phi_incoming_block from MIRNodes with inst, k
 
-        Note: Check if def_block dominates use_block
-        Let dominates be proc does_dominate from Dominance with dom_tree, def_block, use_block
-        If dominates is equal to 0:
-            proc report_error with context_ptr, "verify_dominance_property: definition does not dominate use"
-        End If
+                    If incoming_value is not equal to 0:
+                        Let phi_def_block be proc find_defining_block with cfg, incoming_value
+                        If phi_def_block is equal to negative 1:
+                            proc report_warning with context_ptr, "verify_dominance_property: phi incoming value defined outside block stream"
+                        Otherwise:
+                            Let pred_dominated be proc dominates from Dominance with dom_info, phi_def_block, predecessor_id
+                            If pred_dominated is equal to 0:
+                                proc report_error with context_ptr, "verify_dominance_property: phi incoming definition does not dominate predecessor"
+                            End If
+                        End If
+                    End If
+
+                    Set k to k plus 1
+                End While
+            Otherwise:
+                Note: Regular instruction: each used header operand must be
+                Note: dominated by its definition at this block
+                Let slot be 1
+                While slot is less than or equal to 3:
+                    Let used_value be proc get_mir_node_operand from MIR with inst, slot
+
+                    If used_value is not equal to 0:
+                        Let def_block be proc find_defining_block with cfg, used_value
+                        If def_block is equal to negative 1:
+                            proc report_warning with context_ptr, "verify_dominance_property: value used but not defined in block stream"
+                        Otherwise:
+                            Let def_dominates be proc dominates from Dominance with dom_info, def_block, use_block_id
+                            If def_dominates is equal to 0:
+                                proc report_error with context_ptr, "verify_dominance_property: definition does not dominate use"
+                            End If
+                        End If
+                    End If
+
+                    Set slot to slot plus 1
+                End While
+            End If
+
+            Set j to j plus 1
+        End While
 
         Set i to i plus 1
     End While
 
-    Note: Cleanup dominance tree
-    proc destroy_dominance_tree from Dominance with dom_tree
+    Note: Cleanup dominance info
+    proc destroy_dominance_info from Dominance with dom_info
 
     Return 1
 End Process
@@ -735,21 +809,24 @@ Process called "verify_phi_nodes" that takes context_ptr as Integer, cfg as Inte
     @End Reasoning
 
     @Implementation
-    For each block, count the number of phi instructions (opcode 20300)
-    encountered before the first non-phi instruction. Two invariants
-    are enforced:
-    - Each phi's operand count (queried via
-      `proc get_phi_operand_count from MIRNodes`) must equal the number
+    For each block, walk the instruction list tracking whether the scan
+    is still inside the leading phi region. Four invariants are enforced:
+    - Placement: a phi encountered AFTER the first non-phi instruction
+      is an error ("phi not at block start"). The scan does not stop at
+      the first non-phi precisely so that misplaced phis are detected
+      rather than silently skipped.
+    - Each phi's incoming count (queried via
+      `proc get_phi_incoming_count from MIRNodes`) must equal the number
       of predecessors. A mismatch indicates either a broken predecessor
       list or a phi that did not get updated after a CFG edit.
+    - Each phi's incoming block ids must actually appear in the block's
+      predecessor list; a stale id left behind by edge redirection or
+      block removal is reported.
     - Blocks with fewer than two predecessors must contain zero phis;
       such phis are semantically degenerate (their value would always
       equal a single incoming operand) and indicate the SSA builder
       failed to clean up after a block merge or single-edge
       simplification.
-    The inner loop terminates as soon as a non-phi follows any seen
-    phi, which both saves work and enforces the "phis must be at block
-    start" canonical-SSA placement rule.
     @End Implementation
 
     @Performance_Hints
@@ -764,40 +841,61 @@ Process called "verify_phi_nodes" that takes context_ptr as Integer, cfg as Inte
         Return 0
     End If
 
-    Note: Get all blocks
-    Let block_count be proc get_block_count from CFG with cfg
+    Note: Get all blocks (canonical block storage: pointers, borrowed)
+    Let blocks be proc get_mir_cfg_blocks from CFG with cfg
+    Let block_count be proc get_cfg_block_count from CFG with cfg
 
     Let i be 0
     While i is less than block_count:
-        Let block be proc get_block from CFG with cfg, i
-        Let predecessors be proc get_block_predecessors from CFG with block
-        Let pred_count be proc length from List with predecessors
+        Let block be proc get from List with blocks, i
+        Let predecessors be proc get_block_predecessors from MIR with block
+        Let pred_count be 0
+        If predecessors is not equal to 0:
+            Set pred_count to proc length from List with predecessors
+        End If
 
         Note: Get block instructions
-        Let instructions be proc get_block_instructions from CFG with block
+        Let instructions be proc get_block_instructions from MIR with block
         Let inst_count be proc length from List with instructions
 
-        Note: Count phi nodes in this block
+        Note: Walk all instructions, tracking the leading phi region
         Let phi_count be 0
+        Let in_phi_region be 1
         Let j be 0
         While j is less than inst_count:
             Let inst be proc get from List with instructions, j
-            Let opcode be proc get_instruction_opcode from MIRNodes with inst
+            Let opcode be proc get_mir_node_opcode from MIR with inst
 
             If opcode is equal to 20300:  Note: MIR_PHI
                 Set phi_count to phi_count plus 1
 
-                Note: Verify phi operand count matches predecessor count
-                Let phi_operand_count be proc get_phi_operand_count from MIRNodes with inst
-                If phi_operand_count is not equal to pred_count:
+                Note: Placement: phis must form a contiguous block prefix
+                If in_phi_region is equal to 0:
+                    proc report_error with context_ptr, "verify_phi_nodes: phi not at block start"
+                End If
+
+                Note: Verify phi incoming count matches predecessor count
+                Let phi_incoming_count be proc get_phi_incoming_count from MIRNodes with inst
+                If phi_incoming_count is not equal to pred_count:
                     proc report_error with context_ptr, "verify_phi_nodes: phi operand count mismatch"
                 End If
+
+                Note: Verify every incoming block is a real predecessor
+                Let k be 0
+                While k is less than phi_incoming_count:
+                    Let incoming_block_id be proc get_phi_incoming_block from MIRNodes with inst, k
+                    Let is_real_pred be 0
+                    If predecessors is not equal to 0:
+                        Set is_real_pred to proc contains from List with predecessors, incoming_block_id
+                    End If
+                    If is_real_pred is equal to 0:
+                        proc report_error with context_ptr, "verify_phi_nodes: phi incoming block is not a predecessor"
+                    End If
+                    Set k to k plus 1
+                End While
             Otherwise:
-                Note: Phi nodes must be at block start, no more phis after first non-phi
-                If phi_count is greater than 0:
-                    Note: All phis have been seen, stop checking
-                    Set j to inst_count
-                End If
+                Note: First non-phi instruction closes the phi region
+                Set in_phi_region to 0
             End If
 
             Set j to j plus 1
@@ -825,43 +923,49 @@ Process called "find_defining_block" that takes cfg as Integer, value_id as Inte
     - Check each instruction for value definition
     - Return block when definition is found
 
-    Returns block ID, or 0 if not found.
+    Returns the defining block's ID, or -1 if not found. The -1 sentinel
+    is required because 0 is a VALID block id (the entry block by
+    convention); using 0 as "not found" would misreport every value
+    defined in the entry block.
     @End Reasoning
 
     @Implementation
-    Linear scan over all blocks and instructions, returning the block
-    index as soon as `proc get_instruction_result_value from MIRNodes`
-    matches `value_id`. The block index (not the block pointer) is
-    returned because callers feed it into the dominance-tree query,
-    which keys on integer block ids.
+    Linear scan over all blocks and instructions, returning the block's
+    real id (via CFG.get_mir_basic_block_id) as soon as the instruction's
+    header value_id mirror (MIR.get_mir_node_value_id, which covers phi
+    results) matches `value_id`. The real block ID (never the storage
+    index) is returned because callers feed it into the dominance
+    queries, which key on block ids - ids and storage indices diverge
+    once blocks have been removed or split.
     @End Implementation
 
     @Performance_Hints
     O(total_instructions) per call. `verify_dominance_property` invokes
     this once per use; both helpers can be replaced with a single
-    precomputed `value_id -> block_index` map for large functions if
+    precomputed `value_id -> block_id` map for large functions if
     the linear cost becomes measurable on profiling.
     @End Performance_Hints
 
     If cfg is equal to 0:
-        Return 0
+        Return negative 1
     End If
 
-    Let block_count be proc get_block_count from CFG with cfg
+    Let blocks be proc get_mir_cfg_blocks from CFG with cfg
+    Let block_count be proc get_cfg_block_count from CFG with cfg
     Let i be 0
     While i is less than block_count:
-        Let block be proc get_block from CFG with cfg, i
-        Let instructions be proc get_block_instructions from CFG with block
+        Let block be proc get from List with blocks, i
+        Let instructions be proc get_block_instructions from MIR with block
         Let inst_count be proc length from List with instructions
 
         Let j be 0
         While j is less than inst_count:
             Let inst be proc get from List with instructions, j
-            Let result_value be proc get_instruction_result_value from MIRNodes with inst
+            Let result_value be proc get_mir_node_value_id from MIR with inst
 
             If result_value is equal to value_id:
-                Note: Found defining block
-                Return i
+                Note: Found defining block - return its real id
+                Return proc get_mir_basic_block_id from CFG with block
             End If
 
             Set j to j plus 1
@@ -870,7 +974,7 @@ Process called "find_defining_block" that takes cfg as Integer, value_id as Inte
         Set i to i plus 1
     End While
 
-    Return 0
+    Return negative 1
 End Process
 
 Process called "find_using_block" that takes cfg as Integer, value_id as Integer, use_index as Integer returns Integer:
@@ -882,51 +986,55 @@ Process called "find_using_block" that takes cfg as Integer, value_id as Integer
     - Check each instruction for value use
     - Return block when use is found
 
-    Returns block ID, or 0 if not found.
+    Returns the using block's ID, or -1 if not found (-1 because 0 is
+    the valid entry-block id).
     @End Reasoning
 
     @Implementation
-    Linear scan that examines every operand of every instruction via
-    `proc get_instruction_operand from MIRNodes`. Returns the first
-    block containing a matching operand. `use_index` is accepted in the
-    signature so future revisions can return the n-th using block when
-    the same value is used in multiple blocks, but the current
-    implementation always returns the first match because dominance
-    failures at the first use imply failure at all subsequent uses on
-    the same path.
+    Linear scan that examines every use of every instruction via
+    CFG.get_instruction_used_values, which enumerates header operand
+    slots for regular instructions and incoming-pair values for phis -
+    so phi uses are found too. Returns the first block (by real block
+    id, via CFG.get_mir_basic_block_id) containing a matching use.
+    `use_index` is accepted in the signature so future revisions can
+    return the n-th using block when the same value is used in multiple
+    blocks, but the current implementation always returns the first
+    match because dominance failures at the first use imply failure at
+    all subsequent uses on the same path.
     @End Implementation
 
     @Performance_Hints
-    O(total_instructions * avg_operand_count) per call. Same upgrade
-    path as `find_defining_block` applies: precompute a `value_id -> [block_indices]`
+    O(total_instructions * avg_operand_count) per call plus one List
+    allocation per instruction probed. Same upgrade path as
+    `find_defining_block` applies: precompute a `value_id -> [block_ids]`
     map to amortise across all uses of a value.
     @End Performance_Hints
 
     If cfg is equal to 0:
-        Return 0
+        Return negative 1
     End If
 
-    Let block_count be proc get_block_count from CFG with cfg
+    Let blocks be proc get_mir_cfg_blocks from CFG with cfg
+    Let block_count be proc get_cfg_block_count from CFG with cfg
     Let i be 0
     While i is less than block_count:
-        Let block be proc get_block from CFG with cfg, i
-        Let instructions be proc get_block_instructions from CFG with block
+        Let block be proc get from List with blocks, i
+        Let instructions be proc get_block_instructions from MIR with block
         Let inst_count be proc length from List with instructions
 
         Let j be 0
         While j is less than inst_count:
             Let inst be proc get from List with instructions, j
-            Let operand_count be proc get_instruction_operand_count from MIRNodes with inst
 
-            Let k be 0
-            While k is less than operand_count:
-                Let operand be proc get_instruction_operand from MIRNodes with inst, k
-                If operand is equal to value_id:
-                    Note: Found using block
-                    Return i
+            Let used_values be proc get_instruction_used_values from CFG with inst
+            If used_values is not equal to 0:
+                Let uses_match be proc contains from List with used_values, value_id
+                proc destroy from List with used_values
+                If uses_match is equal to 1:
+                    Note: Found using block - return its real id
+                    Return proc get_mir_basic_block_id from CFG with block
                 End If
-                Set k to k plus 1
-            End While
+            End If
 
             Set j to j plus 1
         End While
@@ -934,7 +1042,7 @@ Process called "find_using_block" that takes cfg as Integer, value_id as Integer
         Set i to i plus 1
     End While
 
-    Return 0
+    Return negative 1
 End Process
 
 Note: ============================================================================
@@ -1004,7 +1112,8 @@ Process called "verify_cfg_structure" that takes context_ptr as Integer, cfg as 
     Note: Check if any errors were found
     Let error_count be proc get_error_count with context_ptr
     If error_count is greater than 0:
-        Display "verify_cfg_structure: found " joined with error_count joined with " CFG errors"
+        Let error_count_str be proc integer_to_string from StringUtils with error_count
+        Display "verify_cfg_structure: found " joined with error_count_str joined with " CFG errors"
         Return 0
     End If
 
@@ -1049,8 +1158,11 @@ Process called "verify_entry_block" that takes context_ptr as Integer, cfg as In
     End If
 
     Note: Verify entry block has no predecessors
-    Let predecessors be proc get_block_predecessors from CFG with entry_block
-    Let pred_count be proc length from List with predecessors
+    Let predecessors be proc get_block_predecessors from MIR with entry_block
+    Let pred_count be 0
+    If predecessors is not equal to 0:
+        Set pred_count to proc length from List with predecessors
+    End If
     If pred_count is greater than 0:
         proc report_warning with context_ptr, "verify_entry_block: entry block has predecessors"
     End If
@@ -1062,11 +1174,13 @@ Process called "verify_block_terminators" that takes context_ptr as Integer, cfg
     @Reasoning
     Verifies that each block ends with exactly one terminator instruction.
 
-    **TERMINATOR INSTRUCTIONS:**
-    - MIR_BRANCH (20302) - conditional branch
-    - MIR_JUMP (20303) - unconditional jump
-    - MIR_RETURN (20310) - function return
-    - MIR_THROW (20311) - exception throw
+    **TERMINATOR INSTRUCTIONS (canonical opcode constants, mir.runa):**
+    - MIR_BRANCH (20301) - conditional branch
+    - MIR_JUMP (20302) - unconditional jump
+    - MIR_RETURN (20303) - function return
+    - MIR_SWITCH (20306) - multi-way branch
+    - plus the exception-flow terminators recognized by the canonical
+      MIR.is_terminator predicate (INVOKE, THROW, RESUME, UNWIND)
 
     **REQUIREMENTS:**
     - Each block must have exactly one terminator
@@ -1075,11 +1189,13 @@ Process called "verify_block_terminators" that takes context_ptr as Integer, cfg
     @End Reasoning
 
     @Implementation
-    For each block, two checks run.
+    For each block, two checks run, both delegated to the canonical
+    MIR.is_terminator predicate (OD-7 as-built: takes the instruction
+    POINTER and reads the genuine opcode at header offset 0), so the
+    terminator set tracked here can never drift from the contract's.
 
     First, the block must contain at least one instruction and its last
-    instruction must be one of {MIR_BRANCH=20302, MIR_JUMP=20303,
-    MIR_RETURN=20310, MIR_THROW=20311}. An empty block has no successor
+    instruction must be a terminator. An empty block has no successor
     edge and is treated as a hard error because the CFG cannot reach
     subsequent blocks from it.
 
@@ -1087,7 +1203,7 @@ Process called "verify_block_terminators" that takes context_ptr as Integer, cfg
     NOT be terminators. A terminator in the middle of a block means
     the block was never properly split; emitting code from that block
     would produce dead code after the terminator and likely a verifier
-    cascade. Each in-prefix terminator opcode is reported separately so
+    cascade. Each in-prefix terminator is reported separately so
     the developer can locate every offending instruction.
     @End Implementation
 
@@ -1103,11 +1219,12 @@ Process called "verify_block_terminators" that takes context_ptr as Integer, cfg
         Return 0
     End If
 
-    Let block_count be proc get_block_count from CFG with cfg
+    Let blocks be proc get_mir_cfg_blocks from CFG with cfg
+    Let block_count be proc get_cfg_block_count from CFG with cfg
     Let i be 0
     While i is less than block_count:
-        Let block be proc get_block from CFG with cfg, i
-        Let instructions be proc get_block_instructions from CFG with block
+        Let block be proc get from List with blocks, i
+        Let instructions be proc get_block_instructions from MIR with block
         Let inst_count be proc length from List with instructions
 
         If inst_count is equal to 0:
@@ -1116,25 +1233,12 @@ Process called "verify_block_terminators" that takes context_ptr as Integer, cfg
             Continue
         End If
 
-        Note: Check last instruction is a terminator
+        Note: Check last instruction is a terminator (canonical pointer-based
+        Note: predicate, OD-7: reads the genuine opcode at header offset 0)
         Let last_inst be proc get from List with instructions, inst_count minus 1
-        Let last_opcode be proc get_instruction_opcode from MIRNodes with last_inst
+        Let last_is_terminator be proc is_terminator from MIR with last_inst
 
-        Let is_terminator be 0
-        If last_opcode is equal to 20302:  Note: MIR_BRANCH
-            Set is_terminator to 1
-        End If
-        If last_opcode is equal to 20303:  Note: MIR_JUMP
-            Set is_terminator to 1
-        End If
-        If last_opcode is equal to 20310:  Note: MIR_RETURN
-            Set is_terminator to 1
-        End If
-        If last_opcode is equal to 20311:  Note: MIR_THROW
-            Set is_terminator to 1
-        End If
-
-        If is_terminator is equal to 0:
+        If last_is_terminator is equal to 0:
             proc report_error with context_ptr, "verify_block_terminators: block does not end with terminator"
         End If
 
@@ -1142,18 +1246,9 @@ Process called "verify_block_terminators" that takes context_ptr as Integer, cfg
         Let j be 0
         While j is less than inst_count minus 1:
             Let inst be proc get from List with instructions, j
-            Let opcode be proc get_instruction_opcode from MIRNodes with inst
+            Let mid_is_terminator be proc is_terminator from MIR with inst
 
-            If opcode is equal to 20302:  Note: MIR_BRANCH
-                proc report_error with context_ptr, "verify_block_terminators: terminator before end of block"
-            End If
-            If opcode is equal to 20303:  Note: MIR_JUMP
-                proc report_error with context_ptr, "verify_block_terminators: terminator before end of block"
-            End If
-            If opcode is equal to 20310:  Note: MIR_RETURN
-                proc report_error with context_ptr, "verify_block_terminators: terminator before end of block"
-            End If
-            If opcode is equal to 20311:  Note: MIR_THROW
+            If mid_is_terminator is equal to 1:
                 proc report_error with context_ptr, "verify_block_terminators: terminator before end of block"
             End If
 
@@ -1179,15 +1274,19 @@ Process called "verify_edge_consistency" that takes context_ptr as Integer, cfg 
 
     @Implementation
     For each block, walks the successor list (from
-    `proc get_block_successors from CFG`) and checks each successor's
-    block id is in `[0, block_count)`. Two distinct errors are emitted
-    (negative id vs out-of-bounds id) so the developer can distinguish
-    a corrupted/uninitialised list entry from a stale id left behind
-    by block removal.
+    `proc get_block_successors from MIR`) and checks each successor id.
+    Negative ids are flagged as corrupted/uninitialised entries. For
+    non-negative ids the check resolves the id through
+    CFG.get_block_by_id rather than comparing against block_count:
+    block ids are allocated monotonically and survive block removal, so
+    a perfectly valid id can exceed the current block count while a
+    stale id below the count can reference a removed block - existence
+    in the CFG is the truthful criterion.
     @End Implementation
 
     @Performance_Hints
-    O(total_edges). Pure integer comparisons; no list mutations.
+    O(total_edges * blocks) because get_block_by_id is a linear search.
+    No list mutations.
     @End Performance_Hints
 
     If context_ptr is equal to 0:
@@ -1197,24 +1296,30 @@ Process called "verify_edge_consistency" that takes context_ptr as Integer, cfg 
         Return 0
     End If
 
-    Let block_count be proc get_block_count from CFG with cfg
+    Let blocks be proc get_mir_cfg_blocks from CFG with cfg
+    Let block_count be proc get_cfg_block_count from CFG with cfg
     Let i be 0
     While i is less than block_count:
-        Let block be proc get_block from CFG with cfg, i
-        Let successors be proc get_block_successors from CFG with block
-        Let succ_count be proc length from List with successors
+        Let block be proc get from List with blocks, i
+        Let successors be proc get_block_successors from MIR with block
+        Let succ_count be 0
+        If successors is not equal to 0:
+            Set succ_count to proc length from List with successors
+        End If
 
         Note: Verify each successor is a valid block
         Let j be 0
         While j is less than succ_count:
             Let succ_block_id be proc get from List with successors, j
 
-            Note: Check block ID is within bounds
             If succ_block_id is less than 0:
                 proc report_error with context_ptr, "verify_edge_consistency: invalid successor block ID"
-            End If
-            If succ_block_id is greater than or equal to block_count:
-                proc report_error with context_ptr, "verify_edge_consistency: successor block ID out of bounds"
+            Otherwise:
+                Note: The id must resolve to a live block in this CFG
+                Let succ_block be proc get_block_by_id from CFG with cfg, succ_block_id
+                If succ_block is equal to 0:
+                    proc report_error with context_ptr, "verify_edge_consistency: successor references nonexistent block"
+                End If
             End If
 
             Set j to j plus 1
@@ -1279,11 +1384,13 @@ Process called "verify_block_reachability" that takes context_ptr as Integer, cf
     Let visited be proc memory_get_int64 from Layout with context_ptr, 64
     proc clear from List with visited
 
-    Note: Perform DFS from entry
-    proc dfs_mark_reachable with cfg, entry_block, visited
+    Note: Perform DFS from entry (dfs_mark_reachable keys on block IDs,
+    Note: so the entry block POINTER must be converted to its id first)
+    Let entry_block_id be proc get_mir_basic_block_id from CFG with entry_block
+    proc dfs_mark_reachable with cfg, entry_block_id, visited
 
     Note: Check all blocks were visited
-    Let block_count be proc get_block_count from CFG with cfg
+    Let block_count be proc get_cfg_block_count from CFG with cfg
     Let visited_count be proc length from List with visited
 
     If visited_count is less than block_count:
@@ -1342,10 +1449,17 @@ Process called "dfs_mark_reachable" that takes cfg as Integer, block_id as Integ
     Note: Mark as visited
     proc append from List with visited, block_id
 
-    Note: Get successors and recursively visit
-    Let block be proc get_block from CFG with cfg, block_id
-    Let successors be proc get_block_successors from CFG with block
-    Let succ_count be proc length from List with successors
+    Note: Get successors and recursively visit (block_id is a real id,
+    Note: so resolve through the id-keyed lookup, not storage indexing)
+    Let block be proc get_block_by_id from CFG with cfg, block_id
+    If block is equal to 0:
+        Return 0
+    End If
+    Let successors be proc get_block_successors from MIR with block
+    Let succ_count be 0
+    If successors is not equal to 0:
+        Set succ_count to proc length from List with successors
+    End If
 
     Set i to 0
     While i is less than succ_count:
@@ -1393,34 +1507,46 @@ Process called "verify_predecessor_successor_consistency" that takes context_ptr
         Return 0
     End If
 
-    Let block_count be proc get_block_count from CFG with cfg
+    Let blocks be proc get_mir_cfg_blocks from CFG with cfg
+    Let block_count be proc get_cfg_block_count from CFG with cfg
     Let i be 0
     While i is less than block_count:
-        Let block be proc get_block from CFG with cfg, i
-        Let successors be proc get_block_successors from CFG with block
-        Let succ_count be proc length from List with successors
+        Let block be proc get from List with blocks, i
+        Let block_id be proc get_mir_basic_block_id from CFG with block
+        Let successors be proc get_block_successors from MIR with block
+        Let succ_count be 0
+        If successors is not equal to 0:
+            Set succ_count to proc length from List with successors
+        End If
 
         Note: For each successor, verify it lists this block as predecessor
         Let j be 0
         While j is less than succ_count:
             Let succ_id be proc get from List with successors, j
-            Let succ_block be proc get_block from CFG with cfg, succ_id
-            Let succ_preds be proc get_block_predecessors from CFG with succ_block
+            Let succ_block be proc get_block_by_id from CFG with cfg, succ_id
 
-            Note: Check if current block is in successor's predecessor list
-            Let found be 0
-            Let k be 0
-            Let pred_count be proc length from List with succ_preds
-            While k is less than pred_count:
-                Let pred_id be proc get from List with succ_preds, k
-                If pred_id is equal to i:
-                    Set found to 1
+            If succ_block is not equal to 0:
+                Let succ_preds be proc get_block_predecessors from MIR with succ_block
+
+                Note: Check the current block's REAL id (not its storage
+                Note: index) is in the successor's predecessor list
+                Let found be 0
+                Let pred_count be 0
+                If succ_preds is not equal to 0:
+                    Set pred_count to proc length from List with succ_preds
                 End If
-                Set k to k plus 1
-            End While
+                Let k be 0
+                While k is less than pred_count:
+                    Let pred_id be proc get from List with succ_preds, k
+                    If pred_id is equal to block_id:
+                        Set found to 1
+                    End If
+                    Set k to k plus 1
+                End While
 
-            If found is equal to 0:
-                proc report_error with context_ptr, "verify_predecessor_successor_consistency: inconsistent edges"
+                If found is equal to 0:
+                    proc report_error with context_ptr, "verify_predecessor_successor_consistency: inconsistent edges"
+                End If
             End If
 
             Set j to j plus 1
@@ -1480,11 +1606,12 @@ Process called "verify_instructions" that takes context_ptr as Integer, cfg as I
 
     Display "verify_instructions: starting instruction validation"
 
-    Let block_count be proc get_block_count from CFG with cfg
+    Let blocks be proc get_mir_cfg_blocks from CFG with cfg
+    Let block_count be proc get_cfg_block_count from CFG with cfg
     Let i be 0
     While i is less than block_count:
-        Let block be proc get_block from CFG with cfg, i
-        Let instructions be proc get_block_instructions from CFG with block
+        Let block be proc get from List with blocks, i
+        Let instructions be proc get_block_instructions from MIR with block
         Let inst_count be proc length from List with instructions
 
         Let j be 0
@@ -1505,7 +1632,8 @@ Process called "verify_instructions" that takes context_ptr as Integer, cfg as I
 
     Let error_count be proc get_error_count with context_ptr
     If error_count is greater than 0:
-        Display "verify_instructions: found " joined with error_count joined with " instruction errors"
+        Let error_count_str be proc integer_to_string from StringUtils with error_count
+        Display "verify_instructions: found " joined with error_count_str joined with " instruction errors"
         Return 0
     End If
 
@@ -1517,23 +1645,28 @@ Process called "verify_instruction_opcode" that takes context_ptr as Integer, in
     @Reasoning
     Verifies that instruction opcode is valid.
 
-    **VALID OPCODE RANGES:**
-    - 20000-20099: Arithmetic operations
+    **VALID OPCODE RANGES (canonical bands, mir.runa:58-164):**
+    - 20000-20099: Arithmetic operations (incl. CONST and COPY)
     - 20100-20199: Comparison operations
     - 20200-20299: Memory operations
     - 20300-20399: Control flow operations
-    - 20400-20499: Type operations
+    - 20400-20499: Type/cast operations
+    - 20500-20599: Atomic operations
+    - 20600-20699: Vector/SIMD operations
+    - 20700-20799: Exception handling operations
+    - 20800-20899: Debug information operations
 
     Any opcode outside these ranges is invalid.
     @End Reasoning
 
     @Implementation
-    Reads the opcode via `proc get_instruction_opcode from MIRNodes`
-    and tests membership against the five canonical MIR opcode ranges
-    by independent range checks. The implementation deliberately uses
-    separate `If` blocks (not a chained switch) so the same code path
-    holds even if a future family is added at a higher range; new
-    families need only an additional independent range check.
+    Reads the opcode via `proc get_mir_node_opcode from MIR` (the
+    canonical header reader) and tests membership against the nine
+    canonical MIR opcode bands by independent range checks. The
+    implementation deliberately uses separate `If` blocks (not a
+    chained switch) so the same code path holds even if a future
+    family is added at a higher range; new families need only an
+    additional independent range check.
     @End Implementation
 
     If context_ptr is equal to 0:
@@ -1543,7 +1676,7 @@ Process called "verify_instruction_opcode" that takes context_ptr as Integer, in
         Return 0
     End If
 
-    Let opcode be proc get_instruction_opcode from MIRNodes with inst
+    Let opcode be proc get_mir_node_opcode from MIR with inst
 
     Note: Check if opcode is in valid range
     Let valid be 0
@@ -1583,6 +1716,34 @@ Process called "verify_instruction_opcode" that takes context_ptr as Integer, in
         End If
     End If
 
+    Note: Atomic operations (20500-20599)
+    If opcode is greater than or equal to 20500:
+        If opcode is less than 20600:
+            Set valid to 1
+        End If
+    End If
+
+    Note: Vector/SIMD operations (20600-20699)
+    If opcode is greater than or equal to 20600:
+        If opcode is less than 20700:
+            Set valid to 1
+        End If
+    End If
+
+    Note: Exception handling operations (20700-20799)
+    If opcode is greater than or equal to 20700:
+        If opcode is less than 20800:
+            Set valid to 1
+        End If
+    End If
+
+    Note: Debug information operations (20800-20899)
+    If opcode is greater than or equal to 20800:
+        If opcode is less than 20900:
+            Set valid to 1
+        End If
+    End If
+
     If valid is equal to 0:
         proc report_error with context_ptr, "verify_instruction_opcode: invalid opcode"
     End If
@@ -1609,17 +1770,26 @@ Process called "verify_instruction_operands" that takes context_ptr as Integer, 
     @End Reasoning
 
     @Implementation
-    Reads opcode and operand count once, then applies a series of
-    independent shape checks. Each opcode family that has a fixed
-    arity emits a precise error message naming the expected count.
-    Binary arithmetic (20002-20012) requires 2 operands; the unary
-    operations NEG (20007) and NOT (20013) require 1; comparisons
-    (20100-20105) require 2; LOAD (20201) requires 1; STORE (20202)
-    requires 2; BRANCH (20302) requires 1 (the condition). Note that
-    NEG appears in the binary range; the binary-arithmetic test fires
-    a false positive that the unary test then re-reports under the
-    correct shape, which surfaces NEG-shaped instructions that were
-    constructed in error.
+    Reads opcode (canonical header reader) and operand count (count of
+    non-zero header operand slots via MIR.get_instruction_operand_count)
+    once, then applies a series of independent shape checks against the
+    CANONICAL opcode constants from mir.runa:
+    - Binary arithmetic ADD..MOD (20002-20006) and the bitwise/shift
+      band AND..SAR (20010-20016) excluding the unary NOT (20013):
+      exactly 2 operands.
+    - Unary NEG (20007) and NOT (20013): exactly 1 operand.
+    - COPY (20008, OD-5): exactly 1 operand (the source value id).
+    - Comparisons EQ..GE (20100-20105): exactly 2 operands.
+    - LOAD (20200): exactly 1 operand (the address). STORE (20201):
+      exactly 2 (address + value).
+    - PHI (20300): ZERO header operands - a phi's uses live exclusively
+      in its incoming-pairs List, so any non-zero header slot indicates
+      a corrupted record.
+    - BRANCH (20301): exactly 1 (the condition). JUMP (20302): zero
+      (the target is a block id in the extended record, never a value
+      use). RETURN (20303): at most 1 (void returns carry none).
+    Each violation emits a precise error message naming the expected
+    count.
     @End Implementation
 
     If context_ptr is equal to 0:
@@ -1629,31 +1799,49 @@ Process called "verify_instruction_operands" that takes context_ptr as Integer, 
         Return 0
     End If
 
-    Let opcode be proc get_instruction_opcode from MIRNodes with inst
-    Let operand_count be proc get_instruction_operand_count from MIRNodes with inst
+    Let opcode be proc get_mir_node_opcode from MIR with inst
+    Let operand_count be proc get_instruction_operand_count from MIR with inst
 
-    Note: Binary arithmetic operations (20002-20012)
+    Note: Binary arithmetic ADD..MOD (20002-20006)
     If opcode is greater than or equal to 20002:
-        If opcode is less than or equal to 20012:
+        If opcode is less than or equal to 20006:
             If operand_count is not equal to 2:
                 proc report_error with context_ptr, "verify_instruction_operands: binary op requires 2 operands"
             End If
         End If
     End If
 
-    Note: Unary operations (20007, 20013)
-    If opcode is equal to 20007:  Note: NEG
+    Note: Bitwise/shift band AND..SAR (20010-20016), excluding unary NOT
+    If opcode is greater than or equal to 20010:
+        If opcode is less than or equal to 20016:
+            If opcode is not equal to 20013:
+                If operand_count is not equal to 2:
+                    proc report_error with context_ptr, "verify_instruction_operands: binary op requires 2 operands"
+                End If
+            End If
+        End If
+    End If
+
+    Note: Unary operations NEG (20007) and NOT (20013)
+    If opcode is equal to 20007:
         If operand_count is not equal to 1:
             proc report_error with context_ptr, "verify_instruction_operands: unary op requires 1 operand"
         End If
     End If
-    If opcode is equal to 20013:  Note: NOT
+    If opcode is equal to 20013:
         If operand_count is not equal to 1:
             proc report_error with context_ptr, "verify_instruction_operands: unary op requires 1 operand"
         End If
     End If
 
-    Note: Comparison operations (20100-20105)
+    Note: COPY (20008): one source operand
+    If opcode is equal to 20008:
+        If operand_count is not equal to 1:
+            proc report_error with context_ptr, "verify_instruction_operands: copy requires 1 operand"
+        End If
+    End If
+
+    Note: Comparison operations EQ..GE (20100-20105)
     If opcode is greater than or equal to 20100:
         If opcode is less than or equal to 20105:
             If operand_count is not equal to 2:
@@ -1662,22 +1850,43 @@ Process called "verify_instruction_operands" that takes context_ptr as Integer, 
         End If
     End If
 
-    Note: Load/Store operations
-    If opcode is equal to 20201:  Note: LOAD
+    Note: Load/Store operations (canonical: LOAD=20200, STORE=20201)
+    If opcode is equal to 20200:
         If operand_count is not equal to 1:
             proc report_error with context_ptr, "verify_instruction_operands: load requires 1 operand"
         End If
     End If
-    If opcode is equal to 20202:  Note: STORE
+    If opcode is equal to 20201:
         If operand_count is not equal to 2:
             proc report_error with context_ptr, "verify_instruction_operands: store requires 2 operands"
         End If
     End If
 
-    Note: Branch operation
-    If opcode is equal to 20302:  Note: BRANCH
+    Note: PHI (20300): uses live only in the incoming-pairs List
+    If opcode is equal to 20300:
+        If operand_count is not equal to 0:
+            proc report_error with context_ptr, "verify_instruction_operands: phi must have no header operands"
+        End If
+    End If
+
+    Note: BRANCH (20301): exactly the condition operand
+    If opcode is equal to 20301:
         If operand_count is not equal to 1:
             proc report_error with context_ptr, "verify_instruction_operands: branch requires 1 operand"
+        End If
+    End If
+
+    Note: JUMP (20302): target is a block id, never a value operand
+    If opcode is equal to 20302:
+        If operand_count is not equal to 0:
+            proc report_error with context_ptr, "verify_instruction_operands: jump takes no operands"
+        End If
+    End If
+
+    Note: RETURN (20303): zero (void) or one returned value
+    If opcode is equal to 20303:
+        If operand_count is greater than 1:
+            proc report_error with context_ptr, "verify_instruction_operands: return takes at most 1 operand"
         End If
     End If
 
@@ -1716,30 +1925,34 @@ Process called "verify_types" that takes context_ptr as Integer, cfg as Integer 
     @End Reasoning
 
     @Implementation
-    Walks every instruction. The dispatch is by opcode family:
-    - Phi (20300): delegated to `verify_phi_type_consistency` for the
-      full type-equality check across incoming values; the outer loop
-      continues to the next instruction afterwards.
-    - Binary arithmetic (20100-20120) and comparisons (20200-20220):
-      both operands and the result type slot (offset 40) must be
-      populated. Missing type info is reported because downstream
-      passes (register allocation, instruction selection) cannot
-      lower a typeless arithmetic instruction.
-    - Load (20400) / Store (20401): the pointer operand (and value
-      operand for stores) at offsets 16/24 must be non-zero, and
-      loads must additionally carry a result type for the loaded
-      value.
-    - Call (20500): the function operand at offset 16 must be present.
-      If the call has a result value (offset 8 non-zero) it must
-      carry a return type (offset 40). Every argument id in the
-      arguments list (offset 24) must be non-zero. Argument count is
-      read from offset 32.
-    - Return (20502): the return value is read from offset 16; the
-      function-signature compatibility check is left to the
-      function-level pass that owns the signature context.
+    Walks every instruction. The dispatch is by CANONICAL opcode family
+    (constants from mir.runa):
+    - Phi (MIR_PHI 20300): delegated to `verify_phi_type_consistency`
+      for the full type-equality check across incoming values; the
+      outer loop continues to the next instruction afterwards.
+    - Binary arithmetic 20002-20006, bitwise/shift 20010-20016, unary
+      NEG 20007, and comparisons 20100-20105: the result type slot
+      (header offset 40) must be populated when the operands are.
+      Missing type info is reported because downstream passes
+      (register allocation, instruction selection) cannot lower a
+      typeless arithmetic instruction. MIR_COPY (20008) is exempt by
+      OD-5: a copy is type-transparent and carries type 0 by design.
+    - Load (MIR_LOAD 20200): the address operand (header operand1) must
+      be non-zero and the node must carry a result type. Store
+      (MIR_STORE 20201): both header operands (address, value) must be
+      non-zero.
+    - Call (MIR_CALL 20304 / MIR_CALL_INDIRECT 20305): the callee
+      (MIRNodes.get_call_callee, extended offset 80) must be present.
+      If the call has a result value (header value_id non-zero) it must
+      carry a return type (MIRNodes.get_call_return_type, extended
+      offset 104). Every argument id in the arguments List
+      (get_call_arguments / get_call_argument_count) must be non-zero.
+    - Return (MIR_RETURN 20303): the function-signature compatibility
+      check is left to the function-level pass that owns the signature
+      context; no local rule fires here.
 
-    For all non-phi cases the type-info field at offset 40 is read
-    once at the top of the loop and reused across the per-family
+    For the arithmetic and comparison families the type-info field at
+    header offset 40 is read once and reused across the per-family
     blocks.
     @End Implementation
 
@@ -1759,11 +1972,12 @@ Process called "verify_types" that takes context_ptr as Integer, cfg as Integer 
 
     Display "verify_types: starting comprehensive type validation"
 
-    Let block_count be proc get_block_count from CFG with cfg
+    Let blocks be proc get_mir_cfg_blocks from CFG with cfg
+    Let block_count be proc get_cfg_block_count from CFG with cfg
     Let i be 0
     While i is less than block_count:
-        Let block be proc get_block from CFG with cfg, i
-        Let instructions be proc get_block_instructions from CFG with block
+        Let block be proc get from List with blocks, i
+        Let instructions be proc get_block_instructions from MIR with block
         Let inst_count be proc length from List with instructions
 
         Let j be 0
@@ -1774,7 +1988,7 @@ Process called "verify_types" that takes context_ptr as Integer, cfg as Integer 
                 Continue
             End If
 
-            Let opcode be proc get_instruction_opcode from MIRNodes with inst
+            Let opcode be proc get_mir_node_opcode from MIR with inst
 
             Note: Verify phi node type consistency
             If opcode is equal to 20300:  Note: MIR_PHI
@@ -1783,44 +1997,50 @@ Process called "verify_types" that takes context_ptr as Integer, cfg as Integer 
                 Continue
             End If
 
-            Note: Get instruction type info (offset 40 in MIRNode)
+            Note: Get instruction type info (header offset 40)
             Let inst_type be proc memory_get_int64 from Layout with inst, 40
 
-            Note: Verify binary arithmetic operations (ADD, SUB, MUL, DIV, etc.)
-            If opcode is greater than or equal to 20100 and opcode is less than or equal to 20120:
-                Note: Get operands (offset 16 and 24 in MIRNode)
-                Let op1 be proc memory_get_int64 from Layout with inst, 16
-                Let op2 be proc memory_get_int64 from Layout with inst, 24
-
-                If op1 is not equal to 0 and op2 is not equal to 0:
-                    Note: For arithmetic ops, both operands must have numeric type
-                    Note: Type checking  compare type IDs here
-                    Note: Since type metadata may not always be available, we perform structural validation
+            Note: Arithmetic families requiring type info: ADD..MOD
+            Note: (20002-20006), NEG (20007), AND..SAR (20010-20016).
+            Note: COPY (20008) is exempt - type-transparent per OD-5.
+            Let needs_arith_type be 0
+            If opcode is greater than or equal to 20002:
+                If opcode is less than or equal to 20007:
+                    Set needs_arith_type to 1
+                End If
+            End If
+            If opcode is greater than or equal to 20010:
+                If opcode is less than or equal to 20016:
+                    Set needs_arith_type to 1
+                End If
+            End If
+            If needs_arith_type is equal to 1:
+                Let op1 be proc get_mir_node_operand from MIR with inst, 1
+                If op1 is not equal to 0:
                     If inst_type is equal to 0:
                         proc report_error with context_ptr, "verify_types: binary op missing type information"
                     End If
                 End If
             End If
 
-            Note: Verify comparison operations (EQ, NE, LT, GT, LE, GE)
-            If opcode is greater than or equal to 20200 and opcode is less than or equal to 20220:
-                Note: Get operands
-                Set op1 to proc memory_get_int64 from Layout with inst, 16
-                Set op2 to proc memory_get_int64 from Layout with inst, 24
-
-                If op1 is not equal to 0 and op2 is not equal to 0:
-                    Note: Comparison operands must have compatible types
-                    Note: Result type should be boolean/i1
-                    If inst_type is equal to 0:
-                        proc report_error with context_ptr, "verify_types: comparison missing type information"
+            Note: Comparison operations EQ..GE (20100-20105)
+            If opcode is greater than or equal to 20100:
+                If opcode is less than or equal to 20105:
+                    Let cmp_op1 be proc get_mir_node_operand from MIR with inst, 1
+                    Let cmp_op2 be proc get_mir_node_operand from MIR with inst, 2
+                    If cmp_op1 is not equal to 0:
+                        If cmp_op2 is not equal to 0:
+                            If inst_type is equal to 0:
+                                proc report_error with context_ptr, "verify_types: comparison missing type information"
+                            End If
+                        End If
                     End If
                 End If
             End If
 
-            Note: Verify load operations
-            If opcode is equal to 20400:  Note: MIR_LOAD
-                Note: Load requires pointer operand
-                Let ptr_operand be proc memory_get_int64 from Layout with inst, 16
+            Note: Verify load operations (MIR_LOAD 20200)
+            If opcode is equal to 20200:
+                Let ptr_operand be proc get_mir_node_operand from MIR with inst, 1
                 If ptr_operand is equal to 0:
                     proc report_error with context_ptr, "verify_types: load missing pointer operand"
                 End If
@@ -1829,49 +2049,47 @@ Process called "verify_types" that takes context_ptr as Integer, cfg as Integer 
                 End If
             End If
 
-            Note: Verify store operations
-            If opcode is equal to 20401:  Note: MIR_STORE
-                Note: Store requires pointer and value operands
-                Let value_operand be proc memory_get_int64 from Layout with inst, 16
-                Set ptr_operand to proc memory_get_int64 from Layout with inst, 24
-                If value_operand is equal to 0 or ptr_operand is equal to 0:
+            Note: Verify store operations (MIR_STORE 20201)
+            If opcode is equal to 20201:
+                Let store_address be proc get_mir_node_operand from MIR with inst, 1
+                Let store_value be proc get_mir_node_operand from MIR with inst, 2
+                If store_address is equal to 0 or store_value is equal to 0:
                     proc report_error with context_ptr, "verify_types: store missing operands"
                 End If
             End If
 
-            Note: Verify call operations
-            If opcode is equal to 20500:  Note: MIR_CALL
-                Note: Call requires function pointer operand
-                Let func_operand be proc memory_get_int64 from Layout with inst, 16
-                If func_operand is equal to 0:
+            Note: Verify call operations (MIR_CALL 20304 / MIR_CALL_INDIRECT 20305)
+            Let is_call be 0
+            If opcode is equal to 20304:
+                Set is_call to 1
+            End If
+            If opcode is equal to 20305:
+                Set is_call to 1
+            End If
+            If is_call is equal to 1:
+                Note: Callee from the extended record (canonical accessor)
+                Let callee be proc get_call_callee from MIRNodes with inst
+                If callee is equal to 0:
                     proc report_error with context_ptr, "verify_types: call missing function operand"
                 End If
 
-                Note: Function signature type checking
-                Note: Get return type from MIRCall structure (offset 40)
-                Let return_type be proc memory_get_int64 from Layout with inst, 40
-
-                Note: Get arguments list (offset 24) and argument count (offset 32)
-                Let arguments_list be proc memory_get_int64 from Layout with inst, 24
-                Let argument_count be proc memory_get_int64 from Layout with inst, 32
-
-                Note: Verify return type is not equal to 0 for non-void calls
-                Note: Get result value (offset 8)
-                Let result_value be proc memory_get_int64 from Layout with inst, 8
+                Note: Non-void calls (header value_id set) need a return type
+                Let result_value be proc get_mir_node_value_id from MIR with inst
                 If result_value is not equal to 0:
-                    Note: Non-void call must have return type
+                    Let return_type be proc get_call_return_type from MIRNodes with inst
                     If return_type is equal to 0:
                         proc report_error with context_ptr, "verify_types: call with result has no return type"
                     End If
                 End If
 
-                Note: Verify all arguments have valid types
+                Note: Verify all arguments are present
+                Let arguments_list be proc get_call_arguments from MIRNodes with inst
+                Let argument_count be proc get_call_argument_count from MIRNodes with inst
                 If arguments_list is not equal to 0:
                     Let arg_idx be 0
                     While arg_idx is less than argument_count:
                         Let arg_value_id be proc get from List with arguments_list, arg_idx
 
-                        Note: Verify argument value is not equal to 0
                         If arg_value_id is equal to 0:
                             proc report_error with context_ptr, "verify_types: call has null argument"
                         End If
@@ -1879,13 +2097,6 @@ Process called "verify_types" that takes context_ptr as Integer, cfg as Integer 
                         Set arg_idx to arg_idx plus 1
                     End While
                 End If
-            End If
-
-            Note: Verify return operations have correct type
-            If opcode is equal to 20502:  Note: MIR_RETURN
-                Let return_value be proc memory_get_int64 from Layout with inst, 16
-                Note: If function has return type, verify return value matches
-                Note: This requires function context which we validate separately
             End If
 
             Set j to j plus 1
@@ -1896,7 +2107,8 @@ Process called "verify_types" that takes context_ptr as Integer, cfg as Integer 
 
     Let error_count be proc get_error_count with context_ptr
     If error_count is greater than 0:
-        Display "verify_types: found " joined with error_count joined with " type errors"
+        Let error_count_str be proc integer_to_string from StringUtils with error_count
+        Display "verify_types: found " joined with error_count_str joined with " type errors"
         Return 0
     End If
 
@@ -1913,8 +2125,8 @@ Process called "verify_phi_type_consistency" that takes context_ptr as Integer, 
     All incoming values must have the same type as the phi result.
 
     **VALIDATION ALGORITHM:**
-    1. Get phi result type from MIRPhi structure (offset 32)
-    2. Get incoming value count from MIRPhi (offset 24)
+    1. Get phi result type via MIRNodes.get_phi_result_type
+    2. Get incoming value count via MIRNodes.get_phi_incoming_count
     3. For each incoming value:
        - Get the value ID
        - Look up the defining instruction for that value
@@ -1922,43 +2134,46 @@ Process called "verify_phi_type_consistency" that takes context_ptr as Integer, 
        - Compare with phi result type
     4. Report error if any operand type doesn't match result type
 
-    **MIRPhi STRUCTURE:**
-    - Offset 0: base MIRNode pointer
-    - Offset 8: result_value_id
-    - Offset 16: incoming_pairs list (value_id, block_id pairs)
-    - Offset 24: incoming_count
-    - Offset 32: result_type (HIRTypeInfo pointer)
-    - Offset 40: parent_block
+    **MIRPhiNode STRUCTURE (OD-1 as-built, prefix embedded):**
+    - Offsets 0-71: canonical MIRNode header (value_id at 8 mirrors result)
+    - Offset 72:  result_value_id
+    - Offset 80:  incoming_pairs List (interleaved: block at 2N, value at 2N+1)
+    - Offset 88:  incoming_count
+    - Offset 96:  result_type (HIRTypeInfo pointer)
+    - Offset 104: parent_block
 
     **TYPE COMPARISON:**
     Since we may not always have full HIRTypeInfo metadata, we perform:
     - Structural validation (non-null type pointers)
-    - Type ID equality comparison (when available)
+    - Type pointer equality comparison (when available)
     - Report warnings for missing type info
     @End Reasoning
 
     @Implementation
     1. Confirms the supplied instruction is actually a phi (opcode
        20300); a non-phi here is a routing error in the caller.
-    2. Reads the phi result type from MIRPhi offset 32. A null result
-       type is a hard error because the phi is meant to be the SSA
-       merge point that carries its own type.
-    3. Reads incoming_count from offset 24. An empty phi (count=0) is
-       not an error: the SSA renamer fills in incoming values after
-       the phi is inserted, so a freshly-inserted phi can legitimately
-       be in this state during construction. The routine returns
-       success in this case to avoid noise.
-    4. Reads the `incoming_pairs` list from offset 16. A null list with
-       non-zero count is structurally inconsistent and is reported.
-    5. For each `(value_id, block_id)` pair (offsets 0 and 8 inside
-       each pair) performs:
+    2. Reads the phi result type via MIRNodes.get_phi_result_type
+       (prefix-embedded offset 96). A null result type is a hard error
+       because the phi is meant to be the SSA merge point that carries
+       its own type.
+    3. Reads the incoming count via MIRNodes.get_phi_incoming_count.
+       An empty phi (count=0) is not an error: the SSA renamer fills in
+       incoming values after the phi is inserted, so a freshly-inserted
+       phi can legitimately be in this state during construction. The
+       routine returns success in this case to avoid noise.
+    4. For each incoming pair, read through the canonical
+       MIRNodes.get_phi_incoming_value / get_phi_incoming_block
+       accessors, then:
        - Structural validation: value_id != 0 and block_id != -1.
-       - Type comparison: look up the defining instruction via
-         `proc lookup_defining_instruction from MIR`, read its type
-         from offset 40, and compare against the phi's result type.
-         A mismatch is reported only when both sides have non-null
-         types, so a partially-typed function still produces useful
-         signal without spurious warnings on every typeless operand.
+       - Type comparison: the MIR function being verified is read from
+         the verifier context's current_function slot (offset 32 - NOT
+         offset 0, which is the error list), the defining instruction
+         is located via `proc lookup_defining_instruction from MIR`,
+         its result type is read via MIR.get_instruction_result_type,
+         and compared against the phi's result type. A mismatch is
+         reported only when both sides have non-null types, so a
+         partially-typed function still produces useful signal without
+         spurious warnings on every typeless operand.
     @End Implementation
 
     @Performance_Hints
@@ -1977,73 +2192,63 @@ Process called "verify_phi_type_consistency" that takes context_ptr as Integer, 
     End If
 
     Note: Check if this is actually a phi node
-    Let opcode be proc get_instruction_opcode from MIRNodes with phi_inst
+    Let opcode be proc get_mir_node_opcode from MIR with phi_inst
     If opcode is not equal to 20300:  Note: MIR_PHI
         proc report_error with context_ptr, "verify_phi_type_consistency: not a phi node"
         Return 0
     End If
 
-    Note: Get phi result type (offset 32 in MIRPhi)
-    Let phi_result_type be proc memory_get_int64 from Layout with phi_inst, 32
+    Note: Get phi result type (canonical accessor, prefix-embedded offset 96)
+    Let phi_result_type be proc get_phi_result_type from MIRNodes with phi_inst
     If phi_result_type is equal to 0:
         proc report_error with context_ptr, "verify_phi_type_consistency: phi node missing result type"
         Return 0
     End If
 
-    Note: Get incoming values count (offset 24 in MIRPhi)
-    Let incoming_count be proc memory_get_int64 from Layout with phi_inst, 24
+    Note: Get incoming values count (canonical accessor)
+    Let incoming_count be proc get_phi_incoming_count from MIRNodes with phi_inst
     If incoming_count is equal to 0:
         Note: Phi with no incoming values is suspicious but not necessarily an error
         Note: (might be before SSA renaming fills in values)
         Return 1
     End If
 
-    Note: Get incoming_pairs list (offset 16 in MIRPhi)
-    Let incoming_pairs be proc memory_get_int64 from Layout with phi_inst, 16
-    If incoming_pairs is equal to 0:
-        proc report_error with context_ptr, "verify_phi_type_consistency: phi missing incoming pairs list"
-        Return 0
-    End If
-
-    Note: Get MIR function pointer from context to look up instructions
-    Let mir_function be proc memory_get_int64 from Layout with context_ptr, 0
+    Note: Get MIR function pointer from the context's current_function
+    Note: slot (offset 32) to look up defining instructions
+    Let mir_function be proc memory_get_int64 from Layout with context_ptr, 32
 
     Note: Verify each incoming value has compatible type
     Let i be 0
     While i is less than incoming_count:
-        Note: Get the (value_id, block_id) pair
-        Let pair be proc get from List with incoming_pairs, i
-        If pair is not equal to 0:
-            Note: Get value_id from pair (offset 0)
-            Let value_id be proc memory_get_int64 from Layout with pair, 0
-            Let block_id be proc memory_get_int64 from Layout with pair, 8
+        Note: Decode the (block_id, value_id) pair via canonical accessors
+        Let value_id be proc get_phi_incoming_value from MIRNodes with phi_inst, i
+        Let block_id be proc get_phi_incoming_block from MIRNodes with phi_inst, i
 
-            Note: Structural validation
-            If value_id is equal to 0:
-                proc report_error with context_ptr, "verify_phi_type_consistency: phi has null incoming value"
-            End If
+        Note: Structural validation
+        If value_id is equal to 0:
+            proc report_error with context_ptr, "verify_phi_type_consistency: phi has null incoming value"
+        End If
 
-            If block_id is equal to -1:
-                proc report_error with context_ptr, "verify_phi_type_consistency: phi has invalid incoming block"
-            End If
+        If block_id is equal to -1:
+            proc report_error with context_ptr, "verify_phi_type_consistency: phi has invalid incoming block"
+        End If
 
-            Note: Type checking - look up defining instruction and compare types
-            If mir_function is not equal to 0:
-                If value_id is not equal to 0:
-                    Note: Look up which instruction defines this value
-                    Let defining_inst be proc lookup_defining_instruction from MIR with mir_function, value_id
+        Note: Type checking - look up defining instruction and compare types
+        If mir_function is not equal to 0:
+            If value_id is not equal to 0:
+                Note: Look up which instruction defines this value
+                Let defining_inst be proc lookup_defining_instruction from MIR with mir_function, value_id
 
-                    If defining_inst is not equal to 0:
-                        Note: Get type from defining instruction (offset 40 in MIRNode)
-                        Let incoming_type be proc memory_get_int64 from Layout with defining_inst, 40
+                If defining_inst is not equal to 0:
+                    Note: Get type from defining instruction (header offset 40)
+                    Let incoming_type be proc get_instruction_result_type from MIR with defining_inst
 
-                        Note: Compare with phi result type
-                        If incoming_type is not equal to phi_result_type:
-                            Note: Types don't match - this is a type error
-                            If incoming_type is not equal to 0:
-                                If phi_result_type is not equal to 0:
-                                    proc report_error with context_ptr, "verify_phi_type_consistency: incoming value type does not match phi result type"
-                                End If
+                    Note: Compare with phi result type
+                    If incoming_type is not equal to phi_result_type:
+                        Note: Types don't match - this is a type error
+                        If incoming_type is not equal to 0:
+                            If phi_result_type is not equal to 0:
+                                proc report_error with context_ptr, "verify_phi_type_consistency: incoming value type does not match phi result type"
                             End If
                         End If
                     End If
@@ -2091,7 +2296,7 @@ Process called "verify_mir_function" that takes mir_function as Integer returns 
     Top-level driver for single-function verification. Creates a fresh
     verifier context, writes the MIR function pointer into the context's
     current_function slot (offset 32), extracts the CFG via
-    `proc get_function_cfg from MIRNodes`, and runs the four passes in
+    `proc get_mir_function_cfg from MIR`, and runs the four passes in
     a fixed order: CFG structure -> SSA form -> instructions -> types.
     Pass order matters: SSA form assumes valid CFG block ids; the
     instruction pass assumes valid opcodes and operand counts; the
@@ -2132,8 +2337,8 @@ Process called "verify_mir_function" that takes mir_function as Integer returns 
     Note: Set current function in context
     proc memory_set_int64 from Layout with context, 32, mir_function
 
-    Note: Get CFG from function
-    Let cfg be proc get_function_cfg from MIRNodes with mir_function
+    Note: Get CFG from function (canonical accessor: MIRFunction cfg at offset 8)
+    Let cfg be proc get_mir_function_cfg from MIR with mir_function
     If cfg is equal to 0:
         Display "verify_mir_function: function has no CFG"
         proc destroy_verifier_context with context
@@ -2158,8 +2363,10 @@ Process called "verify_mir_function" that takes mir_function as Integer returns 
     Let warning_count be proc get_warning_count with context
 
     Display "verify_mir_function: verification complete"
-    Display "  Errors: " joined with error_count
-    Display "  Warnings: " joined with warning_count
+    Let error_count_str be proc integer_to_string from StringUtils with error_count
+    Let warning_count_str be proc integer_to_string from StringUtils with warning_count
+    Display "  Errors: " joined with error_count_str
+    Display "  Warnings: " joined with warning_count_str
 
     Note: Cleanup context
     proc destroy_verifier_context with context
@@ -2228,14 +2435,16 @@ Process called "verify_mir_program" that takes mir_program as Integer returns In
     End If
 
     Let func_count be proc length from List with functions
-    Display "verify_mir_program: verifying " joined with func_count joined with " functions"
+    Let func_count_str be proc integer_to_string from StringUtils with func_count
+    Display "verify_mir_program: verifying " joined with func_count_str joined with " functions"
 
     Let total_errors be 0
     Let i be 0
     While i is less than func_count:
         Let func be proc get from List with functions, i
 
-        Display "verify_mir_program: verifying function " joined with i
+        Let func_index_str be proc integer_to_string from StringUtils with i
+        Display "verify_mir_program: verifying function " joined with func_index_str
 
         Note: Verify this function
         Let result be proc verify_mir_function with func
@@ -2247,8 +2456,9 @@ Process called "verify_mir_program" that takes mir_program as Integer returns In
     End While
 
     Display "verify_mir_program: verification complete"
-    Display "  Total functions: " joined with func_count
-    Display "  Failed functions: " joined with total_errors
+    Let total_errors_str be proc integer_to_string from StringUtils with total_errors
+    Display "  Total functions: " joined with func_count_str
+    Display "  Failed functions: " joined with total_errors_str
 
     If total_errors is greater than 0:
         Display "verify_mir_program: program verification FAILED"
@@ -2322,7 +2532,8 @@ Process called "quick_verify_mir" that takes cfg as Integer returns Integer:
     proc destroy_verifier_context with context
 
     If error_count is greater than 0:
-        Display "quick_verify_mir: FAILED with " joined with error_count joined with " errors"
+        Let error_count_str be proc integer_to_string from StringUtils with error_count
+        Display "quick_verify_mir: FAILED with " joined with error_count_str joined with " errors"
         Return 0
     End If
 

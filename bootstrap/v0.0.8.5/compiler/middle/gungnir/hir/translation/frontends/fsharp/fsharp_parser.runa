@@ -803,7 +803,14 @@ AST_LITERAL carrying the START token, then [expression, AST_LITERAL]
 pairs follow for every hole - so the HIR translator can walk children in
 order and distinguish text from expressions by node kind. Empty text
 segments are preserved (an AST_LITERAL whose token lexeme is the empty
-string) so segment positions stay aligned with hole positions.
+string) so segment positions stay aligned with hole positions. A hole's
+format spec - the printf-style specifier written before the hole
+(%d{expr}) or the .NET alignment/format suffix written inside it
+({expr,alignment:format}) - arrives on the segment token FOLLOWING the
+hole (the lexer's spec slot at token offset 40) and is copied onto the
+hole expression's metadata slot (AST node offset 40) so AST consumers
+read formatting from the expression child itself; consumers that do not
+format may ignore it.
 @End Reasoning
 Process called "parse_interpolated_string" takes parser as Integer returns Integer:
     Note: Parse interpolated string into alternating literal/expression children
@@ -833,6 +840,14 @@ Process called "parse_interpolated_string" takes parser as Integer returns Integ
         End If
 
         Set segment_token to proc current_token with parser
+
+        Note: The spec the lexer attached to this segment belongs to the
+        Note: hole expression just parsed
+        Let format_spec be proc get_token_spec from Lexer with segment_token
+        If format_spec is not equal to 0:
+            proc memory_set_int64 from Layout with hole_expr, 40, format_spec
+        End If
+
         Set segment_node to proc create_ast_node with parser, AST_LITERAL
         proc set_node_value with segment_node, segment_token
         proc add_child with node, segment_node
@@ -2312,17 +2327,24 @@ Process called "parse_type_atom" takes parser as Integer returns Integer:
     Return 0
 End Process
 
-Process called "parse_type_expression" takes parser as Integer returns Integer:
-    Note: Parse type expression (names, generics, postfix applications, arrows)
+@Reasoning:
+The postfix-application layer of the type grammar: an atom followed by
+zero or more juxtaposed constructor names (int option, int list, 'a seq,
+int option list). Each juxtaposed name applies to the entire type built
+so far, chaining left-to-right. Split from parse_type_expression so the
+tuple layer (which binds looser than postfix application but tighter
+than the arrow) can parse each star-separated element at exactly this
+precedence: int * string list is int * (string list), per the F#
+specification.
+@End Reasoning
+Process called "parse_type_postfix" takes parser as Integer returns Integer:
+    Note: Parse a type atom with postfix constructor applications
 
     Let left be proc parse_type_atom with parser
     If left is equal to 0:
         Return 0
     End If
 
-    Note: Postfix type-constructor applications: int option, int list,
-    Note: 'a seq, int option list. Each juxtaposed name applies to the
-    Note: entire type built so far, chaining left-to-right.
     Let postfixing be 1
     While postfixing is equal to 1:
         Let current_type be proc current_token_type with parser
@@ -2345,6 +2367,51 @@ Process called "parse_type_expression" takes parser as Integer returns Integer:
         proc add_child with app_node, left
         Set left to app_node
     End While
+
+    Return left
+End Process
+
+@Reasoning:
+Full type-expression grammar in precedence order: postfix applications
+bind tightest (handled by parse_type_postfix), star-separated tuple
+types bind next (int * string * bool becomes one flat AST_TYPE_TUPLE
+whose children are the element types in source order, matching F#'s
+n-ary tuple semantics rather than nested pairs), and the right-
+associative function arrow binds loosest (int * int -> bool is a
+function FROM a tuple; int -> int -> bool chains through the recursive
+call on the result side).
+@End Reasoning
+Process called "parse_type_expression" takes parser as Integer returns Integer:
+    Note: Parse type expression (names, generics, postfix, tuples, arrows)
+
+    Let left be proc parse_type_postfix with parser
+    If left is equal to 0:
+        Return 0
+    End If
+
+    Note: Tuple types: t1 * t2 * t3 collects into one flat tuple node
+    Let current_type be proc current_token_type with parser
+    If current_type is equal to TOKEN_MULTIPLY from Lexer:
+        Let tuple_node be proc create_ast_node with parser, AST_TYPE_TUPLE
+        proc add_child with tuple_node, left
+
+        Let collecting be 1
+        While collecting is equal to 1:
+            Set current_type to proc current_token_type with parser
+            If current_type is equal to TOKEN_MULTIPLY from Lexer:
+                proc advance_token with parser
+                Let element be proc parse_type_postfix with parser
+                If element is equal to 0:
+                    Return 0
+                End If
+                proc add_child with tuple_node, element
+            Otherwise:
+                Set collecting to 0
+            End If
+        End While
+
+        Set left to tuple_node
+    End If
 
     Set current_type to proc current_token_type with parser
     If current_type is equal to TOKEN_ARROW from Lexer:
@@ -2546,6 +2613,33 @@ Process called "parse_let_binding" takes parser as Integer returns Integer:
     If pattern is equal to 0:
         Return 0
     End If
+
+    Note: Unparenthesised tuple-pattern binding: let a, b = ... - F# tuple
+    Note: patterns in let bindings need no parentheses, so a comma after
+    Note: the first pattern collects the remaining components
+    Set current_type to proc current_token_type with parser
+    If current_type is equal to TOKEN_COMMA from Lexer:
+        Let tuple_pattern be proc create_ast_node with parser, AST_PATTERN_TUPLE
+        proc add_child with tuple_pattern, pattern
+
+        Let collecting_components be 1
+        While collecting_components is equal to 1:
+            Set current_type to proc current_token_type with parser
+            If current_type is equal to TOKEN_COMMA from Lexer:
+                proc advance_token with parser  Note: Skip ,
+                Let component be proc parse_pattern with parser
+                If component is equal to 0:
+                    Return 0
+                End If
+                proc add_child with tuple_pattern, component
+            Otherwise:
+                Set collecting_components to 0
+            End If
+        End While
+
+        Set pattern to tuple_pattern
+    End If
+
     proc add_child with binding_node, pattern
 
     Note: Collect curried function parameters until = or : or EOF
@@ -2593,6 +2687,34 @@ Process called "parse_let_binding" takes parser as Integer returns Integer:
     proc skip_newlines with parser
 
     Let expr be proc parse_expression with parser
+
+    Note: Unparenthesised tuple RHS: let a, b = 1, 2 - a comma after the
+    Note: bound expression collects the remaining tuple components, exactly
+    Note: as F# builds a tuple from a top-level comma in a binding body
+    Set current_type to proc current_token_type with parser
+    If current_type is equal to TOKEN_COMMA from Lexer:
+        Let tuple_expr be proc create_ast_node with parser, AST_TUPLE_EXPRESSION
+        proc add_child with tuple_expr, expr
+
+        Let collecting_elements be 1
+        While collecting_elements is equal to 1:
+            Set current_type to proc current_token_type with parser
+            If current_type is equal to TOKEN_COMMA from Lexer:
+                proc advance_token with parser  Note: Skip ,
+                proc skip_newlines with parser
+                Let element be proc parse_expression with parser
+                If element is equal to 0:
+                    Set collecting_elements to 0
+                    Continue
+                End If
+                proc add_child with tuple_expr, element
+            Otherwise:
+                Set collecting_elements to 0
+            End If
+        End While
+
+        Set expr to tuple_expr
+    End If
 
     Note: Function bindings desugar to let name = fun params -> body
     Let param_count be proc list_length from List with params

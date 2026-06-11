@@ -90,6 +90,10 @@ Constant TYPE_FUNCTION as Integer is 7105
 Constant TYPE_RECORD as Integer is 7106
 Constant TYPE_UNION as Integer is 7107
 Constant TYPE_SEQUENCE as Integer is 7108
+Constant TYPE_ARRAY2D as Integer is 7109
+Constant TYPE_ARRAY3D as Integer is 7110
+Constant TYPE_MAP as Integer is 7111
+Constant TYPE_SET as Integer is 7112
 
 Note: Special types
 Constant TYPE_GENERIC as Integer is 7201
@@ -123,15 +127,21 @@ Offsets: symbol_table (0), scope_stack (8), type_env (16),
 constraint_solver (24), module_table (32), error_list (40),
 warning_list (48), measure_system (56).
 
-The constraint solver is a 40-byte record: substitution List indexed by
+The constraint solver is a 48-byte record: substitution List indexed by
 type-variable id (0), next fresh variable id (8), match registry List of
 16-byte [match node, scrutinee type] pairs (16), definitions List of
-32-byte symbol records (24), and the allocation pool List that owns
-every ad-hoc record this analyzer creates (32).
+40-byte symbol records (24), the allocation pool List that owns every
+ad-hoc record this analyzer creates (32), and the env-types List (40) of
+pooled 16-byte [scope depth, bound type] pairs - one per live binding,
+truncated on pop_scope - which generalization scans to determine which
+type variables are bound by the environment.
 
-Symbol records are 32 bytes: bound type (0), is_used flag (8), name
-string (16), is_local flag (24). Composite type records start with the
-type tag at offset 0 followed by tag-specific payload fields.
+Symbol records are 40 bytes: bound type (0), is_used flag (8), name
+string (16), is_local flag (24), and the type-scheme quantifier record
+(32): 0 for monomorphic bindings, otherwise a pooled [count, id...]
+record of the let-generalized type-variable ids that instantiation
+refreshes at every use. Composite type records start with the type tag
+at offset 0 followed by tag-specific payload fields.
 @End Implementation
 
 Type called "FSharpSemanticAnalyzer":
@@ -210,9 +220,9 @@ ownership bookkeeping.
 @End Reasoning
 
 Process called "create_constraint_solver" takes analyzer as Integer returns Integer:
-    Note: Create the unification and registry store (40-byte record)
+    Note: Create the unification and registry store (48-byte record)
 
-    Let solver be proc allocate from Layout with 40
+    Let solver be proc allocate from Layout with 48
     If solver is equal to 0:
         Return 0
     End If
@@ -229,6 +239,9 @@ Process called "create_constraint_solver" takes analyzer as Integer returns Inte
 
     Let alloc_pool be proc list_create from List
     proc memory_set_int64 from Layout with solver, 32, alloc_pool
+
+    Let env_types be proc list_create from List
+    proc memory_set_int64 from Layout with solver, 40, env_types
 
     Return solver
 End Process
@@ -338,6 +351,11 @@ Process called "destroy_fsharp_semantic_analyzer" takes analyzer as Integer retu
             proc list_destroy from List with definitions
         End If
 
+        Let env_types be proc memory_get_int64 from Layout with solver, 40
+        If env_types is not equal to 0:
+            proc list_destroy from List with env_types
+        End If
+
         proc deallocate from Layout with solver
     End If
 
@@ -430,7 +448,427 @@ Process called "setup_fsharp_builtins" takes analyzer as Integer returns Integer
     proc hashtable_set from Dict with type_env, "obj", TYPE_ANY
     proc hashtable_set from Dict with type_env, "exn", TYPE_ANY
 
+    proc setup_dotnet_members with analyzer
+
     Return 1
+End Process
+
+@Reasoning:
+Registers one F# core module's member surface from a compact
+"name:signature;name:signature;..." table. Three key families land in
+the type environment: "netmod:<Module>" marks the module name as known
+(so an unknown member under a KNOWN module is a hard error while an
+unknown module degrades to a warning), and "net:<Module>.<member>" maps
+each member to a pooled copy of its SIGNATURE string - the real
+FSharp.Core type encoded in the prefix notation member_signature_type
+parses (one fresh instantiation per use site). Nested module surfaces
+(Array.Parallel, List.Parallel) register under their full dotted name,
+so dotted member paths of any depth resolve through the same table:
+"net:Array.Parallel.map" is the member key the full identifier spelling
+produces directly. Module name values are always pointers (>= 65536)
+because both keys and values must be distinguishable from the
+hashtable's 0-means-absent.
+
+Signature notation (prefix grammar, one character per constructor):
+  a b c d        type variables (shared within one signature)
+  I F S B U C O D  int, float, string, bool, unit, char, obj/any, decimal
+  > X Y          function X -> Y
+  l X / r X / q X / o X   list / array / seq / option of X
+  2 X / 3 X      two- / three-dimensional array of X
+  E X            set of X
+  M K V          map from K to V
+  R              the built-in Result union (unifies by name)
+  t N X1..XN     tuple of N elements (N a single digit)
+@End Reasoning
+
+Process called "seed_dotnet_module" takes analyzer as Integer, module_name as Integer, members_spec as Integer returns Integer:
+    Note: Register a known .NET module and its member signatures
+
+    Let type_env be proc memory_get_int64 from Layout with analyzer, 16
+
+    Let module_key be proc pool_concat with analyzer, "netmod:", module_name
+    proc hashtable_set from Dict with type_env, module_key, module_key
+
+    Let prefix be proc pool_concat with analyzer, "net:", module_name
+    Set prefix to proc pool_concat with analyzer, prefix, "."
+
+    Let spec_len be proc string_length from StringCore with members_spec
+    Let i be 0
+    While i is less than spec_len:
+        Note: Collect the member name up to the ':' separator
+        Let name_start be i
+        Let scanning_name be 1
+        While scanning_name is equal to 1:
+            If i is greater than or equal to spec_len:
+                Set scanning_name to 0
+                Continue
+            End If
+            Let ch be proc string_char_at from StringCore with members_spec, i
+            If ch is equal to 58:  Note: ':'
+                Set scanning_name to 0
+                Continue
+            End If
+            Set i to i plus 1
+        End While
+
+        Let name_len be i minus name_start
+        If name_len is equal to 0:
+            Set i to i plus 1
+            Continue
+        End If
+
+        Let name_buf be proc pool_allocate with analyzer, name_len plus 1
+        If name_buf is equal to 0:
+            Return 0
+        End If
+        Let c be 0
+        While c is less than name_len:
+            Set ch to proc string_char_at from StringCore with members_spec, name_start plus c
+            proc memory_set_byte from Layout with name_buf, c, ch
+            Set c to c plus 1
+        End While
+        proc memory_set_byte from Layout with name_buf, name_len, 0
+
+        Set i to i plus 1  Note: Skip ':'
+
+        Note: Collect the signature text up to the ';' separator
+        Let sig_start be i
+        Let scanning_sig be 1
+        While scanning_sig is equal to 1:
+            If i is greater than or equal to spec_len:
+                Set scanning_sig to 0
+                Continue
+            End If
+            Set ch to proc string_char_at from StringCore with members_spec, i
+            If ch is equal to 59:  Note: ';'
+                Set scanning_sig to 0
+                Continue
+            End If
+            Set i to i plus 1
+        End While
+
+        Let sig_len be i minus sig_start
+        Let sig_buf be proc pool_allocate with analyzer, sig_len plus 1
+        If sig_buf is equal to 0:
+            Return 0
+        End If
+        Set c to 0
+        While c is less than sig_len:
+            Set ch to proc string_char_at from StringCore with members_spec, sig_start plus c
+            proc memory_set_byte from Layout with sig_buf, c, ch
+            Set c to c plus 1
+        End While
+        proc memory_set_byte from Layout with sig_buf, sig_len, 0
+
+        If i is less than spec_len:
+            Set ch to proc string_char_at from StringCore with members_spec, i
+            If ch is equal to 59:  Note: ';'
+                Set i to i plus 1
+            End If
+        End If
+
+        Let member_key be proc pool_concat with analyzer, prefix, name_buf
+        proc hashtable_set from Dict with type_env, member_key, sig_buf
+    End While
+
+    Return 1
+End Process
+
+@Reasoning:
+Registers the standard exception constructors F# code raises without
+declaration ("netexn:<Name>" keys). They type as one-argument
+constructors (fresh -> exn-compatible obj) because .NET constructor
+argument lists are tupled - ArgumentException("a", "b") applies the
+constructor to ONE tuple expression - so a single curried step with a
+fresh parameter covers every overload soundly.
+@End Reasoning
+
+Process called "seed_exception_constructors" takes analyzer as Integer, names_spec as Integer returns Integer:
+    Note: Register standard exception constructor names
+
+    Let type_env be proc memory_get_int64 from Layout with analyzer, 16
+
+    Let spec_len be proc string_length from StringCore with names_spec
+    Let i be 0
+    While i is less than spec_len:
+        Let name_start be i
+        Let scanning_name be 1
+        While scanning_name is equal to 1:
+            If i is greater than or equal to spec_len:
+                Set scanning_name to 0
+                Continue
+            End If
+            Let ch be proc string_char_at from StringCore with names_spec, i
+            If ch is equal to 59:  Note: ';'
+                Set scanning_name to 0
+                Continue
+            End If
+            Set i to i plus 1
+        End While
+
+        Let name_len be i minus name_start
+        If name_len is greater than 0:
+            Let name_buf be proc pool_allocate with analyzer, name_len plus 1
+            If name_buf is equal to 0:
+                Return 0
+            End If
+            Let c be 0
+            While c is less than name_len:
+                Set ch to proc string_char_at from StringCore with names_spec, name_start plus c
+                proc memory_set_byte from Layout with name_buf, c, ch
+                Set c to c plus 1
+            End While
+            proc memory_set_byte from Layout with name_buf, name_len, 0
+
+            Let exn_key be proc pool_concat with analyzer, "netexn:", name_buf
+            proc hashtable_set from Dict with type_env, exn_key, 1
+        End If
+
+        Set i to i plus 1  Note: Skip ';'
+    End While
+
+    Return 1
+End Process
+
+@Reasoning:
+The complete F# core surface this single-file frontend can legitimately
+see: the FSharp.Core collection and value modules (List, Array, Seq,
+Option, Result, String, Map, Set), the multidimensional Array2D and
+Array3D modules, and the nested parallel-collection modules
+(Array.Parallel, List.Parallel) - every public function registered with
+its REAL FSharp.Core 6 curried signature (including the F# 6 insertAt/
+removeAt/updateAt family) in the prefix notation documented at
+seed_dotnet_module, plus the standard .NET and F# exception
+constructors. This set is bounded and decidable, so membership is
+enforced: an unknown member of one of THESE modules is a semantic error
+exactly as the F# compiler reports FS0039, while modules outside the
+table (System.*, user assemblies) stay permissive warnings. Real
+signatures make application checking exact: partial application is
+legal, an argument whose shape disagrees with the declared parameter is
+an error, and applying more arguments than the signature's arrow chain
+allows is an over-application error (when the chain ends in a type
+variable - List.head over a list of functions - further application
+remains legal, exactly as in F#). Long member tables are split across
+multiple seed calls per module purely to keep source lines reviewable;
+re-seeding the netmod: key is idempotent.
+@End Reasoning
+
+Process called "setup_dotnet_members" takes analyzer as Integer returns Integer:
+    Note: Seed the F# core module signature registry and exception constructors
+
+    proc seed_dotnet_module with analyzer, "List", "allPairs:>la>lblt2ab;append:>la>lala;average:>laa;averageBy:>>ab>lab;choose:>>aob>lalb;chunkBySize:>I>lalla;collect:>>alb>lalb;compareWith:>>a>aI>la>laI;concat:>qlala;contains:>a>laB;countBy:>>ab>lalt2bI;distinct:>lala;distinctBy:>>ab>lala;empty:la;exactlyOne:>laa;except:>qa>lala;exists:>>aB>laB;exists2:>>a>bB>la>lbB;filter:>>aB>lala;find:>>aB>laa;findBack:>>aB>laa;findIndex:>>aB>laI;findIndexBack:>>aB>laI;fold:>>a>ba>a>lba;fold2:>>a>b>ca>a>lb>lca;foldBack:>>a>bb>la>bb;foldBack2:>>a>b>cc>la>lb>cc;forall:>>aB>laB;forall2:>>a>bB>la>lbB;groupBy:>>ab>lalt2bla;head:>laa;indexed:>lalt2Ia;init:>I>>Iala;insertAt:>I>a>lala;insertManyAt:>I>qa>lala;isEmpty:>laB;item:>I>laa;iter:>>aU>laU;iter2:>>a>bU>la>lbU;iteri:>>I>aU>laU;iteri2:>>I>a>bU>la>lbU;last:>laa;length:>laI"
+    proc seed_dotnet_module with analyzer, "List", "map:>>ab>lalb;map2:>>a>bc>la>lblc;map3:>>a>b>cd>la>lb>lcld;mapFold:>>a>bt2ca>a>lbt2lca;mapFoldBack:>>a>bt2cb>la>bt2lcb;mapi:>>I>ab>lalb;mapi2:>>I>a>bc>la>lblc;max:>laa;maxBy:>>ab>laa;min:>laa;minBy:>>ab>laa;ofArray:>rala;ofSeq:>qala;pairwise:>lalt2aa;partition:>>aB>lat2lala;permute:>>II>lala;pick:>>aob>lab;reduce:>>a>aa>laa;reduceBack:>>a>aa>laa;removeAt:>I>lala;removeManyAt:>I>I>lala;replicate:>I>ala;rev:>lala;scan:>>a>ba>a>lbla;scanBack:>>a>bb>la>blb;singleton:>ala;skip:>I>lala;skipWhile:>>aB>lala;sort:>lala;sortBy:>>ab>lala;sortByDescending:>>ab>lala;sortDescending:>lala;sortWith:>>a>aI>lala;splitAt:>I>lat2lala;splitInto:>I>lalla;sum:>laa;sumBy:>>ab>lab;tail:>lala;take:>I>lala;takeWhile:>>aB>lala;toArray:>lara;toSeq:>laqa;transpose:>qlalla;truncate:>I>lala;tryExactlyOne:>laoa;tryFind:>>aB>laoa;tryFindBack:>>aB>laoa;tryFindIndex:>>aB>laoI;tryFindIndexBack:>>aB>laoI;tryHead:>laoa;tryItem:>I>laoa;tryLast:>laoa;tryPick:>>aob>laob;unfold:>>aot2ba>alb;unzip:>lt2abt2lalb;unzip3:>lt3abct3lalblc;updateAt:>I>a>lala;where:>>aB>lala;windowed:>I>lalla;zip:>la>lblt2ab;zip3:>la>lb>lclt3abc"
+
+    proc seed_dotnet_module with analyzer, "Array", "allPairs:>ra>rbrt2ab;append:>ra>rara;average:>raa;averageBy:>>ab>rab;blit:>ra>I>ra>I>IU;choose:>>aob>rarb;chunkBySize:>I>rarra;collect:>>arb>rarb;compareWith:>>a>aI>ra>raI;concat:>qrara;contains:>a>raB;copy:>rara;countBy:>>ab>rart2bI;create:>I>ara;distinct:>rara;distinctBy:>>ab>rara;empty:ra;exactlyOne:>raa;except:>qa>rara;exists:>>aB>raB;exists2:>>a>bB>ra>rbB;fill:>ra>I>I>aU;filter:>>aB>rara;find:>>aB>raa;findBack:>>aB>raa;findIndex:>>aB>raI;findIndexBack:>>aB>raI;fold:>>a>ba>a>rba;fold2:>>a>b>ca>a>rb>rca;foldBack:>>a>bb>ra>bb;foldBack2:>>a>b>cc>ra>rb>cc;forall:>>aB>raB;forall2:>>a>bB>ra>rbB;get:>ra>Ia;groupBy:>>ab>rart2bra;head:>raa;indexed:>rart2Ia;init:>I>>Iara;insertAt:>I>a>rara;insertManyAt:>I>qa>rara;isEmpty:>raB;item:>I>raa;iter:>>aU>raU;iter2:>>a>bU>ra>rbU;iteri:>>I>aU>raU;iteri2:>>I>a>bU>ra>rbU;last:>raa;length:>raI"
+    proc seed_dotnet_module with analyzer, "Array", "map:>>ab>rarb;map2:>>a>bc>ra>rbrc;map3:>>a>b>cd>ra>rb>rcrd;mapFold:>>a>bt2ca>a>rbt2rca;mapFoldBack:>>a>bt2cb>ra>bt2rcb;mapi:>>I>ab>rarb;mapi2:>>I>a>bc>ra>rbrc;max:>raa;maxBy:>>ab>raa;min:>raa;minBy:>>ab>raa;ofList:>lara;ofSeq:>qara;pairwise:>rart2aa;partition:>>aB>rat2rara;permute:>>II>rara;pick:>>aob>rab;reduce:>>a>aa>raa;reduceBack:>>a>aa>raa;removeAt:>I>rara;removeManyAt:>I>I>rara;replicate:>I>ara;rev:>rara;scan:>>a>ba>a>rbra;scanBack:>>a>bb>ra>brb;set:>ra>I>aU;singleton:>ara;skip:>I>rara;skipWhile:>>aB>rara;sort:>rara;sortBy:>>ab>rara;sortByDescending:>>ab>rara;sortDescending:>rara;sortInPlace:>raU;sortInPlaceBy:>>ab>raU;sortInPlaceWith:>>a>aI>raU;sortWith:>>a>aI>rara;splitAt:>I>rat2rara;splitInto:>I>rarra;sub:>ra>I>Ira;sum:>raa;sumBy:>>ab>rab;tail:>rara;take:>I>rara;takeWhile:>>aB>rara;toList:>rala;toSeq:>raqa;transpose:>qrarra;truncate:>I>rara;tryExactlyOne:>raoa;tryFind:>>aB>raoa;tryFindBack:>>aB>raoa;tryFindIndex:>>aB>raoI;tryFindIndexBack:>>aB>raoI;tryHead:>raoa;tryItem:>I>raoa;tryLast:>raoa;tryPick:>>aob>raob;unfold:>>aot2ba>arb;unzip:>rt2abt2rarb;unzip3:>rt3abct3rarbrc;updateAt:>I>a>rara;where:>>aB>rara;windowed:>I>rarra;zeroCreate:>Ira;zip:>ra>rbrt2ab;zip3:>ra>rb>rcrt3abc"
+
+    proc seed_dotnet_module with analyzer, "Seq", "allPairs:>qa>qbqt2ab;append:>qa>qaqa;average:>qaa;averageBy:>>ab>qab;cache:>qaqa;cast:>Oqa;choose:>>aob>qaqb;chunkBySize:>I>qaqra;collect:>>aqb>qaqb;compareWith:>>a>aI>qa>qaI;concat:>qqaqa;contains:>a>qaB;countBy:>>ab>qaqt2bI;delay:>>Uqaqa;distinct:>qaqa;distinctBy:>>ab>qaqa;empty:qa;exactlyOne:>qaa;except:>qa>qaqa;exists:>>aB>qaB;exists2:>>a>bB>qa>qbB;filter:>>aB>qaqa;find:>>aB>qaa;findBack:>>aB>qaa;findIndex:>>aB>qaI;findIndexBack:>>aB>qaI;fold:>>a>ba>a>qba;fold2:>>a>b>ca>a>qb>qca;foldBack:>>a>bb>qa>bb;foldBack2:>>a>b>cc>qa>qb>cc;forall:>>aB>qaB;forall2:>>a>bB>qa>qbB;groupBy:>>ab>qaqt2bqa;head:>qaa;indexed:>qaqt2Ia;init:>I>>Iaqa;initInfinite:>>Iaqa;insertAt:>I>a>qaqa;insertManyAt:>I>qa>qaqa;isEmpty:>qaB;item:>I>qaa;iter:>>aU>qaU;iter2:>>a>bU>qa>qbU;iteri:>>I>aU>qaU;iteri2:>>I>a>bU>qa>qbU;last:>qaa;length:>qaI"
+    proc seed_dotnet_module with analyzer, "Seq", "map:>>ab>qaqb;map2:>>a>bc>qa>qbqc;map3:>>a>b>cd>qa>qb>qcqd;mapFold:>>a>bt2ca>a>qbt2qca;mapFoldBack:>>a>bt2cb>qa>bt2qcb;mapi:>>I>ab>qaqb;mapi2:>>I>a>bc>qa>qbqc;max:>qaa;maxBy:>>ab>qaa;min:>qaa;minBy:>>ab>qaa;ofArray:>raqa;ofList:>laqa;pairwise:>qaqt2aa;permute:>>II>qaqa;pick:>>aob>qab;readonly:>qaqa;reduce:>>a>aa>qaa;reduceBack:>>a>aa>qaa;removeAt:>I>qaqa;removeManyAt:>I>I>qaqa;replicate:>I>aqa;rev:>qaqa;scan:>>a>ba>a>qbqa;scanBack:>>a>bb>qa>bqb;singleton:>aqa;skip:>I>qaqa;skipWhile:>>aB>qaqa;sort:>qaqa;sortBy:>>ab>qaqa;sortByDescending:>>ab>qaqa;sortDescending:>qaqa;sortWith:>>a>aI>qaqa;splitInto:>I>qaqra;sum:>qaa;sumBy:>>ab>qab;tail:>qaqa;take:>I>qaqa;takeWhile:>>aB>qaqa;toArray:>qara;toList:>qala;transpose:>qqaqqa;truncate:>I>qaqa;tryExactlyOne:>qaoa;tryFind:>>aB>qaoa;tryFindBack:>>aB>qaoa;tryFindIndex:>>aB>qaoI;tryFindIndexBack:>>aB>qaoI;tryHead:>qaoa;tryItem:>I>qaoa;tryLast:>qaoa;tryPick:>>aob>qaob;unfold:>>aot2ba>aqa;where:>>aB>qaqa;windowed:>I>qaqra;zip:>qa>qbqt2ab;zip3:>qa>qb>qcqt3abc"
+
+    proc seed_dotnet_module with analyzer, "Option", "bind:>>aob>oaob;contains:>a>oaB;count:>oaI;defaultValue:>a>oaa;defaultWith:>>Ua>oaa;exists:>>aB>oaB;filter:>>aB>oaoa;flatten:>ooaoa;fold:>>a>ba>a>oba;foldBack:>>a>bb>oa>bb;forall:>>aB>oaB;get:>oaa;isNone:>oaB;isSome:>oaB;iter:>>aU>oaU;map:>>ab>oaob;map2:>>a>bc>oa>oboc;map3:>>a>b>cd>oa>ob>ocod;ofNullable:>Ooa;ofObj:>aoa;orElse:>oa>oaoa;orElseWith:>>Uoa>oaoa;toArray:>oara;toList:>oala;toNullable:>oaO;toObj:>oaa"
+
+    proc seed_dotnet_module with analyzer, "Result", "bind:>>aR>RR;contains:>a>RB;count:>RI;defaultValue:>a>Ra;defaultWith:>>ba>Ra;exists:>>aB>RB;fold:>>a>ba>a>Ra;foldBack:>>a>bb>R>bb;forall:>>aB>RB;isError:>RB;isOk:>RB;iter:>>aU>RU;map:>>ab>RR;mapError:>>ab>RR;toArray:>Rra;toList:>Rla;toOption:>Roa;toValueOption:>Roa"
+
+    proc seed_dotnet_module with analyzer, "String", "collect:>>CS>SS;concat:>S>qSS;exists:>>CB>SB;filter:>>CB>SS;forall:>>CB>SB;init:>I>>ISS;iter:>>CU>SU;iteri:>>I>CU>SU;length:>SI;map:>>CC>SS;mapi:>>I>CC>SS;replicate:>I>SS"
+
+    proc seed_dotnet_module with analyzer, "Map", "add:>a>b>MabMab;change:>a>>obob>MabMab;containsKey:>a>MabB;count:>MabI;empty:Mab;exists:>>a>bB>MabB;filter:>>a>bB>MabMab;find:>a>Mabb;findKey:>>a>bB>Maba;fold:>>a>b>ca>a>Mbca;foldBack:>>a>b>cc>Mab>cc;forall:>>a>bB>MabB;isEmpty:>MabB;iter:>>a>bU>MabU;keys:>Mabqa;map:>>a>bc>MabMac;maxKeyValue:>Mabt2ab;minKeyValue:>Mabt2ab;ofArray:>rt2abMab;ofList:>lt2abMab;ofSeq:>qt2abMab;partition:>>a>bB>Mabt2MabMab;pick:>>a>boc>Mabc;remove:>a>MabMab;toArray:>Mabrt2ab;toList:>Mablt2ab;toSeq:>Mabqt2ab;tryFind:>a>Mabob;tryFindKey:>>a>bB>Maboa;tryPick:>>a>boc>Maboc;values:>Mabqb"
+
+    proc seed_dotnet_module with analyzer, "Set", "add:>a>EaEa;contains:>a>EaB;count:>EaI;difference:>Ea>EaEa;empty:Ea;exists:>>aB>EaB;filter:>>aB>EaEa;fold:>>a>ba>a>Eba;foldBack:>>a>bb>Ea>bb;forall:>>aB>EaB;intersect:>Ea>EaEa;intersectMany:>qEaEa;isEmpty:>EaB;isProperSubset:>Ea>EaB;isProperSuperset:>Ea>EaB;isSubset:>Ea>EaB;isSuperset:>Ea>EaB;map:>>ab>EaEb;maxElement:>Eaa;minElement:>Eaa;ofArray:>raEa;ofList:>laEa;ofSeq:>qaEa;partition:>>aB>Eat2EaEa;remove:>a>EaEa;singleton:>aEa;toArray:>Eara;toList:>Eala;toSeq:>Eaqa;union:>Ea>EaEa;unionMany:>qEaEa"
+
+    proc seed_dotnet_module with analyzer, "Array2D", "base1:>2aI;base2:>2aI;blit:>2a>I>I>2a>I>I>I>IU;copy:>2a2a;create:>I>I>a2a;get:>2a>I>Ia;init:>I>I>>I>Ia2a;iter:>>aU>2aU;iteri:>>I>I>aU>2aU;length1:>2aI;length2:>2aI;map:>>ab>2a2b;mapi:>>I>I>ab>2a2b;rebase:>2a>I>I2a;set:>2a>I>I>aU;zeroCreate:>I>I2a"
+
+    proc seed_dotnet_module with analyzer, "Array3D", "create:>I>I>I>a3a;get:>3a>I>I>Ia;init:>I>I>I>>I>I>Ia3a;iter:>>aU>3aU;iteri:>>I>I>I>aU>3aU;length1:>3aI;length2:>3aI;length3:>3aI;map:>>ab>3a3b;mapi:>>I>I>I>ab>3a3b;set:>3a>I>I>I>aU;zeroCreate:>I>I>I3a"
+
+    proc seed_dotnet_module with analyzer, "Array.Parallel", "choose:>>aob>rarb;collect:>>arb>rarb;exists:>>aB>raB;forall:>>aB>raB;init:>I>>Iara;iter:>>aU>raU;iteri:>>I>aU>raU;map:>>ab>rarb;mapi:>>I>ab>rarb;partition:>>aB>rat2rara;tryFind:>>aB>raoa;tryFindIndex:>>aB>raoI;tryPick:>>aob>raob"
+
+    proc seed_dotnet_module with analyzer, "List.Parallel", "choose:>>aob>lalb;collect:>>alb>lalb;exists:>>aB>laB;forall:>>aB>laB;init:>I>>Iala;iter:>>aU>laU;iteri:>>I>aU>laU;map:>>ab>lalb;mapi:>>I>ab>lalb;partition:>>aB>lat2lala;tryFind:>>aB>laoa;tryFindIndex:>>aB>laoI;tryPick:>>aob>laob"
+
+    proc seed_exception_constructors with analyzer, "Exception;ArgumentException;ArgumentNullException;ArgumentOutOfRangeException;InvalidOperationException;InvalidCastException;NotImplementedException;NotSupportedException;NullReferenceException;IndexOutOfRangeException;KeyNotFoundException;DivideByZeroException;FormatException;OverflowException;ArithmeticException;StackOverflowException;OutOfMemoryException;TimeoutException;IOException;FileNotFoundException;DirectoryNotFoundException;EndOfStreamException;PathTooLongException;UnauthorizedAccessException;AggregateException;TaskCanceledException;OperationCanceledException;ObjectDisposedException;MatchFailureException"
+
+    Return 1
+End Process
+
+@Reasoning:
+Signature type variables are shared within ONE signature instantiation -
+'a -> 'a list must produce v -> v list, not v1 -> v2 list - and fresh
+ACROSS instantiations so every use site of a registry member constrains
+its own copy (the same per-use polymorphism instantiate gives
+let-generalized bindings). The cursor record memoizes up to four
+variables (slots a..d at offsets 16..40) created lazily on first
+reference.
+@End Reasoning
+
+Process called "sig_cursor_var" takes analyzer as Integer, cursor as Integer, slot as Integer returns Integer:
+    Note: Get or lazily create the signature type variable for a slot
+
+    Let var_offset be 16 plus (slot multiplied by 8)
+    Let existing be proc memory_get_int64 from Layout with cursor, var_offset
+    If existing is not equal to 0:
+        Return existing
+    End If
+
+    Let fresh be proc fresh_type_var with analyzer
+    proc memory_set_int64 from Layout with cursor, var_offset, fresh
+    Return fresh
+End Process
+
+@Reasoning:
+Recursive-descent parser over the prefix signature notation documented
+at seed_dotnet_module. Prefix notation needs no parentheses or
+precedence: every constructor consumes exactly its payload count, so one
+character of lookahead (the character itself) drives the whole parse.
+The cursor record carries [signature string @0, position @8, variable
+slots @16..40]. Registry strings are compiler-internal, but a malformed
+character still degrades to TYPE_ERROR (absorbing unification) rather
+than reading past the buffer.
+@End Reasoning
+
+Process called "parse_sig_type" takes analyzer as Integer, cursor as Integer returns Integer:
+    Note: Parse one type from the signature cursor
+
+    Let sig be proc memory_get_int64 from Layout with cursor, 0
+    Let pos be proc memory_get_int64 from Layout with cursor, 8
+    Let ch be proc string_char_at from StringCore with sig, pos
+    proc memory_set_int64 from Layout with cursor, 8, pos plus 1
+
+    If ch is equal to 0:
+        Return TYPE_ERROR
+    End If
+
+    If ch is equal to 62:  Note: '>' function
+        Let param be proc parse_sig_type with analyzer, cursor
+        Let ret be proc parse_sig_type with analyzer, cursor
+        Return proc make_type2 with analyzer, TYPE_FUNCTION, param, ret
+    End If
+
+    If ch is equal to 108:  Note: 'l' list
+        Let inner be proc parse_sig_type with analyzer, cursor
+        Return proc make_type1 with analyzer, TYPE_LIST, inner
+    End If
+    If ch is equal to 114:  Note: 'r' array
+        Set inner to proc parse_sig_type with analyzer, cursor
+        Return proc make_type1 with analyzer, TYPE_ARRAY, inner
+    End If
+    If ch is equal to 113:  Note: 'q' seq
+        Set inner to proc parse_sig_type with analyzer, cursor
+        Return proc make_type1 with analyzer, TYPE_SEQUENCE, inner
+    End If
+    If ch is equal to 111:  Note: 'o' option
+        Set inner to proc parse_sig_type with analyzer, cursor
+        Return proc make_type1 with analyzer, TYPE_OPTION, inner
+    End If
+    If ch is equal to 50:  Note: '2' array2d
+        Set inner to proc parse_sig_type with analyzer, cursor
+        Return proc make_type1 with analyzer, TYPE_ARRAY2D, inner
+    End If
+    If ch is equal to 51:  Note: '3' array3d
+        Set inner to proc parse_sig_type with analyzer, cursor
+        Return proc make_type1 with analyzer, TYPE_ARRAY3D, inner
+    End If
+    If ch is equal to 69:  Note: 'E' set
+        Set inner to proc parse_sig_type with analyzer, cursor
+        Return proc make_type1 with analyzer, TYPE_SET, inner
+    End If
+
+    If ch is equal to 77:  Note: 'M' map
+        Let key_type be proc parse_sig_type with analyzer, cursor
+        Let value_type be proc parse_sig_type with analyzer, cursor
+        Return proc make_type2 with analyzer, TYPE_MAP, key_type, value_type
+    End If
+
+    If ch is equal to 82:  Note: 'R' Result union
+        Let result_cases be proc list_create from List
+        proc list_append from List with result_cases, "Ok"
+        proc list_append from List with result_cases, "Error"
+        Return proc make_type2 with analyzer, TYPE_UNION, "Result", result_cases
+    End If
+
+    If ch is equal to 116:  Note: 't' tuple
+        Set pos to proc memory_get_int64 from Layout with cursor, 8
+        Let count_ch be proc string_char_at from StringCore with sig, pos
+        proc memory_set_int64 from Layout with cursor, 8, pos plus 1
+        Let elem_count be count_ch minus 48
+        If elem_count is less than 0:
+            Return TYPE_ERROR
+        End If
+        Let elems be proc list_create from List
+        Let e be 0
+        While e is less than elem_count:
+            Let elem be proc parse_sig_type with analyzer, cursor
+            proc list_append from List with elems, elem
+            Set e to e plus 1
+        End While
+        Return proc make_type1 with analyzer, TYPE_TUPLE, elems
+    End If
+
+    If ch is equal to 97:  Note: 'a'
+        Return proc sig_cursor_var with analyzer, cursor, 0
+    End If
+    If ch is equal to 98:  Note: 'b'
+        Return proc sig_cursor_var with analyzer, cursor, 1
+    End If
+    If ch is equal to 99:  Note: 'c'
+        Return proc sig_cursor_var with analyzer, cursor, 2
+    End If
+    If ch is equal to 100:  Note: 'd'
+        Return proc sig_cursor_var with analyzer, cursor, 3
+    End If
+
+    If ch is equal to 73:  Note: 'I'
+        Return TYPE_INT
+    End If
+    If ch is equal to 70:  Note: 'F'
+        Return TYPE_FLOAT
+    End If
+    If ch is equal to 83:  Note: 'S'
+        Return TYPE_STRING
+    End If
+    If ch is equal to 66:  Note: 'B'
+        Return TYPE_BOOL
+    End If
+    If ch is equal to 85:  Note: 'U'
+        Return TYPE_UNIT
+    End If
+    If ch is equal to 67:  Note: 'C'
+        Return TYPE_CHAR
+    End If
+    If ch is equal to 79:  Note: 'O'
+        Return TYPE_ANY
+    End If
+    If ch is equal to 68:  Note: 'D'
+        Return TYPE_DECIMAL
+    End If
+
+    Return TYPE_ERROR
+End Process
+
+@Reasoning:
+Public instantiation entry: builds one fresh copy of a registered
+member's type from its signature string. A fresh cursor per call gives
+per-use polymorphism directly - the parse allocates new variable records
+for a..d every time, so List.map used at two types constrains two
+independent copies, exactly like scheme instantiation.
+@End Reasoning
+
+Process called "member_signature_type" takes analyzer as Integer, signature as Integer returns Integer:
+    Note: Instantiate a registry signature string as a fresh type
+
+    If signature is equal to 0:
+        Return proc fresh_type_var with analyzer
+    End If
+
+    Let cursor be proc pool_allocate with analyzer, 48
+    If cursor is equal to 0:
+        Return proc fresh_type_var with analyzer
+    End If
+    proc memory_set_int64 from Layout with cursor, 0, signature
+    proc memory_set_int64 from Layout with cursor, 8, 0
+    proc memory_set_int64 from Layout with cursor, 16, 0
+    proc memory_set_int64 from Layout with cursor, 24, 0
+    proc memory_set_int64 from Layout with cursor, 32, 0
+    proc memory_set_int64 from Layout with cursor, 40, 0
+
+    Return proc parse_sig_type with analyzer, cursor
 End Process
 
 @Reasoning:
@@ -475,6 +913,9 @@ Process called "clear_analysis_results" takes analyzer as Integer returns Intege
 
     Let definitions be proc memory_get_int64 from Layout with solver, 24
     proc list_clear from List with definitions
+
+    Let env_types be proc memory_get_int64 from Layout with solver, 40
+    proc list_clear from List with env_types
 
     Let scope_stack be proc memory_get_int64 from Layout with analyzer, 8
     Let scope_count be proc list_length from List with scope_stack
@@ -665,6 +1106,16 @@ Process called "occurs_check" takes analyzer as Integer, var_id as Integer, type
         Return proc occurs_check with analyzer, var_id, ret
     End If
 
+    If tag is equal to TYPE_MAP:
+        Let key_type be proc memory_get_int64 from Layout with resolved, 8
+        Set found to proc occurs_check with analyzer, var_id, key_type
+        If found is equal to 1:
+            Return 1
+        End If
+        Let value_type be proc memory_get_int64 from Layout with resolved, 16
+        Return proc occurs_check with analyzer, var_id, value_type
+    End If
+
     If tag is equal to TYPE_TUPLE:
         Let elems be proc memory_get_int64 from Layout with resolved, 8
         Let count be proc list_length from List with elems
@@ -700,6 +1151,15 @@ Process called "occurs_check" takes analyzer as Integer, var_id as Integer, type
         Set is_wrapper to 1
     End If
     If tag is equal to TYPE_MEASURE:
+        Set is_wrapper to 1
+    End If
+    If tag is equal to TYPE_ARRAY2D:
+        Set is_wrapper to 1
+    End If
+    If tag is equal to TYPE_ARRAY3D:
+        Set is_wrapper to 1
+    End If
+    If tag is equal to TYPE_SET:
         Set is_wrapper to 1
     End If
 
@@ -773,6 +1233,33 @@ Process called "unify_types" takes analyzer as Integer, type1 as Integer, type2 
         Return 1
     End If
 
+    Note: F# sequence covariance: list, array, and set values flow into
+    Note: seq<'T> positions ('T list :> seq<'T>). Unification call sites
+    Note: pass the ACTUAL type first and the EXPECTED type second, so the
+    Note: coercion is directional - a seq value does NOT unify into a
+    Note: list position, exactly as F# rejects it. Element types unify.
+    If tag2 is equal to TYPE_SEQUENCE:
+        Let seq_coercible be 0
+        If tag1 is equal to TYPE_LIST:
+            Set seq_coercible to 1
+        End If
+        If tag1 is equal to TYPE_ARRAY:
+            Set seq_coercible to 1
+        End If
+        If tag1 is equal to TYPE_SET:
+            Set seq_coercible to 1
+        End If
+        If seq_coercible is equal to 1:
+            If t1 is greater than or equal to 65536:
+                If t2 is greater than or equal to 65536:
+                    Let coerce_inner1 be proc memory_get_int64 from Layout with t1, 8
+                    Let coerce_inner2 be proc memory_get_int64 from Layout with t2, 8
+                    Return proc unify_types with analyzer, coerce_inner1, coerce_inner2
+                End If
+            End If
+        End If
+    End If
+
     If tag1 is not equal to tag2:
         Return 0
     End If
@@ -787,6 +1274,18 @@ Process called "unify_types" takes analyzer as Integer, type1 as Integer, type2 
         Let ret1 be proc memory_get_int64 from Layout with t1, 16
         Let ret2 be proc memory_get_int64 from Layout with t2, 16
         Return proc unify_types with analyzer, ret1, ret2
+    End If
+
+    If tag1 is equal to TYPE_MAP:
+        Let key1 be proc memory_get_int64 from Layout with t1, 8
+        Let key2 be proc memory_get_int64 from Layout with t2, 8
+        Set ok to proc unify_types with analyzer, key1, key2
+        If ok is equal to 0:
+            Return 0
+        End If
+        Let val1 be proc memory_get_int64 from Layout with t1, 16
+        Let val2 be proc memory_get_int64 from Layout with t2, 16
+        Return proc unify_types with analyzer, val1, val2
     End If
 
     If tag1 is equal to TYPE_TUPLE:
@@ -827,6 +1326,15 @@ Process called "unify_types" takes analyzer as Integer, type1 as Integer, type2 
         Set is_wrapper to 1
     End If
     If tag1 is equal to TYPE_COMPUTATION:
+        Set is_wrapper to 1
+    End If
+    If tag1 is equal to TYPE_ARRAY2D:
+        Set is_wrapper to 1
+    End If
+    If tag1 is equal to TYPE_ARRAY3D:
+        Set is_wrapper to 1
+    End If
+    If tag1 is equal to TYPE_SET:
         Set is_wrapper to 1
     End If
 
@@ -910,6 +1418,30 @@ Process called "types_compatible" takes analyzer as Integer, type1 as Integer, t
         Return 1
     End If
 
+    Note: F# sequence covariance mirror of unify_types: a list, array, or
+    Note: set value is compatible with a seq<'T> expectation
+    If tag2 is equal to TYPE_SEQUENCE:
+        Let seq_coercible be 0
+        If tag1 is equal to TYPE_LIST:
+            Set seq_coercible to 1
+        End If
+        If tag1 is equal to TYPE_ARRAY:
+            Set seq_coercible to 1
+        End If
+        If tag1 is equal to TYPE_SET:
+            Set seq_coercible to 1
+        End If
+        If seq_coercible is equal to 1:
+            If t1 is greater than or equal to 65536:
+                If t2 is greater than or equal to 65536:
+                    Let coerce_inner1 be proc memory_get_int64 from Layout with t1, 8
+                    Let coerce_inner2 be proc memory_get_int64 from Layout with t2, 8
+                    Return proc types_compatible with analyzer, coerce_inner1, coerce_inner2
+                End If
+            End If
+        End If
+    End If
+
     If tag1 is not equal to tag2:
         Return 0
     End If
@@ -924,6 +1456,18 @@ Process called "types_compatible" takes analyzer as Integer, type1 as Integer, t
         Let ret1 be proc memory_get_int64 from Layout with t1, 16
         Let ret2 be proc memory_get_int64 from Layout with t2, 16
         Return proc types_compatible with analyzer, ret1, ret2
+    End If
+
+    If tag1 is equal to TYPE_MAP:
+        Let key1 be proc memory_get_int64 from Layout with t1, 8
+        Let key2 be proc memory_get_int64 from Layout with t2, 8
+        Set ok to proc types_compatible with analyzer, key1, key2
+        If ok is equal to 0:
+            Return 0
+        End If
+        Let val1 be proc memory_get_int64 from Layout with t1, 16
+        Let val2 be proc memory_get_int64 from Layout with t2, 16
+        Return proc types_compatible with analyzer, val1, val2
     End If
 
     If tag1 is equal to TYPE_TUPLE:
@@ -964,6 +1508,15 @@ Process called "types_compatible" takes analyzer as Integer, type1 as Integer, t
         Set is_wrapper to 1
     End If
     If tag1 is equal to TYPE_COMPUTATION:
+        Set is_wrapper to 1
+    End If
+    If tag1 is equal to TYPE_ARRAY2D:
+        Set is_wrapper to 1
+    End If
+    If tag1 is equal to TYPE_ARRAY3D:
+        Set is_wrapper to 1
+    End If
+    If tag1 is equal to TYPE_SET:
         Set is_wrapper to 1
     End If
 
@@ -1129,6 +1682,372 @@ Process called "apply_function_type" takes analyzer as Integer, function_type as
 End Process
 
 Note: ============================================================================
+Note: Let-Polymorphism: Generalization and Instantiation
+Note: ============================================================================
+
+@Reasoning:
+Membership test over an integer id List; the free-variable collectors
+need set semantics and the lists involved are small (a binding rarely
+has more than a handful of free variables), so a linear scan is the
+right structure.
+@End Reasoning
+
+Process called "type_var_list_contains" takes id_list as Integer, var_id as Integer returns Integer:
+    Note: Check whether a type-variable id List contains the given id
+
+    If id_list is equal to 0:
+        Return 0
+    End If
+
+    Let count be proc list_length from List with id_list
+    Let i be 0
+    While i is less than count:
+        Let entry be proc list_get from List with id_list, i
+        If entry is equal to var_id:
+            Return 1
+        End If
+        Set i to i plus 1
+    End While
+
+    Return 0
+End Process
+
+@Reasoning:
+Collects the ids of every UNBOUND type variable reachable from a type
+into the accumulator list (deduplicated). Resolution happens at each
+step so variables already solved by unification contribute their
+binding's free variables, not themselves. The walk mirrors occurs_check
+structurally: functions and measures recurse into both payloads, tuples
+into every element, single-payload wrappers into their element; records,
+unions, and primitive codes carry no type variables.
+@End Reasoning
+
+Process called "collect_free_type_vars" takes analyzer as Integer, type_value as Integer, acc as Integer returns Integer:
+    Note: Accumulate the unbound type-variable ids reachable from a type
+
+    Let resolved be proc resolve_type with analyzer, type_value
+    If resolved is equal to 0:
+        Return 1
+    End If
+    If resolved is less than 65536:
+        Return 1
+    End If
+
+    Let tag be proc memory_get_int64 from Layout with resolved, 0
+
+    If tag is equal to TYPE_GENERIC:
+        Let var_id be proc memory_get_int64 from Layout with resolved, 8
+        Let already be proc type_var_list_contains with acc, var_id
+        If already is equal to 0:
+            proc list_append from List with acc, var_id
+        End If
+        Return 1
+    End If
+
+    If tag is equal to TYPE_FUNCTION:
+        Let param be proc memory_get_int64 from Layout with resolved, 8
+        proc collect_free_type_vars with analyzer, param, acc
+        Let ret be proc memory_get_int64 from Layout with resolved, 16
+        proc collect_free_type_vars with analyzer, ret, acc
+        Return 1
+    End If
+
+    If tag is equal to TYPE_MAP:
+        Let key_type be proc memory_get_int64 from Layout with resolved, 8
+        proc collect_free_type_vars with analyzer, key_type, acc
+        Let value_type be proc memory_get_int64 from Layout with resolved, 16
+        proc collect_free_type_vars with analyzer, value_type, acc
+        Return 1
+    End If
+
+    If tag is equal to TYPE_MEASURE:
+        Let base be proc memory_get_int64 from Layout with resolved, 8
+        proc collect_free_type_vars with analyzer, base, acc
+        Return 1
+    End If
+
+    If tag is equal to TYPE_TUPLE:
+        Let elems be proc memory_get_int64 from Layout with resolved, 8
+        Let count be proc list_length from List with elems
+        Let i be 0
+        While i is less than count:
+            Let elem be proc list_get from List with elems, i
+            proc collect_free_type_vars with analyzer, elem, acc
+            Set i to i plus 1
+        End While
+        Return 1
+    End If
+
+    Let is_wrapper be 0
+    If tag is equal to TYPE_LIST:
+        Set is_wrapper to 1
+    End If
+    If tag is equal to TYPE_ARRAY:
+        Set is_wrapper to 1
+    End If
+    If tag is equal to TYPE_OPTION:
+        Set is_wrapper to 1
+    End If
+    If tag is equal to TYPE_SEQUENCE:
+        Set is_wrapper to 1
+    End If
+    If tag is equal to TYPE_ASYNC:
+        Set is_wrapper to 1
+    End If
+    If tag is equal to TYPE_COMPUTATION:
+        Set is_wrapper to 1
+    End If
+    If tag is equal to TYPE_ARRAY2D:
+        Set is_wrapper to 1
+    End If
+    If tag is equal to TYPE_ARRAY3D:
+        Set is_wrapper to 1
+    End If
+    If tag is equal to TYPE_SET:
+        Set is_wrapper to 1
+    End If
+
+    If is_wrapper is equal to 1:
+        Let inner be proc memory_get_int64 from Layout with resolved, 8
+        proc collect_free_type_vars with analyzer, inner, acc
+        Return 1
+    End If
+
+    Return 1
+End Process
+
+@Reasoning:
+Hindley-Milner generalization at a let binding: quantify exactly the
+type variables free in the binding's type but NOT free in the
+environment. The environment surface is the solver's env-types list;
+env_limit caps the scan so recursive bindings exclude their own
+pre-bound self entry (which would otherwise anchor every variable of
+the binding and block generalization). The result is a pooled
+[count, id, id, ...] quantifier record, or 0 when nothing generalizes -
+the monomorphic case, which instantiation treats as a plain type. The
+temporary id Lists are destroyed before returning; the quantifier
+record is pool-owned so the analyzer's sweep frees it.
+@End Reasoning
+
+Process called "generalize" takes analyzer as Integer, type_value as Integer, env_limit as Integer returns Integer:
+    Note: Build the quantifier record for a let-bound type (0 if monomorphic)
+
+    Let type_vars be proc list_create from List
+    proc collect_free_type_vars with analyzer, type_value, type_vars
+
+    Let type_var_count be proc list_length from List with type_vars
+    If type_var_count is equal to 0:
+        proc list_destroy from List with type_vars
+        Return 0
+    End If
+
+    Let env_vars be proc list_create from List
+    Let solver be proc memory_get_int64 from Layout with analyzer, 24
+    Let env_types be proc memory_get_int64 from Layout with solver, 40
+    Let env_count be proc list_length from List with env_types
+    Let scan_limit be env_limit
+    If scan_limit is greater than env_count:
+        Set scan_limit to env_count
+    End If
+
+    Let e be 0
+    While e is less than scan_limit:
+        Let env_entry be proc list_get from List with env_types, e
+        Let env_type be proc memory_get_int64 from Layout with env_entry, 8
+        proc collect_free_type_vars with analyzer, env_type, env_vars
+        Set e to e plus 1
+    End While
+
+    Let quantified be proc list_create from List
+    Let i be 0
+    While i is less than type_var_count:
+        Let var_id be proc list_get from List with type_vars, i
+        Let in_env be proc type_var_list_contains with env_vars, var_id
+        If in_env is equal to 0:
+            proc list_append from List with quantified, var_id
+        End If
+        Set i to i plus 1
+    End While
+
+    Let quant_count be proc list_length from List with quantified
+    If quant_count is equal to 0:
+        proc list_destroy from List with type_vars
+        proc list_destroy from List with env_vars
+        proc list_destroy from List with quantified
+        Return 0
+    End If
+
+    Let scheme be proc pool_allocate with analyzer, 8 plus (quant_count multiplied by 8)
+    If scheme is equal to 0:
+        proc list_destroy from List with type_vars
+        proc list_destroy from List with env_vars
+        proc list_destroy from List with quantified
+        Return 0
+    End If
+
+    proc memory_set_int64 from Layout with scheme, 0, quant_count
+    Set i to 0
+    While i is less than quant_count:
+        Set var_id to proc list_get from List with quantified, i
+        proc memory_set_int64 from Layout with scheme, 8 plus (i multiplied by 8), var_id
+        Set i to i plus 1
+    End While
+
+    proc list_destroy from List with type_vars
+    proc list_destroy from List with env_vars
+    proc list_destroy from List with quantified
+    Return scheme
+End Process
+
+@Reasoning:
+Recursive copy step of instantiation: rebuilds the type with every
+quantified variable replaced by its pre-allocated fresh counterpart
+(fresh_list is positionally parallel to the scheme's id array so the
+SAME quantified variable maps to the SAME fresh variable everywhere it
+occurs - 'a -> 'a must instantiate to v -> v, not v1 -> v2).
+Non-quantified variables and variable-free types are returned as-is:
+sharing them is sound because instantiation never mutates, and it keeps
+allocation proportional to the polymorphic part of the type.
+@End Reasoning
+
+Process called "instantiate_type" takes analyzer as Integer, type_value as Integer, scheme as Integer, fresh_list as Integer returns Integer:
+    Note: Copy a type replacing quantified variables with fresh ones
+
+    Let resolved be proc resolve_type with analyzer, type_value
+    If resolved is equal to 0:
+        Return resolved
+    End If
+    If resolved is less than 65536:
+        Return resolved
+    End If
+
+    Let tag be proc memory_get_int64 from Layout with resolved, 0
+
+    If tag is equal to TYPE_GENERIC:
+        Let var_id be proc memory_get_int64 from Layout with resolved, 8
+        Let quant_count be proc memory_get_int64 from Layout with scheme, 0
+        Let i be 0
+        While i is less than quant_count:
+            Let quant_id be proc memory_get_int64 from Layout with scheme, 8 plus (i multiplied by 8)
+            If quant_id is equal to var_id:
+                Return proc list_get from List with fresh_list, i
+            End If
+            Set i to i plus 1
+        End While
+        Return resolved
+    End If
+
+    If tag is equal to TYPE_FUNCTION:
+        Let param be proc memory_get_int64 from Layout with resolved, 8
+        Let ret be proc memory_get_int64 from Layout with resolved, 16
+        Let new_param be proc instantiate_type with analyzer, param, scheme, fresh_list
+        Let new_ret be proc instantiate_type with analyzer, ret, scheme, fresh_list
+        Return proc make_type2 with analyzer, TYPE_FUNCTION, new_param, new_ret
+    End If
+
+    If tag is equal to TYPE_MAP:
+        Let key_type be proc memory_get_int64 from Layout with resolved, 8
+        Let value_type be proc memory_get_int64 from Layout with resolved, 16
+        Let new_key be proc instantiate_type with analyzer, key_type, scheme, fresh_list
+        Let new_value be proc instantiate_type with analyzer, value_type, scheme, fresh_list
+        Return proc make_type2 with analyzer, TYPE_MAP, new_key, new_value
+    End If
+
+    If tag is equal to TYPE_MEASURE:
+        Let base be proc memory_get_int64 from Layout with resolved, 8
+        Let unit be proc memory_get_int64 from Layout with resolved, 16
+        Let new_base be proc instantiate_type with analyzer, base, scheme, fresh_list
+        Return proc make_type2 with analyzer, TYPE_MEASURE, new_base, unit
+    End If
+
+    If tag is equal to TYPE_TUPLE:
+        Let elems be proc memory_get_int64 from Layout with resolved, 8
+        Let count be proc list_length from List with elems
+        Let new_elems be proc list_create from List
+        Set i to 0
+        While i is less than count:
+            Let elem be proc list_get from List with elems, i
+            Let new_elem be proc instantiate_type with analyzer, elem, scheme, fresh_list
+            proc list_append from List with new_elems, new_elem
+            Set i to i plus 1
+        End While
+        Return proc make_type1 with analyzer, TYPE_TUPLE, new_elems
+    End If
+
+    Let is_wrapper be 0
+    If tag is equal to TYPE_LIST:
+        Set is_wrapper to 1
+    End If
+    If tag is equal to TYPE_ARRAY:
+        Set is_wrapper to 1
+    End If
+    If tag is equal to TYPE_OPTION:
+        Set is_wrapper to 1
+    End If
+    If tag is equal to TYPE_SEQUENCE:
+        Set is_wrapper to 1
+    End If
+    If tag is equal to TYPE_ASYNC:
+        Set is_wrapper to 1
+    End If
+    If tag is equal to TYPE_COMPUTATION:
+        Set is_wrapper to 1
+    End If
+    If tag is equal to TYPE_ARRAY2D:
+        Set is_wrapper to 1
+    End If
+    If tag is equal to TYPE_ARRAY3D:
+        Set is_wrapper to 1
+    End If
+    If tag is equal to TYPE_SET:
+        Set is_wrapper to 1
+    End If
+
+    If is_wrapper is equal to 1:
+        Let inner be proc memory_get_int64 from Layout with resolved, 8
+        Let new_inner be proc instantiate_type with analyzer, inner, scheme, fresh_list
+        Return proc make_type1 with analyzer, tag, new_inner
+    End If
+
+    Return resolved
+End Process
+
+@Reasoning:
+Hindley-Milner instantiation at a use site: a polymorphic binding's type
+is copied with one fresh variable per quantified variable, so every use
+constrains its own copy - let id = fun x -> x then typechecks at int and
+at bool in the same scope. Monomorphic bindings (scheme 0) return the
+stored type unchanged, preserving exactly the pre-polymorphism
+behaviour (and the value restriction: non-generalized bindings share
+one type across uses).
+@End Reasoning
+
+Process called "instantiate" takes analyzer as Integer, type_value as Integer, scheme as Integer returns Integer:
+    Note: Instantiate a generalized type with fresh variables per use
+
+    If scheme is equal to 0:
+        Return type_value
+    End If
+
+    Let quant_count be proc memory_get_int64 from Layout with scheme, 0
+    If quant_count is equal to 0:
+        Return type_value
+    End If
+
+    Let fresh_list be proc list_create from List
+    Let i be 0
+    While i is less than quant_count:
+        Let fresh be proc fresh_type_var with analyzer
+        proc list_append from List with fresh_list, fresh
+        Set i to i plus 1
+    End While
+
+    Let result be proc instantiate_type with analyzer, type_value, scheme, fresh_list
+    proc list_destroy from List with fresh_list
+    Return result
+End Process
+
+Note: ============================================================================
 Note: Scopes, Symbols, and Diagnostics
 Note: ============================================================================
 
@@ -1168,6 +2087,28 @@ Process called "pop_scope" takes analyzer as Integer returns Integer:
         Let scope_to_remove be proc list_get from List with scope_stack, top_index
         proc list_remove from List with scope_stack, top_index
         proc hashtable_destroy from Dict with scope_to_remove
+
+        Note: Drop env-type entries recorded at the departing depth so
+        Note: generalization no longer treats the popped bindings' type
+        Note: variables as environment-bound. Entries are pool-owned, so
+        Note: truncation here is bookkeeping only - the pool frees them.
+        Let solver be proc memory_get_int64 from Layout with analyzer, 24
+        Let env_types be proc memory_get_int64 from Layout with solver, 40
+        Let trimming be 1
+        While trimming is equal to 1:
+            Let env_count be proc list_length from List with env_types
+            If env_count is equal to 0:
+                Set trimming to 0
+                Continue
+            End If
+            Let last_entry be proc list_get from List with env_types, env_count minus 1
+            Let entry_depth be proc memory_get_int64 from Layout with last_entry, 0
+            If entry_depth is less than scope_count:
+                Set trimming to 0
+                Continue
+            End If
+            proc list_remove from List with env_types, env_count minus 1
+        End While
     End If
 
     Return 1
@@ -1192,11 +2133,16 @@ Process called "current_scope_table" takes analyzer as Integer returns Integer:
 End Process
 
 @Reasoning:
-Creates a symbol record (type, is_used, name, is_local) and binds it in
-the innermost scope. Local definitions (any open scope) also register in
-the definitions list for the unused-binding sweep; module-level
-definitions are exported surface and are exempt from unused analysis,
-matching the F# compiler's default warning behaviour.
+Creates a symbol record (type, is_used, name, is_local, scheme) and
+binds it in the innermost scope. Local definitions (any open scope) also
+register in the definitions list for the unused-binding sweep;
+module-level definitions are exported surface and are exempt from unused
+analysis, matching the F# compiler's default warning behaviour. Every
+definition additionally records a [depth, type] pair in the solver's
+env-types list - the environment surface generalization scans - which
+pop_scope truncates when the binding goes out of scope. The scheme slot
+starts monomorphic (0); analyze_let_binding_declaration writes the
+quantifier record for generalizable let bindings.
 @End Reasoning
 
 Process called "define_symbol" takes analyzer as Integer, symbol_name as Integer, symbol_type as Integer returns Integer:
@@ -1206,7 +2152,7 @@ Process called "define_symbol" takes analyzer as Integer, symbol_name as Integer
         Return 0
     End If
 
-    Let symbol be proc pool_allocate with analyzer, 32
+    Let symbol be proc pool_allocate with analyzer, 40
     If symbol is equal to 0:
         Return 0
     End If
@@ -1222,6 +2168,7 @@ Process called "define_symbol" takes analyzer as Integer, symbol_name as Integer
     proc memory_set_int64 from Layout with symbol, 8, 0   Note: is_used
     proc memory_set_int64 from Layout with symbol, 16, symbol_name
     proc memory_set_int64 from Layout with symbol, 24, is_local
+    proc memory_set_int64 from Layout with symbol, 32, 0  Note: scheme quantifiers
 
     Let scope_table be proc current_scope_table with analyzer
     proc hashtable_set from Dict with scope_table, symbol_name, symbol
@@ -1229,6 +2176,14 @@ Process called "define_symbol" takes analyzer as Integer, symbol_name as Integer
     Let solver be proc memory_get_int64 from Layout with analyzer, 24
     Let definitions be proc memory_get_int64 from Layout with solver, 24
     proc list_append from List with definitions, symbol
+
+    Let env_entry be proc pool_allocate with analyzer, 16
+    If env_entry is not equal to 0:
+        proc memory_set_int64 from Layout with env_entry, 0, scope_count
+        proc memory_set_int64 from Layout with env_entry, 8, symbol_type
+        Let env_types be proc memory_get_int64 from Layout with solver, 40
+        proc list_append from List with env_types, env_entry
+    End If
 
     Return symbol
 End Process
@@ -1403,6 +2358,25 @@ Process called "resolve_type_expr" takes analyzer as Integer, type_node as Integ
         Let arg_type be proc resolve_type_expr with analyzer, arg_node
         Let result_type be proc resolve_type_expr with analyzer, result_node
         Return proc make_type2 with analyzer, TYPE_FUNCTION, arg_type, result_type
+    End If
+
+    Note: Tuple types (int * string) carry their element list in the same
+    Note: [TYPE_TUPLE, element List] shape infer_tuple_type builds, so
+    Note: annotated tuples unify structurally with inferred tuple values
+    If node_kind is equal to AST_TYPE_TUPLE from Parser:
+        Set children to proc memory_get_int64 from Layout with type_node, 16
+        Set child_count to proc memory_get_int64 from Layout with type_node, 24
+
+        Let element_types be proc list_create from List
+        Let t be 0
+        While t is less than child_count:
+            Let element_node be proc list_get from List with children, t
+            Let element_type be proc resolve_type_expr with analyzer, element_node
+            proc list_append from List with element_types, element_type
+            Set t to t plus 1
+        End While
+
+        Return proc make_type1 with analyzer, TYPE_TUPLE, element_types
     End If
 
     If node_kind is equal to AST_TYPE_APPLICATION from Parser:
@@ -1826,15 +2800,105 @@ Note: Expression Type Inference
 Note: ============================================================================
 
 @Reasoning:
+Builds the per-use type of the top-level printf family. Their real
+FSharp.Core types are PrintfFormat-driven (the format string's
+specifiers determine the remaining curried parameters), which a
+value-level signature cannot fix statically; the faithful model is
+format-string -> fresh, where the fresh result absorbs exactly as many
+further applications as the format demands (and infer_application_type
+validates the format string's specifier table separately). fprintf and
+fprintfn take the writer first. Returns 0 for non-family names so
+identifier lookup proceeds.
+@End Reasoning
+
+Process called "printf_family_type" takes analyzer as Integer, name as Integer returns Integer:
+    Note: Build the per-use type of a printf-family function, or 0
+
+    Let format_index be proc printf_family_format_index with name
+    If format_index is equal to 0:
+        Return 0
+    End If
+
+    Let rest be proc fresh_type_var with analyzer
+    Let fmt_fn be proc make_type2 with analyzer, TYPE_FUNCTION, TYPE_STRING, rest
+    If format_index is equal to 2:
+        Return proc make_type2 with analyzer, TYPE_FUNCTION, TYPE_ANY, fmt_fn
+    End If
+    Return fmt_fn
+End Process
+
+@Reasoning:
+Single classification point for the printf family shared by identifier
+typing and format-string checking: the returned index is the position of
+the format-string argument in the parser's flattened application shape
+(child 0 is the callee), so printf/printfn/sprintf/eprintf/eprintfn/
+failwithf format at child 1 and the writer-first fprintf/fprintfn at
+child 2. 0 means not a printf-family name.
+@End Reasoning
+
+Process called "printf_family_format_index" takes name as Integer returns Integer:
+    Note: Argument index of the format string for printf-family callees
+
+    If name is equal to 0:
+        Return 0
+    End If
+
+    Let is_fmt1 be proc string_equals from StringCore with name, "printf"
+    If is_fmt1 is equal to 0:
+        Set is_fmt1 to proc string_equals from StringCore with name, "printfn"
+    End If
+    If is_fmt1 is equal to 0:
+        Set is_fmt1 to proc string_equals from StringCore with name, "sprintf"
+    End If
+    If is_fmt1 is equal to 0:
+        Set is_fmt1 to proc string_equals from StringCore with name, "eprintf"
+    End If
+    If is_fmt1 is equal to 0:
+        Set is_fmt1 to proc string_equals from StringCore with name, "eprintfn"
+    End If
+    If is_fmt1 is equal to 0:
+        Set is_fmt1 to proc string_equals from StringCore with name, "failwithf"
+    End If
+    If is_fmt1 is equal to 1:
+        Return 1
+    End If
+
+    Let is_fmt2 be proc string_equals from StringCore with name, "fprintf"
+    If is_fmt2 is equal to 0:
+        Set is_fmt2 to proc string_equals from StringCore with name, "fprintfn"
+    End If
+    If is_fmt2 is equal to 1:
+        Return 2
+    End If
+
+    Return 0
+End Process
+
+@Reasoning:
 Resolves a bare identifier in priority order: built-in operator
 spellings (the parser routes infix operators here as identifier
 callees), built-in polymorphic constructors, declared union constructors
 (payload constructors type as payload -> union, nullary ones as the
-union itself), the scope chain, and finally dotted cross-module paths
-(List.map, System.Math.Sqrt) which type as fresh variables because their
-signatures live outside this compilation unit. Only a plain undotted
-name that none of those resolve is a genuine "Undefined variable" error
-- the same partition the F# checker applies given one file.
+union itself), the scope chain (let-generalized bindings instantiate a
+fresh copy of their scheme per use, so polymorphic functions check at
+every type they are applied at), the printf family, the standard
+exception constructors, and finally dotted paths. Dotted resolution
+partitions three ways: a qualifier that is a bound value or a
+user-declared module is a member access this structural analysis types
+fresh; a path whose leading segment is in the .NET core-module registry
+(List, Array, Seq, Option, Result, String, Map, Set, Array2D, Array3D
+and the nested Array.Parallel / List.Parallel surfaces) resolves through
+the nested module tables - the member key is the full dotted spelling,
+so depth >2 paths land on their registered nested-module member directly
+- and validates membership against the COMPLETE registered surface:
+unknown members of known modules are hard errors exactly as F# reports
+FS0039, and known members instantiate their REAL registered signature
+via member_signature_type, so wrong-shape arguments and over-application
+both surface as type errors; any other qualifier (System.*, external
+assemblies) is outside this compilation unit's knowledge and degrades to
+a documented warning plus a fresh variable. Only a plain undotted name
+that nothing resolves is a genuine "Undefined variable" error - the same
+partition the F# checker applies given one file.
 @End Reasoning
 
 Process called "infer_identifier_type" takes analyzer as Integer, identifier_node as Integer returns Integer:
@@ -1869,11 +2933,100 @@ Process called "infer_identifier_type" takes analyzer as Integer, identifier_nod
 
     Let symbol_info be proc lookup_symbol with analyzer, identifier_name
     If symbol_info is not equal to 0:
-        Return proc get_symbol_type with symbol_info
+        Let symbol_type be proc get_symbol_type with symbol_info
+        Let scheme be proc memory_get_int64 from Layout with symbol_info, 32
+        If scheme is not equal to 0:
+            Return proc instantiate with analyzer, symbol_type, scheme
+        End If
+        Return symbol_type
+    End If
+
+    Note: Top-level printf family (printf, printfn, sprintf, ...)
+    Let printf_type be proc printf_family_type with analyzer, identifier_name
+    If printf_type is not equal to 0:
+        Return printf_type
+    End If
+
+    Let type_env be proc memory_get_int64 from Layout with analyzer, 16
+
+    Note: Standard exception constructors (raise (ArgumentException "..."))
+    Let exn_key be proc pool_concat with analyzer, "netexn:", identifier_name
+    Let exn_known be proc hashtable_get from Dict with type_env, exn_key
+    If exn_known is not equal to 0:
+        Let exn_arg be proc fresh_type_var with analyzer
+        Return proc make_type2 with analyzer, TYPE_FUNCTION, exn_arg, TYPE_ANY
     End If
 
     Let is_dotted be proc string_contains from StringUtils with identifier_name, "."
     If is_dotted is equal to 1:
+        Note: Split at the first dot to find the qualifier
+        Let name_len be proc string_length from StringCore with identifier_name
+        Let dot_pos be 0
+        Let scanning be 1
+        While scanning is equal to 1:
+            If dot_pos is greater than or equal to name_len:
+                Set scanning to 0
+                Continue
+            End If
+            Let ch be proc string_char_at from StringCore with identifier_name, dot_pos
+            If ch is equal to 46:  Note: '.'
+                Set scanning to 0
+                Continue
+            End If
+            Set dot_pos to dot_pos plus 1
+        End While
+
+        Let qualifier be proc pool_allocate with analyzer, dot_pos plus 1
+        If qualifier is equal to 0:
+            Return proc fresh_type_var with analyzer
+        End If
+        Let c be 0
+        While c is less than dot_pos:
+            Set ch to proc string_char_at from StringCore with identifier_name, c
+            proc memory_set_byte from Layout with qualifier, c, ch
+            Set c to c plus 1
+        End While
+        proc memory_set_byte from Layout with qualifier, dot_pos, 0
+
+        Note: Member access on a bound value (record.field, instance.Method)
+        Let qualifier_symbol be proc lookup_symbol with analyzer, qualifier
+        If qualifier_symbol is not equal to 0:
+            Return proc fresh_type_var with analyzer
+        End If
+
+        Note: Qualified reference into a user-declared module or namespace
+        Let module_table be proc memory_get_int64 from Layout with analyzer, 32
+        Let user_module be proc hashtable_get from Dict with module_table, qualifier
+        If user_module is not equal to 0:
+            Return proc fresh_type_var with analyzer
+        End If
+
+        Note: F# core-module registry: complete surface, so membership
+        Note: decides. Nested module tables register under their full dotted
+        Note: name (netmod:Array.Parallel), so member resolution keys on the
+        Note: FULL path: depth >2 spellings (List.Parallel.map) land on their
+        Note: nested-module member entry directly, and an unknown member
+        Note: under ANY registered module prefix is the FS0039 hard error.
+        Let module_key be proc pool_concat with analyzer, "netmod:", qualifier
+        Let module_known be proc hashtable_get from Dict with type_env, module_key
+        If module_known is not equal to 0:
+            Let member_key be proc pool_concat with analyzer, "net:", identifier_name
+            Let member_entry be proc hashtable_get from Dict with type_env, member_key
+            If member_entry is equal to 0:
+                Let unknown_message be proc pool_concat with analyzer, "Unknown member: ", identifier_name
+                proc add_semantic_error with analyzer, unknown_message
+                Return TYPE_ERROR
+            End If
+
+            Note: Stored value is the member's real signature string;
+            Note: instantiate a fresh copy for this use site
+            Return proc member_signature_type with analyzer, member_entry
+        End If
+
+        Note: Unknown external qualifier: outside this compilation unit's
+        Note: knowledge - warn (documented permissive interop) and proceed
+        Let warn_message be proc pool_concat with analyzer, "Unresolved external module reference: ", identifier_name
+        proc add_semantic_warning with analyzer, warn_message
         Return proc fresh_type_var with analyzer
     End If
 
@@ -1888,7 +3041,10 @@ the callee (an operator identifier for infix uses), children 1..n are
 the arguments in order. Each argument applies one currying step through
 apply_function_type, which also teaches free-variable callees their
 function shape - so higher-order lambda parameters get usable types from
-their first application.
+their first application. printf-family callees additionally validate
+their literal format-string argument against the F# specifier
+combination table - the same static check the F# compiler runs when a
+string literal is adopted as a PrintfFormat.
 @End Reasoning
 
 Process called "infer_application_type" takes analyzer as Integer, app_node as Integer returns Integer:
@@ -1902,6 +3058,39 @@ Process called "infer_application_type" takes analyzer as Integer, app_node as I
     End If
 
     Let function_node be proc list_get from List with children, 0
+
+    Note: printf-family format-string validation on the literal argument
+    Let function_kind be proc memory_get_int64 from Layout with function_node, 0
+    If function_kind is equal to AST_IDENTIFIER from Parser:
+        Let callee_token be proc memory_get_int64 from Layout with function_node, 8
+        Let callee_name be proc get_token_text from Lexer with callee_token
+        Let fmt_index be proc printf_family_format_index with callee_name
+        If fmt_index is greater than 0:
+            If child_count is greater than fmt_index:
+                Let fmt_node be proc list_get from List with children, fmt_index
+                Let fmt_kind be proc memory_get_int64 from Layout with fmt_node, 0
+                If fmt_kind is equal to AST_LITERAL from Parser:
+                    Let fmt_token be proc memory_get_int64 from Layout with fmt_node, 8
+                    Let fmt_token_kind be proc get_token_type from Lexer with fmt_token
+                    Let is_format_literal be 0
+                    If fmt_token_kind is equal to TOKEN_STRING from Lexer:
+                        Set is_format_literal to 1
+                    End If
+                    If fmt_token_kind is equal to TOKEN_VERBATIM_STRING from Lexer:
+                        Set is_format_literal to 1
+                    End If
+                    If fmt_token_kind is equal to TOKEN_TRIPLE_QUOTE_STRING from Lexer:
+                        Set is_format_literal to 1
+                    End If
+                    If is_format_literal is equal to 1:
+                        Let fmt_text be proc get_token_text from Lexer with fmt_token
+                        proc validate_printf_format_string with analyzer, fmt_text
+                    End If
+                End If
+            End If
+        End If
+    End If
+
     Let result_type be proc infer_expression_type with analyzer, function_node
 
     Let i be 1
@@ -1993,6 +3182,121 @@ Process called "infer_lambda_type" takes analyzer as Integer, lambda_node as Int
 End Process
 
 @Reasoning:
+The syntactic-value judgement of the F# value restriction: lambdas,
+literals, identifiers, and unit are values, and a TUPLE expression is a
+value exactly when every component is - (fun x -> x), 5 is a value while
+(f g), 5 is expansive. Applications, control flow, and every other shape
+may allocate or observe state and must stay monomorphic.
+@End Reasoning
+
+Process called "expr_is_syntactic_value" takes expr_node as Integer returns Integer:
+    Note: Decide whether an expression is a syntactic value
+
+    If expr_node is equal to 0:
+        Return 0
+    End If
+
+    Let expr_kind be proc memory_get_int64 from Layout with expr_node, 0
+
+    If expr_kind is equal to AST_LAMBDA from Parser:
+        Return 1
+    End If
+    If expr_kind is equal to AST_LITERAL from Parser:
+        Return 1
+    End If
+    If expr_kind is equal to AST_IDENTIFIER from Parser:
+        Return 1
+    End If
+    If expr_kind is equal to AST_UNIT from Parser:
+        Return 1
+    End If
+
+    If expr_kind is equal to AST_TUPLE_EXPRESSION from Parser:
+        Let children be proc memory_get_int64 from Layout with expr_node, 16
+        Let child_count be proc memory_get_int64 from Layout with expr_node, 24
+        Let i be 0
+        While i is less than child_count:
+            Let child be proc list_get from List with children, i
+            Let child_is_value be proc expr_is_syntactic_value with child
+            If child_is_value is equal to 0:
+                Return 0
+            End If
+            Set i to i plus 1
+        End While
+        Return 1
+    End If
+
+    Return 0
+End Process
+
+@Reasoning:
+Generalization over a binding pattern: every variable the pattern bound
+receives its own scheme computed from ITS OWN component type against the
+environment captured before the binding - so let f, n = (fun x -> x), 5
+quantifies f's arrow variables while n stays the plain int, exactly how
+a single-name let generalizes. Tuple patterns recurse so nested
+destructuring (let (f, g), h = ...) generalizes every component.
+As-patterns generalize both the inner pattern's variables and the alias.
+The bound symbol is read from the innermost table directly (not
+lookup_symbol) so the definition itself is not marked used.
+@End Reasoning
+
+Process called "generalize_pattern_schemes" takes analyzer as Integer, pattern_node as Integer, env_limit as Integer returns Integer:
+    Note: Attach generalization schemes to a binding pattern's variables
+
+    If pattern_node is equal to 0:
+        Return 1
+    End If
+
+    Let pattern_kind be proc memory_get_int64 from Layout with pattern_node, 0
+
+    If pattern_kind is equal to AST_PATTERN_VARIABLE from Parser:
+        Let pattern_token be proc memory_get_int64 from Layout with pattern_node, 8
+        Let bound_name be proc get_token_text from Lexer with pattern_token
+        If bound_name is equal to 0:
+            Return 1
+        End If
+        Let scope_table be proc current_scope_table with analyzer
+        Let bound_symbol be proc hashtable_get from Dict with scope_table, bound_name
+        If bound_symbol is equal to 0:
+            Return 1
+        End If
+        Let bound_type be proc memory_get_int64 from Layout with bound_symbol, 0
+        Let scheme be proc generalize with analyzer, bound_type, env_limit
+        If scheme is not equal to 0:
+            proc memory_set_int64 from Layout with bound_symbol, 32, scheme
+        End If
+        Return 1
+    End If
+
+    If pattern_kind is equal to AST_PATTERN_TUPLE from Parser:
+        Let children be proc memory_get_int64 from Layout with pattern_node, 16
+        Let child_count be proc memory_get_int64 from Layout with pattern_node, 24
+        Let i be 0
+        While i is less than child_count:
+            Let child be proc list_get from List with children, i
+            proc generalize_pattern_schemes with analyzer, child, env_limit
+            Set i to i plus 1
+        End While
+        Return 1
+    End If
+
+    If pattern_kind is equal to AST_PATTERN_AS from Parser:
+        Set children to proc memory_get_int64 from Layout with pattern_node, 16
+        Set child_count to proc memory_get_int64 from Layout with pattern_node, 24
+        Set i to 0
+        While i is less than child_count:
+            Set child to proc list_get from List with children, i
+            proc generalize_pattern_schemes with analyzer, child, env_limit
+            Set i to i plus 1
+        End While
+        Return 1
+    End If
+
+    Return 1
+End Process
+
+@Reasoning:
 Analyzes one let binding (children [pattern, expression], metadata slot
 = optional return-type annotation, value slot = TOKEN_REC tag when
 recursive). Recursive bindings pre-bind the pattern against a fresh
@@ -2002,10 +3306,22 @@ giving correct shadowing. Function bindings (body is a lambda) check the
 annotation against the lambda's final return type by walking one
 function-arrow step per parameter; value bindings check it against the
 whole type.
+
+After inference and annotation checking, the binding is GENERALIZED
+under the F# value restriction: syntactic values (lambdas, literals,
+identifiers, unit, and tuples of syntactic values) bound to a variable
+or tuple pattern quantify their environment-free type variables into a
+per-variable scheme via generalize_pattern_schemes; expressions with
+possible effects or hidden state (applications, control flow) stay
+monomorphic, so let g = f h used at two different types is correctly
+rejected while let id = fun x -> x and let f, n = (fun x -> x), 5 check
+at every type. The env-types length is captured BEFORE any pattern
+binding so a recursive binding's own pre-bound entry never anchors its
+variables.
 @End Reasoning
 
 Process called "analyze_let_binding_declaration" takes analyzer as Integer, binding_node as Integer returns Integer:
-    Note: Analyze one let binding and bind its pattern
+    Note: Analyze one let binding, bind its pattern, and generalize
 
     Let children be proc memory_get_int64 from Layout with binding_node, 16
     Let child_count be proc memory_get_int64 from Layout with binding_node, 24
@@ -2016,6 +3332,10 @@ Process called "analyze_let_binding_declaration" takes analyzer as Integer, bind
 
     Let pattern_node be proc list_get from List with children, 0
     Let expr_node be proc list_get from List with children, 1
+
+    Let solver be proc memory_get_int64 from Layout with analyzer, 24
+    Let env_types be proc memory_get_int64 from Layout with solver, 40
+    Let env_limit be proc list_length from List with env_types
 
     Let rec_flag be proc memory_get_int64 from Layout with binding_node, 8
     Let expr_type be 0
@@ -2059,6 +3379,25 @@ Process called "analyze_let_binding_declaration" takes analyzer as Integer, bind
             If anno_ok is equal to 0:
                 proc add_semantic_error with analyzer, "Binding does not match its declared type"
             End If
+        End If
+    End If
+
+    Note: Let-polymorphism: generalize syntactic values bound to a variable
+    Note: or tuple pattern (the F# value restriction); each bound variable
+    Note: receives a scheme over its OWN component type
+    Let pattern_kind be proc memory_get_int64 from Layout with pattern_node, 0
+    Let generalizable_pattern be 0
+    If pattern_kind is equal to AST_PATTERN_VARIABLE from Parser:
+        Set generalizable_pattern to 1
+    End If
+    If pattern_kind is equal to AST_PATTERN_TUPLE from Parser:
+        Set generalizable_pattern to 1
+    End If
+
+    If generalizable_pattern is equal to 1:
+        Let is_value be proc expr_is_syntactic_value with expr_node
+        If is_value is equal to 1:
+            proc generalize_pattern_schemes with analyzer, pattern_node, env_limit
         End If
     End If
 
@@ -2582,9 +3921,405 @@ Process called "infer_pipe_type" takes analyzer as Integer, pipe_node as Integer
 End Process
 
 @Reasoning:
+The printf-family invalid-combination table, exactly as F#'s format
+checker (CheckFormatStrings) enforces over %[flags][width][.precision]
+type with the type letters b c d i u x X o s f F e E g G M A O:
+- the '#' modifier is invalid in F# with EVERY specifier;
+- the '0' zero-padding flag is invalid with the non-numeric specifiers
+  %b %c %s %O and with %A;
+- the '+' and ' ' numeric-prefix flags are invalid with %b %c %s %O;
+  %A accepts '+' (structured plus signs) but not ' ';
+- precision is valid ONLY with the floating/decimal family
+  %f %F %e %E %g %G %M - integer and non-numeric specifiers reject it;
+- '-' (left justify) and width are valid with every specifier.
+One shared checker keeps interpolated-hole validation and printf-family
+format-string validation on the identical table.
+@End Reasoning
+
+Process called "check_spec_combination" takes analyzer as Integer, has_zero as Integer, has_plus as Integer, has_space as Integer, has_hash as Integer, has_precision as Integer, type_ch as Integer returns Integer:
+    Note: Apply the F# flag/specifier invalid-combination table
+
+    If has_hash is equal to 1:
+        proc add_semantic_error with analyzer, "The # formatting modifier is invalid in F#"
+        Return 0
+    End If
+
+    Let is_non_numeric be 0
+    If type_ch is equal to 98:  Note: 'b'
+        Set is_non_numeric to 1
+    End If
+    If type_ch is equal to 99:  Note: 'c'
+        Set is_non_numeric to 1
+    End If
+    If type_ch is equal to 115:  Note: 's'
+        Set is_non_numeric to 1
+    End If
+    If type_ch is equal to 79:  Note: 'O'
+        Set is_non_numeric to 1
+    End If
+
+    If is_non_numeric is equal to 1:
+        If has_zero is equal to 1:
+            proc add_semantic_error with analyzer, "The '0' padding flag is invalid with a non-numeric format specifier"
+            Return 0
+        End If
+        If has_plus is equal to 1:
+            proc add_semantic_error with analyzer, "The '+' prefix flag is invalid with a non-numeric format specifier"
+            Return 0
+        End If
+        If has_space is equal to 1:
+            proc add_semantic_error with analyzer, "The ' ' prefix flag is invalid with a non-numeric format specifier"
+            Return 0
+        End If
+    End If
+
+    If type_ch is equal to 65:  Note: 'A'
+        If has_zero is equal to 1:
+            proc add_semantic_error with analyzer, "The '0' padding flag is invalid with %A"
+            Return 0
+        End If
+        If has_space is equal to 1:
+            proc add_semantic_error with analyzer, "The ' ' prefix flag is invalid with %A"
+            Return 0
+        End If
+    End If
+
+    If has_precision is equal to 1:
+        Let precision_ok be 0
+        If type_ch is equal to 102:  Note: 'f'
+            Set precision_ok to 1
+        End If
+        If type_ch is equal to 70:   Note: 'F'
+            Set precision_ok to 1
+        End If
+        If type_ch is equal to 101:  Note: 'e'
+            Set precision_ok to 1
+        End If
+        If type_ch is equal to 69:   Note: 'E'
+            Set precision_ok to 1
+        End If
+        If type_ch is equal to 103:  Note: 'g'
+            Set precision_ok to 1
+        End If
+        If type_ch is equal to 71:   Note: 'G'
+            Set precision_ok to 1
+        End If
+        If type_ch is equal to 77:   Note: 'M'
+            Set precision_ok to 1
+        End If
+        If precision_ok is equal to 0:
+            proc add_semantic_error with analyzer, "A precision is not valid with this format specifier"
+            Return 0
+        End If
+    End If
+
+    Return 1
+End Process
+
+@Reasoning:
+Parses one %specifier beginning at the '%' byte and validates it against
+the combination table. Returns the position just past the type character
+on success and -1 on error (the diagnostic is already recorded), so the
+format-string scanner can resume after each specifier. An unknown type
+letter is itself an error - printf rejects undefined specifiers
+statically.
+@End Reasoning
+
+Process called "validate_printf_spec_at" takes analyzer as Integer, text as Integer, start as Integer, text_len as Integer returns Integer:
+    Note: Validate one printf specifier; return end position or -1
+
+    Let i be start plus 1
+    Let has_zero be 0
+    Let has_plus be 0
+    Let has_space be 0
+    Let has_hash be 0
+
+    Let scanning_flags be 1
+    While scanning_flags is equal to 1:
+        If i is greater than or equal to text_len:
+            Set scanning_flags to 0
+            Continue
+        End If
+        Let ch be proc string_char_at from StringCore with text, i
+        Let is_flag be 0
+        If ch is equal to 43:  Note: '+'
+            Set has_plus to 1
+            Set is_flag to 1
+        End If
+        If ch is equal to 45:  Note: '-'
+            Set is_flag to 1
+        End If
+        If ch is equal to 32:  Note: ' '
+            Set has_space to 1
+            Set is_flag to 1
+        End If
+        If ch is equal to 48:  Note: '0'
+            Set has_zero to 1
+            Set is_flag to 1
+        End If
+        If ch is equal to 35:  Note: '#'
+            Set has_hash to 1
+            Set is_flag to 1
+        End If
+        If is_flag is equal to 1:
+            Set i to i plus 1
+        Otherwise:
+            Set scanning_flags to 0
+        End If
+    End While
+
+    While i is less than text_len:
+        Set ch to proc string_char_at from StringCore with text, i
+        Let is_width_digit be 0
+        If ch is greater than or equal to 48:
+            If ch is less than or equal to 57:
+                Set is_width_digit to 1
+            End If
+        End If
+        If is_width_digit is equal to 0:
+            Break
+        End If
+        Set i to i plus 1
+    End While
+
+    Let has_precision be 0
+    If i is less than text_len:
+        Set ch to proc string_char_at from StringCore with text, i
+        If ch is equal to 46:  Note: '.'
+            Set has_precision to 1
+            Set i to i plus 1
+            While i is less than text_len:
+                Set ch to proc string_char_at from StringCore with text, i
+                Let is_prec_digit be 0
+                If ch is greater than or equal to 48:
+                    If ch is less than or equal to 57:
+                        Set is_prec_digit to 1
+                    End If
+                End If
+                If is_prec_digit is equal to 0:
+                    Break
+                End If
+                Set i to i plus 1
+            End While
+        End If
+    End If
+
+    If i is greater than or equal to text_len:
+        proc add_semantic_error with analyzer, "Incomplete printf format specifier"
+        Return 0 minus 1
+    End If
+
+    Let type_ch be proc string_char_at from StringCore with text, i
+    Let is_type be 0
+    If type_ch is equal to 98:
+        Set is_type to 1
+    End If
+    If type_ch is equal to 99:
+        Set is_type to 1
+    End If
+    If type_ch is equal to 100:
+        Set is_type to 1
+    End If
+    If type_ch is equal to 105:
+        Set is_type to 1
+    End If
+    If type_ch is equal to 117:
+        Set is_type to 1
+    End If
+    If type_ch is equal to 120:
+        Set is_type to 1
+    End If
+    If type_ch is equal to 88:
+        Set is_type to 1
+    End If
+    If type_ch is equal to 111:
+        Set is_type to 1
+    End If
+    If type_ch is equal to 115:
+        Set is_type to 1
+    End If
+    If type_ch is equal to 102:
+        Set is_type to 1
+    End If
+    If type_ch is equal to 70:
+        Set is_type to 1
+    End If
+    If type_ch is equal to 101:
+        Set is_type to 1
+    End If
+    If type_ch is equal to 69:
+        Set is_type to 1
+    End If
+    If type_ch is equal to 103:
+        Set is_type to 1
+    End If
+    If type_ch is equal to 71:
+        Set is_type to 1
+    End If
+    If type_ch is equal to 77:
+        Set is_type to 1
+    End If
+    If type_ch is equal to 65:
+        Set is_type to 1
+    End If
+    If type_ch is equal to 79:
+        Set is_type to 1
+    End If
+
+    If is_type is equal to 0:
+        proc add_semantic_error with analyzer, "Invalid printf format specifier"
+        Return 0 minus 1
+    End If
+
+    Let combo_ok be proc check_spec_combination with analyzer, has_zero, has_plus, has_space, has_hash, has_precision, type_ch
+    If combo_ok is equal to 0:
+        Return 0 minus 1
+    End If
+
+    Return i plus 1
+End Process
+
+@Reasoning:
+Scans a printf-family format-string literal and validates every
+%specifier against the combination table. %% is the literal-percent
+escape and is skipped. Returns 1 when every specifier is valid; errors
+are recorded per offending specifier and scanning continues so one bad
+specifier does not hide the next.
+@End Reasoning
+
+Process called "validate_printf_format_string" takes analyzer as Integer, fmt as Integer returns Integer:
+    Note: Validate every %specifier in a printf-family format string
+
+    If fmt is equal to 0:
+        Return 1
+    End If
+
+    Let fmt_len be proc string_length from StringCore with fmt
+    Let all_ok be 1
+    Let i be 0
+    While i is less than fmt_len:
+        Let ch be proc string_char_at from StringCore with fmt, i
+        If ch is equal to 37:  Note: '%'
+            Let next_i be i plus 1
+            If next_i is less than fmt_len:
+                Let next_ch be proc string_char_at from StringCore with fmt, next_i
+                If next_ch is equal to 37:  Note: %% escape
+                    Set i to i plus 2
+                    Continue
+                End If
+            End If
+            Let end_pos be proc validate_printf_spec_at with analyzer, fmt, i, fmt_len
+            If end_pos is less than 0:
+                Set all_ok to 0
+                Set i to i plus 1
+            Otherwise:
+                Set i to end_pos
+            End If
+            Continue
+        End If
+        Set i to i plus 1
+    End While
+
+    Return all_ok
+End Process
+
+@Reasoning:
+Validates the format specification attached to one interpolation hole.
+The lexer preserves both spellings losslessly: a printf-style specifier
+captured before the hole arrives first ("%d"), and a .NET-style
+alignment/format suffix captured inside the hole arrives with its
+leading separator (",10", ":F2", ",10:F2"). F# forbids COMBINING the
+two on one hole - %d{x,10} is the alignment+specifier combination the
+compiler rejects - so a spec that starts with '%' must end exactly at
+its type character. Pure .NET alignment must be an optional '-' followed
+by digits (F# requires a constant integer alignment); the :format text
+is free-form and validated by the runtime formatter.
+@End Reasoning
+
+Process called "validate_hole_format_spec" takes analyzer as Integer, spec as Integer returns Integer:
+    Note: Validate one interpolation hole's format specification
+
+    If spec is equal to 0:
+        Return 1
+    End If
+
+    Let spec_len be proc string_length from StringCore with spec
+    If spec_len is equal to 0:
+        Return 1
+    End If
+
+    Let first be proc string_char_at from StringCore with spec, 0
+
+    If first is equal to 37:  Note: '%' printf-style specifier
+        Let end_pos be proc validate_printf_spec_at with analyzer, spec, 0, spec_len
+        If end_pos is less than 0:
+            Return 0
+        End If
+        If end_pos is less than spec_len:
+            Let combo_message be proc pool_concat with analyzer, "A printf-style format specifier cannot be combined with .NET-style alignment or format text in an interpolated string hole: ", spec
+            proc add_semantic_error with analyzer, combo_message
+            Return 0
+        End If
+        Return 1
+    End If
+
+    If first is equal to 44:  Note: ',' .NET alignment
+        Let i be 1
+        If i is less than spec_len:
+            Let ch be proc string_char_at from StringCore with spec, i
+            If ch is equal to 45:  Note: '-'
+                Set i to i plus 1
+            End If
+        End If
+        Let digit_count be 0
+        Let scanning_digits be 1
+        While scanning_digits is equal to 1:
+            If i is greater than or equal to spec_len:
+                Set scanning_digits to 0
+                Continue
+            End If
+            Set ch to proc string_char_at from StringCore with spec, i
+            If ch is greater than or equal to 48:
+                If ch is less than or equal to 57:
+                    Set digit_count to digit_count plus 1
+                    Set i to i plus 1
+                    Continue
+                End If
+            End If
+            Set scanning_digits to 0
+        End While
+
+        If digit_count is equal to 0:
+            proc add_semantic_error with analyzer, "Invalid alignment in interpolated string hole"
+            Return 0
+        End If
+        If i is less than spec_len:
+            Set ch to proc string_char_at from StringCore with spec, i
+            If ch is not equal to 58:  Note: only a ':' format may follow
+                proc add_semantic_error with analyzer, "Invalid alignment in interpolated string hole"
+                Return 0
+            End If
+        End If
+        Return 1
+    End If
+
+    If first is equal to 58:  Note: ':' .NET format text - runtime-validated
+        Return 1
+    End If
+
+    proc add_semantic_error with analyzer, "Malformed format specification in interpolated string hole"
+    Return 0
+End Process
+
+@Reasoning:
 Interpolated strings type as string. Hole expressions are inferred for
 their own diagnostics but accept any type (F# formats holes through %O /
-ToString), and literal segment children are string by construction.
+ToString), and literal segment children are string by construction. The
+parser's child layout is positional - child 0 is the leading literal
+segment, then [hole expression, literal segment] pairs - so the odd
+indices are exactly the holes; each hole's metadata slot (offset 40)
+carries its format specification when one was written, validated here
+against the F# combination rules.
 @End Reasoning
 
 Process called "infer_interpolated_type" takes analyzer as Integer, interp_node as Integer returns Integer:
@@ -2593,9 +4328,21 @@ Process called "infer_interpolated_type" takes analyzer as Integer, interp_node 
     Let children be proc memory_get_int64 from Layout with interp_node, 16
     Let child_count be proc memory_get_int64 from Layout with interp_node, 24
     Let i be 0
+    Let is_hole be 0
     While i is less than child_count:
         Let child be proc list_get from List with children, i
         proc infer_expression_type with analyzer, child
+
+        If is_hole is equal to 1:
+            Let hole_spec be proc memory_get_int64 from Layout with child, 40
+            If hole_spec is not equal to 0:
+                proc validate_hole_format_spec with analyzer, hole_spec
+            End If
+            Set is_hole to 0
+        Otherwise:
+            Set is_hole to 1
+        End If
+
         Set i to i plus 1
     End While
 

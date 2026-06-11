@@ -51,6 +51,7 @@ Import "compiler/middle/gungnir/hir/hir.runa" as HIR
 Import "compiler/frontend/primitives/memory/layout.runa" as Layout
 Import "compiler/frontend/primitives/collections/list.runa" as List
 Import "compiler/frontend/primitives/collections/dictionary.runa" as Dictionary
+Import "compiler/frontend/primitives/collections/ordered_map.runa" as OrderedMap
 Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
 
 Note: ============================================================================
@@ -123,16 +124,20 @@ Process called "create_lir_builder" that takes mir_function as Integer, calling_
     proc memory_set_int64 from Layout with builder, 0, mir_function
     proc memory_set_int64 from Layout with builder, 8, lir_function
 
-    Let value_to_register be proc create from Dictionary
+    Note: All three lookup maps are keyed by INTEGER ids (SSA value ids and
+    Note: MIR block ids). collections/dictionary string-hashes its keys, so an
+    Note: integer key is dereferenced as a string pointer and crashes at
+    Note: runtime — integer-keyed maps must use collections/ordered_map.
+    Let value_to_register be proc omap_create from OrderedMap
     proc memory_set_int64 from Layout with builder, 16, value_to_register
 
-    Let block_mapping be proc create from Dictionary
+    Let block_mapping be proc omap_create from OrderedMap
     proc memory_set_int64 from Layout with builder, 24, block_mapping
 
     proc memory_set_int64 from Layout with builder, 32, 0 Note: current_block (set later)
     proc memory_set_int64 from Layout with builder, 40, calling_convention
 
-    Let type_cache be proc create from Dictionary
+    Let type_cache be proc omap_create from OrderedMap
     proc memory_set_int64 from Layout with builder, 48, type_cache
 
     proc memory_set_int64 from Layout with builder, 56, 1000 Note: next_vreg_id starts at 1000
@@ -156,7 +161,7 @@ Process called "get_or_create_register_for_value" that takes builder as Integer,
 
     Note: Check if mapping already exists
     Let value_to_register be proc memory_get_int64 from Layout with builder, 16
-    Let existing_reg be proc get from Dictionary with value_to_register, value_id
+    Let existing_reg be proc omap_get from OrderedMap with value_to_register, value_id
 
     If existing_reg is not equal to 0:
         Return existing_reg
@@ -172,11 +177,11 @@ Process called "get_or_create_register_for_value" that takes builder as Integer,
     Let vreg_id be proc lir_create_virtual_register from LIR with lir_function, reg_class, reg_size
 
     Note: Store mapping
-    proc set from Dictionary with value_to_register, value_id, vreg_id
+    proc omap_set from OrderedMap with value_to_register, value_id, vreg_id
 
     Note: Cache type info
     Let type_cache be proc memory_get_int64 from Layout with builder, 48
-    proc set from Dictionary with type_cache, value_id, type_info
+    proc omap_set from OrderedMap with type_cache, value_id, type_info
 
     Return vreg_id
 End Process
@@ -193,7 +198,7 @@ Process called "get_or_create_lir_block" that takes builder as Integer, mir_bloc
     End If
 
     Let block_mapping be proc memory_get_int64 from Layout with builder, 24
-    Let existing_block be proc get from Dictionary with block_mapping, mir_block_id
+    Let existing_block be proc omap_get from OrderedMap with block_mapping, mir_block_id
 
     If existing_block is not equal to 0:
         Return existing_block
@@ -211,7 +216,7 @@ Process called "get_or_create_lir_block" that takes builder as Integer, mir_bloc
     Let lir_block_id be proc lir_add_block from LIR with lir_function, is_entry
 
     Note: Store mapping
-    proc set from Dictionary with block_mapping, mir_block_id, lir_block_id
+    proc omap_set from OrderedMap with block_mapping, mir_block_id, lir_block_id
 
     Return lir_block_id
 End Process
@@ -505,6 +510,46 @@ Process called "lower_unary_op" that takes builder as Integer, mir_node as Integ
     Return 1
 End Process
 
+@Reasoning
+OD-5 (approved 2026-06-10): lowers MIR_COPY — the dedicated SSA value-copy
+instruction emitted by SSA destruction and copy-insertion passes — to a
+single LIR register move. MIR_COPY is a plain 72-byte MIRNode: the
+destination SSA id is the header value_id (offset 8) and the source SSA
+id is header operand1 (offset 16). type_info (offset 40) is 0 by the
+create_mir_copy contract (a copy is type-transparent), and get_type_size
+maps a null type to the 8-byte pointer/integer width, which is the
+correct register width for the int64-everywhere bootstrap ABI.
+@End Reasoning
+
+@Implementation
+Reads dest from header offset 8 and source from header offset 16, maps
+both through get_or_create_register_for_value, and emits one
+create_lir_move. Returns 1 on success, 0 on null parameters.
+@End Implementation
+
+Process called "lower_copy" that takes builder as Integer, mir_node as Integer returns Integer:
+    If builder is equal to 0 or mir_node is equal to 0:
+        Display "lower_copy: null parameter"
+        Return 0
+    End If
+
+    Let result_value_id be proc memory_get_int64 from Layout with mir_node, 8
+    Let source_value_id be proc memory_get_int64 from Layout with mir_node, 16
+    Let type_info be proc memory_get_int64 from Layout with mir_node, 40
+
+    Let result_reg be proc get_or_create_register_for_value with builder, result_value_id, type_info
+    Let source_reg be proc get_or_create_register_for_value with builder, source_value_id, type_info
+
+    Let size be proc get_type_size with type_info
+    Let dest_operand be proc create_register_operand from LIRNodes with result_reg, size
+    Let src_operand be proc create_register_operand from LIRNodes with source_reg, size
+
+    Let move_inst be proc create_lir_move from LIRNodes with dest_operand, src_operand, size
+    proc append_lir_instruction with builder, move_inst
+
+    Return 1
+End Process
+
 Note: ============================================================================
 Note: Comparison Operation Lowering
 Note: ============================================================================
@@ -743,12 +788,17 @@ Process called "lower_branch" that takes builder as Integer, mir_node as Integer
         Return 0
     End If
 
-    Let condition_value_id be proc memory_get_int64 from Layout with mir_node, 16
-    Let true_block_id be proc memory_get_int64 from Layout with mir_node, 24
-    Let false_block_id be proc memory_get_int64 from Layout with mir_node, 32
+    Note: Post-OD-1 layout: the condition use is mirrored into header operand1
+    Note: (slot 16), but the block targets live ONLY in the extended region
+    Note: (true at 80, false at 88) — read them through the canonical accessors.
+    Let condition_value_id be proc get_mir_node_operand from MIR with mir_node, 1
+    Let true_block_id be proc get_mir_branch_true_block from MIRNodes with mir_node
+    Let false_block_id be proc get_mir_branch_false_block from MIRNodes with mir_node
 
-    Note: Get condition register
-    Let type_info be proc memory_get_int64 from Layout with mir_node, 40
+    Note: The branch header carries no result type; resolve the condition's
+    Note: type from the builder's value-type cache populated during lowering.
+    Let type_cache be proc memory_get_int64 from Layout with builder, 48
+    Let type_info be proc omap_get from OrderedMap with type_cache, condition_value_id
     Let condition_reg be proc get_or_create_register_for_value with builder, condition_value_id, type_info
 
     Note: Compare condition with 0 to set flags
@@ -785,7 +835,9 @@ Process called "lower_jump" that takes builder as Integer, mir_node as Integer r
         Return 0
     End If
 
-    Let target_block_id be proc memory_get_int64 from Layout with mir_node, 16
+    Note: Post-OD-1 layout: the jump target block id lives in the extended
+    Note: region at offset 72, never in a header operand slot.
+    Let target_block_id be proc get_mir_jump_target_block from MIRNodes with mir_node
 
     Note: Get LIR block ID for target
     Let lir_target_block be proc get_or_create_lir_block with builder, target_block_id
@@ -854,11 +906,13 @@ Process called "lower_phi_node" that takes builder as Integer, mir_phi as Intege
         Return 0
     End If
 
-    Note: Get phi result and incoming values
-    Let result_value_id be proc memory_get_int64 from Layout with mir_phi, 8
-    Let incoming_pairs be proc memory_get_int64 from Layout with mir_phi, 16
-    Let incoming_count be proc memory_get_int64 from Layout with mir_phi, 24
-    Let type_info be proc memory_get_int64 from Layout with mir_phi, 32
+    Note: Get phi result and incoming values through the post-OD-1 canonical
+    Note: accessors: result mirrors into header value_id at 8, the incoming
+    Note: list is a FLAT pair List at 80 (block at 2N, value at 2N+1), the
+    Note: incoming count is at 88, and the result type is at 96.
+    Let result_value_id be proc get_mir_node_value_id from MIR with mir_phi
+    Let incoming_count be proc get_phi_incoming_count from MIRNodes with mir_phi
+    Let type_info be proc get_phi_result_type from MIRNodes with mir_phi
 
     Note: Get result register
     Let result_reg be proc get_or_create_register_for_value with builder, result_value_id, type_info
@@ -867,10 +921,9 @@ Process called "lower_phi_node" that takes builder as Integer, mir_phi as Intege
     Note: For each incoming value, insert move at end of predecessor block
     Let i be 0
     While i is less than incoming_count:
-        Note: Get (block_id, value_id) pair
-        Let pair be proc get from List with incoming_pairs, i
-        Let pred_block_id be proc memory_get_int64 from Layout with pair, 0
-        Let value_id be proc memory_get_int64 from Layout with pair, 8
+        Note: Decode the (block_id, value_id) pair from the flat list
+        Let pred_block_id be proc get_phi_incoming_block from MIRNodes with mir_phi, i
+        Let value_id be proc get_phi_incoming_value from MIRNodes with mir_phi, i
 
         Note: Get source register
         Let src_reg be proc get_or_create_register_for_value with builder, value_id, type_info
@@ -916,11 +969,15 @@ Process called "lower_call" that takes builder as Integer, mir_node as Integer r
         Return 0
     End If
 
-    Let result_value_id be proc memory_get_int64 from Layout with mir_node, 8
-    Let callee_name be proc memory_get_int64 from Layout with mir_node, 16
-    Let arguments be proc memory_get_int64 from Layout with mir_node, 24
-    Let argument_count be proc memory_get_int64 from Layout with mir_node, 32
-    Let return_type be proc memory_get_int64 from Layout with mir_node, 40
+    Note: Post-OD-1 layout: MIRCall extended fields live at 72+ (callee at 80,
+    Note: arguments List at 88, argument_count at 96, return_type at 104) —
+    Note: read through the canonical accessors. The result id stays in the
+    Note: header value_id slot at 8.
+    Let result_value_id be proc get_mir_node_value_id from MIR with mir_node
+    Let callee_name be proc get_call_callee from MIRNodes with mir_node
+    Let arguments be proc get_call_arguments from MIRNodes with mir_node
+    Let argument_count be proc get_call_argument_count from MIRNodes with mir_node
+    Let return_type be proc get_call_return_type from MIRNodes with mir_node
     Let calling_convention be proc memory_get_int64 from Layout with builder, 40
 
     Note:
@@ -930,8 +987,8 @@ Process called "lower_call" that takes builder as Integer, mir_node as Integer r
     For non-FFI calls (callee_is_external == 0), the existing caller-convention
     path runs unchanged.
     :End Note
-    Let callee_is_external be proc memory_get_int64 from Layout with mir_node, 64
-    Let callee_convention_id be proc memory_get_int64 from Layout with mir_node, 72
+    Let callee_is_external be proc mir_call_get_callee_is_external from MIRNodes with mir_node
+    Let callee_convention_id be proc mir_call_get_callee_convention_id from MIRNodes with mir_node
 
     Note:
     P2-D FFI Q3 (Objective-C dispatch, convention_id = FFI_CALLING_CONV_OBJC = 5).
@@ -948,7 +1005,7 @@ Process called "lower_call" that takes builder as Integer, mir_node as Integer r
 
         Note: Get type info for argument (cached during lowering)
         Let type_cache be proc memory_get_int64 from Layout with builder, 48
-        Let arg_type be proc get from Dictionary with type_cache, arg_value_id
+        Let arg_type be proc omap_get from OrderedMap with type_cache, arg_value_id
 
         Let arg_reg be proc get_or_create_register_for_value with builder, arg_value_id, arg_type
         Let is_float be proc is_float_type with arg_type
@@ -1028,8 +1085,10 @@ Process called "lower_const" that takes builder as Integer, mir_node as Integer 
         Return 0
     End If
 
-    Let result_value_id be proc memory_get_int64 from Layout with mir_node, 8
-    Let constant_value be proc memory_get_int64 from Layout with mir_node, 16
+    Note: Post-OD-1 layout: the constant payload lives in the extended region
+    Note: at offset 80 (get_const_value), never in a header operand slot.
+    Let result_value_id be proc get_mir_node_value_id from MIR with mir_node
+    Let constant_value be proc get_const_value from MIRNodes with mir_node
     Let type_info be proc memory_get_int64 from Layout with mir_node, 40
 
     Let result_reg be proc get_or_create_register_for_value with builder, result_value_id, type_info
@@ -1382,23 +1441,26 @@ Process called "lower_call_indirect" that takes builder as Integer, mir_node as 
         Return 0
     End If
 
-    Let result_value_id be proc memory_get_int64 from Layout with mir_node, 8
-    Let callee_value_id be proc memory_get_int64 from Layout with mir_node, 16
-    Let arguments be proc memory_get_int64 from Layout with mir_node, 24
-    Let argument_count be proc memory_get_int64 from Layout with mir_node, 32
-    Let return_type be proc memory_get_int64 from Layout with mir_node, 40
+    Note: Post-OD-1 layout: for CALL_INDIRECT the callee slot at 80 carries the
+    Note: SSA value id of the function pointer; arguments List at 88, count at
+    Note: 96, return type at 104 — all read through the canonical accessors.
+    Let result_value_id be proc get_mir_node_value_id from MIR with mir_node
+    Let callee_value_id be proc get_call_callee from MIRNodes with mir_node
+    Let arguments be proc get_call_arguments from MIRNodes with mir_node
+    Let argument_count be proc get_call_argument_count from MIRNodes with mir_node
+    Let return_type be proc get_call_return_type from MIRNodes with mir_node
     Let calling_convention be proc memory_get_int64 from Layout with builder, 40
 
     Note: Get callee register (function pointer)
     Let type_cache be proc memory_get_int64 from Layout with builder, 48
-    Let callee_type be proc get from Dictionary with type_cache, callee_value_id
+    Let callee_type be proc omap_get from OrderedMap with type_cache, callee_value_id
     Let callee_reg be proc get_or_create_register_for_value with builder, callee_value_id, callee_type
 
     Note: Setup arguments according to calling convention (same as direct call)
     Let arg_index be 0
     While arg_index is less than argument_count:
         Let arg_value_id be proc get from List with arguments, arg_index
-        Let arg_type be proc get from Dictionary with type_cache, arg_value_id
+        Let arg_type be proc omap_get from OrderedMap with type_cache, arg_value_id
 
         Let arg_reg be proc get_or_create_register_for_value with builder, arg_value_id, arg_type
         Let is_float be proc is_float_type with arg_type
@@ -1467,11 +1529,16 @@ Process called "lower_switch" that takes builder as Integer, mir_node as Integer
         Return 0
     End If
 
-    Let condition_value_id be proc memory_get_int64 from Layout with mir_node, 16
-    Let cases be proc memory_get_int64 from Layout with mir_node, 24
-    Let case_count be proc memory_get_int64 from Layout with mir_node, 32
-    Let default_block_id be proc memory_get_int64 from Layout with mir_node, 40
-    Let type_info be proc memory_get_int64 from Layout with mir_node, 48
+    Note: Post-OD-1 layout: scrutinee value at 72 (mirrored in header
+    Note: operand1), flat case pair List at 80 (value at 2N, block at 2N+1),
+    Note: case_count at 88, default block at 96 — read via canonical
+    Note: accessors. The switch header carries no result type; resolve the
+    Note: scrutinee's type from the builder's value-type cache.
+    Let condition_value_id be proc get_switch_value from MIRNodes with mir_node
+    Let case_count be proc get_mir_switch_case_count from MIRNodes with mir_node
+    Let default_block_id be proc get_mir_switch_default_block from MIRNodes with mir_node
+    Let type_cache be proc memory_get_int64 from Layout with builder, 48
+    Let type_info be proc omap_get from OrderedMap with type_cache, condition_value_id
 
     Let condition_reg be proc get_or_create_register_for_value with builder, condition_value_id, type_info
     Let size be proc get_type_size with type_info
@@ -1484,10 +1551,10 @@ Process called "lower_switch" that takes builder as Integer, mir_node as Integer
     Note: Generate linear comparison sequence
     Let i be 0
     While i is less than case_count:
-        Note: Get case (value, target_block_id) pair
-        Let case_entry be proc get from List with cases, i
-        Let case_value be proc memory_get_int64 from Layout with case_entry, 0
-        Let target_block_id be proc memory_get_int64 from Layout with case_entry, 8
+        Note: Decode the (value, target_block_id) pair from the flat list:
+        Note: case value at slot 2N, target block at slot 2N+1
+        Let case_value be proc get_switch_case_value from MIRNodes with mir_node, i
+        Let target_block_id be proc get_mir_switch_case_block from MIRNodes with mir_node, i
 
         Note: Get LIR target block
         Let lir_target_block be proc get_or_create_lir_block with builder, target_block_id
@@ -1542,11 +1609,15 @@ Process called "lower_atomic_op" that takes builder as Integer, mir_node as Inte
         Return 0
     End If
 
-    Let opcode be proc memory_get_int64 from Layout with mir_node, 0
-    Let result_value_id be proc memory_get_int64 from Layout with mir_node, 8
-    Let address_value_id be proc memory_get_int64 from Layout with mir_node, 16
-    Let value_value_id be proc memory_get_int64 from Layout with mir_node, 24
-    Let ordering be proc memory_get_int64 from Layout with mir_node, 32
+    Note: Post-OD-1 layout: address at 80 and operand at 88 are mirrored into
+    Note: header operands 1/2; the memory ordering lives ONLY in the extended
+    Note: region at 104 (get_atomic_memory_order). Result type is mirrored
+    Note: into the header type slot at 40 by the constructor.
+    Let opcode be proc get_mir_node_opcode from MIR with mir_node
+    Let result_value_id be proc get_mir_node_value_id from MIR with mir_node
+    Let address_value_id be proc get_atomic_address from MIRNodes with mir_node
+    Let value_value_id be proc get_atomic_operand from MIRNodes with mir_node
+    Let ordering be proc get_atomic_memory_order from MIRNodes with mir_node
     Let type_info be proc memory_get_int64 from Layout with mir_node, 40
 
     Let address_reg be proc get_or_create_register_for_value with builder, address_value_id, type_info
@@ -1807,17 +1878,25 @@ Process called "lower_debug_annotation" that takes builder as Integer, mir_node 
     End If
 
     Let opcode be proc memory_get_int64 from Layout with mir_node, 0
-    Let info_ptr be proc memory_get_int64 from Layout with mir_node, 16
+
+    Note: Post-OD-1 layout: debug payloads live in the extended region at 72+.
+    Note: Carry the record's leading extended field through the LIR marker:
+    Note: the tracked value id for DEBUG_VALUE, the source file for
+    Note: DEBUG_LOCATION. DECLARE/LABEL markers are plain-header nodes whose
+    Note: payload (if any) rides in header operand1.
+    Let info_ptr be proc get_mir_node_operand from MIR with mir_node, 1
 
     Note: Map debug opcode to LIR debug marker
     Let lir_opcode be 0
 
     If opcode is equal to MIR_DEBUG_LOCATION from MIR:
         Set lir_opcode to LIR_DEBUG_LOCATION from LIR
+        Set info_ptr to proc get_location_source_file from MIRNodes with mir_node
     End If
 
     If opcode is equal to MIR_DEBUG_VALUE from MIR:
         Set lir_opcode to LIR_DEBUG_VALUE from LIR
+        Set info_ptr to proc get_debug_value_id from MIRNodes with mir_node
     End If
 
     If opcode is equal to MIR_DEBUG_DECLARE from MIR:
@@ -1851,6 +1930,13 @@ Process called "lower_mir_instruction" that takes builder as Integer, mir_node a
     End If
 
     Let opcode be proc memory_get_int64 from Layout with mir_node, 0
+
+    Note: SSA copy (OD-5). MIR_COPY (20008) sits numerically inside the
+    Note: [MIR_ADD..MIR_SAR] band but is a single-operand data move, so it
+    Note: must be dispatched BEFORE the binary-band range test.
+    If opcode is equal to MIR_COPY from MIR:
+        Return proc lower_copy with builder, mir_node
+    End If
 
     Note: Arithmetic and logical operations
     If opcode is greater than or equal to MIR_ADD from MIR and opcode is less than or equal to MIR_SAR from MIR:
@@ -1964,9 +2050,10 @@ Process called "lower_mir_instruction" that takes builder as Integer, mir_node a
         Return 1
     End If
 
-    Display "lower_mir_instruction: unsupported MIR opcode "
-    Display opcode
-    Display ""
+    Note: Convert the opcode before displaying - joining or displaying a raw
+    Note: integer treats it as a string pointer and crashes
+    Let opcode_str be proc integer_to_string from StringUtils with opcode
+    Display "lower_mir_instruction: unsupported MIR opcode " joined with opcode_str
     Return 0
 End Process
 
@@ -2176,13 +2263,13 @@ Process called "print_builder_stats" that takes builder as Integer returns Integ
     Display ""
 
     Let value_to_register be proc memory_get_int64 from Layout with builder, 16
-    Let mapping_count be proc size from Dictionary with value_to_register
+    Let mapping_count be proc omap_size from OrderedMap with value_to_register
     Display "SSA Value -> Register mappings: "
     Display mapping_count
     Display ""
 
     Let block_mapping be proc memory_get_int64 from Layout with builder, 24
-    Let block_mapping_count be proc size from Dictionary with block_mapping
+    Let block_mapping_count be proc omap_size from OrderedMap with block_mapping
     Display "MIR Block -> LIR Block mappings: "
     Display block_mapping_count
     Display ""

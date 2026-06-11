@@ -41,18 +41,19 @@ Dependencies:
 - compiler/middle/analysis/data_flow.runa (def-use chains)
 - compiler/frontend/primitives/memory/layout.runa (OWNED HEAP allocation - Tier 3)
 - compiler/frontend/primitives/collections/list.runa (constraint lists)
-- compiler/frontend/primitives/collections/dictionary.runa (pointer mappings)
+- compiler/frontend/primitives/collections/ordered_map.runa (integer-keyed pointer mappings)
 - compiler/frontend/primitives/collections/set.runa (points-to sets)
 - compiler/frontend/primitives/core/string_core.runa (debug printing)
 :End Note
 
 Import "compiler/middle/gungnir/mir/mir.runa" as MIR
+Import "compiler/middle/gungnir/mir/mir_nodes.runa" as MIRNodes
 Import "compiler/middle/gungnir/hir/hir.runa" as HIR
 Import "compiler/middle/analysis/control_flow.runa" as CFG
 Import "compiler/middle/analysis/data_flow.runa" as DataFlow
 Import "compiler/frontend/primitives/memory/layout.runa" as Layout
 Import "compiler/frontend/primitives/collections/list.runa" as List
-Import "compiler/frontend/primitives/collections/dictionary.runa" as Dictionary
+Import "compiler/frontend/primitives/collections/ordered_map.runa" as OrderedMap
 Import "compiler/frontend/primitives/collections/set.runa" as Set
 Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
 
@@ -65,6 +66,13 @@ Constant CONSTRAINT_ADDR_OF as Integer is 1      Note: p = &q (address-of)
 Constant CONSTRAINT_COPY as Integer is 2         Note: p = q (copy)
 Constant CONSTRAINT_LOAD as Integer is 3         Note: p = *q (load/dereference)
 Constant CONSTRAINT_STORE as Integer is 4        Note: *p = q (store/assignment through pointer)
+
+Note: Points-to nodes are keyed by SSA value_id INTEGERS (the MIRNode header
+Note: value_id slot at offset 8), and abstract-location CONTENT sets share
+Note: the same pointer_to_set dictionary. Location ids are sequential from
+Note: zero and would collide with small SSA value ids, so content sets are
+Note: namespaced at this base - far above any per-function value id count
+Constant LOCATION_CONTENT_KEY_BASE as Integer is 1000000000
 
 Note: ============================================================================
 Note: POINTS-TO ANALYSIS TYPE DEFINITIONS
@@ -167,10 +175,11 @@ Used by alias analysis and escape analysis.
 
 Fields:
 - locations: List of AbstractLocation pointers
-- pointer_to_set: Dictionary mapping pointer_id -> PointsToSet
+- pointer_to_set: Integer-keyed ordered map (omap) pointer_id -> PointsToSet
 - constraints: List of PointsToConstraint pointers
 - next_location_id: Counter for generating unique location IDs
-- worklist: Worklist for constraint propagation (pointer IDs to process)
+- worklist: Scratch List retained for layout compatibility (the solver
+  iterates the constraint set exhaustively and does not consult it)
 - location_count: Number of abstract locations
 - constraint_count: Number of constraints
 
@@ -180,10 +189,10 @@ Size: 7 fields × 8 bytes = 56 bytes
 
 Type called "PointsToGraph":
     locations as Integer            Note: List of AbstractLocation pointers
-    pointer_to_set as Integer       Note: Dictionary pointer_id -> PointsToSet
+    pointer_to_set as Integer       Note: Integer-keyed omap pointer_id -> PointsToSet
     constraints as Integer          Note: List of PointsToConstraint pointers
     next_location_id as Integer     Note: Location ID counter
-    worklist as Integer             Note: List of pointer IDs to process
+    worklist as Integer             Note: Scratch List (layout compatibility; solver does not consult it)
     location_count as Integer       Note: Number of locations
     constraint_count as Integer     Note: Number of constraints
 End Type
@@ -287,7 +296,7 @@ Process called "create_points_to_graph" returns Integer:
 
     Note: Create empty collections
     Let locations be proc create from List
-    Let pointer_to_set be proc create from Dictionary
+    Let pointer_to_set be proc omap_create from OrderedMap
     Let constraints be proc create from List
     Let worklist be proc create from List
 
@@ -360,7 +369,7 @@ Process called "get_or_create_points_to_set" that takes graph as Integer, pointe
     Let pts_dict be proc memory_get_int64 from Layout with graph, 8
 
     Note: Check if already exists
-    Let pts be proc get from Dictionary with pts_dict, pointer_id
+    Let pts be proc omap_get from OrderedMap with pts_dict, pointer_id
     If pts is not equal to 0:
         Return pts
     End If
@@ -372,7 +381,7 @@ Process called "get_or_create_points_to_set" that takes graph as Integer, pointe
     End If
 
     Note: Store in dictionary
-    proc set from Dictionary with pts_dict, pointer_id, pts
+    proc omap_set from OrderedMap with pts_dict, pointer_id, pts
 
     Return pts
 End Process
@@ -411,9 +420,14 @@ Process called "add_constraint" that takes graph as Integer, constraint_type as 
     Let count be proc memory_get_int64 from Layout with graph, 48
     proc memory_set_int64 from Layout with graph, 48, count plus 1
 
-    Note: Ensure points-to sets exist for lhs and rhs
+    Note: Ensure a points-to set exists for the lhs pointer. The rhs of an
+    Note: ADDR_OF constraint is an abstract-location id, NOT a pointer value
+    Note: id - location content sets live under LOCATION_CONTENT_KEY_BASE
+    Note: and are created lazily by the solver, so no rhs set is made here
     Let lhs_pts be get_or_create_points_to_set(graph, lhs)
-    Let rhs_pts be get_or_create_points_to_set(graph, rhs)
+    If constraint_type is not equal to 1:
+        Let rhs_pts be get_or_create_points_to_set(graph, rhs)
+    End If
 
     Return 1
 End Process
@@ -437,22 +451,29 @@ Process called "extract_constraints_from_mir" that takes graph as Integer, mir_f
         Return 0
     End If
 
-    Note: Get MIR CFG
+    Note: Get MIR CFG (canonical MIRFunction: cfg pointer at offset 8)
     Let mir_cfg be proc memory_get_int64 from Layout with mir_function, 8
     If mir_cfg is equal to 0:
         Return 0
     End If
 
-    Note: Get blocks
+    Note: Get blocks (canonical MIRCFG: blocks List at 16, count at 24)
     Let blocks be proc memory_get_int64 from Layout with mir_cfg, 16
     Let block_count be proc memory_get_int64 from Layout with mir_cfg, 24
+
+    Note: Abstract locations for address-of sites are keyed by the ADDRESSED
+    Note: value id so that two MIR_ADDRESS_OF instructions over the same
+    Note: value share one location - required for may_alias soundness.
+    Note: Stored shifted by one so location id 0 is distinguishable from
+    Note: the dictionary's 0 = absent sentinel
+    Let addressed_locations be proc omap_create from OrderedMap
 
     Note: For each block
     Let b be 0
     While b is less than block_count:
         Let block be proc get from List with blocks, b
 
-        Note: Get instructions
+        Note: Get instructions (canonical MIRBasicBlock: List at 16, count at 24)
         Let instructions be proc memory_get_int64 from Layout with block, 16
         Let inst_count be proc memory_get_int64 from Layout with block, 24
 
@@ -461,89 +482,126 @@ Process called "extract_constraints_from_mir" that takes graph as Integer, mir_f
         While i is less than inst_count:
             Let inst be proc get from List with instructions, i
 
-            Note: Get opcode (offset 0 in MIRNode)
+            Note: Get opcode (offset 0 in the canonical MIRNode header)
             Let opcode be proc memory_get_int64 from Layout with inst, 0
 
-            Note: Get result value (destination pointer)
-            Let result be proc memory_get_int64 from Layout with inst, 8
+            Note: The result is the SSA value_id INTEGER in the header slot
+            Note: at offset 8 (0 if the instruction produces no value);
+            Note: type_info pointer lives in the header slot at offset 40
+            Let result_id be proc memory_get_int64 from Layout with inst, 8
+            Let inst_type be proc memory_get_int64 from Layout with inst, 40
 
-            Note: Handle different instruction types
-            Note: Allocation instructions (opcodes 20800-20899)
-            If opcode is greater than or equal to 20800 and opcode is less than 20900:
-                Note: Create abstract location for this allocation
-                If result is not equal to 0:
-                    Let value_id be proc memory_get_int64 from Layout with result, 0
-                    Let type_info be proc memory_get_int64 from Layout with result, 8
-
-                    Let location_id be add_abstract_location(graph, inst, type_info)
-
-                    Note: Add ADDR_OF constraint: result points to this location
-                    add_constraint(graph, 1, value_id, location_id, inst)  Note: ADDR_OF = 1
+            Note: Stack allocation (MIR_ALLOCA 20202): fresh abstract
+            Note: location, result points to it
+            If opcode is equal to 20202:
+                If result_id is not equal to 0:
+                    Let location_id be add_abstract_location(graph, inst, inst_type)
+                    add_constraint(graph, 1, result_id, location_id, inst)  Note: ADDR_OF = 1
                 End If
             End If
 
-            Note: Copy/assignment instructions (opcodes 20000-20099)
-            If opcode is greater than or equal to 20000 and opcode is less than 20100:
-                If result is not equal to 0:
-                    Let lhs_id be proc memory_get_int64 from Layout with result, 0
+            Note: Heap allocation (OD-2: direct MIR_CALL whose callee name is
+            Note: in the canonical allocator family): fresh heap location.
+            Note: The 20800 band is DEBUG metadata, never allocation
+            If proc is_allocation_call from MIRNodes with inst is equal to 1:
+                If result_id is not equal to 0:
+                    Set location_id to add_abstract_location(graph, inst, inst_type)
 
-                    Note: Get operands
-                    Let operands be proc memory_get_int64 from Layout with inst, 16
-                    If operands is not equal to 0:
-                        Let operand_count be proc length from List with operands
-                        If operand_count is greater than 0:
-                            Let rhs be proc get from List with operands, 0
-                            If rhs is not equal to 0:
-                                Let rhs_id be proc memory_get_int64 from Layout with rhs, 0
+                    Note: Mark the location as heap: location ids are handed
+                    Note: out sequentially and records are appended in id
+                    Note: order, so the record at index location_id is the
+                    Note: one just created (is_heap field at offset 24)
+                    Let loc_list be proc memory_get_int64 from Layout with graph, 0
+                    Let new_loc be proc get from List with loc_list, location_id
+                    If new_loc is not equal to 0:
+                        proc memory_set_int64 from Layout with new_loc, 24, 1
+                    End If
 
-                                Note: Add COPY constraint: lhs = rhs
-                                add_constraint(graph, 2, lhs_id, rhs_id, inst)  Note: COPY = 2
-                            End If
-                        End If
+                    add_constraint(graph, 1, result_id, location_id, inst)  Note: ADDR_OF = 1
+                End If
+            End If
+
+            Note: Address-of (MIR_ADDRESS_OF 20205): result = &operand, with
+            Note: the addressed value's SSA use in header operand1 (offset 16)
+            If opcode is equal to 20205:
+                Let addressed be proc memory_get_int64 from Layout with inst, 16
+                If result_id is not equal to 0 and addressed is not equal to 0:
+                    Let existing_loc be proc omap_get from OrderedMap with addressed_locations, addressed
+                    If existing_loc is equal to 0:
+                        Set location_id to add_abstract_location(graph, inst, inst_type)
+                        proc omap_set from OrderedMap with addressed_locations, addressed, location_id plus 1
+                    Otherwise:
+                        Set location_id to existing_loc minus 1
+                    End If
+                    add_constraint(graph, 1, result_id, location_id, inst)  Note: ADDR_OF = 1
+                End If
+            End If
+
+            Note: Value-propagating ops: the arithmetic/bitwise band
+            Note: (20002-20016, including MIR_COPY 20008 and unary ops whose
+            Note: operand2 is simply 0) and the cast band (20400-20408).
+            Note: Pointer arithmetic and casts preserve pointing relations,
+            Note: so the result inherits the points-to sets of its operands
+            Note: (field-insensitive Andersen treatment of p + k)
+            Let is_value_prop be 0
+            If opcode is greater than or equal to 20002 and opcode is less than or equal to 20016:
+                Set is_value_prop to 1
+            End If
+            If opcode is greater than or equal to 20400 and opcode is less than or equal to 20408:
+                Set is_value_prop to 1
+            End If
+
+            If is_value_prop is equal to 1:
+                If result_id is not equal to 0:
+                    Let op1 be proc memory_get_int64 from Layout with inst, 16
+                    Let op2 be proc memory_get_int64 from Layout with inst, 24
+
+                    If op1 is not equal to 0:
+                        add_constraint(graph, 2, result_id, op1, inst)  Note: COPY = 2
+                    End If
+                    If op2 is not equal to 0:
+                        add_constraint(graph, 2, result_id, op2, inst)  Note: COPY = 2
                     End If
                 End If
             End If
 
-            Note: Load instructions (opcodes 20300-20349)
-            If opcode is greater than or equal to 20300 and opcode is less than 20350:
-                If result is not equal to 0:
-                    Set lhs_id to proc memory_get_int64 from Layout with result, 0
-
-                    Note: Get pointer operand
-                    Set operands to proc memory_get_int64 from Layout with inst, 16
-                    If operands is not equal to 0:
-                        Set operand_count to proc length from List with operands
-                        If operand_count is greater than 0:
-                            Let ptr be proc get from List with operands, 0
-                            If ptr is not equal to 0:
-                                Let ptr_id be proc memory_get_int64 from Layout with ptr, 0
-
-                                Note: Add LOAD constraint: lhs = *ptr
-                                add_constraint(graph, 3, lhs_id, ptr_id, inst)  Note: LOAD = 3
-                            End If
+            Note: Phi (MIR_PHI 20300): the merged value inherits the
+            Note: points-to set of every incoming value - one COPY
+            Note: constraint per incoming edge (mir_nodes pair accessors)
+            If opcode is equal to 20300:
+                If result_id is not equal to 0:
+                    Let incoming_count be proc get_phi_incoming_count from MIRNodes with inst
+                    Let k be 0
+                    While k is less than incoming_count:
+                        Let incoming_value be proc get_phi_incoming_value from MIRNodes with inst, k
+                        If incoming_value is not equal to 0:
+                            add_constraint(graph, 2, result_id, incoming_value, inst)  Note: COPY = 2
                         End If
+                        Set k to k plus 1
+                    End While
+                End If
+            End If
+
+            Note: Loads (MIR_LOAD 20200, MIR_LOAD_FIELD 20203, MIR_DEREF
+            Note: 20206): result = *address, address use at header operand1
+            If opcode is equal to 20200 or opcode is equal to 20203 or opcode is equal to 20206:
+                If result_id is not equal to 0:
+                    Let addr_id be proc memory_get_int64 from Layout with inst, 16
+                    If addr_id is not equal to 0:
+                        add_constraint(graph, 3, result_id, addr_id, inst)  Note: LOAD = 3
                     End If
                 End If
             End If
 
-            Note: Store instructions (opcodes 20350-20399)
-            If opcode is greater than or equal to 20350 and opcode is less than 20400:
-                Note: Get operands
-                Set operands to proc memory_get_int64 from Layout with inst, 16
-                If operands is not equal to 0:
-                    Set operand_count to proc length from List with operands
-                    If operand_count is greater than or equal to 2:
-                        Set ptr to proc get from List with operands, 0
-                        Let value be proc get from List with operands, 1
+            Note: Stores (MIR_STORE 20201, MIR_STORE_FIELD 20204):
+            Note: *address = value; address use at header operand1 (16),
+            Note: stored value use at header operand2 (24)
+            If opcode is equal to 20201 or opcode is equal to 20204:
+                Let store_addr be proc memory_get_int64 from Layout with inst, 16
+                Let store_value be proc memory_get_int64 from Layout with inst, 24
 
-                        If ptr is not equal to 0 and value is not equal to 0:
-                            Set ptr_id to proc memory_get_int64 from Layout with ptr, 0
-                            Set value_id to proc memory_get_int64 from Layout with value, 0
-
-                            Note: Add STORE constraint: *ptr = value
-                            add_constraint(graph, 4, ptr_id, value_id, inst)  Note: STORE = 4
-                        End If
-                    End If
+                If store_addr is not equal to 0 and store_value is not equal to 0:
+                    add_constraint(graph, 4, store_addr, store_value, inst)  Note: STORE = 4
                 End If
             End If
 
@@ -561,10 +619,12 @@ Note: ANDERSEN'S POINTS-TO ANALYSIS (Inclusion-Based)
 Note: ============================================================================
 
 @Reasoning
-Adds a location to a points-to set and propagates changes.
+Adds a location to a points-to set.
 
-If the pointee set actually changes, adds the pointer to the worklist
-for constraint re-evaluation.
+The return value is the solver's change signal: the exhaustive-iteration
+solver in compute_points_to_andersen re-runs the whole constraint set
+while any add_pointee call in a pass returns 1, so set membership is the
+single source of truth for convergence.
 
 Returns: 1 if set changed, 0 if no change
 @End Reasoning
@@ -585,31 +645,36 @@ Process called "add_pointee" that takes graph as Integer, pts as Integer, locati
     Note: Add to set
     proc add from Set with pointees, location_id
 
-    Note: Add pointer to worklist (changed, need to re-evaluate constraints)
-    Let pointer_id be proc memory_get_int64 from Layout with pts, 0
-    Let worklist be proc memory_get_int64 from Layout with graph, 32
-    proc append from List with worklist, pointer_id
-
     Return 1
 End Process
 
 @Reasoning
 Computes points-to sets using Andersen's inclusion-based analysis.
 
-Algorithm (worklist-based):
+Algorithm (exhaustive iteration to a global fixed point):
 1. Initialize: Extract constraints from program
-2. Process simple constraints (ADDR_OF)
-3. Worklist iteration:
-   - Pop pointer p from worklist
-   - For each constraint involving p:
-     - COPY (p = q): pts(p) ⊇ pts(q)
-     - LOAD (p = *q): pts(p) ⊇ ⋃_{l ∈ pts(q)} pts(l)
-     - STORE (*p = q): ∀l ∈ pts(p), pts(l) ⊇ pts(q)
-   - If any pts set changes, add affected pointers to worklist
-4. Repeat until worklist empty (fixed point)
+2. Process simple constraints (ADDR_OF) to seed the points-to sets
+3. Pass loop: re-evaluate EVERY inclusion constraint
+   - COPY (p = q): pts(p) ⊇ pts(q)
+   - LOAD (p = *q): pts(p) ⊇ ⋃_{l ∈ pts(q)} contents(l)
+   - STORE (*p = q): ∀l ∈ pts(p), contents(l) ⊇ pts(q)
+4. Repeat while any points-to set grew during the pass (fixed point)
 
-Complexity: O(n³) worst case, but efficient in practice
-Flow-insensitive: Same points-to set for all program points
+contents(l) is the abstract-location content set: what pointers stored
+INTO location l point to. Content sets share the pointer_to_set
+dictionary, namespaced under LOCATION_CONTENT_KEY_BASE so location ids
+never collide with SSA value-id keys.
+
+Exhaustive passes (rather than a selective worklist) guarantee that
+indirect propagation chains - a STORE growing contents(l) after a LOAD
+through l already ran - are re-examined on the next pass. The transfer
+functions are monotone over a finite lattice (locations are created only
+during constraint extraction), so termination is guaranteed;
+max_iterations is a defensive bound only.
+
+Complexity: O(passes × constraints × set size), cubic worst case -
+the textbook Andersen bound. Flow-insensitive: one points-to set per
+pointer for the whole program.
 
 Returns: 1 if successful
 @End Reasoning
@@ -623,7 +688,6 @@ Process called "compute_points_to_andersen" that takes graph as Integer returns 
     Note: Get graph fields
     Let constraints be proc memory_get_int64 from Layout with graph, 16
     Let constraint_count be proc memory_get_int64 from Layout with graph, 48
-    Let worklist be proc memory_get_int64 from Layout with graph, 32
     Let pts_dict be proc memory_get_int64 from Layout with graph, 8
 
     Note: Phase 1: Process ADDR_OF constraints (initialize points-to sets)
@@ -636,7 +700,7 @@ Process called "compute_points_to_andersen" that takes graph as Integer returns 
             Let lhs be proc memory_get_int64 from Layout with constraint, 8
             Let location_id be proc memory_get_int64 from Layout with constraint, 16
 
-            Note: pts(lhs) = {location_id}
+            Note: pts(lhs) ⊇ {location_id}
             Let pts be get_or_create_points_to_set(graph, lhs)
             add_pointee(graph, pts, location_id)
         End If
@@ -644,24 +708,15 @@ Process called "compute_points_to_andersen" that takes graph as Integer returns 
         Set c to c plus 1
     End While
 
-    Note: Phase 2: Iterative constraint solving (worklist algorithm)
+    Note: Phase 2: Exhaustive constraint iteration to a global fixed point
     Let iteration be 0
     Let max_iterations be 1000
+    Let solver_changed be 1
 
-    While proc length from List with worklist is greater than 0 and iteration is less than max_iterations:
+    While solver_changed is equal to 1 and iteration is less than max_iterations:
+        Set solver_changed to 0
         Set iteration to iteration plus 1
 
-        Note: Pop pointer from worklist
-        Let pointer_id be proc get from List with worklist, 0
-        proc remove_at from List with worklist, 0
-
-        Note: Get points-to set for this pointer
-        Let ptr_pts be proc get from Dictionary with pts_dict, pointer_id
-        If ptr_pts is equal to 0:
-            Continue
-        End If
-
-        Note: Process all constraints involving this pointer
         Set c to 0
         While c is less than constraint_count:
             Set constraint to proc get from List with constraints, c
@@ -669,34 +724,34 @@ Process called "compute_points_to_andersen" that takes graph as Integer returns 
             Set lhs to proc memory_get_int64 from Layout with constraint, 8
             Let rhs be proc memory_get_int64 from Layout with constraint, 16
 
-            Note: COPY constraint: lhs = rhs
+            Note: COPY constraint: pts(lhs) ⊇ pts(rhs)
             If type is equal to 2:  Note: COPY
-                Note: If rhs changed, propagate to lhs
-                If rhs is equal to pointer_id:
+                Let rhs_pts be proc omap_get from OrderedMap with pts_dict, rhs
+                If rhs_pts is not equal to 0:
                     Let lhs_pts be get_or_create_points_to_set(graph, lhs)
-                    Let rhs_pointees be proc memory_get_int64 from Layout with ptr_pts, 8
+                    Let rhs_pointees be proc memory_get_int64 from Layout with rhs_pts, 8
 
-                    Note: pts(lhs) ⊇ pts(rhs)
                     Let pointee_list be proc to_list from Set with rhs_pointees
                     Let pointee_count be proc length from List with pointee_list
 
                     Let p be 0
                     While p is less than pointee_count:
                         Set location_id to proc get from List with pointee_list, p
-                        add_pointee(graph, lhs_pts, location_id)
+                        If add_pointee(graph, lhs_pts, location_id) is equal to 1:
+                            Set solver_changed to 1
+                        End If
                         Set p to p plus 1
                     End While
                 End If
             End If
 
-            Note: LOAD constraint: lhs = *rhs
+            Note: LOAD constraint: pts(lhs) ⊇ contents(l) for each l in pts(rhs)
             If type is equal to 3:  Note: LOAD
-                Note: If rhs changed, propagate from rhs's pointees to lhs
-                If rhs is equal to pointer_id:
+                Set rhs_pts to proc omap_get from OrderedMap with pts_dict, rhs
+                If rhs_pts is not equal to 0:
                     Set lhs_pts to get_or_create_points_to_set(graph, lhs)
-                    Set rhs_pointees to proc memory_get_int64 from Layout with ptr_pts, 8
+                    Set rhs_pointees to proc memory_get_int64 from Layout with rhs_pts, 8
 
-                    Note: For each location l in pts(rhs)
                     Set pointee_list to proc to_list from Set with rhs_pointees
                     Set pointee_count to proc length from List with pointee_list
 
@@ -704,52 +759,58 @@ Process called "compute_points_to_andersen" that takes graph as Integer returns 
                     While p is less than pointee_count:
                         Set location_id to proc get from List with pointee_list, p
 
-                        Note: pts(lhs) ⊇ pts(location_id)
-                        Let loc_pts be get_or_create_points_to_set(graph, location_id)
-                        Let loc_pointees be proc memory_get_int64 from Layout with loc_pts, 8
+                        Note: Location content sets are namespaced under
+                        Note: LOCATION_CONTENT_KEY_BASE (see constant above)
+                        Let loc_pts be proc omap_get from OrderedMap with pts_dict, LOCATION_CONTENT_KEY_BASE plus location_id
+                        If loc_pts is not equal to 0:
+                            Let loc_pointees be proc memory_get_int64 from Layout with loc_pts, 8
 
-                        Let loc_pointee_list be proc to_list from Set with loc_pointees
-                        Let loc_pointee_count be proc length from List with loc_pointee_list
+                            Let loc_pointee_list be proc to_list from Set with loc_pointees
+                            Let loc_pointee_count be proc length from List with loc_pointee_list
 
-                        Let q be 0
-                        While q is less than loc_pointee_count:
-                            Let target_id be proc get from List with loc_pointee_list, q
-                            add_pointee(graph, lhs_pts, target_id)
-                            Set q to q plus 1
-                        End While
+                            Let q be 0
+                            While q is less than loc_pointee_count:
+                                Let target_id be proc get from List with loc_pointee_list, q
+                                If add_pointee(graph, lhs_pts, target_id) is equal to 1:
+                                    Set solver_changed to 1
+                                End If
+                                Set q to q plus 1
+                            End While
+                        End If
 
                         Set p to p plus 1
                     End While
                 End If
             End If
 
-            Note: STORE constraint: *lhs = rhs
+            Note: STORE constraint: contents(l) ⊇ pts(rhs) for each l in pts(lhs)
             If type is equal to 4:  Note: STORE
-                Note: If lhs changed, propagate rhs to lhs's pointees
-                If lhs is equal to pointer_id:
-                    Let rhs_pts be get_or_create_points_to_set(graph, rhs)
-                    Let lhs_pointees be proc memory_get_int64 from Layout with ptr_pts, 8
+                Let lhs_ptr_pts be proc omap_get from OrderedMap with pts_dict, lhs
+                Set rhs_pts to proc omap_get from OrderedMap with pts_dict, rhs
 
-                    Note: For each location l in pts(lhs)
+                If lhs_ptr_pts is not equal to 0 and rhs_pts is not equal to 0:
+                    Let lhs_pointees be proc memory_get_int64 from Layout with lhs_ptr_pts, 8
+                    Set rhs_pointees to proc memory_get_int64 from Layout with rhs_pts, 8
+
                     Set pointee_list to proc to_list from Set with lhs_pointees
                     Set pointee_count to proc length from List with pointee_list
+
+                    Let rhs_pointee_list be proc to_list from Set with rhs_pointees
+                    Let rhs_pointee_count be proc length from List with rhs_pointee_list
 
                     Set p to 0
                     While p is less than pointee_count:
                         Set location_id to proc get from List with pointee_list, p
 
-                        Note: pts(location_id) ⊇ pts(rhs)
-                        Set loc_pts to get_or_create_points_to_set(graph, location_id)
-                        Set rhs_pointees to proc memory_get_int64 from Layout with rhs_pts, 8
+                        Set loc_pts to get_or_create_points_to_set(graph, LOCATION_CONTENT_KEY_BASE plus location_id)
 
-                        Let rhs_pointee_list be proc to_list from Set with rhs_pointees
-                        Let rhs_pointee_count be proc length from List with rhs_pointee_list
-
-                        Set q to 0
-                        While q is less than rhs_pointee_count:
-                            Set target_id to proc get from List with rhs_pointee_list, q
-                            add_pointee(graph, loc_pts, target_id)
-                            Set q to q plus 1
+                        Let q2 be 0
+                        While q2 is less than rhs_pointee_count:
+                            Let target2 be proc get from List with rhs_pointee_list, q2
+                            If add_pointee(graph, loc_pts, target2) is equal to 1:
+                                Set solver_changed to 1
+                            End If
+                            Set q2 to q2 plus 1
                         End While
 
                         Set p to p plus 1
@@ -761,8 +822,10 @@ Process called "compute_points_to_andersen" that takes graph as Integer returns 
         End While
     End While
 
-    Note: Check for convergence
-    If iteration is equal to max_iterations:
+    Note: Defensive convergence check: the loop exits either because a full
+    Note: pass made no change (solver_changed = 0, converged) or because the
+    Note: defensive iteration bound was hit while sets were still growing
+    If solver_changed is equal to 1:
         Display "compute_points_to_andersen: max iterations reached (may not have converged)"
         Return 0
     End If
@@ -790,7 +853,7 @@ Process called "query_points_to" that takes graph as Integer, pointer_id as Inte
     Let pts_dict be proc memory_get_int64 from Layout with graph, 8
 
     Note: Look up points-to set
-    Let pts be proc get from Dictionary with pts_dict, pointer_id
+    Let pts be proc omap_get from OrderedMap with pts_dict, pointer_id
 
     Return pts
 End Process
@@ -1090,17 +1153,15 @@ Process called "print_points_to_graph" that takes graph as Integer returns Integ
         Set i to i plus 1
     End While
 
-    Note: Print points-to sets
+    Note: Print points-to sets (insertion-ordered omap entry walk)
     Display ""
     Display "Points-To Sets:"
     Let pts_dict be proc memory_get_int64 from Layout with graph, 8
-    Let pointer_ids be proc keys from Dictionary with pts_dict
-    Let ptr_count be proc length from List with pointer_ids
 
-    Set i to 0
-    While i is less than ptr_count:
-        Let pointer_id be proc get from List with pointer_ids, i
-        Let pts be proc get from Dictionary with pts_dict, pointer_id
+    Let map_entry be proc omap_first from OrderedMap with pts_dict
+    While map_entry is not equal to 0:
+        Let pointer_id be proc omap_entry_key from OrderedMap with map_entry
+        Let pts be proc omap_entry_value from OrderedMap with map_entry
 
         Display "  Pointer "
         Display pointer_id
@@ -1122,7 +1183,7 @@ Process called "print_points_to_graph" that takes graph as Integer returns Integ
 
         Display "}"
 
-        Set i to i plus 1
+        Set map_entry to proc omap_entry_next from OrderedMap with map_entry
     End While
 
     Note: Print constraints

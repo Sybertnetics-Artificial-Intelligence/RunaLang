@@ -36,6 +36,7 @@ This file consists of the following functions/features/operation types:
 :End Note
 
 Import "compiler/middle/gungnir/mir/mir.runa" as MIR
+Import "compiler/middle/gungnir/mir/mir_nodes.runa" as MIRNodes
 Import "compiler/middle/gungnir/mir/mir_builder.runa" as MIRBuilder
 Import "compiler/middle/analysis/control_flow.runa" as ControlFlowGraph
 Import "compiler/middle/analysis/points_to.runa" as PointsToAnalysis
@@ -85,11 +86,13 @@ Constant CALL_TYPE_VIRTUAL as Integer is 2     Note: Virtual method call
 @Implementation
 CallGraphNode represents a single function in the call graph.
 Fields:
-- function_id: Unique function identifier (from MIR)
+- function_id: The MIRFunction POINTER (OD-4 2026-06-10: function identity
+  is the function record pointer; the canonical MIRFunction has no numeric
+  id field — its offset 0 is the name string)
 - function_name: Pointer to function name string
 - call_sites: List of CallSite structures (outgoing edges)
 - call_site_count: Number of direct calls this function makes
-- callers: List of caller function IDs (incoming edges)
+- callers: List of caller MIRFunction pointers (incoming edges)
 - caller_count: Number of functions that call this one
 - is_recursive: Boolean flag indicating if function is in recursive cycle
 - scc_id: Strongly connected component ID (same ID = same SCC)
@@ -120,14 +123,18 @@ End Type
 CallSite represents a single call site (a location where a call occurs).
 Fields:
 - instruction_ptr: Pointer to MIR instruction making the call
-- callee_id: Target function ID (0 if indirect/virtual with multiple targets)
+- callee_id: Target MIRFunction pointer (0 if indirect/virtual with multiple targets)
 - call_type: DIRECT (0), INDIRECT (1), or VIRTUAL (2)
 - block_id: Basic block containing this call site
 - frequency: Execution frequency from profile data (0 if no profile)
 - is_tail_call: Boolean indicating tail call optimization candidate
 - call_context: Context-sensitive information (for context-sensitive analysis)
+- caller_id: MIRFunction pointer of the function CONTAINING this call site
+  (added in the Wave-2 OD-4 rework: indirect-call consumers need the caller
+  identity and the record previously had no slot for it — the historical
+  code misread the callee_id slot, which is always 0 for indirect sites)
 
-Memory layout (56 bytes, Tier 3 OWNED HEAP):
+Memory layout (64 bytes, Tier 3 OWNED HEAP):
 Offset 0: instruction_ptr (8 bytes)
 Offset 8: callee_id (8 bytes)
 Offset 16: call_type (8 bytes)
@@ -135,6 +142,7 @@ Offset 24: block_id (8 bytes)
 Offset 32: frequency (8 bytes)
 Offset 40: is_tail_call (8 bytes)
 Offset 48: call_context (8 bytes)
+Offset 56: caller_id (8 bytes)
 @End Implementation
 
 Type called "CallSite":
@@ -145,6 +153,7 @@ Type called "CallSite":
     frequency as Integer
     is_tail_call as Integer
     call_context as Integer
+    caller_id as Integer
 End Type
 
 @Implementation
@@ -169,7 +178,10 @@ End Type
 @Implementation
 CallGraph is the main call graph structure.
 Fields:
-- nodes: Dictionary mapping function_id -> CallGraphNode
+- nodes: Dictionary mapping stringified MIRFunction pointer -> CallGraphNode
+  (the hashtable primitive hashes keys as strings, so pointer identities
+  are stored via StringUtils.integer_to_string per the same convention
+  MIR.register_value_definition uses)
 - node_count: Total number of functions in graph
 - edges: List of (caller_id, callee_id) tuples
 - edge_count: Total number of call edges
@@ -259,8 +271,8 @@ Frequency defaults to 0 (no profile data), is_tail_call defaults to false.
 @End Reasoning
 
 Process called "create_call_site" that takes instruction_ptr as Integer, callee_id as Integer, call_type as Integer, block_id as Integer returns Integer:
-    Note: Allocate CallSite (56 bytes, Tier 3 OWNED HEAP)
-    Let site be proc allocate from Layout with 56
+    Note: Allocate CallSite (64 bytes, Tier 3 OWNED HEAP)
+    Let site be proc allocate from Layout with 64
 
     Note: Initialize fields
     proc memory_set_int64 from MemoryCore with site, 0, instruction_ptr
@@ -270,6 +282,7 @@ Process called "create_call_site" that takes instruction_ptr as Integer, callee_
     proc memory_set_int64 from MemoryCore with site, 32, 0 Note: frequency = 0
     proc memory_set_int64 from MemoryCore with site, 40, 0 Note: is_tail_call = false
     proc memory_set_int64 from MemoryCore with site, 48, 0 Note: call_context = null
+    proc memory_set_int64 from MemoryCore with site, 56, 0 Note: caller_id (set by add_direct_call / add_indirect_call)
 
     Return site
 End Process
@@ -342,26 +355,62 @@ Process called "build_call_graph" that takes mir as Integer, points_to_analysis 
     Let functions be proc memory_get_int64 from MemoryCore with mir, 0
     Let function_count be proc length from List with functions
 
-    Note: Phase 1: Create nodes for all functions
+    Note: Phase 1: Create nodes for all functions.
+    Note: OD-4 (2026-06-10): function identity is the MIRFunction POINTER.
+    Note: The canonical MIRFunction has NO numeric id field — offset 0 is the
+    Note: name string pointer (mir.runa:284). Node Dictionary keys are the
+    Note: decimal rendering of the function pointer (the hashtable primitive
+    Note: hashes keys as strings, so raw pointers must be stringified —
+    Note: the same convention MIR.register_value_definition uses).
+    Note: name_index maps function-name string -> MIRFunction pointer for
+    Note: O(1) direct-callee resolution in Phase 2. The hashtable primitive
+    Note: hashes string keys by CONTENT, so the callee-name string stored in
+    Note: a MIRCall record resolves even though it is a different allocation
+    Note: than the function's own name string.
+    Let name_index be proc create from Dictionary
+
     Let i be 0
     While i is less than function_count:
         Let mir_func be proc list_get from List with functions, i
-        Let function_id be proc memory_get_int64 from MemoryCore with mir_func, 0
-        Let function_name be proc memory_get_int64 from MemoryCore with mir_func, 8
+        Let function_name be proc memory_get_int64 from MemoryCore with mir_func, 0
 
-        Note: Create call graph node
-        Let node be create_call_graph_node(function_id, function_name)
-        proc set from Dictionary with nodes, function_id, node
+        Note: Create call graph node keyed by the function pointer
+        Let node be create_call_graph_node(mir_func, function_name)
+        Let node_key be proc integer_to_string from StringUtils with mir_func
+        proc set from Dictionary with nodes, node_key, node
+
+        If function_name is not equal to 0:
+            proc set from Dictionary with name_index, function_name, mir_func
+        End If
 
         Note: Increment node count
         Let node_count be proc memory_get_int64 from MemoryCore with cg, 8
         Set node_count to node_count plus 1
         proc memory_set_int64 from MemoryCore with cg, 8, node_count
 
-        Note: Check if this is an entry function (exported or main)
-        Let is_exported be proc memory_get_int64 from MemoryCore with mir_func, 24
-        If is_exported is equal to 1:
-            proc append from List with entry_functions, function_id
+        Note: Entry detection: the "main" function is the program entry; a
+        Note: metadata export flag (metadata at offset 88, flags word at
+        Note: offset 8, bit 0) marks linker-visible exports. The old read of
+        Note: offset 24 was the parameter_count slot — never a valid flag.
+        Let is_entry be 0
+        If function_name is not equal to 0:
+            Let is_main be proc string_equals from StringCore with function_name, "main"
+            If is_main is equal to 1:
+                Set is_entry to 1
+            End If
+        End If
+        If is_entry is equal to 0:
+            Let func_metadata be proc memory_get_int64 from MemoryCore with mir_func, 88
+            If func_metadata is not equal to 0:
+                Let meta_flags be proc memory_get_int64 from MemoryCore with func_metadata, 8
+                Let export_flag be meta_flags bitwise_and 1
+                If export_flag is equal to 1:
+                    Set is_entry to 1
+                End If
+            End If
+        End If
+        If is_entry is equal to 1:
+            proc append from List with entry_functions, mir_func
         End If
 
         Set i to i plus 1
@@ -371,13 +420,12 @@ Process called "build_call_graph" that takes mir as Integer, points_to_analysis 
     Set i to 0
     While i is less than function_count:
         Set mir_func to proc list_get from List with functions, i
-        Let caller_id be proc memory_get_int64 from MemoryCore with mir_func, 0
 
-        Note: Get CFG for this function
-        Let cfg be proc memory_get_int64 from MemoryCore with mir_func, 16
+        Note: Get CFG for this function (canonical MIRFunction cfg at offset 8)
+        Let cfg be proc memory_get_int64 from MemoryCore with mir_func, 8
         If cfg is not equal to 0:
-            Note: Scan all blocks for calls
-            Let blocks be proc memory_get_int64 from MemoryCore with cfg, 0
+            Note: Scan all blocks for calls (canonical MIRCFG blocks at offset 16)
+            Let blocks be proc memory_get_int64 from MemoryCore with cfg, 16
             Let block_count be proc length from List with blocks
 
             Let b be 0
@@ -394,17 +442,26 @@ Process called "build_call_graph" that takes mir as Integer, points_to_analysis 
                     Let inst be proc list_get from List with instructions, j
                     Let opcode be proc memory_get_int64 from MemoryCore with inst, 0
 
-                    Note: MIR_CALL (20304) - direct function call
+                    Note: MIR_CALL (20304) - direct function call. The callee
+                    Note: slot of the prefix-embedded MIRCall record holds the
+                    Note: callee's NAME STRING (mir_nodes.runa:843); resolve it
+                    Note: to the MIRFunction pointer by name comparison. Calls
+                    Note: to functions not present in this program (runtime /
+                    Note: external symbols) resolve to nothing and create no
+                    Note: edge — they cannot be inlined or DCE-analyzed anyway.
                     If opcode is equal to 20304:
-                        Let callee_id be proc memory_get_int64 from MemoryCore with inst, 16
-                        If callee_id is not equal to 0:
-                            add_direct_call(cg, caller_id, callee_id, inst, block_id)
+                        Let callee_name be proc get_call_callee from MIRNodes with inst
+                        If callee_name is not equal to 0:
+                            Let callee_func be proc get from Dictionary with name_index, callee_name
+                            If callee_func is not equal to 0:
+                                add_direct_call(cg, mir_func, callee_func, inst, block_id)
+                            End If
                         End If
                     End If
 
                     Note: MIR_CALL_INDIRECT (20305) - indirect call through function pointer
                     If opcode is equal to 20305:
-                        add_indirect_call(cg, caller_id, inst, block_id, points_to_analysis)
+                        add_indirect_call(cg, mir_func, inst, block_id, points_to_analysis)
                     End If
 
                     Set j to j plus 1
@@ -416,6 +473,9 @@ Process called "build_call_graph" that takes mir as Integer, points_to_analysis 
 
         Set i to i plus 1
     End While
+
+    Note: Phase 2 cleanup — the name index is build-local
+    proc destroy from Dictionary with name_index
 
     Note: Phase 3: Compute SCCs using Tarjan's algorithm
     compute_sccs_tarjan(cg)
@@ -433,23 +493,28 @@ and updates the callee's caller list for bidirectional navigation.
 @End Reasoning
 
 Process called "add_direct_call" that takes cg as Integer, caller_id as Integer, callee_id as Integer, inst as Integer, block_id as Integer returns Integer:
+    Note: OD-4: caller_id / callee_id are MIRFunction POINTERS; node lookups
+    Note: stringify the pointer to match the build-time Dictionary keys.
     Let nodes be proc memory_get_int64 from MemoryCore with cg, 0
     Let edges be proc memory_get_int64 from MemoryCore with cg, 16
 
     Note: Get caller node
-    Let caller_node be proc get from Dictionary with nodes, caller_id
+    Let caller_key be proc integer_to_string from StringUtils with caller_id
+    Let caller_node be proc get from Dictionary with nodes, caller_key
     If caller_node is equal to 0:
         Return 0
     End If
 
     Note: Get callee node
-    Let callee_node be proc get from Dictionary with nodes, callee_id
+    Let callee_key be proc integer_to_string from StringUtils with callee_id
+    Let callee_node be proc get from Dictionary with nodes, callee_key
     If callee_node is equal to 0:
         Return 0
     End If
 
-    Note: Create call site
+    Note: Create call site (record the caller identity at offset 56)
     Let call_site be create_call_site(inst, callee_id, 0, block_id)
+    proc memory_set_int64 from MemoryCore with call_site, 56, caller_id
 
     Note: Add call site to caller's list
     Let call_sites be proc memory_get_int64 from MemoryCore with caller_node, 16
@@ -494,17 +559,21 @@ Process called "add_indirect_call" that takes cg as Integer, caller_id as Intege
     Let nodes be proc memory_get_int64 from MemoryCore with cg, 0
     Let indirect_calls be proc memory_get_int64 from MemoryCore with cg, 64
 
-    Note: Get caller node
-    Let caller_node be proc get from Dictionary with nodes, caller_id
+    Note: Get caller node (OD-4 pointer key)
+    Let caller_key be proc integer_to_string from StringUtils with caller_id
+    Let caller_node be proc get from Dictionary with nodes, caller_key
     If caller_node is equal to 0:
         Return 0
     End If
 
-    Note: Get function pointer operand
-    Let func_ptr be proc memory_get_int64 from MemoryCore with inst, 16
+    Note: Get function pointer operand. For MIR_CALL_INDIRECT the callee
+    Note: slot of the prefix-embedded record (offset 80, via accessor)
+    Note: holds the SSA value id of the function-pointer expression.
+    Let func_ptr be proc get_call_callee from MIRNodes with inst
 
-    Note: Create call site with INDIRECT type
+    Note: Create call site with INDIRECT type (record caller at offset 56)
     Let call_site be create_call_site(inst, 0, 1, block_id)
+    proc memory_set_int64 from MemoryCore with call_site, 56, caller_id
 
     Note: Add to caller's call site list
     Let call_sites be proc memory_get_int64 from MemoryCore with caller_node, 16
@@ -591,37 +660,55 @@ Process called "compute_sccs_tarjan" that takes cg as Integer returns Integer:
     Let nodes be proc memory_get_int64 from MemoryCore with cg, 0
     Let sccs be proc memory_get_int64 from MemoryCore with cg, 32
 
-    Note: Tarjan's algorithm state
-    Let index_counter be 0
+    Note: Tarjan's algorithm state. The two counters (discovery index and
+    Note: SCC id) MUST live in a shared heap cell because the recursive
+    Note: tarjan_strong_connect mutates them — integer parameters are
+    Note: by-value in Runa, so passing bare integers loses the updates
+    Note: across recursion levels (the historical form of this code did
+    Note: exactly that and produced wrong SCCs). Discovery indices start
+    Note: at 1 so a Dictionary miss (0) unambiguously means "unvisited".
+    Let counters be proc allocate from Layout with 16
+    proc memory_set_int64 from MemoryCore with counters, 0, 1 Note: next discovery index
+    proc memory_set_int64 from MemoryCore with counters, 8, 0 Note: next scc id
     Let stack be proc list_create from List
     Let on_stack be proc create from Set
-    Let node_index be proc create from Dictionary Note: node_id -> discovery index
-    Let node_lowlink be proc create from Dictionary Note: node_id -> lowlink value
-    Let scc_id_counter be 0
+    Let node_index be proc create from Dictionary Note: ptr-key string -> discovery index
+    Let node_lowlink be proc create from Dictionary Note: ptr-key string -> lowlink value
 
-    Note: Get all function IDs
-    Let function_ids be proc keys from Dictionary with nodes
-    Let function_count be proc length from List with function_ids
+    Note: Enumerate nodes. Dictionary keys are stringified function
+    Note: pointers; the node record's offset 0 holds the raw pointer.
+    Let node_keys be proc keys from Dictionary with nodes
+    Let function_count be proc length from List with node_keys
 
     Note: Visit each unvisited node
     Let i be 0
     While i is less than function_count:
-        Let function_id be proc list_get from List with function_ids, i
+        Let nk be proc list_get from List with node_keys, i
+        Let node be proc get from Dictionary with nodes, nk
+        If node is not equal to 0:
+            Let function_ptr be proc memory_get_int64 from MemoryCore with node, 0
 
-        Note: Check if node has been visited
-        Let visited be proc get from Dictionary with node_index, function_id
-        If visited is equal to 0:
-            tarjan_strong_connect(cg, function_id, index_counter, stack, on_stack, node_index, node_lowlink, scc_id_counter)
+            Note: Check if node has been visited (0 = unvisited sentinel)
+            Let visited be proc get from Dictionary with node_index, nk
+            If visited is equal to 0:
+                tarjan_strong_connect(cg, function_ptr, counters, stack, on_stack, node_index, node_lowlink)
+            End If
         End If
 
         Set i to i plus 1
     End While
 
-    Note: Update SCC count
-    Let scc_count be proc memory_get_int64 from MemoryCore with cg, 40
-    proc memory_set_int64 from MemoryCore with cg, 40, scc_id_counter
+    Note: Update SCC count and release algorithm state
+    Let scc_total be proc memory_get_int64 from MemoryCore with counters, 8
+    proc memory_set_int64 from MemoryCore with cg, 40, scc_total
 
-    Return scc_id_counter
+    proc deallocate from Layout with counters
+    proc list_destroy from List with stack
+    proc destroy from Set with on_stack
+    proc destroy from Dictionary with node_index
+    proc destroy from Dictionary with node_lowlink
+
+    Return scc_total
 End Process
 
 @Reasoning
@@ -631,21 +718,27 @@ It visits a node, explores its successors, and identifies SCCs.
 This is the core of the SCC detection algorithm.
 @End Reasoning
 
-Process called "tarjan_strong_connect" that takes cg as Integer, node_id as Integer, index_counter as Integer, stack as Integer, on_stack as Integer, node_index as Integer, node_lowlink as Integer, scc_id_counter as Integer returns Integer:
+Process called "tarjan_strong_connect" that takes cg as Integer, node_id as Integer, counters as Integer, stack as Integer, on_stack as Integer, node_index as Integer, node_lowlink as Integer returns Integer:
+    Note: node_id is the MIRFunction POINTER (OD-4). Dictionary state is
+    Note: keyed by the stringified pointer; the counters cell carries the
+    Note: discovery-index counter at offset 0 and the SCC id counter at
+    Note: offset 8 so mutations survive recursion.
     Let nodes be proc memory_get_int64 from MemoryCore with cg, 0
     Let sccs_list be proc memory_get_int64 from MemoryCore with cg, 32
+    Let node_key be proc integer_to_string from StringUtils with node_id
 
-    Note: Set discovery index and lowlink
-    proc set from Dictionary with node_index, node_id, index_counter
-    proc set from Dictionary with node_lowlink, node_id, index_counter
-    Let index_counter be index_counter plus 1
+    Note: Set discovery index and lowlink, then bump the shared counter
+    Let my_index be proc memory_get_int64 from MemoryCore with counters, 0
+    proc set from Dictionary with node_index, node_key, my_index
+    proc set from Dictionary with node_lowlink, node_key, my_index
+    proc memory_set_int64 from MemoryCore with counters, 0, my_index plus 1
 
     Note: Push node onto stack
     proc append from List with stack, node_id
     proc add from Set with on_stack, node_id
 
     Note: Get node's call sites (successors)
-    Let node be proc get from Dictionary with nodes, node_id
+    Let node be proc get from Dictionary with nodes, node_key
     Let call_sites be proc memory_get_int64 from MemoryCore with node, 16
     Let call_site_count be proc length from List with call_sites
 
@@ -657,26 +750,27 @@ Process called "tarjan_strong_connect" that takes cg as Integer, node_id as Inte
 
         Note: Skip indirect calls (successor_id = 0)
         If successor_id is not equal to 0:
-            Let successor_index be proc get from Dictionary with node_index, successor_id
+            Let successor_key be proc integer_to_string from StringUtils with successor_id
+            Let successor_index be proc get from Dictionary with node_index, successor_key
 
             Note: If successor not visited, recurse
             If successor_index is equal to 0:
-                tarjan_strong_connect(cg, successor_id, index_counter, stack, on_stack, node_index, node_lowlink, scc_id_counter)
+                tarjan_strong_connect(cg, successor_id, counters, stack, on_stack, node_index, node_lowlink)
 
                 Note: Update lowlink after recursion
-                Let node_lowlink_value be proc get from Dictionary with node_lowlink, node_id
-                Let successor_lowlink be proc get from Dictionary with node_lowlink, successor_id
+                Let node_lowlink_value be proc get from Dictionary with node_lowlink, node_key
+                Let successor_lowlink be proc get from Dictionary with node_lowlink, successor_key
                 If successor_lowlink is less than node_lowlink_value:
-                    proc set from Dictionary with node_lowlink, node_id, successor_lowlink
+                    proc set from Dictionary with node_lowlink, node_key, successor_lowlink
                 End If
             Otherwise:
                 Note: Successor visited, check if on stack (back edge)
                 Let is_on_stack be proc contains from Set with on_stack, successor_id
                 If is_on_stack is equal to 1:
                     Note: Back edge found, update lowlink
-                    Set node_lowlink_value to proc get from Dictionary with node_lowlink, node_id
+                    Set node_lowlink_value to proc get from Dictionary with node_lowlink, node_key
                     If successor_index is less than node_lowlink_value:
-                        proc set from Dictionary with node_lowlink, node_id, successor_index
+                        proc set from Dictionary with node_lowlink, node_key, successor_index
                     End If
                 End If
             End If
@@ -686,11 +780,12 @@ Process called "tarjan_strong_connect" that takes cg as Integer, node_id as Inte
     End While
 
     Note: If this is root of SCC, pop stack and create SCC
-    Let node_index_value be proc get from Dictionary with node_index, node_id
-    Set node_lowlink_value to proc get from Dictionary with node_lowlink, node_id
+    Let node_index_value be proc get from Dictionary with node_index, node_key
+    Set node_lowlink_value to proc get from Dictionary with node_lowlink, node_key
 
     If node_lowlink_value is equal to node_index_value:
         Note: Create new SCC
+        Let scc_id_counter be proc memory_get_int64 from MemoryCore with counters, 8
         Let scc be create_scc(scc_id_counter)
         Let scc_function_ids be proc memory_get_int64 from MemoryCore with scc, 8
 
@@ -706,21 +801,32 @@ Process called "tarjan_strong_connect" that takes cg as Integer, node_id as Inte
             proc append from List with scc_function_ids, popped_id
 
             Note: Mark node as belonging to this SCC
-            Let popped_node be proc get from Dictionary with nodes, popped_id
-            proc memory_set_int64 from MemoryCore with popped_node, 56, scc_id_counter
-
-            Note: If SCC has more than one function, it's recursive
-            Let scc_size be proc length from List with scc_function_ids
-            If scc_size is greater than 1:
-                proc memory_set_int64 from MemoryCore with scc, 16, 1 Note: is_recursive = true
-
-                Note: Mark all nodes as recursive
-                proc memory_set_int64 from MemoryCore with popped_node, 48, 1
+            Let popped_key be proc integer_to_string from StringUtils with popped_id
+            Let popped_node be proc get from Dictionary with nodes, popped_key
+            If popped_node is not equal to 0:
+                proc memory_set_int64 from MemoryCore with popped_node, 56, scc_id_counter
             End If
         End While
 
+        Note: A multi-function SCC is a recursive cycle: mark the SCC and
+        Note: EVERY member node (the historical in-loop marking skipped the
+        Note: first popped member because the size test trailed the pop).
+        Let scc_size be proc length from List with scc_function_ids
+        If scc_size is greater than 1:
+            proc memory_set_int64 from MemoryCore with scc, 16, 1 Note: is_recursive = true
+            Let r be 0
+            While r is less than scc_size:
+                Let member_id be proc list_get from List with scc_function_ids, r
+                Let member_key be proc integer_to_string from StringUtils with member_id
+                Let member_node be proc get from Dictionary with nodes, member_key
+                If member_node is not equal to 0:
+                    proc memory_set_int64 from MemoryCore with member_node, 48, 1
+                End If
+                Set r to r plus 1
+            End While
+        End If
+
         Note: Check for self-recursion (single-node SCC with self-edge)
-        Set scc_size to proc length from List with scc_function_ids
         If scc_size is equal to 1:
             Note: Check if node calls itself
             Let self_calls be 0
@@ -742,9 +848,9 @@ Process called "tarjan_strong_connect" that takes cg as Integer, node_id as Inte
             End If
         End If
 
-        Note: Add SCC to list
+        Note: Add SCC to list and bump the shared SCC id counter
         proc append from List with sccs_list, scc
-        Let scc_id_counter be scc_id_counter plus 1
+        proc memory_set_int64 from MemoryCore with counters, 8, scc_id_counter plus 1
     End If
 
     Return 0
@@ -766,27 +872,33 @@ This is Kahn's algorithm with O(V + E) complexity.
 @End Reasoning
 
 Process called "topological_sort_call_graph" that takes cg as Integer returns Integer:
+    Note: OD-4: nodes are keyed by stringified MIRFunction pointers; the raw
+    Note: pointer is recovered from node offset 0. The in-degree Dictionary
+    Note: uses the same stringified-pointer keys. Kahn's queue and the
+    Note: topological_order List carry raw pointers. In-degrees start at 1
+    Note: (not 0) so a Dictionary miss is distinguishable from a genuine
+    Note: zero in-degree; the +1 bias is subtracted at the comparison sites.
     Let nodes be proc memory_get_int64 from MemoryCore with cg, 0
     Let topological_order be proc memory_get_int64 from MemoryCore with cg, 48
 
     Note: Compute in-degree for each node
     Let in_degree be proc create from Dictionary
-    Let function_ids be proc keys from Dictionary with nodes
-    Let function_count be proc length from List with function_ids
+    Let node_keys be proc keys from Dictionary with nodes
+    Let function_count be proc length from List with node_keys
 
-    Note: Initialize all in-degrees to 0
+    Note: Initialize all in-degrees to the +1 bias value
     Let i be 0
     While i is less than function_count:
-        Let function_id be proc list_get from List with function_ids, i
-        proc set from Dictionary with in_degree, function_id, 0
+        Let nk be proc list_get from List with node_keys, i
+        proc set from Dictionary with in_degree, nk, 1
         Set i to i plus 1
     End While
 
     Note: Count incoming edges for each node
     Set i to 0
     While i is less than function_count:
-        Set function_id to proc list_get from List with function_ids, i
-        Let node be proc get from Dictionary with nodes, function_id
+        Set nk to proc list_get from List with node_keys, i
+        Let node be proc get from Dictionary with nodes, nk
         Let call_sites be proc memory_get_int64 from MemoryCore with node, 16
         Let call_site_count be proc length from List with call_sites
 
@@ -797,9 +909,12 @@ Process called "topological_sort_call_graph" that takes cg as Integer returns In
 
             Note: Increment in-degree of callee (skip indirect calls)
             If callee_id is not equal to 0:
-                Let current_in_degree be proc get from Dictionary with in_degree, callee_id
-                Set current_in_degree to current_in_degree plus 1
-                proc set from Dictionary with in_degree, callee_id, current_in_degree
+                Let callee_key be proc integer_to_string from StringUtils with callee_id
+                Let current_in_degree be proc get from Dictionary with in_degree, callee_key
+                If current_in_degree is not equal to 0:
+                    Set current_in_degree to current_in_degree plus 1
+                    proc set from Dictionary with in_degree, callee_key, current_in_degree
+                End If
             End If
 
             Set j to j plus 1
@@ -808,14 +923,16 @@ Process called "topological_sort_call_graph" that takes cg as Integer returns In
         Set i to i plus 1
     End While
 
-    Note: Collect nodes with zero in-degree (entry points)
+    Note: Collect nodes with zero in-degree (biased value 1)
     Let queue be proc list_create from List
     Set i to 0
     While i is less than function_count:
-        Set function_id to proc list_get from List with function_ids, i
-        Let degree be proc get from Dictionary with in_degree, function_id
-        If degree is equal to 0:
-            proc append from List with queue, function_id
+        Set nk to proc list_get from List with node_keys, i
+        Let degree be proc get from Dictionary with in_degree, nk
+        If degree is equal to 1:
+            Set node to proc get from Dictionary with nodes, nk
+            Let function_ptr be proc memory_get_int64 from MemoryCore with node, 0
+            proc append from List with queue, function_ptr
         End If
         Set i to i plus 1
     End While
@@ -830,7 +947,8 @@ Process called "topological_sort_call_graph" that takes cg as Integer returns In
         proc append from List with topological_order, current_id
 
         Note: Decrease in-degree of successors
-        Set node to proc get from Dictionary with nodes, current_id
+        Let current_key be proc integer_to_string from StringUtils with current_id
+        Set node to proc get from Dictionary with nodes, current_key
         Set call_sites to proc memory_get_int64 from MemoryCore with node, 16
         Set call_site_count to proc length from List with call_sites
 
@@ -840,19 +958,25 @@ Process called "topological_sort_call_graph" that takes cg as Integer returns In
             Set callee_id to proc memory_get_int64 from MemoryCore with call_site, 8
 
             If callee_id is not equal to 0:
-                Set degree to proc get from Dictionary with in_degree, callee_id
-                Set degree to degree minus 1
-                proc set from Dictionary with in_degree, callee_id, degree
+                Set callee_key to proc integer_to_string from StringUtils with callee_id
+                Set degree to proc get from Dictionary with in_degree, callee_key
+                If degree is not equal to 0:
+                    Set degree to degree minus 1
+                    proc set from Dictionary with in_degree, callee_key, degree
 
-                Note: If in-degree reaches zero, add to queue
-                If degree is equal to 0:
-                    proc append from List with queue, callee_id
+                    Note: If biased in-degree reaches 1 (true zero), enqueue
+                    If degree is equal to 1:
+                        proc append from List with queue, callee_id
+                    End If
                 End If
             End If
 
             Set i to i plus 1
         End While
     End While
+
+    proc destroy from Dictionary with in_degree
+    proc list_destroy from List with queue
 
     Note: Verify all nodes were visited (no cycles except in SCCs)
     Let order_size be proc length from List with topological_order
@@ -872,87 +996,65 @@ Returns a list of (caller_id, callee_id, call_site) tuples ranked by benefit.
 @End Reasoning
 
 Process called "identify_inlining_candidates" that takes cg as Integer, mir as Integer, max_inline_size as Integer returns Integer:
+    Note: Returns a List of 24-byte candidate records:
+    Note:   offset 0:  caller (MIRFunction pointer)
+    Note:   offset 8:  callee (MIRFunction pointer)
+    Note:   offset 16: benefit/priority score
+    Note: This record shape is the contract consumed by the LTO layer
+    Note: (whole_program_analysis.identify_cross_module_inlining and
+    Note: cross_module_optimization.select_inlining_candidates /
+    Note: apply_inlining_candidate). The historical flat-triple encoding
+    Note: (three bare List entries per candidate) collided with that
+    Note: contract and made consumers dereference priority integers.
     Let nodes be proc memory_get_int64 from MemoryCore with cg, 0
     Let candidates be proc list_create from List
 
-    Note: Get all function IDs
-    Let function_ids be proc keys from Dictionary with nodes
-    Let function_count be proc length from List with function_ids
+    Note: Enumerate all call graph nodes
+    Let node_keys be proc keys from Dictionary with nodes
+    Let function_count be proc length from List with node_keys
 
     Note: Examine each function as potential inline candidate
     Let i be 0
     While i is less than function_count:
-        Let callee_id be proc list_get from List with function_ids, i
-        Let callee_node be proc get from Dictionary with nodes, callee_id
+        Let nk be proc list_get from List with node_keys, i
+        Let callee_node be proc get from Dictionary with nodes, nk
+        Let callee_ptr be proc memory_get_int64 from MemoryCore with callee_node, 0
 
         Note: Check if function is recursive
         Let is_recursive be proc memory_get_int64 from MemoryCore with callee_node, 48
         If is_recursive is equal to 0:
-            Note: Get function size from MIR by counting instructions
-            Note: Look up function in MIR to count total instructions
-            Let functions be proc memory_get_int64 from MemoryCore with mir, 0
-            Let func_count be proc length from List with functions
-            Let function_size be 0
+            Note: Measure the callee body via the shared sizing primitive
+            Let function_size be get_function_instruction_count(mir, callee_ptr)
 
-            Note: Find the function in MIR
-            Let f be 0
-            While f is less than func_count:
-                Let mir_func be proc list_get from List with functions, f
-                Let fid be proc memory_get_int64 from MemoryCore with mir_func, 0
+            Note: External or bodiless functions size to 0 — not inlinable
+            If function_size is greater than 0:
+                If function_size is less than max_inline_size:
+                    Note: Get callers (List of caller MIRFunction pointers)
+                    Let callers be proc memory_get_int64 from MemoryCore with callee_node, 32
+                    Let caller_count be proc length from List with callers
 
-                If fid is equal to callee_id:
-                    Note: Count instructions in all blocks
-                    Let cfg be proc memory_get_int64 from MemoryCore with mir_func, 16
-                    If cfg is not equal to 0:
-                        Let blocks be proc memory_get_int64 from MemoryCore with cfg, 0
-                        Let block_count be proc length from List with blocks
-
-                        Let b be 0
-                        While b is less than block_count:
-                            Let block be proc list_get from List with blocks, b
-                            Let instructions be proc memory_get_int64 from MemoryCore with block, 16
-                            Let inst_count be proc length from List with instructions
-                            Set function_size to function_size plus inst_count
-                            Set b to b plus 1
-                        End While
-                    End If
-
-                    Set f to func_count  Note: Break loop
-                End If
-
-                Set f to f plus 1
-            End While
-
-            Note: If size couldn't be determined, use call site count as fallback
-            If function_size is equal to 0:
-                Set function_size to proc memory_get_int64 from MemoryCore with callee_node, 24
-            End If
-
-            Note: Check if function is small enough
-            If function_size is less than max_inline_size:
-                Note: Get callers
-                Let callers be proc memory_get_int64 from MemoryCore with callee_node, 32
-                Let caller_count be proc length from List with callers
-
-                Note: Single caller is best candidate
-                If caller_count is equal to 1:
-                    Let caller_id be proc list_get from List with callers, 0
-                    Note: Add to candidates
-                    Note: Store as tuple: (caller_id, callee_id, priority)
-                    proc append from List with candidates, caller_id
-                    proc append from List with candidates, callee_id
-                    proc append from List with candidates, 100 Note: High priority for single caller
-                Otherwise:
-                    Note: Multiple callers, lower priority but still candidate
-                    If caller_count is less than 5:
-                        Let j be 0
-                        While j is less than caller_count:
-                            Set caller_id to proc list_get from List with callers, j
-                            proc append from List with candidates, caller_id
-                            proc append from List with candidates, callee_id
-                            proc append from List with candidates, 50 Note: Medium priority
-                            Set j to j plus 1
-                        End While
+                    Note: Single caller is best candidate
+                    If caller_count is equal to 1:
+                        Let caller_ptr be proc list_get from List with callers, 0
+                        Let record be proc allocate from Layout with 24
+                        proc memory_set_int64 from MemoryCore with record, 0, caller_ptr
+                        proc memory_set_int64 from MemoryCore with record, 8, callee_ptr
+                        proc memory_set_int64 from MemoryCore with record, 16, 100 Note: High priority for single caller
+                        proc append from List with candidates, record
+                    Otherwise:
+                        Note: Multiple callers, lower priority but still candidate
+                        If caller_count is less than 5:
+                            Let j be 0
+                            While j is less than caller_count:
+                                Set caller_ptr to proc list_get from List with callers, j
+                                Let multi_record be proc allocate from Layout with 24
+                                proc memory_set_int64 from MemoryCore with multi_record, 0, caller_ptr
+                                proc memory_set_int64 from MemoryCore with multi_record, 8, callee_ptr
+                                proc memory_set_int64 from MemoryCore with multi_record, 16, 50 Note: Medium priority
+                                proc append from List with candidates, multi_record
+                                Set j to j plus 1
+                            End While
+                        End If
                     End If
                 End If
             End If
@@ -1052,17 +1154,20 @@ Process called "get_function_instruction_count" that takes mir as Integer, funct
     While i is less than func_count:
         Let mir_func be proc list_get from List with functions, i
         If mir_func is not equal to 0:
-            Let fid be proc memory_get_int64 from MemoryCore with mir_func, 0
-            If fid is equal to function_id:
-                Note: Found the function - walk its CFG. The file-local
-                Note: convention in call_graph.runa and profile_guided.runa
-                Note: uses offset 16 for the cfg field of MIRFunction.
-                Let cfg be proc memory_get_int64 from MemoryCore with mir_func, 16
+            Note: OD-4: function identity is the MIRFunction pointer itself.
+            Note: The membership scan validates that the supplied identity
+            Note: names a function actually present in this program (callers
+            Note: may pass ids derived from instructions that no longer
+            Note: resolve); an absent identity returns 0.
+            If mir_func is equal to function_id:
+                Note: Canonical MIRFunction: cfg at offset 8;
+                Note: canonical MIRCFG: blocks List at offset 16.
+                Let cfg be proc memory_get_int64 from MemoryCore with mir_func, 8
                 If cfg is equal to 0:
                     Return 0
                 End If
 
-                Let blocks be proc memory_get_int64 from MemoryCore with cfg, 0
+                Let blocks be proc memory_get_int64 from MemoryCore with cfg, 16
                 If blocks is equal to 0:
                     Return 0
                 End If
@@ -1109,15 +1214,16 @@ Process called "identify_dead_functions" that takes cg as Integer returns Intege
     Let entry_functions be proc memory_get_int64 from MemoryCore with cg, 56
     Let dead_functions be proc list_create from List
 
-    Note: Get all function IDs
-    Let function_ids be proc keys from Dictionary with nodes
-    Let function_count be proc length from List with function_ids
+    Note: Enumerate nodes; recover the raw function pointer from offset 0
+    Let node_keys be proc keys from Dictionary with nodes
+    Let function_count be proc length from List with node_keys
 
     Note: Check each function
     Let i be 0
     While i is less than function_count:
-        Let function_id be proc list_get from List with function_ids, i
-        Let node be proc get from Dictionary with nodes, function_id
+        Let nk be proc list_get from List with node_keys, i
+        Let node be proc get from Dictionary with nodes, nk
+        Let function_id be proc memory_get_int64 from MemoryCore with node, 0
 
         Note: Get caller count
         Let caller_count be proc memory_get_int64 from MemoryCore with node, 40
@@ -1166,7 +1272,8 @@ This is determined during SCC computation.
 
 Process called "is_function_recursive" that takes cg as Integer, function_id as Integer returns Integer:
     Let nodes be proc memory_get_int64 from MemoryCore with cg, 0
-    Let node be proc get from Dictionary with nodes, function_id
+    Let node_key be proc integer_to_string from StringUtils with function_id
+    Let node be proc get from Dictionary with nodes, node_key
 
     If node is equal to 0:
         Return 0
@@ -1183,7 +1290,8 @@ Useful for inter-procedural analysis.
 
 Process called "get_function_callers" that takes cg as Integer, function_id as Integer returns Integer:
     Let nodes be proc memory_get_int64 from MemoryCore with cg, 0
-    Let node be proc get from Dictionary with nodes, function_id
+    Let node_key be proc integer_to_string from StringUtils with function_id
+    Let node be proc get from Dictionary with nodes, node_key
 
     If node is equal to 0:
         Return proc list_create from List
@@ -1200,7 +1308,8 @@ Returns call sites which contain callee IDs.
 
 Process called "get_function_callees" that takes cg as Integer, function_id as Integer returns Integer:
     Let nodes be proc memory_get_int64 from MemoryCore with cg, 0
-    Let node be proc get from Dictionary with nodes, function_id
+    Let node_key be proc integer_to_string from StringUtils with function_id
+    Let node be proc get from Dictionary with nodes, node_key
 
     If node is equal to 0:
         Return proc list_create from List

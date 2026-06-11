@@ -435,6 +435,10 @@ Process called "collect_dart_declarations" takes analyzer as Integer, node as In
     Otherwise:
     If node_type is equal to DART_FIELD_DECL from Parser:
         proc collect_variable_declaration with analyzer, node
+    Otherwise:
+    If node_type is equal to DART_TYPEDEF_DECL from Parser:
+        proc collect_typedef_declaration with analyzer, node
+    End If
     End If
     End If
     End If
@@ -624,6 +628,97 @@ Process called "collect_mixin_declaration" takes analyzer as Integer, mixin_node
     Let registry be proc memory_get_int64 from Layout with analyzer, 40
     proc set from Dict with registry, mixin_name, mixin_node
     Return 1
+End Process
+
+@Reasoning:
+Typedefs are library-scoped declarations like classes: the alias name is
+a type name usable anywhere a type annotation appears, so it registers
+into the global scope (giving both duplicate detection against classes,
+enums, and mixins sharing the spelling, and resolution of the alias
+name in resolve_type_annotation). The registered symbol is the typedef
+AST node itself - expand_function_type_context reaches the aliased type
+through it whenever a function-type context must be consulted.
+@End Reasoning
+Process called "collect_typedef_declaration" takes analyzer as Integer, typedef_node as Integer returns Integer:
+    Let typedef_name be proc declaration_name with typedef_node
+    If typedef_name is equal to 0:
+        Return 0
+    End If
+
+    Let global_scope be proc memory_get_int64 from Layout with analyzer, 0
+    Let existing be proc contains from Dict with global_scope, typedef_name
+    If existing is equal to 1:
+        Let error_msg be proc string_concat from StringUtils with "Duplicate typedef declaration: ", typedef_name
+        proc add_error with analyzer, error_msg
+        Return 0
+    End If
+
+    proc set from Dict with global_scope, typedef_name, typedef_node
+    Return 1
+End Process
+
+@Reasoning:
+The single funnel that turns a declared type reference into the
+function type it denotes, or 0 when it denotes none. Nullable wrappers
+are unwrapped (a "Cb?" context still types the lambda), a literal
+DART_FUNCTION_TYPE answers itself, and a named annotation (or generic
+instantiation of a named alias) is resolved through the global scope:
+when the name is a registered typedef, its aliased type (the last
+child - the name sits at child 0 and an optional type-parameter list
+may sit between) is expanded recursively so typedefs of typedefs
+resolve to the ultimate function type. The depth bound is the cycle
+guard: mutually-aliasing typedefs (themselves a Dart compile error in
+the declaring library) terminate with the no-function-type answer
+instead of diverging.
+@End Reasoning
+Process called "expand_function_type_context" takes analyzer as Integer, type_ref as Integer, depth as Integer returns Integer:
+    If type_ref is equal to 0:
+        Return 0
+    End If
+    If depth is greater than 16:
+        Return 0
+    End If
+
+    Let kind be proc ast_node_type from Parser with type_ref
+
+    If kind is equal to DART_NULLABLE_TYPE from Parser:
+        Let wrapped be proc ast_node_child from Parser with type_ref, 0
+        Return proc expand_function_type_context with analyzer, wrapped, depth plus 1
+    End If
+
+    If kind is equal to DART_FUNCTION_TYPE from Parser:
+        Return type_ref
+    End If
+
+    Let base_name be 0
+    If kind is equal to DART_TYPE_ANNOTATION from Parser:
+        Set base_name to proc ast_node_value from Parser with type_ref
+    End If
+    If kind is equal to DART_GENERIC_TYPE from Parser:
+        Let generic_base be proc ast_node_child from Parser with type_ref, 0
+        Set base_name to proc type_base_name with generic_base
+    End If
+    If base_name is equal to 0:
+        Return 0
+    End If
+
+    Let global_scope be proc memory_get_int64 from Layout with analyzer, 0
+    Let decl be proc get from Dict with global_scope, base_name
+    If decl is equal to 0:
+        Return 0
+    End If
+
+    Let decl_kind be proc ast_node_type from Parser with decl
+    If decl_kind is not equal to DART_TYPEDEF_DECL from Parser:
+        Return 0
+    End If
+
+    Let child_count be proc ast_node_child_count from Parser with decl
+    If child_count is less than 2:
+        Return 0
+    End If
+    Let aliased be proc ast_node_child from Parser with decl, child_count minus 1
+    Return proc expand_function_type_context with analyzer, aliased, depth plus 1
 End Process
 
 Note: ================================================================
@@ -1113,6 +1208,106 @@ Process called "infer_expression_type" takes analyzer as Integer, expr as Intege
         Return proc ast_node_child from Parser with expr, 0
     End If
 
+    If kind is equal to DART_CALL_EXPR from Parser:
+        Let call_callee be proc ast_node_child from Parser with expr, 0
+        If call_callee is equal to 0:
+            Return 0
+        End If
+        Let call_callee_kind be proc ast_node_type from Parser with call_callee
+
+        If call_callee_kind is equal to DART_IDENTIFIER from Parser:
+            Let call_name be proc ast_node_value from Parser with call_callee
+            Let call_decl be proc lookup_symbol with analyzer, call_name
+            If call_decl is equal to 0:
+                Return 0
+            End If
+            Let call_decl_kind be proc ast_node_type from Parser with call_decl
+
+            Note: A bare ClassName(...) is a constructor invocation and
+            Note: reports the constructed type
+            If call_decl_kind is equal to DART_CLASS_DECL from Parser:
+                Return proc make_type with call_name
+            End If
+            If call_decl_kind is equal to DART_ENUM_DECL from Parser:
+                Return proc make_type with call_name
+            End If
+
+            Let call_is_fn be 0
+            If call_decl_kind is equal to DART_FUNCTION_DECL from Parser:
+                Set call_is_fn to 1
+            End If
+            If call_decl_kind is equal to DART_METHOD_DECL from Parser:
+                Set call_is_fn to 1
+            End If
+            If call_is_fn is equal to 1:
+                Return proc ast_node_child from Parser with call_decl, 1
+            End If
+
+            Note: A function-typed value invocation reports the function
+            Note: type's declared return type
+            Let call_is_value be 0
+            If call_decl_kind is equal to DART_VARIABLE_DECL from Parser:
+                Set call_is_value to 1
+            End If
+            If call_decl_kind is equal to DART_FIELD_DECL from Parser:
+                Set call_is_value to 1
+            End If
+            If call_decl_kind is equal to DART_PARAMETER from Parser:
+                Set call_is_value to 1
+            End If
+            If call_decl_kind is equal to DART_NAMED_PARAMETER from Parser:
+                Set call_is_value to 1
+            End If
+            If call_decl_kind is equal to DART_OPTIONAL_PARAMETER from Parser:
+                Set call_is_value to 1
+            End If
+            If call_is_value is equal to 1:
+                Let call_declared be proc ast_node_child from Parser with call_decl, 1
+                Let call_fn_type be proc expand_function_type_context with analyzer, call_declared, 0
+                If call_fn_type is not equal to 0:
+                    Return proc ast_node_child from Parser with call_fn_type, 0
+                End If
+            End If
+            Return 0
+        End If
+
+        If call_callee_kind is equal to DART_MEMBER_EXPR from Parser:
+            Let m_name be proc ast_node_value from Parser with call_callee
+            Let m_recv be proc ast_node_child from Parser with call_callee, 0
+            Let m_recv_type be proc infer_expression_type with analyzer, m_recv, depth plus 1
+            Let m_base be proc type_base_name with m_recv_type
+            If m_base is equal to 0:
+                Return 0
+            End If
+            Let m_global be proc memory_get_int64 from Layout with analyzer, 0
+            Let m_class be proc get from Dict with m_global, m_base
+            If m_class is equal to 0:
+                Return 0
+            End If
+            Let m_member be proc find_class_member with analyzer, m_class, m_name, 0
+            If m_member is equal to 0:
+                Return 0
+            End If
+            Let m_member_kind be proc ast_node_type from Parser with m_member
+            If m_member_kind is equal to DART_METHOD_DECL from Parser:
+                Return proc ast_node_child from Parser with m_member, 1
+            End If
+            If m_member_kind is equal to DART_GETTER_DECL from Parser:
+                Return proc ast_node_child from Parser with m_member, 1
+            End If
+            If m_member_kind is equal to DART_FIELD_DECL from Parser:
+                Let m_field_type be proc ast_node_child from Parser with m_member, 1
+                Let m_fn_type be proc expand_function_type_context with analyzer, m_field_type, 0
+                If m_fn_type is not equal to 0:
+                    Return proc ast_node_child from Parser with m_fn_type, 0
+                End If
+            End If
+            Return 0
+        End If
+
+        Return 0
+    End If
+
     Return 0
 End Process
 
@@ -1478,6 +1673,42 @@ Process called "validate_async_await" takes analyzer as Integer, node as Integer
 
     Let node_type be proc ast_node_type from Parser with node
 
+    Note: The async walk maintains the same lexical scope discipline as
+    Note: the collector and the null-safety walk: every declaration the
+    Note: walk passes registers into the current scope BEFORE any call
+    Note: site later in the walk consults it, so lambda-argument context
+    Note: checks resolve local functions, local variables, parameters,
+    Note: and fields exactly as Dart's shadowing rules dictate
+    Let registers_decl be 0
+    If node_type is equal to DART_FUNCTION_DECL from Parser:
+        Set registers_decl to 1
+    End If
+    If node_type is equal to DART_METHOD_DECL from Parser:
+        Set registers_decl to 1
+    End If
+    If node_type is equal to DART_VARIABLE_DECL from Parser:
+        Set registers_decl to 1
+    End If
+    If node_type is equal to DART_FIELD_DECL from Parser:
+        Set registers_decl to 1
+    End If
+    If node_type is equal to DART_PARAMETER from Parser:
+        Set registers_decl to 1
+    End If
+    If node_type is equal to DART_NAMED_PARAMETER from Parser:
+        Set registers_decl to 1
+    End If
+    If node_type is equal to DART_OPTIONAL_PARAMETER from Parser:
+        Set registers_decl to 1
+    End If
+    If registers_decl is equal to 1:
+        Let reg_name be proc declaration_name with node
+        If reg_name is not equal to 0:
+            Let reg_scope be proc memory_get_int64 from Layout with analyzer, 8
+            proc set from Dict with reg_scope, reg_name, node
+        End If
+    End If
+
     Let is_callable be 0
     Let ret_index be 1
     If node_type is equal to DART_FUNCTION_DECL from Parser:
@@ -1506,6 +1737,42 @@ Process called "validate_async_await" takes analyzer as Integer, node as Integer
         Return proc validate_yield_statement with analyzer, node
     End If
 
+    Note: Context-typed lambda contracts: a flagged lambda initializing a
+    Note: variable or field whose declared type is a function type (or a
+    Note: typedef naming one) is checked against that type's return-type
+    Note: wrapper before the generic descent reaches the lambda itself
+    Let is_value_decl be 0
+    If node_type is equal to DART_VARIABLE_DECL from Parser:
+        Set is_value_decl to 1
+    End If
+    If node_type is equal to DART_FIELD_DECL from Parser:
+        Set is_value_decl to 1
+    End If
+    If is_value_decl is equal to 1:
+        Let decl_children be proc ast_node_child_count from Parser with node
+        If decl_children is greater than or equal to 3:
+            Let decl_init be proc ast_node_child from Parser with node, 2
+            Let init_kind be proc ast_node_type from Parser with decl_init
+            If init_kind is equal to DART_LAMBDA_EXPR from Parser:
+                Let decl_type be proc ast_node_child from Parser with node, 1
+                proc validate_lambda_context_type with analyzer, decl_type, decl_init
+            End If
+        End If
+    End If
+
+    Note: Flagged lambda arguments are checked against the declared
+    Note: function types of the callee's parameters when the callee
+    Note: resolves to a declared function, a method on the receiver's
+    Note: class, or a function-typed variable
+    If node_type is equal to DART_CALL_EXPR from Parser:
+        proc validate_call_lambda_arguments with analyzer, node
+    End If
+
+    Let introduces be proc node_introduces_scope with node_type
+    If introduces is equal to 1:
+        proc enter_scope with analyzer
+    End If
+
     Let count be proc ast_node_child_count from Parser with node
     Let index be 0
     While index is less than count:
@@ -1513,6 +1780,10 @@ Process called "validate_async_await" takes analyzer as Integer, node as Integer
         proc validate_async_await with analyzer, child
         Set index to index plus 1
     End While
+
+    If introduces is equal to 1:
+        proc exit_scope with analyzer
+    End If
 
     Return 1
 End Process
@@ -1523,10 +1794,18 @@ callable. Dart's rules: an async function's declared return type must
 be Future/FutureOr (or void/dynamic, or omitted); an async* generator
 must declare Stream (or dynamic, or omitted); a sync* generator must
 declare Iterable (or dynamic/Object, or omitted). ret_index is -1 for
-lambdas, which carry no return-type child - their contract is checked
-at the assignment/inference level, not here. The previous async-state
-slots are saved before and restored after the recursive descent so
-contexts nest correctly through nested functions and lambdas.
+lambdas, which carry no return-type child - their declared contract is
+checked against the context (variable declarations and call arguments
+with declared function types) by validate_lambda_context_type, while
+the body is checked structurally here: a generator lambda needs a block
+body (Dart forbids => bodies for generators), a sync* generator lambda
+must contain at least one yield, and no generator lambda may return a
+value - the body scan stops at nested callables so each lambda answers
+only for its own body. An async non-generator lambda body is never
+flagged for its return expressions because Dart implicitly wraps a
+non-Future returned value in a Future. The previous async-state slots
+are saved before and restored after the recursive descent so contexts
+nest correctly through nested functions and lambdas.
 @End Reasoning
 Process called "validate_callable_async" takes analyzer as Integer, node as Integer, ret_index as Integer returns Integer:
     Let is_async be proc ast_node_has_flag from Parser with node, "async"
@@ -1555,6 +1834,45 @@ Process called "validate_callable_async" takes analyzer as Integer, node as Inte
                 End If
             End If
         End If
+
+        Note: The declared return type is a lambda context too: a lambda
+        Note: returned from this callable's own body is checked against
+        Note: it when it denotes a function type (directly or through a
+        Note: typedef alias)
+        If return_type is not equal to 0:
+            Let rl_count be proc ast_node_child_count from Parser with node
+            Let rl be 0
+            While rl is less than rl_count:
+                Let rl_child be proc ast_node_child from Parser with node, rl
+                proc check_returned_lambdas with analyzer, rl_child, return_type
+                Set rl to rl plus 1
+            End While
+        End If
+    End If
+
+    If ret_index is less than 0:
+        Note: Lambda structural body checks - generators need a block
+        Note: body, a sync* generator body must yield, and no generator
+        Note: body may return a value
+        If is_generator is equal to 1:
+            Let lambda_body be proc ast_node_child from Parser with node, 1
+            Let is_arrow be proc ast_node_has_flag from Parser with node, "arrow"
+            If is_arrow is equal to 1:
+                proc add_error with analyzer, "A generator lambda (async* or sync*) cannot use an arrow (=>) body"
+            Otherwise:
+                Let body_scan be proc scan_lambda_body_constructs with lambda_body
+                Let has_yield be body_scan modulo by 2
+                Let has_value_return be (body_scan divided by 2) modulo by 2
+                If is_async is equal to 0:
+                    If has_yield is equal to 0:
+                        proc add_error with analyzer, "A sync* generator lambda must contain at least one yield statement"
+                    End If
+                End If
+                If has_value_return is equal to 1:
+                    proc add_error with analyzer, "A generator lambda cannot return a value"
+                End If
+            End If
+        End If
     End If
 
     Let state be proc memory_get_int64 from Layout with analyzer, 32
@@ -1576,6 +1894,11 @@ Process called "validate_callable_async" takes analyzer as Integer, node as Inte
     proc memory_set_int64 from Layout with state, 8, in_async_gen
     proc memory_set_int64 from Layout with state, 16, in_sync_gen
 
+    Note: The callable's own lexical scope: parameters and body-local
+    Note: declarations register inside it during the descent and become
+    Note: invisible again when the callable is left
+    proc enter_scope with analyzer
+
     Let count be proc ast_node_child_count from Parser with node
     Let index be 0
     While index is less than count:
@@ -1583,6 +1906,8 @@ Process called "validate_callable_async" takes analyzer as Integer, node as Inte
         proc validate_async_await with analyzer, child
         Set index to index plus 1
     End While
+
+    proc exit_scope with analyzer
 
     proc memory_set_int64 from Layout with state, 0, saved_async
     proc memory_set_int64 from Layout with state, 8, saved_async_gen
@@ -1648,6 +1973,588 @@ Process called "validate_yield_statement" takes analyzer as Integer, yield_stmt 
     End While
 
     Return 1
+End Process
+
+@Reasoning:
+Lambdas carry async-ness as flags but no return-type child, so their
+wrapper contract is enforced against the context that receives them
+whenever that context declares a function type: the lambda's async
+marker requires the function type's return type to satisfy Future (or
+void/dynamic, the same acceptance set named functions get), async*
+requires Stream, and sync* requires Iterable. A nullable function type
+("int Function()?") is unwrapped first. Contexts without a function
+type - var/dynamic declarations, untyped parameters - report nothing
+here; the structural body checks in validate_callable_async still
+apply to those lambdas. Unflagged lambdas are never checked because a
+plain lambda may legitimately return a hand-built Future/Stream/
+Iterable into a matching context.
+@End Reasoning
+Process called "validate_lambda_context_type" takes analyzer as Integer, declared_type as Integer, lambda as Integer returns Integer:
+    If declared_type is equal to 0:
+        Return 0
+    End If
+    If lambda is equal to 0:
+        Return 0
+    End If
+
+    Let is_async be proc ast_node_has_flag from Parser with lambda, "async"
+    Let is_generator be proc ast_node_has_flag from Parser with lambda, "generator"
+    If is_async is equal to 0:
+        If is_generator is equal to 0:
+            Return 0
+        End If
+    End If
+
+    Note: Resolve the declared context down to the function type it
+    Note: denotes: nullable wrappers unwrap and typedef aliases expand
+    Note: (including typedefs of typedefs, with a cycle guard)
+    Let fn_type be proc expand_function_type_context with analyzer, declared_type, 0
+    If fn_type is equal to 0:
+        Return 0
+    End If
+
+    Let context_return be proc ast_node_child from Parser with fn_type, 0
+
+    If is_async is equal to 1:
+        If is_generator is equal to 0:
+            Let future_ok be proc is_future_type with context_return
+            If future_ok is equal to 0:
+                proc add_error with analyzer, "An async lambda requires a context return type of Future<T> (or void/dynamic)"
+            Otherwise:
+                proc check_lambda_wrapper_type_argument with analyzer, context_return, lambda, is_async, is_generator
+            End If
+        Otherwise:
+            Let stream_ok be proc is_stream_type with context_return
+            If stream_ok is equal to 0:
+                proc add_error with analyzer, "An async* generator lambda requires a context return type of Stream<T>"
+            Otherwise:
+                proc check_lambda_wrapper_type_argument with analyzer, context_return, lambda, is_async, is_generator
+            End If
+        End If
+    Otherwise:
+        Let iterable_ok be proc is_iterable_type with context_return
+        If iterable_ok is equal to 0:
+            proc add_error with analyzer, "A sync* generator lambda requires a context return type of Iterable<T>"
+        Otherwise:
+            proc check_lambda_wrapper_type_argument with analyzer, context_return, lambda, is_async, is_generator
+        End If
+    End If
+
+    Return 1
+End Process
+
+@Reasoning:
+The second context where a lambda's required wrapper is knowable: an
+argument position whose receiving parameter declares a function type.
+The callee resolves through the full lexical scope chain maintained by
+the async walk, reaching three callee shapes: a plain identifier naming
+a declared function or method (top-level OR local - the walk registers
+nested function declarations into their enclosing scopes), a plain
+identifier naming a function-typed value (a variable, field, or
+parameter whose declared type is a function type or a typedef alias of
+one - its parameter types provide the contexts), and a member access
+(obj.m(...)) whose method resolves through the receiver's inferred
+class and its locally-known member tables (including inherited members
+through extends/with/implements chains). Declared-parameter callees
+match positional arguments against positional (required then optional)
+parameters by ordinal and named arguments against named parameters by
+spelling; function-type callees match positional ordinals against the
+function type's parameter-type list (function types carry no named-
+parameter spellings in this AST, so named arguments stay silent there).
+Every non-matching or non-representable case (computed callees,
+unknown names, arity overflow, untyped parameters) reports nothing -
+the structural checks still run when the walk reaches the lambda node.
+@End Reasoning
+Process called "validate_call_lambda_arguments" takes analyzer as Integer, call_node as Integer returns Integer:
+    Let callee be proc ast_node_child from Parser with call_node, 0
+    If callee is equal to 0:
+        Return 0
+    End If
+    Let args be proc ast_node_child from Parser with call_node, 1
+    If args is equal to 0:
+        Return 0
+    End If
+
+    Let callee_kind be proc ast_node_type from Parser with callee
+    Let params_node be 0
+    Let fn_type_node be 0
+
+    If callee_kind is equal to DART_IDENTIFIER from Parser:
+        Let callee_name be proc ast_node_value from Parser with callee
+        Let decl be proc lookup_symbol with analyzer, callee_name
+        If decl is equal to 0:
+            Return 0
+        End If
+
+        Let decl_kind be proc ast_node_type from Parser with decl
+        Let is_function be 0
+        If decl_kind is equal to DART_FUNCTION_DECL from Parser:
+            Set is_function to 1
+        End If
+        If decl_kind is equal to DART_METHOD_DECL from Parser:
+            Set is_function to 1
+        End If
+
+        If is_function is equal to 1:
+            Set params_node to proc ast_node_child from Parser with decl, 2
+        Otherwise:
+            Let is_value be 0
+            If decl_kind is equal to DART_VARIABLE_DECL from Parser:
+                Set is_value to 1
+            End If
+            If decl_kind is equal to DART_FIELD_DECL from Parser:
+                Set is_value to 1
+            End If
+            If decl_kind is equal to DART_PARAMETER from Parser:
+                Set is_value to 1
+            End If
+            If decl_kind is equal to DART_NAMED_PARAMETER from Parser:
+                Set is_value to 1
+            End If
+            If decl_kind is equal to DART_OPTIONAL_PARAMETER from Parser:
+                Set is_value to 1
+            End If
+            If is_value is equal to 1:
+                Let declared be proc ast_node_child from Parser with decl, 1
+                Set fn_type_node to proc expand_function_type_context with analyzer, declared, 0
+            End If
+        End If
+    End If
+
+    If callee_kind is equal to DART_MEMBER_EXPR from Parser:
+        Let method_name be proc ast_node_value from Parser with callee
+        Let receiver be proc ast_node_child from Parser with callee, 0
+        Let recv_type be proc infer_expression_type with analyzer, receiver, 0
+        Let recv_base be proc type_base_name with recv_type
+        If recv_base is not equal to 0:
+            Let global_scope be proc memory_get_int64 from Layout with analyzer, 0
+            Let class_decl be proc get from Dict with global_scope, recv_base
+            If class_decl is not equal to 0:
+                Let member be proc find_class_member with analyzer, class_decl, method_name, 0
+                If member is not equal to 0:
+                    Let member_kind be proc ast_node_type from Parser with member
+                    If member_kind is equal to DART_METHOD_DECL from Parser:
+                        Set params_node to proc ast_node_child from Parser with member, 2
+                    End If
+                    If member_kind is equal to DART_FIELD_DECL from Parser:
+                        Let field_type be proc ast_node_child from Parser with member, 1
+                        Set fn_type_node to proc expand_function_type_context with analyzer, field_type, 0
+                    End If
+                End If
+            End If
+        End If
+    End If
+
+    If params_node is not equal to 0:
+        Let params_kind be proc ast_node_type from Parser with params_node
+        If params_kind is equal to DART_PARAM_LIST from Parser:
+            Return proc match_lambda_args_to_param_list with analyzer, args, params_node
+        End If
+        Return 0
+    End If
+
+    If fn_type_node is not equal to 0:
+        Return proc match_lambda_args_to_function_type with analyzer, args, fn_type_node
+    End If
+
+    Return 0
+End Process
+
+@Reasoning:
+Argument-to-parameter matching against a declared parameter list (the
+callee resolved to a function, method, or local function declaration).
+Positional arguments walk the positional (required and optional)
+parameters by ordinal; named arguments find their named parameter by
+spelling. Each matched lambda argument is checked against the
+parameter's declared type through validate_lambda_context_type, which
+expands typedef-named function types itself.
+@End Reasoning
+Process called "match_lambda_args_to_param_list" takes analyzer as Integer, args as Integer, params as Integer returns Integer:
+    Let param_count be proc ast_node_child_count from Parser with params
+    Let arg_count be proc ast_node_child_count from Parser with args
+
+    Let positional_index be 0
+    Let a be 0
+    While a is less than arg_count:
+        Let arg be proc ast_node_child from Parser with args, a
+        Let arg_kind be proc ast_node_type from Parser with arg
+
+        If arg_kind is equal to DART_ARG from Parser:
+            Let arg_value be proc ast_node_child from Parser with arg, 0
+            Let value_kind be proc ast_node_type from Parser with arg_value
+            If value_kind is equal to DART_LAMBDA_EXPR from Parser:
+                Note: Match the positional ordinal against the positional
+                Note: (required and optional) parameters in order
+                Let seen be 0
+                Let p be 0
+                While p is less than param_count:
+                    Let param be proc ast_node_child from Parser with params, p
+                    Let param_kind be proc ast_node_type from Parser with param
+                    Let is_positional be 0
+                    If param_kind is equal to DART_PARAMETER from Parser:
+                        Set is_positional to 1
+                    End If
+                    If param_kind is equal to DART_OPTIONAL_PARAMETER from Parser:
+                        Set is_positional to 1
+                    End If
+                    If is_positional is equal to 1:
+                        If seen is equal to positional_index:
+                            Let param_type be proc ast_node_child from Parser with param, 1
+                            proc validate_lambda_context_type with analyzer, param_type, arg_value
+                            Break
+                        End If
+                        Set seen to seen plus 1
+                    End If
+                    Set p to p plus 1
+                End While
+            End If
+            Set positional_index to positional_index plus 1
+        Otherwise:
+            If arg_kind is equal to DART_NAMED_ARG from Parser:
+                Let named_value be proc ast_node_child from Parser with arg, 1
+                Let named_value_kind be proc ast_node_type from Parser with named_value
+                If named_value_kind is equal to DART_LAMBDA_EXPR from Parser:
+                    Let arg_name_node be proc ast_node_child from Parser with arg, 0
+                    Let arg_name be proc ast_node_value from Parser with arg_name_node
+                    Let q be 0
+                    While q is less than param_count:
+                        Let named_param be proc ast_node_child from Parser with params, q
+                        Let named_param_kind be proc ast_node_type from Parser with named_param
+                        If named_param_kind is equal to DART_NAMED_PARAMETER from Parser:
+                            Let named_param_name be proc declaration_name with named_param
+                            Let names_match be proc string_equals from StringCore with named_param_name, arg_name
+                            If names_match is equal to 1:
+                                Let named_param_type be proc ast_node_child from Parser with named_param, 1
+                                proc validate_lambda_context_type with analyzer, named_param_type, named_value
+                                Break
+                            End If
+                        End If
+                        Set q to q plus 1
+                    End While
+                End If
+            End If
+        End If
+
+        Set a to a plus 1
+    End While
+
+    Return 1
+End Process
+
+@Reasoning:
+Argument matching when the callee is a function-typed VALUE rather
+than a declaration: the contexts are the parameter types of the
+DART_FUNCTION_TYPE itself (child 1, a DART_TYPE_ARG_LIST whose
+children are type nodes in positional order). Named arguments are
+skipped because this AST shape records no named-parameter spellings
+for function types; positional lambda arguments beyond the type list's
+arity are also skipped (the arity mismatch is a different diagnostic
+outside this check's charter).
+@End Reasoning
+Process called "match_lambda_args_to_function_type" takes analyzer as Integer, args as Integer, fn_type as Integer returns Integer:
+    Let param_types be proc ast_node_child from Parser with fn_type, 1
+    If param_types is equal to 0:
+        Return 0
+    End If
+    Let type_count be proc ast_node_child_count from Parser with param_types
+    Let arg_count be proc ast_node_child_count from Parser with args
+
+    Let positional_index be 0
+    Let a be 0
+    While a is less than arg_count:
+        Let arg be proc ast_node_child from Parser with args, a
+        Let arg_kind be proc ast_node_type from Parser with arg
+
+        If arg_kind is equal to DART_ARG from Parser:
+            Let arg_value be proc ast_node_child from Parser with arg, 0
+            Let value_kind be proc ast_node_type from Parser with arg_value
+            If value_kind is equal to DART_LAMBDA_EXPR from Parser:
+                If positional_index is less than type_count:
+                    Let param_type be proc ast_node_child from Parser with param_types, positional_index
+                    proc validate_lambda_context_type with analyzer, param_type, arg_value
+                End If
+            End If
+            Set positional_index to positional_index plus 1
+        End If
+
+        Set a to a plus 1
+    End While
+
+    Return 1
+End Process
+
+@Reasoning:
+Member resolution through the locally-known type hierarchy: the
+receiver's class declaration is searched for a member (method, getter,
+setter, or field) with the requested spelling, then the search follows
+the extends base, the with-clause mixins, the implements entries, and
+- for mixins - the on-clause constraints, all through declarations the
+global scope knows. The first match wins (Dart's override rule makes
+the most-derived declaration the one whose signature applies). Names
+whose chains leave local knowledge simply fail to resolve, keeping the
+caller silent rather than guessing. The depth bound terminates cyclic
+hierarchies.
+@End Reasoning
+Process called "find_class_member" takes analyzer as Integer, type_decl as Integer, member_name as Integer, depth as Integer returns Integer:
+    If type_decl is equal to 0:
+        Return 0
+    End If
+    If member_name is equal to 0:
+        Return 0
+    End If
+    If depth is greater than 32:
+        Return 0
+    End If
+
+    Let decl_kind be proc ast_node_type from Parser with type_decl
+    Let searchable be 0
+    If decl_kind is equal to DART_CLASS_DECL from Parser:
+        Set searchable to 1
+    End If
+    If decl_kind is equal to DART_MIXIN_DECL from Parser:
+        Set searchable to 1
+    End If
+    If decl_kind is equal to DART_ENUM_DECL from Parser:
+        Set searchable to 1
+    End If
+    If searchable is equal to 0:
+        Return 0
+    End If
+
+    Note: Direct members first - the most-derived declaration wins
+    Let count be proc ast_node_child_count from Parser with type_decl
+    Let i be 0
+    While i is less than count:
+        Let child be proc ast_node_child from Parser with type_decl, i
+        Let child_kind be proc ast_node_type from Parser with child
+        Let is_member be 0
+        If child_kind is equal to DART_METHOD_DECL from Parser:
+            Set is_member to 1
+        End If
+        If child_kind is equal to DART_GETTER_DECL from Parser:
+            Set is_member to 1
+        End If
+        If child_kind is equal to DART_SETTER_DECL from Parser:
+            Set is_member to 1
+        End If
+        If child_kind is equal to DART_FIELD_DECL from Parser:
+            Set is_member to 1
+        End If
+        If is_member is equal to 1:
+            Let child_name be proc declaration_name with child
+            If child_name is not equal to 0:
+                Let matches be proc string_equals from StringCore with child_name, member_name
+                If matches is equal to 1:
+                    Return child
+                End If
+            End If
+        End If
+        Set i to i plus 1
+    End While
+
+    Note: Inherited members through the locally-known supertype chains
+    Let global_scope be proc memory_get_int64 from Layout with analyzer, 0
+
+    Let extends_clause be proc find_child_of_kind with type_decl, DART_EXTENDS from Parser
+    If extends_clause is not equal to 0:
+        Let base_type be proc ast_node_child from Parser with extends_clause, 0
+        Let base_name be proc type_base_name with base_type
+        If base_name is not equal to 0:
+            Let base_decl be proc get from Dict with global_scope, base_name
+            Let found be proc find_class_member with analyzer, base_decl, member_name, depth plus 1
+            If found is not equal to 0:
+                Return found
+            End If
+        End If
+    End If
+
+    Let with_clause be proc find_child_of_kind with type_decl, DART_WITH from Parser
+    If with_clause is not equal to 0:
+        Let with_count be proc ast_node_child_count from Parser with with_clause
+        Let w be 0
+        While w is less than with_count:
+            Let with_type be proc ast_node_child from Parser with with_clause, w
+            Let with_name be proc type_base_name with with_type
+            If with_name is not equal to 0:
+                Let with_decl be proc get from Dict with global_scope, with_name
+                Let with_found be proc find_class_member with analyzer, with_decl, member_name, depth plus 1
+                If with_found is not equal to 0:
+                    Return with_found
+                End If
+            End If
+            Set w to w plus 1
+        End While
+    End If
+
+    Let implements_clause be proc find_child_of_kind with type_decl, DART_IMPLEMENTS from Parser
+    If implements_clause is not equal to 0:
+        Let impl_count be proc ast_node_child_count from Parser with implements_clause
+        Let im be 0
+        While im is less than impl_count:
+            Let impl_type be proc ast_node_child from Parser with implements_clause, im
+            Let impl_name be proc type_base_name with impl_type
+            If impl_name is not equal to 0:
+                Let impl_decl be proc get from Dict with global_scope, impl_name
+                Let impl_found be proc find_class_member with analyzer, impl_decl, member_name, depth plus 1
+                If impl_found is not equal to 0:
+                    Return impl_found
+                End If
+            End If
+            Set im to im plus 1
+        End While
+    End If
+
+    Let on_clause be proc find_child_of_kind with type_decl, DART_ON_CLAUSE from Parser
+    If on_clause is not equal to 0:
+        Let on_count be proc ast_node_child_count from Parser with on_clause
+        Let oc be 0
+        While oc is less than on_count:
+            Let on_type be proc ast_node_child from Parser with on_clause, oc
+            Let on_name be proc type_base_name with on_type
+            If on_name is not equal to 0:
+                Let on_decl be proc get from Dict with global_scope, on_name
+                Let on_found be proc find_class_member with analyzer, on_decl, member_name, depth plus 1
+                If on_found is not equal to 0:
+                    Return on_found
+                End If
+            End If
+            Set oc to oc plus 1
+        End While
+    End If
+
+    Return 0
+End Process
+
+@Reasoning:
+The third context where a lambda's required wrapper is knowable: a
+return statement inside a callable whose declared return type denotes
+a function type (directly or through a typedef alias). The scan walks
+the callable's own body, stops at nested callables (their returns
+answer to their own declared types), and routes every directly-
+returned lambda through validate_lambda_context_type with the
+enclosing declaration's return type as the context.
+@End Reasoning
+Process called "check_returned_lambdas" takes analyzer as Integer, node as Integer, declared_ret as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+
+    Let kind be proc ast_node_type from Parser with node
+
+    If kind is equal to DART_LAMBDA_EXPR from Parser:
+        Return 0
+    End If
+    If kind is equal to DART_FUNCTION_DECL from Parser:
+        Return 0
+    End If
+    If kind is equal to DART_METHOD_DECL from Parser:
+        Return 0
+    End If
+    If kind is equal to DART_GETTER_DECL from Parser:
+        Return 0
+    End If
+    If kind is equal to DART_SETTER_DECL from Parser:
+        Return 0
+    End If
+    If kind is equal to DART_CONSTRUCTOR_DECL from Parser:
+        Return 0
+    End If
+    If kind is equal to DART_FACTORY_DECL from Parser:
+        Return 0
+    End If
+
+    If kind is equal to DART_RETURN_STMT from Parser:
+        Let return_children be proc ast_node_child_count from Parser with node
+        If return_children is greater than 0:
+            Let returned be proc ast_node_child from Parser with node, 0
+            Let returned_kind be proc ast_node_type from Parser with returned
+            If returned_kind is equal to DART_LAMBDA_EXPR from Parser:
+                proc validate_lambda_context_type with analyzer, declared_ret, returned
+            End If
+        End If
+    End If
+
+    Let count be proc ast_node_child_count from Parser with node
+    Let index be 0
+    While index is less than count:
+        Let child be proc ast_node_child from Parser with node, index
+        proc check_returned_lambdas with analyzer, child, declared_ret
+        Set index to index plus 1
+    End While
+
+    Return 1
+End Process
+
+@Reasoning:
+The structural body scan behind the lambda generator checks: reports
+whether a lambda body contains a yield statement (bit value 1) and
+whether it contains a value-bearing return statement (bit value 2),
+composed arithmetically so the caller decodes with modulo/division and
+no bitwise-operator precedence concerns arise. Nested callables are
+opaque - a yield inside an inner lambda or local function belongs to
+that inner body's own validation, never to the enclosing lambda's -
+so the walk stops at every callable-introducing node kind.
+@End Reasoning
+Process called "scan_lambda_body_constructs" takes node as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+
+    Let kind be proc ast_node_type from Parser with node
+
+    Note: Nested callables answer for their own bodies
+    If kind is equal to DART_LAMBDA_EXPR from Parser:
+        Return 0
+    End If
+    If kind is equal to DART_FUNCTION_DECL from Parser:
+        Return 0
+    End If
+    If kind is equal to DART_METHOD_DECL from Parser:
+        Return 0
+    End If
+    If kind is equal to DART_GETTER_DECL from Parser:
+        Return 0
+    End If
+    If kind is equal to DART_SETTER_DECL from Parser:
+        Return 0
+    End If
+    If kind is equal to DART_CONSTRUCTOR_DECL from Parser:
+        Return 0
+    End If
+    If kind is equal to DART_FACTORY_DECL from Parser:
+        Return 0
+    End If
+
+    Let has_yield be 0
+    Let has_value_return be 0
+
+    If kind is equal to DART_YIELD_STMT from Parser:
+        Set has_yield to 1
+    End If
+    If kind is equal to DART_RETURN_STMT from Parser:
+        Let return_children be proc ast_node_child_count from Parser with node
+        If return_children is greater than 0:
+            Set has_value_return to 1
+        End If
+    End If
+
+    Let count be proc ast_node_child_count from Parser with node
+    Let index be 0
+    While index is less than count:
+        Let child be proc ast_node_child from Parser with node, index
+        Let child_scan be proc scan_lambda_body_constructs with child
+        Let child_yield be child_scan modulo by 2
+        Let child_return be (child_scan divided by 2) modulo by 2
+        If child_yield is equal to 1:
+            Set has_yield to 1
+        End If
+        If child_return is equal to 1:
+            Set has_value_return to 1
+        End If
+        Set index to index plus 1
+    End While
+
+    Return has_yield plus (has_value_return multiplied by 2)
 End Process
 
 @Reasoning:
@@ -1766,6 +2673,747 @@ Process called "is_iterable_type" takes type_ref as Integer returns Integer:
     Set matches to proc string_equals from StringCore with base, "var"
     If matches is equal to 1:
         Return 1
+    End If
+
+    Return 0
+End Process
+
+Note: ================================================================
+Note: Wrapper Type-Argument Checking
+Note: ================================================================
+
+@Reasoning:
+Once a lambda's wrapper FAMILY satisfies its context (Future/Stream/
+Iterable), the wrapper's type argument must be satisfied too: a
+"Future<String> Function()" context rejects "() async => 1" because the
+lambda's element type int is not assignable to String. The declared
+element is the first argument of the context's generic instantiation
+(a bare wrapper spelling means <dynamic> and accepts everything). The
+lambda's produced elements are read from its own body: the arrow
+expression or the value-bearing return statements for an async lambda
+(with Dart's Future-flattening: returning a Future<X> from an async
+body produces Future<X>, so X is the element), and the yield statements
+for generators (yield* contributing its operand's own element type).
+Inference runs inside a scope carrying the lambda's parameters so
+elements referencing them resolve. Every provably non-assignable
+element is diagnosed; unknown types stay silent.
+@End Reasoning
+Process called "check_lambda_wrapper_type_argument" takes analyzer as Integer, context_return as Integer, lambda as Integer, is_async as Integer, is_generator as Integer returns Integer:
+    If context_return is equal to 0:
+        Return 1
+    End If
+    If lambda is equal to 0:
+        Return 1
+    End If
+
+    Let wrapper be context_return
+    Let w_kind be proc ast_node_type from Parser with wrapper
+    While w_kind is equal to DART_NULLABLE_TYPE from Parser:
+        Set wrapper to proc ast_node_child from Parser with wrapper, 0
+        If wrapper is equal to 0:
+            Return 1
+        End If
+        Set w_kind to proc ast_node_type from Parser with wrapper
+    End While
+
+    If w_kind is not equal to DART_GENERIC_TYPE from Parser:
+        Return 1
+    End If
+
+    Let type_args be proc ast_node_child from Parser with wrapper, 1
+    If type_args is equal to 0:
+        Return 1
+    End If
+    Let arg_count be proc ast_node_child_count from Parser with type_args
+    If arg_count is equal to 0:
+        Return 1
+    End If
+    Let declared_elem be proc ast_node_child from Parser with type_args, 0
+
+    Let body be proc ast_node_child from Parser with lambda, 1
+    If body is equal to 0:
+        Return 1
+    End If
+
+    Note: The lambda's parameters scope over its element expressions
+    proc enter_scope with analyzer
+    proc register_lambda_parameters with analyzer, lambda
+
+    If is_generator is equal to 1:
+        proc check_generator_yield_elements with analyzer, body, declared_elem
+    Otherwise:
+        Let is_arrow be proc ast_node_has_flag from Parser with lambda, "arrow"
+        If is_arrow is equal to 1:
+            proc check_element_expression with analyzer, body, declared_elem, 1
+        Otherwise:
+            proc check_async_return_elements with analyzer, body, declared_elem
+        End If
+    End If
+
+    proc exit_scope with analyzer
+    Return 1
+End Process
+
+@Reasoning:
+Element inference inside a lambda body must see the lambda's own
+parameters ("(int x) async => x" produces int through x's declared
+type). The parameters live in the DART_PARAM_LIST at child 0; each
+positional, named, or optional parameter registers by its declared
+name into the current (freshly entered) scope.
+@End Reasoning
+Process called "register_lambda_parameters" takes analyzer as Integer, lambda as Integer returns Integer:
+    Let params be proc ast_node_child from Parser with lambda, 0
+    If params is equal to 0:
+        Return 0
+    End If
+    Let params_kind be proc ast_node_type from Parser with params
+    If params_kind is not equal to DART_PARAM_LIST from Parser:
+        Return 0
+    End If
+
+    Let scope be proc memory_get_int64 from Layout with analyzer, 8
+    Let count be proc ast_node_child_count from Parser with params
+    Let i be 0
+    While i is less than count:
+        Let param be proc ast_node_child from Parser with params, i
+        Let param_kind be proc ast_node_type from Parser with param
+        Let is_param be 0
+        If param_kind is equal to DART_PARAMETER from Parser:
+            Set is_param to 1
+        End If
+        If param_kind is equal to DART_NAMED_PARAMETER from Parser:
+            Set is_param to 1
+        End If
+        If param_kind is equal to DART_OPTIONAL_PARAMETER from Parser:
+            Set is_param to 1
+        End If
+        If is_param is equal to 1:
+            Let param_name be proc declaration_name with param
+            If param_name is not equal to 0:
+                proc set from Dict with scope, param_name, param
+            End If
+        End If
+        Set i to i plus 1
+    End While
+    Return 1
+End Process
+
+@Reasoning:
+Collects the value-bearing return statements of an async lambda's own
+block body and checks each returned expression against the declared
+element type. Nested callables are opaque - their returns answer to
+their own contexts - so the walk stops at every callable-introducing
+node kind, exactly like scan_lambda_body_constructs.
+@End Reasoning
+Process called "check_async_return_elements" takes analyzer as Integer, node as Integer, declared_elem as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+
+    Let kind be proc ast_node_type from Parser with node
+
+    If kind is equal to DART_LAMBDA_EXPR from Parser:
+        Return 0
+    End If
+    If kind is equal to DART_FUNCTION_DECL from Parser:
+        Return 0
+    End If
+    If kind is equal to DART_METHOD_DECL from Parser:
+        Return 0
+    End If
+    If kind is equal to DART_GETTER_DECL from Parser:
+        Return 0
+    End If
+    If kind is equal to DART_SETTER_DECL from Parser:
+        Return 0
+    End If
+    If kind is equal to DART_CONSTRUCTOR_DECL from Parser:
+        Return 0
+    End If
+    If kind is equal to DART_FACTORY_DECL from Parser:
+        Return 0
+    End If
+
+    If kind is equal to DART_RETURN_STMT from Parser:
+        Let return_children be proc ast_node_child_count from Parser with node
+        If return_children is greater than 0:
+            Let returned be proc ast_node_child from Parser with node, 0
+            proc check_element_expression with analyzer, returned, declared_elem, 1
+        End If
+    End If
+
+    Let count be proc ast_node_child_count from Parser with node
+    Let index be 0
+    While index is less than count:
+        Let child be proc ast_node_child from Parser with node, index
+        proc check_async_return_elements with analyzer, child, declared_elem
+        Set index to index plus 1
+    End While
+
+    Return 1
+End Process
+
+@Reasoning:
+Generator element collection: every plain yield contributes its
+operand's type directly; every yield* contributes the ELEMENT type of
+its operand's generic instantiation (yield* delegates a whole Stream/
+Iterable, so only a known instantiation argument is comparable - bare
+or unknown operand types stay silent). Nested callables are opaque for
+the same reason as everywhere else in the body scans.
+@End Reasoning
+Process called "check_generator_yield_elements" takes analyzer as Integer, node as Integer, declared_elem as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+
+    Let kind be proc ast_node_type from Parser with node
+
+    If kind is equal to DART_LAMBDA_EXPR from Parser:
+        Return 0
+    End If
+    If kind is equal to DART_FUNCTION_DECL from Parser:
+        Return 0
+    End If
+    If kind is equal to DART_METHOD_DECL from Parser:
+        Return 0
+    End If
+    If kind is equal to DART_GETTER_DECL from Parser:
+        Return 0
+    End If
+    If kind is equal to DART_SETTER_DECL from Parser:
+        Return 0
+    End If
+    If kind is equal to DART_CONSTRUCTOR_DECL from Parser:
+        Return 0
+    End If
+    If kind is equal to DART_FACTORY_DECL from Parser:
+        Return 0
+    End If
+
+    If kind is equal to DART_YIELD_STMT from Parser:
+        Let yield_children be proc ast_node_child_count from Parser with node
+        If yield_children is greater than 0:
+            Let yielded be proc ast_node_child from Parser with node, 0
+            Let is_each be proc ast_node_has_flag from Parser with node, "yield_each"
+            If is_each is equal to 1:
+                Let delegate_type be proc infer_expression_type with analyzer, yielded, 0
+                If delegate_type is not equal to 0:
+                    Let delegate_kind be proc ast_node_type from Parser with delegate_type
+                    If delegate_kind is equal to DART_GENERIC_TYPE from Parser:
+                        Let delegate_args be proc ast_node_child from Parser with delegate_type, 1
+                        If delegate_args is not equal to 0:
+                            Let delegate_arg_count be proc ast_node_child_count from Parser with delegate_args
+                            If delegate_arg_count is greater than 0:
+                                Let delegate_elem be proc ast_node_child from Parser with delegate_args, 0
+                                Let delegate_ok be proc dart_type_assignable with analyzer, delegate_elem, declared_elem, 0
+                                If delegate_ok is equal to 0:
+                                    proc report_element_mismatch with analyzer, delegate_elem, declared_elem
+                                End If
+                            End If
+                        End If
+                    End If
+                End If
+            Otherwise:
+                proc check_element_expression with analyzer, yielded, declared_elem, 0
+            End If
+        End If
+    End If
+
+    Let count be proc ast_node_child_count from Parser with node
+    Let index be 0
+    While index is less than count:
+        Let child be proc ast_node_child from Parser with node, index
+        proc check_generator_yield_elements with analyzer, child, declared_elem
+        Set index to index plus 1
+    End While
+
+    Return 1
+End Process
+
+@Reasoning:
+One produced element against the declared wrapper argument. Two Dart
+subtleties live here: an integer LITERAL in a double context is a
+double literal (so "() async => 1" satisfies Future<double> even
+though computed ints would not), and an async body returning a
+Future<X> is flattened to element X (await-free forwarding is
+idiomatic Dart). A bare Future/FutureOr spelling flattens to unknown
+and stays silent. Everything else defers to dart_type_assignable,
+which answers 0 only on provable mismatches.
+@End Reasoning
+Process called "check_element_expression" takes analyzer as Integer, expr as Integer, declared_elem as Integer, flatten as Integer returns Integer:
+    If expr is equal to 0:
+        Return 1
+    End If
+    If declared_elem is equal to 0:
+        Return 1
+    End If
+
+    Let declared_base be proc type_base_name with declared_elem
+    Let expr_kind be proc ast_node_type from Parser with expr
+    If expr_kind is equal to DART_INT_LITERAL from Parser:
+        If declared_base is not equal to 0:
+            Let is_double_ctx be proc string_equals from StringCore with declared_base, "double"
+            If is_double_ctx is equal to 1:
+                Return 1
+            End If
+        End If
+    End If
+
+    Let value_type be proc infer_expression_type with analyzer, expr, 0
+    If value_type is equal to 0:
+        Return 1
+    End If
+
+    If flatten is equal to 1:
+        Let v_kind be proc ast_node_type from Parser with value_type
+        Let v_base be proc type_base_name with value_type
+        Let is_future_base be proc name_final_segment_equals with v_base, "Future"
+        If is_future_base is equal to 0:
+            Set is_future_base to proc name_final_segment_equals with v_base, "FutureOr"
+        End If
+        If is_future_base is equal to 1:
+            If v_kind is equal to DART_GENERIC_TYPE from Parser:
+                Let v_args be proc ast_node_child from Parser with value_type, 1
+                If v_args is equal to 0:
+                    Return 1
+                End If
+                Let v_arg_count be proc ast_node_child_count from Parser with v_args
+                If v_arg_count is equal to 0:
+                    Return 1
+                End If
+                Set value_type to proc ast_node_child from Parser with v_args, 0
+            Otherwise:
+                Note: A bare Future spelling carries no element knowledge
+                Return 1
+            End If
+        End If
+    End If
+
+    Let ok be proc dart_type_assignable with analyzer, value_type, declared_elem, 0
+    If ok is equal to 0:
+        proc report_element_mismatch with analyzer, value_type, declared_elem
+        Return 0
+    End If
+
+    Return 1
+End Process
+
+@Reasoning:
+One diagnostic spelling for every element mismatch, naming both sides
+by their base spellings so the message reads like the Dart analyzer's
+assignability errors.
+@End Reasoning
+Process called "report_element_mismatch" takes analyzer as Integer, value_type as Integer, declared_elem as Integer returns Integer:
+    Let value_name be proc type_display_name with value_type
+    Let declared_name be proc type_display_name with declared_elem
+    Let error_msg be proc string_concat from StringUtils with "Lambda result type '", value_name
+    Set error_msg to proc string_concat from StringUtils with error_msg, "' is not assignable to the declared wrapper type argument '"
+    Set error_msg to proc string_concat from StringUtils with error_msg, declared_name
+    Set error_msg to proc string_concat from StringUtils with error_msg, "'"
+    proc add_error with analyzer, error_msg
+    Return 1
+End Process
+
+@Reasoning:
+Diagnostic spelling for a type reference: the base name when one
+exists, the fixed function-type spelling otherwise (function types
+have no single base name by construction of type_base_name).
+@End Reasoning
+Process called "type_display_name" takes type_ref as Integer returns Integer:
+    Let base be proc type_base_name with type_ref
+    If base is not equal to 0:
+        Return base
+    End If
+    Return "<function type>"
+End Process
+
+@Reasoning:
+Dart assignability over the analyzer's type references, answering 1
+for assignable-or-unknown and 0 only for PROVABLE mismatches - every
+silent path here is a case a single-file analyzer genuinely cannot
+judge. The order encodes Dart's rules: a nullable declared side
+accepts Null and anything assignable to its base; declared function
+types stay silent (inference never produces function-type values to
+compare); typedef-aliased names on either side expand before judgment;
+the top types (dynamic, void, and - for non-Null values - Object)
+accept everything; generic type parameters are unjudgeable locally; a
+nullable value cannot flow into the remaining (non-nullable, non-top)
+contexts; Null flows only into Null; identical base names compare
+their first instantiation arguments when both sides carry them (Dart
+generics are covariant); and the remaining cross-name verdicts come
+from the builtin subtype table when both sides are dart:core types,
+from supertype_conforms when locally-declared classes are involved,
+and stay silent when either side lives in an unseen library.
+@End Reasoning
+Process called "dart_type_assignable" takes analyzer as Integer, value_type as Integer, declared_type as Integer, depth as Integer returns Integer:
+    If value_type is equal to 0:
+        Return 1
+    End If
+    If declared_type is equal to 0:
+        Return 1
+    End If
+    If depth is greater than 16:
+        Return 1
+    End If
+
+    Let global_scope be proc memory_get_int64 from Layout with analyzer, 0
+    Let d_kind be proc ast_node_type from Parser with declared_type
+
+    If d_kind is equal to DART_NULLABLE_TYPE from Parser:
+        Let v_null_base be proc type_base_name with value_type
+        If v_null_base is not equal to 0:
+            Let v_is_null be proc string_equals from StringCore with v_null_base, "Null"
+            If v_is_null is equal to 1:
+                Return 1
+            End If
+        End If
+        Let unwrapped_value be value_type
+        Let v_kind0 be proc ast_node_type from Parser with value_type
+        If v_kind0 is equal to DART_NULLABLE_TYPE from Parser:
+            Set unwrapped_value to proc ast_node_child from Parser with value_type, 0
+        End If
+        Let d_unwrapped be proc ast_node_child from Parser with declared_type, 0
+        Return proc dart_type_assignable with analyzer, unwrapped_value, d_unwrapped, depth plus 1
+    End If
+
+    If d_kind is equal to DART_FUNCTION_TYPE from Parser:
+        Return 1
+    End If
+
+    Let d_base be proc type_base_name with declared_type
+    If d_base is equal to 0:
+        Return 1
+    End If
+
+    Note: Expand a typedef-aliased declared name before judging
+    Let d_decl be proc get from Dict with global_scope, d_base
+    If d_decl is not equal to 0:
+        Let d_decl_kind be proc ast_node_type from Parser with d_decl
+        If d_decl_kind is equal to DART_TYPEDEF_DECL from Parser:
+            Let d_cc be proc ast_node_child_count from Parser with d_decl
+            If d_cc is greater than or equal to 2:
+                Let d_aliased be proc ast_node_child from Parser with d_decl, d_cc minus 1
+                Return proc dart_type_assignable with analyzer, value_type, d_aliased, depth plus 1
+            End If
+        End If
+    End If
+
+    Let d_top be proc string_equals from StringCore with d_base, "dynamic"
+    If d_top is equal to 1:
+        Return 1
+    End If
+    Set d_top to proc string_equals from StringCore with d_base, "var"
+    If d_top is equal to 1:
+        Return 1
+    End If
+    Set d_top to proc string_equals from StringCore with d_base, "void"
+    If d_top is equal to 1:
+        Return 1
+    End If
+
+    Let generic_params be proc memory_get_int64 from Layout with analyzer, 56
+    Let d_is_param be proc contains from Dict with generic_params, d_base
+    If d_is_param is equal to 1:
+        Return 1
+    End If
+
+    Let v_kind be proc ast_node_type from Parser with value_type
+
+    If v_kind is equal to DART_NULLABLE_TYPE from Parser:
+        Note: A nullable value cannot flow into a non-nullable,
+        Note: non-top declared context
+        Return 0
+    End If
+
+    If v_kind is equal to DART_FUNCTION_TYPE from Parser:
+        Let d_is_function be proc string_equals from StringCore with d_base, "Function"
+        If d_is_function is equal to 1:
+            Return 1
+        End If
+        Let d_is_object be proc string_equals from StringCore with d_base, "Object"
+        If d_is_object is equal to 1:
+            Return 1
+        End If
+        Let d_builtin0 be proc is_dart_builtin_type with analyzer, d_base
+        If d_builtin0 is equal to 1:
+            Return 0
+        End If
+        Let d_local0 be proc contains from Dict with global_scope, d_base
+        If d_local0 is equal to 1:
+            Return 0
+        End If
+        Return 1
+    End If
+
+    Let v_base be proc type_base_name with value_type
+    If v_base is equal to 0:
+        Return 1
+    End If
+
+    Let v_top be proc string_equals from StringCore with v_base, "dynamic"
+    If v_top is equal to 1:
+        Return 1
+    End If
+    Set v_top to proc string_equals from StringCore with v_base, "var"
+    If v_top is equal to 1:
+        Return 1
+    End If
+
+    Let v_is_param be proc contains from Dict with generic_params, v_base
+    If v_is_param is equal to 1:
+        Return 1
+    End If
+
+    Note: Expand a typedef-aliased value name before judging
+    Let v_decl be proc get from Dict with global_scope, v_base
+    If v_decl is not equal to 0:
+        Let v_decl_kind be proc ast_node_type from Parser with v_decl
+        If v_decl_kind is equal to DART_TYPEDEF_DECL from Parser:
+            Let v_cc be proc ast_node_child_count from Parser with v_decl
+            If v_cc is greater than or equal to 2:
+                Let v_aliased be proc ast_node_child from Parser with v_decl, v_cc minus 1
+                Return proc dart_type_assignable with analyzer, v_aliased, declared_type, depth plus 1
+            End If
+        End If
+    End If
+
+    Let v_is_null be proc string_equals from StringCore with v_base, "Null"
+    If v_is_null is equal to 1:
+        Let d_is_null be proc string_equals from StringCore with d_base, "Null"
+        If d_is_null is equal to 1:
+            Return 1
+        End If
+        Return 0
+    End If
+
+    Let v_is_never be proc string_equals from StringCore with v_base, "Never"
+    If v_is_never is equal to 1:
+        Return 1
+    End If
+
+    Let d_is_object2 be proc string_equals from StringCore with d_base, "Object"
+    If d_is_object2 is equal to 1:
+        Return 1
+    End If
+
+    Note: FutureOr<T> accepts both T and Future<T>; a bare FutureOr
+    Note: spelling means FutureOr<dynamic> and accepts everything
+    Let d_is_futureor be proc name_final_segment_equals with d_base, "FutureOr"
+    If d_is_futureor is equal to 1:
+        Let dfo_kind be proc ast_node_type from Parser with declared_type
+        If dfo_kind is not equal to DART_GENERIC_TYPE from Parser:
+            Return 1
+        End If
+        Let dfo_args be proc ast_node_child from Parser with declared_type, 1
+        If dfo_args is equal to 0:
+            Return 1
+        End If
+        Let dfo_count be proc ast_node_child_count from Parser with dfo_args
+        If dfo_count is equal to 0:
+            Return 1
+        End If
+        Let dfo_inner be proc ast_node_child from Parser with dfo_args, 0
+        Let dfo_direct be proc dart_type_assignable with analyzer, value_type, dfo_inner, depth plus 1
+        If dfo_direct is equal to 1:
+            Return 1
+        End If
+        Let vfo_is_future be proc name_final_segment_equals with v_base, "Future"
+        If vfo_is_future is equal to 1:
+            If v_kind is equal to DART_GENERIC_TYPE from Parser:
+                Let vfo_args be proc ast_node_child from Parser with value_type, 1
+                If vfo_args is not equal to 0:
+                    Let vfo_count be proc ast_node_child_count from Parser with vfo_args
+                    If vfo_count is greater than 0:
+                        Let vfo_inner be proc ast_node_child from Parser with vfo_args, 0
+                        Return proc dart_type_assignable with analyzer, vfo_inner, dfo_inner, depth plus 1
+                    End If
+                End If
+            End If
+            Return 1
+        End If
+        Return 0
+    End If
+
+    Note: Identical base names: compare the first instantiation
+    Note: arguments when both sides carry them
+    Let same be proc string_equals from StringCore with v_base, d_base
+    If same is equal to 0:
+        Set same to proc name_final_segment_equals with v_base, d_base
+    End If
+    If same is equal to 0:
+        Set same to proc name_final_segment_equals with d_base, v_base
+    End If
+    If same is equal to 1:
+        If v_kind is equal to DART_GENERIC_TYPE from Parser:
+            Let dd_kind be proc ast_node_type from Parser with declared_type
+            If dd_kind is equal to DART_GENERIC_TYPE from Parser:
+                Let v_args2 be proc ast_node_child from Parser with value_type, 1
+                Let d_args2 be proc ast_node_child from Parser with declared_type, 1
+                If v_args2 is not equal to 0:
+                    If d_args2 is not equal to 0:
+                        Let v_ac be proc ast_node_child_count from Parser with v_args2
+                        Let d_ac be proc ast_node_child_count from Parser with d_args2
+                        If v_ac is greater than 0:
+                            If d_ac is greater than 0:
+                                Let v_first be proc ast_node_child from Parser with v_args2, 0
+                                Let d_first be proc ast_node_child from Parser with d_args2, 0
+                                Return proc dart_type_assignable with analyzer, v_first, d_first, depth plus 1
+                            End If
+                        End If
+                    End If
+                End If
+            End If
+        End If
+        Return 1
+    End If
+
+    Let v_builtin be proc is_dart_builtin_type with analyzer, v_base
+    Let d_builtin be proc is_dart_builtin_type with analyzer, d_base
+
+    If d_builtin is equal to 1:
+        If v_builtin is equal to 1:
+            Return proc dart_builtin_assignable with v_base, d_base
+        End If
+        Note: A locally-declared value type may implement a builtin
+        Note: interface; an unseen one always might
+        Let v_known be proc contains from Dict with global_scope, v_base
+        If v_known is equal to 1:
+            Let verdict be proc supertype_conforms with analyzer, v_base, d_base, 0
+            If verdict is equal to 0:
+                Return 0
+            End If
+            Return 1
+        End If
+        Return 1
+    End If
+
+    Let d_known be proc contains from Dict with global_scope, d_base
+    If d_known is equal to 0:
+        Return 1
+    End If
+
+    If v_builtin is equal to 1:
+        Note: No dart:core type descends from a user-declared type
+        Return 0
+    End If
+
+    Let v_known2 be proc contains from Dict with global_scope, v_base
+    If v_known2 is equal to 0:
+        Return 1
+    End If
+
+    Let verdict2 be proc supertype_conforms with analyzer, v_base, d_base, 0
+    If verdict2 is equal to 0:
+        Return 0
+    End If
+    Return 1
+End Process
+
+@Reasoning:
+The dart:core subtype table over BASE spellings, consulted only when
+both sides are builtin types and their names differ (equality returned
+earlier). Encodes the numeric tower (int and double flow into num but
+never into each other - integer LITERAL demotion is handled at the
+expression layer), the Comparable implementors, the Pattern
+implementors (String and RegExp), the Iterable family (List, Set, and
+Runes), StringBuffer's StringSink contract, and Future into FutureOr.
+Everything else among distinct builtins is a provable mismatch - that
+is exactly the verdict that lets "Future<String>" reject an async
+lambda producing int.
+@End Reasoning
+Process called "dart_builtin_assignable" takes v_base as Integer, d_base as Integer returns Integer:
+    Let is_num_ctx be proc string_equals from StringCore with d_base, "num"
+    If is_num_ctx is equal to 1:
+        Let v_int be proc string_equals from StringCore with v_base, "int"
+        If v_int is equal to 1:
+            Return 1
+        End If
+        Let v_double be proc string_equals from StringCore with v_base, "double"
+        If v_double is equal to 1:
+            Return 1
+        End If
+        Return 0
+    End If
+
+    Let is_comparable_ctx be proc string_equals from StringCore with d_base, "Comparable"
+    If is_comparable_ctx is equal to 1:
+        Let c_match be proc string_equals from StringCore with v_base, "int"
+        If c_match is equal to 1:
+            Return 1
+        End If
+        Set c_match to proc string_equals from StringCore with v_base, "double"
+        If c_match is equal to 1:
+            Return 1
+        End If
+        Set c_match to proc string_equals from StringCore with v_base, "num"
+        If c_match is equal to 1:
+            Return 1
+        End If
+        Set c_match to proc string_equals from StringCore with v_base, "String"
+        If c_match is equal to 1:
+            Return 1
+        End If
+        Set c_match to proc string_equals from StringCore with v_base, "Duration"
+        If c_match is equal to 1:
+            Return 1
+        End If
+        Set c_match to proc string_equals from StringCore with v_base, "DateTime"
+        If c_match is equal to 1:
+            Return 1
+        End If
+        Set c_match to proc string_equals from StringCore with v_base, "BigInt"
+        If c_match is equal to 1:
+            Return 1
+        End If
+        Return 0
+    End If
+
+    Let is_pattern_ctx be proc string_equals from StringCore with d_base, "Pattern"
+    If is_pattern_ctx is equal to 1:
+        Let p_match be proc string_equals from StringCore with v_base, "String"
+        If p_match is equal to 1:
+            Return 1
+        End If
+        Set p_match to proc string_equals from StringCore with v_base, "RegExp"
+        If p_match is equal to 1:
+            Return 1
+        End If
+        Return 0
+    End If
+
+    Let is_iterable_ctx be proc string_equals from StringCore with d_base, "Iterable"
+    If is_iterable_ctx is equal to 1:
+        Let i_match be proc string_equals from StringCore with v_base, "List"
+        If i_match is equal to 1:
+            Return 1
+        End If
+        Set i_match to proc string_equals from StringCore with v_base, "Set"
+        If i_match is equal to 1:
+            Return 1
+        End If
+        Set i_match to proc string_equals from StringCore with v_base, "Runes"
+        If i_match is equal to 1:
+            Return 1
+        End If
+        Return 0
+    End If
+
+    Let is_sink_ctx be proc string_equals from StringCore with d_base, "StringSink"
+    If is_sink_ctx is equal to 1:
+        Let s_match be proc string_equals from StringCore with v_base, "StringBuffer"
+        If s_match is equal to 1:
+            Return 1
+        End If
+        Return 0
+    End If
+
+    Let is_futureor_ctx be proc string_equals from StringCore with d_base, "FutureOr"
+    If is_futureor_ctx is equal to 1:
+        Let f_match be proc string_equals from StringCore with v_base, "Future"
+        If f_match is equal to 1:
+            Return 1
+        End If
+        Return 0
     End If
 
     Return 0

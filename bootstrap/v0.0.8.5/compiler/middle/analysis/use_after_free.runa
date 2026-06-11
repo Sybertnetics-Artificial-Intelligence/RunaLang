@@ -36,6 +36,8 @@ This file consists of the following functions/features/operation types:
 :End Note
 
 Import "compiler/middle/gungnir/mir/mir.runa" as MIR
+Import "compiler/middle/gungnir/mir/mir_nodes.runa" as MIRNodes
+Import "compiler/middle/gungnir/mir/cfg.runa" as MirCFG
 Import "compiler/middle/gungnir/mir/mir_builder.runa" as MIRBuilder
 Import "compiler/middle/analysis/control_flow.runa" as ControlFlowGraph
 Import "compiler/middle/analysis/data_flow.runa" as DataFlowAnalysis
@@ -44,6 +46,7 @@ Import "compiler/middle/analysis/lifetime_analysis.runa" as LifetimeAnalysis
 Import "compiler/middle/analysis/alias_analysis.runa" as AliasAnalysis
 Import "compiler/frontend/primitives/memory/layout.runa" as Layout
 Import "compiler/frontend/primitives/collections/dictionary.runa" as Dictionary
+Import "compiler/frontend/primitives/collections/ordered_map.runa" as OrderedMap
 Import "compiler/frontend/primitives/collections/list.runa" as List
 Import "compiler/frontend/primitives/collections/set.runa" as Set
 Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
@@ -59,7 +62,8 @@ The analysis uses three freed states:
 - UNKNOWN (2): Freed state is unknown (conservative assumption)
 
 The analysis is flow-sensitive and must handle:
-1. Explicit deallocations (FREE, DELETE instructions)
+1. Explicit deallocations (OD-2: direct MIR_CALL instructions whose callee
+   name is in the canonical deallocator family - deallocate/memory_free)
 2. Moved values (ownership transfer implies inaccessibility)
 3. Alias relationships (if pointer A is freed, aliases of A are also freed)
 4. Control flow merging (conservative UNKNOWN at merge points)
@@ -118,7 +122,7 @@ End Type
 UAFInfo tracks freed states at a specific program point.
 Fields:
 - program_point: Instruction ID or block ID
-- freed_states: Dictionary mapping value_id -> FreedState
+- freed_states: Integer-keyed ordered map (omap) value_id -> FreedState
 - dealloc_sites: List of deallocation instruction IDs at this point
 - dominates: Set of program points dominated by this point
 - phi_nodes: List of phi node IDs at this point
@@ -126,7 +130,7 @@ Fields:
 
 Memory layout (56 bytes, Tier 3 OWNED HEAP):
 Offset 0: program_point (8 bytes)
-Offset 8: freed_states (8 bytes, pointer to Dictionary)
+Offset 8: freed_states (8 bytes, pointer to integer-keyed omap)
 Offset 16: dealloc_sites (8 bytes, pointer to List)
 Offset 24: dominates (8 bytes, pointer to Set)
 Offset 32: phi_nodes (8 bytes, pointer to List)
@@ -172,9 +176,9 @@ UseAfterFreeAnalysis is the main analysis state for UAF detection.
 Fields:
 - mir: Pointer to MIR structure
 - cfg: Pointer to control flow graph
-- value_to_freed: Dictionary mapping value_id -> current FreedState
-- block_to_info: Dictionary mapping block_id -> UAFInfo
-- inst_to_info: Dictionary mapping inst_id -> UAFInfo
+- value_to_freed: Integer-keyed ordered map (omap) value_id -> current FreedState
+- block_to_info: Integer-keyed ordered map (omap) block_id -> UAFInfo
+- inst_to_info: Integer-keyed ordered map (omap) inst_id -> UAFInfo
 - error_list: List of UAFError objects
 - error_count: Number of errors detected
 - ownership_analysis: Pointer to OwnershipAnalysis for integration
@@ -209,14 +213,14 @@ create_freed_state creates a new FreedState with the given parameters.
 The default state is ALLOCATED (0) because memory starts as allocated
 until explicitly freed or moved.
 
-New allocations (ALLOC, NEW instructions) create ALLOCATED states.
-FREE/DELETE instructions transition to FREED state.
-MOVE instructions transition to UNKNOWN state (no longer accessible).
+New allocations (MIR_ALLOCA and OD-2 allocator calls) create ALLOCATED states.
+OD-2 deallocator calls transition to FREED state.
+Moved values transition to UNKNOWN state (no longer accessible).
 @End Reasoning
 
 Process called "create_freed_state" that takes value_id as Integer, state as Integer, freed_at as Integer, allocated_at as Integer returns Integer:
     Note: Allocate FreedState (56 bytes, Tier 3 OWNED HEAP)
-    Let fs be proc memory_allocate from Layout with 56
+    Let fs be proc allocate from Layout with 56
 
     Note: Initialize fields
     proc memory_set_int64 from Layout with fs, 0, value_id
@@ -238,11 +242,11 @@ the freed states of all pointers at that point.
 
 Process called "create_uaf_info" that takes program_point as Integer returns Integer:
     Note: Allocate UAFInfo (56 bytes, Tier 3 OWNED HEAP)
-    Let ui be proc memory_allocate from Layout with 56
+    Let ui be proc allocate from Layout with 56
 
     Note: Initialize fields
     proc memory_set_int64 from Layout with ui, 0, program_point
-    proc memory_set_int64 from Layout with ui, 8, Dictionary.create( )   Note: freed_states
+    proc memory_set_int64 from Layout with ui, 8, OrderedMap.omap_create( )  Note: freed_states (integer-keyed)
     proc memory_set_int64 from Layout with ui, 16, List.create( )        Note: dealloc_sites
     proc memory_set_int64 from Layout with ui, 24, Set.create( )         Note: dominates
     proc memory_set_int64 from Layout with ui, 32, List.create( )        Note: phi_nodes
@@ -258,7 +262,7 @@ This encapsulates all information needed for error reporting.
 
 Process called "create_uaf_error" that takes error_type as Integer, value_id as Integer, use_site as Integer, free_site as Integer returns Integer:
     Note: Allocate UAFError (48 bytes, Tier 3 OWNED HEAP)
-    Let ue be proc memory_allocate from Layout with 48
+    Let ue be proc allocate from Layout with 48
 
     Note: Initialize fields
     proc memory_set_int64 from Layout with ue, 0, error_type
@@ -277,14 +281,14 @@ This initializes all data structures needed for UAF detection.
 
 Process called "create_use_after_free_analysis" that takes mir as Integer, cfg as Integer, ownership_analysis as Integer, alias_analysis as Integer returns Integer:
     Note: Allocate UseAfterFreeAnalysis (72 bytes, Tier 3 OWNED HEAP)
-    Let uafa be proc memory_allocate from Layout with 72
+    Let uafa be proc allocate from Layout with 72
 
     Note: Initialize fields
     proc memory_set_int64 from Layout with uafa, 0, mir
     proc memory_set_int64 from Layout with uafa, 8, cfg
-    proc memory_set_int64 from Layout with uafa, 16, Dictionary.create( )  Note: value_to_freed
-    proc memory_set_int64 from Layout with uafa, 24, Dictionary.create( )  Note: block_to_info
-    proc memory_set_int64 from Layout with uafa, 32, Dictionary.create( )  Note: inst_to_info
+    proc memory_set_int64 from Layout with uafa, 16, OrderedMap.omap_create( )  Note: value_to_freed (integer-keyed)
+    proc memory_set_int64 from Layout with uafa, 24, OrderedMap.omap_create( )  Note: block_to_info (integer-keyed)
+    proc memory_set_int64 from Layout with uafa, 32, OrderedMap.omap_create( )  Note: inst_to_info (integer-keyed)
     proc memory_set_int64 from Layout with uafa, 40, List.create( )        Note: error_list
     proc memory_set_int64 from Layout with uafa, 48, 0 Note: error_count
     proc memory_set_int64 from Layout with uafa, 56, ownership_analysis
@@ -303,7 +307,7 @@ Algorithm:
 2. Identify allocations and track them
 3. Integrate with ownership analysis (MOVED → UNKNOWN)
 4. Iterate through CFG until fixed point
-5. Track FREE/DELETE instructions
+5. Track OD-2 deallocation calls
 6. Propagate freed states through control flow
 7. At phi nodes, merge freed states conservatively
 8. Detect use-after-free and double-free errors
@@ -318,8 +322,8 @@ Process called "compute_freed_states" that takes uafa as Integer returns Integer
     Let block_to_info be proc memory_get_int64 from Layout with uafa, 24
     Let ownership_analysis be proc memory_get_int64 from Layout with uafa, 56
 
-    Note: Get CFG structure
-    Let blocks be proc memory_get_int64 from Layout with cfg, 0
+    Note: Get CFG structure (canonical MIRCFG: blocks List at offset 16)
+    Let blocks be proc get_mir_cfg_blocks from MirCFG with cfg
     Let block_count be proc length from List with blocks
 
     Note: Initialize all pointer values to ALLOCATED state
@@ -330,7 +334,7 @@ Process called "compute_freed_states" that takes uafa as Integer returns Integer
 
         Note: Create UAFInfo for this block
         Let info be create_uaf_info(block_id)
-        proc set from Dictionary with block_to_info, block_id, info
+        proc omap_set from OrderedMap with block_to_info, block_id, info
 
         Note: Process instructions in block
         Let instructions be proc memory_get_int64 from Layout with block, 16
@@ -345,14 +349,25 @@ Process called "compute_freed_states" that takes uafa as Integer returns Integer
             If value_id is not equal to 0:
                 Let opcode be proc memory_get_int64 from Layout with inst, 0
 
-                Note: ALLOC (20201) and NEW (20202) produce allocated pointers
-                If opcode is equal to 20201 or opcode is equal to 20202:
+                Note: MIR_ALLOCA (20202, stack allocation) and heap allocator
+                Note: calls (OD-2: direct MIR_CALL whose callee name is in the
+                Note: canonical allocator family) produce freshly allocated
+                Note: pointers with a known allocation site
+                Let is_alloc be 0
+                If opcode is equal to 20202:
+                    Set is_alloc to 1
+                End If
+                If proc is_allocation_call from MIRNodes with inst is equal to 1:
+                    Set is_alloc to 1
+                End If
+
+                If is_alloc is equal to 1:
                     Let fs be create_freed_state(value_id, 0, 0, inst)  Note: ALLOCATED
-                    proc set from Dictionary with value_to_freed, value_id, fs
+                    proc omap_set from OrderedMap with value_to_freed, value_id, fs
                 Otherwise:
                     Note: Default to ALLOCATED state for other instructions
                     Set fs to create_freed_state(value_id, 0, 0, 0)
-                    proc set from Dictionary with value_to_freed, value_id, fs
+                    proc omap_set from OrderedMap with value_to_freed, value_id, fs
                 End If
             End If
 
@@ -437,17 +452,18 @@ Process called "analyze_freed_in_block" that takes uafa as Integer, block as Int
     Let alias_analysis be proc memory_get_int64 from Layout with uafa, 64
 
     Note: Get block info
-    Let info be proc get from Dictionary with block_to_info, block_id
+    Let info be proc omap_get from OrderedMap with block_to_info, block_id
     If info is equal to 0:
         Set info to create_uaf_info(block_id)
-        proc set from Dictionary with block_to_info, block_id, info
+        proc omap_set from OrderedMap with block_to_info, block_id, info
     End If
 
     Let freed_states be proc memory_get_int64 from Layout with info, 8
     Let changed be 0
 
-    Note: Propagate freed states from predecessors
-    Let predecessors be proc memory_get_int64 from Layout with block, 8
+    Note: Propagate freed states from predecessors (canonical MIRBasicBlock:
+    Note: predecessor block-id List at offset 32, via the MIR accessor)
+    Let predecessors be proc get_block_predecessors from MIR with block
     Let pred_count be proc length from List with predecessors
 
     Note: If multiple predecessors, merge freed states at phi nodes
@@ -468,9 +484,17 @@ Process called "analyze_freed_in_block" that takes uafa as Integer, block as Int
         Let opcode be proc memory_get_int64 from Layout with inst, 0
         Let value_id be proc memory_get_int64 from Layout with inst, 8
 
-        Note: FREE instruction (20206) - mark pointer as freed
-        If opcode is equal to 20206:
-            Let ptr be proc memory_get_int64 from Layout with inst, 16
+        Note: Deallocation (OD-2): heap memory is freed by a direct MIR_CALL
+        Note: whose callee name is in the canonical deallocator family. The
+        Note: pointer being freed is the call's FIRST argument (an SSA value
+        Note: id in the prefix-embedded arguments List, via the accessors)
+        If proc is_deallocation_call from MIRNodes with inst is equal to 1:
+            Let ptr be 0
+            Let dealloc_args be proc get_call_arguments from MIRNodes with inst
+            Let dealloc_argc be proc get_call_argument_count from MIRNodes with inst
+            If dealloc_args is not equal to 0 and dealloc_argc is greater than 0:
+                Set ptr to proc get from List with dealloc_args, 0
+            End If
 
             If ptr is not equal to 0:
                 Let dealloc_changed be track_deallocation(uafa, ptr, inst, block_id)
@@ -480,7 +504,7 @@ Process called "analyze_freed_in_block" that takes uafa as Integer, block as Int
 
                 Note: Propagate freed state to aliases
                 If alias_analysis is not equal to 0:
-                    Let ptr_state be proc get from Dictionary with value_to_freed, ptr
+                    Let ptr_state be proc omap_get from OrderedMap with value_to_freed, ptr
                     If ptr_state is not equal to 0:
                         Let alias_set be proc memory_get_int64 from Layout with ptr_state, 32
                         Let alias_list be proc to_list from Set with alias_set
@@ -501,25 +525,12 @@ Process called "analyze_freed_in_block" that takes uafa as Integer, block as Int
             End If
         End If
 
-        Note: LOAD instruction - check if loading through freed pointer
-        If opcode is equal to 20203:
-            Let addr be proc memory_get_int64 from Layout with inst, 16
-            Note: Will be checked in check_use_after_free
-        End If
+        Note: Loads (20200/20203), stores (20201/20204), dereferences (20206)
+        Note: and call arguments are validated against the final freed states
+        Note: by check_use_after_free after the fixed point is reached
 
-        Note: STORE instruction - check if storing through freed pointer
-        If opcode is equal to 20204:
-            Set addr to proc memory_get_int64 from Layout with inst, 16
-            Note: Will be checked in check_use_after_free
-        End If
-
-        Note: CALL instruction - arguments might be freed pointers
-        If opcode is equal to 20304:
-            Note: Will be checked in check_use_after_free
-        End If
-
-        Note: PHI instruction - merge freed states from predecessors
-        If opcode is equal to 20101:
+        Note: MIR_PHI (20300) - merge freed states from predecessors
+        If opcode is equal to 20300:
             Let phi_changed be propagate_freed_state(uafa, block)
             If phi_changed is equal to 1:
                 Set changed to 1
@@ -551,20 +562,19 @@ Process called "propagate_freed_state" that takes uafa as Integer, block as Inte
     Let block_to_info be proc memory_get_int64 from Layout with uafa, 24
     Let cfg be proc memory_get_int64 from Layout with uafa, 8
 
-    Let info be proc get from Dictionary with block_to_info, block_id
+    Let info be proc omap_get from OrderedMap with block_to_info, block_id
     Let changed be 0
 
-    Note: Get predecessors
-    Let predecessors be proc memory_get_int64 from Layout with block, 8
+    Note: Get predecessors (canonical: block-id List at offset 32)
+    Let predecessors be proc get_block_predecessors from MIR with block
     Let pred_count be proc length from List with predecessors
 
-    Note: For each value, merge freed states from all predecessors
-    Let all_values be proc keys from Dictionary with value_to_freed
-    Let value_count be proc length from List with all_values
-
-    Let i be 0
-    While i is less than value_count:
-        Let value_id be proc get from List with all_values, i
+    Note: For each tracked value, merge freed states from all predecessors.
+    Note: Iterates the ordered map's insertion-ordered entry chain; the body
+    Note: only replaces values for EXISTING keys, so the chain is stable
+    Let entry be proc omap_first from OrderedMap with value_to_freed
+    While entry is not equal to 0:
+        Let value_id be proc omap_entry_key from OrderedMap with entry
 
         Note: Collect freed states from all predecessors
         Let merged_state be -1  Note: -1 means uninitialized
@@ -572,11 +582,11 @@ Process called "propagate_freed_state" that takes uafa as Integer, block as Inte
         Let p be 0
         While p is less than pred_count:
             Let pred_id be proc get from List with predecessors, p
-            Let pred_info be proc get from Dictionary with block_to_info, pred_id
+            Let pred_info be proc omap_get from OrderedMap with block_to_info, pred_id
 
             If pred_info is not equal to 0:
                 Let pred_freed_states be proc memory_get_int64 from Layout with pred_info, 8
-                Let pred_state_obj be proc get from Dictionary with pred_freed_states, value_id
+                Let pred_state_obj be proc omap_get from OrderedMap with pred_freed_states, value_id
 
                 If pred_state_obj is not equal to 0:
                     Let pred_state be proc memory_get_int64 from Layout with pred_state_obj, 8
@@ -596,27 +606,27 @@ Process called "propagate_freed_state" that takes uafa as Integer, block as Inte
 
         Note: Update value's freed state if it changed
         If merged_state is not equal to -1:
-            Let current_state_obj be proc get from Dictionary with value_to_freed, value_id
+            Let current_state_obj be proc omap_get from OrderedMap with value_to_freed, value_id
 
             If current_state_obj is not equal to 0:
                 Let current_state be proc memory_get_int64 from Layout with current_state_obj, 8
 
                 If current_state is not equal to merged_state:
                     Let fs be create_freed_state(value_id, merged_state, 0, 0)
-                    proc set from Dictionary with value_to_freed, value_id, fs
+                    proc omap_set from OrderedMap with value_to_freed, value_id, fs
                     Set changed to 1
                 End If
             End If
         End If
 
-        Set i to i plus 1
+        Set entry to proc omap_entry_next from OrderedMap with entry
     End While
 
     Return changed
 End Process
 
 @Reasoning
-track_deallocation tracks a FREE or DELETE instruction.
+track_deallocation tracks an OD-2 deallocation call site.
 It transitions the pointer from ALLOCATED to FREED state and
 records the deallocation site for error reporting.
 
@@ -628,12 +638,12 @@ Process called "track_deallocation" that takes uafa as Integer, ptr as Integer, 
     Let block_to_info be proc memory_get_int64 from Layout with uafa, 24
 
     Note: Get current freed state
-    Let ptr_state be proc get from Dictionary with value_to_freed, ptr
+    Let ptr_state be proc omap_get from OrderedMap with value_to_freed, ptr
 
     If ptr_state is equal to 0:
         Note: Unknown pointer, create new state as FREED
         Let fs be create_freed_state(ptr, 1, inst, 0)
-        proc set from Dictionary with value_to_freed, ptr, fs
+        proc omap_set from OrderedMap with value_to_freed, ptr, fs
         Return 1
     End If
 
@@ -707,12 +717,14 @@ Process called "check_use_after_free" that takes uafa as Integer, inst as Intege
     Let error_list be proc memory_get_int64 from Layout with uafa, 40
     Let error_count be proc memory_get_int64 from Layout with uafa, 48
 
-    Note: LOAD - check if loading through freed pointer
-    If opcode is equal to 20203:
+    Note: MIR_LOAD (20200) / MIR_LOAD_FIELD (20203) / MIR_DEREF (20206) -
+    Note: check if reading through a freed pointer. The address SSA use
+    Note: sits in header operand1 (offset 16) for all three
+    If opcode is equal to 20200 or opcode is equal to 20203 or opcode is equal to 20206:
         Let addr be proc memory_get_int64 from Layout with inst, 16
 
         If addr is not equal to 0:
-            Let addr_state be proc get from Dictionary with value_to_freed, addr
+            Let addr_state be proc omap_get from OrderedMap with value_to_freed, addr
 
             If addr_state is not equal to 0:
                 Let state be proc memory_get_int64 from Layout with addr_state, 8
@@ -741,12 +753,13 @@ Process called "check_use_after_free" that takes uafa as Integer, inst as Intege
         End If
     End If
 
-    Note: STORE - check if storing through freed pointer
-    If opcode is equal to 20204:
+    Note: MIR_STORE (20201) / MIR_STORE_FIELD (20204) - check if storing
+    Note: through a freed pointer (address use at header operand1)
+    If opcode is equal to 20201 or opcode is equal to 20204:
         Set addr to proc memory_get_int64 from Layout with inst, 16
 
         If addr is not equal to 0:
-            Set addr_state to proc get from Dictionary with value_to_freed, addr
+            Set addr_state to proc omap_get from OrderedMap with value_to_freed, addr
 
             If addr_state is not equal to 0:
                 Set state to proc memory_get_int64 from Layout with addr_state, 8
@@ -773,12 +786,15 @@ Process called "check_use_after_free" that takes uafa as Integer, inst as Intege
         End If
     End If
 
-    Note: CALL - check if calling through freed function pointer
-    If opcode is equal to 20304:
-        Let func_ptr be proc memory_get_int64 from Layout with inst, 16
+    Note: MIR_CALL_INDIRECT (20305) - check if calling through a freed
+    Note: function pointer. Only indirect calls carry an SSA value id in the
+    Note: callee slot (prefix-embedded offset 80, via the accessor); direct
+    Note: MIR_CALL callees are name pointers and are never freed values
+    If opcode is equal to 20305:
+        Let func_ptr be proc get_call_callee from MIRNodes with inst
 
         If func_ptr is not equal to 0:
-            Let func_state be proc get from Dictionary with value_to_freed, func_ptr
+            Let func_state be proc omap_get from OrderedMap with value_to_freed, func_ptr
 
             If func_state is not equal to 0:
                 Set state to proc memory_get_int64 from Layout with func_state, 8
@@ -805,6 +821,53 @@ Process called "check_use_after_free" that takes uafa as Integer, inst as Intege
         End If
     End If
 
+    Note: Call arguments (MIR_CALL 20304 and MIR_CALL_INDIRECT 20305) -
+    Note: passing a freed pointer into a call is a use of freed memory.
+    Note: Deallocator calls (OD-2) are exempt: their pointer argument IS the
+    Note: free itself, and repeated frees are policed by check_double_free
+    If opcode is equal to 20304 or opcode is equal to 20305:
+        If proc is_deallocation_call from MIRNodes with inst is equal to 0:
+            Let call_args be proc get_call_arguments from MIRNodes with inst
+            Let call_argc be proc get_call_argument_count from MIRNodes with inst
+
+            If call_args is not equal to 0:
+                Let a be 0
+                While a is less than call_argc:
+                    Let arg_id be proc get from List with call_args, a
+
+                    If arg_id is not equal to 0:
+                        Let arg_state be proc omap_get from OrderedMap with value_to_freed, arg_id
+
+                        If arg_state is not equal to 0:
+                            Set state to proc memory_get_int64 from Layout with arg_state, 8
+
+                            If state is equal to 1:
+                                Set freed_at to proc memory_get_int64 from Layout with arg_state, 16
+                                Set error to create_uaf_error(0, arg_id, inst, freed_at)
+                                Set error_msg to proc string_duplicate from StringCore with "Use-after-free: passing freed pointer as call argument"
+                                proc memory_set_int64 from Layout with error, 32, error_msg
+                                proc append from List with error_list, error
+                                Set error_count to error_count plus 1
+                                proc memory_set_int64 from Layout with uafa, 48, error_count
+                            End If
+
+                            If state is equal to 2:
+                                Set error to create_uaf_error(0, arg_id, inst, 0)
+                                Set error_msg to proc string_duplicate from StringCore with "Potential use-after-free: passing possibly freed pointer as call argument"
+                                proc memory_set_int64 from Layout with error, 32, error_msg
+                                proc append from List with error_list, error
+                                Set error_count to error_count plus 1
+                                proc memory_set_int64 from Layout with uafa, 48, error_count
+                            End If
+                        End If
+                    End If
+
+                    Set a to a plus 1
+                End While
+            End If
+        End If
+    End If
+
     Return 0
 End Process
 
@@ -813,8 +876,8 @@ check_double_free detects double-free errors.
 A double-free occurs when a program attempts to free memory that
 has already been freed. This is a critical security vulnerability.
 
-If a pointer's freed state is already FREED when we encounter a FREE
-instruction, this is a double-free error.
+If a pointer's freed state was already FREED by a different instruction
+when we encounter a deallocation call, this is a double-free error.
 @End Reasoning
 
 Process called "check_double_free" that takes uafa as Integer, inst as Integer returns Integer:
@@ -823,25 +886,36 @@ Process called "check_double_free" that takes uafa as Integer, inst as Integer r
     Let error_list be proc memory_get_int64 from Layout with uafa, 40
     Let error_count be proc memory_get_int64 from Layout with uafa, 48
 
-    Note: FREE instruction - check if freeing already-freed pointer
-    If opcode is equal to 20206:
-        Let ptr be proc memory_get_int64 from Layout with inst, 16
+    Note: Deallocation call (OD-2) - check if freeing already-freed pointer.
+    Note: The pointer being freed is the call's first argument
+    If proc is_deallocation_call from MIRNodes with inst is equal to 1:
+        Let ptr be 0
+        Let dealloc_args be proc get_call_arguments from MIRNodes with inst
+        Let dealloc_argc be proc get_call_argument_count from MIRNodes with inst
+        If dealloc_args is not equal to 0 and dealloc_argc is greater than 0:
+            Set ptr to proc get from List with dealloc_args, 0
+        End If
 
         If ptr is not equal to 0:
-            Let ptr_state be proc get from Dictionary with value_to_freed, ptr
+            Let ptr_state be proc omap_get from OrderedMap with value_to_freed, ptr
 
             If ptr_state is not equal to 0:
                 Let state be proc memory_get_int64 from Layout with ptr_state, 8
 
-                Note: If already FREED, this is a double-free
+                Note: If already FREED by a DIFFERENT instruction, this is a
+                Note: double-free. The recorded freed_at site is the first
+                Note: free encountered during the fixed point, so the first
+                Note: free sees its own instruction here and is exempt
                 If state is equal to 1:
                     Let first_free be proc memory_get_int64 from Layout with ptr_state, 16
-                    Let error be create_uaf_error(1, ptr, inst, first_free)
-                    Let error_msg be proc string_duplicate from StringCore with "Double-free: freeing already freed pointer"
-                    proc memory_set_int64 from Layout with error, 32, error_msg
-                    proc append from List with error_list, error
-                    Set error_count to error_count plus 1
-                    proc memory_set_int64 from Layout with uafa, 48, error_count
+                    If first_free is not equal to inst:
+                        Let error be create_uaf_error(1, ptr, inst, first_free)
+                        Let error_msg be proc string_duplicate from StringCore with "Double-free: freeing already freed pointer"
+                        proc memory_set_int64 from Layout with error, 32, error_msg
+                        proc append from List with error_list, error
+                        Set error_count to error_count plus 1
+                        proc memory_set_int64 from Layout with uafa, 48, error_count
+                    End If
                 End If
 
                 Note: If UNKNOWN, potential double-free
@@ -867,7 +941,7 @@ Returns the FreedState object, or 0 if no state is tracked for this value.
 
 Process called "get_freed_state" that takes uafa as Integer, value_id as Integer returns Integer:
     Let value_to_freed be proc memory_get_int64 from Layout with uafa, 16
-    Let state be proc get from Dictionary with value_to_freed, value_id
+    Let state be proc omap_get from OrderedMap with value_to_freed, value_id
     Return state
 End Process
 
@@ -928,7 +1002,7 @@ Process called "integrate_with_ownership" that takes uafa as Integer, ownership_
             Note: MOVED state (1) means value is inaccessible
             If state is equal to 1:
                 Note: Mark as UNKNOWN freed state
-                Let freed_state be proc get from Dictionary with value_to_freed, value_id
+                Let freed_state be proc omap_get from OrderedMap with value_to_freed, value_id
 
                 If freed_state is not equal to 0:
                     proc memory_set_int64 from Layout with freed_state, 8, 2 Note: state = UNKNOWN
@@ -936,7 +1010,7 @@ Process called "integrate_with_ownership" that takes uafa as Integer, ownership_
                 Otherwise:
                     Let fs be create_freed_state(value_id, 2, 0, 0)
                     proc memory_set_int64 from Layout with fs, 40, 1 Note: is_moved = true
-                    proc set from Dictionary with value_to_freed, value_id, fs
+                    proc omap_set from OrderedMap with value_to_freed, value_id, fs
                 End If
             End If
         End If

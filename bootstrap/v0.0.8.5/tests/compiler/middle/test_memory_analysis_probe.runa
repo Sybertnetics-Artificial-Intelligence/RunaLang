@@ -1,0 +1,228 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+Licensed under Apache 2.0
+:End Note
+
+Note:
+Wave 3 gate probe for the memory-analysis trio (MIR reconciliation #432).
+
+Builds one MIR function by hand against the CANONICAL contract
+(MIR_RECONCILIATION_PLAN.md Part 1) and runs all three analyses over it:
+
+  block0:
+    v1 = ALLOCA (20202)                     stack allocation
+    v2 = CONST 42 (20001)
+    STORE *v1 = v2 (20201)
+    v3 = CALL "allocate"(v2) (20304)        heap allocation per OD-2
+    CALL "deallocate"(v3) (20304)           heap deallocation per OD-2
+    v4 = LOAD *v3 (20200)                   use-after-free
+    v5 = CALL "opaque_source"() (20304)     opaque pointer source
+    v6 = LOAD *v5 (20200)                   potentially-null dereference
+    RETURN v6 (20303)
+
+Assertions:
+  - null_safety: flags the LOAD through v5 (MAYBE state) as a null-deref
+    pattern; ALLOCA result v1 and allocator result v3 are definitely
+    non-null (OD-2 callee-name recognition keeps v3 NON_NULL).
+  - use_after_free: flags the LOAD through v3 after the deallocate call
+    (OD-2 deallocator recognition: FREE = CALL "deallocate", pointer is
+    argument 0); v3 is definitely freed; the single free is NOT reported
+    as a double-free.
+  - points_to: reports the expected abstract location for the tracked
+    values - v1 resolves to the ALLOCA site (stack), v3 resolves to the
+    allocator call site (heap), and the two do not alias.
+
+Conventions: canonical tests/test_utils.runa harness; PASS = the
+"ALL TESTS PASSED" summary plus exit 0.
+:End Note
+
+Import "tests/test_utils.runa" as TestUtils
+Import "compiler/middle/gungnir/mir/mir.runa" as MIR
+Import "compiler/middle/gungnir/mir/mir_nodes.runa" as MIRNodes
+Import "compiler/middle/gungnir/mir/cfg.runa" as MirCFG
+Import "compiler/middle/analysis/null_safety.runa" as NullSafety
+Import "compiler/middle/analysis/use_after_free.runa" as UseAfterFree
+Import "compiler/middle/analysis/points_to.runa" as PointsTo
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/collections/list.runa" as List
+
+@Reasoning
+Constructs the probe MIRFunction described in the file header using only
+canonical creators (MIR.create_mir_function, MIR.create_mir_basic_block,
+MIRNodes.create_mir_*) and canonical wiring (MIR.add_block_to_cfg,
+MIR.set_cfg_entry_block, MirCFG.add_instruction_to_block). Returns the
+MIRFunction pointer; the instruction pointers needed by the assertions are
+written into the caller-provided 8-slot out buffer (alloca at 0, heap call
+at 8) so main can compare points-to allocation sites against the exact
+instructions.
+@End Reasoning
+
+Process called "build_probe_function" that takes out_insts as Integer returns Integer:
+    Let func be proc create_mir_function from MIR with "probe_fn", 0, 0
+    If func is equal to 0:
+        Return 0
+    End If
+
+    Let cfg be proc get_mir_function_cfg from MIR with func
+    If cfg is equal to 0:
+        Return 0
+    End If
+
+    Let block be proc create_mir_basic_block from MIR with 0, 0
+    If block is equal to 0:
+        Return 0
+    End If
+
+    proc add_block_to_cfg from MIR with cfg, block
+    proc set_cfg_entry_block from MIR with cfg, block
+
+    Note: v1 = ALLOCA (count value 0 = scalar slot, alignment 8)
+    Let alloca_inst be proc create_mir_alloca from MIRNodes with 1, 0, 0, 8
+    proc add_instruction_to_block from MirCFG with block, alloca_inst
+    proc memory_set_int64 from Layout with out_insts, 0, alloca_inst
+
+    Note: v2 = CONST 42 (numeric, no string payload)
+    Let const_inst be proc create_mir_const from MIRNodes with 2, 42, 0, 0, 0
+    proc add_instruction_to_block from MirCFG with block, const_inst
+
+    Note: STORE *v1 = v2 (offset 0, untyped, non-volatile)
+    Let store_inst be proc create_mir_store from MIRNodes with 1, 2, 0, 0, 0
+    proc add_instruction_to_block from MirCFG with block, store_inst
+
+    Note: v3 = CALL "allocate"(v2) - heap allocation per OD-2
+    Let alloc_args be proc create from List
+    proc append from List with alloc_args, 2
+    Let alloc_call be proc create_mir_call from MIRNodes with 3, "allocate", alloc_args, 1, 0, 0, 0
+    proc add_instruction_to_block from MirCFG with block, alloc_call
+    proc memory_set_int64 from Layout with out_insts, 8, alloc_call
+
+    Note: CALL "deallocate"(v3) - heap deallocation per OD-2 (no result)
+    Let dealloc_args be proc create from List
+    proc append from List with dealloc_args, 3
+    Let dealloc_call be proc create_mir_call from MIRNodes with 0, "deallocate", dealloc_args, 1, 0, 0, 0
+    proc add_instruction_to_block from MirCFG with block, dealloc_call
+
+    Note: v4 = LOAD *v3 - use of freed heap memory
+    Let uaf_load be proc create_mir_load from MIRNodes with 4, 3, 0, 0, 0
+    proc add_instruction_to_block from MirCFG with block, uaf_load
+
+    Note: v5 = CALL "opaque_source"() - conservatively MAYBE-null result
+    Let opaque_args be proc create from List
+    Let opaque_call be proc create_mir_call from MIRNodes with 5, "opaque_source", opaque_args, 0, 0, 0, 0
+    proc add_instruction_to_block from MirCFG with block, opaque_call
+
+    Note: v6 = LOAD *v5 - dereference of a potentially null pointer
+    Let null_load be proc create_mir_load from MIRNodes with 6, 5, 0, 0, 0
+    proc add_instruction_to_block from MirCFG with block, null_load
+
+    Note: RETURN v6
+    Let ret_inst be proc create_mir_return from MIRNodes with 6, 0
+    proc add_instruction_to_block from MirCFG with block, ret_inst
+
+    Return func
+End Process
+
+Process called "main" returns Integer:
+    Let results be proc create_test_results from TestUtils
+    proc begin_suite from TestUtils with results, "memory_analysis_probe (Wave 3 gate)"
+
+    Note: Out buffer: alloca instruction at offset 0, heap alloc call at 8
+    Let out_insts be proc allocate from Layout with 16
+    proc memory_set_int64 from Layout with out_insts, 0, 0
+    proc memory_set_int64 from Layout with out_insts, 8, 0
+
+    Let func be build_probe_function(out_insts)
+    proc assert_not_null from TestUtils with results, "probe MIR function built", func
+
+    Let cfg be proc get_mir_function_cfg from MIR with func
+    proc assert_not_null from TestUtils with results, "probe CFG present", cfg
+
+    Let alloca_inst be proc memory_get_int64 from Layout with out_insts, 0
+    Let alloc_call be proc memory_get_int64 from Layout with out_insts, 8
+    proc assert_not_null from TestUtils with results, "alloca instruction captured", alloca_inst
+    proc assert_not_null from TestUtils with results, "heap alloc call captured", alloc_call
+
+    Note: OD-2 recognizers agree with the construction
+    Let alloc_recognized be proc is_allocation_call from MIRNodes with alloc_call
+    proc assert_equal from TestUtils with results, "OD-2 recognizes allocate call", alloc_recognized, 1
+    Let alloca_not_call be proc is_allocation_call from MIRNodes with alloca_inst
+    proc assert_equal from TestUtils with results, "ALLOCA is not an allocator CALL", alloca_not_call, 0
+
+    Note: ---- null_safety ----
+    Let na be proc create_null_analysis from NullSafety with 0, cfg
+    proc assert_not_null from TestUtils with results, "null analysis created", na
+
+    Let null_errors be proc compute_null_states from NullSafety with na
+    proc assert_equal from TestUtils with results, "null-deref pattern flagged (LOAD *v5)", null_errors, 1
+
+    Let v1_non_null be proc is_definitely_non_null from NullSafety with na, 1
+    proc assert_equal from TestUtils with results, "ALLOCA result v1 is NON_NULL", v1_non_null, 1
+
+    Let v3_non_null be proc is_definitely_non_null from NullSafety with na, 3
+    proc assert_equal from TestUtils with results, "allocator result v3 stays NON_NULL (OD-2)", v3_non_null, 1
+
+    Let v5_non_null be proc is_definitely_non_null from NullSafety with na, 5
+    proc assert_equal from TestUtils with results, "opaque call result v5 is not NON_NULL", v5_non_null, 0
+
+    Note: ---- use_after_free ----
+    Let uafa be proc create_use_after_free_analysis from UseAfterFree with 0, cfg, 0, 0
+    proc assert_not_null from TestUtils with results, "UAF analysis created", uafa
+
+    Let uaf_errors be proc compute_freed_states from UseAfterFree with uafa
+    proc assert_equal from TestUtils with results, "UAF flagged once, no spurious double-free", uaf_errors, 1
+
+    Let v3_freed be proc is_definitely_freed from UseAfterFree with uafa, 3
+    proc assert_equal from TestUtils with results, "v3 definitely freed after deallocate", v3_freed, 1
+
+    Let v1_freed be proc is_definitely_freed from UseAfterFree with uafa, 1
+    proc assert_equal from TestUtils with results, "stack v1 never freed", v1_freed, 0
+
+    Note: ---- points_to ----
+    Let graph be proc create_points_to_graph from PointsTo
+    proc assert_not_null from TestUtils with results, "points-to graph created", graph
+
+    Let extract_ok be proc extract_constraints_from_mir from PointsTo with graph, func
+    proc assert_equal from TestUtils with results, "constraint extraction succeeded", extract_ok, 1
+
+    Note: Expected constraints: ADDR_OF(v1,loc0), ADDR_OF(v3,loc1),
+    Note: STORE(*v1=v2), LOAD(v4=*v3), LOAD(v6=*v5) - exactly five
+    Let constraint_count be proc memory_get_int64 from Layout with graph, 48
+    proc assert_equal from TestUtils with results, "five constraints extracted", constraint_count, 5
+
+    Let solve_ok be proc compute_points_to_andersen from PointsTo with graph
+    proc assert_equal from TestUtils with results, "Andersen solver converged", solve_ok, 1
+
+    Note: v1 resolves to exactly one location: the ALLOCA site (stack)
+    Let v1_loc be proc get_allocation_location from PointsTo with graph, 1
+    proc assert_not_null from TestUtils with results, "v1 has a unique allocation location", v1_loc
+    If v1_loc is not equal to 0:
+        Let v1_site be proc memory_get_int64 from Layout with v1_loc, 8
+        proc assert_equal from TestUtils with results, "v1 location site is the ALLOCA", v1_site, alloca_inst
+        Let v1_is_heap be proc memory_get_int64 from Layout with v1_loc, 24
+        proc assert_equal from TestUtils with results, "v1 location is stack", v1_is_heap, 0
+    End If
+
+    Note: v3 resolves to exactly one location: the allocator call (heap)
+    Let v3_loc be proc get_allocation_location from PointsTo with graph, 3
+    proc assert_not_null from TestUtils with results, "v3 has a unique allocation location", v3_loc
+    If v3_loc is not equal to 0:
+        Let v3_site be proc memory_get_int64 from Layout with v3_loc, 8
+        proc assert_equal from TestUtils with results, "v3 location site is the allocate call", v3_site, alloc_call
+        Let v3_is_heap be proc memory_get_int64 from Layout with v3_loc, 24
+        proc assert_equal from TestUtils with results, "v3 location is heap (OD-2)", v3_is_heap, 1
+    End If
+
+    Note: Distinct locations must not alias; a pointer aliases itself
+    Let alias_13 be proc may_alias from PointsTo with graph, 1, 3
+    proc assert_equal from TestUtils with results, "v1 and v3 do not alias", alias_13, 0
+    Let alias_11 be proc may_alias from PointsTo with graph, 1, 1
+    proc assert_equal from TestUtils with results, "v1 aliases itself", alias_11, 1
+
+    proc print_summary from TestUtils with results
+
+    Let ok be proc all_passed from TestUtils with results
+    If ok is equal to 1:
+        Return 0
+    End If
+    Return 1
+End Process

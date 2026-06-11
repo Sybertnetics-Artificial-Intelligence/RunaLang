@@ -2474,9 +2474,18 @@ Process called "remove_cfg_edge" that takes cfg_ptr as Integer, pred_id as Integ
     @End Reasoning
 
     @Implementation
-    Removes an edge from pred_id to succ_id in the CFG.
-    Updates both predecessor and successor lists.
-    Returns 1 on success, 0 on failure.
+    Removes an edge from pred_id to succ_id in the CFG. As the canonical
+    remover (Wave 5a, task #460) it owns the FULL edge representation:
+    1. Removes succ_id from pred's successor ID list (offset 48) and
+       re-syncs the cached successor_count (offset 56) from the list length.
+    2. Removes pred_id from succ's predecessor ID list (offset 32) and
+       re-syncs the cached predecessor_count (offset 40) from the list length.
+    3. Removes the (pred_id, succ_id) pair from the CFG's flat edge table
+       (MIRCFG offset 32 — add_cfg_edge appends pred then succ as two
+       consecutive List entries) and decrements the cached edge_count
+       (MIRCFG offset 40) when a pair was found.
+    Callers therefore never need per-site count re-syncs after this call.
+    Returns 1 on success, 0 when either endpoint block does not exist.
     @End Implementation
 
     If cfg_ptr is equal to 0:
@@ -2497,7 +2506,7 @@ Process called "remove_cfg_edge" that takes cfg_ptr as Integer, pred_id as Integ
         Return 0
     End If
 
-    Note: Remove succ_id from pred's successor list
+    Note: Remove succ_id from pred's successor list, re-sync cached count
     Let pred_successors be proc get_block_successors with pred_block
 
     If pred_successors is not equal to 0:
@@ -2505,15 +2514,51 @@ Process called "remove_cfg_edge" that takes cfg_ptr as Integer, pred_id as Integ
         If succ_idx is greater than or equal to 0:
             list_remove(pred_successors, succ_idx)
         End If
+        Let succ_list_len be proc list_length with pred_successors
+        proc memory_set_int64 from Layout with pred_block, 56, succ_list_len
     End If
 
-    Note: Remove pred_id from succ's predecessor list
+    Note: Remove pred_id from succ's predecessor list, re-sync cached count
     Let succ_predecessors be proc get_block_predecessors with succ_block
 
     If succ_predecessors is not equal to 0:
         Let pred_idx be proc list_index_of with succ_predecessors, pred_id
         If pred_idx is greater than or equal to 0:
             list_remove(succ_predecessors, pred_idx)
+        End If
+        Let pred_list_len be proc list_length with succ_predecessors
+        proc memory_set_int64 from Layout with succ_block, 40, pred_list_len
+    End If
+
+    Note: Remove the (pred_id, succ_id) pair from the CFG edge table and
+    Note: decrement the cached edge count. The table is a flat List of
+    Note: consecutive (pred, succ) entries appended by add_cfg_edge.
+    Let edge_table be proc memory_get_int64 from Layout with cfg_ptr, 32
+    If edge_table is not equal to 0:
+        Let table_len be proc list_length with edge_table
+        Let scan be 0
+        Let found_pair be 0
+        While scan is less than table_len:
+            If found_pair is equal to 0:
+                Let entry_pred be proc list_get with edge_table, scan
+                Let entry_succ be proc list_get with edge_table, (scan plus 1)
+                If entry_pred is equal to pred_id:
+                    If entry_succ is equal to succ_id:
+                        Note: Remove succ entry first so the pred index stays valid
+                        list_remove(edge_table, (scan plus 1))
+                        list_remove(edge_table, scan)
+                        Set found_pair to 1
+                    End If
+                End If
+            End If
+            Set scan to scan plus 2
+        End While
+
+        If found_pair is equal to 1:
+            Let edge_count be proc memory_get_int64 from Layout with cfg_ptr, 40
+            If edge_count is greater than 0:
+                proc memory_set_int64 from Layout with cfg_ptr, 40, edge_count minus 1
+            End If
         End If
     End If
 
@@ -2642,12 +2687,14 @@ four terminator node shapes (branch, jump, switch, invoke) and to the
 mir_nodes.runa; these write-side helpers are the CFG module's counterpart,
 because the only legitimate writers of terminator targets are the CFG
 transformations in this file (edge splitting, block merging, jump
-threading). Field offsets follow the node layouts established by
-create_mir_branch (true target at 16, false at 24), create_mir_jump
-(target at 8), create_mir_switch / add_switch_case (default at 32, case
-pair List at 16 with block IDs in odd slots), create_mir_invoke (normal
-destination at 48, unwind destination at 56), and create_mir_phi_node /
-add_phi_incoming (pair List at 16 with block IDs in even slots).
+threading). Field offsets follow the OD-1 prefix-embedded node layouts
+established by the mir_nodes.runa constructors (72-byte MIRNode header
+first, extended fields after): create_mir_branch (true target at 80,
+false at 88), create_mir_jump (target at 72), create_mir_switch /
+add_switch_case (default at 96, case pair List at 80 with block IDs in
+odd slots), create_mir_invoke (normal destination at 112, unwind
+destination at 120), and create_mir_phi_node / add_phi_incoming (pair
+List at 80 with block IDs in even slots).
 @End Reasoning
 
 Process called "update_branch_target" that takes branch as Integer, old_target as Integer, new_target as Integer returns Integer:
@@ -2656,15 +2703,15 @@ Process called "update_branch_target" that takes branch as Integer, old_target a
     End If
 
     Let changed be 0
-    Let true_target be proc memory_get_int64 from Layout with branch, 16
+    Let true_target be proc memory_get_int64 from Layout with branch, 80
     If true_target is equal to old_target:
-        proc memory_set_int64 from Layout with branch, 16, new_target
+        proc memory_set_int64 from Layout with branch, 80, new_target
         Set changed to 1
     End If
 
-    Let false_target be proc memory_get_int64 from Layout with branch, 24
+    Let false_target be proc memory_get_int64 from Layout with branch, 88
     If false_target is equal to old_target:
-        proc memory_set_int64 from Layout with branch, 24, new_target
+        proc memory_set_int64 from Layout with branch, 88, new_target
         Set changed to 1
     End If
 
@@ -2676,7 +2723,7 @@ Process called "update_jump_target" that takes jump as Integer, new_target as In
         Return 0
     End If
 
-    proc memory_set_int64 from Layout with jump, 8, new_target
+    proc memory_set_int64 from Layout with jump, 72, new_target
     Return 1
 End Process
 
@@ -2688,16 +2735,16 @@ Process called "update_switch_target" that takes switch_ptr as Integer, old_targ
     Let changed be 0
 
     Note: Rewrite the default target when it matches
-    Let default_target be proc memory_get_int64 from Layout with switch_ptr, 32
+    Let default_target be proc memory_get_int64 from Layout with switch_ptr, 96
     If default_target is equal to old_target:
-        proc memory_set_int64 from Layout with switch_ptr, 32, new_target
+        proc memory_set_int64 from Layout with switch_ptr, 96, new_target
         Set changed to 1
     End If
 
     Note: Rewrite matching case targets. Cases are stored as a flat pair
     Note: List of (case_value, block_id); block IDs occupy the odd slots.
-    Let cases be proc memory_get_int64 from Layout with switch_ptr, 16
-    Let case_count be proc memory_get_int64 from Layout with switch_ptr, 24
+    Let cases be proc memory_get_int64 from Layout with switch_ptr, 80
+    Let case_count be proc memory_get_int64 from Layout with switch_ptr, 88
 
     If cases is not equal to 0:
         Let ci be 0
@@ -2721,15 +2768,15 @@ Process called "update_invoke_target" that takes invoke as Integer, old_target a
     End If
 
     Let changed be 0
-    Let normal_target be proc memory_get_int64 from Layout with invoke, 48
+    Let normal_target be proc memory_get_int64 from Layout with invoke, 112
     If normal_target is equal to old_target:
-        proc memory_set_int64 from Layout with invoke, 48, new_target
+        proc memory_set_int64 from Layout with invoke, 112, new_target
         Set changed to 1
     End If
 
-    Let unwind_target be proc memory_get_int64 from Layout with invoke, 56
+    Let unwind_target be proc memory_get_int64 from Layout with invoke, 120
     If unwind_target is equal to old_target:
-        proc memory_set_int64 from Layout with invoke, 56, new_target
+        proc memory_set_int64 from Layout with invoke, 120, new_target
         Set changed to 1
     End If
 
@@ -2745,8 +2792,8 @@ Process called "update_phi_node_predecessor" that takes phi as Integer, old_pred
 
     Note: Incoming pairs are stored as a flat List of (block_id, value_id);
     Note: block IDs occupy the even slots.
-    Let incoming_pairs be proc memory_get_int64 from Layout with phi, 16
-    Let incoming_count be proc memory_get_int64 from Layout with phi, 24
+    Let incoming_pairs be proc memory_get_int64 from Layout with phi, 80
+    Let incoming_count be proc memory_get_int64 from Layout with phi, 88
 
     If incoming_pairs is not equal to 0:
         Let pi be 0
@@ -4388,7 +4435,7 @@ SSA verification needs to know which SSA values an instruction consumes.
 The base MIRNode layout carries up to three operand value-ID slots
 (operand1 at offset 16, operand2 at 24, operand3 at 32, zero when unused);
 phi nodes are the exception - their consumed values are the odd slots of
-the incoming (block_id, value_id) pair List at offset 16. Collecting the
+the incoming (block_id, value_id) pair List at prefix-embedded offset 80. Collecting the
 used values into a fresh List keeps the verifier's dominance loop simple
 and uniform across instruction shapes. The caller owns the returned List.
 @End Reasoning
@@ -4407,8 +4454,9 @@ Process called "get_instruction_used_values" that takes inst as Integer returns 
 
     If opcode is equal to MIR_PHI:
         Note: Phi incoming values are the odd slots of the pair List
-        Let incoming_pairs be proc memory_get_int64 from Layout with inst, 16
-        Let incoming_count be proc memory_get_int64 from Layout with inst, 24
+        Note: (prefix-embedded offsets: pair List at 80, count at 88)
+        Let incoming_pairs be proc memory_get_int64 from Layout with inst, 80
+        Let incoming_count be proc memory_get_int64 from Layout with inst, 88
         If incoming_pairs is not equal to 0:
             Let pi be 0
             While pi is less than incoming_count:
@@ -6033,6 +6081,75 @@ Process called "add_instruction_to_block" that takes block_ptr as Integer, instr
 End Process
 
 @Reasoning
+Inverse companion to add_instruction_to_block (Wave 5a canonical addition,
+approved in the MIR reconciliation plan Part 3 licm table). Code-motion
+passes (LICM hoisting, inlining call removal, dead-instruction deletion)
+need a CFG-level "detach this instruction from this block" primitive that
+keeps the block's cached instruction_count in lockstep with the canonical
+instruction List. Without a single owner for that invariant every pass
+would re-implement the find/remove/decrement dance and any one of them
+forgetting the count re-sync would desynchronize get_block_instruction_count
+from the List length — the exact class of cached-count drift task #460
+identified on the edge side.
+@End Reasoning
+
+@Implementation
+Scans the block's instruction List (MIRBasicBlock offset 16) for an entry
+pointer-equal to instruction_ptr. On a hit: removes the entry via
+list_remove, re-syncs the cached instruction_count (offset 24) from the
+List length, and clears the instruction's parent_block back-pointer
+(MIRNode offset 56) so the detached instruction reports no residence until
+re-inserted through a canonical add path. Returns 1 when the instruction
+was found and removed, 0 when either pointer is null or the instruction is
+not a member of the block.
+@End Implementation
+
+@Performance_Hints
+O(I) scan in the block's instruction count plus an O(I) List shift on
+removal. Code-motion passes call this once per moved instruction, never on
+a per-analysis-visit hot path.
+@End Performance_Hints
+
+@Security_Scope
+Null guards on both pointers before any dereference. The removal is
+membership-checked: a stale instruction pointer that is not in the block
+mutates nothing and returns 0, so double-detach is harmless. The
+instruction itself is NOT deallocated — ownership stays with the caller,
+which either re-inserts it (hoisting) or frees it explicitly (deletion).
+@End Security_Scope
+
+Process called "remove_instruction_from_block" that takes block_ptr as Integer, instruction_ptr as Integer returns Integer:
+    If block_ptr is equal to 0:
+        Return 0
+    End If
+
+    If instruction_ptr is equal to 0:
+        Return 0
+    End If
+
+    Let instructions be proc memory_get_int64 from Layout with block_ptr, 16
+    If instructions is equal to 0:
+        Return 0
+    End If
+
+    Let inst_idx be proc list_index_of with instructions, instruction_ptr
+    If inst_idx is less than 0:
+        Return 0
+    End If
+
+    list_remove(instructions, inst_idx)
+
+    Note: Re-sync cached instruction_count from the canonical List length
+    Let new_len be proc list_length with instructions
+    proc memory_set_int64 from Layout with block_ptr, 24, new_len
+
+    Note: Clear the detached instruction's parent_block back-pointer
+    proc memory_set_int64 from Layout with instruction_ptr, 56, 0
+
+    Return 1
+End Process
+
+@Reasoning
 CFG-level "add an edge between two blocks" primitive. The lower-level
 add_cfg_edge in mir.runa takes block IDs (not block pointers) because the
 edge table at MIRCFG offset 32 is keyed by ID. Optimization passes such as
@@ -6040,37 +6157,43 @@ inlining typically hold block POINTERS, so this canonical wrapper extracts
 the IDs from both endpoints before delegating to add_cfg_edge. This keeps
 the optimization-pass code reading at the pointer-based abstraction level
 while preserving the lower-level edge table's ID-based representation.
+
+The CFG pointer is an EXPLICIT parameter (Wave 5a, task #460). The canonical
+MIRBasicBlock layout carries no parent-CFG back-pointer: offset 48 is the
+SUCCESSORS List. The previous revision of this function read offset 48 as a
+"parent_cfg" slot and handed that List to add_cfg_edge as a CFG record,
+which corrupted the List header on every call. Blocks cannot derive their
+owning CFG, so the caller — which always holds it — must supply it.
 @End Reasoning
 
 @Implementation
 Reads each block's block_id from MIRBasicBlock offset 0 (the canonical ID
 slot established by create_mir_basic_block), then forwards to add_cfg_edge
-with the CFG pointer and the two extracted IDs. add_cfg_edge takes care of
-both directions of the edge (predecessor and successor lists) so this
-wrapper does not need to do any additional wiring. Returns 1 on success or
-0 if any input pointer is null.
-
-The CFG pointer is recovered from the source block's parent function (which
-both pointers must share). We extract the cfg from the source block via the
-block-level parent chain: pred_block -> block.cfg slot (MIRBasicBlock offset
-48 is parent_cfg per CFG-edge management invariants established in
-construct_cfg_edges).
+with the supplied CFG pointer and the two extracted IDs. add_cfg_edge takes
+care of both directions of the edge (predecessor and successor ID lists),
+the cached predecessor/successor counts, and the CFG edge table at MIRCFG
+offset 32, so this wrapper does not need to do any additional wiring.
+Returns 1 on success or 0 if any input pointer is null.
 @End Implementation
 
 @Performance_Hints
-Three int64 loads plus the delegated add_cfg_edge call. add_cfg_edge is
+Two int64 loads plus the delegated add_cfg_edge call. add_cfg_edge is
 O(V) in block count for the ID -> block lookup it performs internally;
 this wrapper adds no asymptotic overhead.
 @End Performance_Hints
 
 @Security_Scope
-Null guards on both block pointers and on the recovered CFG before any
-edge mutation. add_cfg_edge performs its own ID-based block lookup and
-returns 0 cleanly if either endpoint cannot be located, so this wrapper
-inherits its safety properties.
+Null guards on the CFG and both block pointers before any edge mutation.
+add_cfg_edge performs its own ID-based block lookup and returns 0 cleanly
+if either endpoint cannot be located, so this wrapper inherits its safety
+properties.
 @End Security_Scope
 
-Process called "add_edge" that takes pred_block as Integer, succ_block as Integer returns Integer:
+Process called "add_edge" that takes cfg_ptr as Integer, pred_block as Integer, succ_block as Integer returns Integer:
+    If cfg_ptr is equal to 0:
+        Return 0
+    End If
+
     If pred_block is equal to 0:
         Return 0
     End If
@@ -6082,17 +6205,6 @@ Process called "add_edge" that takes pred_block as Integer, succ_block as Intege
     Note: Block IDs live at MIRBasicBlock offset 0
     Let pred_id be proc memory_get_int64 with pred_block, 0
     Let succ_id be proc memory_get_int64 with succ_block, 0
-
-    Note: Recover CFG pointer from source block's parent_cfg slot (offset 48)
-    Let cfg_ptr be proc memory_get_int64 with pred_block, 48
-    If cfg_ptr is equal to 0:
-        Note: Try recovering via successor instead
-        Set cfg_ptr to proc memory_get_int64 with succ_block, 48
-    End If
-
-    If cfg_ptr is equal to 0:
-        Return 0
-    End If
 
     Return proc add_cfg_edge with cfg_ptr, pred_id, succ_id
 End Process

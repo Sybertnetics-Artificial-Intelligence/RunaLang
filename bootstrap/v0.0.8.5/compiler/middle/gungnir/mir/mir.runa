@@ -63,6 +63,7 @@ Constant MIR_MUL as Integer is 20004                  Note: Integer/float multip
 Constant MIR_DIV as Integer is 20005                  Note: Integer/float division
 Constant MIR_MOD as Integer is 20006                  Note: Integer modulo
 Constant MIR_NEG as Integer is 20007                  Note: Unary negation
+Constant MIR_COPY as Integer is 20008                 Note: SSA copy / register move (band extension 2026-06-10, OD-5: dest value_id at header offset 8, source value id at header operand1 offset 16; plain 72-byte MIRNode record, no extended fields)
 Constant MIR_AND as Integer is 20010                  Note: Bitwise AND
 Constant MIR_OR as Integer is 20011                   Note: Bitwise OR
 Constant MIR_XOR as Integer is 20012                  Note: Bitwise XOR
@@ -327,20 +328,24 @@ Note: All allocations use TIER 3 (OWNED HEAP) - permanent structures
 Note: ============================================================================
 
 @Reasoning
-Allocates and initialises a fresh MIRNode — the unit of three-address SSA in
-this IR. Every instruction the compiler will ever optimise, schedule, or lower
-flows through this constructor, so the layout and initial-state guarantees
+The next two functions are the MIRNode construction pair — the unit of
+three-address SSA in this IR. init_mir_node_header writes the canonical
+72-byte header in place (shared by plain nodes and every prefix-embedded
+extended record), and create_mir_node allocates 72 bytes and delegates to
+it. Every instruction the compiler will ever optimise, schedule, or lower
+flows through this pair, so the layout and initial-state guarantees
 established here are load-bearing for every downstream pass (verifier, DCE,
 inliner, LIR builder, register allocator).
 @End Reasoning
 
 @Implementation
-Allocates 72 bytes on the owned heap (TIER 3) — matching the 9-field MIRNode
-type — and zero-initialises all fields except opcode (offset 0). value_id
-(offset 8) starts at 0 to mark the instruction as non-producing until the
-caller assigns one, and operand1/2/3 (offsets 16/24/32), type_info (40),
-next (48), parent_block (56), and metadata (64) all start at 0. Returns 0
-if allocation fails, allowing the caller to abort safely.
+create_mir_node allocates 72 bytes on the owned heap (TIER 3) — matching
+the 9-field MIRNode type — and init_mir_node_header zero-initialises all
+fields except opcode (offset 0). value_id (offset 8) starts at 0 to mark
+the instruction as non-producing until the caller assigns one, and
+operand1/2/3 (offsets 16/24/32), type_info (40), next (48), parent_block
+(56), and metadata (64) all start at 0. create_mir_node returns 0 if
+allocation fails, allowing the caller to abort safely.
 @End Implementation
 
 @Security_Scope
@@ -349,9 +354,35 @@ within the 72-byte block; no unchecked pointer arithmetic. Failure to allocate
 returns 0 rather than dereferencing a null pointer.
 @End Security_Scope
 
-Process called "create_mir_node" that takes opcode as Integer returns Integer:
-    Let node_size be 72
-    Let node be proc allocate from Layout with node_size
+Process called "init_mir_node_header" that takes node as Integer, opcode as Integer returns Integer:
+    @Reasoning
+    OD-1 prefix embedding (2026-06-10): every extended MIR record (MIRCall,
+    MIRBranch, MIRPhiNode, ...) is now a SINGLE allocation whose first 72
+    bytes are the canonical MIRNode header — opcode genuinely at offset 0,
+    value_id at 8, operands at 16/24/32, type_info at 40, next at 48,
+    parent_block at 56, metadata at 64 — with the record's extended fields
+    placed AFTER the header at offset 72 and beyond. This in-place
+    initialiser is the single source of truth for header initial state:
+    create_mir_node delegates to it for plain 72-byte nodes, and every
+    extended-record constructor in mir_nodes.runa calls it on the first 72
+    bytes of its larger allocation. Centralising the header writes here
+    guarantees that plain and extended records share byte-identical header
+    semantics, which is the invariant every consumer (cfg.runa terminator
+    scans, lir_builder dispatch, verifier, optimization passes) relies on.
+    @End Reasoning
+
+    @Implementation
+    Writes opcode at offset 0 and zeroes the remaining eight header slots
+    (value_id 8, operand1 16, operand2 24, operand3 32, type_info 40,
+    next 48, parent_block 56, metadata 64). Returns 1 on success, 0 for a
+    null node pointer. Does not allocate; the caller owns the allocation
+    and is responsible for sizing it at 72 bytes minimum.
+    @End Implementation
+
+    @Security_Scope
+    Deterministic fixed-offset writes inside the caller-provided block.
+    Null pointer is rejected before any write.
+    @End Security_Scope
 
     If node is equal to 0:
         Return 0
@@ -366,6 +397,19 @@ Process called "create_mir_node" that takes opcode as Integer returns Integer:
     proc memory_set_int64 from Layout with node, 48, 0
     proc memory_set_int64 from Layout with node, 56, 0
     proc memory_set_int64 from Layout with node, 64, 0
+
+    Return 1
+End Process
+
+Process called "create_mir_node" that takes opcode as Integer returns Integer:
+    Let node_size be 72
+    Let node be proc allocate from Layout with node_size
+
+    If node is equal to 0:
+        Return 0
+    End If
+
+    proc init_mir_node_header with node, opcode
 
     Return node
 End Process
@@ -2133,12 +2177,46 @@ Note: MIR Analysis Helper Functions
 Note: ============================================================================
 
 @Reasoning
-Predicate testing whether an opcode terminates a basic block. The block
+Predicate testing whether an instruction terminates a basic block. The block
 verifier requires every block to end with exactly one terminator and to
 contain no terminator in any non-final position. CFG construction uses
 this test to decide where to close one block and open the next when
 emitting MIR linearly. Lowering uses it to identify points where the
 machine-code emitter must emit branch instructions.
+
+OD-7 (2026-06-10, task #432): the parameter is an instruction POINTER, not
+a raw opcode. Both live call sites (cfg.runa leader identification and
+cfg.runa validate_cfg terminator checking) pass instruction pointers, and
+under the OD-1 prefix-embedded representation the opcode genuinely lives
+at byte offset 0 of every record — plain and extended alike — so the
+pointer form is both the correct contract and a single load away from the
+opcode. Callers that already hold a bare opcode use is_terminator_opcode.
+@End Reasoning
+
+@Implementation
+Rejects a null pointer, loads the opcode from header offset 0, and
+delegates to is_terminator_opcode for the band test.
+@End Implementation
+
+@Performance_Hints
+Inlining candidate; called on every instruction during block-bounded
+optimisation passes. One load plus four compare-and-branch sequences.
+@End Performance_Hints
+
+Process called "is_terminator" that takes inst_ptr as Integer returns Integer:
+    If inst_ptr is equal to 0:
+        Return 0
+    End If
+
+    Let opcode be proc memory_get_int64 from Layout with inst_ptr, 0
+    Return proc is_terminator_opcode with opcode
+End Process
+
+@Reasoning
+Opcode-keyed companion of is_terminator for callers that have already
+loaded or computed a bare opcode (instruction-builder paths and printers
+that classify before a record exists). Keeping the band test in one
+function ensures the pointer form and the opcode form can never diverge.
 @End Reasoning
 
 @Implementation
@@ -2149,11 +2227,10 @@ than a range check because terminator opcodes are non-contiguous in the
 @End Implementation
 
 @Performance_Hints
-Inlining candidate; called on every instruction during block-bounded
-optimisation passes. Compiles to four compare-and-branch sequences.
+Inlining candidate; compiles to four compare-and-branch sequences.
 @End Performance_Hints
 
-Process called "is_terminator" that takes opcode as Integer returns Integer:
+Process called "is_terminator_opcode" that takes opcode as Integer returns Integer:
     If opcode is equal to MIR_BRANCH:
         Return 1
     End If
@@ -2221,6 +2298,12 @@ Used in hot loops during instruction selection and peephole optimization.
 @End Performance_Hints
 
 Process called "is_binary_op" that takes opcode as Integer returns Integer:
+    Note: MIR_COPY (20008) sits numerically inside the [MIR_ADD..MIR_SAR]
+    Note: band but is a single-operand data move, not a binary operation.
+    If opcode is equal to MIR_COPY:
+        Return 0
+    End If
+
     If opcode is greater than or equal to MIR_ADD:
         If opcode is less than or equal to MIR_SAR:
             Return 1
@@ -2310,6 +2393,269 @@ Process called "produces_value" that takes opcode as Integer returns Integer:
 End Process
 
 Note: ============================================================================
+Note: Instruction Cloning (OD-6, 2026-06-10)
+Note: ============================================================================
+
+Process called "deep_copy_value_list" that takes list_ptr as Integer returns Integer:
+    @Reasoning
+    OD-6 sub-primitive: extended MIR records embed List pointers (phi
+    incoming pairs, call/invoke argument lists, switch case pairs,
+    landing-pad catch clauses). A structural byte copy of the record would
+    alias those Lists between original and clone, so a mutation through
+    either record would corrupt the other. This helper materialises an
+    independent List holding the same integer elements so the clone owns
+    its own backing store.
+    @End Reasoning
+
+    @Implementation
+    Returns 0 for a null input (the clone keeps the original's 0 slot).
+    Otherwise creates a fresh List and appends every element of the source
+    in order. Elements are value IDs, block IDs, case values, or type IDs —
+    plain integers in every embedded-list shape, so an element-wise copy is
+    a full deep copy.
+    @End Implementation
+
+    @Security_Scope
+    Allocates one List plus its backing store. The returned List is owned
+    by the cloned record; freeing the clone must free it exactly once.
+    @End Security_Scope
+
+    If list_ptr is equal to 0:
+        Return 0
+    End If
+
+    Let copy be proc create from List
+    If copy is equal to 0:
+        Return 0
+    End If
+
+    Let count be proc length from List with list_ptr
+    Let i be 0
+    While i is less than count:
+        Let element be proc get from List with list_ptr, i
+        proc append from List with copy, element
+        Set i to i plus 1
+    End While
+
+    Return copy
+End Process
+
+Process called "clone_instruction" that takes inst_ptr as Integer returns Integer:
+    @Reasoning
+    OD-6 (approved 2026-06-10): loop unrolling, inlining, and tail
+    duplication all need an exact, independent copy of an existing MIR
+    instruction. Under the OD-1 prefix-embedded representation every
+    instruction is a single allocation — 72-byte MIRNode header first,
+    extended fields after at offset 72+ — so cloning is a sized byte copy
+    followed by deep-copying the embedded Lists that selected record kinds
+    carry. The record size is derived from the opcode band exactly as the
+    constructors in mir_nodes.runa allocate it; the two tables MUST stay in
+    lockstep when a constructor's layout changes.
+
+    CALLER CONTRACT — value identity: the clone retains the original's
+    value_id (header offset 8) and, for extended records, the duplicated
+    result slot at offset 72. Allocating a fresh SSA value id is the
+    CALLER's job: call allocate_value_id on the owning function, write it
+    with set_mir_node_value_id (and the record's result slot at offset 72
+    for value-producing extended records; set_phi_result_value_id does both
+    for phis), then register_value_definition. The clone is returned
+    detached: next (offset 48) and parent_block (offset 56) are reset to 0,
+    so the caller must insert it into a block explicitly.
+
+    SHARED POINTERS: type_info (offset 40), metadata (offset 64), callee
+    name strings, and constant string pointers are aliased, not copied —
+    they are immutable shared descriptors owned by the type table, the
+    metadata arena, and the string table respectively.
+    @End Reasoning
+
+    @Implementation
+    1. Read the opcode from header offset 0.
+    2. Resolve the record size by opcode band (sizes match the
+       mir_nodes.runa constructors under prefix embedding):
+       72  plain header: NOP, COPY, RESUME, CATCH, CLEANUP, UNWIND,
+           LOAD_FIELD, STORE_FIELD, ADDRESS_OF, DEREF, DEBUG_DECLARE,
+           DEBUG_SCOPE, DEBUG_LABEL, unknown opcodes
+       80  JUMP
+       88  RETURN, THROW
+       104 binary band 20002-20016 (excluding COPY), comparisons
+           20100-20105, casts 20400-20408, unary records, ALLOCA
+       112 CONST, LOAD, STORE, PHI, BRANCH, SWITCH, DEBUG_LOCATION
+       120 atomics 20500-20511, LANDINGPAD, DEBUG_VALUE
+       128 vector band 20600-20622
+       136 INVOKE
+       144 CALL, CALL_INDIRECT
+    3. Allocate the size and copy every 8-byte word.
+    4. Reset next (48) and parent_block (56) to 0.
+    5. Deep-copy embedded Lists: PHI incoming pairs (offset 80), CALL /
+       CALL_INDIRECT / INVOKE argument lists (offset 88), SWITCH case
+       pairs (offset 80), LANDINGPAD catch clauses (offset 88).
+    Returns the clone pointer, or 0 on null input or allocation failure.
+    @End Implementation
+
+    @Performance_Hints
+    O(size/8) word copies plus O(k) for embedded-list elements. Called by
+    code-duplication transforms only — never on the per-instruction hot
+    path of analysis passes.
+    @End Performance_Hints
+
+    @Security_Scope
+    Reads exactly the bytes the constructor allocated for the opcode; the
+    size table never exceeds the constructor's allocation, so no
+    out-of-bounds reads occur. The clone is a fresh TIER 3 allocation owned
+    by the caller.
+    @End Security_Scope
+
+    If inst_ptr is equal to 0:
+        Return 0
+    End If
+
+    Let opcode be proc memory_get_int64 from Layout with inst_ptr, 0
+
+    Note: Resolve the prefix-embedded record size for this opcode.
+    Let record_size be 72
+
+    If opcode is equal to MIR_CONST:
+        Set record_size to 112
+    End If
+
+    If opcode is greater than or equal to MIR_ADD:
+        If opcode is less than or equal to MIR_SAR:
+            Set record_size to 104
+        End If
+    End If
+    If opcode is equal to MIR_COPY:
+        Set record_size to 72
+    End If
+
+    If opcode is greater than or equal to MIR_EQ:
+        If opcode is less than or equal to MIR_GE:
+            Set record_size to 104
+        End If
+    End If
+
+    If opcode is equal to MIR_LOAD:
+        Set record_size to 112
+    End If
+    If opcode is equal to MIR_STORE:
+        Set record_size to 112
+    End If
+    If opcode is equal to MIR_ALLOCA:
+        Set record_size to 104
+    End If
+
+    If opcode is equal to MIR_PHI:
+        Set record_size to 112
+    End If
+    If opcode is equal to MIR_BRANCH:
+        Set record_size to 112
+    End If
+    If opcode is equal to MIR_JUMP:
+        Set record_size to 80
+    End If
+    If opcode is equal to MIR_RETURN:
+        Set record_size to 88
+    End If
+    If opcode is equal to MIR_CALL:
+        Set record_size to 144
+    End If
+    If opcode is equal to MIR_CALL_INDIRECT:
+        Set record_size to 144
+    End If
+    If opcode is equal to MIR_SWITCH:
+        Set record_size to 112
+    End If
+
+    If opcode is greater than or equal to MIR_CAST:
+        If opcode is less than or equal to MIR_INT_TO_PTR:
+            Set record_size to 104
+        End If
+    End If
+
+    If opcode is greater than or equal to MIR_ATOMIC_LOAD:
+        If opcode is less than or equal to MIR_FENCE:
+            Set record_size to 120
+        End If
+    End If
+
+    If opcode is greater than or equal to MIR_VECTOR_ADD:
+        If opcode is less than or equal to MIR_VECTOR_XOR:
+            Set record_size to 128
+        End If
+    End If
+
+    If opcode is equal to MIR_INVOKE:
+        Set record_size to 136
+    End If
+    If opcode is equal to MIR_LANDINGPAD:
+        Set record_size to 120
+    End If
+    If opcode is equal to MIR_THROW:
+        Set record_size to 88
+    End If
+
+    If opcode is equal to MIR_DEBUG_VALUE:
+        Set record_size to 120
+    End If
+    If opcode is equal to MIR_DEBUG_LOCATION:
+        Set record_size to 112
+    End If
+
+    Let clone be proc allocate from Layout with record_size
+    If clone is equal to 0:
+        Return 0
+    End If
+
+    Note: Word-wise structural copy of the entire record.
+    Let offset be 0
+    While offset is less than record_size:
+        Let word be proc memory_get_int64 from Layout with inst_ptr, offset
+        proc memory_set_int64 from Layout with clone, offset, word
+        Set offset to offset plus 8
+    End While
+
+    Note: The clone is detached: clear next and parent_block links.
+    proc memory_set_int64 from Layout with clone, 48, 0
+    proc memory_set_int64 from Layout with clone, 56, 0
+
+    Note: Deep-copy embedded Lists so the clone owns independent storage.
+    If opcode is equal to MIR_PHI:
+        Let phi_pairs be proc memory_get_int64 from Layout with inst_ptr, 80
+        Let phi_pairs_copy be proc deep_copy_value_list with phi_pairs
+        proc memory_set_int64 from Layout with clone, 80, phi_pairs_copy
+    End If
+
+    If opcode is equal to MIR_CALL:
+        Let call_args be proc memory_get_int64 from Layout with inst_ptr, 88
+        Let call_args_copy be proc deep_copy_value_list with call_args
+        proc memory_set_int64 from Layout with clone, 88, call_args_copy
+    End If
+    If opcode is equal to MIR_CALL_INDIRECT:
+        Let icall_args be proc memory_get_int64 from Layout with inst_ptr, 88
+        Let icall_args_copy be proc deep_copy_value_list with icall_args
+        proc memory_set_int64 from Layout with clone, 88, icall_args_copy
+    End If
+    If opcode is equal to MIR_INVOKE:
+        Let invoke_args be proc memory_get_int64 from Layout with inst_ptr, 88
+        Let invoke_args_copy be proc deep_copy_value_list with invoke_args
+        proc memory_set_int64 from Layout with clone, 88, invoke_args_copy
+    End If
+
+    If opcode is equal to MIR_SWITCH:
+        Let switch_cases be proc memory_get_int64 from Layout with inst_ptr, 80
+        Let switch_cases_copy be proc deep_copy_value_list with switch_cases
+        proc memory_set_int64 from Layout with clone, 80, switch_cases_copy
+    End If
+
+    If opcode is equal to MIR_LANDINGPAD:
+        Let pad_clauses be proc memory_get_int64 from Layout with inst_ptr, 88
+        Let pad_clauses_copy be proc deep_copy_value_list with pad_clauses
+        proc memory_set_int64 from Layout with clone, 88, pad_clauses_copy
+    End If
+
+    Return clone
+End Process
+
+Note: ============================================================================
 Note: MIR Debug Printing Functions
 Note: Essential for optimizer development and debugging
 Note: ============================================================================
@@ -2361,6 +2707,9 @@ Process called "opcode_to_string" that takes opcode as Integer returns Integer:
     End If
     If opcode is equal to MIR_NEG:
         Return proc string_duplicate from StringCore with "neg"
+    End If
+    If opcode is equal to MIR_COPY:
+        Return proc string_duplicate from StringCore with "copy"
     End If
     If opcode is equal to MIR_AND:
         Return proc string_duplicate from StringCore with "and"

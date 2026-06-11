@@ -20,8 +20,8 @@ This file handles loop unrolling optimization for MIR.
 This file performs the following tasks:
 - Process loop structure analysis and unroll candidate selection
 - Handle full loop unrolling for known iteration counts
-- Manage partial loop unrolling with remainder handling
-- Process loop body cloning and induction variable adjustment
+- Manage partial (retained-exit) loop unrolling for unknown counts
+- Process loop body cloning, SSA value remapping, and phi resolution
 
 This file is essential because of the following reasons:
 - Loop unrolling reduces branch overhead and enables instruction-level parallelism
@@ -29,145 +29,155 @@ This file is essential because of the following reasons:
 - Unrolling is critical for vectorization and CPU pipeline utilization
 
 This file consists of the following functions/features/operation types:
-- Trip count analysis and constant iteration detection
-- Full unrolling for small constant-count loops
-- Partial unrolling with configurable unroll factors
-- Remainder loop generation and phi node rewriting
+- Trip count analysis against canonical CONST payloads
+- Full unrolling for small constant-count loops (loop eliminated)
+- Partial unrolling with per-copy retained exit tests (sound for any trip count)
+- Per-iteration block cloning via MIR.clone_instruction with fresh SSA ids
+- Header-phi resolution chaining values across iterations
+- CFG edge maintenance via MIR.add_cfg_edge / CFG.remove_cfg_edge with
+  cached pred/succ count resynchronization at every removal site
+
+Reconciled to the canonical MIR contract (task #432, Wave 5b): all struct
+access goes through mir.runa / cfg.runa / mir_nodes.runa / dominance.runa /
+ssa.runa canonical accessors per the post-OD-1 prefix-embedded layouts.
+Integer-keyed maps use collections/ordered_map because collections/dictionary
+string-hashes its keys (integer keys crash at runtime).
 :End Note
 
 Import "compiler/middle/gungnir/mir/mir.runa" as MIR
+Import "compiler/middle/gungnir/mir/mir_nodes.runa" as MIRNodes
 Import "compiler/middle/gungnir/mir/cfg.runa" as CFG
 Import "compiler/middle/gungnir/mir/ssa.runa" as SSA
 Import "compiler/middle/gungnir/mir/dominance.runa" as Dominance
-Import "compiler/frontend/primitives/collections/dictionary.runa" as Dictionary
-Import "compiler/frontend/primitives/collections/set.runa" as Set
 Import "compiler/frontend/primitives/collections/list.runa" as List
+Import "compiler/frontend/primitives/collections/ordered_map.runa" as OrderedMap
 Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/internal/string_utils.runa" as StringUtils
 
-Note: Type definition for induction variable information (88 bytes)
+Note: Type definition for induction variable information (96 bytes)
 Type called "InductionVariable":
     phi_inst_ptr as Integer          Note: Pointer to phi instruction defining IV
     block_id as Integer               Note: Block containing the phi (loop header)
-    init_value_ptr as Integer         Note: Initial value from preheader
-    step_value_ptr as Integer         Note: Step value operand
+    init_value_id as Integer          Note: SSA value id of initial value from preheader
+    step_value_id as Integer          Note: SSA value id of the step operand
     step_constant as Integer          Note: 1 if step is constant, 0 otherwise
-    step_amount as Integer            Note: Constant step amount if known
-    update_inst_ptr as Integer        Note: Instruction computing IV plus step
-    exit_condition_ptr as Integer     Note: Branch instruction for exit test
-    bound_value_ptr as Integer        Note: Loop bound operand in comparison
-    comparison_opcode as Integer      Note: Comparison operation (LT, LE, GT, GE)
-    is_canonical as Integer           Note: 1 if IV = phi(init, IV+step), 0 otherwise
+    step_amount as Integer            Note: Signed effective step (negated for SUB updates)
+    update_inst_ptr as Integer        Note: Instruction computing IV plus/minus step
+    exit_condition_ptr as Integer     Note: Comparison instruction feeding the exit branch
+    bound_value_id as Integer         Note: Loop bound operand in the comparison
+    comparison_opcode as Integer      Note: Comparison operation (EQ/NE/LT/LE/GT/GE)
+    is_canonical as Integer           Note: 1 if IV is phi(init, IV +- step), 0 otherwise
+    tested_value_is_next as Integer   Note: 1 if exit test reads the updated value, 0 if it reads the phi
 End Type
 
-Note: Type definition for loop information (72 bytes)
+Note: Type definition for loop information (80 bytes)
 Type called "LoopInfo":
     header_id as Integer              Note: Loop header block ID
-    preheader_id as Integer           Note: Preheader block ID (single entry)
+    preheader_id as Integer           Note: Preheader block ID (0 if none/multiple outside preds)
     latch_id as Integer               Note: Block with back-edge to header
-    exit_block_id as Integer          Note: Primary exit block
-    body_blocks as Integer            Note: Set of block IDs in loop body
-    back_edges as Integer             Note: List of (source, target) pairs
+    exit_block_id as Integer          Note: Single exit target block (0 if not single)
+    body_blocks as Integer            Note: OrderedMap block_id -> 1 of blocks in loop body
+    back_edges as Integer             Note: List of 16-byte (source, target) pairs
     nesting_level as Integer          Note: Loop nesting depth
     induction_vars as Integer         Note: List of InductionVariable structures
-    trip_count as Integer             Note: -1 if unknown, else constant count
-    has_multiple_exits as Integer     Note: 1 if multiple exits, 0 otherwise
+    trip_count as Integer             Note: -1 if unknown, else constant body-execution count
+    has_multiple_exits as Integer     Note: 1 if exit structure is not a single latch->exit edge
 End Type
 
-Note: Type definition for loop unrolling context (88 bytes)
+Note: Type definition for loop unrolling context (72 bytes)
 Type called "LoopUnrollContext":
-    cfg as Integer                    Note: CFG pointer
+    function_ptr as Integer           Note: MIRFunction pointer (threads value-id allocation and def lookup)
+    cfg as Integer                    Note: MIRCFG pointer (function offset 8)
     loops as Integer                  Note: List of LoopInfo
-    dominance_ptr as Integer          Note: Dominance tree
-    ssa_ptr as Integer                Note: SSA information
-    block_clone_map as Integer        Note: original_block_id -> cloned_block_id
-    value_rename_map as Integer       Note: original_value -> list of renamed values
+    dominance_ptr as Integer          Note: DominanceInfo pointer from compute_dominance_tree
     full_unrolls as Integer           Note: Counter for full unrolls performed
     partial_unrolls as Integer        Note: Counter for partial unrolls performed
     unroll_factor as Integer          Note: Default unroll factor (4)
-    max_unroll_iterations as Integer  Note: Max iterations for full unroll (16)
+    max_unroll_iterations as Integer  Note: Max trip count for full unroll (16)
     code_size_threshold as Integer    Note: Max instructions to unroll (200)
 End Type
 
 @Reasoning
 Loop unrolling optimization workflow:
 
-1. **Loop Detection** - Identify natural loops via back-edge analysis
-2. **Induction Variable Identification** - Find canonical IVs (phi nodes with add/sub updates)
-3. **Trip Count Analysis** - Compute constant trip counts when possible
-4. **Profitability Analysis** - Determine if unrolling benefits outweigh costs
-5. **Transformation** - Full unroll (constant small trips) or partial unroll (large/unknown trips)
-6. **SSA Maintenance** - Rename cloned values and update phi nodes
+1. **Loop Detection** - Identify natural loops via dominance back-edge analysis
+2. **Structure Analysis** - Compute preheader, single exit edge, exiting block
+3. **Induction Variable Identification** - Find canonical IVs (header phis with
+   add/sub updates whose latch operand chains through the phi itself)
+4. **Trip Count Analysis** - Closed-form trip counts when init/bound/step are
+   constants, distinguishing latch tests on the phi value from tests on the
+   updated value (the two shapes have different closed forms)
+5. **Profitability Analysis** - Code size, call barriers, exit-structure gates
+6. **Transformation** - Full unroll (small constant trips: the loop is replaced
+   by trip_count chained copies and deleted) or partial unroll (unknown/large
+   trips: K-1 retained-exit copies are chained inside the loop cycle)
+7. **SSA Maintenance** - Every cloned definition receives a fresh value id via
+   MIR.allocate_value_id and is registered through MIR.register_value_definition;
+   header phis are resolved per copy by chaining the previous copy's values
 
-Full unrolling transforms `for(i=0; i<3; i++) body(i);` into `body(0); body(1); body(2);`
-
-Partial unrolling with factor K transforms iterations to process K elements per iteration,
-reducing loop overhead by factor K while maintaining correctness via remainder loop.
+Partial unrolling RETAINS each copy's exit test (classical unrolling without
+condition elimination). This is sound for every trip count - including unknown
+and non-divisible counts - without remainder-loop machinery: a copy whose test
+fails exits to the single exit block exactly as the original iteration would
+have. The win is one back-edge jump per K iterations plus cross-copy scheduling
+and folding visibility; downstream branch folding removes tests it can prove.
 @End Reasoning
 
 Note: Create loop unrolling context with initialized data structures
-Process called "create_loop_unroll_context" that takes cfg_ptr as Integer returns Integer:
+Process called "create_loop_unroll_context" that takes function_ptr as Integer returns Integer:
     @Reasoning
-    The context aggregates every long-lived data structure consulted by the
-    unrolling pipeline so downstream procs need only one pointer to access
-    CFG, dominance, SSA, the clone/rename maps, and the tunable thresholds.
+    The context aggregates every long-lived structure the pipeline consults.
+    It is keyed on the FUNCTION pointer (not the bare CFG) because the
+    canonical contract threads the function through value-id allocation
+    (MIR.allocate_value_id reads next_value_id at function offset 56),
+    defining-instruction lookup (MIR.lookup_defining_instruction reads the
+    value_to_instruction map at offset 64), and SSA-form queries
+    (SSA.is_in_ssa_form). The CFG is derived once via MIR.get_mir_function_cfg.
 
     Tunables matter for correctness AND code size:
-    - unroll_factor=4 balances ILP gains against I-cache pressure; matches
-      the typical width of modern superscalar pipelines.
-    - max_unroll_iterations=16 bounds full-unroll explosion: a 16-iter loop
-      with a 200-instruction body becomes 3200 instructions — already the
-      ceiling before profitability is rejected.
-    - code_size_threshold=200 prevents pathological unrolling of large
-      bodies, which destroys I-cache locality and hurts inlining downstream.
-
-    Centralizing these on the context (rather than as globals) lets the
-    optimizer caller override them per-function (hot loops vs. cold code).
+    - unroll_factor=4 balances ILP gains against I-cache pressure
+    - max_unroll_iterations=16 bounds full-unroll explosion
+    - code_size_threshold=200 prevents pathological unrolling of large bodies
     @End Reasoning
 
     @Implementation
-    Allocates 88-byte context structure on Tier 3 OWNED HEAP.
-    Initializes CFG reference, empty loops list, computes dominance tree,
-    creates clone/rename maps, sets default parameters.
+    Allocates the 72-byte context on the owned heap via Layout.allocate.
+    Stores the function pointer, derives the CFG, creates the empty loops
+    list, computes the dominance tree via Dominance.compute_dominance_tree
+    (required for back-edge detection), zeroes the counters, and seeds the
+    default tunables. Returns 0 when the function, its CFG, or the dominance
+    computation is unavailable.
     @End Implementation
 
-    Let context_size be 88
-    Let context_ptr be proc allocate_memory from Layout with context_size, 8
+    If function_ptr is equal to 0:
+        Return 0
+    End If
 
+    Let cfg_ptr be proc get_mir_function_cfg from MIR with function_ptr
+    If cfg_ptr is equal to 0:
+        Return 0
+    End If
+
+    Let context_ptr be proc allocate from Layout with 72
     If context_ptr is equal to 0:
         Return 0
     End If
 
-    Note: Store CFG pointer
-    proc memory_set_int64 from Layout with context_ptr, 0, cfg_ptr
+    proc memory_set_int64 from Layout with context_ptr, 0, function_ptr
+    proc memory_set_int64 from Layout with context_ptr, 8, cfg_ptr
 
-    Note: Create empty loops list
     Let loops_list be proc create from List
-    proc memory_set_int64 from Layout with context_ptr, 8, loops_list
+    proc memory_set_int64 from Layout with context_ptr, 16, loops_list
 
-    Note: Compute dominance information (required for back-edge detection)
-    Let dominance_ptr be proc compute_dominance from Dominance with cfg_ptr
-    proc memory_set_int64 from Layout with context_ptr, 16, dominance_ptr
+    Let dominance_ptr be proc compute_dominance_tree from Dominance with cfg_ptr
+    proc memory_set_int64 from Layout with context_ptr, 24, dominance_ptr
 
-    Note: Get SSA information from CFG
-    Let ssa_ptr be proc get_ssa_info from CFG with cfg_ptr
-    proc memory_set_int64 from Layout with context_ptr, 24, ssa_ptr
-
-    Note: Create block clone map (original_id -> cloned_id)
-    Let block_clone_map be proc create from Dictionary
-    proc memory_set_int64 from Layout with context_ptr, 32, block_clone_map
-
-    Note: Create value rename map (original_value -> renamed_values_per_iteration)
-    Let value_rename_map be proc create from Dictionary
-    proc memory_set_int64 from Layout with context_ptr, 40, value_rename_map
-
-    Note: Initialize counters to zero
-    proc memory_set_int64 from Layout with context_ptr, 48, 0  Note: full_unrolls
-    proc memory_set_int64 from Layout with context_ptr, 56, 0  Note: partial_unrolls
-
-    Note: Set default unrolling parameters
-    proc memory_set_int64 from Layout with context_ptr, 64, 4  Note: unroll_factor
-    proc memory_set_int64 from Layout with context_ptr, 72, 16  Note: max_unroll_iterations
-    proc memory_set_int64 from Layout with context_ptr, 80, 200 Note: code_size_threshold
+    proc memory_set_int64 from Layout with context_ptr, 32, 0  Note: full_unrolls
+    proc memory_set_int64 from Layout with context_ptr, 40, 0  Note: partial_unrolls
+    proc memory_set_int64 from Layout with context_ptr, 48, 4  Note: unroll_factor
+    proc memory_set_int64 from Layout with context_ptr, 56, 16  Note: max_unroll_iterations
+    proc memory_set_int64 from Layout with context_ptr, 64, 200 Note: code_size_threshold
 
     Return context_ptr
 End Process
@@ -175,33 +185,27 @@ End Process
 Note: Destroy loop unrolling context and free all allocated memory
 Process called "destroy_loop_unroll_context" that takes context_ptr as Integer returns Nothing:
     @Reasoning
-    The context owns a deep tree of allocations: loops list, then per-loop
-    body sets, back-edge lists (with allocated 16-byte pair structs),
-    induction-variable lists (with 88-byte IV structs), then dominance tree,
-    block-clone dictionary, and value-rename dictionary (whose values are
-    themselves lists). A single proc destroy call would leak the inner
-    structures and corrupt the heap; deterministic teardown is required.
-
-    Walk order matters: free children before parents, so the parent's
-    pointers are still valid when iterating. Edge pairs and IV structs
-    are released individually because they were individually allocated.
+    The context owns a deep tree of allocations: the loops list, then per-loop
+    body maps, back-edge lists (with individually allocated 16-byte pair
+    structs), induction-variable lists (with 96-byte IV structs), and the
+    dominance info. Deterministic post-order teardown frees children before
+    parents so parent pointers stay valid while iterating.
     @End Reasoning
 
     @Implementation
-    Deterministic post-order tear-down on Tier 3 OWNED HEAP:
-    1. For each LoopInfo: free body_blocks set, back_edges list (releasing
-       each 16-byte edge pair), induction_vars list (releasing each 88-byte
-       IV struct), then the 72-byte LoopInfo itself.
-    2. Free the loops list container.
-    3. Free dominance tree via Dominance.destroy_dominance.
-    4. Free block_clone_map dictionary.
-    5. Free value_rename_map: iterate keys, free each per-key rename list,
-       then free the outer dictionary.
-    6. Free the 88-byte context struct.
+    1. For each LoopInfo: destroy the body OrderedMap, free each 16-byte edge
+       pair then the back_edges list, free each 96-byte IV struct then the
+       induction_vars list, then the 80-byte LoopInfo itself.
+    2. Destroy the loops list container.
+    3. Release dominance info via Dominance.destroy_dominance_info.
+    4. Free the 72-byte context struct via Layout.deallocate.
     @End Implementation
 
-    Note: Free loops list and all nested structures
-    Let loops_list be proc memory_get_int64 from Layout with context_ptr, 8
+    If context_ptr is equal to 0:
+        Return
+    End If
+
+    Let loops_list be proc memory_get_int64 from Layout with context_ptr, 16
     If loops_list is not equal to 0:
         Let loops_count be proc length from List with loops_list
         Let loop_idx be 0
@@ -210,13 +214,11 @@ Process called "destroy_loop_unroll_context" that takes context_ptr as Integer r
             Let loop_ptr be proc get from List with loops_list, loop_idx
 
             If loop_ptr is not equal to 0:
-                Note: Free body blocks set
                 Let body_blocks be proc memory_get_int64 from Layout with loop_ptr, 32
                 If body_blocks is not equal to 0:
-                    proc destroy from Set with body_blocks
+                    proc omap_destroy from OrderedMap with body_blocks
                 End If
 
-                Note: Free back edges list (including edge pair allocations)
                 Let back_edges be proc memory_get_int64 from Layout with loop_ptr, 40
                 If back_edges is not equal to 0:
                     Let edge_count be proc length from List with back_edges
@@ -224,14 +226,13 @@ Process called "destroy_loop_unroll_context" that takes context_ptr as Integer r
                     While edge_idx is less than edge_count:
                         Let edge_pair be proc get from List with back_edges, edge_idx
                         If edge_pair is not equal to 0:
-                            proc deallocate_memory from Layout with edge_pair, 16
+                            proc deallocate from Layout with edge_pair
                         End If
                         Set edge_idx to edge_idx plus 1
                     End While
                     proc destroy from List with back_edges
                 End If
 
-                Note: Free induction variables list and IV structures
                 Let induction_vars be proc memory_get_int64 from Layout with loop_ptr, 56
                 If induction_vars is not equal to 0:
                     Let iv_count be proc length from List with induction_vars
@@ -239,15 +240,14 @@ Process called "destroy_loop_unroll_context" that takes context_ptr as Integer r
                     While iv_idx is less than iv_count:
                         Let iv_ptr be proc get from List with induction_vars, iv_idx
                         If iv_ptr is not equal to 0:
-                            proc deallocate_memory from Layout with iv_ptr, 88
+                            proc deallocate from Layout with iv_ptr
                         End If
                         Set iv_idx to iv_idx plus 1
                     End While
                     proc destroy from List with induction_vars
                 End If
 
-                Note: Free LoopInfo structure (72 bytes)
-                proc deallocate_memory from Layout with loop_ptr, 72
+                proc deallocate from Layout with loop_ptr
             End If
 
             Set loop_idx to loop_idx plus 1
@@ -256,111 +256,89 @@ Process called "destroy_loop_unroll_context" that takes context_ptr as Integer r
         proc destroy from List with loops_list
     End If
 
-    Note: Free dominance tree
-    Let dominance_ptr be proc memory_get_int64 from Layout with context_ptr, 16
+    Let dominance_ptr be proc memory_get_int64 from Layout with context_ptr, 24
     If dominance_ptr is not equal to 0:
-        proc destroy_dominance from Dominance with dominance_ptr
+        proc destroy_dominance_info from Dominance with dominance_ptr
     End If
 
-    Note: Free block clone map
-    Let block_clone_map be proc memory_get_int64 from Layout with context_ptr, 32
-    If block_clone_map is not equal to 0:
-        proc destroy from Dictionary with block_clone_map
-    End If
-
-    Note: Free value rename map (including nested lists)
-    Let value_rename_map be proc memory_get_int64 from Layout with context_ptr, 40
-    If value_rename_map is not equal to 0:
-        Let keys be proc keys from Dictionary with value_rename_map
-        Let key_count be proc length from List with keys
-        Let key_idx be 0
-        While key_idx is less than key_count:
-            Let key be proc get from List with keys, key_idx
-            Let rename_list be proc get from Dictionary with value_rename_map, key
-            If rename_list is not equal to 0:
-                proc destroy from List with rename_list
-            End If
-            Set key_idx to key_idx plus 1
-        End While
-        proc destroy from Dictionary with value_rename_map
-    End If
-
-    Note: Free context structure (88 bytes)
-    proc deallocate_memory from Layout with context_ptr, 88
+    proc deallocate from Layout with context_ptr
 End Process
 
 Note: Print loop unrolling statistics
 Process called "print_loop_unrolling_stats" that takes context_ptr as Integer returns Nothing:
+    @Implementation
+    Reads both transformation counters and reports them through Display.
+    Integer payloads are converted with StringUtils.integer_to_string because
+    joining a raw integer treats it as a string pointer.
+    @End Implementation
+
     If context_ptr is equal to 0:
         Return
     End If
 
-    Let full_unrolls be proc memory_get_int64 from Layout with context_ptr, 48
-    Let partial_unrolls be proc memory_get_int64 from Layout with context_ptr, 56
+    Let full_unrolls be proc memory_get_int64 from Layout with context_ptr, 32
+    Let partial_unrolls be proc memory_get_int64 from Layout with context_ptr, 40
     Let total_unrolls be full_unrolls plus partial_unrolls
 
-    Note: Print statistics
+    If total_unrolls is greater than 0:
+        Let full_str be proc integer_to_string from StringUtils with full_unrolls
+        Let partial_str be proc integer_to_string from StringUtils with partial_unrolls
+        Display "loop_unrolling: full=" joined with full_str joined with " partial=" joined with partial_str
+    End If
 End Process
 
 Note: Check if edge (source -> target) is a back edge using dominance
 Process called "is_back_edge" that takes source_id as Integer, target_id as Integer, dominance_ptr as Integer returns Integer:
     @Reasoning
-    Natural-loop detection in v0.0.8.5 follows the standard dragon-book
-    definition: an edge B -> H is a back edge iff H dominates B. Using
-    dominance (rather than ad-hoc cycle-finding) is critical because:
-
-    - It picks out *reducible* loops only, the only kind the rest of the
-      optimization pipeline (LICM, vectorization, strength reduction) is
-      prepared to reason about.
-    - It scales linearly in CFG size when paired with a precomputed
-      dominance tree (single dominance query is amortized O(1) with the
-      Lengauer-Tarjan tree we build in create_loop_unroll_context).
-    - It naturally rejects irreducible flow (goto-spaghetti) which would
-      otherwise produce malformed LoopInfo and crash later phases.
+    Natural-loop detection follows the standard definition: an edge B -> H is
+    a back edge iff H dominates B. Dominance-based detection picks out
+    reducible loops only - the only kind downstream passes are prepared to
+    reason about - and rejects irreducible flow.
     @End Reasoning
 
     @Implementation
-    A back edge occurs when the target dominates the source (target -> ... -> source -> target).
-    This forms the basis of natural loop detection.
+    Queries the canonical Dominance.dominates(info, dominator_id, block_id)
+    with the precomputed dominance info threaded from the context.
     @End Implementation
 
     If dominance_ptr is equal to 0:
         Return 0
     End If
 
-    Let dominates be proc does_dominate from Dominance with dominance_ptr, target_id, source_id
-    Return dominates
+    Return proc dominates from Dominance with dominance_ptr, target_id, source_id
 End Process
 
 Note: Find all back edges in the CFG
 Process called "find_back_edges" that takes cfg_ptr as Integer, dominance_ptr as Integer returns Integer:
     @Reasoning
-    The back-edge set is the seed of every subsequent loop analysis: each
-    back edge B -> H uniquely identifies one natural loop with header H and
-    latch B. Returning a freshly-allocated list (rather than mutating CFG
-    annotations) keeps this proc idempotent — callers may run it multiple
-    times across optimization passes without aliasing concerns.
-
-    Edge pairs are stored as 16-byte (source, target) structs rather than
-    as a packed encoding so subsequent passes (loop nesting, exit-block
-    discovery) can iterate them without bit-shifting. The 16 bytes are
-    owned by the returned list and released by destroy_loop_unroll_context.
+    The back-edge set seeds every subsequent loop analysis: each back edge
+    B -> H identifies one natural loop with header H and latch B. Edge pairs
+    are stored as 16-byte (source, target) structs so subsequent passes can
+    iterate them directly; the pairs are owned by the returned list and
+    released by destroy_loop_unroll_context.
     @End Reasoning
 
     @Implementation
-    Scans all edges in the CFG. For each edge (B -> H), checks if H dominates B.
-    If so, (B -> H) is a back edge and H is a loop header.
-    Returns list of (source, target) pairs representing back edges.
+    Walks the CFG block list (CFG.get_mir_cfg_blocks yields block POINTERS;
+    ids come from CFG.get_mir_basic_block_id). Successor lists from
+    MIR.get_block_successors are lists of BLOCK IDS per the canonical
+    contract. For each edge (B -> H) where H dominates B, allocates a pair
+    struct and appends it.
     @End Implementation
 
     Let back_edges be proc create from List
-    Let blocks_count be proc get_block_count from CFG with cfg_ptr
+    Let blocks_list be proc get_mir_cfg_blocks from CFG with cfg_ptr
+    Let blocks_count be proc length from List with blocks_list
     Let block_idx be 0
 
     While block_idx is less than blocks_count:
-        Let block_id be proc get_block_id_at_index from CFG with cfg_ptr, block_idx
-        Let successors be proc get_successors from CFG with cfg_ptr, block_id
-        Let succ_count be proc length from List with successors
+        Let block_ptr be proc get from List with blocks_list, block_idx
+        Let block_id be proc get_mir_basic_block_id from CFG with block_ptr
+        Let successors be proc get_block_successors from MIR with block_ptr
+        Let succ_count be 0
+        If successors is not equal to 0:
+            Set succ_count to proc length from List with successors
+        End If
         Let succ_idx be 0
 
         While succ_idx is less than succ_count:
@@ -368,8 +346,7 @@ Process called "find_back_edges" that takes cfg_ptr as Integer, dominance_ptr as
             Let is_back be proc is_back_edge with block_id, succ_id, dominance_ptr
 
             If is_back is equal to 1:
-                Note: Allocate edge pair structure (16 bytes: source, target)
-                Let edge_pair be proc allocate_memory from Layout with 16, 8
+                Let edge_pair be proc allocate from Layout with 16
                 proc memory_set_int64 from Layout with edge_pair, 0, block_id
                 proc memory_set_int64 from Layout with edge_pair, 8, succ_id
                 proc append from List with back_edges, edge_pair
@@ -387,119 +364,197 @@ End Process
 Note: Compute natural loop body for back edge (latch -> header)
 Process called "compute_loop_body" that takes header_id as Integer, latch_id as Integer, cfg_ptr as Integer returns Integer:
     @Reasoning
-    The natural-loop body is precisely the set of blocks that can reach the
-    latch without first leaving the loop via the header. Computing it as a
-    reverse-flow worklist closure (rather than a structural region match)
-    correctly handles:
-
-    - Multi-block loops with internal branches (if/else inside the loop).
-    - Nested loops: the outer pass collects the union of nested + outer
-      bodies; the nesting-level computation in detect_natural_loops then
-      separates them.
-    - Self-loops (header == latch): the worklist exits immediately after
-      the early-return guard.
-
-    Block IDs are stored as strings inside the Set because the Set
-    primitive is keyed by String, not Integer. The int_to_string round-trip
-    is cheap relative to dominance queries and keeps the API uniform with
-    other set-of-blocks uses across the optimizer.
+    The natural-loop body is the set of blocks that reach the latch without
+    passing through the header, computed as a reverse-flow worklist closure.
+    Membership is tracked in an integer-keyed OrderedMap (block_id -> 1)
+    because collections/dictionary string-hashes keys and crashes on integer
+    keys; OrderedMap also gives an entry walk for body iteration.
     @End Reasoning
 
     @Implementation
-    Natural loop body consists of all nodes that can reach the latch without
-    going through the header. Uses worklist algorithm starting from latch,
-    adding predecessors until reaching header.
-
-    Algorithm:
-    1. Initialize body = {header, latch}
-    2. worklist = {latch}
-    3. While worklist not empty:
-         node = worklist.pop()
-         for pred in predecessors(node):
-             if pred != header and pred not in body:
-                 body.add(pred)
-                 worklist.add(pred)
+    1. body = {header, latch}; worklist = [latch]
+    2. While worklist not empty: pop node; for each predecessor id (the
+       canonical predecessor list holds BLOCK IDS) not equal to the header
+       and not yet in body: add to body and worklist.
+    Predecessor lists are reached by resolving ids to block pointers through
+    CFG.get_block_by_id_from_cfg and reading MIR.get_block_predecessors.
     @End Implementation
 
-    Let body_blocks be proc create from Set
-    Let header_str be proc int_to_string from MIR with header_id
-    Let latch_str be proc int_to_string from MIR with latch_id
+    Let body_blocks be proc omap_create from OrderedMap
+    proc omap_set from OrderedMap with body_blocks, header_id, 1
+    proc omap_set from OrderedMap with body_blocks, latch_id, 1
 
-    Note: Add header and latch to body
-    proc add from Set with body_blocks, header_str
-    proc add from Set with body_blocks, latch_str
-
-    Note: Handle self-loop case
     If header_id is equal to latch_id:
         Return body_blocks
     End If
 
-    Note: Worklist algorithm to find all predecessors that reach latch
     Let worklist be proc create from List
     proc append from List with worklist, latch_id
+    Let work_remaining be proc length from List with worklist
 
-    While proc length from List with worklist is greater than 0:
+    While work_remaining is greater than 0:
         Let current_id be proc pop from List with worklist
-        Let predecessors be proc get_predecessors from CFG with cfg_ptr, current_id
-        Let pred_count be proc length from List with predecessors
-        Let pred_idx be 0
+        Let current_ptr be proc get_block_by_id_from_cfg from CFG with cfg_ptr, current_id
 
-        While pred_idx is less than pred_count:
-            Let pred_id be proc get from List with predecessors, pred_idx
-
-            Note: Don't go beyond loop header
-            If pred_id is not equal to header_id:
-                Let pred_str be proc int_to_string from MIR with pred_id
-                Let already_in_body be proc contains from Set with body_blocks, pred_str
-
-                If already_in_body is equal to 0:
-                    proc add from Set with body_blocks, pred_str
-                    proc append from List with worklist, pred_id
-                End If
+        If current_ptr is not equal to 0:
+            Let predecessors be proc get_block_predecessors from MIR with current_ptr
+            Let pred_count be 0
+            If predecessors is not equal to 0:
+                Set pred_count to proc length from List with predecessors
             End If
+            Let pred_idx be 0
 
-            Set pred_idx to pred_idx plus 1
-        End While
+            While pred_idx is less than pred_count:
+                Let pred_id be proc get from List with predecessors, pred_idx
+
+                If pred_id is not equal to header_id:
+                    Let already_in_body be proc omap_contains from OrderedMap with body_blocks, pred_id
+                    If already_in_body is equal to 0:
+                        proc omap_set from OrderedMap with body_blocks, pred_id, 1
+                        proc append from List with worklist, pred_id
+                    End If
+                End If
+
+                Set pred_idx to pred_idx plus 1
+            End While
+        End If
+
+        Set work_remaining to proc length from List with worklist
     End While
 
     proc destroy from List with worklist
     Return body_blocks
 End Process
 
-Note: Detect all natural loops in the CFG using back-edge analysis
-Process called "detect_natural_loops" that takes context_ptr as Integer returns Integer:
+Note: Compute preheader, exit edge, and exit-structure flag for one loop
+Process called "compute_loop_structure" that takes context_ptr as Integer, loop_ptr as Integer returns Nothing:
     @Reasoning
-    This is the entry point that converts raw CFG back-edge information
-    into the structured LoopInfo records the rest of the pipeline operates
-    on. One LoopInfo is emitted per back edge: in degenerate cases (a
-    header with two latches) this yields two LoopInfos sharing a header,
-    which is exactly what subsequent profitability analysis needs to merge
-    or reject.
-
-    Nesting level is computed inline rather than in a separate pass because
-    the back-edge list is already in hand: a body block that is itself the
-    target of any back edge in the function is a nested-loop header, and
-    each such hit increments the outer loop's nesting depth. Deeper loops
-    get higher nesting, which the AOTT runtime uses later to prioritize
-    optimization budget.
-
-    trip_count is initialized to -1 (unknown) and refined later by
-    analyze_trip_count, after induction-variable identification. This keeps
-    detection cheap and lets the pipeline skip trip-count analysis for
-    loops that fail an earlier profitability gate.
+    Both transformations depend on loop structure that detection alone does
+    not provide: the preheader (the unique outside predecessor of the header,
+    needed to rewire entry into the unrolled copies) and the exit edge (the
+    unique body-to-outside edge, needed to rewire the final copy and to fix
+    exit-block phis). Loops without a unique preheader or with anything other
+    than a single latch-to-exit edge are flagged so profitability rejects
+    them - a malformed unroll cannot be undone.
     @End Reasoning
 
     @Implementation
-    Natural loop detection algorithm:
-    1. Find all back edges (B -> H where H dominates B)
-    2. For each back edge, H is loop header, B is latch
-    3. Compute loop body (nodes reaching B without going through H)
-    4. Create LoopInfo structure for each loop
+    Preheader: walk the header's predecessor ids; the ids outside body_blocks
+    are outside entries. Exactly one outside entry => preheader, else -1.
+    Exit edge: walk every body block's successor ids; ids outside body_blocks
+    are exit edges (exiting_block -> exit_target). has_multiple_exits is set
+    unless exactly one exit edge exists AND its exiting block is the latch.
+    exit_block_id records the single exit target (-1 otherwise). The absence
+    sentinel is -1, NOT 0: block id 0 is the entry block's perfectly valid id
+    and is the preheader in the common case.
     @End Implementation
 
-    Let cfg_ptr be proc memory_get_int64 from Layout with context_ptr, 0
-    Let dominance_ptr be proc memory_get_int64 from Layout with context_ptr, 16
-    Let loops_list be proc memory_get_int64 from Layout with context_ptr, 8
+    Let cfg_ptr be proc memory_get_int64 from Layout with context_ptr, 8
+    Let header_id be proc memory_get_int64 from Layout with loop_ptr, 0
+    Let latch_id be proc memory_get_int64 from Layout with loop_ptr, 16
+    Let body_blocks be proc memory_get_int64 from Layout with loop_ptr, 32
+
+    Note: Preheader discovery (-1 = no unique preheader; 0 is a valid id)
+    Let header_ptr be proc get_block_by_id_from_cfg from CFG with cfg_ptr, header_id
+    Let outside_pred_count be 0
+    Let preheader_id be 0 minus 1
+
+    If header_ptr is not equal to 0:
+        Let predecessors be proc get_block_predecessors from MIR with header_ptr
+        Let pred_count be 0
+        If predecessors is not equal to 0:
+            Set pred_count to proc length from List with predecessors
+        End If
+        Let pred_idx be 0
+
+        While pred_idx is less than pred_count:
+            Let pred_id be proc get from List with predecessors, pred_idx
+            Let in_body be proc omap_contains from OrderedMap with body_blocks, pred_id
+            If in_body is equal to 0:
+                Set outside_pred_count to outside_pred_count plus 1
+                Set preheader_id to pred_id
+            End If
+            Set pred_idx to pred_idx plus 1
+        End While
+    End If
+
+    If outside_pred_count is not equal to 1:
+        Set preheader_id to 0 minus 1
+    End If
+    proc memory_set_int64 from Layout with loop_ptr, 8, preheader_id
+
+    Note: Exit edge discovery across all body blocks
+    Let exit_edge_count be 0
+    Let exiting_block_id be 0
+    Let exit_target_id be 0
+    Let entry be proc omap_first from OrderedMap with body_blocks
+
+    While entry is not equal to 0:
+        Let body_id be proc omap_entry_key from OrderedMap with entry
+        Let body_ptr be proc get_block_by_id_from_cfg from CFG with cfg_ptr, body_id
+
+        If body_ptr is not equal to 0:
+            Let successors be proc get_block_successors from MIR with body_ptr
+            Let succ_count be 0
+            If successors is not equal to 0:
+                Set succ_count to proc length from List with successors
+            End If
+            Let succ_idx be 0
+
+            While succ_idx is less than succ_count:
+                Let succ_id be proc get from List with successors, succ_idx
+                Let succ_in_body be proc omap_contains from OrderedMap with body_blocks, succ_id
+                If succ_in_body is equal to 0:
+                    Set exit_edge_count to exit_edge_count plus 1
+                    Set exiting_block_id to body_id
+                    Set exit_target_id to succ_id
+                End If
+                Set succ_idx to succ_idx plus 1
+            End While
+        End If
+
+        Set entry to proc omap_entry_next from OrderedMap with entry
+    End While
+
+    Let multiple_exits be 0
+    If exit_edge_count is not equal to 1:
+        Set multiple_exits to 1
+    End If
+    If exiting_block_id is not equal to latch_id:
+        Set multiple_exits to 1
+    End If
+
+    If multiple_exits is equal to 1:
+        proc memory_set_int64 from Layout with loop_ptr, 24, 0 minus 1
+    Otherwise:
+        proc memory_set_int64 from Layout with loop_ptr, 24, exit_target_id
+    End If
+    proc memory_set_int64 from Layout with loop_ptr, 72, multiple_exits
+End Process
+
+Note: Detect all natural loops in the CFG using back-edge analysis
+Process called "detect_natural_loops" that takes context_ptr as Integer returns Integer:
+    @Reasoning
+    Converts raw back-edge information into the structured LoopInfo records
+    the rest of the pipeline operates on. One LoopInfo is emitted per back
+    edge. Nesting level is computed inline: a body block that is itself the
+    target of any back edge is a nested-loop header. trip_count starts at -1
+    (unknown) and is refined by analyze_trip_count after IV identification.
+    Preheader/exit structure is computed immediately per loop because both
+    transformations and profitability depend on it.
+    @End Reasoning
+
+    @Implementation
+    1. Find back edges (B -> H where H dominates B)
+    2. For each: H is header, B is latch; compute body via worklist closure
+    3. Allocate the 80-byte LoopInfo, fill detection fields, compute nesting,
+       then compute preheader/exit structure via compute_loop_structure
+    Returns the number of loops detected.
+    @End Implementation
+
+    Let cfg_ptr be proc memory_get_int64 from Layout with context_ptr, 8
+    Let dominance_ptr be proc memory_get_int64 from Layout with context_ptr, 24
+    Let loops_list be proc memory_get_int64 from Layout with context_ptr, 16
 
     Let back_edges be proc find_back_edges with cfg_ptr, dominance_ptr
     Let back_edge_count be proc length from List with back_edges
@@ -512,215 +567,363 @@ Process called "detect_natural_loops" that takes context_ptr as Integer returns 
 
         Let body_blocks be proc compute_loop_body with header_id, latch_id, cfg_ptr
 
-        Note: Allocate LoopInfo structure (72 bytes)
-        Let loop_ptr be proc allocate_memory from Layout with 72, 8
+        Let loop_ptr be proc allocate from Layout with 80
         proc memory_set_int64 from Layout with loop_ptr, 0, header_id
-        proc memory_set_int64 from Layout with loop_ptr, 8, 0  Note: preheader_id (computed later if needed)
+        proc memory_set_int64 from Layout with loop_ptr, 8, 0 minus 1
         proc memory_set_int64 from Layout with loop_ptr, 16, latch_id
-        proc memory_set_int64 from Layout with loop_ptr, 24, 0  Note: exit_block_id (computed later if needed)
+        proc memory_set_int64 from Layout with loop_ptr, 24, 0 minus 1
         proc memory_set_int64 from Layout with loop_ptr, 32, body_blocks
 
-        Note: Create back edges list for this loop
         Let loop_back_edges be proc create from List
         proc append from List with loop_back_edges, edge_pair
         proc memory_set_int64 from Layout with loop_ptr, 40, loop_back_edges
 
-        Note: Compute nesting level by checking if any body block is a loop header
+        Note: Nesting level: count body blocks that are themselves back-edge targets
         Let nesting_level be 0
-        Let body_list be proc to_list from Set with body_blocks
-        Let body_count be proc length from List with body_list
-        Let body_idx be 0
-
-        While body_idx is less than body_count:
-            Let body_block_str be proc get from List with body_list, body_idx
-            Let body_block_id be proc string_to_int from MIR with body_block_str
-
-            Note: Check if this body block is a loop header (has back edges to it)
+        Let entry be proc omap_first from OrderedMap with body_blocks
+        While entry is not equal to 0:
+            Let body_block_id be proc omap_entry_key from OrderedMap with entry
             Let inner_edge_idx be 0
             While inner_edge_idx is less than back_edge_count:
                 Let inner_edge_pair be proc get from List with back_edges, inner_edge_idx
                 Let inner_target_id be proc memory_get_int64 from Layout with inner_edge_pair, 8
-
-                Note: If body block is target of a back edge, it's a nested loop header
                 If body_block_id is equal to inner_target_id:
                     Set nesting_level to nesting_level plus 1
                 End If
-
                 Set inner_edge_idx to inner_edge_idx plus 1
             End While
-
-            Set body_idx to body_idx plus 1
+            Set entry to proc omap_entry_next from OrderedMap with entry
         End While
-
         proc memory_set_int64 from Layout with loop_ptr, 48, nesting_level
 
-        Note: Create empty induction variables list
         Let induction_vars be proc create from List
         proc memory_set_int64 from Layout with loop_ptr, 56, induction_vars
 
-        proc memory_set_int64 from Layout with loop_ptr, 64, -1  Note: trip_count (unknown initially)
-        proc memory_set_int64 from Layout with loop_ptr, 68, 0  Note: has_multiple_exits
+        proc memory_set_int64 from Layout with loop_ptr, 64, -1  Note: trip_count unknown initially
+        proc memory_set_int64 from Layout with loop_ptr, 72, 0   Note: has_multiple_exits (refined below)
+
+        proc compute_loop_structure with context_ptr, loop_ptr
 
         proc append from List with loops_list, loop_ptr
         Set edge_idx to edge_idx plus 1
     End While
 
+    Note: The pairs referenced by per-loop lists are owned by the per-loop
+    Note: lists; only the outer container is destroyed here.
+    proc destroy from List with back_edges
+
     Return proc length from List with loops_list
 End Process
 
-Note: Identify induction variables in a loop
-Process called "identify_induction_variables" that takes context_ptr as Integer, loop_ptr as Integer returns Integer:
+Note: Check whether an SSA value is defined by a MIR_CONST instruction
+Process called "value_is_constant" that takes function_ptr as Integer, value_id as Integer returns Integer:
+    @Implementation
+    Canonical constant test: resolve the defining instruction through
+    MIR.lookup_defining_instruction and test its opcode for MIR_CONST
+    (20001). Returns 1 for constants, 0 otherwise. Value id 0 means
+    "no value" and is never constant.
+    @End Implementation
+
+    If value_id is equal to 0:
+        Return 0
+    End If
+
+    Let def_inst be proc lookup_defining_instruction from MIR with function_ptr, value_id
+    If def_inst is equal to 0:
+        Return 0
+    End If
+
+    Let def_opcode be proc get_mir_node_opcode from MIR with def_inst
+    If def_opcode is equal to 20001:
+        Return 1
+    End If
+
+    Return 0
+End Process
+
+Note: Read the constant payload of an SSA value defined by MIR_CONST
+Process called "get_value_constant" that takes function_ptr as Integer, value_id as Integer returns Integer:
+    @Implementation
+    Resolves the defining instruction and reads the canonical constant
+    payload from the extended region at offset 80 via
+    MIRNodes.get_const_value. Callers must gate on value_is_constant first;
+    a non-constant resolves to 0.
+    @End Implementation
+
+    If value_id is equal to 0:
+        Return 0
+    End If
+
+    Let def_inst be proc lookup_defining_instruction from MIR with function_ptr, value_id
+    If def_inst is equal to 0:
+        Return 0
+    End If
+
+    Let def_opcode be proc get_mir_node_opcode from MIR with def_inst
+    If def_opcode is not equal to 20001:
+        Return 0
+    End If
+
+    Return proc get_const_value from MIRNodes with def_inst
+End Process
+
+Note: Resolve the callee name of a direct call (dual-form per producer divergence)
+Process called "resolve_call_callee_name" that takes function_ptr as Integer, call_inst as Integer returns Integer:
     @Reasoning
-    Canonical induction variables (BIVs: basic induction variables) are the
-    only IVs this pass is willing to act on, and that constraint is
-    intentional. Canonical means a header phi of exactly two operands —
-    init from the preheader, next from the latch — where the latch operand
-    is an add or subtract that takes the phi itself plus a loop-invariant
-    step.
-
-    Restricting to canonical form trades expressiveness for soundness:
-
-    - Multi-operand phis indicate complex control flow (loop with multiple
-      backedges, header reached from a non-preheader, etc.) where
-      unrolling correctness is fragile.
-    - Non-canonical update instructions (e.g., `next = step + phi` rather
-      than `next = phi + step`, or chained adds) require commutativity
-      reasoning the v0.0.8.5 MIR optimizer does not yet perform.
-    - Non-constant step values are *recorded* (step_is_constant = 0) but
-      defer trip-count analysis; without a constant step we cannot evaluate
-      the closed-form trip count below.
-
-    Derived (DIV: derived induction variables — c1 * BIV + c2 expressions)
-    are NOT identified here; strength_reduction.runa is the proper owner
-    of that analysis and runs as a separate pass.
-
-    Returns the count of canonical IVs found so the caller can short-circuit
-    profitability if no usable IV exists.
+    The MIRCall callee slot (extended offset 80, read via get_call_callee)
+    carries either a function-name string pointer (direct-call contract) or
+    the SSA value id of a lowered callee expression. Resolution mirrors the
+    dual-form scheme established in transformations/optimization.runa: the
+    value-id form resolves through the function's value_to_instruction map
+    to a string CONST whose payload names the callee; the name-pointer form
+    is returned directly when no defining instruction exists for the raw
+    slot value. The raw slot value is never dereferenced as a string here.
     @End Reasoning
 
     @Implementation
-    Induction variable pattern:
-    - Phi node in loop header: iv = phi([init, preheader], [next, latch])
-    - Update in loop body: next = iv + step (or iv - step)
-    - Step is loop-invariant (constant or defined outside loop)
-
-    Algorithm:
-    1. Get all phi nodes in header
-    2. For each phi with 2 operands:
-         a. Identify init (from preheader) and next (from latch)
-         b. Check if next is computed by add/sub using iv
-         c. Extract step value
-         d. Create InductionVariable structure
+    1. Read the callee field via MIRNodes.get_call_callee.
+    2. Try MIR.lookup_defining_instruction on it as a value id; when the
+       definition is a string MIR_CONST, return its string payload via
+       MIRNodes.get_const_string.
+    3. Otherwise treat the field as the interned name pointer and return it.
+    Returns 0 for a null callee field.
     @End Implementation
 
-    Let cfg_ptr be proc memory_get_int64 from Layout with context_ptr, 0
-    Let ssa_ptr be proc memory_get_int64 from Layout with context_ptr, 24
+    If call_inst is equal to 0:
+        Return 0
+    End If
+
+    Let callee_field be proc get_call_callee from MIRNodes with call_inst
+    If callee_field is equal to 0:
+        Return 0
+    End If
+
+    Let callee_def be proc lookup_defining_instruction from MIR with function_ptr, callee_field
+    If callee_def is not equal to 0:
+        Let def_opcode be proc get_mir_node_opcode from MIR with callee_def
+        If def_opcode is equal to 20001:
+            Let def_is_string be proc is_const_string from MIRNodes with callee_def
+            If def_is_string is equal to 1:
+                Return proc get_const_string from MIRNodes with callee_def
+            End If
+        End If
+        Return 0
+    End If
+
+    Return callee_field
+End Process
+
+Note: Determine whether a function contains a direct call to itself
+Process called "function_is_recursive" that takes function_ptr as Integer returns Integer:
+    @Reasoning
+    Self-recursion detection scans the function's own CALL instructions for a
+    callee that resolves to the function's own name (dual-form resolution:
+    name-pointer identity, or value-id chased to a string CONST compared via
+    StringCore.string_equals). Recursive functions are penalized by the
+    unrolling cost model because unrolled code size multiplies through every
+    recursive activation's instruction working set.
+    @End Reasoning
+
+    @Implementation
+    Walks every block's instruction list; for opcodes MIR_CALL (20304),
+    resolves the callee name via resolve_call_callee_name and compares
+    against the function's interned name at MIRFunction offset 0 - first by
+    pointer identity, then by string content. Returns 1 on the first match.
+    @End Implementation
+
+    If function_ptr is equal to 0:
+        Return 0
+    End If
+
+    Let own_name be proc memory_get_int64 from Layout with function_ptr, 0
+    If own_name is equal to 0:
+        Return 0
+    End If
+
+    Let cfg_ptr be proc get_mir_function_cfg from MIR with function_ptr
+    If cfg_ptr is equal to 0:
+        Return 0
+    End If
+
+    Let blocks_list be proc get_mir_cfg_blocks from CFG with cfg_ptr
+    Let blocks_count be proc length from List with blocks_list
+    Let block_idx be 0
+    Let found_recursion be 0
+
+    While block_idx is less than blocks_count:
+        Let block_ptr be proc get from List with blocks_list, block_idx
+        Let inst_list be proc get_block_instructions from MIR with block_ptr
+        Let inst_count be 0
+        If inst_list is not equal to 0:
+            Set inst_count to proc length from List with inst_list
+        End If
+        Let inst_idx be 0
+
+        While inst_idx is less than inst_count:
+            Let inst_ptr be proc get from List with inst_list, inst_idx
+            Let opcode be proc get_mir_node_opcode from MIR with inst_ptr
+
+            If opcode is equal to 20304:
+                Let callee_name be proc resolve_call_callee_name with function_ptr, inst_ptr
+                If callee_name is not equal to 0:
+                    If callee_name is equal to own_name:
+                        Set found_recursion to 1
+                    Otherwise:
+                        Let names_match be proc string_equals from StringCore with callee_name, own_name
+                        If names_match is equal to 1:
+                            Set found_recursion to 1
+                        End If
+                    End If
+                End If
+            End If
+
+            Set inst_idx to inst_idx plus 1
+        End While
+
+        Set block_idx to block_idx plus 1
+    End While
+
+    Return found_recursion
+End Process
+
+Note: Identify canonical induction variables in a loop
+Process called "identify_induction_variables" that takes context_ptr as Integer, loop_ptr as Integer returns Integer:
+    @Reasoning
+    Canonical induction variables are the only IVs this pass acts on: a
+    header phi of exactly two incomings - init from outside the loop, next
+    from the latch - where next is an ADD or SUB chaining through the phi
+    itself with a loop-invariant step. SUB updates are only canonical when
+    the phi is the LEFT operand (i - step); step - i is not an induction
+    chain. The effective step for SUB is recorded NEGATED so trip-count
+    closed forms operate on one signed step convention.
+
+    Phis are discovered by scanning the header's instruction list for the
+    MIR_PHI opcode (canonical residence) rather than relying solely on the
+    secondary phi_nodes registry, so hand-built MIR without the registry is
+    analyzed identically.
+    @End Reasoning
+
+    @Implementation
+    For each header phi with exactly 2 incomings (MIRNodes.get_phi_incoming_*):
+    1. Classify incomings by block: latch side = next, other side = init
+    2. Resolve next's defining instruction via MIR.lookup_defining_instruction
+    3. Accept ADD (20002) with the phi result in either operand slot, or SUB
+       (20003) with the phi result in operand slot 1 only
+    4. The other operand is the step; record constancy and signed amount via
+       the canonical CONST payload (extended offset 80)
+    5. Allocate the 96-byte InductionVariable and append it
+    Returns the count of canonical IVs found.
+    @End Implementation
+
+    Let cfg_ptr be proc memory_get_int64 from Layout with context_ptr, 8
+    Let function_ptr be proc memory_get_int64 from Layout with context_ptr, 0
     Let header_id be proc memory_get_int64 from Layout with loop_ptr, 0
     Let latch_id be proc memory_get_int64 from Layout with loop_ptr, 16
     Let induction_vars be proc memory_get_int64 from Layout with loop_ptr, 56
 
-    Let block_ptr be proc get_block_by_id from CFG with cfg_ptr, header_id
+    Let block_ptr be proc get_block_by_id_from_cfg from CFG with cfg_ptr, header_id
     If block_ptr is equal to 0:
         Return 0
     End If
 
-    Let phi_list be proc get_phi_nodes from MIR with block_ptr
-    If phi_list is equal to 0:
+    Let inst_list be proc get_block_instructions from MIR with block_ptr
+    If inst_list is equal to 0:
         Return 0
     End If
 
-    Let phi_count be proc length from List with phi_list
-    Let phi_idx be 0
+    Let inst_count be proc length from List with inst_list
+    Let inst_idx be 0
     Let found_count be 0
 
-    While phi_idx is less than phi_count:
-        Let phi_inst_ptr be proc get from List with phi_list, phi_idx
-        Let operands be proc get_phi_operands from MIR with phi_inst_ptr
-        Let operand_count be proc length from List with operands
+    While inst_idx is less than inst_count:
+        Let phi_inst_ptr be proc get from List with inst_list, inst_idx
+        Let inst_opcode be proc get_mir_node_opcode from MIR with phi_inst_ptr
 
-        Note: Canonical IV has exactly 2 operands
-        If operand_count is equal to 2:
-            Let op0_pair be proc get from List with operands, 0
-            Let op1_pair be proc get from List with operands, 1
-            Let op0_value be proc memory_get_int64 from Layout with op0_pair, 0
-            Let op0_block be proc memory_get_int64 from Layout with op0_pair, 8
-            Let op1_value be proc memory_get_int64 from Layout with op1_pair, 0
-            Let op1_block be proc memory_get_int64 from Layout with op1_pair, 8
+        If inst_opcode is equal to 20300:
+            Let operand_count be proc get_phi_incoming_count from MIRNodes with phi_inst_ptr
 
-            Note: Determine which operand comes from latch
-            Let init_value be 0
-            Let next_value be 0
+            If operand_count is equal to 2:
+                Let op0_value be proc get_phi_incoming_value from MIRNodes with phi_inst_ptr, 0
+                Let op0_block be proc get_phi_incoming_block from MIRNodes with phi_inst_ptr, 0
+                Let op1_value be proc get_phi_incoming_value from MIRNodes with phi_inst_ptr, 1
+                Let op1_block be proc get_phi_incoming_block from MIRNodes with phi_inst_ptr, 1
 
-            If op0_block is equal to latch_id:
-                Set next_value to op0_value
-                Set init_value to op1_value
-            End If
+                Let init_value be 0
+                Let next_value be 0
 
-            If op1_block is equal to latch_id:
-                Set next_value to op1_value
-                Set init_value to op0_value
-            End If
+                If op0_block is equal to latch_id:
+                    Set next_value to op0_value
+                    Set init_value to op1_value
+                End If
 
-            If next_value is not equal to 0:
-                Let next_inst_ptr be proc get_defining_instruction from SSA with ssa_ptr, next_value
+                If op1_block is equal to latch_id:
+                    Set next_value to op1_value
+                    Set init_value to op0_value
+                End If
 
-                If next_inst_ptr is not equal to 0:
-                    Let next_opcode be proc get_opcode from MIR with next_inst_ptr
+                If next_value is not equal to 0:
+                    Let next_inst_ptr be proc lookup_defining_instruction from MIR with function_ptr, next_value
 
-                    Note: Check for add or sub instruction (MIR_ADD = 20002, MIR_SUB = 20003)
-                    If next_opcode is equal to 20002 or next_opcode is equal to 20003:
-                        Let next_op0 be proc get_operand from MIR with next_inst_ptr, 0
-                        Let next_op1 be proc get_operand from MIR with next_inst_ptr, 1
-                        Let phi_result be proc get_result from MIR with phi_inst_ptr
+                    If next_inst_ptr is not equal to 0:
+                        Let next_opcode be proc get_mir_node_opcode from MIR with next_inst_ptr
 
-                        Note: Check if one operand is phi itself
-                        Let step_value be 0
-                        Let is_canonical be 0
+                        If next_opcode is equal to 20002 or next_opcode is equal to 20003:
+                            Let next_op0 be proc get_mir_node_operand from MIR with next_inst_ptr, 1
+                            Let next_op1 be proc get_mir_node_operand from MIR with next_inst_ptr, 2
+                            Let phi_result be proc get_mir_node_value_id from MIR with phi_inst_ptr
 
-                        If next_op0 is equal to phi_result:
-                            Set step_value to next_op1
-                            Set is_canonical to 1
-                        End If
+                            Let step_value be 0
+                            Let is_canonical be 0
 
-                        If next_op1 is equal to phi_result:
-                            Set step_value to next_op0
-                            Set is_canonical to 1
-                        End If
-
-                        If step_value is not equal to 0:
-                            Note: Allocate InductionVariable structure (88 bytes)
-                            Let iv_ptr be proc allocate_memory from Layout with 88, 8
-                            proc memory_set_int64 from Layout with iv_ptr, 0, phi_inst_ptr
-                            proc memory_set_int64 from Layout with iv_ptr, 8, header_id
-                            proc memory_set_int64 from Layout with iv_ptr, 16, init_value
-                            proc memory_set_int64 from Layout with iv_ptr, 24, step_value
-
-                            Note: Check if step is constant
-                            Let step_is_constant be proc is_constant from MIR with step_value
-                            proc memory_set_int64 from Layout with iv_ptr, 32, step_is_constant
-
-                            Note: Get constant step value if available
-                            Let step_amount be 0
-                            If step_is_constant is equal to 1:
-                                Set step_amount to proc get_constant_value from MIR with step_value
+                            If next_op0 is equal to phi_result:
+                                Set step_value to next_op1
+                                Set is_canonical to 1
                             End If
-                            proc memory_set_int64 from Layout with iv_ptr, 40, step_amount
 
-                            proc memory_set_int64 from Layout with iv_ptr, 48, next_inst_ptr
-                            proc memory_set_int64 from Layout with iv_ptr, 56, 0  Note: exit_condition_ptr
-                            proc memory_set_int64 from Layout with iv_ptr, 64, 0  Note: bound_value_ptr
-                            proc memory_set_int64 from Layout with iv_ptr, 72, 0  Note: comparison_opcode
-                            proc memory_set_int64 from Layout with iv_ptr, 80, is_canonical
+                            Note: ADD commutes; SUB only chains as (phi - step)
+                            If next_opcode is equal to 20002:
+                                If next_op1 is equal to phi_result:
+                                    Set step_value to next_op0
+                                    Set is_canonical to 1
+                                End If
+                            End If
 
-                            proc append from List with induction_vars, iv_ptr
-                            Set found_count to found_count plus 1
+                            If step_value is not equal to 0:
+                                Let iv_ptr be proc allocate from Layout with 96
+                                proc memory_set_int64 from Layout with iv_ptr, 0, phi_inst_ptr
+                                proc memory_set_int64 from Layout with iv_ptr, 8, header_id
+                                proc memory_set_int64 from Layout with iv_ptr, 16, init_value
+                                proc memory_set_int64 from Layout with iv_ptr, 24, step_value
+
+                                Let step_is_constant be proc value_is_constant with function_ptr, step_value
+                                proc memory_set_int64 from Layout with iv_ptr, 32, step_is_constant
+
+                                Let step_amount be 0
+                                If step_is_constant is equal to 1:
+                                    Set step_amount to proc get_value_constant with function_ptr, step_value
+                                    If next_opcode is equal to 20003:
+                                        Set step_amount to 0 minus step_amount
+                                    End If
+                                End If
+                                proc memory_set_int64 from Layout with iv_ptr, 40, step_amount
+
+                                proc memory_set_int64 from Layout with iv_ptr, 48, next_inst_ptr
+                                proc memory_set_int64 from Layout with iv_ptr, 56, 0  Note: exit_condition_ptr
+                                proc memory_set_int64 from Layout with iv_ptr, 64, 0  Note: bound_value_id
+                                proc memory_set_int64 from Layout with iv_ptr, 72, 0  Note: comparison_opcode
+                                proc memory_set_int64 from Layout with iv_ptr, 80, is_canonical
+                                proc memory_set_int64 from Layout with iv_ptr, 88, 0  Note: tested_value_is_next
+
+                                proc append from List with induction_vars, iv_ptr
+                                Set found_count to found_count plus 1
+                            End If
                         End If
                     End If
                 End If
             End If
         End If
 
-        Set phi_idx to phi_idx plus 1
+        Set inst_idx to inst_idx plus 1
     End While
 
     Return found_count
@@ -729,120 +932,116 @@ End Process
 Note: Analyze loop exit condition to compute trip count
 Process called "analyze_trip_count" that takes context_ptr as Integer, loop_ptr as Integer returns Integer:
     @Reasoning
-    Trip-count analysis is the single most decisive piece of information for
-    unrolling profitability:
+    Trip count - the number of BODY EXECUTIONS once the loop is entered - is
+    the decisive input for full unrolling. The latch-resident exit test comes
+    in two shapes with DIFFERENT closed forms:
 
-    - A known small constant trip count (<= max_unroll_iterations, i.e. 16)
-      unlocks FULL unrolling, which eliminates the loop entirely and exposes
-      iteration-specific constant folding (e.g., index-based array offsets
-      become compile-time constants).
-    - A known large constant or an unknown trip count steers the pipeline
-      to PARTIAL unrolling with a remainder loop, which still reduces
-      branch overhead by the unroll factor but keeps code size bounded.
-    - A trip count of 0 (e.g., `for(i=5; i<0; i++)`) causes the loop to be
-      entirely dead — we clamp to 0 and let DCE remove it.
+    - Test on the UPDATED value (rotated do-while: next = i + s; branch on
+      next < bound): trips = ceil((bound - init) / s).
+    - Test on the PHI value (branch on i < bound after the body, with the old
+      i): the body has already executed once more by the time the old value
+      fails, so trips = ceil((bound - init) / s) + 1.
 
-    Closed-form derivation requires init, bound, and step to all be
-    compile-time constants. We deliberately do NOT attempt symbolic trip
-    counts here (e.g., `for(i=0; i<N; i++)` where N is a function parameter)
-    because partial unrolling already covers that case without needing the
-    exact count. Adding symbolic trip-count analysis is reserved for a
-    future SCEV (scalar evolution) pass.
-
-    Comparison operator and step sign must agree: LT/LE require positive
-    step (counting up); GT/GE require negative step (counting down). The
-    handler returns -1 if signs disagree, signaling an infinite loop or a
-    loop that depends on integer overflow — neither is safely unrollable.
-
-    EQ/NE comparisons are recognized as comparisons but deliberately not
-    given closed-form trip counts: they create exit conditions whose trip
-    count depends on whether the IV's trajectory passes exactly through
-    the bound, which is fragile to wraparound and rarely arises in
-    production code that benefits from unrolling.
+    Conflating the two (the pre-reconciliation defect) over- or under-unrolls
+    by one iteration - a wrong-code bug. Comparison operator and step sign
+    must agree: LT/LE require positive step, GT/GE negative. EQ/NE exits are
+    recognized but given no closed form: their trip count depends on the IV
+    trajectory passing exactly through the bound, which is wraparound-fragile.
+    A non-positive range clamps to 1 trip (a latch-tested loop body runs once
+    whenever entered). Step 0 is rejected (non-terminating).
     @End Reasoning
 
     @Implementation
-    Trip count computation for canonical loops:
-
-    for (iv = init; iv < bound; iv += step):
-        trip_count = (bound - init) / step
-
-    Algorithm:
-    1. Find exit branch instruction (in latch or exiting block)
-    2. Get comparison instruction feeding the branch
-    3. Check if comparison uses an induction variable
-    4. If IV, bound, and step are all constant, compute trip count
-    5. Handle different comparison operators (LT, LE, GT, GE, EQ, NE)
-
-    Returns computed trip count or -1 if non-constant.
+    1. Latch terminator must be MIR_BRANCH (20301); its condition use is
+       header operand slot 1
+    2. Resolve the comparison via MIR.lookup_defining_instruction; accept
+       opcodes 20100-20105
+    3. Match either comparison operand against each IV's phi result AND its
+       update result, recording which form was matched
+    4. When init, bound (canonical CONST payloads at extended offset 80), and
+       step are constants, evaluate the closed form for the operator/shape
+    5. Record condition/bound/opcode/shape on the IV and the count on the loop
+    Returns the trip count or -1 when non-constant or unsupported.
     @End Implementation
 
-    Let cfg_ptr be proc memory_get_int64 from Layout with context_ptr, 0
-    Let ssa_ptr be proc memory_get_int64 from Layout with context_ptr, 24
-    Let header_id be proc memory_get_int64 from Layout with loop_ptr, 0
+    Let cfg_ptr be proc memory_get_int64 from Layout with context_ptr, 8
+    Let function_ptr be proc memory_get_int64 from Layout with context_ptr, 0
     Let latch_id be proc memory_get_int64 from Layout with loop_ptr, 16
     Let induction_vars be proc memory_get_int64 from Layout with loop_ptr, 56
 
-    Let latch_ptr be proc get_block_by_id from CFG with cfg_ptr, latch_id
+    Let latch_ptr be proc get_block_by_id_from_cfg from CFG with cfg_ptr, latch_id
     If latch_ptr is equal to 0:
         Return -1
     End If
 
-    Let terminator_ptr be proc get_terminator from MIR with latch_ptr
+    Let terminator_ptr be proc get_block_terminator from CFG with latch_ptr
     If terminator_ptr is equal to 0:
         Return -1
     End If
 
-    Let term_opcode be proc get_opcode from MIR with terminator_ptr
-    Note: MIR_BRANCH = 20301 (conditional branch)
+    Let term_opcode be proc get_mir_node_opcode from MIR with terminator_ptr
     If term_opcode is not equal to 20301:
         Return -1
     End If
 
-    Let condition_value be proc get_operand from MIR with terminator_ptr, 0
+    Let condition_value be proc get_mir_node_operand from MIR with terminator_ptr, 1
     If condition_value is equal to 0:
         Return -1
     End If
 
-    Let cmp_inst_ptr be proc get_defining_instruction from SSA with ssa_ptr, condition_value
+    Let cmp_inst_ptr be proc lookup_defining_instruction from MIR with function_ptr, condition_value
     If cmp_inst_ptr is equal to 0:
         Return -1
     End If
 
-    Let cmp_opcode be proc get_opcode from MIR with cmp_inst_ptr
+    Let cmp_opcode be proc get_mir_node_opcode from MIR with cmp_inst_ptr
     Let is_comparison be 0
-
-    Note: MIR comparison opcodes: MIR_EQ=20100, MIR_NE=20101, MIR_LT=20102, MIR_LE=20103, MIR_GT=20104, MIR_GE=20105
-    If cmp_opcode is equal to 20102 or cmp_opcode is equal to 20103 or cmp_opcode is equal to 20104 or cmp_opcode is equal to 20105 or cmp_opcode is equal to 20100 or cmp_opcode is equal to 20101:
-        Set is_comparison to 1
+    If cmp_opcode is greater than or equal to 20100:
+        If cmp_opcode is less than or equal to 20105:
+            Set is_comparison to 1
+        End If
     End If
 
     If is_comparison is equal to 0:
         Return -1
     End If
 
-    Let cmp_op0 be proc get_operand from MIR with cmp_inst_ptr, 0
-    Let cmp_op1 be proc get_operand from MIR with cmp_inst_ptr, 1
+    Let cmp_op0 be proc get_mir_node_operand from MIR with cmp_inst_ptr, 1
+    Let cmp_op1 be proc get_mir_node_operand from MIR with cmp_inst_ptr, 2
 
-    Note: Find which operand is an induction variable
+    Note: Match a comparison operand against each IV's phi result or update result
     Let iv_count be proc length from List with induction_vars
     Let iv_idx be 0
     Let matching_iv_ptr be 0
     Let bound_value be 0
+    Let tested_next be 0
 
     While iv_idx is less than iv_count:
         Let iv_ptr be proc get from List with induction_vars, iv_idx
         Let phi_inst_ptr be proc memory_get_int64 from Layout with iv_ptr, 0
-        Let phi_result be proc get_result from MIR with phi_inst_ptr
+        Let phi_result be proc get_mir_node_value_id from MIR with phi_inst_ptr
+        Let update_inst be proc memory_get_int64 from Layout with iv_ptr, 48
+        Let next_result be proc get_mir_node_value_id from MIR with update_inst
 
         If cmp_op0 is equal to phi_result:
             Set matching_iv_ptr to iv_ptr
             Set bound_value to cmp_op1
+            Set tested_next to 0
         End If
-
         If cmp_op1 is equal to phi_result:
             Set matching_iv_ptr to iv_ptr
             Set bound_value to cmp_op0
+            Set tested_next to 0
+        End If
+        If cmp_op0 is equal to next_result:
+            Set matching_iv_ptr to iv_ptr
+            Set bound_value to cmp_op1
+            Set tested_next to 1
+        End If
+        If cmp_op1 is equal to next_result:
+            Set matching_iv_ptr to iv_ptr
+            Set bound_value to cmp_op0
+            Set tested_next to 1
         End If
 
         Set iv_idx to iv_idx plus 1
@@ -852,65 +1051,80 @@ Process called "analyze_trip_count" that takes context_ptr as Integer, loop_ptr 
         Return -1
     End If
 
-    Note: Update IV with exit condition information
     proc memory_set_int64 from Layout with matching_iv_ptr, 56, cmp_inst_ptr
     proc memory_set_int64 from Layout with matching_iv_ptr, 64, bound_value
     proc memory_set_int64 from Layout with matching_iv_ptr, 72, cmp_opcode
+    proc memory_set_int64 from Layout with matching_iv_ptr, 88, tested_next
 
-    Note: Attempt constant trip count computation
     Let init_value be proc memory_get_int64 from Layout with matching_iv_ptr, 16
     Let step_is_constant be proc memory_get_int64 from Layout with matching_iv_ptr, 32
     Let step_amount be proc memory_get_int64 from Layout with matching_iv_ptr, 40
-    Let init_is_constant be proc is_constant from MIR with init_value
-    Let bound_is_constant be proc is_constant from MIR with bound_value
+    Let init_is_constant be proc value_is_constant with function_ptr, init_value
+    Let bound_is_constant be proc value_is_constant with function_ptr, bound_value
 
     If init_is_constant is equal to 1 and bound_is_constant is equal to 1 and step_is_constant is equal to 1:
-        Let init_val be proc get_constant_value from MIR with init_value
-        Let bound_val be proc get_constant_value from MIR with bound_value
-        Let trip_count be -1
+        If step_amount is equal to 0:
+            Return -1
+        End If
 
-        Note: Compute trip count based on comparison operator
-        Note: MIR_LT = 20102 — for(i=init; i<bound; i+=step) — trips = (bound-init)/step
+        Let init_val be proc get_value_constant with function_ptr, init_value
+        Let bound_val be proc get_value_constant with function_ptr, bound_value
+        Let trip_count be -1
+        Let range be 0
+        Let abs_step be 0
+
+        Note: MIR_LT = 20102 (counting up, positive step)
         If cmp_opcode is equal to 20102:
             If step_amount is greater than 0:
-                Let range be bound_val minus init_val
-                Set trip_count to range divided by step_amount
+                Set range to bound_val minus init_val
+                Set abs_step to step_amount
             End If
         End If
 
-        Note: MIR_LE = 20103 — for(i=init; i<=bound; i+=step) — trips = (bound-init+1)/step
+        Note: MIR_LE = 20103 - inclusive bound widens the range by one
         If cmp_opcode is equal to 20103:
             If step_amount is greater than 0:
                 Set range to bound_val minus init_val plus 1
-                Set trip_count to range divided by step_amount
+                Set abs_step to step_amount
             End If
         End If
 
-        Note: MIR_GT = 20104 — for(i=init; i>bound; i-=|step|) — trips = (init-bound)/|step|
+        Note: MIR_GT = 20104 (counting down, negative step)
         If cmp_opcode is equal to 20104:
             If step_amount is less than 0:
-                Let abs_step be 0 minus step_amount
                 Set range to init_val minus bound_val
-                Set trip_count to range divided by abs_step
+                Set abs_step to 0 minus step_amount
             End If
         End If
 
-        Note: MIR_GE = 20105 — for(i=init; i>=bound; i-=|step|) — trips = (init-bound+1)/|step|
+        Note: MIR_GE = 20105 - inclusive bound widens the range by one
         If cmp_opcode is equal to 20105:
             If step_amount is less than 0:
-                Set abs_step to 0 minus step_amount
                 Set range to init_val minus bound_val plus 1
-                Set trip_count to range divided by abs_step
+                Set abs_step to 0 minus step_amount
             End If
         End If
 
-        Note: Ensure non-negative trip count
-        If trip_count is less than 0:
-            Set trip_count to 0
+        If abs_step is greater than 0:
+            If range is less than or equal to 0:
+                Note: Latch-tested body runs once whenever the loop is entered
+                Set trip_count to 1
+            Otherwise:
+                Note: ceil(range / abs_step) via positive-operand truncation
+                Set trip_count to (range plus abs_step minus 1) divided by abs_step
+                If tested_next is equal to 0:
+                    Note: Test on the OLD phi value: one extra body execution
+                    Set trip_count to trip_count plus 1
+                End If
+            End If
         End If
 
-        proc memory_set_int64 from Layout with loop_ptr, 64, trip_count
-        Return trip_count
+        If trip_count is greater than 0:
+            proc memory_set_int64 from Layout with loop_ptr, 64, trip_count
+            Return trip_count
+        End If
+
+        Return -1
     End If
 
     Return -1
@@ -919,134 +1133,76 @@ End Process
 Note: Determine if loop unrolling is profitable
 Process called "is_profitable_to_unroll" that takes context_ptr as Integer, loop_ptr as Integer returns Integer:
     @Reasoning
-    Unrolling is one of the few optimizations whose profitability is
-    genuinely hard to predict — it can either accelerate a hot loop by 2-3x
-    (through ILP, scheduling slack, and constant folding across iterations)
-    or destroy performance by busting the I-cache. The gating logic here is
-    conservative on purpose: a borderline candidate is rejected rather than
-    risk regressions.
+    Unrolling either accelerates a hot loop (ILP, scheduling slack, folding
+    across iterations) or destroys performance through I-cache pressure, so
+    borderline candidates are rejected. Rejection axes:
 
-    The three rejection axes:
+    1. Code-size threshold (200 instructions): beyond this, the unrolled body
+       thrashes L1 I-cache.
+    2. Exit structure: the transformations require a unique preheader and a
+       single latch-to-exit edge; anything else (computed by
+       compute_loop_structure) is rejected outright - a malformed unroll
+       cannot be undone.
+    3. Call barriers: a CALL/CALL_INDIRECT/INVOKE inside the body dominates
+       loop cost regardless of branch overhead. This pass runs with
+       function-local scope (no whole-program context), so a callee's size
+       cannot be inspected here: a self-call (resolved via the dual-form
+       callee scheme) is categorically non-inlinable recursion, and any other
+       callee is unverifiable - both are conservative barriers.
+    4. Recursive enclosing function: unrolled code size multiplies through
+       every recursive activation's working set, so self-recursive functions
+       (function_is_recursive) are excluded from unrolling.
 
-    1. **Code-size threshold (200 instructions)** — beyond this, the
-       resulting unrolled body exceeds an L1 I-cache line group on most
-       modern x86-64 microarchitectures (32 KB / 16 instructions-per-line
-       budget). Full unrolling of a 200-instruction body at trip=16 would
-       produce 3,200 instructions — well into i-cache thrashing territory.
-
-    2. **Multiple exits** — early-exit blocks complicate unrolling because
-       each cloned iteration needs its own exit edge to the same target,
-       which can balloon successor sets and confuse downstream passes.
-       Single-exit loops have a clean "fall through to next iteration or
-       leave" shape that mirrors the unrolled-sequential layout.
-
-    3. **Non-inlinable function calls** — a call inside a loop body that
-       cannot be inlined is the dominant cost regardless of branch overhead.
-       Unrolling it just multiplies the call sites without reducing latency.
-       Inlinable calls are NOT a barrier: the inliner will subsequently
-       absorb them, and unrolling exposes the call sites to inlining.
-
-    The two acceptance buckets:
-
-    - **Return 2 (full unroll)** requires a small constant trip count
-      (<= 16). Full unrolling eliminates the loop and exposes per-iteration
-      constants — a 16-iteration loop with a clamp-and-shift body becomes
-      a flat 16-instruction sequence the CSE/GVN passes can collapse.
-
-    - **Return 1 (partial unroll)** is used for any other passable loop:
-      unknown trip count or large constant trip count, body small enough
-      that 4 copies stay within the partial threshold (50 instructions).
-      Factor 4 matches the typical superscalar issue width and is the
-      sweet spot for cleaning up branch overhead without code bloat.
-
-    Inline-size threshold (20 instructions) is independent of the unrolling
-    code-size threshold: it governs ONLY the inlinability lookahead.
+    Acceptance buckets:
+    - Return 2 (full unroll): constant trip count in (0, max_unroll_iterations]
+    - Return 1 (partial unroll): unknown or large trip count with a body small
+      enough that unroll_factor copies stay within a quarter of the threshold
     @End Reasoning
 
     @Implementation
-    Profitability analysis considers:
-
-    1. **Code Size**: Loop body size vs. threshold
-       - Large bodies cause excessive code bloat when unrolled
-       - Threshold: 200 instructions for full unroll, 50 for partial
-
-    2. **Trip Count**: Known constant vs. unknown
-       - Full unroll requires constant trip count < or equal to 16
-       - Partial unroll works with any trip count
-
-    3. **Loop Complexity**:
-       - Multiple exits complicate unrolling (less profitable)
-       - Function calls reduce benefit (unless inlinable)
-       - Memory operations benefit less from unrolling
-
-    Return values:
-    - 0: Not profitable (don't unroll)
-    - 1: Profitable for partial unrolling (factor 4)
-    - 2: Profitable for full unrolling (eliminate loop)
+    Walks the body OrderedMap, resolves each block via
+    CFG.get_block_by_id_from_cfg, totals MIR.get_block_instruction_count, and
+    scans MIR.get_block_instructions for call opcodes (20304/20305/20700) and
+    memory operations (20200/20201). Applies the gates above and returns
+    0 (reject), 1 (partial), or 2 (full).
     @End Implementation
 
-    Let cfg_ptr be proc memory_get_int64 from Layout with context_ptr, 0
-    Let max_unroll_iterations be proc memory_get_int64 from Layout with context_ptr, 72
-    Let code_size_threshold be proc memory_get_int64 from Layout with context_ptr, 80
+    Let cfg_ptr be proc memory_get_int64 from Layout with context_ptr, 8
+    Let function_ptr be proc memory_get_int64 from Layout with context_ptr, 0
+    Let max_unroll_iterations be proc memory_get_int64 from Layout with context_ptr, 56
+    Let code_size_threshold be proc memory_get_int64 from Layout with context_ptr, 64
     Let body_blocks be proc memory_get_int64 from Layout with loop_ptr, 32
     Let trip_count be proc memory_get_int64 from Layout with loop_ptr, 64
-    Let has_multiple_exits be proc memory_get_int64 from Layout with loop_ptr, 68
+    Let has_multiple_exits be proc memory_get_int64 from Layout with loop_ptr, 72
+    Let preheader_id be proc memory_get_int64 from Layout with loop_ptr, 8
+    Let exit_block_id be proc memory_get_int64 from Layout with loop_ptr, 24
 
-    Note: Count instructions and analyze complexity
     Let total_instructions be 0
-    Let has_non_inlinable_calls be 0
+    Let has_call_barrier be 0
     Let memory_ops be 0
-    Let inline_size_threshold be 20
 
-    Let body_list be proc to_list from Set with body_blocks
-    Let body_count be proc length from List with body_list
-    Let block_idx be 0
-
-    While block_idx is less than body_count:
-        Let block_id_str be proc get from List with body_list, block_idx
-        Let block_id be proc string_to_int from MIR with block_id_str
-        Let block_ptr be proc get_block_by_id from CFG with cfg_ptr, block_id
+    Let entry be proc omap_first from OrderedMap with body_blocks
+    While entry is not equal to 0:
+        Let block_id be proc omap_entry_key from OrderedMap with entry
+        Let block_ptr be proc get_block_by_id_from_cfg from CFG with cfg_ptr, block_id
 
         If block_ptr is not equal to 0:
-            Let inst_list be proc get_instructions from MIR with block_ptr
-            Let inst_count be proc length from List with inst_list
+            Let inst_list be proc get_block_instructions from MIR with block_ptr
+            Let inst_count be 0
+            If inst_list is not equal to 0:
+                Set inst_count to proc length from List with inst_list
+            End If
             Set total_instructions to total_instructions plus inst_count
 
             Let inst_idx be 0
             While inst_idx is less than inst_count:
                 Let inst_ptr be proc get from List with inst_list, inst_idx
-                Let opcode be proc get_opcode from MIR with inst_ptr
+                Let opcode be proc get_mir_node_opcode from MIR with inst_ptr
 
-                Note: MIR_CALL = 20304
-                If opcode is equal to 20304:
-                    Note: Check if this call is inlinable
-                    Let callee_fn_ptr be proc get_call_target from MIR with inst_ptr
-                    Let is_inlinable be 0
-
-                    If callee_fn_ptr is not equal to 0:
-                        Note: Get callee function size
-                        Let callee_cfg be proc get_function_cfg from MIR with callee_fn_ptr
-                        If callee_cfg is not equal to 0:
-                            Let callee_inst_count be proc count_instructions from CFG with callee_cfg
-
-                            Note: Function is inlinable if small and non-recursive
-                            If callee_inst_count is less than or equal to inline_size_threshold:
-                                Note: Check for recursion (callee doesn't call itself)
-                                Let has_recursion be proc function_is_recursive from MIR with callee_fn_ptr
-                                If has_recursion is equal to 0:
-                                    Set is_inlinable to 1
-                                End If
-                            End If
-                        End If
-                    End If
-
-                    Note: If call is not inlinable, mark as problematic for unrolling
-                    If is_inlinable is equal to 0:
-                        Set has_non_inlinable_calls to 1
-                    End If
+                If opcode is equal to 20304 or opcode is equal to 20305 or opcode is equal to 20700:
+                    Set has_call_barrier to 1
                 End If
 
-                Note: MIR_LOAD = 20200, MIR_STORE = 20201
                 If opcode is equal to 20200 or opcode is equal to 20201:
                     Set memory_ops to memory_ops plus 1
                 End If
@@ -1055,35 +1211,42 @@ Process called "is_profitable_to_unroll" that takes context_ptr as Integer, loop
             End While
         End If
 
-        Set block_idx to block_idx plus 1
+        Set entry to proc omap_entry_next from OrderedMap with entry
     End While
 
-    Note: Reject if too large
     If total_instructions is greater than code_size_threshold:
         Return 0
     End If
 
-    Note: Reject if multiple exits (complex control flow)
     If has_multiple_exits is equal to 1:
         Return 0
     End If
 
-    Note: Reject if non-inlinable function calls present
-    If has_non_inlinable_calls is equal to 1:
+    Note: -1 sentinels (0 is a valid block id - typically the preheader's)
+    If preheader_id is less than 0:
         Return 0
     End If
 
-    Note: Check for full unroll opportunity
+    If exit_block_id is less than 0:
+        Return 0
+    End If
+
+    If has_call_barrier is equal to 1:
+        Return 0
+    End If
+
+    Let enclosing_is_recursive be proc function_is_recursive with function_ptr
+    If enclosing_is_recursive is equal to 1:
+        Return 0
+    End If
+
     If trip_count is greater than 0 and trip_count is less than or equal to max_unroll_iterations:
-        Note: Small constant trip count - full unroll is beneficial
         Return 2
     End If
 
-    Note: Check for partial unroll opportunity
     If trip_count is greater than max_unroll_iterations or trip_count is equal to -1:
         Let partial_threshold be code_size_threshold divided by 4
         If total_instructions is less than or equal to partial_threshold:
-            Note: Reasonably small body - partial unroll beneficial
             Return 1
         End If
     End If
@@ -1091,599 +1254,1239 @@ Process called "is_profitable_to_unroll" that takes context_ptr as Integer, loop
     Return 0
 End Process
 
-Note: Clone a basic block with unique suffix
-Process called "clone_block" that takes context_ptr as Integer, original_block_id as Integer, suffix as Integer returns Integer:
+Note: Remove one instruction from a block's instruction list and phi registry
+Process called "unroll_remove_instruction_from_block" that takes block_ptr as Integer, inst_ptr as Integer returns Integer:
+    @Implementation
+    Locates the instruction in the block's canonical instruction list
+    (MIRBasicBlock offset 16) via list_index_of, removes it, and resyncs the
+    cached instruction_count at offset 24 to the list's true length - the
+    same residence/count discipline ssa.runa uses for phi destruction. Phi
+    instructions are also dropped from the secondary phi_nodes registry at
+    offset 88 when present. Returns 1 when the instruction was found.
+    @End Implementation
+
+    If block_ptr is equal to 0 or inst_ptr is equal to 0:
+        Return 0
+    End If
+
+    Let inst_list be proc get_block_instructions from MIR with block_ptr
+    If inst_list is equal to 0:
+        Return 0
+    End If
+
+    Let idx be proc list_index_of from List with inst_list, inst_ptr
+    If idx is less than 0:
+        Return 0
+    End If
+
+    proc list_remove from List with inst_list, idx
+    Let new_count be proc length from List with inst_list
+    proc memory_set_int64 from Layout with block_ptr, 24, new_count
+
+    Let opcode be proc get_mir_node_opcode from MIR with inst_ptr
+    If opcode is equal to 20300:
+        Let registry be proc memory_get_int64 from Layout with block_ptr, 88
+        If registry is not equal to 0:
+            Let ridx be proc list_index_of from List with registry, inst_ptr
+            If ridx is greater than or equal to 0:
+                proc list_remove from List with registry, ridx
+            End If
+        End If
+    End If
+
+    Return 1
+End Process
+
+Note: Resynchronize a block's cached predecessor/successor counts
+Process called "unroll_resync_edge_counts" that takes cfg_ptr as Integer, block_id as Integer returns Nothing:
     @Reasoning
-    Block cloning is the workhorse primitive of both full and partial
-    unrolling: each iteration of the unrolled loop becomes its own copy of
-    the body. The suffix-encoded id scheme (original_id * 1000 + suffix)
-    is deliberately simple — it produces unique, predictable, easily
-    debuggable block ids without needing a separate id allocator state on
-    the context.
+    CFG.remove_cfg_edge removes ids from the predecessor/successor LISTS but
+    does not decrement the cached counts at MIRBasicBlock offsets 40/56 (the
+    count-desync defect owned by the cfg.runa wave). Per the reconciliation
+    coordination rule this pass does not edit cfg.runa; instead every removal
+    site resynchronizes the caches to the lists' true lengths, the same way
+    transformations/optimization.runa handles its removal sites.
+    @End Reasoning
 
-    The 1000 multiplier is safe because:
-    - The MIR builder reserves block ids below 1000 for canonical blocks;
-      cloned ids never collide with originals.
-    - Suffix range is bounded: full unroll uses 0..max_unroll_iterations
-      (i.e., 0..15), partial unroll uses 0..unroll_factor-1 plus the
-      remainder-loop suffix 9000. All fit cleanly within the [0, 1000)
-      window per original block.
+    Let block_ptr be proc get_block_by_id_from_cfg from CFG with cfg_ptr, block_id
+    If block_ptr is equal to 0:
+        Return
+    End If
 
-    Instructions are cloned via MIR's clone_instruction primitive, which
-    handles deep-copy semantics for operand vectors. SSA renaming is
-    delegated to rename_cloned_values rather than done inline — separating
-    structural cloning from value renaming keeps each phase
-    independently testable.
+    Let predecessors be proc get_block_predecessors from MIR with block_ptr
+    Let pred_len be 0
+    If predecessors is not equal to 0:
+        Set pred_len to proc length from List with predecessors
+    End If
+    proc memory_set_int64 from Layout with block_ptr, 40, pred_len
+
+    Let successors be proc get_block_successors from MIR with block_ptr
+    Let succ_len be 0
+    If successors is not equal to 0:
+        Set succ_len to proc length from List with successors
+    End If
+    proc memory_set_int64 from Layout with block_ptr, 56, succ_len
+End Process
+
+Note: Resynchronize cached edge counts for every block in the CFG
+Process called "unroll_resync_all_edge_counts" that takes cfg_ptr as Integer returns Nothing:
+    @Implementation
+    Defensive full-CFG resync used after block deletion: remove_block_from_cfg
+    unlinks edges of every neighbor internally through remove_cfg_edge, so
+    neighbor caches desync without this pass seeing the individual calls, and
+    it removes the block from the CFG's block list without decrementing the
+    cached block_count at MIRCFG offset 24 (the same count-desync class owned
+    by the cfg.runa wave). One linear walk restores every per-block cache to
+    its list's true length, and the CFG-level block_count cache is resynced
+    to the block list's true length first.
+    @End Implementation
+
+    Let blocks_list be proc get_mir_cfg_blocks from CFG with cfg_ptr
+    Let blocks_count be proc length from List with blocks_list
+    proc memory_set_int64 from Layout with cfg_ptr, 24, blocks_count
+    Let block_idx be 0
+
+    While block_idx is less than blocks_count:
+        Let block_ptr be proc get from List with blocks_list, block_idx
+        Let block_id be proc get_mir_basic_block_id from CFG with block_ptr
+        proc unroll_resync_edge_counts with cfg_ptr, block_id
+        Set block_idx to block_idx plus 1
+    End While
+End Process
+
+Note: Clone a basic block into the CFG with a fresh allocator-issued id
+Process called "clone_block" that takes context_ptr as Integer, original_block_id as Integer, clone_map as Integer returns Integer:
+    @Reasoning
+    Block cloning is the workhorse primitive of both transformations. Clone
+    ids come from the CFG's own allocator (CFG.create_basic_block reads
+    get_next_block_id) - never from arithmetic schemes on the original id,
+    which can collide with allocator-issued ids. Instructions are cloned via
+    MIR.clone_instruction (OD-6): records are 72-144 bytes sized by opcode
+    band, and the clone deep-copies embedded lists (phi pairs, call args,
+    switch cases), so any fixed-size copy would be a heap overrun and any
+    shallow copy would alias mutable lists.
     @End Reasoning
 
     @Implementation
-    Block cloning creates a copy of all instructions in the block with new IDs.
-
-    Steps:
-    1. Generate unique block ID (original_id * 1000 + suffix)
-    2. Create new block in CFG
-    3. Clone each instruction using MIR.clone_instruction
-    4. Add cloned instructions to new block
-    5. Update block_clone_map for edge rewriting
-
-    Returns new block ID or 0 on failure.
+    1. CFG.create_basic_block allocates the block with a fresh id; it does
+       NOT register it, so MIR.add_block_to_cfg is called immediately (before
+       any further id allocation, which computes max(existing)+1)
+    2. Each original instruction is cloned via MIR.clone_instruction and
+       appended through CFG.add_instruction_to_block (which maintains the
+       instruction count and parent back-pointer)
+    3. Cloned phis are mirrored into the clone's phi_nodes registry at
+       block offset 88, preserving the secondary index SSA maintains
+    4. Records original_id -> clone_id in the caller's OrderedMap
+    Returns the clone's block id, or 0 on failure.
     @End Implementation
 
-    Let cfg_ptr be proc memory_get_int64 from Layout with context_ptr, 0
-    Let block_clone_map be proc memory_get_int64 from Layout with context_ptr, 32
-    Let original_block_ptr be proc get_block_by_id from CFG with cfg_ptr, original_block_id
+    Let cfg_ptr be proc memory_get_int64 from Layout with context_ptr, 8
+    Let original_block_ptr be proc get_block_by_id_from_cfg from CFG with cfg_ptr, original_block_id
 
     If original_block_ptr is equal to 0:
         Return 0
     End If
 
-    Note: Generate unique block ID
-    Let new_block_id be original_block_id multiplied by 1000 plus suffix
-    Let new_block_ptr be proc create_block from CFG with cfg_ptr, new_block_id
-
+    Let new_block_ptr be proc create_basic_block from CFG with cfg_ptr
     If new_block_ptr is equal to 0:
         Return 0
     End If
+    proc add_block_to_cfg from MIR with cfg_ptr, new_block_ptr
+    Let new_block_id be proc get_mir_basic_block_id from CFG with new_block_ptr
 
-    Note: Clone all instructions
-    Let inst_list be proc get_instructions from MIR with original_block_ptr
-    Let inst_count be proc length from List with inst_list
+    Let inst_list be proc get_block_instructions from MIR with original_block_ptr
+    Let inst_count be 0
+    If inst_list is not equal to 0:
+        Set inst_count to proc length from List with inst_list
+    End If
     Let inst_idx be 0
 
     While inst_idx is less than inst_count:
         Let original_inst_ptr be proc get from List with inst_list, inst_idx
         Let cloned_inst_ptr be proc clone_instruction from MIR with original_inst_ptr
-        proc add_instruction from MIR with new_block_ptr, cloned_inst_ptr
+        If cloned_inst_ptr is not equal to 0:
+            proc add_instruction_to_block from CFG with new_block_ptr, cloned_inst_ptr
+
+            Let cloned_opcode be proc get_mir_node_opcode from MIR with cloned_inst_ptr
+            If cloned_opcode is equal to 20300:
+                Let registry be proc memory_get_int64 from Layout with new_block_ptr, 88
+                If registry is not equal to 0:
+                    proc append from List with registry, cloned_inst_ptr
+                End If
+            End If
+        End If
         Set inst_idx to inst_idx plus 1
     End While
 
-    Note: Update clone map
-    Let original_id_str be proc int_to_string from MIR with original_block_id
-    Let new_id_str be proc int_to_string from MIR with new_block_id
-    proc set from Dictionary with block_clone_map, original_id_str, new_id_str
+    proc omap_set from OrderedMap with clone_map, original_block_id, new_block_id
 
     Return new_block_id
 End Process
 
-Note: Rename SSA values in cloned block for specific iteration
-Process called "rename_cloned_values" that takes context_ptr as Integer, cloned_block_id as Integer, iteration as Integer returns Nothing:
+Note: Resolve header-clone phis into chained values and delete the phi clones
+Process called "resolve_header_phis" that takes context_ptr as Integer, header_clone_id as Integer, loop_ptr as Integer, prev_value_map as Integer, value_map as Integer, use_init as Integer returns Nothing:
     @Reasoning
-    SSA's defining invariant is that every value has exactly one definition;
-    cloning a block N times produces N redundant definitions of every result
-    inside, violating SSA. Renaming restores the invariant by giving each
-    cloned definition a distinct SSA name keyed by iteration index.
+    A cloned copy of the loop header has straight-line entry (one incoming
+    path), so its phis are not merges any more - each resolves to a single
+    value. Copy 0 of a full unroll enters from the preheader: every phi
+    resolves to its init-side incoming. Every later copy enters from the
+    previous copy: the phi resolves to its latch-side incoming value
+    translated through the previous copy's rename map (chaining values
+    across iterations). The resolution is recorded in this copy's value map
+    keyed by the ORIGINAL phi result id - cloned instructions still carry
+    original operand ids at this point - and the now-meaningless phi clone
+    is removed from the clone block.
 
-    The value_rename_map is a two-level structure: original_value_id ->
-    List indexed by iteration -> new value_id. This layout matters:
-
-    - It lets later iterations look up values produced by earlier
-      iterations (forward references in the unrolled body) without needing
-      to re-walk the cloned blocks.
-    - It supports out-of-order iteration processing (which the partial
-      unroller exploits when it clones for clone_idx = 1..unroll_factor-1
-      out of order).
-    - The list is grown lazily with zero-padding so set-at-index is safe
-      even when iterations are processed non-monotonically.
-
-    Operand rewriting consults this map only — original operands that have
-    no entry (loop-invariant values defined outside the loop) are
-    intentionally left untouched, since they remain valid across all
-    cloned iterations.
+    This generic resolution covers EVERY header phi (induction variables,
+    accumulators, pointers), not only the IV: correctness never depends on a
+    special-cased constant substitution, and downstream constant folding
+    collapses the IV chain when init and step are constants.
     @End Reasoning
 
     @Implementation
-    SSA renaming ensures each cloned instruction produces unique values.
-
-    For iteration N:
-    - Original: %result = add %a, %b
-    - Renamed: %result.N = add %a.N, %b.N
-
-    Algorithm:
-    1. For each instruction in cloned block:
-         a. Create new SSA name for result value
-         b. Update value_rename_map[original_result][iteration] = new_result
-         c. For each operand:
-              - Look up renamed value from current/previous iterations
-              - Update operand to use renamed value
-
-    The value_rename_map maintains: original_value -> list[iteration] -> renamed_value
+    Collects the phi clones first (removal mutates the instruction list),
+    then for each: reads its incomings via the canonical phi accessors, picks
+    the init side (incoming block != latch) when use_init is 1, otherwise the
+    latch side translated through prev_value_map (identity when the previous
+    copy is the original loop body itself, signalled by prev_value_map = 0 or
+    a missing key). Maps original phi result -> resolved value and removes
+    the clone via unroll_remove_instruction_from_block.
     @End Implementation
 
-    Let cfg_ptr be proc memory_get_int64 from Layout with context_ptr, 0
-    Let ssa_ptr be proc memory_get_int64 from Layout with context_ptr, 24
-    Let value_rename_map be proc memory_get_int64 from Layout with context_ptr, 40
-    Let block_ptr be proc get_block_by_id from CFG with cfg_ptr, cloned_block_id
+    Let cfg_ptr be proc memory_get_int64 from Layout with context_ptr, 8
+    Let latch_id be proc memory_get_int64 from Layout with loop_ptr, 16
+    Let header_clone_ptr be proc get_block_by_id_from_cfg from CFG with cfg_ptr, header_clone_id
+    If header_clone_ptr is equal to 0:
+        Return
+    End If
 
+    Let inst_list be proc get_block_instructions from MIR with header_clone_ptr
+    If inst_list is equal to 0:
+        Return
+    End If
+
+    Note: Collect phi clones before removing any (removal mutates the list)
+    Let phi_clones be proc create from List
+    Let inst_count be proc length from List with inst_list
+    Let inst_idx be 0
+    While inst_idx is less than inst_count:
+        Let inst_ptr be proc get from List with inst_list, inst_idx
+        Let opcode be proc get_mir_node_opcode from MIR with inst_ptr
+        If opcode is equal to 20300:
+            proc append from List with phi_clones, inst_ptr
+        End If
+        Set inst_idx to inst_idx plus 1
+    End While
+
+    Let phi_count be proc length from List with phi_clones
+    Let phi_idx be 0
+
+    While phi_idx is less than phi_count:
+        Let phi_clone be proc get from List with phi_clones, phi_idx
+        Let orig_result be proc get_mir_node_value_id from MIR with phi_clone
+
+        Let resolved be 0
+        Let incoming_count be proc get_phi_incoming_count from MIRNodes with phi_clone
+        Let k be 0
+        While k is less than incoming_count:
+            Let in_block be proc get_phi_incoming_block from MIRNodes with phi_clone, k
+            Let in_value be proc get_phi_incoming_value from MIRNodes with phi_clone, k
+
+            If use_init is equal to 1:
+                If in_block is not equal to latch_id:
+                    Set resolved to in_value
+                End If
+            Otherwise:
+                If in_block is equal to latch_id:
+                    Set resolved to in_value
+                    If prev_value_map is not equal to 0:
+                        Let mapped be proc omap_get from OrderedMap with prev_value_map, in_value
+                        If mapped is not equal to 0:
+                            Set resolved to mapped
+                        End If
+                    End If
+                End If
+            End If
+
+            Set k to k plus 1
+        End While
+
+        If orig_result is not equal to 0 and resolved is not equal to 0:
+            proc omap_set from OrderedMap with value_map, orig_result, resolved
+        End If
+
+        proc unroll_remove_instruction_from_block with header_clone_ptr, phi_clone
+        Set phi_idx to phi_idx plus 1
+    End While
+
+    proc destroy from List with phi_clones
+End Process
+
+Note: Assign fresh SSA result ids to every definition in a cloned block
+Process called "assign_fresh_result_ids" that takes context_ptr as Integer, block_id as Integer, value_map as Integer returns Nothing:
+    @Reasoning
+    SSA's defining invariant is one definition per value; cloning produces
+    duplicate definitions of every result. Each cloned definition receives a
+    fresh id from the function-level allocator (MIR.allocate_value_id) and is
+    registered through MIR.register_value_definition so
+    lookup_defining_instruction stays authoritative. Phi results route
+    through MIRNodes.set_phi_result_value_id, which keeps the header value_id
+    and the extended result mirror coherent per OD-1; all other records use
+    the canonical header mutator (the header slot at offset 8 is the
+    authoritative result slot for every consumer).
+    @End Reasoning
+
+    Let function_ptr be proc memory_get_int64 from Layout with context_ptr, 0
+    Let cfg_ptr be proc memory_get_int64 from Layout with context_ptr, 8
+    Let block_ptr be proc get_block_by_id_from_cfg from CFG with cfg_ptr, block_id
     If block_ptr is equal to 0:
         Return
     End If
 
-    Let inst_list be proc get_instructions from MIR with block_ptr
+    Let inst_list be proc get_block_instructions from MIR with block_ptr
+    If inst_list is equal to 0:
+        Return
+    End If
+
     Let inst_count be proc length from List with inst_list
     Let inst_idx be 0
 
     While inst_idx is less than inst_count:
         Let inst_ptr be proc get from List with inst_list, inst_idx
-        Let original_result be proc get_result from MIR with inst_ptr
+        Let orig_result be proc get_mir_node_value_id from MIR with inst_ptr
 
-        Note: Rename result value
-        If original_result is not equal to 0:
-            Let new_result be proc create_new_value from SSA with ssa_ptr, original_result, iteration
-            proc set_result from MIR with inst_ptr, new_result
-
-            Note: Update rename map
-            Let original_result_str be proc int_to_string from MIR with original_result
-            Let rename_list be proc get from Dictionary with value_rename_map, original_result_str
-
-            If rename_list is equal to 0:
-                Set rename_list to proc create from List
-                proc set from Dictionary with value_rename_map, original_result_str, rename_list
+        If orig_result is not equal to 0:
+            Let new_id be proc allocate_value_id from MIR with function_ptr
+            Let opcode be proc get_mir_node_opcode from MIR with inst_ptr
+            If opcode is equal to 20300:
+                proc set_phi_result_value_id from MIRNodes with inst_ptr, new_id
+            Otherwise:
+                proc set_mir_node_value_id from MIR with inst_ptr, new_id
             End If
-
-            Note: Ensure list is large enough
-            While proc length from List with rename_list is less than or equal to iteration:
-                proc append from List with rename_list, 0
-            End While
-
-            proc set from List with rename_list, iteration, new_result
+            proc register_value_definition from MIR with function_ptr, new_id, inst_ptr
+            proc omap_set from OrderedMap with value_map, orig_result, new_id
         End If
-
-        Note: Rename operands
-        Let operand_count be proc get_operand_count from MIR with inst_ptr
-        Let op_idx be 0
-
-        While op_idx is less than operand_count:
-            Let original_operand be proc get_operand from MIR with inst_ptr, op_idx
-            Let original_operand_str be proc int_to_string from MIR with original_operand
-            Set rename_list to proc get from Dictionary with value_rename_map, original_operand_str
-
-            If rename_list is not equal to 0:
-                Note: Get renamed value from appropriate iteration
-                If iteration is less than proc length from List with rename_list:
-                    Let renamed_operand be proc get from List with rename_list, iteration
-                    If renamed_operand is not equal to 0:
-                        proc set_operand from MIR with inst_ptr, op_idx, renamed_operand
-                    End If
-                End If
-            End If
-
-            Set op_idx to op_idx plus 1
-        End While
 
         Set inst_idx to inst_idx plus 1
     End While
 End Process
 
+Note: Rewrite value uses in one block through a rename map
+Process called "rewrite_uses_in_block" that takes context_ptr as Integer, block_id as Integer, value_map as Integer returns Nothing:
+    @Reasoning
+    Use rewriting goes through MIRNodes.set_mir_node_used_value, the single
+    write point that keeps the canonical header operand slots AND the
+    per-record extended mirrors coherent under OD-1 (the Wave 4 mutator).
+    MIR.replace_all_uses is NOT used: it operates on MIRValue use-lists that
+    SSA never materializes. Phi incoming values are rewritten through
+    set_phi_incoming_value; call/invoke argument lists are value-id Lists
+    rewritten in place. Indirect-call callee uses cannot occur here because
+    profitability bars every call opcode from unrolled bodies.
+    @End Reasoning
+
+    Let cfg_ptr be proc memory_get_int64 from Layout with context_ptr, 8
+    Let block_ptr be proc get_block_by_id_from_cfg from CFG with cfg_ptr, block_id
+    If block_ptr is equal to 0:
+        Return
+    End If
+
+    Let inst_list be proc get_block_instructions from MIR with block_ptr
+    If inst_list is equal to 0:
+        Return
+    End If
+
+    Let inst_count be proc length from List with inst_list
+    Let inst_idx be 0
+
+    While inst_idx is less than inst_count:
+        Let inst_ptr be proc get from List with inst_list, inst_idx
+        Let opcode be proc get_mir_node_opcode from MIR with inst_ptr
+
+        If opcode is equal to 20300:
+            Let incoming_count be proc get_phi_incoming_count from MIRNodes with inst_ptr
+            Let k be 0
+            While k is less than incoming_count:
+                Let in_value be proc get_phi_incoming_value from MIRNodes with inst_ptr, k
+                If in_value is not equal to 0:
+                    Let mapped be proc omap_get from OrderedMap with value_map, in_value
+                    If mapped is not equal to 0:
+                        proc set_phi_incoming_value from MIRNodes with inst_ptr, k, mapped
+                    End If
+                End If
+                Set k to k plus 1
+            End While
+        Otherwise:
+            If opcode is equal to 20304 or opcode is equal to 20305 or opcode is equal to 20700:
+                Let args be proc get_call_arguments from MIRNodes with inst_ptr
+                Let arg_count be 0
+                If args is not equal to 0:
+                    Set arg_count to proc length from List with args
+                End If
+                Let a be 0
+                While a is less than arg_count:
+                    Let arg_value be proc get from List with args, a
+                    If arg_value is not equal to 0:
+                        Let mapped_arg be proc omap_get from OrderedMap with value_map, arg_value
+                        If mapped_arg is not equal to 0:
+                            proc set from List with args, a, mapped_arg
+                        End If
+                    End If
+                    Set a to a plus 1
+                End While
+            End If
+
+            Let slot be 1
+            While slot is less than or equal to 3:
+                Let op_value be proc get_mir_node_operand from MIR with inst_ptr, slot
+                If op_value is not equal to 0:
+                    Let mapped_op be proc omap_get from OrderedMap with value_map, op_value
+                    If mapped_op is not equal to 0:
+                        proc set_mir_node_used_value from MIRNodes with inst_ptr, slot, mapped_op
+                    End If
+                End If
+                Set slot to slot plus 1
+            End While
+        End If
+
+        Set inst_idx to inst_idx plus 1
+    End While
+End Process
+
+Note: Remap phi incoming block ids in one block through a block clone map
+Process called "remap_phi_incoming_blocks" that takes context_ptr as Integer, block_id as Integer, clone_map as Integer returns Nothing:
+    @Implementation
+    For each phi in the block, every incoming block id present in the clone
+    map is retargeted to its clone via the canonical
+    CFG.update_phi_node_predecessor. Used for join-point phis INSIDE cloned
+    iterations (internal control-flow merges); header phis are resolved and
+    deleted before this runs.
+    @End Implementation
+
+    Let cfg_ptr be proc memory_get_int64 from Layout with context_ptr, 8
+    Let block_ptr be proc get_block_by_id_from_cfg from CFG with cfg_ptr, block_id
+    If block_ptr is equal to 0:
+        Return
+    End If
+
+    Let inst_list be proc get_block_instructions from MIR with block_ptr
+    If inst_list is equal to 0:
+        Return
+    End If
+
+    Let inst_count be proc length from List with inst_list
+    Let inst_idx be 0
+
+    While inst_idx is less than inst_count:
+        Let inst_ptr be proc get from List with inst_list, inst_idx
+        Let opcode be proc get_mir_node_opcode from MIR with inst_ptr
+
+        If opcode is equal to 20300:
+            Let incoming_count be proc get_phi_incoming_count from MIRNodes with inst_ptr
+            Let k be 0
+            While k is less than incoming_count:
+                Let in_block be proc get_phi_incoming_block from MIRNodes with inst_ptr, k
+                Let mapped_block be proc omap_get from OrderedMap with clone_map, in_block
+                If mapped_block is not equal to 0:
+                    proc update_phi_node_predecessor from CFG with inst_ptr, in_block, mapped_block
+                End If
+                Set k to k plus 1
+            End While
+        End If
+
+        Set inst_idx to inst_idx plus 1
+    End While
+End Process
+
+Note: Remap a cloned block's terminator targets through a block clone map
+Process called "remap_block_targets" that takes context_ptr as Integer, block_id as Integer, clone_map as Integer returns Nothing:
+    @Reasoning
+    Cloned terminators still target ORIGINAL block ids; every target with a
+    clone in this iteration's map is retargeted so intra-iteration control
+    flow stays inside the iteration. Targets are read first through the
+    canonical per-opcode accessors and only matching targets are passed to
+    CFG.update_terminator_target - the JUMP arm of that updater rewrites
+    unconditionally regardless of the old id, so blind per-map-entry calls
+    would smash unrelated jump targets.
+    @End Reasoning
+
+    Let cfg_ptr be proc memory_get_int64 from Layout with context_ptr, 8
+    Let block_ptr be proc get_block_by_id_from_cfg from CFG with cfg_ptr, block_id
+    If block_ptr is equal to 0:
+        Return
+    End If
+
+    Let terminator be proc get_block_terminator from CFG with block_ptr
+    If terminator is equal to 0:
+        Return
+    End If
+
+    Let opcode be proc get_mir_node_opcode from MIR with terminator
+
+    If opcode is equal to 20301:
+        Let true_target be proc get_mir_branch_true_block from MIRNodes with terminator
+        Let mapped_true be proc omap_get from OrderedMap with clone_map, true_target
+        If mapped_true is not equal to 0:
+            proc update_terminator_target from CFG with cfg_ptr, block_id, true_target, mapped_true
+        End If
+        Let false_target be proc get_mir_branch_false_block from MIRNodes with terminator
+        Let mapped_false be proc omap_get from OrderedMap with clone_map, false_target
+        If mapped_false is not equal to 0:
+            proc update_terminator_target from CFG with cfg_ptr, block_id, false_target, mapped_false
+        End If
+    End If
+
+    If opcode is equal to 20302:
+        Let jump_target be proc get_mir_jump_target_block from MIRNodes with terminator
+        Let mapped_jump be proc omap_get from OrderedMap with clone_map, jump_target
+        If mapped_jump is not equal to 0:
+            proc update_terminator_target from CFG with cfg_ptr, block_id, jump_target, mapped_jump
+        End If
+    End If
+
+    If opcode is equal to 20306:
+        Let default_target be proc get_mir_switch_default_block from MIRNodes with terminator
+        Let mapped_default be proc omap_get from OrderedMap with clone_map, default_target
+        If mapped_default is not equal to 0:
+            proc update_terminator_target from CFG with cfg_ptr, block_id, default_target, mapped_default
+        End If
+        Let case_count be proc get_mir_switch_case_count from MIRNodes with terminator
+        Let c be 0
+        While c is less than case_count:
+            Let case_target be proc get_mir_switch_case_block from MIRNodes with terminator, c
+            Let mapped_case be proc omap_get from OrderedMap with clone_map, case_target
+            If mapped_case is not equal to 0:
+                proc update_terminator_target from CFG with cfg_ptr, block_id, case_target, mapped_case
+            End If
+            Set c to c plus 1
+        End While
+    End If
+
+    If opcode is equal to 20700:
+        Let normal_target be proc get_mir_invoke_normal_block from MIRNodes with terminator
+        Let mapped_normal be proc omap_get from OrderedMap with clone_map, normal_target
+        If mapped_normal is not equal to 0:
+            proc update_terminator_target from CFG with cfg_ptr, block_id, normal_target, mapped_normal
+        End If
+        Let unwind_target be proc get_mir_invoke_unwind_block from MIRNodes with terminator
+        Let mapped_unwind be proc omap_get from OrderedMap with clone_map, unwind_target
+        If mapped_unwind is not equal to 0:
+            proc update_terminator_target from CFG with cfg_ptr, block_id, unwind_target, mapped_unwind
+        End If
+    End If
+End Process
+
+Note: Register CFG edges for every target of a block's terminator
+Process called "unroll_add_terminator_edges" that takes cfg_ptr as Integer, block_id as Integer returns Nothing:
+    @Implementation
+    Reads the block's terminator targets through the canonical per-opcode
+    accessors and registers each distinct target once via MIR.add_cfg_edge
+    (which maintains both endpoint lists, both cached counts, and the CFG
+    edge table). A local seen-list deduplicates targets so a branch with
+    equal arms or a switch with repeated case targets does not produce
+    duplicate edges.
+    @End Implementation
+
+    Let block_ptr be proc get_block_by_id_from_cfg from CFG with cfg_ptr, block_id
+    If block_ptr is equal to 0:
+        Return
+    End If
+
+    Let terminator be proc get_block_terminator from CFG with block_ptr
+    If terminator is equal to 0:
+        Return
+    End If
+
+    Let opcode be proc get_mir_node_opcode from MIR with terminator
+    Let targets be proc create from List
+
+    If opcode is equal to 20301:
+        Let true_target be proc get_mir_branch_true_block from MIRNodes with terminator
+        proc append from List with targets, true_target
+        Let false_target be proc get_mir_branch_false_block from MIRNodes with terminator
+        proc append from List with targets, false_target
+    End If
+
+    If opcode is equal to 20302:
+        Let jump_target be proc get_mir_jump_target_block from MIRNodes with terminator
+        proc append from List with targets, jump_target
+    End If
+
+    If opcode is equal to 20306:
+        Let default_target be proc get_mir_switch_default_block from MIRNodes with terminator
+        proc append from List with targets, default_target
+        Let case_count be proc get_mir_switch_case_count from MIRNodes with terminator
+        Let c be 0
+        While c is less than case_count:
+            Let case_target be proc get_mir_switch_case_block from MIRNodes with terminator, c
+            proc append from List with targets, case_target
+            Set c to c plus 1
+        End While
+    End If
+
+    If opcode is equal to 20700:
+        Let normal_target be proc get_mir_invoke_normal_block from MIRNodes with terminator
+        proc append from List with targets, normal_target
+        Let unwind_target be proc get_mir_invoke_unwind_block from MIRNodes with terminator
+        proc append from List with targets, unwind_target
+    End If
+
+    Let seen be proc create from List
+    Let target_count be proc length from List with targets
+    Let t be 0
+    While t is less than target_count:
+        Let target_id be proc get from List with targets, t
+        Let already be proc contains from List with seen, target_id
+        If already is equal to 0:
+            proc append from List with seen, target_id
+            proc add_cfg_edge from MIR with cfg_ptr, block_id, target_id
+        End If
+        Set t to t plus 1
+    End While
+
+    proc destroy from List with seen
+    proc destroy from List with targets
+End Process
+
+Note: Replace a block's terminator with an unconditional jump
+Process called "unroll_replace_terminator_with_jump" that takes context_ptr as Integer, block_id as Integer, target_id as Integer returns Nothing:
+    @Implementation
+    Removes the existing terminator (the comparison feeding it remains and is
+    swept by DCE) and appends a fresh MIRNodes.create_mir_jump record - a
+    112-byte branch cannot legally be mutated into an 80-byte jump in place
+    under the record-size discipline. The caller is responsible for edge
+    registration after all retargeting settles.
+    @End Implementation
+
+    Let cfg_ptr be proc memory_get_int64 from Layout with context_ptr, 8
+    Let block_ptr be proc get_block_by_id_from_cfg from CFG with cfg_ptr, block_id
+    If block_ptr is equal to 0:
+        Return
+    End If
+
+    Let terminator be proc get_block_terminator from CFG with block_ptr
+    If terminator is not equal to 0:
+        proc unroll_remove_instruction_from_block with block_ptr, terminator
+    End If
+
+    Let jump_inst be proc create_mir_jump from MIRNodes with target_id
+    proc add_instruction_to_block from CFG with block_ptr, jump_inst
+End Process
+
 Note: Perform full loop unrolling (completely eliminate loop)
 Process called "full_unroll_loop" that takes context_ptr as Integer, loop_ptr as Integer returns Integer:
     @Reasoning
-    Full unrolling is the maximally aggressive transformation: it replaces
-    the loop with a flat instruction sequence of trip_count copies of the
-    body, then removes the original header/latch/back-edge entirely. The
-    win comes from three compounding effects:
+    Full unrolling replaces the loop with trip_count chained copies of the
+    ENTIRE body (header and latch included) and deletes the originals. Wins:
+    back-edge branches disappear, iteration-specific values become foldable
+    constants once the IV chain is resolved, and the LIR scheduler can
+    interleave instructions across former iterations.
 
-    1. **Branch elimination** — the loop's back-edge branch is gone in
-       every iteration, removing branch-prediction pressure.
-    2. **Iteration-specific constant folding** — substituting the IV with
-       its actual constant value in each cloned body lets the constant_prop
-       and gvn passes collapse iteration-dependent expressions (e.g.,
-       `array[i*4 + 12]` with i=3 becomes `array[24]`, a constant offset).
-    3. **Cross-iteration scheduling** — the LIR scheduler can now interleave
-       instructions from different iterations, exploiting ILP that was
-       previously hidden behind the back-edge.
+    Copy semantics: each copy's header phis are resolved (copy 0 takes the
+    init incoming, copy k takes copy k-1's renamed latch incoming), every
+    definition gets a fresh SSA id, uses are rewritten through the copy's
+    rename map, intra-copy control flow is retargeted to the copy's blocks,
+    and each copy's latch terminator becomes an unconditional JUMP to the
+    next copy's header (the exit block for the final copy) - the exit test's
+    comparison is left behind as dead code for DCE.
 
-    The proc returns 0 (failure) rather than partially-unrolling when:
-    - trip_count is non-positive or above max_unroll_iterations (caller
-      should have screened this, but defense-in-depth matters here because
-      a malformed unroll cannot be undone).
-    - No induction variable was found (no IV means no closed-form
-      substitution, so cloning produces a non-terminating residual loop).
-
-    Block connection order is preserved iteration-by-iteration: iteration N
-    flows into iteration N+1 via redirect_block_successor, and the final
-    iteration's last block redirects to the loop's original exit. This
-    keeps the post-unroll CFG well-formed for downstream passes.
-
-    Memory ownership: cloned_blocks_per_iteration is locally owned and
-    destroyed before return. The cloned blocks themselves now belong to
-    the CFG, which owns their lifetime via CFG.destroy.
+    Stitching: the preheader's terminator and edge move from the original
+    header to copy 0's header; exit-block phis retarget their latch incoming
+    to the final copy's latch with the final renamed value; every block
+    outside the loop is swept through the final rename map so loop-defined
+    values used downstream resolve to their last-iteration definitions; the
+    original loop blocks are then removed and all cached edge counts
+    resynchronized (remove_block_from_cfg cascades through remove_cfg_edge,
+    whose count desync is owned by the cfg.runa wave).
     @End Reasoning
 
     @Implementation
-    Full unrolling transforms:
-    ```
-    for (i = 0; i < N; i++)
-        body(i);
-    ```
-    Into:
-    ```
-    body(0);
-    body(1);
-    ...
-    body(N-1);
-    ```
-
-    Algorithm:
-    1. Verify trip count is constant and < or equal to max_unroll_iterations
-    2. Get canonical induction variable
-    3. For each iteration 0..N-1:
-         a. Clone loop body blocks
-         b. Rename SSA values with iteration suffix
-         c. Substitute IV uses with constant iteration value
-    4. Connect cloned blocks sequentially
-    5. Remove original loop blocks and branches
-    6. Redirect preheader to first iteration, last iteration to exit
-
-    Returns 1 on success, 0 on failure.
+    Phase 1: per iteration - clone all body blocks (fresh allocator ids),
+             resolve header phis against the previous iteration's map,
+             assign fresh result ids, rewrite uses, remap phi incoming
+             blocks and terminator targets into the iteration
+    Phase 2: chain - replace each iteration latch terminator with a jump to
+             the next iteration's header clone (exit for the last)
+    Phase 3: register edges for every cloned block's final terminator
+    Phase 4: rewire preheader (terminator target + edge swap + count resync)
+    Phase 5: fix exit-block phis (incoming block latch -> last latch clone,
+             incoming value through the final rename map)
+    Phase 6: sweep every non-loop, non-clone block through the final map
+    Phase 7: delete original loop blocks; full-CFG edge-count resync
+    Returns 1 on success, 0 when preconditions fail (nothing mutated).
     @End Implementation
 
-    Let cfg_ptr be proc memory_get_int64 from Layout with context_ptr, 0
-    Let max_unroll_iterations be proc memory_get_int64 from Layout with context_ptr, 72
+    Let cfg_ptr be proc memory_get_int64 from Layout with context_ptr, 8
+    Let max_unroll_iterations be proc memory_get_int64 from Layout with context_ptr, 56
     Let header_id be proc memory_get_int64 from Layout with loop_ptr, 0
+    Let preheader_id be proc memory_get_int64 from Layout with loop_ptr, 8
     Let latch_id be proc memory_get_int64 from Layout with loop_ptr, 16
+    Let exit_block_id be proc memory_get_int64 from Layout with loop_ptr, 24
     Let body_blocks be proc memory_get_int64 from Layout with loop_ptr, 32
     Let trip_count be proc memory_get_int64 from Layout with loop_ptr, 64
     Let induction_vars be proc memory_get_int64 from Layout with loop_ptr, 56
+    Let has_multiple_exits be proc memory_get_int64 from Layout with loop_ptr, 72
 
     If trip_count is less than or equal to 0 or trip_count is greater than max_unroll_iterations:
         Return 0
     End If
+    If preheader_id is less than 0 or exit_block_id is less than 0:
+        Return 0
+    End If
+    If has_multiple_exits is equal to 1:
+        Return 0
+    End If
 
     Let iv_count be proc length from List with induction_vars
     If iv_count is less than 1:
         Return 0
     End If
 
-    Note: Get primary induction variable
-    Let iv_ptr be proc get from List with induction_vars, 0
-    Let phi_inst_ptr be proc memory_get_int64 from Layout with iv_ptr, 0
-    Let phi_result be proc get_result from MIR with phi_inst_ptr
-    Let init_value be proc memory_get_int64 from Layout with iv_ptr, 16
-    Let step_amount be proc memory_get_int64 from Layout with iv_ptr, 40
-    Let init_constant be proc get_constant_value from MIR with init_value
+    Note: The latch terminator must be a branch whose targets are exactly
+    Note: the header (back edge) and the exit block
+    Let latch_ptr be proc get_block_by_id_from_cfg from CFG with cfg_ptr, latch_id
+    If latch_ptr is equal to 0:
+        Return 0
+    End If
+    Let latch_term be proc get_block_terminator from CFG with latch_ptr
+    If latch_term is equal to 0:
+        Return 0
+    End If
+    Let latch_term_opcode be proc get_mir_node_opcode from MIR with latch_term
+    If latch_term_opcode is not equal to 20301:
+        Return 0
+    End If
+    Let latch_true be proc get_mir_branch_true_block from MIRNodes with latch_term
+    Let latch_false be proc get_mir_branch_false_block from MIRNodes with latch_term
+    Let shape_ok be 0
+    If latch_true is equal to header_id and latch_false is equal to exit_block_id:
+        Set shape_ok to 1
+    End If
+    If latch_true is equal to exit_block_id and latch_false is equal to header_id:
+        Set shape_ok to 1
+    End If
+    If shape_ok is equal to 0:
+        Return 0
+    End If
 
-    Note: Get body blocks excluding header and latch
-    Let body_list be proc to_list from Set with body_blocks
+    Note: Body id snapshot (the omap walk order is stable across phases)
+    Let body_list be proc create from List
+    Let entry be proc omap_first from OrderedMap with body_blocks
+    While entry is not equal to 0:
+        Let body_id be proc omap_entry_key from OrderedMap with entry
+        proc append from List with body_list, body_id
+        Set entry to proc omap_entry_next from OrderedMap with entry
+    End While
     Let body_count be proc length from List with body_list
-    Let cloned_blocks_per_iteration be proc create from List
 
-    Note: Clone body for each iteration
+    Let iter_headers be proc create from List
+    Let iter_latches be proc create from List
+    Let clone_maps be proc create from List
+    Let value_maps be proc create from List
+
+    Note: Phase 1 - clone, resolve, rename, rewrite, remap per iteration
+    Let prev_map be 0
     Let iter be 0
     While iter is less than trip_count:
-        Let iv_value be init_constant plus (iter multiplied by step_amount)
-        Let iteration_blocks be proc create from List
+        Let clone_map be proc omap_create from OrderedMap
+        Let value_map be proc omap_create from OrderedMap
+
         Let block_idx be 0
-
         While block_idx is less than body_count:
-            Let block_id_str be proc get from List with body_list, block_idx
-            Let block_id be proc string_to_int from MIR with block_id_str
-
-            If block_id is not equal to header_id and block_id is not equal to latch_id:
-                Let cloned_block_id be proc clone_block with context_ptr, block_id, iter
-                proc append from List with iteration_blocks, cloned_block_id
-                proc rename_cloned_values with context_ptr, cloned_block_id, iter
-
-                Note: Substitute IV with constant
-                Let cloned_block_ptr be proc get_block_by_id from CFG with cfg_ptr, cloned_block_id
-                proc substitute_value_with_constant from MIR with cloned_block_ptr, phi_result, iv_value
-            End If
-
+            Let orig_id be proc get from List with body_list, block_idx
+            proc clone_block with context_ptr, orig_id, clone_map
             Set block_idx to block_idx plus 1
         End While
 
-        proc append from List with cloned_blocks_per_iteration, iteration_blocks
+        Let header_clone be proc omap_get from OrderedMap with clone_map, header_id
+        Let latch_clone be proc omap_get from OrderedMap with clone_map, latch_id
+        proc append from List with iter_headers, header_clone
+        proc append from List with iter_latches, latch_clone
+
+        Let use_init be 0
+        If iter is equal to 0:
+            Set use_init to 1
+        End If
+        proc resolve_header_phis with context_ptr, header_clone, loop_ptr, prev_map, value_map, use_init
+
+        Set block_idx to 0
+        While block_idx is less than body_count:
+            Set orig_id to proc get from List with body_list, block_idx
+            Let clone_id be proc omap_get from OrderedMap with clone_map, orig_id
+            proc assign_fresh_result_ids with context_ptr, clone_id, value_map
+            Set block_idx to block_idx plus 1
+        End While
+
+        Set block_idx to 0
+        While block_idx is less than body_count:
+            Set orig_id to proc get from List with body_list, block_idx
+            Set clone_id to proc omap_get from OrderedMap with clone_map, orig_id
+            proc rewrite_uses_in_block with context_ptr, clone_id, value_map
+            proc remap_phi_incoming_blocks with context_ptr, clone_id, clone_map
+            proc remap_block_targets with context_ptr, clone_id, clone_map
+            Set block_idx to block_idx plus 1
+        End While
+
+        proc append from List with clone_maps, clone_map
+        proc append from List with value_maps, value_map
+        Set prev_map to value_map
         Set iter to iter plus 1
     End While
 
-    Note: Connect iterations sequentially and remove loop blocks
-    Let preheader_id be proc memory_get_int64 from Layout with loop_ptr, 8
-    Let exit_block_id be proc memory_get_int64 from Layout with loop_ptr, 24
-
-    Note: Get first and last iteration block IDs for redirection
-    Let first_iteration_blocks be proc get from List with cloned_blocks_per_iteration, 0
-    Let last_iteration_blocks be proc get from List with cloned_blocks_per_iteration, trip_count minus 1
-
-    If first_iteration_blocks is not equal to 0 and proc length from List with first_iteration_blocks is greater than 0:
-        Let first_block_id be proc get from List with first_iteration_blocks, 0
-
-        Note: Redirect preheader to first iteration block
-        If preheader_id is not equal to 0:
-            Let preheader_block be proc get_block_by_id from CFG with cfg_ptr, preheader_id
-            If preheader_block is not equal to 0:
-                Note: Update preheader terminator to branch to first iteration instead of header
-                proc redirect_block_successor from CFG with preheader_block, header_id, first_block_id
-            End If
+    Note: Phase 2 - chain iteration latches with unconditional jumps
+    Set iter to 0
+    While iter is less than trip_count:
+        Let chain_target be exit_block_id
+        If iter is less than trip_count minus 1:
+            Set chain_target to proc get from List with iter_headers, iter plus 1
         End If
-    End If
-
-    Note: Connect iterations sequentially
-    Let iteration_idx be 0
-    While iteration_idx is less than trip_count minus 1:
-        Let current_iter_blocks be proc get from List with cloned_blocks_per_iteration, iteration_idx
-        Let next_iter_blocks be proc get from List with cloned_blocks_per_iteration, iteration_idx plus 1
-
-        If current_iter_blocks is not equal to 0 and next_iter_blocks is not equal to 0:
-            Let current_count be proc length from List with current_iter_blocks
-            Let next_first_block be proc get from List with next_iter_blocks, 0
-
-            If current_count is greater than 0:
-                Note: Get last block of current iteration
-                Let current_last_block_id be proc get from List with current_iter_blocks, current_count minus 1
-                Let current_last_block be proc get_block_by_id from CFG with cfg_ptr, current_last_block_id
-
-                If current_last_block is not equal to 0:
-                    Note: Redirect to next iteration instead of looping back
-                    proc redirect_block_successor from CFG with current_last_block, header_id, next_first_block
-                End If
-            End If
-        End If
-
-        Set iteration_idx to iteration_idx plus 1
+        Let this_latch be proc get from List with iter_latches, iter
+        proc unroll_replace_terminator_with_jump with context_ptr, this_latch, chain_target
+        Set iter to iter plus 1
     End While
 
-    Note: Redirect last iteration to exit
-    If last_iteration_blocks is not equal to 0 and exit_block_id is not equal to 0:
-        Let last_count be proc length from List with last_iteration_blocks
-        If last_count is greater than 0:
-            Let last_block_id be proc get from List with last_iteration_blocks, last_count minus 1
-            Let last_block be proc get_block_by_id from CFG with cfg_ptr, last_block_id
+    Note: Phase 3 - register edges for every cloned block's final terminator
+    Set iter to 0
+    While iter is less than trip_count:
+        Let iter_clone_map be proc get from List with clone_maps, iter
+        Let map_entry be proc omap_first from OrderedMap with iter_clone_map
+        While map_entry is not equal to 0:
+            Let cloned_id be proc omap_entry_value from OrderedMap with map_entry
+            proc unroll_add_terminator_edges with cfg_ptr, cloned_id
+            Set map_entry to proc omap_entry_next from OrderedMap with map_entry
+        End While
+        Set iter to iter plus 1
+    End While
 
-            If last_block is not equal to 0:
-                Note: Redirect last iteration to exit instead of looping back
-                proc redirect_block_successor from CFG with last_block, header_id, exit_block_id
-            End If
+    Note: Phase 4 - rewire the preheader into iteration 0
+    Let first_header be proc get from List with iter_headers, 0
+    proc update_terminator_target from CFG with cfg_ptr, preheader_id, header_id, first_header
+    proc remove_cfg_edge from CFG with cfg_ptr, preheader_id, header_id
+    proc add_cfg_edge from MIR with cfg_ptr, preheader_id, first_header
+    proc unroll_resync_edge_counts with cfg_ptr, preheader_id
+    proc unroll_resync_edge_counts with cfg_ptr, header_id
+
+    Note: Phase 5 - retarget exit-block phis from the original latch to the
+    Note: final iteration's latch clone with final renamed values
+    Let last_latch be proc get from List with iter_latches, trip_count minus 1
+    Let final_map be proc get from List with value_maps, trip_count minus 1
+    Let exit_ptr be proc get_block_by_id_from_cfg from CFG with cfg_ptr, exit_block_id
+    If exit_ptr is not equal to 0:
+        Let exit_insts be proc get_block_instructions from MIR with exit_ptr
+        Let exit_inst_count be 0
+        If exit_insts is not equal to 0:
+            Set exit_inst_count to proc length from List with exit_insts
         End If
+        Let e be 0
+        While e is less than exit_inst_count:
+            Let exit_inst be proc get from List with exit_insts, e
+            Let exit_opcode be proc get_mir_node_opcode from MIR with exit_inst
+            If exit_opcode is equal to 20300:
+                Let exit_in_count be proc get_phi_incoming_count from MIRNodes with exit_inst
+                Let k be 0
+                While k is less than exit_in_count:
+                    Let in_block be proc get_phi_incoming_block from MIRNodes with exit_inst, k
+                    If in_block is equal to latch_id:
+                        Let in_value be proc get_phi_incoming_value from MIRNodes with exit_inst, k
+                        Let mapped_value be proc omap_get from OrderedMap with final_map, in_value
+                        If mapped_value is not equal to 0:
+                            proc set_phi_incoming_value from MIRNodes with exit_inst, k, mapped_value
+                        End If
+                    End If
+                    Set k to k plus 1
+                End While
+                proc update_phi_node_predecessor from CFG with exit_inst, latch_id, last_latch
+            End If
+            Set e to e plus 1
+        End While
     End If
 
-    Note: Remove original loop blocks from CFG
+    Note: Phase 6 - sweep every block outside the loop and outside the clones
+    Note: through the final rename map (loop-defined values used downstream)
+    Let all_clone_ids be proc omap_create from OrderedMap
+    Set iter to 0
+    While iter is less than trip_count:
+        Set iter_clone_map to proc get from List with clone_maps, iter
+        Set map_entry to proc omap_first from OrderedMap with iter_clone_map
+        While map_entry is not equal to 0:
+            Let cid be proc omap_entry_value from OrderedMap with map_entry
+            proc omap_set from OrderedMap with all_clone_ids, cid, 1
+            Set map_entry to proc omap_entry_next from OrderedMap with map_entry
+        End While
+        Set iter to iter plus 1
+    End While
+
+    Let blocks_list be proc get_mir_cfg_blocks from CFG with cfg_ptr
+    Let blocks_count be proc length from List with blocks_list
+    Let b be 0
+    While b is less than blocks_count:
+        Let walk_ptr be proc get from List with blocks_list, b
+        Let walk_id be proc get_mir_basic_block_id from CFG with walk_ptr
+        Let in_body be proc omap_contains from OrderedMap with body_blocks, walk_id
+        Let is_clone be proc omap_contains from OrderedMap with all_clone_ids, walk_id
+        If in_body is equal to 0 and is_clone is equal to 0:
+            proc rewrite_uses_in_block with context_ptr, walk_id, final_map
+        End If
+        Set b to b plus 1
+    End While
+    proc omap_destroy from OrderedMap with all_clone_ids
+
+    Note: Phase 7 - delete the original loop blocks and resync all caches
     Let body_idx be 0
     While body_idx is less than body_count:
-        Set block_id_str to proc get from List with body_list, body_idx
-        Set block_id to proc string_to_int from MIR with block_id_str
-        proc remove_block from CFG with cfg_ptr, block_id
+        Let removed_id be proc get from List with body_list, body_idx
+        proc remove_block_from_cfg from CFG with cfg_ptr, removed_id
         Set body_idx to body_idx plus 1
     End While
+    proc unroll_resync_all_edge_counts with cfg_ptr
 
-    Let full_unrolls be proc memory_get_int64 from Layout with context_ptr, 48
-    proc memory_set_int64 from Layout with context_ptr, 48, full_unrolls plus 1
+    Let full_unrolls be proc memory_get_int64 from Layout with context_ptr, 32
+    proc memory_set_int64 from Layout with context_ptr, 32, full_unrolls plus 1
 
-    proc destroy from List with cloned_blocks_per_iteration
+    Note: Release transformation-local structures
+    Set iter to 0
+    While iter is less than trip_count:
+        Let cm be proc get from List with clone_maps, iter
+        proc omap_destroy from OrderedMap with cm
+        Let vm be proc get from List with value_maps, iter
+        proc omap_destroy from OrderedMap with vm
+        Set iter to iter plus 1
+    End While
+    proc destroy from List with clone_maps
+    proc destroy from List with value_maps
+    proc destroy from List with iter_headers
+    proc destroy from List with iter_latches
+    proc destroy from List with body_list
+
     Return 1
 End Process
 
-Note: Perform partial loop unrolling with remainder loop
+Note: Perform partial loop unrolling with per-copy retained exit tests
 Process called "partial_unroll_loop" that takes context_ptr as Integer, loop_ptr as Integer returns Integer:
     @Reasoning
-    Partial unrolling is the fallback when full unrolling is unsafe or
-    unprofitable — typically when trip count is unknown or large. The
-    transformation does K-1 body clones inside the loop (so each iteration
-    processes K original iterations' worth of work) and multiplies the
-    induction step by K so the IV still advances by K original-iterations
-    per loop step.
+    Partial unrolling handles unknown or large trip counts. K-1 copies of the
+    full body are chained INSIDE the loop cycle: original body -> copy 1 ->
+    ... -> copy K-1 -> back edge to the original header. Each copy's header
+    phis resolve to the previous copy's chained values (copy 1 takes the
+    original latch incomings directly), so the induction chain advances K
+    original steps per cycle without any step multiplication or bound
+    rewrite.
 
-    The remainder loop is essential for correctness when N % K != 0: the
-    main unrolled loop only handles multiples of K, leaving 0..K-1 trailing
-    iterations to execute one-at-a-time. Without the remainder loop, an
-    arbitrary trip count would silently skip the trailing iterations and
-    introduce a wrong-answer bug — the single most dangerous failure mode
-    of any loop optimization.
+    Every copy RETAINS its own exit test: a copy's cloned latch branch keeps
+    its false edge to the single exit block while its true edge chains to the
+    next copy. This is sound for EVERY trip count - including counts not
+    divisible by K and counts unknown at compile time - because a mid-group
+    iteration whose test fails leaves through the exact edge the original
+    iteration would have taken, carrying correctly chained values. No
+    remainder loop is needed; the cost is that K-1 conditional branches
+    remain per cycle, which downstream branch folding removes whenever it
+    can prove them.
 
-    Suffix 9000 is reserved for remainder blocks specifically so debug
-    output (block id printouts, dumped CFG diagrams) trivially distinguishes
-    the main unrolled body (suffix 1..K-1) from the remainder body
-    (suffix 9000). This convention applies repo-wide.
-
-    The remainder phi rewiring at the end is the subtle piece: the cloned
-    update instruction inherits the main loop's multiplied step (because
-    clone_instruction copies operands verbatim), and must be reset to the
-    original single-iteration step. Skipping this reset produces a
-    remainder loop that overshoots its bound — exactly the bug class the
-    remainder loop exists to prevent.
-
-    Unroll factor (4) is chosen on the context, not on the loop, because
-    making it loop-specific would require a heuristic that depends on body
-    size, IV usage, and microarchitecture — that decision properly lives in
-    the cost model, not in the transformer.
+    Phi maintenance: the original header phis' latch incomings move to the
+    final copy's latch (block via update_phi_node_predecessor, value through
+    the final copy's rename map). The exit block gains one phi incoming per
+    copy (the copy's latch with the copy's chained value) since each copy's
+    latch is now an exit predecessor.
     @End Reasoning
 
     @Implementation
-    Partial unrolling with factor K transforms:
-    ```
-    for (i = 0; i < N; i += 1)
-        body(i);
-    ```
-    Into:
-    ```
-    for (i = 0; i < N - (N % K); i += K) {
-        body(i);
-        body(i+1);
-        ...
-        body(i+K-1);
-    }
-    for (; i < N; i += 1)
-        body(i);  // Remainder loop
-    ```
-
-    Algorithm:
-    1. Clone loop body (K-1) multiplied by within the loop
-    2. Rename SSA values for each clone
-    3. Update IV step: step * K
-    4. Adjust loop bound: N - (N % K)
-    5. Create remainder loop for N % K iterations
-    6. Update phi nodes for new control flow
-
-    Returns 1 on success, 0 on failure.
+    1. Validate latch shape (branch over {header, exit}) and unroll factor
+    2. For j in 1..K-1: clone all body blocks, resolve header-clone phis
+       against copy j-1's map (identity for j=1), assign fresh ids, rewrite
+       uses, remap intra-copy phi incomings and terminator targets
+    3. Chain: original latch's header target -> copy 1 header (edge swap +
+       count resync); copy j latch's own-header target -> copy j+1 header,
+       final copy -> original header
+    4. Register edges for all cloned blocks' final terminators
+    5. Original header phi fixup: latch incoming -> (final copy latch,
+       final chained value)
+    6. Exit phi fixup: add one incoming per copy BEFORE edge counts change
+       the predecessor relation readers depend on (values read before
+       appending)
+    Returns 1 on success, 0 when preconditions fail (nothing mutated).
     @End Implementation
 
-    Let cfg_ptr be proc memory_get_int64 from Layout with context_ptr, 0
-    Let unroll_factor be proc memory_get_int64 from Layout with context_ptr, 64
+    Let cfg_ptr be proc memory_get_int64 from Layout with context_ptr, 8
+    Let unroll_factor be proc memory_get_int64 from Layout with context_ptr, 48
     Let header_id be proc memory_get_int64 from Layout with loop_ptr, 0
+    Let preheader_id be proc memory_get_int64 from Layout with loop_ptr, 8
     Let latch_id be proc memory_get_int64 from Layout with loop_ptr, 16
+    Let exit_block_id be proc memory_get_int64 from Layout with loop_ptr, 24
     Let body_blocks be proc memory_get_int64 from Layout with loop_ptr, 32
     Let induction_vars be proc memory_get_int64 from Layout with loop_ptr, 56
+    Let has_multiple_exits be proc memory_get_int64 from Layout with loop_ptr, 72
+
+    If unroll_factor is less than 2:
+        Return 0
+    End If
+    If preheader_id is less than 0 or exit_block_id is less than 0:
+        Return 0
+    End If
+    If has_multiple_exits is equal to 1:
+        Return 0
+    End If
 
     Let iv_count be proc length from List with induction_vars
     If iv_count is less than 1:
         Return 0
     End If
 
-    Let iv_ptr be proc get from List with induction_vars, 0
-    Let update_inst_ptr be proc memory_get_int64 from Layout with iv_ptr, 48
-    Let step_amount be proc memory_get_int64 from Layout with iv_ptr, 40
-    Let new_step be step_amount multiplied by unroll_factor
+    Let latch_ptr be proc get_block_by_id_from_cfg from CFG with cfg_ptr, latch_id
+    If latch_ptr is equal to 0:
+        Return 0
+    End If
+    Let latch_term be proc get_block_terminator from CFG with latch_ptr
+    If latch_term is equal to 0:
+        Return 0
+    End If
+    Let latch_term_opcode be proc get_mir_node_opcode from MIR with latch_term
+    If latch_term_opcode is not equal to 20301:
+        Return 0
+    End If
+    Let latch_true be proc get_mir_branch_true_block from MIRNodes with latch_term
+    Let latch_false be proc get_mir_branch_false_block from MIRNodes with latch_term
+    Let shape_ok be 0
+    If latch_true is equal to header_id and latch_false is equal to exit_block_id:
+        Set shape_ok to 1
+    End If
+    If latch_true is equal to exit_block_id and latch_false is equal to header_id:
+        Set shape_ok to 1
+    End If
+    If shape_ok is equal to 0:
+        Return 0
+    End If
 
-    Note: Get body blocks
-    Let body_list be proc to_list from Set with body_blocks
+    Let body_list be proc create from List
+    Let entry be proc omap_first from OrderedMap with body_blocks
+    While entry is not equal to 0:
+        Let body_id be proc omap_entry_key from OrderedMap with entry
+        proc append from List with body_list, body_id
+        Set entry to proc omap_entry_next from OrderedMap with entry
+    End While
     Let body_count be proc length from List with body_list
 
-    Note: Clone body (unroll_factor - 1) times
-    Let clone_idx be 1
-    While clone_idx is less than unroll_factor:
+    Let copy_headers be proc create from List
+    Let copy_latches be proc create from List
+    Let clone_maps be proc create from List
+    Let value_maps be proc create from List
+
+    Note: Read exit-phi latch incomings BEFORE any mutation (fixup inputs)
+    Let exit_phi_list be proc create from List
+    Let exit_phi_values be proc create from List
+    Let exit_ptr be proc get_block_by_id_from_cfg from CFG with cfg_ptr, exit_block_id
+    If exit_ptr is not equal to 0:
+        Let exit_insts be proc get_block_instructions from MIR with exit_ptr
+        Let exit_inst_count be 0
+        If exit_insts is not equal to 0:
+            Set exit_inst_count to proc length from List with exit_insts
+        End If
+        Let e be 0
+        While e is less than exit_inst_count:
+            Let exit_inst be proc get from List with exit_insts, e
+            Let exit_opcode be proc get_mir_node_opcode from MIR with exit_inst
+            If exit_opcode is equal to 20300:
+                Let exit_in_count be proc get_phi_incoming_count from MIRNodes with exit_inst
+                Let k be 0
+                While k is less than exit_in_count:
+                    Let in_block be proc get_phi_incoming_block from MIRNodes with exit_inst, k
+                    If in_block is equal to latch_id:
+                        Let in_value be proc get_phi_incoming_value from MIRNodes with exit_inst, k
+                        proc append from List with exit_phi_list, exit_inst
+                        proc append from List with exit_phi_values, in_value
+                    End If
+                    Set k to k plus 1
+                End While
+            End If
+            Set e to e plus 1
+        End While
+    End If
+
+    Note: Clone and rename K-1 copies, chaining values through copy j-1
+    Let prev_map be 0
+    Let copy_idx be 1
+    While copy_idx is less than unroll_factor:
+        Let clone_map be proc omap_create from OrderedMap
+        Let value_map be proc omap_create from OrderedMap
+
         Let block_idx be 0
         While block_idx is less than body_count:
-            Let block_id_str be proc get from List with body_list, block_idx
-            Let block_id be proc string_to_int from MIR with block_id_str
-
-            If block_id is not equal to header_id:
-                Let cloned_block_id be proc clone_block with context_ptr, block_id, clone_idx
-                proc rename_cloned_values with context_ptr, cloned_block_id, clone_idx
-            End If
-
+            Let orig_id be proc get from List with body_list, block_idx
+            proc clone_block with context_ptr, orig_id, clone_map
             Set block_idx to block_idx plus 1
         End While
-        Set clone_idx to clone_idx plus 1
+
+        Let header_clone be proc omap_get from OrderedMap with clone_map, header_id
+        Let latch_clone be proc omap_get from OrderedMap with clone_map, latch_id
+        proc append from List with copy_headers, header_clone
+        proc append from List with copy_latches, latch_clone
+
+        proc resolve_header_phis with context_ptr, header_clone, loop_ptr, prev_map, value_map, 0
+
+        Set block_idx to 0
+        While block_idx is less than body_count:
+            Set orig_id to proc get from List with body_list, block_idx
+            Let clone_id be proc omap_get from OrderedMap with clone_map, orig_id
+            proc assign_fresh_result_ids with context_ptr, clone_id, value_map
+            Set block_idx to block_idx plus 1
+        End While
+
+        Set block_idx to 0
+        While block_idx is less than body_count:
+            Set orig_id to proc get from List with body_list, block_idx
+            Set clone_id to proc omap_get from OrderedMap with clone_map, orig_id
+            proc rewrite_uses_in_block with context_ptr, clone_id, value_map
+            proc remap_phi_incoming_blocks with context_ptr, clone_id, clone_map
+            proc remap_block_targets with context_ptr, clone_id, clone_map
+            Set block_idx to block_idx plus 1
+        End While
+
+        proc append from List with clone_maps, clone_map
+        proc append from List with value_maps, value_map
+        Set prev_map to value_map
+        Set copy_idx to copy_idx plus 1
     End While
 
-    Note: Update induction variable step in main loop
-    Let new_step_value be proc create_constant from MIR with new_step
-    proc set_operand from MIR with update_inst_ptr, 1, new_step_value
+    Let copy_count be proc length from List with copy_headers
 
-    Note: Create remainder loop for (N % unroll_factor) iterations
-    Note: Remainder loop handles remaining iterations with original step
-    Let exit_block_id be proc memory_get_int64 from Layout with loop_ptr, 24
-    Let remainder_suffix be 9000
+    Note: Chain the original latch into copy 1 (edge swap + count resync)
+    Let first_copy_header be proc get from List with copy_headers, 0
+    proc update_terminator_target from CFG with cfg_ptr, latch_id, header_id, first_copy_header
+    proc remove_cfg_edge from CFG with cfg_ptr, latch_id, header_id
+    proc add_cfg_edge from MIR with cfg_ptr, latch_id, first_copy_header
+    proc unroll_resync_edge_counts with cfg_ptr, latch_id
+    proc unroll_resync_edge_counts with cfg_ptr, header_id
 
-    Note: Clone header for remainder loop
-    Let remainder_header_id be proc clone_block with context_ptr, header_id, remainder_suffix
-
-    Note: Clone body blocks for remainder loop (with different suffix)
-    Let remainder_blocks be proc create from List
-    Set block_idx to 0
-    While block_idx is less than body_count:
-        Set block_id_str to proc get from List with body_list, block_idx
-        Set block_id to proc string_to_int from MIR with block_id_str
-
-        If block_id is not equal to header_id and block_id is not equal to latch_id:
-            Let remainder_block_id be proc clone_block with context_ptr, block_id, remainder_suffix
-            proc append from List with remainder_blocks, remainder_block_id
-            Note: Rename values in remainder block
-            proc rename_cloned_values with context_ptr, remainder_block_id, remainder_suffix
+    Note: Chain each copy's latch: own header clone -> next copy header,
+    Note: final copy -> original header (the real back edge)
+    Let c be 0
+    While c is less than copy_count:
+        Let this_latch be proc get from List with copy_latches, c
+        Let own_header be proc get from List with copy_headers, c
+        Let chain_target be header_id
+        If c is less than copy_count minus 1:
+            Set chain_target to proc get from List with copy_headers, c plus 1
         End If
-
-        Set block_idx to block_idx plus 1
+        proc update_terminator_target from CFG with cfg_ptr, this_latch, own_header, chain_target
+        Set c to c plus 1
     End While
 
-    Note: Clone latch for remainder loop
-    Let remainder_latch_id be proc clone_block with context_ptr, latch_id, remainder_suffix
+    Note: Register edges for all cloned blocks' final terminators
+    Set c to 0
+    While c is less than copy_count:
+        Let iter_clone_map be proc get from List with clone_maps, c
+        Let map_entry be proc omap_first from OrderedMap with iter_clone_map
+        While map_entry is not equal to 0:
+            Let cloned_id be proc omap_entry_value from OrderedMap with map_entry
+            proc unroll_add_terminator_edges with cfg_ptr, cloned_id
+            Set map_entry to proc omap_entry_next from OrderedMap with map_entry
+        End While
+        Set c to c plus 1
+    End While
 
-    Note: Connect main loop exit to remainder loop header
-    Let main_latch_block be proc get_block_by_id from CFG with cfg_ptr, latch_id
-    If main_latch_block is not equal to 0:
-        Note: When main loop exits, enter remainder loop instead of final exit
-        proc redirect_block_successor from CFG with main_latch_block, exit_block_id, remainder_header_id
-    End If
-
-    Note: Connect remainder loop exit to original exit block
-    Let remainder_latch_block be proc get_block_by_id from CFG with cfg_ptr, remainder_latch_id
-    If remainder_latch_block is not equal to 0:
-        Note: Remainder loop exits to original exit block
-        proc redirect_block_successor from CFG with remainder_latch_block, remainder_header_id, exit_block_id
-    End If
-
-    Note: Ensure remainder loop uses original step (not multiplied step)
-    Let remainder_phi be proc get_phi_node from MIR with remainder_header_id, phi_result
-    If remainder_phi is not equal to 0:
-        Let remainder_update be proc get_phi_update_instruction from MIR with remainder_phi
-        If remainder_update is not equal to 0:
-            Note: Reset step to original value (before multiplication)
-            Let original_step_value be proc create_constant from MIR with step_amount
-            proc set_operand from MIR with remainder_update, 1, original_step_value
+    Note: Original header phi fixup: latch incoming moves to the final copy
+    Let final_latch be proc get from List with copy_latches, copy_count minus 1
+    Let final_map be proc get from List with value_maps, copy_count minus 1
+    Let header_ptr be proc get_block_by_id_from_cfg from CFG with cfg_ptr, header_id
+    If header_ptr is not equal to 0:
+        Let header_insts be proc get_block_instructions from MIR with header_ptr
+        Let header_inst_count be 0
+        If header_insts is not equal to 0:
+            Set header_inst_count to proc length from List with header_insts
         End If
+        Let h be 0
+        While h is less than header_inst_count:
+            Let header_inst be proc get from List with header_insts, h
+            Let header_opcode be proc get_mir_node_opcode from MIR with header_inst
+            If header_opcode is equal to 20300:
+                Let h_in_count be proc get_phi_incoming_count from MIRNodes with header_inst
+                Let hk be 0
+                While hk is less than h_in_count:
+                    Let h_in_block be proc get_phi_incoming_block from MIRNodes with header_inst, hk
+                    If h_in_block is equal to latch_id:
+                        Let h_in_value be proc get_phi_incoming_value from MIRNodes with header_inst, hk
+                        Let h_mapped be proc omap_get from OrderedMap with final_map, h_in_value
+                        If h_mapped is not equal to 0:
+                            proc set_phi_incoming_value from MIRNodes with header_inst, hk, h_mapped
+                        End If
+                    End If
+                    Set hk to hk plus 1
+                End While
+                proc update_phi_node_predecessor from CFG with header_inst, latch_id, final_latch
+            End If
+            Set h to h plus 1
+        End While
     End If
 
-    proc destroy from List with remainder_blocks
+    Note: Exit phi fixup: one new incoming per copy (each copy's latch is now
+    Note: an exit predecessor carrying that copy's chained value)
+    Let fixup_count be proc length from List with exit_phi_list
+    Let f be 0
+    While f is less than fixup_count:
+        Let fix_phi be proc get from List with exit_phi_list, f
+        Let fix_value be proc get from List with exit_phi_values, f
+        Set c to 0
+        While c is less than copy_count:
+            Let copy_latch_id be proc get from List with copy_latches, c
+            Let copy_map be proc get from List with value_maps, c
+            Let mapped_value be fix_value
+            Let copy_mapped be proc omap_get from OrderedMap with copy_map, fix_value
+            If copy_mapped is not equal to 0:
+                Set mapped_value to copy_mapped
+            End If
+            proc add_phi_incoming from MIRNodes with fix_phi, copy_latch_id, mapped_value
+            Set c to c plus 1
+        End While
+        Set f to f plus 1
+    End While
 
-    Let partial_unrolls be proc memory_get_int64 from Layout with context_ptr, 56
-    proc memory_set_int64 from Layout with context_ptr, 56, partial_unrolls plus 1
+    Let partial_unrolls be proc memory_get_int64 from Layout with context_ptr, 40
+    proc memory_set_int64 from Layout with context_ptr, 40, partial_unrolls plus 1
+
+    Note: Release transformation-local structures
+    Set c to 0
+    While c is less than copy_count:
+        Let cm be proc get from List with clone_maps, c
+        proc omap_destroy from OrderedMap with cm
+        Let vm be proc get from List with value_maps, c
+        proc omap_destroy from OrderedMap with vm
+        Set c to c plus 1
+    End While
+    proc destroy from List with clone_maps
+    proc destroy from List with value_maps
+    proc destroy from List with copy_headers
+    proc destroy from List with copy_latches
+    proc destroy from List with body_list
+    proc destroy from List with exit_phi_list
+    proc destroy from List with exit_phi_values
 
     Return 1
 End Process
 
 Note: Main entry point for loop unrolling optimization
-Process called "optimize_function_with_loop_unrolling" that takes cfg_ptr as Integer returns Integer:
+Process called "optimize_function_with_loop_unrolling" that takes function_ptr as Integer returns Integer:
     @Reasoning
-    The pipeline is deliberately linear: detect, analyze, decide, transform,
-    repeat. Loops are processed in detection order (which is approximately
-    pre-order in the CFG), so outer loops are processed before inner ones.
-    This ordering matters because:
+    The pipeline is linear: detect, analyze, decide, transform. At most ONE
+    loop is transformed per invocation: both transformations restructure the
+    CFG (blocks added, originals deleted, edges moved), which invalidates the
+    dominance information and the body sets the remaining LoopInfo records
+    were computed against. Acting on stale loop structure is how malformed
+    unrolls happen; the optimizer driver's standard fix-point loop re-invokes
+    the pass, which re-detects against the fresh CFG and picks up the next
+    candidate.
 
-    - Full-unrolling an outer loop creates K copies of any contained
-      inner-loop infrastructure, which the inner-loop pass would then have
-      to redo K times. Inner-first would avoid that redundancy, but
-      outer-first gives the inliner and constant_prop more cross-iteration
-      visibility before the inner-loop work happens.
-    - The decision was made to let the post-unroll pipeline re-run if a
-      transformation invalidated an inner loop's analyses. The optimizer
-      driver handles this via the standard fix-point loop in
-      mir_optimizer.runa; this proc only commits to a single sweep.
-
-    Per-loop transformation is independent — failure of one loop's unroll
-    does not abort the sweep. is_profitable_to_unroll has already
-    pre-screened, but full_unroll_loop and partial_unroll_loop each have
-    their own internal guards (no IV, malformed trip count) and return 0
-    silently when those fire. The pipeline trusts those guards and moves
-    on.
-
-    The proc returns 1 (success) even when no loops are unrolled; "no
-    work" is not a failure for an optimization pass.
+    Returns 1 ONLY when a transformation occurred (the bridge marks the
+    context changed on 1, and a pass that reports change without making any
+    would spin the driver's fix-point loop); 0 means no work was done.
     @End Reasoning
 
     @Implementation
-    Loop unrolling pipeline:
-
-    1. Initialize context with CFG, dominance tree, SSA info
-    2. Detect natural loops using back-edge analysis
-    3. For each loop:
-         a. Identify induction variables
-         b. Analyze trip count (constant or symbolic)
-         c. Evaluate profitability (code size, complexity)
-         d. Apply transformation (full or partial unroll)
-    4. Report statistics and clean up
-
-    Returns 1 on success, 0 on failure.
+    1. Build the context (function, derived CFG, dominance tree)
+    2. Detect natural loops with structure analysis
+    3. Walk candidates: identify IVs, analyze trip count, evaluate
+       profitability; apply the first transformation that succeeds
+    4. Report statistics, tear down the context, return the changed flag
     @End Implementation
 
-    Let context_ptr be proc create_loop_unroll_context with cfg_ptr
+    Let context_ptr be proc create_loop_unroll_context with function_ptr
     If context_ptr is equal to 0:
         Return 0
     End If
@@ -1691,24 +2494,27 @@ Process called "optimize_function_with_loop_unrolling" that takes cfg_ptr as Int
     Let loops_count be proc detect_natural_loops with context_ptr
     If loops_count is equal to 0:
         proc destroy_loop_unroll_context with context_ptr
-        Return 1
+        Return 0
     End If
 
-    Let loops_list be proc memory_get_int64 from Layout with context_ptr, 8
+    Let loops_list be proc memory_get_int64 from Layout with context_ptr, 16
     Let loop_idx be 0
+    Let changed be 0
 
     While loop_idx is less than loops_count:
-        Let loop_ptr be proc get from List with loops_list, loop_idx
-        Let iv_count be proc identify_induction_variables with context_ptr, loop_ptr
-        Let trip_count be proc analyze_trip_count with context_ptr, loop_ptr
-        Let profitable be proc is_profitable_to_unroll with context_ptr, loop_ptr
+        If changed is equal to 0:
+            Let loop_ptr be proc get from List with loops_list, loop_idx
+            Let iv_count be proc identify_induction_variables with context_ptr, loop_ptr
+            Let trip_count be proc analyze_trip_count with context_ptr, loop_ptr
+            Let profitable be proc is_profitable_to_unroll with context_ptr, loop_ptr
 
-        If profitable is equal to 2:
-            proc full_unroll_loop with context_ptr, loop_ptr
-        End If
+            If profitable is equal to 2:
+                Set changed to proc full_unroll_loop with context_ptr, loop_ptr
+            End If
 
-        If profitable is equal to 1:
-            proc partial_unroll_loop with context_ptr, loop_ptr
+            If profitable is equal to 1:
+                Set changed to proc partial_unroll_loop with context_ptr, loop_ptr
+            End If
         End If
 
         Set loop_idx to loop_idx plus 1
@@ -1717,55 +2523,48 @@ Process called "optimize_function_with_loop_unrolling" that takes cfg_ptr as Int
     proc print_loop_unrolling_stats with context_ptr
     proc destroy_loop_unroll_context with context_ptr
 
-    Return 1
+    Return changed
 End Process
 
 Note: Wrapper for optimization pass execution
-Process called "run_loop_unrolling_pass" that takes cfg_ptr as Integer returns Integer:
+Process called "run_loop_unrolling_pass" that takes function_ptr as Integer returns Integer:
     @Reasoning
-    Thin façade so the optimizer pipeline can register every pass with a
-    uniform signature. The should_run gate is checked here (not inside
-    optimize_function_with_loop_unrolling) so the gate logic can be exposed
-    for cost-model introspection without forcing the full transformer to
-    instantiate a context.
-
-    Return 1 on skip is the optimizer pipeline's convention for "pass
-    voluntarily declined", distinct from 0 which would signal a hard error.
+    Thin facade so the optimizer pipeline registers every pass with a uniform
+    signature. The signature takes the MIRFunction pointer per the canonical
+    contract: value-id allocation, defining-instruction lookup, and SSA-form
+    queries are all function-scoped. The gate is checked here so its logic is
+    exposed for cost-model introspection without instantiating a context.
+    Returns 1 only when the pass changed the function.
     @End Reasoning
 
-    @Implementation
-    Gate first, transform second. should_run_loop_unrolling performs a
-    cheap CFG scan to confirm at least one back edge exists; only then do
-    we pay the cost of building the unroll context.
-    @End Implementation
-
-    Let should_run be proc should_run_loop_unrolling with cfg_ptr
+    Let should_run be proc should_run_loop_unrolling with function_ptr
     If should_run is equal to 0:
-        Return 1
+        Return 0
     End If
 
-    Return proc optimize_function_with_loop_unrolling with cfg_ptr
+    Return proc optimize_function_with_loop_unrolling with function_ptr
 End Process
 
 Note: Check if loop unrolling pass should execute
-Process called "should_run_loop_unrolling" that takes cfg_ptr as Integer returns Integer:
+Process called "should_run_loop_unrolling" that takes function_ptr as Integer returns Integer:
     @Reasoning
-    The cheapest possible "does this function contain a loop?" approximation
-    is block count: a function with fewer than 2 blocks cannot contain a
-    loop (a loop requires at least a header and a latch, even when they
-    are the same block — that case still needs an entry block to dominate
-    it). This conservative gate avoids the expense of building a dominance
-    tree just to discover the function is loop-free.
-
-    A more precise gate would scan for back edges directly, but at that
-    point we're already paying most of the cost of the full pass. The
-    block-count heuristic is correct (no false negatives) and trades a
-    small false-positive rate (we may build a context for a 2-block
-    loop-free function) for a far cheaper check on the common case.
+    The cheapest "does this function contain a loop?" approximation is block
+    count: fewer than 2 blocks cannot form a loop with a distinct entry. The
+    gate is conservative (no false negatives) and avoids building a dominance
+    tree for trivially loop-free functions; precise back-edge detection costs
+    most of the full pass.
     @End Reasoning
 
-    Note: Check if CFG has loops (presence of back edges)
-    Let blocks_count be proc get_block_count from CFG with cfg_ptr
+    If function_ptr is equal to 0:
+        Return 0
+    End If
+
+    Let cfg_ptr be proc get_mir_function_cfg from MIR with function_ptr
+    If cfg_ptr is equal to 0:
+        Return 0
+    End If
+
+    Let blocks_count be proc get_cfg_block_count from CFG with cfg_ptr
     If blocks_count is less than 2:
         Return 0
     End If

@@ -229,6 +229,22 @@ Process called "codegen_scan_set_targets" takes codegen as Integer, stmt as Inte
             End If
         End If
     End If
+    Note: STMT_UNSAFE_BLOCK = 18: body(8), body_count(16)
+    If stmt_type is equal to 18:
+        Let ub_scan_body be memory_get_pointer(stmt, 8)
+        Let ub_scan_count be memory_get_int32(stmt, 16)
+        If ub_scan_body is not equal to 0:
+            If ub_scan_count is greater than 0:
+                Let ubsi be 0
+                While ubsi is less than ub_scan_count:
+                    Let ubsi_offset be ubsi multiplied by 8
+                    Let ub_scan_child be memory_get_pointer(ub_scan_body, ubsi_offset)
+                    codegen_scan_set_targets(codegen, ub_scan_child, program)
+                    Set ubsi to ubsi plus 1
+                End While
+            End If
+        End If
+    End If
     Note: STMT_FOR_EACH = 12: var_name(8), collection(16), body(24), body_count(32), type_name(40)
     If stmt_type is equal to 12:
         Let for_body be memory_get_pointer(stmt, 24)
@@ -336,6 +352,61 @@ Mirrors the (separately-linked) TARGET_PLATFORM_KEY/set_target_platform_key
 pair in import_system.runa - same lifetime contract, different module.
 :End Note
 Let CODEGEN_TARGET_PLATFORM_KEY be 0
+
+Note:
+Module-global lexical depth of `Unsafe Block: ... End Unsafe` scopes during
+statement generation (P2-D Q4 FFI enforcement, task #455). Incremented when
+codegen_generate_statement enters a STMT_UNSAFE_BLOCK body and decremented on
+exit, so nesting is handled naturally. Both direct-call emission
+(codegen_generate_function_call) and qualified-call emission (the
+EXPR_QUALIFIED_CALL branch of codegen_generate_expression) consult it: a call
+whose resolved target is an `unsafe External Process` (Function.is_unsafe at
+offset 60) while this depth is 0 is a hard compile error. Generation is
+single-threaded and statements are generated strictly inside their enclosing
+blocks, so a module-global counter exactly mirrors the lexical nesting.
+:End Note
+Let CODEGEN_UNSAFE_DEPTH be 0
+
+Note:
+Module-global storing the output-file path registered by codegen_create
+once the output file has been opened for writing (task #450 silent-
+truncation fix). 0 = no output registered (pre-codegen phases). When a
+hard compile error fires after the output file exists, the exit_with_code
+override below unlinks the partially-written file before terminating, so
+a failed compile NEVER leaves a truncated .s on disk that downstream
+tooling could mistake for a successful artifact. The pointer is the
+caller-owned output_filename string; its lifetime exceeds codegen because
+main.runa only deallocates it after codegen_generate returns, and every
+exit_with_code path terminates the process immediately.
+:End Note
+Let CODEGEN_FAIL_CLEANUP_OUTPUT_PATH be 0
+
+Note:
+Process-wide failure exit used by lexer/parser/codegen hard errors. This
+definition intentionally shadows the runtime's exit_with_code: the stage1
+link passes --allow-multiple-definition and places the compiler objects
+before runtime.o, so this definition wins for every call site (including
+the runtime's own exit/_exit wrappers, which delegate to exit_with_code).
+Behavior: on a nonzero exit code, if codegen_create has registered an
+output path, the partially-written output file is unlinked first (failed
+compiles must not leave truncated artifacts); then the process terminates
+via the exit_group syscall with the same code. The syscall is invoked
+directly (syscall_1 + SYS_EXIT_GROUP, mirroring the runtime's own
+exit_with_code body) because the runtime's exit/_exit wrappers route back
+through exit_with_code - calling them here would recurse forever.
+Zero codes terminate the same way without touching the output file.
+:End Note
+Process called "exit_with_code" takes code as Integer returns Integer:
+    If code is not equal to 0:
+        If CODEGEN_FAIL_CLEANUP_OUTPUT_PATH is not equal to 0:
+            unlink_path(CODEGEN_FAIL_CLEANUP_OUTPUT_PATH)
+            Set CODEGEN_FAIL_CLEANUP_OUTPUT_PATH to 0
+        End If
+    End If
+    Let exit_group_number be SYS_EXIT_GROUP()
+    syscall_1(exit_group_number, code)
+    Return 0
+End Process
 
 Process called "set_codegen_target_platform_key" takes key as Integer returns Integer:
     Set CODEGEN_TARGET_PLATFORM_KEY to key
@@ -856,6 +927,13 @@ Process called "codegen_fold_body" takes codegen as Integer, program as Integer,
                     If stmt_type is equal to 6:
                         Note: STMT_WHILE: body(16), body_count(24)
                         codegen_fold_body(codegen, program, stmt, 16, 24)
+                        Set handled to 1
+                    End If
+                End If
+                If handled is equal to 0:
+                    If stmt_type is equal to 18:
+                        Note: STMT_UNSAFE_BLOCK: body(8), body_count(16)
+                        codegen_fold_body(codegen, program, stmt, 8, 16)
                         Set handled to 1
                     End If
                 End If
@@ -1488,11 +1566,11 @@ Process called "codegen_collect_strings_from_statement" takes codegen as Integer
     Let stmt_type be memory_get_int32(stmt, 0)  Note: stmt->type
 
 
-    Note: Safety check - statement types should be reasonable (0-17 for now, including STMT_COMPOUND_ASSIGN = 17)
+    Note: Safety check - statement types span 0-18 (STMT_UNSAFE_BLOCK = 18)
     If stmt_type is less than 0:
         Return 0
     End If
-    If stmt_type is greater than 17:
+    If stmt_type is greater than 18:
         Return 1
     End If
 
@@ -1584,6 +1662,19 @@ Process called "codegen_collect_strings_from_statement" takes codegen as Integer
         While i is less than body_count:
             Set stmt_offset to i multiplied by 8
             Set stmt_ptr to memory_get_pointer(body, stmt_offset)
+            codegen_collect_strings_from_statement(codegen, stmt_ptr)
+            Set i to i plus 1
+        End While
+        Return 0
+    End If
+
+    If stmt_type is equal to 18:  Note: STMT_UNSAFE_BLOCK - body(8), body_count(16)
+        Let ub_str_body be memory_get_pointer(stmt, 8)
+        Let ub_str_count be memory_get_int32(stmt, 16)
+        Set i to 0
+        While i is less than ub_str_count:
+            Set stmt_offset to i multiplied by 8
+            Set stmt_ptr to memory_get_pointer(ub_str_body, stmt_offset)
             codegen_collect_strings_from_statement(codegen, stmt_ptr)
             Set i to i plus 1
         End While
@@ -4431,6 +4522,26 @@ Process called "codegen_generate_function_call" takes codegen as Integer, expr a
     If target_func is not equal to 0:
         Set is_external to memory_get_int32(target_func, 56)
     End If
+
+    Note: P2-D Q4 FFI enforcement (task #455): an `unsafe External Process`
+    Note: may only be called from inside an `Unsafe Block: ... End Unsafe`
+    Note: lexical scope. Function.is_unsafe lives at offset 60 (set by the
+    Note: parser for `unsafe External Process called ...` declarations);
+    Note: CODEGEN_UNSAFE_DEPTH tracks the Unsafe Block nesting during
+    Note: statement generation. Violations are hard compile errors.
+    If is_external is equal to 1:
+        Let fc_is_unsafe be memory_get_int32(target_func, 60)
+        If fc_is_unsafe is equal to 1:
+            If CODEGEN_UNSAFE_DEPTH is equal to 0:
+                print_string("[FFI ERROR] Cannot call unsafe External '")
+                print_string(function_name)
+                print_string("' outside an Unsafe Block.")
+                print_string("Wrap the call site in 'Unsafe Block: ... End Unsafe'.")
+                exit_with_code(1)
+            End If
+        End If
+    End If
+
     Let external_spill_cleanup be 0
     Let external_need_pad be 0
     If is_external is equal to 1:
@@ -4488,6 +4599,19 @@ Process called "codegen_generate_function_call" takes codegen as Integer, expr a
         If fc_mangled is not equal to 0:
             Set fc_emit_name to fc_mangled
             Set fc_owned_name to fc_mangled
+        End If
+    End If
+
+    Note: External `aliased as "X"` binding (task #455): the parser stores the
+    Note: foreign symbol at Function offset 80 for
+    Note: `External Process called "runa_name" ... aliased as "X"` declarations.
+    Note: The call must target the foreign symbol X, not the Runa-side name.
+    Note: The alias string is owned by the Function node -- do NOT mark it as
+    Note: an owned (call-site-freed) name.
+    If is_external is equal to 1:
+        Let fc_alias_name be memory_get_pointer(target_func, 80)
+        If fc_alias_name is not equal to 0:
+            Set fc_emit_name to fc_alias_name
         End If
     End If
 
@@ -6353,7 +6477,7 @@ Process called "codegen_generate_expression" takes codegen as Integer, expr as I
                 print_string("[SAFETY ERROR] Array index ")
                 print_integer(constant_index)
                 print_string(" is negative - arrays cannot have negative indices\n")
-                exit(1)
+                exit_with_code(1)
             End If
 
             Note: Check if array is an array literal (we know the size at compile time)
@@ -6365,7 +6489,7 @@ Process called "codegen_generate_expression" takes codegen as Integer, expr as I
                     print_string(" is out of bounds (array size is ")
                     print_integer(array_size)
                     print_string(")\n")
-                    exit(1)
+                    exit_with_code(1)
                 End If
                 print_string("[SAFETY] Compile-time bounds check PASSED: index ")
                 print_integer(constant_index)
@@ -6895,7 +7019,7 @@ Process called "codegen_generate_expression" takes codegen as Integer, expr as I
                     print_string("[CODEGEN ERROR] Free variable not found in scope: ")
                     print_string(var_name)
                     print_newline()
-                    exit(1)
+                    exit_with_code(1)
                 End If
 
                 Note: Load variable value into %rbx
@@ -6907,7 +7031,7 @@ Process called "codegen_generate_expression" takes codegen as Integer, expr as I
                 Note: Check if this variable is itself a closure variable (shouldn't happen in normal cases)
                 If stack_offset_u is equal to 4294967295:
                     print_string("[CODEGEN ERROR] Attempting to capture a closure variable - this indicates a compiler bug")
-                    exit(1)
+                    exit_with_code(1)
                 End If
                 file_write_buffered(output_file, "    movq -", 0)
                 file_write_buffered(output_file, integer_to_string(stack_offset_u), 0)
@@ -7050,6 +7174,16 @@ Process called "codegen_generate_expression" takes codegen as Integer, expr as I
                 Set qual_emit_name to qual_mangled
                 Set qual_owned_name to qual_mangled
             End If
+            Note: External `aliased as "X"` binding (task #455): qualified
+            Note: calls to an aliased External must also target the foreign
+            Note: symbol stored at Function offset 80. The alias is owned by
+            Note: the Function node, so it is not an owned (freed) name.
+            If memory_get_int32(qual_target_func, 56) is equal to 1:
+                Let qual_alias_name be memory_get_pointer(qual_target_func, 80)
+                If qual_alias_name is not equal to 0:
+                    Set qual_emit_name to qual_alias_name
+                End If
+            End If
         End If
 
         Note: Reorder named args according to the target function's parameter
@@ -7077,6 +7211,25 @@ Process called "codegen_generate_expression" takes codegen as Integer, expr as I
         If qual_target_func is not equal to 0:
             Set qual_is_external to memory_get_int32(qual_target_func, 56)
         End If
+
+        Note: P2-D Q4 FFI enforcement (task #455): qualified calls
+        Note: (`proc f from Module with ...` / `Module.f(...)`) to an
+        Note: `unsafe External Process` are subject to the same Unsafe
+        Note: Block requirement as bare calls. Function.is_unsafe is at
+        Note: offset 60; CODEGEN_UNSAFE_DEPTH tracks Unsafe Block nesting.
+        If qual_is_external is equal to 1:
+            Let qual_is_unsafe be memory_get_int32(qual_target_func, 60)
+            If qual_is_unsafe is equal to 1:
+                If CODEGEN_UNSAFE_DEPTH is equal to 0:
+                    print_string("[FFI ERROR] Cannot call unsafe External '")
+                    print_string(qual_function_name)
+                    print_string("' outside an Unsafe Block.")
+                    print_string("Wrap the call site in 'Unsafe Block: ... End Unsafe'.")
+                    exit_with_code(1)
+                End If
+            End If
+        End If
+
         Let qual_spill_cleanup be 0
         Let qual_need_pad be 0
         If qual_is_external is equal to 1:
@@ -7924,6 +8077,26 @@ Process called "codegen_generate_statement" takes codegen as Integer, stmt as In
         Return 0
     End If
 
+    If stmt_type is equal to 18:  Note: STMT_UNSAFE_BLOCK - body(8), body_count(16)
+        Note: P2-D Q4 FFI enforcement (task #455): enter the unsafe lexical
+        Note: scope. Every call emitted while CODEGEN_UNSAFE_DEPTH > 0 is
+        Note: permitted to target an `unsafe External Process`; the depth is
+        Note: a counter so nested Unsafe Blocks compose correctly. The block
+        Note: emits no code of its own -- it is purely a compile-time gate
+        Note: around its body statements.
+        Set CODEGEN_UNSAFE_DEPTH to CODEGEN_UNSAFE_DEPTH plus 1
+        Let ubgen_body be memory_get_pointer(stmt, 8)
+        Let ubgen_count be memory_get_int32(stmt, 16)
+        Let ubgen_i be 0
+        While ubgen_i is less than ubgen_count:
+            Let ubgen_stmt be memory_get_pointer(ubgen_body, ubgen_i multiplied by 8)
+            codegen_generate_statement(codegen, ubgen_stmt)
+            Set ubgen_i to ubgen_i plus 1
+        End While
+        Set CODEGEN_UNSAFE_DEPTH to CODEGEN_UNSAFE_DEPTH minus 1
+        Return 0
+    End If
+
     If stmt_type is equal to 9:  Note: STMT_BREAK
         Let loop_ctx be codegen_current_loop_context(codegen)
         If loop_ctx is not equal to 0:
@@ -8671,6 +8844,10 @@ Process called "codegen_create" takes output_filename as Integer, arena as Integ
         deallocate(codegen)
         Return 0
     End If
+    Note: Register the output path so any subsequent hard error (exit_with_code
+    Note: with a nonzero code) unlinks the partially-written file instead of
+    Note: leaving a truncated artifact on disk (task #450).
+    Set CODEGEN_FAIL_CLEANUP_OUTPUT_PATH to output_filename
     memory_set_integer(codegen, 0, output_file)  Note: codegen->output_file
     memory_set_pointer(codegen, 88, arena)  Note: codegen->arena - store for temporary allocations
 
@@ -9022,6 +9199,22 @@ Process called "codegen_estimate_stmt_frame" takes stmt as Integer, program as I
                 Let wchild_size be codegen_estimate_stmt_frame(wchild, program)
                 Set total to total plus wchild_size
                 Set wi to wi plus 1
+            End While
+        End If
+        Return total
+    End If
+
+    Note: STMT_UNSAFE_BLOCK = 18: body(8), body_count(16)
+    If stmt_type is equal to 18:
+        Let ub_frame_body be memory_get_pointer(stmt, 8)
+        Let ub_frame_count be memory_get_int32(stmt, 16)
+        If ub_frame_body is not equal to 0:
+            Let ubfi be 0
+            While ubfi is less than ub_frame_count:
+                Let ub_frame_child be memory_get_pointer(ub_frame_body, ubfi multiplied by 8)
+                Let ub_frame_size be codegen_estimate_stmt_frame(ub_frame_child, program)
+                Set total to total plus ub_frame_size
+                Set ubfi to ubfi plus 1
             End While
         End If
         Return total
@@ -10865,6 +11058,18 @@ Process called "callgraph_collect_calls_from_stmt" takes graph as Integer, node 
         While i is less than body_count:
             Let body_stmt be memory_get_pointer(body_stmts, i multiplied by 8)
             callgraph_collect_calls_from_stmt(graph, node, body_stmt)
+            Set i to i plus 1
+        End While
+    End If
+
+    Note: STMT_UNSAFE_BLOCK = 18: body(8), body_count(16)
+    If stmt_type is equal to 18:
+        Set body_stmts to memory_get_pointer(stmt, 8)
+        Set body_count to memory_get_int32(stmt, 16)
+        Set i to 0
+        While i is less than body_count:
+            Let ub_cg_stmt be memory_get_pointer(body_stmts, i multiplied by 8)
+            callgraph_collect_calls_from_stmt(graph, node, ub_cg_stmt)
             Set i to i plus 1
         End While
     End If

@@ -42,14 +42,13 @@ Note: ==========================================================================
 Import "compiler/middle/gungnir/mir/mir.runa" as MIR
 Import "compiler/middle/gungnir/mir/mir_nodes.runa" as MIRNodes
 Import "compiler/middle/gungnir/mir/cfg.runa" as CFG
-Import "compiler/middle/gungnir/mir/ssa.runa" as SSA
 Import "compiler/middle/gungnir/mir/dominance.runa" as Dominance
-Import "compiler/middle/gungnir/mir/mir_verifier.runa" as Verifier
 Import "compiler/frontend/primitives/memory/layout.runa" as Layout
 Import "compiler/frontend/primitives/collections/list.runa" as List
 Import "compiler/frontend/primitives/collections/dictionary.runa" as Dictionary
+Import "compiler/frontend/primitives/collections/ordered_map.runa" as OMap
 Import "compiler/frontend/primitives/collections/set.runa" as Set
-Import "compiler/frontend/primitives/core/string_core.runa" as String
+Import "compiler/internal/string_utils.runa" as StringUtils
 
 Note: ============================================================================
 Note: TYPE DEFINITIONS - Loop Information and LICM Context
@@ -93,25 +92,36 @@ Type called "LICMContext":
 
     **LICM ALGORITHM:**
     1. Detect natural loops (back-edge identification)
-    2. Build loop nesting structure
-    3. Insert preheaders for loops with multiple entries
-    4. Detect loop-invariant instructions (fixed-point)
-    5. Check hoisting safety (no side effects, dominates exits)
-    6. Hoist invariant instructions to preheader
+    2. Insert preheaders so every loop has a single hoist landing pad
+    3. Recompute dominance (preheaders change the topology)
+    4. Detect loop-invariant instructions (fixed-point, per loop)
+    5. Check hoisting safety (pure non-trapping whitelist, dominates exits)
+    6. Hoist invariant instructions to the preheader in marking order
 
     **MEMORY LAYOUT** (96 bytes):
     ```
     Offset 0:  cfg (Integer - MIRCFG pointer)
     Offset 8:  loops (Integer - List of LoopInfo pointers)
-    Offset 16: invariant_insts (Integer - Set of invariant instruction pointers)
+    Offset 16: invariant_insts (Integer - Set of string-encoded invariant
+               instruction pointers; recreated fresh for every loop)
     Offset 24: hoisted_count (Integer - number of instructions hoisted)
     Offset 32: loops_processed (Integer - number of loops processed)
     Offset 40: preheaders_inserted (Integer - number of preheaders created)
-    Offset 48: dominance_ptr (Integer - DominanceInfo pointer)
-    Offset 56: ssa_ptr (Integer - SSA info pointer)
-    Offset 64: use_def_chains (Integer - Dictionary pointer)
-    Offset 72: def_use_chains (Integer - Dictionary pointer)
-    Offset 80: block_to_loop (Integer - Dictionary: block_id → LoopInfo)
+    Offset 48: dominance_ptr (Integer - DominanceInfo pointer, owned;
+               recomputed after preheader insertion)
+    Offset 56: function_ptr (Integer - MIRFunction pointer; value-id and
+               instruction lookups are threaded through the function)
+    Offset 64: def_map (Integer - OMap value_id -> defining instruction.
+               LOCAL def-use structure built by one CFG scan: SSA does NOT
+               materialize MIRValue use-lists (Wave 4 finding) and
+               collections/dictionary string-hashes keys so integer keys
+               crash (Wave 3 finding) - hence an integer-keyed ordered map)
+    Offset 72: invariant_list (Integer - List of invariant instruction
+               pointers in MARKING order; an instruction is only marked
+               after every operand is invariant, so marking order is a
+               valid dependency (topological) order for hoisting;
+               recreated fresh for every loop)
+    Offset 80: block_to_loop (Integer - Dictionary: block_id string -> LoopInfo)
     Offset 88: iteration_count (Integer - invariant detection iterations)
     ```
     @End Reasoning
@@ -123,9 +133,9 @@ Type called "LICMContext":
     loops_processed as Integer
     preheaders_inserted as Integer
     dominance_ptr as Integer
-    ssa_ptr as Integer
-    use_def_chains as Integer
-    def_use_chains as Integer
+    function_ptr as Integer
+    def_map as Integer
+    invariant_list as Integer
     block_to_loop as Integer
     iteration_count as Integer
 End Type
@@ -134,64 +144,125 @@ Note: ==========================================================================
 Note: CONTEXT MANAGEMENT
 Note: ============================================================================
 
-Process called "create_licm_context" that takes cfg_ptr as Integer returns Integer:
+Process called "build_def_map" that takes cfg_ptr as Integer returns Integer:
     @Reasoning
-    Constructs the LICM analysis context that ties together the CFG under
-    optimization with the dominance tree, SSA def/use information, and the
-    per-pass bookkeeping structures (loop list, invariant set, statistics
-    counters). Every downstream LICM stage reads its inputs and writes its
-    outputs through this single shared block, so the constructor is the
-    only place where ownership of those auxiliary tables is established.
+    Builds the pass-local definition map: SSA value id -> defining
+    instruction pointer. This is the LOCAL def-use structure that replaces
+    the never-implemented SSA.build_def_use_chains dependency. Two prior
+    findings shape it: SSA construction does not materialize MIRValue
+    use-lists (Wave 4), so the only authoritative def source is the
+    instruction stream itself; and collections/dictionary string-hashes
+    its keys, so integer keys crash at runtime (Wave 3) — hence the
+    integer-keyed ordered map. One O(I) scan up front converts every
+    later "who defines this operand?" probe in the fixed-point invariant
+    analysis into an O(1) omap_get, and a value id ABSENT from the map is
+    by construction defined outside every block (a function parameter),
+    which the invariance classifier treats as trivially loop-invariant.
+    @End Reasoning
 
-    Dominance must be computed up front because back-edge identification,
-    natural-loop body discovery, and the hoist-safety dominance check on
-    loop exits all require a ready dominance oracle. Computing it lazily
-    later would force every consumer to defensively trigger the analysis
-    and would prevent the constructor from validating its prerequisites
-    in one place.
+    @Implementation
+    Walks every block in the CFG's canonical storage list and every
+    instruction in each block's instruction List. For every instruction
+    whose header value_id (offset 8) is non-zero, records
+    omap_set(def_map, value_id, instruction). Phi results participate
+    because OD-1 mirrors the phi result into the header value_id slot.
+    Returns the populated OMap; the caller owns it.
+    @End Implementation
 
-    Returns the populated context pointer on success, or 0 if the CFG is
-    null or any allocation fails. On allocation failure the routine does
-    not attempt partial cleanup of any structures already created — the
-    teardown path in destroy_licm_context is the single deallocation
-    surface and is only safe to invoke against a fully constructed
-    context.
+    Let def_map be proc omap_create from OMap
+    If cfg_ptr is equal to 0:
+        Return def_map
+    End If
+
+    Let blocks be proc get_mir_cfg_blocks from CFG with cfg_ptr
+    If blocks is equal to 0:
+        Return def_map
+    End If
+
+    Let block_count be proc length from List with blocks
+    Let b_idx be 0
+    While b_idx is less than block_count:
+        Let block_ptr be proc get from List with blocks, b_idx
+        If block_ptr is not equal to 0:
+            Let instructions be proc get_block_instructions from MIR with block_ptr
+            If instructions is not equal to 0:
+                Let inst_count be proc length from List with instructions
+                Let i_idx be 0
+                While i_idx is less than inst_count:
+                    Let inst_ptr be proc get from List with instructions, i_idx
+                    If inst_ptr is not equal to 0:
+                        Let value_id be proc get_mir_node_value_id from MIR with inst_ptr
+                        If value_id is not equal to 0:
+                            proc omap_set from OMap with def_map, value_id, inst_ptr
+                        End If
+                    End If
+                    Set i_idx to i_idx plus 1
+                End While
+            End If
+        End If
+        Set b_idx to b_idx plus 1
+    End While
+
+    Return def_map
+End Process
+
+Process called "create_licm_context" that takes function_ptr as Integer returns Integer:
+    @Reasoning
+    Constructs the LICM analysis context that ties together the function
+    under optimization with its CFG, the dominance tree, the local
+    definition map, and the per-pass bookkeeping structures (loop list,
+    invariant set/list, statistics counters). Every downstream LICM stage
+    reads its inputs and writes its outputs through this single shared
+    block, so the constructor is the only place where ownership of those
+    auxiliary tables is established.
+
+    The pass is keyed on the FUNCTION (not the bare CFG) because value-id
+    bookkeeping — the definition map and value registration — lives on
+    MIRFunction, and the CFG is derived via the canonical
+    MIR.get_mir_function_cfg accessor.
+
+    Dominance must be computed up front because back-edge identification
+    and natural-loop body discovery require a ready dominance oracle.
+    insert_preheaders RECOMPUTES it after mutating the topology; the
+    context owns whichever instance is current and destroy_licm_context
+    frees it.
+
+    Returns the populated context pointer on success, or 0 if the
+    function/CFG is null or any allocation fails.
     @End Reasoning
 
     @Implementation
     Allocates the 96-byte context block via Layout.allocate and populates
     it field-by-field using the canonical offsets documented on LICMContext:
-      0   cfg                  (argument)
+      0   cfg                  (MIR.get_mir_function_cfg(function))
       8   loops                (List, fresh)
-      16  invariant_insts      (Set, fresh)
+      16  invariant_insts      (Set, fresh; recreated per loop)
       24  hoisted_count        (0)
       32  loops_processed      (0)
       40  preheaders_inserted  (0)
-      48  dominance_ptr        (compute_dominance_tree(cfg))
-      56  ssa_ptr              (get_ssa_info(cfg))
-      64  use_def_chains       (build_use_def_chains(cfg))
-      72  def_use_chains       (build_def_use_chains(cfg))
-      80  block_to_loop        (Dictionary, fresh)
+      48  dominance_ptr        (Dominance.compute_dominance_tree(cfg))
+      56  function_ptr         (argument)
+      64  def_map              (build_def_map(cfg) - integer-keyed OMap)
+      72  invariant_list       (List, fresh; recreated per loop)
+      80  block_to_loop        (Dictionary, fresh; string block-id keys)
       88  iteration_count      (0)
-
-    Null CFG is rejected before allocation. Allocation failures from
-    Layout.allocate return 0 to the caller without leaking the partially
-    constructed context because no nested structures are created prior
-    to the allocation check.
     @End Implementation
 
     @Performance_Hints
-    Dominance computation is O(N * E * α(N)) using the Lengauer-Tarjan
-    algorithm. SSA def/use chain construction is O(I) in the number of
-    instructions. The context itself is a flat 96-byte block — no
-    indirection or cache misses beyond the dominance/SSA structures.
-    Callers that invoke LICM repeatedly on the same CFG should reuse the
-    dominance information rather than rebuilding it per pass; the pass
-    manager is responsible for that scheduling.
+    Dominance computation dominates construction cost. The definition map
+    scan is O(I) in the instruction count and pays for itself after the
+    first fixed-point iteration of any non-trivial loop. The context
+    itself is a flat 96-byte block.
     @End Performance_Hints
 
+    If function_ptr is equal to 0:
+        Display "create_licm_context: null function"
+        Return 0
+    End If
+
+    Let cfg_ptr be proc get_mir_function_cfg from MIR with function_ptr
     If cfg_ptr is equal to 0:
-        Display "create_licm_context: null CFG"
+        Display "create_licm_context: function has no CFG"
         Return 0
     End If
 
@@ -219,19 +290,19 @@ Process called "create_licm_context" that takes cfg_ptr as Integer returns Integ
     proc memory_set_int64 from Layout with context_ptr, 40, 0 Note: preheaders_inserted
 
     Note: Compute dominance information
-    Display "create_licm_context: computing dominance information"
     Let dom_info be proc compute_dominance_tree from Dominance with cfg_ptr
     proc memory_set_int64 from Layout with context_ptr, 48, dom_info
 
-    Note: Get SSA info
-    Let ssa_ptr be proc get_ssa_info from SSA with cfg_ptr
-    proc memory_set_int64 from Layout with context_ptr, 56, ssa_ptr
+    Note: Thread the function pointer
+    proc memory_set_int64 from Layout with context_ptr, 56, function_ptr
 
-    Note: Build use-def and def-use chains
-    Let use_def be proc build_use_def_chains from SSA with cfg_ptr
-    Let def_use be proc build_def_use_chains from SSA with cfg_ptr
-    proc memory_set_int64 from Layout with context_ptr, 64, use_def
-    proc memory_set_int64 from Layout with context_ptr, 72, def_use
+    Note: Build the local definition map (value id -> defining instruction)
+    Let def_map be proc build_def_map with cfg_ptr
+    proc memory_set_int64 from Layout with context_ptr, 64, def_map
+
+    Note: Create the marking-order invariant list
+    Let invariant_list be proc create from List
+    proc memory_set_int64 from Layout with context_ptr, 72, invariant_list
 
     Note: Create block_to_loop mapping
     Let block_to_loop be proc create from Dictionary
@@ -240,7 +311,6 @@ Process called "create_licm_context" that takes cfg_ptr as Integer returns Integ
     Note: Initialize iteration count
     proc memory_set_int64 from Layout with context_ptr, 88, 0
 
-    Display "create_licm_context: context created successfully"
     Return context_ptr
 End Process
 
@@ -270,18 +340,24 @@ Process called "destroy_licm_context" that takes context_ptr as Integer returns 
     @End Reasoning
 
     @Implementation
-    Performs a four-phase ordered teardown:
+    Performs an ordered teardown:
       1. loops_list (offset 8): iterate every LoopInfo, free its
          body_blocks Set (offset 16), exit_blocks Set (offset 24), and
-         back_edges List (offset 32), then deallocate the 64-byte
-         LoopInfo struct. After the walk, destroy loops_list.
+         back_edges List (offset 32) including the 16-byte edge pairs it
+         owns, then deallocate the 64-byte LoopInfo struct. After the
+         walk, destroy loops_list.
       2. invariant_insts (offset 16): destroy the Set. The pointed-to
          instructions remain owned by MIR.
-      3. block_to_loop (offset 80): destroy the Dictionary. Values alias
+      3. invariant_list (offset 72): destroy the List spine (same
+         non-ownership rule).
+      4. def_map (offset 64): omap_destroy. Values are borrowed
+         instruction pointers.
+      5. dominance_ptr (offset 48): destroy_dominance_info — the context
+         OWNS the dominance info it computed (constructor and the
+         insert_preheaders recompute both store the owned instance here).
+      6. block_to_loop (offset 80): destroy the Dictionary. Values alias
          LoopInfo entries already freed in phase 1.
-      4. Deallocate the 96-byte context block itself.
-    Dominance, SSA, and use/def chain structures are NOT freed here;
-    they are owned by the analysis cache and outlive a single LICM pass.
+      7. Deallocate the 96-byte context block itself.
     @End Implementation
 
     If context_ptr is equal to 0:
@@ -308,9 +384,19 @@ Process called "destroy_licm_context" that takes context_ptr as Integer returns 
                     proc destroy from Set with exit_blocks
                 End If
 
-                Note: Free loop's back_edges list
+                Note: Free loop's back_edges list and the 16-byte edge
+                Note: pairs it owns (transferred from find_back_edges)
                 Let back_edges be proc memory_get_int64 from Layout with loop_info, 32
                 If back_edges is not equal to 0:
+                    Let edge_count be proc length from List with back_edges
+                    Let e_idx be 0
+                    While e_idx is less than edge_count:
+                        Let edge_pair be proc get from List with back_edges, e_idx
+                        If edge_pair is not equal to 0:
+                            proc deallocate from Layout with edge_pair
+                        End If
+                        Set e_idx to e_idx plus 1
+                    End While
                     proc destroy from List with back_edges
                 End If
 
@@ -327,6 +413,24 @@ Process called "destroy_licm_context" that takes context_ptr as Integer returns 
     Let invariant_set be proc memory_get_int64 from Layout with context_ptr, 16
     If invariant_set is not equal to 0:
         proc destroy from Set with invariant_set
+    End If
+
+    Note: Free invariant_list (List of borrowed instruction pointers)
+    Let invariant_list be proc memory_get_int64 from Layout with context_ptr, 72
+    If invariant_list is not equal to 0:
+        proc destroy from List with invariant_list
+    End If
+
+    Note: Free the local definition map
+    Let def_map be proc memory_get_int64 from Layout with context_ptr, 64
+    If def_map is not equal to 0:
+        proc omap_destroy from OMap with def_map
+    End If
+
+    Note: Free the owned dominance info
+    Let dom_info be proc memory_get_int64 from Layout with context_ptr, 48
+    If dom_info is not equal to 0:
+        proc destroy_dominance_info from Dominance with dom_info
     End If
 
     Note: Free block_to_loop dictionary
@@ -358,16 +462,20 @@ Process called "print_licm_stats" that takes context_ptr as Integer returns Inte
     Display "============================================"
 
     Let loops_processed be proc memory_get_int64 from Layout with context_ptr, 32
-    Display "Loops processed: " joined with loops_processed
+    Let loops_str be proc integer_to_string from StringUtils with loops_processed
+    Display "Loops processed: " joined with loops_str
 
     Let preheaders_inserted be proc memory_get_int64 from Layout with context_ptr, 40
-    Display "Preheaders inserted: " joined with preheaders_inserted
+    Let preheaders_str be proc integer_to_string from StringUtils with preheaders_inserted
+    Display "Preheaders inserted: " joined with preheaders_str
 
     Let hoisted_count be proc memory_get_int64 from Layout with context_ptr, 24
-    Display "Instructions hoisted: " joined with hoisted_count
+    Let hoisted_str be proc integer_to_string from StringUtils with hoisted_count
+    Display "Instructions hoisted: " joined with hoisted_str
 
     Let iteration_count be proc memory_get_int64 from Layout with context_ptr, 88
-    Display "Invariant detection iterations: " joined with iteration_count
+    Let iter_str be proc integer_to_string from StringUtils with iteration_count
+    Display "Invariant detection iterations: " joined with iter_str
 
     Display "============================================"
     Display ""
@@ -395,9 +503,9 @@ Process called "is_back_edge" that takes source_id as Integer, target_id as Inte
     @End Reasoning
 
     @Implementation
-    Delegates the dominance test to does_dominate on the precomputed
-    dominance tree. The check is O(log N) average using the dominator
-    tree's path-compressed ancestor query.
+    Delegates the dominance test to Dominance.dominates(info, dom, blk)
+    on the precomputed dominance tree (the canonical oracle; there is no
+    does_dominate). The check walks the immediate-dominator chain.
     @End Implementation
 
     If dominance_ptr is equal to 0:
@@ -405,9 +513,9 @@ Process called "is_back_edge" that takes source_id as Integer, target_id as Inte
     End If
 
     Note: Check if target dominates source
-    Let dominates be proc does_dominate from Dominance with dominance_ptr, target_id, source_id
+    Let target_dominates be proc dominates from Dominance with dominance_ptr, target_id, source_id
 
-    Return dominates
+    Return target_dominates
 End Process
 
 Process called "find_back_edges" that takes cfg_ptr as Integer, dominance_ptr as Integer returns Integer:
@@ -429,12 +537,11 @@ Process called "find_back_edges" that takes cfg_ptr as Integer, dominance_ptr as
     @End Reasoning
 
     @Implementation
-    Iterates every block returned by get_all_blocks. For each block B,
-    iterates B's successors and applies is_back_edge(B, S, dominance).
+    Iterates every block POINTER in the canonical storage list
+    (CFG.get_mir_cfg_blocks, borrowed). For each block B, iterates B's
+    successor BLOCK IDS and applies is_back_edge(B, S, dominance).
     A back edge produces a 16-byte heap pair (source_id at offset 0,
-    target_id at offset 8) appended to the result List. Diagnostic
-    Display traces each discovery so codegen problems remain visible
-    during bringup.
+    target_id at offset 8) appended to the result List.
     @End Implementation
 
     @Performance_Hints
@@ -452,12 +559,10 @@ Process called "find_back_edges" that takes cfg_ptr as Integer, dominance_ptr as
         Return 0
     End If
 
-    Display "find_back_edges: scanning CFG for back edges"
-
     Let back_edges be proc create from List
 
-    Note: Get all blocks
-    Let all_blocks be proc get_all_blocks from CFG with cfg_ptr
+    Note: Get the block POINTER storage list (canonical accessor)
+    Let all_blocks be proc get_mir_cfg_blocks from CFG with cfg_ptr
     If all_blocks is equal to 0:
         Return back_edges
     End If
@@ -467,17 +572,16 @@ Process called "find_back_edges" that takes cfg_ptr as Integer, dominance_ptr as
 
     While i is less than block_count:
         Let block_ptr be proc get from List with all_blocks, i
-        Let block_id be proc get_block_id from CFG with block_ptr
+        Let block_id be proc get_mir_basic_block_id from CFG with block_ptr
 
-        Note: Get successors
-        Let successors be proc get_block_successors from CFG with block_ptr
+        Note: Successor lists hold BLOCK IDS (canonical representation)
+        Let successors be proc get_block_successors from MIR with block_ptr
         If successors is not equal to 0:
             Let succ_count be proc length from List with successors
             Let j be 0
 
             While j is less than succ_count:
-                Let succ_ptr be proc get from List with successors, j
-                Let succ_id be proc get_block_id from CFG with succ_ptr
+                Let succ_id be proc get from List with successors, j
 
                 Note: Check if this is a back edge
                 Let is_back be proc is_back_edge with block_id, succ_id, dominance_ptr
@@ -489,8 +593,6 @@ Process called "find_back_edges" that takes cfg_ptr as Integer, dominance_ptr as
                     proc memory_set_int64 from Layout with edge_pair, 8, succ_id
 
                     proc append from List with back_edges, edge_pair
-
-                    Display "find_back_edges: found back edge " joined with block_id joined with " → " joined with succ_id
                 End If
 
                 Set j to j plus 1
@@ -499,9 +601,6 @@ Process called "find_back_edges" that takes cfg_ptr as Integer, dominance_ptr as
 
         Set i to i plus 1
     End While
-
-    Let edge_count be proc length from List with back_edges
-    Display "find_back_edges: found " joined with edge_count joined with " back edges"
 
     Return back_edges
 End Process
@@ -516,11 +615,11 @@ Process called "compute_loop_body" that takes header_id as Integer, back_edge_so
     preheader insertion). The header is included by definition; the
     back-edge source is included as the worklist seed.
 
-    The result Set owns string-encoded block IDs (one per body block).
-    String keys are required because the underlying Set is keyed by
-    String and not by Integer — encoding once on insertion avoids
-    re-encoding during the hot membership checks performed by
-    is_loop_invariant_operand and the preheader walk.
+    The result Set holds raw integer block IDs. The Set primitive
+    string-encodes its keys INTERNALLY (collections/set add/contains
+    take the integer element), so callers must never pre-encode —
+    doing so would key the set on string pointer values and break
+    every membership check.
 
     Returns the populated body Set on success, or 0 when the CFG
     argument is null. The header_id is unconditionally included even
@@ -540,8 +639,7 @@ Process called "compute_loop_body" that takes header_id as Integer, back_edge_so
     body terminates upward at the header because the header dominates
     every body block by definition of "natural".
 
-    Block ID encoding to String is done once per insertion via
-    integer_to_string; the Set uses string equality for membership.
+    Elements are raw integer block ids (the Set encodes internally).
     The worklist is destroyed before return; body_blocks is handed to
     the caller.
     @End Implementation
@@ -558,17 +656,15 @@ Process called "compute_loop_body" that takes header_id as Integer, back_edge_so
         Return 0
     End If
 
-    Display "compute_loop_body: computing body for loop header " joined with header_id
-
     Let body_blocks be proc create from Set
     Let worklist be proc create from List
 
-    Note: Add back-edge source and header to body
-    Let source_str be proc integer_to_string from String with back_edge_source
-    proc add from Set with body_blocks, source_str
-
-    Let header_str be proc integer_to_string from String with header_id
-    proc add from Set with body_blocks, header_str
+    Note: Add back-edge source and header to body. The Set primitive
+    Note: takes RAW INTEGER elements (it string-encodes its keys
+    Note: internally) - pre-encoding here would key the set on string
+    Note: POINTER values and break membership tests.
+    proc add from Set with body_blocks, back_edge_source
+    proc add from Set with body_blocks, header_id
 
     Note: Add back-edge source to worklist
     proc append from List with worklist, back_edge_source
@@ -581,27 +677,23 @@ Process called "compute_loop_body" that takes header_id as Integer, back_edge_so
 
         Note: Get current block
         Let current_block be proc get_block_by_id from CFG with cfg_ptr, current_id
-        If current_block is equal to 0:
-            Display "compute_loop_body: warning - block " joined with current_id joined with " not found"
-        Otherwise:
-            Note: Process predecessors
-            Let predecessors be proc get_block_predecessors from CFG with current_block
+        If current_block is not equal to 0:
+            Note: Predecessor lists hold BLOCK IDS
+            Let predecessors be proc get_block_predecessors from MIR with current_block
             If predecessors is not equal to 0:
                 Let pred_count be proc length from List with predecessors
                 Let i be 0
 
                 While i is less than pred_count:
-                    Let pred_ptr be proc get from List with predecessors, i
-                    Let pred_id be proc get_block_id from CFG with pred_ptr
+                    Let pred_id be proc get from List with predecessors, i
 
                     Note: Don't go past header
                     If pred_id is not equal to header_id:
-                        Let pred_str be proc integer_to_string from String with pred_id
-                        Let already_in_body be proc contains from Set with body_blocks, pred_str
+                        Let already_in_body be proc contains from Set with body_blocks, pred_id
 
                         If already_in_body is equal to 0:
                             Note: Add to body and worklist
-                            proc add from Set with body_blocks, pred_str
+                            proc add from Set with body_blocks, pred_id
                             proc append from List with worklist, pred_id
                         End If
                     End If
@@ -613,9 +705,6 @@ Process called "compute_loop_body" that takes header_id as Integer, back_edge_so
     End While
 
     proc destroy from List with worklist
-
-    Let body_size be proc size from Set with body_blocks
-    Display "compute_loop_body: loop body contains " joined with body_size joined with " blocks"
 
     Return body_blocks
 End Process
@@ -666,32 +755,30 @@ Process called "compute_loop_exits" that takes loop_info as Integer, cfg_ptr as 
     Let exit_blocks be proc create from Set
     Let body_blocks be proc memory_get_int64 from Layout with loop_info, 16
 
-    Note: Get body block members
-    Let body_members be proc members from Set with body_blocks
+    Note: Enumerate body block ids (to_list returns a fresh List of raw
+    Note: integer elements owned by the caller)
+    Let body_members be proc to_list from Set with body_blocks
     Let body_count be proc length from List with body_members
 
     Let i be 0
     While i is less than body_count:
-        Let block_id_str be proc get from List with body_members, i
-        Let block_id be proc string_to_integer from String with block_id_str
+        Let block_id be proc get from List with body_members, i
 
         Let block_ptr be proc get_block_by_id from CFG with cfg_ptr, block_id
         If block_ptr is not equal to 0:
-            Note: Check successors
-            Let successors be proc get_block_successors from CFG with block_ptr
+            Note: Successor lists hold BLOCK IDS
+            Let successors be proc get_block_successors from MIR with block_ptr
             If successors is not equal to 0:
                 Let succ_count be proc length from List with successors
                 Let j be 0
 
                 While j is less than succ_count:
-                    Let succ_ptr be proc get from List with successors, j
-                    Let succ_id be proc get_block_id from CFG with succ_ptr
-                    Let succ_str be proc integer_to_string from String with succ_id
+                    Let succ_id be proc get from List with successors, j
 
                     Note: If successor not in loop body, it's an exit
-                    Let in_body be proc contains from Set with body_blocks, succ_str
+                    Let in_body be proc contains from Set with body_blocks, succ_id
                     If in_body is equal to 0:
-                        proc add from Set with exit_blocks, succ_str
+                        proc add from Set with exit_blocks, succ_id
                     End If
 
                     Set j to j plus 1
@@ -701,6 +788,8 @@ Process called "compute_loop_exits" that takes loop_info as Integer, cfg_ptr as 
 
         Set i to i plus 1
     End While
+
+    proc destroy from List with body_members
 
     Return exit_blocks
 End Process
@@ -756,12 +845,6 @@ Process called "detect_natural_loops" that takes context_ptr as Integer returns 
         Return 0
     End If
 
-    Display ""
-    Display "============================================"
-    Display "LOOP DETECTION"
-    Display "============================================"
-    Display ""
-
     Let cfg_ptr be proc memory_get_int64 from Layout with context_ptr, 0
     Let dominance_ptr be proc memory_get_int64 from Layout with context_ptr, 48
     Let loops_list be proc memory_get_int64 from Layout with context_ptr, 8
@@ -770,12 +853,10 @@ Process called "detect_natural_loops" that takes context_ptr as Integer returns 
     Note: Find all back edges
     Let back_edges be proc find_back_edges with cfg_ptr, dominance_ptr
     If back_edges is equal to 0:
-        Display "detect_natural_loops: no back edges found"
         Return 0
     End If
 
     Let edge_count be proc length from List with back_edges
-    Display "detect_natural_loops: processing " joined with edge_count joined with " back edges"
 
     Note: Create LoopInfo for each back edge
     Let i be 0
@@ -783,8 +864,6 @@ Process called "detect_natural_loops" that takes context_ptr as Integer returns 
         Let edge_pair be proc get from List with back_edges, i
         Let source_id be proc memory_get_int64 from Layout with edge_pair, 0
         Let target_id be proc memory_get_int64 from Layout with edge_pair, 8
-
-        Display "detect_natural_loops: creating loop for back edge " joined with source_id joined with " → " joined with target_id
 
         Note: Allocate LoopInfo (64 bytes)
         Let loop_info be proc allocate from Layout with 64
@@ -818,25 +897,28 @@ Process called "detect_natural_loops" that takes context_ptr as Integer returns 
         Note: Add to loops list
         proc append from List with loops_list, loop_info
 
-        Note: Map all body blocks to this loop
-        Let body_members be proc members from Set with body_blocks
+        Note: Map all body blocks to this loop (Dictionary requires
+        Note: STRING keys - string-hash on integer keys crashes)
+        Let body_members be proc to_list from Set with body_blocks
         Let body_count be proc length from List with body_members
         Let j be 0
         While j is less than body_count:
-            Let block_id_str be proc get from List with body_members, j
+            Let body_block_id be proc get from List with body_members, j
+            Let block_id_str be proc integer_to_string from StringUtils with body_block_id
             proc set from Dictionary with block_to_loop, block_id_str, loop_info
             Set j to j plus 1
         End While
+        proc destroy from List with body_members
 
         Set i to i plus 1
     End While
 
-    Note: Free back_edges list
+    Note: Free the back_edges spine only - each pair pointer was
+    Note: transferred into its LoopInfo's per-loop back_edges list,
+    Note: which owns it from here (destroy_licm_context frees it)
     proc destroy from List with back_edges
 
     Let loop_count be proc length from List with loops_list
-    Display "detect_natural_loops: detected " joined with loop_count joined with " natural loops"
-    Display ""
 
     Return loop_count
 End Process
@@ -896,8 +978,8 @@ Process called "needs_preheader" that takes loop_info as Integer, cfg_ptr as Int
         Return 0
     End If
 
-    Note: Count non-back-edge predecessors
-    Let predecessors be proc get_block_predecessors from CFG with header_block
+    Note: Count non-back-edge predecessors (predecessor lists hold IDS)
+    Let predecessors be proc get_block_predecessors from MIR with header_block
     If predecessors is equal to 0:
         Return 0
     End If
@@ -907,12 +989,10 @@ Process called "needs_preheader" that takes loop_info as Integer, cfg_ptr as Int
 
     Let i be 0
     While i is less than pred_count:
-        Let pred_ptr be proc get from List with predecessors, i
-        Let pred_id be proc get_block_id from CFG with pred_ptr
-        Let pred_str be proc integer_to_string from String with pred_id
+        Let pred_id be proc get from List with predecessors, i
 
         Note: Check if predecessor is in loop body (back edge)
-        Let in_body be proc contains from Set with body_blocks, pred_str
+        Let in_body be proc contains from Set with body_blocks, pred_id
         If in_body is equal to 0:
             Note: Non-back-edge predecessor
             Set non_back_edge_preds to non_back_edge_preds plus 1
@@ -930,7 +1010,7 @@ Process called "needs_preheader" that takes loop_info as Integer, cfg_ptr as Int
     Return 1
 End Process
 
-Process called "insert_preheader" that takes loop_info as Integer, cfg_ptr as Integer returns Integer:
+Process called "insert_preheader" that takes loop_info as Integer, cfg_ptr as Integer, function_ptr as Integer returns Integer:
     @Reasoning
     Materialises a preheader block for the loop and rewires every
     external predecessor of the header to land in the preheader
@@ -955,18 +1035,35 @@ Process called "insert_preheader" that takes loop_info as Integer, cfg_ptr as In
     @End Reasoning
 
     @Implementation
-    1. Create a fresh basic block via create_basic_block; capture its
-       id and block pointer.
-    2. Materialise an unconditional branch instruction targeting the
-       header (create_branch_instruction) and append it to the
-       preheader so the preheader terminates with a single edge to
-       the header.
-    3. For every predecessor P of the header: if P is NOT in
-       body_blocks (i.e. P is an external entry, not a back edge),
-       call redirect_edge(P, header, preheader) to retarget P's
-       successor edge. Back-edge predecessors are deliberately left
-       pointing at the header.
-    4. Write the new preheader id into loop_info offset 8.
+    1. Create a fresh basic block via CFG.create_basic_block (returns the
+       block POINTER), publish it via CFG.add_block_to_function, and read
+       its id via CFG.get_mir_basic_block_id.
+    2. Materialise the preheader terminator: an unconditional
+       MIRNodes.create_mir_jump targeting the header block id (a MIRJump
+       carries its target as a BLOCK ID at ext offset 72), appended via
+       the canonical CFG.add_instruction_to_block.
+    3. For every predecessor P of the header (predecessor lists hold
+       BLOCK IDS): if P is NOT in body_blocks (i.e. P is an external
+       entry, not a back edge), redirect the edge P -> header to
+       P -> preheader by composing the canonical primitives:
+         CFG.remove_cfg_edge(cfg, P, header)
+         MIR.add_cfg_edge(cfg, P, preheader)
+         CFG.update_terminator_target(cfg, P, header, preheader)
+       (there is no redirect_edge in the canonical surface).
+       Back-edge predecessors are deliberately left pointing at the
+       header. The predecessor list is snapshotted before the walk
+       because remove_cfg_edge mutates it.
+    4. Header phi maintenance: for each phi in the header, every
+       incoming whose block is a redirected external predecessor must
+       now flow through the preheader. With exactly one external
+       incoming the pair's block id is rewritten in place. With
+       multiple external incomings a MERGE PHI is materialised in the
+       preheader (fresh value id from the function), the external
+       pairs are collapsed out of the header phi's pair list, and one
+       (preheader, merge-phi) incoming replaces them — the only
+       semantics-preserving rewrite when the external values differ.
+    5. Add the preheader -> header CFG edge.
+    6. Write the new preheader id into loop_info offset 8.
     @End Implementation
 
     @Performance_Hints
@@ -997,20 +1094,14 @@ Process called "insert_preheader" that takes loop_info as Integer, cfg_ptr as In
     Let header_id be proc memory_get_int64 from Layout with loop_info, 0
     Let body_blocks be proc memory_get_int64 from Layout with loop_info, 16
 
-    Display "insert_preheader: inserting preheader for loop header " joined with header_id
-
-    Note: Create new preheader block
-    Let preheader_id be proc create_basic_block from CFG with cfg_ptr
-    If preheader_id is equal to 0:
+    Note: Create and publish the preheader block (pointer, then id)
+    Let preheader_block be proc create_basic_block from CFG with cfg_ptr
+    If preheader_block is equal to 0:
         Display "insert_preheader: failed to create preheader block"
         Return 0
     End If
-
-    Let preheader_block be proc get_block_by_id from CFG with cfg_ptr, preheader_id
-    If preheader_block is equal to 0:
-        Display "insert_preheader: failed to get preheader block"
-        Return 0
-    End If
+    proc add_block_to_function from CFG with cfg_ptr, preheader_block
+    Let preheader_id be proc get_mir_basic_block_id from CFG with preheader_block
 
     Let header_block be proc get_block_by_id from CFG with cfg_ptr, header_id
     If header_block is equal to 0:
@@ -1018,39 +1109,207 @@ Process called "insert_preheader" that takes loop_info as Integer, cfg_ptr as In
         Return 0
     End If
 
-    Note: Add unconditional branch from preheader to header
-    Let branch_inst be proc create_branch_instruction from MIR with header_id
-    proc add_instruction_to_block from CFG with preheader_block, branch_inst
+    Note: Terminate the preheader with an unconditional jump to the header
+    Let jump_inst be proc create_mir_jump from MIRNodes with header_id
+    proc add_instruction_to_block from CFG with preheader_block, jump_inst
 
-    Note: Redirect non-back-edge predecessors to preheader
-    Let predecessors be proc get_block_predecessors from CFG with header_block
+    Note: Snapshot the external (non-back-edge) predecessors first -
+    Note: remove_cfg_edge mutates the predecessor list being walked.
+    Note: Predecessor lists hold BLOCK IDS.
+    Let external_preds be proc create from List
+    Let predecessors be proc get_block_predecessors from MIR with header_block
     If predecessors is not equal to 0:
         Let pred_count be proc length from List with predecessors
         Let i be 0
 
         While i is less than pred_count:
-            Let pred_ptr be proc get from List with predecessors, i
-            Let pred_id be proc get_block_id from CFG with pred_ptr
-            Let pred_str be proc integer_to_string from String with pred_id
+            Let pred_id be proc get from List with predecessors, i
 
-            Note: Check if predecessor is outside loop
-            Let in_body be proc contains from Set with body_blocks, pred_str
+            Note: A predecessor outside the loop body is an external entry
+            Let in_body be proc contains from Set with body_blocks, pred_id
             If in_body is equal to 0:
-                Note: Redirect edge from pred to header → pred to preheader
-                proc redirect_edge from CFG with cfg_ptr, pred_id, header_id, preheader_id
-                Display "insert_preheader: redirected edge " joined with pred_id joined with " → " joined with header_id joined with " to preheader"
+                proc append from List with external_preds, pred_id
             End If
 
             Set i to i plus 1
         End While
     End If
 
+    Note: Redirect every external edge pred -> header to pred -> preheader
+    Note: (canonical composition; there is no redirect_edge primitive)
+    Let ext_count be proc length from List with external_preds
+    Let e_idx be 0
+    While e_idx is less than ext_count:
+        Let ext_pred_id be proc get from List with external_preds, e_idx
+        proc remove_cfg_edge from CFG with cfg_ptr, ext_pred_id, header_id
+        proc add_cfg_edge from MIR with cfg_ptr, ext_pred_id, preheader_id
+        proc update_terminator_target from CFG with cfg_ptr, ext_pred_id, header_id, preheader_id
+        Set e_idx to e_idx plus 1
+    End While
+
+    Note: Header phi maintenance. Every header phi incoming arriving from
+    Note: a redirected external predecessor now flows through the
+    Note: preheader. Pairs are stored flat: block at 2N, value at 2N+1.
+    If ext_count is greater than 0:
+        Let header_insts be proc get_block_instructions from MIR with header_block
+        If header_insts is not equal to 0:
+            Let header_inst_count be proc length from List with header_insts
+            Let h_idx be 0
+            While h_idx is less than header_inst_count:
+                Let header_inst be proc get from List with header_insts, h_idx
+                If header_inst is not equal to 0:
+                    Let h_opcode be proc get_mir_node_opcode from MIR with header_inst
+                    If h_opcode is equal to 20300:
+                        proc reroute_phi_externals_through_preheader with header_inst, external_preds, preheader_block, preheader_id, function_ptr
+                    End If
+                End If
+                Set h_idx to h_idx plus 1
+            End While
+        End If
+    End If
+
+    proc destroy from List with external_preds
+
+    Note: Wire the preheader -> header edge
+    proc add_cfg_edge from MIR with cfg_ptr, preheader_id, header_id
+
     Note: Update loop info with preheader ID
     proc memory_set_int64 from Layout with loop_info, 8, preheader_id
 
-    Display "insert_preheader: preheader block " joined with preheader_id joined with " created"
-
     Return preheader_id
+End Process
+
+Process called "reroute_phi_externals_through_preheader" that takes phi_ptr as Integer, external_preds as Integer, preheader_block as Integer, preheader_id as Integer, function_ptr as Integer returns Integer:
+    @Reasoning
+    Maintains a single header phi across preheader insertion. Incomings
+    from redirected external predecessors can no longer name those
+    predecessors (the CFG edge now runs through the preheader). One
+    external incoming is a pure rename. Multiple external incomings with
+    potentially different values require a MERGE PHI in the preheader:
+    the preheader is the unique join of the external entries, so merging
+    there and feeding the single merged value into the header phi is the
+    only rewrite that preserves the phi's per-path semantics.
+    @End Reasoning
+
+    @Implementation
+    1. Collect the pair-list indices whose incoming BLOCK is a member of
+       external_preds.
+    2. Zero matches: nothing to do.
+    3. One match: rewrite the pair's block slot (index 2N) to
+       preheader_id in place.
+    4. Two or more: allocate a fresh value id on the function, create a
+       MIRNodes.create_mir_phi_node in the preheader, move each external
+       (block, value) pair onto it via add_phi_incoming, register the
+       result in the function's value map and the preheader's phi
+       registry (offset 88), insert it at the preheader's block START
+       (before the jump terminator) via MIR.insert_instruction_at_block
+       _start, then rebuild the header phi's pair list without the
+       external pairs and append the single (preheader_id, merge value)
+       incoming, re-syncing incoming_count at ext offset 88.
+    @End Implementation
+
+    If phi_ptr is equal to 0:
+        Return 0
+    End If
+    If external_preds is equal to 0:
+        Return 0
+    End If
+
+    Let pairs be proc memory_get_int64 from Layout with phi_ptr, 80
+    If pairs is equal to 0:
+        Return 0
+    End If
+
+    Let pair_len be proc length from List with pairs
+    Let ext_count be proc length from List with external_preds
+
+    Note: Count external incomings and remember the first match index
+    Let match_count be 0
+    Let first_match_idx be 0 minus 1
+    Let p_idx be 0
+    While p_idx is less than pair_len:
+        Let inc_block be proc get from List with pairs, p_idx
+        Let is_external be 0
+        Let x_idx be 0
+        While x_idx is less than ext_count:
+            Let ext_id be proc get from List with external_preds, x_idx
+            If inc_block is equal to ext_id:
+                Set is_external to 1
+            End If
+            Set x_idx to x_idx plus 1
+        End While
+        If is_external is equal to 1:
+            Set match_count to match_count plus 1
+            If first_match_idx is less than 0:
+                Set first_match_idx to p_idx
+            End If
+        End If
+        Set p_idx to p_idx plus 2
+    End While
+
+    If match_count is equal to 0:
+        Return 1
+    End If
+
+    If match_count is equal to 1:
+        Note: Pure rename: the external incoming now arrives via the preheader
+        proc set from List with pairs, first_match_idx, preheader_id
+        Return 1
+    End If
+
+    Note: Multiple external incomings: materialise a preheader merge phi
+    Let phi_type be proc memory_get_int64 from Layout with phi_ptr, 96
+    Let merge_vid be proc allocate_value_id from MIR with function_ptr
+    Let merge_phi be proc create_mir_phi_node from MIRNodes with merge_vid, phi_type, preheader_block
+    If merge_phi is equal to 0:
+        Return 0
+    End If
+
+    Note: Rebuild the header phi pair list, moving external pairs onto
+    Note: the merge phi
+    Let rebuilt_pairs be proc create from List
+    Set p_idx to 0
+    While p_idx is less than pair_len:
+        Let scan_block be proc get from List with pairs, p_idx
+        Let scan_value be proc get from List with pairs, (p_idx plus 1)
+        Let scan_external be 0
+        Let s_idx be 0
+        While s_idx is less than ext_count:
+            Let scan_ext_id be proc get from List with external_preds, s_idx
+            If scan_block is equal to scan_ext_id:
+                Set scan_external to 1
+            End If
+            Set s_idx to s_idx plus 1
+        End While
+        If scan_external is equal to 1:
+            proc add_phi_incoming from MIRNodes with merge_phi, scan_block, scan_value
+        Otherwise:
+            proc append from List with rebuilt_pairs, scan_block
+            proc append from List with rebuilt_pairs, scan_value
+        End If
+        Set p_idx to p_idx plus 2
+    End While
+
+    Note: The merged value enters the header phi from the preheader
+    proc append from List with rebuilt_pairs, preheader_id
+    proc append from List with rebuilt_pairs, merge_vid
+
+    Note: Swap the rebuilt pair list in and re-sync incoming_count
+    proc destroy from List with pairs
+    proc memory_set_int64 from Layout with phi_ptr, 80, rebuilt_pairs
+    Let rebuilt_len be proc length from List with rebuilt_pairs
+    proc memory_set_int64 from Layout with phi_ptr, 88, (rebuilt_len divided by 2)
+
+    Note: Publish the merge phi: block start (before the jump terminator),
+    Note: phi registry, and the function value map
+    proc insert_instruction_at_block_start from MIR with preheader_block, merge_phi
+    Let phi_registry be proc memory_get_int64 from Layout with preheader_block, 88
+    If phi_registry is not equal to 0:
+        proc append from List with phi_registry, merge_phi
+    End If
+    proc register_value_definition from MIR with function_ptr, merge_vid, merge_phi
+
+    Return 1
 End Process
 
 Process called "insert_preheaders" that takes context_ptr as Integer returns Integer:
@@ -1068,24 +1327,25 @@ Process called "insert_preheaders" that takes context_ptr as Integer returns Int
     @End Reasoning
 
     @Implementation
-    Reads cfg and loops_list from the context. For each LoopInfo:
+    Reads cfg, function, and loops_list from the context. For each
+    LoopInfo:
       - Calls needs_preheader to decide.
       - On 1, calls insert_preheader; counts successful insertions
         (return != 0).
-    Writes the running total into context offset 40 before returning.
+    After the walk, when any preheader was inserted the CFG topology has
+    changed, so the context's dominance info is RECOMPUTED (the old
+    instance is destroyed, the fresh one stored at offset 48) — the
+    hoist-safety dominance queries in can_hoist_instruction must run
+    against the post-preheader graph. Writes the running total into
+    context offset 40 before returning.
     @End Implementation
 
     If context_ptr is equal to 0:
         Return 0
     End If
 
-    Display ""
-    Display "============================================"
-    Display "PREHEADER INSERTION"
-    Display "============================================"
-    Display ""
-
     Let cfg_ptr be proc memory_get_int64 from Layout with context_ptr, 0
+    Let function_ptr be proc memory_get_int64 from Layout with context_ptr, 56
     Let loops_list be proc memory_get_int64 from Layout with context_ptr, 8
 
     Let loop_count be proc length from List with loops_list
@@ -1099,7 +1359,7 @@ Process called "insert_preheaders" that takes context_ptr as Integer returns Int
         Let needs_ph be proc needs_preheader with loop_info, cfg_ptr
 
         If needs_ph is equal to 1:
-            Let preheader_id be proc insert_preheader with loop_info, cfg_ptr
+            Let preheader_id be proc insert_preheader with loop_info, cfg_ptr, function_ptr
             If preheader_id is not equal to 0:
                 Set preheaders_created to preheaders_created plus 1
             End If
@@ -1108,11 +1368,18 @@ Process called "insert_preheaders" that takes context_ptr as Integer returns Int
         Set i to i plus 1
     End While
 
+    Note: Preheaders changed the topology - recompute owned dominance
+    If preheaders_created is greater than 0:
+        Let old_dom be proc memory_get_int64 from Layout with context_ptr, 48
+        If old_dom is not equal to 0:
+            proc destroy_dominance_info from Dominance with old_dom
+        End If
+        Let new_dom be proc compute_dominance_tree from Dominance with cfg_ptr
+        proc memory_set_int64 from Layout with context_ptr, 48, new_dom
+    End If
+
     Note: Update context counter
     proc memory_set_int64 from Layout with context_ptr, 40, preheaders_created
-
-    Display "insert_preheaders: inserted " joined with preheaders_created joined with " preheaders"
-    Display ""
 
     Return preheaders_created
 End Process
@@ -1121,51 +1388,71 @@ Note: ==========================================================================
 Note: INVARIANT DETECTION - Fixed-Point Analysis
 Note: ============================================================================
 
-Process called "is_loop_invariant_operand" that takes operand_id as Integer, loop_info as Integer, invariant_set as Integer, ssa_ptr as Integer, cfg_ptr as Integer returns Integer:
+Process called "get_instruction_block_id" that takes inst_ptr as Integer returns Integer:
+    @Reasoning
+    Returns the id of the block an instruction currently resides in, or
+    -1 when the instruction is detached (parent_block of 0). Derived
+    from the canonical MIRNode parent_block back-pointer at header
+    offset 56, which every canonical insertion path stamps
+    (mir.runa add_instruction_to_block and
+    insert_instruction_at_block_start, cfg.runa add_instruction_to_block)
+    and the canonical remove_instruction_from_block clears. -1 (not 0)
+    is the sentinel because 0 is the entry block's VALID id.
+    @End Reasoning
+
+    If inst_ptr is equal to 0:
+        Return 0 minus 1
+    End If
+
+    Let parent_block be proc get_mir_node_parent_block from MIR with inst_ptr
+    If parent_block is equal to 0:
+        Return 0 minus 1
+    End If
+
+    Return proc get_mir_basic_block_id from CFG with parent_block
+End Process
+
+Process called "is_loop_invariant_operand" that takes operand_id as Integer, loop_info as Integer, invariant_set as Integer, def_map as Integer returns Integer:
     @Reasoning
     Per-operand classifier for the fixed-point invariant analysis. An
     operand is loop-invariant if, on every iteration of the loop, it
-    has the same value. Three sources of invariance are recognised:
-      1. The operand is already in invariant_set — i.e. its defining
-         instruction has been classified invariant in a previous
-         iteration of the fixed-point loop.
-      2. The operand is an MIR constant node — constants are
-         invariant by construction.
-      3. The operand's defining instruction lives in a block outside
-         the loop body — such defs are unreachable for re-evaluation
-         from inside the loop and therefore stable across iterations.
+    has the same value. Sources of invariance, checked in order of
+    decreasing cheapness:
+      1. The operand has no entry in the definition map — it is not
+         defined by any instruction in any block, i.e. it is a function
+         parameter. Parameters are fixed for the whole invocation and
+         therefore invariant in every loop.
+      2. The operand's defining instruction is a MIR_CONST (20001) —
+         constants are invariant by construction.
+      3. The defining instruction lives in a block outside the loop
+         body — such defs cannot be re-evaluated from inside the loop
+         and are stable across iterations.
+      4. The defining instruction has already been classified invariant
+         in a previous step of the fixed-point loop (membership of the
+         DEFINING INSTRUCTION pointer in invariant_set — the set is
+         keyed by instruction pointer, matching what
+         mark_invariant_instructions inserts; the pre-reconciliation
+         code probed it with the operand VALUE id, a key family that was
+         never inserted, so invariant chaining silently never fired).
 
-    This three-way classification is what makes the surrounding
-    fixed-point analysis monotone: once an instruction's operands are
-    classified invariant, the classification cannot regress in a later
-    iteration, so the worklist converges.
+    This classification is monotone: once an operand is classified
+    invariant the classification cannot regress, so the fixed point
+    converges.
 
     Returns 1 if invariant, 0 if not invariant or loop_info is null.
-    Null ssa_ptr disables case (3) but cases (1) and (2) still apply.
     @End Reasoning
 
     @Implementation
-    Sequential check of the three cases in order of decreasing
-    cheapness:
-      Case 1: integer_to_string on operand_id, then Set.contains
-              against invariant_set.
-      Case 2: get_mir_value on operand_id from MIR; if non-null,
-              get_mir_node_type from MIR, then compare against
-              MIR.MIR_CONSTANT.
-      Case 3: get_defining_instruction on operand_id from SSA;
-              if non-null, get_instruction_block_id from MIR, then
-              string-encode and call Set.contains against body_blocks.
-              If the defining block is NOT in body_blocks, the
-              operand is classified invariant.
-    Falls through to Return 0 when none of the three apply.
+    Probes the integer-keyed def_map (OMap) once. Absence => case 1.
+    Otherwise reads the defining instruction's opcode (case 2), its
+    residence block id via get_instruction_block_id against the loop's
+    body_blocks Set (case 3), and finally the instruction-pointer key
+    against invariant_set (case 4).
     @End Implementation
 
     @Performance_Hints
-    Case 1 dominates in the steady state of the fixed-point loop
-    (most operands are already classified by mid-iteration). Cost is
-    O(1) Set lookup plus O(log operand_id) string encode. Case 3
-    requires an SSA lookup and a second Set lookup; this is the
-    warmest path during the first iteration but quickly becomes rare.
+    One O(1) omap probe plus at most one Set probe per call. The
+    integer_to_string encodes are bounded by pointer/id digit counts.
     @End Performance_Hints
 
     If loop_info is equal to 0:
@@ -1173,38 +1460,39 @@ Process called "is_loop_invariant_operand" that takes operand_id as Integer, loo
     End If
 
     Let body_blocks be proc memory_get_int64 from Layout with loop_info, 16
-    Let operand_str be proc integer_to_string from String with operand_id
 
-    Note: Check if operand is in invariant set (already marked as invariant)
-    Let is_in_invariant_set be proc contains from Set with invariant_set, operand_str
-    If is_in_invariant_set is equal to 1:
+    Note: Case 1 - no defining instruction anywhere: function parameter
+    Let has_def be proc omap_contains from OMap with def_map, operand_id
+    If has_def is equal to 0:
         Return 1
     End If
 
-    Note: Check if operand is a constant (constants are always invariant)
-    Let operand_node be proc get_mir_value from MIR with operand_id
-    If operand_node is not equal to 0:
-        Let node_type be proc get_mir_node_type from MIR with operand_node
-        If node_type is equal to MIR.MIR_CONSTANT:
+    Let defining_inst be proc omap_get from OMap with def_map, operand_id
+    If defining_inst is equal to 0:
+        Return 1
+    End If
+
+    Note: Case 2 - constants are invariant by construction
+    Let def_opcode be proc get_mir_node_opcode from MIR with defining_inst
+    If def_opcode is equal to 20001:
+        Return 1
+    End If
+
+    Note: Case 3 - defined outside the loop body (Set elements are raw
+    Note: integer block ids)
+    Let defining_block_id be proc get_instruction_block_id with defining_inst
+    If defining_block_id is greater than or equal to 0:
+        Let is_in_loop be proc contains from Set with body_blocks, defining_block_id
+        If is_in_loop is equal to 0:
             Return 1
         End If
     End If
 
-    Note: Check if operand is defined outside loop
-    If ssa_ptr is not equal to 0:
-        Let defining_inst be proc get_defining_instruction from SSA with ssa_ptr, operand_id
-        If defining_inst is not equal to 0:
-            Note: Get block containing defining instruction
-            Let defining_block_id be proc get_instruction_block_id from MIR with defining_inst
-            Let defining_block_str be proc integer_to_string from String with defining_block_id
-
-            Note: Check if defining block is in loop body
-            Let is_in_loop be proc contains from Set with body_blocks, defining_block_str
-            If is_in_loop is equal to 0:
-                Note: Defined outside loop - invariant
-                Return 1
-            End If
-        End If
+    Note: Case 4 - defining instruction already classified invariant
+    Note: (set elements are raw INSTRUCTION POINTERS)
+    Let def_marked be proc contains from Set with invariant_set, defining_inst
+    If def_marked is equal to 1:
+        Return 1
     End If
 
     Return 0
@@ -1265,7 +1553,7 @@ Process called "can_hoist_instruction" that takes inst_ptr as Integer, loop_info
     bypass), but combined with Property 1 the strict dominance
     requirement guards future relaxations and matches the textbook
     LICM safety criterion. The check uses the precomputed dominance
-    oracle (does_dominate).
+    oracle (Dominance.dominates).
 
     PROPERTY 3 — MAY-NOT-THROW
     Combined with Property 1's rejection of MIR_CALL and MIR_LOAD,
@@ -1289,16 +1577,31 @@ Process called "can_hoist_instruction" that takes inst_ptr as Integer, loop_info
 
     @Implementation
     Steps:
-      1. Read opcode via MIR.get_mir_node_opcode. Reject opcodes
-         MIR_STORE, MIR_CALL, MIR_LOAD (Property 1 + Property 3).
+      1. Read opcode via MIR.get_mir_node_opcode and test it against a
+         POSITIVE whitelist of side-effect-free, trap-free,
+         non-control-flow opcodes:
+           20001 CONST; 20002-20004 ADD/SUB/MUL; 20007 NEG; 20008 COPY;
+           20010-20016 bitwise/shift; 20100-20105 comparisons;
+           20400-20408 casts.
+         Everything else is rejected: stores/loads/field ops/deref
+         (Property 1: memory effects or trap potential), calls/invokes/
+         atomics (arbitrary effects), DIV/MOD 20005/20006 (divide-by-
+         zero trap — Property 3; a path inside the loop may guard the
+         divisor, and a preheader evaluation would trap on inputs the
+         original program handled), terminators and phis (control flow
+         and merge semantics are position-dependent by definition), and
+         the debug/vector/exception bands. A whitelist fails CLOSED for
+         any future opcode until it is audited against all three
+         properties.
       2. Read exit_blocks (offset 24) and enumerate its members via
-         Set.members. If dominance_ptr is non-null and there is at
-         least one exit, query does_dominate(dominance_ptr,
+         Set.to_list. If dominance_ptr is non-null and there is at
+         least one exit, query Dominance.dominates(dominance_ptr,
          inst_block_id, exit_block_id) for each exit. Any failure
          returns 0 (Property 2).
       3. Reaching the end means all three properties hold; return 1.
-    inst_block_id is fetched once via get_instruction_block_id before
-    the loop to avoid repeated lookups inside the exit walk.
+    inst_block_id is fetched once via the parent_block-derived
+    get_instruction_block_id before the loop to avoid repeated lookups
+    inside the exit walk; a detached instruction (-1) is rejected.
     @End Implementation
 
     @Performance_Hints
@@ -1307,8 +1610,8 @@ Process called "can_hoist_instruction" that takes inst_ptr as Integer, loop_info
     with a single exit (most natural loops) this is effectively a
     constant-time predicate. The exit walk is the inner loop of the
     fixed-point analysis when many candidates pass Property 1; the
-    Set.members allocation per call is the main optimisation target
-    if profiling identifies hotspot.
+    Set.to_list allocation per call is the main optimisation target
+    if profiling identifies a hotspot.
     @End Performance_Hints
 
     @Security_Scope
@@ -1331,42 +1634,63 @@ Process called "can_hoist_instruction" that takes inst_ptr as Integer, loop_info
 
     Let opcode be proc get_mir_node_opcode from MIR with inst_ptr
 
-    Note: Check for side effects
-    If opcode is equal to MIR.MIR_STORE:
-        Return 0
+    Note: Positive whitelist (Properties 1 and 3) - fail closed
+    Let hoistable_opcode be 0
+    If opcode is equal to 20001:
+        Set hoistable_opcode to 1
     End If
-    If opcode is equal to MIR.MIR_CALL:
-        Return 0
+    If opcode is greater than or equal to 20002 and opcode is less than or equal to 20004:
+        Set hoistable_opcode to 1
     End If
-    If opcode is equal to MIR.MIR_LOAD:
-        Note: Loads can trap - be conservative
+    If opcode is equal to 20007 or opcode is equal to 20008:
+        Set hoistable_opcode to 1
+    End If
+    If opcode is greater than or equal to 20010 and opcode is less than or equal to 20016:
+        Set hoistable_opcode to 1
+    End If
+    If opcode is greater than or equal to 20100 and opcode is less than or equal to 20105:
+        Set hoistable_opcode to 1
+    End If
+    If opcode is greater than or equal to 20400 and opcode is less than or equal to 20408:
+        Set hoistable_opcode to 1
+    End If
+
+    If hoistable_opcode is equal to 0:
         Return 0
     End If
 
-    Note: Check dominance of all loop exits
+    Note: Check dominance of all loop exits (to_list returns a fresh
+    Note: List of raw integer block ids owned by this caller)
     Let exit_blocks be proc memory_get_int64 from Layout with loop_info, 24
-    Let exit_members be proc members from Set with exit_blocks
+    Let exit_members be proc to_list from Set with exit_blocks
     Let exit_count be proc length from List with exit_members
 
     Note: Instruction must dominate ALL loop exits to be safe to hoist
     If dominance_ptr is not equal to 0 and exit_count is greater than 0:
-        Let inst_block_id be proc get_instruction_block_id from MIR with inst_ptr
+        Let inst_block_id be proc get_instruction_block_id with inst_ptr
+        If inst_block_id is less than 0:
+            Note: Detached instruction - no residence, no proof
+            proc destroy from List with exit_members
+            Return 0
+        End If
         Let exit_idx be 0
 
         While exit_idx is less than exit_count:
-            Let exit_block_str be proc get from List with exit_members, exit_idx
-            Let exit_block_id be proc string_to_integer from String with exit_block_str
+            Let exit_block_id be proc get from List with exit_members, exit_idx
 
             Note: Check if instruction's block dominates this exit
-            Let dominates be proc does_dominate from Dominance with dominance_ptr, inst_block_id, exit_block_id
-            If dominates is equal to 0:
+            Let inst_dominates_exit be proc dominates from Dominance with dominance_ptr, inst_block_id, exit_block_id
+            If inst_dominates_exit is equal to 0:
                 Note: Instruction does not dominate this exit - unsafe to hoist
+                proc destroy from List with exit_members
                 Return 0
             End If
 
             Set exit_idx to exit_idx plus 1
         End While
     End If
+
+    proc destroy from List with exit_members
 
     Return 1
 End Process
@@ -1407,29 +1731,32 @@ Process called "mark_invariant_instructions" that takes context_ptr as Integer, 
     @Implementation
     Outer loop terminates when changed == 0 or iteration >= 50.
     Inner walks:
-      - For each block id in body_blocks (string-decoded back to Int):
+      - For each block id in body_blocks (raw integer Set elements):
         - For each instruction inst in the block:
-          - Skip if already in invariant_set.
-          - Read operands op1 (offset 16) and op2 (offset 24).
-          - Default each operand's invariance flag to 1; for a
-            non-null operand, override the flag with the result of
-            calling is_loop_invariant_operand on it.
-          - If both flags are 1, query can_hoist_instruction. On
-            accept, insert the instruction (string-encoded) into
-            invariant_set and set changed = 1.
-    After convergence, write the invariant set size into loop_info
-    offset 56 and accumulate the iteration count into context
-    offset 88.
+          - Skip if already in invariant_set (raw instruction-pointer
+            membership).
+          - Query can_hoist_instruction FIRST (cheap whitelist plus
+            exit-dominance; rejects stores, loads, calls, div/mod,
+            terminators, and phis before any operand analysis).
+          - Enumerate EVERY value use of the instruction through the
+            canonical CFG.get_instruction_used_values (header operand
+            slots plus phi incomings) and require
+            is_loop_invariant_operand to accept each one.
+          - On full acceptance: add the instruction POINTER to
+            invariant_set, append it to invariant_list (marking order
+            is dependency order - an instruction is only marked after
+            its operands are classified), set changed = 1.
+    After convergence, write the invariant count into loop_info offset
+    56 and accumulate the iteration count into context offset 88.
     @End Implementation
 
     @Performance_Hints
     O(K * |body| * inst-per-block) per iteration where K is the
     number of iterations until convergence (typically 2-5). The
-    inner cost is dominated by is_loop_invariant_operand and
-    can_hoist_instruction, each O(log) per call. Set.contains for
-    inst_str is the warmest pure-bookkeeping cost. For loops with
-    >1000 instructions the integer_to_string traffic on the inner
-    inst_ptr -> inst_str path is the prime optimisation target.
+    inner cost is dominated by can_hoist_instruction (one Set.to_list
+    per candidate) and is_loop_invariant_operand (one O(1) omap probe
+    per use). Set.contains on the instruction pointer is the warmest
+    pure-bookkeeping cost.
     @End Performance_Hints
 
     If context_ptr is equal to 0:
@@ -1442,10 +1769,14 @@ Process called "mark_invariant_instructions" that takes context_ptr as Integer, 
     Let cfg_ptr be proc memory_get_int64 from Layout with context_ptr, 0
     Let invariant_set be proc memory_get_int64 from Layout with context_ptr, 16
     Let dominance_ptr be proc memory_get_int64 from Layout with context_ptr, 48
-    Let ssa_ptr be proc memory_get_int64 from Layout with context_ptr, 56
+    Let def_map be proc memory_get_int64 from Layout with context_ptr, 64
+    Let invariant_list be proc memory_get_int64 from Layout with context_ptr, 72
     Let body_blocks be proc memory_get_int64 from Layout with loop_info, 16
 
-    Display "mark_invariant_instructions: starting fixed-point analysis"
+    Note: The body block-id set does not change during the analysis -
+    Note: enumerate it once (raw integer elements, caller-owned List)
+    Let body_members be proc to_list from Set with body_blocks
+    Let body_count be proc length from List with body_members
 
     Let iteration be 0
     Let max_iterations be 50
@@ -1455,57 +1786,60 @@ Process called "mark_invariant_instructions" that takes context_ptr as Integer, 
         Set changed to 0
         Set iteration to iteration plus 1
 
-        Display "mark_invariant_instructions: iteration " joined with iteration
-
-        Note: Process all instructions in loop body
-        Let body_members be proc members from Set with body_blocks
-        Let body_count be proc length from List with body_members
-
         Let i be 0
         While i is less than body_count:
-            Let block_id_str be proc get from List with body_members, i
-            Let block_id be proc string_to_integer from String with block_id_str
+            Let block_id be proc get from List with body_members, i
 
             Let block_ptr be proc get_block_by_id from CFG with cfg_ptr, block_id
             If block_ptr is not equal to 0:
-                Let inst_list be proc get_block_instructions from CFG with block_ptr
+                Let inst_list be proc get_block_instructions from MIR with block_ptr
                 If inst_list is not equal to 0:
                     Let inst_count be proc length from List with inst_list
                     Let j be 0
 
                     While j is less than inst_count:
                         Let inst_ptr be proc get from List with inst_list, j
-                        Let inst_str be proc integer_to_string from String with inst_ptr
 
                         Note: Check if already marked invariant
-                        Let already_invariant be proc contains from Set with invariant_set, inst_str
+                        Let already_invariant be 1
+                        If inst_ptr is not equal to 0:
+                            Set already_invariant to proc contains from Set with invariant_set, inst_ptr
+                        End If
 
                         If already_invariant is equal to 0:
-                            Note: Check if all operands are invariant
-                            Let op1 be proc memory_get_int64 from Layout with inst_ptr, 16
-                            Let op2 be proc memory_get_int64 from Layout with inst_ptr, 24
+                            Note: Cheap safety gate first (whitelist +
+                            Note: exit dominance)
+                            Let can_hoist be proc can_hoist_instruction with inst_ptr, loop_info, dominance_ptr, cfg_ptr
 
-                            Let op1_invariant be 1
-                            Let op2_invariant be 1
+                            If can_hoist is equal to 1:
+                                Note: Every value USE must be invariant
+                                Note: (canonical enumeration: header
+                                Note: operand slots + phi incomings)
+                                Let used_values be proc get_instruction_used_values from CFG with inst_ptr
+                                Let all_invariant be 1
+                                If used_values is not equal to 0:
+                                    Let use_count be proc length from List with used_values
+                                    Let u_idx be 0
+                                    While u_idx is less than use_count:
+                                        Let use_id be proc get from List with used_values, u_idx
+                                        If use_id is not equal to 0:
+                                            Let use_invariant be proc is_loop_invariant_operand with use_id, loop_info, invariant_set, def_map
+                                            If use_invariant is equal to 0:
+                                                Set all_invariant to 0
+                                                Set u_idx to use_count
+                                            End If
+                                        End If
+                                        Set u_idx to u_idx plus 1
+                                    End While
+                                    proc destroy from List with used_values
+                                End If
 
-                            If op1 is not equal to 0:
-                                Set op1_invariant to proc is_loop_invariant_operand with op1, loop_info, invariant_set, ssa_ptr, cfg_ptr
-                            End If
-
-                            If op2 is not equal to 0:
-                                Set op2_invariant to proc is_loop_invariant_operand with op2, loop_info, invariant_set, ssa_ptr, cfg_ptr
-                            End If
-
-                            Note: If all operands invariant and safe to hoist
-                            If op1_invariant is equal to 1 and op2_invariant is equal to 1:
-                                Let can_hoist be proc can_hoist_instruction with inst_ptr, loop_info, dominance_ptr, cfg_ptr
-
-                                If can_hoist is equal to 1:
-                                    Note: Mark as invariant
-                                    proc add from Set with invariant_set, inst_str
+                                If all_invariant is equal to 1:
+                                    Note: Mark as invariant (pointer-keyed
+                                    Note: set + marking-order list)
+                                    proc add from Set with invariant_set, inst_ptr
+                                    proc append from List with invariant_list, inst_ptr
                                     Set changed to 1
-
-                                    Display "mark_invariant_instructions: marked instruction " joined with inst_ptr joined with " as invariant"
                                 End If
                             End If
                         End If
@@ -1519,8 +1853,9 @@ Process called "mark_invariant_instructions" that takes context_ptr as Integer, 
         End While
     End While
 
+    proc destroy from List with body_members
+
     Let invariant_count be proc size from Set with invariant_set
-    Display "mark_invariant_instructions: found " joined with invariant_count joined with " invariant instructions in " joined with iteration joined with " iterations"
 
     Note: Update loop info
     proc memory_set_int64 from Layout with loop_info, 56, invariant_count
@@ -1571,15 +1906,20 @@ Process called "hoist_instruction" that takes inst_ptr as Integer, loop_info as 
     1. Resolve preheader_id from loop_info offset 8. If zero, abort
        with diagnostic (no preheader was inserted for this loop).
     2. Resolve preheader_block via get_block_by_id; abort on failure.
-    3. Resolve original_block via get_instruction_block_id +
-       get_block_by_id. If found, call
-       remove_instruction_from_block; a non-zero failure is logged
-       but not fatal (the instruction will be appended to the
-       preheader regardless, which is benign because dead copies in
-       the original block are removed by subsequent DCE).
-    4. Append the instruction to the preheader via
-       add_instruction_to_block. The preheader's CFG implementation
-       inserts before the terminator branch.
+    3. Resolve the original block from the instruction's parent_block
+       back-pointer and detach the instruction through the canonical
+       CFG.remove_instruction_from_block (removes the List entry,
+       re-syncs the cached count, clears parent_block). A failed
+       detach ABORTS the hoist — appending a still-resident
+       instruction to a second block would double-own it.
+    4. Insert the instruction into the preheader BEFORE its jump
+       terminator: when the preheader's last instruction is a
+       terminator (MIR.is_terminator) the instruction is List-inserted
+       at count-1 with the cached count and parent_block stamped
+       manually (mirroring the canonical add path); otherwise it is
+       appended via CFG.add_instruction_to_block. Successive hoists
+       therefore stack in marking order ahead of the terminator,
+       preserving dependency order between hoisted instructions.
     @End Implementation
 
     @Security_Scope
@@ -1613,25 +1953,44 @@ Process called "hoist_instruction" that takes inst_ptr as Integer, loop_info as 
         Return 0
     End If
 
-    Display "hoist_instruction: hoisting instruction " joined with inst_ptr joined with " to preheader " joined with preheader_id
+    Note: Detach from the original block (resolved via the parent_block
+    Note: back-pointer). A failed detach aborts - the instruction must
+    Note: never be resident in two blocks at once.
+    Let original_block be proc get_mir_node_parent_block from MIR with inst_ptr
+    If original_block is equal to 0:
+        Display "hoist_instruction: instruction has no resident block"
+        Return 0
+    End If
 
-    Note: Get original block containing instruction
-    Let original_block_id be proc get_instruction_block_id from MIR with inst_ptr
-    Let original_block be proc get_block_by_id from CFG with cfg_ptr, original_block_id
+    Let removal_result be proc remove_instruction_from_block from CFG with original_block, inst_ptr
+    If removal_result is equal to 0:
+        Display "hoist_instruction: failed to detach instruction from original block"
+        Return 0
+    End If
 
-    If original_block is not equal to 0:
-        Note: Remove instruction from original block
-        Let removal_result be proc remove_instruction_from_block from CFG with original_block, inst_ptr
-        If removal_result is equal to 0:
-            Display "hoist_instruction: WARNING - failed to remove instruction from original block"
+    Note: Insert into the preheader BEFORE its jump terminator
+    Let preheader_insts be proc get_block_instructions from MIR with preheader_block
+    Let preheader_count be proc length from List with preheader_insts
+
+    Let inserted_before_terminator be 0
+    If preheader_count is greater than 0:
+        Let last_inst be proc get from List with preheader_insts, (preheader_count minus 1)
+        Let last_is_terminator be proc is_terminator from MIR with last_inst
+        If last_is_terminator is equal to 1:
+            proc insert from List with preheader_insts, (preheader_count minus 1), inst_ptr
+            Let new_len be proc length from List with preheader_insts
+            proc memory_set_int64 from Layout with preheader_block, 24, new_len
+            proc memory_set_int64 from Layout with inst_ptr, 56, preheader_block
+            Set inserted_before_terminator to 1
         End If
     End If
 
-    Note: Add instruction to preheader (before terminator)
-    Let add_result be proc add_instruction_to_block from CFG with preheader_block, inst_ptr
-    If add_result is equal to 0:
-        Display "hoist_instruction: ERROR - failed to add instruction to preheader"
-        Return 0
+    If inserted_before_terminator is equal to 0:
+        Let add_result be proc add_instruction_to_block from CFG with preheader_block, inst_ptr
+        If add_result is equal to 0:
+            Display "hoist_instruction: failed to add instruction to preheader"
+            Return 0
+        End If
     End If
 
     Return 1
@@ -1646,24 +2005,24 @@ Process called "hoist_invariant_instructions" that takes context_ptr as Integer,
     set) and the transformation phase (hoist_instruction, which
     mutates the CFG).
 
-    The current implementation hoists the entire invariant_set into
-    one loop's preheader. When LICM processes multiple loops in a
-    function, the caller is responsible for clearing or re-seeding
-    invariant_set between loops; the current optimize_function_with_licm
-    pipeline relies on the convention that mark_invariant_instructions
-    is called immediately before hoist_invariant_instructions for each
-    loop in turn.
+    The invariant bookkeeping (set + marking-order list) is PER LOOP:
+    optimize_function_with_licm recreates both before each
+    mark/hoist pair, so this routine always sees exactly the current
+    loop's classification and can never re-hoist a previous loop's
+    instructions into the wrong preheader.
 
     Returns the number of instructions successfully hoisted. The
     return value contributes to the context's hoisted_count statistic.
     @End Reasoning
 
     @Implementation
-    Reads invariant_set from context offset 16. Enumerates members via
-    Set.members, decodes each instruction pointer with
-    string_to_integer, and calls hoist_instruction. Counts successful
-    hoists (return == 1). Diagnostic Display lines bracket the loop
-    for codegen-bringup observability.
+    Iterates the context's invariant_list (offset 72) - NOT the set -
+    because the list preserves MARKING ORDER, which is a valid
+    dependency (topological) order: an instruction is only marked after
+    every operand it uses is classified invariant, so hoisting in list
+    order places defining instructions ahead of their users in the
+    preheader. Calls hoist_instruction per entry and counts successful
+    hoists (return == 1).
     @End Implementation
 
     If context_ptr is equal to 0:
@@ -1674,20 +2033,15 @@ Process called "hoist_invariant_instructions" that takes context_ptr as Integer,
     End If
 
     Let cfg_ptr be proc memory_get_int64 from Layout with context_ptr, 0
-    Let invariant_set be proc memory_get_int64 from Layout with context_ptr, 16
-
-    Display "hoist_invariant_instructions: hoisting invariant instructions"
+    Let invariant_list be proc memory_get_int64 from Layout with context_ptr, 72
 
     Let hoisted be 0
 
-    Note: Get all invariant instructions
-    Let invariant_members be proc members from Set with invariant_set
-    Let invariant_count be proc length from List with invariant_members
+    Let invariant_count be proc length from List with invariant_list
 
     Let i be 0
     While i is less than invariant_count:
-        Let inst_str be proc get from List with invariant_members, i
-        Let inst_ptr be proc string_to_integer from String with inst_str
+        Let inst_ptr be proc get from List with invariant_list, i
 
         Note: Hoist instruction
         Let result be proc hoist_instruction with inst_ptr, loop_info, cfg_ptr
@@ -1698,8 +2052,6 @@ Process called "hoist_invariant_instructions" that takes context_ptr as Integer,
         Set i to i plus 1
     End While
 
-    Display "hoist_invariant_instructions: hoisted " joined with hoisted joined with " instructions"
-
     Return hoisted
 End Process
 
@@ -1707,103 +2059,117 @@ Note: ==========================================================================
 Note: ENTRY POINTS AND PIPELINE INTEGRATION
 Note: ============================================================================
 
-Process called "optimize_function_with_licm" that takes cfg_ptr as Integer returns Integer:
+Process called "optimize_function_with_licm" that takes function_ptr as Integer returns Integer:
     @Reasoning
     Top-level driver for the Loop-Invariant Code Motion optimization
-    pass on a single function CFG. The pipeline composes the six
-    LICM stages in their required order:
+    pass on a single MIRFunction. The pipeline composes the LICM
+    stages in their required order:
 
-      1. Construct the LICM context. This computes dominance, SSA
-         use/def chains, and allocates the bookkeeping structures.
+      1. Construct the LICM context. This derives the CFG, computes
+         dominance, builds the local definition map, and allocates
+         the bookkeeping structures.
       2. Detect natural loops. Without any loops the pass terminates
          successfully (no work to do).
       3. Insert preheaders so every loop has a single landing pad for
-         hoisted instructions.
-      4. For each loop, run mark_invariant_instructions to find the
-         transitive closure of safe-to-hoist instructions, then
+         hoisted instructions, then recompute dominance against the
+         mutated topology.
+      4. Sort loops inner-first (ascending body size).
+      5. For each loop, with FRESH per-loop invariant bookkeeping,
+         run mark_invariant_instructions to find the transitive
+         closure of safe-to-hoist instructions, then
          hoist_invariant_instructions to materialise the transform.
          The two are tightly coupled: marking must finish before
          hoisting because hoisting mutates the CFG and would
          invalidate the analysis if interleaved.
-      5. Print statistics for telemetry consumers.
       6. Destroy the context.
 
     The pass is idempotent at the function level: re-running LICM on
-    a CFG that has no further invariant motion to perform produces
-    no transformations and identical output.
+    a function that has no further invariant motion to perform
+    produces no new motion (already-hoisted instructions reside in
+    preheaders outside every loop body).
 
     Returns 1 on success (including the "no loops found" case), 0 on
-    context creation failure or null CFG.
+    context creation failure or null function.
     @End Reasoning
 
     @Implementation
-    Stage 1: create_licm_context. On null return, abort with
-    diagnostic and propagate 0.
+    Stage 1: create_licm_context(function). On null return, propagate 0.
     Stage 2: detect_natural_loops. On 0 return, destroy context and
     return 1 (success with no work).
-    Stage 3: insert_preheaders.
-    Stage 4: iterate loops_list (offset 8); for each LoopInfo, call
+    Stage 3: insert_preheaders (owns the dominance recompute).
+    Stage 4: sort_loops_by_body_size on loops_list (offset 8).
+    Stage 5: iterate loops_list; for each LoopInfo, recreate the
+    invariant set (offset 16) and marking-order list (offset 72), call
     mark_invariant_instructions and hoist_invariant_instructions,
     accumulate hoisted count, increment loops_processed counter at
     context offset 32.
-    Final: write total_hoisted into context offset 24, call
-    print_licm_stats, destroy context, return 1.
+    Final: write total_hoisted into context offset 24, destroy
+    context, return 1. Statistics remain queryable via
+    print_licm_stats before destruction when a caller orchestrates
+    the stages manually.
     @End Implementation
 
     @Performance_Hints
-    Per-function cost is dominated by stage 1 (dominance + SSA
-    construction) and the fixed-point analysis in stage 4. For
+    Per-function cost is dominated by stage 1 (dominance + definition
+    map construction) and the fixed-point analysis in stage 5. For
     functions with no loops the early exit after stage 2 keeps the
     cost at one dominance computation plus one CFG scan, which is
     why the heuristic guard in should_run_licm matters for compile
     time on loop-light input.
     @End Performance_Hints
 
-    If cfg_ptr is equal to 0:
-        Display "optimize_function_with_licm: null CFG"
+    If function_ptr is equal to 0:
+        Display "optimize_function_with_licm: null function"
         Return 0
     End If
 
-    Display ""
-    Display "============================================"
-    Display "LOOP-INVARIANT CODE MOTION"
-    Display "============================================"
-    Display ""
-
-    Note: Step 1: Create context
-    Display "Step 1: Creating LICM context..."
-    Let context_ptr be proc create_licm_context with cfg_ptr
+    Note: Step 1: Create context (derives the CFG, computes dominance,
+    Note: builds the local definition map)
+    Let context_ptr be proc create_licm_context with function_ptr
     If context_ptr is equal to 0:
-        Display "optimize_function_with_licm: failed to create context"
         Return 0
     End If
 
     Note: Step 2: Detect natural loops
-    Display "Step 2: Detecting natural loops..."
     Let loop_count be proc detect_natural_loops with context_ptr
 
     If loop_count is equal to 0:
-        Display "optimize_function_with_licm: no loops found"
         proc destroy_licm_context with context_ptr
         Return 1
     End If
 
-    Note: Step 3: Insert preheaders
-    Display "Step 3: Inserting preheaders..."
+    Note: Step 3: Insert preheaders (recomputes dominance afterwards)
     proc insert_preheaders with context_ptr
 
-    Note: Step 4: Process each loop
-    Display "Step 4: Processing loops for invariant code motion..."
+    Note: Step 3.5: Order loops inner-first (ascending body size) so an
+    Note: inner loop's hoists land in its own preheader before the
+    Note: enclosing loop is analyzed
     Let loops_list be proc memory_get_int64 from Layout with context_ptr, 8
+    proc sort_loops_by_body_size with loops_list
+
+    Note: Step 4: Process each loop with FRESH per-loop invariant
+    Note: bookkeeping - reusing the set across loops would re-hoist a
+    Note: previous loop's instructions into the current loop's preheader
     Let total_hoisted be 0
 
     Let i be 0
     While i is less than loop_count:
         Let loop_info be proc get from List with loops_list, i
-        Let header_id be proc memory_get_int64 from Layout with loop_info, 0
 
-        Display ""
-        Display "Processing loop with header " joined with header_id joined with "..."
+        Note: Reset per-loop invariant set and marking-order list
+        Let old_set be proc memory_get_int64 from Layout with context_ptr, 16
+        If old_set is not equal to 0:
+            proc destroy from Set with old_set
+        End If
+        Let fresh_set be proc create from Set
+        proc memory_set_int64 from Layout with context_ptr, 16, fresh_set
+
+        Let old_list be proc memory_get_int64 from Layout with context_ptr, 72
+        If old_list is not equal to 0:
+            proc destroy from List with old_list
+        End If
+        Let fresh_list be proc create from List
+        proc memory_set_int64 from Layout with context_ptr, 72, fresh_list
 
         Note: Mark invariant instructions
         proc mark_invariant_instructions with context_ptr, loop_info
@@ -1823,27 +2189,73 @@ Process called "optimize_function_with_licm" that takes cfg_ptr as Integer retur
     Note: Update total hoisted count
     proc memory_set_int64 from Layout with context_ptr, 24, total_hoisted
 
-    Note: Step 5: Print statistics
-    proc print_licm_stats with context_ptr
-
-    Note: Step 6: Destroy context
+    Note: Step 5: Destroy context
     proc destroy_licm_context with context_ptr
-
-    Display ""
-    Display "LOOP-INVARIANT CODE MOTION COMPLETE"
-    Display ""
 
     Return 1
 End Process
 
-Process called "run_licm_pass" that takes cfg_ptr as Integer returns Integer:
+Process called "sort_loops_by_body_size" that takes loops_list as Integer returns Integer:
     @Reasoning
-    Convenience wrapper for running LICM as an optimization pass.
-
-    Returns 1 if CFG was modified, 0 if no changes.
+    Orders detected loops by ascending body-block count, which places
+    inner loops (strict subsets of their enclosing loops, hence smaller
+    bodies) before outer ones. Processing inner loops first is the
+    standard LICM schedule: an inner hoist lands in the inner preheader
+    (which is inside the outer loop body), keeping each instruction's
+    motion minimal and sound; the outer pass then operates on the
+    already-optimized inner structure. A simple in-place selection sort
+    is used - loop counts per function are tiny (rarely above single
+    digits), so asymptotics are irrelevant and the sort allocates
+    nothing.
     @End Reasoning
 
-    Return proc optimize_function_with_licm with cfg_ptr
+    If loops_list is equal to 0:
+        Return 0
+    End If
+
+    Let count be proc length from List with loops_list
+    Let i be 0
+    While i is less than count:
+        Let min_idx be i
+        Let min_loop be proc get from List with loops_list, min_idx
+        Let min_body be proc memory_get_int64 from Layout with min_loop, 16
+        Let min_size be proc size from Set with min_body
+
+        Let j be i plus 1
+        While j is less than count:
+            Let cand_loop be proc get from List with loops_list, j
+            Let cand_body be proc memory_get_int64 from Layout with cand_loop, 16
+            Let cand_size be proc size from Set with cand_body
+            If cand_size is less than min_size:
+                Set min_idx to j
+                Set min_size to cand_size
+            End If
+            Set j to j plus 1
+        End While
+
+        If min_idx is not equal to i:
+            Let tmp be proc get from List with loops_list, i
+            Let min_entry be proc get from List with loops_list, min_idx
+            proc set from List with loops_list, i, min_entry
+            proc set from List with loops_list, min_idx, tmp
+        End If
+
+        Set i to i plus 1
+    End While
+
+    Return 1
+End Process
+
+Process called "run_licm_pass" that takes function_ptr as Integer returns Integer:
+    @Reasoning
+    Convenience wrapper for running LICM as an optimization pass. Takes
+    the MIRFunction pointer (the pass needs the function for value-id
+    allocation and definition lookups; the CFG is derived internally).
+
+    Returns 1 on success, 0 on failure.
+    @End Reasoning
+
+    Return proc optimize_function_with_licm with function_ptr
 End Process
 
 Process called "should_run_licm" that takes cfg_ptr as Integer returns Integer:
@@ -1866,8 +2278,8 @@ Process called "should_run_licm" that takes cfg_ptr as Integer returns Integer:
     @End Reasoning
 
     @Implementation
-    Reads get_block_count from the CFG. Returns 0 immediately on
-    null CFG or block_count < 3. Otherwise returns 1.
+    Reads the canonical CFG.get_cfg_block_count. Returns 0 immediately
+    on null CFG or block_count < 3. Otherwise returns 1.
     @End Implementation
 
     If cfg_ptr is equal to 0:
@@ -1875,11 +2287,10 @@ Process called "should_run_licm" that takes cfg_ptr as Integer returns Integer:
     End If
 
     Note: Get block count
-    Let block_count be proc get_block_count from CFG with cfg_ptr
+    Let block_count be proc get_cfg_block_count from CFG with cfg_ptr
 
     Note: Skip trivial functions
     If block_count is less than 3:
-        Display "should_run_licm: skipping trivial function"
         Return 0
     End If
 

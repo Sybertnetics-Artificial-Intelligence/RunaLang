@@ -1,0 +1,405 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+SSA round-trip probe (Wave 4 gate of the MIR reconciliation plan).
+
+Builds a diamond CFG by hand through the canonical MIR construction API:
+
+    entry (B0)  --cond-->  left (B1)   [x = 11]
+                \-->       right (B2)  [x = 22]
+    left/right  --jump-->  merge (B3)  [return]
+
+with the source variable "x" assigned a different constant on each arm,
+then drives the full SSA life cycle and asserts the canonical contract
+at every step:
+
+  1. construct_ssa_form: a phi for x exists at the head of the merge
+     block with exactly two incomings referencing the correct
+     predecessor blocks and the correct renamed values; the branch
+     condition use is renamed coherently in BOTH the header operand
+     slot and the extended-record mirror (OD-1).
+  2. SSA.verify_ssa_form and MIRVerifier.verify_mir_function both
+     validate the constructed form.
+  3. destruct_ssa_form: no phi remains in any block's instruction
+     stream or phi registry, and each diamond arm carries exactly one
+     MIR_COPY (opcode 20008, OD-5) materializing the phi's semantics.
+  4. CFG.validate_cfg reports the destructed CFG clean.
+
+This probe is the executable specification of the ssa.runa /
+mir_verifier.runa reconciliation: it fails if phi storage, the OD-1
+prefix-embedded offsets, the value-id mirrors, or the verifier rules
+regress.
+:End Note
+
+Import "tests/test_utils.runa" as T
+Import "compiler/middle/gungnir/mir/mir.runa" as MIR
+Import "compiler/middle/gungnir/mir/mir_nodes.runa" as MIRNodes
+Import "compiler/middle/gungnir/mir/cfg.runa" as CFG
+Import "compiler/middle/gungnir/mir/ssa.runa" as SSA
+Import "compiler/middle/gungnir/mir/mir_verifier.runa" as MIRVerifier
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/collections/list.runa" as List
+
+Note: Rig list slot indices for the constructed diamond
+Constant RIG_FN as Integer is 0
+Constant RIG_CFG as Integer is 1
+Constant RIG_ENTRY as Integer is 2
+Constant RIG_LEFT as Integer is 3
+Constant RIG_RIGHT as Integer is 4
+Constant RIG_MERGE as Integer is 5
+Constant RIG_COND_CONST as Integer is 6
+Constant RIG_LEFT_CONST as Integer is 7
+Constant RIG_RIGHT_CONST as Integer is 8
+Constant RIG_BRANCH as Integer is 9
+
+Process called "build_diamond" returns Integer:
+    @Reasoning
+    Constructs the diamond function exclusively through the canonical
+    construction surface (create_mir_function / create_mir_basic_block /
+    add_block_to_cfg / add_cfg_edge / add_instruction_to_block and the
+    MIRNodes constructors) so the probe exercises the same contract the
+    HIR-to-MIR builder uses. Pre-SSA value ids are chosen in the
+    >= 1000 range (1100..1102) because MIR.operand_is_variable keys the
+    variable/constant split at 1000; this models the recompute path
+    where uses must be renamed. Source-variable identity is carried by
+    metadata (create_mir_metadata + set_mir_node_metadata), which is
+    the canonical channel the SSA construction reads variable names
+    from. Returns the rig List, or 0 on any construction failure.
+    @End Reasoning
+
+    Note: Shared HIRTypeInfo stand-in: kind at 0, flags at 8, size at 16
+    Let type_info be Layout.allocate(24)
+    If type_info is equal to 0:
+        Return 0
+    End If
+    Layout.memory_set_int64(type_info, 0, 1)
+    Layout.memory_set_int64(type_info, 8, 0)
+    Layout.memory_set_int64(type_info, 16, 8)
+
+    Let fn be MIR.create_mir_function("diamond_probe", type_info, 0)
+    If fn is equal to 0:
+        Return 0
+    End If
+    Let cfg be MIR.get_mir_function_cfg(fn)
+    If cfg is equal to 0:
+        Return 0
+    End If
+
+    Note: Blocks B0..B3
+    Let entry_block be MIR.create_mir_basic_block(0, 0)
+    Let left_block be MIR.create_mir_basic_block(1, 0)
+    Let right_block be MIR.create_mir_basic_block(2, 0)
+    Let merge_block be MIR.create_mir_basic_block(3, 0)
+    If merge_block is equal to 0:
+        Return 0
+    End If
+
+    MIR.add_block_to_cfg(cfg, entry_block)
+    MIR.add_block_to_cfg(cfg, left_block)
+    MIR.add_block_to_cfg(cfg, right_block)
+    MIR.add_block_to_cfg(cfg, merge_block)
+
+    MIR.set_cfg_entry_block(cfg, entry_block)
+    MIR.set_cfg_exit_block(cfg, merge_block)
+
+    Note: Diamond edges
+    MIR.add_cfg_edge(cfg, 0, 1)
+    MIR.add_cfg_edge(cfg, 0, 2)
+    MIR.add_cfg_edge(cfg, 1, 3)
+    MIR.add_cfg_edge(cfg, 2, 3)
+
+    Note: entry: cond = const 1, then branch on it to left/right
+    Let cond_const be MIRNodes.create_mir_const(1100, 1, type_info, 0, 0)
+    If cond_const is equal to 0:
+        Return 0
+    End If
+    Let cond_metadata be MIRNodes.create_mir_metadata("cond", 0, 0, 0, type_info)
+    MIR.set_mir_node_metadata(cond_const, cond_metadata)
+    MIR.add_instruction_to_block(entry_block, cond_const)
+    MIR.register_value_definition(fn, 1100, cond_const)
+
+    Let branch be MIRNodes.create_mir_branch(1100, 1, 2, 50, 50)
+    If branch is equal to 0:
+        Return 0
+    End If
+    MIR.add_instruction_to_block(entry_block, branch)
+
+    Note: left: x = 11, jump merge
+    Let left_const be MIRNodes.create_mir_const(1101, 11, type_info, 0, 0)
+    If left_const is equal to 0:
+        Return 0
+    End If
+    Let left_metadata be MIRNodes.create_mir_metadata("x", 0, 0, 0, type_info)
+    MIR.set_mir_node_metadata(left_const, left_metadata)
+    MIR.add_instruction_to_block(left_block, left_const)
+    MIR.register_value_definition(fn, 1101, left_const)
+
+    Let left_jump be MIRNodes.create_mir_jump(3)
+    MIR.add_instruction_to_block(left_block, left_jump)
+
+    Note: right: x = 22, jump merge
+    Let right_const be MIRNodes.create_mir_const(1102, 22, type_info, 0, 0)
+    If right_const is equal to 0:
+        Return 0
+    End If
+    Let right_metadata be MIRNodes.create_mir_metadata("x", 0, 0, 0, type_info)
+    MIR.set_mir_node_metadata(right_const, right_metadata)
+    MIR.add_instruction_to_block(right_block, right_const)
+    MIR.register_value_definition(fn, 1102, right_const)
+
+    Let right_jump be MIRNodes.create_mir_jump(3)
+    MIR.add_instruction_to_block(right_block, right_jump)
+
+    Note: merge: void return
+    Let merge_return be MIRNodes.create_mir_return(0, 0)
+    MIR.add_instruction_to_block(merge_block, merge_return)
+
+    Note: Package the rig
+    Let rig be List.create()
+    List.append(rig, fn)
+    List.append(rig, cfg)
+    List.append(rig, entry_block)
+    List.append(rig, left_block)
+    List.append(rig, right_block)
+    List.append(rig, merge_block)
+    List.append(rig, cond_const)
+    List.append(rig, left_const)
+    List.append(rig, right_const)
+    List.append(rig, branch)
+
+    Return rig
+End Process
+
+Process called "count_phis_in_block" that takes block_ptr as Integer returns Integer:
+    @Reasoning
+    Counts MIR_PHI instructions anywhere in the block's instruction
+    list (not just the prefix), so a misplaced phi after destruct is
+    still detected.
+    @End Reasoning
+
+    Let instructions be MIR.get_block_instructions(block_ptr)
+    Let inst_count be MIR.get_block_instruction_count(block_ptr)
+    Let phi_count be 0
+    Let i be 0
+    While i is less than inst_count:
+        Let inst be List.get(instructions, i)
+        Let inst_is_phi be MIRNodes.is_phi_node(inst)
+        If inst_is_phi is equal to 1:
+            Set phi_count to phi_count plus 1
+        End If
+        Set i to i plus 1
+    End While
+    Return phi_count
+End Process
+
+Process called "find_copy_in_block" that takes block_ptr as Integer returns Integer:
+    @Reasoning
+    Returns the first MIR_COPY (opcode 20008) instruction in the block,
+    or 0 when none exists. Used to assert the destruct phase
+    materialized exactly one per-edge copy on each diamond arm.
+    @End Reasoning
+
+    Let instructions be MIR.get_block_instructions(block_ptr)
+    Let inst_count be MIR.get_block_instruction_count(block_ptr)
+    Let i be 0
+    While i is less than inst_count:
+        Let inst be List.get(instructions, i)
+        Let opcode be MIR.get_mir_node_opcode(inst)
+        If opcode is equal to 20008:
+            Return inst
+        End If
+        Set i to i plus 1
+    End While
+    Return 0
+End Process
+
+Process called "count_copies_in_block" that takes block_ptr as Integer returns Integer:
+    Let instructions be MIR.get_block_instructions(block_ptr)
+    Let inst_count be MIR.get_block_instruction_count(block_ptr)
+    Let copy_count be 0
+    Let i be 0
+    While i is less than inst_count:
+        Let inst be List.get(instructions, i)
+        Let opcode be MIR.get_mir_node_opcode(inst)
+        If opcode is equal to 20008:
+            Set copy_count to copy_count plus 1
+        End If
+        Set i to i plus 1
+    End While
+    Return copy_count
+End Process
+
+Process called "run_roundtrip" that takes results as Integer returns Integer:
+    T.begin_suite(results, "ssa_roundtrip_diamond")
+
+    Let rig be build_diamond()
+    T.assert_not_null(results, "diamond rig constructed", rig)
+    If rig is equal to 0:
+        Return 0
+    End If
+
+    Let fn be List.get(rig, RIG_FN)
+    Let cfg be List.get(rig, RIG_CFG)
+    Let left_block be List.get(rig, RIG_LEFT)
+    Let right_block be List.get(rig, RIG_RIGHT)
+    Let merge_block be List.get(rig, RIG_MERGE)
+    Let cond_const be List.get(rig, RIG_COND_CONST)
+    Let left_const be List.get(rig, RIG_LEFT_CONST)
+    Let right_const be List.get(rig, RIG_RIGHT_CONST)
+    Let branch be List.get(rig, RIG_BRANCH)
+
+    Note: ---- Phase 1: construct SSA ----
+    Let construct_ok be SSA.construct_ssa_form(fn)
+    T.assert_equal(results, "construct_ssa_form succeeds", construct_ok, 1)
+    Let in_ssa be SSA.is_in_ssa_form(fn)
+    T.assert_equal(results, "ssa_form flag set after construction", in_ssa, 1)
+
+    Note: ---- Phase 2: phi shape at the merge block ----
+    Let merge_insts be MIR.get_block_instructions(merge_block)
+    Let merge_inst_count be MIR.get_block_instruction_count(merge_block)
+    T.assert_equal(results, "merge block has phi + return", merge_inst_count, 2)
+
+    Let phi be List.get(merge_insts, 0)
+    Let head_is_phi be MIRNodes.is_phi_node(phi)
+    T.assert_equal(results, "merge block head is a phi", head_is_phi, 1)
+
+    Let incoming_count be MIRNodes.get_phi_incoming_count(phi)
+    T.assert_equal(results, "phi has exactly 2 incomings", incoming_count, 2)
+
+    Note: Renamed per-arm definitions of x (header value_id mirrors)
+    Let left_val be MIR.get_mir_node_value_id(left_const)
+    Let right_val be MIR.get_mir_node_value_id(right_const)
+    T.assert_greater_than(results, "left x def renamed to fresh SSA id", left_val, 999)
+    T.assert_greater_than(results, "right x def renamed to fresh SSA id", right_val, 999)
+    T.assert_not_equal(results, "arm defs have distinct SSA ids", left_val, right_val)
+
+    Note: Each incoming must pair the arm's block id with the arm's value
+    Let incoming_block_0 be MIRNodes.get_phi_incoming_block(phi, 0)
+    Let incoming_block_1 be MIRNodes.get_phi_incoming_block(phi, 1)
+    Let incoming_value_0 be MIRNodes.get_phi_incoming_value(phi, 0)
+    Let incoming_value_1 be MIRNodes.get_phi_incoming_value(phi, 1)
+
+    Let block_id_sum be incoming_block_0 plus incoming_block_1
+    T.assert_equal(results, "incoming blocks are left(1) and right(2)", block_id_sum, 3)
+    T.assert_not_equal(results, "incoming blocks are distinct", incoming_block_0, incoming_block_1)
+
+    If incoming_block_0 is equal to 1:
+        T.assert_equal(results, "incoming 0 carries left value", incoming_value_0, left_val)
+        T.assert_equal(results, "incoming 1 carries right value", incoming_value_1, right_val)
+    Otherwise:
+        T.assert_equal(results, "incoming 0 carries right value", incoming_value_0, right_val)
+        T.assert_equal(results, "incoming 1 carries left value", incoming_value_1, left_val)
+    End If
+
+    Let phi_result be MIR.get_mir_node_value_id(phi)
+    T.assert_greater_than(results, "phi result carries fresh SSA id", phi_result, 999)
+    Let phi_result_ext be Layout.memory_get_int64(phi, 72)
+    T.assert_equal(results, "phi result header mirror matches ext slot", phi_result, phi_result_ext)
+
+    Note: Branch condition use renamed coherently (header + ext mirror)
+    Let cond_val be MIR.get_mir_node_value_id(cond_const)
+    T.assert_greater_than(results, "cond def renamed to fresh SSA id", cond_val, 999)
+    Let branch_header_op be MIR.get_mir_node_operand(branch, 1)
+    T.assert_equal(results, "branch header operand renamed to cond SSA id", branch_header_op, cond_val)
+    Let branch_ext_cond be MIRNodes.get_branch_condition(branch)
+    T.assert_equal(results, "branch ext condition mirror kept coherent", branch_ext_cond, cond_val)
+
+    Note: ---- Phase 3: verifiers accept the constructed form ----
+    Let ssa_verified be SSA.verify_ssa_form(fn)
+    T.assert_equal(results, "SSA.verify_ssa_form validates", ssa_verified, 1)
+
+    Let verifier_ok be MIRVerifier.verify_mir_function(fn)
+    T.assert_equal(results, "MIRVerifier.verify_mir_function validates", verifier_ok, 1)
+
+    Note: ---- Phase 4: destruct SSA ----
+    Let destruct_ok be SSA.destruct_ssa_form(fn)
+    T.assert_equal(results, "destruct_ssa_form succeeds", destruct_ok, 1)
+    Let still_ssa be SSA.is_in_ssa_form(fn)
+    T.assert_equal(results, "ssa_form flag cleared after destruction", still_ssa, 0)
+
+    Note: No phi anywhere in the instruction streams
+    Let total_phis be 0
+    Let blocks be CFG.get_mir_cfg_blocks(cfg)
+    Let block_count be CFG.get_cfg_block_count(cfg)
+    Let bi be 0
+    While bi is less than block_count:
+        Let scan_block be List.get(blocks, bi)
+        Let block_phis be count_phis_in_block(scan_block)
+        Set total_phis to total_phis plus block_phis
+        Set bi to bi plus 1
+    End While
+    T.assert_equal(results, "no phis remain after destruction", total_phis, 0)
+
+    Note: Phi registry of the merge block is empty too
+    Let merge_registry be Layout.memory_get_int64(merge_block, 88)
+    If merge_registry is not equal to 0:
+        Let registry_len be List.length(merge_registry)
+        T.assert_equal(results, "merge phi registry cleared", registry_len, 0)
+    End If
+
+    Note: Each arm carries exactly one MIR_COPY feeding the old phi result
+    Let left_copies be count_copies_in_block(left_block)
+    T.assert_equal(results, "left arm has exactly one copy", left_copies, 1)
+    Let right_copies be count_copies_in_block(right_block)
+    T.assert_equal(results, "right arm has exactly one copy", right_copies, 1)
+
+    Let left_copy be find_copy_in_block(left_block)
+    T.assert_not_null(results, "left copy located", left_copy)
+    If left_copy is not equal to 0:
+        Let left_copy_dest be MIR.get_mir_node_value_id(left_copy)
+        T.assert_equal(results, "left copy dest is old phi result", left_copy_dest, phi_result)
+        Let left_copy_src be MIR.get_mir_node_operand(left_copy, 1)
+        T.assert_equal(results, "left copy source is left x value", left_copy_src, left_val)
+    End If
+
+    Let right_copy be find_copy_in_block(right_block)
+    T.assert_not_null(results, "right copy located", right_copy)
+    If right_copy is not equal to 0:
+        Let right_copy_dest be MIR.get_mir_node_value_id(right_copy)
+        T.assert_equal(results, "right copy dest is old phi result", right_copy_dest, phi_result)
+        Let right_copy_src be MIR.get_mir_node_operand(right_copy, 1)
+        T.assert_equal(results, "right copy source is right x value", right_copy_src, right_val)
+    End If
+
+    Note: Copies must precede the arm terminators
+    Let left_terminator be CFG.get_block_terminator(left_block)
+    Let left_term_opcode be MIR.get_mir_node_opcode(left_terminator)
+    T.assert_equal(results, "left arm still ends with jump", left_term_opcode, 20302)
+    Let right_terminator be CFG.get_block_terminator(right_block)
+    Let right_term_opcode be MIR.get_mir_node_opcode(right_terminator)
+    T.assert_equal(results, "right arm still ends with jump", right_term_opcode, 20302)
+
+    Note: ---- Phase 5: destructed CFG validates clean ----
+    Let cfg_valid be CFG.validate_cfg(cfg)
+    T.assert_equal(results, "validate_cfg clean after destruction", cfg_valid, 1)
+
+    Return 1
+End Process
+
+Process called "main" returns Integer:
+    Let results be T.create_test_results()
+    run_roundtrip(results)
+
+    T.print_summary(results)
+    Let passed be T.all_passed(results)
+    T.destroy_test_results(results)
+
+    If passed is equal to 1:
+        Return 0
+    End If
+    Return 1
+End Process

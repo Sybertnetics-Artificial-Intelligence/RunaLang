@@ -36,11 +36,13 @@ This file consists of the following functions/features/operation types:
 :End Note
 
 Import "compiler/middle/gungnir/mir/mir.runa" as MIR
+Import "compiler/middle/gungnir/mir/mir_nodes.runa" as MIRNodes
+Import "compiler/middle/gungnir/mir/cfg.runa" as MirCFG
 Import "compiler/middle/gungnir/mir/mir_builder.runa" as MIRBuilder
 Import "compiler/middle/analysis/control_flow.runa" as ControlFlowGraph
 Import "compiler/middle/analysis/data_flow.runa" as DataFlowAnalysis
 Import "compiler/frontend/primitives/memory/layout.runa" as Layout
-Import "compiler/frontend/primitives/collections/dictionary.runa" as Dictionary
+Import "compiler/frontend/primitives/collections/ordered_map.runa" as OrderedMap
 Import "compiler/frontend/primitives/collections/list.runa" as List
 Import "compiler/frontend/primitives/collections/set.runa" as Set
 Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
@@ -102,14 +104,14 @@ End Type
 NullInfo tracks null states at a specific program point (instruction or block).
 Fields:
 - program_point: Instruction ID or block ID
-- null_states: Dictionary mapping value_id -> NullState
+- null_states: Integer-keyed ordered map (omap) value_id -> NullState
 - phi_nodes: List of phi node IDs at this point
 - dominates: Set of program points dominated by this point
 - null_checks: List of null check instructions at this point
 
 Memory layout (48 bytes, Tier 3 OWNED HEAP):
 Offset 0: program_point (8 bytes)
-Offset 8: null_states (8 bytes, pointer to Dictionary)
+Offset 8: null_states (8 bytes, pointer to integer-keyed omap)
 Offset 16: phi_nodes (8 bytes, pointer to List)
 Offset 24: dominates (8 bytes, pointer to Set)
 Offset 32: null_checks (8 bytes, pointer to List)
@@ -128,9 +130,9 @@ NullAnalysis is the main analysis state for null safety analysis.
 Fields:
 - mir: Pointer to MIR structure
 - cfg: Pointer to control flow graph
-- value_to_null: Dictionary mapping value_id -> current NullState
-- block_to_info: Dictionary mapping block_id -> NullInfo
-- inst_to_info: Dictionary mapping inst_id -> NullInfo
+- value_to_null: Integer-keyed ordered map (omap) value_id -> current NullState
+- block_to_info: Integer-keyed ordered map (omap) block_id -> NullInfo
+- inst_to_info: Integer-keyed ordered map (omap) inst_id -> NullInfo
 - error_list: List of null safety errors
 - error_count: Number of errors detected
 - optional_types: Set of type IDs that are optional types
@@ -168,7 +170,7 @@ fresh allocations cannot be null.
 
 Process called "create_null_state" that takes value_id as Integer, state as Integer, checked_at as Integer, is_optional as Integer returns Integer:
     Note: Allocate NullState (48 bytes, Tier 3 OWNED HEAP)
-    Let ns be proc memory_allocate from Layout with 48
+    Let ns be proc allocate from Layout with 48
 
     Note: Initialize fields
     proc memory_set_int64 from Layout with ns, 0, value_id
@@ -189,11 +191,11 @@ the null states of all values at that point.
 
 Process called "create_null_info" that takes program_point as Integer returns Integer:
     Note: Allocate NullInfo (48 bytes, Tier 3 OWNED HEAP)
-    Let ni be proc memory_allocate from Layout with 48
+    Let ni be proc allocate from Layout with 48
 
     Note: Initialize fields
     proc memory_set_int64 from Layout with ni, 0, program_point
-    proc memory_set_int64 from Layout with ni, 8, Dictionary.create( )   Note: null_states
+    proc memory_set_int64 from Layout with ni, 8, OrderedMap.omap_create( )  Note: null_states (integer-keyed)
     proc memory_set_int64 from Layout with ni, 16, List.create( )        Note: phi_nodes
     proc memory_set_int64 from Layout with ni, 24, Set.create( )         Note: dominates
     proc memory_set_int64 from Layout with ni, 32, List.create( )        Note: null_checks
@@ -208,14 +210,14 @@ This initializes all data structures needed for null safety analysis.
 
 Process called "create_null_analysis" that takes mir as Integer, cfg as Integer returns Integer:
     Note: Allocate NullAnalysis (64 bytes, Tier 3 OWNED HEAP)
-    Let na be proc memory_allocate from Layout with 64
+    Let na be proc allocate from Layout with 64
 
     Note: Initialize fields
     proc memory_set_int64 from Layout with na, 0, mir
     proc memory_set_int64 from Layout with na, 8, cfg
-    proc memory_set_int64 from Layout with na, 16, Dictionary.create( )  Note: value_to_null
-    proc memory_set_int64 from Layout with na, 24, Dictionary.create( )  Note: block_to_info
-    proc memory_set_int64 from Layout with na, 32, Dictionary.create( )  Note: inst_to_info
+    proc memory_set_int64 from Layout with na, 16, OrderedMap.omap_create( )  Note: value_to_null (integer-keyed)
+    proc memory_set_int64 from Layout with na, 24, OrderedMap.omap_create( )  Note: block_to_info (integer-keyed)
+    proc memory_set_int64 from Layout with na, 32, OrderedMap.omap_create( )  Note: inst_to_info (integer-keyed)
     proc memory_set_int64 from Layout with na, 40, List.create( )        Note: error_list
     proc memory_set_int64 from Layout with na, 48, 0 Note: error_count
     proc memory_set_int64 from Layout with na, 56, Set.create( )         Note: optional_types
@@ -246,8 +248,8 @@ Process called "compute_null_states" that takes na as Integer returns Integer:
     Let value_to_null be proc memory_get_int64 from Layout with na, 16
     Let block_to_info be proc memory_get_int64 from Layout with na, 24
 
-    Note: Get CFG structure
-    Let blocks be proc memory_get_int64 from Layout with cfg, 0
+    Note: Get CFG structure (canonical MIRCFG: blocks List at offset 16)
+    Let blocks be proc get_mir_cfg_blocks from MirCFG with cfg
     Let block_count be proc length from List with blocks
 
     Note: Initialize all values to MAYBE state
@@ -258,7 +260,7 @@ Process called "compute_null_states" that takes na as Integer returns Integer:
 
         Note: Create NullInfo for this block
         Let info be create_null_info(block_id)
-        proc set from Dictionary with block_to_info, block_id, info
+        proc omap_set from OrderedMap with block_to_info, block_id, info
 
         Note: Process instructions in block
         Let instructions be proc memory_get_int64 from Layout with block, 16
@@ -274,15 +276,35 @@ Process called "compute_null_states" that takes na as Integer returns Integer:
                 Note: Check if this is an allocation instruction
                 Let opcode be proc memory_get_int64 from Layout with inst, 0
 
-                Note: ALLOC (20201) and NEW (20202) produce non-null values
-                If opcode is equal to 20201 or opcode is equal to 20202:
-                    Let ns be create_null_state(value_id, 1, 0, 0)  Note: NON_NULL
+                Note: Values whose result type is registered in the
+                Note: optional_types set are flagged optional so that
+                Note: verify_optional_unwrap can police their dereferences
+                Let optional_types be proc memory_get_int64 from Layout with na, 56
+                Let inst_type be proc memory_get_int64 from Layout with inst, 40
+                Let is_opt be 0
+                If inst_type is not equal to 0:
+                    Set is_opt to proc contains from Set with optional_types, inst_type
+                End If
+
+                Note: MIR_ALLOCA (20202, stack allocation) and heap allocator
+                Note: calls (OD-2: direct MIR_CALL whose callee name is in the
+                Note: canonical allocator family) produce non-null values
+                Let is_alloc be 0
+                If opcode is equal to 20202:
+                    Set is_alloc to 1
+                End If
+                If proc is_allocation_call from MIRNodes with inst is equal to 1:
+                    Set is_alloc to 1
+                End If
+
+                If is_alloc is equal to 1:
+                    Let ns be create_null_state(value_id, 1, 0, is_opt)  Note: NON_NULL
                     proc memory_set_int64 from Layout with ns, 40, inst Note: source_alloc
-                    proc set from Dictionary with value_to_null, value_id, ns
+                    proc omap_set from OrderedMap with value_to_null, value_id, ns
                 Otherwise:
                     Note: Default to MAYBE state
-                    Set ns to create_null_state(value_id, 2, 0, 0)
-                    proc set from Dictionary with value_to_null, value_id, ns
+                    Set ns to create_null_state(value_id, 2, 0, is_opt)
+                    proc omap_set from OrderedMap with value_to_null, value_id, ns
                 End If
             End If
 
@@ -362,17 +384,18 @@ Process called "analyze_null_in_block" that takes na as Integer, block as Intege
     Let cfg be proc memory_get_int64 from Layout with na, 8
 
     Note: Get block info
-    Let info be proc get from Dictionary with block_to_info, block_id
+    Let info be proc omap_get from OrderedMap with block_to_info, block_id
     If info is equal to 0:
         Set info to create_null_info(block_id)
-        proc set from Dictionary with block_to_info, block_id, info
+        proc omap_set from OrderedMap with block_to_info, block_id, info
     End If
 
     Let null_states be proc memory_get_int64 from Layout with info, 8
     Let changed be 0
 
-    Note: Propagate null states from predecessors
-    Let predecessors be proc memory_get_int64 from Layout with block, 8
+    Note: Propagate null states from predecessors (canonical MIRBasicBlock:
+    Note: predecessor block-id List at offset 32, via the MIR accessor)
+    Let predecessors be proc get_block_predecessors from MIR with block
     Let pred_count be proc length from List with predecessors
 
     Note: If multiple predecessors, merge null states at phi nodes
@@ -393,46 +416,49 @@ Process called "analyze_null_in_block" that takes na as Integer, block as Intege
         Let opcode be proc memory_get_int64 from Layout with inst, 0
         Let value_id be proc memory_get_int64 from Layout with inst, 8
 
-        Note: LOAD instruction - loaded value might be null
-        If opcode is equal to 20203:
-            Let addr be proc memory_get_int64 from Layout with inst, 16
+        Note: MIR_LOAD (20200) / MIR_LOAD_FIELD (20203) - loaded value might be null
+        If opcode is equal to 20200 or opcode is equal to 20203:
             Note: Conservatively assume loaded values are MAYBE
             If value_id is not equal to 0:
-                Let old_state be proc get from Dictionary with value_to_null, value_id
+                Let old_state be proc omap_get from OrderedMap with value_to_null, value_id
                 If old_state is not equal to 0:
                     Let old_state_value be proc memory_get_int64 from Layout with old_state, 8
                     If old_state_value is not equal to 2:
                         Let ns be create_null_state(value_id, 2, 0, 0)
-                        proc set from Dictionary with value_to_null, value_id, ns
+                        proc omap_set from OrderedMap with value_to_null, value_id, ns
                         Set changed to 1
                     End If
                 End If
             End If
         End If
 
-        Note: STORE instruction - does not change null states
-        If opcode is equal to 20204:
+        Note: MIR_STORE (20201) / MIR_STORE_FIELD (20204) - do not change null states
+        If opcode is equal to 20201 or opcode is equal to 20204:
             Note: Store operations do not affect null state tracking
         End If
 
-        Note: CALL instruction - return value might be null
-        If opcode is equal to 20304:
+        Note: MIR_CALL (20304) / MIR_CALL_INDIRECT (20305) - return value might be null
+        If opcode is equal to 20304 or opcode is equal to 20305:
             If value_id is not equal to 0:
-                Note: Function return values are conservatively MAYBE
-                Set old_state to proc get from Dictionary with value_to_null, value_id
-                If old_state is not equal to 0:
-                    Set old_state_value to proc memory_get_int64 from Layout with old_state, 8
-                    If old_state_value is not equal to 2:
-                        Set ns to create_null_state(value_id, 2, 0, 0)
-                        proc set from Dictionary with value_to_null, value_id, ns
-                        Set changed to 1
+                Note: Allocator calls (OD-2 callee-name recognition) keep the
+                Note: NON_NULL state assigned at initialization; every other
+                Note: call result is conservatively MAYBE
+                If proc is_allocation_call from MIRNodes with inst is equal to 0:
+                    Set old_state to proc omap_get from OrderedMap with value_to_null, value_id
+                    If old_state is not equal to 0:
+                        Set old_state_value to proc memory_get_int64 from Layout with old_state, 8
+                        If old_state_value is not equal to 2:
+                            Set ns to create_null_state(value_id, 2, 0, 0)
+                            proc omap_set from OrderedMap with value_to_null, value_id, ns
+                            Set changed to 1
+                        End If
                     End If
                 End If
             End If
         End If
 
-        Note: PHI instruction - merge null states from predecessors
-        If opcode is equal to 20101:
+        Note: MIR_PHI (20300) - merge null states from predecessors
+        If opcode is equal to 20300:
             Let phi_changed be propagate_null_state(na, block)
             If phi_changed is equal to 1:
                 Set changed to 1
@@ -450,11 +476,14 @@ Process called "analyze_null_in_block" that takes na as Integer, block as Intege
             proc append from List with null_checks, inst
         End If
 
-        Note: BRANCH instruction - refine null states based on condition
-        If opcode is equal to 20501:
+        Note: MIR_BRANCH (20301) - refine null states based on condition.
+        Note: The condition SSA use sits in header operand1 (offset 16); the
+        Note: target block ids live in the prefix-embedded extended region
+        Note: and are read through the mir_nodes accessors
+        If opcode is equal to 20301:
             Let condition be proc memory_get_int64 from Layout with inst, 16
-            Let true_target be proc memory_get_int64 from Layout with inst, 24
-            Let false_target be proc memory_get_int64 from Layout with inst, 32
+            Let true_target be proc get_mir_branch_true_block from MIRNodes with inst
+            Let false_target be proc get_mir_branch_false_block from MIRNodes with inst
 
             Note: Refine null states in true and false branches
             refine_null_from_condition(na, condition, true_target, false_target)
@@ -486,20 +515,19 @@ Process called "propagate_null_state" that takes na as Integer, block as Integer
     Let block_to_info be proc memory_get_int64 from Layout with na, 24
     Let cfg be proc memory_get_int64 from Layout with na, 8
 
-    Let info be proc get from Dictionary with block_to_info, block_id
+    Let info be proc omap_get from OrderedMap with block_to_info, block_id
     Let changed be 0
 
-    Note: Get predecessors
-    Let predecessors be proc memory_get_int64 from Layout with block, 8
+    Note: Get predecessors (canonical: block-id List at offset 32)
+    Let predecessors be proc get_block_predecessors from MIR with block
     Let pred_count be proc length from List with predecessors
 
-    Note: For each value, merge null states from all predecessors
-    Let all_values be proc keys from Dictionary with value_to_null
-    Let value_count be proc length from List with all_values
-
-    Let i be 0
-    While i is less than value_count:
-        Let value_id be proc get from List with all_values, i
+    Note: For each tracked value, merge null states from all predecessors.
+    Note: Iterates the ordered map's insertion-ordered entry chain; the body
+    Note: only replaces values for EXISTING keys, so the chain is stable
+    Let entry be proc omap_first from OrderedMap with value_to_null
+    While entry is not equal to 0:
+        Let value_id be proc omap_entry_key from OrderedMap with entry
 
         Note: Collect null states from all predecessors
         Let merged_state be -1  Note: -1 means uninitialized
@@ -507,11 +535,11 @@ Process called "propagate_null_state" that takes na as Integer, block as Integer
         Let p be 0
         While p is less than pred_count:
             Let pred_id be proc get from List with predecessors, p
-            Let pred_info be proc get from Dictionary with block_to_info, pred_id
+            Let pred_info be proc omap_get from OrderedMap with block_to_info, pred_id
 
             If pred_info is not equal to 0:
                 Let pred_null_states be proc memory_get_int64 from Layout with pred_info, 8
-                Let pred_state_obj be proc get from Dictionary with pred_null_states, value_id
+                Let pred_state_obj be proc omap_get from OrderedMap with pred_null_states, value_id
 
                 If pred_state_obj is not equal to 0:
                     Let pred_state be proc memory_get_int64 from Layout with pred_state_obj, 8
@@ -536,20 +564,20 @@ Process called "propagate_null_state" that takes na as Integer, block as Integer
 
         Note: Update value's null state if it changed
         If merged_state is not equal to -1:
-            Let current_state_obj be proc get from Dictionary with value_to_null, value_id
+            Let current_state_obj be proc omap_get from OrderedMap with value_to_null, value_id
 
             If current_state_obj is not equal to 0:
                 Let current_state be proc memory_get_int64 from Layout with current_state_obj, 8
 
                 If current_state is not equal to merged_state:
                     Let ns be create_null_state(value_id, merged_state, 0, 0)
-                    proc set from Dictionary with value_to_null, value_id, ns
+                    proc omap_set from OrderedMap with value_to_null, value_id, ns
                     Set changed to 1
                 End If
             End If
         End If
 
-        Set i to i plus 1
+        Set entry to proc omap_entry_next from OrderedMap with entry
     End While
 
     Return changed
@@ -561,13 +589,12 @@ A null constant is a CONST instruction (opcode 20001) with value 0.
 @End Reasoning
 
 Process called "is_null_constant" that takes na as Integer, value_id as Integer returns Integer:
-    Let mir be proc memory_get_int64 from Layout with na, 0
-
-    Note: Null constant detection uses two methods:
+    Note: Null constant detection uses three methods:
     Note: 1. SSA convention: value_id == 0 represents null in many SSA IRs
     Note: 2. Null state tracking: if value is definitely null, treat as null constant
-    Note: This conservative approach catches both explicit null constants and
-    Note: values proven to be null through dataflow analysis
+    Note: 3. Defining instruction: a MIR_CONST (20001) with numeric payload 0
+    Note: This catches explicit null constants, values proven null through
+    Note: dataflow analysis, and literal zero constants used as null
 
     Note: Check SSA convention: value ID 0 represents null
     If value_id is equal to 0:
@@ -576,7 +603,7 @@ Process called "is_null_constant" that takes na as Integer, value_id as Integer 
 
     Note: Check if this value has been proven null through dataflow analysis
     Let value_to_null be proc memory_get_int64 from Layout with na, 16
-    Let state_obj be proc get from Dictionary with value_to_null, value_id
+    Let state_obj be proc omap_get from OrderedMap with value_to_null, value_id
 
     If state_obj is not equal to 0:
         Let state be proc memory_get_int64 from Layout with state_obj, 8
@@ -584,6 +611,44 @@ Process called "is_null_constant" that takes na as Integer, value_id as Integer 
         If state is equal to 0:
             Return 1
         End If
+    End If
+
+    Note: Check the defining instruction: MIR_CONST (20001) with a numeric
+    Note: (non-string) payload of 0 is the canonical null constant
+    Let cfg be proc memory_get_int64 from Layout with na, 8
+    If cfg is not equal to 0:
+        Let blocks be proc get_mir_cfg_blocks from MirCFG with cfg
+        Let block_count be proc length from List with blocks
+
+        Let b be 0
+        While b is less than block_count:
+            Let block be proc get from List with blocks, b
+            Let instructions be proc memory_get_int64 from Layout with block, 16
+            Let inst_count be proc length from List with instructions
+
+            Let i be 0
+            While i is less than inst_count:
+                Let inst be proc get from List with instructions, i
+                Let def_id be proc memory_get_int64 from Layout with inst, 8
+
+                If def_id is equal to value_id:
+                    Let def_opcode be proc memory_get_int64 from Layout with inst, 0
+                    If def_opcode is equal to 20001:
+                        Let is_string be proc is_const_string from MIRNodes with inst
+                        Let const_value be proc get_const_value from MIRNodes with inst
+                        If is_string is equal to 0 and const_value is equal to 0:
+                            Return 1
+                        End If
+                    End If
+                    Note: Defining instruction found and it is not CONST 0
+                    Return 0
+                End If
+
+                Set i to i plus 1
+            End While
+
+            Set b to b plus 1
+        End While
     End If
 
     Note: Not a null constant
@@ -615,8 +680,9 @@ Process called "refine_null_from_condition" that takes na as Integer, condition 
     Note: We need to find the comparison instruction that produced this value
     Note: In SSA form, each value has exactly one defining instruction
 
-    Note: Get CFG blocks to find the comparison instruction
-    Let blocks be proc memory_get_int64 from Layout with cfg, 0
+    Note: Get CFG blocks to find the comparison instruction (canonical
+    Note: MIRCFG: blocks List at offset 16, via the cfg accessor)
+    Let blocks be proc get_mir_cfg_blocks from MirCFG with cfg
     Let block_count be proc length from List with blocks
 
     Note: Search for the comparison instruction that defines the condition value
@@ -685,17 +751,17 @@ Process called "refine_null_from_condition" that takes na as Integer, condition 
     Note: Refine null states in true and false branches
 
     Note: Get true and false branch block info
-    Let true_info be proc get from Dictionary with block_to_info, true_target
-    Let false_info be proc get from Dictionary with block_to_info, false_target
+    Let true_info be proc omap_get from OrderedMap with block_to_info, true_target
+    Let false_info be proc omap_get from OrderedMap with block_to_info, false_target
 
     If true_info is equal to 0:
         Set true_info to create_null_info(true_target)
-        proc set from Dictionary with block_to_info, true_target, true_info
+        proc omap_set from OrderedMap with block_to_info, true_target, true_info
     End If
 
     If false_info is equal to 0:
         Set false_info to create_null_info(false_target)
-        proc set from Dictionary with block_to_info, false_target, false_info
+        proc omap_set from OrderedMap with block_to_info, false_target, false_info
     End If
 
     Let true_states be proc memory_get_int64 from Layout with true_info, 8
@@ -706,22 +772,22 @@ Process called "refine_null_from_condition" that takes na as Integer, condition 
         Note: MIR_EQ: x == null
         Note: True branch: x is NULL
         Let null_state be create_null_state(checked_value, 0, comparison_inst, 0)
-        proc set from Dictionary with true_states, checked_value, null_state
+        proc omap_set from OrderedMap with true_states, checked_value, null_state
 
         Note: False branch: x is NON_NULL
         Let non_null_state be create_null_state(checked_value, 1, comparison_inst, 0)
-        proc set from Dictionary with false_states, checked_value, non_null_state
+        proc omap_set from OrderedMap with false_states, checked_value, non_null_state
     End If
 
     If comparison_opcode is equal to 20101:
         Note: MIR_NE: x != null
         Note: True branch: x is NON_NULL
         Set non_null_state to create_null_state(checked_value, 1, comparison_inst, 0)
-        proc set from Dictionary with true_states, checked_value, non_null_state
+        proc omap_set from OrderedMap with true_states, checked_value, non_null_state
 
         Note: False branch: x is NULL
         Set null_state to create_null_state(checked_value, 0, comparison_inst, 0)
-        proc set from Dictionary with false_states, checked_value, null_state
+        proc omap_set from OrderedMap with false_states, checked_value, null_state
     End If
 
     Note: Also update global value_to_null map
@@ -784,12 +850,14 @@ Process called "check_null_dereference" that takes na as Integer, inst as Intege
     Let error_list be proc memory_get_int64 from Layout with na, 40
     Let error_count be proc memory_get_int64 from Layout with na, 48
 
-    Note: LOAD - check if loading from potentially null pointer
-    If opcode is equal to 20203:
+    Note: MIR_LOAD (20200) / MIR_LOAD_FIELD (20203) / MIR_DEREF (20206) -
+    Note: check if reading through a potentially null pointer. The address
+    Note: SSA use sits in header operand1 (offset 16) for all three
+    If opcode is equal to 20200 or opcode is equal to 20203 or opcode is equal to 20206:
         Let addr be proc memory_get_int64 from Layout with inst, 16
 
         If addr is not equal to 0:
-            Let addr_state be proc get from Dictionary with value_to_null, addr
+            Let addr_state be proc omap_get from OrderedMap with value_to_null, addr
 
             If addr_state is not equal to 0:
                 Let state be proc memory_get_int64 from Layout with addr_state, 8
@@ -814,12 +882,13 @@ Process called "check_null_dereference" that takes na as Integer, inst as Intege
         End If
     End If
 
-    Note: STORE - check if storing to potentially null pointer
-    If opcode is equal to 20204:
+    Note: MIR_STORE (20201) / MIR_STORE_FIELD (20204) - check if storing
+    Note: to a potentially null pointer (address use at header operand1)
+    If opcode is equal to 20201 or opcode is equal to 20204:
         Set addr to proc memory_get_int64 from Layout with inst, 16
 
         If addr is not equal to 0:
-            Set addr_state to proc get from Dictionary with value_to_null, addr
+            Set addr_state to proc omap_get from OrderedMap with value_to_null, addr
 
             If addr_state is not equal to 0:
                 Set state to proc memory_get_int64 from Layout with addr_state, 8
@@ -841,12 +910,15 @@ Process called "check_null_dereference" that takes na as Integer, inst as Intege
         End If
     End If
 
-    Note: CALL - check if calling through potentially null function pointer
-    If opcode is equal to 20304:
-        Let func_ptr be proc memory_get_int64 from Layout with inst, 16
+    Note: MIR_CALL_INDIRECT (20305) - check if calling through a potentially
+    Note: null function pointer. Only indirect calls carry an SSA value id in
+    Note: the callee slot (prefix-embedded offset 80, via the accessor);
+    Note: direct MIR_CALL callees are name pointers and cannot be null values
+    If opcode is equal to 20305:
+        Let func_ptr be proc get_call_callee from MIRNodes with inst
 
         If func_ptr is not equal to 0:
-            Let func_state be proc get from Dictionary with value_to_null, func_ptr
+            Let func_state be proc omap_get from OrderedMap with value_to_null, func_ptr
 
             If func_state is not equal to 0:
                 Set state to proc memory_get_int64 from Layout with func_state, 8
@@ -888,13 +960,17 @@ Process called "verify_optional_unwrap" that takes na as Integer, inst as Intege
     Let error_list be proc memory_get_int64 from Layout with na, 40
     Let error_count be proc memory_get_int64 from Layout with na, 48
 
-    Note: UNWRAP or EXPECT operations (opcode TBD - using 20999 as placeholder)
-    Note: These operations extract the value from an optional type
-    If opcode is equal to 20999:
+    Note: Optional unwrapping has no dedicated MIR opcode: the frontend
+    Note: lowers an unwrap to a dereference of the optional's payload.
+    Note: Every dereferencing instruction (MIR_LOAD 20200, MIR_LOAD_FIELD
+    Note: 20203, MIR_DEREF 20206) whose address operand carries an
+    Note: optional-flagged null state is therefore an unwrap site and must
+    Note: be proven NON_NULL before the dereference
+    If opcode is equal to 20200 or opcode is equal to 20203 or opcode is equal to 20206:
         Let optional_value be proc memory_get_int64 from Layout with inst, 16
 
         If optional_value is not equal to 0:
-            Let opt_state be proc get from Dictionary with value_to_null, optional_value
+            Let opt_state be proc omap_get from OrderedMap with value_to_null, optional_value
 
             If opt_state is not equal to 0:
                 Let is_optional be proc memory_get_int64 from Layout with opt_state, 24
@@ -934,7 +1010,7 @@ Returns the NullState object, or 0 if no state is tracked for this value.
 
 Process called "get_null_state" that takes na as Integer, value_id as Integer returns Integer:
     Let value_to_null be proc memory_get_int64 from Layout with na, 16
-    Let state be proc get from Dictionary with value_to_null, value_id
+    Let state be proc omap_get from OrderedMap with value_to_null, value_id
     Return state
 End Process
 

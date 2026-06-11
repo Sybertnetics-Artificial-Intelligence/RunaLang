@@ -608,15 +608,18 @@ levels), nullable suffix, Function-type suffix - over the pre-collected
 token list without moving the cursor, then reports whether an identifier
 follows. Used by statement parsing, member parsing, and parameter parsing.
 @End Reasoning
-Process called "lookahead_is_declaration" takes parser as Integer returns Integer:
-    Note: Check whether the cursor begins "Type name" (a declaration head)
+Process called "scan_type_spelling_end" takes parser as Integer returns Integer:
+    Note: Returns the token index immediately after a type spelling that
+    Note: begins at the cursor, or -1 when the cursor does not start a
+    Note: type spelling. Shared by the declaration and local-function
+    Note: lookaheads so their type grammars cannot drift apart.
 
     Let position be proc memory_get_int64 from Memory with parser, 24
     Let t be proc token_type_at with parser, position
 
     Let starts be proc token_is_type_start with t
     If starts is equal to 0:
-        Return 0
+        Return 0 minus 1
     End If
 
     Let i be position plus 1
@@ -628,7 +631,7 @@ Process called "lookahead_is_declaration" takes parser as Integer returns Intege
         If after_dot is equal to TOKEN_IDENTIFIER from Lexer:
             Set i to i plus 2
         Otherwise:
-            Return 0
+            Return 0 minus 1
         End If
     End If
 
@@ -640,13 +643,13 @@ Process called "lookahead_is_declaration" takes parser as Integer returns Intege
         While depth is greater than 0:
             Set t to proc token_type_at with parser, i
             If t is equal to TOKEN_EOF from Lexer:
-                Return 0
+                Return 0 minus 1
             End If
             If t is equal to TOKEN_SEMICOLON from Lexer:
-                Return 0
+                Return 0 minus 1
             End If
             If t is equal to TOKEN_LEFT_BRACE from Lexer:
-                Return 0
+                Return 0 minus 1
             End If
             If t is equal to TOKEN_LESS_THAN from Lexer:
                 Set depth to depth plus 1
@@ -681,7 +684,7 @@ Process called "lookahead_is_declaration" takes parser as Integer returns Intege
             While pdepth is greater than 0:
                 Set t to proc token_type_at with parser, i
                 If t is equal to TOKEN_EOF from Lexer:
-                    Return 0
+                    Return 0 minus 1
                 End If
                 If t is equal to TOKEN_LEFT_PAREN from Lexer:
                     Set pdepth to pdepth plus 1
@@ -699,7 +702,44 @@ Process called "lookahead_is_declaration" takes parser as Integer returns Intege
         End If
     End While
 
+    Return i
+End Process
+
+Process called "lookahead_is_declaration" takes parser as Integer returns Integer:
+    Note: Check whether the cursor begins "Type name" (a declaration head)
+
+    Let i be proc scan_type_spelling_end with parser
+    If i is less than 0:
+        Return 0
+    End If
+
+    Let t be proc token_type_at with parser, i
     If t is equal to TOKEN_IDENTIFIER from Lexer:
+        Return 1
+    End If
+
+    Return 0
+End Process
+
+Process called "lookahead_is_local_function" takes parser as Integer returns Integer:
+    Note: Check whether the cursor begins "Type name(" or "Type name<"
+    Note: - a local function declaration head in statement position
+
+    Let i be proc scan_type_spelling_end with parser
+    If i is less than 0:
+        Return 0
+    End If
+
+    Let t be proc token_type_at with parser, i
+    If t is not equal to TOKEN_IDENTIFIER from Lexer:
+        Return 0
+    End If
+
+    Let after be proc token_type_at with parser, i plus 1
+    If after is equal to TOKEN_LEFT_PAREN from Lexer:
+        Return 1
+    End If
+    If after is equal to TOKEN_LESS_THAN from Lexer:
         Return 1
     End If
 
@@ -709,9 +749,9 @@ End Process
 @Reasoning:
 A left paren in expression position is either a parenthesized expression
 or a lambda's parameter list. The grammar decides by what follows the
-matching close paren: "=>" or "{" means lambda. The scan walks the token
-list with a depth counter so nested parens inside default values do not
-fool it.
+matching close paren: "=>", "{", or an async/sync body marker (async,
+async*, sync*) means lambda. The scan walks the token list with a depth
+counter so nested parens inside default values do not fool it.
 @End Reasoning
 Process called "is_lambda_ahead" takes parser as Integer returns Integer:
     Note: Check whether the cursor's left paren opens a lambda parameter list
@@ -746,6 +786,9 @@ Process called "is_lambda_ahead" takes parser as Integer returns Integer:
         Return 1
     End If
     If t is equal to TOKEN_ASYNC from Lexer:
+        Return 1
+    End If
+    If t is equal to TOKEN_SYNC from Lexer:
         Return 1
     End If
 
@@ -1367,6 +1410,145 @@ Process called "parse_interpolated_string" takes parser as Integer returns Integ
     proc add_node_child with interp_node, tail_node
 
     Return interp_node
+End Process
+
+@Reasoning:
+The Dart specification merges adjacent string literals into one string
+("'a' 'b'" denotes "ab"), including any mix of plain and interpolated
+spellings. The merge happens at the primary-expression level, after the
+first string token has been consumed: while the next token is again a
+string (plain or interpolated), the next member is parsed through the
+same cooking path the standalone cases use and folded into the running
+result with merge_adjacent_string_pair. Folding left-to-right keeps the
+merge associative-by-construction and means selectors after the final
+member ("'a' 'b'.length") apply to the whole merged literal, exactly as
+the Dart grammar prescribes.
+@End Reasoning
+Process called "parse_adjacent_string_concatenation" takes parser as Integer, first as Integer returns Integer:
+    Note: Fold a run of adjacent string tokens into one string node
+
+    Let result be first
+
+    While 1 is equal to 1:
+        Let token_type be proc current_token_type with parser
+
+        If token_type is equal to TOKEN_STRING_LITERAL from Lexer:
+            Let next_lexeme be proc current_lexeme with parser
+            Let next_cooked be proc cook_string_literal with next_lexeme
+            Let next_literal be proc create_value_node with DART_STRING_LITERAL, next_cooked
+            proc advance_parser with parser
+            Set result to proc merge_adjacent_string_pair with result, next_literal
+        Otherwise:
+            If token_type is equal to TOKEN_STRING_INTERP from Lexer:
+                Let next_interp be proc parse_interpolated_string with parser
+                Set result to proc merge_adjacent_string_pair with result, next_interp
+            Otherwise:
+                Break
+            End If
+        End If
+    End While
+
+    Return result
+End Process
+
+@Reasoning:
+Merges two adjacent string members into one node. Two plain literals
+concatenate their cooked text into a single DART_STRING_LITERAL. As soon
+as either side is interpolated the result is a DART_STRING_INTERP node
+whose children preserve the alternating literal/expression invariant:
+interpolation children always begin and end with a literal part, and a
+plain literal is itself a one-element literal sequence, so the seam
+between the two sides is always literal-next-to-literal and the two seam
+literals are joined into one child. The merged node's value concatenates
+both members' values so diagnostics keep a spelling that covers the full
+merged extent; a defensive non-literal seam guard appends both seam
+nodes unjoined rather than corrupting the child list if a producer ever
+violates the invariant.
+@End Reasoning
+Process called "merge_adjacent_string_pair" takes left as Integer, right as Integer returns Integer:
+    Note: Merge two adjacent string nodes per the Dart concatenation rule
+
+    Let left_kind be proc ast_node_type with left
+    Let right_kind be proc ast_node_type with right
+
+    Let left_value be proc ast_node_value with left
+    If left_value is equal to 0:
+        Set left_value to ""
+    End If
+    Let right_value be proc ast_node_value with right
+    If right_value is equal to 0:
+        Set right_value to ""
+    End If
+
+    Note: Plain + plain: cooked-text concatenation into one literal
+    If left_kind is equal to DART_STRING_LITERAL:
+        If right_kind is equal to DART_STRING_LITERAL:
+            Let joined_text be proc string_concat from StringUtils with left_value, right_value
+            Return proc create_value_node with DART_STRING_LITERAL, joined_text
+        End If
+    End If
+
+    Note: At least one interpolated member: build a merged interpolation
+    Let merged_value be proc string_concat from StringUtils with left_value, right_value
+    Let merged be proc create_value_node with DART_STRING_INTERP, merged_value
+
+    Note: Left side: copy every part except its trailing literal, which is
+    Note: held back for the seam join
+    Let pending be left
+    If left_kind is equal to DART_STRING_INTERP:
+        Let left_count be proc ast_node_child_count with left
+        Let i be 0
+        While i is less than left_count minus 1:
+            Let left_part be proc ast_node_child with left, i
+            proc add_node_child with merged, left_part
+            Set i to i plus 1
+        End While
+        Set pending to proc ast_node_child with left, left_count minus 1
+    End If
+
+    Note: Right side: its leading literal joins the held-back left literal
+    Let right_count be 1
+    Let right_first be right
+    If right_kind is equal to DART_STRING_INTERP:
+        Set right_count to proc ast_node_child_count with right
+        Set right_first to proc ast_node_child with right, 0
+    End If
+
+    Let pending_kind be proc ast_node_type with pending
+    Let first_kind be proc ast_node_type with right_first
+    Let seam_joined be 0
+    If pending_kind is equal to DART_STRING_LITERAL:
+        If first_kind is equal to DART_STRING_LITERAL:
+            Let pending_text be proc ast_node_value with pending
+            If pending_text is equal to 0:
+                Set pending_text to ""
+            End If
+            Let first_text be proc ast_node_value with right_first
+            If first_text is equal to 0:
+                Set first_text to ""
+            End If
+            Let seam_text be proc string_concat from StringUtils with pending_text, first_text
+            Let seam_node be proc create_value_node with DART_STRING_LITERAL, seam_text
+            proc add_node_child with merged, seam_node
+            Set seam_joined to 1
+        End If
+    End If
+    If seam_joined is equal to 0:
+        proc add_node_child with merged, pending
+        proc add_node_child with merged, right_first
+    End If
+
+    Note: Remaining right parts after the seam
+    If right_kind is equal to DART_STRING_INTERP:
+        Let j be 1
+        While j is less than right_count:
+            Let right_part be proc ast_node_child with right, j
+            proc add_node_child with merged, right_part
+            Set j to j plus 1
+        End While
+    End If
+
+    Return merged
 End Process
 
 Note: ============================================================================
@@ -3654,6 +3836,14 @@ Process called "parse_statement" takes parser as Integer returns Integer:
     End If
     If is_var_intro is equal to 0:
         Set is_var_intro to proc lookahead_is_declaration with parser
+        If is_var_intro is equal to 1:
+            Note: "Type name(" or "Type name<" in statement position is a
+            Note: local function declaration, not a variable declaration
+            Let is_local_fn be proc lookahead_is_local_function with parser
+            If is_local_fn is equal to 1:
+                Return proc parse_local_function_declaration with parser
+            End If
+        End If
     End If
 
     If is_var_intro is equal to 1:
@@ -3667,6 +3857,33 @@ Process called "parse_statement" takes parser as Integer returns Integer:
     proc expect_token with parser, TOKEN_SEMICOLON from Lexer
 
     Return stmt
+End Process
+
+@Reasoning:
+Local (nested) function declarations are first-class Dart: any block may
+declare "ReturnType name(params) [async|async*|sync*] { body }" and the
+name scopes to the enclosing block. The shared declaration engine
+(parse_function_or_variable_declaration) already parses exactly this
+shape for top-level functions, so the statement form delegates to it
+through a detached carrier node and returns the single declaration it
+produced - keeping local and top-level function grammars identical by
+construction. The carrier fallback (a parse error consumed no
+declaration) returns an empty expression statement so the block loop
+always receives a node.
+@End Reasoning
+Process called "parse_local_function_declaration" takes parser as Integer returns Integer:
+    Note: Parse a local function declaration in statement position
+
+    Let carrier be proc create_ast_node with DART_PROGRAM
+    proc parse_function_or_variable_declaration with parser, carrier, 0, 0
+
+    Let produced be proc ast_node_child_count with carrier
+    If produced is greater than 0:
+        Return proc ast_node_child with carrier, 0
+    End If
+
+    Let empty_stmt be proc create_ast_node with DART_EXPR_STMT
+    Return empty_stmt
 End Process
 
 @Reasoning:
@@ -5167,11 +5384,12 @@ Process called "parse_primary_expression" takes parser as Integer returns Intege
         Let cooked be proc cook_string_literal with string_lexeme
         Let string_node be proc create_value_node with DART_STRING_LITERAL, cooked
         proc advance_parser with parser
-        Return string_node
+        Return proc parse_adjacent_string_concatenation with parser, string_node
     End If
 
     If token_type is equal to TOKEN_STRING_INTERP from Lexer:
-        Return proc parse_interpolated_string with parser
+        Let interp_first be proc parse_interpolated_string with parser
+        Return proc parse_adjacent_string_concatenation with parser, interp_first
     End If
 
     If token_type is equal to TOKEN_TRUE from Lexer:

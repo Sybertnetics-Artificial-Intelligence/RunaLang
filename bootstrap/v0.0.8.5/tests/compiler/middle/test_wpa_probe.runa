@@ -1,0 +1,234 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+Licensed under Apache 2.0
+:End Note
+
+Note:
+Wave 2 gate probe for the LTO pair (MIR reconciliation #432,
+MIR_RECONCILIATION_PLAN.md Part 4 Wave 2 / Part 2.2 / Part 2.3).
+
+Builds a three-function MIRProgram by hand through the canonical
+constructors:
+
+  main:    v1 = CONST 0
+           CALL helper()        (callee linked BY NAME per the canonical
+                                 MIRCall contract, mir_nodes.runa:843)
+           RETURN v1
+  helper:  v1 = CONST 42
+           RETURN v1
+  orphan:  v1 = CONST 7
+           RETURN v1            (never called, not exported)
+
+and runs the full WPA pipeline (create_whole_program_analysis +
+initialize_wpa_from_mir) followed by the CMO pipeline
+(create_cross_module_optimizer + initialize_cmo_from_wpa +
+perform_whole_program_dce) over it.
+
+Gate assertions (per the plan's Wave 2 gate):
+  1. Entry identification by NAME: "main" lands in the reachable set
+     (OD-4: reachability sets store MIRFunction POINTERS).
+  2. Call-edge reachability: helper (reached only through the name-
+     resolved direct-call edge main -> helper) is reachable.
+  3. Unreachable flagging: orphan is in wpa.unreachable_functions and
+     is_function_reachable reports 0 for it.
+  4. Names SURVIVE the pipeline (regression for the historical
+     cross_module_optimization.runa:2146 clobber that wrote a sequential
+     id over MIRFunction offset 0 — the name pointer): after WPA + CMO
+     DCE + compact_function_table, main/helper still carry their exact
+     name strings.
+  5. The DCE sweep keeps both reachable functions and drops the orphan
+     from mir.functions, with the program function_count following.
+
+Conventions: canonical tests/test_utils.runa harness; PASS = the
+"ALL TESTS PASSED" summary plus exit 0; the process exit code is the
+failed-assertion count.
+:End Note
+
+Import "tests/test_utils.runa" as T
+Import "compiler/middle/gungnir/mir/mir.runa" as MIR
+Import "compiler/middle/gungnir/mir/mir_nodes.runa" as MIRNodes
+Import "compiler/middle/gungnir/mir/cfg.runa" as MirCFG
+Import "compiler/middle/lto/whole_program_analysis.runa" as WPA
+Import "compiler/middle/lto/cross_module_optimization.runa" as CMO
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/collections/list.runa" as List
+Import "compiler/frontend/primitives/collections/set.runa" as Set
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+
+@Reasoning
+Builds one single-block function with the canonical creators: a CONST
+defining value id 1, an optional zero-argument direct CALL to
+callee_name (skipped when callee_name is 0), and a RETURN of value 1.
+The CFG entry/exit both point at the single block; the value definition
+is registered through the canonical map so downstream
+lookup_defining_instruction queries (constant detection, points-to)
+resolve. Returns the MIRFunction pointer, or 0 on construction failure.
+@End Reasoning
+
+Process called "build_probe_function" that takes name as Integer, callee_name as Integer returns Integer:
+    Let func be proc create_mir_function from MIR with name, 0, 0
+    If func is equal to 0:
+        Return 0
+    End If
+
+    Let cfg be proc get_mir_function_cfg from MIR with func
+    If cfg is equal to 0:
+        Return 0
+    End If
+
+    Let block_id be proc allocate_block_id from MIR with cfg
+    Let block be proc create_mir_basic_block from MIR with block_id, 0
+    If block is equal to 0:
+        Return 0
+    End If
+
+    proc add_block_to_cfg from MIR with cfg, block
+    proc set_cfg_entry_block from MIR with cfg, block
+    proc set_cfg_exit_block from MIR with cfg, block
+
+    Note: v1 = CONST (numeric payload 42, no string)
+    Let const_inst be proc create_mir_const from MIRNodes with 1, 42, 0, 0, 0
+    If const_inst is equal to 0:
+        Return 0
+    End If
+    proc add_instruction_to_block from MirCFG with block, const_inst
+    proc register_value_definition from MIR with func, 1, const_inst
+
+    Note: Optional zero-argument direct call, callee linked by name
+    If callee_name is not equal to 0:
+        Let empty_args be proc list_create from List
+        Let call_inst be proc create_mir_call from MIRNodes with 2, callee_name, empty_args, 0, 0, 0, 0
+        If call_inst is equal to 0:
+            Return 0
+        End If
+        proc add_instruction_to_block from MirCFG with block, call_inst
+        proc register_value_definition from MIR with func, 2, call_inst
+    End If
+
+    Note: RETURN v1
+    Let ret_inst be proc create_mir_return from MIRNodes with 1, 0
+    If ret_inst is equal to 0:
+        Return 0
+    End If
+    proc add_instruction_to_block from MirCFG with block, ret_inst
+
+    Return func
+End Process
+
+@Reasoning
+Linear scan over the program's functions List testing pointer identity —
+the OD-4 membership probe the assertions use to verify the DCE sweep
+kept or dropped a specific function record.
+@End Reasoning
+
+Process called "program_contains_function" that takes mir as Integer, func as Integer returns Integer:
+    Let functions be proc memory_get_int64 from Layout with mir, 0
+    If functions is equal to 0:
+        Return 0
+    End If
+    Let count be proc length from List with functions
+    Let i be 0
+    While i is less than count:
+        Let probe be proc list_get from List with functions, i
+        If probe is equal to func:
+            Return 1
+        End If
+        Set i to i plus 1
+    End While
+    Return 0
+End Process
+
+Process called "main" returns Integer:
+    Let results be proc create_test_results from T
+    proc begin_suite from T with results, "wpa_probe (Wave 2 gate)"
+
+    Note: ---- Build the three-function program ----
+    Let mir be proc create_mir_program from MIR with 0
+    proc assert_not_null from T with results, "MIRProgram built", mir
+
+    Let main_func be build_probe_function("main", "helper")
+    Let helper_func be build_probe_function("helper", 0)
+    Let orphan_func be build_probe_function("orphan", 0)
+    proc assert_not_null from T with results, "main function built", main_func
+    proc assert_not_null from T with results, "helper function built", helper_func
+    proc assert_not_null from T with results, "orphan function built", orphan_func
+
+    Let functions be proc memory_get_int64 from Layout with mir, 0
+    proc append from List with functions, main_func
+    proc append from List with functions, helper_func
+    proc append from List with functions, orphan_func
+    proc memory_set_int64 from Layout with mir, 8, 3
+
+    Note: ---- Run WPA ----
+    Let wpa be proc create_whole_program_analysis from WPA with mir
+    proc assert_not_null from T with results, "WPA workspace created", wpa
+
+    Let init_ok be proc initialize_wpa_from_mir from WPA with wpa, mir
+    proc assert_equal from T with results, "WPA initialization succeeds", init_ok, 1
+
+    Note: Gate 1 — entry identified by name: main reachable
+    Let main_reachable be proc is_function_reachable from WPA with wpa, main_func
+    proc assert_equal from T with results, "main (entry by name) is reachable", main_reachable, 1
+
+    Note: Gate 2 — call-edge reachability: helper reachable only through
+    Note: the name-resolved direct call main -> helper
+    Let helper_reachable be proc is_function_reachable from WPA with wpa, helper_func
+    proc assert_equal from T with results, "helper reachable via name-resolved call edge", helper_reachable, 1
+
+    Note: Gate 3 — unreachable flagging: orphan in the unreachable set
+    Let orphan_reachable be proc is_function_reachable from WPA with wpa, orphan_func
+    proc assert_equal from T with results, "orphan is not reachable", orphan_reachable, 0
+
+    Let unreachable_set be proc memory_get_int64 from Layout with wpa, 32
+    Let orphan_flagged be proc contains from Set with unreachable_set, orphan_func
+    proc assert_equal from T with results, "orphan flagged in unreachable_functions", orphan_flagged, 1
+    Let main_flagged be proc contains from Set with unreachable_set, main_func
+    proc assert_equal from T with results, "main not flagged unreachable", main_flagged, 0
+    Let helper_flagged be proc contains from Set with unreachable_set, helper_func
+    proc assert_equal from T with results, "helper not flagged unreachable", helper_flagged, 0
+
+    Note: ---- Run the CMO pipeline (exercises sweep + compact) ----
+    Let cmo be proc create_cross_module_optimizer from CMO with wpa, mir
+    proc assert_not_null from T with results, "CMO workspace created", cmo
+    proc initialize_cmo_from_wpa from CMO with cmo
+
+    Let dce_removed be proc perform_whole_program_dce from CMO with cmo
+    proc assert_equal from T with results, "DCE removes exactly the orphan", dce_removed, 1
+
+    Note: Gate 5 — sweep results: main/helper kept, orphan dropped,
+    Note: function_count synchronized by compact_function_table
+    Let main_kept be program_contains_function(mir, main_func)
+    proc assert_equal from T with results, "main survives the DCE sweep", main_kept, 1
+    Let helper_kept be program_contains_function(mir, helper_func)
+    proc assert_equal from T with results, "helper survives the DCE sweep", helper_kept, 1
+    Let orphan_kept be program_contains_function(mir, orphan_func)
+    proc assert_equal from T with results, "orphan removed by the DCE sweep", orphan_kept, 0
+    Let surviving_count be proc memory_get_int64 from Layout with mir, 8
+    proc assert_equal from T with results, "program function_count follows the sweep", surviving_count, 2
+
+    Note: Gate 4 — NAME SURVIVAL (regression for the historical
+    Note: compact_function_table clobber of MIRFunction offset 0)
+    Let main_name be proc memory_get_int64 from Layout with main_func, 0
+    proc assert_not_null from T with results, "main name pointer non-null after pipeline", main_name
+    Let main_name_ok be proc string_equals from StringCore with main_name, "main"
+    proc assert_equal from T with results, "main name string survives the pipeline", main_name_ok, 1
+
+    Let helper_name be proc memory_get_int64 from Layout with helper_func, 0
+    proc assert_not_null from T with results, "helper name pointer non-null after pipeline", helper_name
+    Let helper_name_ok be proc string_equals from StringCore with helper_name, "helper"
+    proc assert_equal from T with results, "helper name string survives the pipeline", helper_name_ok, 1
+
+    Note: The merged program remains structurally valid (every direct
+    Note: call still carries a callee name)
+    Let still_valid be proc validate_merged_program from CMO with cmo
+    proc assert_equal from T with results, "merged program validates after DCE", still_valid, 1
+
+    Note: ---- Tear down ----
+    proc destroy_cross_module_optimizer from CMO with cmo
+    proc destroy_whole_program_analysis from WPA with wpa
+
+    proc print_summary from T with results
+    Let failed be proc get_failed from T with results
+    proc destroy_test_results from T with results
+    Return failed
+End Process

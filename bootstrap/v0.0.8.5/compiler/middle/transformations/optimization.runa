@@ -47,6 +47,7 @@ Dependencies:
 :End Note
 
 Import "compiler/middle/gungnir/mir/mir.runa" as MIR
+Import "compiler/middle/gungnir/mir/mir_nodes.runa" as MIRNodes
 Import "compiler/middle/gungnir/mir/cfg.runa" as CFG
 Import "compiler/middle/gungnir/mir/dominance.runa" as Dominance
 Import "compiler/middle/analysis/data_flow.runa" as DataFlow
@@ -82,7 +83,7 @@ The OptimizationContext maintains all state needed during optimization:
 
 This allows optimization passes to share analysis results and avoid recomputation.
 
-Memory Layout (136 bytes, Tier 3: OWNED HEAP):
+Memory Layout (144 bytes, Tier 3: OWNED HEAP):
 Offset  Size  Field                    Description
 ------  ----  -----                    -----------
 0       8     mir_function             Pointer to MIR function being optimized
@@ -106,6 +107,12 @@ Offset  Size  Field                    Description
 128     8     pga                      Pointer to ProfileGuidedAnalysis (PGO workspace,
                                        set by apply_profile_guided_optimizations,
                                        0 when PGO has not run for this function)
+136     8     mir_program              Pointer to the enclosing MIRProgram (0 when the
+                                       function is optimized outside program scope).
+                                       Used for callee-name resolution per OD-4:
+                                       function identity is the MIRFunction pointer,
+                                       names are resolved by scanning the program's
+                                       functions List
 @End Reasoning
 
 Type called "OptimizationContext":
@@ -128,6 +135,7 @@ Type called "OptimizationContext":
     basic_block_count as Integer
     statistics as Integer
     pga as Integer
+    mir_program as Integer
 End Type
 
 Note: ============================================================================
@@ -235,16 +243,18 @@ Creates and initializes an OptimizationContext for a MIR function.
 Runs necessary analyses and builds data structures for optimization passes.
 @End Reasoning
 
-Process called "create_optimization_context" that takes mir_func as Integer, opt_level as Integer returns Integer:
-    Note: Allocate OptimizationContext structure (136 bytes - was 128
-    Note: before the PGA field at offset 128 was added).
-    Let ctx be proc allocate from Layout with 136
+Process called "create_optimization_context" that takes mir_func as Integer, opt_level as Integer, mir_program as Integer returns Integer:
+    Note: Allocate OptimizationContext structure (144 bytes - grew from 136
+    Note: when the mir_program field at offset 136 was added for OD-4
+    Note: callee-name resolution).
+    Let ctx be proc allocate from Layout with 144
 
     Note: Initialize MIR function pointer
     proc memory_set_int64 from MemoryCore with ctx, 0, mir_func
 
-    Note: Get CFG from MIR function
-    Let cfg be proc memory_get_int64 from MemoryCore with mir_func, 32
+    Note: Get CFG from MIR function (canonical MIRFunction cfg slot at
+    Note: offset 8, read through the canonical accessor)
+    Let cfg be proc get_mir_function_cfg from MIR with mir_func
     proc memory_set_int64 from MemoryCore with ctx, 8, cfg
 
     Note: Compute dominance information
@@ -315,8 +325,9 @@ Process called "create_optimization_context" that takes mir_func as Integer, opt
     Let dead_instructions be proc create from Dictionary
     proc memory_set_int64 from MemoryCore with ctx, 104, dead_instructions
 
-    Note: Count instructions and blocks
-    Let blocks be proc memory_get_int64 from MemoryCore with cfg, 0
+    Note: Count instructions and blocks (canonical MIRCFG blocks List at
+    Note: offset 16, read through the canonical accessor)
+    Let blocks be proc get_mir_cfg_blocks from CFG with cfg
     Let block_count be proc length from List with blocks
     proc memory_set_int32 from MemoryCore with ctx, 116, block_count
 
@@ -330,6 +341,11 @@ Process called "create_optimization_context" that takes mir_func as Integer, opt
     Note: Initialize PGA pointer to 0 (set later by
     Note: apply_profile_guided_optimizations when profile data is present).
     proc memory_set_int64 from MemoryCore with ctx, 128, 0
+
+    Note: Record the enclosing MIR program (0 when not optimizing inside
+    Note: program scope). Used by inline_functions and optimize_tail_calls
+    Note: to resolve callee names to MIRFunction pointers per OD-4.
+    proc memory_set_int64 from MemoryCore with ctx, 136, mir_program
 
     Return ctx
 End Process
@@ -345,7 +361,7 @@ Process called "count_total_instructions" that takes blocks as Integer returns I
     Let i be 0
     While i is less than block_count:
         Let block be proc list_get from List with blocks, i
-        Let instructions be proc memory_get_int64 from MemoryCore with block, 8
+        Let instructions be proc get_block_instructions from MIR with block
         Let inst_count be proc length from List with instructions
         Set total to total plus inst_count
         Set i to i plus 1
@@ -395,7 +411,7 @@ Algorithm:
 
 Process called "build_use_def_chains" that takes ctx as Integer returns Integer:
     Let cfg be proc memory_get_int64 from MemoryCore with ctx, 8
-    Let blocks be proc memory_get_int64 from MemoryCore with cfg, 0
+    Let blocks be proc get_mir_cfg_blocks from CFG with cfg
     Let block_count be proc length from List with blocks
 
     Let use_def_chains be proc memory_get_int64 from MemoryCore with ctx, 48
@@ -405,14 +421,14 @@ Process called "build_use_def_chains" that takes ctx as Integer returns Integer:
     Let i be 0
     While i is less than block_count:
         Let block be proc list_get from List with blocks, i
-        Let instructions be proc memory_get_int64 from MemoryCore with block, 8
+        Let instructions be proc get_block_instructions from MIR with block
         Let inst_count be proc length from List with instructions
 
         Let j be 0
         While j is less than inst_count:
             Let inst be proc list_get from List with instructions, j
-            Let opcode be proc memory_get_int32 from MemoryCore with inst, 0
-            Let result_value be proc memory_get_int32 from MemoryCore with inst, 8
+            Let opcode be proc get_mir_node_opcode from MIR with inst
+            Let result_value be proc get_mir_node_value_id from MIR with inst
 
             Note: If instruction produces a result, create use-def chain
             If result_value is not equal to 0:
@@ -430,7 +446,7 @@ Process called "build_use_def_chains" that takes ctx as Integer returns Integer:
     Set i to 0
     While i is less than block_count:
         Set block to proc list_get from List with blocks, i
-        Set instructions to proc memory_get_int64 from MemoryCore with block, 8
+        Set instructions to proc get_block_instructions from MIR with block
         Set inst_count to proc length from List with instructions
 
         Set j to 0
@@ -488,64 +504,56 @@ Note: record_instruction_uses - Record uses of values in instruction
 Note: ============================================================================
 
 Process called "record_instruction_uses" that takes ctx as Integer, inst as Integer, block as Integer returns Integer:
-    Let opcode be proc memory_get_int32 from MemoryCore with inst, 0
+    Let opcode be proc get_mir_node_opcode from MIR with inst
     Let use_def_chains be proc memory_get_int64 from MemoryCore with ctx, 48
 
-    Note: Record operand uses based on opcode
-    Note: Binary operations use operands at offsets 16 and 24
-    If opcode is greater than or equal to 20002 and opcode is less than or equal to 20016:
-        Let operand1 be proc memory_get_int32 from MemoryCore with inst, 16
-        Let operand2 be proc memory_get_int32 from MemoryCore with inst, 24
-
-        If operand1 is not equal to 0:
-            add_use_to_chain(use_def_chains, operand1, inst, block)
-        End If
-
-        If operand2 is not equal to 0:
-            add_use_to_chain(use_def_chains, operand2, inst, block)
-        End If
+    Note: Canonical operand roles (re-derived against the OD-1 prefix-embedded
+    Note: layouts): SSA value-id USES live in the header operand slots
+    Note: (operand1 at 16, operand2 at 24, operand3 at 32) for every
+    Note: instruction shape - LOAD uses operand1=address, STORE uses
+    Note: operand1=address / operand2=value, RETURN uses operand1=value,
+    Note: BRANCH uses operand1=condition. PHI uses live in the odd slots of
+    Note: the incoming pair List at extended offset 80. The canonical
+    Note: collector handles every one of those shapes uniformly.
+    Let used_values be proc get_instruction_used_values from CFG with inst
+    If used_values is not equal to 0:
+        Let used_count be proc length from List with used_values
+        Let u be 0
+        While u is less than used_count:
+            Let used_value be proc list_get from List with used_values, u
+            add_use_to_chain(use_def_chains, used_value, inst, block)
+            Set u to u plus 1
+        End While
+        proc list_destroy from List with used_values
     End If
 
-    Note: Comparison operations (20100-20105)
-    If opcode is greater than or equal to 20100 and opcode is less than or equal to 20105:
-        Set operand1 to proc memory_get_int32 from MemoryCore with inst, 16
-        Set operand2 to proc memory_get_int32 from MemoryCore with inst, 24
-
-        If operand1 is not equal to 0:
-            add_use_to_chain(use_def_chains, operand1, inst, block)
-        End If
-
-        If operand2 is not equal to 0:
-            add_use_to_chain(use_def_chains, operand2, inst, block)
-        End If
+    Note: Call-family arguments are NOT header operands - they live in the
+    Note: arguments List at extended offset 88 (MIR_CALL 20304,
+    Note: MIR_CALL_INDIRECT 20305, MIR_INVOKE 20700). Record each argument
+    Note: value id as a use.
+    Let has_arg_list be 0
+    If opcode is equal to 20304:
+        Set has_arg_list to 1
+    End If
+    If opcode is equal to 20305:
+        Set has_arg_list to 1
+    End If
+    If opcode is equal to 20700:
+        Set has_arg_list to 1
     End If
 
-    Note: Memory operations
-    If opcode is equal to 20200:  Note: MIR_LOAD
-        Let addr be proc memory_get_int32 from MemoryCore with inst, 16
-        If addr is not equal to 0:
-            add_use_to_chain(use_def_chains, addr, inst, block)
-        End If
-    End If
-
-    If opcode is equal to 20201:  Note: MIR_STORE
-        Set addr to proc memory_get_int32 from MemoryCore with inst, 8
-        Let value be proc memory_get_int32 from MemoryCore with inst, 16
-
-        If addr is not equal to 0:
-            add_use_to_chain(use_def_chains, addr, inst, block)
-        End If
-
-        If value is not equal to 0:
-            add_use_to_chain(use_def_chains, value, inst, block)
-        End If
-    End If
-
-    Note: Return uses value
-    If opcode is equal to 20303:  Note: MIR_RETURN
-        Set value to proc memory_get_int32 from MemoryCore with inst, 8
-        If value is not equal to 0:
-            add_use_to_chain(use_def_chains, value, inst, block)
+    If has_arg_list is equal to 1:
+        Let arguments be proc get_call_arguments from MIRNodes with inst
+        If arguments is not equal to 0:
+            Let arg_count be proc length from List with arguments
+            Let a be 0
+            While a is less than arg_count:
+                Let arg_value be proc list_get from List with arguments, a
+                If arg_value is not equal to 0:
+                    add_use_to_chain(use_def_chains, arg_value, inst, block)
+                End If
+                Set a to a plus 1
+            End While
         End If
     End If
 
@@ -594,14 +602,17 @@ Runs a sequence of optimization passes based on optimization level:
 Returns 1 if any changes were made, 0 otherwise.
 @End Reasoning
 
-Process called "optimize_function" that takes mir_func as Integer, opt_level as Integer returns Integer:
+Process called "optimize_function" that takes mir_func as Integer, opt_level as Integer, mir_program as Integer returns Integer:
     Note: No optimization at O0
     If opt_level is equal to 0:
         Return 0
     End If
 
-    Note: Create optimization context
-    Let ctx be create_optimization_context(mir_func, opt_level)
+    Note: Create optimization context (mir_program may be 0 when the
+    Note: function is optimized outside program scope; callee resolution
+    Note: in inline_functions / optimize_tail_calls then degrades to
+    Note: pointer-identity checks only)
+    Let ctx be create_optimization_context(mir_func, opt_level, mir_program)
 
     Note: Track if any pass made changes
     Let global_changed be 0
@@ -763,9 +774,10 @@ CMO via create_cross_module_optimizer(wpa, mir). The CMO struct stores wpa
 at its offset 0 so all CMO passes can read it.
 
 Surviving-function check at Phase C uses Set.contains on
-wpa.unreachable_functions (offset 32 of WPA). MIR function records carry
-function_id at offset 0 (verified pattern, lines 596 and 1620 of
-cross_module_optimization.runa).
+wpa.unreachable_functions (offset 32 of WPA). Function identity is the
+MIRFunction POINTER per OD-4 (2026-06-10): MIRFunction offset 0 holds the
+function NAME string pointer, not an id, so the unreachable-set membership
+test keys on the function pointer itself (unique and stable in-process).
 
 optimize_function's contract is "returns 1 if changed, 0 if not, never
 fails", so its return value is not inspected for failure. CMO entry points
@@ -828,7 +840,7 @@ Process called "optimize_program" that takes mir as Integer, opt_level as Intege
         While i is less than function_count:
             Let mir_func be proc list_get from List with functions, i
             If mir_func is not equal to 0:
-                optimize_function(mir_func, opt_level)
+                optimize_function(mir_func, opt_level, mir)
             End If
             Set i to i plus 1
         End While
@@ -880,13 +892,15 @@ Process called "optimize_program" that takes mir as Integer, opt_level as Intege
     While fi is less than function_count:
         Let mir_func be proc list_get from List with functions, fi
         If mir_func is not equal to 0:
-            Let func_id be proc memory_get_int64 from MemoryCore with mir_func, 0
+            Note: OD-4 function identity: the unreachable set is keyed by
+            Note: MIRFunction pointer (offset 0 of the record is the NAME
+            Note: string pointer, never an id)
             Let is_unreachable be 0
             If unreachable_set is not equal to 0:
-                Set is_unreachable to proc contains from Set with unreachable_set, func_id
+                Set is_unreachable to proc contains from Set with unreachable_set, mir_func
             End If
             If is_unreachable is equal to 0:
-                optimize_function(mir_func, opt_level)
+                optimize_function(mir_func, opt_level, mir)
             End If
         End If
         Set fi to fi plus 1
@@ -916,7 +930,7 @@ This is a critical optimization that enables other passes.
 
 Process called "eliminate_dead_code" that takes ctx as Integer returns Integer:
     Let cfg be proc memory_get_int64 from MemoryCore with ctx, 8
-    Let blocks be proc memory_get_int64 from MemoryCore with cfg, 0
+    Let blocks be proc get_mir_cfg_blocks from CFG with cfg
     Let block_count be proc length from List with blocks
 
     Note: Create worklist of live instructions
@@ -929,16 +943,27 @@ Process called "eliminate_dead_code" that takes ctx as Integer returns Integer:
     Let i be 0
     While i is less than block_count:
         Let block be proc list_get from List with blocks, i
-        Let instructions be proc memory_get_int64 from MemoryCore with block, 8
+        Let instructions be proc get_block_instructions from MIR with block
         Let inst_count be proc length from List with instructions
 
         Let j be 0
         While j is less than inst_count:
             Let inst be proc list_get from List with instructions, j
-            Let opcode be proc memory_get_int32 from MemoryCore with inst, 0
+            Let opcode be proc get_mir_node_opcode from MIR with inst
 
-            Note: Instructions with side effects are always live
+            Note: Instructions with side effects are always live. Volatile
+            Note: loads are critical too: MIRLoad keeps is_volatile at
+            Note: extended offset 104, and a volatile load must never be
+            Note: dead-code eliminated.
             Let is_critical be is_critical_instruction(opcode)
+            If is_critical is equal to 0:
+                If opcode is equal to 20200:
+                    Let load_is_volatile be proc memory_get_int64 from MemoryCore with inst, 104
+                    If load_is_volatile is not equal to 0:
+                        Set is_critical to 1
+                    End If
+                End If
+            End If
             If is_critical is equal to 1:
                 proc set from Dictionary with live_instructions, inst, 1
                 proc append from List with worklist, inst
@@ -966,7 +991,7 @@ Process called "eliminate_dead_code" that takes ctx as Integer returns Integer:
     Set i to 0
     While i is less than block_count:
         Set block to proc list_get from List with blocks, i
-        Set instructions to proc memory_get_int64 from MemoryCore with block, 8
+        Set instructions to proc get_block_instructions from MIR with block
         Set inst_count to proc length from List with instructions
 
         Note: Iterate backwards to safely remove
@@ -983,6 +1008,11 @@ Process called "eliminate_dead_code" that takes ctx as Integer returns Integer:
 
             Set j to j minus 1
         End While
+
+        Note: Re-sync the block's cached instruction_count (offset 24)
+        Note: with the instruction List after removals
+        Let remaining be proc length from List with instructions
+        proc memory_set_int64 from MemoryCore with block, 24, remaining
 
         Set i to i plus 1
     End While
@@ -1041,6 +1071,24 @@ Process called "is_critical_instruction" that takes opcode as Integer returns In
         Return 1
     End If
 
+    Note: Atomic operations (20500-20511) - memory side effects and
+    Note: synchronization semantics; never dead
+    If opcode is greater than or equal to 20500 and opcode is less than or equal to 20511:
+        Return 1
+    End If
+
+    Note: MIR_VECTOR_STORE (20611) - writes to memory
+    If opcode is equal to 20611:
+        Return 1
+    End If
+
+    Note: Exception-handling band (20700-20706): INVOKE transfers control
+    Note: and may have callee side effects; LANDINGPAD / RESUME / THROW
+    Note: define the unwind path
+    If opcode is greater than or equal to 20700 and opcode is less than or equal to 20706:
+        Return 1
+    End If
+
     Return 0
 End Process
 
@@ -1049,46 +1097,51 @@ Note: mark_operands_live - Mark defining instructions of operands as live
 Note: ============================================================================
 
 Process called "mark_operands_live" that takes inst as Integer, use_def_chains as Integer, live_instructions as Integer, worklist as Integer returns Integer:
-    Let opcode be proc memory_get_int32 from MemoryCore with inst, 0
+    Let opcode be proc get_mir_node_opcode from MIR with inst
 
-    Note: Get operands based on instruction type
-    Note: Binary operations
-    If opcode is greater than or equal to 20002 and opcode is less than or equal to 20016:
-        Let operand1 be proc memory_get_int32 from MemoryCore with inst, 16
-        Let operand2 be proc memory_get_int32 from MemoryCore with inst, 24
-
-        mark_value_definition_live(operand1, use_def_chains, live_instructions, worklist)
-        mark_value_definition_live(operand2, use_def_chains, live_instructions, worklist)
+    Note: Canonical operand roles (OD-1): SSA value-id uses live in the
+    Note: header operand slots (16/24/32) for every instruction shape -
+    Note: LOAD address=operand1, STORE address=operand1 / value=operand2,
+    Note: RETURN value=operand1, BRANCH condition=operand1 - and phi uses
+    Note: live in the incoming pair List. The canonical collector covers
+    Note: all of those uniformly.
+    Let used_values be proc get_instruction_used_values from CFG with inst
+    If used_values is not equal to 0:
+        Let used_count be proc length from List with used_values
+        Let u be 0
+        While u is less than used_count:
+            Let used_value be proc list_get from List with used_values, u
+            mark_value_definition_live(used_value, use_def_chains, live_instructions, worklist)
+            Set u to u plus 1
+        End While
+        proc list_destroy from List with used_values
     End If
 
-    Note: Comparison operations
-    If opcode is greater than or equal to 20100 and opcode is less than or equal to 20105:
-        Set operand1 to proc memory_get_int32 from MemoryCore with inst, 16
-        Set operand2 to proc memory_get_int32 from MemoryCore with inst, 24
-
-        mark_value_definition_live(operand1, use_def_chains, live_instructions, worklist)
-        mark_value_definition_live(operand2, use_def_chains, live_instructions, worklist)
+    Note: Call-family arguments live in the arguments List at extended
+    Note: offset 88 (MIR_CALL 20304, MIR_CALL_INDIRECT 20305,
+    Note: MIR_INVOKE 20700); their definitions must stay live as well
+    Let has_arg_list be 0
+    If opcode is equal to 20304:
+        Set has_arg_list to 1
+    End If
+    If opcode is equal to 20305:
+        Set has_arg_list to 1
+    End If
+    If opcode is equal to 20700:
+        Set has_arg_list to 1
     End If
 
-    Note: LOAD
-    If opcode is equal to 20200:
-        Let addr be proc memory_get_int32 from MemoryCore with inst, 16
-        mark_value_definition_live(addr, use_def_chains, live_instructions, worklist)
-    End If
-
-    Note: STORE
-    If opcode is equal to 20201:
-        Set addr to proc memory_get_int32 from MemoryCore with inst, 8
-        Let value be proc memory_get_int32 from MemoryCore with inst, 16
-
-        mark_value_definition_live(addr, use_def_chains, live_instructions, worklist)
-        mark_value_definition_live(value, use_def_chains, live_instructions, worklist)
-    End If
-
-    Note: RETURN
-    If opcode is equal to 20303:
-        Set value to proc memory_get_int32 from MemoryCore with inst, 8
-        mark_value_definition_live(value, use_def_chains, live_instructions, worklist)
+    If has_arg_list is equal to 1:
+        Let arguments be proc get_call_arguments from MIRNodes with inst
+        If arguments is not equal to 0:
+            Let arg_count be proc length from List with arguments
+            Let a be 0
+            While a is less than arg_count:
+                Let arg_value be proc list_get from List with arguments, a
+                mark_value_definition_live(arg_value, use_def_chains, live_instructions, worklist)
+                Set a to a plus 1
+            End While
+        End If
     End If
 
     Return 1
@@ -1145,7 +1198,7 @@ This is a fundamental optimization that often enables other optimizations.
 
 Process called "fold_constants" that takes ctx as Integer returns Integer:
     Let cfg be proc memory_get_int64 from MemoryCore with ctx, 8
-    Let blocks be proc memory_get_int64 from MemoryCore with cfg, 0
+    Let blocks be proc get_mir_cfg_blocks from CFG with cfg
     Let block_count be proc length from List with blocks
 
     Let constant_values be proc memory_get_int64 from MemoryCore with ctx, 72
@@ -1155,16 +1208,20 @@ Process called "fold_constants" that takes ctx as Integer returns Integer:
     Let i be 0
     While i is less than block_count:
         Let block be proc list_get from List with blocks, i
-        Let instructions be proc memory_get_int64 from MemoryCore with block, 8
+        Let instructions be proc get_block_instructions from MIR with block
         Let inst_count be proc length from List with instructions
 
         Let j be 0
         While j is less than inst_count:
             Let inst be proc list_get from List with instructions, j
-            Let opcode be proc memory_get_int32 from MemoryCore with inst, 0
+            Let opcode be proc get_mir_node_opcode from MIR with inst
 
-            Note: Try to fold this instruction
-            Let folded be try_fold_instruction(inst, opcode, constant_values)
+            Note: Try to fold this instruction (the list and index are
+            Note: passed so a folded binary op can be REPLACED by a fresh
+            Note: canonical 112-byte MIRConst record - the 104-byte binary
+            Note: record is too small to be rewritten into a const in
+            Note: place under OD-1)
+            Let folded be try_fold_instruction(ctx, instructions, j, inst, opcode, constant_values)
 
             If folded is equal to 1:
                 Set folded_count to folded_count plus 1
@@ -1193,34 +1250,97 @@ Note: ==========================================================================
 Note: try_fold_instruction - Try to fold constant operation
 Note: ============================================================================
 
-Process called "try_fold_instruction" that takes inst as Integer, opcode as Integer, constant_values as Integer returns Integer:
-    Note: MIR_CONST - record constant value
+Process called "try_fold_instruction" that takes ctx as Integer, instructions as Integer, j as Integer, inst as Integer, opcode as Integer, constant_values as Integer returns Integer:
+    Note: MIR_CONST - record constant value (numeric payload lives at
+    Note: extended offset 80 under OD-1, read via the canonical accessor)
     If opcode is equal to 20001:
-        Let result_id be proc memory_get_int32 from MemoryCore with inst, 8
-        Let const_value be proc memory_get_int64 from MemoryCore with inst, 16
+        Let result_id be proc get_mir_node_value_id from MIR with inst
+        Let const_value be proc get_const_value from MIRNodes with inst
         proc set from Dictionary with constant_values, result_id, const_value
         Return 0
     End If
 
-    Note: Binary arithmetic operations
+    Note: Binary arithmetic / bitwise operations (operand value ids in the
+    Note: header operand slots at 16/24). MIR_COPY (20008) and MIR_NEG /
+    Note: MIR_NOT (20007/20013, unary) are excluded - they do not carry two
+    Note: operand uses.
+    Let is_two_operand be 0
     If opcode is greater than or equal to 20002 and opcode is less than or equal to 20006:
-        Let operand1_id be proc memory_get_int32 from MemoryCore with inst, 16
-        Let operand2_id be proc memory_get_int32 from MemoryCore with inst, 24
+        Set is_two_operand to 1
+    End If
+    If opcode is greater than or equal to 20010 and opcode is less than or equal to 20016:
+        If opcode is not equal to 20013:
+            Set is_two_operand to 1
+        End If
+    End If
 
-        Note: Check if both operands are constants
-        Let const1 be proc get from Dictionary with constant_values, operand1_id
-        Let const2 be proc get from Dictionary with constant_values, operand2_id
+    If is_two_operand is equal to 1:
+        Let operand1_id be proc get_mir_node_operand from MIR with inst, 1
+        Let operand2_id be proc get_mir_node_operand from MIR with inst, 2
 
-        If const1 is not equal to 0 and const2 is not equal to 0:
+        Note: Check if both operands are constants (Dictionary.contains
+        Note: distinguishes "not constant" from "constant zero")
+        Let has1 be proc contains from Dictionary with constant_values, operand1_id
+        Let has2 be proc contains from Dictionary with constant_values, operand2_id
+
+        If has1 is equal to 1 and has2 is equal to 1:
+            Let const1 be proc get from Dictionary with constant_values, operand1_id
+            Let const2 be proc get from Dictionary with constant_values, operand2_id
+
+            Note: Soundness guards: never fold division/modulo by zero (it
+            Note: must trap at runtime, not become 0), never fold a shift
+            Note: with an out-of-range count, and never fold a logical
+            Note: right shift of a negative value (Runa's shift evaluates
+            Note: arithmetically on signed 64-bit values)
+            Let can_fold be 1
+            If opcode is equal to 20005 or opcode is equal to 20006:
+                If const2 is equal to 0:
+                    Set can_fold to 0
+                End If
+            End If
+            If opcode is greater than or equal to 20014 and opcode is less than or equal to 20016:
+                If const2 is less than 0:
+                    Set can_fold to 0
+                End If
+                If const2 is greater than 63:
+                    Set can_fold to 0
+                End If
+            End If
+            If opcode is equal to 20015 or opcode is equal to 20016:
+                If const1 is less than 0:
+                    Set can_fold to 0
+                End If
+            End If
+
+            If can_fold is equal to 0:
+                Return 0
+            End If
+
             Note: Both operands are constants, fold the operation
             Let result_value be evaluate_binary_operation(opcode, const1, const2)
 
-            Note: Replace instruction with constant
-            proc memory_set_int32 from MemoryCore with inst, 0, 20001 Note: Change to MIR_CONST
-            proc memory_set_int64 from MemoryCore with inst, 16, result_value
+            Note: Replace the 104-byte binary record with a fresh canonical
+            Note: 112-byte MIRConst that keeps the same result value id.
+            Note: An in-place rewrite is forbidden: MIRConst writes its
+            Note: string_ptr slot at offset 104, one word past the binary
+            Note: record's allocation, and MIR.clone_instruction sizes
+            Note: const clones at 112 bytes.
+            Let result_id be proc get_mir_node_value_id from MIR with inst
+            Let result_type be proc get_mir_node_type from MIR with inst
+            Let const_inst be proc create_mir_const from MIRNodes with result_id, result_value, result_type, 0, 0
+            If const_inst is equal to 0:
+                Return 0
+            End If
+            Let parent_block be proc get_mir_node_parent_block from MIR with inst
+            proc set_mir_node_parent_block from MIR with const_inst, parent_block
+            proc list_set from List with instructions, j, const_inst
+
+            Note: Keep the function's value->instruction map pointing at
+            Note: the replacement definition
+            Let mir_function be proc memory_get_int64 from MemoryCore with ctx, 0
+            proc register_value_definition from MIR with mir_function, result_id, const_inst
 
             Note: Record result as constant
-            Set result_id to proc memory_get_int32 from MemoryCore with inst, 8
             proc set from Dictionary with constant_values, result_id, result_value
 
             Return 1
@@ -1266,6 +1386,40 @@ Process called "evaluate_binary_operation" that takes opcode as Integer, left as
         Return left modulo by right
     End If
 
+    Note: MIR_AND (20010)
+    If opcode is equal to 20010:
+        Return left bitwise and right
+    End If
+
+    Note: MIR_OR (20011)
+    If opcode is equal to 20011:
+        Return left bitwise or right
+    End If
+
+    Note: MIR_XOR (20012)
+    If opcode is equal to 20012:
+        Return left bitwise xor right
+    End If
+
+    Note: MIR_SHL (20014) - caller guarantees 0 <= right <= 63
+    If opcode is equal to 20014:
+        Return left shifted left by right
+    End If
+
+    Note: MIR_SHR (20015) - logical right shift; caller guarantees
+    Note: left >= 0 and 0 <= right <= 63, where the arithmetic and
+    Note: logical shifts agree
+    If opcode is equal to 20015:
+        Return left shifted right by right
+    End If
+
+    Note: MIR_SAR (20016) - arithmetic right shift; caller guarantees
+    Note: left >= 0 and 0 <= right <= 63 (negative operands are never
+    Note: folded so shift-flavor differences cannot change the result)
+    If opcode is equal to 20016:
+        Return left shifted right by right
+    End If
+
     Return 0
 End Process
 
@@ -1294,8 +1448,11 @@ This is more powerful than simple constant folding as it considers control flow.
 
 Process called "propagate_constants" that takes ctx as Integer returns Integer:
     Let cfg be proc memory_get_int64 from MemoryCore with ctx, 8
-    Let blocks be proc memory_get_int64 from MemoryCore with cfg, 0
+    Let blocks be proc get_mir_cfg_blocks from CFG with cfg
     Let block_count be proc length from List with blocks
+    If block_count is equal to 0:
+        Return 0
+    End If
 
     Note: Create lattice value map (0=UNKNOWN, 1=CONSTANT, 2=OVERDEFINED)
     Let lattice_values be proc create from Dictionary
@@ -1312,8 +1469,13 @@ Process called "propagate_constants" that takes ctx as Integer returns Integer:
     Note: Create CFG edge worklist
     Let edge_worklist be proc list_create from List
 
-    Note: Add entry block to edge worklist
-    Let entry_block be proc list_get from List with blocks, 0
+    Note: Add entry block to edge worklist (canonical entry slot at MIRCFG
+    Note: offset 0; fall back to the first registered block when the entry
+    Note: slot was never stamped)
+    Let entry_block be proc get_cfg_entry_block from MIR with cfg
+    If entry_block is equal to 0:
+        Set entry_block to proc list_get from List with blocks, 0
+    End If
     proc append from List with edge_worklist, entry_block
 
     Note: Initialize all SSA values to UNKNOWN (0)
@@ -1331,7 +1493,7 @@ Process called "propagate_constants" that takes ctx as Integer returns Integer:
                 proc set from Dictionary with reachable_blocks, block, 1
 
                 Note: Add all instructions to SSA worklist
-                Let instructions be proc memory_get_int64 from MemoryCore with block, 8
+                Let instructions be proc get_block_instructions from MIR with block
                 Let inst_count be proc length from List with instructions
 
                 Let j be 0
@@ -1343,10 +1505,12 @@ Process called "propagate_constants" that takes ctx as Integer returns Integer:
             End If
         End While
 
-        Note: Process SSA values
+        Note: Process SSA values (terminators enqueue their reachable
+        Note: successor blocks onto edge_worklist; lattice transitions
+        Note: re-enqueue the changed value's uses onto ssa_worklist)
         While proc length from List with ssa_worklist is greater than 0:
             Set inst to proc list_remove from List with ssa_worklist, 0
-            evaluate_instruction_sccp(inst, lattice_values, const_values, edge_worklist, ssa_worklist)
+            evaluate_instruction_sccp(ctx, cfg, inst, lattice_values, const_values, edge_worklist, ssa_worklist)
         End While
     End While
 
@@ -1372,19 +1536,19 @@ Note: ==========================================================================
 
 Process called "initialize_lattice_values" that takes ctx as Integer, lattice_values as Integer returns Integer:
     Let cfg be proc memory_get_int64 from MemoryCore with ctx, 8
-    Let blocks be proc memory_get_int64 from MemoryCore with cfg, 0
+    Let blocks be proc get_mir_cfg_blocks from CFG with cfg
     Let block_count be proc length from List with blocks
 
     Let i be 0
     While i is less than block_count:
         Let block be proc list_get from List with blocks, i
-        Let instructions be proc memory_get_int64 from MemoryCore with block, 8
+        Let instructions be proc get_block_instructions from MIR with block
         Let inst_count be proc length from List with instructions
 
         Let j be 0
         While j is less than inst_count:
             Let inst be proc list_get from List with instructions, j
-            Let result_id be proc memory_get_int32 from MemoryCore with inst, 8
+            Let result_id be proc get_mir_node_value_id from MIR with inst
 
             If result_id is not equal to 0:
                 proc set from Dictionary with lattice_values, result_id, 0 Note: UNKNOWN
@@ -1403,29 +1567,187 @@ Note: ==========================================================================
 Note: evaluate_instruction_sccp - Evaluate instruction for SCCP
 Note: ============================================================================
 
-Process called "evaluate_instruction_sccp" that takes inst as Integer, lattice_values as Integer, const_values as Integer, edge_worklist as Integer, ssa_worklist as Integer returns Integer:
-    Let opcode be proc memory_get_int32 from MemoryCore with inst, 0
-    Let result_id be proc memory_get_int32 from MemoryCore with inst, 8
+Process called "evaluate_instruction_sccp" that takes ctx as Integer, cfg as Integer, inst as Integer, lattice_values as Integer, const_values as Integer, edge_worklist as Integer, ssa_worklist as Integer returns Integer:
+    Let opcode be proc get_mir_node_opcode from MIR with inst
+    Let result_id be proc get_mir_node_value_id from MIR with inst
 
-    Note: MIR_CONST - constant value
-    If opcode is equal to 20001:
-        Let const_value be proc memory_get_int64 from MemoryCore with inst, 16
-        proc set from Dictionary with lattice_values, result_id, 1 Note: CONSTANT
-        proc set from Dictionary with const_values, result_id, const_value
+    Note: --- Terminators: enqueue reachable successor blocks ---
+
+    Note: MIR_JUMP (20302) - the single target (block ID at extended
+    Note: offset 72) is always reachable
+    If opcode is equal to 20302:
+        Let jump_target_id be proc get_jump_target from MIRNodes with inst
+        Let jump_target be proc get_block_by_id_from_cfg from CFG with cfg, jump_target_id
+        If jump_target is not equal to 0:
+            proc append from List with edge_worklist, jump_target
+        End If
         Return 1
     End If
 
-    Note: Binary operations
+    Note: MIR_BRANCH (20301) - condition value id is header operand1;
+    Note: target block IDs live at extended offsets 80/88. A proven
+    Note: constant condition makes only the taken edge reachable
+    Note: (Wegman-Zadeck conditional pruning); otherwise both edges are
+    Note: enqueued. An UNKNOWN condition enqueues nothing yet - the branch
+    Note: is re-evaluated when the condition's lattice value changes.
+    If opcode is equal to 20301:
+        Let cond_id be proc get_mir_node_operand from MIR with inst, 1
+        Let cond_lattice be proc get from Dictionary with lattice_values, cond_id
+        Let true_id be proc get_branch_true_target from MIRNodes with inst
+        Let false_id be proc get_branch_false_target from MIRNodes with inst
+
+        If cond_lattice is equal to 1:
+            Let cond_value be proc get from Dictionary with const_values, cond_id
+            Let taken_id be false_id
+            If cond_value is not equal to 0:
+                Set taken_id to true_id
+            End If
+            Let taken_block be proc get_block_by_id_from_cfg from CFG with cfg, taken_id
+            If taken_block is not equal to 0:
+                proc append from List with edge_worklist, taken_block
+            End If
+        Otherwise:
+            If cond_lattice is equal to 2:
+                Let true_block be proc get_block_by_id_from_cfg from CFG with cfg, true_id
+                If true_block is not equal to 0:
+                    proc append from List with edge_worklist, true_block
+                End If
+                Let false_block be proc get_block_by_id_from_cfg from CFG with cfg, false_id
+                If false_block is not equal to 0:
+                    proc append from List with edge_worklist, false_block
+                End If
+            End If
+        End If
+        Return 1
+    End If
+
+    Note: MIR_SWITCH (20306) - a constant scrutinee selects exactly one
+    Note: case (or the default); otherwise every case and the default are
+    Note: reachable. Cases are a flat pair List (value, block_id).
+    If opcode is equal to 20306:
+        Let switch_value_id be proc get_mir_node_operand from MIR with inst, 1
+        Let switch_lattice be proc get from Dictionary with lattice_values, switch_value_id
+        Let case_count be proc get_switch_case_count from MIRNodes with inst
+        Let default_id be proc get_switch_default_block from MIRNodes with inst
+
+        If switch_lattice is equal to 1:
+            Let scrutinee be proc get from Dictionary with const_values, switch_value_id
+            Let matched_id be default_id
+            Let ci be 0
+            While ci is less than case_count:
+                Let case_value be proc get_switch_case_value from MIRNodes with inst, ci
+                If case_value is equal to scrutinee:
+                    Set matched_id to proc get_switch_case_block from MIRNodes with inst, ci
+                    Set ci to case_count
+                End If
+                Set ci to ci plus 1
+            End While
+            Let matched_block be proc get_block_by_id_from_cfg from CFG with cfg, matched_id
+            If matched_block is not equal to 0:
+                proc append from List with edge_worklist, matched_block
+            End If
+        Otherwise:
+            If switch_lattice is equal to 2:
+                Let ci be 0
+                While ci is less than case_count:
+                    Let case_block_id be proc get_switch_case_block from MIRNodes with inst, ci
+                    Let case_block be proc get_block_by_id_from_cfg from CFG with cfg, case_block_id
+                    If case_block is not equal to 0:
+                        proc append from List with edge_worklist, case_block
+                    End If
+                    Set ci to ci plus 1
+                End While
+                Let default_block be proc get_block_by_id_from_cfg from CFG with cfg, default_id
+                If default_block is not equal to 0:
+                    proc append from List with edge_worklist, default_block
+                End If
+            End If
+        End If
+        Return 1
+    End If
+
+    Note: MIR_RETURN (20303) / MIR_THROW (20703) - no successors, no result
+    If opcode is equal to 20303 or opcode is equal to 20703:
+        Return 1
+    End If
+
+    Note: --- Value-producing instructions ---
+
+    Note: MIR_CONST - constant value (numeric payload at extended offset 80)
+    If opcode is equal to 20001:
+        Let const_value be proc get_const_value from MIRNodes with inst
+        Let is_string_const be proc is_const_string from MIRNodes with inst
+        If is_string_const is equal to 1:
+            Note: String constants are addresses, not foldable integers
+            sccp_raise_lattice(ctx, lattice_values, const_values, result_id, 2, 0, ssa_worklist)
+        Otherwise:
+            sccp_raise_lattice(ctx, lattice_values, const_values, result_id, 1, const_value, ssa_worklist)
+        End If
+        Return 1
+    End If
+
+    Note: MIR_COPY (20008) - dest takes the source's lattice value
+    If opcode is equal to 20008:
+        Let src_id be proc get_mir_node_operand from MIR with inst, 1
+        Let src_lattice be proc get from Dictionary with lattice_values, src_id
+        If src_lattice is equal to 1:
+            Let src_value be proc get from Dictionary with const_values, src_id
+            sccp_raise_lattice(ctx, lattice_values, const_values, result_id, 1, src_value, ssa_worklist)
+        Otherwise:
+            If src_lattice is equal to 2:
+                sccp_raise_lattice(ctx, lattice_values, const_values, result_id, 2, 0, ssa_worklist)
+            End If
+        End If
+        Return 1
+    End If
+
+    Note: Binary arithmetic / bitwise band and comparisons - two operand
+    Note: uses in header slots 16/24. MIR_NEG / MIR_NOT (20007/20013) are
+    Note: unary (operand1 only).
+    Let is_two_operand be 0
     If opcode is greater than or equal to 20002 and opcode is less than or equal to 20006:
-        Let operand1_id be proc memory_get_int32 from MemoryCore with inst, 16
-        Let operand2_id be proc memory_get_int32 from MemoryCore with inst, 24
+        Set is_two_operand to 1
+    End If
+    If opcode is greater than or equal to 20010 and opcode is less than or equal to 20016:
+        If opcode is not equal to 20013:
+            Set is_two_operand to 1
+        End If
+    End If
+    Let is_comparison be 0
+    If opcode is greater than or equal to 20100 and opcode is less than or equal to 20105:
+        Set is_comparison to 1
+        Set is_two_operand to 1
+    End If
+
+    Note: Unary negation / bitwise not
+    If opcode is equal to 20007 or opcode is equal to 20013:
+        Let unary_op_id be proc get_mir_node_operand from MIR with inst, 1
+        Let unary_lattice be proc get from Dictionary with lattice_values, unary_op_id
+        If unary_lattice is equal to 1:
+            Let unary_in be proc get from Dictionary with const_values, unary_op_id
+            Let unary_out be 0 minus unary_in
+            If opcode is equal to 20013:
+                Set unary_out to 0 minus unary_in minus 1
+            End If
+            sccp_raise_lattice(ctx, lattice_values, const_values, result_id, 1, unary_out, ssa_worklist)
+        Otherwise:
+            If unary_lattice is equal to 2:
+                sccp_raise_lattice(ctx, lattice_values, const_values, result_id, 2, 0, ssa_worklist)
+            End If
+        End If
+        Return 1
+    End If
+
+    If is_two_operand is equal to 1:
+        Let operand1_id be proc get_mir_node_operand from MIR with inst, 1
+        Let operand2_id be proc get_mir_node_operand from MIR with inst, 2
 
         Let lattice1 be proc get from Dictionary with lattice_values, operand1_id
         Let lattice2 be proc get from Dictionary with lattice_values, operand2_id
 
         Note: If either operand is OVERDEFINED (2), result is OVERDEFINED
         If lattice1 is equal to 2 or lattice2 is equal to 2:
-            proc set from Dictionary with lattice_values, result_id, 2 Note: OVERDEFINED
+            sccp_raise_lattice(ctx, lattice_values, const_values, result_id, 2, 0, ssa_worklist)
             Return 1
         End If
 
@@ -1433,10 +1755,43 @@ Process called "evaluate_instruction_sccp" that takes inst as Integer, lattice_v
         If lattice1 is equal to 1 and lattice2 is equal to 1:
             Let const1 be proc get from Dictionary with const_values, operand1_id
             Let const2 be proc get from Dictionary with const_values, operand2_id
-            Let result_value be evaluate_binary_operation(opcode, const1, const2)
 
-            proc set from Dictionary with lattice_values, result_id, 1 Note: CONSTANT
-            proc set from Dictionary with const_values, result_id, result_value
+            If is_comparison is equal to 1:
+                Let cmp_result be evaluate_comparison_operation(opcode, const1, const2)
+                sccp_raise_lattice(ctx, lattice_values, const_values, result_id, 1, cmp_result, ssa_worklist)
+                Return 1
+            End If
+
+            Note: Same soundness guards as try_fold_instruction: no
+            Note: division/modulo by zero, no out-of-range shift counts,
+            Note: no right shift of a negative value
+            Let can_fold be 1
+            If opcode is equal to 20005 or opcode is equal to 20006:
+                If const2 is equal to 0:
+                    Set can_fold to 0
+                End If
+            End If
+            If opcode is greater than or equal to 20014 and opcode is less than or equal to 20016:
+                If const2 is less than 0:
+                    Set can_fold to 0
+                End If
+                If const2 is greater than 63:
+                    Set can_fold to 0
+                End If
+            End If
+            If opcode is equal to 20015 or opcode is equal to 20016:
+                If const1 is less than 0:
+                    Set can_fold to 0
+                End If
+            End If
+
+            If can_fold is equal to 0:
+                sccp_raise_lattice(ctx, lattice_values, const_values, result_id, 2, 0, ssa_worklist)
+                Return 1
+            End If
+
+            Let result_value be evaluate_binary_operation(opcode, const1, const2)
+            sccp_raise_lattice(ctx, lattice_values, const_values, result_id, 1, result_value, ssa_worklist)
             Return 1
         End If
 
@@ -1444,10 +1799,121 @@ Process called "evaluate_instruction_sccp" that takes inst as Integer, lattice_v
         Return 0
     End If
 
-    Note: For other instructions, conservatively mark as OVERDEFINED
-    proc set from Dictionary with lattice_values, result_id, 2
+    Note: For all other value-producing instructions (loads, calls, phis,
+    Note: allocas, casts whose semantics are type-dependent, ...) the
+    Note: result is conservatively OVERDEFINED. Instructions with no
+    Note: result (result_id 0) are skipped.
+    If result_id is not equal to 0:
+        sccp_raise_lattice(ctx, lattice_values, const_values, result_id, 2, 0, ssa_worklist)
+    End If
 
     Return 1
+End Process
+
+Note: ============================================================================
+Note: sccp_raise_lattice - Monotone lattice transition with use re-enqueueing
+Note: ============================================================================
+
+@Reasoning
+SCCP is a fixpoint over a three-level lattice (UNKNOWN 0 -> CONSTANT 1 ->
+OVERDEFINED 2). Every raise must re-enqueue the instructions that USE the
+changed value so they are re-evaluated with the new fact - that is what
+makes the algorithm sparse. The transition is monotone: a value never moves
+back down, and a CONSTANT that is recomputed to a DIFFERENT constant value
+is raised to OVERDEFINED (this happens at join points and for values
+flowing around loops). Monotonicity bounds the work at two raises per
+value, guaranteeing termination.
+@End Reasoning
+
+Process called "sccp_raise_lattice" that takes ctx as Integer, lattice_values as Integer, const_values as Integer, value_id as Integer, new_lattice as Integer, new_value as Integer, ssa_worklist as Integer returns Integer:
+    If value_id is equal to 0:
+        Return 0
+    End If
+
+    Let old_lattice be proc get from Dictionary with lattice_values, value_id
+    Let changed be 0
+
+    If new_lattice is greater than old_lattice:
+        proc set from Dictionary with lattice_values, value_id, new_lattice
+        If new_lattice is equal to 1:
+            proc set from Dictionary with const_values, value_id, new_value
+        End If
+        Set changed to 1
+    Otherwise:
+        If new_lattice is equal to 1 and old_lattice is equal to 1:
+            Let old_value be proc get from Dictionary with const_values, value_id
+            If old_value is not equal to new_value:
+                Note: Conflicting constants meet at OVERDEFINED
+                proc set from Dictionary with lattice_values, value_id, 2
+                Set changed to 1
+            End If
+        End If
+    End If
+
+    If changed is equal to 1:
+        Note: Re-enqueue every use of this value so it is re-evaluated
+        Note: with the raised lattice fact
+        Let use_def_chains be proc memory_get_int64 from MemoryCore with ctx, 48
+        Let chain be proc get from Dictionary with use_def_chains, value_id
+        If chain is not equal to 0:
+            Let uses be proc memory_get_int64 from MemoryCore with chain, 24
+            If uses is not equal to 0:
+                Let use_count be proc length from List with uses
+                Let u be 0
+                While u is less than use_count:
+                    Let using_inst be proc list_get from List with uses, u
+                    proc append from List with ssa_worklist, using_inst
+                    Set u to u plus 1
+                End While
+            End If
+        End If
+    End If
+
+    Return changed
+End Process
+
+Note: ============================================================================
+Note: evaluate_comparison_operation - Evaluate constant comparison
+Note: ============================================================================
+
+Process called "evaluate_comparison_operation" that takes opcode as Integer, left as Integer, right as Integer returns Integer:
+    If opcode is equal to 20100:
+        If left is equal to right:
+            Return 1
+        End If
+        Return 0
+    End If
+    If opcode is equal to 20101:
+        If left is not equal to right:
+            Return 1
+        End If
+        Return 0
+    End If
+    If opcode is equal to 20102:
+        If left is less than right:
+            Return 1
+        End If
+        Return 0
+    End If
+    If opcode is equal to 20103:
+        If left is less than or equal to right:
+            Return 1
+        End If
+        Return 0
+    End If
+    If opcode is equal to 20104:
+        If left is greater than right:
+            Return 1
+        End If
+        Return 0
+    End If
+    If opcode is equal to 20105:
+        If left is greater than or equal to right:
+            Return 1
+        End If
+        Return 0
+    End If
+    Return 0
 End Process
 
 Note: ============================================================================
@@ -1456,8 +1922,9 @@ Note: ==========================================================================
 
 Process called "replace_constants_and_remove_unreachable" that takes ctx as Integer, lattice_values as Integer, const_values as Integer, reachable_blocks as Integer returns Integer:
     Let cfg be proc memory_get_int64 from MemoryCore with ctx, 8
-    Let blocks be proc memory_get_int64 from MemoryCore with cfg, 0
+    Let blocks be proc get_mir_cfg_blocks from CFG with cfg
     Let block_count be proc length from List with blocks
+    Let mir_function be proc memory_get_int64 from MemoryCore with ctx, 0
 
     Let replaced_count be 0
 
@@ -1475,25 +1942,40 @@ Process called "replace_constants_and_remove_unreachable" that takes ctx as Inte
             Set replaced_count to replaced_count plus 1
         Otherwise:
             Note: Replace constant values in reachable blocks
-            Let instructions be proc memory_get_int64 from MemoryCore with block, 8
+            Let instructions be proc get_block_instructions from MIR with block
             Let inst_count be proc length from List with instructions
 
             Let j be 0
             While j is less than inst_count:
                 Let inst be proc list_get from List with instructions, j
-                Let result_id be proc memory_get_int32 from MemoryCore with inst, 8
+                Let opcode be proc get_mir_node_opcode from MIR with inst
+                Let result_id be proc get_mir_node_value_id from MIR with inst
 
                 Let lattice be proc get from Dictionary with lattice_values, result_id
 
-                Note: If result is constant, replace instruction
+                Note: If result is a proven constant, replace the defining
+                Note: instruction with a fresh canonical MIRConst record.
+                Note: Only pure value computations are rewritten - calls,
+                Note: loads, atomics, and terminators keep their side
+                Note: effects even when their result is constant, and an
+                Note: instruction that already IS a const needs no rewrite.
                 If lattice is equal to 1:
-                    Let const_value be proc get from Dictionary with const_values, result_id
-
-                    Note: Replace with MIR_CONST
-                    proc memory_set_int32 from MemoryCore with inst, 0, 20001
-                    proc memory_set_int64 from MemoryCore with inst, 16, const_value
-
-                    Set replaced_count to replaced_count plus 1
+                    Let is_pure be is_pure_operation(opcode)
+                    If opcode is equal to 20008:
+                        Set is_pure to 1
+                    End If
+                    If is_pure is equal to 1:
+                        Let const_value be proc get from Dictionary with const_values, result_id
+                        Let result_type be proc get_mir_node_type from MIR with inst
+                        Let const_inst be proc create_mir_const from MIRNodes with result_id, const_value, result_type, 0, 0
+                        If const_inst is not equal to 0:
+                            Let parent_block be proc get_mir_node_parent_block from MIR with inst
+                            proc set_mir_node_parent_block from MIR with const_inst, parent_block
+                            proc list_set from List with instructions, j, const_inst
+                            proc register_value_definition from MIR with mir_function, result_id, const_inst
+                            Set replaced_count to replaced_count plus 1
+                        End If
+                    End If
                 End If
 
                 Set j to j plus 1
@@ -1502,6 +1984,11 @@ Process called "replace_constants_and_remove_unreachable" that takes ctx as Inte
 
         Set i to i plus 1
     End While
+
+    Note: Re-sync the CFG's cached block_count (offset 24) after
+    Note: unreachable-block removal
+    Let remaining_blocks be proc length from List with blocks
+    proc memory_set_int64 from MemoryCore with cfg, 24, remaining_blocks
 
     Return replaced_count
 End Process
@@ -1519,7 +2006,7 @@ This simplifies the program and enables other optimizations.
 
 Process called "propagate_copies" that takes ctx as Integer returns Integer:
     Let cfg be proc memory_get_int64 from MemoryCore with ctx, 8
-    Let blocks be proc memory_get_int64 from MemoryCore with cfg, 0
+    Let blocks be proc get_mir_cfg_blocks from CFG with cfg
     Let block_count be proc length from List with blocks
 
     Let use_def_chains be proc memory_get_int64 from MemoryCore with ctx, 48
@@ -1531,41 +2018,37 @@ Process called "propagate_copies" that takes ctx as Integer returns Integer:
     Let i be 0
     While i is less than block_count:
         Let block be proc list_get from List with blocks, i
-        Let instructions be proc memory_get_int64 from MemoryCore with block, 8
+        Let instructions be proc get_block_instructions from MIR with block
         Let inst_count be proc length from List with instructions
 
         Let j be 0
         While j is less than inst_count:
             Let inst be proc list_get from List with instructions, j
-            Let opcode be proc memory_get_int32 from MemoryCore with inst, 0
+            Let opcode be proc get_mir_node_opcode from MIR with inst
 
-            Note: Detect copy instructions (MOV, COPY, identity assignments)
-            Note: Opcode 100 = MOV (move/copy instruction)
-            Note: Opcode 101 = IDENTITY (no-op transformation)
-            Note: Opcode 102 = PHI with single operand (copy in SSA form)
+            Note: Detect copy instructions in the canonical opcode model:
+            Note: MIR_COPY (20008, OD-5) carries dest in the header
+            Note: value_id slot and source in operand1; a PHI (20300) with
+            Note: exactly one incoming pair is a copy in SSA form, its
+            Note: source being the single incoming value.
 
-            If opcode is equal to 100:  Note: MOV instruction
-                Note: result = source (no transformation)
-                Let result_value be proc memory_get_int32 from MemoryCore with inst, 8 Note: Destination register
-                Let source_value be proc memory_get_int32 from MemoryCore with inst, 16 Note: Source register
-
-                Note: Record copy relationship: result_value = source_value
-                proc set from Dictionary with copy_map, result_value, source_value
-            End If
-
-            If opcode is equal to 101:  Note: IDENTITY instruction
-                Set result_value to proc memory_get_int32 from MemoryCore with inst, 8
-                Set source_value to proc memory_get_int32 from MemoryCore with inst, 16
-                proc set from Dictionary with copy_map, result_value, source_value
-            End If
-
-            If opcode is equal to 102:  Note: PHI instruction
-                Note: Check if PHI has single operand (degenerate PHI = copy)
-                Let operand_count be proc memory_get_int32 from MemoryCore with inst, 20
-                If operand_count is equal to 1:
-                    Set result_value to proc memory_get_int32 from MemoryCore with inst, 8
-                    Set source_value to proc memory_get_int32 from MemoryCore with inst, 16
+            If opcode is equal to 20008:  Note: MIR_COPY
+                Let result_value be proc get_mir_node_value_id from MIR with inst
+                Let source_value be proc get_mir_node_operand from MIR with inst, 1
+                If result_value is not equal to 0 and source_value is not equal to 0:
                     proc set from Dictionary with copy_map, result_value, source_value
+                End If
+            End If
+
+            If opcode is equal to 20300:  Note: MIR_PHI
+                Note: Degenerate single-incoming PHI = copy
+                Let incoming_count be proc get_phi_incoming_count from MIRNodes with inst
+                If incoming_count is equal to 1:
+                    Let phi_result be proc get_mir_node_value_id from MIR with inst
+                    Let phi_source be proc get_phi_incoming_value from MIRNodes with inst, 0
+                    If phi_result is not equal to 0 and phi_source is not equal to 0:
+                        proc set from Dictionary with copy_map, phi_result, phi_source
+                    End If
                 End If
             End If
 
@@ -1621,15 +2104,221 @@ Note: replace_value_in_instruction - Replace value ID in instruction operands
 Note: ============================================================================
 
 Process called "replace_value_in_instruction" that takes inst as Integer, old_value as Integer, new_value as Integer returns Integer:
-    Note: Check operand slots and replace if matching
-    Let operand1 be proc memory_get_int32 from MemoryCore with inst, 16
-    If operand1 is equal to old_value:
-        proc memory_set_int32 from MemoryCore with inst, 16, new_value
+    Note: Canonical use replacement under OD-1. Uses live in the header
+    Note: operand slots (16/24/32) AND are mirrored in the extended region
+    Note: for several record kinds (binop left/right at 72+8/72+16, load
+    Note: address at 80, store address/value at 72/80, branch condition at
+    Note: 72, return value at 72, alloca count at 88, switch scrutinee at
+    Note: 72, atomic address/operand/expected at 80/88/96). Both copies
+    Note: must be rewritten so header-reading consumers (lir_builder binop
+    Note: lowering, DCE, the SSA verifier) and extended-field consumers
+    Note: (load/store/branch/return lowering arms) stay in agreement.
+    Note: Phi incoming values and call/invoke argument lists hold uses in
+    Note: their embedded Lists and are rewritten element-wise.
+    If inst is equal to 0:
+        Return 0
+    End If
+    If old_value is equal to 0:
+        Return 0
     End If
 
-    Let operand2 be proc memory_get_int32 from MemoryCore with inst, 24
+    Let opcode be proc get_mir_node_opcode from MIR with inst
+
+    Note: --- Header operand slots (uses only, never block ids/immediates) ---
+    Let operand1 be proc get_mir_node_operand from MIR with inst, 1
+    If operand1 is equal to old_value:
+        proc set_mir_node_operand from MIR with inst, 1, new_value
+    End If
+
+    Let operand2 be proc get_mir_node_operand from MIR with inst, 2
     If operand2 is equal to old_value:
-        proc memory_set_int32 from MemoryCore with inst, 24, new_value
+        proc set_mir_node_operand from MIR with inst, 2, new_value
+    End If
+
+    Let operand3 be proc get_mir_node_operand from MIR with inst, 3
+    If operand3 is equal to old_value:
+        proc set_mir_node_operand from MIR with inst, 3, new_value
+    End If
+
+    Note: --- Extended-region mirrors, per record kind ---
+
+    Note: Binary band 20002-20016 (except plain-header MIR_COPY 20008),
+    Note: comparisons 20100-20105, casts 20400-20408: left at 80, right at
+    Note: 88 (unary records keep their single operand at 80)
+    Let is_binop_layout be 0
+    If opcode is greater than or equal to 20002 and opcode is less than or equal to 20016:
+        If opcode is not equal to 20008:
+            Set is_binop_layout to 1
+        End If
+    End If
+    If opcode is greater than or equal to 20100 and opcode is less than or equal to 20105:
+        Set is_binop_layout to 1
+    End If
+    If opcode is greater than or equal to 20400 and opcode is less than or equal to 20408:
+        Set is_binop_layout to 1
+    End If
+    If is_binop_layout is equal to 1:
+        Let ext_left be proc memory_get_int64 from MemoryCore with inst, 80
+        If ext_left is equal to old_value:
+            proc memory_set_int64 from MemoryCore with inst, 80, new_value
+        End If
+        Note: Unary records (NEG 20007, NOT 20013, casts) keep result_type
+        Note: at 88; only rewrite 88 for true two-operand records
+        If opcode is not equal to 20007 and opcode is not equal to 20013:
+            If opcode is less than 20400:
+                Let ext_right be proc memory_get_int64 from MemoryCore with inst, 88
+                If ext_right is equal to old_value:
+                    proc memory_set_int64 from MemoryCore with inst, 88, new_value
+                End If
+            End If
+        End If
+    End If
+
+    Note: MIR_LOAD 20200: address at 80
+    If opcode is equal to 20200:
+        Let load_addr be proc memory_get_int64 from MemoryCore with inst, 80
+        If load_addr is equal to old_value:
+            proc memory_set_int64 from MemoryCore with inst, 80, new_value
+        End If
+    End If
+
+    Note: MIR_STORE 20201: address at 72, value at 80
+    If opcode is equal to 20201:
+        Let store_addr be proc memory_get_int64 from MemoryCore with inst, 72
+        If store_addr is equal to old_value:
+            proc memory_set_int64 from MemoryCore with inst, 72, new_value
+        End If
+        Let store_value be proc memory_get_int64 from MemoryCore with inst, 80
+        If store_value is equal to old_value:
+            proc memory_set_int64 from MemoryCore with inst, 80, new_value
+        End If
+    End If
+
+    Note: MIR_ALLOCA 20202: count at 88
+    If opcode is equal to 20202:
+        Let alloca_count be proc memory_get_int64 from MemoryCore with inst, 88
+        If alloca_count is equal to old_value:
+            proc memory_set_int64 from MemoryCore with inst, 88, new_value
+        End If
+    End If
+
+    Note: MIR_BRANCH 20301: condition at 72 (targets at 80/88 are block
+    Note: ids, never touched)
+    If opcode is equal to 20301:
+        Let branch_cond be proc memory_get_int64 from MemoryCore with inst, 72
+        If branch_cond is equal to old_value:
+            proc memory_set_int64 from MemoryCore with inst, 72, new_value
+        End If
+    End If
+
+    Note: MIR_RETURN 20303: return value at 72
+    If opcode is equal to 20303:
+        Let ret_value be proc memory_get_int64 from MemoryCore with inst, 72
+        If ret_value is equal to old_value:
+            proc memory_set_int64 from MemoryCore with inst, 72, new_value
+        End If
+    End If
+
+    Note: MIR_SWITCH 20306: scrutinee at 72 (case pair List holds
+    Note: (value, block_id) pairs - case VALUES are immediates, not uses)
+    If opcode is equal to 20306:
+        Let switch_value be proc memory_get_int64 from MemoryCore with inst, 72
+        If switch_value is equal to old_value:
+            proc memory_set_int64 from MemoryCore with inst, 72, new_value
+        End If
+    End If
+
+    Note: MIR_THROW 20703: exception value at 72
+    If opcode is equal to 20703:
+        Let throw_value be proc memory_get_int64 from MemoryCore with inst, 72
+        If throw_value is equal to old_value:
+            proc memory_set_int64 from MemoryCore with inst, 72, new_value
+        End If
+    End If
+
+    Note: Atomic band 20500-20511: address at 80, operand at 88,
+    Note: expected at 96
+    If opcode is greater than or equal to 20500 and opcode is less than or equal to 20511:
+        Let atomic_addr be proc memory_get_int64 from MemoryCore with inst, 80
+        If atomic_addr is equal to old_value:
+            proc memory_set_int64 from MemoryCore with inst, 80, new_value
+        End If
+        Let atomic_operand be proc memory_get_int64 from MemoryCore with inst, 88
+        If atomic_operand is equal to old_value:
+            proc memory_set_int64 from MemoryCore with inst, 88, new_value
+        End If
+        Let atomic_expected be proc memory_get_int64 from MemoryCore with inst, 96
+        If atomic_expected is equal to old_value:
+            proc memory_set_int64 from MemoryCore with inst, 96, new_value
+        End If
+    End If
+
+    Note: Vector band 20600-20622: op1/op2/op3 at 80/88/96
+    If opcode is greater than or equal to 20600 and opcode is less than or equal to 20622:
+        Let vec_op1 be proc memory_get_int64 from MemoryCore with inst, 80
+        If vec_op1 is equal to old_value:
+            proc memory_set_int64 from MemoryCore with inst, 80, new_value
+        End If
+        Let vec_op2 be proc memory_get_int64 from MemoryCore with inst, 88
+        If vec_op2 is equal to old_value:
+            proc memory_set_int64 from MemoryCore with inst, 88, new_value
+        End If
+        Let vec_op3 be proc memory_get_int64 from MemoryCore with inst, 96
+        If vec_op3 is equal to old_value:
+            proc memory_set_int64 from MemoryCore with inst, 96, new_value
+        End If
+    End If
+
+    Note: MIR_PHI 20300: incoming values are the odd slots of the flat
+    Note: pair List at extended offset 80
+    If opcode is equal to 20300:
+        Let incoming_pairs be proc memory_get_int64 from MemoryCore with inst, 80
+        Let incoming_count be proc memory_get_int64 from MemoryCore with inst, 88
+        If incoming_pairs is not equal to 0:
+            Let pi be 0
+            While pi is less than incoming_count:
+                Let value_slot be pi multiplied by 2 plus 1
+                Let incoming_value be proc list_get from List with incoming_pairs, value_slot
+                If incoming_value is equal to old_value:
+                    proc list_set from List with incoming_pairs, value_slot, new_value
+                End If
+                Set pi to pi plus 1
+            End While
+        End If
+    End If
+
+    Note: MIR_CALL 20304 / MIR_CALL_INDIRECT 20305 / MIR_INVOKE 20700:
+    Note: argument value ids in the List at extended offset 88. For the
+    Note: indirect forms the callee at 80 is itself an SSA use.
+    Let has_arg_list be 0
+    If opcode is equal to 20304:
+        Set has_arg_list to 1
+    End If
+    If opcode is equal to 20305:
+        Set has_arg_list to 1
+    End If
+    If opcode is equal to 20700:
+        Set has_arg_list to 1
+    End If
+    If has_arg_list is equal to 1:
+        If opcode is equal to 20305:
+            Let indirect_callee be proc memory_get_int64 from MemoryCore with inst, 80
+            If indirect_callee is equal to old_value:
+                proc memory_set_int64 from MemoryCore with inst, 80, new_value
+            End If
+        End If
+        Let arguments be proc memory_get_int64 from MemoryCore with inst, 88
+        If arguments is not equal to 0:
+            Let arg_count be proc length from List with arguments
+            Let a be 0
+            While a is less than arg_count:
+                Let arg_value be proc list_get from List with arguments, a
+                If arg_value is equal to old_value:
+                    proc list_set from List with arguments, a, new_value
+                End If
+                Set a to a plus 1
+            End While
+        End If
     End If
 
     Return 1
@@ -1650,7 +2339,7 @@ This uses value numbering to identify equivalent expressions.
 
 Process called "eliminate_common_subexpressions" that takes ctx as Integer returns Integer:
     Let cfg be proc memory_get_int64 from MemoryCore with ctx, 8
-    Let blocks be proc memory_get_int64 from MemoryCore with cfg, 0
+    Let blocks be proc get_mir_cfg_blocks from CFG with cfg
     Let block_count be proc length from List with blocks
 
     Let value_numbers be proc memory_get_int64 from MemoryCore with ctx, 64
@@ -1660,17 +2349,22 @@ Process called "eliminate_common_subexpressions" that takes ctx as Integer retur
     Let i be 0
     While i is less than block_count:
         Let block be proc list_get from List with blocks, i
-        Let instructions be proc memory_get_int64 from MemoryCore with block, 8
+        Let instructions be proc get_block_instructions from MIR with block
         Let inst_count be proc length from List with instructions
 
-        Note: Map expression signatures to their result values
+        Note: Map expression signatures to their result values, with a
+        Note: parallel map to the representative instruction so a
+        Note: signature hit can be VERIFIED structurally (opcode and both
+        Note: operands must match exactly). Hash collisions therefore
+        Note: degrade to a missed elimination, never to a wrong one.
         Let expression_map be proc create from Dictionary
+        Let expression_insts be proc create from Dictionary
 
         Let j be 0
         While j is less than inst_count:
             Let inst be proc list_get from List with instructions, j
-            Let opcode be proc memory_get_int32 from MemoryCore with inst, 0
-            Let result_id be proc memory_get_int32 from MemoryCore with inst, 8
+            Let opcode be proc get_mir_node_opcode from MIR with inst
+            Let result_id be proc get_mir_node_value_id from MIR with inst
 
             Note: Compute expression signature
             Let signature be compute_expression_signature(inst, opcode)
@@ -1679,7 +2373,26 @@ Process called "eliminate_common_subexpressions" that takes ctx as Integer retur
                 Note: Check if we've seen this expression before
                 Let previous_result be proc get from Dictionary with expression_map, signature
 
+                Let verified be 0
                 If previous_result is not equal to 0:
+                    Let rep_inst be proc get from Dictionary with expression_insts, signature
+                    If rep_inst is not equal to 0:
+                        Let rep_opcode be proc get_mir_node_opcode from MIR with rep_inst
+                        Let rep_op1 be proc get_mir_node_operand from MIR with rep_inst, 1
+                        Let rep_op2 be proc get_mir_node_operand from MIR with rep_inst, 2
+                        Let this_op1 be proc get_mir_node_operand from MIR with inst, 1
+                        Let this_op2 be proc get_mir_node_operand from MIR with inst, 2
+                        If rep_opcode is equal to opcode:
+                            If rep_op1 is equal to this_op1:
+                                If rep_op2 is equal to this_op2:
+                                    Set verified to 1
+                                End If
+                            End If
+                        End If
+                    End If
+                End If
+
+                If verified is equal to 1:
                     Note: Redundant computation found, replace uses
                     replace_all_uses(ctx, result_id, previous_result)
                     Set eliminated_count to eliminated_count plus 1
@@ -1688,13 +2401,19 @@ Process called "eliminate_common_subexpressions" that takes ctx as Integer retur
                     Let dead_instructions be proc memory_get_int64 from MemoryCore with ctx, 104
                     proc set from Dictionary with dead_instructions, inst, 1
                 Otherwise:
-                    Note: Record this expression
-                    proc set from Dictionary with expression_map, signature, result_id
+                    If previous_result is equal to 0:
+                        Note: Record this expression
+                        proc set from Dictionary with expression_map, signature, result_id
+                        proc set from Dictionary with expression_insts, signature, inst
+                    End If
                 End If
             End If
 
             Set j to j plus 1
         End While
+
+        proc destroy from Dictionary with expression_map
+        proc destroy from Dictionary with expression_insts
 
         Set i to i plus 1
     End While
@@ -1725,11 +2444,21 @@ Process called "compute_expression_signature" that takes inst as Integer, opcode
         Return 0
     End If
 
-    Note: Compute signature: opcode * 1000000 + operand1 * 1000 + operand2
-    Let operand1 be proc memory_get_int32 from MemoryCore with inst, 16
-    Let operand2 be proc memory_get_int32 from MemoryCore with inst, 24
+    Note: Hash signature over (opcode, operand1, operand2). Collisions are
+    Note: possible for large value ids; the CSE / GVN consumers verify a
+    Note: hit structurally against the representative instruction before
+    Note: eliminating, so the hash only needs good distribution, not
+    Note: injectivity. The mixing constants are primes.
+    Let operand1 be proc get_mir_node_operand from MIR with inst, 1
+    Let operand2 be proc get_mir_node_operand from MIR with inst, 2
 
-    Let signature be opcode multiplied by 1000000 plus operand1 multiplied by 1000 plus operand2
+    Let signature be opcode multiplied by 1000003
+    Set signature to signature plus operand1 multiplied by 8191
+    Set signature to signature plus operand2 multiplied by 127
+
+    If signature is equal to 0:
+        Set signature to 1
+    End If
 
     Return signature
 End Process
@@ -1749,8 +2478,8 @@ Process called "is_pure_operation" that takes opcode as Integer returns Integer:
         Return 1
     End If
 
-    Note: CAST (20400)
-    If opcode is equal to 20400:
+    Note: Cast band (20400-20408) - all casts are pure value conversions
+    If opcode is greater than or equal to 20400 and opcode is less than or equal to 20408:
         Return 1
     End If
 
@@ -1788,7 +2517,7 @@ Note: ==========================================================================
 
 Process called "remove_dead_instructions" that takes ctx as Integer returns Integer:
     Let cfg be proc memory_get_int64 from MemoryCore with ctx, 8
-    Let blocks be proc memory_get_int64 from MemoryCore with cfg, 0
+    Let blocks be proc get_mir_cfg_blocks from CFG with cfg
     Let block_count be proc length from List with blocks
 
     Let dead_instructions be proc memory_get_int64 from MemoryCore with ctx, 104
@@ -1796,7 +2525,7 @@ Process called "remove_dead_instructions" that takes ctx as Integer returns Inte
     Let i be 0
     While i is less than block_count:
         Let block be proc list_get from List with blocks, i
-        Let instructions be proc memory_get_int64 from MemoryCore with block, 8
+        Let instructions be proc get_block_instructions from MIR with block
         Let inst_count be proc length from List with instructions
 
         Note: Remove backwards to avoid index issues
@@ -1811,6 +2540,10 @@ Process called "remove_dead_instructions" that takes ctx as Integer returns Inte
 
             Set j to j minus 1
         End While
+
+        Note: Re-sync the block's cached instruction_count (offset 24)
+        Let remaining be proc length from List with instructions
+        proc memory_set_int64 from MemoryCore with block, 24, remaining
 
         Set i to i plus 1
     End While
@@ -1845,8 +2578,11 @@ control flow joins.
 Process called "global_value_numbering" that takes ctx as Integer returns Integer:
     Note: Proper GVN with dominator tree traversal and scoped hash tables
     Let cfg be proc memory_get_int64 from MemoryCore with ctx, 8
-    Let blocks be proc memory_get_int64 from MemoryCore with cfg, 0
+    Let blocks be proc get_mir_cfg_blocks from CFG with cfg
     Let block_count be proc length from List with blocks
+    If block_count is equal to 0:
+        Return 0
+    End If
 
     Note: Build dominator tree for the CFG
     Let dom_tree be build_dominator_tree(ctx)
@@ -1855,12 +2591,28 @@ Process called "global_value_numbering" that takes ctx as Integer returns Intege
     Let vn_stack be proc list_create from List
     Let eliminated_count be 0
 
-    Note: Traverse CFG in dominator tree preorder
-    Let entry_block be proc list_get from List with blocks, 0
+    Note: Traverse CFG in dominator tree preorder, rooted at the canonical
+    Note: entry block (MIRCFG offset 0; first registered block when the
+    Note: entry slot was never stamped)
+    Let entry_block be proc get_cfg_entry_block from MIR with cfg
+    If entry_block is equal to 0:
+        Set entry_block to proc list_get from List with blocks, 0
+    End If
     Set eliminated_count to gvn_traverse_block(ctx, entry_block, dom_tree, vn_stack, 0)
 
     Note: Cleanup dominator tree
     destroy_dominator_tree(dom_tree)
+
+    Note: Sweep the instructions GVN marked dead and update statistics
+    Note: (GVN counts into the CSE elimination slot - it is the
+    Note: cross-block generalization of the same redundancy elimination)
+    If eliminated_count is greater than 0:
+        remove_dead_instructions(ctx)
+        Let statistics be proc memory_get_int64 from MemoryCore with ctx, 120
+        Let current_cse be proc memory_get_int32 from MemoryCore with statistics, 16
+        proc memory_set_int32 from MemoryCore with statistics, 16, current_cse plus eliminated_count
+        proc memory_set_int32 from MemoryCore with ctx, 80, 1
+    End If
 
     Return eliminated_count
 End Process
@@ -1875,13 +2627,13 @@ Uses the Lengauer-Tarjan algorithm for O(n log n) dominator tree construction.
 
 Process called "build_dominator_tree" that takes ctx as Integer returns Integer:
     Let cfg be proc memory_get_int64 from MemoryCore with ctx, 8
-    Let blocks be proc memory_get_int64 from MemoryCore with cfg, 0
+    Let blocks be proc get_mir_cfg_blocks from CFG with cfg
     Let block_count be proc length from List with blocks
 
     Note: Create dominator tree structure
     Let dom_tree be proc allocate from Layout with 64
 
-    Note: Create immediate dominator map (idom)
+    Note: Create immediate dominator map (idom), keyed by block pointer
     Let idom be proc create from Dictionary
     proc memory_set_int64 from MemoryCore with dom_tree, 0, idom
 
@@ -1889,15 +2641,21 @@ Process called "build_dominator_tree" that takes ctx as Integer returns Integer:
     Let children be proc create from Dictionary
     proc memory_set_int64 from MemoryCore with dom_tree, 8, children
 
-    Note: Entry block dominates itself
-    Let entry_block be proc list_get from List with blocks, 0
+    Note: Entry block dominates itself (canonical entry slot; first
+    Note: registered block as fallback)
+    Let entry_block be proc get_cfg_entry_block from MIR with cfg
+    If entry_block is equal to 0:
+        Set entry_block to proc list_get from List with blocks, 0
+    End If
     proc set from Dictionary with idom, entry_block, entry_block
 
     Note: Initialize all other blocks to have no immediate dominator
-    Let i be 1
+    Let i be 0
     While i is less than block_count:
         Let block be proc list_get from List with blocks, i
-        proc set from Dictionary with idom, block, 0
+        If block is not equal to entry_block:
+            proc set from Dictionary with idom, block, 0
+        End If
         Set i to i plus 1
     End While
 
@@ -1906,40 +2664,53 @@ Process called "build_dominator_tree" that takes ctx as Integer returns Integer:
     While changed is equal to 1:
         Set changed to 0
 
-        Set i to 1  Note: Skip entry block
+        Set i to 0
         While i is less than block_count:
             Set block to proc list_get from List with blocks, i
 
-            Note: Get predecessors of this block
-            Let preds be proc memory_get_int64 from MemoryCore with block, 16
-            Let pred_count be proc length from List with preds
-
-            Note: Find new immediate dominator (intersection of predecessor dominators)
-            Let new_idom be 0
-            Let p be 0
-            While p is less than pred_count:
-                Let pred be proc list_get from List with preds, p
-                Let pred_idom be proc get from Dictionary with idom, pred
-
-                If pred_idom is not equal to 0:
-                    If new_idom is equal to 0:
-                        Set new_idom to pred
-                    Otherwise:
-                        Set new_idom to intersect_dominators(idom, new_idom, pred)
-                    End If
+            If block is equal to entry_block:
+                Set i to i plus 1
+            Otherwise:
+                Note: Get predecessors of this block - the canonical
+                Note: predecessor List (block offset 32) holds block IDs,
+                Note: resolved to pointers through the CFG
+                Let preds be proc get_block_predecessors from MIR with block
+                Let pred_count be 0
+                If preds is not equal to 0:
+                    Set pred_count to proc length from List with preds
                 End If
 
-                Set p to p plus 1
-            End While
+                Note: Find new immediate dominator (intersection of
+                Note: predecessor dominators)
+                Let new_idom be 0
+                Let p be 0
+                While p is less than pred_count:
+                    Let pred_id be proc list_get from List with preds, p
+                    Let pred be proc get_block_by_id_from_cfg from CFG with cfg, pred_id
+                    If pred is not equal to 0:
+                        Let pred_idom be proc get from Dictionary with idom, pred
 
-            Note: Check if immediate dominator changed
-            Let old_idom be proc get from Dictionary with idom, block
-            If new_idom is not equal to old_idom:
-                proc set from Dictionary with idom, block, new_idom
-                Set changed to 1
+                        If pred_idom is not equal to 0:
+                            If new_idom is equal to 0:
+                                Set new_idom to pred
+                            Otherwise:
+                                Set new_idom to intersect_dominators(idom, new_idom, pred)
+                            End If
+                        End If
+                    End If
+
+                    Set p to p plus 1
+                End While
+
+                Note: Check if immediate dominator changed
+                Let old_idom be proc get from Dictionary with idom, block
+                If new_idom is not equal to old_idom:
+                    proc set from Dictionary with idom, block, new_idom
+                    Set changed to 1
+                End If
+
+                Set i to i plus 1
             End If
-
-            Set i to i plus 1
         End While
     End While
 
@@ -1969,6 +2740,15 @@ End Process
 
 @Reasoning
 Finds the common dominator of two blocks by walking up the dominator tree.
+The walk direction uses canonical block IDs (MIRBasicBlock offset 0,
+allocated in creation order from 0 at the entry): the finger whose block
+has the LARGER id is deeper in the creation order and is the one moved up
+its idom chain, exactly mirroring Cooper-Harvey-Kennedy intersect with
+creation-order numbering in place of postorder numbers. The previous
+revision compared raw block POINTERS and moved the SMALLER one up, which
+could walk past the entry block's self-loop and never terminate; the
+0-guards remain as a backstop for irreducible regions where an idom is
+still unresolved mid-fixpoint.
 @End Reasoning
 
 Process called "intersect_dominators" that takes idom as Integer, b1 as Integer, b2 as Integer returns Integer:
@@ -1977,14 +2757,17 @@ Process called "intersect_dominators" that takes idom as Integer, b1 as Integer,
     Let finger2 be b2
 
     While finger1 is not equal to finger2:
-        Note: Move finger that's "lower" in the tree up
-        If finger1 is less than finger2:
+        Note: Move the finger with the larger block id (deeper in
+        Note: creation order) up its idom chain
+        Let id1 be proc get_mir_basic_block_id from CFG with finger1
+        Let id2 be proc get_mir_basic_block_id from CFG with finger2
+        If id1 is greater than id2:
             Set finger1 to proc get from Dictionary with idom, finger1
         Otherwise:
             Set finger2 to proc get from Dictionary with idom, finger2
         End If
 
-        Note: Guard against infinite loop (shouldn't happen with valid CFG)
+        Note: Guard against infinite loop (unresolved idom mid-fixpoint)
         If finger1 is equal to 0:
             Return finger2
         End If
@@ -2008,37 +2791,64 @@ Process called "gvn_traverse_block" that takes ctx as Integer, block as Integer,
     proc append from List with vn_stack, vn_table
 
     Note: Process instructions in this block
-    Let instructions be proc memory_get_int64 from MemoryCore with block, 8
+    Let instructions be proc get_block_instructions from MIR with block
     Let inst_count be proc length from List with instructions
 
     Let j be 0
     While j is less than inst_count:
         Let inst be proc list_get from List with instructions, j
-        Let opcode be proc memory_get_int32 from MemoryCore with inst, 0
+        Let opcode be proc get_mir_node_opcode from MIR with inst
 
-        Note: Skip non-expression instructions
-        If opcode is greater than or equal to 20000:  Note: MIR instructions
-            If opcode is less than 21000:  Note: Expression range
-                Note: Compute expression hash
-                Let expr_hash be hash_instruction(inst)
+        Note: Only pure value computations may be value-numbered. Loads,
+        Note: stores, calls, phis, and terminators are NEVER eligible -
+        Note: numbering them would merge side-effecting or
+        Note: control-dependent operations.
+        If is_pure_operation(opcode) is equal to 1:
+            Note: Compute expression hash
+            Let expr_hash be compute_expression_signature(inst, opcode)
 
-                Note: Look up in scoped hash tables (search from innermost to outermost)
-                Let existing_value be lookup_value_number(vn_stack, expr_hash)
+            If expr_hash is not equal to 0:
+                Note: Look up the representative instruction in the scoped
+                Note: tables (innermost to outermost), then VERIFY the hit
+                Note: structurally - hash collisions must degrade to a
+                Note: miss, never to a wrong elimination
+                Let rep_inst be lookup_value_number(vn_stack, expr_hash)
 
-                If existing_value is not equal to 0:
-                    Note: Found equivalent expression - replace with existing value
-                    Let result be proc memory_get_int32 from MemoryCore with inst, 8
-                    replace_all_uses(ctx, result, existing_value)
+                Let verified be 0
+                If rep_inst is not equal to 0:
+                    Let rep_opcode be proc get_mir_node_opcode from MIR with rep_inst
+                    Let rep_op1 be proc get_mir_node_operand from MIR with rep_inst, 1
+                    Let rep_op2 be proc get_mir_node_operand from MIR with rep_inst, 2
+                    Let this_op1 be proc get_mir_node_operand from MIR with inst, 1
+                    Let this_op2 be proc get_mir_node_operand from MIR with inst, 2
+                    If rep_opcode is equal to opcode:
+                        If rep_op1 is equal to this_op1:
+                            If rep_op2 is equal to this_op2:
+                                Set verified to 1
+                            End If
+                        End If
+                    End If
+                End If
 
-                    Note: Mark instruction as dead
-                    Let dead_instructions be proc memory_get_int64 from MemoryCore with ctx, 104
-                    proc set from Dictionary with dead_instructions, inst, 1
+                If verified is equal to 1:
+                    Note: Found equivalent dominating expression - replace
+                    Note: with the representative's result value
+                    Let result be proc get_mir_node_value_id from MIR with inst
+                    Let existing_value be proc get_mir_node_value_id from MIR with rep_inst
+                    If result is not equal to 0 and existing_value is not equal to 0:
+                        replace_all_uses(ctx, result, existing_value)
 
-                    Let eliminated be eliminated plus 1
+                        Note: Mark instruction as dead
+                        Let dead_instructions be proc memory_get_int64 from MemoryCore with ctx, 104
+                        proc set from Dictionary with dead_instructions, inst, 1
+
+                        Set eliminated to eliminated plus 1
+                    End If
                 Otherwise:
-                    Note: New expression - assign value number
-                    Set result to proc memory_get_int32 from MemoryCore with inst, 8
-                    proc set from Dictionary with vn_table, expr_hash, result
+                    If rep_inst is equal to 0:
+                        Note: New expression - record the representative
+                        proc set from Dictionary with vn_table, expr_hash, inst
+                    End If
                 End If
             End If
         End If
@@ -2060,34 +2870,23 @@ Process called "gvn_traverse_block" that takes ctx as Integer, block as Integer,
         End While
     End If
 
-    Note: Pop value numbering scope when leaving block
-    proc list_remove from List with vn_stack, List.length(vn_stack minus 1)
+    Note: Pop value numbering scope when leaving block (and release the
+    Note: scope's table). The previous revision computed the pop index as
+    Note: length(vn_stack minus 1) - the length of a corrupted pointer -
+    Note: instead of length(vn_stack) minus 1.
+    Let top_index be proc length from List with vn_stack
+    Set top_index to top_index minus 1
+    proc list_remove from List with vn_stack, top_index
+    proc destroy from Dictionary with vn_table
 
     Return eliminated
 End Process
 
 @Reasoning
-Hashes an instruction to create a unique identifier for the expression.
-Two instructions that compute the same value will hash to the same value.
-@End Reasoning
-
-Process called "hash_instruction" that takes inst as Integer returns Integer:
-    Let opcode be proc memory_get_int32 from MemoryCore with inst, 0
-    Let hash be opcode multiplied by 31
-
-    Note: Hash operands
-    Let operand1 be proc memory_get_int32 from MemoryCore with inst, 16
-    Let operand2 be proc memory_get_int32 from MemoryCore with inst, 20
-
-    Set hash to hash plus (operand1 multiplied by 17)
-    Set hash to hash plus (operand2 multiplied by 13)
-
-    Return hash
-End Process
-
-@Reasoning
 Looks up a value number in the scoped hash table stack.
-Searches from innermost scope to outermost.
+Searches from innermost scope to outermost. Returns the REPRESENTATIVE
+INSTRUCTION recorded for the hash (not a bare value id) so the caller can
+verify the hit structurally before eliminating.
 @End Reasoning
 
 Process called "lookup_value_number" that takes vn_stack as Integer, expr_hash as Integer returns Integer:
@@ -2166,7 +2965,7 @@ primarily cleanup and validation.
 
 Process called "promote_memory_to_registers" that takes ctx as Integer returns Integer:
     Let cfg be proc memory_get_int64 from MemoryCore with ctx, 8
-    Let blocks be proc memory_get_int64 from MemoryCore with cfg, 0
+    Let blocks be proc get_mir_cfg_blocks from CFG with cfg
     Let block_count be proc length from List with blocks
 
     Let promoted_count be 0
@@ -2177,17 +2976,18 @@ Process called "promote_memory_to_registers" that takes ctx as Integer returns I
     Let i be 0
     While i is less than block_count:
         Let block be proc list_get from List with blocks, i
-        Let instructions be proc memory_get_int64 from MemoryCore with block, 8
+        Let instructions be proc get_block_instructions from MIR with block
         Let inst_count be proc length from List with instructions
 
         Let j be 0
         While j is less than inst_count:
             Let inst be proc list_get from List with instructions, j
-            Let opcode be proc memory_get_int32 from MemoryCore with inst, 0
+            Let opcode be proc get_mir_node_opcode from MIR with inst
 
-            Note: MIR_ALLOCA (20202)
+            Note: MIR_ALLOCA (20202) - the alloca's pointer-producing
+            Note: result id lives in the header value_id slot
             If opcode is equal to 20202:
-                Let alloca_id be proc memory_get_int32 from MemoryCore with inst, 8
+                Let alloca_id be proc get_mir_node_value_id from MIR with inst
 
                 Note: Check if promotable (no address taken)
                 Let is_promotable be check_promotable_alloca(ctx, alloca_id)
@@ -2203,21 +3003,23 @@ Process called "promote_memory_to_registers" that takes ctx as Integer returns I
         Set i to i plus 1
     End While
 
-    Note: Eliminate loads/stores to promotable allocas
+    Note: Eliminate loads/stores to promotable allocas. Canonical operand
+    Note: roles: LOAD address = header operand1; STORE address = header
+    Note: operand1 (the stored value is operand2).
     Set i to 0
     While i is less than block_count:
         Set block to proc list_get from List with blocks, i
-        Set instructions to proc memory_get_int64 from MemoryCore with block, 8
+        Set instructions to proc get_block_instructions from MIR with block
         Set inst_count to proc length from List with instructions
 
         Set j to inst_count minus 1
         While j is greater than or equal to 0:
             Set inst to proc list_get from List with instructions, j
-            Set opcode to proc memory_get_int32 from MemoryCore with inst, 0
+            Set opcode to proc get_mir_node_opcode from MIR with inst
 
             Note: MIR_LOAD from promotable alloca
             If opcode is equal to 20200:
-                Let addr be proc memory_get_int32 from MemoryCore with inst, 16
+                Let addr be proc get_mir_node_operand from MIR with inst, 1
                 Set is_promotable to proc get from Dictionary with promotable_allocas, addr
 
                 If is_promotable is equal to 1:
@@ -2230,7 +3032,7 @@ Process called "promote_memory_to_registers" that takes ctx as Integer returns I
 
             Note: MIR_STORE to promotable alloca
             If opcode is equal to 20201:
-                Set addr to proc memory_get_int32 from MemoryCore with inst, 8
+                Set addr to proc get_mir_node_operand from MIR with inst, 1
                 Set is_promotable to proc get from Dictionary with promotable_allocas, addr
 
                 If is_promotable is equal to 1:
@@ -2243,6 +3045,10 @@ Process called "promote_memory_to_registers" that takes ctx as Integer returns I
 
             Set j to j minus 1
         End While
+
+        Note: Re-sync the block's cached instruction_count (offset 24)
+        Let remaining be proc length from List with instructions
+        proc memory_set_int64 from MemoryCore with block, 24, remaining
 
         Set i to i plus 1
     End While
@@ -2275,15 +3081,26 @@ Process called "check_promotable_alloca" that takes ctx as Integer, alloca_id as
     Let uses be proc memory_get_int64 from MemoryCore with chain, 24
     Let use_count be proc length from List with uses
 
-    Note: Check that all uses are loads or stores (no address taken)
+    Note: Check that all uses are loads or stores ADDRESSING the alloca
+    Note: (no address taken). Canonical roles: LOAD address = operand1;
+    Note: STORE address = operand1, stored value = operand2. A STORE whose
+    Note: stored VALUE is the alloca pointer escapes the address and
+    Note: disqualifies promotion.
     Let i be 0
     While i is less than use_count:
         Let using_inst be proc list_get from List with uses, i
-        Let opcode be proc memory_get_int32 from MemoryCore with using_inst, 0
+        Let opcode be proc get_mir_node_opcode from MIR with using_inst
 
         Note: Only LOAD and STORE are allowed
         If opcode is not equal to 20200 and opcode is not equal to 20201:
             Return 0  Note: Address is taken or used in other way
+        End If
+
+        If opcode is equal to 20201:
+            Let stored_value be proc get_mir_node_operand from MIR with using_inst, 2
+            If stored_value is equal to alloca_id:
+                Return 0  Note: Alloca pointer escapes as a stored value
+            End If
         End If
 
         Set i to i plus 1
@@ -2310,141 +3127,245 @@ This reduces CFG complexity and enables further optimizations.
 
 Process called "simplify_cfg" that takes ctx as Integer returns Integer:
     Let cfg be proc memory_get_int64 from MemoryCore with ctx, 8
-    Let blocks be proc memory_get_int64 from MemoryCore with cfg, 0
+    Let blocks be proc get_mir_cfg_blocks from CFG with cfg
     Let block_count be proc length from List with blocks
     Let changed be 0
 
-    Note: Pass 1: Merge blocks with single predecessor/successor
+    Note: Dead blocks are tracked in a side Dictionary keyed by block
+    Note: pointer. Block id 0 is a VALID id under the canonical model
+    Note: (allocate_block_id starts at 0, so the entry block usually
+    Note: carries id 0) - the previous revision's "write 0 into the id
+    Note: slot" dead-marking would have deleted the entry block.
+    Let dead_blocks be proc create from Dictionary
+
+    Note: The entry block is never merged away or thread-removed
+    Let entry_block be proc get_cfg_entry_block from MIR with cfg
+    If entry_block is equal to 0:
+        If block_count is greater than 0:
+            Set entry_block to proc list_get from List with blocks, 0
+        End If
+    End If
+    Let exit_block be proc get_cfg_exit_block from MIR with cfg
+
+    Note: Pass 1: Merge blocks with single predecessor/successor.
+    Note: Successor / predecessor Lists hold canonical block IDs
+    Note: (offsets 48 / 32), resolved to pointers through the CFG.
     Let i be 0
     While i is less than block_count:
         Let block be proc list_get from List with blocks, i
-        Let successors be proc memory_get_int64 from MemoryCore with block, 24
-        Let succ_count be proc length from List with successors
+        Let block_is_dead be proc get from Dictionary with dead_blocks, block
+        Let successors be proc get_block_successors from MIR with block
+        Let succ_count be 0
+        If successors is not equal to 0:
+            Set succ_count to proc length from List with successors
+        End If
 
         Note: Check if block has exactly one successor
-        If succ_count is equal to 1:
-            Let successor be proc list_get from List with successors, 0
-            Let pred_list be proc memory_get_int64 from MemoryCore with successor, 16
-            Let pred_count be proc length from List with pred_list
+        If block_is_dead is equal to 0 and succ_count is equal to 1:
+            Let block_id be proc get_mir_basic_block_id from CFG with block
+            Let succ_id be proc list_get from List with successors, 0
+            Let successor be proc get_block_by_id_from_cfg from CFG with cfg, succ_id
 
-            Note: Check if successor has exactly one predecessor (this block)
-            If pred_count is equal to 1:
-                Note: Merge: move successor's instructions into this block
-                Let block_insts be proc memory_get_int64 from MemoryCore with block, 8
-                Let succ_insts be proc memory_get_int64 from MemoryCore with successor, 8
-                Let succ_inst_count be proc length from List with succ_insts
+            Note: Never merge a self-loop, the entry block, or an
+            Note: already-dead block
+            Let merge_ok be 1
+            If successor is equal to 0:
+                Set merge_ok to 0
+            End If
+            If successor is equal to block:
+                Set merge_ok to 0
+            End If
+            If successor is equal to entry_block:
+                Set merge_ok to 0
+            End If
+            If merge_ok is equal to 1:
+                Let succ_is_dead be proc get from Dictionary with dead_blocks, successor
+                If succ_is_dead is not equal to 0:
+                    Set merge_ok to 0
+                End If
+            End If
 
-                Note: Remove jump from block (last instruction)
-                Let block_inst_count be proc length from List with block_insts
-                If block_inst_count is greater than 0:
-                    proc list_remove from List with block_insts, block_inst_count minus 1
+            If merge_ok is equal to 1:
+                Let pred_list be proc get_block_predecessors from MIR with successor
+                Let pred_count be 0
+                If pred_list is not equal to 0:
+                    Set pred_count to proc length from List with pred_list
                 End If
 
-                Note: Append successor instructions to block
-                Let si be 0
-                While si is less than succ_inst_count:
-                    Let inst be proc list_get from List with succ_insts, si
-                    proc append from List with block_insts, inst
-                    Set si to (si plus 1)
-                End While
+                Note: Check if successor has exactly one predecessor (this block)
+                If pred_count is equal to 1:
+                    Note: Merge: move successor's instructions into this block
+                    Let block_insts be proc get_block_instructions from MIR with block
+                    Let succ_insts be proc get_block_instructions from MIR with successor
+                    Let succ_inst_count be proc length from List with succ_insts
 
-                Note: Update block's successors to successor's successors
-                Let succ_successors be proc memory_get_int64 from MemoryCore with successor, 24
-                proc memory_set_int64 from MemoryCore with block, 24, succ_successors
+                    Note: Remove the single-target terminator from block
+                    Let block_inst_count be proc length from List with block_insts
+                    If block_inst_count is greater than 0:
+                        proc list_remove from List with block_insts, block_inst_count minus 1
+                    End If
 
-                Note: Mark successor for removal
-                proc memory_set_int32 from MemoryCore with successor, 0, 0 Note: Mark as dead
-                Set changed to 1
+                    Note: Append successor instructions to block and
+                    Note: re-parent them
+                    Let si be 0
+                    While si is less than succ_inst_count:
+                        Let inst be proc list_get from List with succ_insts, si
+                        proc append from List with block_insts, inst
+                        proc set_mir_node_parent_block from MIR with inst, block
+                        Set si to (si plus 1)
+                    End While
+                    Let merged_count be proc length from List with block_insts
+                    proc memory_set_int64 from MemoryCore with block, 24, merged_count
+
+                    Note: Block inherits successor's successor ids; rewrite
+                    Note: each grand-successor's predecessor list to name
+                    Note: this block instead of the merged-away successor
+                    Let succ_successors be proc get_block_successors from MIR with successor
+                    proc list_clear from List with successors
+                    If succ_successors is not equal to 0:
+                        Let ss_count be proc length from List with succ_successors
+                        Let ssi be 0
+                        While ssi is less than ss_count:
+                            Let grand_id be proc list_get from List with succ_successors, ssi
+                            proc append from List with successors, grand_id
+                            Let grand_block be proc get_block_by_id_from_cfg from CFG with cfg, grand_id
+                            If grand_block is not equal to 0:
+                                Let grand_preds be proc get_block_predecessors from MIR with grand_block
+                                If grand_preds is not equal to 0:
+                                    Let gp_idx be proc list_index_of from List with grand_preds, succ_id
+                                    If gp_idx is greater than or equal to 0:
+                                        proc list_set from List with grand_preds, gp_idx, block_id
+                                    End If
+                                End If
+                            End If
+                            Set ssi to (ssi plus 1)
+                        End While
+                    End If
+                    Let new_succ_count be proc length from List with successors
+                    proc memory_set_int64 from MemoryCore with block, 56, new_succ_count
+
+                    Note: If the merged successor was the CFG exit, this
+                    Note: block becomes the exit
+                    If successor is equal to exit_block:
+                        proc set_cfg_exit_block from MIR with cfg, block
+                        Set exit_block to block
+                    End If
+
+                    Note: Mark successor for removal
+                    proc set from Dictionary with dead_blocks, successor, 1
+                    Set changed to 1
+                End If
             End If
         End If
 
         Set i to (i plus 1)
     End While
 
-    Note: Pass 2: Remove empty blocks (only contain jump)
+    Note: Pass 2: Thread empty blocks (single unconditional jump). The
+    Note: jump target is a canonical block ID at extended offset 72.
     Set i to 0
     While i is less than block_count:
         Set block to proc list_get from List with blocks, i
-        Let instructions be proc memory_get_int64 from MemoryCore with block, 8
+        Let block_is_dead be proc get from Dictionary with dead_blocks, block
+        Let instructions be proc get_block_instructions from MIR with block
         Let inst_count be proc length from List with instructions
 
-        Note: Check if block only has a jump instruction
-        If inst_count is equal to 1:
+        Note: Check if block only has a jump instruction (never thread the
+        Note: entry block away - the CFG's entry pointer must stay valid)
+        If block_is_dead is equal to 0 and inst_count is equal to 1 and block is not equal to entry_block:
             Set inst to proc list_get from List with instructions, 0
-            Let opcode be proc memory_get_int32 from MemoryCore with inst, 0
+            Let opcode be proc get_mir_node_opcode from MIR with inst
 
             Note: MIR_JUMP is 20302
             If opcode is equal to 20302:
-                Note: Thread predecessors to jump directly to successor
-                Let target be proc memory_get_int64 from MemoryCore with inst, 8
-                Let predecessors be proc memory_get_int64 from MemoryCore with block, 16
-                Set pred_count to proc length from List with predecessors
+                Let block_id be proc get_mir_basic_block_id from CFG with block
+                Let target_id be proc get_jump_target from MIRNodes with inst
+                Let target_block be proc get_block_by_id_from_cfg from CFG with cfg, target_id
 
-                Let pi be 0
-                While pi is less than pred_count:
-                    Let pred be proc list_get from List with predecessors, pi
-                    Note: Update pred's successors: replace block with target
-                    Let pred_succs be proc memory_get_int64 from MemoryCore with pred, 24
-                    Let ps_count be proc length from List with pred_succs
-
-                    Let psi be 0
-                    While psi is less than ps_count:
-                        Let succ be proc list_get from List with pred_succs, psi
-                        If succ is equal to block:
-                            proc list_set from List with pred_succs, psi, target
-                        End If
-                        Set psi to (psi plus 1)
-                    End While
-
-                    Note: Update terminator instruction in predecessor
-                    Let pred_insts be proc memory_get_int64 from MemoryCore with pred, 8
-                    Let pred_inst_count be proc length from List with pred_insts
-                    If pred_inst_count is greater than 0:
-                        Let term_inst be proc list_get from List with pred_insts, pred_inst_count minus 1
-                        Let term_opcode be proc memory_get_int32 from MemoryCore with term_inst, 0
-
-                        Note: Update branch/jump target
-                        If term_opcode is equal to 20301:  Note: MIR_BRANCH
-                            Let then_block be proc memory_get_int64 from MemoryCore with term_inst, 16
-                            Let else_block be proc memory_get_int64 from MemoryCore with term_inst, 24
-                            If then_block is equal to block:
-                                proc memory_set_int64 from MemoryCore with term_inst, 16, target
-                            End If
-                            If else_block is equal to block:
-                                proc memory_set_int64 from MemoryCore with term_inst, 24, target
-                            End If
-                        Otherwise:
-                            If term_opcode is equal to 20302:  Note: MIR_JUMP
-                                proc memory_set_int64 from MemoryCore with term_inst, 8, target
-                            End If
-                        End If
+                Note: A jump-to-self is degenerate; leave it alone
+                If target_id is not equal to block_id and target_block is not equal to 0:
+                    Let predecessors be proc get_block_predecessors from MIR with block
+                    Let pred_count be 0
+                    If predecessors is not equal to 0:
+                        Set pred_count to proc length from List with predecessors
                     End If
 
-                    Set pi to (pi plus 1)
-                End While
+                    Let target_preds be proc get_block_predecessors from MIR with target_block
 
-                Note: Mark empty block for removal
-                proc memory_set_int32 from MemoryCore with block, 0, 0
-                Set changed to 1
+                    Let pi be 0
+                    While pi is less than pred_count:
+                        Let pred_id be proc list_get from List with predecessors, pi
+                        Let pred be proc get_block_by_id_from_cfg from CFG with cfg, pred_id
+
+                        If pred is not equal to 0:
+                            Note: Update pred's successor ids: replace this
+                            Note: block's id with the target id
+                            Let pred_succs be proc get_block_successors from MIR with pred
+                            If pred_succs is not equal to 0:
+                                Let ps_count be proc length from List with pred_succs
+                                Let psi be 0
+                                While psi is less than ps_count:
+                                    Let succ_entry be proc list_get from List with pred_succs, psi
+                                    If succ_entry is equal to block_id:
+                                        proc list_set from List with pred_succs, psi, target_id
+                                    End If
+                                    Set psi to (psi plus 1)
+                                End While
+                            End If
+
+                            Note: Retarget the predecessor's terminator
+                            Note: (branch / jump / switch / invoke) through
+                            Note: the canonical updater
+                            proc update_terminator_target from CFG with cfg, pred_id, block_id, target_id
+
+                            Note: The target now has pred as a predecessor
+                            If target_preds is not equal to 0:
+                                proc append from List with target_preds, pred_id
+                            End If
+                        End If
+
+                        Set pi to (pi plus 1)
+                    End While
+
+                    Note: The threaded-away block is no longer a
+                    Note: predecessor of the target
+                    If target_preds is not equal to 0:
+                        Let tp_idx be proc list_index_of from List with target_preds, block_id
+                        If tp_idx is greater than or equal to 0:
+                            proc list_remove from List with target_preds, tp_idx
+                        End If
+                        Let tp_count be proc length from List with target_preds
+                        proc memory_set_int64 from MemoryCore with target_block, 40, tp_count
+                    End If
+
+                    Note: Mark empty block for removal
+                    proc set from Dictionary with dead_blocks, block, 1
+                    Set changed to 1
+                End If
             End If
         End If
 
         Set i to (i plus 1)
     End While
 
-    Note: Pass 3: Remove dead blocks from CFG
+    Note: Pass 3: Remove dead blocks from the CFG block list and re-sync
+    Note: the cached block_count (offset 24)
     Let new_blocks be proc list_create from List
     Set i to 0
     While i is less than block_count:
         Set block to proc list_get from List with blocks, i
-        Let block_id be proc memory_get_int32 from MemoryCore with block, 0
-        If block_id is not equal to 0:  Note: Not marked as dead
+        Let block_is_dead be proc get from Dictionary with dead_blocks, block
+        If block_is_dead is equal to 0:
             proc append from List with new_blocks, block
         End If
         Set i to (i plus 1)
     End While
 
-    proc memory_set_int64 from MemoryCore with cfg, 0, new_blocks
+    proc memory_set_int64 from MemoryCore with cfg, 16, new_blocks
+    Let new_block_count be proc length from List with new_blocks
+    proc memory_set_int64 from MemoryCore with cfg, 24, new_block_count
+
+    proc destroy from Dictionary with dead_blocks
 
     Note: Update changed flag in context
     If changed is equal to 1:
@@ -2522,7 +3443,11 @@ Process called "hoist_loop_invariants" that takes ctx as Integer, loop_info as I
     Note: Locate the unique out-of-loop predecessor of the header (the
     Note: preheader). Multiple outside entries mean there is no single
     Note: dominating insertion point, so hoisting is skipped entirely.
-    Let header_preds be proc memory_get_int64 from MemoryCore with header, 16
+    Note: The canonical predecessor List (block offset 32) holds block
+    Note: IDs; each is resolved to a pointer through the CFG before the
+    Note: body-membership test (the body List holds block pointers).
+    Let cfg be proc memory_get_int64 from MemoryCore with ctx, 8
+    Let header_preds be proc get_block_predecessors from MIR with header
     If header_preds is equal to 0:
         Return 0
     End If
@@ -2532,20 +3457,23 @@ Process called "hoist_loop_invariants" that takes ctx as Integer, loop_info as I
     Let hp be 0
     Let hp_count be proc length from List with header_preds
     While hp is less than hp_count:
-        Let pred be proc list_get from List with header_preds, hp
-        Let in_body be 0
-        Let bi be 0
-        While bi is less than body_count:
-            Let bb be proc list_get from List with body_blocks, bi
-            If bb is equal to pred:
-                Set in_body to 1
-                Set bi to body_count
+        Let pred_id be proc list_get from List with header_preds, hp
+        Let pred be proc get_block_by_id_from_cfg from CFG with cfg, pred_id
+        If pred is not equal to 0:
+            Let in_body be 0
+            Let bi be 0
+            While bi is less than body_count:
+                Let bb be proc list_get from List with body_blocks, bi
+                If bb is equal to pred:
+                    Set in_body to 1
+                    Set bi to body_count
+                End If
+                Set bi to (bi plus 1)
+            End While
+            If in_body is equal to 0:
+                Set preheader to pred
+                Set outside_count to (outside_count plus 1)
             End If
-            Set bi to (bi plus 1)
-        End While
-        If in_body is equal to 0:
-            Set preheader to pred
-            Set outside_count to (outside_count plus 1)
         End If
         Set hp to (hp plus 1)
     End While
@@ -2572,12 +3500,12 @@ Process called "hoist_loop_invariants" that takes ctx as Integer, loop_info as I
         Let cb be 0
         While cb is less than body_count:
             Let body_block be proc list_get from List with body_blocks, cb
-            Let body_insts be proc memory_get_int64 from MemoryCore with body_block, 8
+            Let body_insts be proc get_block_instructions from MIR with body_block
             Let body_inst_count be proc length from List with body_insts
             Let ci be 0
             While ci is less than body_inst_count:
                 Let cinst be proc list_get from List with body_insts, ci
-                Let cresult be proc memory_get_int32 from MemoryCore with cinst, 8
+                Let cresult be proc get_mir_node_value_id from MIR with cinst
                 If cresult is not equal to 0:
                     Let def_count be proc get from Dictionary with loop_defs, cresult
                     proc set from Dictionary with loop_defs, cresult, def_count plus 1
@@ -2591,13 +3519,13 @@ Process called "hoist_loop_invariants" that takes ctx as Integer, loop_info as I
         Set cb to 0
         While cb is less than body_count:
             Let body_block be proc list_get from List with body_blocks, cb
-            Let body_insts be proc memory_get_int64 from MemoryCore with body_block, 8
+            Let body_insts be proc get_block_instructions from MIR with body_block
             Let body_inst_count be proc length from List with body_insts
 
             Let ci be 0
             While ci is less than body_inst_count:
                 Let cinst be proc list_get from List with body_insts, ci
-                Let copcode be proc memory_get_int32 from MemoryCore with cinst, 0
+                Let copcode be proc get_mir_node_opcode from MIR with cinst
                 Let is_candidate be 0
 
                 Note: CONST is always invariant
@@ -2615,7 +3543,7 @@ Process called "hoist_loop_invariants" that takes ctx as Integer, loop_info as I
                         If copcode is equal to 20005 or copcode is equal to 20006:
                             Set is_candidate to 0
                             If constant_values is not equal to 0:
-                                Let divisor_reg be proc memory_get_int32 from MemoryCore with cinst, 24
+                                Let divisor_reg be proc get_mir_node_operand from MIR with cinst, 2
                                 Let divisor_const be proc get from Dictionary with constant_values, divisor_reg
                                 If divisor_const is not equal to 0:
                                     Set is_candidate to 1
@@ -2633,7 +3561,7 @@ Process called "hoist_loop_invariants" that takes ctx as Integer, loop_info as I
                 End If
 
                 If is_candidate is equal to 1:
-                    Let cresult be proc memory_get_int32 from MemoryCore with cinst, 8
+                    Let cresult be proc get_mir_node_value_id from MIR with cinst
                     If cresult is equal to 0:
                         Set is_candidate to 0
                     Otherwise:
@@ -2645,11 +3573,12 @@ Process called "hoist_loop_invariants" that takes ctx as Integer, loop_info as I
                 End If
 
                 Note: Operands must have no definition inside the loop
-                Note: (CONST carries an immediate, not operand registers)
+                Note: (CONST carries its immediate at extended offset 80,
+                Note: not in the operand slots)
                 If is_candidate is equal to 1:
                     If copcode is not equal to 20001:
-                        Let cop1 be proc memory_get_int32 from MemoryCore with cinst, 16
-                        Let cop2 be proc memory_get_int32 from MemoryCore with cinst, 24
+                        Let cop1 be proc get_mir_node_operand from MIR with cinst, 1
+                        Let cop2 be proc get_mir_node_operand from MIR with cinst, 2
                         If cop1 is not equal to 0:
                             Let op1_defs be proc get from Dictionary with loop_defs, cop1
                             If op1_defs is not equal to 0:
@@ -2669,31 +3598,24 @@ Process called "hoist_loop_invariants" that takes ctx as Integer, loop_info as I
                     Note: Hoist: remove from the loop block and insert into
                     Note: the preheader before its terminator
                     proc list_remove from List with body_insts, ci
+                    Let body_remaining be proc length from List with body_insts
+                    proc memory_set_int64 from MemoryCore with body_block, 24, body_remaining
 
-                    Let pre_insts be proc memory_get_int64 from MemoryCore with preheader, 8
+                    Let pre_insts be proc get_block_instructions from MIR with preheader
                     Let pre_count be proc length from List with pre_insts
                     Let insert_pos be pre_count
                     If pre_count is greater than 0:
                         Let pre_last be proc list_get from List with pre_insts, pre_count minus 1
-                        Let pre_last_opcode be proc memory_get_int32 from MemoryCore with pre_last, 0
-                        Let is_terminator be 0
-                        If pre_last_opcode is equal to 20301:
-                            Set is_terminator to 1
-                        End If
-                        If pre_last_opcode is equal to 20302:
-                            Set is_terminator to 1
-                        End If
-                        If pre_last_opcode is equal to 20303:
-                            Set is_terminator to 1
-                        End If
-                        If pre_last_opcode is equal to 20306:
-                            Set is_terminator to 1
-                        End If
-                        If is_terminator is equal to 1:
+                        Let pre_last_opcode be proc get_mir_node_opcode from MIR with pre_last
+                        Let last_is_terminator be proc is_terminator_opcode from MIR with pre_last_opcode
+                        If last_is_terminator is equal to 1:
                             Set insert_pos to pre_count minus 1
                         End If
                     End If
                     proc list_insert from List with pre_insts, insert_pos, cinst
+                    proc set_mir_node_parent_block from MIR with cinst, preheader
+                    Let pre_new_count be proc length from List with pre_insts
+                    proc memory_set_int64 from MemoryCore with preheader, 24, pre_new_count
 
                     Set total_moved to (total_moved plus 1)
                     Set changed to 1
@@ -2741,7 +3663,7 @@ Process called "analyze_loop_unroll_opportunity" that takes ctx as Integer, loop
         Return 1
     End If
 
-    Let insts be proc memory_get_int64 from MemoryCore with header, 8
+    Let insts be proc get_block_instructions from MIR with header
     Let inst_count be proc length from List with insts
     If inst_count is less than 3:
         Return 1
@@ -2749,13 +3671,13 @@ Process called "analyze_loop_unroll_opportunity" that takes ctx as Integer, loop
 
     Note: The block must end with comparison + conditional branch
     Let branch be proc list_get from List with insts, inst_count minus 1
-    Let branch_opcode be proc memory_get_int32 from MemoryCore with branch, 0
+    Let branch_opcode be proc get_mir_node_opcode from MIR with branch
     If branch_opcode is not equal to 20301:
         Return 1
     End If
 
     Let cmp be proc list_get from List with insts, inst_count minus 2
-    Let cmp_opcode be proc memory_get_int32 from MemoryCore with cmp, 0
+    Let cmp_opcode be proc get_mir_node_opcode from MIR with cmp
     If cmp_opcode is less than 20100:
         Return 1
     End If
@@ -2763,9 +3685,10 @@ Process called "analyze_loop_unroll_opportunity" that takes ctx as Integer, loop
         Return 1
     End If
 
-    Note: The branch condition must be exactly the comparison result
-    Let cmp_result be proc memory_get_int32 from MemoryCore with cmp, 8
-    Let branch_cond be proc memory_get_int32 from MemoryCore with branch, 8
+    Note: The branch condition (header operand1 of the branch) must be
+    Note: exactly the comparison result (header value_id of the compare)
+    Let cmp_result be proc get_mir_node_value_id from MIR with cmp
+    Let branch_cond be proc get_mir_node_operand from MIR with branch, 1
     If cmp_result is equal to 0:
         Return 1
     End If
@@ -2773,11 +3696,12 @@ Process called "analyze_loop_unroll_opportunity" that takes ctx as Integer, loop
         Return 1
     End If
 
-    Note: The loop must continue on the TRUE edge (then-target is the
-    Note: header) so trip count counts iterations while the comparison
-    Note: holds
-    Let then_block be proc memory_get_int64 from MemoryCore with branch, 16
-    If then_block is not equal to header:
+    Note: The loop must continue on the TRUE edge (the true target BLOCK
+    Note: ID at extended offset 80 names the header) so trip count counts
+    Note: iterations while the comparison holds
+    Let header_id be proc get_mir_basic_block_id from CFG with header
+    Let then_block_id be proc get_branch_true_target from MIRNodes with branch
+    If then_block_id is not equal to header_id:
         Return 1
     End If
 
@@ -2785,9 +3709,9 @@ Process called "analyze_loop_unroll_opportunity" that takes ctx as Integer, loop
     Let use_scan be 0
     While use_scan is less than inst_count minus 1:
         Let uinst be proc list_get from List with insts, use_scan
-        Let uop1 be proc memory_get_int32 from MemoryCore with uinst, 16
-        Let uop2 be proc memory_get_int32 from MemoryCore with uinst, 24
-        Let uopcode be proc memory_get_int32 from MemoryCore with uinst, 0
+        Let uop1 be proc get_mir_node_operand from MIR with uinst, 1
+        Let uop2 be proc get_mir_node_operand from MIR with uinst, 2
+        Let uopcode be proc get_mir_node_opcode from MIR with uinst
         If uopcode is not equal to 20001:
             If uop1 is equal to cmp_result:
                 Return 1
@@ -2800,8 +3724,8 @@ Process called "analyze_loop_unroll_opportunity" that takes ctx as Integer, loop
     End While
 
     Note: Induction variable: comparison operand1; bound: operand2
-    Let iv_reg be proc memory_get_int32 from MemoryCore with cmp, 16
-    Let bound_reg be proc memory_get_int32 from MemoryCore with cmp, 24
+    Let iv_reg be proc get_mir_node_operand from MIR with cmp, 1
+    Let bound_reg be proc get_mir_node_operand from MIR with cmp, 2
     If iv_reg is equal to 0:
         Return 1
     End If
@@ -2814,17 +3738,17 @@ Process called "analyze_loop_unroll_opportunity" that takes ctx as Integer, loop
     Let s be 0
     While s is less than inst_count minus 2:
         Let sinst be proc list_get from List with insts, s
-        Let sopcode be proc memory_get_int32 from MemoryCore with sinst, 0
-        Let sresult be proc memory_get_int32 from MemoryCore with sinst, 8
+        Let sopcode be proc get_mir_node_opcode from MIR with sinst
+        Let sresult be proc get_mir_node_value_id from MIR with sinst
         If sresult is equal to iv_reg:
             Set iv_defs to (iv_defs plus 1)
             If sopcode is equal to 20002:
-                Let sop1 be proc memory_get_int32 from MemoryCore with sinst, 16
-                Let sop2 be proc memory_get_int32 from MemoryCore with sinst, 24
+                Let sop1 be proc get_mir_node_operand from MIR with sinst, 1
+                Let sop2 be proc get_mir_node_operand from MIR with sinst, 2
                 If sop1 is equal to iv_reg:
                     Let sconst be find_block_constant_def(header, sop2)
                     If sconst is not equal to 0:
-                        Set step_value to proc memory_get_int64 from MemoryCore with sconst, 16
+                        Set step_value to proc get_const_value from MIRNodes with sconst
                         Set step_found to 1
                     End If
                 End If
@@ -2844,8 +3768,10 @@ Process called "analyze_loop_unroll_opportunity" that takes ctx as Integer, loop
     End If
 
     Note: Init: a CONST defining iv in the loop's preheader; Bound: a
-    Note: CONST defining bound_reg in the preheader (or the loop block)
-    Let header_preds be proc memory_get_int64 from MemoryCore with header, 16
+    Note: CONST defining bound_reg in the preheader (or the loop block).
+    Note: Predecessors are canonical block IDs resolved through the CFG.
+    Let cfg be proc memory_get_int64 from MemoryCore with ctx, 8
+    Let header_preds be proc get_block_predecessors from MIR with header
     If header_preds is equal to 0:
         Return 1
     End If
@@ -2854,10 +3780,13 @@ Process called "analyze_loop_unroll_opportunity" that takes ctx as Integer, loop
     Let hp be 0
     Let hp_count be proc length from List with header_preds
     While hp is less than hp_count:
-        Let pred be proc list_get from List with header_preds, hp
-        If pred is not equal to header:
-            Set preheader to pred
-            Set outside_count to (outside_count plus 1)
+        Let pred_id be proc list_get from List with header_preds, hp
+        If pred_id is not equal to header_id:
+            Let pred be proc get_block_by_id_from_cfg from CFG with cfg, pred_id
+            If pred is not equal to 0:
+                Set preheader to pred
+                Set outside_count to (outside_count plus 1)
+            End If
         End If
         Set hp to (hp plus 1)
     End While
@@ -2869,7 +3798,7 @@ Process called "analyze_loop_unroll_opportunity" that takes ctx as Integer, loop
     If init_const is equal to 0:
         Return 1
     End If
-    Let init_value be proc memory_get_int64 from MemoryCore with init_const, 16
+    Let init_value be proc get_const_value from MIRNodes with init_const
 
     Let bound_const be find_block_constant_def(preheader, bound_reg)
     If bound_const is equal to 0:
@@ -2878,7 +3807,7 @@ Process called "analyze_loop_unroll_opportunity" that takes ctx as Integer, loop
     If bound_const is equal to 0:
         Return 1
     End If
-    Let bound_value be proc memory_get_int64 from MemoryCore with bound_const, 16
+    Let bound_value be proc get_const_value from MIRNodes with bound_const
 
     Note: Trip count for the supported comparison forms with positive step
     Let trip be 0
@@ -2919,8 +3848,9 @@ End Process
 @Reasoning
 Helper for the unroll analysis: finds the unique CONST definition of a
 register within one block and returns the CONST instruction (so the caller
-can read the immediate at offset 16), or 0 when the register has no CONST
-definition there or is redefined.
+can read the immediate through MIRNodes.get_const_value - extended offset
+80 under OD-1), or 0 when the register has no CONST definition there or is
+redefined.
 @End Reasoning
 
 Process called "find_block_constant_def" that takes block as Integer, reg as Integer returns Integer:
@@ -2931,7 +3861,7 @@ Process called "find_block_constant_def" that takes block as Integer, reg as Int
         Return 0
     End If
 
-    Let insts be proc memory_get_int64 from MemoryCore with block, 8
+    Let insts be proc get_block_instructions from MIR with block
     If insts is equal to 0:
         Return 0
     End If
@@ -2943,12 +3873,15 @@ Process called "find_block_constant_def" that takes block as Integer, reg as Int
     Let i be 0
     While i is less than inst_count:
         Let inst be proc list_get from List with insts, i
-        Let result be proc memory_get_int32 from MemoryCore with inst, 8
+        Let result be proc get_mir_node_value_id from MIR with inst
         If result is equal to reg:
             Set def_count to (def_count plus 1)
-            Let opcode be proc memory_get_int32 from MemoryCore with inst, 0
+            Let opcode be proc get_mir_node_opcode from MIR with inst
             If opcode is equal to 20001:
-                Set found to inst
+                Let is_string_const be proc is_const_string from MIRNodes with inst
+                If is_string_const is equal to 0:
+                    Set found to inst
+                End If
             End If
         End If
         Set i to (i plus 1)
@@ -2988,20 +3921,20 @@ Process called "unroll_loop" that takes ctx as Integer, loop_info as Integer, fa
         Return 0
     End If
 
-    Let insts be proc memory_get_int64 from MemoryCore with header, 8
+    Let insts be proc get_block_instructions from MIR with header
     Let inst_count be proc length from List with insts
     If inst_count is less than 3:
         Return 0
     End If
 
     Let branch be proc list_get from List with insts, inst_count minus 1
-    Let branch_opcode be proc memory_get_int32 from MemoryCore with branch, 0
+    Let branch_opcode be proc get_mir_node_opcode from MIR with branch
     If branch_opcode is not equal to 20301:
         Return 0
     End If
 
     Let cmp be proc list_get from List with insts, inst_count minus 2
-    Let cmp_opcode be proc memory_get_int32 from MemoryCore with cmp, 0
+    Let cmp_opcode be proc get_mir_node_opcode from MIR with cmp
     If cmp_opcode is less than 20100:
         Return 0
     End If
@@ -3009,18 +3942,28 @@ Process called "unroll_loop" that takes ctx as Integer, loop_info as Integer, fa
         Return 0
     End If
 
-    Let exit_block be proc memory_get_int64 from MemoryCore with branch, 24
-    Let then_block be proc memory_get_int64 from MemoryCore with branch, 16
-    If then_block is not equal to header:
+    Note: Branch targets are canonical BLOCK IDs at extended offsets 80
+    Note: (true) and 88 (false); the loop continues on the true edge and
+    Note: exits on the false edge
+    Let header_id be proc get_mir_basic_block_id from CFG with header
+    Let exit_block_id be proc get_branch_false_target from MIRNodes with branch
+    Let then_block_id be proc get_branch_true_target from MIRNodes with branch
+    If then_block_id is not equal to header_id:
         Return 0
     End If
+    Let cfg be proc memory_get_int64 from MemoryCore with ctx, 8
+    Let exit_block be proc get_block_by_id_from_cfg from CFG with cfg, exit_block_id
     If exit_block is equal to 0:
         Return 0
     End If
 
     Note: Replicate the straight-line body factor-1 times before the
-    Note: comparison. Instruction records are the module's 64-byte cells,
-    Note: cloned bytewise.
+    Note: comparison. Clones are produced by the canonical OD-6
+    Note: MIR.clone_instruction (sized word copy per the opcode-band
+    Note: table, embedded Lists deep-copied, next/parent_block reset).
+    Note: Value ids are intentionally RETAINED: this transform operates on
+    Note: the proven single-definition register form where each replica
+    Note: re-defines the same registers, exactly replaying the iteration.
     Let body_len be inst_count minus 2
     Let rep be 1
     While rep is less than factor:
@@ -3030,11 +3973,11 @@ Process called "unroll_loop" that takes ctx as Integer, loop_info as Integer, fa
         Let k be 0
         While k is less than body_len:
             Let original be proc list_get from List with insts, k
-            Let clone be proc allocate from Layout with 64
+            Let clone be proc clone_instruction from MIR with original
             If clone is equal to 0:
                 Return 0
             End If
-            proc memory_copy from MemoryCore with clone, original, 64
+            proc set_mir_node_parent_block from MIR with clone, header
             proc list_insert from List with insts, insert_base plus k, clone
             Set k to (k plus 1)
         End While
@@ -3043,31 +3986,33 @@ Process called "unroll_loop" that takes ctx as Integer, loop_info as Integer, fa
     End While
 
     Note: Delete the comparison and convert the branch into an
-    Note: unconditional jump to the exit block
+    Note: unconditional jump to the exit block. The branch record is 112
+    Note: bytes - large enough to hold the 80-byte jump layout in place:
+    Note: opcode 20302 at 0, target block id at extended offset 72, the
+    Note: stale branch fields at 80/88/96/104 zeroed, and the condition
+    Note: use cleared from header operand1.
     Let final_count be proc length from List with insts
     proc list_remove from List with insts, final_count minus 2
 
-    proc memory_set_int32 from MemoryCore with branch, 0, 20302
-    proc memory_set_int64 from MemoryCore with branch, 8, exit_block
-    proc memory_set_int64 from MemoryCore with branch, 16, 0
-    proc memory_set_int64 from MemoryCore with branch, 24, 0
+    proc set_mir_node_opcode from MIR with branch, 20302
+    proc set_mir_node_operand from MIR with branch, 1, 0
+    proc memory_set_int64 from MemoryCore with branch, 72, exit_block_id
+    proc memory_set_int64 from MemoryCore with branch, 80, 0
+    proc memory_set_int64 from MemoryCore with branch, 88, 0
+    proc memory_set_int64 from MemoryCore with branch, 96, 0
+    proc memory_set_int64 from MemoryCore with branch, 104, 0
 
-    Note: Remove the back edge from the CFG: the header no longer succeeds
-    Note: or precedes itself
-    Let succs be proc memory_get_int64 from MemoryCore with header, 24
-    If succs is not equal to 0:
-        Let s_idx be proc list_index_of with succs, header
-        If s_idx is greater than or equal to 0:
-            proc list_remove from List with succs, s_idx
-        End If
-    End If
-    Let preds be proc memory_get_int64 from MemoryCore with header, 16
-    If preds is not equal to 0:
-        Let p_idx be proc list_index_of with preds, header
-        If p_idx is greater than or equal to 0:
-            proc list_remove from List with preds, p_idx
-        End If
-    End If
+    Note: Re-sync the header's cached instruction_count after the
+    Note: replication + comparison removal
+    Let unrolled_count be proc length from List with insts
+    proc memory_set_int64 from MemoryCore with header, 24, unrolled_count
+
+    Note: Remove the back edge from the CFG through the canonical edge
+    Note: remover. Since Wave 5a (task #460) remove_cfg_edge owns the
+    Note: cached predecessor/successor count re-sync and the CFG edge
+    Note: table, so no per-site re-sync is needed here (the Wave 1
+    Note: stopgap re-sync was removed as redundant).
+    proc remove_cfg_edge from CFG with cfg, header_id, header_id
 
     Return factor minus 1
 End Process
@@ -3082,6 +4027,8 @@ Process called "should_inline_function" that takes ctx as Integer, callee as Int
     Note: transformation inline_call_site performs (no register renaming
     Note: is possible in this module's register model, so callees whose
     Note: instructions would survive into the caller are rejected).
+    Note: The callee parameter is a resolved MIRFunction POINTER (produced
+    Note: by inline_functions' OD-4 callee resolution).
 
     If ctx is equal to 0:
         Return 0
@@ -3090,18 +4037,25 @@ Process called "should_inline_function" that takes ctx as Integer, callee as Int
         Return 0
     End If
 
-    Note: Never inline self-recursive calls
+    Note: Never inline self-recursive calls (OD-4 identity: MIRFunction
+    Note: pointer comparison)
     Let current_function be proc memory_get_int64 from MemoryCore with ctx, 0
     If callee is equal to current_function:
         Return 0
     End If
 
-    Let callee_cfg be proc memory_get_int64 from MemoryCore with callee, 32
+    Note: External (FFI) functions have no MIR body to evaluate
+    Let callee_is_external be proc is_external_function from MIR with callee
+    If callee_is_external is equal to 1:
+        Return 0
+    End If
+
+    Let callee_cfg be proc get_mir_function_cfg from MIR with callee
     If callee_cfg is equal to 0:
         Return 0
     End If
 
-    Let callee_blocks be proc memory_get_int64 from MemoryCore with callee_cfg, 0
+    Let callee_blocks be proc get_mir_cfg_blocks from CFG with callee_cfg
     If callee_blocks is equal to 0:
         Return 0
     End If
@@ -3110,7 +4064,7 @@ Process called "should_inline_function" that takes ctx as Integer, callee as Int
     End If
 
     Let callee_block be proc list_get from List with callee_blocks, 0
-    Let callee_insts be proc memory_get_int64 from MemoryCore with callee_block, 8
+    Let callee_insts be proc get_block_instructions from MIR with callee_block
     If callee_insts is equal to 0:
         Return 0
     End If
@@ -3130,25 +4084,29 @@ Process called "should_inline_function" that takes ctx as Integer, callee as Int
 
     Note: Last instruction must be RETURN of a register
     Let last be proc list_get from List with callee_insts, callee_inst_count minus 1
-    Let last_opcode be proc memory_get_int32 from MemoryCore with last, 0
+    Let last_opcode be proc get_mir_node_opcode from MIR with last
     If last_opcode is not equal to 20303:
         Return 0
     End If
 
     Note: Every body instruction must be pure compute with locally
-    Note: defined operands
+    Note: defined operands (numeric CONSTs only - a string const is an
+    Note: address, not an evaluable integer)
     Let defined be proc create from Dictionary
     Let ok be 1
 
     Let i be 0
     While i is less than callee_inst_count minus 1:
         Let inst be proc list_get from List with callee_insts, i
-        Let opcode be proc memory_get_int32 from MemoryCore with inst, 0
-        Let result be proc memory_get_int32 from MemoryCore with inst, 8
+        Let opcode be proc get_mir_node_opcode from MIR with inst
+        Let result be proc get_mir_node_value_id from MIR with inst
 
         Let is_pure be 0
         If opcode is equal to 20001:
-            Set is_pure to 1
+            Let is_string_const be proc is_const_string from MIRNodes with inst
+            If is_string_const is equal to 0:
+                Set is_pure to 1
+            End If
         End If
         If opcode is greater than or equal to 20002:
             If opcode is less than or equal to 20006:
@@ -3166,8 +4124,8 @@ Process called "should_inline_function" that takes ctx as Integer, callee as Int
             Set i to callee_inst_count
         Otherwise:
             If opcode is not equal to 20001:
-                Let op1 be proc memory_get_int32 from MemoryCore with inst, 16
-                Let op2 be proc memory_get_int32 from MemoryCore with inst, 24
+                Let op1 be proc get_mir_node_operand from MIR with inst, 1
+                Let op2 be proc get_mir_node_operand from MIR with inst, 2
                 If op1 is not equal to 0:
                     Let def1 be proc get from Dictionary with defined, op1
                     If def1 is equal to 0:
@@ -3191,9 +4149,10 @@ Process called "should_inline_function" that takes ctx as Integer, callee as Int
         Set i to (i plus 1)
     End While
 
-    Note: The returned register must be locally defined
+    Note: The returned register (header operand1 of the RETURN) must be
+    Note: locally defined
     If ok is equal to 1:
-        Let return_reg be proc memory_get_int32 from MemoryCore with last, 8
+        Let return_reg be proc get_return_value from MIRNodes with last
         If return_reg is equal to 0:
             Set ok to 0
         Otherwise:
@@ -3224,11 +4183,11 @@ Process called "inline_call_site" that takes ctx as Integer, block as Integer, j
         Return 0
     End If
 
-    Let callee_cfg be proc memory_get_int64 from MemoryCore with callee, 32
+    Let callee_cfg be proc get_mir_function_cfg from MIR with callee
     If callee_cfg is equal to 0:
         Return 0
     End If
-    Let callee_blocks be proc memory_get_int64 from MemoryCore with callee_cfg, 0
+    Let callee_blocks be proc get_mir_cfg_blocks from CFG with callee_cfg
     If callee_blocks is equal to 0:
         Return 0
     End If
@@ -3237,7 +4196,7 @@ Process called "inline_call_site" that takes ctx as Integer, block as Integer, j
     End If
 
     Let callee_block be proc list_get from List with callee_blocks, 0
-    Let callee_insts be proc memory_get_int64 from MemoryCore with callee_block, 8
+    Let callee_insts be proc get_block_instructions from MIR with callee_block
     If callee_insts is equal to 0:
         Return 0
     End If
@@ -3247,27 +4206,28 @@ Process called "inline_call_site" that takes ctx as Integer, block as Integer, j
     End If
 
     Let last be proc list_get from List with callee_insts, callee_inst_count minus 1
-    Let last_opcode be proc memory_get_int32 from MemoryCore with last, 0
+    Let last_opcode be proc get_mir_node_opcode from MIR with last
     If last_opcode is not equal to 20303:
         Return 0
     End If
 
-    Note: Evaluate the constant body
+    Note: Evaluate the constant body (canonical reads: CONST immediate at
+    Note: extended offset 80, operand uses in header slots 16/24)
     Let env be proc create from Dictionary
     Let ok be 1
 
     Let i be 0
     While i is less than callee_inst_count minus 1:
         Let inst be proc list_get from List with callee_insts, i
-        Let opcode be proc memory_get_int32 from MemoryCore with inst, 0
-        Let result be proc memory_get_int32 from MemoryCore with inst, 8
+        Let opcode be proc get_mir_node_opcode from MIR with inst
+        Let result be proc get_mir_node_value_id from MIR with inst
 
         If opcode is equal to 20001:
-            Let imm be proc memory_get_int64 from MemoryCore with inst, 16
+            Let imm be proc get_const_value from MIRNodes with inst
             proc set from Dictionary with env, result, imm
         Otherwise:
-            Let op1 be proc memory_get_int32 from MemoryCore with inst, 16
-            Let op2 be proc memory_get_int32 from MemoryCore with inst, 24
+            Let op1 be proc get_mir_node_operand from MIR with inst, 1
+            Let op2 be proc get_mir_node_operand from MIR with inst, 2
             Let v1 be proc get from Dictionary with env, op1
             Let v2 be proc get from Dictionary with env, op2
 
@@ -3289,40 +4249,8 @@ Process called "inline_call_site" that takes ctx as Integer, block as Integer, j
                     End If
                 End If
             End If
-            If opcode is equal to 20100:
-                If v1 is equal to v2:
-                    Set value to 1
-                End If
-                Set handled to 1
-            End If
-            If opcode is equal to 20101:
-                If v1 is not equal to v2:
-                    Set value to 1
-                End If
-                Set handled to 1
-            End If
-            If opcode is equal to 20102:
-                If v1 is less than v2:
-                    Set value to 1
-                End If
-                Set handled to 1
-            End If
-            If opcode is equal to 20103:
-                If v1 is less than or equal to v2:
-                    Set value to 1
-                End If
-                Set handled to 1
-            End If
-            If opcode is equal to 20104:
-                If v1 is greater than v2:
-                    Set value to 1
-                End If
-                Set handled to 1
-            End If
-            If opcode is equal to 20105:
-                If v1 is greater than or equal to v2:
-                    Set value to 1
-                End If
+            If opcode is greater than or equal to 20100 and opcode is less than or equal to 20105:
+                Set value to evaluate_comparison_operation(opcode, v1, v2)
                 Set handled to 1
             End If
 
@@ -3341,19 +4269,28 @@ Process called "inline_call_site" that takes ctx as Integer, block as Integer, j
 
     Let success be 0
     If ok is equal to 1:
-        Let return_reg be proc memory_get_int32 from MemoryCore with last, 8
+        Let return_reg be proc get_return_value from MIRNodes with last
         Let return_value be proc get from Dictionary with env, return_reg
 
-        Note: Replace the CALL in place with CONST(result_reg, value)
-        Let instructions be proc memory_get_int64 from MemoryCore with block, 8
+        Note: Replace the CALL with a fresh canonical MIRConst carrying the
+        Note: evaluated result into the call's destination value id. The
+        Note: 144-byte call record could legally be rewritten in place
+        Note: (112 <= 144), but a fresh record keeps clone_instruction's
+        Note: size table honest and releases the call's argument List from
+        Note: the instruction stream.
+        Let instructions be proc get_block_instructions from MIR with block
         Let call_inst be proc list_get from List with instructions, j
         If call_inst is not equal to 0:
-            Let call_result be proc memory_get_int32 from MemoryCore with call_inst, 8
-            proc memory_set_int32 from MemoryCore with call_inst, 0, 20001
-            proc memory_set_int32 from MemoryCore with call_inst, 8, call_result
-            proc memory_set_int64 from MemoryCore with call_inst, 16, return_value
-            proc memory_set_int64 from MemoryCore with call_inst, 24, 0
-            Set success to 1
+            Let call_result be proc get_mir_node_value_id from MIR with call_inst
+            Let call_return_type be proc get_call_return_type from MIRNodes with call_inst
+            Let const_inst be proc create_mir_const from MIRNodes with call_result, return_value, call_return_type, 0, 0
+            If const_inst is not equal to 0:
+                proc set_mir_node_parent_block from MIR with const_inst, block
+                proc list_set from List with instructions, j, const_inst
+                Let mir_function be proc memory_get_int64 from MemoryCore with ctx, 0
+                proc register_value_definition from MIR with mir_function, call_result, const_inst
+                Set success to 1
+            End If
         End If
     End If
 
@@ -3363,36 +4300,48 @@ End Process
 
 Process called "optimize_loops" that takes ctx as Integer returns Integer:
     Let cfg be proc memory_get_int64 from MemoryCore with ctx, 8
-    Let blocks be proc memory_get_int64 from MemoryCore with cfg, 0
+    Let blocks be proc get_mir_cfg_blocks from CFG with cfg
     Let block_count be proc length from List with blocks
     Let optimizations_applied be 0
 
     Note: Step 1: Detect loops using back edges
-    Note: A back edge is an edge from node B to node A where A dominates B
+    Note: A back edge is an edge from node B to node A where A dominates B.
+    Note: Successor lists hold canonical block IDs, and
+    Note: Dominance.dominates takes (info, dominator_id, block_id).
     Let dominance_info be proc memory_get_int64 from MemoryCore with ctx, 16
     Let loops be proc list_create from List
 
     Let i be 0
     While i is less than block_count:
         Let block be proc list_get from List with blocks, i
-        Let successors be proc memory_get_int64 from MemoryCore with block, 24
-        Let succ_count be proc length from List with successors
+        Let block_id be proc get_mir_basic_block_id from CFG with block
+        Let successors be proc get_block_successors from MIR with block
+        Let succ_count be 0
+        If successors is not equal to 0:
+            Set succ_count to proc length from List with successors
+        End If
 
         Note: Check each successor for back edges
         Let si be 0
         While si is less than succ_count:
-            Let successor be proc list_get from List with successors, si
+            Let succ_id be proc list_get from List with successors, si
 
             Note: Check if successor dominates block (back edge)
-            Let is_back_edge be proc dominates from Dominance with dominance_info, successor, block
+            Let is_back_edge be proc dominates from Dominance with dominance_info, succ_id, block_id
 
             If is_back_edge is equal to 1:
-                Note: Found natural loop: successor is header, block is latch
-                Let loop_info be proc allocate from Layout with 32
-                proc memory_set_int64 from MemoryCore with loop_info, 0, successor Note: header
-                proc memory_set_int64 from MemoryCore with loop_info, 8, block Note: latch
-                proc memory_set_int64 from MemoryCore with loop_info, 16, List.create( )  Note: body blocks
-                proc append from List with loops, loop_info
+                Note: Found natural loop: successor is header, block is
+                Note: latch (the loop_info record is file-owned and holds
+                Note: block POINTERS)
+                Let header_block be proc get_block_by_id_from_cfg from CFG with cfg, succ_id
+                If header_block is not equal to 0:
+                    Let loop_info be proc allocate from Layout with 32
+                    proc memory_set_int64 from MemoryCore with loop_info, 0, header_block Note: header
+                    proc memory_set_int64 from MemoryCore with loop_info, 8, block Note: latch
+                    Let body_list be proc list_create from List
+                    proc memory_set_int64 from MemoryCore with loop_info, 16, body_list Note: body blocks
+                    proc append from List with loops, loop_info
+                End If
             End If
 
             Set si to (si plus 1)
@@ -3436,13 +4385,21 @@ Process called "optimize_loops" that takes ctx as Integer returns Integer:
                 If already_in_body is equal to 0:
                     proc append from List with body_blocks, current
 
-                    Note: Add predecessors to worklist
-                    Let preds be proc memory_get_int64 from MemoryCore with current, 16
-                    Let pred_count be proc length from List with preds
+                    Note: Add predecessors to worklist (canonical
+                    Note: predecessor lists hold block IDs - resolve each
+                    Note: to a pointer through the CFG)
+                    Let preds be proc get_block_predecessors from MIR with current
+                    Let pred_count be 0
+                    If preds is not equal to 0:
+                        Set pred_count to proc length from List with preds
+                    End If
                     Let pi be 0
                     While pi is less than pred_count:
-                        Let pred be proc list_get from List with preds, pi
-                        proc append from List with worklist, pred
+                        Let pred_id be proc list_get from List with preds, pi
+                        Let pred be proc get_block_by_id_from_cfg from CFG with cfg, pred_id
+                        If pred is not equal to 0:
+                            proc append from List with worklist, pred
+                        End If
                         Set pi to (pi plus 1)
                     End While
                 End If
@@ -3490,13 +4447,21 @@ Aggressive mode uses more liberal inlining thresholds.
 Process called "inline_functions" that takes ctx as Integer, aggressive as Integer returns Integer:
     Let mir_function be proc memory_get_int64 from MemoryCore with ctx, 0
     Let cfg be proc memory_get_int64 from MemoryCore with ctx, 8
-    Let blocks be proc memory_get_int64 from MemoryCore with cfg, 0
+    Let blocks be proc get_mir_cfg_blocks from CFG with cfg
     Let block_count be proc length from List with blocks
     Let inlined_count be 0
 
-    Let call_graph be proc memory_get_int64 from MemoryCore with ctx, 96
-    If call_graph is equal to 0:
-        Note: No call graph available, cannot inline
+    Note: Callee resolution requires program scope (OD-4: function
+    Note: identity is the MIRFunction pointer; the program's functions
+    Note: List is the only name-to-function authority). Without a program
+    Note: no callee body is reachable and no inlining is possible.
+    Let mir_program be proc memory_get_int64 from MemoryCore with ctx, 136
+    If mir_program is equal to 0:
+        Return 0
+    End If
+    Let program_functions be proc memory_get_int64 from MemoryCore with mir_program, 0
+    Let program_function_count be proc memory_get_int64 from MemoryCore with mir_program, 8
+    If program_functions is equal to 0:
         Return 0
     End If
 
@@ -3504,30 +4469,90 @@ Process called "inline_functions" that takes ctx as Integer, aggressive as Integ
     Let i be 0
     While i is less than block_count:
         Let block be proc list_get from List with blocks, i
-        Let instructions be proc memory_get_int64 from MemoryCore with block, 8
+        Let instructions be proc get_block_instructions from MIR with block
         Let inst_count be proc length from List with instructions
 
         Let j be 0
         While j is less than inst_count:
             Let inst be proc list_get from List with instructions, j
-            Let opcode be proc memory_get_int32 from MemoryCore with inst, 0
+            Let opcode be proc get_mir_node_opcode from MIR with inst
 
             Note: MIR_CALL is 20304 (20300 is MIR_PHI - the old comparison
-            Note: against 20300 matched phi nodes, never calls)
+            Note: against 20300 matched phi nodes, never calls). Indirect
+            Note: calls (20305) have unknowable targets and are never
+            Note: trivially inlined.
             If opcode is equal to 20304:
-                Note: Get called function
-                Let callee be proc memory_get_int64 from MemoryCore with inst, 16
+                Note: Resolve the callee to a MIRFunction pointer. The
+                Note: canonical callee slot (extended offset 80) holds
+                Note: either a function-name string pointer (direct-call
+                Note: contract) or the SSA value id of the lowered callee
+                Note: expression. Resolution never dereferences the raw
+                Note: slot value: (1) the value-id form resolves through
+                Note: the function's value_to_instruction map to a string
+                Note: CONST whose payload names the callee; (2) the
+                Note: name-pointer form resolves by POINTER comparison
+                Note: against each program function's interned name; (3) a
+                Note: program-function pointer matches by identity. An
+                Note: unresolvable callee is simply not inlinable.
+                Let callee_field be proc get_call_callee from MIRNodes with inst
+
+                Let callee_name be 0
+                Let resolved_callee be 0
+
+                If callee_field is not equal to 0:
+                    Let callee_def be proc lookup_defining_instruction from MIR with mir_function, callee_field
+                    If callee_def is not equal to 0:
+                        Let def_opcode be proc get_mir_node_opcode from MIR with callee_def
+                        If def_opcode is equal to 20001:
+                            Let def_is_string be proc is_const_string from MIRNodes with callee_def
+                            If def_is_string is equal to 1:
+                                Set callee_name to proc get_const_string from MIRNodes with callee_def
+                            End If
+                        End If
+                    End If
+
+                    Let fscan be 0
+                    While fscan is less than program_function_count:
+                        Let candidate be proc list_get from List with program_functions, fscan
+                        If candidate is not equal to 0:
+                            If candidate is equal to callee_field:
+                                Set resolved_callee to candidate
+                                Set fscan to program_function_count
+                            Otherwise:
+                                Let candidate_name be proc memory_get_int64 from MemoryCore with candidate, 0
+                                If candidate_name is not equal to 0:
+                                    If candidate_name is equal to callee_field:
+                                        Set resolved_callee to candidate
+                                        Set fscan to program_function_count
+                                    Otherwise:
+                                        If callee_name is not equal to 0:
+                                            Let names_match be proc string_equals from StringCore with candidate_name, callee_name
+                                            If names_match is equal to 1:
+                                                Set resolved_callee to candidate
+                                                Set fscan to program_function_count
+                                            End If
+                                        End If
+                                    End If
+                                End If
+                            End If
+                        End If
+                        Set fscan to (fscan plus 1)
+                    End While
+                End If
 
                 Note: Check if function is inlinable
-                Let is_inlinable be should_inline_function(ctx, callee, aggressive)
+                Let is_inlinable be 0
+                If resolved_callee is not equal to 0:
+                    Set is_inlinable to should_inline_function(ctx, resolved_callee, aggressive)
+                End If
 
                 If is_inlinable is equal to 1:
                     Note: Inline function at this call site
-                    Let success be inline_call_site(ctx, block, j, callee)
+                    Let success be inline_call_site(ctx, block, j, resolved_callee)
                     If success is equal to 1:
                         Set inlined_count to (inlined_count plus 1)
                         Set inst_count to proc length from List with instructions
-                        Note: Don't increment j - instruction was replaced
+                        Set j to (j plus 1)
                     Otherwise:
                         Set j to (j plus 1)
                     End If
@@ -3542,8 +4567,11 @@ Process called "inline_functions" that takes ctx as Integer, aggressive as Integ
         Set i to (i plus 1)
     End While
 
-    Note: Update changed flag if any functions were inlined
+    Note: Update changed flag and statistics if any functions were inlined
     If inlined_count is greater than 0:
+        Let statistics be proc memory_get_int64 from MemoryCore with ctx, 120
+        Let current_inlined be proc memory_get_int32 from MemoryCore with statistics, 20
+        proc memory_set_int32 from MemoryCore with statistics, 20, current_inlined plus inlined_count
         proc memory_set_int32 from MemoryCore with ctx, 80, 1
     End If
 
@@ -3551,16 +4579,28 @@ Process called "inline_functions" that takes ctx as Integer, aggressive as Integ
 End Process
 
 @Implementation
-Tail call optimization converts tail-recursive calls into loops,
-eliminating call overhead and preventing stack growth.
+Tail call optimization identifies calls in tail position and stamps the
+canonical is_tail_call flag (MIRCall extended offset 120) that the LIR
+layer consumes for jmp-vs-call selection.
 
 Algorithm:
-1. Identify tail calls (calls that are immediately followed by return)
-2. For tail-recursive calls (function calls itself):
-   a. Replace arguments with parameter assignments
-   b. Replace call + return with jump to function start
-3. For tail calls to other functions:
-   a. Convert to tail call instruction (if supported by target)
+1. Identify tail calls: a MIR_CALL or MIR_CALL_INDIRECT immediately
+   followed by a MIR_RETURN that returns the call's result (or a void
+   return after a void call).
+2. Stamp is_tail_call = 1 on each confirmed tail call. The LIR tail-call
+   lowering owns argument placement and the actual jump emission, which
+   makes the transform sound for self-recursive and cross-function tail
+   calls alike.
+
+The previous revision attempted a bespoke self-recursion-to-loop rewrite
+that deleted the call+return and jumped to the entry block WITHOUT
+rebinding the call's arguments to the function's parameters - a miscompile
+whenever it fired (it never did: it tested opcode 20300, which is MIR_PHI,
+not MIR_CALL). Under the canonical contract the live parameter lowering
+materializes parameters through allocas rather than the MIRFunction
+parameter List, so a sound MIR-level rebinding has no parameter value ids
+to target; routing every tail call through the canonical flag is the
+complete and correct mechanism.
 
 This is crucial for functional programming patterns and prevents stack overflow.
 @End Implementation
@@ -3568,18 +4608,15 @@ This is crucial for functional programming patterns and prevents stack overflow.
 Process called "optimize_tail_calls" that takes ctx as Integer returns Integer:
     Let mir_function be proc memory_get_int64 from MemoryCore with ctx, 0
     Let cfg be proc memory_get_int64 from MemoryCore with ctx, 8
-    Let blocks be proc memory_get_int64 from MemoryCore with cfg, 0
+    Let blocks be proc get_mir_cfg_blocks from CFG with cfg
     Let block_count be proc length from List with blocks
     Let optimized_count be 0
-
-    Note: Get function pointer for identifying self-recursion
-    Let func_addr be mir_function
 
     Note: Scan all blocks for tail call patterns
     Let i be 0
     While i is less than block_count:
         Let block be proc list_get from List with blocks, i
-        Let instructions be proc memory_get_int64 from MemoryCore with block, 8
+        Let instructions be proc get_block_instructions from MIR with block
         Let inst_count be proc length from List with instructions
 
         Note: Check if block ends with call followed by return
@@ -3587,49 +4624,36 @@ Process called "optimize_tail_calls" that takes ctx as Integer returns Integer:
             Let call_inst be proc list_get from List with instructions, inst_count minus 2
             Let ret_inst be proc list_get from List with instructions, inst_count minus 1
 
-            Let call_opcode be proc memory_get_int32 from MemoryCore with call_inst, 0
-            Let ret_opcode be proc memory_get_int32 from MemoryCore with ret_inst, 0
+            Let call_opcode be proc get_mir_node_opcode from MIR with call_inst
+            Let ret_opcode be proc get_mir_node_opcode from MIR with ret_inst
 
-            Note: MIR_CALL is 20300, MIR_RETURN is 20303
-            If call_opcode is equal to 20300:
+            Note: MIR_CALL is 20304, MIR_CALL_INDIRECT is 20305,
+            Note: MIR_RETURN is 20303
+            Let is_call be 0
+            If call_opcode is equal to 20304:
+                Set is_call to 1
+            End If
+            If call_opcode is equal to 20305:
+                Set is_call to 1
+            End If
+
+            If is_call is equal to 1:
                 If ret_opcode is equal to 20303:
-                    Note: This is a tail call - check if it returns the call result
-                    Let call_result be proc memory_get_int32 from MemoryCore with call_inst, 8
-                    Let ret_value be proc memory_get_int32 from MemoryCore with ret_inst, 8
+                    Note: This is a tail-position call - confirm the return
+                    Note: feeds back exactly the call's result (both zero
+                    Note: covers the void-call + void-return shape)
+                    Let call_result be proc get_mir_node_value_id from MIR with call_inst
+                    Let ret_value be proc get_return_value from MIRNodes with ret_inst
 
                     If call_result is equal to ret_value:
-                        Note: Confirmed tail call
-                        Let callee be proc memory_get_int64 from MemoryCore with call_inst, 16
-
-                        Note: Check if self-recursive
-                        If callee is equal to func_addr:
-                            Note: Tail-recursive call - convert to loop
-                            Note: Replace call+return with parameter updates + jump to start
-
-                            Note: Remove call and return instructions
-                            proc list_remove from List with instructions, inst_count minus 1
-                            proc list_remove from List with instructions, inst_count minus 2
-
-                            Note: Add jump to function entry block
-                            Let entry_block be proc list_get from List with blocks, 0
-                            Let jump_inst be proc allocate from Layout with 64
-                            proc memory_set_int32 from MemoryCore with jump_inst, 0, 20302 Note: MIR_JUMP
-                            proc memory_set_int64 from MemoryCore with jump_inst, 8, entry_block
-                            proc append from List with instructions, jump_inst
-
-                            Note: Update CFG edges
-                            Let successors be proc memory_get_int64 from MemoryCore with block, 24
-                            proc list_clear from List with successors
-                            proc append from List with successors, entry_block
-
-                            Let entry_preds be proc memory_get_int64 from MemoryCore with entry_block, 16
-                            proc append from List with entry_preds, block
-
-                            Set optimized_count to (optimized_count plus 1)
-                        Otherwise:
-                            Note: Tail call to different function
-                            Note: Mark as tail call for backend optimization
-                            proc memory_set_int32 from MemoryCore with call_inst, 32, 1 Note: Set tail call flag
+                        Note: Confirmed tail call - stamp the canonical
+                        Note: is_tail_call flag (extended offset 120) for
+                        Note: the LIR jmp-vs-call selector. Already-stamped
+                        Note: calls are not recounted so the O3 pipeline
+                        Note: reaches a fixpoint.
+                        Let already_tail be proc is_tail_call from MIRNodes with call_inst
+                        If already_tail is equal to 0:
+                            proc memory_set_int64 from MemoryCore with call_inst, 120, 1
                             Set optimized_count to (optimized_count plus 1)
                         End If
                     End If
@@ -3640,8 +4664,11 @@ Process called "optimize_tail_calls" that takes ctx as Integer returns Integer:
         Set i to (i plus 1)
     End While
 
-    Note: Update changed flag if any tail calls optimized
+    Note: Update changed flag and statistics if any tail calls optimized
     If optimized_count is greater than 0:
+        Let statistics be proc memory_get_int64 from MemoryCore with ctx, 120
+        Let current_tail be proc memory_get_int32 from MemoryCore with statistics, 28
+        proc memory_set_int32 from MemoryCore with statistics, 28, current_tail plus optimized_count
         proc memory_set_int32 from MemoryCore with ctx, 80, 1
     End If
 
@@ -3649,36 +4676,55 @@ Process called "optimize_tail_calls" that takes ctx as Integer returns Integer:
 End Process
 
 Process called "reduce_strength" that takes ctx as Integer returns Integer:
-    Note: Strength reduction: replace expensive operations with cheaper equivalents
-    Note: Example: x * 2 → x shifted left by 1, x / 8 → x shifted right by 3
+    Note: Strength reduction: replace expensive operations with cheaper
+    Note: equivalents. Example: x * 2 -> x shifted left by 1.
+    Note: Under the canonical contract operand slots hold SSA value-id
+    Note: USES, never immediates - so the shift amount must be
+    Note: materialized as a fresh CONST instruction with its own value id,
+    Note: inserted before the reduced instruction, and referenced as
+    Note: operand2 (header slot 24 and the binop's extended right slot 88).
     Let cfg be proc memory_get_int64 from MemoryCore with ctx, 8
-    Let blocks be proc memory_get_int64 from MemoryCore with cfg, 0
+    Let blocks be proc get_mir_cfg_blocks from CFG with cfg
     Let block_count be proc length from List with blocks
+    Let mir_function be proc memory_get_int64 from MemoryCore with ctx, 0
 
     Let reduced_count be 0
 
     Let i be 0
     While i is less than block_count:
         Let block be proc list_get from List with blocks, i
-        Let instructions be proc memory_get_int64 from MemoryCore with block, 8
+        Let instructions be proc get_block_instructions from MIR with block
         Let inst_count be proc length from List with instructions
 
         Let j be 0
         While j is less than inst_count:
             Let inst be proc list_get from List with instructions, j
-            Let opcode be proc memory_get_int32 from MemoryCore with inst, 0
+            Let opcode be proc get_mir_node_opcode from MIR with inst
 
-            Note: Multiplication by power of 2
+            Note: Multiplication by power of 2 (integer only - the shift
+            Note: rewrite is invalid for float multiplication; HIRTypeInfo
+            Note: kind tag TYPE_FLOAT = 13016 lives at type_info offset 0)
             If opcode is equal to 20004:  Note: MIR_MUL
+                Let is_float_mul be 0
+                Let mul_type be proc get_mir_node_type from MIR with inst
+                If mul_type is not equal to 0:
+                    Let mul_type_kind be proc memory_get_int64 from MemoryCore with mul_type, 0
+                    If mul_type_kind is equal to 13016:
+                        Set is_float_mul to 1
+                    End If
+                End If
+
                 Let constant_values be proc memory_get_int64 from MemoryCore with ctx, 72
-                Let operand2 be proc memory_get_int32 from MemoryCore with inst, 24
+                Let operand2 be proc get_mir_node_operand from MIR with inst, 2
                 Let const_val be proc get from Dictionary with constant_values, operand2
 
                 Note: Check if const_val is power of 2
+                Let is_pow2 be 0
                 If const_val is equal to 2 or const_val is equal to 4 or const_val is equal to 8 or const_val is equal to 16:
-                    Note: Replace with left shift
-                    proc memory_set_int32 from MemoryCore with inst, 0, 20014 Note: MIR_SHL
+                    Set is_pow2 to 1
+                End If
 
+                If is_float_mul is equal to 0 and is_pow2 is equal to 1:
                     Note: Compute shift amount
                     Let shift_amount be 1  Note: Default for *2
                     If const_val is equal to 4:
@@ -3691,9 +4737,32 @@ Process called "reduce_strength" that takes ctx as Integer returns Integer:
                         Set shift_amount to 4
                     End If
 
-                    Note: Update operand2 with shift amount
-                    proc memory_set_int32 from MemoryCore with inst, 24, shift_amount
-                    Set reduced_count to reduced_count plus 1
+                    Note: Materialize the shift amount as a fresh CONST
+                    Note: with its own SSA value id, inserted before the
+                    Note: instruction being reduced
+                    Let shift_id be proc allocate_value_id from MIR with mir_function
+                    Let shift_const be proc create_mir_const from MIRNodes with shift_id, shift_amount, mul_type, 0, 0
+                    If shift_const is not equal to 0:
+                        proc set_mir_node_parent_block from MIR with shift_const, block
+                        proc list_insert from List with instructions, j, shift_const
+                        proc register_value_definition from MIR with mir_function, shift_id, shift_const
+                        proc set from Dictionary with constant_values, shift_id, shift_amount
+
+                        Note: Rewrite MUL -> SHL referencing the new const
+                        Note: (header operand2 and the binop ext right slot)
+                        proc set_mir_node_opcode from MIR with inst, 20014 Note: MIR_SHL
+                        proc set_mir_node_operand from MIR with inst, 2, shift_id
+                        proc memory_set_int64 from MemoryCore with inst, 88, shift_id
+
+                        Note: Account for the inserted const: the reduced
+                        Note: instruction now sits at j + 1
+                        Set inst_count to proc length from List with instructions
+                        Let new_inst_total be proc length from List with instructions
+                        proc memory_set_int64 from MemoryCore with block, 24, new_inst_total
+                        Set j to j plus 1
+
+                        Set reduced_count to reduced_count plus 1
+                    End If
                 End If
             End If
 
@@ -3718,57 +4787,85 @@ End Process
 
 Process called "apply_peephole_optimizations" that takes ctx as Integer returns Integer:
     Note: Peephole optimizations: local pattern-based improvements
-    Note: Examples: x + 0 → x, x * 1 → x, x - x → 0
+    Note: Examples: x + 0 -> x, x * 1 -> x, x * 0 -> 0
     Let cfg be proc memory_get_int64 from MemoryCore with ctx, 8
-    Let blocks be proc memory_get_int64 from MemoryCore with cfg, 0
+    Let blocks be proc get_mir_cfg_blocks from CFG with cfg
     Let block_count be proc length from List with blocks
+    Let mir_function be proc memory_get_int64 from MemoryCore with ctx, 0
 
     Let optimized_count be 0
     Let constant_values be proc memory_get_int64 from MemoryCore with ctx, 72
+    Let dead_instructions be proc memory_get_int64 from MemoryCore with ctx, 104
 
     Let i be 0
     While i is less than block_count:
         Let block be proc list_get from List with blocks, i
-        Let instructions be proc memory_get_int64 from MemoryCore with block, 8
+        Let instructions be proc get_block_instructions from MIR with block
         Let inst_count be proc length from List with instructions
 
         Let j be 0
         While j is less than inst_count:
             Let inst be proc list_get from List with instructions, j
-            Let opcode be proc memory_get_int32 from MemoryCore with inst, 0
+            Let opcode be proc get_mir_node_opcode from MIR with inst
 
-            Note: Addition with 0: x + 0 → x
+            Note: Addition with 0: x + 0 -> x. The identity is applied by
+            Note: forwarding every use of the ADD's result to operand1 and
+            Note: marking the ADD dead. Dictionary.contains distinguishes
+            Note: "operand2 is the constant 0" from "operand2 is not a
+            Note: known constant".
             If opcode is equal to 20002:  Note: MIR_ADD
-                Let operand2 be proc memory_get_int32 from MemoryCore with inst, 24
+                Let operand1 be proc get_mir_node_operand from MIR with inst, 1
+                Let operand2 be proc get_mir_node_operand from MIR with inst, 2
+                Let has_const be proc contains from Dictionary with constant_values, operand2
                 Let const_val be proc get from Dictionary with constant_values, operand2
 
-                If const_val is equal to 0:
-                    Note: Result is just operand1, eliminate operation
-                    Set optimized_count to optimized_count plus 1
+                If has_const is equal to 1 and const_val is equal to 0 and operand1 is not equal to 0:
+                    Let add_result be proc get_mir_node_value_id from MIR with inst
+                    If add_result is not equal to 0:
+                        replace_all_uses(ctx, add_result, operand1)
+                        proc set from Dictionary with dead_instructions, inst, 1
+                        Set optimized_count to optimized_count plus 1
+                    End If
                 End If
             End If
 
-            Note: Multiplication by 1: x * 1 → x
+            Note: Multiplication by 1: x * 1 -> x (same forwarding)
             If opcode is equal to 20004:  Note: MIR_MUL
-                Set operand2 to proc memory_get_int32 from MemoryCore with inst, 24
-                Set const_val to proc get from Dictionary with constant_values, operand2
+                Let operand1 be proc get_mir_node_operand from MIR with inst, 1
+                Let operand2 be proc get_mir_node_operand from MIR with inst, 2
+                Let const_val be proc get from Dictionary with constant_values, operand2
 
-                If const_val is equal to 1:
-                    Note: Result is just operand1
-                    Set optimized_count to optimized_count plus 1
+                If const_val is equal to 1 and operand1 is not equal to 0:
+                    Let mul_result be proc get_mir_node_value_id from MIR with inst
+                    If mul_result is not equal to 0:
+                        replace_all_uses(ctx, mul_result, operand1)
+                        proc set from Dictionary with dead_instructions, inst, 1
+                        Set optimized_count to optimized_count plus 1
+                    End If
                 End If
             End If
 
-            Note: Multiplication by 0: x * 0 → 0
+            Note: Multiplication by 0: x * 0 -> 0. The MUL is replaced by a
+            Note: fresh canonical MIRConst of 0 with the same result id
+            Note: (the 104-byte binop record cannot legally be rewritten
+            Note: into a 112-byte const in place).
             If opcode is equal to 20004:  Note: MIR_MUL
-                Set operand2 to proc memory_get_int32 from MemoryCore with inst, 24
-                Set const_val to proc get from Dictionary with constant_values, operand2
+                Let operand2 be proc get_mir_node_operand from MIR with inst, 2
+                Let has_const be proc contains from Dictionary with constant_values, operand2
+                Let const_val be proc get from Dictionary with constant_values, operand2
+                Let already_dead be proc get from Dictionary with dead_instructions, inst
 
-                If const_val is equal to 0:
-                    Note: Replace with constant 0
-                    proc memory_set_int32 from MemoryCore with inst, 0, 20001 Note: MIR_CONST
-                    proc memory_set_int64 from MemoryCore with inst, 16, 0
-                    Set optimized_count to optimized_count plus 1
+                If has_const is equal to 1 and const_val is equal to 0 and already_dead is equal to 0:
+                    Let mul_result be proc get_mir_node_value_id from MIR with inst
+                    Let mul_type be proc get_mir_node_type from MIR with inst
+                    Let zero_const be proc create_mir_const from MIRNodes with mul_result, 0, mul_type, 0, 0
+                    If zero_const is not equal to 0:
+                        proc set_mir_node_parent_block from MIR with zero_const, block
+                        proc list_set from List with instructions, j, zero_const
+                        proc register_value_definition from MIR with mir_function, mul_result, zero_const
+                        proc set from Dictionary with constant_values, mul_result, 0
+                        Set optimized_count to optimized_count plus 1
+                    End If
                 End If
             End If
 
@@ -3777,6 +4874,11 @@ Process called "apply_peephole_optimizations" that takes ctx as Integer returns 
 
         Set i to i plus 1
     End While
+
+    Note: Sweep the instructions made dead by the identity forwarding
+    If optimized_count is greater than 0:
+        remove_dead_instructions(ctx)
+    End If
 
     Note: Update statistics
     Let statistics be proc memory_get_int64 from MemoryCore with ctx, 120

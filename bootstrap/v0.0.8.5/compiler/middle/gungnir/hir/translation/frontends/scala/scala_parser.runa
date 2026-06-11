@@ -31,6 +31,7 @@ Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
 Import "compiler/frontend/primitives/memory/layout.runa" as Layout
 Import "compiler/frontend/primitives/collections/list.runa" as List
 Import "compiler/frontend/primitives/collections/hashtable.runa" as HashTable
+Import "compiler/internal/string_utils.runa" as StringUtils
 Note: AST node type constants
 Constant AST_ERROR as Integer is 0
 Constant AST_PROGRAM as Integer is 1
@@ -139,18 +140,18 @@ then building the parser value with default state, then priming the
 first token via advance_token.
 @End Reasoning
 Process called "create_scala_parser" takes source as String returns Integer:
-    Let lexer be proc create_scala_lexer from source
+    Let lexer be proc create_scala_lexer with source
     Let parser be a value of type ScalaParser with
         lexer as lexer,
         current_token as 0,
         current_token_value as "",
-        errors as proc create_list,
+        errors as proc list_create from List,
         position as 0,
         line as 1,
         column as 1
 
     Note: Get first token
-    Let parser_addr be proc memory_address_of from Layout with parser
+    Let parser_addr be parser
     proc advance_token with parser_addr
 
     Return parser_addr
@@ -167,23 +168,23 @@ Process called "create_ast_node" takes node_type as Integer, value as String ret
     Let node be a value of type ASTNode with
         node_type as node_type,
         value as value,
-        children as proc create_list,
+        children as proc list_create from List,
         line as 0,
         column as 0,
-        attributes as proc create_hash_table
+        attributes as proc hashtable_create from HashTable
 
-    Return proc memory_address_of from Layout with node
+    Return node
 End Process
 
 Note: Add child to AST node
 @Reasoning:
-Appends child to parent.children list. Note the parent is taken as
-ASTNode (by-value) but resolved via memory_get_address - this idiom
-gives us a stable pointer for the children list across calls.
+Appends child to parent.children list. The parent handle is re-bound
+to an ASTNode-typed local - struct values are heap pointers in this
+compiler, so the binding gives typed field access to the same object.
 @End Reasoning
 Process called "add_child" takes parent as ASTNode, child as Integer:
-    Let parent_node be proc memory_get_address from Layout with parent, 0 of type ASTNode
-    proc add_to_list with parent_node.children, child
+    Let parent_node be parent of type ASTNode
+    proc list_append from List with parent_node.children, child
 End Process
 
 Note: Set node attribute
@@ -193,8 +194,8 @@ metadata that the fixed schema doesn't capture (modifiers, generic
 bounds, annotations).
 @End Reasoning
 Process called "set_node_attribute" takes node as Integer, key as String, value as String:
-    Let node_obj be proc memory_get_address from Layout with node, 0
-    proc set_hash_value with node_obj.attributes, key, value
+    Let node_obj as ASTNode be node
+    proc hashtable_set from HashTable with node_obj.attributes, key, value
 End Process
 
 Note: Get node attribute
@@ -203,8 +204,8 @@ Looks up key in node.attributes; returns the stored value or empty
 string if absent (hash_value default).
 @End Reasoning
 Process called "get_node_attribute" takes node as Integer, key as String returns String:
-    Let node_obj be proc memory_get_address from Layout with node, 0
-    Return proc get_hash_value with node_obj.attributes, key
+    Let node_obj as ASTNode be node
+    Return proc hashtable_get from HashTable with node_obj.attributes, key
 End Process
 
 Note: Advance to next token
@@ -214,7 +215,7 @@ line/column from the lexer's state. The parser maintains its own snapshot
 so token-position queries don't dive into the lexer per call.
 @End Reasoning
 Process called "advance_token" takes parser as Integer:
-    Let parser_obj be proc memory_get_address from Layout with parser, 0
+    Let parser_obj as ScalaParser be parser
     Set parser_obj.current_token to proc next_scala_token with parser_obj.lexer
     Set parser_obj.position to proc get_lexer_position with parser_obj.lexer
     Set parser_obj.line to proc get_lexer_line with parser_obj.lexer
@@ -224,18 +225,29 @@ End Process
 Note: Peek at next token without consuming it
 @Reasoning:
 Returns the type of the token AFTER current without committing the
-cursor. The current implementation does a forward fetch and relies on
-the lexer's save/restore for non-destructive lookahead.
+cursor. The full lexer cursor state (position, line, column,
+current_char, error_message) is snapshotted before the forward fetch
+and restored afterwards, so the lookahead is genuinely non-destructive
+even when the peeked token sets a lexer error.
 @End Reasoning
 Process called "peek_token" takes parser as Integer returns Integer:
-    Let parser_obj be proc memory_get_address from Layout with parser, 0
-    Let saved_position be proc get_lexer_position with parser_obj.lexer
-    Let saved_line be proc get_lexer_line with parser_obj.lexer
-    Let saved_column be proc get_lexer_column with parser_obj.lexer
+    Let parser_obj as ScalaParser be parser
+    Let lexer_obj as ScalaLexer be parser_obj.lexer
+    Let saved_position be lexer_obj.position
+    Let saved_line be lexer_obj.line
+    Let saved_column be lexer_obj.column
+    Let saved_char be lexer_obj.current_char
+    Let saved_error be lexer_obj.error_message
 
     Let next_token be proc next_scala_token with parser_obj.lexer
 
-    Note: Restore lexer state ( - in deployment needs proper state management)
+    Note: Restore the complete lexer cursor state
+    Set lexer_obj.position to saved_position
+    Set lexer_obj.line to saved_line
+    Set lexer_obj.column to saved_column
+    Set lexer_obj.current_char to saved_char
+    Set lexer_obj.error_message to saved_error
+
     Return next_token
 End Process
 
@@ -245,7 +257,7 @@ Non-consuming predicate: returns true iff current_token equals expected.
 Used for optional-token decisions without committing the cursor.
 @End Reasoning
 Process called "match_token" takes parser as Integer, expected as Integer returns Boolean:
-    Let parser_obj be proc memory_get_address from Layout with parser, 0
+    Let parser_obj as ScalaParser be parser
     Return parser_obj.current_token is equal to expected
 End Process
 
@@ -257,7 +269,7 @@ Caller decides whether the miss is a syntax error.
 @End Reasoning
 Process called "consume_token" takes parser as Integer, expected as Integer returns Boolean:
     If proc match_token with parser, expected:
-        proc advance_token from parser
+        proc advance_token with parser
         Return true
     End If
     Return false
@@ -270,8 +282,8 @@ caller sees all errors at once rather than only the first; useful for
 batch diagnostics.
 @End Reasoning
 Process called "add_parser_error" takes parser as Integer, message as String:
-    Let parser_obj be proc memory_get_address from Layout with parser, 0
-    proc add_to_list with parser_obj.errors, message
+    Let parser_obj as ScalaParser be parser
+    proc list_append from List with parser_obj.errors, message
 End Process
 
 Note: Skip to next statement or declaration
@@ -282,17 +294,17 @@ so parsing can resume at the next statement. Allows multiple errors
 to be reported per file rather than aborting on first.
 @End Reasoning
 Process called "skip_to_recovery" takes parser as Integer:
-    Let parser_obj be proc memory_get_address from Layout with parser, 0
+    Let parser_obj as ScalaParser be parser
 
     While parser_obj.current_token is not equal to TOKEN_EOF and
           parser_obj.current_token is not equal to TOKEN_SEMICOLON and
           parser_obj.current_token is not equal to TOKEN_NEWLINE and
           parser_obj.current_token is not equal to TOKEN_RIGHT_BRACE:
-        proc advance_token from parser
+        proc advance_token with parser
     End While
 
     If parser_obj.current_token is equal to TOKEN_SEMICOLON or parser_obj.current_token is equal to TOKEN_NEWLINE:
-        proc advance_token from parser
+        proc advance_token with parser
     End If
 End Process
 
@@ -303,12 +315,12 @@ top-level declarations until EOF. Error recovery via skip_to_recovery
 keeps parsing alive after a malformed declaration.
 @End Reasoning
 Process called "parse_scala_compilation_unit" takes parser as Integer returns Integer:
-    Let parser_obj be proc memory_get_address from Layout with parser, 0
+    Let parser_obj as ScalaParser be parser
     Let program be proc create_ast_node with AST_PROGRAM, ""
 
     Note: Parse optional package declaration
     If proc match_token with parser, TOKEN_PACKAGE:
-        Let package_decl be proc parse_package_declaration from parser
+        Let package_decl be proc parse_package_declaration with parser
         If package_decl is not equal to 0:
             proc add_child with program, package_decl
         End If
@@ -316,7 +328,7 @@ Process called "parse_scala_compilation_unit" takes parser as Integer returns In
 
     Note: Parse imports
     While proc match_token with parser, TOKEN_IMPORT:
-        Let import_decl be proc parse_import_declaration from parser
+        Let import_decl be proc parse_import_declaration with parser
         If import_decl is not equal to 0:
             proc add_child with program, import_decl
         End If
@@ -324,11 +336,11 @@ Process called "parse_scala_compilation_unit" takes parser as Integer returns In
 
     Note: Parse top-level declarations
     While parser_obj.current_token is not equal to TOKEN_EOF:
-        Let decl be proc parse_top_level_declaration from parser
+        Let decl be proc parse_top_level_declaration with parser
         If decl is not equal to 0:
             proc add_child with program, decl
         Otherwise:
-            proc skip_to_recovery from parser
+            proc skip_to_recovery with parser
         End If
     End While
 
@@ -342,7 +354,7 @@ package nesting via successive dots; qualified identifier handles the
 full dotted path.
 @End Reasoning
 Process called "parse_package_declaration" takes parser as Integer returns Integer:
-    Let parser_obj be proc memory_get_address from Layout with parser, 0
+    Let parser_obj as ScalaParser be parser
 
     If not proc consume_token with parser, TOKEN_PACKAGE:
         proc add_parser_error with parser, "Expected 'package'"
@@ -350,7 +362,7 @@ Process called "parse_package_declaration" takes parser as Integer returns Integ
     End If
 
     Let package_node be proc create_ast_node with AST_PACKAGE, ""
-    Let package_name be proc parse_qualified_identifier from parser
+    Let package_name be proc parse_qualified_identifier with parser
 
     If package_name is not equal to 0:
         proc add_child with package_node, package_name
@@ -373,7 +385,7 @@ choosing names (import x.{A, B => C, _}). Each selector can be a plain
 name, an alias rename, or a wildcard.
 @End Reasoning
 Process called "parse_import_declaration" takes parser as Integer returns Integer:
-    Let parser_obj be proc memory_get_address from Layout with parser, 0
+    Let parser_obj as ScalaParser be parser
 
     If not proc consume_token with parser, TOKEN_IMPORT:
         proc add_parser_error with parser, "Expected 'import'"
@@ -381,7 +393,7 @@ Process called "parse_import_declaration" takes parser as Integer returns Intege
     End If
 
     Let import_node be proc create_ast_node with AST_IMPORT, ""
-    Let import_path be proc parse_import_path from parser
+    Let import_path be proc parse_import_path with parser
 
     If import_path is not equal to 0:
         proc add_child with import_node, import_path
@@ -404,22 +416,22 @@ references. Produced as a single QUALIFIED_IDENTIFIER node whose value
 is the joined dot-string.
 @End Reasoning
 Process called "parse_qualified_identifier" takes parser as Integer returns Integer:
-    Let parser_obj be proc memory_get_address from Layout with parser, 0
+    Let parser_obj as ScalaParser be parser
     Let result be proc create_ast_node with AST_IDENTIFIER, ""
-    Let name_parts be proc create_list
+    Let name_parts be proc list_create from List
 
     If not proc match_token with parser, TOKEN_IDENTIFIER:
         proc add_parser_error with parser, "Expected identifier"
         Return 0
     End If
 
-    proc add_to_list with name_parts, parser_obj.current_token_value
-    proc advance_token from parser
+    proc list_append from List with name_parts, parser_obj.current_token_value
+    proc advance_token with parser
 
     While proc consume_token with parser, TOKEN_DOT:
         If proc match_token with parser, TOKEN_IDENTIFIER:
-            proc add_to_list with name_parts, parser_obj.current_token_value
-            proc advance_token from parser
+            proc list_append from List with name_parts, parser_obj.current_token_value
+            proc advance_token with parser
         Otherwise:
             proc add_parser_error with parser, "Expected identifier after '.'"
             Return 0
@@ -429,12 +441,12 @@ Process called "parse_qualified_identifier" takes parser as Integer returns Inte
     Note: Join name parts with dots
     Let full_name be ""
     Let i be 0
-    While i is less than proc get_list_size from name_parts:
+    While i is less than proc list_length from List with name_parts:
         If i is greater than 0:
-            Set full_name to proc string_append from StringCore with full_name, "."
+            Set full_name to proc string_concat from StringUtils with full_name, "."
         End If
-        Let part be proc get_from_list with name_parts, i
-        Set full_name to proc string_append from StringCore with full_name, part
+        Let part be proc list_get from List with name_parts, i
+        Set full_name to proc string_concat from StringUtils with full_name, part
         Set i to i plus 1
     End While
 
@@ -452,8 +464,8 @@ Process called "parse_import_path" takes parser as Integer returns Integer:
     Note: parser_obj was referenced (lines 379/386 below) but never bound in the
     Note: original source. Without this Let the codegen reports
     Note: [CODEGEN ERROR] Unknown variable 'parser_obj'.
-    Let parser_obj be proc memory_get_address from Layout with parser, 0
-    Let qualified_id be proc parse_qualified_identifier from parser
+    Let parser_obj as ScalaParser be parser
+    Let qualified_id be proc parse_qualified_identifier with parser
 
     If qualified_id is equal to 0:
         Return 0
@@ -461,7 +473,7 @@ Process called "parse_import_path" takes parser as Integer returns Integer:
 
     Note: Handle import selectors {x, y, z}
     If proc match_token with parser, TOKEN_LEFT_BRACE:
-        proc advance_token from parser
+        proc advance_token with parser
 
         Let selector_list be proc create_ast_node with AST_LIST_LITERAL, "selectors"
 
@@ -469,13 +481,13 @@ Process called "parse_import_path" takes parser as Integer returns Integer:
             If proc match_token with parser, TOKEN_IDENTIFIER:
                 Let selector be proc create_ast_node with AST_IDENTIFIER, parser_obj.current_token_value
                 proc add_child with selector_list, selector
-                proc advance_token from parser
+                proc advance_token with parser
 
                 Note: Handle rename (x => y)
                 If proc consume_token with parser, TOKEN_DOUBLE_ARROW:
                     If proc match_token with parser, TOKEN_IDENTIFIER:
                         proc set_node_attribute with selector, "rename", parser_obj.current_token_value
-                        proc advance_token from parser
+                        proc advance_token with parser
                     Otherwise:
                         proc add_parser_error with parser, "Expected identifier after '=>'"
                     End If
@@ -520,16 +532,16 @@ abstract/final/sealed/implicit) are collected first then passed down to
 the kind-specific parser.
 @End Reasoning
 Process called "parse_top_level_declaration" takes parser as Integer returns Integer:
-    Let parser_obj be proc memory_get_address from Layout with parser, 0
+    Let parser_obj as ScalaParser be parser
 
     Note: Parse modifiers and annotations
-    Let modifiers be proc parse_modifiers from parser
+    Let modifiers be proc parse_modifiers with parser
 
     Note: Parse main declaration
     If proc match_token with parser, TOKEN_CLASS:
         Return proc parse_class_declaration with parser, modifiers
     Otherwise If proc match_token with parser, TOKEN_CASE:
-        proc advance_token from parser
+        proc advance_token with parser
         If proc match_token with parser, TOKEN_CLASS:
             Return proc parse_case_class_declaration with parser, modifiers
         Otherwise:
@@ -562,34 +574,34 @@ abstract, final, sealed, implicit, override, lazy, etc.) plus annotations
 as written in the source.
 @End Reasoning
 Process called "parse_modifiers" takes parser as Integer returns Integer:
-    Let parser_obj be proc memory_get_address from Layout with parser, 0
-    Let modifiers be proc create_list
+    Let parser_obj as ScalaParser be parser
+    Let modifiers be proc list_create from List
 
     While true:
         If proc match_token with parser, TOKEN_PRIVATE:
-            proc add_to_list with modifiers, "private"
-            proc advance_token from parser
+            proc list_append from List with modifiers, "private"
+            proc advance_token with parser
         Otherwise If proc match_token with parser, TOKEN_PROTECTED:
-            proc add_to_list with modifiers, "protected"
-            proc advance_token from parser
+            proc list_append from List with modifiers, "protected"
+            proc advance_token with parser
         Otherwise If proc match_token with parser, TOKEN_OVERRIDE:
-            proc add_to_list with modifiers, "override"
-            proc advance_token from parser
+            proc list_append from List with modifiers, "override"
+            proc advance_token with parser
         Otherwise If proc match_token with parser, TOKEN_FINAL:
-            proc add_to_list with modifiers, "final"
-            proc advance_token from parser
+            proc list_append from List with modifiers, "final"
+            proc advance_token with parser
         Otherwise If proc match_token with parser, TOKEN_SEALED:
-            proc add_to_list with modifiers, "sealed"
-            proc advance_token from parser
+            proc list_append from List with modifiers, "sealed"
+            proc advance_token with parser
         Otherwise If proc match_token with parser, TOKEN_ABSTRACT:
-            proc add_to_list with modifiers, "abstract"
-            proc advance_token from parser
+            proc list_append from List with modifiers, "abstract"
+            proc advance_token with parser
         Otherwise If proc match_token with parser, TOKEN_IMPLICIT:
-            proc add_to_list with modifiers, "implicit"
-            proc advance_token from parser
+            proc list_append from List with modifiers, "implicit"
+            proc advance_token with parser
         Otherwise If proc match_token with parser, TOKEN_LAZY:
-            proc add_to_list with modifiers, "lazy"
-            proc advance_token from parser
+            proc list_append from List with modifiers, "lazy"
+            proc advance_token with parser
         Otherwise:
             Break
         End If
@@ -605,7 +617,7 @@ Scala class. Supports type parameters with variance/bounds, a primary
 constructor parameter list, extends clause with mixin traits via with.
 @End Reasoning
 Process called "parse_class_declaration" takes parser as Integer, modifiers as Integer returns Integer:
-    Let parser_obj be proc memory_get_address from Layout with parser, 0
+    Let parser_obj as ScalaParser be parser
 
     If not proc consume_token with parser, TOKEN_CLASS:
         proc add_parser_error with parser, "Expected 'class'"
@@ -618,11 +630,11 @@ Process called "parse_class_declaration" takes parser as Integer, modifiers as I
     End If
 
     Let class_node be proc create_ast_node with AST_CLASS, parser_obj.current_token_value
-    proc advance_token from parser
+    proc advance_token with parser
 
     Note: Parse type parameters
     If proc match_token with parser, TOKEN_LEFT_BRACKET:
-        Let type_params be proc parse_type_parameter_list from parser
+        Let type_params be proc parse_type_parameter_list with parser
         If type_params is not equal to 0:
             proc add_child with class_node, type_params
         End If
@@ -630,7 +642,7 @@ Process called "parse_class_declaration" takes parser as Integer, modifiers as I
 
     Note: Parse primary constructor
     If proc match_token with parser, TOKEN_LEFT_PAREN:
-        Let constructor be proc parse_parameter_list from parser
+        Let constructor be proc parse_parameter_list with parser
         If constructor is not equal to 0:
             proc add_child with class_node, constructor
         End If
@@ -638,7 +650,7 @@ Process called "parse_class_declaration" takes parser as Integer, modifiers as I
 
     Note: Parse extends clause
     If proc consume_token with parser, TOKEN_EXTENDS:
-        Let parent_type be proc parse_type from parser
+        Let parent_type be proc parse_type with parser
         If parent_type is not equal to 0:
             proc add_child with class_node, parent_type
         End If
@@ -646,7 +658,7 @@ Process called "parse_class_declaration" takes parser as Integer, modifiers as I
 
     Note: Parse with clauses (mixins)
     While proc consume_token with parser, TOKEN_WITH:
-        Let mixin_type be proc parse_type from parser
+        Let mixin_type be proc parse_type with parser
         If mixin_type is not equal to 0:
             proc add_child with class_node, mixin_type
         End If
@@ -654,7 +666,7 @@ Process called "parse_class_declaration" takes parser as Integer, modifiers as I
 
     Note: Parse class body
     If proc match_token with parser, TOKEN_LEFT_BRACE:
-        Let body be proc parse_class_body from parser
+        Let body be proc parse_class_body with parser
         If body is not equal to 0:
             proc add_child with class_node, body
         End If
@@ -673,7 +685,7 @@ members.
 Process called "parse_case_class_declaration" takes parser as Integer, modifiers as Integer returns Integer:
     Let class_node be proc parse_class_declaration with parser, modifiers
     If class_node is not equal to 0:
-        Let class_obj be proc memory_get_address from Layout with class_node, 0 of type ASTNode
+        Let class_obj as ASTNode be class_node
         Set class_obj.node_type to AST_CASE_CLASS
     End If
     Return class_node
@@ -686,7 +698,7 @@ to static class in Java but as a first-class value). Can extend and
 mix in traits like classes.
 @End Reasoning
 Process called "parse_object_declaration" takes parser as Integer, modifiers as Integer returns Integer:
-    Let parser_obj be proc memory_get_address from Layout with parser, 0
+    Let parser_obj as ScalaParser be parser
 
     If not proc consume_token with parser, TOKEN_OBJECT:
         proc add_parser_error with parser, "Expected 'object'"
@@ -699,11 +711,11 @@ Process called "parse_object_declaration" takes parser as Integer, modifiers as 
     End If
 
     Let object_node be proc create_ast_node with AST_OBJECT, parser_obj.current_token_value
-    proc advance_token from parser
+    proc advance_token with parser
 
     Note: Parse extends clause
     If proc consume_token with parser, TOKEN_EXTENDS:
-        Let parent_type be proc parse_type from parser
+        Let parent_type be proc parse_type with parser
         If parent_type is not equal to 0:
             proc add_child with object_node, parent_type
         End If
@@ -711,7 +723,7 @@ Process called "parse_object_declaration" takes parser as Integer, modifiers as 
 
     Note: Parse with clauses (mixins)
     While proc consume_token with parser, TOKEN_WITH:
-        Let mixin_type be proc parse_type from parser
+        Let mixin_type be proc parse_type with parser
         If mixin_type is not equal to 0:
             proc add_child with object_node, mixin_type
         End If
@@ -719,7 +731,7 @@ Process called "parse_object_declaration" takes parser as Integer, modifiers as 
 
     Note: Parse object body
     If proc match_token with parser, TOKEN_LEFT_BRACE:
-        Let body be proc parse_class_body from parser
+        Let body be proc parse_class_body with parser
         If body is not equal to 0:
             proc add_child with object_node, body
         End If
@@ -735,7 +747,7 @@ Note: Parse trait declaration
 concrete state - more powerful than Java interfaces.
 @End Reasoning
 Process called "parse_trait_declaration" takes parser as Integer, modifiers as Integer returns Integer:
-    Let parser_obj be proc memory_get_address from Layout with parser, 0
+    Let parser_obj as ScalaParser be parser
 
     If not proc consume_token with parser, TOKEN_TRAIT:
         proc add_parser_error with parser, "Expected 'trait'"
@@ -748,11 +760,11 @@ Process called "parse_trait_declaration" takes parser as Integer, modifiers as I
     End If
 
     Let trait_node be proc create_ast_node with AST_TRAIT, parser_obj.current_token_value
-    proc advance_token from parser
+    proc advance_token with parser
 
     Note: Parse type parameters
     If proc match_token with parser, TOKEN_LEFT_BRACKET:
-        Let type_params be proc parse_type_parameter_list from parser
+        Let type_params be proc parse_type_parameter_list with parser
         If type_params is not equal to 0:
             proc add_child with trait_node, type_params
         End If
@@ -760,7 +772,7 @@ Process called "parse_trait_declaration" takes parser as Integer, modifiers as I
 
     Note: Parse extends clause
     If proc consume_token with parser, TOKEN_EXTENDS:
-        Let parent_type be proc parse_type from parser
+        Let parent_type be proc parse_type with parser
         If parent_type is not equal to 0:
             proc add_child with trait_node, parent_type
         End If
@@ -768,7 +780,7 @@ Process called "parse_trait_declaration" takes parser as Integer, modifiers as I
 
     Note: Parse with clauses (mixins)
     While proc consume_token with parser, TOKEN_WITH:
-        Let mixin_type be proc parse_type from parser
+        Let mixin_type be proc parse_type with parser
         If mixin_type is not equal to 0:
             proc add_child with trait_node, mixin_type
         End If
@@ -776,7 +788,7 @@ Process called "parse_trait_declaration" takes parser as Integer, modifiers as I
 
     Note: Parse trait body
     If proc match_token with parser, TOKEN_LEFT_BRACE:
-        Let body be proc parse_class_body from parser
+        Let body be proc parse_class_body with parser
         If body is not equal to 0:
             proc add_child with trait_node, body
         End If
@@ -792,7 +804,7 @@ variance markers (+T/-T), upper/lower bounds (<:/>:), and context bounds
 (T : Ord requires implicit Ord[T]).
 @End Reasoning
 Process called "parse_type_parameter_list" takes parser as Integer returns Integer:
-    Let parser_obj be proc memory_get_address from Layout with parser, 0
+    Let parser_obj as ScalaParser be parser
 
     If not proc consume_token with parser, TOKEN_LEFT_BRACKET:
         proc add_parser_error with parser, "Expected '['"
@@ -802,7 +814,7 @@ Process called "parse_type_parameter_list" takes parser as Integer returns Integ
     Let param_list be proc create_ast_node with AST_PARAMETER_LIST, "type_parameters"
 
     While not proc match_token with parser, TOKEN_RIGHT_BRACKET and not proc match_token with parser, TOKEN_EOF:
-        Let type_param be proc parse_type_parameter from parser
+        Let type_param be proc parse_type_parameter with parser
         If type_param is not equal to 0:
             proc add_child with param_list, type_param
         End If
@@ -829,7 +841,7 @@ Variance markers (+/-) prefix the name; bounds and context bounds follow
 as separate clauses. Each constraint becomes an attribute on the node.
 @End Reasoning
 Process called "parse_type_parameter" takes parser as Integer returns Integer:
-    Let parser_obj be proc memory_get_address from Layout with parser, 0
+    Let parser_obj as ScalaParser be parser
 
     If not proc match_token with parser, TOKEN_IDENTIFIER:
         proc add_parser_error with parser, "Expected type parameter name"
@@ -837,21 +849,21 @@ Process called "parse_type_parameter" takes parser as Integer returns Integer:
     End If
 
     Let type_param be proc create_ast_node with AST_TYPE_PARAMETER, parser_obj.current_token_value
-    proc advance_token from parser
+    proc advance_token with parser
 
     Note: Parse variance annotations
     If proc match_token with parser, TOKEN_PLUS:
         proc set_node_attribute with type_param, "variance", "covariant"
-        proc advance_token from parser
+        proc advance_token with parser
     Otherwise If proc match_token with parser, TOKEN_MINUS:
         proc set_node_attribute with type_param, "variance", "contravariant"
-        proc advance_token from parser
+        proc advance_token with parser
     End If
 
     Note: Parse upper bound (<:)
     If proc match_token with parser, TOKEN_TYPE_BOUND_UPPER:
-        proc advance_token from parser
-        Let upper_bound be proc parse_type from parser
+        proc advance_token with parser
+        Let upper_bound be proc parse_type with parser
         If upper_bound is not equal to 0:
             proc set_node_attribute with type_param, "upper_bound", "true"
             proc add_child with type_param, upper_bound
@@ -860,8 +872,8 @@ Process called "parse_type_parameter" takes parser as Integer returns Integer:
 
     Note: Parse lower bound (>:)
     If proc match_token with parser, TOKEN_TYPE_BOUND_LOWER:
-        proc advance_token from parser
-        Let lower_bound be proc parse_type from parser
+        proc advance_token with parser
+        Let lower_bound be proc parse_type with parser
         If lower_bound is not equal to 0:
             proc set_node_attribute with type_param, "lower_bound", "true"
             proc add_child with type_param, lower_bound
@@ -870,8 +882,8 @@ Process called "parse_type_parameter" takes parser as Integer returns Integer:
 
     Note: Parse view bound (<%
     If proc match_token with parser, TOKEN_VIEW_BOUND:
-        proc advance_token from parser
-        Let view_bound be proc parse_type from parser
+        proc advance_token with parser
+        Let view_bound be proc parse_type with parser
         If view_bound is not equal to 0:
             proc set_node_attribute with type_param, "view_bound", "true"
             proc add_child with type_param, view_bound
@@ -880,8 +892,8 @@ Process called "parse_type_parameter" takes parser as Integer returns Integer:
 
     Note: Parse context bound (:)
     If proc match_token with parser, TOKEN_CONTEXT_BOUND:
-        proc advance_token from parser
-        Let context_bound be proc parse_type from parser
+        proc advance_token with parser
+        Let context_bound be proc parse_type with parser
         If context_bound is not equal to 0:
             proc set_node_attribute with type_param, "context_bound", "true"
             proc add_child with type_param, context_bound
@@ -898,7 +910,7 @@ lists (currying) and implicit lists ((implicit ev: Ord[T])). Each list
 becomes a sub-node of the function/method signature.
 @End Reasoning
 Process called "parse_parameter_list" takes parser as Integer returns Integer:
-    Let parser_obj be proc memory_get_address from Layout with parser, 0
+    Let parser_obj as ScalaParser be parser
 
     If not proc consume_token with parser, TOKEN_LEFT_PAREN:
         proc add_parser_error with parser, "Expected '('"
@@ -908,7 +920,7 @@ Process called "parse_parameter_list" takes parser as Integer returns Integer:
     Let param_list be proc create_ast_node with AST_PARAMETER_LIST, ""
 
     While not proc match_token with parser, TOKEN_RIGHT_PAREN and not proc match_token with parser, TOKEN_EOF:
-        Let param be proc parse_parameter from parser
+        Let param be proc parse_parameter with parser
         If param is not equal to 0:
             proc add_child with param_list, param
         End If
@@ -935,13 +947,13 @@ modifiers (val/var for primary constructor) and type annotation. Default
 value uses "=" and is optional.
 @End Reasoning
 Process called "parse_parameter" takes parser as Integer returns Integer:
-    Let parser_obj be proc memory_get_address from Layout with parser, 0
+    Let parser_obj as ScalaParser be parser
 
     Note: Handle implicit parameters
     Let is_implicit be false
     If proc match_token with parser, TOKEN_IMPLICIT:
         Set is_implicit to true
-        proc advance_token from parser
+        proc advance_token with parser
     End If
 
     If not proc match_token with parser, TOKEN_IDENTIFIER:
@@ -950,7 +962,7 @@ Process called "parse_parameter" takes parser as Integer returns Integer:
     End If
 
     Let param be proc create_ast_node with AST_PARAMETER, parser_obj.current_token_value
-    proc advance_token from parser
+    proc advance_token with parser
 
     If is_implicit:
         proc set_node_attribute with param, "implicit", "true"
@@ -958,7 +970,7 @@ Process called "parse_parameter" takes parser as Integer returns Integer:
 
     Note: Parse parameter type
     If proc consume_token with parser, TOKEN_COLON:
-        Let param_type be proc parse_type from parser
+        Let param_type be proc parse_type with parser
         If param_type is not equal to 0:
             proc add_child with param, param_type
         End If
@@ -966,7 +978,7 @@ Process called "parse_parameter" takes parser as Integer returns Integer:
 
     Note: Parse default value
     If proc consume_token with parser, TOKEN_ASSIGN:
-        Let default_value be proc parse_expression from parser
+        Let default_value be proc parse_expression with parser
         If default_value is not equal to 0:
             proc set_node_attribute with param, "has_default", "true"
             proc add_child with param, default_value
@@ -983,10 +995,10 @@ parameterised types (Map[K, V]), refined types (T { def f: Int }).
 Falls through to parse_primary_type for atomic types.
 @End Reasoning
 Process called "parse_type" takes parser as Integer returns Integer:
-    Let parser_obj be proc memory_get_address from Layout with parser, 0
+    Let parser_obj as ScalaParser be parser
 
     Note: Handle function types and complex types
-    Let type_expr be proc parse_primary_type from parser
+    Let type_expr be proc parse_primary_type with parser
 
     If type_expr is equal to 0:
         Return 0
@@ -994,8 +1006,8 @@ Process called "parse_type" takes parser as Integer returns Integer:
 
     Note: Handle function types (A => B)
     If proc match_token with parser, TOKEN_DOUBLE_ARROW:
-        proc advance_token from parser
-        Let return_type be proc parse_type from parser
+        proc advance_token with parser
+        Let return_type be proc parse_type with parser
         If return_type is not equal to 0:
             Let function_type be proc create_ast_node with AST_FUNCTION_TYPE, ""
             proc add_child with function_type, type_expr
@@ -1014,16 +1026,16 @@ Atomic type recognisers: named types (Int, MyType), parameterised types
 ((A, B) => C), singleton types (x.type), structural types ({ def m(): Unit }).
 @End Reasoning
 Process called "parse_primary_type" takes parser as Integer returns Integer:
-    Let parser_obj be proc memory_get_address from Layout with parser, 0
+    Let parser_obj as ScalaParser be parser
 
     Note: Handle tuple types
     If proc match_token with parser, TOKEN_LEFT_PAREN:
-        proc advance_token from parser
+        proc advance_token with parser
 
         Let tuple_type be proc create_ast_node with AST_TUPLE_TYPE, ""
 
         While not proc match_token with parser, TOKEN_RIGHT_PAREN and not proc match_token with parser, TOKEN_EOF:
-            Let element_type be proc parse_type from parser
+            Let element_type be proc parse_type with parser
             If element_type is not equal to 0:
                 proc add_child with tuple_type, element_type
             End If
@@ -1046,17 +1058,17 @@ Process called "parse_primary_type" takes parser as Integer returns Integer:
     Note: Handle type identifier
     If proc match_token with parser, TOKEN_IDENTIFIER:
         Let type_node be proc create_ast_node with AST_TYPE, parser_obj.current_token_value
-        proc advance_token from parser
+        proc advance_token with parser
 
         Note: Handle type application (List[String])
         If proc match_token with parser, TOKEN_LEFT_BRACKET:
-            proc advance_token from parser
+            proc advance_token with parser
 
             Let type_app be proc create_ast_node with AST_TYPE_APPLICATION, ""
             proc add_child with type_app, type_node
 
             While not proc match_token with parser, TOKEN_RIGHT_BRACKET and not proc match_token with parser, TOKEN_EOF:
-                Let type_arg be proc parse_type from parser
+                Let type_arg be proc parse_type with parser
                 If type_arg is not equal to 0:
                     proc add_child with type_app, type_arg
                 End If
@@ -1090,7 +1102,7 @@ nested classes/traits/objects. Members are collected in source order
 into the class node's children list.
 @End Reasoning
 Process called "parse_class_body" takes parser as Integer returns Integer:
-    Let parser_obj be proc memory_get_address from Layout with parser, 0
+    Let parser_obj as ScalaParser be parser
 
     If not proc consume_token with parser, TOKEN_LEFT_BRACE:
         proc add_parser_error with parser, "Expected '{'"
@@ -1109,11 +1121,11 @@ Process called "parse_class_body" takes parser as Integer returns Integer:
             Break
         End If
 
-        Let member be proc parse_class_member from parser
+        Let member be proc parse_class_member with parser
         If member is not equal to 0:
             proc add_child with body, member
         Otherwise:
-            proc skip_to_recovery from parser
+            proc skip_to_recovery with parser
         End If
     End While
 
@@ -1130,10 +1142,10 @@ Dispatcher within a class body, routing val/var/def/type/class/object/
 trait declarations. Modifiers are collected first then passed down.
 @End Reasoning
 Process called "parse_class_member" takes parser as Integer returns Integer:
-    Let parser_obj be proc memory_get_address from Layout with parser, 0
+    Let parser_obj as ScalaParser be parser
 
     Note: Parse modifiers
-    Let modifiers be proc parse_modifiers from parser
+    Let modifiers be proc parse_modifiers with parser
 
     Note: Parse member based on keyword
     If proc match_token with parser, TOKEN_DEF:
@@ -1163,7 +1175,7 @@ can be expression-form (= expr) or block-form ({ stmts }). Abstract
 methods omit the body entirely.
 @End Reasoning
 Process called "parse_function_declaration" takes parser as Integer, modifiers as Integer returns Integer:
-    Let parser_obj be proc memory_get_address from Layout with parser, 0
+    Let parser_obj as ScalaParser be parser
 
     If not proc consume_token with parser, TOKEN_DEF:
         proc add_parser_error with parser, "Expected 'def'"
@@ -1176,11 +1188,11 @@ Process called "parse_function_declaration" takes parser as Integer, modifiers a
     End If
 
     Let function_node be proc create_ast_node with AST_FUNCTION, parser_obj.current_token_value
-    proc advance_token from parser
+    proc advance_token with parser
 
     Note: Parse type parameters
     If proc match_token with parser, TOKEN_LEFT_BRACKET:
-        Let type_params be proc parse_type_parameter_list from parser
+        Let type_params be proc parse_type_parameter_list with parser
         If type_params is not equal to 0:
             proc add_child with function_node, type_params
         End If
@@ -1188,7 +1200,7 @@ Process called "parse_function_declaration" takes parser as Integer, modifiers a
 
     Note: Parse parameter lists (can have multiple)
     While proc match_token with parser, TOKEN_LEFT_PAREN:
-        Let param_list be proc parse_parameter_list from parser
+        Let param_list be proc parse_parameter_list with parser
         If param_list is not equal to 0:
             proc add_child with function_node, param_list
         End If
@@ -1196,7 +1208,7 @@ Process called "parse_function_declaration" takes parser as Integer, modifiers a
 
     Note: Parse return type
     If proc consume_token with parser, TOKEN_COLON:
-        Let return_type be proc parse_type from parser
+        Let return_type be proc parse_type with parser
         If return_type is not equal to 0:
             proc set_node_attribute with function_node, "return_type", "true"
             proc add_child with function_node, return_type
@@ -1205,12 +1217,12 @@ Process called "parse_function_declaration" takes parser as Integer, modifiers a
 
     Note: Parse function body
     If proc consume_token with parser, TOKEN_ASSIGN:
-        Let body be proc parse_expression from parser
+        Let body be proc parse_expression with parser
         If body is not equal to 0:
             proc add_child with function_node, body
         End If
     Otherwise If proc match_token with parser, TOKEN_LEFT_BRACE:
-        Set body to proc parse_block_expression from parser
+        Set body to proc parse_block_expression with parser
         If body is not equal to 0:
             proc add_child with function_node, body
         End If
@@ -1226,7 +1238,7 @@ Note: Parse val declaration
 val members in classes generate a getter but no setter.
 @End Reasoning
 Process called "parse_val_declaration" takes parser as Integer, modifiers as Integer returns Integer:
-    Let parser_obj be proc memory_get_address from Layout with parser, 0
+    Let parser_obj as ScalaParser be parser
 
     If not proc consume_token with parser, TOKEN_VAL:
         proc add_parser_error with parser, "Expected 'val'"
@@ -1239,11 +1251,11 @@ Process called "parse_val_declaration" takes parser as Integer, modifiers as Int
     End If
 
     Let val_node be proc create_ast_node with AST_VAL_DECLARATION, parser_obj.current_token_value
-    proc advance_token from parser
+    proc advance_token with parser
 
     Note: Parse type annotation
     If proc consume_token with parser, TOKEN_COLON:
-        Let val_type be proc parse_type from parser
+        Let val_type be proc parse_type with parser
         If val_type is not equal to 0:
             proc add_child with val_node, val_type
         End If
@@ -1251,7 +1263,7 @@ Process called "parse_val_declaration" takes parser as Integer, modifiers as Int
 
     Note: Parse initializer
     If proc consume_token with parser, TOKEN_ASSIGN:
-        Let initializer be proc parse_expression from parser
+        Let initializer be proc parse_expression with parser
         If initializer is not equal to 0:
             proc add_child with val_node, initializer
         End If
@@ -1267,7 +1279,7 @@ getter and setter in class context. Mostly used in transitional code;
 idiomatic Scala prefers immutability.
 @End Reasoning
 Process called "parse_var_declaration" takes parser as Integer, modifiers as Integer returns Integer:
-    Let parser_obj be proc memory_get_address from Layout with parser, 0
+    Let parser_obj as ScalaParser be parser
 
     If not proc consume_token with parser, TOKEN_VAR:
         proc add_parser_error with parser, "Expected 'var'"
@@ -1280,11 +1292,11 @@ Process called "parse_var_declaration" takes parser as Integer, modifiers as Int
     End If
 
     Let var_node be proc create_ast_node with AST_VAR_DECLARATION, parser_obj.current_token_value
-    proc advance_token from parser
+    proc advance_token with parser
 
     Note: Parse type annotation
     If proc consume_token with parser, TOKEN_COLON:
-        Let var_type be proc parse_type from parser
+        Let var_type be proc parse_type with parser
         If var_type is not equal to 0:
             proc add_child with var_node, var_type
         End If
@@ -1292,7 +1304,7 @@ Process called "parse_var_declaration" takes parser as Integer, modifiers as Int
 
     Note: Parse initializer
     If proc consume_token with parser, TOKEN_ASSIGN:
-        Let initializer be proc parse_expression from parser
+        Let initializer be proc parse_expression with parser
         If initializer is not equal to 0:
             proc add_child with var_node, initializer
         End If
@@ -1308,7 +1320,7 @@ complex types and parameterising them; abstract type members (no = RHS)
 are also handled by this routine.
 @End Reasoning
 Process called "parse_type_alias" takes parser as Integer, modifiers as Integer returns Integer:
-    Let parser_obj be proc memory_get_address from Layout with parser, 0
+    Let parser_obj as ScalaParser be parser
 
     If not proc consume_token with parser, TOKEN_TYPE:
         proc add_parser_error with parser, "Expected 'type'"
@@ -1321,11 +1333,11 @@ Process called "parse_type_alias" takes parser as Integer, modifiers as Integer 
     End If
 
     Let type_alias be proc create_ast_node with AST_TYPE_ALIAS, parser_obj.current_token_value
-    proc advance_token from parser
+    proc advance_token with parser
 
     Note: Parse type parameters
     If proc match_token with parser, TOKEN_LEFT_BRACKET:
-        Let type_params be proc parse_type_parameter_list from parser
+        Let type_params be proc parse_type_parameter_list with parser
         If type_params is not equal to 0:
             proc add_child with type_alias, type_params
         End If
@@ -1333,7 +1345,7 @@ Process called "parse_type_alias" takes parser as Integer, modifiers as Integer 
 
     Note: Parse alias target
     If proc consume_token with parser, TOKEN_ASSIGN:
-        Let target_type be proc parse_type from parser
+        Let target_type be proc parse_type with parser
         If target_type is not equal to 0:
             proc add_child with type_alias, target_type
         End If
@@ -1358,19 +1370,19 @@ determined by the operator's first character (per the language spec).
 Operators ending in ":" are right-associative; others left-associative.
 @End Reasoning
 Process called "parse_expression_precedence" takes parser as Integer, min_precedence as Integer returns Integer:
-    Let left be proc parse_primary_expression from parser
+    Let left be proc parse_primary_expression with parser
 
     If left is equal to 0:
         Return 0
     End If
 
     While true:
-        Let precedence be proc get_operator_precedence from parser
+        Let precedence be proc get_operator_precedence with parser
         If precedence is less than min_precedence:
             Break
         End If
 
-        Let operator be proc parse_operator from parser
+        Let operator be proc parse_operator with parser
         If operator is equal to 0:
             Break
         End If
@@ -1402,7 +1414,7 @@ others (highest before unary). The first-char rule lets user-defined
 operators slot into the table automatically.
 @End Reasoning
 Process called "get_operator_precedence" takes parser as Integer returns Integer:
-    Let parser_obj be proc memory_get_address from Layout with parser, 0
+    Let parser_obj as ScalaParser be parser
 
     If parser_obj.current_token is equal to TOKEN_OR:
         Return 1
@@ -1429,10 +1441,10 @@ Consumes the current operator token and returns its lexeme. Used by the
 precedence climber after get_operator_precedence has decided to consume.
 @End Reasoning
 Process called "parse_operator" takes parser as Integer returns Integer:
-    Let parser_obj be proc memory_get_address from Layout with parser, 0
+    Let parser_obj as ScalaParser be parser
     Let operator_name be proc get_token_name with parser_obj.current_token
     Let operator_node be proc create_ast_node with AST_IDENTIFIER, operator_name
-    proc advance_token from parser
+    proc advance_token with parser
     Return operator_node
 End Process
 
@@ -1444,27 +1456,27 @@ if/match/for/while/try, new, lambda (x => body), tuple literals, and
 forward references.
 @End Reasoning
 Process called "parse_primary_expression" takes parser as Integer returns Integer:
-    Let parser_obj be proc memory_get_address from Layout with parser, 0
+    Let parser_obj as ScalaParser be parser
 
     Note: Handle literals
     If proc is_literal_token with parser_obj.current_token:
         Let literal be proc create_ast_node with AST_LITERAL, parser_obj.current_token_value
         proc set_node_attribute with literal, "literal_type", proc get_token_name with parser_obj.current_token
-        proc advance_token from parser
+        proc advance_token with parser
         Return literal
     End If
 
     Note: Handle identifiers
     If proc match_token with parser, TOKEN_IDENTIFIER:
         Let identifier be proc create_ast_node with AST_IDENTIFIER, parser_obj.current_token_value
-        proc advance_token from parser
+        proc advance_token with parser
 
         Note: Handle function/method calls
         If proc match_token with parser, TOKEN_LEFT_PAREN:
             Let call be proc create_ast_node with AST_FUNCTION_CALL, ""
             proc add_child with call, identifier
 
-            Let args be proc parse_argument_list from parser
+            Let args be proc parse_argument_list with parser
             If args is not equal to 0:
                 proc add_child with call, args
             End If
@@ -1477,7 +1489,7 @@ Process called "parse_primary_expression" takes parser as Integer returns Intege
 
     Note: Handle parenthesized expressions
     If proc consume_token with parser, TOKEN_LEFT_PAREN:
-        Let expr be proc parse_expression from parser
+        Let expr be proc parse_expression with parser
         If not proc consume_token with parser, TOKEN_RIGHT_PAREN:
             proc add_parser_error with parser, "Expected ')'"
         End If
@@ -1486,43 +1498,43 @@ Process called "parse_primary_expression" takes parser as Integer returns Intege
 
     Note: Handle block expressions
     If proc match_token with parser, TOKEN_LEFT_BRACE:
-        Return proc parse_block_expression from parser
+        Return proc parse_block_expression with parser
     End If
 
     Note: Handle if expressions
     If proc match_token with parser, TOKEN_IF:
-        Return proc parse_if_expression from parser
+        Return proc parse_if_expression with parser
     End If
 
     Note: Handle match expressions
     If proc match_token with parser, TOKEN_MATCH:
-        Return proc parse_match_expression from parser
+        Return proc parse_match_expression with parser
     End If
 
     Note: Handle for expressions
     If proc match_token with parser, TOKEN_FOR:
-        Return proc parse_for_expression from parser
+        Return proc parse_for_expression with parser
     End If
 
     Note: Handle while expressions
     If proc match_token with parser, TOKEN_WHILE:
-        Return proc parse_while_expression from parser
+        Return proc parse_while_expression with parser
     End If
 
     Note: Handle try expressions
     If proc match_token with parser, TOKEN_TRY:
-        Return proc parse_try_expression from parser
+        Return proc parse_try_expression with parser
     End If
 
     Note: Handle new expressions
     If proc match_token with parser, TOKEN_NEW:
-        Return proc parse_new_expression from parser
+        Return proc parse_new_expression with parser
     End If
 
     Note: Handle lambda expressions
     If proc match_token with parser, TOKEN_LEFT_PAREN:
         Note: Could be lambda parameters
-        Return proc parse_lambda_expression from parser
+        Return proc parse_lambda_expression with parser
     End If
 
     proc add_parser_error with parser, "Expected expression"
@@ -1536,7 +1548,7 @@ Note: Parse argument list for function calls
 an expression.
 @End Reasoning
 Process called "parse_argument_list" takes parser as Integer returns Integer:
-    Let parser_obj be proc memory_get_address from Layout with parser, 0
+    Let parser_obj as ScalaParser be parser
 
     If not proc consume_token with parser, TOKEN_LEFT_PAREN:
         proc add_parser_error with parser, "Expected '('"
@@ -1546,7 +1558,7 @@ Process called "parse_argument_list" takes parser as Integer returns Integer:
     Let arg_list be proc create_ast_node with AST_LIST_LITERAL, "arguments"
 
     While not proc match_token with parser, TOKEN_RIGHT_PAREN and not proc match_token with parser, TOKEN_EOF:
-        Let arg be proc parse_expression from parser
+        Let arg be proc parse_expression with parser
         If arg is not equal to 0:
             proc add_child with arg_list, arg
         End If
@@ -1574,7 +1586,7 @@ statements; only the last must be an expression (semicolons or newlines
 separate items).
 @End Reasoning
 Process called "parse_block_expression" takes parser as Integer returns Integer:
-    Let parser_obj be proc memory_get_address from Layout with parser, 0
+    Let parser_obj as ScalaParser be parser
 
     If not proc consume_token with parser, TOKEN_LEFT_BRACE:
         proc add_parser_error with parser, "Expected '{'"
@@ -1593,11 +1605,11 @@ Process called "parse_block_expression" takes parser as Integer returns Integer:
             Break
         End If
 
-        Let stmt be proc parse_statement from parser
+        Let stmt be proc parse_statement with parser
         If stmt is not equal to 0:
             proc add_child with block, stmt
         Otherwise:
-            proc skip_to_recovery from parser
+            proc skip_to_recovery with parser
         End If
     End While
 
@@ -1615,7 +1627,7 @@ plus expression statements (return/throw via parse_primary_expression
 chain). Returns 0 on EOF or close-brace.
 @End Reasoning
 Process called "parse_statement" takes parser as Integer returns Integer:
-    Let parser_obj be proc memory_get_address from Layout with parser, 0
+    Let parser_obj as ScalaParser be parser
 
     Note: Handle declarations
     If proc match_token with parser, TOKEN_VAL:
@@ -1625,12 +1637,12 @@ Process called "parse_statement" takes parser as Integer returns Integer:
     Otherwise If proc match_token with parser, TOKEN_DEF:
         Return proc parse_function_declaration with parser, 0
     Otherwise If proc match_token with parser, TOKEN_RETURN:
-        Return proc parse_return_statement from parser
+        Return proc parse_return_statement with parser
     Otherwise If proc match_token with parser, TOKEN_THROW:
-        Return proc parse_throw_statement from parser
+        Return proc parse_throw_statement with parser
     Otherwise:
         Note: Expression statement
-        Let expr be proc parse_expression from parser
+        Let expr be proc parse_expression with parser
         If expr is not equal to 0:
             Let expr_stmt be proc create_ast_node with AST_EXPRESSION_STATEMENT, ""
             proc add_child with expr_stmt, expr
@@ -1646,7 +1658,7 @@ Note: Parse if expression
 a value). Else is optional but if omitted the unit branch returns Unit.
 @End Reasoning
 Process called "parse_if_expression" takes parser as Integer returns Integer:
-    Let parser_obj be proc memory_get_address from Layout with parser, 0
+    Let parser_obj as ScalaParser be parser
 
     If not proc consume_token with parser, TOKEN_IF:
         proc add_parser_error with parser, "Expected 'if'"
@@ -1657,21 +1669,21 @@ Process called "parse_if_expression" takes parser as Integer returns Integer:
 
     Note: Parse condition (optional parentheses)
     proc consume_token with parser, TOKEN_LEFT_PAREN
-    Let condition be proc parse_expression from parser
+    Let condition be proc parse_expression with parser
     If condition is not equal to 0:
         proc add_child with if_expr, condition
     End If
     proc consume_token with parser, TOKEN_RIGHT_PAREN
 
     Note: Parse then branch
-    Let then_branch be proc parse_expression from parser
+    Let then_branch be proc parse_expression with parser
     If then_branch is not equal to 0:
         proc add_child with if_expr, then_branch
     End If
 
     Note: Parse optional else branch
     If proc consume_token with parser, TOKEN_ELSE:
-        Let else_branch be proc parse_expression from parser
+        Let else_branch be proc parse_expression with parser
         If else_branch is not equal to 0:
             proc add_child with if_expr, else_branch
         End If
@@ -1687,9 +1699,9 @@ Returns the body of the first matching case. Exhaustiveness is checked
 by the type system later (case classes form sealed hierarchies).
 @End Reasoning
 Process called "parse_match_expression" takes parser as Integer returns Integer:
-    Let parser_obj be proc memory_get_address from Layout with parser, 0
+    Let parser_obj as ScalaParser be parser
 
-    Let scrutinee be proc parse_expression from parser
+    Let scrutinee be proc parse_expression with parser
     If scrutinee is equal to 0:
         proc add_parser_error with parser, "Expected expression before 'match'"
         Return 0
@@ -1710,11 +1722,11 @@ Process called "parse_match_expression" takes parser as Integer returns Integer:
 
     Note: Parse case clauses
     While not proc match_token with parser, TOKEN_RIGHT_BRACE and not proc match_token with parser, TOKEN_EOF:
-        Let case_clause be proc parse_case_clause from parser
+        Let case_clause be proc parse_case_clause with parser
         If case_clause is not equal to 0:
             proc add_child with match_expr, case_clause
         Otherwise:
-            proc skip_to_recovery from parser
+            proc skip_to_recovery with parser
         End If
     End While
 
@@ -1732,7 +1744,7 @@ Optional guard (boolean condition) filters matches; body is the result
 expression for this case.
 @End Reasoning
 Process called "parse_case_clause" takes parser as Integer returns Integer:
-    Let parser_obj be proc memory_get_address from Layout with parser, 0
+    Let parser_obj as ScalaParser be parser
 
     If not proc consume_token with parser, TOKEN_CASE:
         proc add_parser_error with parser, "Expected 'case'"
@@ -1742,15 +1754,15 @@ Process called "parse_case_clause" takes parser as Integer returns Integer:
     Let case_clause be proc create_ast_node with AST_CASE_CLAUSE, ""
 
     Note: Parse pattern
-    Let pattern be proc parse_pattern from parser
+    Let pattern be proc parse_pattern with parser
     If pattern is not equal to 0:
         proc add_child with case_clause, pattern
     End If
 
     Note: Parse optional guard
     If proc match_token with parser, TOKEN_IF:
-        proc advance_token from parser
-        Let guard be proc parse_expression from parser
+        proc advance_token with parser
+        Let guard be proc parse_expression with parser
         If guard is not equal to 0:
             Let guard_node be proc create_ast_node with AST_GUARD, ""
             proc add_child with guard_node, guard
@@ -1764,7 +1776,7 @@ Process called "parse_case_clause" takes parser as Integer returns Integer:
         Return 0
     End If
 
-    Let body be proc parse_expression from parser
+    Let body be proc parse_expression with parser
     If body is not equal to 0:
         proc add_child with case_clause, body
     End If
@@ -1779,7 +1791,7 @@ patterns (Some(x)), tuple patterns ((a, b)), literal patterns, typed
 patterns (x: T), alternative patterns (a | b), and as-bindings (x @ pat).
 @End Reasoning
 Process called "parse_pattern" takes parser as Integer returns Integer:
-    Let parser_obj be proc memory_get_address from Layout with parser, 0
+    Let parser_obj as ScalaParser be parser
 
     Note: Handle wildcard pattern
     If proc consume_token with parser, TOKEN_UNDERSCORE:
@@ -1789,22 +1801,22 @@ Process called "parse_pattern" takes parser as Integer returns Integer:
     Note: Handle literal patterns
     If proc is_literal_token with parser_obj.current_token:
         Let literal_pattern be proc create_ast_node with AST_LITERAL_PATTERN, parser_obj.current_token_value
-        proc advance_token from parser
+        proc advance_token with parser
         Return literal_pattern
     End If
 
     Note: Handle variable and constructor patterns
     If proc match_token with parser, TOKEN_IDENTIFIER:
         Let pattern_name be parser_obj.current_token_value
-        proc advance_token from parser
+        proc advance_token with parser
 
         Note: Check for constructor pattern
         If proc match_token with parser, TOKEN_LEFT_PAREN:
             Let constructor_pattern be proc create_ast_node with AST_CONSTRUCTOR_PATTERN, pattern_name
 
-            proc advance_token from parser
+            proc advance_token with parser
             While not proc match_token with parser, TOKEN_RIGHT_PAREN and not proc match_token with parser, TOKEN_EOF:
-                Let sub_pattern be proc parse_pattern from parser
+                Let sub_pattern be proc parse_pattern with parser
                 If sub_pattern is not equal to 0:
                     proc add_child with constructor_pattern, sub_pattern
                 End If
@@ -1830,12 +1842,12 @@ Process called "parse_pattern" takes parser as Integer returns Integer:
 
     Note: Handle tuple patterns
     If proc match_token with parser, TOKEN_LEFT_PAREN:
-        proc advance_token from parser
+        proc advance_token with parser
 
         Let tuple_pattern be proc create_ast_node with AST_TUPLE_PATTERN, ""
 
         While not proc match_token with parser, TOKEN_RIGHT_PAREN and not proc match_token with parser, TOKEN_EOF:
-            Let element_pattern be proc parse_pattern from parser
+            Let element_pattern be proc parse_pattern with parser
             If element_pattern is not equal to 0:
                 proc add_child with tuple_pattern, element_pattern
             End If
@@ -1867,7 +1879,7 @@ type system level. yield-form returns a collection; no-yield form
 returns Unit.
 @End Reasoning
 Process called "parse_for_expression" takes parser as Integer returns Integer:
-    Let parser_obj be proc memory_get_address from Layout with parser, 0
+    Let parser_obj as ScalaParser be parser
 
     If not proc consume_token with parser, TOKEN_FOR:
         proc add_parser_error with parser, "Expected 'for'"
@@ -1883,10 +1895,10 @@ Process called "parse_for_expression" takes parser as Integer returns Integer:
             Note: Parse generator (x <- collection)
             If proc match_token with parser, TOKEN_IDENTIFIER:
                 Let var_name be parser_obj.current_token_value
-                proc advance_token from parser
+                proc advance_token with parser
 
                 If proc consume_token with parser, TOKEN_LEFT_ARROW:
-                    Let collection_expr be proc parse_expression from parser
+                    Let collection_expr be proc parse_expression with parser
                     If collection_expr is not equal to 0:
                         Let generator be proc create_ast_node with AST_IDENTIFIER, "generator"
                         proc set_node_attribute with generator, "variable", var_name
@@ -1910,12 +1922,12 @@ Process called "parse_for_expression" takes parser as Integer returns Integer:
 
     Note: Parse yield or do body
     If proc consume_token with parser, TOKEN_YIELD:
-        Let yield_expr be proc parse_expression from parser
+        Let yield_expr be proc parse_expression with parser
         If yield_expr is not equal to 0:
             proc add_child with for_expr, yield_expr
         End If
     Otherwise:
-        Let body_expr be proc parse_expression from parser
+        Let body_expr be proc parse_expression with parser
         If body_expr is not equal to 0:
             proc add_child with for_expr, body_expr
         End If
@@ -1931,7 +1943,7 @@ deprecated do-while; this implementation focuses on the while form
 which remains canonical.
 @End Reasoning
 Process called "parse_while_expression" takes parser as Integer returns Integer:
-    Let parser_obj be proc memory_get_address from Layout with parser, 0
+    Let parser_obj as ScalaParser be parser
 
     If not proc consume_token with parser, TOKEN_WHILE:
         proc add_parser_error with parser, "Expected 'while'"
@@ -1942,14 +1954,14 @@ Process called "parse_while_expression" takes parser as Integer returns Integer:
 
     Note: Parse condition
     proc consume_token with parser, TOKEN_LEFT_PAREN
-    Let condition be proc parse_expression from parser
+    Let condition be proc parse_expression with parser
     If condition is not equal to 0:
         proc add_child with while_expr, condition
     End If
     proc consume_token with parser, TOKEN_RIGHT_PAREN
 
     Note: Parse body
-    Let body be proc parse_expression from parser
+    Let body be proc parse_expression with parser
     If body is not equal to 0:
         proc add_child with while_expr, body
     End If
@@ -1964,7 +1976,7 @@ returning the body's value (or the matched case's value). The catch
 clause is a pattern-match against the thrown exception.
 @End Reasoning
 Process called "parse_try_expression" takes parser as Integer returns Integer:
-    Let parser_obj be proc memory_get_address from Layout with parser, 0
+    Let parser_obj as ScalaParser be parser
 
     If not proc consume_token with parser, TOKEN_TRY:
         proc add_parser_error with parser, "Expected 'try'"
@@ -1974,14 +1986,14 @@ Process called "parse_try_expression" takes parser as Integer returns Integer:
     Let try_expr be proc create_ast_node with AST_TRY_EXPRESSION, ""
 
     Note: Parse try body
-    Let try_body be proc parse_expression from parser
+    Let try_body be proc parse_expression with parser
     If try_body is not equal to 0:
         proc add_child with try_expr, try_body
     End If
 
     Note: Parse catch clause
     If proc consume_token with parser, TOKEN_CATCH:
-        Let catch_body be proc parse_expression from parser
+        Let catch_body be proc parse_expression with parser
         If catch_body is not equal to 0:
             proc add_child with try_expr, catch_body
         End If
@@ -1989,7 +2001,7 @@ Process called "parse_try_expression" takes parser as Integer returns Integer:
 
     Note: Parse finally clause
     If proc consume_token with parser, TOKEN_FINALLY:
-        Let finally_body be proc parse_expression from parser
+        Let finally_body be proc parse_expression with parser
         If finally_body is not equal to 0:
             proc add_child with try_expr, finally_body
         End If
@@ -2005,7 +2017,7 @@ instantiates a class. The body form creates a one-off subclass with
 the given overrides; the call form invokes a constructor.
 @End Reasoning
 Process called "parse_new_expression" takes parser as Integer returns Integer:
-    Let parser_obj be proc memory_get_address from Layout with parser, 0
+    Let parser_obj as ScalaParser be parser
 
     If not proc consume_token with parser, TOKEN_NEW:
         proc add_parser_error with parser, "Expected 'new'"
@@ -2015,14 +2027,14 @@ Process called "parse_new_expression" takes parser as Integer returns Integer:
     Let new_expr be proc create_ast_node with AST_FUNCTION_CALL, "new"
 
     Note: Parse class name and constructor call
-    Let class_name be proc parse_type from parser
+    Let class_name be proc parse_type with parser
     If class_name is not equal to 0:
         proc add_child with new_expr, class_name
     End If
 
     Note: Parse constructor arguments
     If proc match_token with parser, TOKEN_LEFT_PAREN:
-        Let args be proc parse_argument_list from parser
+        Let args be proc parse_argument_list with parser
         If args is not equal to 0:
             proc add_child with new_expr, args
         End If
@@ -2038,13 +2050,13 @@ can omit parentheses around the parameter; multi-parameter must wrap
 in parens. Type annotations on parameters are optional.
 @End Reasoning
 Process called "parse_lambda_expression" takes parser as Integer returns Integer:
-    Let parser_obj be proc memory_get_address from Layout with parser, 0
+    Let parser_obj as ScalaParser be parser
 
     Let lambda_expr be proc create_ast_node with AST_LAMBDA, ""
 
     Note: Parse parameters (if any)
     If proc match_token with parser, TOKEN_LEFT_PAREN:
-        Let params be proc parse_parameter_list from parser
+        Let params be proc parse_parameter_list with parser
         If params is not equal to 0:
             proc add_child with lambda_expr, params
         End If
@@ -2057,7 +2069,7 @@ Process called "parse_lambda_expression" takes parser as Integer returns Integer
     End If
 
     Note: Parse body
-    Let body be proc parse_expression from parser
+    Let body be proc parse_expression with parser
     If body is not equal to 0:
         proc add_child with lambda_expr, body
     End If
@@ -2072,7 +2084,7 @@ methods return the value of their final expression, so explicit return
 is uncommon and usually flagged as a style issue.
 @End Reasoning
 Process called "parse_return_statement" takes parser as Integer returns Integer:
-    Let parser_obj be proc memory_get_address from Layout with parser, 0
+    Let parser_obj as ScalaParser be parser
 
     If not proc consume_token with parser, TOKEN_RETURN:
         proc add_parser_error with parser, "Expected 'return'"
@@ -2085,7 +2097,7 @@ Process called "parse_return_statement" takes parser as Integer returns Integer:
     If not proc match_token with parser, TOKEN_SEMICOLON and
        not proc match_token with parser, TOKEN_NEWLINE and
        not proc match_token with parser, TOKEN_RIGHT_BRACE:
-        Let return_value be proc parse_expression from parser
+        Let return_value be proc parse_expression with parser
         If return_value is not equal to 0:
             proc add_child with return_stmt, return_value
         End If
@@ -2101,7 +2113,7 @@ subclass (not just Exception). The expression follows immediately
 after the keyword.
 @End Reasoning
 Process called "parse_throw_statement" takes parser as Integer returns Integer:
-    Let parser_obj be proc memory_get_address from Layout with parser, 0
+    Let parser_obj as ScalaParser be parser
 
     If not proc consume_token with parser, TOKEN_THROW:
         proc add_parser_error with parser, "Expected 'throw'"
@@ -2111,7 +2123,7 @@ Process called "parse_throw_statement" takes parser as Integer returns Integer:
     Let throw_stmt be proc create_ast_node with AST_THROW, ""
 
     Note: Parse exception expression
-    Let exception_expr be proc parse_expression from parser
+    Let exception_expr be proc parse_expression with parser
     If exception_expr is not equal to 0:
         proc add_child with throw_stmt, exception_expr
     End If
@@ -2125,7 +2137,7 @@ Returns the accumulated errors list. Caller can iterate it to render
 diagnostics; the parser retains ownership until destruction.
 @End Reasoning
 Process called "get_parser_errors" takes parser as Integer returns Integer:
-    Let parser_obj be proc memory_get_address from Layout with parser, 0
+    Let parser_obj as ScalaParser be parser
     Return parser_obj.errors
 End Process
 
@@ -2135,8 +2147,8 @@ Boolean shortcut: returns true if the errors list has any entries.
 Used to gate post-parse handling.
 @End Reasoning
 Process called "parser_has_errors" takes parser as Integer returns Boolean:
-    Let parser_obj be proc memory_get_address from Layout with parser, 0
-    Return proc get_list_size with parser_obj.errors is greater than 0
+    Let parser_obj as ScalaParser be parser
+    Return proc list_length from List with parser_obj.errors is greater than 0
 End Process
 
 Note: Get AST node type
@@ -2145,7 +2157,7 @@ External accessor for node.node_type. Used by downstream HIR translators
 to dispatch on node kind without depending on AST struct internals.
 @End Reasoning
 Process called "get_ast_node_type" takes node as Integer returns Integer:
-    Let node_obj be proc memory_get_address from Layout with node, 0
+    Let node_obj as ASTNode be node
     Return node_obj.node_type
 End Process
 
@@ -2154,7 +2166,7 @@ Note: Get AST node value
 External accessor for node.value (string lexeme or literal payload).
 @End Reasoning
 Process called "get_ast_node_value" takes node as Integer returns String:
-    Let node_obj be proc memory_get_address from Layout with node, 0
+    Let node_obj as ASTNode be node
     Return node_obj.value
 End Process
 
@@ -2164,7 +2176,7 @@ External accessor for node.children list pointer. Consumers traverse
 via get_ast_child_count / get_ast_child rather than the raw list.
 @End Reasoning
 Process called "get_ast_node_children" takes node as Integer returns Integer:
-    Let node_obj be proc memory_get_address from Layout with node, 0
+    Let node_obj as ASTNode be node
     Return node_obj.children
 End Process
 
@@ -2174,8 +2186,8 @@ Returns the number of children in node.children. Used as the loop
 bound for child iteration.
 @End Reasoning
 Process called "get_ast_child_count" takes node as Integer returns Integer:
-    Let node_obj be proc memory_get_address from Layout with node, 0
-    Return proc get_list_size with node_obj.children
+    Let node_obj as ASTNode be node
+    Return proc list_length from List with node_obj.children
 End Process
 
 Note: Get specific child
@@ -2184,6 +2196,6 @@ Returns the child at the given index in node.children. Bounds-unsafe -
 callers must respect get_ast_child_count first.
 @End Reasoning
 Process called "get_ast_child" takes node as Integer, index as Integer returns Integer:
-    Let node_obj be proc memory_get_address from Layout with node, 0
-    Return proc get_from_list with node_obj.children, index
+    Let node_obj as ASTNode be node
+    Return proc list_get from List with node_obj.children, index
 End Process

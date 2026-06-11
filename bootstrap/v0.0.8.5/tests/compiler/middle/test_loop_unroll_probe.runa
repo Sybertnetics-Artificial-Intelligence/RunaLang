@@ -1,0 +1,749 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+Loop unrolling + lir_builder probe (Wave 5b gate of the MIR
+reconciliation plan, task #432).
+
+Builds counted 2-block loops by hand through the canonical MIR
+construction API:
+
+    preheader (B0)  [c0=0, c1=1, c4=4]      --jump-->  header
+    header    (B1)  [i = phi(B0: c0, B2: next); sq = i*i] --jump--> latch
+    latch     (B2)  [next = i+c1; cc = next<bound; branch cc ? header : exit]
+    exit      (B3)  [out = phi(B2: next); return out]
+
+and asserts the Wave 5b contract:
+
+  1. FULL UNROLL (constant bound 4 => trip count 4 on the test-on-next
+     shape): run_loop_unrolling_pass eliminates the original loop, the
+     preheader jumps into a 4-copy chain whose copies carry remapped
+     value ids chained across iterations (copy 0 reads the init value,
+     copy k reads copy k-1's fresh ADD result), every copy keeps an
+     intact terminator, the exit phi retargets to the final copy's
+     latch with the final renamed value, and the cached CFG block count
+     matches the block list after the original blocks are deleted.
+  2. CLONE INDEPENDENCE (OD-6): mutating a clone's operand through
+     set_mir_node_used_value / set_phi_incoming_value leaves the
+     original untouched in BOTH the header slot and the extended mirror.
+  3. PARTIAL UNROLL factor 2 (non-constant bound): the body is doubled
+     inside the loop cycle with retained per-copy exit tests, the
+     original header phis' latch incomings move to the copy latch with
+     the chained value, every header phi incoming references an
+     existing predecessor id, and the exit phi gains the copy's edge.
+  4. MIRVerifier.verify_mir_function returns 1 after both transforms.
+  5. LIR_BUILDER retargets: lowering a function containing a phi, a
+     direct call with arguments, a switch, an atomic op, a conditional
+     branch, and constants produces LIR without crashing and with the
+     expected instruction counts through the post-OD-1 accessors.
+:End Note
+
+Import "tests/test_utils.runa" as T
+Import "compiler/middle/gungnir/mir/mir.runa" as MIR
+Import "compiler/middle/gungnir/mir/mir_nodes.runa" as MIRNodes
+Import "compiler/middle/gungnir/mir/cfg.runa" as CFG
+Import "compiler/middle/gungnir/mir/mir_verifier.runa" as MIRVerifier
+Import "compiler/middle/gungnir/mir/optimizations/loop_unrolling.runa" as LoopUnroll
+Import "compiler/middle/gungnir/lir/lir_builder.runa" as LIRBuilder
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/collections/list.runa" as List
+
+Note: Rig list slot indices for the constructed loops
+Constant RIG_FN as Integer is 0
+Constant RIG_CFG as Integer is 1
+Constant RIG_PREHEADER as Integer is 2
+Constant RIG_HEADER as Integer is 3
+Constant RIG_LATCH as Integer is 4
+Constant RIG_EXIT as Integer is 5
+
+Note: Fixed pre-transform value ids used by the loop rigs
+Constant V_INIT as Integer is 1001
+Constant V_ONE as Integer is 1002
+Constant V_BOUND as Integer is 1003
+Constant V_PHI as Integer is 1004
+Constant V_SQ as Integer is 1005
+Constant V_NEXT as Integer is 1006
+Constant V_CMP as Integer is 1007
+Constant V_OUT as Integer is 1008
+Constant V_FOUR as Integer is 1009
+Constant V_GUARD as Integer is 1010
+
+Process called "make_type_info" returns Integer:
+    Note: Shared HIRTypeInfo stand-in: kind at 0, flags at 8, size at 16
+    Let type_info be Layout.allocate(24)
+    If type_info is equal to 0:
+        Return 0
+    End If
+    Layout.memory_set_int64(type_info, 0, 1)
+    Layout.memory_set_int64(type_info, 8, 0)
+    Layout.memory_set_int64(type_info, 16, 8)
+    Return type_info
+End Process
+
+Process called "register_phi" that takes block_ptr as Integer, phi as Integer returns Nothing:
+    Note: Mirror a hand-built phi into the block's phi_nodes registry at 88
+    Let registry be Layout.memory_get_int64(block_ptr, 88)
+    If registry is not equal to 0:
+        List.append(registry, phi)
+    End If
+End Process
+
+Process called "build_counted_loop" that takes name as Integer, constant_bound as Integer returns Integer:
+    @Reasoning
+    Constructs the canonical GUARDED counted 2-block loop in SSA form
+    through the same construction surface the HIR-to-MIR builder uses: the
+    preheader tests the guard (init < bound) and branches to the header or
+    straight to the exit, so the exit block has two predecessors and its
+    phi is a genuine merge (the verifier rejects single-predecessor phis).
+    The latch test reads the UPDATED induction value (rotated do-while
+    shape), so the closed-form trip count for init 0 / bound 4 / step 1
+    under LT is exactly 4. When constant_bound is 0 the bound value is
+    defined by an ADD instead of a CONST, forcing trip count -1 (the
+    partial-unroll bucket) without changing the loop shape.
+    @End Reasoning
+
+    Let type_info be make_type_info()
+    If type_info is equal to 0:
+        Return 0
+    End If
+
+    Let fn be MIR.create_mir_function(name, type_info, 0)
+    If fn is equal to 0:
+        Return 0
+    End If
+    Let cfg be MIR.get_mir_function_cfg(fn)
+    If cfg is equal to 0:
+        Return 0
+    End If
+
+    Let preheader be MIR.create_mir_basic_block(0, 0)
+    Let header be MIR.create_mir_basic_block(1, 0)
+    Let latch be MIR.create_mir_basic_block(2, 0)
+    Let exit_block be MIR.create_mir_basic_block(3, 0)
+    If exit_block is equal to 0:
+        Return 0
+    End If
+
+    MIR.add_block_to_cfg(cfg, preheader)
+    MIR.add_block_to_cfg(cfg, header)
+    MIR.add_block_to_cfg(cfg, latch)
+    MIR.add_block_to_cfg(cfg, exit_block)
+
+    MIR.set_cfg_entry_block(cfg, preheader)
+    MIR.set_cfg_exit_block(cfg, exit_block)
+
+    MIR.add_cfg_edge(cfg, 0, 1)
+    MIR.add_cfg_edge(cfg, 0, 3)
+    MIR.add_cfg_edge(cfg, 1, 2)
+    MIR.add_cfg_edge(cfg, 2, 1)
+    MIR.add_cfg_edge(cfg, 2, 3)
+
+    Note: preheader: c0 = 0, c1 = 1, bound (const 4 or ADD), guard branch
+    Let c0 be MIRNodes.create_mir_const(V_INIT, 0, type_info, 0, 0)
+    MIR.add_instruction_to_block(preheader, c0)
+    MIR.register_value_definition(fn, V_INIT, c0)
+
+    Let c1 be MIRNodes.create_mir_const(V_ONE, 1, type_info, 0, 0)
+    MIR.add_instruction_to_block(preheader, c1)
+    MIR.register_value_definition(fn, V_ONE, c1)
+
+    If constant_bound is equal to 1:
+        Let bound_inst be MIRNodes.create_mir_const(V_BOUND, 4, type_info, 0, 0)
+        MIR.add_instruction_to_block(preheader, bound_inst)
+        MIR.register_value_definition(fn, V_BOUND, bound_inst)
+    Otherwise:
+        Let c4 be MIRNodes.create_mir_const(V_FOUR, 4, type_info, 0, 0)
+        MIR.add_instruction_to_block(preheader, c4)
+        MIR.register_value_definition(fn, V_FOUR, c4)
+        Let bound_add be MIRNodes.create_mir_binary_op(20002, V_BOUND, V_INIT, V_FOUR, type_info)
+        MIR.add_instruction_to_block(preheader, bound_add)
+        MIR.register_value_definition(fn, V_BOUND, bound_add)
+    End If
+
+    Let guard_cmp be MIRNodes.create_mir_binary_op(20102, V_GUARD, V_INIT, V_BOUND, type_info)
+    MIR.add_instruction_to_block(preheader, guard_cmp)
+    MIR.register_value_definition(fn, V_GUARD, guard_cmp)
+
+    Let guard_branch be MIRNodes.create_mir_branch(V_GUARD, 1, 3, 50, 50)
+    MIR.add_instruction_to_block(preheader, guard_branch)
+
+    Note: header: i = phi(B0: init, B2: next); sq = i * i; jump latch
+    Let iv_phi be MIRNodes.create_mir_phi_node(V_PHI, type_info, header)
+    MIRNodes.add_phi_incoming(iv_phi, 0, V_INIT)
+    MIRNodes.add_phi_incoming(iv_phi, 2, V_NEXT)
+    MIR.add_instruction_to_block(header, iv_phi)
+    register_phi(header, iv_phi)
+    MIR.register_value_definition(fn, V_PHI, iv_phi)
+
+    Let sq be MIRNodes.create_mir_binary_op(20004, V_SQ, V_PHI, V_PHI, type_info)
+    MIR.add_instruction_to_block(header, sq)
+    MIR.register_value_definition(fn, V_SQ, sq)
+
+    Let header_jump be MIRNodes.create_mir_jump(2)
+    MIR.add_instruction_to_block(header, header_jump)
+
+    Note: latch: next = i + 1; cc = next < bound; branch cc ? header : exit
+    Let next_add be MIRNodes.create_mir_binary_op(20002, V_NEXT, V_PHI, V_ONE, type_info)
+    MIR.add_instruction_to_block(latch, next_add)
+    MIR.register_value_definition(fn, V_NEXT, next_add)
+
+    Let cmp be MIRNodes.create_mir_binary_op(20102, V_CMP, V_NEXT, V_BOUND, type_info)
+    MIR.add_instruction_to_block(latch, cmp)
+    MIR.register_value_definition(fn, V_CMP, cmp)
+
+    Let back_branch be MIRNodes.create_mir_branch(V_CMP, 1, 3, 50, 50)
+    MIR.add_instruction_to_block(latch, back_branch)
+
+    Note: exit: out = phi(B2: next, B0: init); return out
+    Let out_phi be MIRNodes.create_mir_phi_node(V_OUT, type_info, exit_block)
+    MIRNodes.add_phi_incoming(out_phi, 2, V_NEXT)
+    MIRNodes.add_phi_incoming(out_phi, 0, V_INIT)
+    MIR.add_instruction_to_block(exit_block, out_phi)
+    register_phi(exit_block, out_phi)
+    MIR.register_value_definition(fn, V_OUT, out_phi)
+
+    Let ret be MIRNodes.create_mir_return(V_OUT, type_info)
+    MIR.add_instruction_to_block(exit_block, ret)
+
+    Let rig be List.create()
+    List.append(rig, fn)
+    List.append(rig, cfg)
+    List.append(rig, preheader)
+    List.append(rig, header)
+    List.append(rig, latch)
+    List.append(rig, exit_block)
+    Return rig
+End Process
+
+Process called "find_inst_by_opcode" that takes block_ptr as Integer, opcode as Integer returns Integer:
+    Let instructions be MIR.get_block_instructions(block_ptr)
+    Let inst_count be MIR.get_block_instruction_count(block_ptr)
+    Let i be 0
+    While i is less than inst_count:
+        Let inst be List.get(instructions, i)
+        Let inst_opcode be MIR.get_mir_node_opcode(inst)
+        If inst_opcode is equal to opcode:
+            Return inst
+        End If
+        Set i to i plus 1
+    End While
+    Return 0
+End Process
+
+Process called "count_insts_by_opcode" that takes block_ptr as Integer, opcode as Integer returns Integer:
+    Let instructions be MIR.get_block_instructions(block_ptr)
+    Let inst_count be MIR.get_block_instruction_count(block_ptr)
+    Let found be 0
+    Let i be 0
+    While i is less than inst_count:
+        Let inst be List.get(instructions, i)
+        Let inst_opcode be MIR.get_mir_node_opcode(inst)
+        If inst_opcode is equal to opcode:
+            Set found to found plus 1
+        End If
+        Set i to i plus 1
+    End While
+    Return found
+End Process
+
+Process called "run_full_unroll_suite" that takes results as Integer returns Integer:
+    T.begin_suite(results, "full_unroll_trip4")
+
+    Let rig be build_counted_loop("unroll_full_probe", 1)
+    T.assert_not_null(results, "counted loop rig constructed", rig)
+    If rig is equal to 0:
+        Return 0
+    End If
+
+    Let fn be List.get(rig, RIG_FN)
+    Let cfg be List.get(rig, RIG_CFG)
+
+    Let changed be LoopUnroll.run_loop_unrolling_pass(fn)
+    T.assert_equal(results, "pass reports a transformation", changed, 1)
+
+    Note: Original header and latch must be gone; preheader and exit remain
+    Let old_header be CFG.get_block_by_id_from_cfg(cfg, 1)
+    T.assert_equal(results, "original header deleted", old_header, 0)
+    Let old_latch be CFG.get_block_by_id_from_cfg(cfg, 2)
+    T.assert_equal(results, "original latch deleted", old_latch, 0)
+    Let preheader_ptr be CFG.get_block_by_id_from_cfg(cfg, 0)
+    T.assert_not_null(results, "preheader still present", preheader_ptr)
+    Let exit_ptr be CFG.get_block_by_id_from_cfg(cfg, 3)
+    T.assert_not_null(results, "exit block still present", exit_ptr)
+
+    Note: 4 original blocks - 2 deleted + 4 iterations x 2 clones = 10
+    Let blocks_list be CFG.get_mir_cfg_blocks(cfg)
+    Let true_block_count be List.length(blocks_list)
+    T.assert_equal(results, "block list has 10 blocks", true_block_count, 10)
+    Let cached_block_count be CFG.get_cfg_block_count(cfg)
+    T.assert_equal(results, "cached block count resynced", cached_block_count, 10)
+
+    Note: Preheader guard now branches into the unrolled chain
+    Let pre_term be CFG.get_block_terminator(preheader_ptr)
+    T.assert_not_null(results, "preheader has terminator", pre_term)
+    Let pre_term_opcode be MIR.get_mir_node_opcode(pre_term)
+    T.assert_equal(results, "preheader terminator still a branch", pre_term_opcode, 20301)
+    Let chain_target be MIRNodes.get_mir_branch_true_block(pre_term)
+    T.assert_not_equal(results, "preheader no longer targets old header", chain_target, 1)
+    Let guard_skip be MIRNodes.get_mir_branch_false_block(pre_term)
+    T.assert_equal(results, "guard skip edge to exit preserved", guard_skip, 3)
+
+    Note: Walk the 4-copy chain: header clone (MUL+jump) -> latch clone
+    Note: (ADD+CMP+jump) -> next, asserting cross-iteration value chaining
+    Let prev_add_result be V_INIT
+    Let last_latch_id be 0
+    Let last_add_result be 0
+    Let chain_intact be 1
+    Let iter be 0
+    While iter is less than 4:
+        Let header_clone be CFG.get_block_by_id_from_cfg(cfg, chain_target)
+        T.assert_not_null(results, "iteration header clone exists", header_clone)
+        If header_clone is equal to 0:
+            Set chain_intact to 0
+            Set iter to 4
+        Otherwise:
+            Let phi_in_clone be count_insts_by_opcode(header_clone, 20300)
+            T.assert_equal(results, "header clone has no phis", phi_in_clone, 0)
+
+            Let mul_inst be find_inst_by_opcode(header_clone, 20004)
+            T.assert_not_null(results, "header clone carries the MUL body", mul_inst)
+            If mul_inst is not equal to 0:
+                Let mul_operand be MIR.get_mir_node_operand(mul_inst, 1)
+                T.assert_equal(results, "MUL reads the chained induction value", mul_operand, prev_add_result)
+                Let mul_result be MIR.get_mir_node_value_id(mul_inst)
+                T.assert_not_equal(results, "MUL result remapped to fresh id", mul_result, V_SQ)
+            End If
+
+            Let header_term be CFG.get_block_terminator(header_clone)
+            T.assert_not_null(results, "header clone terminator intact", header_term)
+            Let header_term_opcode be MIR.get_mir_node_opcode(header_term)
+            T.assert_equal(results, "header clone ends with jump", header_term_opcode, 20302)
+            Let latch_clone_id be MIRNodes.get_mir_jump_target_block(header_term)
+            Let latch_clone be CFG.get_block_by_id_from_cfg(cfg, latch_clone_id)
+            T.assert_not_null(results, "iteration latch clone exists", latch_clone)
+            If latch_clone is equal to 0:
+                Set chain_intact to 0
+                Set iter to 4
+            Otherwise:
+                Let add_inst be find_inst_by_opcode(latch_clone, 20002)
+                T.assert_not_null(results, "latch clone carries the ADD update", add_inst)
+                Let add_result be 0
+                If add_inst is not equal to 0:
+                    Let add_operand be MIR.get_mir_node_operand(add_inst, 1)
+                    T.assert_equal(results, "ADD reads the chained induction value", add_operand, prev_add_result)
+                    Let add_invariant be MIR.get_mir_node_operand(add_inst, 2)
+                    T.assert_equal(results, "loop-invariant step untouched", add_invariant, V_ONE)
+                    Set add_result to MIR.get_mir_node_value_id(add_inst)
+                    T.assert_not_equal(results, "ADD result remapped to fresh id", add_result, V_NEXT)
+                End If
+
+                Let latch_term be CFG.get_block_terminator(latch_clone)
+                T.assert_not_null(results, "latch clone terminator intact", latch_term)
+                Let latch_term_opcode be MIR.get_mir_node_opcode(latch_term)
+                T.assert_equal(results, "latch clone chained with jump", latch_term_opcode, 20302)
+
+                Set last_latch_id to latch_clone_id
+                Set last_add_result to add_result
+                Set prev_add_result to add_result
+                Set chain_target to MIRNodes.get_mir_jump_target_block(latch_term)
+                Set iter to iter plus 1
+            End If
+        End If
+    End While
+
+    If chain_intact is equal to 1:
+        T.assert_equal(results, "final latch clone exits to exit block", chain_target, 3)
+    End If
+
+    Note: Exit phi retargeted to the final copy with the final renamed value
+    Let exit_phi be find_inst_by_opcode(exit_ptr, 20300)
+    T.assert_not_null(results, "exit phi survives", exit_phi)
+    If exit_phi is not equal to 0:
+        Let exit_in_count be MIRNodes.get_phi_incoming_count(exit_phi)
+        T.assert_equal(results, "exit phi keeps two incomings", exit_in_count, 2)
+        Let exit_in_block be MIRNodes.get_phi_incoming_block(exit_phi, 0)
+        T.assert_equal(results, "exit phi incoming from final latch clone", exit_in_block, last_latch_id)
+        Let exit_in_value be MIRNodes.get_phi_incoming_value(exit_phi, 0)
+        T.assert_equal(results, "exit phi carries final renamed value", exit_in_value, last_add_result)
+        Let guard_in_block be MIRNodes.get_phi_incoming_block(exit_phi, 1)
+        T.assert_equal(results, "guard-path incoming untouched (block)", guard_in_block, 0)
+        Let guard_in_value be MIRNodes.get_phi_incoming_value(exit_phi, 1)
+        T.assert_equal(results, "guard-path incoming untouched (value)", guard_in_value, V_INIT)
+    End If
+
+    Note: Canonical verifier accepts the unrolled function
+    Let verified be MIRVerifier.verify_mir_function(fn)
+    T.assert_equal(results, "verify_mir_function passes after full unroll", verified, 1)
+
+    Return 1
+End Process
+
+Process called "run_clone_independence_suite" that takes results as Integer returns Integer:
+    T.begin_suite(results, "clone_independence")
+
+    Let type_info be make_type_info()
+
+    Note: Binary op: mutate the clone, original keeps header AND ext mirror
+    Let original be MIRNodes.create_mir_binary_op(20002, 600, 601, 602, type_info)
+    T.assert_not_null(results, "original binop constructed", original)
+    Let clone be MIR.clone_instruction(original)
+    T.assert_not_null(results, "binop clone constructed", clone)
+    If clone is not equal to 0:
+        MIRNodes.set_mir_node_used_value(clone, 1, 777)
+        Let clone_header_op be MIR.get_mir_node_operand(clone, 1)
+        T.assert_equal(results, "clone header operand rewritten", clone_header_op, 777)
+        Let clone_ext_left be MIRNodes.get_binary_op_left(clone)
+        T.assert_equal(results, "clone ext mirror rewritten", clone_ext_left, 777)
+        Let orig_header_op be MIR.get_mir_node_operand(original, 1)
+        T.assert_equal(results, "original header operand untouched", orig_header_op, 601)
+        Let orig_ext_left be MIRNodes.get_binary_op_left(original)
+        T.assert_equal(results, "original ext mirror untouched", orig_ext_left, 601)
+    End If
+
+    Note: Phi: the incoming pair list must be deep-copied, not aliased
+    Let phi_original be MIRNodes.create_mir_phi_node(610, type_info, 0)
+    MIRNodes.add_phi_incoming(phi_original, 5, 611)
+    Let phi_clone be MIR.clone_instruction(phi_original)
+    T.assert_not_null(results, "phi clone constructed", phi_clone)
+    If phi_clone is not equal to 0:
+        MIRNodes.set_phi_incoming_value(phi_clone, 0, 999)
+        Let clone_in_value be MIRNodes.get_phi_incoming_value(phi_clone, 0)
+        T.assert_equal(results, "phi clone incoming rewritten", clone_in_value, 999)
+        Let orig_in_value be MIRNodes.get_phi_incoming_value(phi_original, 0)
+        T.assert_equal(results, "phi original incoming untouched", orig_in_value, 611)
+    End If
+
+    Return 1
+End Process
+
+Process called "run_partial_unroll_suite" that takes results as Integer returns Integer:
+    T.begin_suite(results, "partial_unroll_factor2")
+
+    Let rig be build_counted_loop("unroll_partial_probe", 0)
+    T.assert_not_null(results, "unknown-bound loop rig constructed", rig)
+    If rig is equal to 0:
+        Return 0
+    End If
+
+    Let fn be List.get(rig, RIG_FN)
+    Let cfg be List.get(rig, RIG_CFG)
+    Let header_ptr be List.get(rig, RIG_HEADER)
+    Let latch_ptr be List.get(rig, RIG_LATCH)
+    Let exit_ptr be List.get(rig, RIG_EXIT)
+
+    Note: Drive the module pipeline directly with unroll factor 2
+    Let context be LoopUnroll.create_loop_unroll_context(fn)
+    T.assert_not_null(results, "unroll context constructed", context)
+    If context is equal to 0:
+        Return 0
+    End If
+    Layout.memory_set_int64(context, 48, 2)
+
+    Let loops_found be LoopUnroll.detect_natural_loops(context)
+    T.assert_equal(results, "one natural loop detected", loops_found, 1)
+    If loops_found is equal to 0:
+        LoopUnroll.destroy_loop_unroll_context(context)
+        Return 0
+    End If
+
+    Let loops_list be Layout.memory_get_int64(context, 16)
+    Let loop_ptr be List.get(loops_list, 0)
+
+    Let preheader_found be Layout.memory_get_int64(loop_ptr, 8)
+    T.assert_equal(results, "preheader identified", preheader_found, 0)
+    Let exit_found be Layout.memory_get_int64(loop_ptr, 24)
+    T.assert_equal(results, "single exit identified", exit_found, 3)
+
+    Let iv_found be LoopUnroll.identify_induction_variables(context, loop_ptr)
+    T.assert_equal(results, "canonical IV identified", iv_found, 1)
+
+    Let trip be LoopUnroll.analyze_trip_count(context, loop_ptr)
+    T.assert_equal(results, "non-constant bound has unknown trip count", trip, 0 minus 1)
+
+    Let profitable be LoopUnroll.is_profitable_to_unroll(context, loop_ptr)
+    T.assert_equal(results, "partial unroll bucket selected", profitable, 1)
+
+    Let unrolled be LoopUnroll.partial_unroll_loop(context, loop_ptr)
+    T.assert_equal(results, "partial unroll succeeds", unrolled, 1)
+
+    Note: 4 original blocks + 1 cloned copy x 2 blocks = 6
+    Let blocks_list be CFG.get_mir_cfg_blocks(cfg)
+    Let block_count be List.length(blocks_list)
+    T.assert_equal(results, "block list has 6 blocks", block_count, 6)
+
+    Note: Original latch keeps its exit test; its back edge enters copy 1
+    Let latch_term be CFG.get_block_terminator(latch_ptr)
+    T.assert_not_null(results, "original latch terminator intact", latch_term)
+    Let latch_term_opcode be MIR.get_mir_node_opcode(latch_term)
+    T.assert_equal(results, "original latch still a branch", latch_term_opcode, 20301)
+    Let copy_header_id be MIRNodes.get_mir_branch_true_block(latch_term)
+    T.assert_not_equal(results, "latch true edge leaves old header", copy_header_id, 1)
+    Let latch_false be MIRNodes.get_mir_branch_false_block(latch_term)
+    T.assert_equal(results, "latch retains its exit edge", latch_false, 3)
+
+    Let copy_header be CFG.get_block_by_id_from_cfg(cfg, copy_header_id)
+    T.assert_not_null(results, "copy header exists", copy_header)
+    If copy_header is equal to 0:
+        LoopUnroll.destroy_loop_unroll_context(context)
+        Return 0
+    End If
+
+    Note: Copy header: phis resolved, body MUL chained through orig next
+    Let copy_phis be count_insts_by_opcode(copy_header, 20300)
+    T.assert_equal(results, "copy header phis resolved away", copy_phis, 0)
+    Let copy_mul be find_inst_by_opcode(copy_header, 20004)
+    T.assert_not_null(results, "copy header carries doubled MUL body", copy_mul)
+    If copy_mul is not equal to 0:
+        Let copy_mul_operand be MIR.get_mir_node_operand(copy_mul, 1)
+        T.assert_equal(results, "copy body chains through original next", copy_mul_operand, V_NEXT)
+    End If
+
+    Note: Body doubling: exactly one MUL in each of header and copy header
+    Let orig_muls be count_insts_by_opcode(header_ptr, 20004)
+    T.assert_equal(results, "original body MUL retained", orig_muls, 1)
+    Let copy_muls be count_insts_by_opcode(copy_header, 20004)
+    T.assert_equal(results, "copy body MUL present", copy_muls, 1)
+
+    Note: Copy latch: retained exit test, real back edge to original header
+    Let copy_header_term be CFG.get_block_terminator(copy_header)
+    Let copy_latch_id be MIRNodes.get_mir_jump_target_block(copy_header_term)
+    Let copy_latch be CFG.get_block_by_id_from_cfg(cfg, copy_latch_id)
+    T.assert_not_null(results, "copy latch exists", copy_latch)
+    Let copy_add_result be 0
+    If copy_latch is not equal to 0:
+        Let copy_add be find_inst_by_opcode(copy_latch, 20002)
+        T.assert_not_null(results, "copy latch carries the ADD update", copy_add)
+        If copy_add is not equal to 0:
+            Let copy_add_operand be MIR.get_mir_node_operand(copy_add, 1)
+            T.assert_equal(results, "copy ADD chains through original next", copy_add_operand, V_NEXT)
+            Set copy_add_result to MIR.get_mir_node_value_id(copy_add)
+            T.assert_not_equal(results, "copy ADD result remapped to fresh id", copy_add_result, V_NEXT)
+        End If
+
+        Let copy_latch_term be CFG.get_block_terminator(copy_latch)
+        T.assert_not_null(results, "copy latch terminator intact", copy_latch_term)
+        Let copy_latch_opcode be MIR.get_mir_node_opcode(copy_latch_term)
+        T.assert_equal(results, "copy latch retains its exit test", copy_latch_opcode, 20301)
+        Let copy_true be MIRNodes.get_mir_branch_true_block(copy_latch_term)
+        T.assert_equal(results, "copy latch back edge returns to header", copy_true, 1)
+        Let copy_false be MIRNodes.get_mir_branch_false_block(copy_latch_term)
+        T.assert_equal(results, "copy latch exit edge to exit block", copy_false, 3)
+    End If
+
+    Note: Header phi fixups: latch incoming moved to the copy latch with the
+    Note: chained value, and every incoming references an existing predecessor
+    Let header_phi be find_inst_by_opcode(header_ptr, 20300)
+    T.assert_not_null(results, "header phi survives partial unroll", header_phi)
+    If header_phi is not equal to 0:
+        Let header_in_count be MIRNodes.get_phi_incoming_count(header_phi)
+        T.assert_equal(results, "header phi keeps two incomings", header_in_count, 2)
+
+        Let header_preds be MIR.get_block_predecessors(header_ptr)
+        Let k be 0
+        While k is less than header_in_count:
+            Let in_block be MIRNodes.get_phi_incoming_block(header_phi, k)
+            Let pred_listed be List.contains(header_preds, in_block)
+            T.assert_equal(results, "phi incoming references existing predecessor", pred_listed, 1)
+
+            Let in_value be MIRNodes.get_phi_incoming_value(header_phi, k)
+            If in_block is equal to copy_latch_id:
+                T.assert_equal(results, "phi back-edge value chained through copy", in_value, copy_add_result)
+            Otherwise:
+                T.assert_equal(results, "phi entry incoming from preheader", in_block, 0)
+                T.assert_equal(results, "phi entry value untouched", in_value, V_INIT)
+            End If
+            Set k to k plus 1
+        End While
+    End If
+
+    Note: Exit phi gains the copy's exit edge with the chained value
+    Let exit_phi be find_inst_by_opcode(exit_ptr, 20300)
+    T.assert_not_null(results, "exit phi survives partial unroll", exit_phi)
+    If exit_phi is not equal to 0:
+        Let exit_in_count be MIRNodes.get_phi_incoming_count(exit_phi)
+        T.assert_equal(results, "exit phi gains the copy incoming", exit_in_count, 3)
+        Let new_in_block be MIRNodes.get_phi_incoming_block(exit_phi, 2)
+        T.assert_equal(results, "new exit incoming from copy latch", new_in_block, copy_latch_id)
+        Let new_in_value be MIRNodes.get_phi_incoming_value(exit_phi, 2)
+        T.assert_equal(results, "new exit incoming carries chained value", new_in_value, copy_add_result)
+        Let kept_in_block be MIRNodes.get_phi_incoming_block(exit_phi, 0)
+        T.assert_equal(results, "original latch incoming kept (block)", kept_in_block, 2)
+        Let kept_in_value be MIRNodes.get_phi_incoming_value(exit_phi, 0)
+        T.assert_equal(results, "original latch incoming kept (value)", kept_in_value, V_NEXT)
+    End If
+
+    Note: Canonical verifier accepts the partially unrolled function
+    Let verified be MIRVerifier.verify_mir_function(fn)
+    T.assert_equal(results, "verify_mir_function passes after partial unroll", verified, 1)
+
+    LoopUnroll.destroy_loop_unroll_context(context)
+    Return 1
+End Process
+
+Process called "build_lowering_function" returns Integer:
+    @Reasoning
+    Builds the MIR function exercising every lir_builder arm retargeted in
+    Wave 5b: constants (payload at 80), a direct call with arguments (callee
+    at 80, args at 88, count at 96), a switch terminator (flat case pairs at
+    80, default at 96), an atomic op (memory ordering at 104), a conditional
+    branch (targets at 80/88), a jump (target at 72), and a phi at the merge
+    (flat incoming pairs at 80, count at 88, type at 96).
+
+        B0: v1=7; v2=9; vaddr=4096; v3=call foo(v1,v2); switch v1 {7->B1, default B2}
+        B1: v4=atomic_add [vaddr], v2 (seq_cst); branch v1 ? B3 : B3
+        B2: jump B3
+        B3: v6=phi(B1: v1, B2: v2); return v6
+    @End Reasoning
+
+    Let type_info be make_type_info()
+    If type_info is equal to 0:
+        Return 0
+    End If
+
+    Let fn be MIR.create_mir_function("lowering_probe", type_info, 0)
+    If fn is equal to 0:
+        Return 0
+    End If
+    Let cfg be MIR.get_mir_function_cfg(fn)
+
+    Let b0 be MIR.create_mir_basic_block(0, 0)
+    Let b1 be MIR.create_mir_basic_block(1, 0)
+    Let b2 be MIR.create_mir_basic_block(2, 0)
+    Let b3 be MIR.create_mir_basic_block(3, 0)
+    MIR.add_block_to_cfg(cfg, b0)
+    MIR.add_block_to_cfg(cfg, b1)
+    MIR.add_block_to_cfg(cfg, b2)
+    MIR.add_block_to_cfg(cfg, b3)
+    MIR.set_cfg_entry_block(cfg, b0)
+    MIR.set_cfg_exit_block(cfg, b3)
+    MIR.add_cfg_edge(cfg, 0, 1)
+    MIR.add_cfg_edge(cfg, 0, 2)
+    MIR.add_cfg_edge(cfg, 1, 3)
+    MIR.add_cfg_edge(cfg, 2, 3)
+
+    Note: B0: three constants, a direct call with 2 args, switch terminator
+    Let c7 be MIRNodes.create_mir_const(2001, 7, type_info, 0, 0)
+    MIR.add_instruction_to_block(b0, c7)
+    MIR.register_value_definition(fn, 2001, c7)
+
+    Let c9 be MIRNodes.create_mir_const(2002, 9, type_info, 0, 0)
+    MIR.add_instruction_to_block(b0, c9)
+    MIR.register_value_definition(fn, 2002, c9)
+
+    Let caddr be MIRNodes.create_mir_const(2003, 4096, type_info, 0, 0)
+    MIR.add_instruction_to_block(b0, caddr)
+    MIR.register_value_definition(fn, 2003, caddr)
+
+    Let args be List.create()
+    List.append(args, 2001)
+    List.append(args, 2002)
+    Let call be MIRNodes.create_mir_call(2004, "foo", args, 2, type_info, 0, 0)
+    MIR.add_instruction_to_block(b0, call)
+    MIR.register_value_definition(fn, 2004, call)
+
+    Let switch be MIRNodes.create_mir_switch(2001, 2, type_info)
+    MIRNodes.add_switch_case(switch, 7, 1)
+    MIR.add_instruction_to_block(b0, switch)
+
+    Note: B1: atomic fetch-add with seq_cst ordering, conditional branch
+    Let atomic be MIRNodes.create_mir_atomic_op(20504, 2005, 2003, 2002, 0, 3, type_info)
+    MIR.add_instruction_to_block(b1, atomic)
+    MIR.register_value_definition(fn, 2005, atomic)
+
+    Let b1_branch be MIRNodes.create_mir_branch(2001, 3, 3, 50, 50)
+    MIR.add_instruction_to_block(b1, b1_branch)
+
+    Note: B2: unconditional jump
+    Let b2_jump be MIRNodes.create_mir_jump(3)
+    MIR.add_instruction_to_block(b2, b2_jump)
+
+    Note: B3: merge phi + return
+    Let merge_phi be MIRNodes.create_mir_phi_node(2006, type_info, b3)
+    MIRNodes.add_phi_incoming(merge_phi, 1, 2001)
+    MIRNodes.add_phi_incoming(merge_phi, 2, 2002)
+    MIR.add_instruction_to_block(b3, merge_phi)
+    register_phi(b3, merge_phi)
+    MIR.register_value_definition(fn, 2006, merge_phi)
+
+    Let ret be MIRNodes.create_mir_return(2006, type_info)
+    MIR.add_instruction_to_block(b3, ret)
+
+    Return fn
+End Process
+
+Process called "run_lir_lowering_suite" that takes results as Integer returns Integer:
+    T.begin_suite(results, "lir_builder_lowering")
+
+    Let fn be build_lowering_function()
+    T.assert_not_null(results, "lowering function constructed", fn)
+    If fn is equal to 0:
+        Return 0
+    End If
+
+    Note: LIR_CC_SYSTEMV = 0
+    Let lir_fn be LIRBuilder.lower_mir_function_to_lir(fn, 0)
+    T.assert_not_null(results, "lowering produced an LIR function", lir_fn)
+    If lir_fn is equal to 0:
+        Return 0
+    End If
+
+    Note: LIRFunction: blocks List at 32, block_count at 40;
+    Note: LIRBasicBlock: instruction_count at 24
+    Let lir_blocks be Layout.memory_get_int64(lir_fn, 32)
+    Let lir_block_count be Layout.memory_get_int64(lir_fn, 40)
+    T.assert_equal(results, "four LIR blocks created", lir_block_count, 4)
+
+    Let total_insts be 0
+    Let i be 0
+    While i is less than lir_block_count:
+        Let lir_block be List.get(lir_blocks, i)
+        If lir_block is not equal to 0:
+            Let block_insts be Layout.memory_get_int64(lir_block, 24)
+            Set total_insts to total_insts plus block_insts
+        End If
+        Set i to i plus 1
+    End While
+
+    Note: Expected emission per the retargeted lowering arms:
+    Note:  B0: 3 const moves + (2 arg moves + call + result move) + (cmp +
+    Note:      branch for the single switch case) = 9
+    Note:  B1: fence + atomic + fence (seq_cst) + cmp + branch = 5,
+    Note:      plus 1 phi move inserted from B3's phi = 6
+    Note:  B2: jump = 1, plus 1 phi move = 2
+    Note:  B3: return-value move + ret = 2  (phi emits no inst in B3)
+    Note:  Total = 19
+    T.assert_equal(results, "lowered instruction count matches", total_insts, 19)
+
+    Return 1
+End Process
+
+Process called "main" returns Integer:
+    Let results be T.create_test_results()
+
+    run_full_unroll_suite(results)
+    run_clone_independence_suite(results)
+    run_partial_unroll_suite(results)
+    run_lir_lowering_suite(results)
+
+    T.print_summary(results)
+    Let passed be T.all_passed(results)
+    T.destroy_test_results(results)
+
+    If passed is equal to 1:
+        Return 0
+    End If
+    Return 1
+End Process

@@ -1,0 +1,980 @@
+Note:
+Copyright 2026 Sybertnetics Artificial Intelligence Solutions
+Licensed under Apache 2.0
+:End Note
+
+Note:
+Pipeline probe for the Dart translation frontend
+(compiler/middle/gungnir/hir/translation/frontends/dart/).
+
+Covers the full lex -> parse -> semantic pipeline:
+  - Lexer: keywords, identifiers, operators, literals (decimal, hex,
+    double, plain and raw strings).
+  - Parser: declaration shapes (class, typedef modern and legacy,
+    function), lambda flags (async/generator/arrow), call/member/named
+    argument shapes, and the four type-node kinds.
+  - Semantic: every check dart_semantic.runa implements today -
+    duplicate declarations, type resolution (with the imports
+    downgrade), null-safety diagnostics (nullable supertypes, redundant
+    ?. and !, late initialization), async/generator return-type
+    contracts, await/yield context legality, lambda structural rules,
+    lambda context typing at variable declarations and call arguments,
+    and mixin application rules.
+  - Task #451 residuals: scoped call-argument lambda context resolution
+    (local functions, method receivers through the class member table,
+    function-typed variable/parameter/field callees), wrapper
+    type-argument checking (the generics/assignment layer over the
+    Future/Stream/Iterable element type), and typedef expansion in
+    every function-type context (variables, parameters, return types,
+    typedefs of typedefs, cycle termination).
+:End Note
+
+Import "tests/test_utils.runa" as T
+Import "compiler/middle/gungnir/hir/translation/frontends/dart/dart_lexer.runa" as Lexer
+Import "compiler/middle/gungnir/hir/translation/frontends/dart/dart_parser.runa" as Parser
+Import "compiler/middle/gungnir/hir/translation/frontends/dart/dart_semantic.runa" as Semantic
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/frontend/primitives/collections/list.runa" as List
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+
+Note: ============================================================================
+Note: PIPELINE HELPERS
+Note: ============================================================================
+
+Process called "next_type" that takes lexer as Integer returns Integer:
+    Let token be Lexer.next_token(lexer)
+    Return Layout.memory_get_int64(token, 0)
+End Process
+
+Process called "next_token_handle" that takes lexer as Integer returns Integer:
+    Return Lexer.next_token(lexer)
+End Process
+
+Process called "token_type_of" that takes token as Integer returns Integer:
+    Return Layout.memory_get_int64(token, 0)
+End Process
+
+Process called "token_lexeme_of" that takes token as Integer returns Integer:
+    Return Layout.memory_get_int64(token, 8)
+End Process
+
+Process called "parse_source" that takes source as String returns Integer:
+    Let lexer be Lexer.create_dart_lexer(source)
+    Let parser be Parser.create_dart_parser(lexer)
+    Return Parser.parse_program(parser)
+End Process
+
+Process called "analyze_source" that takes source as String returns Integer:
+    Let program be parse_source(source)
+    Let analyzer be Semantic.create_dart_semantic_analyzer()
+    Semantic.analyze_dart_program(analyzer, program)
+    Return analyzer
+End Process
+
+Process called "errs_of" that takes source as String returns Integer:
+    Let analyzer be analyze_source(source)
+    Let errors be Semantic.get_errors(analyzer)
+    Return List.size(errors)
+End Process
+
+Process called "warns_of" that takes source as String returns Integer:
+    Let analyzer be analyze_source(source)
+    Let warnings be Semantic.get_warnings(analyzer)
+    Return List.size(warnings)
+End Process
+
+Process called "stmt_expr" that takes stmt as Integer returns Integer:
+    Let k be Parser.ast_node_type(stmt)
+    Let expr_stmt_kind be DART_EXPR_STMT from Parser
+    If k is equal to expr_stmt_kind:
+        Return Parser.ast_node_child(stmt, 0)
+    End If
+    Return stmt
+End Process
+
+Note: ============================================================================
+Note: LEXER SUITES
+Note: ============================================================================
+
+Process called "test_lexer_basics" that takes results as Integer returns Integer:
+    T.begin_suite(results, "dart_lexer basics: class Foo { int x = 1; }")
+
+    Let lx be Lexer.create_dart_lexer("class Foo { int x = 1; }")
+    T.assert_not_equal(results, "L1 lexer created", lx, 0)
+
+    Let t1 be next_type(lx)
+    Let e1 be TOKEN_CLASS from Lexer
+    T.assert_equal(results, "L1 class keyword", t1, e1)
+
+    Let tok2 be next_token_handle(lx)
+    Let t2 be token_type_of(tok2)
+    Let e2 be TOKEN_IDENTIFIER from Lexer
+    T.assert_equal(results, "L1 identifier token", t2, e2)
+    Let lex2 be token_lexeme_of(tok2)
+    Let eq2 be StringCore.string_equals(lex2, "Foo")
+    T.assert_equal(results, "L1 identifier lexeme Foo", eq2, 1)
+
+    Let t3 be next_type(lx)
+    Let e3 be TOKEN_LEFT_BRACE from Lexer
+    T.assert_equal(results, "L1 left brace", t3, e3)
+
+    Let t4 be next_type(lx)
+    Let e4 be TOKEN_INT from Lexer
+    T.assert_equal(results, "L1 int type keyword", t4, e4)
+
+    Let t5 be next_type(lx)
+    Let e5 be TOKEN_IDENTIFIER from Lexer
+    T.assert_equal(results, "L1 identifier x", t5, e5)
+
+    Let t6 be next_type(lx)
+    Let e6 be TOKEN_EQUAL from Lexer
+    T.assert_equal(results, "L1 equal sign", t6, e6)
+
+    Let t7 be next_type(lx)
+    Let e7 be TOKEN_NUMBER_LITERAL from Lexer
+    T.assert_equal(results, "L1 number literal", t7, e7)
+
+    Let t8 be next_type(lx)
+    Let e8 be TOKEN_SEMICOLON from Lexer
+    T.assert_equal(results, "L1 semicolon", t8, e8)
+
+    Let t9 be next_type(lx)
+    Let e9 be TOKEN_RIGHT_BRACE from Lexer
+    T.assert_equal(results, "L1 right brace", t9, e9)
+
+    Let t10 be next_type(lx)
+    Let e10 be TOKEN_EOF from Lexer
+    T.assert_equal(results, "L1 eof", t10, e10)
+
+    Return 1
+End Process
+
+Process called "test_lexer_operators" that takes results as Integer returns Integer:
+    T.begin_suite(results, "dart_lexer operators")
+
+    Let lx be Lexer.create_dart_lexer("=> ?? ?. ~/ != >= && || .. ... ++ <<")
+
+    Let t1 be next_type(lx)
+    Let e1 be TOKEN_ARROW from Lexer
+    T.assert_equal(results, "L2 arrow", t1, e1)
+
+    Let t2 be next_type(lx)
+    Let e2 be TOKEN_QUESTION_QUESTION from Lexer
+    T.assert_equal(results, "L2 question question", t2, e2)
+
+    Let t3 be next_type(lx)
+    Let e3 be TOKEN_QUESTION_DOT from Lexer
+    T.assert_equal(results, "L2 question dot", t3, e3)
+
+    Let t4 be next_type(lx)
+    Let e4 be TOKEN_TILDE_SLASH from Lexer
+    T.assert_equal(results, "L2 tilde slash", t4, e4)
+
+    Let t5 be next_type(lx)
+    Let e5 be TOKEN_NOT_EQUAL from Lexer
+    T.assert_equal(results, "L2 not equal", t5, e5)
+
+    Let t6 be next_type(lx)
+    Let e6 be TOKEN_GREATER_EQUAL from Lexer
+    T.assert_equal(results, "L2 greater equal", t6, e6)
+
+    Let t7 be next_type(lx)
+    Let e7 be TOKEN_AND_AND from Lexer
+    T.assert_equal(results, "L2 and and", t7, e7)
+
+    Let t8 be next_type(lx)
+    Let e8 be TOKEN_OR_OR from Lexer
+    T.assert_equal(results, "L2 or or", t8, e8)
+
+    Let t9 be next_type(lx)
+    Let e9 be TOKEN_DOT_DOT from Lexer
+    T.assert_equal(results, "L2 dot dot", t9, e9)
+
+    Let t10 be next_type(lx)
+    Let e10 be TOKEN_DOT_DOT_DOT from Lexer
+    T.assert_equal(results, "L2 dot dot dot", t10, e10)
+
+    Let t11 be next_type(lx)
+    Let e11 be TOKEN_PLUS_PLUS from Lexer
+    T.assert_equal(results, "L2 plus plus", t11, e11)
+
+    Let t12 be next_type(lx)
+    Let e12 be TOKEN_LEFT_SHIFT from Lexer
+    T.assert_equal(results, "L2 left shift", t12, e12)
+
+    Return 1
+End Process
+
+Process called "test_lexer_keywords_and_literals" that takes results as Integer returns Integer:
+    T.begin_suite(results, "dart_lexer async keywords and literals")
+
+    Let lx be Lexer.create_dart_lexer("async await yield typedef sync 3.14 0xFF 'hi' r'raw' done")
+
+    Let t1 be next_type(lx)
+    Let e1 be TOKEN_ASYNC from Lexer
+    T.assert_equal(results, "L3 async keyword", t1, e1)
+
+    Let t2 be next_type(lx)
+    Let e2 be TOKEN_AWAIT from Lexer
+    T.assert_equal(results, "L3 await keyword", t2, e2)
+
+    Let t3 be next_type(lx)
+    Let e3 be TOKEN_YIELD from Lexer
+    T.assert_equal(results, "L3 yield keyword", t3, e3)
+
+    Let t4 be next_type(lx)
+    Let e4 be TOKEN_TYPEDEF from Lexer
+    T.assert_equal(results, "L3 typedef keyword", t4, e4)
+
+    Let t5 be next_type(lx)
+    Let e5 be TOKEN_SYNC from Lexer
+    T.assert_equal(results, "L3 sync keyword", t5, e5)
+
+    Let tok6 be next_token_handle(lx)
+    Let t6 be token_type_of(tok6)
+    Let e6 be TOKEN_NUMBER_LITERAL from Lexer
+    T.assert_equal(results, "L3 double literal token", t6, e6)
+    Let lex6 be token_lexeme_of(tok6)
+    Let eq6 be StringCore.string_equals(lex6, "3.14")
+    T.assert_equal(results, "L3 double literal lexeme", eq6, 1)
+
+    Let t7 be next_type(lx)
+    Let e7 be TOKEN_NUMBER_LITERAL from Lexer
+    T.assert_equal(results, "L3 hex literal token", t7, e7)
+
+    Let t8 be next_type(lx)
+    Let e8 be TOKEN_STRING_LITERAL from Lexer
+    T.assert_equal(results, "L3 string literal token", t8, e8)
+
+    Let t9 be next_type(lx)
+    Let e9 be TOKEN_STRING_LITERAL from Lexer
+    T.assert_equal(results, "L3 raw string literal token", t9, e9)
+
+    Let t10 be next_type(lx)
+    Let e10 be TOKEN_IDENTIFIER from Lexer
+    T.assert_equal(results, "L3 trailing identifier", t10, e10)
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: PARSER SUITES
+Note: ============================================================================
+
+Process called "test_parser_class_shape" that takes results as Integer returns Integer:
+    T.begin_suite(results, "dart_parser class declaration shape")
+
+    Let program be parse_source("class Foo extends Bar { int x = 1; void m() {} }")
+    T.assert_not_equal(results, "P1 program parsed", program, 0)
+
+    Let pk be Parser.ast_node_type(program)
+    Let pe be DART_PROGRAM from Parser
+    T.assert_equal(results, "P1 program node kind", pk, pe)
+
+    Let cls be Parser.ast_node_child(program, 0)
+    Let ck be Parser.ast_node_type(cls)
+    Let ce be DART_CLASS_DECL from Parser
+    T.assert_equal(results, "P1 class decl kind", ck, ce)
+
+    Let cv be Parser.ast_node_value(cls)
+    Let cve be StringCore.string_equals(cv, "Foo")
+    T.assert_equal(results, "P1 class name Foo", cve, 1)
+
+    Let ext_kind be DART_EXTENDS from Parser
+    Let ext be Semantic.find_child_of_kind(cls, ext_kind)
+    T.assert_not_equal(results, "P1 extends clause present", ext, 0)
+
+    Let base be Parser.ast_node_child(ext, 0)
+    Let base_name be Semantic.type_base_name(base)
+    Let bne be StringCore.string_equals(base_name, "Bar")
+    T.assert_equal(results, "P1 extends base Bar", bne, 1)
+
+    Let fld_kind be DART_FIELD_DECL from Parser
+    Let fld be Semantic.find_child_of_kind(cls, fld_kind)
+    T.assert_not_equal(results, "P1 field member present", fld, 0)
+
+    Let mth_kind be DART_METHOD_DECL from Parser
+    Let mth be Semantic.find_child_of_kind(cls, mth_kind)
+    T.assert_not_equal(results, "P1 method member present", mth, 0)
+
+    Return 1
+End Process
+
+Process called "test_parser_function_and_lambda" that takes results as Integer returns Integer:
+    T.begin_suite(results, "dart_parser function and lambda shapes")
+
+    Let program be parse_source("Future<int> go() async { return 1; } void main() { var f = () async => 1; }")
+
+    Let fn be Parser.ast_node_child(program, 0)
+    Let fk be Parser.ast_node_type(fn)
+    Let fe be DART_FUNCTION_DECL from Parser
+    T.assert_equal(results, "P2 go is function decl", fk, fe)
+
+    Let async_flag be Parser.ast_node_has_flag(fn, "async")
+    T.assert_equal(results, "P2 go async flag", async_flag, 1)
+
+    Let ret be Parser.ast_node_child(fn, 1)
+    Let rk be Parser.ast_node_type(ret)
+    Let re be DART_GENERIC_TYPE from Parser
+    T.assert_equal(results, "P2 return type generic", rk, re)
+
+    Let ret_base be Semantic.type_base_name(ret)
+    Let rbe be StringCore.string_equals(ret_base, "Future")
+    T.assert_equal(results, "P2 return base Future", rbe, 1)
+
+    Let mn be Parser.ast_node_child(program, 1)
+    Let body be Parser.ast_node_child(mn, 3)
+    Let bk be Parser.ast_node_type(body)
+    Let be_kind be DART_BLOCK_STMT from Parser
+    T.assert_equal(results, "P2 main body block", bk, be_kind)
+
+    Let vd be Parser.ast_node_child(body, 0)
+    Let vk be Parser.ast_node_type(vd)
+    Let ve be DART_VARIABLE_DECL from Parser
+    T.assert_equal(results, "P2 var decl kind", vk, ve)
+
+    Let lam be Parser.ast_node_child(vd, 2)
+    Let lk be Parser.ast_node_type(lam)
+    Let le be DART_LAMBDA_EXPR from Parser
+    T.assert_equal(results, "P2 lambda kind", lk, le)
+
+    Let l_async be Parser.ast_node_has_flag(lam, "async")
+    T.assert_equal(results, "P2 lambda async flag", l_async, 1)
+
+    Let l_arrow be Parser.ast_node_has_flag(lam, "arrow")
+    T.assert_equal(results, "P2 lambda arrow flag", l_arrow, 1)
+
+    Let l_gen be Parser.ast_node_has_flag(lam, "generator")
+    T.assert_equal(results, "P2 lambda generator flag clear", l_gen, 0)
+
+    Return 1
+End Process
+
+Process called "test_parser_typedef_shapes" that takes results as Integer returns Integer:
+    T.begin_suite(results, "dart_parser typedef shapes (modern and legacy)")
+
+    Let program be parse_source("typedef Cb = int Function(); typedef int Legacy(int a);")
+
+    Let td0 be Parser.ast_node_child(program, 0)
+    Let k0 be Parser.ast_node_type(td0)
+    Let e0 be DART_TYPEDEF_DECL from Parser
+    T.assert_equal(results, "P3 modern typedef kind", k0, e0)
+
+    Let v0 be Parser.ast_node_value(td0)
+    Let ve0 be StringCore.string_equals(v0, "Cb")
+    T.assert_equal(results, "P3 modern typedef name Cb", ve0, 1)
+
+    Let cc0 be Parser.ast_node_child_count(td0)
+    Let aliased0 be Parser.ast_node_child(td0, cc0 minus 1)
+    Let ak0 be Parser.ast_node_type(aliased0)
+    Let ae0 be DART_FUNCTION_TYPE from Parser
+    T.assert_equal(results, "P3 modern aliased function type", ak0, ae0)
+
+    Let fn_ret be Parser.ast_node_child(aliased0, 0)
+    Let frv be Parser.ast_node_value(fn_ret)
+    Let fre be StringCore.string_equals(frv, "int")
+    T.assert_equal(results, "P3 modern alias return int", fre, 1)
+
+    Let td1 be Parser.ast_node_child(program, 1)
+    Let k1 be Parser.ast_node_type(td1)
+    T.assert_equal(results, "P3 legacy typedef kind", k1, e0)
+
+    Let v1 be Parser.ast_node_value(td1)
+    Let ve1 be StringCore.string_equals(v1, "Legacy")
+    T.assert_equal(results, "P3 legacy typedef name Legacy", ve1, 1)
+
+    Let cc1 be Parser.ast_node_child_count(td1)
+    Let aliased1 be Parser.ast_node_child(td1, cc1 minus 1)
+    Let ak1 be Parser.ast_node_type(aliased1)
+    T.assert_equal(results, "P3 legacy aliased function type", ak1, ae0)
+
+    Let legacy_params be Parser.ast_node_child(aliased1, 1)
+    Let lpc be Parser.ast_node_child_count(legacy_params)
+    T.assert_equal(results, "P3 legacy param type count", lpc, 1)
+
+    Return 1
+End Process
+
+Process called "test_parser_calls_and_members" that takes results as Integer returns Integer:
+    T.begin_suite(results, "dart_parser call, named arg, and member shapes")
+
+    Let program be parse_source("void main() { foo(1, bar: 2); obj.m(3); }")
+    Let mn be Parser.ast_node_child(program, 0)
+    Let body be Parser.ast_node_child(mn, 3)
+
+    Let s0 be Parser.ast_node_child(body, 0)
+    Let call0 be stmt_expr(s0)
+    Let c0k be Parser.ast_node_type(call0)
+    Let c0e be DART_CALL_EXPR from Parser
+    T.assert_equal(results, "P4 first stmt call expr", c0k, c0e)
+
+    Let callee0 be Parser.ast_node_child(call0, 0)
+    Let cl0k be Parser.ast_node_type(callee0)
+    Let cl0e be DART_IDENTIFIER from Parser
+    T.assert_equal(results, "P4 callee identifier", cl0k, cl0e)
+
+    Let cl0v be Parser.ast_node_value(callee0)
+    Let cl0eq be StringCore.string_equals(cl0v, "foo")
+    T.assert_equal(results, "P4 callee name foo", cl0eq, 1)
+
+    Let args0 be Parser.ast_node_child(call0, 1)
+    Let a0k be Parser.ast_node_type(args0)
+    Let a0e be DART_ARG_LIST from Parser
+    T.assert_equal(results, "P4 arg list kind", a0k, a0e)
+
+    Let a0c be Parser.ast_node_child_count(args0)
+    T.assert_equal(results, "P4 arg count 2", a0c, 2)
+
+    Let arg0 be Parser.ast_node_child(args0, 0)
+    Let arg0k be Parser.ast_node_type(arg0)
+    Let arg0e be DART_ARG from Parser
+    T.assert_equal(results, "P4 positional arg kind", arg0k, arg0e)
+
+    Let arg1 be Parser.ast_node_child(args0, 1)
+    Let arg1k be Parser.ast_node_type(arg1)
+    Let arg1e be DART_NAMED_ARG from Parser
+    T.assert_equal(results, "P4 named arg kind", arg1k, arg1e)
+
+    Let name_node be Parser.ast_node_child(arg1, 0)
+    Let nv be Parser.ast_node_value(name_node)
+    Let nve be StringCore.string_equals(nv, "bar")
+    T.assert_equal(results, "P4 named arg name bar", nve, 1)
+
+    Let s1 be Parser.ast_node_child(body, 1)
+    Let call1 be stmt_expr(s1)
+    Let callee1 be Parser.ast_node_child(call1, 0)
+    Let cl1k be Parser.ast_node_type(callee1)
+    Let cl1e be DART_MEMBER_EXPR from Parser
+    T.assert_equal(results, "P4 member callee kind", cl1k, cl1e)
+
+    Let mv be Parser.ast_node_value(callee1)
+    Let mve be StringCore.string_equals(mv, "m")
+    T.assert_equal(results, "P4 member name m", mve, 1)
+
+    Let recv be Parser.ast_node_child(callee1, 0)
+    Let rv be Parser.ast_node_value(recv)
+    Let rve be StringCore.string_equals(rv, "obj")
+    T.assert_equal(results, "P4 receiver name obj", rve, 1)
+
+    Return 1
+End Process
+
+Process called "test_parser_type_nodes" that takes results as Integer returns Integer:
+    T.begin_suite(results, "dart_parser type node kinds")
+
+    Let program be parse_source("int? a; List<String> b; int Function(double) c; Stream<int> Function()? d;")
+
+    Let da be Parser.ast_node_child(program, 0)
+    Let ta be Parser.ast_node_child(da, 1)
+    Let tak be Parser.ast_node_type(ta)
+    Let nullable_kind be DART_NULLABLE_TYPE from Parser
+    T.assert_equal(results, "P5 int? is nullable type", tak, nullable_kind)
+
+    Let wrapped_a be Parser.ast_node_child(ta, 0)
+    Let wav be Parser.ast_node_value(wrapped_a)
+    Let wave be StringCore.string_equals(wav, "int")
+    T.assert_equal(results, "P5 nullable wraps int", wave, 1)
+
+    Let db be Parser.ast_node_child(program, 1)
+    Let tb be Parser.ast_node_child(db, 1)
+    Let tbk be Parser.ast_node_type(tb)
+    Let generic_kind be DART_GENERIC_TYPE from Parser
+    T.assert_equal(results, "P5 List<String> is generic", tbk, generic_kind)
+
+    Let tb_base be Semantic.type_base_name(tb)
+    Let tbe be StringCore.string_equals(tb_base, "List")
+    T.assert_equal(results, "P5 generic base List", tbe, 1)
+
+    Let tb_args be Parser.ast_node_child(tb, 1)
+    Let tb_arg0 be Parser.ast_node_child(tb_args, 0)
+    Let tb_arg0v be Parser.ast_node_value(tb_arg0)
+    Let tbae be StringCore.string_equals(tb_arg0v, "String")
+    T.assert_equal(results, "P5 generic arg String", tbae, 1)
+
+    Let dc be Parser.ast_node_child(program, 2)
+    Let tc be Parser.ast_node_child(dc, 1)
+    Let tck be Parser.ast_node_type(tc)
+    Let fn_kind be DART_FUNCTION_TYPE from Parser
+    T.assert_equal(results, "P5 function type kind", tck, fn_kind)
+
+    Let tc_ret be Parser.ast_node_child(tc, 0)
+    Let tcrv be Parser.ast_node_value(tc_ret)
+    Let tcre be StringCore.string_equals(tcrv, "int")
+    T.assert_equal(results, "P5 function type returns int", tcre, 1)
+
+    Let tc_params be Parser.ast_node_child(tc, 1)
+    Let tcpc be Parser.ast_node_child_count(tc_params)
+    T.assert_equal(results, "P5 function type one param", tcpc, 1)
+
+    Let dd be Parser.ast_node_child(program, 3)
+    Let td be Parser.ast_node_child(dd, 1)
+    Let tdk be Parser.ast_node_type(td)
+    T.assert_equal(results, "P5 nullable function type", tdk, nullable_kind)
+
+    Let td_inner be Parser.ast_node_child(td, 0)
+    Let tdik be Parser.ast_node_type(td_inner)
+    T.assert_equal(results, "P5 nullable wraps function type", tdik, fn_kind)
+
+    Let td_ret be Parser.ast_node_child(td_inner, 0)
+    Let tdrk be Parser.ast_node_type(td_ret)
+    T.assert_equal(results, "P5 inner return generic Stream", tdrk, generic_kind)
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: SEMANTIC SUITES - EXISTING CHECKS
+Note: ============================================================================
+
+Process called "test_semantic_duplicates" that takes results as Integer returns Integer:
+    T.begin_suite(results, "dart_semantic duplicate declarations")
+
+    Let e1 be errs_of("class A {} class B {}")
+    T.assert_equal(results, "S1 distinct classes clean", e1, 0)
+
+    Let e2 be errs_of("class A {} class A {}")
+    T.assert_equal(results, "S1 duplicate class", e2, 1)
+
+    Let e3 be errs_of("void f() {} void f() {}")
+    T.assert_equal(results, "S1 duplicate function", e3, 1)
+
+    Let e4 be errs_of("void f() { int x = 1; int x = 2; }")
+    T.assert_equal(results, "S1 duplicate local variable", e4, 1)
+
+    Let e5 be errs_of("void f() { int x = 1; { int x = 2; } }")
+    T.assert_equal(results, "S1 nested shadowing legal", e5, 0)
+
+    Let e6 be errs_of("enum E { a } enum E { b }")
+    T.assert_equal(results, "S1 duplicate enum", e6, 1)
+
+    Return 1
+End Process
+
+Process called "test_semantic_type_resolution" that takes results as Integer returns Integer:
+    T.begin_suite(results, "dart_semantic type resolution")
+
+    Let e1 be errs_of("class Foo {} Foo x;")
+    T.assert_equal(results, "S2 declared class resolves", e1, 0)
+
+    Let e2 be errs_of("Bar x;")
+    T.assert_equal(results, "S2 undefined type errors", e2, 1)
+
+    Let e3 be errs_of("import 'dart:io'; Bar x;")
+    T.assert_equal(results, "S2 imports downgrade to warning", e3, 0)
+
+    Let w3 be warns_of("import 'dart:io'; Bar x;")
+    T.assert_greater_than_or_equal(results, "S2 unresolved warning emitted", w3, 1)
+
+    Let e4 be errs_of("class Box<T> { T value; }")
+    T.assert_equal(results, "S2 generic parameter resolves", e4, 0)
+
+    Return 1
+End Process
+
+Process called "test_semantic_null_safety" that takes results as Integer returns Integer:
+    T.begin_suite(results, "dart_semantic null safety")
+
+    Let e1 be errs_of("class A {} class B extends A? {}")
+    T.assert_equal(results, "S3 nullable supertype error", e1, 1)
+
+    Let e2 be errs_of("void f() { int x = 1; x?.abs(); }")
+    T.assert_equal(results, "S3 redundant null aware no error", e2, 0)
+    Let w2 be warns_of("void f() { int x = 1; x?.abs(); }")
+    T.assert_equal(results, "S3 redundant null aware warning", w2, 1)
+
+    Let w3 be warns_of("void f() { int x = 1; var y = x!; }")
+    T.assert_equal(results, "S3 redundant null assert warning", w3, 1)
+
+    Let e4 be errs_of("late int z;")
+    T.assert_equal(results, "S3 late never initialized", e4, 1)
+
+    Let e5 be errs_of("late int z; void f() { z = 1; }")
+    T.assert_equal(results, "S3 late assigned elsewhere clean", e5, 0)
+
+    Return 1
+End Process
+
+Process called "test_semantic_async_contracts" that takes results as Integer returns Integer:
+    T.begin_suite(results, "dart_semantic async/generator contracts")
+
+    Let e1 be errs_of("int f() async { return 1; }")
+    T.assert_equal(results, "S4 async needs Future", e1, 1)
+
+    Let e2 be errs_of("Future<int> f() async { return 1; }")
+    T.assert_equal(results, "S4 async Future accepted", e2, 0)
+
+    Let e3 be errs_of("void f() async {}")
+    T.assert_equal(results, "S4 async void accepted", e3, 0)
+
+    Let e4 be errs_of("int g() async* {}")
+    T.assert_equal(results, "S4 async* needs Stream", e4, 1)
+
+    Let e5 be errs_of("Stream<int> g() async* { yield 1; }")
+    T.assert_equal(results, "S4 async* Stream accepted", e5, 0)
+
+    Let e6 be errs_of("int h() sync* {}")
+    T.assert_equal(results, "S4 sync* needs Iterable", e6, 1)
+
+    Let e7 be errs_of("Iterable<int> h() sync* { yield 1; }")
+    T.assert_equal(results, "S4 sync* Iterable accepted", e7, 0)
+
+    Let e8 be errs_of("Future<void> g() async {} void f() { await g(); }")
+    T.assert_equal(results, "S4 await outside async", e8, 1)
+
+    Let e9 be errs_of("Future<void> g() async {} Future<void> f() async { await g(); }")
+    T.assert_equal(results, "S4 await inside async clean", e9, 0)
+
+    Let e10 be errs_of("Future<void> f() async { await 1; }")
+    T.assert_equal(results, "S4 await non-future no error", e10, 0)
+    Let w10 be warns_of("Future<void> f() async { await 1; }")
+    T.assert_equal(results, "S4 await non-future warning", w10, 1)
+
+    Let e11 be errs_of("void f() { yield 1; }")
+    T.assert_equal(results, "S4 yield outside generator", e11, 1)
+
+    Return 1
+End Process
+
+Process called "test_semantic_lambda_contexts" that takes results as Integer returns Integer:
+    T.begin_suite(results, "dart_semantic lambda structural and context checks")
+
+    Let e1 be errs_of("void main() { var f = () async* => 1; }")
+    T.assert_equal(results, "S5 generator arrow body error", e1, 1)
+
+    Let e2 be errs_of("void main() { var f = () sync* {}; }")
+    T.assert_equal(results, "S5 sync* lambda without yield", e2, 1)
+
+    Let e3 be errs_of("void main() { var f = () sync* { yield 1; return 2; }; }")
+    T.assert_equal(results, "S5 generator lambda value return", e3, 1)
+
+    Let e4 be errs_of("void main() { int Function() f = () async => 1; }")
+    T.assert_equal(results, "S5 async lambda non-Future context", e4, 1)
+
+    Let e5 be errs_of("void main() { Future<int> Function() f = () async => 1; }")
+    T.assert_equal(results, "S5 async lambda Future context clean", e5, 0)
+
+    Let e6 be errs_of("void main() { Stream<int> Function() s = () async* { yield 1; }; }")
+    T.assert_equal(results, "S5 async* lambda Stream context clean", e6, 0)
+
+    Let e7 be errs_of("void main() { Iterable<int> Function() i = () sync* { yield 1; }; }")
+    T.assert_equal(results, "S5 sync* lambda Iterable context clean", e7, 0)
+
+    Let e8 be errs_of("void main() { int Function() s = () sync* { yield 1; }; }")
+    T.assert_equal(results, "S5 sync* lambda non-Iterable context", e8, 1)
+
+    Let e9 be errs_of("void main() { Future<int> Function()? f = () async => 1; }")
+    T.assert_equal(results, "S5 nullable context unwrapped", e9, 0)
+
+    Return 1
+End Process
+
+Process called "test_semantic_call_arg_contexts" that takes results as Integer returns Integer:
+    T.begin_suite(results, "dart_semantic call-argument lambda contexts (top level)")
+
+    Let e1 be errs_of("void run(Future<int> Function() job) {} void main() { run(() async => 1); }")
+    T.assert_equal(results, "S6 positional arg Future context clean", e1, 0)
+
+    Let e2 be errs_of("void run(int Function() job) {} void main() { run(() async => 1); }")
+    T.assert_equal(results, "S6 positional arg non-Future context", e2, 1)
+
+    Let e3 be errs_of("void run({Stream<int> Function()? job}) {} void main() { run(job: () async* { yield 1; }); }")
+    T.assert_equal(results, "S6 named arg Stream context clean", e3, 0)
+
+    Let e4 be errs_of("void run({int Function()? job}) {} void main() { run(job: () async => 1); }")
+    T.assert_equal(results, "S6 named arg non-Future context", e4, 1)
+
+    Return 1
+End Process
+
+Process called "test_semantic_mixins" that takes results as Integer returns Integer:
+    T.begin_suite(results, "dart_semantic mixin application rules")
+
+    Let e1 be errs_of("class A {} mixin M on A {} class B with M {}")
+    T.assert_equal(results, "S7 unsatisfied on-clause", e1, 1)
+
+    Let e2 be errs_of("class A {} mixin M on A {} class B extends A with M {}")
+    T.assert_equal(results, "S7 satisfied on-clause clean", e2, 0)
+
+    Let e3 be errs_of("class A { A(); } class C with A {}")
+    T.assert_equal(results, "S7 constructor blocks class-as-mixin", e3, 1)
+
+    Let e4 be errs_of("class P {} class Q with P {}")
+    T.assert_equal(results, "S7 plain class-as-mixin clean", e4, 0)
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: RESIDUAL 1 - SCOPED CALL-ARGUMENT LAMBDA CONTEXT RESOLUTION
+Note: ============================================================================
+
+Process called "test_scoped_local_functions" that takes results as Integer returns Integer:
+    T.begin_suite(results, "residual 1a: local function callees")
+
+    Let e1 be errs_of("void main() { void local(Iterable<int> Function() cb) {} local(() sync* { yield 1; }); }")
+    T.assert_equal(results, "R1 local fn Iterable context clean", e1, 0)
+
+    Let e2 be errs_of("void main() { void local(int Function() cb) {} local(() sync* { yield 1; }); }")
+    T.assert_equal(results, "R1 local fn non-Iterable context", e2, 1)
+
+    Let e3 be errs_of("void main() { void outer() { void inner(Future<int> Function() cb) {} inner(() async => 1); } }")
+    T.assert_equal(results, "R1 nested local fn clean", e3, 0)
+
+    Let e4 be errs_of("void main() { void outer() { void inner(int Function() cb) {} inner(() async => 1); } }")
+    T.assert_equal(results, "R1 nested local fn mismatch", e4, 1)
+
+    Let e5 be errs_of("void run(int Function() cb) {} void main() { void run(Future<int> Function() cb) {} run(() async => 1); }")
+    T.assert_equal(results, "R1 local fn shadows top level", e5, 0)
+
+    Return 1
+End Process
+
+Process called "test_scoped_method_receivers" that takes results as Integer returns Integer:
+    T.begin_suite(results, "residual 1b: method receiver callees")
+
+    Let e1 be errs_of("class Runner { void go(Future<int> Function() job) {} } void main() { Runner r = Runner(); r.go(() async => 1); }")
+    T.assert_equal(results, "R2 declared receiver clean", e1, 0)
+
+    Let e2 be errs_of("class Runner { void go(Future<int> Function() job) {} } void main() { Runner r = Runner(); r.go(() sync* { yield 1; }); }")
+    T.assert_equal(results, "R2 declared receiver mismatch", e2, 1)
+
+    Let e3 be errs_of("class Runner { void go(Stream<int> Function() job) {} } void main() { var r = Runner(); r.go(() async* { yield 1; }); }")
+    T.assert_equal(results, "R2 inferred receiver clean", e3, 0)
+
+    Let e4 be errs_of("class Runner { void go(Stream<int> Function() job) {} } void main() { var r = Runner(); r.go(() async => 1); }")
+    T.assert_equal(results, "R2 inferred receiver mismatch", e4, 1)
+
+    Let e5 be errs_of("class Base { void go(Iterable<int> Function() job) {} } class Sub extends Base {} void main() { Sub s = Sub(); s.go(() sync* { yield 1; }); }")
+    T.assert_equal(results, "R2 inherited method clean", e5, 0)
+
+    Let e6 be errs_of("class Base { void go(Iterable<int> Function() job) {} } class Sub extends Base {} void main() { Sub s = Sub(); s.go(() async => 1); }")
+    T.assert_equal(results, "R2 inherited method mismatch", e6, 1)
+
+    Let e7 be errs_of("class K { void Function(Future<int> Function()) hook = (cb) {}; } void main() { K k = K(); k.hook(() async => 1); }")
+    T.assert_equal(results, "R2 function-typed field clean", e7, 0)
+
+    Let e8 be errs_of("class K { void Function(Future<int> Function()) hook = (cb) {}; } void main() { K k = K(); k.hook(() sync* { yield 1; }); }")
+    T.assert_equal(results, "R2 function-typed field mismatch", e8, 1)
+
+    Return 1
+End Process
+
+Process called "test_scoped_function_typed_values" that takes results as Integer returns Integer:
+    T.begin_suite(results, "residual 1c: function-typed variable callees")
+
+    Let e1 be errs_of("void main() { void Function(Future<int> Function()) h = (cb) {}; h(() async => 1); }")
+    T.assert_equal(results, "R3 fn-typed local var clean", e1, 0)
+
+    Let e2 be errs_of("void main() { void Function(Future<int> Function()) h = (cb) {}; h(() sync* { yield 1; }); }")
+    T.assert_equal(results, "R3 fn-typed local var mismatch", e2, 1)
+
+    Let e3 be errs_of("void main(void Function(Stream<int> Function()) hook) { hook(() async* { yield 1; }); }")
+    T.assert_equal(results, "R3 fn-typed parameter clean", e3, 0)
+
+    Let e4 be errs_of("void main(void Function(Stream<int> Function()) hook) { hook(() async => 1); }")
+    T.assert_equal(results, "R3 fn-typed parameter mismatch", e4, 1)
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: RESIDUAL 2 - WRAPPER TYPE-ARGUMENT CHECKING
+Note: ============================================================================
+
+Process called "test_wrapper_type_arguments_future" that takes results as Integer returns Integer:
+    T.begin_suite(results, "residual 2: Future element assignability")
+
+    Let e1 be errs_of("void main() { Future<String> Function() f = () async => 1; }")
+    T.assert_equal(results, "R4 Future<String> rejects int", e1, 1)
+
+    Let e2 be errs_of("void main() { Future<String> Function() f = () async => 'x'; }")
+    T.assert_equal(results, "R4 Future<String> accepts String", e2, 0)
+
+    Let e3 be errs_of("void main() { Future<int> Function() f = () async => 1.5; }")
+    T.assert_equal(results, "R4 Future<int> rejects double", e3, 1)
+
+    Let e4 be errs_of("void main() { Future<double> Function() f = () async => 1; }")
+    T.assert_equal(results, "R4 Future<double> demotes int literal", e4, 0)
+
+    Let e5 be errs_of("void main() { Future<double> Function() f = () async => 'x'; }")
+    T.assert_equal(results, "R4 Future<double> rejects String", e5, 1)
+
+    Let e6 be errs_of("void main() { Future<num> Function() f = () async => 1; }")
+    T.assert_equal(results, "R4 Future<num> accepts int", e6, 0)
+
+    Let e7 be errs_of("void main() { Future<dynamic> Function() f = () async => 1; }")
+    T.assert_equal(results, "R4 Future<dynamic> accepts all", e7, 0)
+
+    Let e8 be errs_of("void main() { Future<Object> Function() f = () async => 1; }")
+    T.assert_equal(results, "R4 Future<Object> accepts int", e8, 0)
+
+    Let e9 be errs_of("void main() { Future<void> Function() f = () async => 1; }")
+    T.assert_equal(results, "R4 Future<void> accepts value", e9, 0)
+
+    Let e10 be errs_of("void main() { Future<String> Function() f = () async { return 1; }; }")
+    T.assert_equal(results, "R4 block body return rejected", e10, 1)
+
+    Let e11 be errs_of("void main() { Future<String> Function() f = () async { return 'x'; }; }")
+    T.assert_equal(results, "R4 block body return accepted", e11, 0)
+
+    Let e12 be errs_of("class A {} class B extends A {} void main() { Future<A> Function() f = () async => B(); }")
+    T.assert_equal(results, "R4 subtype element accepted", e12, 0)
+
+    Let e13 be errs_of("class A {} class B extends A {} void main() { Future<B> Function() f = () async => A(); }")
+    T.assert_equal(results, "R4 supertype element rejected", e13, 1)
+
+    Let e14 be errs_of("Future<int> fetch() async { return 1; } void main() { Future<int> Function() g = () async => fetch(); }")
+    T.assert_equal(results, "R4 Future flattening accepted", e14, 0)
+
+    Let e15 be errs_of("Future<int> fetch() async { return 1; } void main() { Future<String> Function() g = () async => fetch(); }")
+    T.assert_equal(results, "R4 Future flattening rejected", e15, 1)
+
+    Let e16 be errs_of("void main() { Future<int> Function(int) f = (int x) async => x; }")
+    T.assert_equal(results, "R4 lambda parameter element accepted", e16, 0)
+
+    Let e17 be errs_of("void main() { Future<String> Function(int) f = (int x) async => x; }")
+    T.assert_equal(results, "R4 lambda parameter element rejected", e17, 1)
+
+    Let e18 be errs_of("void run(Future<String> Function() job) {} void main() { run(() async => 1); }")
+    T.assert_equal(results, "R4 call-arg element rejected", e18, 1)
+
+    Return 1
+End Process
+
+Process called "test_wrapper_type_arguments_generators" that takes results as Integer returns Integer:
+    T.begin_suite(results, "residual 2: Stream/Iterable element assignability")
+
+    Let e1 be errs_of("void main() { Stream<String> Function() s = () async* { yield 1; }; }")
+    T.assert_equal(results, "R4 Stream<String> rejects int yield", e1, 1)
+
+    Let e2 be errs_of("void main() { Stream<int> Function() s = () async* { yield 1; }; }")
+    T.assert_equal(results, "R4 Stream<int> accepts int yield", e2, 0)
+
+    Let e3 be errs_of("void main() { Iterable<String> Function() i = () sync* { yield 1; }; }")
+    T.assert_equal(results, "R4 Iterable<String> rejects int yield", e3, 1)
+
+    Let e4 be errs_of("void main() { Iterable<int> Function() i = () sync* { yield 1; }; }")
+    T.assert_equal(results, "R4 Iterable<int> accepts int yield", e4, 0)
+
+    Let e5 be errs_of("Stream<int> demo() async* { yield 1; } void main() { Stream<int> Function() s = () async* { yield* demo(); }; }")
+    T.assert_equal(results, "R4 yield* matching element clean", e5, 0)
+
+    Let e6 be errs_of("Stream<int> demo() async* { yield 1; } void main() { Stream<String> Function() s = () async* { yield* demo(); }; }")
+    T.assert_equal(results, "R4 yield* mismatched element", e6, 1)
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: RESIDUAL 3 - TYPEDEF EXPANSION
+Note: ============================================================================
+
+Process called "test_typedef_expansion" that takes results as Integer returns Integer:
+    T.begin_suite(results, "residual 3: typedef-named function-type contexts")
+
+    Let e1 be errs_of("typedef Cb = Future<int> Function(); void main() { Cb f = () async => 1; }")
+    T.assert_equal(results, "R5 typedef Future context clean", e1, 0)
+
+    Let e2 be errs_of("typedef Bad = int Function(); void main() { Bad g = () async => 1; }")
+    T.assert_equal(results, "R5 typedef non-Future context", e2, 1)
+
+    Let e3 be errs_of("typedef SCb = Future<String> Function(); void main() { SCb h = () async => 1; }")
+    T.assert_equal(results, "R5 typedef element mismatch", e3, 1)
+
+    Let e4 be errs_of("typedef Cb = Future<int> Function(); typedef Alias = Cb; void main() { Alias k = () async => 1; }")
+    T.assert_equal(results, "R5 typedef of typedef clean", e4, 0)
+
+    Let e5 be errs_of("typedef Bad = int Function(); typedef Alias = Bad; void main() { Alias m = () async => 1; }")
+    T.assert_equal(results, "R5 typedef of typedef mismatch", e5, 1)
+
+    Let e6 be errs_of("typedef X1 = Y1; typedef Y1 = X1; void main() { X1 v = () async => 1; }")
+    T.assert_equal(results, "R5 typedef cycle terminates silently", e6, 0)
+
+    Let e7 be errs_of("typedef JCb = Future<int> Function(); void run(JCb job) {} void main() { run(() async => 1); }")
+    T.assert_equal(results, "R5 typedef parameter context clean", e7, 0)
+
+    Let e8 be errs_of("typedef JCb = Future<int> Function(); void run(JCb job) {} void main() { run(() sync* { yield 1; }); }")
+    T.assert_equal(results, "R5 typedef parameter context mismatch", e8, 1)
+
+    Let e9 be errs_of("typedef int LegacyCb(); void main() { LegacyCb v = () async => 1; }")
+    T.assert_equal(results, "R5 legacy typedef context mismatch", e9, 1)
+
+    Let e10 be errs_of("typedef int LegacyCb(); void main() { LegacyCb v = () => 1; }")
+    T.assert_equal(results, "R5 legacy typedef unflagged lambda clean", e10, 0)
+
+    Let e11 be errs_of("typedef Cb = int Function(); Cb x;")
+    T.assert_equal(results, "R5 typedef name resolves as type", e11, 0)
+
+    Let e12 be errs_of("typedef A1 = int Function(); typedef A1 = int Function();")
+    T.assert_equal(results, "R5 duplicate typedef", e12, 1)
+
+    Return 1
+End Process
+
+Process called "test_return_type_contexts" that takes results as Integer returns Integer:
+    T.begin_suite(results, "residual 3: return-type lambda contexts")
+
+    Let e1 be errs_of("Future<int> Function() make() { return () async => 1; }")
+    T.assert_equal(results, "R6 returned lambda Future context clean", e1, 0)
+
+    Let e2 be errs_of("int Function() make() { return () async => 1; }")
+    T.assert_equal(results, "R6 returned lambda non-Future context", e2, 1)
+
+    Let e3 be errs_of("Stream<int> Function() make() { return () sync* { yield 1; }; }")
+    T.assert_equal(results, "R6 returned sync* needs Iterable", e3, 1)
+
+    Let e4 be errs_of("typedef RCb = Stream<int> Function(); RCb make() { return () async* { yield 1; }; }")
+    T.assert_equal(results, "R6 typedef return context clean", e4, 0)
+
+    Let e5 be errs_of("typedef RCb = Stream<int> Function(); RCb make() { return () async => 1; }")
+    T.assert_equal(results, "R6 typedef return context mismatch", e5, 1)
+
+    Let e6 be errs_of("Future<String> Function() make() { return () async => 1; }")
+    T.assert_equal(results, "R6 returned lambda element mismatch", e6, 1)
+
+    Let e7 be errs_of("Future<int> Function() make() => () async => 1;")
+    T.assert_equal(results, "R6 arrow-bodied maker clean", e7, 0)
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: MAIN
+Note: ============================================================================
+
+Process called "main" returns Integer:
+    Let results be T.create_test_results()
+
+    test_lexer_basics(results)
+    test_lexer_operators(results)
+    test_lexer_keywords_and_literals(results)
+
+    test_parser_class_shape(results)
+    test_parser_function_and_lambda(results)
+    test_parser_typedef_shapes(results)
+    test_parser_calls_and_members(results)
+    test_parser_type_nodes(results)
+
+    test_semantic_duplicates(results)
+    test_semantic_type_resolution(results)
+    test_semantic_null_safety(results)
+    test_semantic_async_contracts(results)
+    test_semantic_lambda_contexts(results)
+    test_semantic_call_arg_contexts(results)
+    test_semantic_mixins(results)
+
+    test_scoped_local_functions(results)
+    test_scoped_method_receivers(results)
+    test_scoped_function_typed_values(results)
+
+    test_wrapper_type_arguments_future(results)
+    test_wrapper_type_arguments_generators(results)
+
+    test_typedef_expansion(results)
+    test_return_type_contexts(results)
+
+    T.print_summary(results)
+    Let exit_code be T.get_failed(results)
+    T.destroy_test_results(results)
+    Return exit_code
+End Process

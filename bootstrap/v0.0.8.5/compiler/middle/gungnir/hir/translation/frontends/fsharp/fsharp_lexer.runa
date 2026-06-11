@@ -273,8 +273,13 @@ Note: ==========================================================================
 @Reasoning:
 F# is indentation-sensitive (#light syntax), so the lexer tracks line and
 column for every token. paren/bracket/brace depth counters track grouping
-state so indentation rules can be suppressed inside expressions. in_string/
-in_comment guard against producing tokens inside quoted/commented regions.
+state so indentation rules can be suppressed inside expressions. The
+interp_stack slot holds the interpolation mode stack: one 32-byte entry
+per interpolated string whose hole is currently being lexed (brace depth
+at entry offset 0, paren/bracket depth at 8, verbatim flag at 16, pending
+printf-style format spec at 24). A stack - not a flag - because F# holes
+may contain further interpolated strings ($"a{ $"b{x}c" }d") and each
+nesting level needs its own brace/paren accounting and verbatim rule.
 @End Reasoning
 Type called "FSharpLexer":
     source as Integer           Note: Source code string
@@ -284,7 +289,7 @@ Type called "FSharpLexer":
     length as Integer           Note: Length of source
     indent_stack as Integer     Note: Stack for tracking indentation levels
     current_indent as Integer   Note: Current indentation level
-    in_string as Integer        Note: Flag for string literal state
+    interp_stack as Integer     Note: Interpolation mode stack (List of entries)
     in_comment as Integer       Note: Flag for comment state
     paren_depth as Integer      Note: Parentheses nesting depth
     bracket_depth as Integer    Note: Bracket nesting depth
@@ -296,20 +301,22 @@ Note: Token Record and Accessors
 Note: ============================================================================
 
 @Reasoning:
-A 40-byte token record (5 x i64): type tag at offset 0, lexeme string
+A 48-byte token record (6 x i64): type tag at offset 0, lexeme string
 handle at offset 8, numeric payload at offset 16, source line at offset
-24, source column at offset 32. Tokens are heap-allocated (not arena)
-because they outlive the lexer: the token list flows through the parser
-into the AST value slots and is read by the HIR translator long after
-destroy_fsharp_lexer runs. The numeric payload carries the parsed integer
-value for integer-family literals, the IEEE-754 binary64 bit pattern for
-float-family literals, and the Unicode code point for char literals;
-it is 0 for every non-literal token.
+24, source column at offset 32, and the interpolation format-spec string
+handle at offset 40 (0 for every token except the interpolated-string
+segment tokens that follow a formatted hole). Tokens are heap-allocated
+(not arena) because they outlive the lexer: the token list flows through
+the parser into the AST value slots and is read by the HIR translator
+long after destroy_fsharp_lexer runs. The numeric payload carries the
+parsed integer value for integer-family literals, the IEEE-754 binary64
+bit pattern for float-family literals, and the Unicode code point for
+char literals; it is 0 for every non-literal token.
 @End Reasoning
 Process called "create_token" takes token_type as Integer, lexeme as Integer, value as Integer, line as Integer, column as Integer returns Integer:
-    Note: Create a 40-byte token record with type, lexeme, payload, and position
+    Note: Create a 48-byte token record with type, lexeme, payload, and position
 
-    Let token be proc allocate from Layout with 40
+    Let token be proc allocate from Layout with 48
     If token is equal to 0:
         Return 0
     End If
@@ -319,6 +326,7 @@ Process called "create_token" takes token_type as Integer, lexeme as Integer, va
     proc memory_set_int64 from Layout with token, 16, value
     proc memory_set_int64 from Layout with token, 24, line
     proc memory_set_int64 from Layout with token, 32, column
+    proc memory_set_int64 from Layout with token, 40, 0
 
     Return token
 End Process
@@ -368,6 +376,39 @@ Process called "get_token_value" takes token as Integer returns Integer:
     End If
 
     Return proc memory_get_int64 from Layout with token, 16
+End Process
+
+@Reasoning:
+Format-spec accessor pair for interpolated-string holes. F# holes carry
+optional formatting in two spellings: the printf-style specifier written
+in the literal text immediately before the hole (%d{expr}) and the .NET
+composite-formatting alignment/format suffix written inside the hole
+({expr,alignment:format}). Both are lexed as raw spec text and attached
+(see the @Reasoning on read_interp_segment for the segment-mode flag)
+to the SEGMENT token that follows the hole (TOKEN_INTERP_STRING_MID, or
+the final segment) so the token stream protocol - START, hole tokens,
+MID - is unchanged for consumers that ignore formatting. The parser
+copies the spec onto the hole expression's AST metadata slot.
+@End Reasoning
+Process called "get_token_spec" takes token as Integer returns Integer:
+    Note: Get the interpolation format-spec string (0 when absent)
+
+    If token is equal to 0:
+        Return 0
+    End If
+
+    Return proc memory_get_int64 from Layout with token, 40
+End Process
+
+Process called "set_token_spec" takes token as Integer, spec as Integer returns Integer:
+    Note: Attach an interpolation format-spec string to a token
+
+    If token is equal to 0:
+        Return 0
+    End If
+
+    proc memory_set_int64 from Layout with token, 40, spec
+    Return 1
 End Process
 
 @Reasoning:
@@ -459,7 +500,10 @@ Process called "create_fsharp_lexer" takes source_code as Integer returns Intege
 
     proc memory_set_int64 from Layout with lexer, 40, 0   Note: indent_stack = null
     proc memory_set_int64 from Layout with lexer, 48, 0   Note: current_indent = 0
-    proc memory_set_int64 from Layout with lexer, 56, 0   Note: in_string = false
+
+    Let interp_stack be proc list_create from List
+    proc memory_set_int64 from Layout with lexer, 56, interp_stack
+
     proc memory_set_int64 from Layout with lexer, 64, 0   Note: in_comment = false
     proc memory_set_int64 from Layout with lexer, 72, 0   Note: paren_depth = 0
     proc memory_set_int64 from Layout with lexer, 80, 0   Note: bracket_depth = 0
@@ -485,7 +529,118 @@ Process called "destroy_fsharp_lexer" takes lexer as Integer returns Integer:
         proc deallocate from Layout with indent_stack
     End If
 
+    Let interp_stack be proc memory_get_int64 from Layout with lexer, 56
+    If interp_stack is not equal to 0:
+        Let entry_count be proc list_length from List with interp_stack
+        Let e be 0
+        While e is less than entry_count:
+            Let entry be proc list_get from List with interp_stack, e
+            If entry is not equal to 0:
+                proc deallocate from Layout with entry
+            End If
+            Set e to e plus 1
+        End While
+        proc list_destroy from List with interp_stack
+    End If
+
     proc deallocate from Layout with lexer
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Interpolation Mode Stack
+Note: ============================================================================
+
+@Reasoning:
+One entry per interpolated string whose hole is currently being lexed as
+ordinary expression tokens. Entries are 32 bytes: brace depth inside the
+hole at offset 0 (so record literals in holes do not terminate the hole
+early), paren/bracket depth at offset 8 (so commas and colons inside
+parenthesised hole expressions are not mistaken for .NET alignment/format
+separators), the verbatim flag at offset 16 (so the continuation segment
+after the hole resumes with the correct escape rules), and the pending
+printf-style format spec at offset 24 (captured from the literal text
+immediately before the hole, delivered on the segment token that follows
+the hole). Push happens when a segment ends at a hole; pop happens when
+the hole-closing brace (or format-spec suffix) is consumed.
+@End Reasoning
+Process called "interp_stack_push" takes lexer as Integer, verbatim as Integer, pending_spec as Integer returns Integer:
+    Note: Push a fresh hole-context entry onto the interpolation stack
+
+    Let entry be proc allocate from Layout with 32
+    If entry is equal to 0:
+        Return 0
+    End If
+
+    proc memory_set_int64 from Layout with entry, 0, 0   Note: brace depth
+    proc memory_set_int64 from Layout with entry, 8, 0   Note: paren/bracket depth
+    proc memory_set_int64 from Layout with entry, 16, verbatim
+    proc memory_set_int64 from Layout with entry, 24, pending_spec
+
+    Let interp_stack be proc memory_get_int64 from Layout with lexer, 56
+    proc list_append from List with interp_stack, entry
+    Return entry
+End Process
+
+Process called "interp_stack_top" takes lexer as Integer returns Integer:
+    Note: Get the innermost hole-context entry (0 when no hole is open)
+
+    Let interp_stack be proc memory_get_int64 from Layout with lexer, 56
+    If interp_stack is equal to 0:
+        Return 0
+    End If
+
+    Let entry_count be proc list_length from List with interp_stack
+    If entry_count is equal to 0:
+        Return 0
+    End If
+
+    Return proc list_get from List with interp_stack, entry_count minus 1
+End Process
+
+Process called "interp_stack_pop" takes lexer as Integer returns Integer:
+    Note: Remove and return the innermost hole-context entry (caller frees)
+
+    Let interp_stack be proc memory_get_int64 from Layout with lexer, 56
+    If interp_stack is equal to 0:
+        Return 0
+    End If
+
+    Let entry_count be proc list_length from List with interp_stack
+    If entry_count is equal to 0:
+        Return 0
+    End If
+
+    Let top_index be entry_count minus 1
+    Let entry be proc list_get from List with interp_stack, top_index
+    proc list_remove from List with interp_stack, top_index
+    Return entry
+End Process
+
+@Reasoning:
+Error recovery: an unterminated or malformed interpolated string must not
+leave stale hole contexts behind, otherwise the tokeniser would keep
+routing braces into segment reading after the error token. Every interp
+error path clears the whole stack.
+@End Reasoning
+Process called "interp_stack_clear" takes lexer as Integer returns Integer:
+    Note: Free every hole-context entry and empty the stack
+
+    Let interp_stack be proc memory_get_int64 from Layout with lexer, 56
+    If interp_stack is equal to 0:
+        Return 1
+    End If
+
+    Let entry_count be proc list_length from List with interp_stack
+    Let e be 0
+    While e is less than entry_count:
+        Let entry be proc list_get from List with interp_stack, e
+        If entry is not equal to 0:
+            proc deallocate from Layout with entry
+        End If
+        Set e to e plus 1
+    End While
+    proc list_clear from List with interp_stack
     Return 1
 End Process
 
@@ -1539,28 +1694,198 @@ Process called "read_string_literal" takes lexer as Integer returns Integer:
 End Process
 
 @Reasoning:
-Interpolated strings ($"text {expr} text") are lexed as alternating
-segment tokens and ordinary expression tokens. This recogniser reads one
-literal segment: the run of text from the current cursor up to the next
-interpolation hole ({) or the closing quote. Doubled braces ({{ and }})
-are the F# escapes for literal braces and are collapsed during cooking;
-backslash escapes are decoded exactly like regular strings. The returned
-token's numeric payload is the continuation flag: 1 when the segment
-ended at a hole (expression tokens and a continuation segment follow),
-0 when the segment ended at the closing quote (the string is complete).
-The lexer's in_string slot (offset 56) stays raised across holes so
-next_token can route the hole-closing brace back into this recogniser,
-and the brace_depth slot (offset 88) counts braces opened INSIDE the
-hole expression so record literals in holes do not terminate the hole
-early.
+Detects a printf-style format specifier (%d, %5.2f, %-8s, ...) ending
+exactly at end_pos, i.e. written immediately before an interpolation
+hole as F# permits: $"count = %d{n}". The scan walks forward tracking
+the last unescaped percent (%% is the literal-percent escape and never
+starts a spec), then validates the tail against the printf grammar
+%[flags][width][.precision]type with the F# type letters
+b c d i u x X o s f F e E g G M A O. Returns the byte position where
+the specifier starts, or -1 when the text does not end in a specifier.
+@End Reasoning
+Process called "printf_spec_start" takes source as Integer, start_pos as Integer, end_pos as Integer returns Integer:
+    Note: Find the start of a trailing printf-style format spec, or -1
+
+    Let last_percent be 0 minus 1
+    Let i be start_pos
+    While i is less than end_pos:
+        Let ch be proc string_char_at from StringCore with source, i
+        If ch is equal to 37:  Note: '%'
+            Let next_i be i plus 1
+            If next_i is less than end_pos:
+                Let next_ch be proc string_char_at from StringCore with source, next_i
+                If next_ch is equal to 37:  Note: %% escape - not a spec start
+                    Set i to i plus 2
+                    Continue
+                End If
+            End If
+            Set last_percent to i
+        End If
+        Set i to i plus 1
+    End While
+
+    If last_percent is less than 0:
+        Return 0 minus 1
+    End If
+
+    Note: Validate %[flags][width][.precision]type covering [last_percent, end_pos)
+    Set i to last_percent plus 1
+
+    Let scanning_flags be 1
+    While scanning_flags is equal to 1:
+        If i is greater than or equal to end_pos:
+            Return 0 minus 1
+        End If
+        Set ch to proc string_char_at from StringCore with source, i
+        Let is_flag be 0
+        If ch is equal to 43:  Note: '+'
+            Set is_flag to 1
+        End If
+        If ch is equal to 45:  Note: '-'
+            Set is_flag to 1
+        End If
+        If ch is equal to 32:  Note: ' '
+            Set is_flag to 1
+        End If
+        If ch is equal to 48:  Note: '0'
+            Set is_flag to 1
+        End If
+        If ch is equal to 35:  Note: '#'
+            Set is_flag to 1
+        End If
+        If is_flag is equal to 1:
+            Set i to i plus 1
+        Otherwise:
+            Set scanning_flags to 0
+        End If
+    End While
+
+    While i is less than end_pos:
+        Set ch to proc string_char_at from StringCore with source, i
+        Let is_width_digit be proc is_digit with ch
+        If is_width_digit is equal to 0:
+            Break
+        End If
+        Set i to i plus 1
+    End While
+
+    If i is less than end_pos:
+        Set ch to proc string_char_at from StringCore with source, i
+        If ch is equal to 46:  Note: '.' precision
+            Set i to i plus 1
+            While i is less than end_pos:
+                Set ch to proc string_char_at from StringCore with source, i
+                Let is_prec_digit be proc is_digit with ch
+                If is_prec_digit is equal to 0:
+                    Break
+                End If
+                Set i to i plus 1
+            End While
+        End If
+    End If
+
+    If i is not equal to end_pos minus 1:
+        Return 0 minus 1
+    End If
+
+    Set ch to proc string_char_at from StringCore with source, i
+    Let is_type be 0
+    If ch is equal to 98:   Note: 'b'
+        Set is_type to 1
+    End If
+    If ch is equal to 99:   Note: 'c'
+        Set is_type to 1
+    End If
+    If ch is equal to 100:  Note: 'd'
+        Set is_type to 1
+    End If
+    If ch is equal to 105:  Note: 'i'
+        Set is_type to 1
+    End If
+    If ch is equal to 117:  Note: 'u'
+        Set is_type to 1
+    End If
+    If ch is equal to 120:  Note: 'x'
+        Set is_type to 1
+    End If
+    If ch is equal to 88:   Note: 'X'
+        Set is_type to 1
+    End If
+    If ch is equal to 111:  Note: 'o'
+        Set is_type to 1
+    End If
+    If ch is equal to 115:  Note: 's'
+        Set is_type to 1
+    End If
+    If ch is equal to 102:  Note: 'f'
+        Set is_type to 1
+    End If
+    If ch is equal to 70:   Note: 'F'
+        Set is_type to 1
+    End If
+    If ch is equal to 101:  Note: 'e'
+        Set is_type to 1
+    End If
+    If ch is equal to 69:   Note: 'E'
+        Set is_type to 1
+    End If
+    If ch is equal to 103:  Note: 'g'
+        Set is_type to 1
+    End If
+    If ch is equal to 71:   Note: 'G'
+        Set is_type to 1
+    End If
+    If ch is equal to 77:   Note: 'M'
+        Set is_type to 1
+    End If
+    If ch is equal to 65:   Note: 'A'
+        Set is_type to 1
+    End If
+    If ch is equal to 79:   Note: 'O'
+        Set is_type to 1
+    End If
+
+    If is_type is equal to 0:
+        Return 0 minus 1
+    End If
+
+    Return last_percent
+End Process
+
+@Reasoning:
+Interpolated strings ($"text {expr} text", the verbatim forms
+$@"..." / @$"...", and the triple-quoted form $"""...""") are lexed as
+alternating segment tokens and ordinary expression tokens. This
+recogniser reads one literal segment: the run of text from the current
+cursor up to the next interpolation hole ({) or the closing terminator.
+The is_verbatim parameter is the segment MODE: 0 regular (backslash
+escapes decoded), 1 verbatim (backslashes literal, "" collapses to one
+quote, single quote terminates), 2 triple-quoted (backslashes and
+quotes are literal content - quote runs shorter than three pass
+through byte-for-byte - and the terminator is exactly three quotes).
+Doubled braces ({{ and }}) are the F# escapes for literal braces and
+doubled percents (%%) the escape for a literal percent in every mode;
+both are collapsed during cooking. A printf-style format specifier
+written immediately before a hole (%d{expr}) is stripped from the
+segment text and recorded in the hole-context entry pushed for that
+hole; it is later attached to the segment token following the hole. The
+returned token's numeric payload is the continuation flag: 1 when the
+segment ended at a hole (expression tokens and a continuation segment
+follow), 0 when the segment ended at the closing quote (the string is
+complete). When the segment ends at a hole, a fresh hole-context entry
+is pushed onto the lexer's interpolation stack (offset 56) so next_token
+routes braces, parens, and format separators for that hole; nested
+interpolated strings inside holes push further entries and unwind in
+LIFO order. The format_spec parameter carries the spec for the hole this
+segment CLOSES (0 when none) and is stored on the returned token.
 @End Reasoning
 @Security_Scope:
 Untrusted input. EOF inside a segment and a lone closing brace in
 literal text (F# requires the doubled form) both produce TOKEN_ERROR
-without over-reading the buffer, and clear in_string so the tokeniser
-does not resume string scanning after the error.
+without over-reading the buffer, and clear the interpolation stack so
+the tokeniser does not resume string scanning after the error.
 @End Security_Scope
-Process called "read_interp_segment" takes lexer as Integer, token_kind as Integer returns Integer:
+Process called "read_interp_segment" takes lexer as Integer, token_kind as Integer, is_verbatim as Integer, format_spec as Integer returns Integer:
     Note: Read one literal segment of an interpolated string
 
     Let source be proc memory_get_int64 from Layout with lexer, 0
@@ -1569,6 +1894,7 @@ Process called "read_interp_segment" takes lexer as Integer, token_kind as Integ
     Let content_start be proc memory_get_int64 from Layout with lexer, 8
     Let content_end be content_start
     Let has_hole be 0
+    Let pending_spec be 0
     Let escaped be 0
     Let scanning be 1
 
@@ -1576,28 +1902,61 @@ Process called "read_interp_segment" takes lexer as Integer, token_kind as Integ
         Let current be proc current_char with lexer
 
         If current is equal to 0:  Note: EOF - unterminated interpolated string
-            proc memory_set_int64 from Layout with lexer, 56, 0
+            proc interp_stack_clear with lexer
             Set content_end to proc memory_get_int64 from Layout with lexer, 8
             Let err_lexeme be proc fsharp_substring with source, content_start, content_end
             Return proc create_token with TOKEN_ERROR, err_lexeme, 0, line, column
         End If
 
-        If escaped is equal to 1:
-            Set escaped to 0
-            proc advance_char with lexer
-            Continue
+        If is_verbatim is equal to 0:
+            If escaped is equal to 1:
+                Set escaped to 0
+                proc advance_char with lexer
+                Continue
+            End If
+
+            If current is equal to 92:  Note: backslash starts escape
+                Set escaped to 1
+                proc advance_char with lexer
+                Continue
+            End If
         End If
 
-        If current is equal to 92:  Note: backslash starts escape
-            Set escaped to 1
-            proc advance_char with lexer
-            Continue
-        End If
-
-        If current is equal to 34:  Note: closing quote ends the whole string
+        If current is equal to 34:  Note: quote
+            If is_verbatim is equal to 2:
+                Note: Triple-quoted mode: the terminator is exactly three
+                Note: quotes; any quote run shorter than three is literal
+                Note: content taken byte-for-byte
+                Let triple_q1 be proc peek_char with lexer, 1
+                Let triple_q2 be proc peek_char with lexer, 2
+                Let is_terminator be 0
+                If triple_q1 is equal to 34:
+                    If triple_q2 is equal to 34:
+                        Set is_terminator to 1
+                    End If
+                End If
+                If is_terminator is equal to 0:
+                    proc advance_char with lexer
+                    Continue
+                End If
+                Set content_end to proc memory_get_int64 from Layout with lexer, 8
+                proc advance_char with lexer
+                proc advance_char with lexer
+                proc advance_char with lexer
+                Set scanning to 0
+                Continue
+            End If
+            If is_verbatim is equal to 1:
+                Let quote_next be proc peek_char with lexer, 1
+                If quote_next is equal to 34:  Note: "" is a literal quote
+                    proc advance_char with lexer
+                    proc advance_char with lexer
+                    Continue
+                End If
+            End If
+            Note: Closing quote ends the whole string
             Set content_end to proc memory_get_int64 from Layout with lexer, 8
             proc advance_char with lexer
-            proc memory_set_int64 from Layout with lexer, 56, 0
             Set scanning to 0
             Continue
         End If
@@ -1609,10 +1968,17 @@ Process called "read_interp_segment" takes lexer as Integer, token_kind as Integ
                 proc advance_char with lexer
                 Continue
             End If
-            Note: Interpolation hole begins; expression tokens follow
+            Note: Interpolation hole begins; expression tokens follow. A
+            Note: printf-style spec immediately before the hole belongs to
+            Note: the hole, not to the literal text.
             Set content_end to proc memory_get_int64 from Layout with lexer, 8
+            Let spec_pos be proc printf_spec_start with source, content_start, content_end
+            If spec_pos is greater than or equal to 0:
+                Set pending_spec to proc fsharp_substring with source, spec_pos, content_end
+                Set content_end to spec_pos
+            End If
             proc advance_char with lexer
-            proc memory_set_int64 from Layout with lexer, 88, 0  Note: hole brace depth = 0
+            proc interp_stack_push with lexer, is_verbatim, pending_spec
             Set has_hole to 1
             Set scanning to 0
             Continue
@@ -1626,7 +1992,7 @@ Process called "read_interp_segment" takes lexer as Integer, token_kind as Integ
                 Continue
             End If
             Note: A lone close brace in literal text requires the doubled form
-            proc memory_set_int64 from Layout with lexer, 56, 0
+            proc interp_stack_clear with lexer
             Set content_end to proc memory_get_int64 from Layout with lexer, 8
             Set err_lexeme to proc fsharp_substring with source, content_start, content_end
             Return proc create_token with TOKEN_ERROR, err_lexeme, 0, line, column
@@ -1635,9 +2001,11 @@ Process called "read_interp_segment" takes lexer as Integer, token_kind as Integ
         proc advance_char with lexer
     End While
 
-    Note: Collapse doubled braces over the RAW byte range first (escape
-    Note: decoding could synthesise brace bytes from unicode escapes, so the
-    Note: collapse must not run on decoded text), then decode backslash escapes.
+    Note: Collapse doubled braces, doubled percents, and (verbatim only)
+    Note: doubled quotes over the RAW byte range first (escape decoding could
+    Note: synthesise brace bytes from unicode escapes, so the collapse must
+    Note: not run on decoded text), then decode backslash escapes for the
+    Note: regular form. Verbatim content takes the collapsed bytes as-is.
     Let raw_len be content_end minus content_start
     Let collapsed be proc allocate from Layout with raw_len plus 1
     If collapsed is equal to 0:
@@ -1650,17 +2018,19 @@ Process called "read_interp_segment" takes lexer as Integer, token_kind as Integ
     While read_pos is less than content_end:
         Let ch be proc string_char_at from StringCore with source, read_pos
 
-        If ch is equal to 92:  Note: copy escape pairs verbatim for the decoder
-            proc memory_set_byte from Layout with collapsed, write_pos, ch
-            Set write_pos to write_pos plus 1
-            Set read_pos to read_pos plus 1
-            If read_pos is less than content_end:
-                Let esc_ch be proc string_char_at from StringCore with source, read_pos
-                proc memory_set_byte from Layout with collapsed, write_pos, esc_ch
+        If is_verbatim is equal to 0:
+            If ch is equal to 92:  Note: copy escape pairs verbatim for the decoder
+                proc memory_set_byte from Layout with collapsed, write_pos, ch
                 Set write_pos to write_pos plus 1
                 Set read_pos to read_pos plus 1
+                If read_pos is less than content_end:
+                    Let esc_ch be proc string_char_at from StringCore with source, read_pos
+                    proc memory_set_byte from Layout with collapsed, write_pos, esc_ch
+                    Set write_pos to write_pos plus 1
+                    Set read_pos to read_pos plus 1
+                End If
+                Continue
             End If
-            Continue
         End If
 
         Let pair be 0
@@ -1676,6 +2046,18 @@ Process called "read_interp_segment" takes lexer as Integer, token_kind as Integ
                     Set pair to 1
                 End If
             End If
+            If ch is equal to 37:  Note: %% collapses to a literal percent
+                If ahead is equal to 37:
+                    Set pair to 1
+                End If
+            End If
+            If is_verbatim is equal to 1:
+                If ch is equal to 34:  Note: "" collapses to a literal quote
+                    If ahead is equal to 34:
+                        Set pair to 1
+                    End If
+                End If
+            End If
         End If
 
         proc memory_set_byte from Layout with collapsed, write_pos, ch
@@ -1688,10 +2070,88 @@ Process called "read_interp_segment" takes lexer as Integer, token_kind as Integ
     End While
     proc memory_set_byte from Layout with collapsed, write_pos, 0
 
-    Let lexeme be proc decode_escapes with collapsed, 0, write_pos
-    proc deallocate from Layout with collapsed
+    Let lexeme be 0
+    If is_verbatim is not equal to 0:
+        Note: Verbatim and triple-quoted bodies take the collapsed bytes
+        Note: as-is (backslashes are literal in both)
+        Set lexeme to proc fsharp_substring with collapsed, 0, write_pos
+        proc deallocate from Layout with collapsed
+    Otherwise:
+        Set lexeme to proc decode_escapes with collapsed, 0, write_pos
+        proc deallocate from Layout with collapsed
+    End If
 
-    Return proc create_token with token_kind, lexeme, has_hole, line, column
+    Let token be proc create_token with token_kind, lexeme, has_hole, line, column
+    If format_spec is not equal to 0:
+        proc set_token_spec with token, format_spec
+    End If
+    Return token
+End Process
+
+@Reasoning:
+.NET composite-formatting suffix capture: when next_token meets a comma
+or colon at top level inside an interpolation hole (brace and paren
+depth both zero in the innermost hole context), the rest of the hole up
+to the closing brace is alignment/format text, not expression tokens -
+{value,8} pads to width 8, {price:C2} formats as currency, and
+{value,8:F1} combines both. This routine captures that raw spec text,
+consumes the closing brace, pops the hole context, joins the spec with
+any pending printf-style spec captured before the hole (printf spec
+first, suffix second - both are preserved losslessly for consumers),
+and resumes segment reading with the combined spec attached to the
+returned segment token. EOF or a quote before the closing brace is an
+unterminated hole: the stack is cleared and TOKEN_ERROR returned.
+@End Reasoning
+Process called "read_interp_dotnet_spec" takes lexer as Integer returns Integer:
+    Note: Capture an in-hole ,alignment/:format suffix and resume the segment
+
+    Let source be proc memory_get_int64 from Layout with lexer, 0
+    Let line be proc memory_get_int64 from Layout with lexer, 16
+    Let column be proc memory_get_int64 from Layout with lexer, 24
+    Let spec_start be proc memory_get_int64 from Layout with lexer, 8
+
+    Let scanning be 1
+    While scanning is equal to 1:
+        Let current be proc current_char with lexer
+
+        If current is equal to 0:  Note: EOF - unterminated hole
+            proc interp_stack_clear with lexer
+            Let err_end be proc memory_get_int64 from Layout with lexer, 8
+            Let err_lexeme be proc fsharp_substring with source, spec_start, err_end
+            Return proc create_token with TOKEN_ERROR, err_lexeme, 0, line, column
+        End If
+        If current is equal to 34:  Note: quote before } - malformed hole
+            proc interp_stack_clear with lexer
+            Set err_end to proc memory_get_int64 from Layout with lexer, 8
+            Set err_lexeme to proc fsharp_substring with source, spec_start, err_end
+            Return proc create_token with TOKEN_ERROR, err_lexeme, 0, line, column
+        End If
+        If current is equal to 125:  Note: closing brace ends the spec
+            Set scanning to 0
+            Continue
+        End If
+
+        proc advance_char with lexer
+    End While
+
+    Let spec_end be proc memory_get_int64 from Layout with lexer, 8
+    Let dotnet_spec be proc fsharp_substring with source, spec_start, spec_end
+
+    proc advance_char with lexer  Note: Consume }
+
+    Let entry be proc interp_stack_pop with lexer
+    Let entry_verbatim be 0
+    Let combined_spec be dotnet_spec
+    If entry is not equal to 0:
+        Set entry_verbatim to proc memory_get_int64 from Layout with entry, 16
+        Let printf_spec be proc memory_get_int64 from Layout with entry, 24
+        If printf_spec is not equal to 0:
+            Set combined_spec to proc string_concat from StringUtils with printf_spec, dotnet_spec
+        End If
+        proc deallocate from Layout with entry
+    End If
+
+    Return proc read_interp_segment with lexer, TOKEN_INTERP_STRING_MID, entry_verbatim, combined_spec
 End Process
 
 @Reasoning:
@@ -2546,22 +3006,54 @@ Process called "next_token" takes lexer as Integer returns Integer:
             Return proc read_string_literal with lexer
         End If
 
-        Note: Interpolated strings $"text {expr} text"
+        Note: Interpolated strings $"text {expr} text", the verbatim form
+        Note: $@"raw {expr}" (no backslash escapes, "" quote doubling), and
+        Note: the triple-quoted form $"""raw "quotes" {expr}""" (no escapes,
+        Note: quotes and doubled quotes are content, terminator is exactly
+        Note: three quotes; interpolation holes still lex inside)
         If current is equal to 36:  Note: '$'
             Let interp_next be proc peek_char with lexer, 1
             If interp_next is equal to 34:  Note: '"'
+                Let triple_q2 be proc peek_char with lexer, 2
+                Let triple_q3 be proc peek_char with lexer, 3
+                If triple_q2 is equal to 34:
+                    If triple_q3 is equal to 34:
+                        proc advance_char with lexer  Note: Skip $
+                        proc advance_char with lexer  Note: Skip first quote
+                        proc advance_char with lexer  Note: Skip second quote
+                        proc advance_char with lexer  Note: Skip third quote
+                        Return proc read_interp_segment with lexer, TOKEN_INTERP_STRING_START, 2, 0
+                    End If
+                End If
                 proc advance_char with lexer  Note: Skip $
                 proc advance_char with lexer  Note: Skip opening quote
-                proc memory_set_int64 from Layout with lexer, 56, 1  Note: in_string = interpolation active
-                Return proc read_interp_segment with lexer, TOKEN_INTERP_STRING_START
+                Return proc read_interp_segment with lexer, TOKEN_INTERP_STRING_START, 0, 0
+            End If
+            If interp_next is equal to 64:  Note: '@'
+                Let interp_quote be proc peek_char with lexer, 2
+                If interp_quote is equal to 34:  Note: '"'
+                    proc advance_char with lexer  Note: Skip $
+                    proc advance_char with lexer  Note: Skip @
+                    proc advance_char with lexer  Note: Skip opening quote
+                    Return proc read_interp_segment with lexer, TOKEN_INTERP_STRING_START, 1, 0
+                End If
             End If
         End If
 
-        Note: Verbatim strings @"..."
+        Note: Verbatim strings @"..." and verbatim-interpolated @$"..."
         If current is equal to 64:  Note: '@'
             Let next_ch be proc peek_char with lexer, 1
             If next_ch is equal to 34:  Note: '"'
                 Return proc read_string_literal with lexer
+            End If
+            If next_ch is equal to 36:  Note: '$'
+                Set interp_quote to proc peek_char with lexer, 2
+                If interp_quote is equal to 34:  Note: '"'
+                    proc advance_char with lexer  Note: Skip @
+                    proc advance_char with lexer  Note: Skip $
+                    proc advance_char with lexer  Note: Skip opening quote
+                    Return proc read_interp_segment with lexer, TOKEN_INTERP_STRING_START, 1, 0
+                End If
             End If
         End If
 
@@ -2608,39 +3100,68 @@ Process called "next_token" takes lexer as Integer returns Integer:
             End If
         End If
 
-        Note: Parentheses
+        Note: Parentheses. Inside an interpolation hole the innermost hole
+        Note: context tracks paren depth so format separators (, :) are only
+        Note: recognised at the hole's top level.
         If current is equal to 40:  Note: '('
+            Let interp_top be proc interp_stack_top with lexer
+            If interp_top is not equal to 0:
+                Let group_depth be proc memory_get_int64 from Layout with interp_top, 8
+                proc memory_set_int64 from Layout with interp_top, 8, group_depth plus 1
+            End If
             proc advance_char with lexer
             Let end1 be proc memory_get_int64 from Layout with lexer, 8
             Let lex1 be proc fsharp_substring with source, start_pos, end1
             Return proc create_token with TOKEN_LEFT_PAREN, lex1, 0, line, column
         End If
         If current is equal to 41:  Note: ')'
+            Set interp_top to proc interp_stack_top with lexer
+            If interp_top is not equal to 0:
+                Set group_depth to proc memory_get_int64 from Layout with interp_top, 8
+                If group_depth is greater than 0:
+                    proc memory_set_int64 from Layout with interp_top, 8, group_depth minus 1
+                End If
+            End If
             proc advance_char with lexer
             Set end1 to proc memory_get_int64 from Layout with lexer, 8
             Set lex1 to proc fsharp_substring with source, start_pos, end1
             Return proc create_token with TOKEN_RIGHT_PAREN, lex1, 0, line, column
         End If
 
-        Note: Brackets ([ handles [| in read_operator)
+        Note: Brackets ([ handles [| in read_operator); bracket nesting joins
+        Note: paren nesting in the hole-context group depth
         If current is equal to 91:  Note: '['
+            Set interp_top to proc interp_stack_top with lexer
+            If interp_top is not equal to 0:
+                Set group_depth to proc memory_get_int64 from Layout with interp_top, 8
+                proc memory_set_int64 from Layout with interp_top, 8, group_depth plus 1
+            End If
             Return proc read_operator with lexer
         End If
         If current is equal to 93:  Note: ']'
+            Set interp_top to proc interp_stack_top with lexer
+            If interp_top is not equal to 0:
+                Set group_depth to proc memory_get_int64 from Layout with interp_top, 8
+                If group_depth is greater than 0:
+                    proc memory_set_int64 from Layout with interp_top, 8, group_depth minus 1
+                End If
+            End If
             proc advance_char with lexer
             Set end1 to proc memory_get_int64 from Layout with lexer, 8
             Set lex1 to proc fsharp_substring with source, start_pos, end1
             Return proc create_token with TOKEN_RIGHT_BRACKET, lex1, 0, line, column
         End If
 
-        Note: Braces. While an interpolated string is active (in_string set)
-        Note: the brace_depth slot counts braces opened inside the current
-        Note: hole; the hole-closing brace at depth 0 resumes segment reading.
+        Note: Braces. While an interpolation hole is open (stack non-empty)
+        Note: the innermost hole context counts braces opened inside the
+        Note: hole; the hole-closing brace at depth 0 pops the context and
+        Note: resumes segment reading with the hole's verbatim rule and any
+        Note: pending printf-style format spec.
         If current is equal to 123: Note: '{'
-            Let interp_active be proc memory_get_int64 from Layout with lexer, 56
-            If interp_active is equal to 1:
-                Let hole_depth be proc memory_get_int64 from Layout with lexer, 88
-                proc memory_set_int64 from Layout with lexer, 88, hole_depth plus 1
+            Set interp_top to proc interp_stack_top with lexer
+            If interp_top is not equal to 0:
+                Let hole_depth be proc memory_get_int64 from Layout with interp_top, 0
+                proc memory_set_int64 from Layout with interp_top, 0, hole_depth plus 1
             End If
             proc advance_char with lexer
             Set end1 to proc memory_get_int64 from Layout with lexer, 8
@@ -2648,15 +3169,19 @@ Process called "next_token" takes lexer as Integer returns Integer:
             Return proc create_token with TOKEN_LEFT_BRACE, lex1, 0, line, column
         End If
         If current is equal to 125: Note: '}'
-            Set interp_active to proc memory_get_int64 from Layout with lexer, 56
-            If interp_active is equal to 1:
-                Set hole_depth to proc memory_get_int64 from Layout with lexer, 88
+            Set interp_top to proc interp_stack_top with lexer
+            If interp_top is not equal to 0:
+                Set hole_depth to proc memory_get_int64 from Layout with interp_top, 0
                 If hole_depth is equal to 0:
-                    Note: Hole ends; read the continuation segment
+                    Note: Hole ends; pop its context and read the continuation
                     proc advance_char with lexer
-                    Return proc read_interp_segment with lexer, TOKEN_INTERP_STRING_MID
+                    Let entry be proc interp_stack_pop with lexer
+                    Let entry_verbatim be proc memory_get_int64 from Layout with entry, 16
+                    Let entry_spec be proc memory_get_int64 from Layout with entry, 24
+                    proc deallocate from Layout with entry
+                    Return proc read_interp_segment with lexer, TOKEN_INTERP_STRING_MID, entry_verbatim, entry_spec
                 End If
-                proc memory_set_int64 from Layout with lexer, 88, hole_depth minus 1
+                proc memory_set_int64 from Layout with interp_top, 0, hole_depth minus 1
             End If
             proc advance_char with lexer
             Set end1 to proc memory_get_int64 from Layout with lexer, 8
@@ -2664,8 +3189,20 @@ Process called "next_token" takes lexer as Integer returns Integer:
             Return proc create_token with TOKEN_RIGHT_BRACE, lex1, 0, line, column
         End If
 
-        Note: Comma
+        Note: Comma. At the top level of an interpolation hole a comma is the
+        Note: .NET alignment separator ({value,8}), not an expression comma -
+        Note: F# requires parentheses around tuple expressions in holes.
         If current is equal to 44:  Note: ','
+            Set interp_top to proc interp_stack_top with lexer
+            If interp_top is not equal to 0:
+                Set hole_depth to proc memory_get_int64 from Layout with interp_top, 0
+                Set group_depth to proc memory_get_int64 from Layout with interp_top, 8
+                If hole_depth is equal to 0:
+                    If group_depth is equal to 0:
+                        Return proc read_interp_dotnet_spec with lexer
+                    End If
+                End If
+            End If
             proc advance_char with lexer
             Set end1 to proc memory_get_int64 from Layout with lexer, 8
             Set lex1 to proc fsharp_substring with source, start_pos, end1
@@ -2696,8 +3233,19 @@ Process called "next_token" takes lexer as Integer returns Integer:
             Return proc create_token with TOKEN_HASH, lex1, 0, line, column
         End If
 
-        Note: Operators by lead character
+        Note: Operators by lead character. The |] array closer rejoins the
+        Note: hole-context group depth opened by [|.
         If current is equal to 124: Note: '|'
+            Set next_ch to proc peek_char with lexer, 1
+            If next_ch is equal to 93:  Note: ']' closing |]
+                Set interp_top to proc interp_stack_top with lexer
+                If interp_top is not equal to 0:
+                    Set group_depth to proc memory_get_int64 from Layout with interp_top, 8
+                    If group_depth is greater than 0:
+                        proc memory_set_int64 from Layout with interp_top, 8, group_depth minus 1
+                    End If
+                End If
+            End If
             Return proc read_operator with lexer
         End If
         If current is equal to 60:  Note: '<'
@@ -2712,7 +3260,34 @@ Process called "next_token" takes lexer as Integer returns Integer:
         If current is equal to 61:  Note: '='
             Return proc read_operator with lexer
         End If
+        Note: Colon. At the top level of an interpolation hole a single colon
+        Note: starts the .NET format suffix ({price:C2}) - F# requires
+        Note: parentheses around type-annotated expressions in holes. The ::
+        Note: cons, := ref-assign, and :? type-test spellings stay operators.
         If current is equal to 58:  Note: ':'
+            Set interp_top to proc interp_stack_top with lexer
+            If interp_top is not equal to 0:
+                Set hole_depth to proc memory_get_int64 from Layout with interp_top, 0
+                Set group_depth to proc memory_get_int64 from Layout with interp_top, 8
+                If hole_depth is equal to 0:
+                    If group_depth is equal to 0:
+                        Set next_ch to proc peek_char with lexer, 1
+                        Let is_operator_colon be 0
+                        If next_ch is equal to 58:  Note: '::'
+                            Set is_operator_colon to 1
+                        End If
+                        If next_ch is equal to 61:  Note: ':='
+                            Set is_operator_colon to 1
+                        End If
+                        If next_ch is equal to 63:  Note: ':?'
+                            Set is_operator_colon to 1
+                        End If
+                        If is_operator_colon is equal to 0:
+                            Return proc read_interp_dotnet_spec with lexer
+                        End If
+                    End If
+                End If
+            End If
             Return proc read_operator with lexer
         End If
         If current is equal to 38:  Note: '&'

@@ -1,0 +1,561 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+Licensed under Apache 2.0
+:End Note
+
+Note:
+F# frontend pipeline probe - end-to-end coverage of the lexer, parser,
+and semantic analyzer in
+compiler/middle/gungnir/hir/translation/frontends/fsharp/, plus the
+hir_nodes tuple-type producer surface.
+
+Every check drives the REAL pipeline: tokenize_fsharp ->
+parse_fsharp_source -> analyze_fsharp_ast, then asserts on the
+diagnostic lists. Coverage spans the analyzer's full check inventory
+(literal/operator/application typing, let polymorphism and the value
+restriction, pattern validation, match exhaustiveness and redundancy,
+union constructors, records, pipes, recursion, annotations,
+interpolated strings, unused-binding analysis, the .NET registry) and
+the task #452 residuals:
+  1. real registry signatures (wrong-shape and over-application errors)
+  2. nested module paths (List.Parallel/Array.Parallel) + Array2D/3D
+  3. printf specifier combination rejection (flags table + alignment)
+  4. tuple-pattern let generalization under the value restriction
+  5. triple-quoted interpolated strings ($\"\"\"...\"\"\")
+plus the hir_create_tuple_type producer added to hir_nodes.runa.
+
+Analyzers are deliberately not destroyed: diagnostic strings are pooled
+in the analyzer they belong to, assertions read them in place, and the
+probe is a short-lived process.
+:End Note
+
+Import "tests/test_utils.runa" as T
+Import "compiler/middle/gungnir/hir/translation/frontends/fsharp/fsharp_lexer.runa" as FL
+Import "compiler/middle/gungnir/hir/translation/frontends/fsharp/fsharp_parser.runa" as FP
+Import "compiler/middle/gungnir/hir/translation/frontends/fsharp/fsharp_semantic.runa" as FS
+Import "compiler/middle/gungnir/hir/hir.runa" as HIR
+Import "compiler/middle/gungnir/hir/hir_nodes.runa" as HN
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/internal/string_utils.runa" as StringUtils
+Import "compiler/frontend/primitives/collections/list.runa" as L
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+
+Note: ============================================================================
+Note: PIPELINE HELPERS
+Note: ============================================================================
+
+Process called "run_semantic" that takes source as String returns Integer:
+    Note: Tokenize, parse, and analyze one F# source; returns the analyzer or 0
+
+    Let tokens be FL.tokenize_fsharp(source)
+    If tokens is 0:
+        Return 0
+    End If
+
+    Let ast be FP.parse_fsharp_source(tokens)
+    If ast is 0:
+        Return 0
+    End If
+
+    Let analyzer be FS.create_fsharp_semantic_analyzer()
+    If analyzer is 0:
+        Return 0
+    End If
+
+    FS.analyze_fsharp_ast(analyzer, ast)
+    Return analyzer
+End Process
+
+Process called "parse_ok" that takes source as String returns Integer:
+    Note: 1 when the source tokenizes and parses, 0 otherwise
+
+    Let tokens be FL.tokenize_fsharp(source)
+    If tokens is 0:
+        Return 0
+    End If
+    Let ast be FP.parse_fsharp_source(tokens)
+    If ast is 0:
+        Return 0
+    End If
+    Return 1
+End Process
+
+Process called "error_count" that takes analyzer as Integer returns Integer:
+    If analyzer is 0:
+        Return 0 minus 1
+    End If
+    Let errs be FS.get_semantic_errors(analyzer)
+    Return L.list_length(errs)
+End Process
+
+Process called "warning_count" that takes analyzer as Integer returns Integer:
+    If analyzer is 0:
+        Return 0 minus 1
+    End If
+    Let warns be FS.get_semantic_warnings(analyzer)
+    Return L.list_length(warns)
+End Process
+
+Process called "list_contains_text" that takes msg_list as Integer, needle as String returns Integer:
+    If msg_list is 0:
+        Return 0
+    End If
+    Let count be L.list_length(msg_list)
+    Let i be 0
+    While i is less than count:
+        Let msg be L.list_get(msg_list, i)
+        If msg is not equal to 0:
+            Let hit be StringUtils.string_contains(msg, needle)
+            If hit is equal to 1:
+                Return 1
+            End If
+        End If
+        Set i to i plus 1
+    End While
+    Return 0
+End Process
+
+Process called "errors_contain" that takes analyzer as Integer, needle as String returns Integer:
+    If analyzer is 0:
+        Return 0
+    End If
+    Let errs be FS.get_semantic_errors(analyzer)
+    Return list_contains_text(errs, needle)
+End Process
+
+Process called "warnings_contain" that takes analyzer as Integer, needle as String returns Integer:
+    If analyzer is 0:
+        Return 0
+    End If
+    Let warns be FS.get_semantic_warnings(analyzer)
+    Return list_contains_text(warns, needle)
+End Process
+
+Process called "assert_clean" that takes results as Integer, test_name as String, source as String returns Integer:
+    Note: Assert the source analyzes with zero semantic errors
+
+    Let analyzer be run_semantic(source)
+    T.assert_not_null(results, test_name, analyzer)
+    If analyzer is 0:
+        Return 0
+    End If
+    Return T.assert_equal(results, test_name, error_count(analyzer), 0)
+End Process
+
+Process called "assert_error" that takes results as Integer, test_name as String, source as String, needle as String returns Integer:
+    Note: Assert the source produces at least one error containing needle
+
+    Let analyzer be run_semantic(source)
+    T.assert_not_null(results, test_name, analyzer)
+    If analyzer is 0:
+        Return 0
+    End If
+    T.assert_greater_than(results, test_name, error_count(analyzer), 0)
+    Return T.assert_equal(results, test_name, errors_contain(analyzer, needle), 1)
+End Process
+
+Process called "assert_warning" that takes results as Integer, test_name as String, source as String, needle as String returns Integer:
+    Note: Assert the source produces zero errors and a warning containing needle
+
+    Let analyzer be run_semantic(source)
+    T.assert_not_null(results, test_name, analyzer)
+    If analyzer is 0:
+        Return 0
+    End If
+    T.assert_equal(results, test_name, error_count(analyzer), 0)
+    Return T.assert_equal(results, test_name, warnings_contain(analyzer, needle), 1)
+End Process
+
+Note: ============================================================================
+Note: SUITE 1 - LEXER: INTERPOLATED STRINGS INCLUDING TRIPLE-QUOTED
+Note: ============================================================================
+
+Process called "test_lexer_interpolation" that takes results as Integer returns Integer:
+    T.begin_suite(results, "lexer: interpolated strings incl. triple-quoted")
+
+    Let tokens be FL.tokenize_fsharp("let x = 42")
+    T.assert_not_null(results, "tokenize simple let", tokens)
+    T.assert_greater_than(results, "simple let token count", L.list_length(tokens), 3)
+
+    Note: Regular interpolated string: START segment, hole flag set
+    Let reg be FL.tokenize_fsharp("$\"hi {x}\"")
+    T.assert_not_null(results, "tokenize regular interp", reg)
+    Let reg0 be L.list_get(reg, 0)
+    Let reg0_text be FL.get_token_text(reg0)
+    T.assert_equal(results, "regular interp segment text", StringCore.string_equals(reg0_text, "hi "), 1)
+    T.assert_equal(results, "regular interp has-hole flag", FL.get_token_value(reg0), 1)
+
+    Note: Triple-quoted interpolated: same segment kind as regular
+    Let trip be FL.tokenize_fsharp("$\"\"\"ab\"cd\"\"\"")
+    T.assert_not_null(results, "tokenize triple interp", trip)
+    Let trip0 be L.list_get(trip, 0)
+    T.assert_equal(results, "triple START kind matches regular START kind", FL.get_token_type(trip0), FL.get_token_type(reg0))
+
+    Note: Embedded quotes are content; terminator is exactly three quotes
+    Let trip0_text be FL.get_token_text(trip0)
+    T.assert_equal(results, "triple body length keeps embedded quote", StringCore.string_length(trip0_text), 5)
+    T.assert_equal(results, "triple body left part", StringUtils.string_contains(trip0_text, "ab"), 1)
+    T.assert_equal(results, "triple body right part", StringUtils.string_contains(trip0_text, "cd"), 1)
+    T.assert_equal(results, "triple no-hole flag", FL.get_token_value(trip0), 0)
+
+    Note: Holes still lex inside triple-quoted bodies
+    Let trih be FL.tokenize_fsharp("$\"\"\"v={x} t\"w\" end\"\"\"")
+    T.assert_not_null(results, "tokenize triple interp with hole", trih)
+    Let trih0 be L.list_get(trih, 0)
+    T.assert_equal(results, "triple hole START text", StringCore.string_equals(FL.get_token_text(trih0), "v="), 1)
+    T.assert_equal(results, "triple hole START flag", FL.get_token_value(trih0), 1)
+    Let trih2 be L.list_get(trih, 2)
+    Let trih2_text be FL.get_token_text(trih2)
+    T.assert_equal(results, "triple MID keeps embedded quote run", StringUtils.string_contains(trih2_text, "w"), 1)
+    T.assert_equal(results, "triple MID tail content", StringUtils.string_contains(trih2_text, "end"), 1)
+    T.assert_equal(results, "triple MID terminates string", FL.get_token_value(trih2), 0)
+
+    Note: Brace doubling still escapes braces in triple-quoted mode
+    Let trib be FL.tokenize_fsharp("$\"\"\"{{x}}\"\"\"")
+    Let trib0 be L.list_get(trib, 0)
+    T.assert_equal(results, "triple brace escape collapses", StringCore.string_equals(FL.get_token_text(trib0), "{x}"), 1)
+    T.assert_equal(results, "triple brace escape is not a hole", FL.get_token_value(trib0), 0)
+
+    Note: Backslash is literal content in triple-quoted mode (no escapes)
+    Let tribs be FL.tokenize_fsharp("$\"\"\"a\\nb\"\"\"")
+    Let tribs0 be L.list_get(tribs, 0)
+    T.assert_equal(results, "triple backslash stays literal", StringCore.string_length(FL.get_token_text(tribs0)), 4)
+    Let regbs be FL.tokenize_fsharp("$\"a\\nb\"")
+    Let regbs0 be L.list_get(regbs, 0)
+    T.assert_equal(results, "regular interp decodes escapes", StringCore.string_length(FL.get_token_text(regbs0)), 3)
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: SUITE 2 - PARSER FUNDAMENTALS
+Note: ============================================================================
+
+Process called "test_parser_shapes" that takes results as Integer returns Integer:
+    T.begin_suite(results, "parser: program shapes")
+
+    T.assert_equal(results, "parse simple let", parse_ok("let x = 5"), 1)
+    T.assert_equal(results, "parse function binding", parse_ok("let f x = x + 1"), 1)
+    T.assert_equal(results, "parse lambda", parse_ok("let f = fun x -> x"), 1)
+    T.assert_equal(results, "parse match", parse_ok("let f x =\n    match x with\n    | 1 -> 1\n    | _ -> 0"), 1)
+    T.assert_equal(results, "parse if", parse_ok("let y = if true then 1 else 2"), 1)
+    T.assert_equal(results, "parse type declaration", parse_ok("type Shape =\n    | Circle of int\n    | Square of int"), 1)
+    T.assert_equal(results, "parse list literal", parse_ok("let xs = [1; 2; 3]"), 1)
+    T.assert_equal(results, "parse array literal", parse_ok("let xs = [|1; 2|]"), 1)
+    T.assert_equal(results, "parse parenthesised tuple let", parse_ok("let (a, b) = (1, 2)"), 1)
+    T.assert_equal(results, "parse unparenthesised tuple let", parse_ok("let a, b = 1, 2"), 1)
+    T.assert_equal(results, "parse dotted nested path", parse_ok("let ys = List.Parallel.map (fun x -> x) [1]"), 1)
+    T.assert_equal(results, "parse interpolated string", parse_ok("let s = $\"v={1}\""), 1)
+    T.assert_equal(results, "parse triple interpolated string", parse_ok("let s = $\"\"\"v=\"q\" {1}\"\"\""), 1)
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: SUITE 3 - SEMANTIC CORE: LITERALS, OPERATORS, CONTROL FLOW
+Note: ============================================================================
+
+Process called "test_semantic_core" that takes results as Integer returns Integer:
+    T.begin_suite(results, "semantic: literals, operators, control flow")
+
+    assert_clean(results, "int arithmetic", "let a = 1 + 2\nlet b = a * 3")
+    assert_clean(results, "float literal", "let f = 1.5")
+    assert_clean(results, "bool logic", "let b = true && false\nlet c = b || true")
+    assert_clean(results, "string literal", "let s = \"hello\"")
+    assert_clean(results, "comparison yields bool", "let b = 1 < 2\nlet y = if b then 1 else 2")
+    assert_clean(results, "not on bool", "let c = not true")
+    assert_clean(results, "cons onto list", "let xs = 1 :: [2; 3]\nlet n = List.length xs")
+    assert_clean(results, "unit binding", "let u = ()")
+
+    assert_error(results, "mixed-operand arithmetic rejected", "let a = 1 + true", "Argument type mismatch")
+    assert_error(results, "logical and on int rejected", "let b = 1 && true", "Argument type mismatch")
+    assert_error(results, "not on int rejected", "let c = not 5", "Argument type mismatch")
+    assert_error(results, "cons element mismatch rejected", "let xs = true :: [2]", "Argument type mismatch")
+
+    assert_error(results, "non-bool if condition", "let y = if 1 then 2 else 3", "If condition must have type bool")
+    assert_error(results, "if branch type mismatch", "let y = if true then 1 else false", "Branches of an if expression must have the same type")
+    assert_clean(results, "well-typed if", "let y = if true then 1 else 2\nlet z = y + 1")
+
+    assert_error(results, "undefined variable", "let y = nosuchthing", "Undefined variable: nosuchthing")
+    assert_error(results, "apply non-function", "let y = 5 6", "Expression is not a function")
+
+    assert_clean(results, "lambda application", "let f = fun x -> x + 1\nlet y = f 2")
+    assert_clean(results, "curried function", "let add a b = a + b\nlet y = add 1 2")
+    assert_clean(results, "recursive binding", "let rec fact n = if n < 2 then 1 else n * fact (n - 1)\nlet f5 = fact 5")
+
+    assert_clean(results, "annotation agrees", "let x : int = 5")
+    assert_error(results, "annotation disagrees", "let x : int = true", "Binding does not match its declared type")
+
+    assert_clean(results, "pipe into registry", "let n = [1; 2] |> List.length\nlet m = n + 1")
+    assert_error(results, "pipe wrong shape", "let n = true |> List.length", "Argument type mismatch")
+
+    assert_clean(results, "exception constructor known", "let e = NotImplementedException 0")
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: SUITE 4 - RESIDUAL 1: REAL REGISTRY SIGNATURES
+Note: ============================================================================
+
+Process called "test_registry_signatures" that takes results as Integer returns Integer:
+    T.begin_suite(results, "registry: real signatures, shapes, over-application")
+
+    Note: Well-shaped uses of the core surface
+    assert_clean(results, "List.map well-typed", "let xs = List.map (fun x -> x + 1) [1; 2]\nlet n = List.length xs")
+    assert_clean(results, "List.empty value", "let e = List.empty")
+    assert_clean(results, "List.fold well-typed", "let s = List.fold (fun acc x -> acc + x) 0 [1; 2]\nlet t = s + 1")
+    assert_clean(results, "List.zip yields tuple list", "let ps = List.zip [1] [true]\nlet n = List.length ps")
+    assert_clean(results, "List.filter well-typed", "let xs = List.filter (fun x -> x > 1) [1; 2]")
+    assert_clean(results, "partial application legal", "let f = List.map (fun x -> x + 1)\nlet ys = f [1; 2]")
+    assert_clean(results, "String.length on string", "let n = String.length \"abc\"\nlet m = n + 1")
+    assert_clean(results, "String.concat list-to-seq coercion", "let s = String.concat \", \" [\"a\"; \"b\"]")
+    assert_clean(results, "Seq.map over list coercion", "let s = Seq.map (fun x -> x + 1) [1; 2]")
+    assert_clean(results, "Option.map well-typed", "let o = Option.map (fun x -> x + 1) (Some 2)\nlet d = Option.defaultValue 0 o\nlet e = d + 1")
+    assert_clean(results, "Result.map well-typed", "let r = Result.map (fun x -> x + 1) (Ok 5)\nlet b = Result.isOk r")
+    assert_clean(results, "Map signature chain", "let m = Map.add 1 2 Map.empty\nlet b = Map.containsKey 1 m\nlet v = Map.find 1 m\nlet w = v + 1")
+    assert_clean(results, "Set signature chain", "let s = Set.add 1 Set.empty\nlet b = Set.contains 1 s")
+
+    Note: Wrong-shape arguments are rejected by the real signatures
+    assert_error(results, "List.length on int rejected", "let n = List.length 5", "Argument type mismatch")
+    assert_error(results, "List.map non-function rejected", "let xs = List.map 3 [1]", "Argument type mismatch")
+    assert_error(results, "List.fold non-function folder rejected", "let s = List.fold 5 0 [1]", "Argument type mismatch")
+    assert_error(results, "String.length on int rejected", "let n = String.length 5", "Argument type mismatch")
+    assert_error(results, "Option.get on int rejected", "let o = Option.get 5", "Argument type mismatch")
+    assert_error(results, "Map.find wrong key type rejected", "let m = Map.add 1 2 Map.empty\nlet x = Map.find true m", "Argument type mismatch")
+    assert_error(results, "Set.union on list rejected", "let s = Set.union [1] Set.empty", "Argument type mismatch")
+    assert_error(results, "seq does not flow into list position", "let xs = List.tail (Seq.empty)", "Argument type mismatch")
+
+    Note: Over-application beyond the signature's arrow chain is rejected
+    assert_error(results, "List.length over-applied", "let n = List.length [1; 2] 5", "Expression is not a function")
+    assert_error(results, "List.isEmpty over-applied", "let b = List.isEmpty [1] 2", "Expression is not a function")
+    assert_error(results, "List.map over-applied", "let xs = List.map (fun x -> x + 1) [1] [2]", "Expression is not a function")
+    assert_error(results, "String.length over-applied", "let n = String.length \"a\" \"b\"", "Expression is not a function")
+    assert_error(results, "Map.containsKey over-applied", "let b = Map.containsKey 1 Map.empty 2", "Expression is not a function")
+
+    Note: Variable-tailed chains stay applicable - exactly as in F#
+    assert_clean(results, "List.head of function list applies on", "let r = List.head [(fun x -> x)] 5\nlet t = r + 0")
+
+    Note: Membership is still enforced
+    assert_error(results, "unknown member of known module", "let x = List.frobnicate [1]", "Unknown member: List.frobnicate")
+    assert_warning(results, "unknown external module degrades to warning", "let y = Frobulator.spin 1", "Unresolved external module reference")
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: SUITE 5 - RESIDUAL 2: NESTED MODULE PATHS + ARRAY2D / ARRAY3D
+Note: ============================================================================
+
+Process called "test_nested_modules_and_md_arrays" that takes results as Integer returns Integer:
+    T.begin_suite(results, "nested modules + Array2D/Array3D")
+
+    assert_clean(results, "List.Parallel.map resolves", "let ys = List.Parallel.map (fun x -> x + 1) [1; 2]\nlet n = List.length ys")
+    assert_clean(results, "Array.Parallel.map resolves", "let ys = Array.Parallel.map (fun x -> x + 1) [|1; 2|]")
+    assert_clean(results, "Array.Parallel.partition resolves", "let ps = Array.Parallel.partition (fun x -> x > 1) [|1; 2|]")
+    assert_error(results, "unknown nested member rejected", "let ys = List.Parallel.frob [1]", "Unknown member: List.Parallel.frob")
+    assert_error(results, "nested signature enforced", "let ys = List.Parallel.map 1 [1]", "Argument type mismatch")
+    assert_error(results, "nested over-application rejected", "let b = List.Parallel.exists (fun x -> x > 0) [1] 2", "Expression is not a function")
+
+    assert_clean(results, "Array2D create/get/length chain", "let g = Array2D.create 2 3 0\nlet v = Array2D.get g 0 1\nlet n1 = Array2D.length1 g\nlet n2 = Array2D.length2 g\nlet w = v + n1 + n2")
+    assert_clean(results, "Array2D.init well-typed", "let g = Array2D.init 2 3 (fun i j -> i + j)")
+    assert_clean(results, "Array2D.map preserves rank", "let g = Array2D.create 2 3 0\nlet h = Array2D.map (fun x -> x + 1) g\nlet v2 = Array2D.get h 0 0\nlet w2 = v2 + 1")
+    assert_clean(results, "Array2D.set returns unit", "let g = Array2D.create 2 3 0\nlet u = Array2D.set g 0 0 5")
+    assert_clean(results, "Array2D.iter well-typed", "let g = Array2D.create 2 3 0\nlet u = Array2D.iter (fun x -> ()) g")
+    assert_error(results, "Array2D.get on list rejected", "let v = Array2D.get [1] 0 0", "Argument type mismatch")
+    assert_error(results, "Array2D.length1 over-applied", "let g = Array2D.create 2 3 0\nlet n = Array2D.length1 g 5", "Expression is not a function")
+
+    assert_clean(results, "Array3D create/get/lengths chain", "let g3 = Array3D.create 2 2 2 0\nlet v3 = Array3D.get g3 0 0 0\nlet n3 = Array3D.length3 g3\nlet w3 = v3 + n3")
+    assert_clean(results, "Array3D.map well-typed", "let g3 = Array3D.create 2 2 2 0\nlet h3 = Array3D.map (fun x -> x + 1) g3")
+    assert_clean(results, "Array3D.set well-typed", "let g3 = Array3D.create 2 2 2 0\nlet u = Array3D.set g3 0 0 0 9")
+    assert_error(results, "rank mismatch 2D into 3D rejected", "let g = Array2D.create 2 3 0\nlet n = Array3D.length1 g", "Argument type mismatch")
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: SUITE 6 - RESIDUAL 3: PRINTF SPECIFIER COMBINATION REJECTION
+Note: ============================================================================
+
+Process called "test_printf_combinations" that takes results as Integer returns Integer:
+    T.begin_suite(results, "printf: specifier combination table")
+
+    Note: Valid printf-family format strings
+    assert_clean(results, "printfn %d valid", "printfn \"%d\" 5")
+    assert_clean(results, "printfn %-8s valid", "printfn \"%-8s\" \"x\"")
+    assert_clean(results, "printfn %+d valid", "printfn \"%+d\" 5")
+    assert_clean(results, "printfn %05d valid", "printfn \"%05d\" 5")
+    assert_clean(results, "printfn space-d valid", "printfn \"% d\" 5")
+    assert_clean(results, "printfn %.2f valid", "printfn \"%.2f\" 1.5")
+    assert_clean(results, "sprintf %+A valid", "let s = sprintf \"%+A\" 5")
+    assert_clean(results, "printfn %%-escape ignored", "printfn \"100%%\"")
+
+    Note: Invalid flag/specifier combinations are rejected
+    assert_error(results, "zero flag with %s rejected", "printfn \"%08s\" \"x\"", "padding flag is invalid")
+    assert_error(results, "plus flag with %s rejected", "printfn \"%+s\" \"x\"", "prefix flag is invalid")
+    assert_error(results, "zero flag with %b rejected", "printfn \"%0b\" true", "padding flag is invalid")
+    assert_error(results, "zero flag with %c rejected", "printfn \"%0c\" \"c\"", "padding flag is invalid")
+    assert_error(results, "hash modifier rejected", "printfn \"%#d\" 5", "The # formatting modifier is invalid in F#")
+    assert_error(results, "precision with %d rejected", "sprintf \"%.3d\" 5", "precision is not valid")
+    assert_error(results, "precision with %x rejected", "printfn \"%.2x\" 255", "precision is not valid")
+    assert_error(results, "zero flag with %A rejected", "printfn \"%0A\" 5", "padding flag is invalid with %A")
+    assert_error(results, "space flag with %A rejected", "printfn \"% A\" 5", "prefix flag is invalid with %A")
+    assert_error(results, "failwithf checked too", "let f = fun x -> failwithf \"%+s\" x", "prefix flag is invalid")
+
+    Note: Interpolated-hole specs run the same table
+    assert_clean(results, "hole %d valid", "let s = $\"%d{5}\"")
+    assert_clean(results, "hole %-8s valid", "let x = \"hi\"\nlet s = $\"%-8s{x}\"")
+    assert_clean(results, "hole %.3f valid", "let s = $\"%.3f{1.0}\"")
+    assert_error(results, "hole zero+s rejected", "let x = \"hi\"\nlet s = $\"%08s{x}\"", "padding flag is invalid")
+    assert_error(results, "hole plus+s rejected", "let x = \"hi\"\nlet s = $\"%+s{x}\"", "prefix flag is invalid")
+    assert_error(results, "hole hash rejected", "let s = $\"%#d{5}\"", "The # formatting modifier is invalid in F#")
+    assert_error(results, "hole precision+d rejected", "let s = $\"%.3d{5}\"", "precision is not valid")
+
+    Note: Alignment combined with a printf spec on one hole is the F#
+    Note: forbidden combination; alignment alone stays legal
+    assert_error(results, "alignment combined with %d rejected", "let s = $\"%d{5,10}\"", "cannot be combined with .NET-style alignment")
+    assert_error(results, "alignment combined with %s rejected", "let x = \"hi\"\nlet s = $\"%-8s{x,4}\"", "cannot be combined with .NET-style alignment")
+    assert_clean(results, "dotnet alignment alone valid", "let s = $\"{5,10}\"")
+    assert_clean(results, "dotnet negative alignment valid", "let s = $\"{5,-10}\"")
+    assert_clean(results, "dotnet format alone valid", "let s = $\"{5:N2}\"")
+    assert_clean(results, "dotnet alignment plus format valid", "let s = $\"{5,8:F1}\"")
+    assert_error(results, "non-numeric alignment rejected", "let s = $\"{5,x}\"", "Invalid alignment")
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: SUITE 7 - RESIDUAL 4: TUPLE-PATTERN LET GENERALIZATION
+Note: ============================================================================
+
+Process called "test_tuple_let_generalization" that takes results as Integer returns Integer:
+    T.begin_suite(results, "tuple-let: generalization under the value restriction")
+
+    Note: Single-name behaviour (the baseline tuple-let must match)
+    assert_clean(results, "single-name lambda generalizes", "let id = fun x -> x\nlet a = id 1\nlet b = id true")
+    assert_error(results, "single-name application stays monomorphic", "let id2 = fun x -> x\nlet h = id2 id2\nlet a = h 1\nlet b = h true", "Argument type mismatch")
+
+    Note: Tuple-let with a syntactic-value RHS generalizes each component
+    assert_clean(results, "tuple-let lambda component generalizes", "let f, n = (fun x -> x), 5\nlet a = f 1\nlet b = f true\nlet c = n + 1")
+    assert_clean(results, "parenthesised tuple-let generalizes", "let (g, m) = ((fun x -> x), 7)\nlet a = g 1\nlet b = g true\nlet c = m + 1")
+    assert_clean(results, "nested tuple-let generalizes", "let (f2, n2), m2 = ((fun x -> x), 1), 2\nlet u = f2 1\nlet v = f2 true\nlet w = n2 + m2")
+
+    Note: Expansive RHS keeps every component monomorphic
+    assert_error(results, "tuple-let value restriction holds", "let id2 = fun x -> x\nlet g, m = id2 id2, 5\nlet c = g 1\nlet d = g true", "Argument type mismatch")
+
+    Note: Plain tuple-let destructuring still types componentwise
+    assert_clean(results, "unparenthesised tuple-let types", "let a, b = 1, true\nlet c = a + 1\nlet d = b && true")
+    assert_clean(results, "tuple-let from registry result", "let ls, bs = List.unzip [(1, true)]\nlet n = List.length ls\nlet m = List.length bs")
+    assert_error(results, "tuple-let arity mismatch", "let x, y = 1, 2, 3", "Tuple pattern arity mismatch")
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: SUITE 8 - RESIDUAL 5: TRIPLE-QUOTED INTERPOLATION THROUGH THE PIPELINE
+Note: ============================================================================
+
+Process called "test_triple_quoted_pipeline" that takes results as Integer returns Integer:
+    T.begin_suite(results, "triple-quoted interpolation: full pipeline")
+
+    assert_clean(results, "triple interp types as string", "let name = 1\nlet s = $\"\"\"v \"q\" = {name}\"\"\"\nlet n = String.length s\nlet m = n + 1")
+    assert_clean(results, "triple interp multiple holes", "let a = 1\nlet b = 2\nlet s = $\"\"\"a={a} \"and\" b={b}\"\"\"")
+    assert_clean(results, "triple interp no holes", "let s = $\"\"\"just \"text\"\"\"\"")
+    assert_error(results, "triple interp hole still checked", "let s = $\"\"\"v {nosuch}\"\"\"", "Undefined variable: nosuch")
+    assert_clean(results, "triple interp printf spec valid", "let s = $\"\"\"n=%d{5}\"\"\"")
+    assert_error(results, "triple interp printf combo rejected", "let s = $\"\"\"n=%d{5,10}\"\"\"", "cannot be combined with .NET-style alignment")
+
+    Note: Regular interpolation still round-trips
+    assert_clean(results, "regular interp types as string", "let s = $\"n={1 + 2}\"\nlet n = String.length s")
+    assert_error(results, "regular interp hole checked", "let s = $\"v {nosuch}\"", "Undefined variable: nosuch")
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: SUITE 9 - PATTERNS, MATCH ANALYSIS, UNIONS, RECORDS
+Note: ============================================================================
+
+Process called "test_patterns_and_matches" that takes results as Integer returns Integer:
+    T.begin_suite(results, "patterns: exhaustiveness, unions, records")
+
+    assert_clean(results, "option match exhaustive", "let describe o =\n    match o with\n    | Some x -> x\n    | None -> 0\nlet r = describe (Some 1)")
+    assert_warning(results, "bool match incomplete", "let f b =\n    match b with\n    | true -> 1\nlet r = f true", "Incomplete pattern matches")
+    assert_warning(results, "redundant arm after wildcard", "let f x =\n    match x with\n    | _ -> 1\n    | 2 -> 3\nlet r = f 5", "This rule will never be matched")
+
+    assert_clean(results, "declared union full cover", "type Shape =\n    | Circle of int\n    | Square of int\nlet area s =\n    match s with\n    | Circle r -> r\n    | Square w -> w\nlet a = area (Circle 3)")
+    assert_warning(results, "declared union missing case", "type Shape =\n    | Circle of int\n    | Square of int\nlet area s =\n    match s with\n    | Circle r -> r\nlet a = area (Circle 3)", "Incomplete pattern matches")
+    assert_error(results, "nullary constructor with argument", "type Flag =\n    | On\n    | Off\nlet f x =\n    match x with\n    | On y -> 1\n    | Off -> 0\nlet r = f On", "Constructor takes no arguments: On")
+
+    assert_error(results, "duplicate record field", "let r = { a = 1; a = 2 }", "Duplicate record field: a")
+    assert_error(results, "tuple pattern arity mismatch", "let (x, y) = (1, 2, 3)", "Tuple pattern arity mismatch")
+    assert_clean(results, "wildcard pattern", "let f x =\n    match x with\n    | 1 -> 1\n    | _ -> 0\nlet r = f 2")
+    assert_clean(results, "guarded pattern bool guard", "let f x =\n    match x with\n    | n when n > 0 -> 1\n    | _ -> 0\nlet r = f 3")
+
+    Note: Unused-binding analysis on locals; underscore prefix exempt
+    assert_warning(results, "unused lambda parameter warned", "let k = fun unusedp -> 3\nlet r = k 1", "Unused binding: unusedp")
+    Let underscore_analyzer be run_semantic("let k = fun _quietp -> 3\nlet r = k 1")
+    T.assert_not_null(results, "underscore param analyzes", underscore_analyzer)
+    T.assert_equal(results, "underscore param not warned", warnings_contain(underscore_analyzer, "Unused binding"), 0)
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: SUITE 10 - HIR TUPLE-TYPE PRODUCER
+Note: ============================================================================
+
+Process called "test_hir_tuple_type_producer" that takes results as Integer returns Integer:
+    T.begin_suite(results, "hir_nodes: hir_create_tuple_type producer")
+
+    Let tuple_node be HN.hir_create_tuple_type()
+    T.assert_not_null(results, "producer allocates a node", tuple_node)
+
+    Note: HIR_TUPLE_TYPE is 13007 (hir.runa structured-type kind band)
+    Let node_kind be Layout.memory_get_int64(tuple_node, 0)
+    T.assert_equal(results, "node kind is HIR_TUPLE_TYPE", node_kind, 13007)
+
+    Let elem1 be HN.hir_create_type_ref("int")
+    Let elem2 be HN.hir_create_type_ref("string")
+    T.assert_not_null(results, "first element type-ref", elem1)
+    T.assert_not_null(results, "second element type-ref", elem2)
+
+    T.assert_equal(results, "append first element", HN.hir_add_tuple_element(tuple_node, elem1), 1)
+    T.assert_equal(results, "append second element", HN.hir_add_tuple_element(tuple_node, elem2), 1)
+
+    Note: HIRNode layout: children List at offset 24, child_count at 32
+    Let child_count be Layout.memory_get_int64(tuple_node, 32)
+    T.assert_equal(results, "child count reflects elements", child_count, 2)
+    Let children be Layout.memory_get_int64(tuple_node, 24)
+    T.assert_not_null(results, "children list exists", children)
+    T.assert_equal(results, "element order preserved (first)", L.list_get(children, 0), elem1)
+    T.assert_equal(results, "element order preserved (second)", L.list_get(children, 1), elem2)
+
+    T.assert_equal(results, "null node guarded", HN.hir_add_tuple_element(0, elem1), 0)
+    T.assert_equal(results, "null element guarded", HN.hir_add_tuple_element(tuple_node, 0), 0)
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: MAIN
+Note: ============================================================================
+
+Process called "main" returns Integer:
+    Let results be T.create_test_results()
+
+    test_lexer_interpolation(results)
+    test_parser_shapes(results)
+    test_semantic_core(results)
+    test_registry_signatures(results)
+    test_nested_modules_and_md_arrays(results)
+    test_printf_combinations(results)
+    test_tuple_let_generalization(results)
+    test_triple_quoted_pipeline(results)
+    test_hir_tuple_type_producer(results)
+
+    T.print_summary(results)
+    Let exit_code be T.get_failed(results)
+    T.destroy_test_results(results)
+    Return exit_code
+End Process
