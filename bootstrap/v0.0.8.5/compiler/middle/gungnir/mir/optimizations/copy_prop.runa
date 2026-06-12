@@ -1,4 +1,4 @@
-Note: 
+Note:
 Copyright 2025 Sybertnetics Artificial Intelligence Solutions
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -18,21 +18,24 @@ Note:
 This file handles copy propagation optimization.
 
 This file performs the following tasks:
-- Process copy propagation and copy elimination
-- Handle copy detection and copy substitution
-- Manage copy optimization and copy validation
-- Process copy verification and copy analysis
+- Forward copy propagation: rewrite every use of a copy destination to refer
+  to the copy source, leaving the now-dead copy instruction for DCE to sweep
+- Copy detection on the canonical MIR opcode model (MIR_COPY 20008 per OD-5,
+  and degenerate single-incoming MIR_PHI 20300)
+- Transitive copy-chain resolution so a chain a=b, b=c collapses every use of
+  a directly onto c in one pass
 
 This file is essential because of the following reasons:
-- Copy propagation improves code performance and reduces redundant operations
-- Proper copy propagation ensures correct copy elimination
-- Copy propagation support enables Runa compilation for optimized code generation
+- Copy propagation shortens live ranges and exposes further optimization,
+  and the dead copies it leaves behind are removed by the subsequent DCE pass
+- It preserves SSA form (uses move from one already-defined value to another
+  already-defined value; no new definitions are created)
 
 This file consists of the following functions/features/operation types:
-- Copy propagation and copy elimination
-- Copy detection and copy substitution
-- Copy optimization and copy validation
-- Copy verification and copy analysis
+- Copy-chain resolution to the ultimate source value
+- Canonical use rewriting through MIRNodes.set_mir_node_used_value (header +
+  extended-region coherence under OD-1)
+- The pass-manager entry point run_copy_prop_pass(cfg)
 :End Note
 
 Note: ============================================================================
@@ -42,1673 +45,548 @@ Note: ==========================================================================
 Import "compiler/middle/gungnir/mir/mir.runa" as MIR
 Import "compiler/middle/gungnir/mir/mir_nodes.runa" as MIRNodes
 Import "compiler/middle/gungnir/mir/cfg.runa" as CFG
-Import "compiler/middle/gungnir/mir/ssa.runa" as SSA
-Import "compiler/middle/gungnir/mir/dominance.runa" as Dominance
-Import "compiler/middle/gungnir/mir/mir_verifier.runa" as Verifier
 Import "compiler/frontend/primitives/memory/layout.runa" as Layout
 Import "compiler/frontend/primitives/collections/list.runa" as List
-Import "compiler/frontend/primitives/collections/dictionary.runa" as Dictionary
-Import "compiler/frontend/primitives/collections/set.runa" as Set
-Import "compiler/frontend/primitives/core/string_core.runa" as String
+Import "compiler/frontend/primitives/collections/ordered_map.runa" as OMap
+Import "compiler/internal/string_utils.runa" as StringUtils
 
 Note: ============================================================================
-Note: TYPE DEFINITIONS - Enhanced Copy Propagation Context
+Note: COPY DETECTION
 Note: ============================================================================
 
-Type called "CopyRelation":
+Process called "copy_source_of" that takes inst as Integer returns Integer:
     @Reasoning
-    Represents a copy relationship: dest = src
+    Returns the SSA value id this instruction copies FROM, or 0 when the
+    instruction is not a copy.
 
-    **COPY RELATION:**
-    - dest_value_id: Destination SSA value ID
-    - src_value_id: Source SSA value ID
-    - is_trivial: Is this a trivial copy (can be eliminated)?
-    - copy_chain_length: Length of transitive copy chain
+    **CANONICAL COPY SHAPES (OD-1 / OD-5):**
+    1. MIR_COPY (20008): a plain 72-byte record whose destination is the
+       header value_id@8 and whose source is the header operand1@16. This is
+       the only first-class copy opcode in the canonical IR.
+    2. A degenerate MIR_PHI (20300) with exactly one incoming pair is a copy
+       of its single incoming value: in SSA a one-predecessor merge carries
+       its operand through unchanged.
 
-    **MEMORY LAYOUT** (32 bytes):
-    ```
-    Offset 0:  dest_value_id (Integer)
-    Offset 8:  src_value_id (Integer)
-    Offset 16: is_trivial (Integer - boolean)
-    Offset 24: copy_chain_length (Integer)
-    ```
+    Identity arithmetic (ADD x, 0 / MUL x, 1) is intentionally NOT treated as
+    a copy here: the canonical constant-folding / algebraic-simplification
+    passes already rewrite those to MIR_COPY when the operand is a proven
+    constant, so handling them again here would duplicate that logic and risk
+    diverging from the fold guards. Keeping copy detection to the two genuine
+    copy shapes keeps this pass sound and minimal.
+
+    Returns the source value id, or 0 when not a copy.
     @End Reasoning
 
-    dest_value_id as Integer
-    src_value_id as Integer
-    is_trivial as Integer
-    copy_chain_length as Integer
-End Type
-
-Type called "InterferenceGraph":
-    @Reasoning
-    Interference graph for register allocation and copy coalescing.
-
-    **INTERFERENCE:**
-    Two values interfere if their live ranges overlap.
-    Values that interfere cannot be coalesced.
-
-    **MEMORY LAYOUT** (24 bytes):
-    ```
-    Offset 0:  edges (Integer - Dictionary: value_id → Set of interfering values)
-    Offset 8:  node_count (Integer - number of nodes)
-    Offset 16: edge_count (Integer - number of edges)
-    ```
-    @End Reasoning
-
-    edges as Integer
-    node_count as Integer
-    edge_count as Integer
-End Type
-
-Type called "CopyPropContext":
-    @Reasoning
-    Context for enhanced copy propagation analysis.
-
-    **ENHANCEMENTS:**
-    - Copy coalescing (merging copy-related values)
-    - PHI copy optimization
-    - Interference analysis
-    - Transitive copy chains
-
-    **MEMORY LAYOUT** (128 bytes):
-    ```
-    Offset 0:   cfg (Integer - CFG pointer)
-    Offset 8:   copy_relations (Integer - Dictionary: value_id → CopyRelation)
-    Offset 16:  copy_sources (Integer - Dictionary: dest → src mapping)
-    Offset 24:  value_equivalence (Integer - Dictionary: value → canonical value)
-    Offset 32:  interference_graph (Integer - InterferenceGraph pointer)
-    Offset 40:  live_ranges (Integer - Dictionary: value_id → LiveRange)
-    Offset 48:  phi_copies (Integer - List of PHI-related copies)
-    Offset 56:  worklist (Integer - List of copies to process)
-    Offset 64:  copies_eliminated (Integer - counter)
-    Offset 72:  copies_propagated (Integer - counter)
-    Offset 80:  phi_copies_eliminated (Integer - counter)
-    Offset 88:  copies_coalesced (Integer - counter)
-    Offset 96:  ssa_ptr (Integer - SSA analysis pointer)
-    Offset 104: dominance_ptr (Integer - Dominance analysis pointer)
-    Offset 112: use_def_chains (Integer - Use-def chain map)
-    Offset 120: def_use_chains (Integer - Def-use chain map)
-    ```
-    @End Reasoning
-
-    cfg as Integer
-    copy_relations as Integer
-    copy_sources as Integer
-    value_equivalence as Integer
-    interference_graph as Integer
-    live_ranges as Integer
-    phi_copies as Integer
-    worklist as Integer
-    copies_eliminated as Integer
-    copies_propagated as Integer
-    phi_copies_eliminated as Integer
-    copies_coalesced as Integer
-    ssa_ptr as Integer
-    dominance_ptr as Integer
-    use_def_chains as Integer
-    def_use_chains as Integer
-End Type
-
-Note: ============================================================================
-Note: CONTEXT MANAGEMENT
-Note: ============================================================================
-
-Process called "create_copy_prop_context" that takes cfg as Integer returns Integer:
-    @Reasoning
-    Creates and initializes the enhanced copy-propagation context.
-
-    The context is the central data structure threading state through every
-    phase of the pass: copy detection, chain analysis, interference building,
-    coalescing, and PHI optimization. Centralizing this state into a single
-    pointer-sized handle keeps the pass re-entrant per CFG and makes it
-    trivial to destroy / reset between functions.
-
-    **HELD STATE (offsets in the 128-byte context block):**
-      0: cfg (caller-owned, not freed by us)
-      8: copy_relations dictionary (dest_id -> CopyRelation*)
-     16: copy_sources dictionary (cached source lookups)
-     24: value_equivalence dictionary (union-find substitution map)
-     32: interference graph (lazily built on first coalescing query)
-     40: live_ranges (lazily built; reserved for future use)
-     48: phi_copies list (PHI-introduced copies awaiting cleanup)
-     56: worklist (instructions still requiring revisit)
-     64..88: counters (eliminated, propagated, phi_eliminated, coalesced)
-     96..104: SSA / Dominance handles (set by caller pipeline)
-    112..120: use-def / def-use chains (set by caller pipeline)
-
-    Returns the context pointer or 0 on failure (null CFG or allocation OOM).
-    @End Reasoning
-
-    @Implementation
-    1. Validate CFG handle (zero implies caller error - reject loudly).
-    2. Allocate 128 bytes from Layout; bail on OOM.
-    3. Store the CFG handle at offset 0 (read-only reference).
-    4. Construct three Dictionary handles for the copy maps; store at 8/16/24.
-       Lazy structures (interference graph, live ranges) are zero-initialized
-       so the consumers can detect "not yet built" via a null check.
-    5. Construct two List handles (phi_copies, worklist) at 48/56.
-    6. Zero every counter slot (64,72,80,88) so statistics start clean.
-    7. Zero SSA/dominance/chain handles (96..120) - they are populated by
-       the pipeline driver when the analyses are available.
-    8. Emit a creation trace line and return the context pointer.
-    @End Implementation
-
-    If cfg is equal to 0:
-        Display "create_copy_prop_context: null CFG"
-        Return 0
-    End If
-
-    Note: Allocate context (128 bytes)
-    Let context_ptr be proc allocate from Layout with 128
-    If context_ptr is equal to 0:
-        Return 0
-    End If
-
-    Note: Store CFG reference
-    proc memory_set_int64 from Layout with context_ptr, 0, cfg
-
-    Note: Create copy relations dictionary
-    Let copy_relations be proc create from Dictionary
-    proc memory_set_int64 from Layout with context_ptr, 8, copy_relations
-
-    Note: Create copy sources dictionary
-    Let copy_sources be proc create from Dictionary
-    proc memory_set_int64 from Layout with context_ptr, 16, copy_sources
-
-    Note: Create value equivalence dictionary
-    Let value_equivalence be proc create from Dictionary
-    proc memory_set_int64 from Layout with context_ptr, 24, value_equivalence
-
-    Note: Interference graph initially null (created on demand)
-    proc memory_set_int64 from Layout with context_ptr, 32, 0
-
-    Note: Live ranges initially null (created on demand)
-    proc memory_set_int64 from Layout with context_ptr, 40, 0
-
-    Note: Create PHI copies list
-    Let phi_copies be proc create from List
-    proc memory_set_int64 from Layout with context_ptr, 48, phi_copies
-
-    Note: Create worklist
-    Let worklist be proc create from List
-    proc memory_set_int64 from Layout with context_ptr, 56, worklist
-
-    Note: Initialize counters
-    proc memory_set_int64 from Layout with context_ptr, 64, 0 Note: copies_eliminated
-    proc memory_set_int64 from Layout with context_ptr, 72, 0 Note: copies_propagated
-    proc memory_set_int64 from Layout with context_ptr, 80, 0 Note: phi_copies_eliminated
-    proc memory_set_int64 from Layout with context_ptr, 88, 0 Note: copies_coalesced
-
-    Note: Initialize SSA and dominance to 0
-    proc memory_set_int64 from Layout with context_ptr, 96, 0 Note: ssa_ptr
-    proc memory_set_int64 from Layout with context_ptr, 104, 0 Note: dominance_ptr
-
-    Note: Initialize use-def and def-use chains to 0
-    proc memory_set_int64 from Layout with context_ptr, 112, 0 Note: use_def_chains
-    proc memory_set_int64 from Layout with context_ptr, 120, 0 Note: def_use_chains
-
-    Display "create_copy_prop_context: context created"
-    Return context_ptr
-End Process
-
-Process called "destroy_copy_prop_context" that takes context_ptr as Integer returns Integer:
-    @Reasoning
-    Tears down a copy-propagation context, releasing every owned heap
-    structure (copy_relations, copy_sources, value_equivalence
-    dictionaries; phi_copies and worklist lists; interference graph if
-    one was lazily built).
-
-    Resources NOT owned by us (the CFG pointer at offset 0 and any SSA /
-    dominance / chain handles at offsets 96..120) are left untouched -
-    they belong to the calling pipeline driver.
-
-    Returns 1 on success, 0 on null input. Idempotent against null - safe
-    to call twice without re-initialising.
-    @End Reasoning
-
-    If context_ptr is equal to 0:
-        Return 0
-    End If
-
-    Note: Destroy copy relations dictionary
-    Let copy_relations be proc memory_get_int64 from Layout with context_ptr, 8
-    If copy_relations is not equal to 0:
-        Let keys be proc keys from Dictionary with copy_relations
-        Let key_count be proc length from List with keys
-
-        Let i be 0
-        While i is less than key_count:
-            Let key be proc get from List with keys, i
-            Let copy_rel be proc get from Dictionary with copy_relations, key
-
-            If copy_rel is not equal to 0:
-                proc deallocate from Layout with copy_rel
-            End If
-
-            Set i to i plus 1
-        End While
-
-        proc destroy from List with keys
-        proc destroy from Dictionary with copy_relations
-    End If
-
-    Note: Destroy copy sources dictionary
-    Let copy_sources be proc memory_get_int64 from Layout with context_ptr, 16
-    If copy_sources is not equal to 0:
-        proc destroy from Dictionary with copy_sources
-    End If
-
-    Note: Destroy value equivalence dictionary
-    Let value_equivalence be proc memory_get_int64 from Layout with context_ptr, 24
-    If value_equivalence is not equal to 0:
-        proc destroy from Dictionary with value_equivalence
-    End If
-
-    Note: Destroy interference graph
-    Let interference_graph be proc memory_get_int64 from Layout with context_ptr, 32
-    If interference_graph is not equal to 0:
-        proc destroy_interference_graph with interference_graph
-    End If
-
-    Note: Destroy PHI copies list
-    Let phi_copies be proc memory_get_int64 from Layout with context_ptr, 48
-    If phi_copies is not equal to 0:
-        proc destroy from List with phi_copies
-    End If
-
-    Note: Destroy worklist
-    Let worklist be proc memory_get_int64 from Layout with context_ptr, 56
-    If worklist is not equal to 0:
-        proc destroy from List with worklist
-    End If
-
-    Note: Free context structure
-    proc deallocate from Layout with context_ptr
-
-    Display "destroy_copy_prop_context: context destroyed"
-    Return 1
-End Process
-
-Process called "print_copy_prop_stats" that takes context_ptr as Integer returns Integer:
-    @Reasoning
-    Emits a human-readable summary of the four counters the pass
-    maintains in the context (eliminated, propagated, phi_eliminated,
-    coalesced) plus a totals line. Used by the pipeline driver after
-    every per-function run for the pass log and by regression tests
-    that grep for expected counts.
-
-    Returns 1 on success, 0 on null context.
-    @End Reasoning
-
-    If context_ptr is equal to 0:
-        Return 0
-    End If
-
-    Let copies_eliminated be proc memory_get_int64 from Layout with context_ptr, 64
-    Let copies_propagated be proc memory_get_int64 from Layout with context_ptr, 72
-    Let phi_copies_eliminated be proc memory_get_int64 from Layout with context_ptr, 80
-    Let copies_coalesced be proc memory_get_int64 from Layout with context_ptr, 88
-
-    Display "============================================"
-    Display "ENHANCED COPY PROPAGATION STATISTICS"
-    Display "============================================"
-    Display "Copies eliminated:       " joined with copies_eliminated
-    Display "Copies propagated:       " joined with copies_propagated
-    Display "PHI copies eliminated:   " joined with phi_copies_eliminated
-    Display "Copies coalesced:        " joined with copies_coalesced
-    Display "Total optimizations:     " joined with copies_eliminated plus copies_propagated plus phi_copies_eliminated plus copies_coalesced
-    Display "============================================"
-
-    Return 1
-End Process
-
-Note: ============================================================================
-Note: COPY DETECTION AND ANALYSIS
-Note: ============================================================================
-
-Process called "create_copy_relation" that takes dest_id as Integer, src_id as Integer returns Integer:
-    @Reasoning
-    Allocates and initializes a CopyRelation record (32 bytes) describing
-    the relationship "dest_id is a copy of src_id". Records are stored in
-    the context's copy_relations dictionary, keyed by dest_id, so each
-    destination has at most one canonical source description.
-
-    Defaults:
-      - is_trivial = 1   (the caller can downgrade to 0 if the source
-        eventually proves to come from a non-trivial copy chain).
-      - copy_chain_length = 1 (single-hop; updated by analyze_copy_chains
-        if longer chains are discovered).
-
-    Returns the pointer to the new record, or 0 on allocation failure.
-    @End Reasoning
-
-    Let copy_ptr be proc allocate from Layout with 32
-    If copy_ptr is equal to 0:
-        Return 0
-    End If
-
-    proc memory_set_int64 from Layout with copy_ptr, 0, dest_id
-    proc memory_set_int64 from Layout with copy_ptr, 8, src_id
-    proc memory_set_int64 from Layout with copy_ptr, 16, 1 Note: is_trivial = true initially
-    proc memory_set_int64 from Layout with copy_ptr, 24, 1 Note: copy_chain_length = 1
-
-    Return copy_ptr
-End Process
-
-Process called "detect_copy_instruction" that takes inst_ptr as Integer, cfg_ptr as Integer returns Integer:
-    @Reasoning
-    Classifies a single MIR instruction as a copy or a non-copy.
-
-    A copy is any instruction whose destination value is semantically equal
-    to one of its source values - no transformation, no rounding, no width
-    change with a semantic effect. Recognizing every shape of copy is the
-    pre-requisite for both copy elimination and copy coalescing during
-    register allocation: anything we miss here is a missed optimization
-    downstream.
-
-    **CANONICAL COPY SHAPES:**
-    1. **MIR_COPY (opcode 20018)** - explicit "move src to dest".
-    2. **MIR_BITCAST (opcode 20028)** with src_type == dest_type - the
-       reinterpret is a no-op, so the bitcast is a copy. A bitcast across
-       differing types is NOT a copy (representation may change).
-    3. **MIR_PHI (opcode 20023)** whose incoming operands are all equal -
-       a "trivial PHI" collapses to a copy of that single value.
-    4. **Identity arithmetic** - ADD x, 0 and MUL x, 1 are copies of x.
-       Requires the CFG so we can resolve the right operand's defining
-       instruction and verify it is a literal constant.
-
-    Returns 1 when the instruction is a copy, 0 otherwise.
-    @End Reasoning
-
-    @Implementation
-    1. Reject null instructions immediately (returns 0).
-    2. Fetch the opcode once via get_mir_node_opcode (cheap, used by every
-       branch below).
-    3. **MIR_COPY**: unambiguous - return 1.
-    4. **MIR_BITCAST**: read the encoded src/dest type IDs from the node
-       payload (offsets 24 and 32). If they match, the bitcast is a copy.
-    5. **MIR_PHI**: read operand_count from the node. Empty PHIs are not
-       copies. Compare every operand value against operand[0]; if any
-       differs the PHI is not trivial. All-equal -> copy.
-    6. **Identity arithmetic**: if cfg_ptr is provided, resolve the right
-       operand's defining instruction via find_defining_instruction_copy.
-       For MIR_ADD verify the const is 0; for MIR_MUL verify the const is 1.
-       Either match makes the instruction a copy of the left operand.
-    7. Default: return 0 (not a copy).
-    @End Implementation
-
-    If inst_ptr is equal to 0:
-        Return 0
-    End If
-
-    Let opcode be proc get_mir_node_opcode from MIR with inst_ptr
-
-    Note: Check for explicit COPY/MOV instruction
-    If opcode is equal to 20018:  Note: MIR_COPY
-        Return 1
-    End If
-
-    Note: Check for BITCAST (type conversion)
-    If opcode is equal to 20028:  Note: MIR_BITCAST
-        Note: Get source and dest types
-        Let src_type be proc memory_get_int64 from Layout with inst_ptr, 24
-        Let dest_type be proc memory_get_int64 from Layout with inst_ptr, 32
-
-        Note: If types are same, it's a copy
-        If src_type is equal to dest_type:
-            Return 1
-        End If
-    End If
-
-    Note: Check for trivial PHI (all operands same)
-    If opcode is equal to 20023:  Note: MIR_PHI
-        Let operand_count be proc get_phi_operand_count from MIRNodes with inst_ptr
-
-        If operand_count is less than 1:
-            Return 0
-        End If
-
-        Note: Get first operand value
-        Let first_value be proc get_phi_operand_value from MIRNodes with inst_ptr, 0
-
-        Note: Check if all other operands are the same
-        Let all_same be 1
-        Let i be 1
-        While i is less than operand_count:
-            Let operand_value be proc get_phi_operand_value from MIRNodes with inst_ptr, i
-            If operand_value is not equal to first_value:
-                Set all_same to 0
-            End If
-            Set i to i plus 1
-        End While
-
-        Note: If all PHI operands are same, it's a trivial copy
-        If all_same is equal to 1:
-            Return 1
-        End If
-    End If
-
-    Note: Check for identity operations (requires constant analysis)
-    If cfg_ptr is not equal to 0:
-        If opcode is equal to 20010:  Note: MIR_ADD
-            Let right_operand be proc memory_get_int64 from Layout with inst_ptr, 24
-            Note: Check if right operand is constant 0
-            Let right_inst be proc find_defining_instruction_copy with cfg_ptr, right_operand
-            If right_inst is not equal to 0:
-                Let right_opcode be proc get_mir_node_opcode from MIR with right_inst
-                If right_opcode is equal to 20001:  Note: MIR_CONST
-                    Let const_val be proc memory_get_int64 from Layout with right_inst, 16
-                    If const_val is equal to 0:
-                        Return 1  Note: ADD x, 0 is a copy of x
-                    End If
-                End If
-            End If
-        End If
-
-        If opcode is equal to 20012:  Note: MIR_MUL
-            Set right_operand to proc memory_get_int64 from Layout with inst_ptr, 24
-            Note: Check if right operand is constant 1
-            Set right_inst to proc find_defining_instruction_copy with cfg_ptr, right_operand
-            If right_inst is not equal to 0:
-                Set right_opcode to proc get_mir_node_opcode from MIR with right_inst
-                If right_opcode is equal to 20001:  Note: MIR_CONST
-                    Set const_val to proc memory_get_int64 from Layout with right_inst, 16
-                    If const_val is equal to 1:
-                        Return 1  Note: MUL x, 1 is a copy of x
-                    End If
-                End If
-            End If
-        End If
-    End If
-
-    Note: Not a copy
-    Return 0
-End Process
-
-Process called "find_defining_instruction_copy" that takes cfg_ptr as Integer, value_id as Integer returns Integer:
-    @Reasoning
-    Locates the MIR instruction that defines a given SSA value by linearly
-    scanning every basic block in the CFG.
-
-    Under SSA each value has exactly one definition, so the first match is
-    correct and the function can terminate early. The naive scan is
-    acceptable here because copy_prop runs after SCCP and constant
-    propagation - the CFG sizes encountered at this point are already
-    bounded by per-function granularity, and the use case (identity-arith
-    detection) only resolves a handful of operands per copy.
-
-    Returns the defining instruction pointer or 0 when no definition is
-    found (which generally indicates an undefined-use bug upstream).
-    @End Reasoning
-
-    @Implementation
-    1. Validate both inputs - either null pointer or zero value_id returns 0
-       immediately so callers can chain calls without guarding.
-    2. Iterate every basic block in the CFG via get_block_count /
-       get_block; this preserves the block order chosen by the CFG, which
-       is typically forward, helping locality for forward-defined values.
-    3. For each block, request its instruction list and walk it
-       sequentially.
-    4. For every non-null instruction, read its produced value_id (the SSA
-       "result"). Compare against the target value_id; on equality return
-       the instruction pointer - SSA guarantees uniqueness so an early
-       return is sound.
-    5. Fall through to Return 0 when no block produced the value (e.g.
-       constant inlined from outside the function or a global reference).
-    @End Implementation
-
-    If cfg_ptr is equal to 0 or value_id is equal to 0:
-        Return 0
-    End If
-
-    Let block_count be proc get_block_count from CFG with cfg_ptr
-    Let i be 0
-    While i is less than block_count:
-        Let block be proc get_block from CFG with cfg_ptr, i
-        Let instructions be proc get_block_instructions from CFG with block
-        Let inst_count be proc length from List with instructions
-
-        Let j be 0
-        While j is less than inst_count:
-            Let inst be proc get from List with instructions, j
-            If inst is not equal to 0:
-                Let result_id be proc get_mir_node_value_id from MIR with inst
-                If result_id is equal to value_id:
-                    Return inst
-                End If
-            End If
-            Set j to j plus 1
-        End While
-        Set i to i plus 1
-    End While
-
-    Return 0
-End Process
-
-Process called "analyze_copy_chains" that takes context_ptr as Integer returns Integer:
-    @Reasoning
-    Provides the chain-analysis hook for transitive copy collapse.
-
-    **CHAIN COLLAPSE (CONCEPT):**
-      a = b, b = c, c = d   would compress to   a = d, b = d, c = d
-
-    The current implementation reserves the entry point and contract so the
-    pipeline driver can call it unconditionally. The active chain rewriter
-    lives in coalesce_copy / values_interfere, which together provide
-    equivalent transitive substitution via the value_equivalence map - so a
-    no-op here is correct given the surrounding architecture rather than a
-    deferred TODO.
-
-    Returns the number of chains rewritten by this specific hook (zero
-    while chain collapsing is delegated to the coalescer).
-    @End Reasoning
-
-    @Implementation
-    1. Reject a null context with a 0 return so the driver can call this
-       hook unconditionally without guarding.
-    2. Emit a single trace line so analysis logs make the call site visible
-       when copy-prop debug output is enabled.
-    3. Return 0 - downstream coalescing handles transitive substitution
-       through the value_equivalence map.
-    @End Implementation
-
-    If context_ptr is equal to 0:
-        Return 0
-    End If
-
-    Display "analyze_copy_chains: analyzing transitive copies"
-
-    Let chains_found be 0
-    Return chains_found
-End Process
-
-Note: ============================================================================
-Note: INTERFERENCE ANALYSIS AND COPY COALESCING
-Note: ============================================================================
-
-Process called "create_interference_graph" returns Integer:
-    @Reasoning
-    Allocates a 24-byte InterferenceGraph record:
-      offset 0  - edges Dictionary (value_id_str -> Set of neighbor ids)
-      offset 8  - node_count (incremented as new value ids are registered)
-      offset 16 - edge_count (incremented per add_interference_edge call)
-
-    Returned to the caller as an opaque integer handle - typical usage is
-    perform_copy_coalescing which builds, queries, then releases the graph
-    via destroy_interference_graph at context teardown.
-
-    Returns the handle, or 0 on allocation failure.
-    @End Reasoning
-
-    Let graph_ptr be proc allocate from Layout with 24
-    If graph_ptr is equal to 0:
-        Return 0
-    End If
-
-    Let edges be proc create from Dictionary
-    proc memory_set_int64 from Layout with graph_ptr, 0, edges
-    proc memory_set_int64 from Layout with graph_ptr, 8, 0 Note: node_count
-    proc memory_set_int64 from Layout with graph_ptr, 16, 0 Note: edge_count
-
-    Return graph_ptr
-End Process
-
-Process called "destroy_interference_graph" that takes graph_ptr as Integer returns Integer:
-    @Reasoning
-    Frees an InterferenceGraph. The adjacency Sets stored as values in the
-    edges dictionary are released as part of Dictionary.destroy
-    (Dictionary destroy walks its values when configured for owned-value
-    semantics in this compiler's primitive layer), then the graph record
-    itself is deallocated.
-
-    Returns 1 on success, 0 on null input - safe to call against an
-    uninitialised handle.
-    @End Reasoning
-
-    If graph_ptr is equal to 0:
-        Return 0
-    End If
-
-    Let edges be proc memory_get_int64 from Layout with graph_ptr, 0
-    If edges is not equal to 0:
-        proc destroy from Dictionary with edges
-    End If
-
-    proc deallocate from Layout with graph_ptr
-    Return 1
-End Process
-
-Process called "add_interference_edge" that takes graph_ptr as Integer, value1_id as Integer, value2_id as Integer returns Integer:
-    @Reasoning
-    Adds an undirected interference edge between two SSA values so the
-    coalescer knows it cannot merge them into a single physical register.
-
-    **INTERFERENCE INVARIANT:**
-    Two SSA values interfere when their live ranges overlap at any program
-    point. If we coalesce interfering values, the resulting single
-    register would hold two simultaneously-live logical values - which is
-    a register allocator catastrophe. Maintaining the bidirectional edge
-    set lets values_interfere answer the query in O(1) average time.
-
-    **REPRESENTATION:**
-    The graph is stored as a dictionary keyed by stringified value_id with
-    Set-of-Integer adjacency values. Bidirectional storage trades 2x space
-    for symmetric O(1) lookup from either endpoint.
-
-    Returns 1 when an edge was added or already present, 0 on null graph or
-    self-loop (which carries no meaning - a value never interferes with
-    itself in SSA).
-    @End Reasoning
-
-    @Implementation
-    1. Reject null graph_ptr and self-loops up front (value1 == value2).
-    2. Read the edges Dictionary handle from graph offset 0.
-    3. Stringify value1_id and value2_id to use as Dictionary keys
-       (Dictionary keys are strings in this MIR helper layer).
-    4. For each endpoint:
-         a. Probe the dictionary for an existing adjacency Set.
-         b. If absent, create a new Set and store it; bump node_count
-            (offset 8) for the freshly registered node.
-         c. Add the other endpoint's integer id into the Set; Set.add is
-            idempotent so duplicate edges do not bloat storage.
-    5. Increment edge_count (offset 16) by 1 - one logical undirected edge
-       even though it lives in two adjacency sets.
-    6. Return 1 to signal success.
-    @End Implementation
-
-    If graph_ptr is equal to 0:
-        Return 0
-    End If
-
-    Note: Don't add self-loops
-    If value1_id is equal to value2_id:
-        Return 0
-    End If
-
-    Let edges be proc memory_get_int64 from Layout with graph_ptr, 0
-
-    Note: Add bidirectional edge
-    Let v1_str be proc integer_to_string from String with value1_id
-    Let v2_str be proc integer_to_string from String with value2_id
-
-    Note: Get or create adjacency set for value1
-    Let has_v1 be proc contains from Dictionary with edges, v1_str
-    Let v1_adjacency be 0
-
-    If has_v1 is equal to 0:
-        Note: Create new set for value1
-        Set v1_adjacency to proc create from Set
-        proc set from Dictionary with edges, v1_str, v1_adjacency
-    Otherwise:
-        Set v1_adjacency to proc get from Dictionary with edges, v1_str
-    End If
-
-    Note: Add value2 to value1's adjacency set
-    proc add from Set with v1_adjacency, value2_id
-
-    Note: Get or create adjacency set for value2
-    Let has_v2 be proc contains from Dictionary with edges, v2_str
-    Let v2_adjacency be 0
-
-    If has_v2 is equal to 0:
-        Note: Create new set for value2
-        Set v2_adjacency to proc create from Set
-        proc set from Dictionary with edges, v2_str, v2_adjacency
-    Otherwise:
-        Set v2_adjacency to proc get from Dictionary with edges, v2_str
-    End If
-
-    Note: Add value1 to value2's adjacency set
-    proc add from Set with v2_adjacency, value1_id
-
-    Note: Increment edge count
-    Let edge_count be proc memory_get_int64 from Layout with graph_ptr, 16
-    Set edge_count to edge_count plus 1
-    proc memory_set_int64 from Layout with graph_ptr, 16, edge_count
-
-    Note: Increment node count if new nodes
-    Let node_count be proc memory_get_int64 from Layout with graph_ptr, 8
-    If has_v1 is equal to 0:
-        Set node_count to node_count plus 1
-    End If
-    If has_v2 is equal to 0 and value1_id is not equal to value2_id:
-        Set node_count to node_count plus 1
-    End If
-    proc memory_set_int64 from Layout with graph_ptr, 8, node_count
-
-    Return 1
-End Process
-
-Process called "build_interference_graph_from_liveness" that takes graph_ptr as Integer, cfg_ptr as Integer returns Integer:
-    @Reasoning
-    Constructs the interference graph by combining liveness information with
-    the per-instruction define set.
-
-    **CORRECTNESS FOUNDATION:**
-    A value defined by instruction I interferes with every value that is
-    live immediately before I. Reasoning: the new value goes into a register
-    at the moment of I; any value that is still going to be used must be
-    held in a *different* register, hence the interference. This is the
-    standard textbook construction (Chaitin / Briggs).
-
-    **WHY HERE (not in regalloc):**
-    Copy coalescing uses interference to refuse merging values whose live
-    ranges overlap. The same graph is later consumed (and refined) by the
-    register allocator. Building it once here lets both passes share the
-    O(n^2) worst-case cost.
-
-    Returns the number of interference edges added (counts each successful
-    add_interference_edge call, including duplicates suppressed by Set
-    semantics).
-    @End Reasoning
-
-    @Implementation
-    1. Guard against null graph_ptr or null cfg_ptr by returning 0.
-    2. Allocate a fresh Dictionary as the liveness map (instruction_key ->
-       Set of live value ids). Call compute_liveness to populate it via
-       iterative backward dataflow.
-    3. Iterate every block and every instruction within each block:
-         a. Read the definition value via get_mir_node_value_id; skip
-            instructions with no defined value (e.g. stores).
-         b. Build the instruction key as (block_index * 10000) + inst_index
-            stringified - matches the key scheme compute_liveness uses.
-         c. Look up the live set for this instruction; if missing the
-            instruction is unreachable or non-side-effecting - skip.
-         d. Convert the live Set to a list (stable ordering for the inner
-            loop) and add an interference edge between def_value and each
-            currently-live value. Increment edges_added per call.
-         e. Destroy the temporary live list (the Set itself stays in the
-            liveness map until step 4 cleans up).
-    4. Tear down the liveness map: walk every key, destroy each stored Set,
-       free the keys list, then destroy the dictionary.
-    5. Trace the final edge count and return it.
-    @End Implementation
-
-    @Performance_Hints
-    The 10000-wide encoding of (block_idx, inst_idx) caps the per-block
-    instruction count at 10000 - generous for normal functions but worth
-    revisiting if mega-functions become common. The Set-to-list conversion
-    inside the hot loop is O(live), so the overall cost is O(I * L) where
-    I is total instructions and L is average live set size. This matches
-    the textbook bound and is acceptable at MIR scale.
-    @End Performance_Hints
-
-    If graph_ptr is equal to 0 or cfg_ptr is equal to 0:
-        Return 0
-    End If
-
-    Note: Compute liveness for all blocks
-    Let liveness_map be proc create from Dictionary
-    proc compute_liveness with cfg_ptr, liveness_map
-
-    Note: Build interference edges from liveness
-    Let edges_added be 0
-    Let block_count be proc get_block_count from CFG with cfg_ptr
-
-    Let i be 0
-    While i is less than block_count:
-        Let block be proc get_block from CFG with cfg_ptr, i
-        Let instructions be proc get_block_instructions from CFG with block
-        Let inst_count be proc length from List with instructions
-
-        Let j be 0
-        While j is less than inst_count:
-            Let inst be proc get from List with instructions, j
-            If inst is not equal to 0:
-                Note: Get value defined by this instruction
-                Let def_value be proc get_mir_node_value_id from MIR with inst
-
-                If def_value is not equal to 0:
-                    Note: Get live values at this point
-                    Let inst_key be (i multiplied by 10000) plus j
-                    Let inst_key_str be proc integer_to_string from String with inst_key
-
-                    Let has_live be proc contains from Dictionary with liveness_map, inst_key_str
-                    If has_live is equal to 1:
-                        Let live_set be proc get from Dictionary with liveness_map, inst_key_str
-                        Let live_list be proc to_list from Set with live_set
-                        Let live_count be proc length from List with live_list
-
-                        Note: Add interference edge between def_value and each live value
-                        Let k be 0
-                        While k is less than live_count:
-                            Let live_value be proc get from List with live_list, k
-                            proc add_interference_edge with graph_ptr, def_value, live_value
-                            Set edges_added to edges_added plus 1
-                            Set k to k plus 1
-                        End While
-
-                        proc destroy from List with live_list
-                    End If
-                End If
-            End If
-
-            Set j to j plus 1
-        End While
-
-        Set i to i plus 1
-    End While
-
-    Note: Cleanup liveness map
-    Let keys be proc keys from Dictionary with liveness_map
-    Let key_count be proc length from List with keys
-    Let m be 0
-    While m is less than key_count:
-        Let key be proc get from List with keys, m
-        Set live_set to proc get from Dictionary with liveness_map, key
-        proc destroy from Set with live_set
-        Set m to m plus 1
-    End While
-    proc destroy from List with keys
-    proc destroy from Dictionary with liveness_map
-
-    Display "build_interference_graph_from_liveness: added " joined with edges_added joined with " interference edges"
-
-    Return edges_added
-End Process
-
-Process called "compute_liveness" that takes cfg_ptr as Integer, liveness_map as Integer returns Integer:
-    @Reasoning
-    Computes per-instruction live sets for the entire CFG using classical
-    backward iterative dataflow.
-
-    **DATAFLOW EQUATIONS:**
-      LiveOut(I) = union over successors S of LiveIn(S)
-      LiveIn(I)  = Use(I)  union  (LiveOut(I) minus Def(I))
-
-    Processing blocks in reverse and iterating until no live set changes is
-    the standard worklist-free formulation - simpler than a worklist and
-    perfectly adequate at MIR scale where blocks rarely exceed a few
-    hundred instructions and CFGs are well below 1000 blocks.
-
-    **TERMINATION:**
-    The lattice is monotone (sets only grow) and finite (bounded by total
-    SSA value count) so the algorithm converges. We additionally cap the
-    outer loop at max_iterations as a defensive guard against pathological
-    inputs - in normal functions convergence happens in 2-3 iterations.
-
-    Returns 1 on success, 0 on input validation failure.
-    @End Reasoning
-
-    @Implementation
-    1. Validate both pointers; return 0 if either is null.
-    2. Outer fixed-point loop:
-         - changed flag starts at 1 to force at least one iteration.
-         - iterations counter prevents runaway loops (cap at 100).
-    3. Inner pass (one iteration over the CFG, blocks in reverse):
-         a. For each block, build the live-out by unioning the live-in
-            snapshots of every successor block (read from liveness_map at
-            the successor's first-instruction key).
-         b. Walk the block's instructions in reverse - for each
-            instruction:
-              i.   Remove the defined value from live (it is killed here).
-              ii.  Add every used operand to live via
-                   add_instruction_uses_to_live_set.
-              iii. Build the instruction key (block_idx*10000 + inst_idx)
-                   and snapshot the current live set into liveness_map.
-              iv.  Compare against the previous snapshot; if different,
-                   set changed = 1 to schedule another outer iteration.
-         c. Destroy the per-block live set after recording - we keep only
-            the per-instruction snapshots in liveness_map.
-    4. Trace the iteration count when convergence is reached and return 1.
-    @End Implementation
-
-    If cfg_ptr is equal to 0 or liveness_map is equal to 0:
-        Return 0
-    End If
-
-    Note: Initialize all live sets to empty
-    Note: Iterate until fixed point (no changes)
-    Let changed be 1
-    Let iterations be 0
-    Let max_iterations be 100
-
-    While changed is equal to 1 and iterations is less than max_iterations:
-        Set changed to 0
-        Set iterations to iterations plus 1
-
-        Note: Process blocks in reverse order (backward analysis)
-        Let block_count be proc get_block_count from CFG with cfg_ptr
-        Let i be block_count minus 1
-
-        While i is greater than or equal to 0:
-            Let block be proc get_block from CFG with cfg_ptr, i
-            Let instructions be proc get_block_instructions from CFG with block
-            Let inst_count be proc length from List with instructions
-
-            Note: Start with live-out at end of block
-            Note: Live-out = union of live-in of all successor blocks
-            Let live be proc create from Set
-
-            Note: Get block successors and merge their live-in sets
-            Let successors be proc get_block_successors from CFG with block
-            Let succ_count be proc length from List with successors
-
-            Let s be 0
-            While s is less than succ_count:
-                Let succ_block_id be proc get from List with successors, s
-
-                Note: Get live-in of successor (which is stored at first instruction)
-                Let succ_block be proc get_block from CFG with cfg_ptr, succ_block_id
-                Let succ_instructions be proc get_block_instructions from CFG with succ_block
-
-                If proc length from List with succ_instructions is greater than 0:
-                    Note: Get live set at first instruction of successor
-                    Let succ_first_key be (succ_block_id multiplied by 10000) plus 0
-                    Let succ_first_key_str be proc integer_to_string from String with succ_first_key
-
-                    Let has_succ_live be proc contains from Dictionary with liveness_map, succ_first_key_str
-                    If has_succ_live is equal to 1:
-                        Let succ_live_set be proc get from Dictionary with liveness_map, succ_first_key_str
-
-                        Note: Merge successor's live-in into current live-out
-                        proc union from Set with live, succ_live_set
-                    End If
-                End If
-
-                Set s to s plus 1
-            End While
-
-            Note: Process instructions backward
-            Let j be inst_count minus 1
-            While j is greater than or equal to 0:
-                Let inst be proc get from List with instructions, j
-                If inst is not equal to 0:
-                    Note: Get defined value (remove from live set)
-                    Let def_value be proc get_mir_node_value_id from MIR with inst
-                    If def_value is not equal to 0:
-                        proc remove from Set with live, def_value
-                    End If
-
-                    Note: Add used values to live set
-                    proc add_instruction_uses_to_live_set with inst, live
-
-                    Note: Store live set for this instruction
-                    Let inst_key be (i multiplied by 10000) plus j
-                    Let inst_key_str be proc integer_to_string from String with inst_key
-
-                    Note: Check if live set changed
-                    Let has_old be proc contains from Dictionary with liveness_map, inst_key_str
-                    If has_old is equal to 1:
-                        Let old_live be proc get from Dictionary with liveness_map, inst_key_str
-                        Let sets_equal be proc equals from Set with live, old_live
-                        If sets_equal is equal to 0:
-                            Set changed to 1
-                        End If
-                    Otherwise:
-                        Set changed to 1
-                    End If
-
-                    Note: Update liveness map with copy of live set
-                    Let live_copy be proc create from Set
-                    proc union_into from Set with live_copy, live
-                    proc set from Dictionary with liveness_map, inst_key_str, live_copy
-                End If
-
-                Set j to j minus 1
-            End While
-
-            proc destroy from Set with live
-
-            Set i to i minus 1
-        End While
-    End While
-
-    Display "compute_liveness: converged in " joined with iterations joined with " iterations"
-
-    Return 1
-End Process
-
-Process called "add_instruction_uses_to_live_set" that takes inst as Integer, live_set as Integer returns Integer:
-    @Reasoning
-    Inserts every operand the instruction reads (its "use" set) into the
-    provided live set. This is the dataflow "gen" step of liveness:
-      LiveIn(I) = Use(I)  union  (LiveOut(I) minus Def(I))
-    so this routine implements the Use(I) union side. Without it,
-    backward liveness would silently treat operands as dead and the
-    interference graph would be incomplete - allowing the coalescer to
-    illegally merge values that are in fact simultaneously live.
-
-    The implementation is opcode-aware: every MIR opcode that reads
-    operands has its operand offsets handled explicitly so that no
-    use can leak past us. Returns 1 on success, 0 on null inputs.
-    @End Reasoning
-
-    @Implementation
-    1. Reject null instruction or null live_set with a 0 return.
-    2. Fetch the opcode once and switch on its value (Runa "or"-chained
-       If branches stand in for a switch):
-         - Binary arithmetic family (MIR_ADD, MIR_SUB, MIR_MUL, MIR_DIV,
-           MIR_REM = 20010..20014): read left at offset 16 and right at
-           offset 24; add both to live_set when non-zero.
-         - Comparison (MIR_CMP = 20015): same operand layout as arithmetic.
-         - Store (MIR_STORE = 20020): read pointer at offset 16, value at
-           offset 24; add both.
-    3. Each add is guarded by an "is not equal to 0" check so that zero
-       value ids (placeholder / not-applicable) never pollute the set.
-    4. Return 1.
-    @End Implementation
-
-    If inst is equal to 0 or live_set is equal to 0:
+    If inst is equal to 0:
         Return 0
     End If
 
     Let opcode be proc get_mir_node_opcode from MIR with inst
 
-    Note: Binary operations use two operands
-    If opcode is equal to 20010 or opcode is equal to 20011 or opcode is equal to 20012 or opcode is equal to 20013 or opcode is equal to 20014:
-        Let left be proc memory_get_int64 from Layout with inst, 16
-        Let right be proc memory_get_int64 from Layout with inst, 24
-        If left is not equal to 0:
-            proc add from Set with live_set, left
-        End If
-        If right is not equal to 0:
-            proc add from Set with live_set, right
-        End If
+    Note: MIR_COPY (OD-5): source in header operand1
+    If opcode is equal to 20008:
+        Let src be proc get_mir_node_operand from MIR with inst, 1
+        Return src
     End If
 
-    Note: Comparisons use two operands
-    If opcode is equal to 20015:
-        Set left to proc memory_get_int64 from Layout with inst, 16
-        Set right to proc memory_get_int64 from Layout with inst, 24
-        If left is not equal to 0:
-            proc add from Set with live_set, left
-        End If
-        If right is not equal to 0:
-            proc add from Set with live_set, right
+    Note: Degenerate single-incoming PHI = copy of the lone incoming value
+    If opcode is equal to 20300:
+        Let incoming_count be proc get_phi_incoming_count from MIRNodes with inst
+        If incoming_count is equal to 1:
+            Let phi_src be proc get_phi_incoming_value from MIRNodes with inst, 0
+            Return phi_src
         End If
     End If
-
-    Note: Stores use pointer and value
-    If opcode is equal to 20020:
-        Let ptr be proc memory_get_int64 from Layout with inst, 16
-        Let val be proc memory_get_int64 from Layout with inst, 24
-        If ptr is not equal to 0:
-            proc add from Set with live_set, ptr
-        End If
-        If val is not equal to 0:
-            proc add from Set with live_set, val
-        End If
-    End If
-
-    Return 1
-End Process
-
-Process called "values_interfere" that takes graph_ptr as Integer, value1_id as Integer, value2_id as Integer returns Integer:
-    @Reasoning
-    Predicate query against the interference graph: do value1 and value2
-    have overlapping live ranges?
-
-    This is the critical guard for copy coalescing. Returning a false
-    negative (saying values do not interfere when they actually do) leads
-    to incorrect register allocation and silent miscompiles. Returning a
-    false positive only forfeits an optimization opportunity, so when in
-    doubt the conservative answer is 1 (interfere).
-
-    The graph is undirected and stored bidirectionally, so we only need
-    to query one endpoint's adjacency Set. The dictionary lookup is O(1)
-    average and the Set membership test is also O(1) average, giving an
-    overall O(1) average query.
-
-    Returns 1 when the values interfere, 0 otherwise (including the
-    trivial v == v case and null-graph case).
-    @End Reasoning
-
-    @Implementation
-    1. Reject null graph_ptr with a 0 return - no graph means we have no
-       evidence of interference (the coalescer treats that as "no
-       interference recorded" which is the correct default when the graph
-       was deliberately skipped).
-    2. SSA self-comparison: if value1 == value2, return 0 - a value never
-       interferes with itself.
-    3. Read the edges Dictionary at graph offset 0.
-    4. Stringify value1_id and probe the dictionary; absence means no
-       edges touch value1, so it cannot interfere - return 0.
-    5. Fetch value1's adjacency Set; test Set membership for value2_id.
-    6. Return that boolean directly as the interference verdict.
-    @End Implementation
-
-    If graph_ptr is equal to 0:
-        Return 0
-    End If
-
-    Note: Values don't interfere with themselves
-    If value1_id is equal to value2_id:
-        Return 0
-    End If
-
-    Let edges be proc memory_get_int64 from Layout with graph_ptr, 0
-    Let v1_str be proc integer_to_string from String with value1_id
-
-    Note: Check if value1 has any adjacency information
-    Let has_v1 be proc contains from Dictionary with edges, v1_str
-    If has_v1 is equal to 0:
-        Return 0  Note: No edges for value1 minus doesn't interfere
-    End If
-
-    Note: Get adjacency set for value1
-    Let v1_adjacency be proc get from Dictionary with edges, v1_str
-
-    Note: Check if value2 is in value1's adjacency set
-    Let interferes be proc contains from Set with v1_adjacency, value2_id
-
-    Return interferes
-End Process
-
-Process called "can_coalesce_copy" that takes context_ptr as Integer, dest_id as Integer, src_id as Integer returns Integer:
-    @Reasoning
-    Decides whether the copy "dest = src" is safe to coalesce - that is,
-    whether dest and src can share the same physical register slot without
-    breaking correctness.
-
-    **CORRECTNESS-FIRST POLICY:**
-    Coalescing two interfering values is a silent miscompile. Therefore
-    the only hard rule enforced here is "values must not interfere".
-    Compatibility (type and register class) is enforced upstream because
-    SSA values of mismatching types do not appear as direct copies after
-    type checking.
-
-    **GRACEFUL DEGRADATION:**
-    If no interference graph has been built yet (offset 32 holds 0), this
-    function falls through to a permissive 1. That matches the surrounding
-    pipeline: perform_copy_coalescing builds the graph before this
-    function is queried in production paths; the permissive branch only
-    triggers in unit-test contexts that exercise coalescing in isolation.
-
-    Returns 1 when coalescing is permitted, 0 otherwise.
-    @End Reasoning
-
-    @Implementation
-    1. Reject a null context with a 0 return.
-    2. Read interference_graph at offset 32. If non-null, call
-       values_interfere; on a positive result return 0 immediately.
-    3. If the interference test passed (or no graph is present), return 1
-       to authorize coalescing.
-    @End Implementation
-
-    If context_ptr is equal to 0:
-        Return 0
-    End If
-
-    Note: Check interference
-    Let interference_graph be proc memory_get_int64 from Layout with context_ptr, 32
-    If interference_graph is not equal to 0:
-        Let interfere be proc values_interfere with interference_graph, dest_id, src_id
-        If interfere is equal to 1:
-            Return 0  Note: Cannot coalesce minus values interfere
-        End If
-    End If
-
-    Note: Can coalesce
-    Return 1
-End Process
-
-Process called "coalesce_copy" that takes context_ptr as Integer, dest_id as Integer, src_id as Integer returns Integer:
-    @Reasoning
-    Executes the actual coalescing decision: dest_id is recorded as
-    equivalent to src_id in the value_equivalence map. Downstream rewrite
-    passes (DCE, regalloc) follow this mapping to redirect every use of
-    dest at src, then drop the now-dead copy instruction.
-
-    **WHY MAP NOT REWRITE:**
-    Eagerly rewriting every use during this pass would be expensive and
-    interact badly with concurrent in-flight optimizations. Storing an
-    equivalence and deferring the actual SSA rewrite keeps copy_prop a
-    pure analysis-plus-bookkeeping pass.
-
-    **SRC IS CANONICAL:**
-    The mapping points dest -> src so that following the chain repeatedly
-    converges on the original definition. analyze_copy_chains compresses
-    longer chains; pairwise calls here never produce cycles because
-    can_coalesce_copy guarantees the inputs do not interfere (and a
-    value never interferes with itself).
-
-    Returns 1 on success, 0 on null context.
-    @End Reasoning
-
-    @Implementation
-    1. Reject a null context with a 0 return.
-    2. Fetch the value_equivalence dictionary at offset 24.
-    3. Stringify dest_id (the Dictionary key) - src_id stays an Integer
-       (the Dictionary value).
-    4. Insert / overwrite the mapping dest_str -> src_id.
-    5. Atomically bump the copies_coalesced counter at offset 88 (load,
-       increment, store - this pass is single-threaded so a plain
-       read-modify-write is sound).
-    6. Emit a trace line and return 1.
-    @End Implementation
-
-    If context_ptr is equal to 0:
-        Return 0
-    End If
-
-    Let value_equivalence be proc memory_get_int64 from Layout with context_ptr, 24
-    Let dest_str be proc integer_to_string from String with dest_id
-    Let src_str be proc integer_to_string from String with src_id
-
-    Note: Map dest to src (src is canonical)
-    proc set from Dictionary with value_equivalence, dest_str, src_id
-
-    Note: Increment copies_coalesced counter
-    Let copies_coalesced be proc memory_get_int64 from Layout with context_ptr, 88
-    Set copies_coalesced to copies_coalesced plus 1
-    proc memory_set_int64 from Layout with context_ptr, 88, copies_coalesced
-
-    Display "coalesce_copy: coalesced " joined with dest_id joined with " into " joined with src_id
-
-    Return 1
-End Process
-
-Process called "perform_copy_coalescing" that takes context_ptr as Integer, cfg_ptr as Integer returns Integer:
-    @Reasoning
-    Top-level driver that finds every copy in the function and attempts to
-    coalesce each one against the interference graph.
-
-    **WHY COALESCING MATTERS:**
-    Every coalesced copy removes a move instruction at runtime and frees a
-    register pairing. In tight inner loops, eliminating even a handful of
-    copies can change whether a value lives in a register or spills, which
-    in turn rewrites the loop's instruction count entirely. The pass is
-    therefore one of the highest-leverage MIR-level optimizations.
-
-    **PIPELINE COUPLING:**
-    The function lazily builds the interference graph (via
-    create_interference_graph and build_interference_graph_from_liveness)
-    when none is yet attached - so the analysis cost is amortized over
-    every coalescing query in the same context.
-
-    **STATISTICS:**
-    The function returns the cumulative coalesced count from the context's
-    counter (not just this call's contribution), so callers can compare a
-    pre-call snapshot against the return value if they need a delta.
-
-    Returns the number of copies coalesced (cumulative, from context offset 88).
-    @End Reasoning
-
-    @Implementation
-    1. Guard both null inputs - either returns 0.
-    2. Read interference_graph at offset 32. If null:
-         a. Call create_interference_graph and store the handle at offset 32.
-         b. Populate it via build_interference_graph_from_liveness.
-    3. Walk every block, every instruction:
-         a. detect_copy_instruction tells us whether this instruction is
-            any form of copy (explicit MOV, same-type BITCAST, trivial PHI,
-            or identity arithmetic).
-         b. For copies, fetch dest_id from get_mir_node_value_id.
-         c. Branch on opcode to read src_id from the right offset:
-              - MIR_COPY (20018):   src at instruction offset 16.
-              - MIR_BITCAST (20028): src at instruction offset 16.
-              - MIR_PHI (20023):    operand 0 via get_phi_operand_value
-                                    (legal here because detect_copy already
-                                    confirmed all PHI operands are equal).
-         d. Only proceed when src_id is non-zero (defensive against
-            malformed inputs).
-         e. Ask can_coalesce_copy; on success call coalesce_copy and
-            bump local copies_coalesced_count. Emit a trace line on
-            either branch for debug logs.
-    4. After scanning, print summary statistics (copies found / coalesced).
-    5. Return the cumulative copies_coalesced counter from context offset 88.
-    @End Implementation
-
-    @Performance_Hints
-    Two-level loop over blocks and instructions = O(N) in instruction
-    count. The interference graph build is the dominant cost (O(I*L) per
-    build_interference_graph_from_liveness above). Re-running coalescing
-    in the same context is therefore much cheaper than the first run.
-    @End Performance_Hints
-
-    If context_ptr is equal to 0:
-        Return 0
-    End If
-    If cfg_ptr is equal to 0:
-        Return 0
-    End If
-
-    Display "perform_copy_coalescing: coalescing copies"
-
-    Note: Get or create interference graph
-    Let interference_graph be proc memory_get_int64 from Layout with context_ptr, 32
-    If interference_graph is equal to 0:
-        Note: Create interference graph
-        Set interference_graph to proc create_interference_graph
-        proc memory_set_int64 from Layout with context_ptr, 32, interference_graph
-
-        Note: Build interference graph using liveness analysis
-        proc build_interference_graph_from_liveness with interference_graph, cfg_ptr
-
-        Display "perform_copy_coalescing: built interference graph from liveness analysis"
-    End If
-
-    Note: Scan all blocks to find copies
-    Let copy_relations be proc memory_get_int64 from Layout with context_ptr, 8
-    Let block_count be proc get_block_count from CFG with cfg_ptr
-    Let copies_found be 0
-    Let copies_coalesced_count be 0
-
-    Let i be 0
-    While i is less than block_count:
-        Let block be proc get_block from CFG with cfg_ptr, i
-        Let instructions be proc get_block_instructions from CFG with block
-        Let inst_count be proc length from List with instructions
-
-        Let j be 0
-        While j is less than inst_count:
-            Let inst be proc get from List with instructions, j
-            If inst is not equal to 0:
-                Note: Check if this instruction is a copy
-                Let is_copy be proc detect_copy_instruction with inst, cfg_ptr
-
-                If is_copy is equal to 1:
-                    Set copies_found to copies_found plus 1
-
-                    Note: Get dest and src values
-                    Let dest_id be proc get_mir_node_value_id from MIR with inst
-                    Let src_id be 0
-
-                    Note: Get source based on opcode
-                    Let opcode be proc get_mir_node_opcode from MIR with inst
-
-                    If opcode is equal to 20018:  Note: MIR_COPY
-                        Set src_id to proc memory_get_int64 from Layout with inst, 16
-                    End If
-
-                    If opcode is equal to 20028:  Note: MIR_BITCAST
-                        Set src_id to proc memory_get_int64 from Layout with inst, 16
-                    End If
-
-                    If opcode is equal to 20023:  Note: MIR_PHI (trivial)
-                        Set src_id to proc get_phi_operand_value from MIRNodes with inst, 0
-                    End If
-
-                    Note: Try to coalesce if we have both dest and src
-                    If src_id is not equal to 0:
-                        Note: Check if can coalesce
-                        Let can_coalesce be proc can_coalesce_copy with context_ptr, dest_id, src_id
-
-                        If can_coalesce is equal to 1:
-                            Note: Coalesce this copy
-                            proc coalesce_copy with context_ptr, dest_id, src_id
-                            Set copies_coalesced_count to copies_coalesced_count plus 1
-
-                            Display "perform_copy_coalescing: coalesced copy " joined with dest_id joined with " ← " joined with src_id
-                        Otherwise:
-                            Display "perform_copy_coalescing: cannot coalesce " joined with dest_id joined with " ← " joined with src_id joined with " (interference)"
-                        End If
-                    End If
-                End If
-            End If
-
-            Set j to j plus 1
-        End While
-
-        Set i to i plus 1
-    End While
-
-    Display "perform_copy_coalescing: found " joined with copies_found joined with " copies, coalesced " joined with copies_coalesced_count
-
-    Note: Return coalesced count (already updated in context by coalesce_copy)
-    Let copies_coalesced be proc memory_get_int64 from Layout with context_ptr, 88
-    Return copies_coalesced
-End Process
-
-Note: ============================================================================
-Note: PHI COPY OPTIMIZATION
-Note: ============================================================================
-
-Process called "detect_phi_copies" that takes context_ptr as Integer, cfg_ptr as Integer returns Integer:
-    @Reasoning
-    Pipeline entry point for PHI-related copy detection. PHIs in SSA form
-    typically lower to copies at predecessor block exits during
-    SSA-destruction; identifying them ahead of regalloc lets us coalesce
-    or eliminate them while still in SSA.
-
-    Example shape this hook is designed around:
-        %3 = phi [%1, bb1], [%2, bb2]
-    SSA destruction would synthesize:
-        bb1 tail: copy %1 -> tmp ;  bb2 tail: copy %2 -> tmp ;  %3 := tmp
-    By recognizing the PHI here and feeding it through optimize_phi_copy /
-    eliminate_trivial_phi, we save those moves whenever the operands are
-    structurally identical.
-
-    The function is a thin dispatcher: the heavy lifting lives in
-    optimize_phi_copy and eliminate_trivial_phi which are invoked
-    elsewhere in the driver. This routine exists so the outer pass can
-    keep a clean linear pipeline.
-
-    Returns the number of PHI copies recognized (zero until the deeper
-    walk is enabled by the driver).
-    @End Reasoning
-
-    @Implementation
-    1. Validate both pointers; return 0 if either is null.
-    2. Emit a trace line so the pass log makes the call visible.
-    3. Return the local phi_copies_found counter (currently zero - the
-       driver invokes detect_copy_instruction on PHIs as part of its
-       general copy detection sweep, so a duplicate walk would only
-       double-count).
-    @End Implementation
-
-    If context_ptr is equal to 0:
-        Return 0
-    End If
-    If cfg_ptr is equal to 0:
-        Return 0
-    End If
-
-    Display "detect_phi_copies: detecting PHI-related copies"
-
-    Let phi_copies_found be 0
-    Return phi_copies_found
-End Process
-
-Process called "optimize_phi_copy" that takes context_ptr as Integer, phi_ptr as Integer returns Integer:
-    @Reasoning
-    Inspects a PHI node for optimization opportunities and reports back to
-    the driver whether the PHI was rewritten.
-
-    **TWO OPPORTUNITIES:**
-    1. **Trivial PHI** - every incoming operand is identical, so the PHI
-       collapses to a copy of that single value. eliminate_trivial_phi
-       handles the rewrite when the driver decides to commit it.
-    2. **Operand coalescing** - even non-trivial PHIs can be coalesced
-       with one of their operands (Briggs-style or Chaitin-style PHI
-       coalescing) when the interference graph allows. The decision
-       still flows through can_coalesce_copy / coalesce_copy so the
-       global invariants are preserved.
-
-    This inspection-only entry point keeps the actual rewrite work in the
-    dedicated subroutines while letting the driver pre-screen candidates
-    in a single pass.
-
-    Returns 1 when an optimization is identified, 0 otherwise.
-    @End Reasoning
-
-    @Implementation
-    1. Validate phi_ptr; return 0 on null.
-    2. Emit a trace line so the pass log reflects every PHI inspected.
-    3. Return 0 - the actual classification work is performed by
-       detect_copy_instruction (which already handles trivial PHIs as
-       copies) inside the main coalescing sweep, so duplicating it here
-       would over-count statistics.
-    @End Implementation
-
-    If phi_ptr is equal to 0:
-        Return 0
-    End If
-
-    Note: Check if all PHI incoming values are the same
-    Note: If so, PHI can be replaced with that value (trivial PHI elimination)
-
-    Display "optimize_phi_copy: checking PHI for optimization"
 
     Return 0
 End Process
 
-Process called "eliminate_trivial_phi" that takes context_ptr as Integer, phi_ptr as Integer returns Integer:
+Note: ============================================================================
+Note: COPY-CHAIN RESOLUTION
+Note: ============================================================================
+
+Process called "resolve_copy_source" that takes copy_map as Integer, dest_value as Integer returns Integer:
     @Reasoning
-    Records the elimination of a trivial PHI node (one whose every incoming
-    operand is the same SSA value).
+    Follows the copy chain from dest_value to its ultimate (non-copy) source.
 
-    **WHY THIS IS SOUND:**
-    If every predecessor delivers the same value v into a PHI %p, then
-    every dynamic execution of %p produces v. The PHI can therefore be
-    rewritten as the simple equivalence %p := v with no runtime cost.
-    The SSA rewrite itself is performed by the subsequent regalloc /
-    SSA-destruction pass that consumes the equivalence map; this routine
-    is responsible only for updating the bookkeeping counter so the pass
-    statistics correctly account for the elimination.
+    The copy_map records dest -> immediate-source for every copy in the
+    function. A chain a=b, b=c, c=d (d a non-copy) must collapse so that
+    EVERY use of a, b, and c is rewritten directly to d in a single pass. We
+    therefore walk the map transitively from dest_value until we reach a value
+    that is not itself a copy destination.
 
-    The caller (driver / PHI walker) is responsible for verifying triviality
-    before calling - this function trusts its input.
+    **CYCLE GUARD:** Genuine SSA copy chains are acyclic (a value's source is
+    always an earlier definition). A malformed input could in principle form a
+    cycle; the walk is bounded by the number of entries in the map, after
+    which it returns the current value rather than looping forever. This keeps
+    a corrupt IR from hanging the compiler while never affecting well-formed
+    input.
 
-    Returns 1 on success, 0 on null phi_ptr.
+    Returns the ultimate source value id (which may equal dest_value when
+    dest_value is not a copy destination).
     @End Reasoning
 
-    @Implementation
-    1. Reject a null phi_ptr with a 0 return.
-    2. Read the phi_copies_eliminated counter at context offset 80.
-    3. Increment it by 1 and write it back so subsequent statistics
-       (print_copy_prop_stats) reflect the elimination.
-    4. Return 1.
-    @End Implementation
+    Let current be dest_value
+    Let bound be proc omap_size from OMap with copy_map
+    Let steps be 0
 
-    If phi_ptr is equal to 0:
-        Return 0
-    End If
+    While steps is less than or equal to bound:
+        Let has_next be proc omap_contains from OMap with copy_map, current
+        If has_next is equal to 0:
+            Return current
+        End If
+        Let next be proc omap_get from OMap with copy_map, current
+        If next is equal to current:
+            Return current
+        End If
+        If next is equal to 0:
+            Return current
+        End If
+        Set current to next
+        Set steps to steps plus 1
+    End While
 
-    Note: Get all incoming values
-    Note: Check if all the same
-    Note: If so, replace PHI with that value
-
-    Note: Increment phi_copies_eliminated counter
-    Let phi_copies_eliminated be proc memory_get_int64 from Layout with context_ptr, 80
-    Set phi_copies_eliminated to phi_copies_eliminated plus 1
-    proc memory_set_int64 from Layout with context_ptr, 80, phi_copies_eliminated
-
-    Return 1
+    Return current
 End Process
 
 Note: ============================================================================
-Note: ENTRY POINTS AND PIPELINE INTEGRATION
+Note: USE REWRITING
+Note: ============================================================================
+
+Process called "rewrite_uses_in_instruction" that takes inst as Integer, copy_map as Integer returns Integer:
+    @Reasoning
+    Rewrites every SSA value USE inside one instruction so that any use of a
+    copy destination is replaced by that copy's ultimate source.
+
+    **WHY VALUE-MATCHING, NOT INDEX-MAPPING (OD-1):** A use is rewritten by
+    examining each slot/list-element that can hold an SSA use, and when that
+    slot's current value is a copy destination, writing back its resolved
+    source. The canonical use ENUMERATOR (CFG.get_instruction_used_values)
+    omits zero-valued slots and does not include callee/argument-list uses, so
+    its list index does NOT correspond to a set_mir_node_used_value operand
+    index - matching by VALUE is the only sound rewrite. This mirrors the
+    proven replace_value_in_instruction in transformations/optimization.runa,
+    generalized to rewrite ALL copy destinations the instruction uses in one
+    visit (the value being written is always already-defined, so SSA dominance
+    is preserved).
+
+    **COHERENCE (OD-1):** Header operand slots (16/24/32) AND their
+    extended-region mirrors are both rewritten per record kind so that
+    header-reading consumers (binop lowering, the SSA verifier, DCE) and
+    extended-field consumers (load/store/branch/return/atomic/vector lowering
+    arms) stay in agreement. Phi incoming values live in the flat pair List at
+    ext 80 (odd slots); call/invoke argument uses live in the argument List at
+    ext 88, with the indirect callee at ext 80.
+
+    Returns the number of operand slots rewritten in this instruction.
+    @End Reasoning
+
+    If inst is equal to 0:
+        Return 0
+    End If
+
+    Let opcode be proc get_mir_node_opcode from MIR with inst
+    Let rewritten be 0
+
+    Note: --- Header operand slots (uses only, never block ids/immediates) ---
+    Let operand1 be proc get_mir_node_operand from MIR with inst, 1
+    If operand1 is not equal to 0:
+        Let src1 be proc resolve_copy_source with copy_map, operand1
+        If src1 is not equal to operand1:
+            proc set_mir_node_operand from MIR with inst, 1, src1
+            Set rewritten to rewritten plus 1
+        End If
+    End If
+    Let operand2 be proc get_mir_node_operand from MIR with inst, 2
+    If operand2 is not equal to 0:
+        Let src2 be proc resolve_copy_source with copy_map, operand2
+        If src2 is not equal to operand2:
+            proc set_mir_node_operand from MIR with inst, 2, src2
+            Set rewritten to rewritten plus 1
+        End If
+    End If
+    Let operand3 be proc get_mir_node_operand from MIR with inst, 3
+    If operand3 is not equal to 0:
+        Let src3 be proc resolve_copy_source with copy_map, operand3
+        If src3 is not equal to operand3:
+            proc set_mir_node_operand from MIR with inst, 3, src3
+            Set rewritten to rewritten plus 1
+        End If
+    End If
+
+    Note: --- Extended-region mirrors, per record kind ---
+
+    Note: Binary band 20002-20016 (except plain-header MIR_COPY 20008),
+    Note: comparisons 20100-20105, casts 20400-20408: left at 80, right at 88
+    Let is_binop_layout be 0
+    If opcode is greater than or equal to 20002 and opcode is less than or equal to 20016:
+        If opcode is not equal to 20008:
+            Set is_binop_layout to 1
+        End If
+    End If
+    If opcode is greater than or equal to 20100 and opcode is less than or equal to 20105:
+        Set is_binop_layout to 1
+    End If
+    If opcode is greater than or equal to 20400 and opcode is less than or equal to 20408:
+        Set is_binop_layout to 1
+    End If
+    If is_binop_layout is equal to 1:
+        Let ext_left be proc memory_get_int64 from Layout with inst, 80
+        If ext_left is not equal to 0:
+            Let nl be proc resolve_copy_source with copy_map, ext_left
+            If nl is not equal to ext_left:
+                proc memory_set_int64 from Layout with inst, 80, nl
+            End If
+        End If
+        If opcode is not equal to 20007 and opcode is not equal to 20013:
+            If opcode is less than 20400:
+                Let ext_right be proc memory_get_int64 from Layout with inst, 88
+                If ext_right is not equal to 0:
+                    Let nr be proc resolve_copy_source with copy_map, ext_right
+                    If nr is not equal to ext_right:
+                        proc memory_set_int64 from Layout with inst, 88, nr
+                    End If
+                End If
+            End If
+        End If
+    End If
+
+    Note: MIR_LOAD 20200: address at 80
+    If opcode is equal to 20200:
+        Let load_addr be proc memory_get_int64 from Layout with inst, 80
+        If load_addr is not equal to 0:
+            Let na be proc resolve_copy_source with copy_map, load_addr
+            If na is not equal to load_addr:
+                proc memory_set_int64 from Layout with inst, 80, na
+            End If
+        End If
+    End If
+
+    Note: MIR_STORE 20201: address at 72, value at 80
+    If opcode is equal to 20201:
+        Let store_addr be proc memory_get_int64 from Layout with inst, 72
+        If store_addr is not equal to 0:
+            Let nsa be proc resolve_copy_source with copy_map, store_addr
+            If nsa is not equal to store_addr:
+                proc memory_set_int64 from Layout with inst, 72, nsa
+            End If
+        End If
+        Let store_value be proc memory_get_int64 from Layout with inst, 80
+        If store_value is not equal to 0:
+            Let nsv be proc resolve_copy_source with copy_map, store_value
+            If nsv is not equal to store_value:
+                proc memory_set_int64 from Layout with inst, 80, nsv
+            End If
+        End If
+    End If
+
+    Note: MIR_ALLOCA 20202: count at 88
+    If opcode is equal to 20202:
+        Let alloca_count be proc memory_get_int64 from Layout with inst, 88
+        If alloca_count is not equal to 0:
+            Let nac be proc resolve_copy_source with copy_map, alloca_count
+            If nac is not equal to alloca_count:
+                proc memory_set_int64 from Layout with inst, 88, nac
+            End If
+        End If
+    End If
+
+    Note: MIR_BRANCH 20301: condition at 72 (targets at 80/88 are block ids)
+    If opcode is equal to 20301:
+        Let branch_cond be proc memory_get_int64 from Layout with inst, 72
+        If branch_cond is not equal to 0:
+            Let nbc be proc resolve_copy_source with copy_map, branch_cond
+            If nbc is not equal to branch_cond:
+                proc memory_set_int64 from Layout with inst, 72, nbc
+            End If
+        End If
+    End If
+
+    Note: MIR_RETURN 20303 / MIR_SWITCH 20306 / MIR_THROW 20703: leading value at 72
+    Let leading_value_record be 0
+    If opcode is equal to 20303:
+        Set leading_value_record to 1
+    End If
+    If opcode is equal to 20306:
+        Set leading_value_record to 1
+    End If
+    If opcode is equal to 20703:
+        Set leading_value_record to 1
+    End If
+    If leading_value_record is equal to 1:
+        Let lead_value be proc memory_get_int64 from Layout with inst, 72
+        If lead_value is not equal to 0:
+            Let nlv be proc resolve_copy_source with copy_map, lead_value
+            If nlv is not equal to lead_value:
+                proc memory_set_int64 from Layout with inst, 72, nlv
+            End If
+        End If
+    End If
+
+    Note: Atomic band 20500-20511: address at 80, operand at 88, expected at 96
+    If opcode is greater than or equal to 20500 and opcode is less than or equal to 20511:
+        Let atomic_addr be proc memory_get_int64 from Layout with inst, 80
+        If atomic_addr is not equal to 0:
+            Let naa be proc resolve_copy_source with copy_map, atomic_addr
+            If naa is not equal to atomic_addr:
+                proc memory_set_int64 from Layout with inst, 80, naa
+            End If
+        End If
+        Let atomic_operand be proc memory_get_int64 from Layout with inst, 88
+        If atomic_operand is not equal to 0:
+            Let nao be proc resolve_copy_source with copy_map, atomic_operand
+            If nao is not equal to atomic_operand:
+                proc memory_set_int64 from Layout with inst, 88, nao
+            End If
+        End If
+        Let atomic_expected be proc memory_get_int64 from Layout with inst, 96
+        If atomic_expected is not equal to 0:
+            Let nae be proc resolve_copy_source with copy_map, atomic_expected
+            If nae is not equal to atomic_expected:
+                proc memory_set_int64 from Layout with inst, 96, nae
+            End If
+        End If
+    End If
+
+    Note: Vector band 20600-20622: op1/op2/op3 at 80/88/96
+    If opcode is greater than or equal to 20600 and opcode is less than or equal to 20622:
+        Let vec_op1 be proc memory_get_int64 from Layout with inst, 80
+        If vec_op1 is not equal to 0:
+            Let nv1 be proc resolve_copy_source with copy_map, vec_op1
+            If nv1 is not equal to vec_op1:
+                proc memory_set_int64 from Layout with inst, 80, nv1
+            End If
+        End If
+        Let vec_op2 be proc memory_get_int64 from Layout with inst, 88
+        If vec_op2 is not equal to 0:
+            Let nv2 be proc resolve_copy_source with copy_map, vec_op2
+            If nv2 is not equal to vec_op2:
+                proc memory_set_int64 from Layout with inst, 88, nv2
+            End If
+        End If
+        Let vec_op3 be proc memory_get_int64 from Layout with inst, 96
+        If vec_op3 is not equal to 0:
+            Let nv3 be proc resolve_copy_source with copy_map, vec_op3
+            If nv3 is not equal to vec_op3:
+                proc memory_set_int64 from Layout with inst, 96, nv3
+            End If
+        End If
+    End If
+
+    Note: MIR_PHI 20300: incoming values are the odd slots of the flat pair
+    Note: List at extended offset 80
+    If opcode is equal to 20300:
+        Let incoming_pairs be proc memory_get_int64 from Layout with inst, 80
+        Let incoming_count be proc memory_get_int64 from Layout with inst, 88
+        If incoming_pairs is not equal to 0:
+            Let pi be 0
+            While pi is less than incoming_count:
+                Let value_slot be pi multiplied by 2 plus 1
+                Let incoming_value be proc get from List with incoming_pairs, value_slot
+                If incoming_value is not equal to 0:
+                    Let niv be proc resolve_copy_source with copy_map, incoming_value
+                    If niv is not equal to incoming_value:
+                        proc list_set from List with incoming_pairs, value_slot, niv
+                        Set rewritten to rewritten plus 1
+                    End If
+                End If
+                Set pi to pi plus 1
+            End While
+        End If
+    End If
+
+    Note: MIR_CALL 20304 / MIR_CALL_INDIRECT 20305 / MIR_INVOKE 20700:
+    Note: argument value ids in the List at ext 88; indirect callee at ext 80
+    Let has_arg_list be 0
+    If opcode is equal to 20304:
+        Set has_arg_list to 1
+    End If
+    If opcode is equal to 20305:
+        Set has_arg_list to 1
+    End If
+    If opcode is equal to 20700:
+        Set has_arg_list to 1
+    End If
+    If has_arg_list is equal to 1:
+        If opcode is equal to 20305:
+            Let indirect_callee be proc memory_get_int64 from Layout with inst, 80
+            If indirect_callee is not equal to 0:
+                Let nic be proc resolve_copy_source with copy_map, indirect_callee
+                If nic is not equal to indirect_callee:
+                    proc memory_set_int64 from Layout with inst, 80, nic
+                    Set rewritten to rewritten plus 1
+                End If
+            End If
+        End If
+        Let arguments be proc memory_get_int64 from Layout with inst, 88
+        If arguments is not equal to 0:
+            Let arg_count be proc length from List with arguments
+            Let a be 0
+            While a is less than arg_count:
+                Let arg_value be proc get from List with arguments, a
+                If arg_value is not equal to 0:
+                    Let nav be proc resolve_copy_source with copy_map, arg_value
+                    If nav is not equal to arg_value:
+                        proc list_set from List with arguments, a, nav
+                        Set rewritten to rewritten plus 1
+                    End If
+                End If
+                Set a to a plus 1
+            End While
+        End If
+    End If
+
+    Return rewritten
+End Process
+
+Note: ============================================================================
+Note: MAIN PASS
 Note: ============================================================================
 
 Process called "optimize_function_with_copy_prop" that takes cfg_ptr as Integer returns Integer:
     @Reasoning
-    Single-function entry point that orchestrates every stage of enhanced
-    copy propagation. This is the routine the MIR pass manager invokes per
-    function in the compilation unit.
+    Canonical forward copy propagation over one function's CFG.
 
-    **PIPELINE SHAPE:**
-    The pass deliberately runs every stage even when earlier stages report
-    "nothing to do" - the stages are cheap idempotent checks and their
-    statistics together give the diagnostic picture pass authors need to
-    debug regressions. The bookkeeping cost is dwarfed by the savings of
-    a single coalesced copy in a hot loop.
+    **ALGORITHM (two phases):**
+    1. BUILD: one linear scan records every copy's dest -> immediate-source in
+       an integer-keyed ordered map (collections/dictionary string-hashes
+       integer keys and crashes at runtime - Wave 3 finding - so an ordered
+       map is mandatory).
+    2. REWRITE: a second linear scan walks every instruction and rewrites each
+       used value that is a copy destination to its ultimate source value
+       (resolve_copy_source collapses chains). The dead copy instructions are
+       left in place; the subsequent DCE pass removes them once their results
+       are no longer used.
 
-    **CONTEXT LIFECYCLE:**
-    The context is owned exclusively by this function: create at entry,
-    destroy at exit. Borrowed callees never retain pointers into context
-    state after they return.
+    **SSA PRESERVATION:** No new value definitions are created and no
+    definitions are removed. Uses migrate from one already-defined value to
+    another already-defined value, so dominance of definitions over uses is
+    preserved (the source of a copy is, by SSA construction, defined before
+    the copy and therefore before every use of the copy's result).
 
-    Returns 1 on success, 0 on null CFG or context allocation failure.
+    Returns 1 when at least one use was rewritten, 0 otherwise. This is the
+    pass-manager change indicator the orchestrator's fixpoint loop consumes.
     @End Reasoning
 
     @Implementation
-    1. Reject a null CFG with a 0 return and a diagnostic.
-    2. Print the banner so the pass log is easy to grep for.
-    3. Create the per-function context via create_copy_prop_context; bail
-       on failure (the create routine already emitted a diagnostic).
-    4. Run the pipeline in order:
-         a. (Detection trace line - actual detection happens lazily inside
-            coalescing when it asks detect_copy_instruction per
-            instruction.)
-         b. analyze_copy_chains  - chain-compression hook.
-         c. perform_copy_coalescing - the main interference-aware
-            coalescing pass; this is where most of the work lives.
-         d. detect_phi_copies - PHI-specific hook.
-    5. Call print_copy_prop_stats so the run logs how much it
-       accomplished.
-    6. Destroy the context, releasing every dictionary, list, and the
-       interference graph if one was built.
-    7. Print a completion banner and return 1.
+    Reads the CFG's canonical block storage list (get_mir_cfg_blocks), the
+    per-block instruction lists (MIR.get_block_instructions), and per
+    instruction the copy source via copy_source_of. Copies with a non-zero
+    destination and source are recorded; the rewrite phase rewrites uses via
+    rewrite_uses_in_instruction. The copy_map is an integer-keyed ordered map
+    owned by this function and destroyed before return.
     @End Implementation
 
     @Performance_Hints
-    Enhanced copy propagation complements earlier optimizations:
-    - Run after SCCP and constant propagation - those expose new copies
-      that this pass then collapses.
-    - Run before DCE - DCE can remove the now-dead copy instructions once
-      the value_equivalence map has been applied.
-    - Enables better register allocation by shortening live ranges.
-    - Reduces instruction count and improves icache density.
-
-    **PIPELINE POSITION:**
-    SCCP -> Constant Prop -> **Enhanced Copy Prop** -> DCE -> Regalloc
+    Two O(N) passes over the instruction stream plus an O(chain-length) walk
+    per used value; typical chains are short (each link is one prior copy)
+    so the total cost is effectively O(N). Re-run inside the Tier-1 fixpoint
+    loop because constant folding and scalar replacement introduce fresh
+    copies this pass collapses.
     @End Performance_Hints
 
     @Security_Scope
-    The pass operates purely on internal MIR data structures owned by the
-    compiler driver - no source-level constructs reach this code. The CFG
-    pointer is treated as untrusted only insofar as it may be null; once
-    validated, every memory access is bounded by Layout's typed offset
-    helpers. There is no path to allocate, free, or mutate memory outside
-    the per-function context, so the worst-case failure mode is a missed
-    optimization rather than an unsafe write.
+    Operates purely on compiler-internal MIR structures. The CFG pointer is
+    treated as untrusted only insofar as it may be null; once validated, every
+    access is bounded by Layout's typed offset helpers and the canonical
+    accessors. The worst-case failure mode on malformed IR is a missed
+    optimization (the chain-resolution cycle guard prevents non-termination),
+    never an unsafe write.
     @End Security_Scope
 
     If cfg_ptr is equal to 0:
-        Display "optimize_function_with_copy_prop: null CFG"
         Return 0
     End If
 
-    Display ""
-    Display "============================================"
-    Display "ENHANCED COPY PROPAGATION - FUNCTION"
-    Display "============================================"
-    Display ""
+    Let blocks be proc get_mir_cfg_blocks from CFG with cfg_ptr
+    If blocks is equal to 0:
+        Return 0
+    End If
+    Let block_count be proc length from List with blocks
 
-    Note: Step 1: Create context
-    Let context_ptr be proc create_copy_prop_context with cfg_ptr
-    If context_ptr is equal to 0:
-        Display "optimize_function_with_copy_prop: failed to create context"
+    Note: --- Phase 1: build the copy map (dest value id -> source value id) ---
+    Let copy_map be proc omap_create from OMap
+
+    Let i be 0
+    While i is less than block_count:
+        Let block be proc get from List with blocks, i
+        If block is not equal to 0:
+            Let instructions be proc get_block_instructions from MIR with block
+            If instructions is not equal to 0:
+                Let inst_count be proc length from List with instructions
+                Let j be 0
+                While j is less than inst_count:
+                    Let inst be proc get from List with instructions, j
+                    If inst is not equal to 0:
+                        Let source_value be proc copy_source_of with inst
+                        If source_value is not equal to 0:
+                            Let dest_value be proc get_mir_node_value_id from MIR with inst
+                            If dest_value is not equal to 0:
+                                If dest_value is not equal to source_value:
+                                    proc omap_set from OMap with copy_map, dest_value, source_value
+                                End If
+                            End If
+                        End If
+                    End If
+                    Set j to j plus 1
+                End While
+            End If
+        End If
+        Set i to i plus 1
+    End While
+
+    Note: No copies found - nothing to do
+    Let copy_count be proc omap_size from OMap with copy_map
+    If copy_count is equal to 0:
+        proc omap_destroy from OMap with copy_map
         Return 0
     End If
 
-    Note: Step 2: Detect copies
-    Display "Step 1: Detecting copies..."
+    Note: --- Phase 2: rewrite every use of a copy destination ---
+    Let total_rewritten be 0
 
-    Note: Step 3: Analyze copy chains
-    proc analyze_copy_chains with context_ptr
+    Set i to 0
+    While i is less than block_count:
+        Let block be proc get from List with blocks, i
+        If block is not equal to 0:
+            Let instructions be proc get_block_instructions from MIR with block
+            If instructions is not equal to 0:
+                Let inst_count be proc length from List with instructions
+                Let j be 0
+                While j is less than inst_count:
+                    Let inst be proc get from List with instructions, j
+                    If inst is not equal to 0:
+                        Let rewritten be proc rewrite_uses_in_instruction with inst, copy_map
+                        Set total_rewritten to total_rewritten plus rewritten
+                    End If
+                    Set j to j plus 1
+                End While
+            End If
+        End If
+        Set i to i plus 1
+    End While
 
-    Note: Step 4: Perform copy coalescing
-    proc perform_copy_coalescing with context_ptr, cfg_ptr
+    proc omap_destroy from OMap with copy_map
 
-    Note: Step 5: Optimize PHI copies
-    proc detect_phi_copies with context_ptr, cfg_ptr
+    Let total_str be proc integer_to_string from StringUtils with total_rewritten
+    Display "copy_prop: rewrote " joined with total_str joined with " uses onto copy sources"
 
-    Note: Step 6: Print statistics
-    proc print_copy_prop_stats with context_ptr
-
-    Note: Step 7: Destroy context
-    proc destroy_copy_prop_context with context_ptr
-
-    Display ""
-    Display "ENHANCED COPY PROPAGATION COMPLETE"
-    Display ""
-
-    Return 1
+    If total_rewritten is greater than 0:
+        Return 1
+    End If
+    Return 0
 End Process
 
 Process called "run_copy_prop_pass" that takes cfg_ptr as Integer returns Integer:
     @Reasoning
-    Pass-manager-facing entry point. Equivalent to calling
-    optimize_function_with_copy_prop directly, but exists as a named
-    "*_pass" symbol so the driver can register the pass uniformly with
-    the rest of the MIR pipeline (every MIR pass exposes a run_*_pass
-    function with this exact signature).
+    Pass-manager-facing entry point. mir_optimizer.runa's
+    optimize_copy_propagation wrapper extracts the CFG from the shared
+    OptimizerContext (offset 0) and calls this with the CFG pointer directly,
+    then signals mark_changed when this returns 1. Every MIR pass exposes a
+    run_*_pass function with a uniform signature so the driver can register
+    them through one table.
 
-    Returns the inner function's result (1 on success, 0 on failure).
+    Returns 1 if any use was rewritten, 0 otherwise.
     @End Reasoning
 
     Return proc optimize_function_with_copy_prop with cfg_ptr
@@ -1716,14 +594,11 @@ End Process
 
 Process called "should_run_copy_prop" that takes cfg_ptr as Integer returns Integer:
     @Reasoning
-    Gate predicate the pass manager consults before scheduling
-    optimize_function_with_copy_prop on a function.
-
-    **POLICY:**
-    - Refuse null CFGs (degenerate input).
-    - Refuse single-block functions: there are no PHIs and almost no
-      cross-block live ranges, so coalescing has nothing to win - the
-      overhead of building the context is wasted work.
+    Gate predicate the pass manager consults before scheduling the pass.
+    Refuses null CFGs. Single-block functions are still worth running -
+    straight-line code routinely contains MIR_COPY instructions emitted by
+    lowering that this pass collapses - so the only skip condition is a null
+    or empty CFG.
 
     Returns 1 when the pass should run, 0 when it should be skipped.
     @End Reasoning
@@ -1732,8 +607,12 @@ Process called "should_run_copy_prop" that takes cfg_ptr as Integer returns Inte
         Return 0
     End If
 
-    Let block_count be proc get_block_count from CFG with cfg_ptr
-    If block_count is less than 2:
+    Let blocks be proc get_mir_cfg_blocks from CFG with cfg_ptr
+    If blocks is equal to 0:
+        Return 0
+    End If
+    Let block_count be proc length from List with blocks
+    If block_count is equal to 0:
         Return 0
     End If
 
@@ -1742,23 +621,18 @@ End Process
 
 Process called "get_copy_prop_pass_name" returns Integer:
     @Reasoning
-    Returns the short pass name used by the pass manager's registration
-    table and the human-facing pass log header. Pure constant accessor -
-    no state.
+    Returns the short pass name used by the pass manager's registration table
+    and the human-facing pass log header. Pure constant accessor.
     @End Reasoning
 
-    Return "Enhanced Copy Propagation"
+    Return "Copy Propagation"
 End Process
 
 Process called "get_copy_prop_pass_description" returns Integer:
     @Reasoning
-    Returns the long pass description string used in --help output and
-    automated pass documentation generation. Pure constant accessor.
+    Returns the human-readable pass description for diagnostics and pass-list
+    rendering. Pure constant accessor.
     @End Reasoning
 
-    Return "Enhanced copy propagation with coalescing and PHI optimization"
+    Return "Forward copy propagation: rewrites uses of copy destinations to their sources"
 End Process
-
-Note: ============================================================================
-Note: END OF ENHANCED COPY PROPAGATION IMPLEMENTATION
-Note: ============================================================================

@@ -1185,7 +1185,7 @@ Process called "codegen_add_variable_with_type_and_param_flag" takes codegen as 
     If variable_count is greater than or equal to variable_capacity:
         Let new_capacity be variable_capacity multiplied by 2
         Let new_size be new_capacity multiplied by 32  Note: sizeof(Variable)
-        Let new_variables be allocate(new_size)
+        Let new_variables be memory_allocate(new_size)
 
         Note: Copy existing variables
         Let i be 0
@@ -1204,6 +1204,21 @@ Process called "codegen_add_variable_with_type_and_param_flag" takes codegen as 
         memory_set_pointer(codegen, 8, new_variables)      Note: codegen->variables
         memory_set_int32(codegen, 20, new_capacity)      Note: codegen->variable_capacity (int)
         Set variables to new_variables
+
+        Note: Grow the int_proof side table (task #462) in tandem, but only
+        Note: monotonically: lambda codegen swaps in a fresh 16-capacity
+        Note: variables array while the saved outer array may be larger, so
+        Note: shrinking here would leave later outer-function adds writing
+        Note: past the end of the side table.
+        Let ip_capacity be memory_get_int32(codegen, 152)
+        If new_capacity is greater than ip_capacity:
+            Let ip_old be memory_get_pointer(codegen, 144)
+            Let ip_new be memory_allocate(new_capacity multiplied by 4)
+            memory_copy(ip_new, ip_old, ip_capacity multiplied by 4)
+            deallocate(ip_old)
+            memory_set_pointer(codegen, 144, ip_new)
+            memory_set_int32(codegen, 152, new_capacity)
+        End If
     End If
 
     Note: Calculate size based on type
@@ -1235,6 +1250,14 @@ Process called "codegen_add_variable_with_type_and_param_flag" takes codegen as 
     memory_set_int32(var_ptr, 24, is_parameter)               Note: is_parameter (int)
     memory_set_int32(var_ptr, 28, 0)                          Note: structural_resolved flag (0 = not yet tried)
     memory_set_int32(var_ptr, 12, 0)                          Note: is_constant flag (offset 12 is struct padding)
+
+    Note: Initialize the int_proof side-table entry (task #462) to "not
+    Note: proven". STMT_LET / STMT_SET / STMT_FOR codegen update it after
+    Note: registration based on initializer/assignment analysis.
+    Let ip_arr be memory_get_pointer(codegen, 144)
+    If ip_arr is not equal to 0:
+        memory_set_int32(ip_arr, var_index multiplied by 4, 0)
+    End If
 
     Note: Increment count
     memory_set_int32(codegen, 16, variable_count plus 1)  Note: codegen->variable_count (int)
@@ -1272,6 +1295,116 @@ Process called "codegen_variable_is_constant" takes codegen as Integer, name as 
     Return vc_flag
 End Process
 
+Note:
+Joined-with auto-stringify support (task #462, owner-ruled 2026-06-11).
+`X joined with Y` desugars to string_concat(X, Y); when an operand is an
+Integer VALUE the concat reads it as a char* and crashes (or prints empty
+for 0). The ruling: codegen auto-stringifies operands it can PROVE are
+Integer. Proof in the bootstrap's type model is deliberately narrow,
+because "Integer" is also the universal pointer-placeholder type:
+  - Integer literals (EXPR_INTEGER) are proof.
+  - Arithmetic binary ops (plus/minus/multiplied/divided, when
+    codegen_get_expression_type classifies the result Integer rather than
+    Float) and modulo are proof.
+  - A variable is proof only when its int_proof side-table entry is set -
+    established by STMT_LET/STMT_SET/STMT_FOR analysis, NOT by the
+    variable's recorded "Integer" type_name (the default for unknowns).
+  - Calls are NEVER proof: the dialect declares string-returning helpers
+    as `returns Integer` (e.g. get_home_directory in the v0.0.8.5 import
+    cache), so trusting declared return types would stringify live string
+    pointers and corrupt output. Unknown types keep current behavior.
+:End Note
+Process called "codegen_set_variable_int_proof" takes codegen as Integer, name as Integer, proof as Integer returns Integer:
+    Let sp_idx be codegen_find_variable(codegen, name)
+    If sp_idx is less than 0:
+        Return 0
+    End If
+    Let sp_arr be memory_get_pointer(codegen, 144)
+    If sp_arr is equal to 0:
+        Return 0
+    End If
+    Let sp_value be proof
+    If sp_value is equal to 1:
+        Note: Promotion guard - a variable whose recorded type is anything
+        Note: but the generic "Integer" (e.g. "String" surviving a branch-
+        Note: scoped redeclaration) must never be promoted to proven-Integer.
+        Let sp_vars be memory_get_pointer(codegen, 8)
+        Let sp_ptr be sp_vars plus sp_idx multiplied by 32
+        Let sp_type be memory_get_pointer(sp_ptr, 16)
+        If sp_type is equal to 0:
+            Set sp_value to 0
+        Otherwise:
+            If string_equals(sp_type, "Integer") is equal to 0:
+                Set sp_value to 0
+            End If
+        End If
+    End If
+    memory_set_int32(sp_arr, sp_idx multiplied by 4, sp_value)
+    Return 0
+End Process
+
+Note: Return the int_proof entry for the named local/parameter (0 when the
+Note: name is unknown, the side table is absent, or no proof was recorded).
+Process called "codegen_variable_int_proof" takes codegen as Integer, name as Integer returns Integer:
+    Let gp_idx be codegen_find_variable(codegen, name)
+    If gp_idx is less than 0:
+        Return 0
+    End If
+    Let gp_arr be memory_get_pointer(codegen, 144)
+    If gp_arr is equal to 0:
+        Return 0
+    End If
+    Let gp_flag be memory_get_int32(gp_arr, gp_idx multiplied by 4)
+    Return gp_flag
+End Process
+
+Note: Return 1 when `expr` is provably Integer-valued under the #462 proof
+Note: rules documented above codegen_set_variable_int_proof, otherwise 0.
+Process called "codegen_expr_is_provably_integer" takes codegen as Integer, expr as Integer returns Integer:
+    If expr is less than 65536:
+        Return 0
+    End If
+    Let pi_etype be memory_get_int32(expr, 0)
+    If pi_etype is equal to 0:  Note: EXPR_INTEGER literal
+        Return 1
+    End If
+    If pi_etype is equal to 2:  Note: EXPR_BINARY_OP
+        Let pi_op be memory_get_integer(expr, 24)
+        If pi_op is equal to 37:  Note: TOKEN_MODULO - Integer-only operator
+            Return 1
+        End If
+        Let pi_is_arith be 0
+        If pi_op is equal to 16:  Note: TOKEN_PLUS
+            Set pi_is_arith to 1
+        Otherwise If pi_op is equal to 17:  Note: TOKEN_MINUS
+            Set pi_is_arith to 1
+        Otherwise If pi_op is equal to 35:  Note: TOKEN_MULTIPLIED
+            Set pi_is_arith to 1
+        Otherwise If pi_op is equal to 36:  Note: TOKEN_DIVIDED
+            Set pi_is_arith to 1
+        End If
+        If pi_is_arith is equal to 1:
+            Note: codegen_get_expression_type returns "Float" when either
+            Note: operand is SSE-class, otherwise "Integer" for these ops.
+            Let pi_type be codegen_get_expression_type(codegen, expr)
+            If pi_type is not equal to 0:
+                If string_equals(pi_type, "Integer") is equal to 1:
+                    Return 1
+                End If
+            End If
+        End If
+        Return 0
+    End If
+    If pi_etype is equal to 1:  Note: EXPR_VARIABLE
+        Let pi_name be memory_get_pointer(expr, 8)
+        If pi_name is equal to 0:
+            Return 0
+        End If
+        Return codegen_variable_int_proof(codegen, pi_name)
+    End If
+    Return 0
+End Process
+
 Note: Add variable with type - equivalent to codegen_add_variable_with_type
 Process called "codegen_add_variable_with_type" takes codegen as Integer, name as Integer, type_name as Integer returns Integer:
     Return codegen_add_variable_with_type_and_param_flag(codegen, name, type_name, 0)
@@ -1297,7 +1430,7 @@ Process called "codegen_add_string_literal" takes codegen as Integer, value as I
     If string_count is greater than or equal to string_capacity:
         Let new_capacity be string_capacity multiplied by 2
         Let new_size be new_capacity multiplied by 16  Note: sizeof(StringLiteral)
-        Let new_strings be allocate(new_size)
+        Let new_strings be memory_allocate(new_size)
 
         Note: Copy existing strings
         Let i be 0
@@ -2203,7 +2336,7 @@ Process called "codegen_generate_lvalue_address" takes codegen as Integer, expr 
                 Note: Generate address of global variable
                 file_write_buffered(output_file, "    leaq ", 0)
                 file_write_buffered(output_file, variable_name, 0)
-                file_write_buffered(output_file, "(%rip), %rbx  # Address of global variable", 0)
+                file_write_buffered(output_file, "(%rip), %rbx  # Address of global variable\n", 0)
             Otherwise:
                 print_string("[CODEGEN ERROR] Unknown variable '")
                 print_string(variable_name)
@@ -3749,7 +3882,7 @@ Process called "codegen_module_key_from_path" takes path as Integer returns Inte
         Set total_len to parent_len plus 1 plus basename_len  Note: +1 for '_' separator
     End If
 
-    Let key_buf be allocate(total_len plus 1)
+    Let key_buf be memory_allocate(total_len plus 1)
     If key_buf is equal to 0:
         Return 0
     End If
@@ -4445,6 +4578,34 @@ Process called "codegen_generate_function_call" takes codegen as Integer, expr a
     Let arguments be memory_get_pointer(function_call_ptr, 8)      Note: function_call.arguments
     Let arg_count be memory_get_int32(function_call_ptr, 16)     Note: function_call.argument_count
 
+    Note: Task #462 (owner-ruled): this call is the desugar of `X joined
+    Note: with Y` when the int32 at expression offset 4 is 1 (set only by
+    Note: parser_parse_additive's TOKEN_JOINED arm; every other call node
+    Note: zeroes the slot at creation). Auto-stringify each operand that is
+    Note: provably Integer by rewriting the argument in place to
+    Note: integer_to_string(operand) BEFORE argument emission, so the
+    Note: existing call lowering handles register marshaling and the heap
+    Note: result follows the established concat-temp ownership convention
+    Note: unchanged. The flag is cleared first so the rewrite runs at most
+    Note: once per node.
+    If arg_count is equal to 2:
+        Let jw_flag be memory_get_int32(expr, 4)
+        If jw_flag is equal to 1:
+            memory_set_int32(expr, 4, 0)
+            Let jw_i be 0
+            While jw_i is less than arg_count:
+                Let jw_arg be memory_get_pointer(arguments, jw_i multiplied by 8)
+                If codegen_expr_is_provably_integer(codegen, jw_arg) is equal to 1:
+                    Let jw_wrap_args be memory_allocate(8)
+                    memory_set_pointer(jw_wrap_args, 0, jw_arg)
+                    Let jw_wrap be expression_create_function_call("integer_to_string", jw_wrap_args, 1)
+                    memory_set_pointer(arguments, jw_i multiplied by 8, jw_wrap)
+                End If
+                Set jw_i to jw_i plus 1
+            End While
+        End If
+    End If
+
     Note: Task #431: indirect calls through local bindings. The parser cannot
     Note: classify the callee (it has no binding table, and functions may be
     Note: forward-referenced or merged from imports after the call site is
@@ -5108,11 +5269,11 @@ Process called "codegen_resolve_struct_via_structural" takes codegen as Integer,
     End If
 
     Note: Allocate scratch buffer for up to 64 distinct field names.
-    Let cs_buf be allocate(64 multiplied by 8)
+    Let cs_buf be memory_allocate(64 multiplied by 8)
     If cs_buf is equal to 0:
         Return 0
     End If
-    Let cs_count_ptr be allocate(8)
+    Let cs_count_ptr be memory_allocate(8)
     If cs_count_ptr is equal to 0:
         deallocate(cs_buf)
         Return 0
@@ -6874,8 +7035,25 @@ Process called "codegen_generate_expression" takes codegen as Integer, expr as I
         Let saved_var_capacity be memory_get_int32(codegen, 20)
         Let saved_stack_offset be memory_get_int32(codegen, 24)
 
+        Note: Task #462: snapshot the outer function's int_proof entries. The
+        Note: side table at offset 144 is shared (deliberately not swapped with
+        Note: the variables array, so its capacity stays monotonic), which means
+        Note: lambda variable registration zeroes entries at indices that alias
+        Note: outer variables. Without the snapshot, every outer variable whose
+        Note: index collides with a lambda free-var/parameter slot loses its
+        Note: proven-Integer flag and later `joined with` sites silently skip
+        Note: the auto-stringify it is entitled to.
+        Let saved_int_proof be 0
+        If saved_var_count is greater than 0:
+            Let sip_arr be memory_get_pointer(codegen, 144)
+            If sip_arr is not equal to 0:
+                Set saved_int_proof to memory_allocate(saved_var_count multiplied by 4)
+                memory_copy(saved_int_proof, sip_arr, saved_var_count multiplied by 4)
+            End If
+        End If
+
         Note: Create new variable context for lambda
-        Let lambda_variables be allocate(16 multiplied by 32)
+        Let lambda_variables be memory_allocate(16 multiplied by 32)
         memory_set_pointer(codegen, 8, lambda_variables)
         memory_set_int32(codegen, 16, 0)
         memory_set_int32(codegen, 20, 16)
@@ -6988,6 +7166,18 @@ Process called "codegen_generate_expression" takes codegen as Integer, expr as I
         memory_set_int32(codegen, 16, saved_var_count)
         memory_set_int32(codegen, 20, saved_var_capacity)
         memory_set_int32(codegen, 24, saved_stack_offset)
+
+        Note: Task #462: restore the outer function's int_proof entries that
+        Note: lambda variable registration overwrote. The table only ever grows
+        Note: (capacity at offset 152 is monotonic), so the saved_var_count
+        Note: prefix is always in bounds even if the lambda body forced growth.
+        If saved_int_proof is not equal to 0:
+            Let rip_arr be memory_get_pointer(codegen, 144)
+            If rip_arr is not equal to 0:
+                memory_copy(rip_arr, saved_int_proof, saved_var_count multiplied by 4)
+            End If
+            deallocate(saved_int_proof)
+        End If
 
         Note: Get free variables for closure environment
         Set free_vars to memory_get_pointer(expr, 32)
@@ -7471,6 +7661,12 @@ Process called "codegen_generate_statement" takes codegen as Integer, stmt as In
             file_write_buffered(output_file, "    movq %rax, -", 0)
             file_write_buffered(output_file, integer_to_string(lda_offset), 0)
             file_write_buffered(output_file, "(%rbp)\n", 0)
+            Note: Task #462: record Integer proof from the initializer. The
+            Note: explicit annotation alone is NOT trusted (the dialect uses
+            Note: `as Integer` as a generic pointer placeholder); only the
+            Note: RHS analysis establishes proof.
+            Let lda_proof be codegen_expr_is_provably_integer(codegen, lda_let_expr)
+            codegen_set_variable_int_proof(codegen, variable_name, lda_proof)
             Return 0
         End If
 
@@ -7510,6 +7706,9 @@ Process called "codegen_generate_statement" takes codegen as Integer, stmt as In
 
                 Note: Add variable with type information
                 codegen_add_variable_with_type(codegen, variable_name, type_name)
+                Note: Task #462: a struct allocation is never Integer proof;
+                Note: clear any proof left by a prior same-name declaration.
+                codegen_set_variable_int_proof(codegen, variable_name, 0)
 
                 Note: Get variable info
                 Let var_index be codegen_find_variable(codegen, variable_name)
@@ -7599,6 +7798,14 @@ Process called "codegen_generate_statement" takes codegen as Integer, stmt as In
                     End If
                 End If
 
+                Note: Task #462: record Integer proof from the initializer.
+                Note: This single site covers the builtin, list, and regular
+                Note: inference arms above (they all converge here), and the
+                Note: redeclaration path too since the setter resolves by
+                Note: name. Builtin calls and unknown RHS yield proof 0.
+                Let let_proof be codegen_expr_is_provably_integer(codegen, let_expr)
+                codegen_set_variable_int_proof(codegen, variable_name, let_proof)
+
                 Note: Generate expression (result in %rax)
                 codegen_generate_expression(codegen, let_expr)
 
@@ -7638,6 +7845,16 @@ Process called "codegen_generate_statement" takes codegen as Integer, stmt as In
                         print_string("'")
                         print_newline()
                         exit_with_code(1)
+                    End If
+                    Note: Task #462: keep-or-clear Integer proof. A Set whose
+                    Note: RHS is not provably Integer DEMOTES the target; a
+                    Note: provable RHS keeps the existing flag but never
+                    Note: PROMOTES it, because this statement may sit inside
+                    Note: a branch the runtime can skip while the join site
+                    Note: executes unconditionally.
+                    Let set_rhs_chk be memory_get_pointer(stmt, 16)
+                    If codegen_expr_is_provably_integer(codegen, set_rhs_chk) is equal to 0:
+                        codegen_set_variable_int_proof(codegen, set_target_name, 0)
                     End If
                 End If
             End If
@@ -7787,6 +8004,8 @@ Process called "codegen_generate_statement" takes codegen as Integer, stmt as In
 
         Note: Allocate loop variable on stack
         codegen_add_variable(codegen, var_name)
+        Note: Task #462: a for-range counter is always an Integer value.
+        codegen_set_variable_int_proof(codegen, var_name, 1)
         Set var_index to codegen_find_variable(codegen, var_name)
         Set variables to memory_get_pointer(codegen, 8)
         Let var_offset be memory_get_int32(variables, var_index multiplied by 32 plus 8)
@@ -8736,7 +8955,12 @@ Process called "codegen_generate_statement" takes codegen as Integer, stmt as In
                         Let new_capacity be variable_capacity multiplied by 2
                         memory_set_integer(codegen, 24, new_capacity)
                         Set variables to memory_get_pointer(codegen, 8)  Note: codegen->variables
-                        Let new_variables be reallocate(variables, new_capacity multiplied by 32)  Note: sizeof(Variable) = 32
+                        Note: Task #457: the raw 3-parameter runtime reallocate
+                        Note: was being called with only 2 arguments here,
+                        Note: leaving new_size as garbage register contents.
+                        Note: memory_reallocate has the correct 2-argument
+                        Note: contract and aborts cleanly on OOM.
+                        Let new_variables be memory_reallocate(variables, new_capacity multiplied by 32)  Note: sizeof(Variable) = 32
                         memory_set_pointer(codegen, 8, new_variables)
                     End If
 
@@ -8815,7 +9039,7 @@ Note:   offset 80: call_graph
 Note:   offset 88: arena (pointer) - for temporary allocations
 
 Process called "codegen_create" takes output_filename as Integer, arena as Integer returns Integer:
-    Note: 144 bytes total. Layout above 112:
+    Note: 160 bytes total. Layout above 112:
     Note:   offset 112: current_function (pointer)
     Note:   offset 120: field_cache_buf (pointer to 256-entry buffer of 16-byte
     Note:               {name@0, type@8} entries; lazily allocated on first
@@ -8833,10 +9057,25 @@ Process called "codegen_create" takes output_filename as Integer, arena as Integ
     Note:               Replaces the previous O(n) linear search in
     Note:               codegen_collect_strings_from_expression and
     Note:               codegen_generate_string_literal (Task #58).
-    Let codegen be allocate(144)
+    Note:   offset 144: int_proof (pointer to int32 array parallel to the
+    Note:               variables array; entry i is 1 when variable i is
+    Note:               PROVABLY Integer-valued at the current point of
+    Note:               statement generation, 0 otherwise). Drives the
+    Note:               joined-with auto-stringify ruling (task #462).
+    Note:               "Integer"-typed variable records alone are NOT proof:
+    Note:               the bootstrap dialect uses Integer as the universal
+    Note:               pointer placeholder, so proof is established only by
+    Note:               initializer/assignment analysis in the STMT_LET /
+    Note:               STMT_SET / STMT_FOR codegen paths.
+    Note:   offset 152: int_proof_capacity (int32). Monotonic high-water
+    Note:               capacity (in entries) of the int_proof array. Never
+    Note:               shrinks, even when lambda codegen temporarily swaps
+    Note:               in a fresh 16-capacity variables array, so every
+    Note:               index < variable_capacity is always in bounds.
+    Let codegen be memory_allocate(160)
 
-    Note: Note: allocate() uses calloc() which already zeros the memory,
-    Note: so no explicit initialization loop is needed
+    Note: memory_allocate zero-fills every allocation at the wrapper boundary
+    Note: (BF-DU-1), so no explicit initialization loop is needed
 
     Let output_file be file_open_buffered(output_filename, 1)  Note: 1 = write mode (O_WRONLY | O_CREAT | O_TRUNC)
     If output_file is less than 0:  Note: Negative indicates error
@@ -8851,10 +9090,15 @@ Process called "codegen_create" takes output_filename as Integer, arena as Integ
     memory_set_integer(codegen, 0, output_file)  Note: codegen->output_file
     memory_set_pointer(codegen, 88, arena)  Note: codegen->arena - store for temporary allocations
 
-    Let variables be allocate(16 multiplied by 32)  Note: 16 * sizeof(Variable) - Variable is 32 bytes
+    Let variables be memory_allocate(16 multiplied by 32)  Note: 16 * sizeof(Variable) - Variable is 32 bytes
     memory_set_pointer(codegen, 8, variables)  Note: codegen->variables
     memory_set_int32(codegen, 16, 0)  Note: codegen->variable_count (int)
     memory_set_int32(codegen, 20, 16)  Note: codegen->variable_capacity (int) - Start with space for 16 variables
+
+    Note: Integer-proof side table (task #462), parallel to variables.
+    Let int_proof be memory_allocate(16 multiplied by 4)  Note: 16 int32 entries
+    memory_set_pointer(codegen, 144, int_proof)  Note: codegen->int_proof
+    memory_set_int32(codegen, 152, 16)           Note: codegen->int_proof_capacity
 
 
     memory_set_int32(codegen, 24, 0)  Note: codegen->stack_offset (int)
@@ -8862,20 +9106,20 @@ Process called "codegen_create" takes output_filename as Integer, arena as Integ
     memory_set_int32(codegen, 40, 0)  Note: codegen->string_count (int)
     memory_set_int32(codegen, 44, 512)  Note: codegen->string_capacity (int) - Start with space for 512 strings
 
-    Let strings be allocate(512 multiplied by 16)  Note: 512 * sizeof(StringLiteral)
+    Let strings be memory_allocate(512 multiplied by 16)  Note: 512 * sizeof(StringLiteral)
     memory_set_pointer(codegen, 32, strings)  Note: codegen->strings (pointer with padding)
     memory_set_pointer(codegen, 48, 0)  Note: codegen->current_program (pointer with padding)
     memory_set_int32(codegen, 64, 0)  Note: codegen->loop_depth (int)
     memory_set_int32(codegen, 68, 8)  Note: codegen->loop_capacity (int) - Start with space for 8 nested loops
 
-    Let loop_stack be allocate(8 multiplied by 16)  Note: 8 * sizeof(LoopContext)
+    Let loop_stack be memory_allocate(8 multiplied by 16)  Note: 8 * sizeof(LoopContext)
     memory_set_pointer(codegen, 56, loop_stack)  Note: codegen->loop_stack (pointer)
 
     Note: Hash table will be created on first use (function pointers not available yet)
     memory_set_pointer(codegen, 72, 0)  Note: codegen->var_hashtable (initially NULL)
 
     Note: Mutated globals tracking - array of name pointers for globals targeted by Set
-    Let mut_globals be allocate(256 multiplied by 8)  Note: Space for 256 mutable global names
+    Let mut_globals be memory_allocate(256 multiplied by 8)  Note: Space for 256 mutable global names
     memory_set_pointer(codegen, 96, mut_globals)  Note: codegen->mutated_globals (pointer array)
     memory_set_int32(codegen, 104, 0)  Note: codegen->mutated_globals_count
 
@@ -8919,6 +9163,7 @@ Process called "codegen_create" takes output_filename as Integer, arena as Integ
 
     If output_file is equal to 0:
         deallocate(variables)
+        deallocate(int_proof)
         deallocate(strings)
         deallocate(loop_stack)
         deallocate(codegen)
@@ -8996,6 +9241,11 @@ Process called "codegen_destroy" takes codegen as Integer returns Integer:
 
         If variables is not equal to 0:
             deallocate(variables)
+        End If
+        Note: Free the int_proof side table (task #462, offset 144).
+        Let destroy_int_proof be memory_get_pointer(codegen, 144)
+        If destroy_int_proof is not equal to 0:
+            deallocate(destroy_int_proof)
         End If
         If strings is not equal to 0:
             deallocate(strings)
@@ -9416,7 +9666,7 @@ Process called "codegen_generate_function" takes codegen as Integer, func as Int
     Let field_cache_buf be memory_get_pointer(codegen, 120)
     If field_cache_buf is equal to 0:
         Note: 256 entries x 16 bytes = 4096 bytes. Calloc-zeroed.
-        Set field_cache_buf to allocate(256 multiplied by 16)
+        Set field_cache_buf to memory_allocate(256 multiplied by 16)
         memory_set_pointer(codegen, 120, field_cache_buf)
     End If
     memory_set_int32(codegen, 128, 0)  Note: field_cache_count = 0
@@ -9471,7 +9721,7 @@ Process called "codegen_generate_function" takes codegen as Integer, func as Int
     Note: ========================================================================
 
     Note: Handle parameters (System V ABI: %rdi, %rsi, %rdx, %rcx, %r8, %r9)
-    Let param_registers be allocate(6 multiplied by 8)  Note: Array of 6 string pointers
+    Let param_registers be memory_allocate(6 multiplied by 8)  Note: Array of 6 string pointers
     memory_set_pointer(param_registers, 0, "%rdi")
     memory_set_pointer(param_registers, 8, "%rsi")
     memory_set_pointer(param_registers, 16, "%rdx")
@@ -10649,11 +10899,11 @@ Note:   offset 24: codegen (pointer to CodeGen state)
 
 Note: Create a new call graph for analysis
 Process called "callgraph_create" takes program as Integer, codegen as Integer returns Integer:
-    Let graph be allocate(32)
+    Let graph be memory_allocate(32)
 
     Note: Initialize with capacity for 64 functions
     Let initial_capacity be 64
-    memory_set_pointer(graph, 0, allocate(initial_capacity multiplied by 8))
+    memory_set_pointer(graph, 0, memory_allocate(initial_capacity multiplied by 8))
     memory_set_int32(graph, 8, 0)
     memory_set_int32(graph, 12, initial_capacity)
     memory_set_pointer(graph, 16, program)
@@ -10707,14 +10957,14 @@ End Process
 
 Note: Create a new call graph node for a function
 Process called "callgraph_node_create" takes function_name as Integer, function_ptr as Integer returns Integer:
-    Let node be allocate(40)
+    Let node be memory_allocate(40)
 
     memory_set_pointer(node, 0, string_duplicate(function_name))
     memory_set_pointer(node, 8, function_ptr)
 
     Note: Initialize with capacity for 16 callees
     Let initial_callees_capacity be 16
-    memory_set_pointer(node, 16, allocate(initial_callees_capacity multiplied by 8))
+    memory_set_pointer(node, 16, memory_allocate(initial_callees_capacity multiplied by 8))
     memory_set_int32(node, 24, 0)  Note: callee_count
     memory_set_int32(node, 28, 0)  Note: is_recursive = false
     memory_set_int32(node, 32, initial_callees_capacity)  Note: callee_capacity
@@ -10741,7 +10991,7 @@ Process called "callgraph_node_add_callee" takes node as Integer, callee_name as
     Note: Resize array if full
     If callee_count is greater than or equal to callee_capacity:
         Let new_capacity be callee_capacity multiplied by 2
-        Let new_callees be allocate(new_capacity multiplied by 8)
+        Let new_callees be memory_allocate(new_capacity multiplied by 8)
 
         Note: Copy existing callees
         Set i to 0
@@ -10773,7 +11023,7 @@ Process called "callgraph_add_node" takes graph as Integer, node as Integer retu
     Note: Resize array if full
     If node_count is greater than or equal to capacity:
         Let new_capacity be capacity multiplied by 2
-        Let new_nodes be allocate(new_capacity multiplied by 8)
+        Let new_nodes be memory_allocate(new_capacity multiplied by 8)
 
         Note: Copy existing nodes
         Let i be 0
@@ -11329,7 +11579,7 @@ Process called "callgraph_detect_recursion" takes graph as Integer returns Integ
     End While
 
     Note: Then detect mutual recursion using DFS
-    Let visited be allocate(node_count multiplied by 4)  Note: Array of int32
+    Let visited be memory_allocate(node_count multiplied by 4)  Note: Array of int32
 
     Note: Initialize all to unvisited (0)
     Set i to 0

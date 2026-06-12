@@ -341,8 +341,8 @@ Type called "StackFrame":
     uses_frame_pointer as Integer         Note: Boolean: 1 if uses RBP, 0 if leaf function
     callee_saved_regs as Integer          Note: Pointer to List of callee-saved register IDs
     callee_saved_count as Integer         Note: Number of callee-saved registers
-    local_offsets as Integer              Note: Dictionary mapping local ID -> stack offset
-    spill_offsets as Integer              Note: Dictionary mapping virtual reg -> spill offset
+    local_offsets as Integer              Note: OrderedMap local ID -> stack offset (integer keys; Dictionary string-hashes keys)
+    spill_offsets as Integer              Note: OrderedMap virtual reg -> spill offset (integer keys; Dictionary string-hashes keys)
 End Type
 
 Note: Size: 10 fields * 8 bytes = 80 bytes per StackFrame
@@ -382,10 +382,14 @@ Type called "LIRFunction":
     library_name as Integer               Note: P2-D FFI: Pointer to library name string (0 if not external)
     alias_name as Integer                 Note: P2-D FFI: Pointer to C-side symbol (0 if same as name)
     convention_id as Integer              Note: P2-D FFI: Calling convention ID (0=c, 1=stdcall, 2=fastcall, 3=cdecl, 4=syscall, 5=objc)
+    live_ranges as Integer                Note: Task #473: OrderedMap vreg_id -> flat segment List (block_id, start, end triples), written by liveness.compute_live_ranges (0 until computed)
 End Type
 
-Note: Size: 21 fields * 8 bytes = 168 bytes per LIRFunction
+Note: Size: 22 fields * 8 bytes = 176 bytes per LIRFunction
 Note: P2-D extension: library_name (offset 144), alias_name (offset 152), convention_id (offset 160)
+Note: Task #473 extension: live_ranges (offset 168). The metadata slot at offset 136
+Note: is OWNED by the Wave 5b vreg-class OrderedMap (key 1 -> vreg_classes map) and
+Note: must never be overloaded with liveness results; live ranges live at 168.
 
 @Reasoning
 LIRModule is the top-level container for all LIR functions in a compilation unit.
@@ -426,18 +430,18 @@ Register class determines which physical registers can be allocated (GPR, FPR, V
 2. Load the next_vreg_id counter at offset 88 (starts at 1000 from lir_create_function).
 3. Increment next_vreg_id in place so subsequent calls allocate unique IDs.
 4. Maintain the virtual_reg_count statistic at offset 80 for downstream allocator sizing.
-5. Lazily materialize the per-function metadata Dictionary at offset 136 on first
+5. Lazily materialize the per-function metadata OrderedMap at offset 136 on first
    virtual-register creation to avoid the allocation when no metadata is used.
-6. Within metadata, key 1 maps to the vreg_classes Dictionary; create it on demand.
+6. Within metadata, key 1 maps to the vreg_classes OrderedMap; create it on demand.
 7. Record vreg_id -> reg_class so lir_get_virtual_register_class achieves O(1) lookup
    without scanning every instruction for the defining write.
 @End Implementation
 
 @Performance_Hints
 Hot path during LIR builder execution. Pure integer arithmetic plus at most two
-lazy Dictionary creations (amortized to one creation pair across an entire
-function). The per-vreg insert is a single Dictionary.set, which Dictionary
-inlines as a hashed slot write. Avoid materializing metadata before the first
+lazy OrderedMap creations (amortized to one creation pair across an entire
+function). The per-vreg insert is a single omap_set, which OrderedMap
+implements as a hashed slot write on raw integer keys. Avoid materializing metadata before the first
 vreg is created so leaf accessor functions stay allocation-free.
 @End Performance_Hints
 
@@ -588,23 +592,23 @@ This avoids expensive instruction scanning and is the production-grade approach.
 1. If function is NULL, fall back to the GPR default since no metadata is reachable.
 2. For physical IDs (<1000) delegate to lir_get_register_class for range-based
    classification rather than duplicating the bookkeeping.
-3. Otherwise load the metadata Dictionary at offset 136, key 1, and probe the
-   vreg_classes child Dictionary for the vreg_id entry inserted by
+3. Otherwise load the metadata OrderedMap at offset 136, key 1, and probe the
+   vreg_classes child OrderedMap for the vreg_id entry inserted by
    lir_create_virtual_register.
 4. Any miss (missing metadata, missing child table, or absent key) returns the
    GPR default rather than failing the compilation.
 @End Implementation
 
 @Performance_Hints
-Two Dictionary.get calls in the worst case for virtual IDs; physical IDs
+Two omap_get calls in the worst case for virtual IDs; physical IDs
 skip both. The two-level table is intentional - the outer key (1) keeps
-room for future metadata categories on the same Dictionary without changing
+room for future metadata categories on the same OrderedMap without changing
 offset 136.
 @End Performance_Hints
 
 @Security_Scope
 Read-only. Defends against missing metadata by returning a safe default
-register class. Does not propagate raw Dictionary errors to the caller.
+register class. Does not propagate raw OrderedMap errors to the caller.
 @End Security_Scope
 
 Process called "lir_get_virtual_register_class" that takes function as Integer, vreg_id as Integer returns Integer:
@@ -1124,7 +1128,7 @@ Initializes the function structure with empty block list and default settings.
 @End Reasoning
 
 @Implementation
-1. Allocate 168 bytes on the OWNED HEAP for the LIRFunction header (Tier 3).
+1. Allocate 176 bytes on the OWNED HEAP for the LIRFunction header (Tier 3).
 2. Duplicate the name string so the LIR module owns its own copy independent
    of any HIR lifetime.
 3. Initialize every field offset explicitly: entry/exit blocks (0), block and
@@ -1136,6 +1140,9 @@ Initializes the function structure with empty block list and default settings.
 4. Initialize the P2-D FFI extension trio (library_name, alias_name,
    convention_id) at offsets 144/152/160 to zero so non-external functions
    present a clean default.
+5. Initialize the live_ranges slot (offset 168) to zero; liveness analysis
+   populates it with an OrderedMap on demand and lir_clear_live_ranges
+   releases it before any recompute.
 @End Implementation
 
 @Performance_Hints
@@ -1151,7 +1158,7 @@ partial-initialization escape: the struct is either fully wired or zero.
 @End Security_Scope
 
 Process called "lir_create_function" that takes name as Integer, calling_convention as Integer, return_type as Integer returns Integer:
-    Let function be proc allocate from Layout with 168
+    Let function be proc allocate from Layout with 176
     If function is equal to 0:
         Display "lir_create_function: allocation failed"
         Return 0
@@ -1196,6 +1203,9 @@ Process called "lir_create_function" that takes name as Integer, calling_convent
     proc memory_set_int64 from MemoryCore with function, 144, 0                     Note: library_name
     proc memory_set_int64 from MemoryCore with function, 152, 0                     Note: alias_name
     proc memory_set_int64 from MemoryCore with function, 160, 0                     Note: convention_id
+
+    Note: Task #473 extension field
+    proc memory_set_int64 from MemoryCore with function, 168, 0                     Note: live_ranges (populated by liveness)
 
     Return function
 End Process
@@ -1504,7 +1514,7 @@ End Process
 
 @Reasoning
 get_block_count reads the block_count field of an LIRFunction (offset 40
-in the 168-byte function struct). Together with lir_get_block it forms
+in the 176-byte function struct). Together with lir_get_block it forms
 the documented block-iteration API used by backend code generators that
 walk every block of a function in index order. Centralizing the offset
 here keeps "40" out of backend sources.
@@ -1616,7 +1626,7 @@ End Process
 
 @Reasoning
 get_param_count reads the parameter_count field of an LIRFunction
-(offset 56 in the 168-byte function struct). Backends use it to emit
+(offset 56 in the 176-byte function struct). Backends use it to emit
 parameter declarations (the WASM backend emits one "(param i32)" per
 parameter and registers each with its local allocator) and to size
 argument-passing sequences. Centralizing the offset here keeps "56" out
@@ -1891,15 +1901,15 @@ The frame will be populated during register allocation and stack slot assignment
    alignment is hard-set to 16 for x86-64 ABI compliance, uses_frame_pointer
    defaults to 1 (the prologue lowering may demote this later if the
    function is a leaf with no spills).
-3. Create empty callee_saved_regs List, local_offsets Dictionary, and
-   spill_offsets Dictionary so allocator passes have stable containers to
-   write into.
+3. Create empty callee_saved_regs List, local_offsets OrderedMap, and
+   spill_offsets OrderedMap so allocator passes have stable containers to
+   write into (both maps are integer-keyed, so Dictionary is forbidden).
 4. Wire the new frame into the LIRFunction's stack_frame slot (offset 72).
 @End Implementation
 
 @Performance_Hints
 One frame-sized allocation plus three container allocations (List +
-two Dictionaries). Called once per function and never on a per-instruction
+two OrderedMaps). Called once per function and never on a per-instruction
 path.
 @End Performance_Hints
 
@@ -1933,10 +1943,14 @@ Process called "lir_create_stack_frame" that takes function as Integer returns I
     proc memory_set_int64 from MemoryCore with frame, 48, callee_saved_regs         Note: callee_saved_regs
     proc memory_set_int64 from MemoryCore with frame, 56, 0                         Note: callee_saved_count
 
-    Let local_offsets be proc create from Dictionary
+    Note: Both offset maps are keyed by INTEGERS (local ids, vreg ids).
+    Note: collections/dictionary string-hashes its keys, so integer keys are
+    Note: dereferenced as string pointers and crash at runtime - integer-keyed
+    Note: maps must use collections/ordered_map (task #473).
+    Let local_offsets be proc omap_create from OrderedMap
     proc memory_set_int64 from MemoryCore with frame, 64, local_offsets             Note: local_offsets
 
-    Let spill_offsets be proc create from Dictionary
+    Let spill_offsets be proc omap_create from OrderedMap
     proc memory_set_int64 from MemoryCore with frame, 72, spill_offsets             Note: spill_offsets
 
     Note: Set frame in function
@@ -1960,13 +1974,13 @@ Returns the stack offset (negative, relative to RBP).
    size).
 3. Bump spill_area_size in the frame to reserve the new slot.
 4. Compute the negative RBP-relative offset (slots grow downward) and
-   record vreg_id -> stack_offset in the spill_offsets Dictionary at
+   record vreg_id -> stack_offset in the spill_offsets OrderedMap at
    offset 72 of the frame so the assembly emitter can rematerialize the
    spill location.
 @End Implementation
 
 @Performance_Hints
-A handful of integer arithmetic operations plus one Dictionary.set. Called
+A handful of integer arithmetic operations plus one OrderedMap set. Called
 once per spilled virtual register, which is bounded by the number of
 spills inserted by the register allocator.
 @End Performance_Hints
@@ -2008,9 +2022,9 @@ Process called "lir_allocate_spill_slot" that takes function as Integer, vreg_id
     Note: Stack offset is negative from RBP
     Let stack_offset be -(aligned_offset plus size)
 
-    Note: Record mapping
+    Note: Record mapping (integer-keyed OrderedMap; see lir_create_stack_frame)
     Let spill_offsets be proc memory_get_int64 from MemoryCore with frame, 72
-    proc set from Dictionary with spill_offsets, vreg_id, stack_offset
+    proc omap_set from OrderedMap with spill_offsets, vreg_id, stack_offset
 
     Return stack_offset
 End Process
@@ -2227,6 +2241,128 @@ Note: LIR Instruction Query Functions
 Note: ============================================================================
 
 @Reasoning
+LIR carries TWO instruction record shapes in block instruction Lists:
+1. Bare LIRInstruction records (create_lir_instruction, create_lir_return,
+   create_lir_jump) whose opcode genuinely sits at offset 0.
+2. Typed wrapper records (LIRMove, LIRBinaryOp, LIRLoad, LIRStore, LIRCall,
+   LIRBranch, ...) whose offset 0 holds a POINTER to the base LIRInstruction;
+   lir_builder appends these wrappers directly.
+Every pass that reads opcode or operand slots must first resolve the record
+to its base LIRInstruction. The discriminator is sound: opcodes occupy the
+closed band [30000, 30999] while heap pointers are far outside it, so a
+value in the band IS the opcode (bare record) and anything else is a base
+pointer (wrapper record).
+@End Reasoning
+
+@Implementation
+1. NULL-guard; 0 resolves to 0.
+2. Read the first 8-byte slot. If it lies in [30000, 30999] the record is
+   already a base LIRInstruction - return it unchanged.
+3. Otherwise the slot is the wrapper's base pointer. Validate that the
+   pointed-to record's own offset 0 carries an in-band opcode; if it does,
+   return the base pointer. If it does not, the record is malformed -
+   return 0 so callers fail safely instead of reading garbage operands.
+@End Implementation
+
+@Performance_Hints
+At most two 8-byte loads and four compares. Inlinable into every
+instruction-walking loop in liveness, interference, allocation, and
+spilling.
+@End Performance_Hints
+
+@Security_Scope
+Defends every downstream operand dereference against the dual-shape
+instruction Lists and against malformed records (e.g. wrappers whose base
+construction failed). Returning 0 on malformation converts a wild pointer
+dereference into a skipped instruction plus caller-side diagnostics.
+@End Security_Scope
+
+Process called "lir_resolve_instruction_base" that takes record as Integer returns Integer:
+    If record is equal to 0:
+        Return 0
+    End If
+
+    Let first_slot be proc memory_get_int64 from MemoryCore with record, 0
+
+    Note: In-band opcode: the record is already a base LIRInstruction
+    If first_slot is greater than or equal to 30000:
+        If first_slot is less than or equal to 30999:
+            Return record
+        End If
+    End If
+
+    Note: Wrapper record: offset 0 holds the base LIRInstruction pointer
+    If first_slot is equal to 0:
+        Return 0
+    End If
+
+    Let base_opcode be proc memory_get_int64 from MemoryCore with first_slot, 0
+    If base_opcode is greater than or equal to 30000:
+        If base_opcode is less than or equal to 30999:
+            Return first_slot
+        End If
+    End If
+
+    Note: Neither shape matched: malformed record
+    Return 0
+End Process
+
+@Reasoning
+Releases the live-range storage hanging off LIRFunction offset 168 so
+liveness analysis can recompute from a clean slate without leaking the
+previous OrderedMap and its per-vreg segment Lists. This is the
+destructor coverage for the task #473 record-growth slot: LIRFunction has
+no whole-record destructor (modules are torn down arena-style by the
+driver), so the only lifecycle event for this slot is recompute, and this
+function owns it.
+@End Reasoning
+
+@Implementation
+1. NULL-guard the function pointer.
+2. Load the live_ranges OrderedMap at offset 168; nothing to do when 0.
+3. Walk the map entries (omap_first / omap_entry_next); each entry value
+   is a flat segment List owned by the map - destroy each List.
+4. Destroy the OrderedMap itself and zero the slot so accessors observe
+   the "not computed" state.
+@End Implementation
+
+@Performance_Hints
+O(number of vregs with ranges). Runs once per liveness recompute, off the
+per-instruction hot path.
+@End Performance_Hints
+
+@Security_Scope
+NULL-safe at every level (function, map, entry values). Zeroing the slot
+before returning prevents double-free on repeated calls.
+@End Security_Scope
+
+Process called "lir_clear_live_ranges" that takes function as Integer returns Integer:
+    If function is equal to 0:
+        Return 0
+    End If
+
+    Let live_ranges be proc memory_get_int64 from MemoryCore with function, 168
+    If live_ranges is equal to 0:
+        Return 1
+    End If
+
+    Note: Destroy each per-vreg segment List owned by the map
+    Let entry be proc omap_first from OrderedMap with live_ranges
+    While entry is not equal to 0:
+        Let segment_list be proc omap_entry_value from OrderedMap with entry
+        If segment_list is not equal to 0:
+            proc list_destroy from List with segment_list
+        End If
+        Set entry to proc omap_entry_next from OrderedMap with entry
+    End While
+
+    proc omap_destroy from OrderedMap with live_ranges
+    proc memory_set_int64 from MemoryCore with function, 168, 0
+
+    Return 1
+End Process
+
+@Reasoning
 Checks if an instruction is a terminator (ends a basic block).
 Terminators include: JMP, conditional branches, RET, CALL (indirect only).
 @End Reasoning
@@ -2251,11 +2387,12 @@ extension instructions.
 @End Security_Scope
 
 Process called "lir_is_terminator" that takes instruction as Integer returns Integer:
-    If instruction is equal to 0:
+    Let base be proc lir_resolve_instruction_base with instruction
+    If base is equal to 0:
         Return 0
     End If
 
-    Let opcode be proc memory_get_int64 from MemoryCore with instruction, 0
+    Let opcode be proc memory_get_int64 from MemoryCore with base, 0
 
     Note: Unconditional jump
     If opcode is equal to LIR_JMP:
@@ -2296,11 +2433,12 @@ NULL-safe load. Unknown opcodes return 0.
 @End Security_Scope
 
 Process called "lir_is_branch" that takes instruction as Integer returns Integer:
-    If instruction is equal to 0:
+    Let base be proc lir_resolve_instruction_base with instruction
+    If base is equal to 0:
         Return 0
     End If
 
-    Let opcode be proc memory_get_int64 from MemoryCore with instruction, 0
+    Let opcode be proc memory_get_int64 from MemoryCore with base, 0
 
     Note: Unconditional jump
     If opcode is equal to LIR_JMP:
@@ -2337,11 +2475,12 @@ call form.
 @End Security_Scope
 
 Process called "lir_is_call" that takes instruction as Integer returns Integer:
-    If instruction is equal to 0:
+    Let base be proc lir_resolve_instruction_base with instruction
+    If base is equal to 0:
         Return 0
     End If
 
-    Let opcode be proc memory_get_int64 from MemoryCore with instruction, 0
+    Let opcode be proc memory_get_int64 from MemoryCore with base, 0
 
     If opcode is equal to LIR_CALL or opcode is equal to LIR_CALL_INDIRECT:
         Return 1
@@ -2370,11 +2509,12 @@ NULL-safe. Conservative: returns 0 for any opcode outside the load range.
 @End Security_Scope
 
 Process called "lir_is_load" that takes instruction as Integer returns Integer:
-    If instruction is equal to 0:
+    Let base be proc lir_resolve_instruction_base with instruction
+    If base is equal to 0:
         Return 0
     End If
 
-    Let opcode be proc memory_get_int64 from MemoryCore with instruction, 0
+    Let opcode be proc memory_get_int64 from MemoryCore with base, 0
 
     If opcode is greater than or equal to LIR_LOAD and opcode is less than or equal to LIR_LOAD64:
         Return 1
@@ -2402,11 +2542,12 @@ NULL-safe.
 @End Security_Scope
 
 Process called "lir_is_store" that takes instruction as Integer returns Integer:
-    If instruction is equal to 0:
+    Let base be proc lir_resolve_instruction_base with instruction
+    If base is equal to 0:
         Return 0
     End If
 
-    Let opcode be proc memory_get_int64 from MemoryCore with instruction, 0
+    Let opcode be proc memory_get_int64 from MemoryCore with base, 0
 
     If opcode is greater than or equal to LIR_STORE and opcode is less than or equal to LIR_STORE64:
         Return 1
@@ -2435,11 +2576,12 @@ NULL-safe.
 @End Security_Scope
 
 Process called "lir_is_move" that takes instruction as Integer returns Integer:
-    If instruction is equal to 0:
+    Let base be proc lir_resolve_instruction_base with instruction
+    If base is equal to 0:
         Return 0
     End If
 
-    Let opcode be proc memory_get_int64 from MemoryCore with instruction, 0
+    Let opcode be proc memory_get_int64 from MemoryCore with base, 0
 
     If opcode is equal to LIR_MOV:
         Return 1
@@ -2478,11 +2620,12 @@ that have side effects must be added here before they ship.
 @End Security_Scope
 
 Process called "lir_has_side_effects" that takes instruction as Integer returns Integer:
-    If instruction is equal to 0:
+    Let base be proc lir_resolve_instruction_base with instruction
+    If base is equal to 0:
         Return 0
     End If
 
-    Let opcode be proc memory_get_int64 from MemoryCore with instruction, 0
+    Let opcode be proc memory_get_int64 from MemoryCore with base, 0
 
     Note: Stores have side effects
     If proc lir_is_store with instruction is equal to 1:
@@ -2732,11 +2875,12 @@ incomplete.
 @End Security_Scope
 
 Process called "lir_get_operand_size_from_instruction" that takes instruction as Integer returns Integer:
-    If instruction is equal to 0:
+    Let base be proc lir_resolve_instruction_base with instruction
+    If base is equal to 0:
         Return 8
     End If
 
-    Let opcode be proc memory_get_int64 from MemoryCore with instruction, 0
+    Let opcode be proc memory_get_int64 from MemoryCore with base, 0
 
     Note: Sized load/store operations have explicit size
     If opcode is equal to LIR_LOAD8 or opcode is equal to LIR_STORE8:

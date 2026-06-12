@@ -192,6 +192,7 @@ Type called "ScalaLexer":
     length as Integer
     current_char as Integer
     error_message as String
+    current_lexeme as String
 End Type
 
 Note: Create new Scala lexer
@@ -218,7 +219,8 @@ Process called "create_scala_lexer" takes source as String returns Integer:
         column as 1,
         length as proc string_length from StringCore with source,
         current_char as 0,
-        error_message as ""
+        error_message as "",
+        current_lexeme as ""
 
     Note: Initialize first character
     If lexer.length is greater than 0:
@@ -461,81 +463,22 @@ Note: Convert a Unicode code point to a NUL-terminated UTF-8 string
 @Reasoning:
 The string-literal and char-literal readers accumulate decoded characters
 one at a time, so they need a primitive that materialises a single code
-point as a heap string suitable for string_concat. No such primitive
-exists in StringCore or StringUtils, so the lexer carries its own
-complete UTF-8 encoder covering all four sequence lengths.
+point as a heap string suitable for string_concat. The complete RFC 3629
+encoder (1-4 byte sequences, surrogate and range validation to U+FFFD)
+now lives in StringCore as the canonical char_to_string export (owner
+ruling, task #465); this local Process delegates to it so the lexer's
+existing call sites stay unchanged.
 @End Reasoning
 
 @Implementation:
-Validates the code point first: negative values, values above U+10FFFF,
-and UTF-16 surrogate halves (U+D800..U+DFFF, which are illegal in
-UTF-8) are replaced with U+FFFD REPLACEMENT CHARACTER. Then encodes per
-RFC 3629: 1 byte below U+0080, 2 bytes below U+0800, 3 bytes below
-U+10000, 4 bytes up to U+10FFFF. Each buffer is allocated with one
-extra byte for the NUL terminator. Shift/mask amounts are computed in
-dedicated locals so Runa operator precedence (shift binds weaker than
-plus/minus) can never regroup the expressions.
+Pure delegation to char_to_string from StringCore, which validates the
+code point (negative, above U+10FFFF, and UTF-16 surrogate halves
+U+D800..U+DFFF all map to U+FFFD REPLACEMENT CHARACTER) and encodes per
+RFC 3629 into a freshly allocated NUL-terminated buffer.
 @End Implementation
 
 Process called "char_to_string" takes char_code as Integer returns String:
-    Note: Replace invalid code points with U+FFFD
-    If char_code is less than 0:
-        Set char_code to 65533
-    End If
-    If char_code is greater than 1114111:
-        Set char_code to 65533
-    End If
-    If char_code is greater than or equal to 55296 and char_code is less than or equal to 57343:
-        Set char_code to 65533
-    End If
-
-    Note: 1-byte sequence: U+0000..U+007F
-    If char_code is less than 128:
-        Let buf1 be proc allocate from Layout with 2
-        proc memory_set_byte from Layout with buf1, 0, char_code
-        proc memory_set_byte from Layout with buf1, 1, 0
-        Return buf1
-    End If
-
-    Note: 2-byte sequence: U+0080..U+07FF
-    If char_code is less than 2048:
-        Let hi2 be char_code shifted right by 6
-        Let lo2 be char_code bitwise and 63
-        Let buf2 be proc allocate from Layout with 3
-        proc memory_set_byte from Layout with buf2, 0, 192 plus hi2
-        proc memory_set_byte from Layout with buf2, 1, 128 plus lo2
-        proc memory_set_byte from Layout with buf2, 2, 0
-        Return buf2
-    End If
-
-    Note: 3-byte sequence: U+0800..U+FFFF
-    If char_code is less than 65536:
-        Let hi3 be char_code shifted right by 12
-        Let mid3_shifted be char_code shifted right by 6
-        Let mid3 be mid3_shifted bitwise and 63
-        Let lo3 be char_code bitwise and 63
-        Let buf3 be proc allocate from Layout with 4
-        proc memory_set_byte from Layout with buf3, 0, 224 plus hi3
-        proc memory_set_byte from Layout with buf3, 1, 128 plus mid3
-        proc memory_set_byte from Layout with buf3, 2, 128 plus lo3
-        proc memory_set_byte from Layout with buf3, 3, 0
-        Return buf3
-    End If
-
-    Note: 4-byte sequence: U+10000..U+10FFFF
-    Let b1 be char_code shifted right by 18
-    Let b2_shifted be char_code shifted right by 12
-    Let b2 be b2_shifted bitwise and 63
-    Let b3_shifted be char_code shifted right by 6
-    Let b3 be b3_shifted bitwise and 63
-    Let b4 be char_code bitwise and 63
-    Let buf4 be proc allocate from Layout with 5
-    proc memory_set_byte from Layout with buf4, 0, 240 plus b1
-    proc memory_set_byte from Layout with buf4, 1, 128 plus b2
-    proc memory_set_byte from Layout with buf4, 2, 128 plus b3
-    proc memory_set_byte from Layout with buf4, 3, 128 plus b4
-    proc memory_set_byte from Layout with buf4, 4, 0
-    Return buf4
+    Return proc char_to_string from StringCore with char_code
 End Process
 
 Note: Read string literal
@@ -772,6 +715,68 @@ Process called "read_number" takes lexer as Integer returns String:
     Return result
 End Process
 
+Note: Classify a numeric literal lexeme into its precise token type
+@Reasoning:
+read_number consumes every Scala numeric form (hex, integer, decimal,
+exponent, and the L/F/D suffixes) into one string, so the token type
+must be recovered from the lexeme itself. Scala's rules: an L/l suffix
+makes a Long, an F/f suffix makes a Float, a D/d suffix makes a Double,
+and an unsuffixed literal containing a decimal point or exponent is a
+Double. Hex literals are integral (Int, or Long with an L suffix).
+Everything else is an Int.
+@End Reasoning
+@Implementation:
+Single pass over the lexeme bytes recording whether a '.' or e/E
+exponent marker appears, then a suffix check on the final byte. The
+hex prefix (0x/0X) is detected first because hex digits include 'e'
+and 'd' which would otherwise be misread as exponent or Double-suffix
+markers.
+@End Implementation
+Process called "classify_number_token" takes text as String returns Integer:
+    Let text_length be proc string_length from StringCore with text
+
+    If text_length is equal to 0:
+        Return TOKEN_INTEGER_LITERAL
+    End If
+
+    Let last_char be proc string_char_at from StringCore with text, text_length minus 1
+
+    Note: Hex literals: 0x prefix; only the L suffix changes the type
+    If text_length is greater than 1:
+        Let first_char be proc string_char_at from StringCore with text, 0
+        Let second_char be proc string_char_at from StringCore with text, 1
+        If first_char is equal to 48 and (second_char is equal to 120 or second_char is equal to 88):
+            If last_char is equal to 76 or last_char is equal to 108:
+                Return TOKEN_LONG_LITERAL
+            End If
+            Return TOKEN_INTEGER_LITERAL
+        End If
+    End If
+
+    Note: Explicit suffixes take precedence over the decimal-point scan
+    If last_char is equal to 76 or last_char is equal to 108:  Note: L or l
+        Return TOKEN_LONG_LITERAL
+    End If
+    If last_char is equal to 70 or last_char is equal to 102:  Note: F or f
+        Return TOKEN_FLOAT_LITERAL
+    End If
+    If last_char is equal to 68 or last_char is equal to 100:  Note: D or d
+        Return TOKEN_DOUBLE_LITERAL
+    End If
+
+    Note: Unsuffixed: a decimal point or exponent marker means Double
+    Let scan_index be 0
+    While scan_index is less than text_length:
+        Let scan_char be proc string_char_at from StringCore with text, scan_index
+        If scan_char is equal to 46 or scan_char is equal to 101 or scan_char is equal to 69:  Note: . e E
+            Return TOKEN_DOUBLE_LITERAL
+        End If
+        Set scan_index to scan_index plus 1
+    End While
+
+    Return TOKEN_INTEGER_LITERAL
+End Process
+
 Note: Read identifier or keyword
 @Reasoning:
 Scala supports two identifier forms: normal (letter or underscore +
@@ -999,6 +1004,9 @@ letter/_ (read_identifier then get_keyword_token), s/f/raw + `"`
 Process called "next_scala_token" takes lexer as Integer returns Integer:
     Let lexer_obj as ScalaLexer be lexer
 
+    Note: Reset the lexeme slot so stale text from the previous token never leaks
+    Set lexer_obj.current_lexeme to ""
+
     Note: Skip whitespace
     proc skip_whitespace with lexer
 
@@ -1029,7 +1037,7 @@ Process called "next_scala_token" takes lexer as Integer returns Integer:
 
     Note: Handle string literals
     If lexer_obj.current_char is equal to 34:  Note: double quote
-        proc read_string_literal with lexer
+        Set lexer_obj.current_lexeme to proc read_string_literal with lexer
         Return TOKEN_STRING_LITERAL
     End If
 
@@ -1037,32 +1045,34 @@ Process called "next_scala_token" takes lexer as Integer returns Integer:
     If (lexer_obj.current_char is equal to 115 or lexer_obj.current_char is equal to 102 or
         (lexer_obj.current_char is equal to 114 and proc peek_char with lexer, 1 is equal to 97 and proc peek_char with lexer, 2 is equal to 119)) and
        proc peek_char with lexer, 1 is equal to 34:  Note: s", f", raw"
-        proc read_interpolated_string with lexer
+        Set lexer_obj.current_lexeme to proc read_interpolated_string with lexer
         Return TOKEN_INTERPOLATED_STRING
     End If
 
     Note: Handle character literals
     If lexer_obj.current_char is equal to 39 and proc peek_char with lexer, 2 is equal to 39:  Note: 'x'
-        proc read_char_literal with lexer
+        Set lexer_obj.current_lexeme to proc read_char_literal with lexer
         Return TOKEN_CHAR_LITERAL
     End If
 
     Note: Handle symbol literals
     Let sym_peek_ch be proc peek_char with lexer, 1
     If lexer_obj.current_char is equal to 39 and proc is_letter with sym_peek_ch:
-        proc read_symbol with lexer
+        Set lexer_obj.current_lexeme to proc read_symbol with lexer
         Return TOKEN_SYMBOL_LITERAL
     End If
 
     Note: Handle numeric literals
     If proc is_digit with lexer_obj.current_char:
-        proc read_number with lexer
-        Return TOKEN_INTEGER_LITERAL
+        Let number_text be proc read_number with lexer
+        Set lexer_obj.current_lexeme to number_text
+        Return proc classify_number_token with number_text
     End If
 
     Note: Handle identifiers and keywords
     If proc is_letter with lexer_obj.current_char:
         Let identifier be proc read_identifier with lexer
+        Set lexer_obj.current_lexeme to identifier
         Return proc get_keyword_token with identifier
     End If
 
@@ -1130,11 +1140,6 @@ Process called "next_scala_token" takes lexer as Integer returns Integer:
         Return TOKEN_VIEW_BOUND
     End If
 
-    If ch is equal to 58 and proc peek_char with lexer, 1 is equal to 32:  Note: : (with space minus context bound)
-        proc advance_char with lexer
-        Return TOKEN_CONTEXT_BOUND
-    End If
-
     If ch is equal to 38 and proc peek_char with lexer, 1 is equal to 38:  Note: &&
         proc advance_char with lexer
         proc advance_char with lexer
@@ -1153,17 +1158,17 @@ Process called "next_scala_token" takes lexer as Integer returns Integer:
         Return TOKEN_LEFT_SHIFT
     End If
 
-    If ch is equal to 62 and proc peek_char with lexer, 1 is equal to 62:  Note: >>
-        proc advance_char with lexer
-        proc advance_char with lexer
-        Return TOKEN_RIGHT_SHIFT
-    End If
-
     If ch is equal to 62 and proc peek_char with lexer, 1 is equal to 62 and proc peek_char with lexer, 2 is equal to 62:  Note: >>>
         proc advance_char with lexer
         proc advance_char with lexer
         proc advance_char with lexer
         Return TOKEN_UNSIGNED_RIGHT_SHIFT
+    End If
+
+    If ch is equal to 62 and proc peek_char with lexer, 1 is equal to 62:  Note: >>
+        proc advance_char with lexer
+        proc advance_char with lexer
+        Return TOKEN_RIGHT_SHIFT
     End If
 
     Note: Assignment operators
@@ -1256,7 +1261,7 @@ Process called "next_scala_token" takes lexer as Integer returns Integer:
 
     Note: Handle symbolic operators
     If proc is_operator_char with ch:
-        proc read_operator with lexer
+        Set lexer_obj.current_lexeme to proc read_operator with lexer
         Return TOKEN_OPERATOR_IDENTIFIER
     End If
 
@@ -1329,6 +1334,20 @@ error_message field. Empty string indicates no error occurred.
 Process called "get_lexer_error" takes lexer as Integer returns String:
     Let lexer_obj as ScalaLexer be lexer
     Return lexer_obj.error_message
+End Process
+
+Note: Get the lexeme text of the most recently returned token
+@Reasoning:
+next_scala_token returns only the token type code; the parser needs the
+identifier name, literal text, or operator spelling to build AST node
+values. The lexer records each scanned lexeme into current_lexeme and
+this accessor exposes it without leaking the struct layout. Tokens that
+have a fixed spelling (punctuation, keywords resolved by token type)
+leave the slot empty or carry the keyword text from the identifier path.
+@End Reasoning
+Process called "get_lexer_lexeme" takes lexer as Integer returns String:
+    Let lexer_obj as ScalaLexer be lexer
+    Return lexer_obj.current_lexeme
 End Process
 
 Note: Check if token is a literal
@@ -1416,8 +1435,46 @@ Process called "get_token_name" takes token_type as Integer returns String:
         Return "IDENTIFIER"
     Otherwise If token_type is equal to TOKEN_INTEGER_LITERAL:
         Return "INTEGER_LITERAL"
+    Otherwise If token_type is equal to TOKEN_FLOAT_LITERAL:
+        Return "FLOAT_LITERAL"
+    Otherwise If token_type is equal to TOKEN_DOUBLE_LITERAL:
+        Return "DOUBLE_LITERAL"
+    Otherwise If token_type is equal to TOKEN_LONG_LITERAL:
+        Return "LONG_LITERAL"
+    Otherwise If token_type is equal to TOKEN_CHAR_LITERAL:
+        Return "CHAR_LITERAL"
+    Otherwise If token_type is equal to TOKEN_BOOLEAN_LITERAL:
+        Return "BOOLEAN_LITERAL"
+    Otherwise If token_type is equal to TOKEN_NULL_LITERAL:
+        Return "NULL_LITERAL"
+    Otherwise If token_type is equal to TOKEN_SYMBOL_LITERAL:
+        Return "SYMBOL_LITERAL"
+    Otherwise If token_type is equal to TOKEN_INTERPOLATED_STRING:
+        Return "STRING_LITERAL"
     Otherwise If token_type is equal to TOKEN_STRING_LITERAL:
         Return "STRING_LITERAL"
+    Otherwise If token_type is equal to TOKEN_EQUAL:
+        Return "=="
+    Otherwise If token_type is equal to TOKEN_NOT_EQUAL:
+        Return "!="
+    Otherwise If token_type is equal to TOKEN_LESS_THAN:
+        Return "<"
+    Otherwise If token_type is equal to TOKEN_GREATER_THAN:
+        Return ">"
+    Otherwise If token_type is equal to TOKEN_LESS_EQUAL:
+        Return "<="
+    Otherwise If token_type is equal to TOKEN_GREATER_EQUAL:
+        Return ">="
+    Otherwise If token_type is equal to TOKEN_AND:
+        Return "&&"
+    Otherwise If token_type is equal to TOKEN_OR:
+        Return "||"
+    Otherwise If token_type is equal to TOKEN_MODULO:
+        Return "%"
+    Otherwise If token_type is equal to TOKEN_NOT:
+        Return "!"
+    Otherwise If token_type is equal to TOKEN_BITWISE_NOT:
+        Return "~"
     Otherwise If token_type is equal to TOKEN_CLASS:
         Return "class"
     Otherwise If token_type is equal to TOKEN_DEF:

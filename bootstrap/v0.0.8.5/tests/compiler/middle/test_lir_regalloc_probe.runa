@@ -1,0 +1,537 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+LIR register-allocation subsystem probe (task #473).
+
+Builds small LIR functions by hand through the lir.runa / lir_nodes.runa
+construction API and asserts the task #473 contract over the rebuilt
+allocator pipeline (liveness -> interference -> coloring -> spilling):
+
+  1. LIVE RANGES: a value defined in block 0 and used in block 1 is
+     live-out of block 0 / live-in to block 1, its segments land at
+     LIRFunction offset 168 as (block, start, end) triples covering the
+     cross-block extent, and a DEAD definition yields exactly the
+     degenerate (block, k, k) segment and never enters any live set.
+  2. INTERFERENCE: the graph contains exactly the overlapping pairs -
+     two values simultaneously live interfere, disjoint values do not,
+     and a dead def interferes with the values live across its
+     definition point.
+  3. COLORING: interfering vregs receive DISTINCT physical registers,
+     non-interfering vregs REUSE registers, verify_allocation passes,
+     and apply_allocation leaves no virtual register references in any
+     operand record.
+  4. FORCED SPILL: fifteen simultaneously-live GPR values exceed K=14,
+     the allocator reports actual spills, insert_spill_code grows the
+     program with stores and reloads, and the allocate/spill/retry loop
+     converges to a spill-free, verifiable allocation.
+
+Function A shape (all GPR virtual registers):
+    B0:  vA = MOV 1
+         vB = MOV 2
+         vC = ADD vA, vB     (vA, vB die here)
+         vD = MOV 9          (DEAD def: never used)
+         JMP B1
+    B1:  vE = ADD vC, vC     (vC's only use; vE dead)
+         RET
+
+Expected liveness:  B0 live_out = {vC},  B1 live_in = {vC}
+Expected edges:     exactly {vA-vB, vC-vD}
+Expected vC ranges: (B0, 2, 5) and (B1, 0, 0)
+Expected vD range:  (B0, 3, 3) only
+:End Note
+
+Import "tests/test_utils.runa" as T
+Import "compiler/middle/gungnir/lir/lir.runa" as LIR
+Import "compiler/middle/gungnir/lir/lir_nodes.runa" as LIRNodes
+Import "compiler/middle/gungnir/lir/liveness.runa" as Liveness
+Import "compiler/middle/gungnir/lir/interference.runa" as Interference
+Import "compiler/middle/gungnir/lir/register_alloc.runa" as RegisterAlloc
+Import "compiler/middle/gungnir/lir/spilling.runa" as Spilling
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/collections/list.runa" as List
+Import "compiler/frontend/primitives/collections/ordered_map.runa" as OrderedMap
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+
+Note: Register class and ABI constants used by the rig
+Constant CLASS_GPR as Integer is 0
+Constant OPERAND_SIZE as Integer is 8
+
+Process called "reg_operand" that takes reg_id as Integer returns Integer:
+    Return LIRNodes.create_register_operand(reg_id, OPERAND_SIZE)
+End Process
+
+Process called "imm_operand" that takes value as Integer returns Integer:
+    Return LIRNodes.create_immediate_operand(value, OPERAND_SIZE)
+End Process
+
+Note:
+Counts virtual register references remaining in the function's operand
+records: REGISTER operands with id >= 1000 plus MEMORY operands whose
+base or index register is >= 1000, across the result slot and all three
+operand slots of every (base-resolved) instruction. Zero after
+apply_allocation means the backend will never see a virtual register.
+:End Note
+
+Process called "count_operand_virtual_refs" that takes operand as Integer returns Integer:
+    If operand is equal to 0:
+        Return 0
+    End If
+
+    Let refs be 0
+    Let operand_type be Layout.memory_get_int64(operand, 0)
+
+    Note: OPERAND_TYPE_REGISTER = 1, OPERAND_TYPE_MEMORY = 3
+    If operand_type is equal to 1:
+        Let register_id be Layout.memory_get_int64(operand, 8)
+        If register_id is greater than or equal to 1000:
+            Set refs to refs plus 1
+        End If
+    End If
+
+    If operand_type is equal to 3:
+        Let base_register be Layout.memory_get_int64(operand, 24)
+        If base_register is greater than or equal to 1000:
+            Set refs to refs plus 1
+        End If
+        Let index_register be Layout.memory_get_int64(operand, 32)
+        If index_register is greater than or equal to 1000:
+            Set refs to refs plus 1
+        End If
+    End If
+
+    Return refs
+End Process
+
+Process called "count_virtual_refs" that takes lir_fn as Integer returns Integer:
+    Let total be 0
+    Let block_count be LIR.get_block_count(lir_fn)
+
+    Let b be 0
+    While b is less than block_count:
+        Let block be LIR.lir_get_block(lir_fn, b)
+        If block is not equal to 0:
+            Let inst_count be LIR.get_instruction_count(block)
+            Let i be 0
+            While i is less than inst_count:
+                Let instruction be LIR.get_instruction(block, i)
+                Let base be LIR.lir_resolve_instruction_base(instruction)
+                If base is not equal to 0:
+                    Let result be Layout.memory_get_int64(base, 8)
+                    Set total to total plus count_operand_virtual_refs(result)
+                    Let operand1 be Layout.memory_get_int64(base, 16)
+                    Set total to total plus count_operand_virtual_refs(operand1)
+                    Let operand2 be Layout.memory_get_int64(base, 24)
+                    Set total to total plus count_operand_virtual_refs(operand2)
+                    Let operand3 be Layout.memory_get_int64(base, 32)
+                    Set total to total plus count_operand_virtual_refs(operand3)
+                End If
+                Set i to i plus 1
+            End While
+        End If
+        Set b to b plus 1
+    End While
+
+    Return total
+End Process
+
+Process called "count_total_instructions" that takes lir_fn as Integer returns Integer:
+    Let total be 0
+    Let block_count be LIR.get_block_count(lir_fn)
+    Let b be 0
+    While b is less than block_count:
+        Let block be LIR.lir_get_block(lir_fn, b)
+        If block is not equal to 0:
+            Set total to total plus LIR.get_instruction_count(block)
+        End If
+        Set b to b plus 1
+    End While
+    Return total
+End Process
+
+Note:
+Builds probe function A (see file header for the shape) and returns the
+LIRFunction pointer. The five virtual register ids are deterministic
+(1000..1004, lir_create_function seeds next_vreg_id at 1000) and are
+re-derived by the suites from that contract.
+:End Note
+
+Process called "build_function_a" returns Integer:
+    Let name be StringCore.create_from_literal("regalloc_probe_a")
+    Let lir_fn be LIR.lir_create_function(name, 0, 0)
+    If lir_fn is equal to 0:
+        Return 0
+    End If
+
+    Let b0 be LIR.lir_add_block(lir_fn, 1)
+    Let b1 be LIR.lir_add_block(lir_fn, 0)
+
+    Let va be LIR.lir_create_virtual_register(lir_fn, CLASS_GPR, OPERAND_SIZE)
+    Let vb be LIR.lir_create_virtual_register(lir_fn, CLASS_GPR, OPERAND_SIZE)
+    Let vc be LIR.lir_create_virtual_register(lir_fn, CLASS_GPR, OPERAND_SIZE)
+    Let vd be LIR.lir_create_virtual_register(lir_fn, CLASS_GPR, OPERAND_SIZE)
+    Let ve be LIR.lir_create_virtual_register(lir_fn, CLASS_GPR, OPERAND_SIZE)
+
+    Note: B0 body
+    Let mov_a be LIRNodes.create_lir_move(reg_operand(va), imm_operand(1), OPERAND_SIZE)
+    LIR.lir_append_instruction(lir_fn, b0, mov_a)
+
+    Let mov_b be LIRNodes.create_lir_move(reg_operand(vb), imm_operand(2), OPERAND_SIZE)
+    LIR.lir_append_instruction(lir_fn, b0, mov_b)
+
+    Let add_c be LIRNodes.create_lir_binary_op(LIR.LIR_ADD, reg_operand(vc), reg_operand(va), reg_operand(vb), OPERAND_SIZE)
+    LIR.lir_append_instruction(lir_fn, b0, add_c)
+
+    Note: Dead definition: vd is never read
+    Let mov_d be LIRNodes.create_lir_move(reg_operand(vd), imm_operand(9), OPERAND_SIZE)
+    LIR.lir_append_instruction(lir_fn, b0, mov_d)
+
+    Let jump be LIRNodes.create_lir_jump(b1)
+    LIR.lir_append_instruction(lir_fn, b0, jump)
+
+    Note: B1 body
+    Let add_e be LIRNodes.create_lir_binary_op(LIR.LIR_ADD, reg_operand(ve), reg_operand(vc), reg_operand(vc), OPERAND_SIZE)
+    LIR.lir_append_instruction(lir_fn, b1, add_e)
+
+    Let ret be LIRNodes.create_lir_return(0)
+    LIR.lir_append_instruction(lir_fn, b1, ret)
+
+    Note: CFG edge B0 -> B1
+    LIR.lir_add_edge(lir_fn, b0, b1)
+
+    Return lir_fn
+End Process
+
+Note:
+Suite 1: liveness sets and live range segments on function A.
+vA=1000 vB=1001 vC=1002 vD=1003 vE=1004.
+:End Note
+
+Process called "run_liverange_suite" that takes results as Integer, lir_fn as Integer returns Integer:
+    T.begin_suite(results, "live ranges")
+
+    Let ok be Liveness.compute_function_liveness(lir_fn)
+    T.assert_equal(results, "liveness analysis succeeds", ok, 1)
+    If ok is equal to 0:
+        Return 0
+    End If
+
+    Let block0 be LIR.lir_get_block(lir_fn, 0)
+    Let block1 be LIR.lir_get_block(lir_fn, 1)
+    T.assert_not_null(results, "block 0 present", block0)
+    T.assert_not_null(results, "block 1 present", block1)
+
+    Note: LIRBasicBlock live_in at 64, live_out at 72
+    Let live_out0 be Layout.memory_get_int64(block0, 72)
+    Let live_in1 be Layout.memory_get_int64(block1, 64)
+    T.assert_not_null(results, "block 0 live_out computed", live_out0)
+    T.assert_not_null(results, "block 1 live_in computed", live_in1)
+
+    Note: vC (1002) crosses the block boundary
+    T.assert_equal(results, "vC live-out of B0", Liveness.register_set_contains(live_out0, 1002), 1)
+    T.assert_equal(results, "vC live-in to B1", Liveness.register_set_contains(live_in1, 1002), 1)
+
+    Note: vA and vB die inside B0; dead vD is never live ANYWHERE
+    T.assert_equal(results, "vA not live-out of B0", Liveness.register_set_contains(live_out0, 1000), 0)
+    T.assert_equal(results, "vB not live-out of B0", Liveness.register_set_contains(live_out0, 1001), 0)
+    T.assert_equal(results, "dead vD not live-out of B0", Liveness.register_set_contains(live_out0, 1003), 0)
+    T.assert_equal(results, "dead vD not live-in to B1", Liveness.register_set_contains(live_in1, 1003), 0)
+
+    Note: vC segments: (B0, def@2, block-end 5) then (B1, live-in 0, last use 0)
+    Let vc_segments be Liveness.get_live_range_segments(lir_fn, 1002)
+    T.assert_not_null(results, "vC has live range segments", vc_segments)
+    If vc_segments is not equal to 0:
+        T.assert_equal(results, "vC has two segments (6 flat slots)", List.size(vc_segments), 6)
+        If List.size(vc_segments) is equal to 6:
+            T.assert_equal(results, "vC seg1 block", List.get(vc_segments, 0), 0)
+            T.assert_equal(results, "vC seg1 start at def index 2", List.get(vc_segments, 1), 2)
+            T.assert_equal(results, "vC seg1 end at block end 5", List.get(vc_segments, 2), 5)
+            T.assert_equal(results, "vC seg2 block", List.get(vc_segments, 3), 1)
+            T.assert_equal(results, "vC seg2 live-in start 0", List.get(vc_segments, 4), 0)
+            T.assert_equal(results, "vC seg2 end at last use 0", List.get(vc_segments, 5), 0)
+        End If
+    End If
+
+    Note: dead vD: exactly the degenerate (B0, 3, 3) point segment
+    Let vd_segments be Liveness.get_live_range_segments(lir_fn, 1003)
+    T.assert_not_null(results, "dead vD has a recorded def point", vd_segments)
+    If vd_segments is not equal to 0:
+        T.assert_equal(results, "vD has one segment (3 flat slots)", List.size(vd_segments), 3)
+        If List.size(vd_segments) is equal to 3:
+            T.assert_equal(results, "vD seg block", List.get(vd_segments, 0), 0)
+            T.assert_equal(results, "vD degenerate start", List.get(vd_segments, 1), 3)
+            T.assert_equal(results, "vD degenerate end", List.get(vd_segments, 2), 3)
+        End If
+    End If
+
+    Note: vA: defined at 0, last read at 2, confined to B0
+    Let va_segments be Liveness.get_live_range_segments(lir_fn, 1000)
+    T.assert_not_null(results, "vA has live range segments", va_segments)
+    If va_segments is not equal to 0:
+        T.assert_equal(results, "vA has one segment (3 flat slots)", List.size(va_segments), 3)
+        If List.size(va_segments) is equal to 3:
+            T.assert_equal(results, "vA seg block", List.get(va_segments, 0), 0)
+            T.assert_equal(results, "vA start at def 0", List.get(va_segments, 1), 0)
+            T.assert_equal(results, "vA end at last use 2", List.get(va_segments, 2), 2)
+        End If
+    End If
+
+    Return 1
+End Process
+
+Note:
+Suite 2: the interference graph contains exactly the overlapping pairs.
+Expected edges: {vA-vB} (both live between i1 and i2) and {vC-vD} (vD is
+defined at i3 while vC is live across it). Everything else is disjoint.
+:End Note
+
+Process called "run_interference_suite" that takes results as Integer, lir_fn as Integer, graph as Integer returns Integer:
+    T.begin_suite(results, "interference graph")
+
+    T.assert_not_null(results, "graph constructed", graph)
+    If graph is equal to 0:
+        Return 0
+    End If
+
+    T.assert_equal(results, "graph is internally consistent", Interference.verify_interference_graph(graph), 1)
+
+    Note: Present pairs
+    T.assert_equal(results, "vA-vB interfere", Interference.has_interference(graph, 1000, 1001), 1)
+    T.assert_equal(results, "vC-vD interfere (dead def over live vC)", Interference.has_interference(graph, 1002, 1003), 1)
+
+    Note: Absent pairs
+    T.assert_equal(results, "vA-vC disjoint", Interference.has_interference(graph, 1000, 1002), 0)
+    T.assert_equal(results, "vB-vC disjoint", Interference.has_interference(graph, 1001, 1002), 0)
+    T.assert_equal(results, "vA-vD disjoint", Interference.has_interference(graph, 1000, 1003), 0)
+    T.assert_equal(results, "vB-vD disjoint", Interference.has_interference(graph, 1001, 1003), 0)
+    T.assert_equal(results, "vC-vE disjoint", Interference.has_interference(graph, 1002, 1004), 0)
+    T.assert_equal(results, "vD-vE disjoint", Interference.has_interference(graph, 1003, 1004), 0)
+
+    Note: Exactness: 5 nodes (vA..vE), exactly 2 edges
+    Let stats be Interference.compute_graph_statistics(graph)
+    T.assert_not_null(results, "statistics computed", stats)
+    If stats is not equal to 0:
+        T.assert_equal(results, "node count is exactly 5", OrderedMap.omap_get(stats, 1), 5)
+        T.assert_equal(results, "edge count is exactly 2", OrderedMap.omap_get(stats, 2), 2)
+        OrderedMap.omap_destroy(stats)
+    End If
+
+    Return 1
+End Process
+
+Note:
+Suite 3: coloring. Interfering vregs get distinct physical registers,
+non-interfering vregs reuse them, verification passes, and applying the
+allocation eliminates every virtual register reference.
+:End Note
+
+Process called "run_coloring_suite" that takes results as Integer, lir_fn as Integer, graph as Integer returns Integer:
+    T.begin_suite(results, "graph coloring")
+
+    Let context be RegisterAlloc.allocate_registers(lir_fn, graph)
+    T.assert_not_null(results, "allocation context produced", context)
+    If context is equal to 0:
+        Return 0
+    End If
+
+    Note: AllocationContext: allocation at 24, spill_worklist at 40
+    Let spill_worklist be Layout.memory_get_int64(context, 40)
+    T.assert_equal(results, "no spills needed for 5 vregs", List.size(spill_worklist), 0)
+
+    Let allocation be Layout.memory_get_int64(context, 24)
+    T.assert_not_null(results, "allocation map present", allocation)
+
+    Note: Every vreg received a physical register
+    T.assert_equal(results, "vA allocated", OrderedMap.omap_contains(allocation, 1000), 1)
+    T.assert_equal(results, "vB allocated", OrderedMap.omap_contains(allocation, 1001), 1)
+    T.assert_equal(results, "vC allocated", OrderedMap.omap_contains(allocation, 1002), 1)
+    T.assert_equal(results, "vD allocated", OrderedMap.omap_contains(allocation, 1003), 1)
+    T.assert_equal(results, "vE allocated", OrderedMap.omap_contains(allocation, 1004), 1)
+
+    Let color_a be OrderedMap.omap_get(allocation, 1000)
+    Let color_b be OrderedMap.omap_get(allocation, 1001)
+    Let color_c be OrderedMap.omap_get(allocation, 1002)
+    Let color_d be OrderedMap.omap_get(allocation, 1003)
+    Let color_e be OrderedMap.omap_get(allocation, 1004)
+
+    Note: Interfering pairs must differ
+    T.assert_not_equal(results, "vA and vB get distinct registers", color_a, color_b)
+    T.assert_not_equal(results, "vC and vD get distinct registers", color_c, color_d)
+
+    Note: Non-interfering values must reuse registers: 5 vregs, max
+    Note: simultaneous pressure 2, so distinct colors < 5
+    Let distinct_colors be OrderedMap.omap_create()
+    OrderedMap.omap_set(distinct_colors, color_a, 1)
+    OrderedMap.omap_set(distinct_colors, color_b, 1)
+    OrderedMap.omap_set(distinct_colors, color_c, 1)
+    OrderedMap.omap_set(distinct_colors, color_d, 1)
+    OrderedMap.omap_set(distinct_colors, color_e, 1)
+    T.assert_less_than(results, "non-interfering vregs reuse registers", OrderedMap.omap_size(distinct_colors), 5)
+    OrderedMap.omap_destroy(distinct_colors)
+
+    Note: Full validation against the interference relation
+    T.assert_equal(results, "verify_allocation passes", RegisterAlloc.verify_allocation(lir_fn, allocation, graph), 1)
+
+    Note: Apply and confirm no virtual register reference survives
+    Let before_refs be count_virtual_refs(lir_fn)
+    T.assert_greater_than(results, "virtual references exist before apply", before_refs, 0)
+
+    Let apply_ok be RegisterAlloc.apply_allocation(lir_fn, allocation)
+    T.assert_equal(results, "apply_allocation succeeds", apply_ok, 1)
+
+    Let after_refs be count_virtual_refs(lir_fn)
+    T.assert_equal(results, "no virtual references after apply", after_refs, 0)
+
+    Return 1
+End Process
+
+Note:
+Suite 4: forced spill. Fifteen GPR values defined up front and each used
+afterward are simultaneously live at the def/use frontier - a 15-clique
+against K=14 allocatable GPRs. The allocator must report actual spills,
+insert_spill_code must grow the program with stores and reloads, and the
+allocate/spill/retry loop must converge to a clean allocation.
+:End Note
+
+Process called "run_spill_suite" that takes results as Integer returns Integer:
+    T.begin_suite(results, "forced spill")
+
+    Let name be StringCore.create_from_literal("regalloc_probe_spill")
+    Let lir_fn be LIR.lir_create_function(name, 0, 0)
+    T.assert_not_null(results, "spill function constructed", lir_fn)
+    If lir_fn is equal to 0:
+        Return 0
+    End If
+
+    Let b0 be LIR.lir_add_block(lir_fn, 1)
+
+    Note: Fifteen defs, then fifteen uses - all fifteen live in between
+    Let vregs be List.list_create()
+    Let i be 0
+    While i is less than 15:
+        Let vreg be LIR.lir_create_virtual_register(lir_fn, CLASS_GPR, OPERAND_SIZE)
+        List.append(vregs, vreg)
+        Let mov be LIRNodes.create_lir_move(reg_operand(vreg), imm_operand(i), OPERAND_SIZE)
+        LIR.lir_append_instruction(lir_fn, b0, mov)
+        Set i to i plus 1
+    End While
+
+    Set i to 0
+    While i is less than 15:
+        Let used_vreg be List.get(vregs, i)
+        Let dest_vreg be LIR.lir_create_virtual_register(lir_fn, CLASS_GPR, OPERAND_SIZE)
+        Let add be LIRNodes.create_lir_binary_op(LIR.LIR_ADD, reg_operand(dest_vreg), reg_operand(used_vreg), reg_operand(used_vreg), OPERAND_SIZE)
+        LIR.lir_append_instruction(lir_fn, b0, add)
+        Set i to i plus 1
+    End While
+
+    Let ret be LIRNodes.create_lir_return(0)
+    LIR.lir_append_instruction(lir_fn, b0, ret)
+
+    Note: First allocation attempt must demand spills (15-clique vs K=14)
+    Let graph be Interference.build_interference_graph(lir_fn)
+    T.assert_not_null(results, "spill-rig graph constructed", graph)
+    If graph is equal to 0:
+        Return 0
+    End If
+
+    Let context be RegisterAlloc.allocate_registers(lir_fn, graph)
+    T.assert_not_null(results, "spill-rig allocation context produced", context)
+    If context is equal to 0:
+        Return 0
+    End If
+
+    Let spill_worklist be Layout.memory_get_int64(context, 40)
+    Let spill_count be List.size(spill_worklist)
+    T.assert_greater_than(results, "allocator demands at least one spill", spill_count, 0)
+
+    Note: Spill/retry loop: each round inserts stores+reloads and retries
+    Let rounds be 0
+    Let converged be 1
+    While spill_count is greater than 0:
+        Set rounds to rounds plus 1
+        If rounds is greater than 10:
+            Set converged to 0
+            Set spill_count to 0
+        Otherwise:
+            Let before_insts be count_total_instructions(lir_fn)
+
+            Let spill_ok be Spilling.insert_spill_code(lir_fn, spill_worklist)
+            T.assert_equal(results, "spill code insertion succeeds", spill_ok, 1)
+
+            Let after_insts be count_total_instructions(lir_fn)
+            Note: Every spilled value here has 1 def and 1 use: at least
+            Note: one store AND one reload per spilled register
+            T.assert_greater_than_or_equal(results, "spill grew the program by store+reload", after_insts, before_insts plus 2)
+
+            Note: The program changed: rebuild liveness, graph, allocation
+            Let liveness_ok be Liveness.compute_function_liveness(lir_fn)
+            T.assert_equal(results, "post-spill liveness succeeds", liveness_ok, 1)
+
+            Interference.destroy_interference_graph(graph)
+            Set graph to Interference.build_interference_graph(lir_fn)
+            Set context to RegisterAlloc.allocate_registers(lir_fn, graph)
+
+            Set spill_worklist to Layout.memory_get_int64(context, 40)
+            Set spill_count to List.size(spill_worklist)
+        End If
+    End While
+
+    T.assert_equal(results, "spill/retry loop converges", converged, 1)
+    T.assert_greater_than(results, "at least one spill round ran", rounds, 0)
+
+    Note: Final allocation must validate and fully apply
+    Let allocation be Layout.memory_get_int64(context, 24)
+    T.assert_equal(results, "post-spill verify_allocation passes", RegisterAlloc.verify_allocation(lir_fn, allocation, graph), 1)
+
+    Let apply_ok be RegisterAlloc.apply_allocation(lir_fn, allocation)
+    T.assert_equal(results, "post-spill apply succeeds", apply_ok, 1)
+    T.assert_equal(results, "no virtual references after post-spill apply", count_virtual_refs(lir_fn), 0)
+
+    Interference.destroy_interference_graph(graph)
+
+    Return 1
+End Process
+
+Process called "main" returns Integer:
+    Let results be T.create_test_results()
+
+    Let lir_fn be build_function_a()
+    T.begin_suite(results, "rig construction")
+    T.assert_not_null(results, "function A constructed", lir_fn)
+
+    If lir_fn is not equal to 0:
+        run_liverange_suite(results, lir_fn)
+
+        Let graph be Interference.build_interference_graph(lir_fn)
+        run_interference_suite(results, lir_fn, graph)
+        run_coloring_suite(results, lir_fn, graph)
+        If graph is not equal to 0:
+            Interference.destroy_interference_graph(graph)
+        End If
+    End If
+
+    run_spill_suite(results)
+
+    T.print_summary(results)
+    Let passed be T.all_passed(results)
+    T.destroy_test_results(results)
+
+    If passed is equal to 1:
+        Return 0
+    End If
+    Return 1
+End Process

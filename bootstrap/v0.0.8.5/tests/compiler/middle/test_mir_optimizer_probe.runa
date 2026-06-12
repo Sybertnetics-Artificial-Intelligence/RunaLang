@@ -1,0 +1,670 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+mir_optimizer branch-pass probe (task #472 gate of the MIR
+reconciliation plan, task #432).
+
+Builds small SSA CFGs by hand through the canonical MIR construction
+API and runs the orchestrator's branch optimization through the public
+run_single_optimization_pass(cfg, "branch_optimization") entry (which
+also exercises the repaired pass-name string dispatch), asserting the
+rebuilt simplify_branch / thread_jump_block contract:
+
+  1. CONSTANT-TRUE BRANCH: branch(const 1 ? B1 : B2) becomes a fresh
+     canonical MIR_JUMP to B1 actually spliced into the block, the dead
+     edge B0->B2 is removed on both sides and in the flat edge table,
+     and the merge block's phi drops the incoming routed over the dead
+     edge — degrading to a canonical MIR_COPY of the surviving value
+     because the merge is no longer a join point.
+  2. IDENTICAL-TARGET BRANCH: branch(c ? B1 : B1) with a non-constant
+     condition becomes a jump, the duplicate successor edge is deduped,
+     and the target's phi collapses to a copy of the single value.
+  3. JUMP THREADING (no phis): B0 -> B1(jump only) -> B2 is threaded to
+     B0 -> B2, B1 is removed from the CFG, and the cached block count,
+     per-block predecessor/successor counts, and the CFG edge count all
+     match the live list lengths.
+  4. JUMP THREADING (phi merge + hazard): a diamond whose arms are both
+     jump-only blocks threads the first arm into the merge (the phi
+     gains the routed incoming for the new predecessor and loses the
+     threaded block's), then SKIPS the second arm because its
+     predecessor now branches to the merge directly (the
+     duplicate-incoming hazard), leaving a verifiable partial thread.
+  5. MIRVerifier.verify_mir_function returns 1 after every transform.
+:End Note
+
+Import "tests/test_utils.runa" as T
+Import "compiler/middle/gungnir/mir/mir.runa" as MIR
+Import "compiler/middle/gungnir/mir/mir_nodes.runa" as MIRNodes
+Import "compiler/middle/gungnir/mir/cfg.runa" as CFG
+Import "compiler/middle/gungnir/mir/mir_verifier.runa" as MIRVerifier
+Import "compiler/middle/gungnir/mir/mir_optimizer.runa" as MirOpt
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/collections/list.runa" as List
+
+Note: Rig list slot indices
+Constant RIG_FN as Integer is 0
+Constant RIG_CFG as Integer is 1
+
+Note: Fixed pre-transform value ids used by the rigs
+Constant V_COND as Integer is 2001
+Constant V_T as Integer is 2002
+Constant V_F as Integer is 2003
+Constant V_D as Integer is 2004
+Constant V_OUT as Integer is 2005
+Constant V_A as Integer is 2006
+Constant V_B as Integer is 2007
+Constant V_X as Integer is 2008
+Constant V_Y as Integer is 2009
+Constant V_R as Integer is 2010
+
+Process called "make_type_info" returns Integer:
+    Note: Shared HIRTypeInfo stand-in: kind at 0, flags at 8, size at 16
+    Let type_info be Layout.allocate(24)
+    If type_info is equal to 0:
+        Return 0
+    End If
+    Layout.memory_set_int64(type_info, 0, 1)
+    Layout.memory_set_int64(type_info, 8, 0)
+    Layout.memory_set_int64(type_info, 16, 8)
+    Return type_info
+End Process
+
+Process called "register_phi" that takes block_ptr as Integer, phi as Integer returns Nothing:
+    Note: Mirror a hand-built phi into the block's phi_nodes registry at 88
+    Let registry be Layout.memory_get_int64(block_ptr, 88)
+    If registry is not equal to 0:
+        List.append(registry, phi)
+    End If
+End Process
+
+Process called "count_in_list" that takes list_ptr as Integer, value as Integer returns Integer:
+    If list_ptr is equal to 0:
+        Return 0
+    End If
+    Let found be 0
+    Let n be List.length(list_ptr)
+    Let i be 0
+    While i is less than n:
+        Let entry be List.get(list_ptr, i)
+        If entry is equal to value:
+            Set found to found plus 1
+        End If
+        Set i to i plus 1
+    End While
+    Return found
+End Process
+
+Process called "edge_table_count" that takes cfg as Integer, pred_id as Integer, succ_id as Integer returns Integer:
+    Note: Count (pred, succ) pairs in the MIRCFG flat edge table at 32
+    Let edge_table be Layout.memory_get_int64(cfg, 32)
+    If edge_table is equal to 0:
+        Return 0
+    End If
+    Let found be 0
+    Let n be List.length(edge_table)
+    Let i be 0
+    While i is less than n:
+        Let entry_pred be List.get(edge_table, i)
+        Let entry_succ be List.get(edge_table, i plus 1)
+        If entry_pred is equal to pred_id and entry_succ is equal to succ_id:
+            Set found to found plus 1
+        End If
+        Set i to i plus 2
+    End While
+    Return found
+End Process
+
+Process called "build_const_branch_rig" that takes type_info as Integer returns Integer:
+    @Reasoning
+    Constant-condition rig:
+        B0 (entry): cond = const 1; vT = const 7; vF = const 9;
+                    branch cond ? B1 : B2
+        B1:         d = vT + vT; jump B2      (two instructions, so the
+                                               jump-threading phase
+                                               leaves it alone)
+        B2 (exit):  out = phi(B0: vF, B1: d); return out
+    The branch pass must fold the branch to a jump to B1, remove the
+    B0 -> B2 edge, and drop the phi's (B0, vF) incoming — which degrades
+    the now-single-incoming phi to a copy of d.
+    @End Reasoning
+
+    Let fn be MIR.create_mir_function("branch_const_probe", type_info, 0)
+    If fn is equal to 0:
+        Return 0
+    End If
+    Let cfg be MIR.get_mir_function_cfg(fn)
+    If cfg is equal to 0:
+        Return 0
+    End If
+
+    Let b0 be MIR.create_mir_basic_block(0, 0)
+    Let b1 be MIR.create_mir_basic_block(1, 0)
+    Let b2 be MIR.create_mir_basic_block(2, 0)
+    If b2 is equal to 0:
+        Return 0
+    End If
+    MIR.add_block_to_cfg(cfg, b0)
+    MIR.add_block_to_cfg(cfg, b1)
+    MIR.add_block_to_cfg(cfg, b2)
+    MIR.set_cfg_entry_block(cfg, b0)
+    MIR.set_cfg_exit_block(cfg, b2)
+    MIR.add_cfg_edge(cfg, 0, 1)
+    MIR.add_cfg_edge(cfg, 0, 2)
+    MIR.add_cfg_edge(cfg, 1, 2)
+
+    Let cond_const be MIRNodes.create_mir_const(V_COND, 1, type_info, 0, 0)
+    MIR.add_instruction_to_block(b0, cond_const)
+    MIR.register_value_definition(fn, V_COND, cond_const)
+
+    Let vt be MIRNodes.create_mir_const(V_T, 7, type_info, 0, 0)
+    MIR.add_instruction_to_block(b0, vt)
+    MIR.register_value_definition(fn, V_T, vt)
+
+    Let vf be MIRNodes.create_mir_const(V_F, 9, type_info, 0, 0)
+    MIR.add_instruction_to_block(b0, vf)
+    MIR.register_value_definition(fn, V_F, vf)
+
+    Let branch be MIRNodes.create_mir_branch(V_COND, 1, 2, 50, 50)
+    MIR.add_instruction_to_block(b0, branch)
+
+    Let d_add be MIRNodes.create_mir_binary_op(20002, V_D, V_T, V_T, type_info)
+    MIR.add_instruction_to_block(b1, d_add)
+    MIR.register_value_definition(fn, V_D, d_add)
+
+    Let b1_jump be MIRNodes.create_mir_jump(2)
+    MIR.add_instruction_to_block(b1, b1_jump)
+
+    Let out_phi be MIRNodes.create_mir_phi_node(V_OUT, type_info, b2)
+    MIRNodes.add_phi_incoming(out_phi, 0, V_F)
+    MIRNodes.add_phi_incoming(out_phi, 1, V_D)
+    MIR.add_instruction_to_block(b2, out_phi)
+    register_phi(b2, out_phi)
+    MIR.register_value_definition(fn, V_OUT, out_phi)
+
+    Let ret be MIRNodes.create_mir_return(V_OUT, type_info)
+    MIR.add_instruction_to_block(b2, ret)
+
+    Let rig be List.create()
+    List.append(rig, fn)
+    List.append(rig, cfg)
+    Return rig
+End Process
+
+Process called "run_const_branch_suite" that takes results as Integer returns Integer:
+    T.begin_suite(results, "constant_true_branch_folds_to_jump")
+
+    Let type_info be make_type_info()
+    Let rig be build_const_branch_rig(type_info)
+    T.assert_not_null(results, "constant-branch rig constructed", rig)
+    If rig is equal to 0:
+        Return 0
+    End If
+    Let fn be List.get(rig, RIG_FN)
+    Let cfg be List.get(rig, RIG_CFG)
+
+    Let changed be MirOpt.run_single_optimization_pass(cfg, "branch_optimization")
+    T.assert_greater_than(results, "pass reports a transformation", changed, 0)
+
+    Note: B0's terminator is now a fresh canonical jump to B1
+    Let b0 be CFG.get_block_by_id_from_cfg(cfg, 0)
+    T.assert_not_null(results, "entry block still present", b0)
+    Let b0_term be CFG.get_block_terminator(b0)
+    T.assert_not_null(results, "entry block has a terminator", b0_term)
+    Let b0_term_opcode be MIR.get_mir_node_opcode(b0_term)
+    T.assert_equal(results, "terminator folded to MIR_JUMP", b0_term_opcode, 20302)
+    Let jump_target be MIRNodes.get_mir_jump_target_block(b0_term)
+    T.assert_equal(results, "jump targets the taken (true) block", jump_target, 1)
+    Let b0_inst_count be MIR.get_block_instruction_count(b0)
+    T.assert_equal(results, "entry block kept its 3 consts + 1 terminator", b0_inst_count, 4)
+
+    Note: Dead edge B0 -> B2 removed on both sides and in the edge table
+    Let b0_succs be MIR.get_block_successors(b0)
+    T.assert_equal(results, "entry has exactly one successor", List.length(b0_succs), 1)
+    T.assert_equal(results, "dead successor entry removed", count_in_list(b0_succs, 2), 0)
+    Let b0_succ_count be MIR.get_block_successor_count(b0)
+    T.assert_equal(results, "cached successor count resynced", b0_succ_count, 1)
+    Let b2 be CFG.get_block_by_id_from_cfg(cfg, 2)
+    T.assert_not_null(results, "merge block still present", b2)
+    Let b2_preds be MIR.get_block_predecessors(b2)
+    T.assert_equal(results, "merge has exactly one predecessor", List.length(b2_preds), 1)
+    T.assert_equal(results, "dead predecessor entry removed", count_in_list(b2_preds, 0), 0)
+    Let b2_pred_count be MIR.get_block_predecessor_count(b2)
+    T.assert_equal(results, "cached predecessor count resynced", b2_pred_count, 1)
+    T.assert_equal(results, "dead pair gone from flat edge table", edge_table_count(cfg, 0, 2), 0)
+    T.assert_equal(results, "live pair kept in flat edge table", edge_table_count(cfg, 0, 1), 1)
+
+    Note: The merge phi dropped the dead incoming and degraded to a copy
+    Note: of the surviving value (the merge is no longer a join point)
+    Let b2_instructions be MIR.get_block_instructions(b2)
+    Let b2_first be List.get(b2_instructions, 0)
+    Let b2_first_opcode be MIR.get_mir_node_opcode(b2_first)
+    T.assert_equal(results, "trivial phi degraded to MIR_COPY", b2_first_opcode, 20008)
+    Let copy_result be MIR.get_mir_node_value_id(b2_first)
+    T.assert_equal(results, "copy keeps the phi result id", copy_result, V_OUT)
+    Let copy_source be MIR.get_mir_node_operand(b2_first, 1)
+    T.assert_equal(results, "copy reads the surviving incoming value", copy_source, V_D)
+    Let b2_registry be Layout.memory_get_int64(b2, 88)
+    T.assert_equal(results, "phi registry emptied", List.length(b2_registry), 0)
+
+    Note: Verifier accepts the transformed function
+    Let verified be MIRVerifier.verify_mir_function(fn)
+    T.assert_equal(results, "verify_mir_function passes after fold", verified, 1)
+
+    Return 1
+End Process
+
+Process called "build_same_target_rig" that takes type_info as Integer returns Integer:
+    @Reasoning
+    Identical-target rig:
+        B0 (entry): a = const 5; b = const 6; cond = a < b;
+                    branch cond ? B1 : B1   (two edge instances 0 -> 1)
+        B1 (exit):  out = phi(B0: a, B0: a); return out
+    The condition's defining instruction is a comparison, not a
+    MIR_CONST, so the constant path must NOT fire; the same-target
+    collapse must. After the collapse one duplicate edge instance and
+    one duplicate phi incoming are removed, and the remaining
+    single-incoming phi degrades to a copy.
+    @End Reasoning
+
+    Let fn be MIR.create_mir_function("branch_same_target_probe", type_info, 0)
+    If fn is equal to 0:
+        Return 0
+    End If
+    Let cfg be MIR.get_mir_function_cfg(fn)
+    If cfg is equal to 0:
+        Return 0
+    End If
+
+    Let b0 be MIR.create_mir_basic_block(0, 0)
+    Let b1 be MIR.create_mir_basic_block(1, 0)
+    If b1 is equal to 0:
+        Return 0
+    End If
+    MIR.add_block_to_cfg(cfg, b0)
+    MIR.add_block_to_cfg(cfg, b1)
+    MIR.set_cfg_entry_block(cfg, b0)
+    MIR.set_cfg_exit_block(cfg, b1)
+    MIR.add_cfg_edge(cfg, 0, 1)
+    MIR.add_cfg_edge(cfg, 0, 1)
+
+    Let a_const be MIRNodes.create_mir_const(V_A, 5, type_info, 0, 0)
+    MIR.add_instruction_to_block(b0, a_const)
+    MIR.register_value_definition(fn, V_A, a_const)
+
+    Let b_const be MIRNodes.create_mir_const(V_B, 6, type_info, 0, 0)
+    MIR.add_instruction_to_block(b0, b_const)
+    MIR.register_value_definition(fn, V_B, b_const)
+
+    Let cmp be MIRNodes.create_mir_binary_op(20102, V_COND, V_A, V_B, type_info)
+    MIR.add_instruction_to_block(b0, cmp)
+    MIR.register_value_definition(fn, V_COND, cmp)
+
+    Let branch be MIRNodes.create_mir_branch(V_COND, 1, 1, 50, 50)
+    MIR.add_instruction_to_block(b0, branch)
+
+    Let out_phi be MIRNodes.create_mir_phi_node(V_OUT, type_info, b1)
+    MIRNodes.add_phi_incoming(out_phi, 0, V_A)
+    MIRNodes.add_phi_incoming(out_phi, 0, V_A)
+    MIR.add_instruction_to_block(b1, out_phi)
+    register_phi(b1, out_phi)
+    MIR.register_value_definition(fn, V_OUT, out_phi)
+
+    Let ret be MIRNodes.create_mir_return(V_OUT, type_info)
+    MIR.add_instruction_to_block(b1, ret)
+
+    Let rig be List.create()
+    List.append(rig, fn)
+    List.append(rig, cfg)
+    Return rig
+End Process
+
+Process called "run_same_target_suite" that takes results as Integer returns Integer:
+    T.begin_suite(results, "identical_target_branch_collapses_to_jump")
+
+    Let type_info be make_type_info()
+    Let rig be build_same_target_rig(type_info)
+    T.assert_not_null(results, "same-target rig constructed", rig)
+    If rig is equal to 0:
+        Return 0
+    End If
+    Let fn be List.get(rig, RIG_FN)
+    Let cfg be List.get(rig, RIG_CFG)
+
+    Let changed be MirOpt.run_single_optimization_pass(cfg, "branch_optimization")
+    T.assert_greater_than(results, "pass reports a transformation", changed, 0)
+
+    Note: B0's terminator is now a jump to the single target
+    Let b0 be CFG.get_block_by_id_from_cfg(cfg, 0)
+    Let b0_term be CFG.get_block_terminator(b0)
+    T.assert_not_null(results, "entry block has a terminator", b0_term)
+    Let b0_term_opcode be MIR.get_mir_node_opcode(b0_term)
+    T.assert_equal(results, "terminator collapsed to MIR_JUMP", b0_term_opcode, 20302)
+    Let jump_target be MIRNodes.get_mir_jump_target_block(b0_term)
+    T.assert_equal(results, "jump targets the shared block", jump_target, 1)
+
+    Note: Duplicate edge instance deduped on both sides and in the table
+    Let b0_succs be MIR.get_block_successors(b0)
+    T.assert_equal(results, "one successor entry survives", count_in_list(b0_succs, 1), 1)
+    Let b1 be CFG.get_block_by_id_from_cfg(cfg, 1)
+    Let b1_preds be MIR.get_block_predecessors(b1)
+    T.assert_equal(results, "one predecessor entry survives", count_in_list(b1_preds, 0), 1)
+    T.assert_equal(results, "one flat-table pair survives", edge_table_count(cfg, 0, 1), 1)
+    Let b1_pred_count be MIR.get_block_predecessor_count(b1)
+    T.assert_equal(results, "cached predecessor count resynced", b1_pred_count, 1)
+
+    Note: The deduped single-incoming phi degraded to a copy of the value
+    Let b1_instructions be MIR.get_block_instructions(b1)
+    Let b1_first be List.get(b1_instructions, 0)
+    Let b1_first_opcode be MIR.get_mir_node_opcode(b1_first)
+    T.assert_equal(results, "trivial phi degraded to MIR_COPY", b1_first_opcode, 20008)
+    Let copy_source be MIR.get_mir_node_operand(b1_first, 1)
+    T.assert_equal(results, "copy reads the phi's value", copy_source, V_A)
+
+    Let verified be MIRVerifier.verify_mir_function(fn)
+    T.assert_equal(results, "verify_mir_function passes after collapse", verified, 1)
+
+    Return 1
+End Process
+
+Process called "build_jump_chain_rig" that takes type_info as Integer returns Integer:
+    @Reasoning
+    Phi-free threading rig:
+        B0 (entry): c = const 1; jump B1
+        B1:         jump B2                   (jump-only, no phis)
+        B2 (exit):  r = c + c; return r
+    Threading must retarget B0's jump straight at B2 and remove B1.
+    @End Reasoning
+
+    Let fn be MIR.create_mir_function("jump_chain_probe", type_info, 0)
+    If fn is equal to 0:
+        Return 0
+    End If
+    Let cfg be MIR.get_mir_function_cfg(fn)
+    If cfg is equal to 0:
+        Return 0
+    End If
+
+    Let b0 be MIR.create_mir_basic_block(0, 0)
+    Let b1 be MIR.create_mir_basic_block(1, 0)
+    Let b2 be MIR.create_mir_basic_block(2, 0)
+    If b2 is equal to 0:
+        Return 0
+    End If
+    MIR.add_block_to_cfg(cfg, b0)
+    MIR.add_block_to_cfg(cfg, b1)
+    MIR.add_block_to_cfg(cfg, b2)
+    MIR.set_cfg_entry_block(cfg, b0)
+    MIR.set_cfg_exit_block(cfg, b2)
+    MIR.add_cfg_edge(cfg, 0, 1)
+    MIR.add_cfg_edge(cfg, 1, 2)
+
+    Let c_const be MIRNodes.create_mir_const(V_COND, 1, type_info, 0, 0)
+    MIR.add_instruction_to_block(b0, c_const)
+    MIR.register_value_definition(fn, V_COND, c_const)
+
+    Let b0_jump be MIRNodes.create_mir_jump(1)
+    MIR.add_instruction_to_block(b0, b0_jump)
+
+    Let b1_jump be MIRNodes.create_mir_jump(2)
+    MIR.add_instruction_to_block(b1, b1_jump)
+
+    Let r_add be MIRNodes.create_mir_binary_op(20002, V_R, V_COND, V_COND, type_info)
+    MIR.add_instruction_to_block(b2, r_add)
+    MIR.register_value_definition(fn, V_R, r_add)
+
+    Let ret be MIRNodes.create_mir_return(V_R, type_info)
+    MIR.add_instruction_to_block(b2, ret)
+
+    Let rig be List.create()
+    List.append(rig, fn)
+    List.append(rig, cfg)
+    Return rig
+End Process
+
+Process called "run_jump_chain_suite" that takes results as Integer returns Integer:
+    T.begin_suite(results, "jump_only_block_threaded_out")
+
+    Let type_info be make_type_info()
+    Let rig be build_jump_chain_rig(type_info)
+    T.assert_not_null(results, "jump-chain rig constructed", rig)
+    If rig is equal to 0:
+        Return 0
+    End If
+    Let fn be List.get(rig, RIG_FN)
+    Let cfg be List.get(rig, RIG_CFG)
+
+    Let changed be MirOpt.run_single_optimization_pass(cfg, "branch_optimization")
+    T.assert_greater_than(results, "pass reports a transformation", changed, 0)
+
+    Note: B1 removed; counts consistent with the surviving block list
+    Let b1 be CFG.get_block_by_id_from_cfg(cfg, 1)
+    T.assert_equal(results, "jump-only block removed from CFG", b1, 0)
+    Let blocks_list be CFG.get_mir_cfg_blocks(cfg)
+    T.assert_equal(results, "two blocks survive", List.length(blocks_list), 2)
+    Let cached_block_count be CFG.get_cfg_block_count(cfg)
+    T.assert_equal(results, "cached block count resynced", cached_block_count, 2)
+
+    Note: B0 jumps straight to B2
+    Let b0 be CFG.get_block_by_id_from_cfg(cfg, 0)
+    Let b0_term be CFG.get_block_terminator(b0)
+    Let b0_term_opcode be MIR.get_mir_node_opcode(b0_term)
+    T.assert_equal(results, "entry terminator still MIR_JUMP", b0_term_opcode, 20302)
+    Let jump_target be MIRNodes.get_mir_jump_target_block(b0_term)
+    T.assert_equal(results, "entry jump retargeted past the hop", jump_target, 2)
+
+    Note: Edge structure: exactly one edge 0 -> 2 everywhere, nothing
+    Note: referencing the removed block
+    Let b0_succs be MIR.get_block_successors(b0)
+    T.assert_equal(results, "entry successor list is exactly [2]", List.length(b0_succs), 1)
+    T.assert_equal(results, "entry successor entry is the exit", count_in_list(b0_succs, 2), 1)
+    Let b2 be CFG.get_block_by_id_from_cfg(cfg, 2)
+    Let b2_preds be MIR.get_block_predecessors(b2)
+    T.assert_equal(results, "exit predecessor list is exactly [0]", List.length(b2_preds), 1)
+    T.assert_equal(results, "exit predecessor entry is the entry", count_in_list(b2_preds, 0), 1)
+    T.assert_equal(results, "no stale pairs into removed block", edge_table_count(cfg, 0, 1), 0)
+    T.assert_equal(results, "no stale pairs out of removed block", edge_table_count(cfg, 1, 2), 0)
+    T.assert_equal(results, "threaded pair present in flat table", edge_table_count(cfg, 0, 2), 1)
+    Let cached_edge_count be Layout.memory_get_int64(cfg, 40)
+    Let edge_table be Layout.memory_get_int64(cfg, 32)
+    Let table_pairs be List.length(edge_table) divided by 2
+    T.assert_equal(results, "cached edge count matches flat table", cached_edge_count, table_pairs)
+
+    Let verified be MIRVerifier.verify_mir_function(fn)
+    T.assert_equal(results, "verify_mir_function passes after threading", verified, 1)
+
+    Return 1
+End Process
+
+Process called "build_diamond_rig" that takes type_info as Integer returns Integer:
+    @Reasoning
+    Phi-merge threading rig (diamond with jump-only arms):
+        B0 (entry): x = const 11; y = const 22; cond = x < y;
+                    branch cond ? B1 : B2
+        B1:         jump B3                   (jump-only arm)
+        B2:         jump B3                   (jump-only arm)
+        B3 (exit):  out = phi(B1: x, B2: y); return out
+    Threading B1 moves the (B1, x) incoming to (B0, x). Threading B2 is
+    then BLOCKED by the duplicate-incoming hazard (B0 already branches
+    to B3), so B2 must survive and the result remains a verifiable
+    two-predecessor merge.
+    @End Reasoning
+
+    Let fn be MIR.create_mir_function("diamond_thread_probe", type_info, 0)
+    If fn is equal to 0:
+        Return 0
+    End If
+    Let cfg be MIR.get_mir_function_cfg(fn)
+    If cfg is equal to 0:
+        Return 0
+    End If
+
+    Let b0 be MIR.create_mir_basic_block(0, 0)
+    Let b1 be MIR.create_mir_basic_block(1, 0)
+    Let b2 be MIR.create_mir_basic_block(2, 0)
+    Let b3 be MIR.create_mir_basic_block(3, 0)
+    If b3 is equal to 0:
+        Return 0
+    End If
+    MIR.add_block_to_cfg(cfg, b0)
+    MIR.add_block_to_cfg(cfg, b1)
+    MIR.add_block_to_cfg(cfg, b2)
+    MIR.add_block_to_cfg(cfg, b3)
+    MIR.set_cfg_entry_block(cfg, b0)
+    MIR.set_cfg_exit_block(cfg, b3)
+    MIR.add_cfg_edge(cfg, 0, 1)
+    MIR.add_cfg_edge(cfg, 0, 2)
+    MIR.add_cfg_edge(cfg, 1, 3)
+    MIR.add_cfg_edge(cfg, 2, 3)
+
+    Let x_const be MIRNodes.create_mir_const(V_X, 11, type_info, 0, 0)
+    MIR.add_instruction_to_block(b0, x_const)
+    MIR.register_value_definition(fn, V_X, x_const)
+
+    Let y_const be MIRNodes.create_mir_const(V_Y, 22, type_info, 0, 0)
+    MIR.add_instruction_to_block(b0, y_const)
+    MIR.register_value_definition(fn, V_Y, y_const)
+
+    Let cmp be MIRNodes.create_mir_binary_op(20102, V_COND, V_X, V_Y, type_info)
+    MIR.add_instruction_to_block(b0, cmp)
+    MIR.register_value_definition(fn, V_COND, cmp)
+
+    Let branch be MIRNodes.create_mir_branch(V_COND, 1, 2, 50, 50)
+    MIR.add_instruction_to_block(b0, branch)
+
+    Let b1_jump be MIRNodes.create_mir_jump(3)
+    MIR.add_instruction_to_block(b1, b1_jump)
+
+    Let b2_jump be MIRNodes.create_mir_jump(3)
+    MIR.add_instruction_to_block(b2, b2_jump)
+
+    Let out_phi be MIRNodes.create_mir_phi_node(V_OUT, type_info, b3)
+    MIRNodes.add_phi_incoming(out_phi, 1, V_X)
+    MIRNodes.add_phi_incoming(out_phi, 2, V_Y)
+    MIR.add_instruction_to_block(b3, out_phi)
+    register_phi(b3, out_phi)
+    MIR.register_value_definition(fn, V_OUT, out_phi)
+
+    Let ret be MIRNodes.create_mir_return(V_OUT, type_info)
+    MIR.add_instruction_to_block(b3, ret)
+
+    Let rig be List.create()
+    List.append(rig, fn)
+    List.append(rig, cfg)
+    Return rig
+End Process
+
+Process called "run_diamond_suite" that takes results as Integer returns Integer:
+    T.begin_suite(results, "diamond_partial_thread_with_phi_fixup")
+
+    Let type_info be make_type_info()
+    Let rig be build_diamond_rig(type_info)
+    T.assert_not_null(results, "diamond rig constructed", rig)
+    If rig is equal to 0:
+        Return 0
+    End If
+    Let fn be List.get(rig, RIG_FN)
+    Let cfg be List.get(rig, RIG_CFG)
+
+    Let changed be MirOpt.run_single_optimization_pass(cfg, "branch_optimization")
+    T.assert_greater_than(results, "pass reports a transformation", changed, 0)
+
+    Note: The first arm was threaded out; the second arm survives because
+    Note: of the duplicate-incoming hazard
+    Let b1 be CFG.get_block_by_id_from_cfg(cfg, 1)
+    T.assert_equal(results, "first jump-only arm removed", b1, 0)
+    Let b2 be CFG.get_block_by_id_from_cfg(cfg, 2)
+    T.assert_not_null(results, "second arm kept (hazard skip)", b2)
+    Let blocks_list be CFG.get_mir_cfg_blocks(cfg)
+    T.assert_equal(results, "three blocks survive", List.length(blocks_list), 3)
+    Let cached_block_count be CFG.get_cfg_block_count(cfg)
+    T.assert_equal(results, "cached block count resynced", cached_block_count, 3)
+
+    Note: B0's branch true arm retargeted to the merge, false arm intact
+    Let b0 be CFG.get_block_by_id_from_cfg(cfg, 0)
+    Let b0_term be CFG.get_block_terminator(b0)
+    Let b0_term_opcode be MIR.get_mir_node_opcode(b0_term)
+    T.assert_equal(results, "entry terminator still MIR_BRANCH", b0_term_opcode, 20301)
+    Let true_target be MIRNodes.get_mir_branch_true_block(b0_term)
+    T.assert_equal(results, "true arm threaded to the merge", true_target, 3)
+    Let false_target be MIRNodes.get_mir_branch_false_block(b0_term)
+    T.assert_equal(results, "false arm still the surviving block", false_target, 2)
+
+    Note: Merge predecessors are now {B0, B2}; the phi swapped its (B1, x)
+    Note: incoming for (B0, x) and kept (B2, y)
+    Let b3 be CFG.get_block_by_id_from_cfg(cfg, 3)
+    Let b3_preds be MIR.get_block_predecessors(b3)
+    T.assert_equal(results, "merge keeps two predecessors", List.length(b3_preds), 2)
+    T.assert_equal(results, "entry became a merge predecessor", count_in_list(b3_preds, 0), 1)
+    T.assert_equal(results, "surviving arm still a predecessor", count_in_list(b3_preds, 2), 1)
+    T.assert_equal(results, "removed arm no longer a predecessor", count_in_list(b3_preds, 1), 0)
+
+    Let b3_instructions be MIR.get_block_instructions(b3)
+    Let merge_phi be List.get(b3_instructions, 0)
+    Let merge_phi_opcode be MIR.get_mir_node_opcode(merge_phi)
+    T.assert_equal(results, "merge phi survives (still a join point)", merge_phi_opcode, 20300)
+    Let incoming_count be MIRNodes.get_phi_incoming_count(merge_phi)
+    T.assert_equal(results, "phi keeps two incomings", incoming_count, 2)
+    Let x_via_entry be 0
+    Let y_via_arm be 0
+    Let stale_via_removed be 0
+    Let k be 0
+    While k is less than incoming_count:
+        Let in_block be MIRNodes.get_phi_incoming_block(merge_phi, k)
+        Let in_value be MIRNodes.get_phi_incoming_value(merge_phi, k)
+        If in_block is equal to 0 and in_value is equal to V_X:
+            Set x_via_entry to 1
+        End If
+        If in_block is equal to 2 and in_value is equal to V_Y:
+            Set y_via_arm to 1
+        End If
+        If in_block is equal to 1:
+            Set stale_via_removed to 1
+        End If
+        Set k to k plus 1
+    End While
+    T.assert_equal(results, "phi gained (entry, x) routed incoming", x_via_entry, 1)
+    T.assert_equal(results, "phi kept (arm, y) incoming", y_via_arm, 1)
+    T.assert_equal(results, "phi dropped the removed block's incoming", stale_via_removed, 0)
+
+    Note: Edge structure around the merge is fully consistent
+    T.assert_equal(results, "flat table pair entry -> merge", edge_table_count(cfg, 0, 3), 1)
+    T.assert_equal(results, "flat table pair arm -> merge", edge_table_count(cfg, 2, 3), 1)
+    T.assert_equal(results, "no stale flat pairs via removed arm", edge_table_count(cfg, 1, 3), 0)
+
+    Let verified be MIRVerifier.verify_mir_function(fn)
+    T.assert_equal(results, "verify_mir_function passes after partial thread", verified, 1)
+
+    Return 1
+End Process
+
+Process called "main" returns Integer:
+    Let results be T.create_test_results()
+
+    run_const_branch_suite(results)
+    run_same_target_suite(results)
+    run_jump_chain_suite(results)
+    run_diamond_suite(results)
+
+    T.print_summary(results)
+    Let passed be T.all_passed(results)
+    T.destroy_test_results(results)
+
+    If passed is equal to 1:
+        Return 0
+    End If
+    Return 1
+End Process

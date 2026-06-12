@@ -31,6 +31,13 @@ Assertions:
   - points_to: reports the expected abstract location for the tracked
     values - v1 resolves to the ALLOCA site (stack), v3 resolves to the
     allocator call site (heap), and the two do not alias.
+  - ownership_tracking round-trip (task #458): compute_ownership_states
+    tracks exactly one move (the OD-2 deallocate consuming v3), the
+    flow-sensitive walks flag the LOAD *v3 as a use-after-move without a
+    spurious double-move, invariants verify, and
+    UseAfterFree.integrate_with_ownership reads the ordered_map state
+    representation in lockstep - marking the MOVED v3 as UNKNOWN+is_moved
+    in the freed map while leaving the unmoved v1 untouched.
 
 Conventions: canonical tests/test_utils.runa harness; PASS = the
 "ALL TESTS PASSED" summary plus exit 0.
@@ -43,8 +50,10 @@ Import "compiler/middle/gungnir/mir/cfg.runa" as MirCFG
 Import "compiler/middle/analysis/null_safety.runa" as NullSafety
 Import "compiler/middle/analysis/use_after_free.runa" as UseAfterFree
 Import "compiler/middle/analysis/points_to.runa" as PointsTo
+Import "compiler/middle/analysis/ownership_tracking.runa" as OwnershipTracking
 Import "compiler/frontend/primitives/memory/layout.runa" as Layout
 Import "compiler/frontend/primitives/collections/list.runa" as List
+Import "compiler/frontend/primitives/collections/ordered_map.runa" as OrderedMap
 
 @Reasoning
 Constructs the probe MIRFunction described in the file header using only
@@ -217,6 +226,69 @@ Process called "main" returns Integer:
     proc assert_equal from TestUtils with results, "v1 and v3 do not alias", alias_13, 0
     Let alias_11 be proc may_alias from PointsTo with graph, 1, 1
     proc assert_equal from TestUtils with results, "v1 aliases itself", alias_11, 1
+
+    Note: ---- ownership_tracking + integrate_with_ownership round-trip ----
+    Note: (task #458 lockstep: OwnershipAnalysis.value_to_state at offset 8
+    Note: is an integer-keyed ordered_map from value id to OwnershipState;
+    Note: integrate_with_ownership walks it and marks MOVED values UNKNOWN
+    Note: + is_moved in the UAF freed map)
+    Let oa be proc create_ownership_analysis from OwnershipTracking with cfg, 0
+    proc assert_not_null from TestUtils with results, "ownership analysis created", oa
+
+    Let own_ok be proc compute_ownership_states from OwnershipTracking with oa, func
+    proc assert_equal from TestUtils with results, "ownership states computed", own_ok, 1
+
+    Note: The OD-2 deallocate call consumes v3 - the function's only move
+    Let own_moves be proc memory_get_int64 from Layout with oa, 32
+    proc assert_equal from TestUtils with results, "deallocate consumed v3 (one move tracked)", own_moves, 1
+
+    Let value_to_state be proc memory_get_int64 from Layout with oa, 8
+    Let v3_own be proc omap_get from OrderedMap with value_to_state, 3
+    proc assert_not_null from TestUtils with results, "v3 has an ownership record", v3_own
+    If v3_own is not equal to 0:
+        Let v3_code be proc memory_get_int64 from Layout with v3_own, 8
+        proc assert_equal from TestUtils with results, "v3 summary state is MOVED", v3_code, 1
+        Let v3_moved_at be proc memory_get_int64 from Layout with v3_own, 16
+        proc assert_not_null from TestUtils with results, "v3 records its move site", v3_moved_at
+    End If
+
+    Note: v1 is never moved or borrowed - the map records only deviations
+    Let v1_own be proc omap_get from OrderedMap with value_to_state, 1
+    proc assert_equal from TestUtils with results, "v1 has no deviation record (OWNED)", v1_own, 0
+
+    Note: Flow-sensitive walks: LOAD *v3 after the deallocate is the one
+    Note: use-after-move; the single move is not a double-move
+    Let own_errors be proc memory_get_int64 from Layout with oa, 48
+    Let own_error_count be proc length from List with own_errors
+    proc assert_equal from TestUtils with results, "one ownership error (use-after-move, no spurious double-move)", own_error_count, 1
+
+    Let own_invariants be proc verify_ownership_invariants from OwnershipTracking with oa
+    proc assert_equal from TestUtils with results, "ownership invariants hold", own_invariants, 1
+
+    Note: Round-trip: integration marks the MOVED v3 in the UAF freed map
+    Let integ_ok be proc integrate_with_ownership from UseAfterFree with uafa, oa
+    proc assert_equal from TestUtils with results, "ownership integration succeeded", integ_ok, 1
+
+    Let v3_fs be proc get_freed_state from UseAfterFree with uafa, 3
+    proc assert_not_null from TestUtils with results, "v3 freed-state record present", v3_fs
+    If v3_fs is not equal to 0:
+        Let v3_fs_state be proc memory_get_int64 from Layout with v3_fs, 8
+        proc assert_equal from TestUtils with results, "moved v3 marked UNKNOWN freed state", v3_fs_state, 2
+        Let v3_fs_moved be proc memory_get_int64 from Layout with v3_fs, 40
+        proc assert_equal from TestUtils with results, "moved v3 flagged is_moved", v3_fs_moved, 1
+    End If
+
+    Let v3_definite be proc is_definitely_freed from UseAfterFree with uafa, 3
+    proc assert_equal from TestUtils with results, "post-integration v3 not DEFINITELY freed (UNKNOWN)", v3_definite, 0
+
+    Let v1_fs be proc get_freed_state from UseAfterFree with uafa, 1
+    proc assert_not_null from TestUtils with results, "v1 freed-state record present", v1_fs
+    If v1_fs is not equal to 0:
+        Let v1_fs_moved be proc memory_get_int64 from Layout with v1_fs, 40
+        proc assert_equal from TestUtils with results, "unmoved v1 not flagged is_moved", v1_fs_moved, 0
+        Let v1_fs_state be proc memory_get_int64 from Layout with v1_fs, 8
+        proc assert_equal from TestUtils with results, "unmoved v1 stays ALLOCATED", v1_fs_state, 0
+    End If
 
     proc print_summary from TestUtils with results
 

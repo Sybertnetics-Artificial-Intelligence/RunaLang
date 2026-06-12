@@ -62,6 +62,7 @@ Import "compiler/middle/gungnir/mir/optimizations/dead_store.runa" as DeadStore
 Import "compiler/middle/gungnir/mir/optimizations/sccp.runa" as SCCP
 Import "compiler/frontend/primitives/memory/layout.runa" as Layout
 Import "compiler/frontend/primitives/collections/list.runa" as List
+Import "compiler/internal/string_utils.runa" as StringUtils
 
 Note: ============================================================================
 Note: PHASE 1: DATA STRUCTURES - Optimizer Context bitwise and Pass Infrastructure
@@ -178,7 +179,8 @@ Process called "create_optimizer_context" that takes cfg as Integer, function as
     Let value_map be proc create from List
     proc memory_set_int64 from Layout with context_ptr, 80, value_map
 
-    Display "create_optimizer_context: context created with " joined with inst_count joined with " instructions"
+    Let inst_count_str be proc integer_to_string from StringUtils with inst_count
+    Display "create_optimizer_context: context created with " joined with inst_count_str joined with " instructions"
     Return context_ptr
 End Process
 
@@ -204,9 +206,18 @@ Process called "destroy_optimizer_context" that takes context_ptr as Integer ret
         proc destroy from List with worklist
     End If
 
-    Note: Destroy value number map
+    Note: Destroy value number map (entries are owned 32-byte records)
     Let value_map be proc memory_get_int64 from Layout with context_ptr, 80
     If value_map is not equal to 0:
+        Let entry_count be proc length from List with value_map
+        Let e be 0
+        While e is less than entry_count:
+            Let entry be proc get from List with value_map, e
+            If entry is not equal to 0:
+                proc deallocate from Layout with entry
+            End If
+            Set e to e plus 1
+        End While
         proc destroy from List with value_map
     End If
 
@@ -339,18 +350,25 @@ Process called "print_optimization_stats" that takes context_ptr as Integer retu
     Display "============================================"
     Display "MIR OPTIMIZATION STATISTICS"
     Display "============================================"
-    Display "Initial instructions:    " joined with initial_count
-    Display "Instructions deleted:    " joined with deleted
-    Display "Instructions simplified: " joined with simplified
-    Display "Constants folded:        " joined with const_folded
-    Display "Copies propagated:       " joined with copies_prop
+    Let initial_str be proc integer_to_string from StringUtils with initial_count
+    Display "Initial instructions:    " joined with initial_str
+    Let deleted_str be proc integer_to_string from StringUtils with deleted
+    Display "Instructions deleted:    " joined with deleted_str
+    Let simplified_str be proc integer_to_string from StringUtils with simplified
+    Display "Instructions simplified: " joined with simplified_str
+    Let folded_str be proc integer_to_string from StringUtils with const_folded
+    Display "Constants folded:        " joined with folded_str
+    Let copies_str be proc integer_to_string from StringUtils with copies_prop
+    Display "Copies propagated:       " joined with copies_str
 
     Let final_count be initial_count minus deleted
-    Display "Final instructions:      " joined with final_count
+    Let final_str be proc integer_to_string from StringUtils with final_count
+    Display "Final instructions:      " joined with final_str
 
     If initial_count is greater than 0:
         Let reduction be deleted multiplied by 100 divided by initial_count
-        Display "Reduction:               " joined with reduction joined with "%"
+        Let reduction_str be proc integer_to_string from StringUtils with reduction
+        Display "Reduction:               " joined with reduction_str joined with "%"
     End If
 
     Display "============================================"
@@ -395,10 +413,16 @@ Process called "optimize_constant_folding" that takes context_ptr as Integer ret
     @Implementation
     Walks the CFG in reverse post-order (RPO) so each instruction sees all its
     operand definitions before being processed. For each instruction, dispatches
-    on opcode range: 20002-20012 routes to try_fold_binary_op, 20100-20105 to
-    try_fold_comparison, 20007/20013 (NEG/NOT) to try_fold_unary_op. Each successful
-    fold increments folded_count and calls mark_changed so the orchestrator re-runs
-    dependent passes (DCE in particular) on the next iteration.
+    on the canonical opcode bands: binary arithmetic 20002-20006 plus bitwise
+    20010-20012 plus shifts 20014-20016 route to try_fold_binary_op (MIR_COPY
+    20008 and MIR_NOT 20013 sit inside the numeric range and are excluded),
+    comparisons 20100-20105 to try_fold_comparison, and the unary pair
+    20007/20013 (NEG/NOT) to try_fold_unary_op. A successful fold REPLACES the
+    instruction in the block's instruction list with a fresh canonical MIRConst
+    record (record-size discipline: a 104-byte binary record cannot legally be
+    rewritten in place into a 112-byte const). Each fold increments folded_count
+    and calls mark_changed so the orchestrator re-runs dependent passes (DCE in
+    particular) on the next iteration.
     @End Implementation
 
     @Performance_Hints
@@ -435,9 +459,23 @@ Process called "optimize_constant_folding" that takes context_ptr as Integer ret
             Let inst be proc get from List with instructions, j
             Let opcode be proc get_mir_node_opcode from MIR with inst
 
+            Note: Classify against the canonical binary band: arithmetic
+            Note: 20002-20006, bitwise 20010-20012, shifts 20014-20016.
+            Note: MIR_COPY (20008) and MIR_NOT (20013) are excluded.
+            Let is_binary_fold be 0
+            If opcode is greater than or equal to 20002 and opcode is less than or equal to 20006:
+                Set is_binary_fold to 1
+            End If
+            If opcode is greater than or equal to 20010 and opcode is less than or equal to 20012:
+                Set is_binary_fold to 1
+            End If
+            If opcode is greater than or equal to 20014 and opcode is less than or equal to 20016:
+                Set is_binary_fold to 1
+            End If
+
             Note: Try to fold binary operations
-            If opcode is greater than or equal to 20002 and opcode is less than or equal to 20012:
-                Let result be proc try_fold_binary_op with context_ptr, inst, opcode
+            If is_binary_fold is equal to 1:
+                Let result be proc try_fold_binary_op with context_ptr, block, instructions, j, inst, opcode
                 If result is equal to 1:
                     Set folded_count to folded_count plus 1
                     proc mark_changed with context_ptr
@@ -446,7 +484,7 @@ Process called "optimize_constant_folding" that takes context_ptr as Integer ret
 
             Note: Try to fold comparison operations
             If opcode is greater than or equal to 20100 and opcode is less than or equal to 20105:
-                Set result to proc try_fold_comparison with context_ptr, inst, opcode
+                Set result to proc try_fold_comparison with context_ptr, block, instructions, j, inst, opcode
                 If result is equal to 1:
                     Set folded_count to folded_count plus 1
                     proc mark_changed with context_ptr
@@ -455,7 +493,7 @@ Process called "optimize_constant_folding" that takes context_ptr as Integer ret
 
             Note: Try to fold unary operations
             If opcode is equal to 20007 or opcode is equal to 20013:  Note: NEG or NOT
-                Set result to proc try_fold_unary_op with context_ptr, inst, opcode
+                Set result to proc try_fold_unary_op with context_ptr, block, instructions, j, inst, opcode
                 If result is equal to 1:
                     Set folded_count to folded_count plus 1
                     proc mark_changed with context_ptr
@@ -472,11 +510,174 @@ Process called "optimize_constant_folding" that takes context_ptr as Integer ret
     Let current_count be proc memory_get_int64 from Layout with context_ptr, 56
     proc memory_set_int64 from Layout with context_ptr, 56, current_count plus folded_count
 
-    Display "optimize_constant_folding: folded " joined with folded_count joined with " constants"
+    Let folded_str be proc integer_to_string from StringUtils with folded_count
+    Display "optimize_constant_folding: folded " joined with folded_str joined with " constants"
     Return folded_count
 End Process
 
-Process called "try_fold_binary_op" that takes context_ptr as Integer, inst as Integer, opcode as Integer returns Integer:
+Process called "find_defining_instruction" that takes context_ptr as Integer, value_id as Integer returns Integer:
+    @Reasoning
+    Resolves a value id to its defining instruction pointer. The canonical
+    fast path is MIR.lookup_defining_instruction against the function's
+    value_to_instruction map (MIRFunction offset 64); the OptimizerContext
+    carries the MIRFunction pointer at offset 8 for exactly this purpose.
+    When the optimizer was entered without a function (optimize_mir /
+    run_single_optimization_pass pass 0), the map is unavailable, so the
+    fallback is a direct CFG scan comparing each instruction's header
+    value_id (offset 8) against the query. The scan also covers
+    definitions that were never registered in the map.
+    @End Reasoning
+
+    @Implementation
+    Tries MIR.lookup_defining_instruction first when a function pointer is
+    available. On a miss (or with no function) walks every block's
+    instruction list via the canonical accessors and returns the first
+    instruction whose MIR.get_mir_node_value_id equals value_id. Returns 0
+    when the value has no defining instruction in the block stream (function
+    parameters and undefined values).
+    @End Implementation
+
+    If context_ptr is equal to 0 or value_id is equal to 0:
+        Return 0
+    End If
+
+    Note: Fast path: the function's value -> instruction map
+    Let function be proc memory_get_int64 from Layout with context_ptr, 8
+    If function is not equal to 0:
+        Let mapped be proc lookup_defining_instruction from MIR with function, value_id
+        If mapped is not equal to 0:
+            Return mapped
+        End If
+    End If
+
+    Note: Fallback: direct CFG scan through the canonical accessors
+    Let cfg be proc memory_get_int64 from Layout with context_ptr, 0
+    If cfg is equal to 0:
+        Return 0
+    End If
+
+    Let blocks_list be proc get_mir_cfg_blocks from CFG with cfg
+    Let block_count be proc get_cfg_block_count from CFG with cfg
+    Let i be 0
+    While i is less than block_count:
+        Let block be proc get from List with blocks_list, i
+        If block is not equal to 0:
+            Let instructions be proc get_block_instructions from MIR with block
+            Let inst_count be proc length from List with instructions
+            Let j be 0
+            While j is less than inst_count:
+                Let inst be proc get from List with instructions, j
+                If inst is not equal to 0:
+                    Let result_id be proc get_mir_node_value_id from MIR with inst
+                    If result_id is equal to value_id:
+                        Return inst
+                    End If
+                End If
+                Set j to j plus 1
+            End While
+        End If
+        Set i to i plus 1
+    End While
+
+    Return 0
+End Process
+
+Process called "replace_instruction_with_const" that takes context_ptr as Integer, block as Integer, instructions as Integer, index as Integer, inst as Integer, const_value as Integer returns Integer:
+    @Reasoning
+    Canonical fold splice. An instruction whose result is now a known
+    compile-time constant must be REPLACED with a fresh canonical MIRConst
+    record carrying the same result value id; rewriting the old record in
+    place is forbidden by record-size discipline (a 104-byte binary record
+    cannot legally become a 112-byte const whose string_ptr slot lives at
+    offset 104, one word past the binary allocation). Keeping the result id
+    means no use sites need rewriting.
+    @End Reasoning
+
+    @Implementation
+    Creates the replacement via MIRNodes.create_mir_const with the old
+    instruction's result id and result type (constant payload lands in the
+    extended region at offset 80 where get_const_value reads it), stamps the
+    parent block, swaps it into the block's instruction list slot via
+    List.set (index-stable splice), and re-registers the definition in the
+    function's value_to_instruction map when a function is available so
+    lookup_defining_instruction resolves to the replacement. Returns 1 on
+    success, 0 when the const allocation fails (the original instruction is
+    left untouched in that case).
+    @End Implementation
+
+    If inst is equal to 0 or instructions is equal to 0:
+        Return 0
+    End If
+
+    Let result_id be proc get_mir_node_value_id from MIR with inst
+    Let result_type be proc get_mir_node_type from MIR with inst
+
+    Let const_inst be proc create_mir_const from MIRNodes with result_id, const_value, result_type, 0, 0
+    If const_inst is equal to 0:
+        Return 0
+    End If
+
+    proc set_mir_node_parent_block from MIR with const_inst, block
+    proc set from List with instructions, index, const_inst
+
+    Note: Detach the replaced record from the block
+    proc set_mir_node_parent_block from MIR with inst, 0
+
+    Note: Keep the function's value -> instruction map coherent
+    Let function be proc memory_get_int64 from Layout with context_ptr, 8
+    If function is not equal to 0:
+        proc register_value_definition from MIR with function, result_id, const_inst
+    End If
+
+    Return 1
+End Process
+
+Process called "replace_instruction_with_copy" that takes context_ptr as Integer, block as Integer, instructions as Integer, index as Integer, inst as Integer, source_value_id as Integer returns Integer:
+    @Reasoning
+    Algebraic-identity splice (X + 0 -> X, X * 1 -> X, ...). The identity
+    result IS another SSA value, so the replacement is a canonical MIR_COPY
+    (20008, OD-5: dest at header value_id offset 8, source at header
+    operand1 offset 16) carrying the old result id. Copy propagation then
+    forwards the source and DCE sweeps the dead copy; replacing with a copy
+    instead of rewriting all uses here keeps this pass local and SSA-safe.
+    @End Reasoning
+
+    @Implementation
+    Creates the replacement via MIRNodes.create_mir_copy, stamps the parent
+    block, swaps it into the instruction list slot via List.set, and
+    re-registers the definition when a function is available. Returns 1 on
+    success, 0 when allocation fails.
+    @End Implementation
+
+    If inst is equal to 0 or instructions is equal to 0:
+        Return 0
+    End If
+
+    Let result_id be proc get_mir_node_value_id from MIR with inst
+    Let result_type be proc get_mir_node_type from MIR with inst
+
+    Let copy_inst be proc create_mir_copy from MIRNodes with result_id, source_value_id
+    If copy_inst is equal to 0:
+        Return 0
+    End If
+
+    proc set_mir_node_type from MIR with copy_inst, result_type
+    proc set_mir_node_parent_block from MIR with copy_inst, block
+    proc set from List with instructions, index, copy_inst
+
+    Note: Detach the replaced record from the block
+    proc set_mir_node_parent_block from MIR with inst, 0
+
+    Note: Keep the function's value -> instruction map coherent
+    Let function be proc memory_get_int64 from Layout with context_ptr, 8
+    If function is not equal to 0:
+        proc register_value_definition from MIR with function, result_id, copy_inst
+    End If
+
+    Return 1
+End Process
+
+Process called "try_fold_binary_op" that takes context_ptr as Integer, block as Integer, instructions as Integer, index as Integer, inst as Integer, opcode as Integer returns Integer:
     @Reasoning
     Attempts to fold a binary operation if both operands are constants.
 
@@ -484,30 +685,34 @@ Process called "try_fold_binary_op" that takes context_ptr as Integer, inst as I
     @End Reasoning
 
     @Implementation
-    Reads left/right operand value-ids from instruction offsets 16/24, queries
-    is_constant_value for each, returns 0 if either is non-constant. Otherwise
-    fetches both constant values, computes the result per opcode dispatch
-    (ADD/SUB/MUL/DIV/MOD/AND/OR/XOR), guards DIV and MOD against zero-divisor,
-    then transforms the instruction in place by overwriting its opcode to
-    MIR_CONST (20001) and storing the computed value at offset 16. The result_id
-    at offset 8 is preserved so all use sites see the folded constant without
-    requiring SSA rewrites.
+    Reads left/right operand value-ids through the canonical slot accessor
+    (header operands 1 and 2 hold the SSA uses, mirrored in the binop's
+    extended region), queries is_constant_value for each, returns 0 if either
+    is non-constant. Otherwise fetches both constant payloads, computes the
+    result per opcode dispatch (ADD/SUB/MUL/DIV/MOD, AND/OR/XOR, SHL/SHR/SAR)
+    with soundness guards, and replaces the instruction with a fresh canonical
+    MIRConst via replace_instruction_with_const, preserving the result id so
+    all use sites see the folded constant without SSA rewrites. Opcodes outside
+    the dispatch table are never folded (no default-to-zero hazard).
     @End Implementation
 
     @Security_Scope
-    Division-by-zero and modulo-by-zero are explicitly guarded; in both cases the
-    fold is abandoned and the original divide/modulo instruction is preserved so
-    the runtime (or a later pass) still raises the proper trap. Folding through a
-    divide-by-zero would produce a constant that masks a runtime fault.
+    Soundness guards: division-by-zero and modulo-by-zero folds are abandoned
+    so the runtime still raises the proper trap; the INT64_MIN / -1 overflow
+    case is likewise left to the runtime; shift counts outside [0, 63] are not
+    folded; logical/arithmetic right shifts of negative values are not folded
+    (Runa's shift evaluates arithmetically on signed 64-bit values, so the
+    flavors only agree on non-negative inputs). Folding through any of these
+    would manufacture a constant that masks a runtime fault or mis-evaluates.
     @End Security_Scope
 
     If inst is equal to 0:
         Return 0
     End If
 
-    Note: Get operands (offset 16 and 24 in MIRBinaryOp)
-    Let left_operand be proc memory_get_int64 from Layout with inst, 16
-    Let right_operand be proc memory_get_int64 from Layout with inst, 24
+    Note: Get operand value ids (canonical slot accessor: header + ext mirror)
+    Let left_operand be proc get_mir_node_operand from MIR with inst, 1
+    Let right_operand be proc get_mir_node_operand from MIR with inst, 2
 
     Note: Check if both are constants
     Let left_is_const be proc is_constant_value with context_ptr, left_operand
@@ -523,63 +728,94 @@ Process called "try_fold_binary_op" that takes context_ptr as Integer, inst as I
 
     Note: Compute result based on opcode
     Let result_val be 0
+    Let matched be 0
 
     If opcode is equal to 20002:  Note: ADD
         Set result_val to left_val plus right_val
+        Set matched to 1
     End If
     If opcode is equal to 20003:  Note: SUB
         Set result_val to left_val minus right_val
+        Set matched to 1
     End If
     If opcode is equal to 20004:  Note: MUL
         Set result_val to left_val multiplied by right_val
+        Set matched to 1
     End If
     If opcode is equal to 20005:  Note: DIV
-        If right_val is not equal to 0:
-            Set result_val to left_val divided by right_val
-        Otherwise:
-            Return 0  Note: Division by zero, don't fold
+        If right_val is equal to 0:
+            Return 0  Note: Division by zero must trap at runtime, don't fold
         End If
+        Note: INT64_MIN / -1 overflows; leave it to the runtime
+        If right_val is equal to 0 minus 1:
+            If left_val is less than 0:
+                If 0 minus left_val is equal to left_val:
+                    Return 0
+                End If
+            End If
+        End If
+        Set result_val to left_val divided by right_val
+        Set matched to 1
     End If
     If opcode is equal to 20006:  Note: MOD
-        If right_val is not equal to 0:
-            Set result_val to left_val modulo by right_val
-        Otherwise:
-            Return 0
+        If right_val is equal to 0:
+            Return 0  Note: Modulo by zero must trap at runtime, don't fold
         End If
+        If right_val is equal to 0 minus 1:
+            If left_val is less than 0:
+                If 0 minus left_val is equal to left_val:
+                    Return 0
+                End If
+            End If
+        End If
+        Set result_val to left_val modulo by right_val
+        Set matched to 1
     End If
     If opcode is equal to 20010:  Note: AND
-        Set result_val to left_val AND right_val
+        Set result_val to left_val bitwise and right_val
+        Set matched to 1
     End If
     If opcode is equal to 20011:  Note: OR
-        Set result_val to left_val OR right_val
+        Set result_val to left_val bitwise or right_val
+        Set matched to 1
     End If
     If opcode is equal to 20012:  Note: XOR
-        Set result_val to left_val XOR right_val
+        Set result_val to left_val bitwise xor right_val
+        Set matched to 1
+    End If
+    If opcode is greater than or equal to 20014 and opcode is less than or equal to 20016:
+        Note: SHL/SHR/SAR shift-count and sign guards
+        If right_val is less than 0:
+            Return 0
+        End If
+        If right_val is greater than 63:
+            Return 0
+        End If
+        If opcode is equal to 20014:  Note: SHL
+            Set result_val to left_val shifted left by right_val
+            Set matched to 1
+        Otherwise:
+            Note: SHR (logical) and SAR (arithmetic) agree only on
+            Note: non-negative inputs; Runa evaluates arithmetically
+            If left_val is less than 0:
+                Return 0
+            End If
+            Set result_val to left_val shifted right by right_val
+            Set matched to 1
+        End If
     End If
 
-    Note: Replace instruction with constant by modifying in-place
-    Note: This is a common compiler optimization technique: reuse the same
-    Note: instruction memory but change its opcode and operands to a constant
+    If matched is equal to 0:
+        Return 0
+    End If
 
-    Note: Get result value ID (offset 8) - keep this unchanged
-    Let result_id be proc memory_get_int64 from Layout with inst, 8
-
-    Note: Transform binary operation into MIR_CONST instruction in-place
-    Note: Change opcode to MIR_CONST (20001)
-    proc memory_set_int64 from Layout with inst, 0, 20001
-
-    Note: Keep result_id at offset 8 (already set correctly)
-    Note: Store constant value at offset 16 (where left operand was)
-    proc memory_set_int64 from Layout with inst, 16, result_val
-
-    Note: Clear right operand at offset 24 (no longer needed for constant)
-    proc memory_set_int64 from Layout with inst, 24, 0
-
-    Note: Successfully folded constant
-    Return 1
+    Note: Replace the binary record with a fresh canonical MIRConst that
+    Note: keeps the same result value id (record-size discipline)
+    Let spliced be proc replace_instruction_with_const with context_ptr, block, instructions, index, inst, result_val
+    Return spliced
 End Process
 
-Process called "try_fold_comparison" that takes context_ptr as Integer, inst as Integer, opcode as Integer returns Integer:
+Process called "try_fold_comparison" that takes context_ptr as Integer, block as Integer, instructions as Integer, index as Integer, inst as Integer, opcode as Integer returns Integer:
     @Reasoning
     Attempts to fold a comparison if both operands are constants.
 
@@ -587,19 +823,21 @@ Process called "try_fold_comparison" that takes context_ptr as Integer, inst as 
     @End Reasoning
 
     @Implementation
-    Mirrors try_fold_binary_op but with comparison opcodes 20100-20105 (EQ, NE, LT,
-    LE, GT, GE). Returns early if either operand is non-constant. Computes the
-    boolean result, then transforms the instruction in place into a MIR_CONST
-    holding 0 or 1. This produces a synthesized constant the downstream branch
-    optimizer can use to eliminate dead branches and unify control flow.
+    Mirrors try_fold_binary_op but with comparison opcodes 20100-20105 (EQ, NE,
+    LT, LE, GT, GE). Returns early if either operand is non-constant. Computes
+    the boolean result, then replaces the comparison with a fresh canonical
+    MIRConst holding 0 or 1 via replace_instruction_with_const (record-size
+    discipline forbids the in-place rewrite). This produces a synthesized
+    constant the downstream branch optimizer uses to eliminate dead branches
+    and unify control flow.
     @End Implementation
 
     If inst is equal to 0:
         Return 0
     End If
 
-    Let left_operand be proc memory_get_int64 from Layout with inst, 16
-    Let right_operand be proc memory_get_int64 from Layout with inst, 24
+    Let left_operand be proc get_mir_node_operand from MIR with inst, 1
+    Let right_operand be proc get_mir_node_operand from MIR with inst, 2
 
     Let left_is_const be proc is_constant_value with context_ptr, left_operand
     Let right_is_const be proc is_constant_value with context_ptr, right_operand
@@ -644,40 +882,33 @@ Process called "try_fold_comparison" that takes context_ptr as Integer, inst as 
         End If
     End If
 
-    Note: Replace comparison with constant true (1) or false (0)
-    Note: Transform comparison into MIR_CONST instruction in-place
-
-    Note: Change opcode to MIR_CONST (20001)
-    proc memory_set_int64 from Layout with inst, 0, 20001
-
-    Note: Keep result_id at offset 8 (already set correctly)
-    Note: Store constant value (0 or 1) at offset 16
-    proc memory_set_int64 from Layout with inst, 16, result_val
-
-    Note: Clear right operand at offset 24
-    proc memory_set_int64 from Layout with inst, 24, 0
-
-    Note: Successfully folded comparison
-    Return 1
+    Note: Replace the comparison record with a fresh canonical MIRConst
+    Note: holding 0 or 1 under the same result value id
+    Let spliced be proc replace_instruction_with_const with context_ptr, block, instructions, index, inst, result_val
+    Return spliced
 End Process
 
-Process called "try_fold_unary_op" that takes context_ptr as Integer, inst as Integer, opcode as Integer returns Integer:
+Process called "try_fold_unary_op" that takes context_ptr as Integer, block as Integer, instructions as Integer, index as Integer, inst as Integer, opcode as Integer returns Integer:
     @Reasoning
     Attempts to fold a unary operation if operand is constant.
     @End Reasoning
 
     @Implementation
-    Reads the single operand at offset 16, returns 0 if non-constant. Otherwise
-    computes the unary result: opcode 20007 is arithmetic negation, opcode 20013
-    is bitwise NOT. The instruction is transformed in place to MIR_CONST holding
-    the computed value, with the right operand at offset 24 cleared.
+    Reads the single operand through the canonical slot accessor (header
+    operand 1, mirrored in the unary record's extended region at offset 80),
+    returns 0 if non-constant. Otherwise computes the unary result: opcode
+    20007 is arithmetic negation (two's-complement wraparound on INT64_MIN
+    matches the runtime NEG instruction, so folding it is sound), opcode
+    20013 is bitwise NOT computed as XOR with all-ones. The instruction is
+    replaced with a fresh canonical MIRConst via replace_instruction_with_const
+    (record-size discipline forbids the in-place rewrite).
     @End Implementation
 
     If inst is equal to 0:
         Return 0
     End If
 
-    Let operand be proc memory_get_int64 from Layout with inst, 16
+    Let operand be proc get_mir_node_operand from MIR with inst, 1
     Let is_const be proc is_constant_value with context_ptr, operand
 
     If is_const is equal to 0:
@@ -686,29 +917,26 @@ Process called "try_fold_unary_op" that takes context_ptr as Integer, inst as In
 
     Let operand_val be proc get_constant_value with context_ptr, operand
     Let result_val be 0
+    Let matched be 0
 
     If opcode is equal to 20007:  Note: NEG
-        Set result_val to -operand_val
+        Set result_val to 0 minus operand_val
+        Set matched to 1
     End If
-    If opcode is equal to 20013:  Note: NOT
-        Set result_val to NOT operand_val
+    If opcode is equal to 20013:  Note: NOT (bitwise complement = XOR all-ones)
+        Let all_ones be 0 minus 1
+        Set result_val to operand_val bitwise xor all_ones
+        Set matched to 1
     End If
 
-    Note: Replace unary operation with constant
-    Note: Transform unary operation into MIR_CONST instruction in-place
+    If matched is equal to 0:
+        Return 0
+    End If
 
-    Note: Change opcode to MIR_CONST (20001)
-    proc memory_set_int64 from Layout with inst, 0, 20001
-
-    Note: Keep result_id at offset 8 (already set correctly)
-    Note: Store constant value at offset 16
-    proc memory_set_int64 from Layout with inst, 16, result_val
-
-    Note: Clear operand field (no longer needed)
-    Note: For unary ops, operand is at offset 16, but we're overwriting it with result
-
-    Note: Successfully folded unary operation
-    Return 1
+    Note: Replace the unary record with a fresh canonical MIRConst that
+    Note: keeps the same result value id
+    Let spliced be proc replace_instruction_with_const with context_ptr, block, instructions, index, inst, result_val
+    Return spliced
 End Process
 
 Process called "is_constant_value" that takes context_ptr as Integer, value_id as Integer returns Integer:
@@ -721,18 +949,20 @@ Process called "is_constant_value" that takes context_ptr as Integer, value_id a
     - Otherwise, it's not a constant
 
     **ALGORITHM:**
-    1. Get CFG from context
-    2. Traverse all blocks in CFG
-    3. For each instruction, check if result_id is equal to value_id
-    4. If found, check if opcode is MIR_CONST (20001)
-    5. Return 1 if constant, 0 otherwise
+    1. Resolve the defining instruction via find_defining_instruction
+       (function value_to_instruction map fast path, CFG scan fallback)
+    2. Check if its opcode is MIR_CONST (20001)
+    3. Return 1 if constant, 0 otherwise
 
     Returns 1 if constant, 0 otherwise.
     @End Reasoning
 
     @Implementation
-    Implements complete SSA def-use chain traversal to find the defining
-    instruction and determine if it's a compile-time constant.
+    Delegates the def lookup to find_defining_instruction, which prefers the
+    canonical MIR.lookup_defining_instruction map keyed on the function held
+    at OptimizerContext offset 8 and falls back to a CFG scan when no
+    function context exists. A value is constant exactly when its defining
+    instruction is a MIR_CONST (20001).
     @End Implementation
 
     If value_id is equal to 0:
@@ -743,45 +973,16 @@ Process called "is_constant_value" that takes context_ptr as Integer, value_id a
         Return 0
     End If
 
-    Note: Get CFG from context
-    Let cfg be proc memory_get_int64 from Layout with context_ptr, 0
-    If cfg is equal to 0:
+    Let def_inst be proc find_defining_instruction with context_ptr, value_id
+    If def_inst is equal to 0:
         Return 0
     End If
 
-    Note: Traverse all blocks to find defining instruction
-    Let blocks_list be proc get_mir_cfg_blocks from CFG with cfg
-    Let block_count be proc get_cfg_block_count from CFG with cfg
-    Let i be 0
-    While i is less than block_count:
-        Let block be proc get from List with blocks_list, i
-        If block is not equal to 0:
-            Let instructions be proc get_block_instructions from MIR with block
-            Let inst_count be proc length from List with instructions
+    Let opcode be proc get_mir_node_opcode from MIR with def_inst
+    If opcode is equal to 20001:  Note: MIR_CONST
+        Return 1
+    End If
 
-            Let j be 0
-            While j is less than inst_count:
-                Let inst be proc get from List with instructions, j
-                If inst is not equal to 0:
-                    Note: Check if this instruction defines value_id
-                    Let result_id be proc memory_get_int64 from Layout with inst, 8
-                    If result_id is equal to value_id:
-                        Note: Found defining instruction, check if it's a constant
-                        Let opcode be proc get_mir_node_opcode from MIR with inst
-                        If opcode is equal to 20001:  Note: MIR_CONST
-                            Return 1
-                        End If
-                        Note: Not a constant instruction
-                        Return 0
-                    End If
-                End If
-                Set j to j plus 1
-            End While
-        End If
-        Set i to i plus 1
-    End While
-
-    Note: Value not found or not a constant
     Return 0
 End Process
 
@@ -794,24 +995,21 @@ Process called "get_constant_value" that takes context_ptr as Integer, value_id 
     - Extract constant value from MIR_CONST instruction
     - Return the constant value
 
-    **ALGORITHM:**
-    1. Get CFG from context
-    2. Traverse all blocks in CFG
-    3. For each instruction, check if result_id is equal to value_id
-    4. If found and opcode is MIR_CONST (20001), extract constant value
-    5. Return the constant value
-
-    **MIR_CONST MEMORY LAYOUT:**
-    - Offset 0: opcode (20001)
-    - Offset 8: result_id (value_id)
-    - Offset 16: constant_value (Integer)
+    **MIR_CONST CANONICAL LAYOUT (OD-1 prefix embedding):**
+    - Offset 0:  opcode (20001)
+    - Offset 8:  result_id (value_id)
+    - Offset 80: constant_value (extended region, read via get_const_value)
 
     Returns the constant value.
     @End Reasoning
 
     @Implementation
-    Implements complete CFG traversal to find MIR_CONST instruction
-    and extract the constant value from the instruction structure.
+    Resolves the defining instruction via find_defining_instruction and, when
+    it is a MIR_CONST, reads the payload through the canonical accessor
+    MIRNodes.get_const_value (extended region offset 80 under OD-1 prefix
+    embedding — the header operand slots hold SSA uses only, never payloads).
+    Callers must gate on is_constant_value first; a 0 return here means
+    "constant zero" for gated callers and "no constant" otherwise.
     @End Implementation
 
     If value_id is equal to 0:
@@ -822,47 +1020,18 @@ Process called "get_constant_value" that takes context_ptr as Integer, value_id 
         Return 0
     End If
 
-    Note: Get CFG from context
-    Let cfg be proc memory_get_int64 from Layout with context_ptr, 0
-    If cfg is equal to 0:
+    Let def_inst be proc find_defining_instruction with context_ptr, value_id
+    If def_inst is equal to 0:
         Return 0
     End If
 
-    Note: Traverse all blocks to find MIR_CONST instruction
-    Let blocks_list be proc get_mir_cfg_blocks from CFG with cfg
-    Let block_count be proc get_cfg_block_count from CFG with cfg
-    Let i be 0
-    While i is less than block_count:
-        Let block be proc get from List with blocks_list, i
-        If block is not equal to 0:
-            Let instructions be proc get_block_instructions from MIR with block
-            Let inst_count be proc length from List with instructions
+    Let opcode be proc get_mir_node_opcode from MIR with def_inst
+    If opcode is equal to 20001:  Note: MIR_CONST
+        Let const_value be proc get_const_value from MIRNodes with def_inst
+        Return const_value
+    End If
 
-            Let j be 0
-            While j is less than inst_count:
-                Let inst be proc get from List with instructions, j
-                If inst is not equal to 0:
-                    Note: Check if this instruction defines value_id
-                    Let result_id be proc memory_get_int64 from Layout with inst, 8
-                    If result_id is equal to value_id:
-                        Note: Found defining instruction, verify it's a constant
-                        Let opcode be proc get_mir_node_opcode from MIR with inst
-                        If opcode is equal to 20001:  Note: MIR_CONST
-                            Note: Extract constant value from offset 16
-                            Let const_value be proc memory_get_int64 from Layout with inst, 16
-                            Return const_value
-                        End If
-                        Note: Not a constant instruction, cannot get value
-                        Return 0
-                    End If
-                End If
-                Set j to j plus 1
-            End While
-        End If
-        Set i to i plus 1
-    End While
-
-    Note: Value not found or not a constant
+    Note: Not a constant instruction, cannot get value
     Return 0
 End Process
 
@@ -1073,7 +1242,7 @@ Process called "optimize_algebraic_simplification" that takes context_ptr as Int
             Let opcode be proc get_mir_node_opcode from MIR with inst
 
             Note: Try algebraic simplification
-            Let result be proc try_algebraic_simplify with context_ptr, inst, opcode
+            Let result be proc try_algebraic_simplify with context_ptr, block, instructions, j, inst, opcode
             If result is equal to 1:
                 Set simplified_count to simplified_count plus 1
                 proc mark_changed with context_ptr
@@ -1089,11 +1258,12 @@ Process called "optimize_algebraic_simplification" that takes context_ptr as Int
     Let current_count be proc memory_get_int64 from Layout with context_ptr, 48
     proc memory_set_int64 from Layout with context_ptr, 48, current_count plus simplified_count
 
-    Display "optimize_algebraic_simplification:  " joined with simplified_count joined with " expressions"
+    Let simplified_str be proc integer_to_string from StringUtils with simplified_count
+    Display "optimize_algebraic_simplification: simplified " joined with simplified_str joined with " expressions"
     Return simplified_count
 End Process
 
-Process called "try_algebraic_simplify" that takes context_ptr as Integer, inst as Integer, opcode as Integer returns Integer:
+Process called "try_algebraic_simplify" that takes context_ptr as Integer, block as Integer, instructions as Integer, index as Integer, inst as Integer, opcode as Integer returns Integer:
     @Reasoning
     Attempts to simplify an instruction using algebraic identities.
 
@@ -1102,172 +1272,156 @@ Process called "try_algebraic_simplify" that takes context_ptr as Integer, inst 
 
     @Implementation
     Pattern-matches the instruction against a library of arithmetic and Boolean
-    identities. First checks the operand-equal case (X op X) for identities like
-    X-X=0, X xor X=0, X<X=false. Then checks operand-constant patterns by querying
-    is_constant_value and get_constant_value: X+0=X, X*0=0, X*1=X, X|0=X, X|-1=-1,
-    X and 0=0, X and -1=X. Each successful rewrite synthesizes a MIR_CONST or
-    MIR_COPY through MIRNodes.create_mir_const_instruction / create_mir_copy_instruction
-    and returns 1. Operates safely under SSA because all rewrites preserve the
-    original result-id.
+    identities and performs the REAL rewrite: identities whose result is a
+    constant (X-X=0, X xor X=0, X*0=0, X and 0=0, X or -1=-1, X<X=false,
+    X==X=true, ...) replace the instruction with a fresh canonical MIRConst via
+    replace_instruction_with_const; identities whose result is an existing SSA
+    value (X+0=X, X*1=X, X and X=X, X or 0=X, X shl 0=X, ...) replace it with a
+    fresh canonical MIR_COPY via replace_instruction_with_copy. Both splices
+    preserve the original result id, so no use sites need rewriting; copy
+    propagation forwards the source and DCE sweeps the residue on the next
+    fixpoint iteration. The X-op-X family keys on identical SSA value ids,
+    which is exact under SSA. MIR_COPY (20008) and MIR_NOT (20013) sit inside
+    the binary numeric range and are excluded up front.
     @End Implementation
 
     If inst is equal to 0:
         Return 0
     End If
 
-    Note: Check for binary operations
-    If opcode is less than 20002 or opcode is greater than 20012:
-        Note: Also check comparisons
-        If opcode is less than 20100 or opcode is greater than 20105:
-            Return 0
+    Note: Gate on the canonical binary bands (arithmetic 20002-20006,
+    Note: bitwise 20010-20012, shifts 20014-20016) and comparisons
+    Let in_band be 0
+    If opcode is greater than or equal to 20002 and opcode is less than or equal to 20006:
+        Set in_band to 1
+    End If
+    If opcode is greater than or equal to 20010 and opcode is less than or equal to 20012:
+        Set in_band to 1
+    End If
+    If opcode is greater than or equal to 20014 and opcode is less than or equal to 20016:
+        Set in_band to 1
+    End If
+    If opcode is greater than or equal to 20100 and opcode is less than or equal to 20105:
+        Set in_band to 1
+    End If
+    If in_band is equal to 0:
+        Return 0
+    End If
+
+    Let left_operand be proc get_mir_node_operand from MIR with inst, 1
+    Let right_operand be proc get_mir_node_operand from MIR with inst, 2
+
+    Note: Check if operands are equal (X op X patterns; exact under SSA)
+    If left_operand is equal to right_operand and left_operand is not equal to 0:
+        Note: X - X → 0, X xor X → 0
+        If opcode is equal to 20003 or opcode is equal to 20012:
+            Return proc replace_instruction_with_const with context_ptr, block, instructions, index, inst, 0
+        End If
+
+        Note: X and X → X, X or X → X
+        If opcode is equal to 20010 or opcode is equal to 20011:
+            Return proc replace_instruction_with_copy with context_ptr, block, instructions, index, inst, left_operand
+        End If
+
+        Note: X == X → 1, X <= X → 1, X >= X → 1
+        If opcode is equal to 20100 or opcode is equal to 20103 or opcode is equal to 20105:
+            Return proc replace_instruction_with_const with context_ptr, block, instructions, index, inst, 1
+        End If
+
+        Note: X != X → 0, X < X → 0, X > X → 0
+        If opcode is equal to 20101 or opcode is equal to 20102 or opcode is equal to 20104:
+            Return proc replace_instruction_with_const with context_ptr, block, instructions, index, inst, 0
         End If
     End If
 
-    Let left_operand be proc memory_get_int64 from Layout with inst, 16
-    Let right_operand be proc memory_get_int64 from Layout with inst, 24
-
-    Note: Check if operands are equal (X op X patterns)
-    If left_operand is equal to right_operand:
-        Note: X - X → 0
-        If opcode is equal to 20003:  Note: SUB
-            Let result_id be proc memory_get_int64 from Layout with inst, 8
-            Let const_inst be proc create_mir_const from MIRNodes with result_id, 0, 0, 0, 0
-            Return 1
-        End If
-
-        Note: X bitwise xor X → 0 (XOR)
-        If opcode is equal to 20012:  Note: XOR
-            Set result_id to proc memory_get_int64 from Layout with inst, 8
-            Set const_inst to proc create_mir_const from MIRNodes with result_id, 0, 0, 0, 0
-            Return 1
-        End If
-
-        Note: X < X → 0 (false)
-        If opcode is equal to 20102:  Note: LT
-            Set result_id to proc memory_get_int64 from Layout with inst, 8
-            Set const_inst to proc create_mir_const from MIRNodes with result_id, 0, 0, 0, 0
-            Return 1
-        End If
-
-        Note: X > X → 0 (false)
-        If opcode is equal to 20104:  Note: GT
-            Set result_id to proc memory_get_int64 from Layout with inst, 8
-            Set const_inst to proc create_mir_const from MIRNodes with result_id, 0, 0, 0, 0
-            Return 1
-        End If
-
-        Note: X <= X → 1 (true)
-        If opcode is equal to 20103:  Note: LE
-            Set result_id to proc memory_get_int64 from Layout with inst, 8
-            Set const_inst to proc create_mir_const from MIRNodes with result_id, 1, 0, 0, 0
-            Return 1
-        End If
-
-        Note: X >= X → 1 (true)
-        If opcode is equal to 20105:  Note: GE
-            Set result_id to proc memory_get_int64 from Layout with inst, 8
-            Set const_inst to proc create_mir_const from MIRNodes with result_id, 1, 0, 0, 0
-            Return 1
-        End If
-
-        Note: X == X → 1 (true)
-        If opcode is equal to 20100:  Note: EQ
-            Set result_id to proc memory_get_int64 from Layout with inst, 8
-            Set const_inst to proc create_mir_const from MIRNodes with result_id, 1, 0, 0, 0
-            Return 1
-        End If
-
-        Note: X != X → 0 (false)
-        If opcode is equal to 20101:  Note: NE
-            Set result_id to proc memory_get_int64 from Layout with inst, 8
-            Set const_inst to proc create_mir_const from MIRNodes with result_id, 0, 0, 0, 0
-            Return 1
-        End If
-    End If
-
-    Note: Check if right operand is constant 0 or 1
+    Note: Right-operand constant identities
     Let right_is_const be proc is_constant_value with context_ptr, right_operand
     If right_is_const is equal to 1:
         Let right_val be proc get_constant_value with context_ptr, right_operand
 
-        Note: X + 0 → X
-        If opcode is equal to 20002 and right_val is equal to 0:  Note: ADD
-            Note: Replace with copy of left operand
-            Return 1
+        If right_val is equal to 0:
+            Note: X + 0 → X, X - 0 → X, X or 0 → X, X xor 0 → X
+            If opcode is equal to 20002 or opcode is equal to 20003 or opcode is equal to 20011 or opcode is equal to 20012:
+                Return proc replace_instruction_with_copy with context_ptr, block, instructions, index, inst, left_operand
+            End If
+
+            Note: X shl 0 → X, X shr 0 → X, X sar 0 → X
+            If opcode is greater than or equal to 20014 and opcode is less than or equal to 20016:
+                Return proc replace_instruction_with_copy with context_ptr, block, instructions, index, inst, left_operand
+            End If
+
+            Note: X * 0 → 0, X and 0 → 0
+            If opcode is equal to 20004 or opcode is equal to 20010:
+                Return proc replace_instruction_with_const with context_ptr, block, instructions, index, inst, 0
+            End If
         End If
 
-        Note: X - 0 → X
-        If opcode is equal to 20003 and right_val is equal to 0:  Note: SUB
-            Return 1
+        If right_val is equal to 1:
+            Note: X * 1 → X, X / 1 → X
+            If opcode is equal to 20004 or opcode is equal to 20005:
+                Return proc replace_instruction_with_copy with context_ptr, block, instructions, index, inst, left_operand
+            End If
+
+            Note: X % 1 → 0
+            If opcode is equal to 20006:
+                Return proc replace_instruction_with_const with context_ptr, block, instructions, index, inst, 0
+            End If
         End If
 
-        Note: X * 0 → 0
-        If opcode is equal to 20004 and right_val is equal to 0:  Note: MUL
-            Set result_id to proc memory_get_int64 from Layout with inst, 8
-            Set const_inst to proc create_mir_const from MIRNodes with result_id, 0, 0, 0, 0
-            Return 1
-        End If
+        If right_val is equal to 0 minus 1:
+            Note: X and -1 → X
+            If opcode is equal to 20010:
+                Return proc replace_instruction_with_copy with context_ptr, block, instructions, index, inst, left_operand
+            End If
 
-        Note: X * 1 → X
-        If opcode is equal to 20004 and right_val is equal to 1:  Note: MUL
-            Return 1
-        End If
-
-        Note: X / 1 → X
-        If opcode is equal to 20005 and right_val is equal to 1:  Note: DIV
-            Return 1
-        End If
-
-        Note: X bitwise and 0 → 0
-        If opcode is equal to 20010 and right_val is equal to 0:  Note: AND
-            Set result_id to proc memory_get_int64 from Layout with inst, 8
-            Set const_inst to proc create_mir_const from MIRNodes with result_id, 0, 0, 0, 0
-            Return 1
-        End If
-
-        Note: X bitwise or 0 → X
-        If opcode is equal to 20011 and right_val is equal to 0:  Note: OR
-            Return 1
-        End If
-
-        Note: X bitwise xor 0 → X
-        If opcode is equal to 20012 and right_val is equal to 0:  Note: XOR
-            Return 1
+            Note: X or -1 → -1
+            If opcode is equal to 20011:
+                Return proc replace_instruction_with_const with context_ptr, block, instructions, index, inst, 0 minus 1
+            End If
         End If
     End If
 
-    Note: Check if left operand is constant 0 (commutative operations)
+    Note: Left-operand constant identities (commutative partners plus
+    Note: the zero-dominant shift patterns)
     Let left_is_const be proc is_constant_value with context_ptr, left_operand
     If left_is_const is equal to 1:
         Let left_val be proc get_constant_value with context_ptr, left_operand
 
-        Note: 0 + X → X
-        If opcode is equal to 20002 and left_val is equal to 0:  Note: ADD
-            Return 1
+        If left_val is equal to 0:
+            Note: 0 + X → X, 0 or X → X, 0 xor X → X
+            If opcode is equal to 20002 or opcode is equal to 20011 or opcode is equal to 20012:
+                Return proc replace_instruction_with_copy with context_ptr, block, instructions, index, inst, right_operand
+            End If
+
+            Note: 0 * X → 0, 0 and X → 0
+            If opcode is equal to 20004 or opcode is equal to 20010:
+                Return proc replace_instruction_with_const with context_ptr, block, instructions, index, inst, 0
+            End If
+
+            Note: 0 shl X → 0, 0 shr X → 0, 0 sar X → 0 (a zero value
+            Note: shifted by any count is zero)
+            If opcode is greater than or equal to 20014 and opcode is less than or equal to 20016:
+                Return proc replace_instruction_with_const with context_ptr, block, instructions, index, inst, 0
+            End If
         End If
 
-        Note: 0 * X → 0
-        If opcode is equal to 20004 and left_val is equal to 0:  Note: MUL
-            Set result_id to proc memory_get_int64 from Layout with inst, 8
-            Set const_inst to proc create_mir_const from MIRNodes with result_id, 0, 0, 0, 0
-            Return 1
+        If left_val is equal to 1:
+            Note: 1 * X → X
+            If opcode is equal to 20004:
+                Return proc replace_instruction_with_copy with context_ptr, block, instructions, index, inst, right_operand
+            End If
         End If
 
-        Note: 0 bitwise and X → 0
-        If opcode is equal to 20010 and left_val is equal to 0:  Note: AND
-            Set result_id to proc memory_get_int64 from Layout with inst, 8
-            Set const_inst to proc create_mir_const from MIRNodes with result_id, 0, 0, 0, 0
-            Return 1
-        End If
+        If left_val is equal to 0 minus 1:
+            Note: -1 and X → X
+            If opcode is equal to 20010:
+                Return proc replace_instruction_with_copy with context_ptr, block, instructions, index, inst, right_operand
+            End If
 
-        Note: 0 bitwise or X → X
-        If opcode is equal to 20011 and left_val is equal to 0:  Note: OR
-            Return 1
-        End If
-
-        Note: 0 bitwise xor X → X
-        If opcode is equal to 20012 and left_val is equal to 0:  Note: XOR
-            Return 1
+            Note: -1 or X → -1
+            If opcode is equal to 20011:
+                Return proc replace_instruction_with_const with context_ptr, block, instructions, index, inst, 0 minus 1
+            End If
         End If
     End If
 
@@ -1313,10 +1467,18 @@ Process called "optimize_strength_reduction" that takes context_ptr as Integer r
     This is the inline simple version retained for fast Tier-1 runs; the
     comprehensive version lives in strength_reduction.runa and is invoked through
     optimize_strength_reduction_advanced in Tier 2. Walks the CFG in RPO and for
-    each MUL/DIV/MOD instruction (opcodes 20004, 20005, 20006) delegates to
-    try_strength_reduce which performs the power-of-two check and shift/AND rewrite.
-    The advanced version adds loop-induction-variable strength reduction which is
-    out of scope here.
+    each integer MUL (opcode 20004) delegates to try_strength_reduce, which
+    materializes the shift amount as a fresh CONST value id inserted before the
+    instruction (operand slots hold SSA uses only, never immediates) and rewrites
+    the MUL into a SHL referencing it. A return of 1 from try_strength_reduce
+    means one instruction was inserted before the reduced one, so the loop
+    advances the index by an extra slot and re-reads the list length.
+
+    DIV and MOD by powers of two are deliberately NOT reduced here: for signed
+    64-bit values, x / 2^n is not x sar n and x % 2^n is not x and (2^n - 1)
+    when x is negative (shift rounds toward negative infinity, division
+    truncates toward zero); the sound rewrite requires the sign-bias fixup
+    sequence, which is the advanced pass's induction-variable territory.
     @End Implementation
 
     @Performance_Hints
@@ -1354,12 +1516,16 @@ Process called "optimize_strength_reduction" that takes context_ptr as Integer r
             Let inst be proc get from List with instructions, j
             Let opcode be proc get_mir_node_opcode from MIR with inst
 
-            Note: Try strength reduction on MUL, DIV, MOD
-            If opcode is equal to 20004 or opcode is equal to 20005 or opcode is equal to 20006:
-                Let result be proc try_strength_reduce with context_ptr, inst, opcode
+            Note: Try strength reduction on integer MUL by a power of two
+            If opcode is equal to 20004:
+                Let result be proc try_strength_reduce with context_ptr, block, instructions, j, inst
                 If result is equal to 1:
                     Set reduced_count to reduced_count plus 1
                     proc mark_changed with context_ptr
+                    Note: A CONST was inserted before the reduced
+                    Note: instruction: skip past both and re-read length
+                    Set j to j plus 1
+                    Set inst_count to proc length from List with instructions
                 End If
             End If
 
@@ -1373,31 +1539,61 @@ Process called "optimize_strength_reduction" that takes context_ptr as Integer r
     Let current_count be proc memory_get_int64 from Layout with context_ptr, 48
     proc memory_set_int64 from Layout with context_ptr, 48, current_count plus reduced_count
 
-    Display "optimize_strength_reduction: reduced " joined with reduced_count joined with " operations"
+    Let reduced_str be proc integer_to_string from StringUtils with reduced_count
+    Display "optimize_strength_reduction: reduced " joined with reduced_str joined with " operations"
     Return reduced_count
 End Process
 
-Process called "try_strength_reduce" that takes context_ptr as Integer, inst as Integer, opcode as Integer returns Integer:
+Process called "try_strength_reduce" that takes context_ptr as Integer, block as Integer, instructions as Integer, index as Integer, inst as Integer returns Integer:
     @Reasoning
-    Attempts to reduce operation strength.
+    Attempts to reduce an integer multiplication by a power of two into a
+    left shift (X * 2^n -> X shl n).
 
-    Returns 1 if reduced, 0 otherwise.
+    Returns 1 if reduced (one CONST was inserted before the instruction),
+    0 otherwise.
     @End Reasoning
 
     @Implementation
-    Reads the right operand and requires it to be a constant power-of-two; otherwise
-    bails. Computes the log-base-2 once via calculate_log2 and dispatches: MUL
-    becomes MIR_SHL with the log as the shift amount, DIV becomes MIR_SHR, MOD
-    becomes MIR_AND with mask = right_val - 1. All three rewrites preserve the
-    result_id and left operand so SSA form is intact; only the opcode and right
-    operand mutate in place.
+    Requires a function context (OptimizerContext offset 8) because the shift
+    amount must be materialized as a fresh CONST with its own SSA value id from
+    MIR.allocate_value_id — under the canonical contract operand slots hold SSA
+    value-id USES, never immediates. Excludes float multiplication (the shift
+    rewrite is invalid for floats; HIRTypeInfo kind tag TYPE_FLOAT = 13016 at
+    type_info offset 0). Requires the right operand to be a constant power of
+    two with exponent in [1, 63]. The fresh CONST is inserted before the
+    instruction in the block list (instruction_count resynced), registered via
+    register_value_definition, and the MUL is then rewritten to MIR_SHL (20014)
+    with operand 2 repointed at the new id through set_mir_node_used_value,
+    which keeps the header slot 24 and the binop extended right slot 88
+    coherent. MUL -> SHL is sound for all signed 64-bit inputs because both
+    compute the product modulo 2^64.
+
+    Signed DIV and MOD by powers of two are NOT reduced here: the shift/mask
+    forms mis-evaluate negative dividends and the sound bias-fixup expansion
+    belongs to the advanced pass in strength_reduction.runa.
     @End Implementation
 
     If inst is equal to 0:
         Return 0
     End If
 
-    Let right_operand be proc memory_get_int64 from Layout with inst, 24
+    Note: The shift amount needs a fresh SSA value id, which requires the
+    Note: function's id allocator
+    Let function be proc memory_get_int64 from Layout with context_ptr, 8
+    If function is equal to 0:
+        Return 0
+    End If
+
+    Note: Exclude float multiplication (shift rewrite invalid for floats)
+    Let mul_type be proc get_mir_node_type from MIR with inst
+    If mul_type is not equal to 0:
+        Let mul_type_kind be proc memory_get_int64 from Layout with mul_type, 0
+        If mul_type_kind is equal to 13016:
+            Return 0
+        End If
+    End If
+
+    Let right_operand be proc get_mir_node_operand from MIR with inst, 2
     Let right_is_const be proc is_constant_value with context_ptr, right_operand
 
     If right_is_const is equal to 0:
@@ -1406,73 +1602,43 @@ Process called "try_strength_reduce" that takes context_ptr as Integer, inst as 
 
     Let right_val be proc get_constant_value with context_ptr, right_operand
 
-    Note: Check if right_val is power of 2
+    Note: Require a power of two with exponent at least 1 (X * 1 belongs
+    Note: to algebraic simplification, not strength reduction)
     Let is_power_of_2 be proc check_power_of_two with right_val
     If is_power_of_2 is equal to 0:
         Return 0
     End If
+    If right_val is less than 2:
+        Return 0
+    End If
 
     Let shift_amount be proc calculate_log2 with right_val
-
-    Note: X * 2^n → X shifted left by n
-    If opcode is equal to 20004:  Note: MUL
-        Note: Replace MUL with SHL instruction
-        Let result_id be proc memory_get_int64 from Layout with inst, 8
-        Let left_operand be proc memory_get_int64 from Layout with inst, 16
-
-        Note: Transform MUL into SHL (shift left) instruction in-place
-        Note: Change opcode to MIR_SHL (20008)
-        proc memory_set_int64 from Layout with inst, 0, 20008
-
-        Note: Keep result_id at offset 8 (unchanged)
-        Note: Keep left_operand at offset 16 (unchanged)
-        Note: Replace right_operand (power of 2) with shift amount at offset 24
-        proc memory_set_int64 from Layout with inst, 24, shift_amount
-
-        Note: Successfully reduced MUL to SHL
-        Return 1
+    If shift_amount is greater than 63:
+        Return 0
     End If
 
-    Note: X / 2^n → X shifted right by n
-    If opcode is equal to 20005:  Note: DIV
-        Note: Replace DIV with SHR instruction
-        Set result_id to proc memory_get_int64 from Layout with inst, 8
-        Set left_operand to proc memory_get_int64 from Layout with inst, 16
-
-        Note: Transform DIV into SHR (shift right) instruction in-place
-        Note: Change opcode to MIR_SHR (20009)
-        proc memory_set_int64 from Layout with inst, 0, 20009
-
-        Note: Keep result_id at offset 8 (unchanged)
-        Note: Keep left_operand at offset 16 (unchanged)
-        Note: Replace right_operand (power of 2) with shift amount at offset 24
-        proc memory_set_int64 from Layout with inst, 24, shift_amount
-
-        Note: Successfully reduced DIV to SHR
-        Return 1
+    Note: Materialize the shift amount as a fresh CONST with its own SSA
+    Note: value id, inserted before the instruction being reduced
+    Let shift_id be proc allocate_value_id from MIR with function
+    Let shift_const be proc create_mir_const from MIRNodes with shift_id, shift_amount, mul_type, 0, 0
+    If shift_const is equal to 0:
+        Return 0
     End If
 
-    Note: X % 2^n → X bitwise and (2^n - 1)
-    If opcode is equal to 20006:  Note: MOD
-        Note: Replace MOD with AND instruction
-        Set result_id to proc memory_get_int64 from Layout with inst, 8
-        Set left_operand to proc memory_get_int64 from Layout with inst, 16
-        Let mask be right_val minus 1
+    proc set_mir_node_parent_block from MIR with shift_const, block
+    proc insert from List with instructions, index, shift_const
+    proc register_value_definition from MIR with function, shift_id, shift_const
 
-        Note: Transform MOD into AND instruction in-place
-        Note: Change opcode to MIR_AND (20010)
-        proc memory_set_int64 from Layout with inst, 0, 20010
+    Note: Re-sync the block's cached instruction count after the insert
+    Let new_inst_total be proc length from List with instructions
+    proc memory_set_int64 from Layout with block, 24, new_inst_total
 
-        Note: Keep result_id at offset 8 (unchanged)
-        Note: Keep left_operand at offset 16 (unchanged)
-        Note: Replace right_operand with mask value at offset 24
-        proc memory_set_int64 from Layout with inst, 24, mask
+    Note: Rewrite MUL -> SHL referencing the new const (opcode first so
+    Note: set_mir_node_used_value mirrors into the binop ext right slot)
+    proc set_mir_node_opcode from MIR with inst, 20014
+    proc set_mir_node_used_value from MIRNodes with inst, 2, shift_id
 
-        Note: Successfully reduced MOD to AND
-        Return 1
-    End If
-
-    Return 0
+    Return 1
 End Process
 
 Process called "check_power_of_two" that takes value as Integer returns Integer:
@@ -1506,7 +1672,7 @@ Process called "check_power_of_two" that takes value as Integer returns Integer:
 
     Note: Check if value bitwise and (value - 1) is equal to 0
     Let value_minus_1 be value minus 1
-    Let result be value AND value_minus_1
+    Let result be value bitwise and value_minus_1
 
     If result is equal to 0:
         Return 1
@@ -1601,12 +1767,18 @@ Process called "optimize_common_subexpression_elimination" that takes context_pt
     @Implementation
     Local CSE pass used inside this orchestrator file. Cross-block and value-based
     CSE is handled by the external cse.runa pass wired through optimize_cse_advanced.
-    Walks each block in RPO order; for each pure instruction (is_pure_operation
-    returns 1) computes a value number via compute_value_number against the
-    OptimizerContext's persistent value_map at offset 80. If the value number is
-    already mapped to a result_id (lookup_value_number hits) the instruction is
-    rewritten to reuse the prior result; otherwise the new (value_number,
-    result_id) pair is added via add_value_number.
+    Computes a pass-local dominator tree, clears the OptimizerContext's value map
+    (offset 80, deallocating stale 32-byte entries from prior runs), then walks
+    each block in RPO order. For each pure instruction with a result id, computes
+    a value number via compute_value_number and probes the map through
+    cse_find_equivalent, which requires BOTH structural operand equality against
+    the recorded defining instruction (a hash hit alone is a collision hazard)
+    AND that the recorded definition's block dominates the current block (RPO
+    order alone does not imply dominance, and a non-dominating replacement breaks
+    SSA). On a verified hit every use of the duplicate's result id is rewritten
+    to the surviving id by replace_uses_in_cfg; the dead duplicate is left for
+    DCE. On a miss the (value_number, result_id, inst, block_id) record is added
+    via add_value_number. The dominance info is destroyed before returning.
     @End Implementation
 
     If context_ptr is equal to 0:
@@ -1618,8 +1790,28 @@ Process called "optimize_common_subexpression_elimination" that takes context_pt
     Let cfg be proc memory_get_int64 from Layout with context_ptr, 0
     Let eliminated_count be 0
 
-    Note: Get value number map from context
+    Note: Get value number map from context and clear stale entries from
+    Note: prior runs (each entry is an owned 32-byte allocation)
     Let value_map be proc memory_get_int64 from Layout with context_ptr, 80
+    If value_map is equal to 0:
+        Return 0
+    End If
+    Let stale_count be proc length from List with value_map
+    While stale_count is greater than 0:
+        Let stale_entry be proc get from List with value_map, stale_count minus 1
+        If stale_entry is not equal to 0:
+            proc deallocate from Layout with stale_entry
+        End If
+        proc remove_last from List with value_map
+        Set stale_count to stale_count minus 1
+    End While
+
+    Note: Pass-local dominance (the context cache at offset 16 may be stale
+    Note: after earlier CFG-mutating passes in the same iteration)
+    Let dom_info be proc compute_dominance_tree from Dominance with cfg
+    If dom_info is equal to 0:
+        Return 0
+    End If
 
     Note: Get RPO traversal order
     Note: Canonical RPO lives in cfg.runa keyed on the CFG pointer (the
@@ -1639,24 +1831,25 @@ Process called "optimize_common_subexpression_elimination" that takes context_pt
             Let inst be proc get from List with instructions, j
             Let opcode be proc get_mir_node_opcode from MIR with inst
 
-            Note: Only CSE pure operations (no side effects)
+            Note: Only CSE pure value-producing operations
             Let is_pure be proc is_pure_operation with opcode
-            If is_pure is equal to 1:
+            Let result_id be proc get_mir_node_value_id from MIR with inst
+            If is_pure is equal to 1 and result_id is not equal to 0:
                 Note: Compute value number for this expression
-                Let value_number be proc compute_value_number with inst, opcode, value_map
+                Let value_number be proc compute_value_number with inst, opcode
 
-                Note: Check if this value number exists
-                Let existing_result be proc lookup_value_number with value_map, value_number
-                If existing_result is not equal to 0:
-                    Note: Found common subexpression
-                    Let result_id be proc memory_get_int64 from Layout with inst, 8
-                    Note: Replace all uses of result_id with existing_result
+                Note: Probe for a structurally-equal dominating definition
+                Let existing_result be proc cse_find_equivalent with value_map, value_number, inst, opcode, block_id, dom_info
+                If existing_result is not equal to 0 and existing_result is not equal to result_id:
+                    Note: Found common subexpression: rewrite every use of
+                    Note: the duplicate's result to the surviving value and
+                    Note: leave the dead duplicate for DCE
+                    proc replace_uses_in_cfg with cfg, result_id, existing_result
                     Set eliminated_count to eliminated_count plus 1
                     proc mark_changed with context_ptr
                 Otherwise:
                     Note: Add to value number map
-                    Set result_id to proc memory_get_int64 from Layout with inst, 8
-                    proc add_value_number with value_map, value_number, result_id
+                    proc add_value_number with value_map, value_number, result_id, inst, block_id
                 End If
             End If
 
@@ -1666,12 +1859,127 @@ Process called "optimize_common_subexpression_elimination" that takes context_pt
         Set i to i plus 1
     End While
 
+    proc destroy_dominance_info from Dominance with dom_info
+
     Note: Update counter
     Let current_count be proc memory_get_int64 from Layout with context_ptr, 48
     proc memory_set_int64 from Layout with context_ptr, 48, current_count plus eliminated_count
 
-    Display "optimize_common_subexpression_elimination: eliminated " joined with eliminated_count joined with " expressions"
+    Let eliminated_str be proc integer_to_string from StringUtils with eliminated_count
+    Display "optimize_common_subexpression_elimination: eliminated " joined with eliminated_str joined with " expressions"
     Return eliminated_count
+End Process
+
+Process called "replace_uses_in_cfg" that takes cfg as Integer, old_id as Integer, new_id as Integer returns Integer:
+    @Reasoning
+    Explicit use-rewriting walk. MIR.replace_all_uses requires MIRValue
+    use-lists that the lowering pipeline never materializes (Wave 4 finding),
+    so passes that substitute one SSA value for another must walk the CFG and
+    rewrite each use site directly — the same approach inlining.runa and
+    ssa.runa take with their file-local walkers.
+    @End Reasoning
+
+    @Implementation
+    For every instruction in every block: phi nodes get their incoming values
+    rewritten through MIRNodes.set_phi_incoming_value; call/call-indirect/invoke
+    argument Lists are rewritten element-wise (the canonical accessors expose
+    the List, whose slots are plain value ids); all other operand slots are
+    rewritten through MIRNodes.set_mir_node_used_value, which keeps the header
+    slot and the per-record extended mirror coherent. Returns the number of
+    rewritten use sites.
+    @End Implementation
+
+    If cfg is equal to 0 or old_id is equal to 0:
+        Return 0
+    End If
+
+    Let rewritten be 0
+    Let blocks_list be proc get_mir_cfg_blocks from CFG with cfg
+    Let block_count be proc get_cfg_block_count from CFG with cfg
+    Let i be 0
+    While i is less than block_count:
+        Let block be proc get from List with blocks_list, i
+        If block is not equal to 0:
+            Let instructions be proc get_block_instructions from MIR with block
+            Let inst_count be proc length from List with instructions
+            Let j be 0
+            While j is less than inst_count:
+                Let inst be proc get from List with instructions, j
+                If inst is not equal to 0:
+                    Let opcode be proc get_mir_node_opcode from MIR with inst
+
+                    If opcode is equal to 20300:  Note: PHI incoming values
+                        Let incoming_count be proc get_phi_incoming_count from MIRNodes with inst
+                        Let k be 0
+                        While k is less than incoming_count:
+                            Let incoming_value be proc get_phi_incoming_value from MIRNodes with inst, k
+                            If incoming_value is equal to old_id:
+                                proc set_phi_incoming_value from MIRNodes with inst, k, new_id
+                                Set rewritten to rewritten plus 1
+                            End If
+                            Set k to k plus 1
+                        End While
+                    Otherwise:
+                        Note: Argument Lists of call-family records
+                        Let arg_list be 0
+                        If opcode is equal to 20304 or opcode is equal to 20305:
+                            Set arg_list to proc get_call_arguments from MIRNodes with inst
+                        End If
+                        If opcode is equal to 20700:
+                            Set arg_list to proc get_invoke_arguments from MIRNodes with inst
+                        End If
+                        If arg_list is not equal to 0:
+                            Let arg_count be proc length from List with arg_list
+                            Let a be 0
+                            While a is less than arg_count:
+                                Let arg_value be proc get from List with arg_list, a
+                                If arg_value is equal to old_id:
+                                    proc set from List with arg_list, a, new_id
+                                    Set rewritten to rewritten plus 1
+                                End If
+                                Set a to a plus 1
+                            End While
+                        End If
+
+                        Note: Header operand slots (extended mirrors handled
+                        Note: by set_mir_node_used_value)
+                        Let slot be 1
+                        While slot is less than 4:
+                            Let operand_value be proc get_mir_node_operand from MIR with inst, slot
+                            If operand_value is equal to old_id:
+                                proc set_mir_node_used_value from MIRNodes with inst, slot, new_id
+                                Set rewritten to rewritten plus 1
+                            End If
+                            Set slot to slot plus 1
+                        End While
+
+                        Note: Extended slots set_mir_node_used_value does not
+                        Note: mirror: the indirect-call callee value (ext 80)
+                        Note: and the atomic compare-exchange expected value
+                        Note: (ext 96), per the Part 1.1 as-built table
+                        If opcode is equal to 20305:
+                            Let indirect_callee be proc get_call_callee from MIRNodes with inst
+                            If indirect_callee is equal to old_id:
+                                proc memory_set_int64 from Layout with inst, 80, new_id
+                                Set rewritten to rewritten plus 1
+                            End If
+                        End If
+                        If opcode is greater than or equal to 20500 and opcode is less than or equal to 20510:
+                            Let expected_value be proc get_atomic_expected from MIRNodes with inst
+                            If expected_value is equal to old_id:
+                                proc memory_set_int64 from Layout with inst, 96, new_id
+                                Set rewritten to rewritten plus 1
+                            End If
+                        End If
+                    End If
+                End If
+                Set j to j plus 1
+            End While
+        End If
+        Set i to i plus 1
+    End While
+
+    Return rewritten
 End Process
 
 Process called "is_pure_operation" that takes opcode as Integer returns Integer:
@@ -1695,19 +2003,23 @@ Process called "is_pure_operation" that takes opcode as Integer returns Integer:
     @End Reasoning
 
     @Implementation
-    Range-tests the opcode against four pure-instruction bands: arithmetic 20002-
-    20007 (ADD through NEG), bitwise 20008-20013 (SHL through NOT), comparisons
-    20100-20105, and constant 20001. Anything outside those bands (load, store,
-    call, branch, phi, return) is treated as impure and excluded from CSE.
+    Range-tests the opcode against the canonical pure-instruction bands:
+    arithmetic plus copy 20002-20008 (ADD through MIR_COPY), bitwise and
+    shifts 20010-20016 (AND through SAR, including NOT at 20013), comparisons
+    20100-20105, and constant 20001. DIV and MOD are included: duplicating
+    elimination of an identical divide preserves trap behavior because the
+    surviving instruction has the same operands. Anything outside these bands
+    (load, store, call, branch, phi, return, atomics) is treated as impure
+    and excluded from CSE.
     @End Implementation
 
-    Note: Arithmetic operations (20002-20007)
-    If opcode is greater than or equal to 20002 and opcode is less than or equal to 20007:
+    Note: Arithmetic operations plus SSA copy (20002-20008)
+    If opcode is greater than or equal to 20002 and opcode is less than or equal to 20008:
         Return 1
     End If
 
-    Note: Bitwise operations (20008-20013)
-    If opcode is greater than or equal to 20008 and opcode is less than or equal to 20013:
+    Note: Bitwise and shift operations (20010-20016)
+    If opcode is greater than or equal to 20010 and opcode is less than or equal to 20016:
         Return 1
     End If
 
@@ -1725,7 +2037,28 @@ Process called "is_pure_operation" that takes opcode as Integer returns Integer:
     Return 0
 End Process
 
-Process called "compute_value_number" that takes inst as Integer, opcode as Integer, value_map as Integer returns Integer:
+Process called "is_commutative_opcode" that takes opcode as Integer returns Integer:
+    @Reasoning
+    Shared commutativity classifier for value numbering and structural
+    equivalence checks: ADD, MUL, AND, OR, XOR commute; SUB, DIV, MOD,
+    shifts, and all comparisons do not (LT and GT are inverses, not equals).
+    @End Reasoning
+
+    @Implementation
+    Direct opcode membership test against the five commutative binary
+    opcodes 20002, 20004, 20010, 20011, 20012.
+    @End Implementation
+
+    If opcode is equal to 20002 or opcode is equal to 20004:
+        Return 1
+    End If
+    If opcode is equal to 20010 or opcode is equal to 20011 or opcode is equal to 20012:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Process called "compute_value_number" that takes inst as Integer, opcode as Integer returns Integer:
     @Reasoning
     Computes a value number for an instruction.
 
@@ -1734,17 +2067,22 @@ Process called "compute_value_number" that takes inst as Integer, opcode as Inte
     - For commutative operations (ADD, MUL, AND, OR, XOR):
       - Sort operands to ensure same hash for "a + b" and "b + a"
 
+    The hash is a FILTER, not an equality proof: cse_find_equivalent performs
+    the structural comparison on every hash hit, so collisions cost time but
+    never correctness.
+
     Returns value number (hash).
     @End Reasoning
 
     @Implementation
-    Builds a deterministic hash from the opcode and operand value-ids. The 31/17/13
-    multipliers are prime and chosen to distribute hash values across the
-    value_map index space. For commutative opcodes (ADD, MUL, AND, OR, XOR) the
-    operands are canonicalized by sorting so that "a op b" and "b op a" hash to the
-    same value. Comparison ops are intentionally not commuted because LT and GT
-    have inverse semantics. Unary ops and constants use a single-operand hash; all
-    others fall through producing only the opcode-scaled hash.
+    Builds a deterministic hash from the opcode and operand value-ids read
+    through the canonical slot accessor. The 31/17/13 multipliers are prime and
+    chosen to distribute hash values. For commutative opcodes (per
+    is_commutative_opcode) the operands are canonicalized by sorting so that
+    "a op b" and "b op a" hash to the same value. Comparison ops are
+    intentionally not commuted because LT and GT have inverse semantics. Unary
+    ops (NEG, NOT) and MIR_COPY use a single-operand hash; constants hash their
+    payload read through MIRNodes.get_const_value (extended region offset 80).
     @End Implementation
 
     If inst is equal to 0:
@@ -1753,21 +2091,25 @@ Process called "compute_value_number" that takes inst as Integer, opcode as Inte
 
     Let hash be opcode multiplied by 31
 
-    Note: Binary operations
-    If opcode is greater than or equal to 20002 and opcode is less than or equal to 20012:
-        Let left_operand be proc memory_get_int64 from Layout with inst, 16
-        Let right_operand be proc memory_get_int64 from Layout with inst, 24
+    Note: Binary operations (arithmetic 20002-20006, bitwise 20010-20012,
+    Note: shifts 20014-20016)
+    Let is_binary be 0
+    If opcode is greater than or equal to 20002 and opcode is less than or equal to 20006:
+        Set is_binary to 1
+    End If
+    If opcode is greater than or equal to 20010 and opcode is less than or equal to 20012:
+        Set is_binary to 1
+    End If
+    If opcode is greater than or equal to 20014 and opcode is less than or equal to 20016:
+        Set is_binary to 1
+    End If
 
-        Note: Check if operation is commutative
-        Let is_commutative be 0
-        If opcode is equal to 20002 or opcode is equal to 20004:  Note: ADD, MUL
-            Set is_commutative to 1
-        End If
-        If opcode is equal to 20010 or opcode is equal to 20011 or opcode is equal to 20012:  Note: AND, OR, XOR
-            Set is_commutative to 1
-        End If
+    If is_binary is equal to 1:
+        Let left_operand be proc get_mir_node_operand from MIR with inst, 1
+        Let right_operand be proc get_mir_node_operand from MIR with inst, 2
 
         Note: For commutative operations, order operands
+        Let is_commutative be proc is_commutative_opcode with opcode
         If is_commutative is equal to 1:
             If left_operand is greater than right_operand:
                 Note: Swap for consistent hashing
@@ -1784,43 +2126,54 @@ Process called "compute_value_number" that takes inst as Integer, opcode as Inte
 
     Note: Comparison operations
     If opcode is greater than or equal to 20100 and opcode is less than or equal to 20105:
-        Set left_operand to proc memory_get_int64 from Layout with inst, 16
-        Set right_operand to proc memory_get_int64 from Layout with inst, 24
+        Set left_operand to proc get_mir_node_operand from MIR with inst, 1
+        Set right_operand to proc get_mir_node_operand from MIR with inst, 2
 
         Set hash to hash plus left_operand multiplied by 17
         Set hash to hash plus right_operand multiplied by 13
     End If
 
-    Note: Unary operations
-    If opcode is equal to 20007 or opcode is equal to 20013:  Note: NEG, NOT
-        Let operand be proc memory_get_int64 from Layout with inst, 16
+    Note: Unary operations and SSA copy (single operand)
+    If opcode is equal to 20007 or opcode is equal to 20013 or opcode is equal to 20008:
+        Let operand be proc get_mir_node_operand from MIR with inst, 1
         Set hash to hash plus operand multiplied by 17
     End If
 
-    Note: Constant
+    Note: Constant (payload in the extended region, canonical accessor)
     If opcode is equal to 20001:
-        Let const_value be proc memory_get_int64 from Layout with inst, 16
+        Let const_value be proc get_const_value from MIRNodes with inst
         Set hash to hash plus const_value multiplied by 17
     End If
 
     Return hash
 End Process
 
-Process called "lookup_value_number" that takes value_map as Integer, value_number as Integer returns Integer:
+Process called "cse_find_equivalent" that takes value_map as Integer, value_number as Integer, inst as Integer, opcode as Integer, block_id as Integer, dom_info as Integer returns Integer:
     @Reasoning
-    Looks up a value number in the map.
+    Probes the value-number map for a PROVEN-equivalent prior definition.
+    A hash match alone is unsound (collisions), and an RPO-earlier match
+    alone is unsound (RPO order does not imply dominance, and replacing a
+    use with a non-dominating definition breaks SSA). A hit therefore
+    requires the hash to match, the recorded defining instruction to be
+    structurally identical (same opcode, same operands — order-insensitive
+    for commutative opcodes, payload-compared for constants), and the
+    recorded definition's block to dominate the probing instruction's block.
 
-    Returns result value ID if found, 0 otherwise.
+    Returns the surviving result value id, or 0 when no equivalent exists.
     @End Reasoning
 
     @Implementation
-    Linear scan of the value_map list comparing value-numbers at entry offset 0
-    against the query. Returns the recorded result_id (offset 8) on hit, 0 on miss.
-    Acceptable complexity because value_map entries are bounded by the number of
-    distinct pure-expression hashes seen in the function.
+    Linear scan of the 32-byte map entries (vn at 0, result_id at 8, inst at
+    16, block_id at 24). On a vn match, dispatches the structural comparison
+    by opcode family: constants compare payloads via get_const_value; unary
+    ops and copies compare operand 1; binary ops compare both operands with a
+    swapped-order retry for commutative opcodes; comparisons compare strictly
+    pairwise. Dominance is checked through Dominance.dominates with the
+    pass-local info; the same-block case is covered because entries are added
+    in scan order (the recorded definition textually precedes the probe).
     @End Implementation
 
-    If value_map is equal to 0 or value_number is equal to 0:
+    If value_map is equal to 0 or inst is equal to 0:
         Return 0
     End If
 
@@ -1830,8 +2183,50 @@ Process called "lookup_value_number" that takes value_map as Integer, value_numb
         Let entry be proc get from List with value_map, i
         Let entry_vn be proc memory_get_int64 from Layout with entry, 0
         If entry_vn is equal to value_number:
-            Let result_id be proc memory_get_int64 from Layout with entry, 8
-            Return result_id
+            Let entry_inst be proc memory_get_int64 from Layout with entry, 16
+            Let entry_block_id be proc memory_get_int64 from Layout with entry, 24
+
+            Note: Structural verification against the recorded definition
+            Let structurally_equal be 0
+            Let entry_opcode be proc get_mir_node_opcode from MIR with entry_inst
+            If entry_opcode is equal to opcode:
+                If opcode is equal to 20001:
+                    Let my_payload be proc get_const_value from MIRNodes with inst
+                    Let entry_payload be proc get_const_value from MIRNodes with entry_inst
+                    If my_payload is equal to entry_payload:
+                        Set structurally_equal to 1
+                    End If
+                Otherwise:
+                    Let my_left be proc get_mir_node_operand from MIR with inst, 1
+                    Let my_right be proc get_mir_node_operand from MIR with inst, 2
+                    Let entry_left be proc get_mir_node_operand from MIR with entry_inst, 1
+                    Let entry_right be proc get_mir_node_operand from MIR with entry_inst, 2
+
+                    If my_left is equal to entry_left and my_right is equal to entry_right:
+                        Set structurally_equal to 1
+                    End If
+
+                    Note: Commutative retry with swapped operand order
+                    If structurally_equal is equal to 0:
+                        Let is_commutative be proc is_commutative_opcode with opcode
+                        If is_commutative is equal to 1:
+                            If my_left is equal to entry_right and my_right is equal to entry_left:
+                                Set structurally_equal to 1
+                            End If
+                        End If
+                    End If
+                End If
+            End If
+
+            If structurally_equal is equal to 1:
+                Note: Dominance gate: the surviving definition must dominate
+                Note: this use site
+                Let dominated be proc dominates from Dominance with dom_info, entry_block_id, block_id
+                If dominated is equal to 1:
+                    Let result_id be proc memory_get_int64 from Layout with entry, 8
+                    Return result_id
+                End If
+            End If
         End If
         Set i to i plus 1
     End While
@@ -1839,28 +2234,38 @@ Process called "lookup_value_number" that takes value_map as Integer, value_numb
     Return 0
 End Process
 
-Process called "add_value_number" that takes value_map as Integer, value_number as Integer, result_id as Integer returns Integer:
+Process called "add_value_number" that takes value_map as Integer, value_number as Integer, result_id as Integer, inst as Integer, block_id as Integer returns Integer:
     @Reasoning
-    Adds a value number to the map.
+    Adds a value-number record to the map.
 
     **MAP STRUCTURE:**
-    - List of (value_number, result_id) pairs
-    - Each entry is 16 bytes
+    - List of 32-byte records: value_number at 0, result_id at 8,
+      defining instruction pointer at 16, defining block id at 24
+    - The instruction pointer feeds cse_find_equivalent's structural
+      verification; the block id feeds its dominance gate
     @End Reasoning
 
     @Implementation
-    Allocates a 16-byte (value_number, result_id) record and appends to the
-    value_map list. Called only after lookup_value_number has returned 0,
+    Allocates a 32-byte record, fills all four fields, and appends to the
+    value_map list. Called only after cse_find_equivalent returned 0,
     establishing a new equivalence class for the freshly-computed expression.
+    Entries are owned by the map and deallocated when the CSE pass clears it
+    at the start of the next run (and by destroy_optimizer_context's List
+    teardown for the final run's entries via the clearing pass).
     @End Implementation
 
     If value_map is equal to 0:
         Return 0
     End If
 
-    Let entry be proc allocate from Layout with 16
+    Let entry be proc allocate from Layout with 32
+    If entry is equal to 0:
+        Return 0
+    End If
     proc memory_set_int64 from Layout with entry, 0, value_number
     proc memory_set_int64 from Layout with entry, 8, result_id
+    proc memory_set_int64 from Layout with entry, 16, inst
+    proc memory_set_int64 from Layout with entry, 24, block_id
     proc append from List with value_map, entry
 
     Return 1
@@ -2140,18 +2545,22 @@ Process called "optimize_licm" that takes context_ptr as Integer returns Integer
     - Essential for performance on tight loops
 
     **INTERFACE BRIDGE:**
-    Extracts CFG from OptimizerContext and calls external LICM module.
+    Extracts the MIRFunction from OptimizerContext and calls the external
+    LICM module's function-keyed entry point.
 
     Returns 1 if changes made, 0 otherwise.
     @End Reasoning
 
     @Implementation
     Bridges OptimizerContext to the canonical LICM entry point
-    proc run_licm_pass from LICM with cfg. LICM relies on the dominator tree
-    cached at OptimizerContext offset 16 for preheader insertion and exit-block
-    safety analysis, but the LICM pass loads it directly from the CFG so we do
-    not pass the cached pointer through. Re-running this pass after loop
-    unrolling exposes additional invariant motion opportunities.
+    proc run_licm_pass from LICM with the MIRFunction pointer (OptimizerContext
+    offset 8): the Wave 5a contract keys the pass on the FUNCTION because
+    hoisting needs the function's value-id allocator and definition lookups;
+    the CFG is derived internally via MIR.get_mir_function_cfg, and the pass
+    owns its dominance info (recomputed after preheader insertion mutates the
+    topology). When no function context exists (optimize_mir cfg-only entry)
+    the pass is skipped honestly. Re-running this pass after loop unrolling
+    exposes additional invariant motion opportunities.
     @End Implementation
 
     If context_ptr is equal to 0:
@@ -2159,16 +2568,17 @@ Process called "optimize_licm" that takes context_ptr as Integer returns Integer
         Return 0
     End If
 
-    Note: Extract CFG from context
-    Let cfg be proc memory_get_int64 from Layout with context_ptr, 0
-    If cfg is equal to 0:
-        Display "optimize_licm: null CFG in context"
+    Note: Extract the MIRFunction from the context (offset 8): the canonical
+    Note: run_licm_pass contract takes the FUNCTION pointer, never a CFG
+    Let mir_function be proc memory_get_int64 from Layout with context_ptr, 8
+    If mir_function is equal to 0:
+        Display "optimize_licm: no function context, LICM requires the MIRFunction (skipped)"
         Return 0
     End If
 
     Note: Call external LICM implementation
     Display "optimize_licm: invoking Loop-Invariant Code Motion from licm.runa"
-    Let result be proc run_licm_pass from LICM with cfg
+    Let result be proc run_licm_pass from LICM with mir_function
 
     Note: Mark context as changed if LICM made modifications
     If result is equal to 1:
@@ -2355,9 +2765,9 @@ Process called "optimize_tail_call" that takes context_ptr as Integer returns In
     OptimizerContext offset 8, dispatches to the function-level entry
     proc optimize_function_with_tail_call from TailCall with function, which can
     perform tail-recursion-to-loop transformations that require knowledge of the
-    enclosing function header. Otherwise falls back to the canonical pass-level
-    entry proc run_tail_call_pass from TailCall with cfg which marks sibling
-    tail calls without rewriting the function body.
+    enclosing function header. The pass-level entry run_tail_call_pass takes a
+    MIRProgram pointer, NOT a CFG, so when no function context exists the
+    wrapper returns 0 honestly instead of passing a type-confused pointer.
     @End Implementation
 
     If context_ptr is equal to 0:
@@ -2375,16 +2785,15 @@ Process called "optimize_tail_call" that takes context_ptr as Integer returns In
     Note: Extract function pointer from context (needed for tail call analysis)
     Let function be proc memory_get_int64 from Layout with context_ptr, 8
 
-    Note: Call external tail call optimization implementation
-    Display "optimize_tail_call: invoking tail call optimization from tail_call.runa"
-
-    Note: Tail call optimization operates on function level
+    Note: Tail call optimization operates on function level; the canonical
+    Note: entries are keyed on MIRFunction/MIRProgram pointers, never a CFG
     Let result be 0
     If function is not equal to 0:
+        Display "optimize_tail_call: invoking tail call optimization from tail_call.runa"
         Set result to proc optimize_function_with_tail_call from TailCall with function
     Otherwise:
-        Note: If no function context, run pass on entire CFG
-        Set result to proc run_tail_call_pass from TailCall with cfg
+        Display "optimize_tail_call: no function context, tail-call pass requires the MIRFunction (skipped)"
+        Set result to 0
     End If
 
     Note: Mark context as changed if tail call optimization made modifications
@@ -2440,13 +2849,17 @@ Process called "optimize_inlining" that takes context_ptr as Integer returns Int
     @End Reasoning
 
     @Implementation
-    Function-scope inlining wrapper. Dispatches on whether a function pointer is
-    present at OptimizerContext offset 8: function-level uses
-    proc optimize_function_with_inlining from Inlining with function which has
-    visibility into the callee's complete body for cost analysis, while the
-    pass-level fallback proc run_inlining_pass from Inlining with cfg performs
-    a CFG-wide sweep. Inlining is scheduled before LICM and CSE so the inlined
-    code is exposed to subsequent optimization.
+    Function-scope inlining wrapper. The canonical entry
+    proc optimize_function_with_inlining from Inlining takes (function_ptr,
+    program_ptr); the OptimizerContext carries no MIRProgram (MIRFunction has
+    no parent-program back-pointer — the same pipeline limitation documented
+    for PGO callee costing in the reconciliation plan 2.8), so 0 is passed
+    explicitly and callee resolution inside the pass falls back to its
+    pointer-identity forms. The pass-level entry run_inlining_pass takes a
+    MIRProgram pointer, NOT a CFG, so when no function context exists the
+    wrapper returns 0 honestly instead of passing a type-confused pointer.
+    Inlining is scheduled before LICM and CSE so the inlined code is exposed
+    to subsequent optimization.
     @End Implementation
 
     If context_ptr is equal to 0:
@@ -2464,16 +2877,15 @@ Process called "optimize_inlining" that takes context_ptr as Integer returns Int
     Note: Extract function pointer from context (needed for inlining analysis)
     Let function be proc memory_get_int64 from Layout with context_ptr, 8
 
-    Note: Call external inlining optimization implementation
-    Display "optimize_inlining: invoking function inlining from inlining.runa"
-
-    Note: Inlining operates on function level
+    Note: Inlining operates on function level; the canonical entries are
+    Note: keyed on MIRFunction/MIRProgram pointers, never on a bare CFG
     Let result be 0
     If function is not equal to 0:
-        Set result to proc optimize_function_with_inlining from Inlining with function
+        Display "optimize_inlining: invoking function inlining from inlining.runa"
+        Set result to proc optimize_function_with_inlining from Inlining with function, 0
     Otherwise:
-        Note: If no function context, run pass on entire CFG
-        Set result to proc run_inlining_pass from Inlining with cfg
+        Display "optimize_inlining: no function context, inlining requires the MIRFunction (skipped)"
+        Set result to 0
     End If
 
     Note: Mark context as changed if inlining made modifications
@@ -2537,14 +2949,15 @@ Process called "optimize_devirtualization" that takes context_ptr as Integer ret
     @End Reasoning
 
     @Implementation
-    Function-scope devirtualization wrapper. Extracts both cfg (offset 0) and
-    function (offset 8) and dispatches to
+    Function-scope devirtualization wrapper. Dispatches to
     proc optimize_function_with_devirtualization from Devirtualization with function
-    when the function context is available; otherwise falls back to
-    proc run_devirtualization_pass from Devirtualization with cfg. Function-level
-    is preferred because type-propagation confidence analysis benefits from
-    visibility into all call sites at once. Devirtualization runs before inlining
-    so direct-call rewrites become inlining candidates.
+    when the function context (OptimizerContext offset 8) is available.
+    The pass-level entry run_devirtualization_pass takes a MIRProgram pointer,
+    NOT a CFG, so when no function context exists the wrapper returns 0
+    honestly instead of passing a type-confused pointer. Function-level is
+    preferred because type-propagation confidence analysis benefits from
+    visibility into all call sites at once. Devirtualization runs before
+    inlining so direct-call rewrites become inlining candidates.
     @End Implementation
 
     @Security_Scope
@@ -2570,16 +2983,15 @@ Process called "optimize_devirtualization" that takes context_ptr as Integer ret
     Note: Extract function pointer from context (needed for devirtualization analysis)
     Let function be proc memory_get_int64 from Layout with context_ptr, 8
 
-    Note: Call external devirtualization optimization implementation
-    Display "optimize_devirtualization: invoking devirtualization from devirtualization.runa"
-
-    Note: Devirtualization operates on function level
+    Note: Devirtualization operates on function level; the canonical entries
+    Note: are keyed on MIRFunction/MIRProgram pointers, never on a bare CFG
     Let result be 0
     If function is not equal to 0:
+        Display "optimize_devirtualization: invoking devirtualization from devirtualization.runa"
         Set result to proc optimize_function_with_devirtualization from Devirtualization with function
     Otherwise:
-        Note: If no function context, run pass on entire CFG
-        Set result to proc run_devirtualization_pass from Devirtualization with cfg
+        Display "optimize_devirtualization: no function context, devirtualization requires the MIRFunction (skipped)"
+        Set result to 0
     End If
 
     Note: Mark context as changed if devirtualization made modifications
@@ -2743,51 +3155,49 @@ Process called "optimize_branches" that takes context_ptr as Integer returns Int
     @Reasoning
     **BRANCH OPTIMIZATION**
 
-    Optimizes control flow by simplifying branch patterns.
+    Optimizes control flow in two phases over the canonical terminator
+    contract (MIR_BRANCH 20301, MIR_JUMP 20302):
 
-    **OPTIMIZATIONS:**
     ```
-    1. Constant branch folding:
-       if (true) goto L1 else goto L2  → goto L1
-       if (false) goto L1 else goto L2 → goto L2
+    1. Branch simplification (simplify_branch):
+       if (true)  goto T else goto F  → goto T   (dead edge to F removed,
+                                                  F's phi incomings dropped)
+       if (false) goto T else goto F  → goto F   (symmetric)
+       if (c)     goto L else goto L  → goto L   (duplicate edge deduped)
 
-    2. Branch-to-branch elimination:
-       L1: goto L2  → Redirect all branches to L1 to go directly to L2
-
-    3. Empty block elimination:
-       L1: goto L2  → Remove L1, update predecessors
-
-    4. Unreachable code elimination:
-       Code after unconditional branch/return → Delete
-
-    5. Branch inversion:
-       if (!x) goto L1 else goto L2  → if (x) goto L2 else goto L1
-       (can enable further optimizations)
-    ```
-
-    **EXAMPLE:**
-    ```
-    Before:
-      if (x < 10) goto B1 else goto B2
-      B2: goto B3
-      B3: ...
-
-    After:
-      if (x < 10) goto B1 else goto B3
-      (B2 eliminated)
+    2. Jump threading (thread_jump_block):
+       P: ... goto B          P: ... goto C
+       B: goto C         →    (B removed once no predecessor remains)
+       C: ...                 C: ...
     ```
 
     Returns number of branches optimized.
     @End Reasoning
 
     @Implementation
-    Iterates every block in the CFG and inspects only the terminator (last)
-    instruction. Conditional branches (opcode 20042) are dispatched to
-    optimize_conditional_branch which handles constant-condition folding and
-    same-target collapse. Unconditional branches (opcode 20041) dispatch to
-    optimize_unconditional_branch for branch-to-branch and empty-block elimination.
-    The instructions_simplified counter at offset 48 is updated with the total
-    count and mark_changed is invoked so DCE can sweep up newly-unreachable blocks.
+    Phase 1 walks every block and inspects only the terminator (last)
+    instruction; conditional branches (20301) dispatch to simplify_branch,
+    which performs the constant-condition and same-target collapses by
+    REPLACING the branch with a fresh canonical MIRJump record spliced
+    through CFG.remove_instruction_from_block + CFG.add_instruction_to_block
+    (record-size discipline: a 112-byte branch cannot legally be rewritten in
+    place into an 80-byte jump), with remove_cfg_edge dead-edge maintenance
+    and phi-incoming removal in the dropped successor.
+
+    Phase 2 walks the blocks List and dispatches jump-only phi-free blocks
+    to thread_jump_block, which retargets predecessor terminators via
+    CFG.update_terminator_target, moves edges via remove_cfg_edge +
+    MIR.add_cfg_edge, duplicates the routed phi incoming for each new
+    predecessor in the destination, and retires the bypassed block through
+    the canonical remover (which owns full edge/count maintenance including
+    the MIRCFG block_count resync). Because a successful thread can remove
+    the current block from the blocks List, the loop re-reads the list
+    length every iteration and only advances the index when the block at
+    the current slot survived.
+
+    The instructions_simplified counter at offset 48 is updated with the
+    total and mark_changed is invoked so DCE can sweep newly-unreachable
+    blocks on the next fixpoint iteration.
     @End Implementation
 
     If context_ptr is equal to 0:
@@ -2797,36 +3207,32 @@ Process called "optimize_branches" that takes context_ptr as Integer returns Int
     Display "optimize_branches: starting branch optimization pass"
 
     Let cfg be proc memory_get_int64 from Layout with context_ptr, 0
+    If cfg is equal to 0:
+        Return 0
+    End If
     Let optimized_count be 0
 
+    Note: Phase 1: terminator simplification (constant / same-target branches)
     Let blocks_list be proc get_mir_cfg_blocks from CFG with cfg
     Let block_count be proc get_cfg_block_count from CFG with cfg
     Let i be 0
     While i is less than block_count:
         Let block be proc get from List with blocks_list, i
-        Let instructions be proc get_block_instructions from MIR with block
-        Let inst_count be proc length from List with instructions
+        If block is not equal to 0:
+            Let instructions be proc get_block_instructions from MIR with block
+            Let inst_count be proc length from List with instructions
 
-        If inst_count is greater than 0:
-            Note: Check terminator instruction (last in block)
-            Let terminator be proc get from List with instructions, inst_count minus 1
-            Let opcode be proc get_mir_node_opcode from MIR with terminator
+            If inst_count is greater than 0:
+                Note: Check terminator instruction (last in block)
+                Let terminator be proc get from List with instructions, inst_count minus 1
+                Let opcode be proc get_mir_node_opcode from MIR with terminator
 
-            Note: Optimize conditional branch
-            If opcode is equal to 20042:  Note: COND_BR
-                Let result be proc optimize_conditional_branch with context_ptr, block, terminator
-                If result is equal to 1:
-                    Set optimized_count to optimized_count plus 1
-                    proc mark_changed with context_ptr
-                End If
-            End If
-
-            Note: Optimize unconditional branch (branch-to-branch)
-            If opcode is equal to 20041:  Note: BR
-                Set result to proc optimize_unconditional_branch with context_ptr, block, terminator
-                If result is equal to 1:
-                    Set optimized_count to optimized_count plus 1
-                    proc mark_changed with context_ptr
+                If opcode is equal to 20301:  Note: MIR_BRANCH
+                    Let result be proc simplify_branch with context_ptr, cfg, block, instructions, terminator
+                    If result is equal to 1:
+                        Set optimized_count to optimized_count plus 1
+                        proc mark_changed with context_ptr
+                    End If
                 End If
             End If
         End If
@@ -2834,119 +3240,613 @@ Process called "optimize_branches" that takes context_ptr as Integer returns Int
         Set i to i plus 1
     End While
 
+    Note: Phase 2: jump threading (bypass jump-only blocks). A successful
+    Note: thread can remove the current block from the blocks List, so the
+    Note: length is re-read every iteration and the index only advances
+    Note: when the current slot survived. The entry block is never
+    Note: threaded (it has no predecessors to retarget and must remain the
+    Note: CFG anchor); the recorded exit block is preserved so the exit
+    Note: pointer at MIRCFG offset 8 never dangles.
+    Let entry_block be proc get_cfg_entry_block from MIR with cfg
+    Let exit_block be proc memory_get_int64 from Layout with cfg, 8
+    Set i to 0
+    Let live_count be proc length from List with blocks_list
+    While i is less than live_count:
+        Let block be proc get from List with blocks_list, i
+        Let thread_result be 0
+        If block is not equal to 0 and block is not equal to entry_block and block is not equal to exit_block:
+            Set thread_result to proc thread_jump_block with context_ptr, cfg, block
+            If thread_result is greater than 0:
+                Set optimized_count to optimized_count plus 1
+                proc mark_changed with context_ptr
+            End If
+        End If
+        If thread_result is not equal to 2:
+            Set i to i plus 1
+        End If
+        Set live_count to proc length from List with blocks_list
+    End While
+
     Note: Update counter
     Let current_count be proc memory_get_int64 from Layout with context_ptr, 48
     proc memory_set_int64 from Layout with context_ptr, 48, current_count plus optimized_count
 
-    Display "optimize_branches: optimized " joined with optimized_count joined with " branches"
+    Let optimized_str be proc integer_to_string from StringUtils with optimized_count
+    Display "optimize_branches: optimized " joined with optimized_str joined with " branches"
     Return optimized_count
 End Process
 
-Process called "optimize_conditional_branch" that takes context_ptr as Integer, block as Integer, branch_inst as Integer returns Integer:
+Process called "simplify_branch" that takes context_ptr as Integer, cfg as Integer, block as Integer, instructions as Integer, branch_inst as Integer returns Integer:
     @Reasoning
-    Optimizes a conditional branch.
+    Simplifies a conditional branch terminator.
 
     **PATTERNS:**
-    - Constant condition: fold to unconditional branch
-    - Inverted condition: swap targets if beneficial
-    - Same targets: convert to unconditional branch
+    - Same targets: if (c) goto L else goto L → goto L (the condition's
+      value cannot influence control flow)
+    - Constant condition: if (true) goto T else goto F → goto T, with the
+      edge to F removed and F's phi incomings for this block dropped
+      (symmetric for a false constant)
 
-    Returns 1 if optimized, 0 otherwise.
+    Both rewrites leave the condition's defining instruction in place; if
+    the branch was its last use, DCE sweeps it on the next iteration.
+
+    Returns 1 if simplified, 0 otherwise.
     @End Reasoning
 
     @Implementation
-    Reads the condition operand at offset 16. If is_constant_value reports the
-    condition is a compile-time constant, retrieves its value via
-    get_constant_value and rewrites the branch in place: a non-zero constant
-    converts MIR_COND_BR (20042) to MIR_BR (20041) targeting the true branch,
-    a zero constant rewrites to BR targeting the false branch. The dropped
-    successor block is left to DCE/branch-cleanup on the next pass. SSA form is
-    preserved because we only rewrite control flow, not value definitions.
+    Reads the canonical MIRBranch payload through the mir_nodes accessors:
+    condition value id via get_branch_condition (header operand1 at 16
+    mirrored at ext 72), true/false target BLOCK IDS via
+    get_mir_branch_true_block / get_mir_branch_false_block (ext 80/88).
+    Constant discovery resolves the condition's defining instruction via
+    find_defining_instruction (MIR.lookup_defining_instruction fast path,
+    CFG scan fallback) and reads the MIR_CONST payload through
+    get_const_value (ext 80).
+
+    The replacement is a FRESH create_mir_jump record (target block id at
+    ext 72) — record-size discipline forbids morphing the detached 112-byte
+    branch in place into the 80-byte jump shape. The splice detaches the
+    branch via CFG.remove_instruction_from_block (membership-checked List
+    removal, instruction_count resync, parent_block cleared) and appends
+    the jump via CFG.add_instruction_to_block (which stamps parent_block);
+    append is position-correct because the branch was the block's LAST
+    instruction. If jump allocation fails the original branch is restored
+    so the block is never left without a terminator.
+
+    Dead-edge maintenance for the constant fold is CFG.remove_cfg_edge
+    (canonical full remover: both ID lists, both cached counts, the flat
+    edge table) followed by remove_phi_incomings_for_pred on the dead
+    successor (a phi keeping an incoming for a removed edge fails the
+    verifier's membership rule and would lower a move on a dead path). The
+    same-target collapse instead dedupes: while this block appears more
+    than once in its own successor list for the target, one edge instance
+    and one matching phi incoming per surviving phi are removed, restoring
+    the one-edge/one-incoming invariant.
+
+    The detached branch record is deallocated: it produces no SSA value
+    (never registered in value_to_instruction), is no longer a member of
+    any block, and nothing else holds instruction pointers across passes.
     @End Implementation
 
-    If branch_inst is equal to 0:
+    If branch_inst is equal to 0 or block is equal to 0 or instructions is equal to 0:
         Return 0
     End If
 
-    Let condition be proc memory_get_int64 from Layout with branch_inst, 16
-    Let true_target be proc memory_get_int64 from Layout with branch_inst, 24
-    Let false_target be proc memory_get_int64 from Layout with branch_inst, 32
+    Let condition be proc get_branch_condition from MIRNodes with branch_inst
+    Let true_id be proc get_mir_branch_true_block from MIRNodes with branch_inst
+    Let false_id be proc get_mir_branch_false_block from MIRNodes with branch_inst
+    Let block_id be proc get_mir_basic_block_id from CFG with block
 
-    Note: Pattern 1: Same targets (if x goto L else goto L → goto L)
-    If true_target is equal to false_target:
-        Note: Convert to unconditional branch
-        Let new_br be proc create_mir_jump from MIRNodes with true_target
-        Return 1
-    End If
+    Note: Decide the surviving target. dead_id stays -1 for the
+    Note: same-target collapse (0 is the entry block's VALID id, so the
+    Note: absence sentinel must be negative)
+    Let target_id be 0 minus 1
+    Let dead_id be 0 minus 1
 
-    Note: Pattern 2: Constant condition
-    Let is_const be proc is_constant_value with context_ptr, condition
-    If is_const is equal to 1:
+    If true_id is equal to false_id:
+        Set target_id to true_id
+    Otherwise:
+        Let is_const be proc is_constant_value with context_ptr, condition
+        If is_const is equal to 0:
+            Return 0
+        End If
         Let const_val be proc get_constant_value with context_ptr, condition
         If const_val is not equal to 0:
-            Note: Condition is true, branch to true_target
-            Set new_br to proc create_mir_jump from MIRNodes with true_target
-            Return 1
+            Set target_id to true_id
+            Set dead_id to false_id
         Otherwise:
-            Note: Condition is false, branch to false_target
-            Set new_br to proc create_mir_jump from MIRNodes with false_target
-            Return 1
+            Set target_id to false_id
+            Set dead_id to true_id
         End If
     End If
 
-    Return 0
-End Process
-
-Process called "optimize_unconditional_branch" that takes context_ptr as Integer, block as Integer, branch_inst as Integer returns Integer:
-    @Reasoning
-    Optimizes an unconditional branch (branch-to-branch elimination).
-
-    **PATTERN:**
-    ```
-    B1: goto B2
-    B2: goto B3
-    →
-    B1: goto B3  (eliminate intermediate jump)
-    ```
-
-    Returns 1 if optimized, 0 otherwise.
-    @End Reasoning
-
-    @Implementation
-    Reads the branch target from offset 16 and inspects the target block. If the
-    target contains exactly one instruction and that instruction is also a
-    MIR_BR, the current branch is rewritten to skip the intermediate block by
-    overwriting its target with the final destination. The intermediate block
-    becomes unreachable and is removed by subsequent DCE / dead-block passes.
-    @End Implementation
-
-    If branch_inst is equal to 0:
+    Note: Splice: detach the branch, append a fresh canonical jump
+    Let detached be proc remove_instruction_from_block from CFG with block, branch_inst
+    If detached is equal to 0:
         Return 0
     End If
 
-    Let target be proc memory_get_int64 from Layout with branch_inst, 16
-    Let cfg be proc memory_get_int64 from Layout with context_ptr, 0
+    Let new_jump be proc create_mir_jump from MIRNodes with target_id
+    If new_jump is equal to 0:
+        Note: Restore the original terminator; the block must never be
+        Note: left without one
+        proc add_instruction_to_block from CFG with block, branch_inst
+        Return 0
+    End If
+    proc add_instruction_to_block from CFG with block, new_jump
 
-    Note: Get target block
-    Let target_block be proc get_block_by_id_from_cfg from CFG with cfg, target
-    Let target_instructions be proc get_block_instructions from MIR with target_block
-    Let target_inst_count be proc length from List with target_instructions
-
-    Note: Check if target block is just another branch
-    If target_inst_count is equal to 1:
-        Let target_terminator be proc get from List with target_instructions, 0
-        Let target_opcode be proc get_mir_node_opcode from MIR with target_terminator
-
-        Note: If target is also unconditional branch, redirect
-        If target_opcode is equal to 20041:  Note: BR
-            Let final_target be proc memory_get_int64 from Layout with target_terminator, 16
-            Note: Update branch to skip intermediate block
-            proc memory_set_int64 from Layout with branch_inst, 16, final_target
-            Return 1
+    If dead_id is greater than or equal to 0:
+        Note: Constant fold: drop the dead edge and the dead successor's
+        Note: phi incomings for this block (the path no longer exists).
+        Note: Edge first, so the helper's trivial-phi degrade sweep reads
+        Note: the final predecessor count.
+        proc remove_cfg_edge from CFG with cfg, block_id, dead_id
+        proc remove_phi_incomings_for_pred with context_ptr, cfg, dead_id, block_id, 0 minus 1
+    Otherwise:
+        Note: Same-target collapse: the CFG may carry one edge instance
+        Note: per branch arm. Dedupe down to a single edge and a single
+        Note: phi incoming per phi in the target.
+        Let successors be proc get_block_successors from MIR with block
+        If successors is not equal to 0:
+            Let dup be 0
+            Let s_len be proc length from List with successors
+            Let s be 0
+            While s is less than s_len:
+                Let s_id be proc get from List with successors, s
+                If s_id is equal to target_id:
+                    Set dup to dup plus 1
+                End If
+                Set s to s plus 1
+            End While
+            While dup is greater than 1:
+                proc remove_cfg_edge from CFG with cfg, block_id, target_id
+                proc remove_phi_incomings_for_pred with context_ptr, cfg, target_id, block_id, 1
+                Set dup to dup minus 1
+            End While
         End If
     End If
 
-    Return 0
+    Note: The detached branch record is unreferenced (no SSA result, no
+    Note: block membership): release it
+    proc deallocate from Layout with branch_inst
+    Return 1
+End Process
+
+Process called "thread_jump_block" that takes context_ptr as Integer, cfg as Integer, block as Integer returns Integer:
+    @Reasoning
+    Jump threading: a block whose entire body is one unconditional jump
+    contributes nothing but a hop. Every predecessor whose terminator
+    targets it can branch straight to the jump's destination:
+
+    ```
+    P: ... goto B          P: ... goto C
+    B: goto C         →    (B removed once no predecessor remains)
+    C: ...                 C: ...
+    ```
+
+    Threading a predecessor P is UNSAFE when the destination C carries
+    phis and P already has a direct edge to C: the phi would then need
+    two incomings for P (the direct value and the value routed through
+    B) which may differ. Such predecessors are skipped; partial
+    threading is still sound because B simply keeps its remaining
+    predecessors and its jump.
+
+    Returns 0 (nothing done), 1 (some predecessors threaded, block
+    retained), 2 (all predecessors threaded and the block was removed —
+    the caller's block-list index must not advance).
+    @End Reasoning
+
+    @Implementation
+    Guards: the caller excludes the CFG entry and recorded exit blocks;
+    the body must be exactly one instruction with opcode MIR_JUMP (20302);
+    the phi registry at block offset 88 must be empty (a phi-carrying
+    block cannot be bypassed — its phi values depend on which edge was
+    taken; the single-instruction test already excludes phis from the
+    instruction stream); the destination (jump target block id at ext 72,
+    read via get_mir_jump_target_block) must resolve and differ from this
+    block (a self-looping jump block is degenerate and left to
+    unreachable-code cleanup).
+
+    The destination's phi prefix is snapshotted first, capturing the value
+    each phi routes through this block; threading must hand every new
+    predecessor exactly that value. If any destination phi carries no
+    incoming for this block the CFG is inconsistent and the transform is
+    refused.
+
+    For each snapshotted predecessor id (the live predecessor list mutates
+    during rerouting): skip when the duplicate-incoming hazard applies
+    (destination has phis and the predecessor's successor list already
+    names it); otherwise count the LIVE edge instances pred→block (a
+    conditional branch with both arms on this block carries two — and a
+    duplicate snapshot entry finds zero on its second visit, making the
+    walk idempotent), retarget the predecessor's terminator once via
+    CFG.update_terminator_target (rewrites EVERY slot naming this block
+    across branch/jump/switch/invoke shapes), move each edge instance via
+    remove_cfg_edge + MIR.add_cfg_edge, and append one incoming
+    (new predecessor, routed value) to each destination phi via
+    add_phi_incoming.
+
+    When the predecessor list empties, the block's own incomings in the
+    destination's phis are removed and CFG.remove_block_from_cfg retires
+    the block — the canonical remover owns full edge maintenance, the
+    MIRCFG block_count resync, and deallocation of the block and its
+    instructions (the block pointer is dead after that call).
+    @End Implementation
+
+    If block is equal to 0 or cfg is equal to 0:
+        Return 0
+    End If
+
+    Let instructions be proc get_block_instructions from MIR with block
+    If instructions is equal to 0:
+        Return 0
+    End If
+    Let inst_count be proc length from List with instructions
+    If inst_count is not equal to 1:
+        Return 0
+    End If
+
+    Let jump_inst be proc get from List with instructions, 0
+    Let opcode be proc get_mir_node_opcode from MIR with jump_inst
+    If opcode is not equal to 20302:  Note: MIR_JUMP
+        Return 0
+    End If
+
+    Note: A block with phis cannot be bypassed. The phi registry is the
+    Note: MIRBasicBlock phi_nodes List at offset 88 (no canonical accessor
+    Note: exists for this block field; ssa.runa and cfg.runa read it the
+    Note: same way). The instruction stream needs no separate check: the
+    Note: single instruction is the jump.
+    Let phi_registry be proc memory_get_int64 from Layout with block, 88
+    If phi_registry is not equal to 0:
+        Let registry_count be proc length from List with phi_registry
+        If registry_count is greater than 0:
+            Return 0
+        End If
+    End If
+
+    Let block_id be proc get_mir_basic_block_id from CFG with block
+    Let target_id be proc get_mir_jump_target_block from MIRNodes with jump_inst
+    If target_id is equal to block_id:
+        Return 0
+    End If
+    Let target_block be proc get_block_by_id_from_cfg from CFG with cfg, target_id
+    If target_block is equal to 0:
+        Return 0
+    End If
+
+    Note: Snapshot the destination's phi prefix and the value each phi
+    Note: routes through this block
+    Let target_phis be proc create from List
+    Let routed_values be proc create from List
+    Let target_instructions be proc get_block_instructions from MIR with target_block
+    Let target_inst_count be proc length from List with target_instructions
+    Let consistent be 1
+    Let ti be 0
+    Let scanning be 1
+    While ti is less than target_inst_count and scanning is equal to 1:
+        Let t_inst be proc get from List with target_instructions, ti
+        Let t_opcode be proc get_mir_node_opcode from MIR with t_inst
+        If t_opcode is equal to 20300:  Note: MIR_PHI
+            Let incoming_count be proc get_phi_incoming_count from MIRNodes with t_inst
+            Let routed be 0
+            Let found be 0
+            Let k be 0
+            While k is less than incoming_count:
+                Let in_block be proc get_phi_incoming_block from MIRNodes with t_inst, k
+                If in_block is equal to block_id and found is equal to 0:
+                    Set routed to proc get_phi_incoming_value from MIRNodes with t_inst, k
+                    Set found to 1
+                End If
+                Set k to k plus 1
+            End While
+            If found is equal to 0:
+                Note: A destination phi carries no incoming for this
+                Note: block: the CFG is inconsistent here, refuse to
+                Note: transform on top of it
+                Set consistent to 0
+            End If
+            proc append from List with target_phis, t_inst
+            proc append from List with routed_values, routed
+            Set ti to ti plus 1
+        Otherwise:
+            Set scanning to 0
+        End If
+    End While
+
+    Let phi_count be proc length from List with target_phis
+
+    If consistent is equal to 0:
+        proc destroy from List with target_phis
+        proc destroy from List with routed_values
+        Return 0
+    End If
+
+    Note: Snapshot predecessor ids (the live list mutates during rerouting)
+    Let preds be proc get_block_predecessors from MIR with block
+    Let pred_snapshot be proc create from List
+    If preds is not equal to 0:
+        Let pred_count be proc length from List with preds
+        Let p be 0
+        While p is less than pred_count:
+            Let pred_id be proc get from List with preds, p
+            proc append from List with pred_snapshot, pred_id
+            Set p to p plus 1
+        End While
+    End If
+
+    Let threaded be 0
+    Let snapshot_count be proc length from List with pred_snapshot
+    Let p be 0
+    While p is less than snapshot_count:
+        Let pred_id be proc get from List with pred_snapshot, p
+        Let pred_block be proc get_block_by_id_from_cfg from CFG with cfg, pred_id
+        Let safe be 1
+        If pred_block is equal to 0:
+            Set safe to 0
+        End If
+        If pred_id is equal to block_id:
+            Note: A self-edge cannot occur on a jump-only block whose
+            Note: target differs, but a malformed one must not be threaded
+            Set safe to 0
+        End If
+
+        Note: Duplicate-incoming hazard: destination has phis and the
+        Note: predecessor already branches to it directly
+        If safe is equal to 1 and phi_count is greater than 0:
+            Let pred_successors be proc get_block_successors from MIR with pred_block
+            If pred_successors is not equal to 0:
+                Let already be proc contains from List with pred_successors, target_id
+                If already is equal to 1:
+                    Set safe to 0
+                End If
+            End If
+        End If
+
+        If safe is equal to 1:
+            Note: Count LIVE edge instances pred -> block before mutating
+            Note: (zero on a duplicate snapshot entry's second visit)
+            Let edge_instances be 0
+            Let live_preds be proc get_block_predecessors from MIR with block
+            If live_preds is not equal to 0:
+                Let lp_count be proc length from List with live_preds
+                Let lp be 0
+                While lp is less than lp_count:
+                    Let lp_id be proc get from List with live_preds, lp
+                    If lp_id is equal to pred_id:
+                        Set edge_instances to edge_instances plus 1
+                    End If
+                    Set lp to lp plus 1
+                End While
+            End If
+
+            If edge_instances is greater than 0:
+                Note: Retarget the predecessor terminator (rewrites every
+                Note: slot that names this block)
+                Let retargeted be proc update_terminator_target from CFG with cfg, pred_id, block_id, target_id
+                If retargeted is equal to 1:
+                    Note: Move every edge instance
+                    Let e be 0
+                    While e is less than edge_instances:
+                        proc remove_cfg_edge from CFG with cfg, pred_id, block_id
+                        proc add_cfg_edge from MIR with cfg, pred_id, target_id
+                        Set e to e plus 1
+                    End While
+
+                    Note: Destination phis gain one incoming per new
+                    Note: predecessor, carrying the value previously
+                    Note: routed through this block
+                    Let f be 0
+                    While f is less than phi_count:
+                        Let phi be proc get from List with target_phis, f
+                        Let routed_value be proc get from List with routed_values, f
+                        proc add_phi_incoming from MIRNodes with phi, pred_id, routed_value
+                        Set f to f plus 1
+                    End While
+
+                    Set threaded to 1
+                End If
+            End If
+        End If
+
+        Set p to p plus 1
+    End While
+
+    Note: Retire the block once nothing reaches it
+    Let result be 0
+    If threaded is equal to 1:
+        Set result to 1
+        Let remaining_preds be proc get_block_predecessors from MIR with block
+        Let remaining be 0
+        If remaining_preds is not equal to 0:
+            Set remaining to proc length from List with remaining_preds
+        End If
+        If remaining is equal to 0:
+            Note: Retire the block: drop its outgoing edge FIRST (so the
+            Note: phi helper's trivial-phi degrade sweep reads the
+            Note: destination's final predecessor count), then drop this
+            Note: block's incomings in the destination's phis, then remove
+            Note: the block (the canonical remover finds no edges left to
+            Note: unlink, resyncs block_count, and deallocates the block
+            Note: and its instructions)
+            proc remove_cfg_edge from CFG with cfg, block_id, target_id
+            proc remove_phi_incomings_for_pred with context_ptr, cfg, target_id, block_id, 0 minus 1
+            proc remove_block_from_cfg from CFG with cfg, block_id
+            Set result to 2
+        End If
+    End If
+
+    proc destroy from List with pred_snapshot
+    proc destroy from List with target_phis
+    proc destroy from List with routed_values
+    Return result
+End Process
+
+Process called "remove_phi_incomings_for_pred" that takes context_ptr as Integer, cfg as Integer, block_id as Integer, pred_id as Integer, per_phi_limit as Integer returns Integer:
+    @Reasoning
+    When an edge pred -> block is removed, every phi in the target block
+    must drop incoming pairs for that predecessor, or the phi keeps a
+    reference to a control-flow path that no longer exists (the verifier's
+    incoming-block membership rule fails and lowering would materialize a
+    move on a dead edge). cfg.runa's update_phi(_node)_predecessor handles
+    RETARGETING an incoming; no canonical REMOVER exists in mir_nodes.runa
+    (reported as a gap — this module may not edit mir_nodes.runa), so this
+    pass-local helper owns the removal against the canonical flat pair
+    layout, the exact mirror of MIRNodes.add_phi_incoming.
+
+    A block left with exactly ONE predecessor is no longer a join point,
+    and the verifier rejects phis in blocks with fewer than two
+    predecessors, so every phi the removal leaves with a single incoming
+    is degraded to a canonical MIR_COPY of that incoming value — the same
+    trivial-phi rule ssa.runa's destruct/prune passes apply. Callers must
+    therefore remove the CFG edge BEFORE invoking this helper so the
+    predecessor count it reads is final.
+    @End Reasoning
+
+    @Implementation
+    Resolves the block by id and walks the phi prefix of its instruction
+    list (phis are canonical residents at the head of the list; the scan
+    stops at the first non-phi opcode, matching cfg.update_phi_predecessor).
+    For each phi, removes incoming pairs whose block id matches pred_id
+    from the flat (block_id, value_id) pair List at ext 80 — value slot
+    (2N+1) removed before block slot (2N) so the block index stays valid —
+    and decrements incoming_count at ext 88 per removal. A negative
+    per_phi_limit removes every match in each phi (dead-edge removal); a
+    positive limit caps removals PER PHI (the same-target dedupe removes
+    exactly one per phi, mirroring the one edge instance removed).
+
+    Degrade sweep: when the block's final predecessor count is exactly 1,
+    EVERY phi in the prefix is trivial together (each must carry exactly
+    one incoming when counts are consistent), so each is replaced in its
+    list slot by a fresh create_mir_copy carrying the phi's result id and
+    the surviving incoming value (record-size discipline: the 112-byte phi
+    cannot legally morph into the 72-byte copy). The in-place slot
+    replacement cannot break the phi-prefix invariant because all phis in
+    the block degrade in the same sweep. Each degraded phi is removed from
+    the block's phi_nodes registry at offset 88, its definition is
+    re-registered to the copy when a function context exists
+    (OptimizerContext offset 8), and the detached phi record plus its
+    owned pair List are released. Returns the total number of incoming
+    pairs removed.
+    @End Implementation
+
+    If cfg is equal to 0:
+        Return 0
+    End If
+    Let block_ptr be proc get_block_by_id_from_cfg from CFG with cfg, block_id
+    If block_ptr is equal to 0:
+        Return 0
+    End If
+
+    Let instructions be proc get_block_instructions from MIR with block_ptr
+    If instructions is equal to 0:
+        Return 0
+    End If
+
+    Let removed_total be 0
+    Let inst_count be proc length from List with instructions
+    Let ii be 0
+    Let scanning be 1
+    While ii is less than inst_count and scanning is equal to 1:
+        Let inst be proc get from List with instructions, ii
+        Let opcode be proc get_mir_node_opcode from MIR with inst
+        If opcode is equal to 20300:  Note: MIR_PHI
+            Note: Flat pair layout: pair List at ext 80 (block at slot 2N,
+            Note: value at slot 2N+1), incoming_count at ext 88
+            Let pairs be proc memory_get_int64 from Layout with inst, 80
+            Let incoming_count be proc memory_get_int64 from Layout with inst, 88
+            Let removed_here be 0
+            If pairs is not equal to 0:
+                Let k be 0
+                While k is less than incoming_count:
+                    Let limit_open be 1
+                    If per_phi_limit is greater than or equal to 0:
+                        If removed_here is greater than or equal to per_phi_limit:
+                            Set limit_open to 0
+                        End If
+                    End If
+                    Let incoming_block be proc get from List with pairs, k multiplied by 2
+                    If incoming_block is equal to pred_id and limit_open is equal to 1:
+                        proc remove_at from List with pairs, k multiplied by 2 plus 1
+                        proc remove_at from List with pairs, k multiplied by 2
+                        Set incoming_count to incoming_count minus 1
+                        proc memory_set_int64 from Layout with inst, 88, incoming_count
+                        Set removed_here to removed_here plus 1
+                        Set removed_total to removed_total plus 1
+                    Otherwise:
+                        Set k to k plus 1
+                    End If
+                End While
+            End If
+            Set ii to ii plus 1
+        Otherwise:
+            Set scanning to 0
+        End If
+    End While
+
+    Note: Degrade sweep: a one-predecessor block is no longer a join
+    Note: point, so its phis (now single-incoming when counts are
+    Note: consistent) become canonical copies
+    If removed_total is greater than 0:
+        Let final_pred_count be proc get_block_predecessor_count from MIR with block_ptr
+        If final_pred_count is equal to 1:
+            Let function be proc memory_get_int64 from Layout with context_ptr, 8
+            Set ii to 0
+            Set scanning to 1
+            While ii is less than inst_count and scanning is equal to 1:
+                Let inst be proc get from List with instructions, ii
+                Let opcode be proc get_mir_node_opcode from MIR with inst
+                If opcode is equal to 20300:  Note: MIR_PHI
+                    Let pairs be proc memory_get_int64 from Layout with inst, 80
+                    Let incoming_count be proc memory_get_int64 from Layout with inst, 88
+                    If incoming_count is equal to 1 and pairs is not equal to 0:
+                        Let surviving_value be proc get from List with pairs, 1
+                        Let result_id be proc get_mir_node_value_id from MIR with inst
+                        Let result_type be proc get_phi_result_type from MIRNodes with inst
+                        Let copy_inst be proc create_mir_copy from MIRNodes with result_id, surviving_value
+                        If copy_inst is not equal to 0:
+                            proc set_mir_node_type from MIR with copy_inst, result_type
+                            proc set_mir_node_parent_block from MIR with copy_inst, block_ptr
+                            proc set from List with instructions, ii, copy_inst
+
+                            Note: Drop the phi from the block's phi_nodes
+                            Note: registry (offset 88)
+                            Let registry be proc memory_get_int64 from Layout with block_ptr, 88
+                            If registry is not equal to 0:
+                                Let reg_count be proc length from List with registry
+                                Let r be 0
+                                Let searching be 1
+                                While r is less than reg_count and searching is equal to 1:
+                                    Let reg_entry be proc get from List with registry, r
+                                    If reg_entry is equal to inst:
+                                        proc remove_at from List with registry, r
+                                        Set searching to 0
+                                    Otherwise:
+                                        Set r to r plus 1
+                                    End If
+                                End While
+                            End If
+
+                            Note: Keep the value -> instruction map coherent
+                            If function is not equal to 0:
+                                proc register_value_definition from MIR with function, result_id, copy_inst
+                            End If
+
+                            Note: Release the detached phi and its owned
+                            Note: pair List
+                            proc destroy from List with pairs
+                            proc deallocate from Layout with inst
+                        End If
+                    End If
+                    Set ii to ii plus 1
+                Otherwise:
+                    Set scanning to 0
+                End If
+            End While
+        End If
+    End If
+
+    Return removed_total
 End Process
 
 Note: ============================================================================
@@ -3138,7 +4038,8 @@ Process called "run_optimization_pipeline" that takes cfg as Integer, function a
 
     While pipeline_changed is equal to 1 and iteration is less than max_iterations:
         Set iteration to iteration plus 1
-        Display "--- Iteration " joined with iteration joined with " ---"
+        Let iteration_str be proc integer_to_string from StringUtils with iteration
+        Display "--- Iteration " joined with iteration_str joined with " ---"
 
         Note: Reset changed flag for this iteration
         proc reset_changed_flag with context_ptr
@@ -3190,10 +4091,18 @@ Process called "run_optimization_pipeline" that takes cfg as Integer, function a
     proc optimize_dead_code_elimination with context_ptr
     proc optimize_dead_store_elimination with context_ptr
 
-    Note: Verify MIR correctness
+    Note: Verify MIR correctness. The function-level verifier needs a
+    Note: MIRFunction; on the cfg-only entry (optimize_mir passes function 0)
+    Note: the structural CFG validator is the correct gate — passing 0 to
+    Note: verify_mir_function would report a false failure.
     Display ""
     Display "Verifying optimized MIR..."
-    Let verification_result be proc verify_mir_function from Verifier with function
+    Let verification_result be 0
+    If function is not equal to 0:
+        Set verification_result to proc verify_mir_function from Verifier with function
+    Otherwise:
+        Set verification_result to proc validate_cfg from CFG with cfg
+    End If
     If verification_result is equal to 0:
         Display "ERROR: MIR verification failed after optimization"
         Display "This indicates a bug in the optimizer"
@@ -3425,35 +4334,20 @@ Process called "string_equals" that takes str1 as Integer, str2 as Integer retur
     @End Reasoning
 
     @Implementation
-    Length-prefixed string comparison. Reads the 8-byte length header at offset 0
-    of each string, returns 0 immediately on length mismatch (no comparison cost
-    when sizes differ), otherwise compares character-by-character from the data
-    bytes starting at offset 8. Used exclusively by run_single_optimization_pass
-    to match pass-name selectors; not a general-purpose string utility.
+    Delegates to the canonical byte-wise comparator
+    proc string_equals from StringUtils (NUL-terminated representation — the
+    bootstrap's string literals and runtime strings carry no length prefix;
+    the historical local implementation read a phantom 8-byte length header
+    at offset 0, which on a NUL-terminated string is the first eight
+    CHARACTERS interpreted as a length, and compared overlapping int64
+    windows that read past the terminator). Used exclusively by
+    run_single_optimization_pass to match pass-name selectors.
     @End Implementation
 
     If str1 is equal to 0 or str2 is equal to 0:
         Return 0
     End If
 
-    Note: Get string lengths
-    Let len1 be proc memory_get_int64 from Layout with str1, 0
-    Let len2 be proc memory_get_int64 from Layout with str2, 0
-
-    If len1 is not equal to len2:
-        Return 0
-    End If
-
-    Note: Compare character by character
-    Let i be 0
-    While i is less than len1:
-        Let char1 be proc memory_get_int64 from Layout with str1, 8 plus i
-        Let char2 be proc memory_get_int64 from Layout with str2, 8 plus i
-        If char1 is not equal to char2:
-            Return 0
-        End If
-        Set i to i plus 1
-    End While
-
-    Return 1
+    Let result be proc string_equals from StringUtils with str1, str2
+    Return result
 End Process

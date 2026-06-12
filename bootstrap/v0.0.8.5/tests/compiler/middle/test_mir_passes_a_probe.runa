@@ -1,0 +1,430 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+MIR optimization passes probe, task #481 part A (the four passes
+mir_optimizer.runa dispatches to but whose objects were never built).
+
+Four suites, all built by hand through the canonical MIR construction API
+(the same contract the HIR-to-MIR builder uses), each asserting the EXACT
+effect of one pass plus MIRVerifier.verify_mir_function = 1 afterward:
+
+  1. copy_prop — straight-line block:
+       a   = CONST 5            (id 100)
+       cp  = COPY a             (dest 101, src 100)
+       r   = ADD(cp, a)         (id 102, operand1 = 101)
+       RETURN r
+     After run_copy_prop_pass: r's operand1 (the use of the copy dest 101)
+     is rewritten to the source 100; the COPY itself is left for DCE.
+
+  2. dce — straight-line block:
+       a    = CONST 5           (id 200)        live (used by store/ret)
+       dead = ADD(a, a)         (id 201)        pure, unused -> removable
+       vol  = LOAD(a) volatile  (id 202)        volatile -> kept
+       STORE(a, a)                              side effect -> kept
+       RETURN a
+     After run_aggressive_dce_pass: the dead ADD is gone; the volatile load,
+     the store, the const, and the return remain.
+
+  3. dead_store — straight-line block:
+       p1 = ALLOCA              (id 300)
+       p2 = ALLOCA              (id 301)
+       STORE(p1, c)             killed (overwritten before any read)
+       STORE(p1, c)             survives (last write to p1)
+       STORE(p2, c)             survives (live: read below)
+       ld = LOAD(p2)            reads p2
+       RETURN
+     After run_dead_store_elimination_pass: exactly one store removed (the
+     first store to p1); the second p1 store, the p2 store, and the load
+     remain.
+
+  4. sccp — constant-condition branch + foldable arithmetic:
+       B0: t = CONST 1          (id 400, true)
+           x = ADD(c2, c3)      (id 403, c2=CONST 2, c3=CONST 3)  -> folds to 5
+           BRANCH t ? B1 : B2
+       B1: RETURN
+       B2: RETURN
+     After run_sccp_pass: the branch is folded to an unconditional JUMP to B1,
+     the un-taken edge B0->B2 is removed, and x's defining ADD is replaced by
+     a CONST carrying the proven value 5.
+:End Note
+
+Import "tests/test_utils.runa" as T
+Import "compiler/middle/gungnir/mir/mir.runa" as MIR
+Import "compiler/middle/gungnir/mir/mir_nodes.runa" as MIRNodes
+Import "compiler/middle/gungnir/mir/cfg.runa" as CFG
+Import "compiler/middle/gungnir/mir/mir_verifier.runa" as MIRVerifier
+Import "compiler/middle/gungnir/mir/optimizations/copy_prop.runa" as CopyProp
+Import "compiler/middle/gungnir/mir/optimizations/dce.runa" as DCE
+Import "compiler/middle/gungnir/mir/optimizations/dead_store.runa" as DeadStore
+Import "compiler/middle/gungnir/mir/optimizations/sccp.runa" as SCCP
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/collections/list.runa" as List
+
+Process called "make_type_info" returns Integer:
+    Note: Shared HIRTypeInfo stand-in: kind at 0, flags at 8, size at 16
+    Let type_info be Layout.allocate(24)
+    If type_info is equal to 0:
+        Return 0
+    End If
+    Layout.memory_set_int64(type_info, 0, 1)
+    Layout.memory_set_int64(type_info, 8, 0)
+    Layout.memory_set_int64(type_info, 16, 8)
+    Return type_info
+End Process
+
+Process called "count_opcode_in_cfg" that takes cfg as Integer, opcode as Integer returns Integer:
+    Let blocks be CFG.get_mir_cfg_blocks(cfg)
+    Let block_count be List.length(blocks)
+    Let found be 0
+    Let i be 0
+    While i is less than block_count:
+        Let block_ptr be List.get(blocks, i)
+        If block_ptr is not equal to 0:
+            Let insts be MIR.get_block_instructions(block_ptr)
+            Let inst_count be List.length(insts)
+            Let j be 0
+            While j is less than inst_count:
+                Let inst be List.get(insts, j)
+                Let op be MIR.get_mir_node_opcode(inst)
+                If op is equal to opcode:
+                    Set found to found plus 1
+                End If
+                Set j to j plus 1
+            End While
+        End If
+        Set i to i plus 1
+    End While
+    Return found
+End Process
+
+Note: ============================================================================
+Note: SUITE 1 - copy propagation
+Note: ============================================================================
+
+Process called "run_copy_prop_suite" that takes results as Integer returns Integer:
+    T.begin_suite(results, "copy_prop")
+
+    Let type_info be make_type_info()
+    Let fn be MIR.create_mir_function("cp_a_probe", type_info, 0)
+    T.assert_not_null(results, "copy-prop function constructed", fn)
+    Let cfg be MIR.get_mir_function_cfg(fn)
+
+    Let b0 be MIR.create_mir_basic_block(0, 0)
+    MIR.add_block_to_cfg(cfg, b0)
+    MIR.set_cfg_entry_block(cfg, b0)
+    MIR.set_cfg_exit_block(cfg, b0)
+    Layout.memory_set_int64(cfg, 48, 1)
+    Layout.memory_set_int64(fn, 56, 1000)
+
+    Let a_const be MIRNodes.create_mir_const(100, 5, type_info, 0, 0)
+    MIR.add_instruction_to_block(b0, a_const)
+    MIR.register_value_definition(fn, 100, a_const)
+
+    Let cp be MIRNodes.create_mir_copy(101, 100)
+    MIR.add_instruction_to_block(b0, cp)
+    MIR.register_value_definition(fn, 101, cp)
+
+    Let r_add be MIRNodes.create_mir_binary_op(20002, 102, 101, 100, type_info)
+    MIR.add_instruction_to_block(b0, r_add)
+    MIR.register_value_definition(fn, 102, r_add)
+
+    Let ret be MIRNodes.create_mir_return(102, type_info)
+    MIR.add_instruction_to_block(b0, ret)
+
+    Note: Before: the ADD uses the copy destination 101 as operand1
+    Let op1_before be MIR.get_mir_node_operand(r_add, 1)
+    T.assert_equal(results, "ADD uses copy dest before pass", op1_before, 101)
+
+    Let changed be CopyProp.run_copy_prop_pass(cfg)
+    T.assert_equal(results, "copy-prop reports a change", changed, 1)
+
+    Note: After: the use of 101 is rewritten to the copy source 100
+    Let op1_after be MIR.get_mir_node_operand(r_add, 1)
+    T.assert_equal(results, "ADD operand1 forwarded to source", op1_after, 100)
+    Let op2_after be MIR.get_mir_node_operand(r_add, 2)
+    T.assert_equal(results, "ADD operand2 still the source", op2_after, 100)
+    Note: ext-mirror coherence: the binop left mirror (offset 80) also updated
+    Let ext_left be Layout.memory_get_int64(r_add, 80)
+    T.assert_equal(results, "ADD ext-left mirror forwarded", ext_left, 100)
+
+    Note: The COPY instruction itself is left in place (DCE removes it later)
+    Let copy_count be count_opcode_in_cfg(cfg, 20008)
+    T.assert_equal(results, "COPY left for DCE", copy_count, 1)
+
+    Let verify_rc be MIRVerifier.verify_mir_function(fn)
+    T.assert_equal(results, "verifier accepts post-copy-prop function", verify_rc, 1)
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: SUITE 2 - dead code elimination
+Note: ============================================================================
+
+Process called "run_dce_suite" that takes results as Integer returns Integer:
+    T.begin_suite(results, "dce")
+
+    Let type_info be make_type_info()
+    Let fn be MIR.create_mir_function("dce_a_probe", type_info, 0)
+    T.assert_not_null(results, "dce function constructed", fn)
+    Let cfg be MIR.get_mir_function_cfg(fn)
+
+    Let b0 be MIR.create_mir_basic_block(0, 0)
+    MIR.add_block_to_cfg(cfg, b0)
+    MIR.set_cfg_entry_block(cfg, b0)
+    MIR.set_cfg_exit_block(cfg, b0)
+    Layout.memory_set_int64(cfg, 48, 1)
+    Layout.memory_set_int64(fn, 56, 1000)
+
+    Let a_const be MIRNodes.create_mir_const(200, 5, type_info, 0, 0)
+    MIR.add_instruction_to_block(b0, a_const)
+    MIR.register_value_definition(fn, 200, a_const)
+
+    Note: dead = ADD(a, a) - pure, result unused
+    Let dead_add be MIRNodes.create_mir_binary_op(20002, 201, 200, 200, type_info)
+    MIR.add_instruction_to_block(b0, dead_add)
+    MIR.register_value_definition(fn, 201, dead_add)
+
+    Note: volatile load - its result is also unused but it must survive
+    Let vol_load be MIRNodes.create_mir_load(202, 200, 0, type_info, 1)
+    MIR.add_instruction_to_block(b0, vol_load)
+    MIR.register_value_definition(fn, 202, vol_load)
+
+    Note: store - side effect, survives
+    Let st be MIRNodes.create_mir_store(200, 200, 0, type_info, 0)
+    MIR.add_instruction_to_block(b0, st)
+
+    Let ret be MIRNodes.create_mir_return(200, type_info)
+    MIR.add_instruction_to_block(b0, ret)
+
+    Note: Build a minimal optimizer-context shim: CFG at offset 0, deletion
+    Note: counter at offset 40 (the canonical run_aggressive_dce_pass contract)
+    Let ctx be Layout.allocate(64)
+    Layout.memory_set_int64(ctx, 0, cfg)
+    Layout.memory_set_int64(ctx, 40, 0)
+
+    Let before_count be MIR.get_block_instruction_count(b0)
+    T.assert_equal(results, "block has 5 instructions before DCE", before_count, 5)
+
+    Let deleted be DCE.run_aggressive_dce_pass(ctx)
+    T.assert_equal(results, "DCE deleted exactly one instruction", deleted, 1)
+    Let ctx_counter be Layout.memory_get_int64(ctx, 40)
+    T.assert_equal(results, "context deletion counter accumulated", ctx_counter, 1)
+
+    Note: The dead ADD is gone; everything else survives
+    Let add_count be count_opcode_in_cfg(cfg, 20002)
+    T.assert_equal(results, "dead ADD removed", add_count, 0)
+    Let store_count be count_opcode_in_cfg(cfg, 20201)
+    T.assert_equal(results, "store kept", store_count, 1)
+    Let load_count be count_opcode_in_cfg(cfg, 20200)
+    T.assert_equal(results, "volatile load kept", load_count, 1)
+    Let const_count be count_opcode_in_cfg(cfg, 20001)
+    T.assert_equal(results, "live const kept", const_count, 1)
+    Let after_count be MIR.get_block_instruction_count(b0)
+    T.assert_equal(results, "block has 4 instructions after DCE", after_count, 4)
+
+    Let verify_rc be MIRVerifier.verify_mir_function(fn)
+    T.assert_equal(results, "verifier accepts post-DCE function", verify_rc, 1)
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: SUITE 3 - dead store elimination
+Note: ============================================================================
+
+Process called "run_dead_store_suite" that takes results as Integer returns Integer:
+    T.begin_suite(results, "dead_store")
+
+    Let type_info be make_type_info()
+    Let fn be MIR.create_mir_function("dse_a_probe", type_info, 0)
+    T.assert_not_null(results, "dead-store function constructed", fn)
+    Let cfg be MIR.get_mir_function_cfg(fn)
+
+    Let b0 be MIR.create_mir_basic_block(0, 0)
+    MIR.add_block_to_cfg(cfg, b0)
+    MIR.set_cfg_entry_block(cfg, b0)
+    MIR.set_cfg_exit_block(cfg, b0)
+    Layout.memory_set_int64(cfg, 48, 1)
+    Layout.memory_set_int64(fn, 56, 1000)
+
+    Let p1 be MIRNodes.create_mir_alloca(300, type_info, 0, 8)
+    MIR.add_instruction_to_block(b0, p1)
+    MIR.register_value_definition(fn, 300, p1)
+
+    Let p2 be MIRNodes.create_mir_alloca(301, type_info, 1, 8)
+    MIR.add_instruction_to_block(b0, p2)
+    MIR.register_value_definition(fn, 301, p2)
+
+    Let c be MIRNodes.create_mir_const(302, 7, type_info, 0, 0)
+    MIR.add_instruction_to_block(b0, c)
+    MIR.register_value_definition(fn, 302, c)
+
+    Note: first store to p1 - overwritten before any read -> DEAD
+    Let st1 be MIRNodes.create_mir_store(300, 302, 0, type_info, 0)
+    MIR.add_instruction_to_block(b0, st1)
+
+    Note: second store to p1 - last write -> survives
+    Let st2 be MIRNodes.create_mir_store(300, 302, 0, type_info, 0)
+    MIR.add_instruction_to_block(b0, st2)
+
+    Note: store to p2 then a load of p2 - live, survives
+    Let st3 be MIRNodes.create_mir_store(301, 302, 0, type_info, 0)
+    MIR.add_instruction_to_block(b0, st3)
+
+    Let ld be MIRNodes.create_mir_load(303, 301, 0, type_info, 0)
+    MIR.add_instruction_to_block(b0, ld)
+    MIR.register_value_definition(fn, 303, ld)
+
+    Let ret be MIRNodes.create_mir_return(0, 0)
+    MIR.add_instruction_to_block(b0, ret)
+
+    Let ctx be Layout.allocate(64)
+    Layout.memory_set_int64(ctx, 0, cfg)
+    Layout.memory_set_int64(ctx, 40, 0)
+
+    Let store_before be count_opcode_in_cfg(cfg, 20201)
+    T.assert_equal(results, "three stores before DSE", store_before, 3)
+
+    Let eliminated be DeadStore.run_dead_store_elimination_pass(ctx)
+    T.assert_equal(results, "DSE eliminated exactly one store", eliminated, 1)
+    Let ctx_counter be Layout.memory_get_int64(ctx, 40)
+    T.assert_equal(results, "context counter accumulated", ctx_counter, 1)
+
+    Let store_after be count_opcode_in_cfg(cfg, 20201)
+    T.assert_equal(results, "two stores after DSE", store_after, 2)
+    Let load_after be count_opcode_in_cfg(cfg, 20200)
+    T.assert_equal(results, "load kept", load_after, 1)
+
+    Let verify_rc be MIRVerifier.verify_mir_function(fn)
+    T.assert_equal(results, "verifier accepts post-DSE function", verify_rc, 1)
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: SUITE 4 - sparse conditional constant propagation
+Note: ============================================================================
+
+Process called "run_sccp_suite" that takes results as Integer returns Integer:
+    T.begin_suite(results, "sccp")
+
+    Let type_info be make_type_info()
+    Let fn be MIR.create_mir_function("sccp_a_probe", type_info, 0)
+    T.assert_not_null(results, "sccp function constructed", fn)
+    Let cfg be MIR.get_mir_function_cfg(fn)
+
+    Let b0 be MIR.create_mir_basic_block(0, 0)
+    Let b1 be MIR.create_mir_basic_block(1, 0)
+    Let b2 be MIR.create_mir_basic_block(2, 0)
+    MIR.add_block_to_cfg(cfg, b0)
+    MIR.add_block_to_cfg(cfg, b1)
+    MIR.add_block_to_cfg(cfg, b2)
+    MIR.set_cfg_entry_block(cfg, b0)
+    MIR.set_cfg_exit_block(cfg, b1)
+    Layout.memory_set_int64(cfg, 48, 3)
+    Layout.memory_set_int64(fn, 56, 1000)
+
+    MIR.add_cfg_edge(cfg, 0, 1)
+    MIR.add_cfg_edge(cfg, 0, 2)
+
+    Note: B0: t = CONST 1 (true condition)
+    Let t_const be MIRNodes.create_mir_const(400, 1, type_info, 0, 0)
+    MIR.add_instruction_to_block(b0, t_const)
+    MIR.register_value_definition(fn, 400, t_const)
+
+    Note: B0: c2 = CONST 2; c3 = CONST 3; x = ADD(c2, c3) -> 5
+    Let c2 be MIRNodes.create_mir_const(401, 2, type_info, 0, 0)
+    MIR.add_instruction_to_block(b0, c2)
+    MIR.register_value_definition(fn, 401, c2)
+    Let c3 be MIRNodes.create_mir_const(402, 3, type_info, 0, 0)
+    MIR.add_instruction_to_block(b0, c3)
+    MIR.register_value_definition(fn, 402, c3)
+    Let x_add be MIRNodes.create_mir_binary_op(20002, 403, 401, 402, type_info)
+    MIR.add_instruction_to_block(b0, x_add)
+    MIR.register_value_definition(fn, 403, x_add)
+
+    Note: B0: BRANCH t ? B1 : B2
+    Let branch be MIRNodes.create_mir_branch(400, 1, 2, 50, 50)
+    MIR.add_instruction_to_block(b0, branch)
+
+    Let b1_ret be MIRNodes.create_mir_return(0, 0)
+    MIR.add_instruction_to_block(b1, b1_ret)
+    Let b2_ret be MIRNodes.create_mir_return(0, 0)
+    MIR.add_instruction_to_block(b2, b2_ret)
+
+    Note: Before: a conditional branch and an ADD live in B0
+    Let branch_before be count_opcode_in_cfg(cfg, 20301)
+    T.assert_equal(results, "one branch before SCCP", branch_before, 1)
+    Let add_before be count_opcode_in_cfg(cfg, 20002)
+    T.assert_equal(results, "one ADD before SCCP", add_before, 1)
+
+    Let changed be SCCP.run_sccp_pass(cfg)
+    T.assert_equal(results, "sccp reports a change", changed, 1)
+
+    Note: After: the branch folded to a JUMP; no conditional branch remains
+    Let branch_after be count_opcode_in_cfg(cfg, 20301)
+    T.assert_equal(results, "branch folded away", branch_after, 0)
+    Let jump_after be count_opcode_in_cfg(cfg, 20302)
+    T.assert_equal(results, "branch replaced by JUMP", jump_after, 1)
+
+    Note: The JUMP targets the taken block B1
+    Let jump_inst be CFG.get_block_terminator(b0)
+    Let jump_target be MIRNodes.get_mir_jump_target_block(jump_inst)
+    T.assert_equal(results, "JUMP targets the taken block B1", jump_target, 1)
+
+    Note: x = ADD(2, 3) was folded to a CONST 5 with the same result id
+    Let add_after be count_opcode_in_cfg(cfg, 20002)
+    T.assert_equal(results, "constant ADD folded away", add_after, 0)
+    Let folded be MIR.lookup_defining_instruction(fn, 403)
+    Note: the def map still points at the in-block list; re-resolve via the block
+    Let x_now be List.get(MIR.get_block_instructions(b0), 3)
+    Let x_now_op be MIR.get_mir_node_opcode(x_now)
+    T.assert_equal(results, "x is now a CONST", x_now_op, 20001)
+    Let x_now_val be MIRNodes.get_const_value(x_now)
+    T.assert_equal(results, "x folded to 5", x_now_val, 5)
+    Let x_now_id be MIR.get_mir_node_value_id(x_now)
+    T.assert_equal(results, "folded const keeps the result id", x_now_id, 403)
+
+    Note: The un-taken edge B0->B2 was removed
+    Let b2_preds be MIR.get_block_predecessors(b2)
+    Let b2_pred_count be List.length(b2_preds)
+    T.assert_equal(results, "un-taken edge removed (B2 has no preds)", b2_pred_count, 0)
+
+    Let verify_rc be MIRVerifier.verify_mir_function(fn)
+    T.assert_equal(results, "verifier accepts post-SCCP function", verify_rc, 1)
+
+    Return 1
+End Process
+
+Process called "main" returns Integer:
+    Let results be T.create_test_results()
+
+    run_copy_prop_suite(results)
+    run_dce_suite(results)
+    run_dead_store_suite(results)
+    run_sccp_suite(results)
+
+    T.print_summary(results)
+    Let passed be T.all_passed(results)
+    T.destroy_test_results(results)
+
+    If passed is equal to 1:
+        Return 0
+    End If
+    Return 1
+End Process

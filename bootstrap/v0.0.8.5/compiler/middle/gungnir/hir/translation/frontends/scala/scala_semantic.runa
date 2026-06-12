@@ -36,7 +36,11 @@ Import "compiler/frontend/primitives/memory/layout.runa" as Layout
 Import "compiler/frontend/primitives/collections/list.runa" as List
 Import "compiler/frontend/primitives/collections/hashtable.runa" as HashTable
 Import "compiler/internal/string_utils.runa" as StringUtils
-Note: Type constants
+Note: Type constants.
+Note: TYPE_ERROR is 0 deliberately: it matches the repo-wide "0 = absent"
+Note: convention, so a missing inferred_type attribute and a failed
+Note: inference read back as the same sentinel.
+Constant TYPE_ERROR as Integer is 0
 Constant TYPE_UNIT as Integer is 1
 Constant TYPE_BOOLEAN as Integer is 2
 Constant TYPE_BYTE as Integer is 3
@@ -97,6 +101,7 @@ Type called "ScalaSemanticAnalyzer":
     warnings as List[String]
     type_constraints as List[Integer]
     inference_context as Integer
+    import_table as Integer
 End Type
 
 @Reasoning:
@@ -197,7 +202,8 @@ Process called "create_scala_semantic_analyzer" returns Integer:
         errors as proc list_create from List,
         warnings as proc list_create from List,
         type_constraints as proc list_create from List,
-        inference_context as proc hashtable_create from HashTable
+        inference_context as proc hashtable_create from HashTable,
+        import_table as proc hashtable_create from HashTable
 
     Note: Initialize built-in types
     Let analyzer_addr be analyzer
@@ -424,6 +430,8 @@ Process called "collect_symbols" takes analyzer as Integer, node as Integer:
         proc collect_var_symbol with analyzer, node
     Otherwise If node_type is equal to AST_TYPE_ALIAS:
         proc collect_type_alias_symbol with analyzer, node
+    Otherwise If node_type is equal to AST_IMPORT:
+        proc collect_import_symbol with analyzer, node
     End If
 
     Note: Recursively collect symbols from children
@@ -665,13 +673,21 @@ Process called "collect_parameter_symbol" takes analyzer as Integer, param_node 
     Let param_name be proc get_ast_node_value with param_node
 
     Note: Check if parameter is implicit
-    Let is_implicit be proc string_equals from StringCore with proc get_node_attribute with param_node, "implicit", "true"
+    Let implicit_attr be proc get_node_attribute with param_node, "implicit"
+    Let is_implicit be proc string_equals from StringCore with implicit_attr, "true"
+
+    Note: The declared annotation is the parameter's type; untyped
+    Note: parameters stay TYPE_ANY until context narrows them
+    Let declared_param_type be proc get_parameter_type with param_node
+    If declared_param_type is equal to 0:
+        Set declared_param_type to TYPE_ANY
+    End If
 
     Note: Create parameter symbol
     Let param_symbol be a value of type SymbolInfo with
         name as param_name,
-        symbol_type as TYPE_ANY,  Note: Will be inferred from type annotation
-        declared_type as 0,
+        symbol_type as declared_param_type,
+        declared_type as declared_param_type,
         inferred_type as 0,
         scope_level as analyzer_obj.current_scope,
         modifiers as proc list_create from List,
@@ -815,37 +831,23 @@ Process called "infer_types" takes analyzer as Integer, node as Integer:
 
     Let node_type be proc get_ast_node_type with node
 
-    Note: Handle different expression types
-    If node_type is equal to AST_LITERAL:
-        proc infer_literal_type with analyzer, node
-    Otherwise If node_type is equal to AST_IDENTIFIER:
-        proc infer_identifier_type with analyzer, node
-    Otherwise If node_type is equal to AST_BINARY_OP:
-        proc infer_binary_op_type with analyzer, node
-    Otherwise If node_type is equal to AST_UNARY_OP:
-        proc infer_unary_op_type with analyzer, node
-    Otherwise If node_type is equal to AST_FUNCTION_CALL:
-        proc infer_function_call_type with analyzer, node
-    Otherwise If node_type is equal to AST_METHOD_CALL:
-        proc infer_method_call_type with analyzer, node
-    Otherwise If node_type is equal to AST_LAMBDA:
-        proc infer_lambda_type with analyzer, node
-    Otherwise If node_type is equal to AST_IF_EXPRESSION:
-        proc infer_if_expression_type with analyzer, node
-    Otherwise If node_type is equal to AST_MATCH_EXPRESSION:
-        proc infer_match_expression_type with analyzer, node
-    Otherwise If node_type is equal to AST_BLOCK:
-        proc infer_block_type with analyzer, node
-    Otherwise If node_type is equal to AST_TUPLE:
-        proc infer_tuple_type with analyzer, node
-    Otherwise If node_type is equal to AST_LIST_LITERAL:
-        proc infer_list_literal_type with analyzer, node
-    Otherwise If node_type is equal to AST_VAL_DECLARATION:
-        proc infer_val_declaration_type with analyzer, node
-    Otherwise If node_type is equal to AST_VAR_DECLARATION:
-        proc infer_var_declaration_type with analyzer, node
-    Otherwise If node_type is equal to AST_FUNCTION:
-        proc infer_function_type with analyzer, node
+    Note: Every expression-bearing kind routes through the memoized
+    Note: infer_expression_type entry point. Routing through one entry
+    Note: matters: the unconditional child recursion below re-visits nodes
+    Note: that per-kind handlers already inferred, and without memoization
+    Note: each re-visit would re-emit that node's diagnostics.
+    If node_type is equal to AST_LITERAL or node_type is equal to AST_IDENTIFIER or
+       node_type is equal to AST_BINARY_OP or node_type is equal to AST_UNARY_OP or
+       node_type is equal to AST_FUNCTION_CALL or node_type is equal to AST_METHOD_CALL or
+       node_type is equal to AST_LAMBDA or node_type is equal to AST_IF_EXPRESSION or
+       node_type is equal to AST_MATCH_EXPRESSION or node_type is equal to AST_BLOCK or
+       node_type is equal to AST_TUPLE or node_type is equal to AST_LIST_LITERAL or
+       node_type is equal to AST_VAL_DECLARATION or node_type is equal to AST_VAR_DECLARATION or
+       node_type is equal to AST_FUNCTION or node_type is equal to AST_EXPRESSION_STATEMENT or
+       node_type is equal to AST_RETURN or node_type is equal to AST_THROW or
+       node_type is equal to AST_WHILE_EXPRESSION or node_type is equal to AST_FOR_EXPRESSION or
+       node_type is equal to AST_TRY_EXPRESSION:
+        Let routed_type be proc infer_expression_type with analyzer, node
     End If
 
     Note: Recursively infer types for children
@@ -903,16 +905,58 @@ Process called "infer_identifier_type" takes analyzer as Integer, identifier_nod
     Let analyzer_obj as ScalaSemanticAnalyzer be analyzer
     Let identifier_name be proc get_ast_node_value with identifier_node
 
+    Note: Synthetic AST_IDENTIFIER nodes are not value references: operator
+    Note: nodes (the climber's middle child), for-comprehension generator
+    Note: carriers, and qualified-identifier shells with empty values. They
+    Note: must not be resolved against the symbol table.
+    Let is_operator_node be proc get_node_attribute with identifier_node, "operator"
+    Let operator_marked be proc string_equals from StringCore with is_operator_node, "true"
+    If operator_marked is equal to 1:
+        Return
+    End If
+
+    Let generator_variable be proc get_node_attribute with identifier_node, "variable"
+    If generator_variable is not equal to 0:
+        Return
+    End If
+
+    Let name_is_empty be proc string_equals from StringCore with identifier_name, ""
+    If name_is_empty is equal to 1:
+        Return
+    End If
+    If identifier_name is equal to 0:
+        Return
+    End If
+
     Note: Look up symbol in symbol table (hashtable_get returns 0 when absent)
     Let symbol_address be proc hashtable_get from HashTable with analyzer_obj.symbol_table, identifier_name
 
     If symbol_address is equal to 0:
+        Note: Three-tier fallback mirroring lookup_function_definition:
+        Note: imported names and stdlib functions are defined, just not local.
+        Let imported_entry be proc hashtable_get from HashTable with analyzer_obj.import_table, identifier_name
+        If imported_entry is not equal to 0:
+            proc set_node_attribute with identifier_node, "inferred_type", proc integer_to_string from StringUtils with TYPE_ANY
+            Return
+        End If
+
+        Let stdlib_entry be proc lookup_stdlib_function with identifier_name
+        If stdlib_entry is not equal to 0:
+            proc set_node_attribute with identifier_node, "inferred_type", proc integer_to_string from StringUtils with TYPE_FUNCTION
+            Return
+        End If
+
         proc add_semantic_error with analyzer, ERROR_UNDEFINED_SYMBOL, identifier_name
         proc set_node_attribute with identifier_node, "inferred_type", proc integer_to_string from StringUtils with TYPE_ANY
         Return
     End If
 
     Let symbol_info as SymbolInfo be symbol_address
+    Note: Prefer the resolved binding type when inference has produced one
+    If symbol_info.inferred_type is not equal to 0:
+        proc set_node_attribute with identifier_node, "inferred_type", proc integer_to_string from StringUtils with symbol_info.inferred_type
+        Return
+    End If
     proc set_node_attribute with identifier_node, "inferred_type", proc integer_to_string from StringUtils with symbol_info.symbol_type
 End Process
 
@@ -1018,16 +1062,38 @@ already-typed argument expressions against the looked-up parameter
 types.
 @End Reasoning
 Process called "infer_function_call_type" takes analyzer as Integer, call_node as Integer:
+    Let analyzer_obj as ScalaSemanticAnalyzer be analyzer
     Let children be proc get_ast_node_children with call_node
     Let function_child be proc list_get from List with children, 0
     Let args_child be proc list_get from List with children, 1
+
+    Note: Get function name first so expected argument types can be
+    Note: published to the inference context BEFORE the arguments are
+    Note: inferred - lambda arguments read their parameter types from
+    Note: there (bidirectional typing).
+    Let function_name be proc get_ast_node_value with function_child
+
+    Let known_def be proc lookup_function_definition with analyzer, function_name
+    If known_def is not equal to 0:
+        Let expected_param_types be proc extract_parameter_types with analyzer, known_def
+        Let actual_args be proc get_call_arguments with call_node
+        Let expected_count be proc list_length from List with expected_param_types
+        Let actual_count be proc list_length from List with actual_args
+        Let publish_index be 0
+        While publish_index is less than expected_count and publish_index is less than actual_count:
+            Let expected_arg_type be proc list_get from List with expected_param_types, publish_index
+            Let actual_arg_node be proc list_get from List with actual_args, publish_index
+            Let context_key be proc string_concat from StringUtils with "expected:", proc integer_to_string from StringUtils with actual_arg_node
+            proc hashtable_set from HashTable with analyzer_obj.inference_context, context_key, expected_arg_type
+            Set publish_index to publish_index plus 1
+        End While
+    End If
 
     Note: Infer function type
     proc infer_types with analyzer, function_child
     proc infer_types with analyzer, args_child
 
-    Note: Get function name and look up its type
-    Let function_name be proc get_ast_node_value with function_child
+    Note: Look up the function's return type
     Let function_type be proc lookup_function_return_type with analyzer, function_name
 
     proc set_node_attribute with call_node, "inferred_type", proc integer_to_string from StringUtils with function_type
@@ -1051,10 +1117,20 @@ Process called "lookup_function_return_type" takes analyzer as Integer, function
     Let symbol_address be proc hashtable_get from HashTable with analyzer_obj.symbol_table, function_name
 
     If symbol_address is equal to 0:
+        Note: Not local - consult the stdlib catalog before giving up
+        Let stdlib_def be proc lookup_stdlib_function with function_name
+        If stdlib_def is not equal to 0:
+            Return proc extract_function_return_type with analyzer, stdlib_def
+        End If
         Return TYPE_ANY
     End If
 
     Let symbol_info as SymbolInfo be symbol_address
+
+    Note: Only a def carries a return-type contract; vals/imports do not
+    If symbol_info.symbol_type is not equal to TYPE_FUNCTION:
+        Return TYPE_ANY
+    End If
 
     Note: Get return type from function definition
     Let function_def be symbol_info.definition_node
@@ -1091,8 +1167,21 @@ Process called "extract_function_return_type" takes analyzer as Integer, functio
         End While
     End If
 
-    Note: No explicit return type - infer from function body
-    Return proc infer_function_body_return_type with analyzer, function_def
+    Note: No explicit return type - infer from function body. A recursive
+    Note: def without an annotation would re-enter this routine through its
+    Note: own call site, so an in-progress marker breaks the cycle: the
+    Note: recursive occurrence types as TYPE_ANY (Scala itself requires an
+    Note: explicit return type for recursive methods).
+    Let inference_in_progress be proc get_node_attribute with function_def, "return_inference_in_progress"
+    Let guard_active be proc string_equals from StringCore with inference_in_progress, "true"
+    If guard_active is equal to 1:
+        Return TYPE_ANY
+    End If
+
+    proc set_node_attribute with function_def, "return_inference_in_progress", "true"
+    Let body_return_type be proc infer_function_body_return_type with analyzer, function_def
+    proc set_node_attribute with function_def, "return_inference_in_progress", "false"
+    Return body_return_type
 End Process
 
 @Reasoning:
@@ -1260,9 +1349,15 @@ Process called "are_types_compatible" takes analyzer as Integer, source_type as 
         Return true
     End If
 
-    Note: Numeric conversions
-    If proc is_numeric_type with source_type and proc is_numeric_type with target_type:
-        Return proc is_numeric_conversion_valid with source_type, target_type
+    Note: Numeric conversions. Nested Ifs rather than 'and' - the stage1
+    Note: bootstrap miscompiles 'and' over bare truthy operands (the result
+    Note: register keeps the first operand).
+    Let source_numeric be proc is_numeric_type with source_type
+    If source_numeric is equal to 1:
+        Let target_numeric be proc is_numeric_type with target_type
+        If target_numeric is equal to 1:
+            Return proc is_numeric_conversion_valid with source_type, target_type
+        End If
     End If
 
     Note: Subtyping relationships
@@ -1277,8 +1372,28 @@ keeps the calling code readable and lets the same check apply in
 infer_unary_op_type and operator-result inference.
 @End Reasoning
 Process called "is_numeric_type" takes type_kind as Integer returns Boolean:
-    Return type_kind is equal to TYPE_BYTE or type_kind is equal to TYPE_SHORT or type_kind is equal to TYPE_INT or
-           type_kind is equal to TYPE_LONG or type_kind is equal to TYPE_FLOAT or type_kind is equal to TYPE_DOUBLE
+    Note: Explicit cascade - a Return of a multi-line or-chain miscompiles
+    Note: under the stage1 bootstrap (garbage register), so each membership
+    Note: test returns individually.
+    If type_kind is equal to TYPE_BYTE:
+        Return 1
+    End If
+    If type_kind is equal to TYPE_SHORT:
+        Return 1
+    End If
+    If type_kind is equal to TYPE_INT:
+        Return 1
+    End If
+    If type_kind is equal to TYPE_LONG:
+        Return 1
+    End If
+    If type_kind is equal to TYPE_FLOAT:
+        Return 1
+    End If
+    If type_kind is equal to TYPE_DOUBLE:
+        Return 1
+    End If
+    Return 0
 End Process
 
 @Reasoning:
@@ -1324,14 +1439,21 @@ check_inheritance_subtype walker invoked separately by the constraint
 solver.
 @End Reasoning
 Process called "is_subtype" takes analyzer as Integer, source_type as Integer, target_type as Integer returns Boolean:
-    Note: Value types extend AnyVal
-    If proc is_value_type with source_type and target_type is equal to TYPE_ANYVAL:
-        Return true
+    Note: Value types extend AnyVal. Nested Ifs rather than 'and' - the
+    Note: stage1 bootstrap miscompiles 'and' over bare truthy operands.
+    If target_type is equal to TYPE_ANYVAL:
+        Let source_is_value be proc is_value_type with source_type
+        If source_is_value is equal to 1:
+            Return true
+        End If
     End If
 
     Note: Reference types extend AnyRef
-    If proc is_reference_type with source_type and target_type is equal to TYPE_ANYREF:
-        Return true
+    If target_type is equal to TYPE_ANYREF:
+        Let source_is_ref be proc is_reference_type with source_type
+        If source_is_ref is equal to 1:
+            Return true
+        End If
     End If
 
     Note: Everything extends Any
@@ -1339,7 +1461,11 @@ Process called "is_subtype" takes analyzer as Integer, source_type as Integer, t
         Return true
     End If
 
-    Note: Check class hierarchy ( - needs full inheritance analysis)
+    Note: Class hierarchy - delegate to the nominal extends-chain walker
+    Let hierarchy_result be proc check_inheritance_subtype with analyzer, source_type, target_type
+    If hierarchy_result is equal to 1:
+        Return true
+    End If
     Return false
 End Process
 
@@ -1351,9 +1477,23 @@ other inference helpers that need to distinguish primitive from
 reference types.
 @End Reasoning
 Process called "is_value_type" takes type_kind as Integer returns Boolean:
-    Return type_kind is equal to TYPE_BOOLEAN or type_kind is equal to TYPE_BYTE or type_kind is equal to TYPE_SHORT or
-           type_kind is equal to TYPE_INT or type_kind is equal to TYPE_LONG or type_kind is equal to TYPE_FLOAT or
-           type_kind is equal to TYPE_DOUBLE or type_kind is equal to TYPE_CHAR or type_kind is equal to TYPE_UNIT
+    Note: Explicit cascade - a Return of a multi-line or-chain miscompiles
+    Note: under the stage1 bootstrap (garbage register), so each membership
+    Note: test returns individually.
+    If type_kind is equal to TYPE_BOOLEAN:
+        Return 1
+    End If
+    If type_kind is equal to TYPE_CHAR:
+        Return 1
+    End If
+    If type_kind is equal to TYPE_UNIT:
+        Return 1
+    End If
+    Let numeric be proc is_numeric_type with type_kind
+    If numeric:
+        Return 1
+    End If
+    Return 0
 End Process
 
 @Reasoning:
@@ -1363,8 +1503,40 @@ parametric collections (Array, List), and user-defined declarations
 decisions for class-hierarchy checks.
 @End Reasoning
 Process called "is_reference_type" takes type_kind as Integer returns Boolean:
-    Return type_kind is equal to TYPE_STRING or type_kind is equal to TYPE_ARRAY or type_kind is equal to TYPE_LIST or
-           type_kind is equal to TYPE_CLASS or type_kind is equal to TYPE_TRAIT or type_kind is equal to TYPE_OBJECT
+    Note: Explicit cascade - a Return of a multi-line or-chain miscompiles
+    Note: under the stage1 bootstrap (garbage register), so each membership
+    Note: test returns individually.
+    If type_kind is equal to TYPE_STRING:
+        Return 1
+    End If
+    If type_kind is equal to TYPE_ARRAY:
+        Return 1
+    End If
+    If type_kind is equal to TYPE_LIST:
+        Return 1
+    End If
+    If type_kind is equal to TYPE_CLASS:
+        Return 1
+    End If
+    If type_kind is equal to TYPE_TRAIT:
+        Return 1
+    End If
+    If type_kind is equal to TYPE_OBJECT:
+        Return 1
+    End If
+    If type_kind is equal to TYPE_CASE_CLASS:
+        Return 1
+    End If
+    If type_kind is equal to TYPE_OPTION:
+        Return 1
+    End If
+    If type_kind is equal to TYPE_TUPLE:
+        Return 1
+    End If
+    If type_kind is equal to TYPE_FUNCTION:
+        Return 1
+    End If
+    Return 0
 End Process
 
 @Reasoning:
@@ -1478,25 +1650,38 @@ the set of unresolved type variables, which is finite.
 @End Reasoning
 Process called "solve_type_constraints" takes analyzer as Integer:
     Let analyzer_obj as ScalaSemanticAnalyzer be analyzer
-    Let constraint_count be proc list_length from List with analyzer_obj.type_constraints
+    Let pending be analyzer_obj.type_constraints
 
-    Note: Iteratively solve constraints until fixed point
+    Note: Iteratively solve until fixed point. A RESOLVED constraint is
+    Note: retired from the queue - leaving it in place would re-report
+    Note: progress on every sweep and the loop would never reach the
+    Note: fixed point. Termination: every iteration either retires at
+    Note: least one constraint (queue strictly shrinks) or reports no
+    Note: change and exits.
     Let changed be true
     While changed:
         Set changed to false
 
+        Let remaining be proc list_create from List
+        Let constraint_count be proc list_length from List with pending
         Let i be 0
         While i is less than constraint_count:
-            Let constraint be proc list_get from List with analyzer_obj.type_constraints, i
+            Let constraint be proc list_get from List with pending, i
             Let solved be proc solve_constraint with analyzer, constraint
 
             If solved:
                 Set changed to true
+            Otherwise:
+                proc list_append from List with remaining, constraint
             End If
 
             Set i to i plus 1
         End While
+
+        Set pending to remaining
     End While
+
+    Set analyzer_obj.type_constraints to pending
 End Process
 
 @Reasoning:
@@ -1635,21 +1820,33 @@ matches lets callers distinguish "not found" from a real symbol
 address.
 @End Reasoning
 Process called "lookup_function_definition" takes analyzer as Integer, function_name as String returns Integer:
-    Note: Look up function definition in symbol table and imports
+    Note: Look up function definition in symbol table and imports.
+    Note: The contract is "return an AST_FUNCTION definition node whose
+    Note: signature is KNOWN, or 0". Callers use 0 to skip arity and
+    Note: type checks, which is the correct behaviour for symbols whose
+    Note: signatures this single-file analyzer cannot see.
 
     Let symbol_table be proc get_symbol_table with analyzer
     Let function_symbol be proc hashtable_get from HashTable with symbol_table, function_name
 
     If function_symbol is not equal to 0:
-        Return function_symbol
+        Let symbol_info as SymbolInfo be function_symbol
+        If symbol_info.symbol_type is equal to TYPE_FUNCTION:
+            Return symbol_info.definition_node
+        End If
+        Note: A val/var/class shadowing the name - signature not a def's
+        Return 0
     End If
 
-    Note: Search imported symbols
+    Note: Search imported symbols. An import brings the NAME into scope but
+    Note: its signature lives in another compilation unit, so checks are
+    Note: skipped (returning 0) rather than fabricated. The consult still
+    Note: matters: an explicit import shadows the stdlib catalog below.
     Let import_table be proc get_import_table with analyzer
     Let imported_function be proc hashtable_get from HashTable with import_table, function_name
 
     If imported_function is not equal to 0:
-        Return imported_function
+        Return 0
     End If
 
     Note: Search standard library
@@ -1826,6 +2023,19 @@ Process called "solve_subtype_constraint" takes analyzer as Integer, left_type a
         Return 1
     End If
 
+    Note: Weak conformance - numeric widening conversions are accepted in
+    Note: subtype position ("val d: Double = 1" is legal Scala)
+    Let left_numeric be proc is_numeric_type with left_type
+    If left_numeric is equal to 1:
+        Let right_numeric be proc is_numeric_type with right_type
+        If right_numeric is equal to 1:
+            Let widening_ok be proc is_numeric_conversion_valid with left_type, right_type
+            If widening_ok is equal to 1:
+                Return 1
+            End If
+        End If
+    End If
+
     Note: Check inheritance hierarchy
     Let inheritance_check be proc check_inheritance_subtype with analyzer, left_type, right_type
     If inheritance_check is equal to 1:
@@ -1873,7 +2083,7 @@ Process called "validate_match_exhaustiveness" takes analyzer as Integer, match_
 
     If is_exhaustive is equal to 0:
         Let error_msg be "Match expression is not exhaustive"
-        proc add_semantic_error with analyzer, error_msg
+        proc add_semantic_error with analyzer, ERROR_PATTERN_MATCH, error_msg
     End If
 End Process
 
@@ -1905,7 +2115,7 @@ Process called "validate_class_definition" takes analyzer as Integer, class_node
         Let superclass_exists be proc lookup_type_definition with analyzer, superclass
         If superclass_exists is equal to 0:
             Let error_msg be "Superclass not found"
-            proc add_semantic_error with analyzer, error_msg
+            proc add_semantic_error with analyzer, ERROR_INVALID_INHERITANCE, error_msg
         End If
     End If
 
@@ -1957,7 +2167,7 @@ Process called "validate_trait_definition" takes analyzer as Integer, trait_node
 
         If supertrait_exists is equal to 0:
             Let error_msg be "Super trait not found"
-            proc add_semantic_error with analyzer, error_msg
+            proc add_semantic_error with analyzer, ERROR_INVALID_INHERITANCE, error_msg
         End If
 
         Set supertrait_index to supertrait_index plus 1
@@ -2016,7 +2226,7 @@ Process called "infer_unary_op_type" takes analyzer as Integer, unary_op_node as
             Return operand_type
         Otherwise:
             Let error_msg be "Unary - requires numeric type"
-            proc add_semantic_error with analyzer, error_msg
+            proc add_semantic_error with analyzer, ERROR_TYPE_MISMATCH, error_msg
             Return TYPE_ERROR
         End If
     End If
@@ -2027,7 +2237,7 @@ Process called "infer_unary_op_type" takes analyzer as Integer, unary_op_node as
             Return operand_type
         Otherwise:
             Set error_msg to "Unary + requires numeric type"
-            proc add_semantic_error with analyzer, error_msg
+            proc add_semantic_error with analyzer, ERROR_TYPE_MISMATCH, error_msg
             Return TYPE_ERROR
         End If
     End If
@@ -2039,7 +2249,7 @@ Process called "infer_unary_op_type" takes analyzer as Integer, unary_op_node as
             Return TYPE_BOOLEAN
         Otherwise:
             Set error_msg to "! requires Boolean type"
-            proc add_semantic_error with analyzer, error_msg
+            proc add_semantic_error with analyzer, ERROR_TYPE_MISMATCH, error_msg
             Return TYPE_ERROR
         End If
     End If
@@ -2052,7 +2262,7 @@ Process called "infer_unary_op_type" takes analyzer as Integer, unary_op_node as
             Return operand_type
         Otherwise:
             Set error_msg to "~ requires integral type"
-            proc add_semantic_error with analyzer, error_msg
+            proc add_semantic_error with analyzer, ERROR_TYPE_MISMATCH, error_msg
             Return TYPE_ERROR
         End If
     End If
@@ -2097,8 +2307,8 @@ Process called "infer_method_call_type" takes analyzer as Integer, method_call_n
     Let candidate_count be proc list_length from List with method_candidates
 
     If candidate_count is equal to 0:
-        Let error_msg be "Method not found"
-        proc add_semantic_error with analyzer, error_msg
+        Let error_msg be proc string_concat from StringUtils with "Method not found: ", method_name
+        proc add_semantic_error with analyzer, ERROR_UNDEFINED_SYMBOL, error_msg
         Return TYPE_ERROR
     End If
 
@@ -2109,13 +2319,28 @@ Process called "infer_method_call_type" takes analyzer as Integer, method_call_n
     Let best_method be proc resolve_method_overload with analyzer, method_candidates, arg_types, type_args
 
     If best_method is equal to 0:
-        Set error_msg to "No matching method overload"
-        proc add_semantic_error with analyzer, error_msg
+        Set error_msg to proc string_concat from StringUtils with "No matching method overload: ", method_name
+        proc add_semantic_error with analyzer, ERROR_OVERLOAD_RESOLUTION, error_msg
         Return TYPE_ERROR
     End If
 
-    Note: Resolve implicit parameters
-    proc resolve_implicit_parameters with analyzer, best_method, method_call_node
+    Note: Resolve implicit parameters declared by the chosen overload.
+    Note: resolve_implicit_parameters works from a CALL node and re-derives
+    Note: the callee by name, which is wrong for method dispatch (the
+    Note: overload is already chosen) - so bind directly from best_method.
+    Let method_implicit_params be proc extract_implicit_parameters with analyzer, best_method
+    Let method_implicit_count be proc list_length from List with method_implicit_params
+    Let method_implicit_index be 0
+    While method_implicit_index is less than method_implicit_count:
+        Let method_implicit_param be proc list_get from List with method_implicit_params, method_implicit_index
+        Let method_implicit_candidate be proc find_implicit_candidate with analyzer, method_implicit_param
+        If method_implicit_candidate is equal to 0:
+            Let implicit_param_name be proc get_ast_node_value with method_implicit_param
+            Let implicit_error be proc string_concat from StringUtils with "No implicit found for parameter: ", implicit_param_name
+            proc add_semantic_error with analyzer, ERROR_IMPLICIT_NOT_FOUND, implicit_error
+        End If
+        Set method_implicit_index to method_implicit_index plus 1
+    End While
 
     Note: Infer type parameters if needed
     Let return_type be proc infer_method_return_type with analyzer, best_method, arg_types, type_args
@@ -2206,7 +2431,7 @@ Process called "infer_if_expression_type" takes analyzer as Integer, if_node as 
     Let condition_type be proc infer_expression_type with analyzer, condition
     If condition_type is not equal to TYPE_BOOLEAN:
         Let error_msg be "If condition must be Boolean"
-        proc add_semantic_error with analyzer, error_msg
+        proc add_semantic_error with analyzer, ERROR_TYPE_MISMATCH, error_msg
     End If
 
     Note: Infer branch types
@@ -2259,7 +2484,7 @@ Process called "infer_match_expression_type" takes analyzer as Integer, match_no
         Let pattern_valid be proc check_pattern_type with analyzer, case_pattern, scrutinee_type
         If pattern_valid is equal to 0:
             Let error_msg be "Pattern type mismatch"
-            proc add_semantic_error with analyzer, error_msg
+            proc add_semantic_error with analyzer, ERROR_PATTERN_MATCH, error_msg
         End If
 
         Note: Add pattern variables to scope
@@ -2281,36 +2506,111 @@ Process called "infer_match_expression_type" takes analyzer as Integer, match_no
 End Process
 
 @Reasoning:
-Hook reserved for block-expression type inference. A Scala block is
-typed as its last statement's type (or Unit if the block ends with a
-declaration). The dispatch in infer_types routes AST_BLOCK nodes
-here so this declaration's existence is what makes the block branch
-of the dispatcher legal at compile time.
+A Scala block is typed as its last statement's type, or Unit when the
+block is empty or ends with a declaration (declarations are not value
+expressions). Every child is inferred - not just the last - because
+inner statements can themselves contain declarations and errors that
+must surface. The computed type is stored on the node's
+"inferred_type" attribute so attribute readers and the return value
+agree.
 @End Reasoning
 Process called "infer_block_type" takes analyzer as Integer, block_node as Integer:
-    Note: implementation
+    Let children be proc get_ast_node_children with block_node
+    Let child_count be proc list_length from List with children
+
+    If child_count is equal to 0:
+        proc set_node_attribute with block_node, "inferred_type", proc integer_to_string from StringUtils with TYPE_UNIT
+        Return TYPE_UNIT
+    End If
+
+    Let block_type be TYPE_UNIT
+    Let last_index be child_count minus 1
+    Let i be 0
+    While i is less than child_count:
+        Let child be proc list_get from List with children, i
+        Let child_type be proc infer_expression_type with analyzer, child
+
+        If i is equal to last_index:
+            Let last_kind be proc get_ast_node_type with child
+            If last_kind is equal to AST_VAL_DECLARATION or last_kind is equal to AST_VAR_DECLARATION or
+               last_kind is equal to AST_FUNCTION or last_kind is equal to AST_CLASS or
+               last_kind is equal to AST_TRAIT or last_kind is equal to AST_OBJECT or
+               last_kind is equal to AST_TYPE_ALIAS:
+                Set block_type to TYPE_UNIT
+            Otherwise:
+                Set block_type to child_type
+            End If
+        End If
+
+        Set i to i plus 1
+    End While
+
+    proc set_node_attribute with block_node, "inferred_type", proc integer_to_string from StringUtils with block_type
+    Return block_type
 End Process
 
 @Reasoning:
-Hook reserved for tuple-expression type inference. A TupleN expression
-is typed as TupleN[T1, ..., Tn] where each Ti is the inferred type of
-the corresponding component expression. The dispatch in infer_types
-routes AST_TUPLE nodes here so this declaration's existence is what
-makes the tuple branch of the dispatcher legal at compile time.
+A TupleN expression is typed as TupleN[T1, ..., Tn] where each Ti is
+the inferred type of the corresponding component expression. The
+component types are preserved in a heap TypeInfo record (type_params
+slot) whose address is stored on the node's "tuple_type_info"
+attribute, while the node's "inferred_type" carries the TYPE_TUPLE
+kind so kind-based dispatch elsewhere stays uniform.
 @End Reasoning
 Process called "infer_tuple_type" takes analyzer as Integer, tuple_node as Integer:
-    Note: implementation
+    Let children be proc get_ast_node_children with tuple_node
+    Let child_count be proc list_length from List with children
+
+    Let component_types be proc list_create from List
+    Let i be 0
+    While i is less than child_count:
+        Let child be proc list_get from List with children, i
+        Let child_type be proc infer_expression_type with analyzer, child
+        proc list_append from List with component_types, child_type
+        Set i to i plus 1
+    End While
+
+    Let tuple_name be proc string_concat from StringUtils with "Tuple", proc integer_to_string from StringUtils with child_count
+    Let tuple_info be a value of type TypeInfo with
+        type_kind as TYPE_TUPLE,
+        type_name as tuple_name,
+        type_params as component_types,
+        constraints as proc list_create from List,
+        variance as "",
+        bounds as proc hashtable_create from HashTable,
+        is_resolved as true
+
+    proc set_node_attribute with tuple_node, "tuple_type_info", proc integer_to_string from StringUtils with tuple_info
+    proc set_node_attribute with tuple_node, "inferred_type", proc integer_to_string from StringUtils with TYPE_TUPLE
+    Return TYPE_TUPLE
 End Process
 
 @Reasoning:
-Hook reserved for list-literal type inference. `List(1, 2, 3)` is
-typed as List[T] where T is the LUB of the element types. The
-dispatch in infer_types routes AST_LIST_LITERAL nodes here so this
-declaration's existence is what makes the list-literal branch of the
-dispatcher legal at compile time.
+AST_LIST_LITERAL nodes are element containers: the parser uses them
+for argument lists ("arguments"), method type arguments
+("type_arguments"), and import selectors ("selectors"). All forms are
+typed the same honest way: infer every element, compute the least
+upper bound of the element types, store it as "element_type", and tag
+the container TYPE_LIST. For argument containers the element LUB is
+diagnostic metadata; for a genuine list value it is List[T]'s T.
 @End Reasoning
 Process called "infer_list_literal_type" takes analyzer as Integer, list_node as Integer:
-    Note: implementation
+    Let children be proc get_ast_node_children with list_node
+    Let child_count be proc list_length from List with children
+
+    Let element_types be proc list_create from List
+    Let i be 0
+    While i is less than child_count:
+        Let child be proc list_get from List with children, i
+        Let child_type be proc infer_expression_type with analyzer, child
+        proc list_append from List with element_types, child_type
+        Set i to i plus 1
+    End While
+
+    Let element_lub be proc find_least_upper_bound_list with analyzer, element_types
+    proc set_node_attribute with list_node, "element_type", proc integer_to_string from StringUtils with element_lub
+    proc set_node_attribute with list_node, "inferred_type", proc integer_to_string from StringUtils with TYPE_LIST
+    Return TYPE_LIST
 End Process
 
 @Reasoning:
@@ -2335,49 +2635,86 @@ Process called "infer_val_declaration_type" takes analyzer as Integer, val_node 
     Let explicit_type be proc get_val_explicit_type with val_node
     Let initializer be proc get_val_initializer with val_node
 
-    Note: Infer initializer type
+    Note: Infer initializer type. Error paths still write the memo
+    Note: attribute - otherwise the phase-2 walker's re-visit would re-run
+    Note: this handler and double-report the same diagnostic.
     Let init_type be proc infer_expression_type with analyzer, initializer
     If init_type is equal to TYPE_ERROR:
+        proc set_node_attribute with val_node, "inferred_type", proc integer_to_string from StringUtils with TYPE_ERROR
         Return TYPE_ERROR
     End If
 
     Note: Check against explicit type if present
+    Let binding_type be init_type
     If explicit_type is not equal to 0:
         Let type_compatible be proc solve_subtype_constraint with analyzer, init_type, explicit_type
         If type_compatible is equal to 0:
             Let error_msg be "Initializer type incompatible with declared type"
-            proc add_semantic_error with analyzer, error_msg
+            proc add_semantic_error with analyzer, ERROR_TYPE_MISMATCH, error_msg
+            proc set_node_attribute with val_node, "inferred_type", proc integer_to_string from StringUtils with TYPE_ERROR
             Return TYPE_ERROR
         End If
-        Return explicit_type
-    Otherwise:
-        Return init_type
+        Set binding_type to explicit_type
     End If
+
+    Note: Publish the resolved binding type to the symbol table and node so
+    Note: identifier references resolve to the concrete type, not TYPE_ANY
+    Let analyzer_obj as ScalaSemanticAnalyzer be analyzer
+    Let val_symbol_address be proc hashtable_get from HashTable with analyzer_obj.symbol_table, val_name
+    If val_symbol_address is not equal to 0:
+        Let val_symbol_info as SymbolInfo be val_symbol_address
+        Set val_symbol_info.inferred_type to binding_type
+        Set val_symbol_info.declared_type to explicit_type
+    End If
+    proc set_node_attribute with val_node, "inferred_type", proc integer_to_string from StringUtils with binding_type
+
+    Return binding_type
 End Process
 
 @Reasoning:
-Hook reserved for `var` declaration type inference. Identical
-shape to infer_val_declaration_type at the type-checking level
-because the val/var distinction is about mutability, not typing. The
-dispatch in infer_types routes AST_VAR_DECLARATION nodes here so
-this declaration's existence is what makes the var branch of the
-dispatcher legal at compile time.
+Identical typing algorithm to infer_val_declaration_type - the
+val/var distinction is about mutability, not typing - and the AST
+shapes are byte-for-byte the same (name in value, optional type-node
+child, optional initializer child), so the val accessors are reused
+verbatim. The routine delegates wholesale: it would be a duplicated
+body otherwise.
 @End Reasoning
 Process called "infer_var_declaration_type" takes analyzer as Integer, var_node as Integer:
-    Note: implementation
+    Return proc infer_val_declaration_type with analyzer, var_node
 End Process
 
 @Reasoning:
-Hook reserved for full def-declaration type inference. Builds the
-function type as Function<arity>[<param-types>..., <return-type>]
-where return type uses extract_function_return_type (which already
-handles explicit annotation vs body inference). The dispatch in
-infer_types routes AST_FUNCTION nodes here so this declaration's
-existence is what makes the function branch of the dispatcher legal
-at compile time.
+Full def-declaration type inference. Builds the function type as
+Function<arity>[<param-types>..., <return-type>] where the return
+type uses extract_function_return_type (which already handles
+explicit annotation vs body inference). The heap function-type record
+address is published both to the node ("function_type" attribute) and
+to the function's SymbolInfo.inferred_type so call sites and
+identifier references can recover the full signature, not just the
+TYPE_FUNCTION kind tag.
 @End Reasoning
 Process called "infer_function_type" takes analyzer as Integer, function_node as Integer:
-    Note: implementation
+    Let param_types be proc extract_parameter_types with analyzer, function_node
+    Let return_type be proc extract_function_return_type with analyzer, function_node
+    Let function_type be proc create_function_type with param_types, return_type
+
+    Note: The attribute stores the full record address (not the bare
+    Note: TYPE_FUNCTION kind) so memoized re-reads return the same rich
+    Note: type id the first inference returned.
+    proc set_node_attribute with function_node, "function_type", proc integer_to_string from StringUtils with function_type
+    proc set_node_attribute with function_node, "inferred_type", proc integer_to_string from StringUtils with function_type
+
+    Let analyzer_obj as ScalaSemanticAnalyzer be analyzer
+    Let function_name be proc get_ast_node_value with function_node
+    Let function_symbol_address be proc hashtable_get from HashTable with analyzer_obj.symbol_table, function_name
+    If function_symbol_address is not equal to 0:
+        Let function_symbol_info as SymbolInfo be function_symbol_address
+        If function_symbol_info.symbol_type is equal to TYPE_FUNCTION:
+            Set function_symbol_info.inferred_type to function_type
+        End If
+    End If
+
+    Return function_type
 End Process
 
 @Reasoning:
@@ -2435,4 +2772,3212 @@ Process called "resolve_implicit_conversions" takes analyzer as Integer, call_no
     End While
 
     Return 0
+End Process
+
+Note: ============================================================================
+Note: Analyzer Table Accessors
+Note: ============================================================================
+
+@Reasoning:
+Public accessor for the analyzer's symbol table. Resolution helpers
+take the analyzer handle, and exposing the table through an accessor
+keeps every field read behind one definition instead of scattering
+struct re-bindings through the resolution code.
+@End Reasoning
+Process called "get_symbol_table" takes analyzer as Integer returns Integer:
+    Let analyzer_obj as ScalaSemanticAnalyzer be analyzer
+    Return analyzer_obj.symbol_table
+End Process
+
+@Reasoning:
+Public accessor for the analyzer's import table. The table maps each
+imported member name (the "C" of "import a.b.C", selector names, and
+rename targets) to the AST_IMPORT node that introduced it. Callers
+use presence in this table to suppress undefined-symbol errors and to
+shadow the stdlib catalog; the signature of an imported member lives
+in another compilation unit and is treated as unknown.
+@End Reasoning
+Process called "get_import_table" takes analyzer as Integer returns Integer:
+    Let analyzer_obj as ScalaSemanticAnalyzer be analyzer
+    Return analyzer_obj.import_table
+End Process
+
+@Reasoning:
+Phase-1 handler for AST_IMPORT declarations. Three import forms exist
+in the parser's shape: a plain path ("import a.b.C" - the qualified
+identifier carries the joined path in "name" and the final segment in
+"member"), a selector list ("import a.b.{X, Y => Z}" - each selector
+is an AST_IDENTIFIER child of an AST_LIST_LITERAL tagged "selectors",
+renames carried on the selector's "rename" attribute), and a wildcard
+("import a.b._" - "wildcard" attribute). Named forms register each
+visible name in BOTH the import table (for shadowing/suppression
+decisions) and the symbol table (as a TYPE_ANY binding so identifier
+references resolve without false undefined-symbol errors). Wildcards
+cannot be enumerated from a single compilation unit, so only the path
+itself is recorded in the import table.
+@End Reasoning
+Process called "collect_import_symbol" takes analyzer as Integer, import_node as Integer:
+    Let analyzer_obj as ScalaSemanticAnalyzer be analyzer
+
+    Let import_children be proc get_ast_node_children with import_node
+    Let import_child_count be proc list_length from List with import_children
+    If import_child_count is equal to 0:
+        Return
+    End If
+
+    Let qualified_node be proc list_get from List with import_children, 0
+
+    Note: Wildcard import - the member set is not enumerable here
+    Let wildcard_attr be proc get_node_attribute with qualified_node, "wildcard"
+    Let is_wildcard be proc string_equals from StringCore with wildcard_attr, "true"
+    If is_wildcard is equal to 1:
+        Let full_path be proc get_node_attribute with qualified_node, "name"
+        If full_path is not equal to 0:
+            proc hashtable_set from HashTable with analyzer_obj.import_table, full_path, import_node
+        End If
+        Return
+    End If
+
+    Note: Selector-list import - register every selected (possibly renamed) name
+    Let qualified_children be proc get_ast_node_children with qualified_node
+    Let qualified_child_count be proc list_length from List with qualified_children
+    Let selector_list be 0
+    Let qc_index be 0
+    While qc_index is less than qualified_child_count:
+        Let qc_child be proc list_get from List with qualified_children, qc_index
+        Let qc_kind be proc get_ast_node_type with qc_child
+        If qc_kind is equal to AST_LIST_LITERAL:
+            Set selector_list to qc_child
+        End If
+        Set qc_index to qc_index plus 1
+    End While
+
+    If selector_list is not equal to 0:
+        Let selectors be proc get_ast_node_children with selector_list
+        Let selector_count be proc list_length from List with selectors
+        Let selector_index be 0
+        While selector_index is less than selector_count:
+            Let selector be proc list_get from List with selectors, selector_index
+            Let selector_name be proc get_ast_node_value with selector
+            Let rename_attr be proc get_node_attribute with selector, "rename"
+            Let effective_name be selector_name
+            If rename_attr is not equal to 0:
+                Set effective_name to rename_attr
+            End If
+            proc register_imported_name with analyzer, effective_name, import_node
+            Set selector_index to selector_index plus 1
+        End While
+        Return
+    End If
+
+    Note: Plain path import - the final segment is the visible member
+    Let member_name be proc get_node_attribute with qualified_node, "member"
+    If member_name is not equal to 0:
+        proc register_imported_name with analyzer, member_name, import_node
+    End If
+End Process
+
+@Reasoning:
+Single point of registration for one imported name. The import table
+entry drives shadowing decisions in lookup_function_definition; the
+symbol-table entry (created only when the name is not already locally
+bound - a local definition wins over an import) gives identifier
+inference a TYPE_ANY binding so references to imported names do not
+produce false undefined-symbol diagnostics.
+@End Reasoning
+Process called "register_imported_name" takes analyzer as Integer, imported_name as String, import_node as Integer:
+    Let analyzer_obj as ScalaSemanticAnalyzer be analyzer
+
+    If imported_name is equal to 0:
+        Return
+    End If
+    Let name_empty be proc string_equals from StringCore with imported_name, ""
+    If name_empty is equal to 1:
+        Return
+    End If
+
+    proc hashtable_set from HashTable with analyzer_obj.import_table, imported_name, import_node
+
+    Let existing be proc hashtable_get from HashTable with analyzer_obj.symbol_table, imported_name
+    If existing is equal to 0:
+        Let imported_symbol be a value of type SymbolInfo with
+            name as imported_name,
+            symbol_type as TYPE_ANY,
+            declared_type as 0,
+            inferred_type as 0,
+            scope_level as analyzer_obj.current_scope,
+            modifiers as proc list_create from List,
+            is_implicit as false,
+            is_lazy as false,
+            definition_node as import_node
+
+        proc hashtable_set from HashTable with analyzer_obj.symbol_table, imported_name, imported_symbol
+    End If
+End Process
+
+Note: ============================================================================
+Note: Scope Stack
+Note: ============================================================================
+
+@Reasoning:
+Binds a lambda's parameters before its body is inferred. The scope
+model in this analyzer is a depth counter plus a flat symbol table
+(symbols persist after their scope closes - the table is per-analysis
+and names bound deeper simply stay resolvable), so pushing a lambda
+scope means incrementing the depth and registering each parameter
+with its declared type, or TYPE_ANY when the parameter is untyped and
+no expected type narrowed it.
+@End Reasoning
+Process called "push_lambda_scope" takes analyzer as Integer, parameters as Integer:
+    Let analyzer_obj as ScalaSemanticAnalyzer be analyzer
+    proc enter_scope with analyzer
+
+    If parameters is equal to 0:
+        Return
+    End If
+
+    Let param_count be proc list_length from List with parameters
+    Let param_index be 0
+    While param_index is less than param_count:
+        Let parameter be proc list_get from List with parameters, param_index
+        Let param_name be proc get_ast_node_value with parameter
+
+        Let param_type be proc get_parameter_type with parameter
+        If param_type is equal to 0:
+            Set param_type to TYPE_ANY
+        End If
+
+        Let lambda_param_symbol be a value of type SymbolInfo with
+            name as param_name,
+            symbol_type as param_type,
+            declared_type as param_type,
+            inferred_type as param_type,
+            scope_level as analyzer_obj.current_scope,
+            modifiers as proc list_create from List,
+            is_implicit as false,
+            is_lazy as false,
+            definition_node as parameter
+
+        proc hashtable_set from HashTable with analyzer_obj.symbol_table, param_name, lambda_param_symbol
+        Set param_index to param_index plus 1
+    End While
+End Process
+
+@Reasoning:
+Binds the variables introduced by a match-case pattern before the
+case body is inferred. Variable patterns bind their name; constructor,
+tuple, and list patterns bind the names introduced by their nested
+sub-patterns. The walk is an explicit worklist (not recursion) so the
+scope push happens exactly once regardless of pattern nesting depth.
+Wildcards and literals bind nothing. Bound variables are typed
+TYPE_ANY because the scrutinee's component types are not tracked at
+sub-pattern granularity in this analyzer's integer type model.
+@End Reasoning
+Process called "push_pattern_scope" takes analyzer as Integer, pattern as Integer:
+    Let analyzer_obj as ScalaSemanticAnalyzer be analyzer
+    proc enter_scope with analyzer
+
+    If pattern is equal to 0:
+        Return
+    End If
+
+    Let worklist be proc list_create from List
+    proc list_append from List with worklist, pattern
+
+    Let work_index be 0
+    While work_index is less than proc list_length from List with worklist:
+        Let current be proc list_get from List with worklist, work_index
+        Let current_kind be proc get_ast_node_type with current
+
+        If current_kind is equal to AST_VARIABLE_PATTERN:
+            Let bound_name be proc get_ast_node_value with current
+            Let pattern_symbol be a value of type SymbolInfo with
+                name as bound_name,
+                symbol_type as TYPE_ANY,
+                declared_type as 0,
+                inferred_type as 0,
+                scope_level as analyzer_obj.current_scope,
+                modifiers as proc list_create from List,
+                is_implicit as false,
+                is_lazy as false,
+                definition_node as current
+
+            proc hashtable_set from HashTable with analyzer_obj.symbol_table, bound_name, pattern_symbol
+        Otherwise If current_kind is equal to AST_CONSTRUCTOR_PATTERN or current_kind is equal to AST_TUPLE_PATTERN or
+                   current_kind is equal to AST_LIST_PATTERN or current_kind is equal to AST_PATTERN:
+            Let sub_patterns be proc get_ast_node_children with current
+            Let sub_count be proc list_length from List with sub_patterns
+            Let sub_index be 0
+            While sub_index is less than sub_count:
+                Let sub_pattern be proc list_get from List with sub_patterns, sub_index
+                proc list_append from List with worklist, sub_pattern
+                Set sub_index to sub_index plus 1
+            End While
+        End If
+
+        Set work_index to work_index plus 1
+    End While
+End Process
+
+@Reasoning:
+Closes the innermost scope opened by push_lambda_scope or
+push_pattern_scope. The scope model is a depth counter (the flat
+symbol table deliberately retains bindings - see push_lambda_scope),
+so popping is the counter decrement that exit_scope implements; this
+name exists so scope-pushing call sites read as a balanced push/pop
+pair.
+@End Reasoning
+Process called "pop_scope" takes analyzer as Integer:
+    proc exit_scope with analyzer
+End Process
+
+Note: ============================================================================
+Note: AST Shape Accessors
+Note: The parser's node layouts these decode:
+Note:   AST_MATCH_EXPRESSION: child 0 scrutinee, children 1.. AST_CASE_CLAUSE
+Note:   AST_CASE_CLAUSE: [pattern, optional AST_GUARD, body]
+Note:   AST_IF_EXPRESSION: [condition, then, optional else]
+Note:   AST_CLASS/AST_TRAIT/AST_OBJECT: value = name; children mix the
+Note:     type-parameter list (AST_PARAMETER_LIST tagged "type_parameters"),
+Note:     the primary-constructor AST_PARAMETER_LIST, the extends type node
+Note:     (attribute extends=true), mixin type nodes (attribute mixin=true),
+Note:     and the AST_BLOCK body ("class_body")
+Note:   AST_METHOD_CALL: value = method name; child 0 receiver, optional
+Note:     AST_LIST_LITERAL "type_arguments", optional AST_LIST_LITERAL
+Note:     "arguments"
+Note:   AST_FUNCTION_CALL: [callee, AST_LIST_LITERAL "arguments"]
+Note:   AST_VAL/VAR_DECLARATION: value = name; optional type node child
+Note:     (kinds 50-53), optional initializer child
+Note:   AST_LAMBDA: [optional AST_PARAMETER_LIST, body]
+Note:   AST_UNARY_OP: value = operator lexeme; child 0 operand
+Note:   AST_PARAMETER: value = name; optional type-node child, optional
+Note:     default-value child (attribute has_default)
+Note: ============================================================================
+
+@Reasoning:
+Maps a parsed type node to the analyzer's TYPE_* kind id without
+needing the analyzer handle (callers like get_val_explicit_type take
+only the node). Structure kinds map directly (function type, tuple
+type); type applications take their base type's kind (List[Int] is a
+TYPE_LIST); named types map through the builtin-name table, the
+parametric builtins, and the FunctionN family; any other name is a
+user-declared nominal type and maps to TYPE_CLASS, the kind under
+which user declarations are classified in this analyzer.
+@End Reasoning
+Process called "scala_type_node_kind" takes type_node as Integer returns Integer:
+    If type_node is equal to 0:
+        Return 0
+    End If
+
+    Let node_kind be proc get_ast_node_type with type_node
+
+    If node_kind is equal to AST_FUNCTION_TYPE:
+        Return TYPE_FUNCTION
+    End If
+    If node_kind is equal to AST_TUPLE_TYPE:
+        Return TYPE_TUPLE
+    End If
+    If node_kind is equal to AST_TYPE_APPLICATION:
+        Let app_children be proc get_ast_node_children with type_node
+        Let app_child_count be proc list_length from List with app_children
+        If app_child_count is equal to 0:
+            Return TYPE_ANY
+        End If
+        Let base_node be proc list_get from List with app_children, 0
+        Return proc scala_type_node_kind with base_node
+    End If
+
+    Let type_name be proc get_ast_node_value with type_node
+
+    If proc string_equals from StringCore with type_name, "Unit":
+        Return TYPE_UNIT
+    Otherwise If proc string_equals from StringCore with type_name, "Boolean":
+        Return TYPE_BOOLEAN
+    Otherwise If proc string_equals from StringCore with type_name, "Byte":
+        Return TYPE_BYTE
+    Otherwise If proc string_equals from StringCore with type_name, "Short":
+        Return TYPE_SHORT
+    Otherwise If proc string_equals from StringCore with type_name, "Int":
+        Return TYPE_INT
+    Otherwise If proc string_equals from StringCore with type_name, "Long":
+        Return TYPE_LONG
+    Otherwise If proc string_equals from StringCore with type_name, "Float":
+        Return TYPE_FLOAT
+    Otherwise If proc string_equals from StringCore with type_name, "Double":
+        Return TYPE_DOUBLE
+    Otherwise If proc string_equals from StringCore with type_name, "Char":
+        Return TYPE_CHAR
+    Otherwise If proc string_equals from StringCore with type_name, "String":
+        Return TYPE_STRING
+    Otherwise If proc string_equals from StringCore with type_name, "Any":
+        Return TYPE_ANY
+    Otherwise If proc string_equals from StringCore with type_name, "AnyRef":
+        Return TYPE_ANYREF
+    Otherwise If proc string_equals from StringCore with type_name, "AnyVal":
+        Return TYPE_ANYVAL
+    Otherwise If proc string_equals from StringCore with type_name, "Nothing":
+        Return TYPE_NOTHING
+    Otherwise If proc string_equals from StringCore with type_name, "Null":
+        Return TYPE_NULL
+    Otherwise If proc string_equals from StringCore with type_name, "List":
+        Return TYPE_LIST
+    Otherwise If proc string_equals from StringCore with type_name, "Array":
+        Return TYPE_ARRAY
+    Otherwise If proc string_equals from StringCore with type_name, "Option":
+        Return TYPE_OPTION
+    End If
+
+    Let is_function_n be proc string_starts_with from StringCore with type_name, "Function"
+    If is_function_n is equal to 1:
+        Return TYPE_FUNCTION
+    End If
+
+    Return TYPE_CLASS
+End Process
+
+@Reasoning:
+The scrutinee is always child 0 of a match expression - the postfix
+parser attaches the receiver expression there before consuming the
+case clauses.
+@End Reasoning
+Process called "get_match_scrutinee" takes match_node as Integer returns Integer:
+    Let children be proc get_ast_node_children with match_node
+    Let child_count be proc list_length from List with children
+    If child_count is equal to 0:
+        Return 0
+    End If
+    Return proc list_get from List with children, 0
+End Process
+
+@Reasoning:
+Reads the scrutinee's inferred type from the attribute the inference
+phase stored. An unset attribute (the scrutinee's kind may not store
+one until infer_expression_type visits it) degrades to TYPE_ANY so
+exhaustiveness checking treats the domain as unprovable rather than
+erroring.
+@End Reasoning
+Process called "get_match_scrutinee_type" takes match_node as Integer returns Integer:
+    Let scrutinee be proc get_match_scrutinee with match_node
+    If scrutinee is equal to 0:
+        Return TYPE_ANY
+    End If
+
+    Let type_attr be proc get_node_attribute with scrutinee, "inferred_type"
+    If type_attr is equal to 0:
+        Return TYPE_ANY
+    End If
+    Let attr_empty be proc string_equals from StringCore with type_attr, ""
+    If attr_empty is equal to 1:
+        Return TYPE_ANY
+    End If
+
+    Return proc string_to_integer from StringUtils with type_attr
+End Process
+
+@Reasoning:
+Collects the AST_CASE_CLAUSE children of a match node into a fresh
+list. Filtering by kind (rather than slicing children 1..) keeps the
+accessor correct even if error recovery left a non-case child behind.
+@End Reasoning
+Process called "get_match_cases" takes match_node as Integer returns Integer:
+    Let cases be proc list_create from List
+    Let children be proc get_ast_node_children with match_node
+    Let child_count be proc list_length from List with children
+
+    Let i be 0
+    While i is less than child_count:
+        Let child be proc list_get from List with children, i
+        Let child_kind be proc get_ast_node_type with child
+        If child_kind is equal to AST_CASE_CLAUSE:
+            proc list_append from List with cases, child
+        End If
+        Set i to i plus 1
+    End While
+
+    Return cases
+End Process
+
+@Reasoning:
+The pattern is the first child whose kind lies in the pattern range
+(AST_PATTERN through AST_LIST_PATTERN). Scanning by kind keeps the
+accessor stable against the optional guard child.
+@End Reasoning
+Process called "get_case_pattern" takes case_node as Integer returns Integer:
+    Let children be proc get_ast_node_children with case_node
+    Let child_count be proc list_length from List with children
+
+    Let i be 0
+    While i is less than child_count:
+        Let child be proc list_get from List with children, i
+        Let child_kind be proc get_ast_node_type with child
+        If child_kind is greater than or equal to AST_PATTERN and child_kind is less than or equal to AST_LIST_PATTERN:
+            Return child
+        End If
+        Set i to i plus 1
+    End While
+
+    Return 0
+End Process
+
+@Reasoning:
+The body is the last child of a case clause that is neither a pattern
+nor the optional guard - the parser appends pattern, then guard when
+present, then body.
+@End Reasoning
+Process called "get_case_body" takes case_node as Integer returns Integer:
+    Let children be proc get_ast_node_children with case_node
+    Let child_count be proc list_length from List with children
+
+    Let i be child_count minus 1
+    While i is greater than or equal to 0:
+        Let child be proc list_get from List with children, i
+        Let child_kind be proc get_ast_node_type with child
+        Let is_pattern be 0
+        If child_kind is greater than or equal to AST_PATTERN and child_kind is less than or equal to AST_LIST_PATTERN:
+            Set is_pattern to 1
+        End If
+        If is_pattern is equal to 0 and child_kind is not equal to AST_GUARD:
+            Return child
+        End If
+        Set i to i minus 1
+    End While
+
+    Return 0
+End Process
+
+@Reasoning:
+If-expression children are positional: condition, then-branch, and
+the optional else-branch. Absent branches return 0 so callers can
+treat "no else" as the Unit branch.
+@End Reasoning
+Process called "get_if_condition" takes if_node as Integer returns Integer:
+    Let children be proc get_ast_node_children with if_node
+    Let child_count be proc list_length from List with children
+    If child_count is less than 1:
+        Return 0
+    End If
+    Return proc list_get from List with children, 0
+End Process
+
+@Reasoning:
+Positional accessor for the then-branch (child 1) of an if
+expression; 0 when the parser recovered without one.
+@End Reasoning
+Process called "get_if_then_branch" takes if_node as Integer returns Integer:
+    Let children be proc get_ast_node_children with if_node
+    Let child_count be proc list_length from List with children
+    If child_count is less than 2:
+        Return 0
+    End If
+    Return proc list_get from List with children, 1
+End Process
+
+@Reasoning:
+Positional accessor for the optional else-branch (child 2) of an if
+expression; 0 when the else clause was omitted.
+@End Reasoning
+Process called "get_if_else_branch" takes if_node as Integer returns Integer:
+    Let children be proc get_ast_node_children with if_node
+    Let child_count be proc list_length from List with children
+    If child_count is less than 3:
+        Return 0
+    End If
+    Return proc list_get from List with children, 2
+End Process
+
+@Reasoning:
+A declaration's name is its node value for every declaration kind the
+parser produces - classes included.
+@End Reasoning
+Process called "get_class_name" takes class_node as Integer returns String:
+    Return proc get_ast_node_value with class_node
+End Process
+
+@Reasoning:
+The extends parent is the child type node carrying the "extends"
+attribute the parser stamps when it consumes the extends clause.
+Returns the type NODE (not a kind id) so callers can read both its
+name and its shape; 0 when the class extends nothing.
+@End Reasoning
+Process called "get_class_superclass" takes class_node as Integer returns Integer:
+    Let children be proc get_ast_node_children with class_node
+    Let child_count be proc list_length from List with children
+
+    Let i be 0
+    While i is less than child_count:
+        Let child be proc list_get from List with children, i
+        Let extends_attr be proc get_node_attribute with child, "extends"
+        Let is_extends be proc string_equals from StringCore with extends_attr, "true"
+        If is_extends is equal to 1:
+            Return child
+        End If
+        Set i to i plus 1
+    End While
+
+    Return 0
+End Process
+
+@Reasoning:
+Mixed-in traits are the child type nodes carrying the "mixin"
+attribute stamped by the with-clause parser, collected in source
+order.
+@End Reasoning
+Process called "get_class_traits" takes class_node as Integer returns Integer:
+    Let traits be proc list_create from List
+    Let children be proc get_ast_node_children with class_node
+    Let child_count be proc list_length from List with children
+
+    Let i be 0
+    While i is less than child_count:
+        Let child be proc list_get from List with children, i
+        Let mixin_attr be proc get_node_attribute with child, "mixin"
+        Let is_mixin be proc string_equals from StringCore with mixin_attr, "true"
+        If is_mixin is equal to 1:
+            proc list_append from List with traits, child
+        End If
+        Set i to i plus 1
+    End While
+
+    Return traits
+End Process
+
+@Reasoning:
+Class members live inside the AST_BLOCK body child ("class_body").
+The returned list is the block's children (each member declaration);
+a body-less class yields an empty list, never 0, so iteration code
+needs no null check.
+@End Reasoning
+Process called "get_class_members" takes class_node as Integer returns Integer:
+    Let children be proc get_ast_node_children with class_node
+    Let child_count be proc list_length from List with children
+
+    Let i be 0
+    While i is less than child_count:
+        Let child be proc list_get from List with children, i
+        Let child_kind be proc get_ast_node_type with child
+        If child_kind is equal to AST_BLOCK:
+            Return proc get_ast_node_children with child
+        End If
+        Set i to i plus 1
+    End While
+
+    Return proc list_create from List
+End Process
+
+@Reasoning:
+Traits share the class node layout, so the name accessor is the node
+value, same as classes.
+@End Reasoning
+Process called "get_trait_name" takes trait_node as Integer returns String:
+    Return proc get_ast_node_value with trait_node
+End Process
+
+@Reasoning:
+A trait's supertypes are its extends parent plus every with-clause
+mixin, in declaration order - both participate in linearization and
+both must exist, so validation consumes them as one list of type
+nodes.
+@End Reasoning
+Process called "get_trait_supertypes" takes trait_node as Integer returns Integer:
+    Let supertypes be proc list_create from List
+
+    Let parent be proc get_class_superclass with trait_node
+    If parent is not equal to 0:
+        proc list_append from List with supertypes, parent
+    End If
+
+    Let mixins be proc get_class_traits with trait_node
+    Let mixin_count be proc list_length from List with mixins
+    Let i be 0
+    While i is less than mixin_count:
+        Let mixin be proc list_get from List with mixins, i
+        proc list_append from List with supertypes, mixin
+        Set i to i plus 1
+    End While
+
+    Return supertypes
+End Process
+
+@Reasoning:
+Trait methods are the AST_FUNCTION members of the trait body -
+filtered from get_class_members because trait bodies also hold vals,
+nested types, and the self-type annotation node.
+@End Reasoning
+Process called "get_trait_methods" takes trait_node as Integer returns Integer:
+    Let methods be proc list_create from List
+    Let members be proc get_class_members with trait_node
+    Let member_count be proc list_length from List with members
+
+    Let i be 0
+    While i is less than member_count:
+        Let member be proc list_get from List with members, i
+        Let member_kind be proc get_ast_node_type with member
+        If member_kind is equal to AST_FUNCTION:
+            proc list_append from List with methods, member
+        End If
+        Set i to i plus 1
+    End While
+
+    Return methods
+End Process
+
+@Reasoning:
+The self-type annotation ("self: Foo =>") is parsed as the first body
+item and stamped with the "self_type" attribute on the type node.
+Returns the type node, or 0 when the trait declares no self-type.
+@End Reasoning
+Process called "get_trait_self_type" takes trait_node as Integer returns Integer:
+    Let members be proc get_class_members with trait_node
+    Let member_count be proc list_length from List with members
+
+    Let i be 0
+    While i is less than member_count:
+        Let member be proc list_get from List with members, i
+        Let self_attr be proc get_node_attribute with member, "self_type"
+        Let is_self be proc string_equals from StringCore with self_attr, "true"
+        If is_self is equal to 1:
+            Return member
+        End If
+        Set i to i plus 1
+    End While
+
+    Return 0
+End Process
+
+@Reasoning:
+Method-call receiver is child 0 - the postfix parser attaches the
+already-parsed receiver expression there before the name, type
+arguments, and arguments.
+@End Reasoning
+Process called "get_method_receiver" takes method_call_node as Integer returns Integer:
+    Let children be proc get_ast_node_children with method_call_node
+    Let child_count be proc list_length from List with children
+    If child_count is equal to 0:
+        Return 0
+    End If
+    Return proc list_get from List with children, 0
+End Process
+
+@Reasoning:
+The method name is the AST_METHOD_CALL node's value - the postfix
+parser stores the selected identifier there.
+@End Reasoning
+Process called "get_method_name" takes method_call_node as Integer returns String:
+    Return proc get_ast_node_value with method_call_node
+End Process
+
+@Reasoning:
+Arguments live in the AST_LIST_LITERAL child tagged "arguments". A
+field-style selection has no argument container; the accessor then
+returns an empty list (never 0) so arity logic reads it as a
+zero-argument application.
+@End Reasoning
+Process called "get_method_arguments" takes method_call_node as Integer returns Integer:
+    Let children be proc get_ast_node_children with method_call_node
+    Let child_count be proc list_length from List with children
+
+    Let i be 0
+    While i is less than child_count:
+        Let child be proc list_get from List with children, i
+        Let child_kind be proc get_ast_node_type with child
+        If child_kind is equal to AST_LIST_LITERAL:
+            Let tag be proc get_ast_node_value with child
+            Let is_args be proc string_equals from StringCore with tag, "arguments"
+            If is_args is equal to 1:
+                Return proc get_ast_node_children with child
+            End If
+        End If
+        Set i to i plus 1
+    End While
+
+    Return proc list_create from List
+End Process
+
+@Reasoning:
+Explicit method type arguments live in the AST_LIST_LITERAL child
+tagged "type_arguments" ("recv.m[Int](x)"). Empty list when the call
+site supplied none - inference then derives bindings from argument
+types instead.
+@End Reasoning
+Process called "get_method_type_arguments" takes method_call_node as Integer returns Integer:
+    Let children be proc get_ast_node_children with method_call_node
+    Let child_count be proc list_length from List with children
+
+    Let i be 0
+    While i is less than child_count:
+        Let child be proc list_get from List with children, i
+        Let child_kind be proc get_ast_node_type with child
+        If child_kind is equal to AST_LIST_LITERAL:
+            Let tag be proc get_ast_node_value with child
+            Let is_type_args be proc string_equals from StringCore with tag, "type_arguments"
+            If is_type_args is equal to 1:
+                Return proc get_ast_node_children with child
+            End If
+        End If
+        Set i to i plus 1
+    End While
+
+    Return proc list_create from List
+End Process
+
+@Reasoning:
+Unified argument accessor for both call shapes: method calls delegate
+to get_method_arguments; function calls (including "new") scan for
+the AST_LIST_LITERAL tagged "arguments". Always returns a list (empty
+when the call carries no argument container).
+@End Reasoning
+Process called "get_call_arguments" takes call_node as Integer returns Integer:
+    Let node_kind be proc get_ast_node_type with call_node
+    If node_kind is equal to AST_METHOD_CALL:
+        Return proc get_method_arguments with call_node
+    End If
+
+    Let children be proc get_ast_node_children with call_node
+    Let child_count be proc list_length from List with children
+
+    Let i be 0
+    While i is less than child_count:
+        Let child be proc list_get from List with children, i
+        Let child_kind be proc get_ast_node_type with child
+        If child_kind is equal to AST_LIST_LITERAL:
+            Let tag be proc get_ast_node_value with child
+            Let is_args be proc string_equals from StringCore with tag, "arguments"
+            If is_args is equal to 1:
+                Return proc get_ast_node_children with child
+            End If
+        End If
+        Set i to i plus 1
+    End While
+
+    Return proc list_create from List
+End Process
+
+@Reasoning:
+val/var declarations store their name as the node value.
+@End Reasoning
+Process called "get_val_name" takes val_node as Integer returns String:
+    Return proc get_ast_node_value with val_node
+End Process
+
+@Reasoning:
+The explicit type annotation, when present, is the child whose kind
+lies in the type-node range (AST_TYPE through AST_TUPLE_TYPE). The
+accessor returns the annotation's TYPE_* kind id (via the pure
+node-to-kind mapper) because its consumers feed the constraint
+solver, which works on kind ids; 0 means "no annotation".
+@End Reasoning
+Process called "get_val_explicit_type" takes val_node as Integer returns Integer:
+    Let children be proc get_ast_node_children with val_node
+    Let child_count be proc list_length from List with children
+
+    Let i be 0
+    While i is less than child_count:
+        Let child be proc list_get from List with children, i
+        Let child_kind be proc get_ast_node_type with child
+        If child_kind is greater than or equal to AST_TYPE and child_kind is less than or equal to AST_TUPLE_TYPE:
+            Return proc scala_type_node_kind with child
+        End If
+        Set i to i plus 1
+    End While
+
+    Return 0
+End Process
+
+@Reasoning:
+The initializer is the first child that is NOT a type node - the
+parser appends the optional annotation first, then the optional
+initializer expression. 0 for abstract/uninitialised declarations.
+@End Reasoning
+Process called "get_val_initializer" takes val_node as Integer returns Integer:
+    Let children be proc get_ast_node_children with val_node
+    Let child_count be proc list_length from List with children
+
+    Let i be 0
+    While i is less than child_count:
+        Let child be proc list_get from List with children, i
+        Let child_kind be proc get_ast_node_type with child
+        Let is_type_node be 0
+        If child_kind is greater than or equal to AST_TYPE and child_kind is less than or equal to AST_TUPLE_TYPE:
+            Set is_type_node to 1
+        End If
+        If is_type_node is equal to 0:
+            Return child
+        End If
+        Set i to i plus 1
+    End While
+
+    Return 0
+End Process
+
+@Reasoning:
+Lambda parameters live in the AST_PARAMETER_LIST child; a lambda
+without a parameter list yields an empty list so the arity loop in
+infer_lambda_type runs zero times.
+@End Reasoning
+Process called "get_lambda_parameters" takes lambda_node as Integer returns Integer:
+    Let children be proc get_ast_node_children with lambda_node
+    Let child_count be proc list_length from List with children
+
+    Let i be 0
+    While i is less than child_count:
+        Let child be proc list_get from List with children, i
+        Let child_kind be proc get_ast_node_type with child
+        If child_kind is equal to AST_PARAMETER_LIST:
+            Return proc get_ast_node_children with child
+        End If
+        Set i to i plus 1
+    End While
+
+    Return proc list_create from List
+End Process
+
+@Reasoning:
+The lambda body is the last child that is not the parameter list -
+the parser appends parameters first, body second.
+@End Reasoning
+Process called "get_lambda_body" takes lambda_node as Integer returns Integer:
+    Let children be proc get_ast_node_children with lambda_node
+    Let child_count be proc list_length from List with children
+
+    Let i be child_count minus 1
+    While i is greater than or equal to 0:
+        Let child be proc list_get from List with children, i
+        Let child_kind be proc get_ast_node_type with child
+        If child_kind is not equal to AST_PARAMETER_LIST:
+            Return child
+        End If
+        Set i to i minus 1
+    End While
+
+    Return 0
+End Process
+
+@Reasoning:
+The unary operator's lexeme is the AST_UNARY_OP node's value - the
+prefix parser stores the operator token name there.
+@End Reasoning
+Process called "get_unary_operator" takes unary_op_node as Integer returns String:
+    Return proc get_ast_node_value with unary_op_node
+End Process
+
+@Reasoning:
+The operand is child 0 of a unary node - its only child.
+@End Reasoning
+Process called "get_unary_operand" takes unary_op_node as Integer returns Integer:
+    Let children be proc get_ast_node_children with unary_op_node
+    Let child_count be proc list_length from List with children
+    If child_count is equal to 0:
+        Return 0
+    End If
+    Return proc list_get from List with children, 0
+End Process
+
+@Reasoning:
+A parameter's explicit annotation is its type-node child, mapped to a
+TYPE_* kind id; 0 when the parameter is untyped (lambda parameters
+may omit the annotation and rely on the expected type).
+@End Reasoning
+Process called "get_parameter_explicit_type" takes parameter as Integer returns Integer:
+    Let children be proc get_ast_node_children with parameter
+    Let child_count be proc list_length from List with children
+
+    Let i be 0
+    While i is less than child_count:
+        Let child be proc list_get from List with children, i
+        Let child_kind be proc get_ast_node_type with child
+        If child_kind is greater than or equal to AST_TYPE and child_kind is less than or equal to AST_TUPLE_TYPE:
+            Return proc scala_type_node_kind with child
+        End If
+        Set i to i plus 1
+    End While
+
+    Return 0
+End Process
+
+@Reasoning:
+The general parameter-type accessor used by signature extraction. The
+only type source a parameter node carries is its explicit annotation,
+so this delegates to get_parameter_explicit_type; callers treat the 0
+"no annotation" result as TYPE_ANY where defaulting is appropriate.
+@End Reasoning
+Process called "get_parameter_type" takes parameter as Integer returns Integer:
+    Return proc get_parameter_explicit_type with parameter
+End Process
+
+@Reasoning:
+An implicit conversion candidate is an ImplicitInfo whose
+conversion_type records the SOURCE type it converts from; the type it
+converts TO is its implicit_type field. resolve_implicit_conversions
+asks for the target so it can search that type's methods.
+@End Reasoning
+Process called "get_conversion_target_type" takes conversion as Integer returns Integer:
+    If conversion is equal to 0:
+        Return 0
+    End If
+    Let conversion_obj as ImplicitInfo be conversion
+    Return conversion_obj.implicit_type
+End Process
+
+@Reasoning:
+Flattens every VALUE parameter list of a def into one ordered list of
+AST_PARAMETER nodes. Scala allows multiple (curried) parameter lists
+and an implicit list; arity and implicit extraction both operate on
+the flattened sequence. The type-parameter list shares the
+AST_PARAMETER_LIST kind but carries the "type_parameters" tag and is
+skipped - type parameters are not value parameters.
+@End Reasoning
+Process called "get_function_parameters" takes function_def as Integer returns Integer:
+    Let parameters be proc list_create from List
+    If function_def is equal to 0:
+        Return parameters
+    End If
+
+    Let children be proc get_ast_node_children with function_def
+    Let child_count be proc list_length from List with children
+
+    Let i be 0
+    While i is less than child_count:
+        Let child be proc list_get from List with children, i
+        Let child_kind be proc get_ast_node_type with child
+        If child_kind is equal to AST_PARAMETER_LIST:
+            Let list_tag be proc get_ast_node_value with child
+            Let is_type_params be proc string_equals from StringCore with list_tag, "type_parameters"
+            If is_type_params is equal to 0:
+                Let params be proc get_ast_node_children with child
+                Let param_count be proc list_length from List with params
+                Let j be 0
+                While j is less than param_count:
+                    Let param be proc list_get from List with params, j
+                    proc list_append from List with parameters, param
+                    Set j to j plus 1
+                End While
+            End If
+        End If
+        Set i to i plus 1
+    End While
+
+    Return parameters
+End Process
+
+@Reasoning:
+Reads the expected type a call site published for this node before
+its inference ran (see infer_function_call_type). Keyed by the node's
+address rendered as a string because the inference context hashes
+string keys. 0 means no context imposed an expectation.
+@End Reasoning
+Process called "get_expected_type" takes analyzer as Integer, node as Integer returns Integer:
+    Let analyzer_obj as ScalaSemanticAnalyzer be analyzer
+    Let node_key be proc integer_to_string from StringUtils with node
+    Let context_key be proc string_concat from StringUtils with "expected:", node_key
+    Return proc hashtable_get from HashTable with analyzer_obj.inference_context, context_key
+End Process
+
+@Reasoning:
+Reads the "implicit" marker the parameter parser stamps when it
+consumes the implicit keyword. Returns 1/0 rather than the attribute
+string so callers compare integers.
+@End Reasoning
+Process called "parameter_is_implicit" takes parameter as Integer returns Integer:
+    Let implicit_attr be proc get_node_attribute with parameter, "implicit"
+    Return proc string_equals from StringCore with implicit_attr, "true"
+End Process
+
+Note: ============================================================================
+Note: Type Machinery
+Note: Type ids are either bare TYPE_* kind codes (small integers) or heap
+Note: TypeInfo record addresses. Addresses are distinguished by the same
+Note: >= 65536 guard the fsharp frontend established - no mapped page sits
+Note: below 64K, and every kind code is tiny.
+Note: ============================================================================
+
+@Reasoning:
+Builds the FunctionN type record for a parameter-type list and return
+type. The record's type_params slot stores the parameter types in
+order followed by the return type as the final element - the same
+encoding Scala's FunctionN[T1..TN, R] uses, which makes arity
+(length - 1) and per-slot extraction trivial.
+@End Reasoning
+Process called "create_function_type" takes param_types as Integer, return_type as Integer returns Integer:
+    Let all_types be proc list_create from List
+
+    Let param_count be proc list_length from List with param_types
+    Let i be 0
+    While i is less than param_count:
+        Let param_type be proc list_get from List with param_types, i
+        proc list_append from List with all_types, param_type
+        Set i to i plus 1
+    End While
+    proc list_append from List with all_types, return_type
+
+    Let function_name be proc string_concat from StringUtils with "Function", proc integer_to_string from StringUtils with param_count
+    Let function_info be a value of type TypeInfo with
+        type_kind as TYPE_FUNCTION,
+        type_name as function_name,
+        type_params as all_types,
+        constraints as proc list_create from List,
+        variance as "",
+        bounds as proc hashtable_create from HashTable,
+        is_resolved as true
+
+    Return function_info
+End Process
+
+@Reasoning:
+Extracts the param_index'th parameter type from a function-type
+record. Bare TYPE_FUNCTION codes carry no payload and non-function
+records have no parameter slots, so both degrade to 0 ("unknown") and
+the caller falls back to TYPE_ANY. The final type_params element is
+the return type, hence the index bound of length - 1.
+@End Reasoning
+Process called "extract_function_param_type" takes function_type as Integer, param_index as Integer returns Integer:
+    If function_type is less than 65536:
+        Return 0
+    End If
+
+    Let type_info as TypeInfo be function_type
+    If type_info.type_kind is not equal to TYPE_FUNCTION:
+        Return 0
+    End If
+
+    Let total be proc list_length from List with type_info.type_params
+    Let param_count be total minus 1
+    If param_index is less than 0:
+        Return 0
+    End If
+    If param_index is greater than or equal to param_count:
+        Return 0
+    End If
+
+    Return proc list_get from List with type_info.type_params, param_index
+End Process
+
+@Reasoning:
+A type parameter is a heap TypeInfo created by create_type_parameter:
+kind TYPE_GENERIC with is_resolved false. Bare kind codes are never
+parameters, and a TYPE_GENERIC record that unification already bound
+(is_resolved true) behaves as a concrete type from then on.
+@End Reasoning
+Process called "is_type_parameter" takes type_id as Integer returns Integer:
+    If type_id is less than 65536:
+        Return 0
+    End If
+
+    Let type_info as TypeInfo be type_id
+    If type_info.type_kind is not equal to TYPE_GENERIC:
+        Return 0
+    End If
+    If type_info.is_resolved:
+        Return 0
+    End If
+
+    Return 1
+End Process
+
+@Reasoning:
+Binds an unresolved type parameter to a concrete type, with the two
+soundness checks unification requires: the occurs check (the
+parameter must not appear inside the type it is being bound to -
+binding T := List[T] would build an infinite type) and the
+upper-bound check when the parameter declared one ("T <: Bound" is
+stored under "upper" in the parameter's bounds table). The binding is
+recorded in the analyzer's inference context keyed by the parameter's
+address, and the parameter is marked resolved so subsequent
+is_type_parameter tests treat it as concrete.
+@End Reasoning
+@Implementation:
+The occurs check is an explicit worklist over the bound type's
+type_params graph: heap records push their component types; a
+component identical to the parameter's address is an occurrence.
+Bound enforcement reuses are_types_compatible without an analyzer-
+specific subtype walk because bounds are stored as kind ids.
+@End Implementation
+Process called "unify_type_parameter" takes analyzer as Integer, param_type as Integer, bound_type as Integer:
+    If param_type is equal to 0:
+        Return 0
+    End If
+    If param_type is equal to bound_type:
+        Return 1
+    End If
+
+    Let param_check be proc is_type_parameter with param_type
+    If param_check is equal to 0:
+        Return 0
+    End If
+
+    Note: Occurs check - param_type must not appear inside bound_type
+    If bound_type is greater than or equal to 65536:
+        Let occurs_worklist be proc list_create from List
+        proc list_append from List with occurs_worklist, bound_type
+
+        Let occurs_index be 0
+        While occurs_index is less than proc list_length from List with occurs_worklist:
+            Let occurs_current be proc list_get from List with occurs_worklist, occurs_index
+
+            If occurs_current is equal to param_type:
+                Let analyzer_for_error be analyzer
+                proc add_semantic_error with analyzer_for_error, ERROR_TYPE_BOUNDS, "Occurs check failed: type parameter appears in its own binding"
+                Return 0
+            End If
+
+            If occurs_current is greater than or equal to 65536:
+                Let occurs_info as TypeInfo be occurs_current
+                Let occurs_components be occurs_info.type_params
+                Let occurs_count be proc list_length from List with occurs_components
+                Let occurs_child_index be 0
+                While occurs_child_index is less than occurs_count:
+                    Let occurs_component be proc list_get from List with occurs_components, occurs_child_index
+                    proc list_append from List with occurs_worklist, occurs_component
+                    Set occurs_child_index to occurs_child_index plus 1
+                End While
+            End If
+
+            Set occurs_index to occurs_index plus 1
+        End While
+    End If
+
+    Note: Upper-bound enforcement when the parameter declared one
+    Let param_info as TypeInfo be param_type
+    Let upper_bound be proc hashtable_get from HashTable with param_info.bounds, "upper"
+    If upper_bound is not equal to 0:
+        Let bound_ok be proc are_types_compatible with analyzer, bound_type, upper_bound
+        If bound_ok is equal to 0:
+            proc add_semantic_error with analyzer, ERROR_TYPE_BOUNDS, "Type argument violates declared upper bound"
+            Return 0
+        End If
+    End If
+
+    Note: Record the binding and mark the parameter resolved
+    Let analyzer_obj as ScalaSemanticAnalyzer be analyzer
+    Let binding_key be proc string_concat from StringUtils with "binding:", proc integer_to_string from StringUtils with param_type
+    proc hashtable_set from HashTable with analyzer_obj.inference_context, binding_key, bound_type
+    Set param_info.is_resolved to true
+
+    Return 1
+End Process
+
+@Reasoning:
+Collapses a type id to its canonical form by following the binding
+chain unification recorded in the inference context. Bare kind codes
+are already canonical. The hop limit caps pathological chains - a
+correct binding store never cycles (the occurs check forbids direct
+self-binding and bindings only ever point at older types), but a
+bounded walk turns any corruption into a stale answer instead of a
+hang.
+@End Reasoning
+Process called "resolve_type_alias" takes analyzer as Integer, type_id as Integer returns Integer:
+    Let analyzer_obj as ScalaSemanticAnalyzer be analyzer
+    Let current be type_id
+    Let hops be 0
+
+    While hops is less than 64:
+        If current is less than 65536:
+            Return current
+        End If
+
+        Let binding_key be proc string_concat from StringUtils with "binding:", proc integer_to_string from StringUtils with current
+        Let bound be proc hashtable_get from HashTable with analyzer_obj.inference_context, binding_key
+        If bound is equal to 0:
+            Return current
+        End If
+
+        Set current to bound
+        Set hops to hops plus 1
+    End While
+
+    Return current
+End Process
+
+@Reasoning:
+Structural type equality after alias collapse. Two bare kind codes
+are equal exactly when identical. A bare code against a record
+compares kind-only - the bare side carries no structure to
+contradict. Two records require equal kinds, equal arity, equal names
+for nominal kinds (class/trait/object/case class - List[Int] and
+MyBox[Int] must not unify just because their shapes match), and
+pointwise structural equality of their component types.
+@End Reasoning
+Process called "check_structural_equality" takes analyzer as Integer, left_type as Integer, right_type as Integer returns Integer:
+    Let left be proc resolve_type_alias with analyzer, left_type
+    Let right be proc resolve_type_alias with analyzer, right_type
+
+    If left is equal to right:
+        Return 1
+    End If
+
+    Let left_is_record be 0
+    If left is greater than or equal to 65536:
+        Set left_is_record to 1
+    End If
+    Let right_is_record be 0
+    If right is greater than or equal to 65536:
+        Set right_is_record to 1
+    End If
+
+    If left_is_record is equal to 0 and right_is_record is equal to 0:
+        Return 0
+    End If
+
+    If left_is_record is equal to 0:
+        Let right_info as TypeInfo be right
+        If right_info.type_kind is equal to left:
+            Return 1
+        End If
+        Return 0
+    End If
+
+    If right_is_record is equal to 0:
+        Let left_info as TypeInfo be left
+        If left_info.type_kind is equal to right:
+            Return 1
+        End If
+        Return 0
+    End If
+
+    Let left_record as TypeInfo be left
+    Let right_record as TypeInfo be right
+
+    If left_record.type_kind is not equal to right_record.type_kind:
+        Return 0
+    End If
+
+    Note: Nominal kinds require name identity
+    Let kind be left_record.type_kind
+    If kind is equal to TYPE_CLASS or kind is equal to TYPE_TRAIT or kind is equal to TYPE_OBJECT or kind is equal to TYPE_CASE_CLASS:
+        Let names_equal be proc string_equals from StringCore with left_record.type_name, right_record.type_name
+        If names_equal is equal to 0:
+            Return 0
+        End If
+    End If
+
+    Let left_components be left_record.type_params
+    Let right_components be right_record.type_params
+    Let left_count be proc list_length from List with left_components
+    Let right_count be proc list_length from List with right_components
+
+    If left_count is not equal to right_count:
+        Return 0
+    End If
+
+    Let i be 0
+    While i is less than left_count:
+        Let left_component be proc list_get from List with left_components, i
+        Let right_component be proc list_get from List with right_components, i
+        Let component_equal be proc check_structural_equality with analyzer, left_component, right_component
+        If component_equal is equal to 0:
+            Return 0
+        End If
+        Set i to i plus 1
+    End While
+
+    Return 1
+End Process
+
+@Reasoning:
+Numeric widening rank for LUB computation: Byte < Short < Int < Long
+< Float < Double, mirroring is_numeric_conversion_valid's widening
+order. Non-numeric kinds rank 0 so callers can use the rank as a
+numeric-membership test.
+@End Reasoning
+Process called "numeric_type_rank" takes type_kind as Integer returns Integer:
+    If type_kind is equal to TYPE_BYTE:
+        Return 1
+    Otherwise If type_kind is equal to TYPE_SHORT:
+        Return 2
+    Otherwise If type_kind is equal to TYPE_INT:
+        Return 3
+    Otherwise If type_kind is equal to TYPE_LONG:
+        Return 4
+    Otherwise If type_kind is equal to TYPE_FLOAT:
+        Return 5
+    Otherwise If type_kind is equal to TYPE_DOUBLE:
+        Return 6
+    End If
+    Return 0
+End Process
+
+@Reasoning:
+Least upper bound over the Scala type lattice as this analyzer models
+it. The cascade follows the lattice's structure: identity, error
+absorption (TYPE_ERROR contributes nothing), the Nothing bottom, Null
+under reference types, numeric widening (LUB = higher rank), Any as
+the top absorbing element, subtype-directed LUB for related nominal
+types (if one side is a subtype of the other, the supertype is the
+bound), then the AnyVal/AnyRef intermediate tops for same-family
+unrelated types, and finally TYPE_ANY for cross-family pairs
+(Int vs String has no bound below Any).
+@End Reasoning
+Process called "find_least_upper_bound" takes analyzer as Integer, type_a as Integer, type_b as Integer returns Integer:
+    Let a be proc resolve_type_alias with analyzer, type_a
+    Let b be proc resolve_type_alias with analyzer, type_b
+
+    If a is equal to b:
+        Return a
+    End If
+
+    If a is equal to TYPE_ERROR:
+        Return b
+    End If
+    If b is equal to TYPE_ERROR:
+        Return a
+    End If
+
+    Note: Normalize record addresses to their kind for lattice placement
+    Let a_kind be a
+    If a is greater than or equal to 65536:
+        Let a_info as TypeInfo be a
+        Set a_kind to a_info.type_kind
+    End If
+    Let b_kind be b
+    If b is greater than or equal to 65536:
+        Let b_info as TypeInfo be b
+        Set b_kind to b_info.type_kind
+    End If
+
+    Note: Nothing is the bottom of the lattice
+    If a_kind is equal to TYPE_NOTHING:
+        Return b
+    End If
+    If b_kind is equal to TYPE_NOTHING:
+        Return a
+    End If
+
+    Note: Any is the top - it absorbs everything
+    If a_kind is equal to TYPE_ANY or b_kind is equal to TYPE_ANY:
+        Return TYPE_ANY
+    End If
+
+    Note: Null sits under every reference type
+    If a_kind is equal to TYPE_NULL:
+        Let b_is_ref be proc is_reference_type with b_kind
+        If b_is_ref:
+            Return b
+        End If
+        Return TYPE_ANY
+    End If
+    If b_kind is equal to TYPE_NULL:
+        Let a_is_ref be proc is_reference_type with a_kind
+        If a_is_ref:
+            Return a
+        End If
+        Return TYPE_ANY
+    End If
+
+    Note: Numeric widening - the wider rank is the bound
+    Let a_rank be proc numeric_type_rank with a_kind
+    Let b_rank be proc numeric_type_rank with b_kind
+    If a_rank is greater than 0 and b_rank is greater than 0:
+        If a_rank is greater than or equal to b_rank:
+            Return a_kind
+        End If
+        Return b_kind
+    End If
+
+    Note: Subtype-directed bound for related types
+    Let a_sub_b be proc check_inheritance_subtype with analyzer, a, b
+    If a_sub_b is equal to 1:
+        Return b
+    End If
+    Let b_sub_a be proc check_inheritance_subtype with analyzer, b, a
+    If b_sub_a is equal to 1:
+        Return a
+    End If
+    Let a_trait_b be proc check_trait_subtype with analyzer, a, b
+    If a_trait_b is equal to 1:
+        Return b
+    End If
+    Let b_trait_a be proc check_trait_subtype with analyzer, b, a
+    If b_trait_a is equal to 1:
+        Return a
+    End If
+
+    Note: Same-family intermediate tops. Nested Ifs rather than 'and' -
+    Note: the stage1 bootstrap miscompiles 'and' over bare truthy operands.
+    Let a_value be proc is_value_type with a_kind
+    If a_value is equal to 1:
+        Let b_value be proc is_value_type with b_kind
+        If b_value is equal to 1:
+            Return TYPE_ANYVAL
+        End If
+    End If
+
+    Let a_ref be proc is_reference_type with a_kind
+    If a_ref is equal to 1:
+        Let b_ref be proc is_reference_type with b_kind
+        If b_ref is equal to 1:
+            Return TYPE_ANYREF
+        End If
+    End If
+
+    Note: Cross-family - only Any bounds a value type and a reference type
+    Return TYPE_ANY
+End Process
+
+@Reasoning:
+Folds find_least_upper_bound across a list of types. The empty list
+yields TYPE_NOTHING - the bound of zero alternatives is the lattice
+bottom (a match with no cases can produce no value), which is also
+the fold identity since LUB(Nothing, T) = T.
+@End Reasoning
+Process called "find_least_upper_bound_list" takes analyzer as Integer, types as Integer returns Integer:
+    Let count be proc list_length from List with types
+    If count is equal to 0:
+        Return TYPE_NOTHING
+    End If
+
+    Let result be proc list_get from List with types, 0
+    Let i be 1
+    While i is less than count:
+        Let next_type be proc list_get from List with types, i
+        Set result to proc find_least_upper_bound with analyzer, result, next_type
+        Set i to i plus 1
+    End While
+
+    Return result
+End Process
+
+@Reasoning:
+Membership predicate for the integral types - the operand domain of
+bitwise complement. Char is integral in Scala (it widens to Int in
+arithmetic and bitwise contexts), so it belongs alongside the four
+integer kinds; Float/Double do not.
+@End Reasoning
+Process called "is_integral_type" takes type_kind as Integer returns Integer:
+    If type_kind is equal to TYPE_BYTE or type_kind is equal to TYPE_SHORT or
+       type_kind is equal to TYPE_INT or type_kind is equal to TYPE_LONG or
+       type_kind is equal to TYPE_CHAR:
+        Return 1
+    End If
+    Return 0
+End Process
+
+@Reasoning:
+The canonical expression-typing entry point. Per-kind handlers either
+store the node's "inferred_type" attribute themselves (literal,
+identifier, binary op, call, block, tuple, list, declarations) or
+return the type for this routine to store (unary, method call,
+lambda, if, match). The attribute doubles as a memo: a node whose
+attribute is already set returns the cached value WITHOUT re-running
+its handler, which is what prevents duplicate diagnostics when the
+phase-2 walker's unconditional child recursion re-visits nodes their
+parents already inferred.
+@End Reasoning
+@Implementation:
+Statement-flavoured kinds get their Scala expression types here
+directly: expression statements take their wrapped expression's type;
+return/throw type as Nothing (they never produce a value in place);
+while and yield-less for-comprehensions are Unit; yield-form
+for-comprehensions produce a collection (TYPE_LIST); try expressions
+are the LUB of body and catch handler. Unknown kinds walk their
+children and degrade to TYPE_ANY.
+@End Implementation
+Process called "infer_expression_type" takes analyzer as Integer, expr as Integer returns Integer:
+    If expr is equal to 0:
+        Return TYPE_UNIT
+    End If
+
+    Note: Memo hit - already inferred and diagnosed
+    Let cached_attr be proc get_node_attribute with expr, "inferred_type"
+    If cached_attr is not equal to 0:
+        Let cached_empty be proc string_equals from StringCore with cached_attr, ""
+        If cached_empty is equal to 0:
+            Return proc string_to_integer from StringUtils with cached_attr
+        End If
+    End If
+
+    Let node_type be proc get_ast_node_type with expr
+    Let result_type be TYPE_ANY
+
+    If node_type is equal to AST_LITERAL:
+        proc infer_literal_type with analyzer, expr
+        Let literal_attr be proc get_node_attribute with expr, "inferred_type"
+        Set result_type to proc string_to_integer from StringUtils with literal_attr
+        Return result_type
+    Otherwise If node_type is equal to AST_IDENTIFIER:
+        proc infer_identifier_type with analyzer, expr
+        Let identifier_attr be proc get_node_attribute with expr, "inferred_type"
+        If identifier_attr is equal to 0:
+            Note: Synthetic identifier (operator/generator/qualified shell)
+            Return TYPE_ANY
+        End If
+        Set result_type to proc string_to_integer from StringUtils with identifier_attr
+        Return result_type
+    Otherwise If node_type is equal to AST_BINARY_OP:
+        proc infer_binary_op_type with analyzer, expr
+        Let binary_attr be proc get_node_attribute with expr, "inferred_type"
+        Set result_type to proc string_to_integer from StringUtils with binary_attr
+        Return result_type
+    Otherwise If node_type is equal to AST_UNARY_OP:
+        Set result_type to proc infer_unary_op_type with analyzer, expr
+    Otherwise If node_type is equal to AST_FUNCTION_CALL:
+        proc infer_function_call_type with analyzer, expr
+        Let call_attr be proc get_node_attribute with expr, "inferred_type"
+        Set result_type to proc string_to_integer from StringUtils with call_attr
+        Return result_type
+    Otherwise If node_type is equal to AST_METHOD_CALL:
+        Set result_type to proc infer_method_call_type with analyzer, expr
+    Otherwise If node_type is equal to AST_LAMBDA:
+        Set result_type to proc infer_lambda_type with analyzer, expr
+    Otherwise If node_type is equal to AST_IF_EXPRESSION:
+        Set result_type to proc infer_if_expression_type with analyzer, expr
+    Otherwise If node_type is equal to AST_MATCH_EXPRESSION:
+        Set result_type to proc infer_match_expression_type with analyzer, expr
+    Otherwise If node_type is equal to AST_BLOCK:
+        Return proc infer_block_type with analyzer, expr
+    Otherwise If node_type is equal to AST_TUPLE:
+        Return proc infer_tuple_type with analyzer, expr
+    Otherwise If node_type is equal to AST_LIST_LITERAL:
+        Return proc infer_list_literal_type with analyzer, expr
+    Otherwise If node_type is equal to AST_VAL_DECLARATION:
+        Return proc infer_val_declaration_type with analyzer, expr
+    Otherwise If node_type is equal to AST_VAR_DECLARATION:
+        Return proc infer_var_declaration_type with analyzer, expr
+    Otherwise If node_type is equal to AST_FUNCTION:
+        Return proc infer_function_type with analyzer, expr
+    Otherwise If node_type is equal to AST_EXPRESSION_STATEMENT:
+        Let stmt_children be proc get_ast_node_children with expr
+        Let stmt_child_count be proc list_length from List with stmt_children
+        If stmt_child_count is greater than 0:
+            Let wrapped be proc list_get from List with stmt_children, 0
+            Set result_type to proc infer_expression_type with analyzer, wrapped
+        Otherwise:
+            Set result_type to TYPE_UNIT
+        End If
+    Otherwise If node_type is equal to AST_RETURN or node_type is equal to AST_THROW:
+        Let escape_children be proc get_ast_node_children with expr
+        Let escape_child_count be proc list_length from List with escape_children
+        If escape_child_count is greater than 0:
+            Let escape_value be proc list_get from List with escape_children, 0
+            Let escape_value_type be proc infer_expression_type with analyzer, escape_value
+        End If
+        Set result_type to TYPE_NOTHING
+    Otherwise If node_type is equal to AST_WHILE_EXPRESSION:
+        Let while_children be proc get_ast_node_children with expr
+        Let while_child_count be proc list_length from List with while_children
+        Let while_index be 0
+        While while_index is less than while_child_count:
+            Let while_child be proc list_get from List with while_children, while_index
+            Let while_child_type be proc infer_expression_type with analyzer, while_child
+            Set while_index to while_index plus 1
+        End While
+        Set result_type to TYPE_UNIT
+    Otherwise If node_type is equal to AST_FOR_EXPRESSION:
+        Let for_children be proc get_ast_node_children with expr
+        Let for_child_count be proc list_length from List with for_children
+        Let for_index be 0
+        While for_index is less than for_child_count:
+            Let for_child be proc list_get from List with for_children, for_index
+            Let for_child_type be proc infer_expression_type with analyzer, for_child
+            Set for_index to for_index plus 1
+        End While
+        Let yield_attr be proc get_node_attribute with expr, "yield"
+        Let has_yield be proc string_equals from StringCore with yield_attr, "true"
+        If has_yield is equal to 1:
+            Set result_type to TYPE_LIST
+        Otherwise:
+            Set result_type to TYPE_UNIT
+        End If
+    Otherwise If node_type is equal to AST_TRY_EXPRESSION:
+        Let try_children be proc get_ast_node_children with expr
+        Let try_child_count be proc list_length from List with try_children
+        If try_child_count is equal to 0:
+            Set result_type to TYPE_UNIT
+        Otherwise:
+            Let try_body be proc list_get from List with try_children, 0
+            Let try_body_type be proc infer_expression_type with analyzer, try_body
+            Set result_type to try_body_type
+            If try_child_count is greater than 1:
+                Let catch_body be proc list_get from List with try_children, 1
+                Let catch_type be proc infer_expression_type with analyzer, catch_body
+                Set result_type to proc find_least_upper_bound with analyzer, try_body_type, catch_type
+            End If
+        End If
+    Otherwise:
+        Note: Unknown kind - walk children, type degrades to Any
+        Let other_children be proc get_ast_node_children with expr
+        Let other_child_count be proc list_length from List with other_children
+        Let other_index be 0
+        While other_index is less than other_child_count:
+            Let other_child be proc list_get from List with other_children, other_index
+            Let other_child_type be proc infer_expression_type with analyzer, other_child
+            Set other_index to other_index plus 1
+        End While
+        Set result_type to TYPE_ANY
+    End If
+
+    proc set_node_attribute with expr, "inferred_type", proc integer_to_string from StringUtils with result_type
+    Return result_type
+End Process
+
+Note: ============================================================================
+Note: Stdlib Catalog and Method Resolution
+Note: ============================================================================
+
+@Reasoning:
+Maps a TYPE_* kind code back to its Scala type name. Needed when the
+builtin-method catalog synthesizes signatures whose parameter or
+return type is "the receiver's own type" (abs on Int returns Int, on
+Double returns Double).
+@End Reasoning
+Process called "scala_kind_type_name" takes type_kind as Integer returns String:
+    If type_kind is equal to TYPE_UNIT:
+        Return "Unit"
+    Otherwise If type_kind is equal to TYPE_BOOLEAN:
+        Return "Boolean"
+    Otherwise If type_kind is equal to TYPE_BYTE:
+        Return "Byte"
+    Otherwise If type_kind is equal to TYPE_SHORT:
+        Return "Short"
+    Otherwise If type_kind is equal to TYPE_INT:
+        Return "Int"
+    Otherwise If type_kind is equal to TYPE_LONG:
+        Return "Long"
+    Otherwise If type_kind is equal to TYPE_FLOAT:
+        Return "Float"
+    Otherwise If type_kind is equal to TYPE_DOUBLE:
+        Return "Double"
+    Otherwise If type_kind is equal to TYPE_CHAR:
+        Return "Char"
+    Otherwise If type_kind is equal to TYPE_STRING:
+        Return "String"
+    Otherwise If type_kind is equal to TYPE_NOTHING:
+        Return "Nothing"
+    Otherwise If type_kind is equal to TYPE_NULL:
+        Return "Null"
+    Otherwise If type_kind is equal to TYPE_ANYREF:
+        Return "AnyRef"
+    Otherwise If type_kind is equal to TYPE_ANYVAL:
+        Return "AnyVal"
+    Otherwise If type_kind is equal to TYPE_LIST:
+        Return "List"
+    Otherwise If type_kind is equal to TYPE_ARRAY:
+        Return "Array"
+    Otherwise If type_kind is equal to TYPE_OPTION:
+        Return "Option"
+    End If
+    Return "Any"
+End Process
+
+@Reasoning:
+Builds a synthetic AST_FUNCTION definition node carrying a real
+signature: a parameter list of typed AST_PARAMETER children and an
+explicit return-type child with the "return_type" marker. Every
+signature consumer (get_function_parameters, extract_parameter_types,
+extract_function_return_type, parameter_is_implicit) works on these
+nodes exactly as on user-parsed defs, so the stdlib catalog needs no
+special-case paths anywhere downstream. The "stdlib" attribute marks
+provenance for diagnostics.
+@End Reasoning
+Process called "synthesize_function_signature" takes name as String, param_type_names as Integer, return_type_name as String returns Integer:
+    Let function_node be proc create_ast_node with AST_FUNCTION, name
+    proc set_node_attribute with function_node, "stdlib", "true"
+
+    Let param_list be proc create_ast_node with AST_PARAMETER_LIST, ""
+    Let param_count be proc list_length from List with param_type_names
+    Let i be 0
+    While i is less than param_count:
+        Let param_type_name be proc list_get from List with param_type_names, i
+        Let param_name be proc string_concat from StringUtils with "arg", proc integer_to_string from StringUtils with i
+        Let param_node be proc create_ast_node with AST_PARAMETER, param_name
+        Let param_type_node be proc create_ast_node with AST_TYPE, param_type_name
+        proc add_child with param_node, param_type_node
+        proc add_child with param_list, param_node
+        Set i to i plus 1
+    End While
+    proc add_child with function_node, param_list
+
+    proc set_node_attribute with function_node, "return_type", "true"
+    Let return_type_node be proc create_ast_node with AST_TYPE, return_type_name
+    proc add_child with function_node, return_type_node
+
+    Return function_node
+End Process
+
+@Reasoning:
+Conditional catalog append: when the requested method name matches
+the candidate's name, a signature is synthesized (up to two
+parameters - the catalog's widest arity) and appended to the result
+list. Centralising the name test plus list construction keeps the
+per-receiver catalogs in find_methods declarative: one line per
+method.
+@End Reasoning
+Process called "append_builtin_method" takes methods as Integer, requested_name as String, candidate_name as String, param_count as Integer, param1_type as String, param2_type as String, return_type_name as String:
+    Let names_match be proc string_equals from StringCore with requested_name, candidate_name
+    If names_match is equal to 0:
+        Return
+    End If
+
+    Let param_type_names be proc list_create from List
+    If param_count is greater than or equal to 1:
+        proc list_append from List with param_type_names, param1_type
+    End If
+    If param_count is greater than or equal to 2:
+        proc list_append from List with param_type_names, param2_type
+    End If
+
+    Let signature be proc synthesize_function_signature with candidate_name, param_type_names, return_type_name
+    proc list_append from List with methods, signature
+End Process
+
+@Reasoning:
+The Predef catalog: top-level functions every Scala compilation unit
+sees without imports. Signatures are synthesized on demand (the
+routine takes only a name, so the catalog is a name-indexed
+constructor rather than a stored table - deterministic and
+state-free). Unknown names return 0 so the caller reports an
+undefined symbol.
+@End Reasoning
+Process called "lookup_stdlib_function" takes function_name as String returns Integer:
+    Let is_println be proc string_equals from StringCore with function_name, "println"
+    If is_println is equal to 1:
+        Let println_params be proc list_create from List
+        proc list_append from List with println_params, "Any"
+        Return proc synthesize_function_signature with "println", println_params, "Unit"
+    End If
+
+    Let is_print be proc string_equals from StringCore with function_name, "print"
+    If is_print is equal to 1:
+        Let print_params be proc list_create from List
+        proc list_append from List with print_params, "Any"
+        Return proc synthesize_function_signature with "print", print_params, "Unit"
+    End If
+
+    Let is_assert be proc string_equals from StringCore with function_name, "assert"
+    If is_assert is equal to 1:
+        Let assert_params be proc list_create from List
+        proc list_append from List with assert_params, "Boolean"
+        Return proc synthesize_function_signature with "assert", assert_params, "Unit"
+    End If
+
+    Let is_require be proc string_equals from StringCore with function_name, "require"
+    If is_require is equal to 1:
+        Let require_params be proc list_create from List
+        proc list_append from List with require_params, "Boolean"
+        Return proc synthesize_function_signature with "require", require_params, "Unit"
+    End If
+
+    Let is_identity be proc string_equals from StringCore with function_name, "identity"
+    If is_identity is equal to 1:
+        Let identity_params be proc list_create from List
+        proc list_append from List with identity_params, "Any"
+        Return proc synthesize_function_signature with "identity", identity_params, "Any"
+    End If
+
+    Return 0
+End Process
+
+@Reasoning:
+Enumerates every method named method_name callable on receiver_type.
+Two sources exist in this analyzer's model: user-declared defs (the
+flat symbol table holds methods collected from class/trait/object
+bodies; the matching entry's definition node is a candidate) and the
+builtin-receiver catalog (String, the numeric types, Boolean, Char,
+List, Array, Option each publish their core method signatures,
+including the substring overload pair that exercises arity-based
+overload resolution). Heap record receivers contribute through their
+kind. Always returns a list - empty means "no such method".
+@End Reasoning
+Process called "find_methods" takes analyzer as Integer, receiver_type as Integer, method_name as String returns Integer:
+    Let analyzer_obj as ScalaSemanticAnalyzer be analyzer
+    Let methods be proc list_create from List
+
+    Note: User-declared methods - flat symbol table, name-keyed
+    Let symbol_address be proc hashtable_get from HashTable with analyzer_obj.symbol_table, method_name
+    If symbol_address is not equal to 0:
+        Let symbol_info as SymbolInfo be symbol_address
+        If symbol_info.symbol_type is equal to TYPE_FUNCTION:
+            proc list_append from List with methods, symbol_info.definition_node
+        End If
+    End If
+
+    Note: Builtin catalogs keyed by the receiver's kind
+    Let receiver_kind be receiver_type
+    If receiver_type is greater than or equal to 65536:
+        Let receiver_info as TypeInfo be receiver_type
+        Set receiver_kind to receiver_info.type_kind
+    End If
+
+    If receiver_kind is equal to TYPE_STRING:
+        proc append_builtin_method with methods, method_name, "length", 0, "", "", "Int"
+        proc append_builtin_method with methods, method_name, "isEmpty", 0, "", "", "Boolean"
+        proc append_builtin_method with methods, method_name, "nonEmpty", 0, "", "", "Boolean"
+        proc append_builtin_method with methods, method_name, "charAt", 1, "Int", "", "Char"
+        proc append_builtin_method with methods, method_name, "substring", 1, "Int", "", "String"
+        proc append_builtin_method with methods, method_name, "substring", 2, "Int", "Int", "String"
+        proc append_builtin_method with methods, method_name, "concat", 1, "String", "", "String"
+        proc append_builtin_method with methods, method_name, "contains", 1, "String", "", "Boolean"
+        proc append_builtin_method with methods, method_name, "indexOf", 1, "String", "", "Int"
+        proc append_builtin_method with methods, method_name, "startsWith", 1, "String", "", "Boolean"
+        proc append_builtin_method with methods, method_name, "endsWith", 1, "String", "", "Boolean"
+        proc append_builtin_method with methods, method_name, "toUpperCase", 0, "", "", "String"
+        proc append_builtin_method with methods, method_name, "toLowerCase", 0, "", "", "String"
+        proc append_builtin_method with methods, method_name, "trim", 0, "", "", "String"
+        proc append_builtin_method with methods, method_name, "toInt", 0, "", "", "Int"
+        proc append_builtin_method with methods, method_name, "toLong", 0, "", "", "Long"
+        proc append_builtin_method with methods, method_name, "toDouble", 0, "", "", "Double"
+        proc append_builtin_method with methods, method_name, "toString", 0, "", "", "String"
+    End If
+
+    Let receiver_rank be proc numeric_type_rank with receiver_kind
+    If receiver_rank is greater than 0:
+        Let self_name be proc scala_kind_type_name with receiver_kind
+        proc append_builtin_method with methods, method_name, "toByte", 0, "", "", "Byte"
+        proc append_builtin_method with methods, method_name, "toShort", 0, "", "", "Short"
+        proc append_builtin_method with methods, method_name, "toInt", 0, "", "", "Int"
+        proc append_builtin_method with methods, method_name, "toLong", 0, "", "", "Long"
+        proc append_builtin_method with methods, method_name, "toFloat", 0, "", "", "Float"
+        proc append_builtin_method with methods, method_name, "toDouble", 0, "", "", "Double"
+        proc append_builtin_method with methods, method_name, "toString", 0, "", "", "String"
+        proc append_builtin_method with methods, method_name, "abs", 0, "", "", self_name
+        proc append_builtin_method with methods, method_name, "max", 1, self_name, "", self_name
+        proc append_builtin_method with methods, method_name, "min", 1, self_name, "", self_name
+        proc append_builtin_method with methods, method_name, "compare", 1, self_name, "", "Int"
+    End If
+
+    If receiver_kind is equal to TYPE_BOOLEAN:
+        proc append_builtin_method with methods, method_name, "toString", 0, "", "", "String"
+    End If
+
+    If receiver_kind is equal to TYPE_CHAR:
+        proc append_builtin_method with methods, method_name, "toInt", 0, "", "", "Int"
+        proc append_builtin_method with methods, method_name, "toString", 0, "", "", "String"
+        proc append_builtin_method with methods, method_name, "isDigit", 0, "", "", "Boolean"
+        proc append_builtin_method with methods, method_name, "isLetter", 0, "", "", "Boolean"
+    End If
+
+    If receiver_kind is equal to TYPE_LIST:
+        proc append_builtin_method with methods, method_name, "length", 0, "", "", "Int"
+        proc append_builtin_method with methods, method_name, "size", 0, "", "", "Int"
+        proc append_builtin_method with methods, method_name, "isEmpty", 0, "", "", "Boolean"
+        proc append_builtin_method with methods, method_name, "nonEmpty", 0, "", "", "Boolean"
+        proc append_builtin_method with methods, method_name, "head", 0, "", "", "Any"
+        proc append_builtin_method with methods, method_name, "contains", 1, "Any", "", "Boolean"
+        proc append_builtin_method with methods, method_name, "mkString", 1, "String", "", "String"
+    End If
+
+    If receiver_kind is equal to TYPE_ARRAY:
+        proc append_builtin_method with methods, method_name, "length", 0, "", "", "Int"
+        proc append_builtin_method with methods, method_name, "isEmpty", 0, "", "", "Boolean"
+    End If
+
+    If receiver_kind is equal to TYPE_OPTION:
+        proc append_builtin_method with methods, method_name, "isDefined", 0, "", "", "Boolean"
+        proc append_builtin_method with methods, method_name, "isEmpty", 0, "", "", "Boolean"
+        proc append_builtin_method with methods, method_name, "get", 0, "", "", "Any"
+        proc append_builtin_method with methods, method_name, "getOrElse", 1, "Any", "", "Any"
+    End If
+
+    Return methods
+End Process
+
+@Reasoning:
+Collects the EXPLICIT (non-implicit) parameters of a def - the slots
+a call site fills positionally. Overload arity comparison must ignore
+implicit parameter groups because the compiler, not the caller,
+supplies those.
+@End Reasoning
+Process called "get_explicit_parameters" takes function_def as Integer returns Integer:
+    Let explicit_params be proc list_create from List
+    Let all_params be proc get_function_parameters with function_def
+    Let total be proc list_length from List with all_params
+
+    Let i be 0
+    While i is less than total:
+        Let param be proc list_get from List with all_params, i
+        Let is_implicit be proc parameter_is_implicit with param
+        If is_implicit is equal to 0:
+            proc list_append from List with explicit_params, param
+        End If
+        Set i to i plus 1
+    End While
+
+    Return explicit_params
+End Process
+
+@Reasoning:
+First candidate whose explicit-parameter arity matches the argument
+count and whose every parameter accepts the corresponding argument
+type under are_types_compatible. Untyped parameters accept anything
+(TYPE_ANY). Returns the matching definition node or 0.
+@End Reasoning
+Process called "find_matching_method" takes analyzer as Integer, methods as Integer, arg_types as Integer returns Integer:
+    Let method_count be proc list_length from List with methods
+    Let arg_count be proc list_length from List with arg_types
+
+    Let i be 0
+    While i is less than method_count:
+        Let candidate be proc list_get from List with methods, i
+        Let params be proc get_explicit_parameters with candidate
+        Let param_count be proc list_length from List with params
+
+        If param_count is equal to arg_count:
+            Let all_compatible be 1
+            Let j be 0
+            While j is less than param_count:
+                Let param be proc list_get from List with params, j
+                Let param_type be proc get_parameter_type with param
+                If param_type is equal to 0:
+                    Set param_type to TYPE_ANY
+                End If
+                Let arg_type be proc list_get from List with arg_types, j
+                Let compatible be proc are_types_compatible with analyzer, arg_type, param_type
+                If compatible is equal to 0:
+                    Set all_compatible to 0
+                End If
+                Set j to j plus 1
+            End While
+
+            If all_compatible is equal to 1:
+                Return candidate
+            End If
+        End If
+
+        Set i to i plus 1
+    End While
+
+    Return 0
+End Process
+
+@Reasoning:
+Scala-style two-phase overload resolution restricted to this
+analyzer's kind model: phase 1 prefers an EXACT signature (same arity
+and pointwise identical resolved types - the most specific applicable
+candidate), phase 2 accepts the first arity-matching candidate whose
+parameters are merely compatible (widening, Any-sink, subtypes).
+Explicit type arguments do not change applicability here because the
+catalog's signatures are monomorphic; generic user methods accept
+through their TYPE_ANY parameter defaults and the return side is
+specialised by infer_method_return_type.
+@End Reasoning
+Process called "resolve_method_overload" takes analyzer as Integer, method_candidates as Integer, arg_types as Integer, type_args as Integer returns Integer:
+    Let candidate_count be proc list_length from List with method_candidates
+    Let arg_count be proc list_length from List with arg_types
+
+    Note: Phase 1 - exact signature match
+    Let i be 0
+    While i is less than candidate_count:
+        Let candidate be proc list_get from List with method_candidates, i
+        Let params be proc get_explicit_parameters with candidate
+        Let param_count be proc list_length from List with params
+
+        If param_count is equal to arg_count:
+            Let all_exact be 1
+            Let j be 0
+            While j is less than param_count:
+                Let param be proc list_get from List with params, j
+                Let param_type be proc get_parameter_type with param
+                Let arg_type be proc list_get from List with arg_types, j
+                Let resolved_param be proc resolve_type_alias with analyzer, param_type
+                Let resolved_arg be proc resolve_type_alias with analyzer, arg_type
+                If resolved_param is not equal to resolved_arg:
+                    Set all_exact to 0
+                End If
+                Set j to j plus 1
+            End While
+
+            If all_exact is equal to 1:
+                Return candidate
+            End If
+        End If
+
+        Set i to i plus 1
+    End While
+
+    Note: Phase 2 - compatible match
+    Return proc find_matching_method with analyzer, method_candidates, arg_types
+End Process
+
+@Reasoning:
+Computes a method call's result type with type-argument substitution.
+When the chosen def's return annotation names one of its own type
+parameters, the concrete type comes from (in priority order) the
+call's explicit type argument at the parameter's position, or the
+inferred argument type of the first value parameter annotated with
+that same type parameter - genuine call-site inference. Otherwise the
+ordinary extraction path (explicit annotation or body inference)
+applies.
+@End Reasoning
+Process called "infer_method_return_type" takes analyzer as Integer, best_method as Integer, arg_types as Integer, type_args as Integer:
+    If best_method is equal to 0:
+        Return TYPE_ERROR
+    End If
+
+    Note: Locate the def's type-parameter names and its return-type node
+    Let type_param_names be proc list_create from List
+    Let return_type_node be 0
+
+    Let children be proc get_ast_node_children with best_method
+    Let child_count be proc list_length from List with children
+    Let i be 0
+    While i is less than child_count:
+        Let child be proc list_get from List with children, i
+        Let child_kind be proc get_ast_node_type with child
+
+        If child_kind is equal to AST_PARAMETER_LIST:
+            Let list_tag be proc get_ast_node_value with child
+            Let is_type_param_list be proc string_equals from StringCore with list_tag, "type_parameters"
+            If is_type_param_list is equal to 1:
+                Let tp_children be proc get_ast_node_children with child
+                Let tp_count be proc list_length from List with tp_children
+                Let tp_index be 0
+                While tp_index is less than tp_count:
+                    Let tp_node be proc list_get from List with tp_children, tp_index
+                    Let tp_name be proc get_ast_node_value with tp_node
+                    proc list_append from List with type_param_names, tp_name
+                    Set tp_index to tp_index plus 1
+                End While
+            End If
+        End If
+
+        If child_kind is equal to AST_TYPE and return_type_node is equal to 0:
+            Let has_return_attr be proc get_node_attribute with best_method, "return_type"
+            Let return_declared be proc string_equals from StringCore with has_return_attr, "true"
+            If return_declared is equal to 1:
+                Set return_type_node to child
+            End If
+        End If
+
+        Set i to i plus 1
+    End While
+
+    Note: Substitute when the return annotation names a type parameter
+    If return_type_node is not equal to 0:
+        Let return_name be proc get_ast_node_value with return_type_node
+        Let tp_total be proc list_length from List with type_param_names
+        Let tp_match_index be 0
+        While tp_match_index is less than tp_total:
+            Let candidate_name be proc list_get from List with type_param_names, tp_match_index
+            Let name_matches be proc string_equals from StringCore with return_name, candidate_name
+            If name_matches is equal to 1:
+                Note: Explicit type argument at the parameter's position wins
+                Let explicit_count be proc list_length from List with type_args
+                If tp_match_index is less than explicit_count:
+                    Let explicit_arg_node be proc list_get from List with type_args, tp_match_index
+                    Return proc resolve_type_reference with analyzer, explicit_arg_node
+                End If
+
+                Note: Infer from the first value parameter annotated with
+                Note: the same type parameter
+                Let value_params be proc get_explicit_parameters with best_method
+                Let value_count be proc list_length from List with value_params
+                Let arg_count be proc list_length from List with arg_types
+                Let vp_index be 0
+                While vp_index is less than value_count:
+                    Let value_param be proc list_get from List with value_params, vp_index
+                    Let vp_children be proc get_ast_node_children with value_param
+                    Let vp_child_count be proc list_length from List with vp_children
+                    Let vp_child_index be 0
+                    While vp_child_index is less than vp_child_count:
+                        Let vp_child be proc list_get from List with vp_children, vp_child_index
+                        Let vp_child_kind be proc get_ast_node_type with vp_child
+                        If vp_child_kind is equal to AST_TYPE:
+                            Let vp_type_name be proc get_ast_node_value with vp_child
+                            Let vp_name_matches be proc string_equals from StringCore with vp_type_name, candidate_name
+                            If vp_name_matches is equal to 1:
+                                If vp_index is less than arg_count:
+                                    Return proc list_get from List with arg_types, vp_index
+                                End If
+                            End If
+                        End If
+                        Set vp_child_index to vp_child_index plus 1
+                    End While
+                    Set vp_index to vp_index plus 1
+                End While
+
+                Return TYPE_ANY
+            End If
+            Set tp_match_index to tp_match_index plus 1
+        End While
+    End If
+
+    Note: Monomorphic return - ordinary extraction path
+    Return proc extract_function_return_type with analyzer, best_method
+End Process
+
+@Reasoning:
+Enumerates the implicit conversions applicable to a receiver type. A
+conversion candidate is an ImplicitInfo whose conversion_type records
+the SOURCE type the conversion accepts; applicability means the
+receiver flows into that source under the ordinary compatibility
+rules. Plain implicit values (conversion_type 0) are not conversions
+and are skipped.
+@End Reasoning
+Process called "find_implicit_conversions" takes analyzer as Integer, receiver_type as Integer returns Integer:
+    Let analyzer_obj as ScalaSemanticAnalyzer be analyzer
+    Let conversions be proc list_create from List
+
+    Let total be proc list_length from List with analyzer_obj.implicit_scope
+    Let i be 0
+    While i is less than total:
+        Let entry be proc list_get from List with analyzer_obj.implicit_scope, i
+        Let entry_obj as ImplicitInfo be entry
+        If entry_obj.conversion_type is not equal to 0:
+            Let applicable be proc are_types_compatible with analyzer, receiver_type, entry_obj.conversion_type
+            If applicable is equal to 1:
+                proc list_append from List with conversions, entry
+            End If
+        End If
+        Set i to i plus 1
+    End While
+
+    Return conversions
+End Process
+
+@Reasoning:
+Records that a call site method-dispatches through an implicit
+conversion: the conversion's name and target type are stamped onto
+the call node so the HIR translation layer can materialise the
+conversion call, and a warning notes the implicit rewrite (silent
+implicit conversions are a classic Scala review hazard).
+@End Reasoning
+Process called "record_implicit_conversion" takes analyzer as Integer, call_node as Integer, conversion as Integer:
+    If conversion is equal to 0:
+        Return
+    End If
+    Let analyzer_obj as ScalaSemanticAnalyzer be analyzer
+    Let conversion_obj as ImplicitInfo be conversion
+
+    proc set_node_attribute with call_node, "implicit_conversion", conversion_obj.name
+    proc set_node_attribute with call_node, "implicit_conversion_target", proc integer_to_string from StringUtils with conversion_obj.implicit_type
+
+    Let warning_text be proc string_concat from StringUtils with "Method call resolved through implicit conversion: ", conversion_obj.name
+    proc list_append from List with analyzer_obj.warnings, warning_text
+End Process
+
+@Reasoning:
+Resolves a type-reference NODE (the extends/with clauses hand type
+nodes to validation) to its definition: the type table holds builtins
+and registered templates; the symbol table holds user classes,
+traits, objects, and aliases. Type applications resolve through their
+base name (extending "Box[Int]" must find "Box"). 0 means the name is
+defined nowhere visible.
+@End Reasoning
+Process called "lookup_type_definition" takes analyzer as Integer, type_ref as Integer returns Integer:
+    If type_ref is equal to 0:
+        Return 0
+    End If
+    Let analyzer_obj as ScalaSemanticAnalyzer be analyzer
+
+    Note: Resolve the referenced name, descending through applications
+    Let name_node be type_ref
+    Let node_kind be proc get_ast_node_type with type_ref
+    If node_kind is equal to AST_TYPE_APPLICATION:
+        Let app_children be proc get_ast_node_children with type_ref
+        Let app_count be proc list_length from List with app_children
+        If app_count is greater than 0:
+            Set name_node to proc list_get from List with app_children, 0
+        End If
+    End If
+
+    Let type_name be proc get_ast_node_value with name_node
+    If type_name is equal to 0:
+        Return 0
+    End If
+
+    Let from_type_table be proc hashtable_get from HashTable with analyzer_obj.type_table, type_name
+    If from_type_table is not equal to 0:
+        Return from_type_table
+    End If
+
+    Let from_symbol_table be proc hashtable_get from HashTable with analyzer_obj.symbol_table, type_name
+    If from_symbol_table is not equal to 0:
+        Let symbol_info as SymbolInfo be from_symbol_table
+        Let st be symbol_info.symbol_type
+        If st is equal to TYPE_CLASS or st is equal to TYPE_TRAIT or st is equal to TYPE_OBJECT or
+           st is equal to TYPE_CASE_CLASS or st is equal to TYPE_GENERIC:
+            Return from_symbol_table
+        End If
+    End If
+
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: Subtype Walkers
+Note: ============================================================================
+
+@Reasoning:
+Extracts the referenced base name from a type node - the node's own
+value, or the base child's value for parameterised references
+(Box[Int] names "Box"). Shared by the hierarchy walkers.
+@End Reasoning
+Process called "type_node_base_name" takes type_node as Integer returns String:
+    If type_node is equal to 0:
+        Return ""
+    End If
+    Let node_kind be proc get_ast_node_type with type_node
+    If node_kind is equal to AST_TYPE_APPLICATION:
+        Let app_children be proc get_ast_node_children with type_node
+        Let app_count be proc list_length from List with app_children
+        If app_count is greater than 0:
+            Let base be proc list_get from List with app_children, 0
+            Return proc get_ast_node_value with base
+        End If
+        Return ""
+    End If
+    Return proc get_ast_node_value with type_node
+End Process
+
+@Reasoning:
+Recovers the nominal name carried by a type id: heap TypeInfo records
+carry their type_name; bare kind codes carry no name (every user
+class collapses to TYPE_CLASS in the kind model) and return "".
+@End Reasoning
+Process called "type_id_nominal_name" takes type_id as Integer returns String:
+    If type_id is less than 65536:
+        Return ""
+    End If
+    Let type_info as TypeInfo be type_id
+    Return type_info.type_name
+End Process
+
+@Reasoning:
+Single-inheritance subtype walk (left <: right). The universal
+relationships decide most queries: identity, the Any sink, the
+Nothing source, AnyVal over value kinds, AnyRef over reference kinds.
+Beyond those, a nominal walk climbs the declared extends chain by
+name: starting from the left type's name, each ancestor's definition
+node is looked up in the symbol table and its extends clause followed
+upward until the right name is reached or the chain ends. The walk is
+name-driven, so it engages only when both sides carry nominal names
+(heap records); bare TYPE_CLASS codes are indistinguishable from each
+other and decide at the identity test. A 64-step bound turns any
+inheritance cycle in malformed input into a negative answer instead
+of a hang.
+@End Reasoning
+Process called "check_inheritance_subtype" takes analyzer as Integer, left_type as Integer, right_type as Integer:
+    Let analyzer_obj as ScalaSemanticAnalyzer be analyzer
+    Let left be proc resolve_type_alias with analyzer, left_type
+    Let right be proc resolve_type_alias with analyzer, right_type
+
+    If left is equal to right:
+        Return 1
+    End If
+
+    Let left_kind be left
+    If left is greater than or equal to 65536:
+        Let left_info as TypeInfo be left
+        Set left_kind to left_info.type_kind
+    End If
+    Let right_kind be right
+    If right is greater than or equal to 65536:
+        Let right_info as TypeInfo be right
+        Set right_kind to right_info.type_kind
+    End If
+
+    If right_kind is equal to TYPE_ANY:
+        Return 1
+    End If
+    If left_kind is equal to TYPE_NOTHING:
+        Return 1
+    End If
+
+    If right_kind is equal to TYPE_ANYVAL:
+        Let left_is_value be proc is_value_type with left_kind
+        If left_is_value is equal to 1:
+            Return 1
+        End If
+    End If
+    If right_kind is equal to TYPE_ANYREF:
+        Let left_is_ref be proc is_reference_type with left_kind
+        If left_is_ref is equal to 1:
+            Return 1
+        End If
+        If left_kind is equal to TYPE_NULL:
+            Return 1
+        End If
+    End If
+
+    Note: Nominal extends-chain walk
+    Let left_name be proc type_id_nominal_name with left
+    Let right_name be proc type_id_nominal_name with right
+
+    Let left_name_empty be proc string_equals from StringCore with left_name, ""
+    Let right_name_empty be proc string_equals from StringCore with right_name, ""
+    If left_name_empty is equal to 1 or right_name_empty is equal to 1:
+        Return 0
+    End If
+
+    Let current_name be left_name
+    Let steps be 0
+    While steps is less than 64:
+        Let symbol_address be proc hashtable_get from HashTable with analyzer_obj.symbol_table, current_name
+        If symbol_address is equal to 0:
+            Return 0
+        End If
+
+        Let symbol_info as SymbolInfo be symbol_address
+        Let definition be symbol_info.definition_node
+        If definition is equal to 0:
+            Return 0
+        End If
+
+        Let parent_node be proc get_class_superclass with definition
+        If parent_node is equal to 0:
+            Return 0
+        End If
+
+        Let parent_name be proc type_node_base_name with parent_node
+        Let reached be proc string_equals from StringCore with parent_name, right_name
+        If reached is equal to 1:
+            Return 1
+        End If
+
+        Set current_name to parent_name
+        Set steps to steps plus 1
+    End While
+
+    Return 0
+End Process
+
+@Reasoning:
+Trait-implementation subtype walk (left <: right where right is a
+trait). The left type's full ancestry - itself, its superclasses, and
+every mixed-in trait, transitively - is searched for the right type's
+name. The walk is a worklist over declaration names so diamond
+inheritance terminates: each step pops one name, checks its mixins
+and parent, and pushes them; the 64-element processing bound caps
+malformed cyclic hierarchies. Name-driven like the inheritance walk,
+so bare kind codes decide at identity.
+@End Reasoning
+Process called "check_trait_subtype" takes analyzer as Integer, left_type as Integer, right_type as Integer:
+    Let analyzer_obj as ScalaSemanticAnalyzer be analyzer
+    Let left be proc resolve_type_alias with analyzer, left_type
+    Let right be proc resolve_type_alias with analyzer, right_type
+
+    If left is equal to right:
+        Return 1
+    End If
+
+    Let left_name be proc type_id_nominal_name with left
+    Let right_name be proc type_id_nominal_name with right
+    Let left_name_empty be proc string_equals from StringCore with left_name, ""
+    Let right_name_empty be proc string_equals from StringCore with right_name, ""
+    If left_name_empty is equal to 1 or right_name_empty is equal to 1:
+        Return 0
+    End If
+
+    Let worklist be proc list_create from List
+    proc list_append from List with worklist, left_name
+
+    Let processed be 0
+    Let work_index be 0
+    While work_index is less than proc list_length from List with worklist:
+        If processed is greater than or equal to 64:
+            Return 0
+        End If
+
+        Let current_name be proc list_get from List with worklist, work_index
+        Let symbol_address be proc hashtable_get from HashTable with analyzer_obj.symbol_table, current_name
+        If symbol_address is not equal to 0:
+            Let symbol_info as SymbolInfo be symbol_address
+            Let definition be symbol_info.definition_node
+            If definition is not equal to 0:
+                Let parent_node be proc get_class_superclass with definition
+                If parent_node is not equal to 0:
+                    Let parent_name be proc type_node_base_name with parent_node
+                    Let parent_match be proc string_equals from StringCore with parent_name, right_name
+                    If parent_match is equal to 1:
+                        Return 1
+                    End If
+                    proc list_append from List with worklist, parent_name
+                End If
+
+                Let mixins be proc get_class_traits with definition
+                Let mixin_count be proc list_length from List with mixins
+                Let mixin_index be 0
+                While mixin_index is less than mixin_count:
+                    Let mixin_node be proc list_get from List with mixins, mixin_index
+                    Let mixin_name be proc type_node_base_name with mixin_node
+                    Let mixin_match be proc string_equals from StringCore with mixin_name, right_name
+                    If mixin_match is equal to 1:
+                        Return 1
+                    End If
+                    proc list_append from List with worklist, mixin_name
+                    Set mixin_index to mixin_index plus 1
+                End While
+            End If
+        End If
+
+        Set processed to processed plus 1
+        Set work_index to work_index plus 1
+    End While
+
+    Return 0
+End Process
+
+@Reasoning:
+Resolves the declared variance of one type-parameter position for a
+named parametric type. The builtin parametric types carry Scala's
+canonical variances: List and Option are covariant in their element,
+Array is invariant, FunctionN is contravariant in every parameter
+position and covariant in its result. User-declared types consult
+their definition's type-parameter list, where the parser stored the
+"variance" attribute ("covariant"/"contravariant") from the +T/-T
+prefixes. Returns "+", "-", or "" (invariant).
+@End Reasoning
+Process called "variance_at_position" takes analyzer as Integer, type_name as String, position as Integer, arity as Integer returns String:
+    Let is_list be proc string_equals from StringCore with type_name, "List"
+    Let is_option be proc string_equals from StringCore with type_name, "Option"
+    If is_list is equal to 1 or is_option is equal to 1:
+        Return "+"
+    End If
+
+    Let is_array be proc string_equals from StringCore with type_name, "Array"
+    If is_array is equal to 1:
+        Return ""
+    End If
+
+    Let is_function be proc string_starts_with from StringCore with type_name, "Function"
+    If is_function is equal to 1:
+        Let last_position be arity minus 1
+        If position is equal to last_position:
+            Return "+"
+        End If
+        Return "-"
+    End If
+
+    Note: User-declared variance from the definition's type parameters
+    Let analyzer_obj as ScalaSemanticAnalyzer be analyzer
+    Let symbol_address be proc hashtable_get from HashTable with analyzer_obj.symbol_table, type_name
+    If symbol_address is equal to 0:
+        Return ""
+    End If
+    Let symbol_info as SymbolInfo be symbol_address
+    Let definition be symbol_info.definition_node
+    If definition is equal to 0:
+        Return ""
+    End If
+
+    Let children be proc get_ast_node_children with definition
+    Let child_count be proc list_length from List with children
+    Let i be 0
+    While i is less than child_count:
+        Let child be proc list_get from List with children, i
+        Let child_kind be proc get_ast_node_type with child
+        If child_kind is equal to AST_PARAMETER_LIST:
+            Let list_tag be proc get_ast_node_value with child
+            Let is_type_params be proc string_equals from StringCore with list_tag, "type_parameters"
+            If is_type_params is equal to 1:
+                Let tp_children be proc get_ast_node_children with child
+                Let tp_count be proc list_length from List with tp_children
+                If position is less than tp_count:
+                    Let tp_node be proc list_get from List with tp_children, position
+                    Let variance_attr be proc get_node_attribute with tp_node, "variance"
+                    Let is_covariant be proc string_equals from StringCore with variance_attr, "covariant"
+                    If is_covariant is equal to 1:
+                        Return "+"
+                    End If
+                    Let is_contravariant be proc string_equals from StringCore with variance_attr, "contravariant"
+                    If is_contravariant is equal to 1:
+                        Return "-"
+                    End If
+                End If
+                Return ""
+            End If
+        End If
+        Set i to i plus 1
+    End While
+
+    Return ""
+End Process
+
+@Reasoning:
+Variance-aware subtype check for parameterised types: F[A1..An] <:
+F[B1..Bn] holds when both sides name the same constructor with the
+same arity and every position respects its declared variance -
+covariant positions need Ai <: Bi, contravariant positions need
+Bi <: Ai, invariant positions need structural equality. Component
+subtype queries route back through solve_subtype_constraint, which
+terminates because each step descends one level of the (finite) type
+structure.
+@End Reasoning
+Process called "check_variance_subtype" takes analyzer as Integer, left_type as Integer, right_type as Integer:
+    Let left be proc resolve_type_alias with analyzer, left_type
+    Let right be proc resolve_type_alias with analyzer, right_type
+
+    If left is less than 65536:
+        Return 0
+    End If
+    If right is less than 65536:
+        Return 0
+    End If
+
+    Let left_info as TypeInfo be left
+    Let right_info as TypeInfo be right
+
+    If left_info.type_kind is not equal to right_info.type_kind:
+        Return 0
+    End If
+
+    Let same_name be proc string_equals from StringCore with left_info.type_name, right_info.type_name
+    If same_name is equal to 0:
+        Return 0
+    End If
+
+    Let left_components be left_info.type_params
+    Let right_components be right_info.type_params
+    Let arity be proc list_length from List with left_components
+    Let right_arity be proc list_length from List with right_components
+    If arity is not equal to right_arity:
+        Return 0
+    End If
+
+    Let i be 0
+    While i is less than arity:
+        Let left_component be proc list_get from List with left_components, i
+        Let right_component be proc list_get from List with right_components, i
+        Let variance be proc variance_at_position with analyzer, left_info.type_name, i, arity
+
+        Let position_ok be 0
+        Let is_covariant be proc string_equals from StringCore with variance, "+"
+        Let is_contravariant be proc string_equals from StringCore with variance, "-"
+
+        If is_covariant is equal to 1:
+            Set position_ok to proc solve_subtype_constraint with analyzer, left_component, right_component
+        Otherwise If is_contravariant is equal to 1:
+            Set position_ok to proc solve_subtype_constraint with analyzer, right_component, left_component
+        Otherwise:
+            Set position_ok to proc check_structural_equality with analyzer, left_component, right_component
+        End If
+
+        If position_ok is equal to 0:
+            Return 0
+        End If
+
+        Set i to i plus 1
+    End While
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Pattern Checking
+Note: ============================================================================
+
+@Reasoning:
+Scala distinguishes binding patterns from stable-identifier patterns
+by case: a lowercase bare identifier binds (irrefutable catch-all),
+an uppercase bare identifier references an existing value (None, Nil)
+and is refutable. The wildcard is always a catch-all. This predicate
+encodes that rule for exhaustiveness analysis.
+@End Reasoning
+Process called "pattern_is_catch_all" takes pattern as Integer returns Integer:
+    If pattern is equal to 0:
+        Return 0
+    End If
+
+    Let pattern_kind be proc get_ast_node_type with pattern
+    If pattern_kind is equal to AST_WILDCARD_PATTERN:
+        Return 1
+    End If
+
+    If pattern_kind is equal to AST_VARIABLE_PATTERN:
+        Let name be proc get_ast_node_value with pattern
+        If name is equal to 0:
+            Return 1
+        End If
+        Let first_char be proc string_char_at from StringCore with name, 0
+        If first_char is greater than or equal to 65 and first_char is less than or equal to 90:
+            Note: Uppercase initial - stable identifier reference, refutable
+            Return 0
+        End If
+        Return 1
+    End If
+
+    Return 0
+End Process
+
+@Reasoning:
+Checks one case pattern against the scrutinee's type. Catch-alls and
+binders accept anything. Literal patterns require the literal's kind
+to flow into the scrutinee type (or vice versa - matching an Any
+scrutinee against an Int literal narrows, which is legal). Stable
+identifiers and constructor patterns must name something the symbol
+or type tables know (Option's Some/None are accepted against any
+scrutinee the kind model cannot refute); constructor sub-patterns
+recurse with an unconstrained expected type because component types
+are not tracked per-constructor in the kind model. Tuple patterns
+require a tuple-shaped (or unknown) scrutinee.
+@End Reasoning
+Process called "check_pattern_type" takes analyzer as Integer, pattern as Integer, scrutinee_type as Integer:
+    If pattern is equal to 0:
+        Return 0
+    End If
+
+    Let scrutinee_kind be scrutinee_type
+    If scrutinee_type is greater than or equal to 65536:
+        Let scrutinee_info as TypeInfo be scrutinee_type
+        Set scrutinee_kind to scrutinee_info.type_kind
+    End If
+
+    Let pattern_kind be proc get_ast_node_type with pattern
+
+    If pattern_kind is equal to AST_WILDCARD_PATTERN:
+        Return 1
+    End If
+
+    If pattern_kind is equal to AST_VARIABLE_PATTERN:
+        Let is_binder be proc pattern_is_catch_all with pattern
+        If is_binder is equal to 1:
+            Return 1
+        End If
+        Note: Stable identifier - must reference something known
+        Let stable_name be proc get_ast_node_value with pattern
+        Let analyzer_obj as ScalaSemanticAnalyzer be analyzer
+        Let stable_symbol be proc hashtable_get from HashTable with analyzer_obj.symbol_table, stable_name
+        If stable_symbol is not equal to 0:
+            Return 1
+        End If
+        Note: Option's constructors are always in scope
+        Let is_none be proc string_equals from StringCore with stable_name, "None"
+        If is_none is equal to 1:
+            Return 1
+        End If
+        Let is_nil be proc string_equals from StringCore with stable_name, "Nil"
+        If is_nil is equal to 1:
+            Return 1
+        End If
+        Return 0
+    End If
+
+    If pattern_kind is equal to AST_LITERAL_PATTERN:
+        Let literal_kind_name be proc get_node_attribute with pattern, "literal_type"
+        Let literal_kind be TYPE_ANY
+        If proc string_equals from StringCore with literal_kind_name, "INTEGER_LITERAL":
+            Set literal_kind to TYPE_INT
+        Otherwise If proc string_equals from StringCore with literal_kind_name, "FLOAT_LITERAL":
+            Set literal_kind to TYPE_FLOAT
+        Otherwise If proc string_equals from StringCore with literal_kind_name, "DOUBLE_LITERAL":
+            Set literal_kind to TYPE_DOUBLE
+        Otherwise If proc string_equals from StringCore with literal_kind_name, "LONG_LITERAL":
+            Set literal_kind to TYPE_LONG
+        Otherwise If proc string_equals from StringCore with literal_kind_name, "STRING_LITERAL":
+            Set literal_kind to TYPE_STRING
+        Otherwise If proc string_equals from StringCore with literal_kind_name, "CHAR_LITERAL":
+            Set literal_kind to TYPE_CHAR
+        Otherwise If proc string_equals from StringCore with literal_kind_name, "BOOLEAN_LITERAL":
+            Set literal_kind to TYPE_BOOLEAN
+        Otherwise If proc string_equals from StringCore with literal_kind_name, "NULL_LITERAL":
+            Set literal_kind to TYPE_NULL
+        End If
+
+        If scrutinee_kind is equal to TYPE_ANY:
+            Return 1
+        End If
+        Let forward be proc are_types_compatible with analyzer, literal_kind, scrutinee_kind
+        If forward is equal to 1:
+            Return 1
+        End If
+        Return proc are_types_compatible with analyzer, scrutinee_kind, literal_kind
+    End If
+
+    If pattern_kind is equal to AST_CONSTRUCTOR_PATTERN:
+        Let constructor_name be proc get_ast_node_value with pattern
+        Let known be 0
+
+        Let analyzer_for_ctor as ScalaSemanticAnalyzer be analyzer
+        Let ctor_symbol be proc hashtable_get from HashTable with analyzer_for_ctor.symbol_table, constructor_name
+        If ctor_symbol is not equal to 0:
+            Set known to 1
+        End If
+        Let is_some be proc string_equals from StringCore with constructor_name, "Some"
+        If is_some is equal to 1:
+            Set known to 1
+        End If
+
+        If known is equal to 0:
+            Return 0
+        End If
+
+        Note: Sub-patterns recurse with an unconstrained expected type
+        Let sub_patterns be proc get_ast_node_children with pattern
+        Let sub_count be proc list_length from List with sub_patterns
+        Let sub_index be 0
+        While sub_index is less than sub_count:
+            Let sub_pattern be proc list_get from List with sub_patterns, sub_index
+            Let sub_ok be proc check_pattern_type with analyzer, sub_pattern, TYPE_ANY
+            If sub_ok is equal to 0:
+                Return 0
+            End If
+            Set sub_index to sub_index plus 1
+        End While
+
+        Return 1
+    End If
+
+    If pattern_kind is equal to AST_TUPLE_PATTERN:
+        If scrutinee_kind is not equal to TYPE_TUPLE and scrutinee_kind is not equal to TYPE_ANY:
+            Return 0
+        End If
+        Let tuple_subs be proc get_ast_node_children with pattern
+        Let tuple_sub_count be proc list_length from List with tuple_subs
+        Let tuple_index be 0
+        While tuple_index is less than tuple_sub_count:
+            Let tuple_sub be proc list_get from List with tuple_subs, tuple_index
+            Let tuple_sub_ok be proc check_pattern_type with analyzer, tuple_sub, TYPE_ANY
+            If tuple_sub_ok is equal to 0:
+                Return 0
+            End If
+            Set tuple_index to tuple_index plus 1
+        End While
+        Return 1
+    End If
+
+    Return 1
+End Process
+
+@Reasoning:
+Decides whether a pattern set provably covers its scrutinee's domain.
+Provable coverage exists in three forms this kind model can see: a
+catch-all pattern (wildcard or lowercase binder) covers everything;
+Boolean scrutinees are covered by the true and false literals
+together; Option scrutinees are covered by Some(...) plus the None
+stable identifier. Domains the model cannot enumerate (user classes
+collapse to one kind, numeric/string domains are unbounded without a
+catch-all) are reported NON-exhaustive only for Boolean - for
+unbounded or unenumerable domains the honest answer is "cannot
+disprove", mirroring scalac, which warns only on sealed hierarchies
+it can enumerate.
+@End Reasoning
+Process called "check_pattern_exhaustiveness" takes analyzer as Integer, match_type as Integer, covered_patterns as Integer:
+    Let pattern_count be proc list_length from List with covered_patterns
+
+    Note: A catch-all anywhere settles it
+    Let i be 0
+    While i is less than pattern_count:
+        Let pattern be proc list_get from List with covered_patterns, i
+        Let is_catch_all be proc pattern_is_catch_all with pattern
+        If is_catch_all is equal to 1:
+            Return 1
+        End If
+        Set i to i plus 1
+    End While
+
+    Let match_kind be match_type
+    If match_type is greater than or equal to 65536:
+        Let match_info as TypeInfo be match_type
+        Set match_kind to match_info.type_kind
+    End If
+
+    If match_kind is equal to TYPE_BOOLEAN:
+        Let saw_true be 0
+        Let saw_false be 0
+        Set i to 0
+        While i is less than pattern_count:
+            Let bool_pattern be proc list_get from List with covered_patterns, i
+            Let bool_kind be proc get_ast_node_type with bool_pattern
+            If bool_kind is equal to AST_LITERAL_PATTERN:
+                Let literal_value be proc get_ast_node_value with bool_pattern
+                Let matches_true be proc string_equals from StringCore with literal_value, "true"
+                If matches_true is equal to 1:
+                    Set saw_true to 1
+                End If
+                Let matches_false be proc string_equals from StringCore with literal_value, "false"
+                If matches_false is equal to 1:
+                    Set saw_false to 1
+                End If
+            End If
+            Set i to i plus 1
+        End While
+        If saw_true is equal to 1 and saw_false is equal to 1:
+            Return 1
+        End If
+        Return 0
+    End If
+
+    If match_kind is equal to TYPE_OPTION:
+        Let saw_some be 0
+        Let saw_none be 0
+        Set i to 0
+        While i is less than pattern_count:
+            Let option_pattern be proc list_get from List with covered_patterns, i
+            Let option_kind be proc get_ast_node_type with option_pattern
+            Let option_name be proc get_ast_node_value with option_pattern
+            If option_kind is equal to AST_CONSTRUCTOR_PATTERN:
+                Let names_some be proc string_equals from StringCore with option_name, "Some"
+                If names_some is equal to 1:
+                    Set saw_some to 1
+                End If
+            End If
+            If option_kind is equal to AST_VARIABLE_PATTERN:
+                Let names_none be proc string_equals from StringCore with option_name, "None"
+                If names_none is equal to 1:
+                    Set saw_none to 1
+                End If
+            End If
+            Set i to i plus 1
+        End While
+        If saw_some is equal to 1 and saw_none is equal to 1:
+            Return 1
+        End If
+        Return 0
+    End If
+
+    Note: Unenumerable domain - cannot disprove coverage
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Declaration Validation
+Note: ============================================================================
+
+@Reasoning:
+Decides whether a def node carries a body: any child that is not a
+parameter list (value or type) and not a type node is the body
+expression. Abstract members - permitted in traits and abstract
+classes - have none.
+@End Reasoning
+Process called "method_has_body" takes method_def as Integer returns Integer:
+    Let children be proc get_ast_node_children with method_def
+    Let child_count be proc list_length from List with children
+
+    Let i be 0
+    While i is less than child_count:
+        Let child be proc list_get from List with children, i
+        Let child_kind be proc get_ast_node_type with child
+
+        If child_kind is not equal to AST_PARAMETER_LIST:
+            Let is_type_node be 0
+            If child_kind is greater than or equal to AST_TYPE and child_kind is less than or equal to AST_TUPLE_TYPE:
+                Set is_type_node to 1
+            End If
+            If is_type_node is equal to 0:
+                Return 1
+            End If
+        End If
+
+        Set i to i plus 1
+    End While
+
+    Return 0
+End Process
+
+@Reasoning:
+Well-formedness of one method signature: parameter names must be
+unique within the flattened parameter sequence (Scala rejects
+duplicate parameter names across a def's parameter lists), and every
+type annotation - parameter and return - must reference a resolvable
+type. Builtin names resolve through the pure node-to-kind mapper;
+names that map to the user-nominal kind must exist in the type or
+symbol tables, where the def's own type parameters also appear
+(symbol collection registers them).
+@End Reasoning
+Process called "validate_method_signature" takes analyzer as Integer, method_def as Integer:
+    Let parameters be proc get_function_parameters with method_def
+    Let param_count be proc list_length from List with parameters
+
+    Note: Duplicate parameter names
+    Let i be 0
+    While i is less than param_count:
+        Let param_i be proc list_get from List with parameters, i
+        Let name_i be proc get_ast_node_value with param_i
+        Let j be i plus 1
+        While j is less than param_count:
+            Let param_j be proc list_get from List with parameters, j
+            Let name_j be proc get_ast_node_value with param_j
+            Let same be proc string_equals from StringCore with name_i, name_j
+            If same is equal to 1:
+                Let dup_message be proc string_concat from StringUtils with "Duplicate parameter name: ", name_i
+                proc add_semantic_error with analyzer, ERROR_DUPLICATE_DEFINITION, dup_message
+            End If
+            Set j to j plus 1
+        End While
+        Set i to i plus 1
+    End While
+
+    Note: Parameter type annotations must resolve
+    Set i to 0
+    While i is less than param_count:
+        Let param be proc list_get from List with parameters, i
+        Let param_children be proc get_ast_node_children with param
+        Let param_child_count be proc list_length from List with param_children
+        Let k be 0
+        While k is less than param_child_count:
+            Let param_child be proc list_get from List with param_children, k
+            Let param_child_kind be proc get_ast_node_type with param_child
+            If param_child_kind is greater than or equal to AST_TYPE and param_child_kind is less than or equal to AST_TUPLE_TYPE:
+                proc validate_type_reference_resolves with analyzer, param_child
+            End If
+            Set k to k plus 1
+        End While
+        Set i to i plus 1
+    End While
+
+    Note: Return annotation must resolve when declared
+    Let return_attr be proc get_node_attribute with method_def, "return_type"
+    Let has_return be proc string_equals from StringCore with return_attr, "true"
+    If has_return is equal to 1:
+        Let def_children be proc get_ast_node_children with method_def
+        Let def_child_count be proc list_length from List with def_children
+        Let d be 0
+        While d is less than def_child_count:
+            Let def_child be proc list_get from List with def_children, d
+            Let def_child_kind be proc get_ast_node_type with def_child
+            If def_child_kind is equal to AST_TYPE or def_child_kind is equal to AST_TYPE_APPLICATION:
+                proc validate_type_reference_resolves with analyzer, def_child
+                Return
+            End If
+            Set d to d plus 1
+        End While
+    End If
+End Process
+
+@Reasoning:
+Shared resolution check for a type annotation node: builtin and
+structural names always resolve (the kind mapper returns their
+concrete kind); user-nominal names (TYPE_CLASS mapping) must be
+defined in the type or symbol tables - including type parameters,
+which symbol collection registered. Unresolvable names produce one
+UNDEFINED_SYMBOL diagnostic naming the reference.
+@End Reasoning
+Process called "validate_type_reference_resolves" takes analyzer as Integer, type_node as Integer:
+    If type_node is equal to 0:
+        Return
+    End If
+
+    Let mapped_kind be proc scala_type_node_kind with type_node
+    If mapped_kind is not equal to TYPE_CLASS:
+        Return
+    End If
+
+    Let definition be proc lookup_type_definition with analyzer, type_node
+    If definition is not equal to 0:
+        Return
+    End If
+
+    Note: Type parameters were registered as plain symbols at collection
+    Let analyzer_obj as ScalaSemanticAnalyzer be analyzer
+    Let base_name be proc type_node_base_name with type_node
+    Let symbol_address be proc hashtable_get from HashTable with analyzer_obj.symbol_table, base_name
+    If symbol_address is not equal to 0:
+        Return
+    End If
+
+    Let message be proc string_concat from StringUtils with "Unresolved type reference: ", base_name
+    proc add_semantic_error with analyzer, ERROR_UNDEFINED_SYMBOL, message
+End Process
+
+@Reasoning:
+Enforces the abstract-member contract: a concrete (non-abstract)
+class must provide a body for every abstract method it inherits from
+its superclass chain and mixed-in traits. The ancestry is walked as a
+worklist of declaration names (diamonds terminate, 64-element bound
+caps malformed cycles); along the way every ancestor's bodied methods
+count as provided and bodiless methods as required. A requirement
+satisfied nowhere - not in the class, not by a concrete ancestor
+override - is an ERROR_ABSTRACT_METHOD diagnostic naming the method.
+@End Reasoning
+Process called "validate_abstract_method_implementations" takes analyzer as Integer, class_node as Integer:
+    Note: Abstract classes may leave inherited members abstract
+    Let abstract_attr be proc get_node_attribute with class_node, "abstract"
+    Let is_abstract be proc string_equals from StringCore with abstract_attr, "true"
+    If is_abstract is equal to 1:
+        Return
+    End If
+
+    Let analyzer_obj as ScalaSemanticAnalyzer be analyzer
+    Let required_names be proc list_create from List
+    Let provided_names be proc list_create from List
+
+    Note: The class's own bodied methods provide implementations
+    Let own_members be proc get_class_members with class_node
+    Let own_count be proc list_length from List with own_members
+    Let m be 0
+    While m is less than own_count:
+        Let member be proc list_get from List with own_members, m
+        Let member_kind be proc get_ast_node_type with member
+        If member_kind is equal to AST_FUNCTION:
+            Let has_body be proc method_has_body with member
+            Let member_name be proc get_ast_node_value with member
+            If has_body is equal to 1:
+                proc list_append from List with provided_names, member_name
+            End If
+        End If
+        Set m to m plus 1
+    End While
+
+    Note: Walk the ancestry collecting requirements and provisions
+    Let worklist be proc list_create from List
+    Let parent_node be proc get_class_superclass with class_node
+    If parent_node is not equal to 0:
+        Let parent_name be proc type_node_base_name with parent_node
+        proc list_append from List with worklist, parent_name
+    End If
+    Let mixins be proc get_class_traits with class_node
+    Let mixin_count be proc list_length from List with mixins
+    Let mx be 0
+    While mx is less than mixin_count:
+        Let mixin_node be proc list_get from List with mixins, mx
+        Let mixin_name be proc type_node_base_name with mixin_node
+        proc list_append from List with worklist, mixin_name
+        Set mx to mx plus 1
+    End While
+
+    Let processed be 0
+    Let work_index be 0
+    While work_index is less than proc list_length from List with worklist:
+        If processed is greater than or equal to 64:
+            Set work_index to proc list_length from List with worklist
+        Otherwise:
+            Let ancestor_name be proc list_get from List with worklist, work_index
+            Let ancestor_symbol be proc hashtable_get from HashTable with analyzer_obj.symbol_table, ancestor_name
+            If ancestor_symbol is not equal to 0:
+                Let ancestor_info as SymbolInfo be ancestor_symbol
+                Let ancestor_def be ancestor_info.definition_node
+                If ancestor_def is not equal to 0:
+                    Let ancestor_methods be proc get_trait_methods with ancestor_def
+                    Let ancestor_method_count be proc list_length from List with ancestor_methods
+                    Let am be 0
+                    While am is less than ancestor_method_count:
+                        Let ancestor_method be proc list_get from List with ancestor_methods, am
+                        Let ancestor_method_name be proc get_ast_node_value with ancestor_method
+                        Let ancestor_has_body be proc method_has_body with ancestor_method
+                        If ancestor_has_body is equal to 1:
+                            proc list_append from List with provided_names, ancestor_method_name
+                        Otherwise:
+                            proc list_append from List with required_names, ancestor_method_name
+                        End If
+                        Set am to am plus 1
+                    End While
+
+                    Let grand_parent be proc get_class_superclass with ancestor_def
+                    If grand_parent is not equal to 0:
+                        Let grand_name be proc type_node_base_name with grand_parent
+                        proc list_append from List with worklist, grand_name
+                    End If
+                    Let ancestor_mixins be proc get_class_traits with ancestor_def
+                    Let ancestor_mixin_count be proc list_length from List with ancestor_mixins
+                    Let amx be 0
+                    While amx is less than ancestor_mixin_count:
+                        Let ancestor_mixin be proc list_get from List with ancestor_mixins, amx
+                        Let ancestor_mixin_name be proc type_node_base_name with ancestor_mixin
+                        proc list_append from List with worklist, ancestor_mixin_name
+                        Set amx to amx plus 1
+                    End While
+                End If
+            End If
+            Set processed to processed plus 1
+            Set work_index to work_index plus 1
+        End If
+    End While
+
+    Note: Every requirement must be satisfied by some provision
+    Let required_count be proc list_length from List with required_names
+    Let provided_count be proc list_length from List with provided_names
+    Let r be 0
+    While r is less than required_count:
+        Let required_name be proc list_get from List with required_names, r
+        Let satisfied be 0
+        Let p be 0
+        While p is less than provided_count:
+            Let provided_name be proc list_get from List with provided_names, p
+            Let match be proc string_equals from StringCore with required_name, provided_name
+            If match is equal to 1:
+                Set satisfied to 1
+            End If
+            Set p to p plus 1
+        End While
+
+        If satisfied is equal to 0:
+            Let missing_message be proc string_concat from StringUtils with "Abstract method not implemented: ", required_name
+            proc add_semantic_error with analyzer, ERROR_ABSTRACT_METHOD, missing_message
+        End If
+
+        Set r to r plus 1
+    End While
+End Process
+
+@Reasoning:
+Validates one with-clause of a class: the named entity must exist and
+must actually be a trait (mixing in a class via "with" is invalid
+inheritance), and any class member that overrides one of the trait's
+CONCRETE methods must carry the override modifier - Scala's rule that
+silently shadowing an implemented member is an error. Abstract-member
+satisfaction is deliberately not checked here; that is
+validate_abstract_method_implementations' single responsibility, and
+double-reporting the same missing method would be a diagnostic bug.
+@End Reasoning
+Process called "validate_trait_implementation" takes analyzer as Integer, class_node as Integer, trait_ref as Integer:
+    Let analyzer_obj as ScalaSemanticAnalyzer be analyzer
+    Let trait_name be proc type_node_base_name with trait_ref
+
+    Let trait_symbol be proc hashtable_get from HashTable with analyzer_obj.symbol_table, trait_name
+    If trait_symbol is equal to 0:
+        Let unknown_message be proc string_concat from StringUtils with "Mixed-in trait not found: ", trait_name
+        proc add_semantic_error with analyzer, ERROR_UNDEFINED_SYMBOL, unknown_message
+        Return
+    End If
+
+    Let trait_info as SymbolInfo be trait_symbol
+    If trait_info.symbol_type is not equal to TYPE_TRAIT:
+        Let kind_message be proc string_concat from StringUtils with "Cannot mix in non-trait: ", trait_name
+        proc add_semantic_error with analyzer, ERROR_INVALID_INHERITANCE, kind_message
+        Return
+    End If
+
+    Let trait_def be trait_info.definition_node
+    If trait_def is equal to 0:
+        Return
+    End If
+
+    Note: Overriding a concrete trait member requires the override modifier
+    Let trait_methods be proc get_trait_methods with trait_def
+    Let trait_method_count be proc list_length from List with trait_methods
+    Let class_members be proc get_class_members with class_node
+    Let class_member_count be proc list_length from List with class_members
+
+    Let t be 0
+    While t is less than trait_method_count:
+        Let trait_method be proc list_get from List with trait_methods, t
+        Let trait_method_concrete be proc method_has_body with trait_method
+        If trait_method_concrete is equal to 1:
+            Let trait_method_name be proc get_ast_node_value with trait_method
+            Let c be 0
+            While c is less than class_member_count:
+                Let class_member be proc list_get from List with class_members, c
+                Let class_member_kind be proc get_ast_node_type with class_member
+                If class_member_kind is equal to AST_FUNCTION:
+                    Let class_member_name be proc get_ast_node_value with class_member
+                    Let names_clash be proc string_equals from StringCore with class_member_name, trait_method_name
+                    If names_clash is equal to 1:
+                        Let override_attr be proc get_node_attribute with class_member, "override"
+                        Let has_override be proc string_equals from StringCore with override_attr, "true"
+                        If has_override is equal to 0:
+                            Let override_message be proc string_concat from StringUtils with "Overriding concrete member requires 'override' modifier: ", class_member_name
+                            proc add_semantic_error with analyzer, ERROR_INVALID_INHERITANCE, override_message
+                        End If
+                    End If
+                End If
+                Set c to c plus 1
+            End While
+        End If
+        Set t to t plus 1
+    End While
+End Process
+
+@Reasoning:
+Validates a trait's self-type annotation ("self: Foo =>"): the
+annotated type must reference a known declaration - the constraint it
+imposes ("every concrete mixer must also be a Foo") is meaningless
+against an undefined name. The conformance obligation on mixing
+classes is enforced where classes are validated; here the trait-side
+well-formedness is the contract.
+@End Reasoning
+Process called "validate_self_type_constraint" takes analyzer as Integer, trait_node as Integer, self_type as Integer:
+    If self_type is equal to 0:
+        Return
+    End If
+
+    Let mapped_kind be proc scala_type_node_kind with self_type
+    If mapped_kind is not equal to TYPE_CLASS:
+        Note: Builtin or structural self-type - always resolvable
+        Return
+    End If
+
+    Let definition be proc lookup_type_definition with analyzer, self_type
+    If definition is equal to 0:
+        Let self_name be proc type_node_base_name with self_type
+        Let message be proc string_concat from StringUtils with "Self-type references undefined type: ", self_name
+        proc add_semantic_error with analyzer, ERROR_UNDEFINED_SYMBOL, message
+    End If
 End Process

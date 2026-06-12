@@ -89,9 +89,12 @@ Type called "SSARenamingContext":
     to SSA form. This context maintains:
     - The function being processed
     - Mapping from original variable names to VariableInfo structures
-    - Global SSA value counter (for allocating fresh value IDs)
     - Dominance information (for tree traversal)
     - The CFG (for accessing blocks and instructions)
+
+    Fresh SSA value ids are drawn from the owning function's allocator
+    (MIR.allocate_value_id), synced above all pre-existing ids at context
+    creation - not from a context-private counter.
 
     This is the central data structure for the entire SSA construction process.
     @End Reasoning
@@ -100,7 +103,7 @@ Type called "SSARenamingContext":
     cfg_ptr as Integer               Note: MIRCFG pointer
     variable_map as Integer          Note: Map: original_name -> VariableInfo (List of pairs, TIER 3)
     variable_count as Integer        Note: Number of tracked variables
-    next_value_id as Integer         Note: Global counter for SSA value IDs
+    retired_value_counter as Integer Note: RETIRED slot (OD-#463): fresh ids come from MIR.allocate_value_id; kept to preserve the 48-byte layout
     dominance_info as Integer        Note: DominanceInfo pointer (from Dominance.compute_dominance_tree)
 End Type
 
@@ -416,27 +419,33 @@ Process called "allocate_fresh_ssa_name" that takes var_info_ptr as Integer, con
 
     This creates a new SSA version of the variable (e.g., x_0 -> x_1 -> x_2).
     The version counter is incremented, and a new globally unique value ID
-    is allocated from the context.
+    is drawn from the owning function's allocator.
 
-    Returns: The new SSA value ID
+    Returns: The new SSA value ID, or -1 on error
     @End Reasoning
 
     @Implementation
-    Two counters cooperate: the per-variable current_version at offset 32 of
-    the VariableInfo, used purely for human-readable naming, and the global
-    next_value_id at offset 32 of the SSARenamingContext, which is the unique
-    identifier consumed by the rest of the MIR pipeline. Both are read,
-    returned, and post-incremented in lockstep so that each call yields a new
-    pair of fresh names. The function does not push the new name onto the
-    stack: callers are expected to call push_ssa_name explicitly so that the
-    rename traversal can keep stack discipline aligned with dominance scope.
+    The per-variable current_version at offset 32 of the VariableInfo is
+    incremented for human-readable naming, and the unique value id is drawn
+    from MIR.allocate_value_id on the owning MIRFunction (context offset 0) -
+    the single per-function allocator, whose counter create_ssa_context
+    raised above every pre-existing id via MIR.sync_next_value_id. Because
+    every id this function mints IS a version of a user variable, the id is
+    immediately recorded in the function's variable_values registry through
+    MIR.register_variable_value (OD-#463): operand_is_variable must keep
+    answering 1 for rename versions so that recompute_ssa and any later
+    rename pass treat them as variable uses. The function does not push the
+    new name onto the stack: callers are expected to call push_ssa_name
+    explicitly so that the rename traversal can keep stack discipline
+    aligned with dominance scope.
     @End Implementation
 
     @Performance_Hints
-    O(1) - two memory_get_int64 plus two memory_set_int64 calls. Called once
-    per SSA definition (every original instruction that defines a variable
-    plus every inserted phi), so the per-definition cost must stay constant
-    to keep SSA construction within the documented O(V * |DF+|) envelope.
+    O(1) - one counter increment, one allocator bump, one amortized O(1)
+    registry insert. Called once per SSA definition (every original
+    instruction that defines a variable plus every inserted phi), so the
+    per-definition cost must stay constant to keep SSA construction within
+    the documented O(V * |DF+|) envelope.
     @End Performance_Hints
 
     Note: Null checks
@@ -448,9 +457,20 @@ Process called "allocate_fresh_ssa_name" that takes var_info_ptr as Integer, con
     Let version be proc memory_get_int64 from Layout with var_info_ptr, 32
     proc memory_set_int64 from Layout with var_info_ptr, 32, version plus 1
 
-    Note: Get and increment global value ID counter
-    Let value_id be proc memory_get_int64 from Layout with context_ptr, 32
-    proc memory_set_int64 from Layout with context_ptr, 32, value_id plus 1
+    Note: Draw the unique id from the owning function's allocator
+    Let owning_function be proc memory_get_int64 from Layout with context_ptr, 0
+    If owning_function is equal to 0:
+        Return -1
+    End If
+
+    Let value_id be proc allocate_value_id from MIR with owning_function
+    If value_id is less than or equal to 0:
+        Return -1
+    End If
+
+    Note: A rename version names variable storage - record it in the
+    Note: explicit is-variable registry (OD-#463)
+    proc register_variable_value from MIR with owning_function, value_id
 
     Return value_id
 End Process
@@ -468,7 +488,8 @@ Process called "create_ssa_context" that takes function_ptr as Integer, cfg_ptr 
     - offset 8:  cfg_ptr (8 bytes)
     - offset 16: variable_map list pointer (8 bytes)
     - offset 24: variable_count (8 bytes)
-    - offset 32: next_value_id counter (8 bytes)
+    - offset 32: RETIRED (formerly the private value-id counter; zeroed,
+                 never read - fresh ids come from MIR.allocate_value_id)
     - offset 40: dominance_info pointer (8 bytes)
     Total: 48 bytes
     @End Reasoning
@@ -479,20 +500,24 @@ Process called "create_ssa_context" that takes function_ptr as Integer, cfg_ptr 
     the context alone. A fresh empty List is created to serve as the
     variable map (stored as flat (name, VariableInfo) pairs to avoid the
     overhead of a hashed map for the small per-function variable counts
-    expected here). The next_value_id counter is seeded to 1000 to leave a
-    safety gap above any pre-existing MIR value IDs assigned by HIR-to-MIR
-    lowering, eliminating the need to scan the MIR up-front for the maximum
-    id. The dominance_info slot at offset 40 is zeroed; the caller is
+    expected here). Fresh rename-version ids are drawn from the FUNCTION's
+    allocator (MIR.allocate_value_id) rather than a context-private counter,
+    so this initialiser calls MIR.sync_next_value_id to raise the function's
+    next_value_id above every id already present - the explicit, scan-based
+    replacement for the retired "seed at 1000" magic band (OD-#463). The
+    slot at offset 32 (formerly the 1000-seeded private counter) is retired:
+    it is zeroed and no longer read anywhere; the layout is kept stable
+    rather than renumbering the dominance_info slot every consumer reads at
+    offset 40. The dominance_info slot at offset 40 is zeroed; the caller is
     expected to invoke set_dominance_info once compute_dominance_tree has
     produced a result, keeping context creation and dominance computation
     decoupled.
     @End Implementation
 
     @Performance_Hints
-    Single 48-byte allocation plus one List.create. Called exactly once per
-    function transformed into SSA form, so it is not on the hot path; the
-    seeding choice for next_value_id is what governs steady-state allocation
-    cost during subsequent renaming.
+    Single 48-byte allocation plus one List.create plus the O(P + I)
+    sync_next_value_id scan. Called exactly once per function transformed
+    into SSA form, so it is not on the hot path.
     @End Performance_Hints
 
     Note: Allocate SSARenamingContext structure
@@ -507,9 +532,11 @@ Process called "create_ssa_context" that takes function_ptr as Integer, cfg_ptr 
     proc memory_set_int64 from Layout with context_ptr, 16, variable_map
     proc memory_set_int64 from Layout with context_ptr, 24, 0 Note: variable_count
 
-    Note: Initialize value ID counter
-    Note: Start from 1000 to avoid conflicts with existing MIR value IDs
-    proc memory_set_int64 from Layout with context_ptr, 32, 1000
+    Note: Retired slot (formerly the context-private value-id counter).
+    Note: Fresh ids now come from MIR.allocate_value_id on the function,
+    Note: whose counter is synced above all existing ids right here.
+    proc memory_set_int64 from Layout with context_ptr, 32, 0
+    proc sync_next_value_id from MIR with function_ptr
 
     Note: Dominance info will be set later
     proc memory_set_int64 from Layout with context_ptr, 40, 0
@@ -738,16 +765,21 @@ Process called "collect_variable_definitions" that takes context_ptr as Integer 
     Reads the CFG pointer from offset 8 of the context, then performs a
     nested scan: outer loop iterates every basic block returned by
     CFG.get_mir_cfg_blocks, inner loop iterates every instruction in the block.
-    For each instruction MIR.instruction_defines_variable acts as a guard so
-    only def-producing instructions (assignments, calls returning a value,
-    arithmetic and memory loads, etc.) participate. The defined variable name
-    and result type are extracted, get_or_create_variable_info is used to
-    obtain or create the per-variable record, and add_definition_block records
-    the block ID into the var's def_blocks set. The dedup behavior of
-    add_definition_block ensures that multiple definitions of the same
-    variable inside one block contribute exactly one entry, which is what the
-    Cytron algorithm requires (it cares about the set of definition blocks,
-    not the per-instruction count).
+    Two guards select the instructions that participate:
+    MIR.instruction_defines_variable filters to def-producing instructions
+    (non-zero result value_id), and MIR.operand_is_variable - the explicit
+    per-function variable registry, OD-#463 - filters those down to defs
+    whose value id was registered as user-variable storage by its producer.
+    Single-assignment temporaries and constants are deliberately excluded:
+    they are already in SSA shape, need no phis, and keep their original
+    ids untouched through the rename phase. For each surviving def the
+    variable name and result type are extracted, get_or_create_variable_info
+    is used to obtain or create the per-variable record, and
+    add_definition_block records the block ID into the var's def_blocks set.
+    The dedup behavior of add_definition_block ensures that multiple
+    definitions of the same variable inside one block contribute exactly one
+    entry, which is what the Cytron algorithm requires (it cares about the
+    set of definition blocks, not the per-instruction count).
     @End Implementation
 
     @Performance_Hints
@@ -770,6 +802,9 @@ Process called "collect_variable_definitions" that takes context_ptr as Integer 
         Return 0
     End If
 
+    Note: Owning function (carries the explicit variable registry, OD-#463)
+    Let owning_function be proc memory_get_int64 from Layout with context_ptr, 0
+
     Note: Get all blocks (canonical block storage: List of block pointers, borrowed)
     Let blocks_list be proc get_mir_cfg_blocks from CFG with cfg_ptr
     Let block_count be proc get_cfg_block_count from CFG with cfg_ptr
@@ -789,20 +824,26 @@ Process called "collect_variable_definitions" that takes context_ptr as Integer 
         While inst_idx is less than inst_count:
             Let inst_ptr be proc get from List with instructions, inst_idx
 
-            Note: Check if instruction defines a variable
+            Note: Check if instruction defines a value at all
             Let defines_var be proc instruction_defines_variable from MIR with inst_ptr
             If defines_var is equal to 1:
-                Note: Get variable information from instruction
-                Let var_name be proc get_instruction_defined_variable from MIR with inst_ptr
-                Let var_type be proc get_instruction_result_type from MIR with inst_ptr
+                Note: Only registered variable ids participate in phi
+                Note: placement - temporaries are already single-assignment
+                Let def_value_id be proc get_mir_node_value_id from MIR with inst_ptr
+                Let def_is_variable be proc operand_is_variable from MIR with owning_function, def_value_id
+                If def_is_variable is equal to 1:
+                    Note: Get variable information from instruction
+                    Let var_name be proc get_instruction_defined_variable from MIR with inst_ptr
+                    Let var_type be proc get_instruction_result_type from MIR with inst_ptr
 
-                If var_name is not equal to 0:
-                    Note: Get or create VariableInfo for this variable
-                    Let var_info_ptr be proc get_or_create_variable_info with context_ptr, var_name, var_type
+                    If var_name is not equal to 0:
+                        Note: Get or create VariableInfo for this variable
+                        Let var_info_ptr be proc get_or_create_variable_info with context_ptr, var_name, var_type
 
-                    If var_info_ptr is not equal to 0:
-                        Note: Add this block to variable's definition blocks
-                        proc add_definition_block with var_info_ptr, block_id
+                        If var_info_ptr is not equal to 0:
+                            Note: Add this block to variable's definition blocks
+                            proc add_definition_block with var_info_ptr, block_id
+                        End If
                     End If
                 End If
             End If
@@ -1415,8 +1456,11 @@ Process called "rename_instruction_operands" that takes context_ptr as Integer, 
     operand list from MIR.get_instruction_operands - the compacted list
     drops empty slots and therefore loses the slot index that the write
     side requires. Empty slots (value 0) are skipped, and
-    MIR.operand_is_variable filters out constant-range ids so constants,
-    immediates, and label references remain untouched. For each variable
+    MIR.operand_is_variable - consulting the owning function's explicit
+    variable_values registry (OD-#463), never an id band - selects exactly
+    the operands that reference user-variable storage; uses of
+    single-assignment temporaries and constants remain untouched (their
+    defs are never renamed, so their ids stay valid). For each variable
     operand the source name is obtained via MIR.get_operand_variable_name
     (which needs the owning MIRFunction, read from context offset 0, to
     resolve the operand's defining instruction and its metadata name), the
@@ -1458,8 +1502,9 @@ Process called "rename_instruction_operands" that takes context_ptr as Integer, 
         Let operand_value be proc get_mir_node_operand from MIR with inst_ptr, slot
 
         If operand_value is not equal to 0:
-            Note: Check if operand is a variable (not a constant)
-            Let is_variable be proc operand_is_variable from MIR with operand_value
+            Note: Check the explicit registry: does this operand reference
+            Note: user-variable storage? (OD-#463)
+            Let is_variable be proc operand_is_variable from MIR with owning_function, operand_value
 
             If is_variable is equal to 1:
                 Note: Resolve the operand back to its source variable name
@@ -1506,16 +1551,22 @@ Process called "rename_instruction_result" that takes context_ptr as Integer, in
     @Implementation
     First consults MIR.instruction_defines_variable to short-circuit
     instructions that have no result (stores, branches, unconditional jumps,
-    void calls). For defining instructions the source variable name and
-    result type are pulled and passed to get_or_create_variable_info so a
-    VariableInfo exists. allocate_fresh_ssa_name produces the new id, which
-    is written into the instruction with MIR.set_instruction_result_value_id
-    so all later uses can locate the producer. push_ssa_name then publishes
-    the id onto the variable's SSA name stack, making it visible to
-    subsequent operand renames within the same block and any blocks
-    dominated by the current one. The caller (rename_block) is responsible
-    for the corresponding pop after the dominated subtree finishes
-    processing.
+    void calls), then gates on MIR.operand_is_variable over the owning
+    function's explicit variable registry (OD-#463): only defs whose value
+    id was registered as user-variable storage are versioned, while
+    single-assignment temporaries and constants keep their original ids -
+    renaming a def whose uses the operand pass will not retarget would
+    sever their use/def linkage. For variable defs the source variable name
+    and result type are pulled and passed to get_or_create_variable_info so
+    a VariableInfo exists. allocate_fresh_ssa_name produces the new id
+    (drawn from the function's allocator and itself registered as a
+    variable), which is written into the instruction with
+    MIR.set_instruction_result_value_id so all later uses can locate the
+    producer. push_ssa_name then publishes the id onto the variable's SSA
+    name stack, making it visible to subsequent operand renames within the
+    same block and any blocks dominated by the current one. The caller
+    (rename_block) is responsible for the corresponding pop after the
+    dominated subtree finishes processing.
     @End Implementation
 
     @Performance_Hints
@@ -1530,11 +1581,21 @@ Process called "rename_instruction_result" that takes context_ptr as Integer, in
         Return -1
     End If
 
-    Note: Check if instruction defines a variable
+    Note: Check if instruction defines a value at all
     Let defines_var be proc instruction_defines_variable from MIR with inst_ptr
 
     If defines_var is equal to 0:
         Return 0  Note: No result to rename
+    End If
+
+    Note: Only defs of registered variable ids receive rename versions
+    Note: (OD-#463 explicit registry); single-assignment temporaries keep
+    Note: their original ids so their use/def linkage stays intact.
+    Let result_owner_fn be proc memory_get_int64 from Layout with context_ptr, 0
+    Let result_value_id be proc get_mir_node_value_id from MIR with inst_ptr
+    Let result_is_variable be proc operand_is_variable from MIR with result_owner_fn, result_value_id
+    If result_is_variable is equal to 0:
+        Return 0  Note: Not variable storage - nothing to version
     End If
 
     Note: Get variable information from instruction
@@ -1564,7 +1625,6 @@ Process called "rename_instruction_result" that takes context_ptr as Integer, in
 
     Note: Keep the function's value_to_instruction map in sync (the
     Note: canonical setter intentionally leaves registration to the caller)
-    Let result_owner_fn be proc memory_get_int64 from Layout with context_ptr, 0
     If result_owner_fn is not equal to 0:
         proc register_value_definition from MIR with result_owner_fn, new_value_id, inst_ptr
     End If
@@ -1732,7 +1792,11 @@ Process called "rename_block" that takes context_ptr as Integer, block_ptr as In
     rename_phi_results semantics inline (allocate, set, push); phase 2
     walks the post-phi instructions, calling rename_instruction_operands to
     rewrite uses with the current peek and rename_instruction_result to
-    introduce a new def, while recording each defining variable's name in
+    introduce a new def - both gated on the function's explicit variable
+    registry via MIR.operand_is_variable (OD-#463), with the def gate here
+    kept in exact lockstep with rename_instruction_result's own gate so the
+    pushed_variables tracking never records a push that did not happen -
+    while recording each defining variable's name in
     pushed_variables. Phase 3 invokes fill_phi_incoming_values so successor
     phis see the names that are active at the end of this block. Phase 4
     obtains the dominance children via Dominance.get_dominated_blocks,
@@ -1799,6 +1863,14 @@ Process called "rename_block" that takes context_ptr as Integer, block_ptr as In
     proc rename_phi_results with context_ptr, block_ptr
 
     Note: Step 2: Rename instruction operands and results (non-phi instructions)
+    Note: The def gate mirrors rename_instruction_result exactly: a value-
+    Note: producing instruction is versioned only when its result id is in
+    Note: the function's explicit variable registry (OD-#463). The tracking
+    Note: append below MUST stay in lockstep with the actual push performed
+    Note: inside rename_instruction_result - tracking a push that never
+    Note: happens would make the step-5 epilogue pop a DOMINATING block's
+    Note: name and corrupt the rename stacks.
+    Let rename_owner_fn be proc memory_get_int64 from Layout with context_ptr, 0
     Set i to 0
     While i is less than inst_count:
         Set inst_ptr to proc get from List with instructions, i
@@ -1809,16 +1881,20 @@ Process called "rename_block" that takes context_ptr as Integer, block_ptr as In
             Note: Rename operands (uses)
             proc rename_instruction_operands with context_ptr, inst_ptr
 
-            Note: Rename result (def) if it defines a variable
+            Note: Rename result (def) only for registered variable storage
             Let defines_var be proc instruction_defines_variable from MIR with inst_ptr
             If defines_var is equal to 1:
-                Set var_name to proc get_instruction_defined_variable from MIR with inst_ptr
-                If var_name is not equal to 0:
-                    Note: Track that we pushed a name for this variable
-                    proc append from List with pushed_variables, var_name
-                End If
+                Let def_value_id be proc get_mir_node_value_id from MIR with inst_ptr
+                Let def_is_variable be proc operand_is_variable from MIR with rename_owner_fn, def_value_id
+                If def_is_variable is equal to 1:
+                    Set var_name to proc get_instruction_defined_variable from MIR with inst_ptr
+                    If var_name is not equal to 0:
+                        Note: Track that we pushed a name for this variable
+                        proc append from List with pushed_variables, var_name
+                    End If
 
-                proc rename_instruction_result with context_ptr, inst_ptr
+                    proc rename_instruction_result with context_ptr, inst_ptr
+                End If
             End If
         End If
 

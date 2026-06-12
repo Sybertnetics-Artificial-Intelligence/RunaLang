@@ -1,0 +1,369 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+MIR optimization passes B probe (task #481b, part B of the MIR reconciliation
+plan #432). Builds canonical MIR by hand through the construction API and
+asserts the production contract of the three rebuilt passes:
+
+  SROA (scalar_replacement.runa):
+    A single-block function with a 2-field struct alloca, two STORE_FIELDs and
+    two LOAD_FIELDs feeding an ADD is scalarized: alloca + field ops removed,
+    and the consumer ADD's operands are rewritten to the stored scalar value
+    ids (the loads now read the scalars directly).
+
+  Strength reduction (strength_reduction.runa):
+    x * 8 becomes x << 3 (opcode SHL 20014, right operand is a fresh CONST = 3),
+    while x * 3 is left as a MUL untouched.
+
+  Tail call (tail_call.runa):
+    A self-recursive CALL in tail position (call immediately followed by a
+    RETURN of the call result) is stamped with is_tail_call = 1; a non-tail call
+    (its result consumed by an ADD before the return) is NOT stamped.
+
+  MIRVerifier.verify_mir_function returns 1 after each transform.
+:End Note
+
+Import "tests/test_utils.runa" as T
+Import "compiler/middle/gungnir/mir/mir.runa" as MIR
+Import "compiler/middle/gungnir/mir/mir_nodes.runa" as MIRNodes
+Import "compiler/middle/gungnir/mir/cfg.runa" as CFG
+Import "compiler/middle/gungnir/mir/mir_verifier.runa" as MIRVerifier
+Import "compiler/middle/gungnir/mir/optimizations/scalar_replacement.runa" as SROA
+Import "compiler/middle/gungnir/mir/optimizations/strength_reduction.runa" as StrengthReduction
+Import "compiler/middle/gungnir/mir/optimizations/tail_call.runa" as TailCall
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/collections/list.runa" as List
+
+Note: Build a plain integer HIRTypeInfo stand-in: type_kind at 0, size at 16.
+Process called "make_int_type" returns Integer:
+    Let type_info be Layout.allocate(96)
+    If type_info is equal to 0:
+        Return 0
+    End If
+    Layout.memory_set_int64(type_info, 0, 13015)  Note: TYPE_INTEGER
+    Layout.memory_set_int64(type_info, 16, 8)      Note: size 8
+    Layout.memory_set_int64(type_info, 24, 8)      Note: alignment 8
+    Return type_info
+End Process
+
+Note: Build a 2-field struct HIRTypeInfo: type_kind 7 (TYPE_STRUCT), field_types
+Note: List at offset 72, field_count at offset 80.
+Process called "make_struct_type" that takes field_type as Integer returns Integer:
+    Let type_info be Layout.allocate(96)
+    If type_info is equal to 0:
+        Return 0
+    End If
+    Layout.memory_set_int64(type_info, 0, 7)   Note: TYPE_STRUCT
+    Layout.memory_set_int64(type_info, 16, 16)  Note: size (two 8-byte fields)
+    Layout.memory_set_int64(type_info, 24, 8)
+    Let fields be List.create()
+    List.append(fields, field_type)
+    List.append(fields, field_type)
+    Layout.memory_set_int64(type_info, 72, fields)  Note: field_types
+    Layout.memory_set_int64(type_info, 80, 2)        Note: field_count
+    Return type_info
+End Process
+
+Note: ============================================================
+Note: SROA PROBE
+Note: ============================================================
+Note: Single block:
+Note:   agg   = alloca struct{i64,i64}      (value id 1)
+Note:   a     = const 100                   (value id 2)
+Note:   b     = const 200                   (value id 3)
+Note:   store_field agg, off 0, a
+Note:   store_field agg, off 8, b
+Note:   la    = load_field agg, off 0       (value id 4)
+Note:   lb    = load_field agg, off 8       (value id 5)
+Note:   sum   = la + lb                      (value id 6)
+Note:   return sum
+Note: After SROA: alloca + 2 stores + 2 loads gone; ADD reads a (2) + b (3).
+Process called "run_sroa_probe" that takes results as Integer returns Integer:
+    Let int_type be make_int_type()
+    Let struct_type be make_struct_type(int_type)
+
+    Let fn be MIR.create_mir_function("sroa_probe", int_type, 0)
+    Let cfg be MIR.get_mir_function_cfg(fn)
+    Let b0 be CFG.create_basic_block(cfg)
+    MIR.add_block_to_cfg(cfg, b0)
+    MIR.set_cfg_entry_block(cfg, b0)
+
+    Note: alloca (count operand 0 = single element), value id 1
+    Let agg be MIRNodes.create_mir_alloca(1, struct_type, 0, 8)
+    MIR.add_instruction_to_block(b0, agg)
+    MIR.register_value_definition(fn, 1, agg)
+
+    Let ca be MIRNodes.create_mir_const(2, 100, int_type, 0, 0)
+    MIR.add_instruction_to_block(b0, ca)
+    MIR.register_value_definition(fn, 2, ca)
+
+    Let cb be MIRNodes.create_mir_const(3, 200, int_type, 0, 0)
+    MIR.add_instruction_to_block(b0, cb)
+    MIR.register_value_definition(fn, 3, cb)
+
+    Note: store_field agg, offset 0, value a  (MIRStore record, opcode -> 20204)
+    Let sf0 be MIRNodes.create_mir_store(1, 2, 0, int_type, 0)
+    MIR.set_mir_node_opcode(sf0, 20204)
+    MIR.add_instruction_to_block(b0, sf0)
+
+    Let sf1 be MIRNodes.create_mir_store(1, 3, 8, int_type, 0)
+    MIR.set_mir_node_opcode(sf1, 20204)
+    MIR.add_instruction_to_block(b0, sf1)
+
+    Note: load_field agg, offset 0 -> la (value id 4); MIRLoad, opcode -> 20203
+    Let lf0 be MIRNodes.create_mir_load(4, 1, 0, int_type, 0)
+    MIR.set_mir_node_opcode(lf0, 20203)
+    MIR.add_instruction_to_block(b0, lf0)
+    MIR.register_value_definition(fn, 4, lf0)
+
+    Let lf1 be MIRNodes.create_mir_load(5, 1, 8, int_type, 0)
+    MIR.set_mir_node_opcode(lf1, 20203)
+    MIR.add_instruction_to_block(b0, lf1)
+    MIR.register_value_definition(fn, 5, lf1)
+
+    Note: sum = la + lb (value id 6)
+    Let sum_inst be MIRNodes.create_mir_binary_op(20002, 6, 4, 5, int_type)
+    MIR.add_instruction_to_block(b0, sum_inst)
+    MIR.register_value_definition(fn, 6, sum_inst)
+
+    Let ret be MIRNodes.create_mir_return(6, int_type)
+    MIR.add_instruction_to_block(b0, ret)
+
+    Note: 9 instructions: alloca, const a, const b, 2 store_field, 2 load_field, add, return.
+    Let before_count be List.length(MIR.get_block_instructions(b0))
+    T.assert_equal(results, "sroa: 9 instructions before", before_count, 9)
+
+    Let changed be SROA.optimize_function_with_sroa(cfg)
+    T.assert_equal(results, "sroa: pass reports change", changed, 1)
+
+    Note: After SROA the alloca, both stores and both loads are gone: 9 - 5 = 4
+    Note: (const a, const b, add, return remain).
+    Let after_count be List.length(MIR.get_block_instructions(b0))
+    T.assert_equal(results, "sroa: 4 instructions after", after_count, 4)
+
+    Note: The ADD's operands must now reference the stored scalars (a=2, b=3).
+    Let add_left be MIR.get_mir_node_operand(sum_inst, 1)
+    Let add_right be MIR.get_mir_node_operand(sum_inst, 2)
+    T.assert_equal(results, "sroa: add left rewritten to field-0 scalar", add_left, 2)
+    T.assert_equal(results, "sroa: add right rewritten to field-1 scalar", add_right, 3)
+
+    Note: Ext-mirror coherence: the binop's extended left/right (80/88) match.
+    Let ext_left be Layout.memory_get_int64(sum_inst, 80)
+    Let ext_right be Layout.memory_get_int64(sum_inst, 88)
+    T.assert_equal(results, "sroa: add ext left coherent", ext_left, 2)
+    T.assert_equal(results, "sroa: add ext right coherent", ext_right, 3)
+
+    Let verified be MIRVerifier.verify_mir_function(fn)
+    T.assert_equal(results, "sroa: verify_mir_function = 1", verified, 1)
+    Return 1
+End Process
+
+Note: ============================================================
+Note: STRENGTH REDUCTION PROBE
+Note: ============================================================
+Note: Block:
+Note:   x   = const 7    (value id 1)   -- the "variable" operand stand-in
+Note:   c8  = const 8    (value id 2)
+Note:   c3  = const 3    (value id 3)
+Note:   m8  = x * c8     (value id 4)   -- becomes x << <const 3>
+Note:   m3  = x * c3     (value id 5)   -- stays a MUL
+Note:   return m8
+Process called "run_strength_probe" that takes results as Integer returns Integer:
+    Let int_type be make_int_type()
+
+    Let fn be MIR.create_mir_function("strength_probe", int_type, 0)
+    Let cfg be MIR.get_mir_function_cfg(fn)
+    Let b0 be CFG.create_basic_block(cfg)
+    MIR.add_block_to_cfg(cfg, b0)
+    MIR.set_cfg_entry_block(cfg, b0)
+
+    Let cx be MIRNodes.create_mir_const(1, 7, int_type, 0, 0)
+    MIR.add_instruction_to_block(b0, cx)
+    MIR.register_value_definition(fn, 1, cx)
+
+    Let c8 be MIRNodes.create_mir_const(2, 8, int_type, 0, 0)
+    MIR.add_instruction_to_block(b0, c8)
+    MIR.register_value_definition(fn, 2, c8)
+
+    Let c3 be MIRNodes.create_mir_const(3, 3, int_type, 0, 0)
+    MIR.add_instruction_to_block(b0, c3)
+    MIR.register_value_definition(fn, 3, c3)
+
+    Note: m8 = x * 8  (left = x value id 1, right = const 8 value id 2)
+    Let m8 be MIRNodes.create_mir_binary_op(20004, 4, 1, 2, int_type)
+    MIR.add_instruction_to_block(b0, m8)
+    MIR.register_value_definition(fn, 4, m8)
+
+    Note: m3 = x * 3  (right = const 3 value id 3, not a power of two)
+    Let m3 be MIRNodes.create_mir_binary_op(20004, 5, 1, 3, int_type)
+    MIR.add_instruction_to_block(b0, m3)
+    MIR.register_value_definition(fn, 5, m3)
+
+    Let ret be MIRNodes.create_mir_return(4, int_type)
+    MIR.add_instruction_to_block(b0, ret)
+
+    Let changed be StrengthReduction.run_strength_reduction_pass(cfg)
+    T.assert_equal(results, "strength: pass reports change", changed, 1)
+
+    Note: m8 must now be a SHL (20014).
+    Let m8_opcode be MIR.get_mir_node_opcode(m8)
+    T.assert_equal(results, "strength: x*8 became SHL", m8_opcode, 20014)
+
+    Note: m8 left operand is still x (value id 1).
+    Let m8_left be MIR.get_mir_node_operand(m8, 1)
+    T.assert_equal(results, "strength: SHL left is the variable x", m8_left, 1)
+
+    Note: m8 right operand is a fresh CONST whose value is the shift amount 3.
+    Let m8_right be MIR.get_mir_node_operand(m8, 2)
+    T.assert_not_equal(results, "strength: SHL right is a fresh const id", m8_right, 2)
+    Let shift_def be find_definition(cfg, m8_right)
+    T.assert_not_null(results, "strength: shift-amount const located", shift_def)
+    Let shift_opcode be MIR.get_mir_node_opcode(shift_def)
+    T.assert_equal(results, "strength: shift amount is a CONST", shift_opcode, 20001)
+    Let shift_value be MIRNodes.get_const_value(shift_def)
+    T.assert_equal(results, "strength: shift amount const = 3", shift_value, 3)
+
+    Note: Ext-mirror coherence on the rewritten SHL right operand (offset 88).
+    Let m8_ext_right be Layout.memory_get_int64(m8, 88)
+    T.assert_equal(results, "strength: SHL ext right coherent", m8_ext_right, m8_right)
+
+    Note: m3 (x * 3) must be left as a MUL.
+    Let m3_opcode be MIR.get_mir_node_opcode(m3)
+    T.assert_equal(results, "strength: x*3 left as MUL", m3_opcode, 20004)
+
+    Let verified be MIRVerifier.verify_mir_function(fn)
+    T.assert_equal(results, "strength: verify_mir_function = 1", verified, 1)
+    Return 1
+End Process
+
+Note: Locate a definition by value id via a CFG scan (the strength pass uses a
+Note: CFG-local def map internally; the probe re-derives it for assertions).
+Process called "find_definition" that takes cfg as Integer, value_id as Integer returns Integer:
+    Let blocks be CFG.get_mir_cfg_blocks(cfg)
+    Let block_count be List.length(blocks)
+    Let bi be 0
+    While bi is less than block_count:
+        Let block be List.list_get(blocks, bi)
+        Let instructions be MIR.get_block_instructions(block)
+        Let ic be List.length(instructions)
+        Let ii be 0
+        While ii is less than ic:
+            Let inst be List.list_get(instructions, ii)
+            Let rid be MIR.get_mir_node_value_id(inst)
+            If rid is equal to value_id:
+                Return inst
+            End If
+            Set ii to ii plus 1
+        End While
+        Set bi to bi plus 1
+    End While
+    Return 0
+End Process
+
+Note: ============================================================
+Note: TAIL CALL PROBE
+Note: ============================================================
+Note: Two functions:
+Note:   self_tail: block ends with  r = call self() ; return r   => stamped
+Note:   non_tail : block has  r = call self() ; s = r + r ; return s  => not stamped
+Process called "run_tail_call_probe" that takes results as Integer returns Integer:
+    Let int_type be make_int_type()
+
+    Note: --- self-recursive tail call (should be stamped) ---
+    Let fn_tail be MIR.create_mir_function("self_tail", int_type, 0)
+    Let cfg_t be MIR.get_mir_function_cfg(fn_tail)
+    Let bt be CFG.create_basic_block(cfg_t)
+    MIR.add_block_to_cfg(cfg_t, bt)
+    MIR.set_cfg_entry_block(cfg_t, bt)
+
+    Let args_t be List.create()
+    Let call_t be MIRNodes.create_mir_call(10, "self_tail", args_t, 0, int_type, 0, 0)
+    MIR.add_instruction_to_block(bt, call_t)
+    MIR.register_value_definition(fn_tail, 10, call_t)
+
+    Let ret_t be MIRNodes.create_mir_return(10, int_type)
+    MIR.add_instruction_to_block(bt, ret_t)
+
+    Note: Not stamped before the pass.
+    Let pre_stamp be MIRNodes.is_tail_call(call_t)
+    T.assert_equal(results, "tailcall: not stamped before pass", pre_stamp, 0)
+
+    Let changed_t be TailCall.optimize_function_with_tail_call(fn_tail)
+    T.assert_equal(results, "tailcall: pass reports change on tail position", changed_t, 1)
+
+    Let post_stamp be MIRNodes.is_tail_call(call_t)
+    T.assert_equal(results, "tailcall: tail call stamped is_tail_call=1", post_stamp, 1)
+
+    Note: Stamp lives at the canonical MIRCall extended offset 120.
+    Let raw_120 be Layout.memory_get_int64(call_t, 120)
+    T.assert_equal(results, "tailcall: stamp at offset 120", raw_120, 1)
+
+    Let verified_t be MIRVerifier.verify_mir_function(fn_tail)
+    T.assert_equal(results, "tailcall: verify_mir_function = 1 (tail)", verified_t, 1)
+
+    Note: Idempotence: re-running does not re-report a change.
+    Let changed_again be TailCall.optimize_function_with_tail_call(fn_tail)
+    T.assert_equal(results, "tailcall: idempotent (no second change)", changed_again, 0)
+
+    Note: --- non-tail call (must NOT be stamped) ---
+    Let fn_nt be MIR.create_mir_function("non_tail", int_type, 0)
+    Let cfg_n be MIR.get_mir_function_cfg(fn_nt)
+    Let bn be CFG.create_basic_block(cfg_n)
+    MIR.add_block_to_cfg(cfg_n, bn)
+    MIR.set_cfg_entry_block(cfg_n, bn)
+
+    Let args_n be List.create()
+    Let call_n be MIRNodes.create_mir_call(20, "non_tail", args_n, 0, int_type, 0, 0)
+    MIR.add_instruction_to_block(bn, call_n)
+    MIR.register_value_definition(fn_nt, 20, call_n)
+
+    Note: s = r + r  -- the call result is consumed, so the call is NOT in tail position.
+    Let add_n be MIRNodes.create_mir_binary_op(20002, 21, 20, 20, int_type)
+    MIR.add_instruction_to_block(bn, add_n)
+    MIR.register_value_definition(fn_nt, 21, add_n)
+
+    Let ret_n be MIRNodes.create_mir_return(21, int_type)
+    MIR.add_instruction_to_block(bn, ret_n)
+
+    Let changed_n be TailCall.optimize_function_with_tail_call(fn_nt)
+    T.assert_equal(results, "tailcall: no change on non-tail call", changed_n, 0)
+
+    Let nt_stamp be MIRNodes.is_tail_call(call_n)
+    T.assert_equal(results, "tailcall: non-tail call not stamped", nt_stamp, 0)
+
+    Let verified_n be MIRVerifier.verify_mir_function(fn_nt)
+    T.assert_equal(results, "tailcall: verify_mir_function = 1 (non-tail)", verified_n, 1)
+    Return 1
+End Process
+
+Process called "main" returns Integer:
+    Let results be T.create_test_results()
+    T.begin_suite(results, "MIR passes B probe (SROA / strength reduction / tail call)")
+
+    run_sroa_probe(results)
+    run_strength_probe(results)
+    run_tail_call_probe(results)
+
+    T.print_summary(results)
+    Let failed be T.get_failed(results)
+    T.destroy_test_results(results)
+
+    If failed is greater than 0:
+        Return 1
+    End If
+    Return 0
+End Process

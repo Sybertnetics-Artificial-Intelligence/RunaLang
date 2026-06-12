@@ -34,8 +34,9 @@ This file consists of the following functions/features/operation types:
 - Partial unrolling with per-copy retained exit tests (sound for any trip count)
 - Per-iteration block cloning via MIR.clone_instruction with fresh SSA ids
 - Header-phi resolution chaining values across iterations
-- CFG edge maintenance via MIR.add_cfg_edge / CFG.remove_cfg_edge with
-  cached pred/succ count resynchronization at every removal site
+- CFG edge maintenance via MIR.add_cfg_edge / CFG.remove_cfg_edge (the
+  canonical primitives own the cached pred/succ counts per task #460, and
+  CFG.remove_block_from_cfg owns the cached block_count per task #474)
 
 Reconciled to the canonical MIR contract (task #432, Wave 5b): all struct
 access goes through mir.runa / cfg.runa / mir_nodes.runa / dominance.runa /
@@ -1297,63 +1298,6 @@ Process called "unroll_remove_instruction_from_block" that takes block_ptr as In
     Return 1
 End Process
 
-Note: Resynchronize a block's cached predecessor/successor counts
-Process called "unroll_resync_edge_counts" that takes cfg_ptr as Integer, block_id as Integer returns Nothing:
-    @Reasoning
-    CFG.remove_cfg_edge removes ids from the predecessor/successor LISTS but
-    does not decrement the cached counts at MIRBasicBlock offsets 40/56 (the
-    count-desync defect owned by the cfg.runa wave). Per the reconciliation
-    coordination rule this pass does not edit cfg.runa; instead every removal
-    site resynchronizes the caches to the lists' true lengths, the same way
-    transformations/optimization.runa handles its removal sites.
-    @End Reasoning
-
-    Let block_ptr be proc get_block_by_id_from_cfg from CFG with cfg_ptr, block_id
-    If block_ptr is equal to 0:
-        Return
-    End If
-
-    Let predecessors be proc get_block_predecessors from MIR with block_ptr
-    Let pred_len be 0
-    If predecessors is not equal to 0:
-        Set pred_len to proc length from List with predecessors
-    End If
-    proc memory_set_int64 from Layout with block_ptr, 40, pred_len
-
-    Let successors be proc get_block_successors from MIR with block_ptr
-    Let succ_len be 0
-    If successors is not equal to 0:
-        Set succ_len to proc length from List with successors
-    End If
-    proc memory_set_int64 from Layout with block_ptr, 56, succ_len
-End Process
-
-Note: Resynchronize cached edge counts for every block in the CFG
-Process called "unroll_resync_all_edge_counts" that takes cfg_ptr as Integer returns Nothing:
-    @Implementation
-    Defensive full-CFG resync used after block deletion: remove_block_from_cfg
-    unlinks edges of every neighbor internally through remove_cfg_edge, so
-    neighbor caches desync without this pass seeing the individual calls, and
-    it removes the block from the CFG's block list without decrementing the
-    cached block_count at MIRCFG offset 24 (the same count-desync class owned
-    by the cfg.runa wave). One linear walk restores every per-block cache to
-    its list's true length, and the CFG-level block_count cache is resynced
-    to the block list's true length first.
-    @End Implementation
-
-    Let blocks_list be proc get_mir_cfg_blocks from CFG with cfg_ptr
-    Let blocks_count be proc length from List with blocks_list
-    proc memory_set_int64 from Layout with cfg_ptr, 24, blocks_count
-    Let block_idx be 0
-
-    While block_idx is less than blocks_count:
-        Let block_ptr be proc get from List with blocks_list, block_idx
-        Let block_id be proc get_mir_basic_block_id from CFG with block_ptr
-        proc unroll_resync_edge_counts with cfg_ptr, block_id
-        Set block_idx to block_idx plus 1
-    End While
-End Process
-
 Note: Clone a basic block into the CFG with a fresh allocator-issued id
 Process called "clone_block" that takes context_ptr as Integer, original_block_id as Integer, clone_map as Integer returns Integer:
     @Reasoning
@@ -1894,9 +1838,9 @@ Process called "full_unroll_loop" that takes context_ptr as Integer, loop_ptr as
     to the final copy's latch with the final renamed value; every block
     outside the loop is swept through the final rename map so loop-defined
     values used downstream resolve to their last-iteration definitions; the
-    original loop blocks are then removed and all cached edge counts
-    resynchronized (remove_block_from_cfg cascades through remove_cfg_edge,
-    whose count desync is owned by the cfg.runa wave).
+    original loop blocks are then removed through remove_block_from_cfg,
+    which owns the full removal contract (neighbor edge caches via the
+    remove_cfg_edge cascade, CFG block_count resync per task #474).
     @End Reasoning
 
     @Implementation
@@ -1907,11 +1851,13 @@ Process called "full_unroll_loop" that takes context_ptr as Integer, loop_ptr as
     Phase 2: chain - replace each iteration latch terminator with a jump to
              the next iteration's header clone (exit for the last)
     Phase 3: register edges for every cloned block's final terminator
-    Phase 4: rewire preheader (terminator target + edge swap + count resync)
+    Phase 4: rewire preheader (terminator target + edge swap; the edge
+             primitives own the cached counts)
     Phase 5: fix exit-block phis (incoming block latch -> last latch clone,
              incoming value through the final rename map)
     Phase 6: sweep every non-loop, non-clone block through the final map
-    Phase 7: delete original loop blocks; full-CFG edge-count resync
+    Phase 7: delete original loop blocks (remove_block_from_cfg owns the
+             full removal contract including the block_count resync)
     Returns 1 on success, 0 when preconditions fail (nothing mutated).
     @End Implementation
 
@@ -2057,13 +2003,12 @@ Process called "full_unroll_loop" that takes context_ptr as Integer, loop_ptr as
         Set iter to iter plus 1
     End While
 
-    Note: Phase 4 - rewire the preheader into iteration 0
+    Note: Phase 4 - rewire the preheader into iteration 0 (remove_cfg_edge
+    Note: and add_cfg_edge own the per-block cached edge counts, task #460)
     Let first_header be proc get from List with iter_headers, 0
     proc update_terminator_target from CFG with cfg_ptr, preheader_id, header_id, first_header
     proc remove_cfg_edge from CFG with cfg_ptr, preheader_id, header_id
     proc add_cfg_edge from MIR with cfg_ptr, preheader_id, first_header
-    proc unroll_resync_edge_counts with cfg_ptr, preheader_id
-    proc unroll_resync_edge_counts with cfg_ptr, header_id
 
     Note: Phase 5 - retarget exit-block phis from the original latch to the
     Note: final iteration's latch clone with final renamed values
@@ -2130,14 +2075,15 @@ Process called "full_unroll_loop" that takes context_ptr as Integer, loop_ptr as
     End While
     proc omap_destroy from OrderedMap with all_clone_ids
 
-    Note: Phase 7 - delete the original loop blocks and resync all caches
+    Note: Phase 7 - delete the original loop blocks. remove_block_from_cfg
+    Note: owns the full removal contract (task #474): neighbor edge caches
+    Note: via the remove_cfg_edge cascade and the CFG block_count resync
     Let body_idx be 0
     While body_idx is less than body_count:
         Let removed_id be proc get from List with body_list, body_idx
         proc remove_block_from_cfg from CFG with cfg_ptr, removed_id
         Set body_idx to body_idx plus 1
     End While
-    proc unroll_resync_all_edge_counts with cfg_ptr
 
     Let full_unrolls be proc memory_get_int64 from Layout with context_ptr, 32
     proc memory_set_int64 from Layout with context_ptr, 32, full_unrolls plus 1
@@ -2193,9 +2139,9 @@ Process called "partial_unroll_loop" that takes context_ptr as Integer, loop_ptr
     2. For j in 1..K-1: clone all body blocks, resolve header-clone phis
        against copy j-1's map (identity for j=1), assign fresh ids, rewrite
        uses, remap intra-copy phi incomings and terminator targets
-    3. Chain: original latch's header target -> copy 1 header (edge swap +
-       count resync); copy j latch's own-header target -> copy j+1 header,
-       final copy -> original header
+    3. Chain: original latch's header target -> copy 1 header (edge swap;
+       the edge primitives own the cached counts); copy j latch's
+       own-header target -> copy j+1 header, final copy -> original header
     4. Register edges for all cloned blocks' final terminators
     5. Original header phi fixup: latch incoming -> (final copy latch,
        final chained value)
@@ -2347,13 +2293,12 @@ Process called "partial_unroll_loop" that takes context_ptr as Integer, loop_ptr
 
     Let copy_count be proc length from List with copy_headers
 
-    Note: Chain the original latch into copy 1 (edge swap + count resync)
+    Note: Chain the original latch into copy 1 (remove_cfg_edge and
+    Note: add_cfg_edge own the per-block cached edge counts, task #460)
     Let first_copy_header be proc get from List with copy_headers, 0
     proc update_terminator_target from CFG with cfg_ptr, latch_id, header_id, first_copy_header
     proc remove_cfg_edge from CFG with cfg_ptr, latch_id, header_id
     proc add_cfg_edge from MIR with cfg_ptr, latch_id, first_copy_header
-    proc unroll_resync_edge_counts with cfg_ptr, latch_id
-    proc unroll_resync_edge_counts with cfg_ptr, header_id
 
     Note: Chain each copy's latch: own header clone -> next copy header,
     Note: final copy -> original header (the real back edge)

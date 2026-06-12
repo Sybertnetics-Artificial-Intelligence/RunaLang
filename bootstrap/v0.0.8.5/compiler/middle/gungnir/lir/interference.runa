@@ -29,26 +29,39 @@ This file is essential because of the following reasons:
 - Interference analysis support enables Runa compilation for optimized register allocation
 
 This file consists of the following functions/features/operation types:
-- Interference graph construction and register interference analysis
-- Interference detection and interference graph optimization
-- Interference-based register allocation and interference validation
-- Interference verification and interference analysis
+- Adjacency-list interference graph backed by collections/ordered_map
+- Backward per-instruction interference construction from liveness results
+- Graph statistics, coalescing tests, verification, and debug printing
+
+Representation notes (task #473):
+- The graph maps register id -> neighbor List. Register ids are INTEGERS, so
+  the map is an OrderedMap: the previous Dictionary representation
+  string-hashed its keys (each integer key was dereferenced as a string
+  pointer) and crashed at runtime.
+- Liveness register sets (block live_in/live_out and the per-instruction
+  def/use sets) are OrderedMaps enumerated with the omap_first /
+  omap_entry_next entry walk - never with Dictionary key Lists.
+- Instruction def/use extraction is delegated to liveness.runa
+  (get_instruction_defs / get_instruction_uses), which resolves the
+  dual-shape instruction records through LIR.lir_resolve_instruction_base
+  and models call/syscall/div/shift clobbers. This file never reads
+  instruction operand slots directly.
 
 Dependencies:
-- Requires liveness.runa for live-in/live-out sets and live ranges
+- Requires liveness.runa for live-out sets and def/use extraction
 - Imports LIR types for function and block structures
 - Imports memory/layout.runa for OWNED HEAP allocation (Tier 3)
-- Imports collections for graph data structures
+- Imports collections/ordered_map and collections/list for graph storage
 :End Note
 
 Import "compiler/middle/gungnir/lir/lir.runa" as LIR
 Import "compiler/middle/gungnir/lir/liveness.runa" as Liveness
-Import "compiler/middle/gungnir/lir/lir_nodes.runa" as LIRNodes
 Import "compiler/frontend/primitives/memory/layout.runa" as Layout
 Import "compiler/frontend/primitives/core/memory_core.runa" as MemoryCore
 Import "compiler/frontend/primitives/collections/list.runa" as List
-Import "compiler/frontend/primitives/collections/dictionary.runa" as Dictionary
+Import "compiler/frontend/primitives/collections/ordered_map.runa" as OrderedMap
 Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/internal/string_utils.runa" as StringUtils
 
 Note: ============================================================================
 Note: Interference Graph Construction
@@ -58,8 +71,11 @@ Note:
 OVERVIEW:
 ---------
 This file builds an interference graph from liveness analysis results.
-Two virtual registers interfere if they are simultaneously live at any
-program point (i.e., their live ranges overlap).
+Two registers interfere if one is DEFINED at a program point where the
+other is LIVE (i.e., their live ranges overlap). The def-against-live
+formulation also captures dead definitions: a value that is never used
+still occupies a register at its definition point and must not clobber
+values that live across that instruction.
 
 The interference graph is used by register allocation (register_alloc.runa)
 to perform graph coloring - registers that interfere cannot be assigned
@@ -67,25 +83,24 @@ the same physical register.
 
 INTEGRATION WITH LIVENESS:
 --------------------------
-Before calling interference graph construction, liveness analysis must be
-run on the LIR function:
-
-    Let success be proc compute_function_liveness from Liveness with lir_function
-
-Then interference graph construction can proceed using the computed
-live-in/live-out sets and live ranges.
+build_interference_graph ensures liveness itself: when the function's
+blocks carry no computed live_in/live_out sets it invokes
+Liveness.compute_function_liveness before constructing edges. Callers
+that already ran liveness pay only a pointer test.
 
 ALGORITHM:
 ----------
-For each basic block B:
-  For each instruction I in B:
-    Let live_regs be registers live at I
-    For each pair (r1, r2) in live_regs where r1 ≠ r2:
-      Add edge (r1, r2) to interference graph
+For each basic block B (backward, mirroring the liveness transfer function):
+  current_live := live_out[B]
+  For each instruction I from last to first:
+    For each def d of I:
+      For each r in current_live, r != d: add edge (d, r)
+      For each other def d2 of I:        add edge (d, d2)
+    current_live := (current_live - defs(I)) ∪ uses(I)
 
-The resulting graph G = (V, E) where:
-- V = set of virtual registers
-- E = set of interference edges
+The def-def edges cover multi-definition instructions (IDIV defines both
+RAX and RDX; calls clobber the full caller-saved set) whose results
+coexist and therefore need distinct registers.
 
 USAGE BY REGISTER ALLOCATION:
 ------------------------------
@@ -97,31 +112,62 @@ Graph coloring register allocation uses this interference graph:
 
 Note: ============================================================================
 Note: Interference Graph Data Structure
-Note: Represented as adjacency list: Dictionary<register_id, List<neighbors>>
+Note: Adjacency list: OrderedMap<register_id, List<neighbor register ids>>
 Note: ============================================================================
 
 @Reasoning
 The interference graph uses an adjacency list representation for efficient
-edge queries and neighbor iteration. Each node (virtual register) maps to
-a list of all registers it interferes with.
+edge queries and neighbor iteration. Each node (register) maps to a List of
+all registers it interferes with.
 
 Representation:
-- graph = Dictionary<register_id, adjacency_list>
+- graph = OrderedMap<register_id, adjacency_list> (integer keys)
 - adjacency_list = List<register_id> (neighbors)
 - Undirected graph: if A interferes with B, then B interferes with A
 
-This representation supports O(1) node lookup and O(degree) neighbor iteration,
-which is optimal for graph coloring algorithms.
+This representation supports O(1) node lookup and O(degree) neighbor
+iteration, which is what graph coloring needs. OrderedMap preserves node
+insertion order, so simplification scans are deterministic.
 @End Reasoning
 
 Process called "create_interference_graph" that takes nothing returns Integer:
-    Let graph be proc create from Dictionary
+    Let graph be proc omap_create from OrderedMap
     Return graph
 End Process
 
 @Reasoning
+Destroys an interference graph created by create_interference_graph (or the
+working copies register_alloc.runa makes of one). The graph OWNS its
+adjacency Lists, so each List is destroyed before the map itself. This is
+the destructor counterpart required for the allocator pipeline to be
+leak-free across the spill/retry loop, where the graph is rebuilt after
+every spill insertion.
+@End Reasoning
+
+Process called "destroy_interference_graph" that takes graph as Integer returns Integer:
+    If graph is equal to 0:
+        Return 0
+    End If
+
+    Let entry be proc omap_first from OrderedMap with graph
+    While entry is not equal to 0:
+        Let adjacency_list be proc omap_entry_value from OrderedMap with entry
+        If adjacency_list is not equal to 0:
+            proc list_destroy from List with adjacency_list
+        End If
+        Set entry to proc omap_entry_next from OrderedMap with entry
+    End While
+
+    proc omap_destroy from OrderedMap with graph
+    Return 1
+End Process
+
+@Reasoning
 Adds a node (register) to the interference graph if it doesn't already exist.
-Initializes an empty adjacency list for the node.
+Initializes an empty adjacency list for the node. Uses omap_contains rather
+than omap_get for the existence test so register id 0 (RAX) - whose
+adjacency pointer is always nonzero anyway - and future sentinel choices
+never conflate "missing" with a stored value.
 @End Reasoning
 
 Process called "add_graph_node" that takes graph as Integer, register_id as Integer returns Integer:
@@ -131,22 +177,22 @@ Process called "add_graph_node" that takes graph as Integer, register_id as Inte
     End If
 
     Note: Check if node already exists
-    Let existing be proc get from Dictionary with graph, register_id
-    If existing is not equal to 0:
+    If proc omap_contains from OrderedMap with graph, register_id is equal to 1:
         Return 1
     End If
 
     Note: Create empty adjacency list for this node
     Let adjacency_list be proc list_create from List
-    proc set from Dictionary with graph, register_id, adjacency_list
+    proc omap_set from OrderedMap with graph, register_id, adjacency_list
 
     Return 1
 End Process
 
 @Reasoning
 Adds an undirected edge between two registers, indicating they interfere.
-Since the graph is undirected, adds both (r1, r2) and (r2, r1) edges.
-Ensures nodes exist before adding edge. Prevents duplicate edges.
+Since the graph is undirected, adds both (r1, r2) and (r2, r1) entries.
+Ensures nodes exist before adding the edge. Prevents duplicate edges and
+self-loops.
 @End Reasoning
 
 Process called "add_interference_edge" that takes graph as Integer, reg1 as Integer, reg2 as Integer returns Integer:
@@ -165,8 +211,8 @@ Process called "add_interference_edge" that takes graph as Integer, reg1 as Inte
     proc add_graph_node with graph, reg2
 
     Note: Get adjacency lists
-    Let adj1 be proc get from Dictionary with graph, reg1
-    Let adj2 be proc get from Dictionary with graph, reg2
+    Let adj1 be proc omap_get from OrderedMap with graph, reg1
+    Let adj2 be proc omap_get from OrderedMap with graph, reg2
 
     Note: Check if edge already exists (reg2 in adj1)
     Let size1 be proc list_length from List with adj1
@@ -176,8 +222,10 @@ Process called "add_interference_edge" that takes graph as Integer, reg1 as Inte
         Let neighbor be proc list_get from List with adj1, i
         If neighbor is equal to reg2:
             Set found to 1
+            Set i to size1
+        Otherwise:
+            Set i to i plus 1
         End If
-        Set i to i plus 1
     End While
 
     Note: Add edge if it doesn't exist
@@ -205,7 +253,7 @@ Process called "has_interference" that takes graph as Integer, reg1 as Integer, 
     End If
 
     Note: Get adjacency list for reg1
-    Let adj1 be proc get from Dictionary with graph, reg1
+    Let adj1 be proc omap_get from OrderedMap with graph, reg1
     If adj1 is equal to 0:
         Return 0
     End If
@@ -235,7 +283,7 @@ Process called "get_neighbors" that takes graph as Integer, register_id as Integ
         Return 0
     End If
 
-    Let adj be proc get from Dictionary with graph, register_id
+    Let adj be proc omap_get from OrderedMap with graph, register_id
     Return adj
 End Process
 
@@ -249,7 +297,7 @@ Process called "get_node_degree" that takes graph as Integer, register_id as Int
         Return 0
     End If
 
-    Let adj be proc get from Dictionary with graph, register_id
+    Let adj be proc omap_get from OrderedMap with graph, register_id
     If adj is equal to 0:
         Return 0
     End If
@@ -259,7 +307,10 @@ End Process
 
 @Reasoning
 Removes a node from the graph, also removing all edges incident to it.
-Used during graph simplification phase of register allocation.
+Used during the graph simplification phase of register allocation. The
+node's adjacency List is OWNED by the graph and is destroyed here; callers
+holding a pointer from get_neighbors on the removed node must not use it
+after this call.
 @End Reasoning
 
 Process called "remove_graph_node" that takes graph as Integer, register_id as Integer returns Integer:
@@ -269,7 +320,7 @@ Process called "remove_graph_node" that takes graph as Integer, register_id as I
     End If
 
     Note: Get adjacency list for node to remove
-    Let adj be proc get from Dictionary with graph, register_id
+    Let adj be proc omap_get from OrderedMap with graph, register_id
     If adj is equal to 0:
         Return 1
     End If
@@ -279,7 +330,7 @@ Process called "remove_graph_node" that takes graph as Integer, register_id as I
     Let i be 0
     While i is less than size:
         Let neighbor be proc list_get from List with adj, i
-        Let neighbor_adj be proc get from Dictionary with graph, neighbor
+        Let neighbor_adj be proc omap_get from OrderedMap with graph, neighbor
 
         If neighbor_adj is not equal to 0:
             Note: Find and remove register_id from neighbor's list
@@ -288,19 +339,20 @@ Process called "remove_graph_node" that takes graph as Integer, register_id as I
             While j is less than neighbor_size:
                 Let node be proc list_get from List with neighbor_adj, j
                 If node is equal to register_id:
-                    Note: Remove this element
                     proc list_remove from List with neighbor_adj, j
                     Set j to neighbor_size
+                Otherwise:
+                    Set j to j plus 1
                 End If
-                Set j to j plus 1
             End While
         End If
 
         Set i to i plus 1
     End While
 
-    Note: Remove node from graph
-    proc remove from Dictionary with graph, register_id
+    Note: Remove node from graph and release its adjacency storage
+    proc omap_remove from OrderedMap with graph, register_id
+    proc list_destroy from List with adj
 
     Return 1
 End Process
@@ -313,16 +365,20 @@ Note: ==========================================================================
 Builds the complete interference graph from liveness analysis results.
 This is the main entry point for interference graph construction.
 
-Algorithm:
-1. For each basic block in the function
-2. Start with live_out registers
-3. Process instructions backward (like liveness analysis)
-4. At each instruction:
-   - Remove defs from current_live
-   - Add interferences between all registers in current_live
-   - Add uses to current_live
+Algorithm (per block, backward):
+1. Seed current_live from the block's live_out set; every member becomes a
+   graph node so isolated live-through values still appear in the graph.
+2. At each instruction, every defined register interferes with every
+   register in current_live (excluding itself) AND with every other
+   register defined by the same instruction (multi-def instructions such
+   as IDIV or calls produce values that coexist).
+3. Remove the defs from current_live, then add the uses.
 
-This approach correctly identifies all interference points.
+Liveness is ensured on entry: if the blocks carry no computed live sets
+(live_out pointer is 0), Liveness.compute_function_liveness runs first.
+The def/use extraction is shared with liveness.runa so the interference
+relation and the dataflow are built from the same instruction model
+(dual-shape records, call/syscall/div/shift clobbers, ABI argument uses).
 @End Reasoning
 
 Process called "build_interference_graph" that takes lir_function as Integer returns Integer:
@@ -331,82 +387,105 @@ Process called "build_interference_graph" that takes lir_function as Integer ret
         Return 0
     End If
 
-    Let graph be proc create_interference_graph
-
-    Note: Get all blocks from function
     Let blocks be proc memory_get_int64 from MemoryCore with lir_function, 32
     Let block_count be proc memory_get_int64 from MemoryCore with lir_function, 40
+
+    Note: Ensure liveness results exist (finalize writes nonzero set pointers
+    Note: into every block, so a zero live_out marks an unanalyzed function)
+    If block_count is greater than 0:
+        Let first_block be proc list_get from List with blocks, 0
+        If first_block is not equal to 0:
+            Let first_live_out be proc memory_get_int64 from MemoryCore with first_block, 72
+            If first_live_out is equal to 0:
+                Let liveness_ok be proc compute_function_liveness from Liveness with lir_function
+                If liveness_ok is equal to 0:
+                    Display "build_interference_graph: liveness analysis failed"
+                    Return 0
+                End If
+            End If
+        End If
+    End If
+
+    Let graph be proc create_interference_graph
 
     Note: Process each block
     Let b be 0
     While b is less than block_count:
         Let block be proc list_get from List with blocks, b
+        If block is not equal to 0:
+            Note: Seed current_live with the block's live-out set
+            Let live_out be proc memory_get_int64 from MemoryCore with block, 72
+            Let current_live be proc create_register_set from Liveness
 
-        Note: Get live-out set for this block
-        Let live_out be proc memory_get_int64 from MemoryCore with block, 72
-        Let current_live be proc create_register_set from Liveness
+            If live_out is not equal to 0:
+                Let out_entry be proc omap_first from OrderedMap with live_out
+                While out_entry is not equal to 0:
+                    Let out_reg be proc omap_entry_key from OrderedMap with out_entry
+                    proc register_set_add from Liveness with current_live, out_reg
+                    proc add_graph_node with graph, out_reg
+                    Set out_entry to proc omap_entry_next from OrderedMap with out_entry
+                End While
+            End If
 
-        Note: Initialize current_live with live_out
-        If live_out is not equal to 0:
-            Let live_out_keys be proc keys from Dictionary with live_out
-            Let live_out_size be proc size from Dictionary with live_out
-            Let i be 0
-            While i is less than live_out_size:
-                Let reg_id be proc list_get from List with live_out_keys, i
-                proc register_set_add from Liveness with current_live, reg_id
-                proc add_graph_node with graph, reg_id
-                Set i to i plus 1
-            End While
-        End If
+            Note: Process instructions in reverse order (backward analysis)
+            Let instructions be proc memory_get_int64 from MemoryCore with block, 16
+            Let instruction_count be proc memory_get_int64 from MemoryCore with block, 24
 
-        Note: Process instructions in reverse order (backward analysis)
-        Let instructions be proc memory_get_int64 from MemoryCore with block, 16
-        Let instruction_count be proc memory_get_int64 from MemoryCore with block, 24
+            Let inst_idx be instruction_count minus 1
+            While inst_idx is greater than or equal to 0:
+                Let instruction be proc list_get from List with instructions, inst_idx
 
-        Let inst_idx be instruction_count minus 1
-        While inst_idx is greater than or equal to 0:
-            Let instruction be proc list_get from List with instructions, inst_idx
+                Let inst_defs be proc get_instruction_defs from Liveness with lir_function, instruction
+                Let inst_uses be proc get_instruction_uses from Liveness with lir_function, instruction
 
-            Note: Get defs and uses for this instruction
-            Let inst_defs be proc get_instruction_defs from Liveness with instruction
-            Let inst_uses be proc get_instruction_uses from Liveness with instruction
+                Note: Each def interferes with everything currently live and
+                Note: with every other def of the same instruction
+                Let def_entry be proc omap_first from OrderedMap with inst_defs
+                While def_entry is not equal to 0:
+                    Let def_reg be proc omap_entry_key from OrderedMap with def_entry
+                    proc add_graph_node with graph, def_reg
 
-            Note: Add interferences between result and all live registers
-            Note: (result interferes with everything live after the def)
-            Let def_keys be proc keys from Dictionary with inst_defs
-            Let def_count be proc size from Dictionary with inst_defs
-            Let d be 0
-            While d is less than def_count:
-                Let def_reg be proc list_get from List with def_keys, d
+                    Let live_entry be proc omap_first from OrderedMap with current_live
+                    While live_entry is not equal to 0:
+                        Let live_reg be proc omap_entry_key from OrderedMap with live_entry
+                        proc add_interference_edge with graph, def_reg, live_reg
+                        Set live_entry to proc omap_entry_next from OrderedMap with live_entry
+                    End While
 
-                Note: def_reg interferes with everything currently live
-                Let live_keys be proc keys from Dictionary with current_live
-                Let live_count be proc size from Dictionary with current_live
-                Let l be 0
-                While l is less than live_count:
-                    Let live_reg be proc list_get from List with live_keys, l
-                    proc add_interference_edge with graph, def_reg, live_reg
-                    Set l to l plus 1
+                    Let other_def_entry be proc omap_first from OrderedMap with inst_defs
+                    While other_def_entry is not equal to 0:
+                        Let other_def be proc omap_entry_key from OrderedMap with other_def_entry
+                        proc add_interference_edge with graph, def_reg, other_def
+                        Set other_def_entry to proc omap_entry_next from OrderedMap with other_def_entry
+                    End While
+
+                    Set def_entry to proc omap_entry_next from OrderedMap with def_entry
                 End While
 
-                Note: Remove def from current_live
-                proc register_set_remove from Liveness with current_live, def_reg
-                Set d to d plus 1
+                Note: current_live := (current_live - defs) ∪ uses
+                Set def_entry to proc omap_first from OrderedMap with inst_defs
+                While def_entry is not equal to 0:
+                    Let removed_def be proc omap_entry_key from OrderedMap with def_entry
+                    proc register_set_remove from Liveness with current_live, removed_def
+                    Set def_entry to proc omap_entry_next from OrderedMap with def_entry
+                End While
+
+                Let use_entry be proc omap_first from OrderedMap with inst_uses
+                While use_entry is not equal to 0:
+                    Let use_reg be proc omap_entry_key from OrderedMap with use_entry
+                    proc register_set_add from Liveness with current_live, use_reg
+                    proc add_graph_node with graph, use_reg
+                    Set use_entry to proc omap_entry_next from OrderedMap with use_entry
+                End While
+
+                proc register_set_destroy from Liveness with inst_defs
+                proc register_set_destroy from Liveness with inst_uses
+
+                Set inst_idx to inst_idx minus 1
             End While
 
-            Note: Add uses to current_live
-            Let use_keys be proc keys from Dictionary with inst_uses
-            Let use_count be proc size from Dictionary with inst_uses
-            Let u be 0
-            While u is less than use_count:
-                Let use_reg be proc list_get from List with use_keys, u
-                proc register_set_add from Liveness with current_live, use_reg
-                proc add_graph_node with graph, use_reg
-                Set u to u plus 1
-            End While
-
-            Set inst_idx to inst_idx minus 1
-        End While
+            proc register_set_destroy from Liveness with current_live
+        End If
 
         Set b to b plus 1
     End While
@@ -416,10 +495,17 @@ End Process
 
 @Reasoning
 Alternative construction that adds interferences between all pairs of
-simultaneously live registers at each program point.
+simultaneously live registers at each program point, in addition to the
+def-against-live and def-against-def edges of the primary algorithm.
 
-This is a simpler but potentially less efficient approach than the above.
-Both algorithms produce the same interference graph.
+The pairwise closure is redundant for programs whose every live value has a
+def inside the function (the def point already pairs it against everything
+overlapping), but it also covers values that are live-in without any def -
+e.g. parameter registers in functions whose parameters are never copied
+out - and serves as an independent cross-check for
+verify_interference_graph in tests. It is O(live²) per instruction versus
+O(defs × live) for the primary algorithm, so the primary remains the
+production default.
 @End Reasoning
 
 Process called "build_interference_graph_pairwise" that takes lir_function as Integer returns Integer:
@@ -428,79 +514,114 @@ Process called "build_interference_graph_pairwise" that takes lir_function as In
         Return 0
     End If
 
-    Let graph be proc create_interference_graph
-
     Let blocks be proc memory_get_int64 from MemoryCore with lir_function, 32
     Let block_count be proc memory_get_int64 from MemoryCore with lir_function, 40
 
-    Note: For each block
+    Note: Ensure liveness results exist (same gate as the primary builder)
+    If block_count is greater than 0:
+        Let first_block be proc list_get from List with blocks, 0
+        If first_block is not equal to 0:
+            Let first_live_out be proc memory_get_int64 from MemoryCore with first_block, 72
+            If first_live_out is equal to 0:
+                Let liveness_ok be proc compute_function_liveness from Liveness with lir_function
+                If liveness_ok is equal to 0:
+                    Display "build_interference_graph_pairwise: liveness analysis failed"
+                    Return 0
+                End If
+            End If
+        End If
+    End If
+
+    Let graph be proc create_interference_graph
+
     Let b be 0
     While b is less than block_count:
         Let block be proc list_get from List with blocks, b
+        If block is not equal to 0:
+            Let live_out be proc memory_get_int64 from MemoryCore with block, 72
+            Let current_live be proc create_register_set from Liveness
 
-        Let live_out be proc memory_get_int64 from MemoryCore with block, 72
-        Let current_live be proc create_register_set from Liveness
-
-        If live_out is not equal to 0:
-            Let live_out_keys be proc keys from Dictionary with live_out
-            Let live_out_size be proc size from Dictionary with live_out
-            Let i be 0
-            While i is less than live_out_size:
-                Let reg_id be proc list_get from List with live_out_keys, i
-                proc register_set_add from Liveness with current_live, reg_id
-                proc add_graph_node with graph, reg_id
-                Set i to i plus 1
-            End While
-        End If
-
-        Let instructions be proc memory_get_int64 from MemoryCore with block, 16
-        Let instruction_count be proc memory_get_int64 from MemoryCore with block, 24
-
-        Let inst_idx be instruction_count minus 1
-        While inst_idx is greater than or equal to 0:
-            Let instruction be proc list_get from List with instructions, inst_idx
-
-            Note: Add interferences between ALL pairs of live registers
-            Let live_keys be proc keys from Dictionary with current_live
-            Let live_count be proc size from Dictionary with current_live
-
-            Set i to 0
-            While i is less than live_count:
-                Let reg1 be proc list_get from List with live_keys, i
-                Let j be i plus 1
-                While j is less than live_count:
-                    Let reg2 be proc list_get from List with live_keys, j
-                    proc add_interference_edge with graph, reg1, reg2
-                    Set j to j plus 1
+            If live_out is not equal to 0:
+                Let out_entry be proc omap_first from OrderedMap with live_out
+                While out_entry is not equal to 0:
+                    Let out_reg be proc omap_entry_key from OrderedMap with out_entry
+                    proc register_set_add from Liveness with current_live, out_reg
+                    proc add_graph_node with graph, out_reg
+                    Set out_entry to proc omap_entry_next from OrderedMap with out_entry
                 End While
-                Set i to i plus 1
+            End If
+
+            Let instructions be proc memory_get_int64 from MemoryCore with block, 16
+            Let instruction_count be proc memory_get_int64 from MemoryCore with block, 24
+
+            Let inst_idx be instruction_count minus 1
+            While inst_idx is greater than or equal to 0:
+                Let instruction be proc list_get from List with instructions, inst_idx
+
+                Note: Pairwise edges among ALL currently live registers
+                Let pair_entry be proc omap_first from OrderedMap with current_live
+                While pair_entry is not equal to 0:
+                    Let reg1 be proc omap_entry_key from OrderedMap with pair_entry
+                    Let pair_inner be proc omap_entry_next from OrderedMap with pair_entry
+                    While pair_inner is not equal to 0:
+                        Let reg2 be proc omap_entry_key from OrderedMap with pair_inner
+                        proc add_interference_edge with graph, reg1, reg2
+                        Set pair_inner to proc omap_entry_next from OrderedMap with pair_inner
+                    End While
+                    Set pair_entry to proc omap_entry_next from OrderedMap with pair_entry
+                End While
+
+                Let inst_defs be proc get_instruction_defs from Liveness with lir_function, instruction
+                Let inst_uses be proc get_instruction_uses from Liveness with lir_function, instruction
+
+                Note: Defs interfere with the live set and each other (this
+                Note: also captures dead defs, which never enter the live set)
+                Let def_entry be proc omap_first from OrderedMap with inst_defs
+                While def_entry is not equal to 0:
+                    Let def_reg be proc omap_entry_key from OrderedMap with def_entry
+                    proc add_graph_node with graph, def_reg
+
+                    Let live_entry be proc omap_first from OrderedMap with current_live
+                    While live_entry is not equal to 0:
+                        Let live_reg be proc omap_entry_key from OrderedMap with live_entry
+                        proc add_interference_edge with graph, def_reg, live_reg
+                        Set live_entry to proc omap_entry_next from OrderedMap with live_entry
+                    End While
+
+                    Let other_def_entry be proc omap_first from OrderedMap with inst_defs
+                    While other_def_entry is not equal to 0:
+                        Let other_def be proc omap_entry_key from OrderedMap with other_def_entry
+                        proc add_interference_edge with graph, def_reg, other_def
+                        Set other_def_entry to proc omap_entry_next from OrderedMap with other_def_entry
+                    End While
+
+                    Set def_entry to proc omap_entry_next from OrderedMap with def_entry
+                End While
+
+                Note: current_live := (current_live - defs) ∪ uses
+                Set def_entry to proc omap_first from OrderedMap with inst_defs
+                While def_entry is not equal to 0:
+                    Let removed_def be proc omap_entry_key from OrderedMap with def_entry
+                    proc register_set_remove from Liveness with current_live, removed_def
+                    Set def_entry to proc omap_entry_next from OrderedMap with def_entry
+                End While
+
+                Let use_entry be proc omap_first from OrderedMap with inst_uses
+                While use_entry is not equal to 0:
+                    Let use_reg be proc omap_entry_key from OrderedMap with use_entry
+                    proc register_set_add from Liveness with current_live, use_reg
+                    proc add_graph_node with graph, use_reg
+                    Set use_entry to proc omap_entry_next from OrderedMap with use_entry
+                End While
+
+                proc register_set_destroy from Liveness with inst_defs
+                proc register_set_destroy from Liveness with inst_uses
+
+                Set inst_idx to inst_idx minus 1
             End While
 
-            Note: Update current_live for next instruction
-            Let inst_defs be proc get_instruction_defs from Liveness with instruction
-            Let inst_uses be proc get_instruction_uses from Liveness with instruction
-
-            Let def_keys be proc keys from Dictionary with inst_defs
-            Let def_count be proc size from Dictionary with inst_defs
-            Let d be 0
-            While d is less than def_count:
-                Let def_reg be proc list_get from List with def_keys, d
-                proc register_set_remove from Liveness with current_live, def_reg
-                Set d to d plus 1
-            End While
-
-            Let use_keys be proc keys from Dictionary with inst_uses
-            Let use_count be proc size from Dictionary with inst_uses
-            Let u be 0
-            While u is less than use_count:
-                Let use_reg be proc list_get from List with use_keys, u
-                proc register_set_add from Liveness with current_live, use_reg
-                proc add_graph_node with graph, use_reg
-                Set u to u plus 1
-            End While
-
-            Set inst_idx to inst_idx minus 1
-        End While
+            proc register_set_destroy from Liveness with current_live
+        End If
 
         Set b to b plus 1
     End While
@@ -513,8 +634,10 @@ Note: Graph Analysis and Statistics
 Note: ============================================================================
 
 @Reasoning
-Computes statistics about the interference graph useful for register allocation.
-Returns a Dictionary with keys: node_count, edge_count, max_degree, avg_degree
+Computes statistics about the interference graph useful for register
+allocation. Returns an OrderedMap with integer keys:
+  1 = node_count, 2 = edge_count, 3 = max_degree, 4 = avg_degree
+The caller owns the returned map and destroys it with omap_destroy.
 @End Reasoning
 
 Process called "compute_graph_statistics" that takes graph as Integer returns Integer:
@@ -523,23 +646,23 @@ Process called "compute_graph_statistics" that takes graph as Integer returns In
         Return 0
     End If
 
-    Let stats be proc create from Dictionary
+    Let stats be proc omap_create from OrderedMap
 
     Note: Count nodes
-    Let node_count be proc size from Dictionary with graph
-    proc set from Dictionary with stats, 1, node_count
+    Let node_count be proc omap_size from OrderedMap with graph
+    proc omap_set from OrderedMap with stats, 1, node_count
 
     Note: Count edges and find max degree
-    Let edge_count be 0
     Let max_degree be 0
     Let total_degree be 0
 
-    Let keys be proc keys from Dictionary with graph
-    Let i be 0
-    While i is less than node_count:
-        Let reg_id be proc list_get from List with keys, i
-        Let adj be proc get from Dictionary with graph, reg_id
-        Let degree be proc list_length from List with adj
+    Let entry be proc omap_first from OrderedMap with graph
+    While entry is not equal to 0:
+        Let adj be proc omap_entry_value from OrderedMap with entry
+        Let degree be 0
+        If adj is not equal to 0:
+            Set degree to proc list_length from List with adj
+        End If
 
         Set total_degree to total_degree plus degree
 
@@ -547,20 +670,20 @@ Process called "compute_graph_statistics" that takes graph as Integer returns In
             Set max_degree to degree
         End If
 
-        Set i to i plus 1
+        Set entry to proc omap_entry_next from OrderedMap with entry
     End While
 
     Note: Each edge counted twice (undirected graph)
-    Set edge_count to total_degree divided by 2
-    proc set from Dictionary with stats, 2, edge_count
-    proc set from Dictionary with stats, 3, max_degree
+    Let edge_count be total_degree divided by 2
+    proc omap_set from OrderedMap with stats, 2, edge_count
+    proc omap_set from OrderedMap with stats, 3, max_degree
 
     Note: Compute average degree
     Let avg_degree be 0
     If node_count is greater than 0:
         Set avg_degree to total_degree divided by node_count
     End If
-    proc set from Dictionary with stats, 4, avg_degree
+    proc omap_set from OrderedMap with stats, 4, avg_degree
 
     Return stats
 End Process
@@ -569,7 +692,7 @@ End Process
 Finds all nodes with degree less than K (number of available colors).
 These nodes can be removed during simplification without affecting colorability.
 
-Returns a List of register IDs with degree < K.
+Returns a List of register IDs with degree < K. The caller owns the List.
 @End Reasoning
 
 Process called "find_low_degree_nodes" that takes graph as Integer, k as Integer returns Integer:
@@ -580,19 +703,20 @@ Process called "find_low_degree_nodes" that takes graph as Integer, k as Integer
 
     Let low_degree_nodes be proc list_create from List
 
-    Let keys be proc keys from Dictionary with graph
-    Let node_count be proc size from Dictionary with graph
-
-    Let i be 0
-    While i is less than node_count:
-        Let reg_id be proc list_get from List with keys, i
-        Let degree be proc get_node_degree with graph, reg_id
+    Let entry be proc omap_first from OrderedMap with graph
+    While entry is not equal to 0:
+        Let reg_id be proc omap_entry_key from OrderedMap with entry
+        Let adj be proc omap_entry_value from OrderedMap with entry
+        Let degree be 0
+        If adj is not equal to 0:
+            Set degree to proc list_length from List with adj
+        End If
 
         If degree is less than k:
             proc append from List with low_degree_nodes, reg_id
         End If
 
-        Set i to i plus 1
+        Set entry to proc omap_entry_next from OrderedMap with entry
     End While
 
     Return low_degree_nodes
@@ -601,6 +725,7 @@ End Process
 @Reasoning
 Finds all nodes with degree > or equal to K that are potential spill candidates.
 If no low-degree nodes exist, one of these must be spilled.
+Returns a List of register IDs. The caller owns the List.
 @End Reasoning
 
 Process called "find_high_degree_nodes" that takes graph as Integer, k as Integer returns Integer:
@@ -611,28 +736,31 @@ Process called "find_high_degree_nodes" that takes graph as Integer, k as Intege
 
     Let high_degree_nodes be proc list_create from List
 
-    Let keys be proc keys from Dictionary with graph
-    Let node_count be proc size from Dictionary with graph
-
-    Let i be 0
-    While i is less than node_count:
-        Let reg_id be proc list_get from List with keys, i
-        Let degree be proc get_node_degree with graph, reg_id
+    Let entry be proc omap_first from OrderedMap with graph
+    While entry is not equal to 0:
+        Let reg_id be proc omap_entry_key from OrderedMap with entry
+        Let adj be proc omap_entry_value from OrderedMap with entry
+        Let degree be 0
+        If adj is not equal to 0:
+            Set degree to proc list_length from List with adj
+        End If
 
         If degree is greater than or equal to k:
             proc append from List with high_degree_nodes, reg_id
         End If
 
-        Set i to i plus 1
+        Set entry to proc omap_entry_next from OrderedMap with entry
     End While
 
     Return high_degree_nodes
 End Process
 
 @Reasoning
-Computes an estimate of the chromatic number (minimum colors needed).
-Uses a simple greedy heuristic: chromatic_number > or equal to max_degree + 1
-More sophisticated estimates could use clique detection.
+Computes a lower-bound estimate of the chromatic number (minimum colors
+needed) from the maximum degree: a node of degree d may need up to d+1
+colors in the worst case (itself plus all distinct-colored neighbors).
+The statistics map created for the computation is destroyed before
+returning so the estimator is allocation-neutral.
 @End Reasoning
 
 Process called "estimate_chromatic_number" that takes graph as Integer returns Integer:
@@ -641,9 +769,14 @@ Process called "estimate_chromatic_number" that takes graph as Integer returns I
     End If
 
     Let stats be proc compute_graph_statistics with graph
-    Let max_degree be proc get from Dictionary with stats, 3
+    If stats is equal to 0:
+        Return 0
+    End If
 
-    Note: Chromatic number is at least max_degree + 1
+    Let max_degree be proc omap_get from OrderedMap with stats, 3
+    proc omap_destroy from OrderedMap with stats
+
+    Note: Chromatic number is at most max_degree + 1
     Return max_degree plus 1
 End Process
 
@@ -715,7 +848,9 @@ Note: ==========================================================================
 Verifies the interference graph for consistency:
 - Symmetry: if A interferes with B, then B interferes with A
 - No self-loops: no register interferes with itself
-- Adjacency lists match graph nodes
+- Every node carries a non-null adjacency list
+Integer ids are rendered through StringUtils.integer_to_string because
+Display on a raw Integer treats it as a string pointer.
 @End Reasoning
 
 Process called "verify_interference_graph" that takes graph as Integer returns Integer:
@@ -726,64 +861,55 @@ Process called "verify_interference_graph" that takes graph as Integer returns I
 
     Let errors be 0
 
-    Let keys be proc keys from Dictionary with graph
-    Let node_count be proc size from Dictionary with graph
-
-    Let i be 0
-    While i is less than node_count:
-        Let reg1 be proc list_get from List with keys, i
-        Let adj1 be proc get from Dictionary with graph, reg1
+    Let entry be proc omap_first from OrderedMap with graph
+    While entry is not equal to 0:
+        Let reg1 be proc omap_entry_key from OrderedMap with entry
+        Let adj1 be proc omap_entry_value from OrderedMap with entry
 
         If adj1 is equal to 0:
-            Display "verify_interference_graph: null adjacency list for register "
-            Display reg1
-            Display ""
+            Display "verify_interference_graph: null adjacency list for register:"
+            Let r1_str be proc integer_to_string from StringUtils with reg1
+            Display r1_str
             Set errors to errors plus 1
-            Set i to i plus 1
-            Continue
+        Otherwise:
+            Let size1 be proc list_length from List with adj1
+            Let j be 0
+            While j is less than size1:
+                Let reg2 be proc list_get from List with adj1, j
+
+                Note: Check for self-loops
+                If reg1 is equal to reg2:
+                    Display "verify_interference_graph: self-loop detected for register:"
+                    Let loop_str be proc integer_to_string from StringUtils with reg1
+                    Display loop_str
+                    Set errors to errors plus 1
+                End If
+
+                Note: Check symmetry
+                Let sym_interferes be proc has_interference with graph, reg2, reg1
+                If sym_interferes is equal to 0:
+                    Display "verify_interference_graph: asymmetric edge:"
+                    Let asym1_str be proc integer_to_string from StringUtils with reg1
+                    Display asym1_str
+                    Let asym2_str be proc integer_to_string from StringUtils with reg2
+                    Display asym2_str
+                    Set errors to errors plus 1
+                End If
+
+                Set j to j plus 1
+            End While
         End If
 
-        Let size1 be proc list_length from List with adj1
-        Let j be 0
-        While j is less than size1:
-            Let reg2 be proc list_get from List with adj1, j
-
-            Note: Check for self-loops
-            If reg1 is equal to reg2:
-                Display "verify_interference_graph: self-loop detected for register "
-                Display reg1
-                Display ""
-                Set errors to errors plus 1
-            End If
-
-            Note: Check symmetry
-            Let sym_interferes be proc has_interference with graph, reg2, reg1
-            If sym_interferes is equal to 0:
-                Display "verify_interference_graph: asymmetric edge ("
-                Display reg1
-                Display ", "
-                Display reg2
-                Display ")"
-                Display ""
-                Set errors to errors plus 1
-            End If
-
-            Set j to j plus 1
-        End While
-
-        Set i to i plus 1
+        Set entry to proc omap_entry_next from OrderedMap with entry
     End While
 
     If errors is greater than 0:
-        Display "verify_interference_graph: "
-        Display errors
-        Display " errors found"
-        Display ""
+        Display "verify_interference_graph: errors found:"
+        Let err_str be proc integer_to_string from StringUtils with errors
+        Display err_str
         Return 0
     End If
 
-    Display "verify_interference_graph: graph is valid"
-    Display ""
     Return 1
 End Process
 
@@ -799,44 +925,46 @@ Process called "print_interference_graph" that takes graph as Integer returns In
     End If
 
     Display "===== Interference Graph ====="
-    Display ""
 
-    Let keys be proc keys from Dictionary with graph
-    Let node_count be proc size from Dictionary with graph
+    Let entry be proc omap_first from OrderedMap with graph
+    While entry is not equal to 0:
+        Let reg_id be proc omap_entry_key from OrderedMap with entry
+        Let adj be proc omap_entry_value from OrderedMap with entry
 
-    Let i be 0
-    While i is less than node_count:
-        Let reg_id be proc list_get from List with keys, i
         Let reg_name be proc lir_get_register_name from LIR with reg_id
-        Let adj be proc get from Dictionary with graph, reg_id
-        Let degree be proc list_length from List with adj
+        Display "node:"
+        If reg_name is not equal to 0:
+            Display reg_name
+        End If
 
-        Display reg_name
-        Display " (degree="
-        Display degree
-        Display "): "
+        If adj is not equal to 0:
+            Let degree be proc list_length from List with adj
+            Display "  degree:"
+            Let deg_str be proc integer_to_string from StringUtils with degree
+            Display deg_str
 
-        Let j be 0
-        While j is less than degree:
-            Let neighbor be proc list_get from List with adj, j
-            Let neighbor_name be proc lir_get_register_name from LIR with neighbor
-            Display neighbor_name
-            Display " "
-            Set j to j plus 1
-        End While
+            Let j be 0
+            While j is less than degree:
+                Let neighbor be proc list_get from List with adj, j
+                Let neighbor_name be proc lir_get_register_name from LIR with neighbor
+                If neighbor_name is not equal to 0:
+                    Display neighbor_name
+                End If
+                Set j to j plus 1
+            End While
+        End If
 
-        Display ""
-        Set i to i plus 1
+        Set entry to proc omap_entry_next from OrderedMap with entry
     End While
 
     Display "=============================="
-    Display ""
 
     Return 1
 End Process
 
 @Reasoning
-Prints statistics about the interference graph.
+Prints statistics about the interference graph. The statistics map is
+destroyed before returning.
 @End Reasoning
 
 Process called "print_graph_statistics" that takes graph as Integer returns Integer:
@@ -846,32 +974,36 @@ Process called "print_graph_statistics" that takes graph as Integer returns Inte
     End If
 
     Let stats be proc compute_graph_statistics with graph
+    If stats is equal to 0:
+        Return 0
+    End If
 
-    Let node_count be proc get from Dictionary with stats, 1
-    Let edge_count be proc get from Dictionary with stats, 2
-    Let max_degree be proc get from Dictionary with stats, 3
-    Let avg_degree be proc get from Dictionary with stats, 4
+    Let node_count be proc omap_get from OrderedMap with stats, 1
+    Let edge_count be proc omap_get from OrderedMap with stats, 2
+    Let max_degree be proc omap_get from OrderedMap with stats, 3
+    Let avg_degree be proc omap_get from OrderedMap with stats, 4
 
     Display "===== Graph Statistics ====="
-    Display "Nodes: "
-    Display node_count
-    Display ""
-    Display "Edges: "
-    Display edge_count
-    Display ""
-    Display "Max Degree: "
-    Display max_degree
-    Display ""
-    Display "Avg Degree: "
-    Display avg_degree
-    Display ""
+    Display "Nodes:"
+    Let nodes_str be proc integer_to_string from StringUtils with node_count
+    Display nodes_str
+    Display "Edges:"
+    Let edges_str be proc integer_to_string from StringUtils with edge_count
+    Display edges_str
+    Display "Max Degree:"
+    Let max_str be proc integer_to_string from StringUtils with max_degree
+    Display max_str
+    Display "Avg Degree:"
+    Let avg_str be proc integer_to_string from StringUtils with avg_degree
+    Display avg_str
 
     Let chromatic_estimate be proc estimate_chromatic_number with graph
-    Display "Estimated Chromatic Number: "
-    Display chromatic_estimate
-    Display ""
+    Display "Estimated Chromatic Number:"
+    Let chrom_str be proc integer_to_string from StringUtils with chromatic_estimate
+    Display chrom_str
     Display "============================"
-    Display ""
+
+    proc omap_destroy from OrderedMap with stats
 
     Return 1
 End Process
@@ -883,19 +1015,10 @@ Note: ==========================================================================
 Note:
 USAGE EXAMPLE:
 --------------
-To build an interference graph after liveness analysis:
+To build an interference graph (liveness is ensured automatically):
 
     Import "compiler/middle/gungnir/lir/interference.runa" as Interference
 
-    Note: Step 1: Run liveness analysis
-    Let success be proc compute_function_liveness from Liveness with lir_function
-
-    If success is equal to 0:
-        Display "Liveness analysis failed"
-        Return 0
-    End If
-
-    Note: Step 2: Build interference graph
     Let graph be proc build_interference_graph from Interference with lir_function
 
     If graph is equal to 0:
@@ -903,14 +1026,17 @@ To build an interference graph after liveness analysis:
         Return 0
     End If
 
-    Note: Step 3: Verify graph (optional, for debugging)
+    Note: Verify graph (optional, for debugging)
     Let valid be proc verify_interference_graph from Interference with graph
 
-    Note: Step 4: Print statistics (optional)
+    Note: Print statistics (optional)
     proc print_graph_statistics from Interference with graph
 
-    Note: Step 5: Use graph for register allocation
-    Let allocation be proc allocate_registers from RegisterAlloc with lir_function, graph, k
+    Note: Use graph for register allocation
+    Let context be proc allocate_registers from RegisterAlloc with lir_function, graph
+
+    Note: Release the graph when allocation (and any retry loop) is done
+    proc destroy_interference_graph from Interference with graph
 
 GRAPH QUERIES:
 --------------
@@ -932,7 +1058,7 @@ GRAPH MANIPULATION:
 -------------------
 For register allocation simplification phase:
 
-    Note: Remove a node from the graph
+    Note: Remove a node from the graph (destroys its adjacency List)
     proc remove_graph_node from Interference with graph, reg_id
 
     Note: Check if two nodes can be coalesced
@@ -943,13 +1069,12 @@ INTEGRATION POINTS:
 This interference graph is used by:
 
 1. register_alloc.runa: Main consumer for graph coloring
-   - Uses graph to determine which registers cannot share physical registers
-   - Implements Chaitin-Briggs graph coloring algorithm
-   - Identifies spill candidates when coloring fails
+   - Copies the graph into a working OrderedMap for simplification
+   - Implements Chaitin-Briggs graph coloring with optimistic spilling
+   - Identifies actual spill candidates when coloring fails
 
-2. spilling.runa: Uses graph for spill cost estimation
-   - High-degree nodes are more expensive to spill
-   - Uses neighbor information to minimize spill impact
+2. spilling.runa: Uses graph degrees for spill cost estimation
+   - High-degree nodes free more registers when spilled
 
 COMPILATION PIPELINE:
 ---------------------

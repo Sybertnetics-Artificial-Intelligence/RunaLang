@@ -45,6 +45,7 @@ Import "compiler/middle/gungnir/hir/hir.runa" as HIR
 Import "compiler/frontend/primitives/memory/layout.runa" as Layout
 Import "compiler/frontend/primitives/collections/list.runa" as List
 Import "compiler/frontend/primitives/collections/dictionary.runa" as Dictionary
+Import "compiler/frontend/primitives/collections/set.runa" as Set
 Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
 Import "compiler/internal/string_utils.runa" as StringUtils
 
@@ -294,10 +295,15 @@ Type called "MIRFunction":
     library_name as Integer        Note: Offset 96 - P2-D FFI: Pointer to library name string (0 if not external)
     alias_name as Integer          Note: Offset 104 - P2-D FFI: Pointer to C-side symbol name (0 if same as name)
     convention_id as Integer       Note: Offset 112 - P2-D FFI: Calling convention ID (0=c, 1=stdcall, 2=fastcall, 3=cdecl, 4=syscall, 5=objc)
+    variable_values as Integer     Note: Offset 120 - Pointer to Set of value ids that name user-variable storage (explicit is-variable registry, OD-#463)
 End Type
 
-Note: Size: 15 fields * 8 bytes = 120 bytes per MIRFunction
+Note: Size: 16 fields * 8 bytes = 128 bytes per MIRFunction
 Note: P2-D extension: library_name (offset 96), alias_name (offset 104), convention_id (offset 112)
+Note: OD-#463 extension: variable_values registry (offset 120) - a collections/set of RAW
+Note: integer value ids. Producers call register_variable_value at the moment they create a
+Note: value id for a user variable (mutable storage: ALLOCA results and SSA versions of
+Note: variables); operand_is_variable consults this registry. There is no implicit id band.
 Note: Authoritative is_external offset is 80 (matches all consumers: inlining, devirt, tail_call, lto, lir_builder).
 
 @Reasoning
@@ -578,14 +584,18 @@ also lets diagnostics map MIR-level errors back to source.
 @End Reasoning
 
 @Implementation
-Allocates 120 bytes (15 fields, TIER 3 owned heap). Writes name at offset 0,
+Allocates 128 bytes (16 fields, TIER 3 owned heap). Writes name at offset 0,
 creates a fresh MIRCFG at offset 8, creates parameter List at offset 16 with
 count 0 at offset 24, writes return_type at 32, creates the local-values
-List at 40 with count 0 at 48 and next_value_id seeded 0 at 56, allocates
-the value_to_instruction Dictionary at offset 64, writes hir_node at 72,
-zeroes is_external at the authoritative offset 80, zeroes metadata at 88,
-and zeroes the three P2-D FFI fields library_name (96), alias_name (104),
-convention_id (112). Returns 0 if allocation fails.
+List at 40 with count 0 at 48 and next_value_id seeded 1 at 56 (value id 0
+is the reserved "no value / void" sentinel read by instruction_defines_variable
+and emit-side registration guards, so the allocator must never hand it out),
+allocates the value_to_instruction Dictionary at offset 64, writes hir_node at
+72, zeroes is_external at the authoritative offset 80, zeroes metadata at 88,
+zeroes the three P2-D FFI fields library_name (96), alias_name (104),
+convention_id (112), and creates the variable_values registry Set at offset
+120 (OD-#463: explicit is-variable truth consulted by operand_is_variable).
+Returns 0 if allocation fails.
 @End Implementation
 
 @Security_Scope
@@ -596,7 +606,7 @@ mismatch here would silently corrupt FFI dispatch.
 @End Security_Scope
 
 Process called "create_mir_function" that takes name as Integer, return_type as Integer, hir_node as Integer returns Integer:
-    Let function_size be 120
+    Let function_size be 128
     Let function be proc allocate from Layout with function_size
 
     If function is equal to 0:
@@ -619,10 +629,13 @@ Process called "create_mir_function" that takes name as Integer, return_type as 
     proc memory_set_int64 from Layout with function, 32, return_type
 
     Note: local_values list (offset 40), value_count (offset 48), next_value_id (offset 56)
+    Note: next_value_id is seeded at 1: value id 0 is the reserved "no value" sentinel
+    Note: (instruction_defines_variable and emission-side registration both key on it),
+    Note: so allocate_value_id must never return 0 for a live function.
     Let local_values be proc create from List
     proc memory_set_int64 from Layout with function, 40, local_values
     proc memory_set_int64 from Layout with function, 48, 0
-    proc memory_set_int64 from Layout with function, 56, 0
+    proc memory_set_int64 from Layout with function, 56, 1
 
     Note: value_to_instruction dictionary (offset 64) - CRITICAL for metadata lookup
     Let value_map be proc create from Dictionary
@@ -641,6 +654,12 @@ Process called "create_mir_function" that takes name as Integer, return_type as 
     proc memory_set_int64 from Layout with function, 96, 0
     proc memory_set_int64 from Layout with function, 104, 0
     proc memory_set_int64 from Layout with function, 112, 0
+
+    Note: OD-#463: variable_values registry (offset 120) - Set of RAW integer value ids
+    Note: that name user-variable storage. Populated by register_variable_value at the
+    Note: producer sites; consulted by operand_is_variable. Created empty here.
+    Let variable_values be proc create from Set
+    proc memory_set_int64 from Layout with function, 120, variable_values
 
     Return function
 End Process
@@ -1943,8 +1962,13 @@ large functions.
 @Implementation
 Reads the next_value_id counter at MIRFunction offset 56, returns it as the
 allocated id, then writes back next_id + 1. Returns 0 for a null function
-pointer; legitimate value-ids begin at whatever the SSA construction context
-seeded the counter with (typically 1000+ to distinguish from constants).
+pointer. create_mir_function seeds the counter at 1 (id 0 is the reserved
+"no value" sentinel); callers that hand-author MIR or splice instructions
+into a function whose ids were not all drawn from this allocator must first
+call sync_next_value_id so freshly allocated ids cannot collide with
+pre-existing ones. There is no reserved id band: variable-ness is recorded
+explicitly in the variable_values registry (OD-#463), never inferred from
+the id's magnitude.
 @End Implementation
 
 Process called "allocate_value_id" that takes function as Integer returns Integer:
@@ -1956,6 +1980,170 @@ Process called "allocate_value_id" that takes function as Integer returns Intege
     proc memory_set_int64 from Layout with function, 56, next_id plus 1
 
     Return next_id
+End Process
+
+@Reasoning
+Raises a function's next_value_id counter above every value id already
+present in the function, so that allocate_value_id can never hand out a
+colliding id. Historically the SSA construction context dodged collisions
+by seeding its own counter at 1000 - a magic band that silently broke the
+moment a function carried more than 1000 values, and that doubled as the
+implicit "id >= 1000 means variable" convention. OD-#463 deleted the band:
+variable-ness is now explicit (variable_values registry), and collision
+avoidance is this explicit sync. Callers: SSA construction (create_ssa_context)
+before allocating rename versions, and the HIR-to-MIR lowering finaliser
+after the builder's private temp counter has issued ids the function's
+counter never saw.
+@End Reasoning
+
+@Implementation
+Scans two id populations: the parameters List at offset 16 (parameter value
+ids) and every instruction's result value_id (MIRNode offset 8, which by the
+OD-1 prefix-embedding contract also mirrors every extended record's result,
+including phi results) across all blocks of the function's CFG (cfg at
+offset 8, blocks List at MIRCFG offset 16, per-block instructions List at
+MIRBasicBlock offset 16). Operand slots reference defined ids or parameter
+ids, so the def/parameter maximum bounds every id in a well-formed function.
+Computes max_id over both populations, then raises next_value_id (offset 56)
+to max_id + 1 when it is not already greater, and floors it at 1 so id 0
+(the reserved "no value" sentinel) is never issued. Idempotent: re-running
+it on an already-synced function changes nothing. Returns the resulting
+next_value_id, or 0 for a null function pointer.
+@End Implementation
+
+@Performance_Hints
+O(P + I) for P parameters and I instructions - one linear pass. Called once
+per SSA construction and once per lowered function, never inside rename or
+optimization inner loops.
+@End Performance_Hints
+
+@Security_Scope
+Read-only over the CFG except for the single counter write at offset 56.
+Null function, missing CFG, or missing block list degrade to the floor-at-1
+behavior rather than dereferencing null pointers.
+@End Security_Scope
+
+Process called "sync_next_value_id" that takes function as Integer returns Integer:
+    If function is equal to 0:
+        Return 0
+    End If
+
+    Let max_id be 0
+
+    Note: Parameter value ids (MIRFunction offset 16: List of value ids)
+    Let parameters be proc memory_get_int64 from Layout with function, 16
+    If parameters is not equal to 0:
+        Let param_count be proc length from List with parameters
+        Let p be 0
+        While p is less than param_count:
+            Let param_id be proc get from List with parameters, p
+            If param_id is greater than max_id:
+                Set max_id to param_id
+            End If
+            Set p to p plus 1
+        End While
+    End If
+
+    Note: Instruction result ids across every block of the CFG
+    Let cfg be proc memory_get_int64 from Layout with function, 8
+    If cfg is not equal to 0:
+        Let blocks be proc memory_get_int64 from Layout with cfg, 16
+        If blocks is not equal to 0:
+            Let block_count be proc length from List with blocks
+            Let b be 0
+            While b is less than block_count:
+                Let block be proc get from List with blocks, b
+                If block is not equal to 0:
+                    Let instructions be proc memory_get_int64 from Layout with block, 16
+                    If instructions is not equal to 0:
+                        Let inst_count be proc length from List with instructions
+                        Let i be 0
+                        While i is less than inst_count:
+                            Let inst be proc get from List with instructions, i
+                            If inst is not equal to 0:
+                                Let result_id be proc memory_get_int64 from Layout with inst, 8
+                                If result_id is greater than max_id:
+                                    Set max_id to result_id
+                                End If
+                            End If
+                            Set i to i plus 1
+                        End While
+                    End If
+                End If
+                Set b to b plus 1
+            End While
+        End If
+    End If
+
+    Note: Raise the counter above the observed maximum; floor at 1 so the
+    Note: reserved id 0 is never issued.
+    Let next_id be proc memory_get_int64 from Layout with function, 56
+    If next_id is less than or equal to max_id:
+        Set next_id to max_id plus 1
+    End If
+    If next_id is less than 1:
+        Set next_id to 1
+    End If
+    proc memory_set_int64 from Layout with function, 56, next_id
+
+    Return next_id
+End Process
+
+@Reasoning
+Records that a value id names user-variable storage (OD-#463). This is the
+producer half of the explicit is-variable contract: HIR-to-MIR lowering
+registers every ALLOCA result (Let / Define / parameter slots / compiler-
+materialized mutable cells) at the moment it allocates the id, and SSA
+construction registers every rename version it mints for a variable. The
+consumer half is operand_is_variable, which tests membership. Replaces the
+former "id >= 1000 implies variable" magic-threshold convention, which was
+silently false on low-id MIR produced by the builder (next_value_id starts
+low, so SSA operand renaming never fired there).
+@End Reasoning
+
+@Implementation
+Validates function_ptr and rejects value_id <= 0 (0 is the "no value"
+sentinel and may never be a variable; negative values are error sentinels).
+Reads the variable_values Set at MIRFunction offset 120, creating it lazily
+when the slot is empty (defensive against allocation-failure paths in
+record constructors), then adds the RAW integer id via Set.add - the set
+primitive string-encodes elements internally, per the Wave 5a collections
+convention. Re-registration is idempotent (Set.add deduplicates). Returns 1
+on success, 0 on null function or non-positive id.
+@End Implementation
+
+@Performance_Hints
+Amortized O(1) set insert. Called once per variable-storage allocation and
+once per SSA rename version - linear in variable count overall, never in an
+operand-iteration inner loop.
+@End Performance_Hints
+
+@Security_Scope
+The registry only grows through this function; ids are plain integers, not
+pointers, so a polluted registry cannot cause an invalid dereference - the
+worst failure mode is treating a temporary as a variable, which renames it
+coherently rather than corrupting memory.
+@End Security_Scope
+
+Process called "register_variable_value" that takes function as Integer, value_id as Integer returns Integer:
+    If function is equal to 0:
+        Return 0
+    End If
+    If value_id is less than or equal to 0:
+        Return 0
+    End If
+
+    Let registry be proc memory_get_int64 from Layout with function, 120
+    If registry is equal to 0:
+        Set registry to proc create from Set
+        If registry is equal to 0:
+            Return 0
+        End If
+        proc memory_set_int64 from Layout with function, 120, registry
+    End If
+
+    proc add from Set with registry, value_id
+    Return 1
 End Process
 
 @Reasoning
@@ -3544,30 +3732,51 @@ Process called "get_instruction_operand_count" that takes inst_ptr as Integer re
 End Process
 
 @Reasoning
-Predicate testing whether an operand value-id refers to an SSA variable
-or to a constant. The convention "id >= 1000 ⇒ variable" is established
-by ssa.runa's context initialiser, which seeds next_value_id at 1000 so
-all subsequently allocated SSA ids are guaranteed to be in the variable
-range. Constants encode their value directly in the low-numbered id space.
-This classification is needed by every pass that lowers MIR to a target
-ISA where constants and registers take different operand encodings.
+Predicate testing whether an operand value-id names user-variable storage
+(OD-#463, owner-ruled 2026-06-11). The answer comes from the owning
+MIRFunction's variable_values registry - explicit truth recorded by the
+producers (register_variable_value) at the moment a variable's value id is
+born - never from the id's magnitude. The predecessor convention
+"id >= 1000 implies variable" was a magic threshold established by the SSA
+context's 1000-seeded counter; on low-id MIR produced by the HIR-to-MIR
+builder it classified every operand as a non-variable, silently gating SSA
+operand renaming off and leaving use/def linkage to the metadata-name
+channel alone. SSA construction consults this predicate to decide which
+defs receive rename versions and which operand uses must be retargeted to
+the dominating version; ids not in the registry (single-assignment
+temporaries, constants) keep their original ids untouched.
 @End Reasoning
 
 @Implementation
-Single comparison: returns 1 if operand_value_id >= 1000, else 0.
+Null function_ptr or non-positive operand_value_id returns 0 (id 0 is the
+"no value" sentinel and can never be a variable). Reads the variable_values
+Set pointer at MIRFunction offset 120; an absent registry means nothing was
+ever registered, so the answer is 0. Otherwise returns Set.contains over
+the RAW integer id (the set primitive string-encodes elements internally,
+Wave 5a convention).
 @End Implementation
 
 @Performance_Hints
-Inlining candidate; compiles to a single compare-and-set-flag sequence.
+Amortized O(1) set membership probe. Sits in the SSA rename inner loop
+(once per non-empty operand slot), so it must stay allocation-free on the
+miss path - Set.contains is.
 @End Performance_Hints
 
-Process called "operand_is_variable" that takes operand_value_id as Integer returns Integer:
-    Note: SSA value IDs start from 1000 (as set in ssa.runa context creation)
-    If operand_value_id is greater than or equal to 1000:
-        Return 1
+Process called "operand_is_variable" that takes function_ptr as Integer, operand_value_id as Integer returns Integer:
+    If function_ptr is equal to 0:
+        Return 0
+    End If
+    If operand_value_id is less than or equal to 0:
+        Return 0
     End If
 
-    Return 0
+    Note: Consult the explicit variable registry (MIRFunction offset 120)
+    Let registry be proc memory_get_int64 from Layout with function_ptr, 120
+    If registry is equal to 0:
+        Return 0
+    End If
+
+    Return proc contains from Set with registry, operand_value_id
 End Process
 
 @Reasoning
@@ -3599,13 +3808,36 @@ MIRMetadata record.
 @End Security_Scope
 
 Process called "get_operand_variable_name" that takes function_ptr as Integer, operand_value_id as Integer returns Integer:
+    Let name_buffer be 0
     If function_ptr is equal to 0:
-        Note: No function context - generate SSA name
-        Let name_buffer be proc allocate from Layout with 64
+        Note: No function context - fall through to the synthetic "v_<id>"
+        Note: name path below (the digits and terminator are emitted there;
+        Note: a bare "v_" prefix would collapse every id onto one name).
+        Set name_buffer to proc allocate from Layout with 64
         proc memory_set_byte from Memory with name_buffer, 0, 118  Note: 'v'
         proc memory_set_byte from Memory with name_buffer, 1, 95   Note: '_'
-        Let value_str be proc integer_to_string from StringUtils with operand_value_id
-        Note: Append value_id string after "v_"
+        Let null_ctx_pos be 2
+        Let null_ctx_value be operand_value_id
+        Let null_ctx_digits be 0
+        Let null_ctx_copy be null_ctx_value
+        While null_ctx_copy is greater than 0:
+            Set null_ctx_copy to null_ctx_copy divided by 10
+            Set null_ctx_digits to null_ctx_digits plus 1
+        End While
+        If null_ctx_digits is equal to 0:
+            proc memory_set_byte from Memory with name_buffer, null_ctx_pos, 48  Note: '0'
+            Set null_ctx_pos to null_ctx_pos plus 1
+        Otherwise:
+            Let null_ctx_i be 0
+            While null_ctx_i is less than null_ctx_digits:
+                Let null_ctx_digit be null_ctx_value modulo by 10
+                proc memory_set_byte from Memory with name_buffer, null_ctx_pos plus null_ctx_digits minus null_ctx_i minus 1, null_ctx_digit plus 48
+                Set null_ctx_value to null_ctx_value divided by 10
+                Set null_ctx_i to null_ctx_i plus 1
+            End While
+            Set null_ctx_pos to null_ctx_pos plus null_ctx_digits
+        End If
+        proc memory_set_byte from Memory with name_buffer, null_ctx_pos, 0
         Return name_buffer
     End If
 

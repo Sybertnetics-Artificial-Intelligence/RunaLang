@@ -50,6 +50,7 @@ Import "compiler/frontend/primitives/collections/list.runa" as List
 Import "compiler/frontend/primitives/collections/dictionary.runa" as Dictionary
 Import "compiler/frontend/primitives/collections/set.runa" as Set
 Import "compiler/frontend/primitives/core/string_core.runa" as String
+Import "compiler/internal/string_utils.runa" as StringUtils
 
 Note: ============================================================================
 Note: TYPE DEFINITIONS - Enhanced Constant Propagation Context
@@ -509,7 +510,7 @@ Process called "get_or_create_constant_value" that takes context_ptr as Integer,
     Let constant_values be proc memory_get_int64 from Layout with context_ptr, 8
 
     Note: Convert value_id to string for Dictionary key
-    Let key_str be proc integer_to_string from String with value_id
+    Let key_str be proc integer_to_string from StringUtils with value_id
 
     Note: Check if value exists
     Let contains_value be proc contains from Dictionary with constant_values, key_str
@@ -560,7 +561,7 @@ Process called "update_constant_value" that takes context_ptr as Integer, value_
     End If
 
     Let constant_values be proc memory_get_int64 from Layout with context_ptr, 8
-    Let key_str be proc integer_to_string from String with value_id
+    Let key_str be proc integer_to_string from StringUtils with value_id
 
     Note: Get current constant value
     Let current_const be proc get_or_create_constant_value with context_ptr, value_id
@@ -708,7 +709,7 @@ Process called "analyze_block_constants" that takes context_ptr as Integer, bloc
     Let constants_found be 0
 
     Note: Get instructions in block
-    Let inst_list be proc get_block_instructions from CFG with block_ptr
+    Let inst_list be proc get_block_instructions from MIR with block_ptr
     If inst_list is equal to 0:
         Return 0
     End If
@@ -975,11 +976,13 @@ Process called "identify_global_constants" that takes context_ptr as Integer, mo
     Let globals_written be proc create from Set
 
     Note: Pass 1: Scan all instructions to find globals and stores
-    Let block_count be proc get_block_count from CFG with cfg
+    Note: Canonical block pointer list + cached count accessor
+    Let cp_blocks be proc get_mir_cfg_blocks from CFG with cfg
+    Let block_count be proc get_cfg_block_count from CFG with cfg
     Let i be 0
     While i is less than block_count:
-        Let block be proc get_block from CFG with cfg, i
-        Let instructions be proc get_block_instructions from CFG with block
+        Let block be proc get from List with cp_blocks, i
+        Let instructions be proc get_block_instructions from MIR with block
         Let inst_count be proc length from List with instructions
 
         Let j be 0
@@ -1019,32 +1022,46 @@ Process called "identify_global_constants" that takes context_ptr as Integer, mo
         Let is_written be proc contains from Set with globals_written, global_id
 
         If is_written is equal to 0:
-            Note: Global is read-only - it's a constant!
-
-            Note: Get initializer value from module's global table
-            Let global_table_offset be proc offset_of_Module_global_table from Layout
-            Let global_table be proc memory_get_integer from Layout with module_ptr, global_table_offset
-
+            Note: Global is read-only. Resolve its initializer from the
+            Note: canonical MIRProgram global_values List (offset 16):
+            Note: entries are MIRValue records carrying value_id at 0,
+            Note: is_constant at 40, constant_value at 48. There is no
+            Note: id-keyed "global table" Dictionary in the canonical
+            Note: program record — the historical offset_of_Module_
+            Note: global_table lookup was a phantom API.
+            Let global_values be proc memory_get_int64 from Layout with module_ptr, 16
             Let initializer_value be 0
-            If global_table is not equal to 0:
-                Note: Look up global's initializer in global table
-                Let global_id_str_lookup be proc integer_to_string from String with global_id
-                Let has_initializer be proc contains from Dictionary with global_table, global_id_str_lookup
-
-                If has_initializer is equal to 1:
-                    Set initializer_value to proc get from Dictionary with global_table, global_id_str_lookup
-                    Display "identify_global_constants: global " joined with global_id joined with " has initializer value " joined with initializer_value
-                End If
+            Let has_initializer be 0
+            If global_values is not equal to 0:
+                Let gv_count be proc length from List with global_values
+                Let g be 0
+                While g is less than gv_count:
+                    Let gv be proc get from List with global_values, g
+                    If gv is not equal to 0:
+                        Let gv_id be proc memory_get_int64 from Layout with gv, 0
+                        If gv_id is equal to global_id:
+                            Let gv_is_const be proc memory_get_int64 from Layout with gv, 40
+                            If gv_is_const is equal to 1:
+                                Set initializer_value to proc memory_get_int64 from Layout with gv, 48
+                                Set has_initializer to 1
+                            End If
+                            Set g to gv_count
+                        End If
+                    End If
+                    Set g to g plus 1
+                End While
             End If
 
-            Let const_value be proc create_const_integer with initializer_value
-            Let global_id_str be proc integer_to_string from String with global_id
-
-            proc set from Dictionary with global_constants, global_id_str, const_value
-
-            Set globals_found to globals_found plus 1
-
-            Display "identify_global_constants: global " joined with global_id joined with " is constant (read-only) with value " joined with initializer_value
+            Note: Only a global with a PROVEN constant initializer can be
+            Note: propagated; recording an unproven zero would fabricate a
+            Note: value
+            If has_initializer is equal to 1:
+                Let const_value be proc create_const_integer with initializer_value
+                Let global_id_str be proc integer_to_string from StringUtils with global_id
+                proc set from Dictionary with global_constants, global_id_str, const_value
+                Set globals_found to globals_found plus 1
+                Display "identify_global_constants: global " joined with global_id_str joined with " is a read-only constant"
+            End If
         End If
 
         Set k to k plus 1
@@ -1055,7 +1072,8 @@ Process called "identify_global_constants" that takes context_ptr as Integer, mo
     proc destroy from Set with globals_written
     proc destroy from List with seen_list
 
-    Display "identify_global_constants: found " joined with globals_found joined with " global constants"
+    Let globals_found_str be proc integer_to_string from StringUtils with globals_found
+    Display "identify_global_constants: found " joined with globals_found_str joined with " global constants"
 
     Return globals_found
 End Process
@@ -1105,7 +1123,7 @@ Process called "propagate_global_constant" that takes context_ptr as Integer, cf
     End If
 
     Let global_constants be proc memory_get_int64 from Layout with context_ptr, 16
-    Let global_id_str be proc integer_to_string from String with global_id
+    Let global_id_str be proc integer_to_string from StringUtils with global_id
 
     Note: Get constant value for this global
     Let contains_global be proc contains from Dictionary with global_constants, global_id_str
@@ -1117,12 +1135,14 @@ Process called "propagate_global_constant" that takes context_ptr as Integer, cf
 
     Note: Scan all blocks for LOAD_GLOBAL from this global
     Let loads_replaced be 0
-    Let block_count be proc get_block_count from CFG with cfg_ptr
+    Note: Canonical block pointer list + cached count accessor
+    Let cp_blocks be proc get_mir_cfg_blocks from CFG with cfg_ptr
+    Let block_count be proc get_cfg_block_count from CFG with cfg_ptr
 
     Let i be 0
     While i is less than block_count:
-        Let block be proc get_block from CFG with cfg_ptr, i
-        Let instructions be proc get_block_instructions from CFG with block
+        Let block be proc get from List with cp_blocks, i
+        Let instructions be proc get_block_instructions from MIR with block
         Let inst_count be proc length from List with instructions
 
         Let j be 0
@@ -1145,7 +1165,9 @@ Process called "propagate_global_constant" that takes context_ptr as Integer, cf
 
                         Set loads_replaced to loads_replaced plus 1
 
-                        Display "propagate_global_constant: propagated global " joined with global_id joined with " to value " joined with result_value_id
+                        Let prop_global_str be proc integer_to_string from StringUtils with global_id
+                        Let prop_value_str be proc integer_to_string from StringUtils with result_value_id
+                        Display "propagate_global_constant: propagated global " joined with prop_global_str joined with " to value " joined with prop_value_str
                     End If
                 End If
             End If
@@ -1156,7 +1178,9 @@ Process called "propagate_global_constant" that takes context_ptr as Integer, cf
         Set i to i plus 1
     End While
 
-    Display "propagate_global_constant: replaced " joined with loads_replaced joined with " loads from global " joined with global_id
+    Let loads_replaced_str be proc integer_to_string from StringUtils with loads_replaced
+    Let global_id_done_str be proc integer_to_string from StringUtils with global_id
+    Display "propagate_global_constant: replaced " joined with loads_replaced_str joined with " loads from global " joined with global_id_done_str
 
     Note: Increment globals_propagated counter
     Let globals_propagated be proc memory_get_int64 from Layout with context_ptr, 64
@@ -1226,7 +1250,7 @@ Process called "analyze_all_global_constants" that takes context_ptr as Integer,
             Let key_str be proc get from List with keys, i
 
             Note: Convert key string back to integer
-            Let global_id be proc string_to_integer from String with key_str
+            Let global_id be proc string_to_integer from StringUtils with key_str
 
             Note: Propagate this global constant
             proc propagate_global_constant with context_ptr, cfg_ptr, global_id
@@ -1416,11 +1440,13 @@ Process called "analyze_function_for_summary" that takes context_ptr as Integer,
     Let return_const_value be 0
     Let first_return be 1
 
-    Let block_count be proc get_block_count from CFG with cfg_ptr
+    Note: Canonical block pointer list + cached count accessor
+    Let cp_blocks be proc get_mir_cfg_blocks from CFG with cfg_ptr
+    Let block_count be proc get_cfg_block_count from CFG with cfg_ptr
     Let i be 0
     While i is less than block_count:
-        Let block be proc get_block from CFG with cfg_ptr, i
-        Let instructions be proc get_block_instructions from CFG with block
+        Let block be proc get from List with cp_blocks, i
+        Let instructions be proc get_block_instructions from MIR with block
         Let inst_count be proc length from List with instructions
 
         Let j be 0
@@ -1435,7 +1461,7 @@ Process called "analyze_function_for_summary" that takes context_ptr as Integer,
 
                     Note: Check if this return value is constant by checking our constant values
                     Let const_values be proc memory_get_int64 from Layout with context_ptr, 8
-                    Let value_id_str be proc integer_to_string from String with return_value_id
+                    Let value_id_str be proc integer_to_string from StringUtils with return_value_id
                     Let has_const be proc contains from Dictionary with const_values, value_id_str
 
                     If has_const is equal to 1:
@@ -1484,9 +1510,9 @@ Process called "analyze_function_for_summary" that takes context_ptr as Integer,
         Note:   offset 16: constant_return_value (the constant value if has_constant_return == 1)
 
         proc memory_set_int64 from Layout with summary_ptr, 8, 1
-        proc memory_set_int64 from Layout with summary_ptr, 16, return_const_val
+        proc memory_set_int64 from Layout with summary_ptr, 16, return_const_value
 
-        Display "analyze_function_for_summary: function " joined with function_id joined with " has constant return: " joined with return_const_val
+        Display "analyze_function_for_summary: function " joined with function_id joined with " has constant return: " joined with return_const_value
     Otherwise:
         Note: No constant return
         proc memory_set_int64 from Layout with summary_ptr, 8, 0
@@ -1553,12 +1579,14 @@ Process called "check_function_purity" that takes cfg_ptr as Integer returns Int
     End If
 
     Note: Scan all blocks for side effects
-    Let block_count be proc get_block_count from CFG with cfg_ptr
+    Note: Canonical block pointer list + cached count accessor
+    Let cp_blocks be proc get_mir_cfg_blocks from CFG with cfg_ptr
+    Let block_count be proc get_cfg_block_count from CFG with cfg_ptr
     Let i be 0
 
     While i is less than block_count:
-        Let block be proc get_block from CFG with cfg_ptr, i
-        Let instructions be proc get_block_instructions from CFG with block
+        Let block be proc get from List with cp_blocks, i
+        Let instructions be proc get_block_instructions from MIR with block
         Let inst_count be proc length from List with instructions
 
         Let j be 0
@@ -1601,7 +1629,7 @@ Process called "check_function_purity" that takes cfg_ptr as Integer returns Int
                 Note: Check for CALL (function calls have side effects)
                 If opcode is equal to 20008:  Note: MIR_CALL
                     Note: Check if callee is known to be pure
-                    Let callee_id be proc get_call_target from MIRNodes with inst
+                    Let callee_id be proc get_call_callee from MIRNodes with inst
 
                     Note: Check known pure functions (math functions, etc.)
                     Let callee_is_pure be proc is_known_pure_function with callee_id
@@ -1662,11 +1690,13 @@ Process called "find_defining_instruction" that takes cfg_ptr as Integer, value_
         Return 0
     End If
 
-    Let block_count be proc get_block_count from CFG with cfg_ptr
+    Note: Canonical block pointer list + cached count accessor
+    Let cp_blocks be proc get_mir_cfg_blocks from CFG with cfg_ptr
+    Let block_count be proc get_cfg_block_count from CFG with cfg_ptr
     Let i be 0
     While i is less than block_count:
-        Let block be proc get_block from CFG with cfg_ptr, i
-        Let instructions be proc get_block_instructions from CFG with block
+        Let block be proc get from List with cp_blocks, i
+        Let instructions be proc get_block_instructions from MIR with block
         Let inst_count be proc length from List with instructions
 
         Let j be 0
@@ -1811,14 +1841,20 @@ Process called "propagate_constant_through_call" that takes context_ptr as Integ
     Note: Verify all arguments are constant
     Let all_args_constant be 1
 
-    Note: Get argument count from CALL instruction
+    Note: Get argument count from CALL instruction (canonical MIR_CALL is
+    Note: 20304; arguments live in the ext List read via the accessors —
+    Note: the historical 20008 test matched MIR_COPY post-OD-5)
     Let opcode be proc get_mir_node_opcode from MIR with call_ptr
-    If opcode is equal to 20008:  Note: MIR_CALL
-        Let arg_count be proc get_call_arg_count from MIRNodes with call_ptr
+    If opcode is equal to 20304:  Note: MIR_CALL
+        Let arg_count be proc get_call_argument_count from MIRNodes with call_ptr
+        Let call_args be proc get_call_arguments from MIRNodes with call_ptr
 
         Let i be 0
         While i is less than arg_count:
-            Let arg_value_id be proc get_call_arg from MIRNodes with call_ptr, i
+            Let arg_value_id be 0
+            If call_args is not equal to 0:
+                Set arg_value_id to proc get from List with call_args, i
+            End If
 
             Note: Check if this argument is constant
             If context_ptr is not equal to 0:
@@ -1984,7 +2020,7 @@ Process called "analyze_interprocedural_constants" that takes context_ptr as Int
                 Let summary be proc analyze_function_for_summary with context_ptr, function_cfg, i
 
                 If summary is not equal to 0:
-                    Let func_id_str be proc integer_to_string from String with i
+                    Let func_id_str be proc integer_to_string from StringUtils with i
                     proc set from Dictionary with function_summaries, func_id_str, summary
 
                     Display "analyze_interprocedural_constants: created summary for function " joined with i
@@ -1996,12 +2032,14 @@ Process called "analyze_interprocedural_constants" that takes context_ptr as Int
     End While
 
     Note: Step 2: Find and analyze all CALL instructions
-    Let block_count be proc get_block_count from CFG with cfg
+    Note: Canonical block pointer list + cached count accessor
+    Let cp_blocks be proc get_mir_cfg_blocks from CFG with cfg
+    Let block_count be proc get_cfg_block_count from CFG with cfg
     Set i to 0
 
     While i is less than block_count:
-        Let block be proc get_block from CFG with cfg, i
-        Let instructions be proc get_block_instructions from CFG with block
+        Let block be proc get from List with cp_blocks, i
+        Let instructions be proc get_block_instructions from MIR with block
         Let inst_count be proc length from List with instructions
 
         Let j be 0
@@ -2013,8 +2051,8 @@ Process called "analyze_interprocedural_constants" that takes context_ptr as Int
                 Note: Process CALL instructions
                 If opcode is equal to 20008:  Note: MIR_CALL
                     Note: Get callee function ID
-                    Let callee_id be proc get_call_target from MIRNodes with inst
-                    Let callee_id_str be proc integer_to_string from String with callee_id
+                    Let callee_id be proc get_call_callee from MIRNodes with inst
+                    Let callee_id_str be proc integer_to_string from StringUtils with callee_id
 
                     Note: Check if we have a summary for this function
                     Let has_summary be proc contains from Dictionary with function_summaries, callee_id_str
@@ -2177,7 +2215,7 @@ Process called "track_array_constant_store" that takes context_ptr as Integer, a
     End If
 
     Let array_constants be proc memory_get_int64 from Layout with context_ptr, 32
-    Let array_id_str be proc integer_to_string from String with array_id
+    Let array_id_str be proc integer_to_string from StringUtils with array_id
 
     Note: Get or create array constant info
     Let contains_array be proc contains from Dictionary with array_constants, array_id_str
@@ -2193,7 +2231,7 @@ Process called "track_array_constant_store" that takes context_ptr as Integer, a
 
     Note: Add constant to element_constants dictionary
     Let element_constants be proc memory_get_int64 from Layout with info_ptr, 8
-    Let index_str be proc integer_to_string from String with index
+    Let index_str be proc integer_to_string from StringUtils with index
     proc set from Dictionary with element_constants, index_str, value_const
 
     Note: Update element count
@@ -2232,7 +2270,7 @@ Process called "get_array_element_constant" that takes context_ptr as Integer, a
     End If
 
     Let array_constants be proc memory_get_int64 from Layout with context_ptr, 32
-    Let array_id_str be proc integer_to_string from String with array_id
+    Let array_id_str be proc integer_to_string from StringUtils with array_id
 
     Note: Check if array has constant info
     Let contains_array be proc contains from Dictionary with array_constants, array_id_str
@@ -2244,7 +2282,7 @@ Process called "get_array_element_constant" that takes context_ptr as Integer, a
 
     Note: Check if this element is constant
     Let element_constants be proc memory_get_int64 from Layout with info_ptr, 8
-    Let index_str be proc integer_to_string from String with index
+    Let index_str be proc integer_to_string from StringUtils with index
 
     Let contains_element be proc contains from Dictionary with element_constants, index_str
     If contains_element is equal to 0:
@@ -2372,12 +2410,14 @@ Process called "analyze_array_constants" that takes context_ptr as Integer, cfg_
     Let arrays_propagated be 0
 
     Note: Pass 1: Find array allocations and constant stores
-    Let block_count be proc get_block_count from CFG with cfg_ptr
+    Note: Canonical block pointer list + cached count accessor
+    Let cp_blocks be proc get_mir_cfg_blocks from CFG with cfg_ptr
+    Let block_count be proc get_cfg_block_count from CFG with cfg_ptr
     Let i be 0
 
     While i is less than block_count:
-        Let block be proc get_block from CFG with cfg_ptr, i
-        Let instructions be proc get_block_instructions from CFG with block
+        Let block be proc get from List with cp_blocks, i
+        Let instructions be proc get_block_instructions from MIR with block
         Let inst_count be proc length from List with instructions
 
         Let j be 0
@@ -2420,8 +2460,8 @@ Process called "analyze_array_constants" that takes context_ptr as Integer, cfg_
     Note: Pass 2: Propagate constants through array loads
     Let k be 0
     While k is less than block_count:
-        Set block to proc get_block from CFG with cfg_ptr, k
-        Set instructions to proc get_block_instructions from CFG with block
+        Set block to proc get from List with cp_blocks, k
+        Set instructions to proc get_block_instructions from MIR with block
         Set inst_count to proc length from List with instructions
 
         Let m be 0
@@ -2654,7 +2694,9 @@ Process called "should_run_constant_prop" that takes cfg_ptr as Integer returns 
     End If
 
     Note: Get block count
-    Let block_count be proc get_block_count from CFG with cfg_ptr
+    Note: Canonical block pointer list + cached count accessor
+    Let cp_blocks be proc get_mir_cfg_blocks from CFG with cfg_ptr
+    Let block_count be proc get_cfg_block_count from CFG with cfg_ptr
 
     Note: Skip trivial functions
     If block_count is less than 2:

@@ -18,1208 +18,142 @@ Note:
 This file handles tail call optimization (TCO) for MIR.
 
 This file performs the following tasks:
-- Process tail call identification and analysis
-- Handle tail recursion to loop transformation
-- Manage calling convention compatibility checking
-- Process sibling tail call optimization
+- Identify calls in tail position (a CALL/CALL_INDIRECT whose result flows
+  directly into the function's RETURN with no intervening computation)
+- Stamp the canonical is_tail_call flag (MIRCall extended offset 120) on each
+  confirmed tail call
 
 This file is essential because of the following reasons:
-- Tail call optimization enables constant stack space for recursive functions
-- Proper TCO is essential for functional programming patterns
-- Tail recursion elimination prevents stack overflow in deep recursion
+- The LIR layer consumes the is_tail_call flag for jmp-vs-call selection,
+  enabling constant-stack-space tail recursion and reuse of the caller frame
+- Functional programming patterns rely on tail-call elimination to avoid stack
+  overflow in deep recursion
+
+DESIGN NOTE (canonical contract, matches transformations/optimization.runa
+optimize_tail_calls):
+A previous revision attempted a bespoke self-recursion-to-loop rewrite that
+deleted the call+return and jumped to the entry block WITHOUT rebinding the
+call's arguments to the function's parameters. Under the canonical lowering
+contract, parameters are materialized through allocas rather than the
+MIRFunction parameter value-id List, so a sound MIR-level argument rebinding
+has no parameter value ids to target. The complete and correct mechanism is to
+stamp the canonical flag and let the LIR tail-call lowering own argument
+placement and the actual jump emission — which is sound for self-recursive and
+cross-function tail calls alike.
 
 This file consists of the following functions/features/operation types:
-- Tail position analysis and tail call identification
-- Tail recursion to iterative loop transformation
-- Sibling tail call optimization and marking
-- Calling convention analysis for tail call eligibility
+- Tail-position detection over the canonical instruction stream
+- is_tail_call flag stamping
+- Per-function and per-program drivers
 :End Note
 
-Note: ========== IMPORTS ==========
+Note: ============================================================
+Note: IMPORTS
+Note: ============================================================
 Import "compiler/middle/gungnir/mir/mir.runa" as MIR
 Import "compiler/middle/gungnir/mir/mir_nodes.runa" as MIRNodes
 Import "compiler/middle/gungnir/mir/cfg.runa" as CFG
-Import "compiler/middle/gungnir/mir/ssa.runa" as SSA
-Import "compiler/middle/gungnir/mir/dominance.runa" as Dominance
 Import "compiler/frontend/primitives/memory/layout.runa" as Layout
 Import "compiler/frontend/primitives/collections/list.runa" as List
-Import "compiler/frontend/primitives/collections/dictionary.runa" as Dictionary
-Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/internal/string_utils.runa" as StringUtils
 
 Note: ============================================================
-Note: TYPE DEFINITIONS
-Note: ============================================================
-
-@Reasoning
-TailCallContext stores all state needed for tail call optimization analysis and transformation.
-It tracks the current function being analyzed, CFG and SSA information, and maintains
-statistics about optimizations performed.
-
-The context includes caches for tail call sites and calling convention compatibility
-to avoid redundant analysis. This is particularly important for large functions with
-many call sites.
-
-Size calculation (64-bit pointers, 8 bytes each):
-- 11 fields * 8 bytes = 88 bytes per context
-@End Reasoning
-
-Type called "TailCallContext":
-    cfg as Integer                          Note: CFG pointer for control flow analysis
-    ssa_ptr as Integer                      Note: SSA information pointer
-    dominance_ptr as Integer                Note: Dominance tree pointer
-    current_function_ptr as Integer         Note: Pointer to function being optimized
-    tail_recursion_eliminated as Integer    Note: Counter for tail recursion eliminations
-    sibling_calls_marked as Integer         Note: Counter for sibling tail calls marked
-    total_tail_calls as Integer             Note: Total tail calls identified
-    tail_call_sites as Integer              Note: List of TailCallSite structures
-    blocks_processed as Integer             Note: Number of blocks analyzed
-    call_convention_cache as Integer        Note: Dictionary: callee_ptr -> compatibility_bool
-    instruction_cache as Integer            Note: Dictionary: block_id -> instruction_list
-End Type
-
-@Reasoning
-TailCallSite represents a single identified tail call location in the program.
-It captures all information needed to determine if the call can be optimized
-and to perform the transformation if applicable.
-
-We track whether it's a recursive call (to current function) or sibling call
-(to another function), as these require different transformation strategies.
-
-Size calculation:
-- 6 fields * 8 bytes = 48 bytes per tail call site
-@End Reasoning
-
-Type called "TailCallSite":
-    call_instruction_ptr as Integer         Note: Pointer to MIR_CALL instruction
-    block_ptr as Integer                    Note: Pointer to containing basic block
-    is_recursive as Integer                 Note: Boolean: 1 if self-recursive, 0 otherwise
-    callee_ptr as Integer                   Note: Pointer to called function
-    can_optimize as Integer                 Note: Boolean: 1 if can apply TCO, 0 otherwise
-    transformation_applied as Integer       Note: Boolean: 1 if already transformed, 0 otherwise
-End Type
-
-Note: ============================================================
-Note: CONTEXT MANAGEMENT
+Note: TAIL CALL IDENTIFICATION + STAMPING
 Note: ============================================================
 
 @Reasoning
-Construction is centralised so every downstream pass receives a context with predictable
-field layout and zeroed counters. The cfg pointer is captured at construction time because
-tail-call analysis is inherently scoped to a single CFG and we want every later helper to
-read it from one canonical slot. Caches (call-convention, instruction) are allocated up
-front so the hot loops in collect_tail_call_sites and check_calling_convention_compatibility
-can assume non-null dictionaries and avoid per-call null checks.
+Tail-position detection works on the canonical block instruction stream. A call
+is in tail position when the block ends with the pattern
+    ... ; <call> ; <return>
+where <call> is MIR_CALL (20304) or MIR_CALL_INDIRECT (20305), <return> is
+MIR_RETURN (20303), and the return's returned value-id equals the call's result
+value-id. The both-zero case (void call followed by void return) is also a tail
+call: a void call has result value-id 0 and a void return carries returned
+value-id 0, so the equality test admits it.
+
+WHY THE LAST-TWO-INSTRUCTIONS SHAPE:
+After SSA construction and CFG normalization, a return that consumes a call
+result sits immediately after the call in the same block; there is no
+intervening computation on the result by definition of tail position. We do not
+chase single-successor jump chains because the MIR builder collapses trivial
+branch chains, so the in-block shape captures the realistic patterns while the
+predicate stays O(1) per block.
+
+WHY WE SKIP ALREADY-STAMPED CALLS:
+The O3 pipeline runs passes to a fixpoint. Re-counting an already-stamped tail
+call would keep the "changed" flag set forever and prevent convergence, so a
+call whose flag is already 1 is not recounted.
+
+WHY CONSERVATIVE:
+A false positive would let a non-tail call be lowered as a jump and corrupt the
+caller's stack frame, so every uncertain path declines to stamp.
 @End Reasoning
 
 @Implementation
-Creates and initializes a TailCallContext structure for a given CFG.
-All counters start at zero, and caches are initialized as empty collections.
-
-Memory allocation:
-- Context structure: 88 bytes
-- tail_call_sites: List structure
-- call_convention_cache: Dictionary structure
-- instruction_cache: Dictionary structure
-
-Returns pointer to initialized context, or 0 on allocation failure.
+Scans every block of the CFG and stamps is_tail_call on every confirmed tail
+call. Returns the number of newly-stamped tail calls.
 @End Implementation
-
-Process called "create_tail_call_context" that takes cfg_ptr as Integer returns Integer:
+Process called "stamp_tail_calls" that takes cfg_ptr as Integer returns Integer:
     If cfg_ptr is equal to 0:
         Return 0
     End If
 
-    Let context_size be 88
-    Let context be proc allocate from Layout with context_size
-
-    If context is equal to 0:
-        Return 0
-    End If
-
-    Note: Store CFG pointer
-    proc memory_set_int64 from Layout with context, 0, cfg_ptr
-
-    Note: Initialize SSA pointer (retrieve from CFG or function)
-    Let ssa_ptr be 0
-    proc memory_set_int64 from Layout with context, 8, ssa_ptr
-
-    Note: Initialize dominance pointer
-    Let dominance_ptr be 0
-    proc memory_set_int64 from Layout with context, 16, dominance_ptr
-
-    Note: Initialize current_function_ptr to 0 (will be set during optimization)
-    proc memory_set_int64 from Layout with context, 24, 0
-
-    Note: Initialize counters
-    proc memory_set_int64 from Layout with context, 32, 0  Note: tail_recursion_eliminated
-    proc memory_set_int64 from Layout with context, 40, 0  Note: sibling_calls_marked
-    proc memory_set_int64 from Layout with context, 48, 0  Note: total_tail_calls
-
-    Note: Create tail call sites list
-    Let tail_sites be proc create from List
-    proc memory_set_int64 from Layout with context, 56, tail_sites
-
-    Note: Initialize blocks_processed counter
-    proc memory_set_int64 from Layout with context, 64, 0
-
-    Note: Create call convention cache
-    Let cc_cache be proc create from Dictionary
-    proc memory_set_int64 from Layout with context, 72, cc_cache
-
-    Note: Create instruction cache
-    Let inst_cache be proc create from Dictionary
-    proc memory_set_int64 from Layout with context, 80, inst_cache
-
-    Return context
-End Process
-
-@Reasoning
-The context owns three transitive allocations (sites list, two dictionaries) plus an
-optional dominance tree, and each TailCallSite is itself a heap object. We free in the
-inverse order of construction so dangling references cannot occur even if a future
-extension caches cross-references between caches and site records. The destructor is
-defensive (early-returns on null and per-slot null checks) so it is safe to call from
-error-recovery paths in optimize_function_with_tail_call without partial-init risk.
-@End Reasoning
-
-@Implementation
-Destroys a TailCallContext and frees all associated memory.
-This includes freeing all tail call site structures, caches, and the context itself.
-
-Proper cleanup prevents memory leaks in the optimization pipeline.
-@End Implementation
-
-Process called "destroy_tail_call_context" that takes context_ptr as Integer returns Nothing:
-    If context_ptr is equal to 0:
-        Return
-    End If
-
-    Note: Free tail call sites list (including individual site structures)
-    Let tail_sites be proc memory_get_int64 from Layout with context_ptr, 56
-    If tail_sites is not equal to 0:
-        Let site_count be proc length from List with tail_sites
-        Let i be 0
-        While i is less than site_count:
-            Let site_ptr be proc get from List with tail_sites, i
-            If site_ptr is not equal to 0:
-                proc deallocate from Layout with site_ptr
-            End If
-            Set i to i plus 1
-        End While
-        proc destroy from List with tail_sites
-    End If
-
-    Note: Free call convention cache
-    Let cc_cache be proc memory_get_int64 from Layout with context_ptr, 72
-    If cc_cache is not equal to 0:
-        proc destroy from Dictionary with cc_cache
-    End If
-
-    Note: Free instruction cache
-    Let inst_cache be proc memory_get_int64 from Layout with context_ptr, 80
-    If inst_cache is not equal to 0:
-        proc destroy from Dictionary with inst_cache
-    End If
-
-    Note: Free dominance pointer if allocated
-    Let dominance_ptr be proc memory_get_int64 from Layout with context_ptr, 16
-    If dominance_ptr is not equal to 0:
-        proc destroy_dominance_tree from Dominance with dominance_ptr
-    End If
-
-    Note: Free context structure
-    proc deallocate from Layout with context_ptr
-End Process
-
-@Reasoning
-Stats output is the only feedback channel the pass exposes when running outside of a
-debugger, and the four counters reported here (tail recursion eliminations, sibling
-marks, total tail calls identified, blocks analysed) are precisely the four metrics that
-let a CI dashboard distinguish "pass disabled" from "pass ran but found nothing" from
-"pass ran and rewrote N sites". Keeping the format stable across versions matters for
-that downstream consumer.
-@End Reasoning
-
-@Implementation
-Prints statistics about tail call optimization transformations.
-This provides visibility into the effectiveness of the optimization pass.
-@End Implementation
-
-Process called "print_tail_call_stats" that takes context_ptr as Integer returns Nothing:
-    If context_ptr is equal to 0:
-        Return
-    End If
-
-    Display "========== Tail Call Optimization Statistics =========="
-
-    Let tail_recursion_count be proc memory_get_int64 from Layout with context_ptr, 32
-    Display "Tail recursion eliminations: " joined with tail_recursion_count
-
-    Let sibling_count be proc memory_get_int64 from Layout with context_ptr, 40
-    Display "Sibling tail calls marked: " joined with sibling_count
-
-    Let total_tail_calls be proc memory_get_int64 from Layout with context_ptr, 48
-    Display "Total tail calls identified: " joined with total_tail_calls
-
-    Let blocks_processed be proc memory_get_int64 from Layout with context_ptr, 64
-    Display "Basic blocks analyzed: " joined with blocks_processed
-
-    Display "======================================================="
-End Process
-
-Note: ============================================================
-Note: TAIL POSITION ANALYSIS
-Note: ============================================================
-
-@Reasoning
-A call is in tail position if it is the last operation before returning from the function.
-More precisely, a call instruction I is in tail position if:
-
-1. The value produced by I is directly returned (no computation on the result)
-2. There are no side effects between I and the return
-3. Control flow goes directly from I to a return instruction
-
-In SSA form with basic blocks, this means:
-- The call instruction is followed immediately by a return instruction, OR
-- The call instruction is at the end of a block that has only one successor,
-  and that successor block contains only a return of the call's result
-
-This function performs conservative analysis - it returns false if uncertain.
-@End Reasoning
-
-@Implementation
-Checks if a call instruction is in tail position within its function.
-
-Algorithm:
-1. Get the call instruction's containing block
-2. Find the next instruction after the call
-3. If next instruction is a RETURN, check if it returns the call result
-4. If call is at end of block, check successor blocks for immediate return
-5. Return true only if definitely in tail position
-
-Returns 1 if in tail position, 0 otherwise.
-@End Implementation
-
-@Performance_Hints
-Call-shape detection is constant-time in the common in-block case — we peek at the next
-instruction — and at worst linear in successor count when the call sits at a block
-terminator. We deliberately do not walk arbitrary chains of single-successor blocks:
-that would push detection toward block-count work per call and the upstream MIR-builder
-already collapses trivial branch chains. Conservative single-hop lookahead therefore
-captures the realistic patterns while keeping the predicate cheap enough to run
-unconditionally on every CALL site in collect_tail_call_sites.
-@End Performance_Hints
-
-@Security_Scope
-A false positive here would let a non-tail call be rewritten as a jump, corrupting the
-caller's stack frame at runtime. We therefore default to 0 on every uncertain path
-(missing parent block, non-RETURN successor first instruction, mismatched return operand)
-rather than assuming benign shape. This conservative bias is intentional and must be
-preserved by any future refinement that adds new call-shape patterns.
-@End Security_Scope
-
-Process called "is_tail_position" that takes call_inst_ptr as Integer, context_ptr as Integer returns Integer:
-    If call_inst_ptr is equal to 0 or context_ptr is equal to 0:
-        Return 0
-    End If
-
-    Note: Get the call instruction's value ID (the result it produces)
-    Let call_value_id be proc get_value_id from MIR with call_inst_ptr
-
-    Note: Get the call instruction's parent block
-    Let block_ptr be proc get_parent_block from MIR with call_inst_ptr
-    If block_ptr is equal to 0:
-        Return 0
-    End If
-
-    Note: Get the next instruction after the call
-    Let next_inst be proc get_next_instruction from MIR with call_inst_ptr
-
-    Note: Case 1: Next instruction is a return
-    If next_inst is not equal to 0:
-        Let next_opcode be proc get_opcode from MIR with next_inst
-        If next_opcode is equal to MIR.MIR_RETURN:
-            Note: Check if the return uses the call result directly
-            Let return_operand be proc get_operand from MIR with next_inst, 0
-            If return_operand is equal to call_value_id:
-                Return 1
-            End If
-            Note: Also accept if return has no operand (void return after call)
-            If return_operand is equal to 0:
-                Return 1
-            End If
-        End If
-    End If
-
-    Note: Case 2: Call is at end of block, check successor
-    If next_inst is equal to 0:
-        Note: Call is the last instruction in block
-        Let successors be proc get_block_successors from MIR with block_ptr
-        Let successor_count be proc length from List with successors
-
-        Note: Must have exactly one successor
-        If successor_count is equal to 1:
-            Let succ_block_id be proc get from List with successors, 0
-            Let succ_block_ptr be proc get_block_by_id from CFG with context_ptr, succ_block_id
-
-            If succ_block_ptr is not equal to 0:
-                Note: Check if successor block immediately returns the call result
-                Let first_inst be proc get_first_instruction from CFG with succ_block_ptr
-                If first_inst is not equal to 0:
-                    Let first_opcode be proc get_opcode from MIR with first_inst
-                    If first_opcode is equal to MIR.MIR_RETURN:
-                        Set return_operand to proc get_operand from MIR with first_inst, 0
-                        If return_operand is equal to call_value_id:
-                            Return 1
-                        End If
-                    End If
-                End If
-            End If
-        End If
-    End If
-
-    Note: Not in tail position
-    Return 0
-End Process
-
-@Reasoning
-Determines if a call instruction is a recursive call to the current function.
-This is essential for identifying tail recursion elimination opportunities.
-
-In MIR, calls can be:
-- MIR_CALL: Direct call with known target function
-- MIR_CALL_INDIRECT: Indirect call through function pointer (cannot optimize)
-
-For direct calls, we compare the callee function pointer with the current
-function pointer stored in the context.
-@End Reasoning
-
-@Implementation
-Checks if a call instruction is a self-recursive call.
-
-Algorithm:
-1. Verify the call is a direct call (not indirect)
-2. Extract the callee function pointer from the call instruction
-3. Compare with current function pointer in context
-4. Return true if they match
-
-Returns 1 if recursive call, 0 otherwise.
-@End Implementation
-
-Process called "is_recursive_call" that takes call_inst_ptr as Integer, context_ptr as Integer returns Integer:
-    If call_inst_ptr is equal to 0 or context_ptr is equal to 0:
-        Return 0
-    End If
-
-    Note: Only direct calls can be tail-call optimized
-    Let opcode be proc get_opcode from MIR with call_inst_ptr
-    If opcode is not equal to MIR.MIR_CALL:
-        Return 0
-    End If
-
-    Note: Get the callee function pointer from the call instruction
-    Note: For MIR_CALL, operand 0 is typically the callee function
-    Let callee_ptr be proc get_operand from MIR with call_inst_ptr, 0
-    If callee_ptr is equal to 0:
-        Return 0
-    End If
-
-    Note: Get current function pointer from context
-    Let current_func_ptr be proc memory_get_int64 from Layout with context_ptr, 24
-    If current_func_ptr is equal to 0:
-        Return 0
-    End If
-
-    Note: Check if callee matches current function
-    If callee_ptr is equal to current_func_ptr:
-        Return 1
-    End If
-
-    Return 0
-End Process
-
-Note: ============================================================
-Note: TAIL CALL SITE COLLECTION
-Note: ============================================================
-
-@Reasoning
-Collecting all tail call sites in a function requires traversing all basic blocks
-and examining all call instructions. We identify both recursive and sibling tail calls.
-
-The collection phase separates identification from transformation, allowing us to:
-1. Gather complete information about all tail calls
-2. Make informed decisions about which calls to optimize
-3. Order transformations optimally (recursive before sibling)
-
-We create TailCallSite structures for each identified tail call, storing all
-necessary information for later transformation.
-@End Reasoning
-
-@Implementation
-Scans all basic blocks in the CFG and identifies tail call sites.
-
-Algorithm:
-1. Iterate through all basic blocks in the CFG
-2. For each block, examine all instructions
-3. When a CALL instruction is found:
-   a. Check if it's in tail position
-   b. Determine if it's recursive or sibling call
-   c. Create TailCallSite structure
-   d. Add to tail_call_sites list in context
-4. Update statistics
-
-Returns number of tail call sites identified.
-@End Implementation
-
-Process called "collect_tail_call_sites" that takes context_ptr as Integer returns Integer:
-    If context_ptr is equal to 0:
-        Return 0
-    End If
-
-    Let cfg_ptr be proc memory_get_int64 from Layout with context_ptr, 0
-    If cfg_ptr is equal to 0:
-        Return 0
-    End If
-
-    Let tail_sites be proc memory_get_int64 from Layout with context_ptr, 56
-    Let site_count be 0
-
-    Note: Get all blocks from CFG
-    Let blocks be proc get_all_blocks from CFG with cfg_ptr
+    Let blocks be proc get_mir_cfg_blocks from CFG with cfg_ptr
     If blocks is equal to 0:
         Return 0
     End If
 
     Let block_count be proc length from List with blocks
+    Let stamped be 0
     Let block_idx be 0
 
-    Note: Iterate through all blocks
     While block_idx is less than block_count:
-        Let block_ptr be proc get from List with blocks, block_idx
-
+        Let block_ptr be proc list_get from List with blocks, block_idx
         If block_ptr is not equal to 0:
-            Note: Get instructions in this block
-            Let instructions be proc get_block_instructions from CFG with block_ptr
+            Let instructions be proc get_block_instructions from MIR with block_ptr
             If instructions is not equal to 0:
                 Let inst_count be proc length from List with instructions
-                Let inst_idx be 0
+                If inst_count is greater than or equal to 2:
+                    Let call_inst be proc list_get from List with instructions, inst_count minus 2
+                    Let ret_inst be proc list_get from List with instructions, inst_count minus 1
 
-                Note: Examine each instruction
-                While inst_idx is less than inst_count:
-                    Let inst_ptr be proc get from List with instructions, inst_idx
+                    If call_inst is not equal to 0 and ret_inst is not equal to 0:
+                        Let call_opcode be proc get_mir_node_opcode from MIR with call_inst
+                        Let ret_opcode be proc get_mir_node_opcode from MIR with ret_inst
 
-                    If inst_ptr is not equal to 0:
-                        Let opcode be proc get_opcode from MIR with inst_ptr
+                        Let is_call be 0
+                        If call_opcode is equal to 20304:  Note: MIR_CALL
+                            Set is_call to 1
+                        End If
+                        If call_opcode is equal to 20305:  Note: MIR_CALL_INDIRECT
+                            Set is_call to 1
+                        End If
 
-                        Note: Check if this is a CALL instruction
-                        If opcode is equal to MIR.MIR_CALL:
-                            Note: Check if call is in tail position
-                            Let in_tail_pos be proc is_tail_position with inst_ptr, context_ptr
+                        If is_call is equal to 1:
+                            If ret_opcode is equal to 20303:  Note: MIR_RETURN
+                                Let call_result be proc get_mir_node_value_id from MIR with call_inst
+                                Let ret_value be proc get_return_value from MIRNodes with ret_inst
 
-                            If in_tail_pos is equal to 1:
-                                Note: Create TailCallSite structure
-                                Let site_size be 48
-                                Let site_ptr be proc allocate from Layout with site_size
-
-                                If site_ptr is not equal to 0:
-                                    Note: Set call_instruction_ptr
-                                    proc memory_set_int64 from Layout with site_ptr, 0, inst_ptr
-
-                                    Note: Set block_ptr
-                                    proc memory_set_int64 from Layout with site_ptr, 8, block_ptr
-
-                                    Note: Check if recursive
-                                    Let is_rec be proc is_recursive_call with inst_ptr, context_ptr
-                                    proc memory_set_int64 from Layout with site_ptr, 16, is_rec
-
-                                    Note: Set callee_ptr
-                                    Let callee_ptr be proc get_operand from MIR with inst_ptr, 0
-                                    proc memory_set_int64 from Layout with site_ptr, 24, callee_ptr
-
-                                    Note: Set can_optimize (initially true, may be refined later)
-                                    proc memory_set_int64 from Layout with site_ptr, 32, 1
-
-                                    Note: Set transformation_applied to false
-                                    proc memory_set_int64 from Layout with site_ptr, 40, 0
-
-                                    Note: Add to tail_call_sites list
-                                    proc append from List with tail_sites, site_ptr
-
-                                    Set site_count to site_count plus 1
+                                If call_result is equal to ret_value:
+                                    Let already_tail be proc is_tail_call from MIRNodes with call_inst
+                                    If already_tail is equal to 0:
+                                        Note: Stamp the canonical is_tail_call flag at the
+                                        Note: MIRCall extended offset 120 (OD-1 prefix
+                                        Note: embedding) for the LIR jmp-vs-call selector.
+                                        proc memory_set_int64 from Layout with call_inst, 120, 1
+                                        Set stamped to stamped plus 1
+                                    End If
                                 End If
                             End If
                         End If
                     End If
-
-                    Set inst_idx to inst_idx plus 1
-                End While
+                End If
             End If
-
-            Note: Update blocks_processed counter
-            Let blocks_processed be proc memory_get_int64 from Layout with context_ptr, 64
-            Set blocks_processed to blocks_processed plus 1
-            proc memory_set_int64 from Layout with context_ptr, 64, blocks_processed
         End If
-
         Set block_idx to block_idx plus 1
     End While
 
-    Note: Update total_tail_calls counter in context
-    proc memory_set_int64 from Layout with context_ptr, 48, site_count
-
-    Return site_count
-End Process
-
-Note: ============================================================
-Note: TAIL RECURSION TRANSFORMATION
-Note: ============================================================
-
-@Reasoning
-Tail recursion elimination transforms a recursive function into an iterative loop.
-This is one of the most important optimizations for functional programming patterns.
-
-The transformation strategy:
-1. Create a loop header block (target of backward jump)
-2. Replace function parameters with phi nodes in loop header
-3. Replace tail recursive call with parameter updates + jump to loop header
-4. The original function entry jumps to loop header initially
-
-Example transformation (schematic, parameters n and acc):
-  BEFORE:
-    Process func taking n, acc:
-      If n is equal to 0 return acc
-      Return func with n minus 1, acc plus n
-
-  AFTER:
-    Process func taking n, acc:
-      loop_header:
-        n_phi   := phi over [n, entry], [n_new, recurse]
-        acc_phi := phi over [acc, entry], [acc_new, recurse]
-        If n_phi is equal to 0 return acc_phi
-        n_new   := n_phi minus 1
-        acc_new := acc_phi plus n_phi
-        jump loop_header
-
-This maintains correctness while using constant stack space.
-@End Reasoning
-
-@Implementation
-Transforms a tail recursive function into an iterative loop.
-
-Algorithm:
-1. Create new loop header block with phi nodes for parameters
-   - Phi nodes are allocated via create_mir_phi_node so the extended
-     MIRPhi struct is fully initialized: result_value_id (offset 8),
-     incoming_pairs List (offset 16), incoming_count (offset 24),
-     result_type (offset 32), parent_block (offset 40).
-   - The entry-edge operand (predecessor = entry block, value = original
-     parameter) is appended via add_phi_incoming so the canonical pair
-     encoding (block_id then value_id in incoming_pairs, with the parallel
-     incoming_count bumped) is preserved.
-2. Redirect function entry to loop header
-3. For each tail recursive call:
-   a. Extract argument values
-   b. Append a back-edge phi operand (predecessor = block containing the
-      tail call, value = corresponding argument) via add_phi_incoming.
-      Raw offset writes to MIRPhi are forbidden because offset 16 is a
-      live List* and offset 24 is the count maintained by the API.
-   c. Replace CALL + RETURN with jump to loop header
-4. Update CFG edges
-5. Update SSA form (phi nodes and use-def chains)
-
-Returns 1 on success, 0 on failure.
-@End Implementation
-
-@Performance_Hints
-Stack-frame elision via loop-rewriting collapses a recursive activation tower into a
-single frame, so runtime cost drops from one prologue/epilogue pair per call depth to a
-single pair for the entire iteration. The rewrite itself runs linear in the sum of
-parameter count and recursive-site count, since each phi gets one entry-edge operand at
-construction and one recursive-edge operand per rewrite. We allocate scratch lists (temp_inst_list, phi_list) only as needed and reuse
-the same temporaries between the call-replacement and return-removal phases. SSA recomputation
-at the end is the dominant cost; we accept it because incremental phi maintenance across an
-arbitrary number of recursive sites is fragile compared to a single bulk rebuild.
-@End Performance_Hints
-
-@Security_Scope
-This pass mutates the CFG, instruction lists, and SSA form in place. The order of operations
-matters for correctness: phi nodes must exist in the loop header before recursive jumps are
-emitted (otherwise the back-edge references an undefined value), and the original RETURN must
-be removed before the CALL slot is repurposed (otherwise dead-code elimination cannot tell
-the rewritten flow from the unrewritten one). Every recursive site is gated by both
-can_optimize and transformation_applied so we cannot double-transform and cannot rewrite
-sites that an earlier compatibility step marked ineligible. Param count is read from the
-function structure once and reused, so an attacker cannot induce a mismatch by mutating
-the parameter list mid-pass.
-@End Security_Scope
-
-Process called "transform_tail_recursion_to_loop" that takes context_ptr as Integer returns Integer:
-    If context_ptr is equal to 0:
-        Return 0
-    End If
-
-    Let cfg_ptr be proc memory_get_int64 from Layout with context_ptr, 0
-    Let tail_sites be proc memory_get_int64 from Layout with context_ptr, 56
-    Let current_func_ptr be proc memory_get_int64 from Layout with context_ptr, 24
-
-    If cfg_ptr is equal to 0 or tail_sites is equal to 0 or current_func_ptr is equal to 0:
-        Return 0
-    End If
-
-    Note: Count recursive tail call sites
-    Let site_count be proc length from List with tail_sites
-    Let recursive_count be 0
-    Let i be 0
-
-    While i is less than site_count:
-        Let site_ptr be proc get from List with tail_sites, i
-        Let is_rec be proc memory_get_int64 from Layout with site_ptr, 16
-        If is_rec is equal to 1:
-            Set recursive_count to recursive_count plus 1
-        End If
-        Set i to i plus 1
-    End While
-
-    Note: If no recursive tail calls, nothing to transform
-    If recursive_count is equal to 0:
-        Return 1
-    End If
-
-    Note: Get function parameters (offset 16 in MIRFunction)
-    Let parameters be proc memory_get_int64 from Layout with current_func_ptr, 16
-    If parameters is equal to 0:
-        Return 0
-    End If
-
-    Let param_count be proc length from List with parameters
-
-    Note: Get entry block (offset 0 in MIRCFG = entry_block pointer)
-    Let entry_block be proc memory_get_int64 from Layout with cfg_ptr, 0
-    If entry_block is equal to 0:
-        Return 0
-    End If
-
-    Note: Generate unique block ID (offset 48 in MIRCFG = next_block_id)
-    Let loop_header_id be proc memory_get_int64 from Layout with cfg_ptr, 48
-
-    Note: Increment next_block_id in CFG
-    Let new_next_id be loop_header_id plus 1
-    proc memory_set_int64 from Layout with cfg_ptr, 48, new_next_id
-
-    Note: Create loop header block (label can be 0 for internal blocks)
-    Let loop_header_block be proc create_mir_basic_block from MIR with loop_header_id, 0
-
-    If loop_header_block is equal to 0:
-        Return 0
-    End If
-
-    Note: Get next_value_id from function for phi nodes (offset 56 in MIRFunction)
-    Let next_value_id be proc memory_get_int64 from Layout with current_func_ptr, 56
-
-    Note: Read entry block id up front; phi entry-edge operands are paired
-    Note: with this predecessor (offset 0 in MIRBasicBlock = block id).
-    Let entry_block_id_for_phi be proc memory_get_int64 from Layout with entry_block, 0
-
-    Note: Create phi nodes for each parameter in loop header
-    Let phi_list be proc create from List
-    Let param_idx be 0
-
-    While param_idx is less than param_count:
-        Let param_value_id be proc get from List with parameters, param_idx
-
-        Note: Allocate MIRPhi struct via the canonical constructor so the
-        Note: incoming_pairs List (offset 16) and incoming_count (offset 24)
-        Note: are wired up. Raw create_mir_node would yield only the base
-        Note: MIRNode and leave the phi-specific offsets uninitialized, which
-        Note: previously caused MIRPhi layout corruption when later writes
-        Note: targeted offsets 16 and 24 directly. result_type and parent_block
-        Note: are derived from the loop header context.
-        Let phi_node be proc create_mir_phi_node from MIRNodes with next_value_id, 0, loop_header_id
-        If phi_node is equal to 0:
-            Return 0
-        End If
-
-        Note: Increment the value-id counter; the phi result was assigned
-        Note: next_value_id atomically inside create_mir_phi_node.
-        Set next_value_id to next_value_id plus 1
-
-        Note: Set initial phi operand for the entry edge: the original
-        Note: parameter value flowing in from the function entry block.
-        Note: Routes through add_phi_incoming so incoming_pairs is appended
-        Note: with the (block, value) pair and incoming_count is bumped.
-        proc add_phi_incoming from MIRNodes with phi_node, entry_block_id_for_phi, param_value_id
-
-        Note: Store phi node in list
-        proc append from List with phi_list, phi_node
-
-        Note: Insert phi node at start of loop header block
-        Note: Get instruction list (offset 16 in MIRBasicBlock)
-        Let header_instructions be proc memory_get_int64 from Layout with loop_header_block, 16
-
-        Note: Insert at beginning of instruction list
-        Let first_inst be proc get from List with header_instructions, 0
-        If first_inst is not equal to 0:
-            Note: Insert before first instruction
-            Let temp_list be proc create from List
-            proc append from List with temp_list, phi_node
-
-            Let inst_count be proc length from List with header_instructions
-            Let j be 0
-            While j is less than inst_count:
-                Let existing_inst be proc get from List with header_instructions, j
-                proc append from List with temp_list, existing_inst
-                Set j to j plus 1
-            End While
-
-            Note: Replace instruction list
-            proc memory_set_int64 from Layout with loop_header_block, 16, temp_list
-        Otherwise:
-            Note: Empty block, just append
-            proc append from List with header_instructions, phi_node
-        End If
-
-        Set param_idx to param_idx plus 1
-    End While
-
-    Note: Update next_value_id in function
-    proc memory_set_int64 from Layout with current_func_ptr, 56, next_value_id
-
-    Note: Add loop header to CFG blocks list (offset 16 in MIRCFG)
-    Let blocks_list be proc memory_get_int64 from Layout with cfg_ptr, 16
-    proc append from List with blocks_list, loop_header_block
-
-    Note: Increment block_count (offset 24 in MIRCFG)
-    Let block_count be proc memory_get_int64 from Layout with cfg_ptr, 24
-    Set block_count to block_count plus 1
-    proc memory_set_int64 from Layout with cfg_ptr, 24, block_count
-
-    Note: Get entry block's original successor (offset 48 in MIRBasicBlock = successors)
-    Let entry_successors be proc memory_get_int64 from Layout with entry_block, 48
-    Let original_successor_id be proc get from List with entry_successors, 0
-
-    Note: Clear entry block's successors and add loop header
-    Let new_successors be proc create from List
-    proc append from List with new_successors, loop_header_id
-    proc memory_set_int64 from Layout with entry_block, 48, new_successors
-    proc memory_set_int64 from Layout with entry_block, 56, 1
-
-    Note: Set loop header as successor of entry, and original as successor of header
-    Let header_successors be proc memory_get_int64 from Layout with loop_header_block, 48
-    proc append from List with header_successors, original_successor_id
-    proc memory_set_int64 from Layout with loop_header_block, 56, 1
-
-    Note: Update loop header predecessors to include entry
-    Let header_predecessors be proc memory_get_int64 from Layout with loop_header_block, 32
-    Let entry_block_id be proc memory_get_int64 from Layout with entry_block, 0
-    proc append from List with header_predecessors, entry_block_id
-    proc memory_set_int64 from Layout with loop_header_block, 40, 1
-
-    Note: Transform each recursive tail call
-    Set i to 0
-    Let transformations_applied be 0
-
-    While i is less than site_count:
-        Set site_ptr to proc get from List with tail_sites, i
-        Set is_rec to proc memory_get_int64 from Layout with site_ptr, 16
-
-        If is_rec is equal to 1:
-            Let can_optimize be proc memory_get_int64 from Layout with site_ptr, 32
-            Let already_transformed be proc memory_get_int64 from Layout with site_ptr, 40
-
-            If can_optimize is equal to 1 and already_transformed is equal to 0:
-                Let call_inst_ptr be proc memory_get_int64 from Layout with site_ptr, 0
-                Let call_block_ptr be proc memory_get_int64 from Layout with site_ptr, 8
-
-                Note: Extract call arguments
-                Let arg_values be proc create from List
-                Let arg_idx be 0
-
-                While arg_idx is less than param_count:
-                    Note: Call operands start at offset 16, skip operand 0 (callee)
-                    Let arg_offset be 24 plus (arg_idx multiplied by 8)
-                    Let arg_value be proc memory_get_int64 from Layout with call_inst_ptr plus arg_offset, 0
-                    proc append from List with arg_values, arg_value
-                    Set arg_idx to arg_idx plus 1
-                End While
-
-                Note: Update phi nodes with new incoming values from this recursive call.
-                Note: The recursive-edge predecessor is the block containing the
-                Note: tail call (call_block_ptr); read its id from offset 0 of
-                Note: the MIRBasicBlock struct and pair it with each arg.
-                Let recursive_pred_block_id be proc memory_get_int64 from Layout with call_block_ptr, 0
-                Set param_idx to 0
-                While param_idx is less than param_count:
-                    Set phi_node to proc get from List with phi_list, param_idx
-                    Set arg_value to proc get from List with arg_values, param_idx
-
-                    Note: Add phi operand for the recursive back-edge. Phi nodes
-                    Note: track (block_id, value_id) pairs in incoming_pairs and
-                    Note: a parallel incoming_count, both maintained by the
-                    Note: canonical add_phi_incoming API. Direct offset writes
-                    Note: would corrupt the MIRPhi layout (offset 16 is a List*,
-                    Note: offset 24 is the count).
-                    proc add_phi_incoming from MIRNodes with phi_node, recursive_pred_block_id, arg_value
-
-                    Set param_idx to param_idx plus 1
-                End While
-
-                Note: Remove RETURN instruction after call
-                Note: Get next instruction (offset 48 in MIRNode)
-                Let next_inst be proc memory_get_int64 from Layout with call_inst_ptr, 48
-                If next_inst is not equal to 0:
-                    Note: Get opcode (offset 0 in MIRNode)
-                    Let next_opcode be proc memory_get_int64 from Layout with next_inst, 0
-
-                    Note: If it's a RETURN (20303), remove it from block
-                    If next_opcode is equal to 20303:
-                        Note: Get block's instruction list (offset 16 in MIRBasicBlock)
-                        Let block_instructions be proc memory_get_int64 from Layout with call_block_ptr, 16
-
-                        Note: Find and remove the RETURN instruction
-                        Let temp_inst_list be proc create from List
-                        Let inst_list_count be proc length from List with block_instructions
-                        Let k be 0
-
-                        While k is less than inst_list_count:
-                            Let current_inst be proc get from List with block_instructions, k
-                            If current_inst is not equal to next_inst:
-                                proc append from List with temp_inst_list, current_inst
-                            End If
-                            Set k to k plus 1
-                        End While
-
-                        Note: Replace instruction list
-                        proc memory_set_int64 from Layout with call_block_ptr, 16, temp_inst_list
-
-                        Note: Update instruction count (offset 24 in MIRBasicBlock)
-                        Let new_count be proc length from List with temp_inst_list
-                        proc memory_set_int64 from Layout with call_block_ptr, 24, new_count
-                    End If
-                End If
-
-                Note: Replace CALL with unconditional JUMP to loop header
-                Let jump_inst be proc create_mir_node from MIR with 20302
-                proc memory_set_int64 from Layout with jump_inst, 16, loop_header_id
-
-                Note: Replace CALL instruction in block's instruction list
-                Set block_instructions to proc memory_get_int64 from Layout with call_block_ptr, 16
-                Set temp_inst_list to proc create from List
-                Set inst_list_count to proc length from List with block_instructions
-                Set k to 0
-
-                While k is less than inst_list_count:
-                    Set current_inst to proc get from List with block_instructions, k
-                    If current_inst is equal to call_inst_ptr:
-                        proc append from List with temp_inst_list, jump_inst
-                    Otherwise:
-                        proc append from List with temp_inst_list, current_inst
-                    End If
-                    Set k to k plus 1
-                End While
-
-                Note: Replace instruction list
-                proc memory_set_int64 from Layout with call_block_ptr, 16, temp_inst_list
-
-                Note: Update CFG edges - add edge from call block to loop header
-                Note: Get call block ID (offset 0 in MIRBasicBlock)
-                Let call_block_id be proc memory_get_int64 from Layout with call_block_ptr, 0
-
-                Note: Add loop header to call block's successors
-                Let call_block_successors be proc memory_get_int64 from Layout with call_block_ptr, 48
-                proc append from List with call_block_successors, loop_header_id
-
-                Note: Update successor count (offset 56 in MIRBasicBlock)
-                Let succ_count be proc memory_get_int64 from Layout with call_block_ptr, 56
-                Set succ_count to succ_count plus 1
-                proc memory_set_int64 from Layout with call_block_ptr, 56, succ_count
-
-                Note: Add call block to loop header's predecessors
-                proc append from List with header_predecessors, call_block_id
-
-                Note: Update loop header predecessor count (offset 40 in MIRBasicBlock)
-                Let pred_count be proc memory_get_int64 from Layout with loop_header_block, 40
-                Set pred_count to pred_count plus 1
-                proc memory_set_int64 from Layout with loop_header_block, 40, pred_count
-
-                Note: Mark as transformed
-                proc memory_set_int64 from Layout with site_ptr, 40, 1
-                Set transformations_applied to transformations_applied plus 1
-            End If
-        End If
-
-        Set i to i plus 1
-    End While
-
-    Note: Update context statistics
-    Let current_eliminated be proc memory_get_int64 from Layout with context_ptr, 32
-    Set current_eliminated to current_eliminated plus transformations_applied
-    proc memory_set_int64 from Layout with context_ptr, 32, current_eliminated
-
-    Note: Recompute SSA form after transformation
-    proc recompute_ssa from SSA with cfg_ptr
-
-    Return 1
-End Process
-
-Note: ============================================================
-Note: SIBLING TAIL CALL OPTIMIZATION
-Note: ============================================================
-
-@Reasoning
-Sibling tail calls are tail calls to other functions (not self-recursive).
-These cannot be transformed into loops, but can be optimized using tail call
-instructions that reuse the caller's stack frame.
-
-For a sibling tail call to be optimizable:
-1. Call must be in tail position
-2. Calling conventions must be compatible (same ABI)
-3. Caller stack frame must be at least as large as callee's
-4. No callee-saved registers are live across the call
-
-When these conditions are met, we can:
-- Mark the call as a tail call (backend uses special calling convention)
-- Deallocate caller's stack frame before the call
-- Jump to callee instead of call+return
-
-This optimization saves stack space and eliminates the return overhead.
-@End Reasoning
-
-@Reasoning
-Sibling tail-call rewrites reuse the caller's stack frame and jump straight to the callee,
-so they are only sound when the two functions agree on how that frame is interpreted. Four
-properties matter: ABI (an external function may use a platform ABI we cannot synthesise),
-return-type slot (return registers must match), frame footprint (the callee must not need
-more locals than the caller provided), and unwinding (a tail jump skips the caller's
-landingpad chain, so caller and callee must agree on exception presence). We bail out the
-moment any of these diverges. The cache is keyed on callee identity because per-callsite
-recomputation would be wasted work for callees with many tail-call sites.
-@End Reasoning
-
-@Implementation
-Checks calling convention compatibility between caller and callee.
-
-Performs comprehensive compatibility analysis including:
-- External function detection (different ABIs incompatible)
-- Return type compatibility verification
-- Stack frame size analysis (callee must fit in caller's frame)
-- Exception handling compatibility scanning
-- Results are cached for performance
-
-Returns 1 if compatible, 0 otherwise.
-@End Implementation
-
-@Security_Scope
-A false positive here is a silent ABI break: control transfers to the callee with a frame
-the callee will misread. Every check defaults to incompatible (return 0 + cache 0) on
-ambiguity, including null inputs and missing CFGs. The exception-handling scan is
-exhaustive across both CFGs precisely because a partial scan could miss an INVOKE in a
-seldom-reached block and let us strip its landingpad coverage. The cache stores 0 for
-incompatible decisions so a previously-rejected callee cannot be revisited and silently
-flipped to compatible.
-@End Security_Scope
-
-Process called "check_calling_convention_compatibility" that takes caller_ptr as Integer, callee_ptr as Integer, context_ptr as Integer returns Integer:
-    If caller_ptr is equal to 0 or callee_ptr is equal to 0 or context_ptr is equal to 0:
-        Return 0
-    End If
-
-    Note: Check cache first
-    Let cc_cache be proc memory_get_int64 from Layout with context_ptr, 72
-    Let cached_result be proc get from Dictionary with cc_cache, callee_ptr
-
-    If cached_result is not equal to 0:
-        Note: Return cached compatibility result
-        Return cached_result
-    End If
-
-    Note: Check if either function is external (offset 80 in MIRFunction)
-    Let caller_is_external be proc memory_get_int64 from Layout with caller_ptr, 80
-    Let callee_is_external be proc memory_get_int64 from Layout with callee_ptr, 80
-
-    Note: External functions use different calling conventions - incompatible
-    If caller_is_external is equal to 1 or callee_is_external is equal to 1:
-        proc set from Dictionary with cc_cache, callee_ptr, 0
-        Return 0
-    End If
-
-    Note: Check return type compatibility (offset 32 in MIRFunction)
-    Let caller_return_type be proc memory_get_int64 from Layout with caller_ptr, 32
-    Let callee_return_type be proc memory_get_int64 from Layout with callee_ptr, 32
-
-    If caller_return_type is not equal to callee_return_type:
-        Note: Different return types prevent tail call optimization
-        proc set from Dictionary with cc_cache, callee_ptr, 0
-        Return 0
-    End If
-
-    Note: Check stack frame size compatibility
-    Note: Callee's stack frame must not exceed caller's (offset 48 = value_count)
-    Let caller_locals be proc memory_get_int64 from Layout with caller_ptr, 48
-    Let callee_locals be proc memory_get_int64 from Layout with callee_ptr, 48
-
-    If callee_locals is greater than caller_locals:
-        Note: Callee needs more stack space than caller has - incompatible
-        proc set from Dictionary with cc_cache, callee_ptr, 0
-        Return 0
-    End If
-
-    Note: Check exception handling compatibility
-    Let caller_has_exceptions be 0
-    Let callee_has_exceptions be 0
-
-    Note: Scan caller CFG for exception handling instructions (offset 8 = cfg)
-    Let caller_cfg be proc memory_get_int64 from Layout with caller_ptr, 8
-    If caller_cfg is not equal to 0:
-        Let caller_blocks be proc get_all_blocks from CFG with caller_cfg
-        Let block_count be proc length from List with caller_blocks
-        Let i be 0
-
-        While i is less than block_count:
-            Let block_ptr be proc get from List with caller_blocks, i
-            Let instructions be proc get_block_instructions from CFG with block_ptr
-            Let inst_count be proc length from List with instructions
-            Let j be 0
-
-            While j is less than inst_count:
-                Let inst_ptr be proc get from List with instructions, j
-                Let opcode be proc get_opcode from MIR with inst_ptr
-
-                Note: Exception handling opcodes: 20700-20706 (INVOKE, LANDINGPAD, etc.)
-                If opcode is greater than or equal to 20700 and opcode is less than or equal to 20706:
-                    Set caller_has_exceptions to 1
-                End If
-
-                Set j to j plus 1
-            End While
-
-            Set i to i plus 1
-        End While
-    End If
-
-    Note: Scan callee CFG for exception handling instructions
-    Let callee_cfg be proc memory_get_int64 from Layout with callee_ptr, 8
-    If callee_cfg is not equal to 0:
-        Let callee_blocks be proc get_all_blocks from CFG with callee_cfg
-        Set block_count to proc length from List with callee_blocks
-        Set i to 0
-
-        While i is less than block_count:
-            Set block_ptr to proc get from List with callee_blocks, i
-            Set instructions to proc get_block_instructions from CFG with block_ptr
-            Set inst_count to proc length from List with instructions
-            Set j to 0
-
-            While j is less than inst_count:
-                Set inst_ptr to proc get from List with instructions, j
-                Set opcode to proc get_opcode from MIR with inst_ptr
-
-                Note: Exception handling opcodes: 20700-20706
-                If opcode is greater than or equal to 20700 and opcode is less than or equal to 20706:
-                    Set callee_has_exceptions to 1
-                End If
-
-                Set j to j plus 1
-            End While
-
-            Set i to i plus 1
-        End While
-    End If
-
-    Note: Functions with differing exception handling are incompatible
-    If caller_has_exceptions is not equal to callee_has_exceptions:
-        proc set from Dictionary with cc_cache, callee_ptr, 0
-        Return 0
-    End If
-
-    Note: All compatibility checks passed - cache and return success
-    proc set from Dictionary with cc_cache, callee_ptr, 1
-    Return 1
-End Process
-
-@Reasoning
-Sibling tail calls (calls to a function other than the current one) cannot be lowered to
-a loop because the callee is opaque to us. The valuable optimisation in that case is
-stack-frame elision at the call boundary: the backend can deallocate the caller's frame,
-move arguments into the canonical ABI registers, and JMP to the callee. We perform only
-the marking step here; emitting the actual frame-shrinking sequence is the backend's job
-because it owns target-specific calling conventions. Marking is gated by both site-level
-flags (can_optimize, transformation_applied) and the global compatibility check, so a
-single ineligibility signal is enough to suppress the rewrite.
-@End Reasoning
-
-@Implementation
-Applies sibling tail call optimization to eligible call sites.
-
-Algorithm:
-1. Iterate through all tail call sites
-2. Filter for non-recursive (sibling) calls
-3. Check calling convention compatibility
-4. Mark eligible calls as tail calls
-5. Update statistics
-
-The actual tail call implementation is handled by the backend code generator,
-which will emit the appropriate calling sequence.
-
-Returns number of sibling tail calls marked.
-@End Implementation
-
-Process called "optimize_sibling_tail_calls" that takes context_ptr as Integer returns Integer:
-    If context_ptr is equal to 0:
-        Return 0
-    End If
-
-    Let tail_sites be proc memory_get_int64 from Layout with context_ptr, 56
-    Let current_func_ptr be proc memory_get_int64 from Layout with context_ptr, 24
-
-    If tail_sites is equal to 0 or current_func_ptr is equal to 0:
-        Return 0
-    End If
-
-    Let site_count be proc length from List with tail_sites
-    Let marked_count be 0
-    Let i be 0
-
-    Note: Process each tail call site
-    While i is less than site_count:
-        Let site_ptr be proc get from List with tail_sites, i
-
-        If site_ptr is not equal to 0:
-            Let is_rec be proc memory_get_int64 from Layout with site_ptr, 16
-
-            Note: Only process sibling calls (non-recursive)
-            If is_rec is equal to 0:
-                Let can_optimize be proc memory_get_int64 from Layout with site_ptr, 32
-                Let already_transformed be proc memory_get_int64 from Layout with site_ptr, 40
-
-                If can_optimize is equal to 1 and already_transformed is equal to 0:
-                    Note: Get callee function pointer
-                    Let callee_ptr be proc memory_get_int64 from Layout with site_ptr, 24
-
-                    Note: Check calling convention compatibility
-                    Let compatible be proc check_calling_convention_compatibility with current_func_ptr, callee_ptr, context_ptr
-
-                    If compatible is equal to 1:
-                        Note: Mark call as tail call
-                        Let call_inst_ptr be proc memory_get_int64 from Layout with site_ptr, 0
-                        proc mark_as_tail_call from MIR with call_inst_ptr
-
-                        Note: Mark as transformed
-                        proc memory_set_int64 from Layout with site_ptr, 40, 1
-                        Set marked_count to marked_count plus 1
-                    End If
-                End If
-            End If
-        End If
-
-        Set i to i plus 1
-    End While
-
-    Note: Update context statistics
-    Let current_sibling_count be proc memory_get_int64 from Layout with context_ptr, 40
-    Set current_sibling_count to current_sibling_count plus marked_count
-    proc memory_set_int64 from Layout with context_ptr, 40, current_sibling_count
-
-    Return marked_count
+    Return stamped
 End Process
 
 Note: ============================================================
@@ -1227,111 +161,54 @@ Note: MAIN ENTRY POINTS
 Note: ============================================================
 
 @Reasoning
-The per-function driver enforces the canonical phase ordering: identification before
-transformation, recursion-to-loop before sibling marking. Identification is intentionally
-separated from rewriting so we have a complete worklist when deciding which sites to
-transform first. Recursion is handled before sibling marking because the loop rewrite can
-delete RETURN instructions that a sibling pass might otherwise observe and mis-classify.
-The driver guarantees context cleanup on every exit path so a partial optimisation cannot
-leak the sites list or its caches.
+Per-function driver. mir_optimizer.optimize_tail_call dispatches here with the
+MIRFunction pointer (extracted from OptimizerContext offset 8). External
+functions have no body to analyze; the CFG fetch returns 0 for them and we
+decline. Returns 1 only when at least one tail call was newly stamped so the
+optimizer pipeline's change predicate observes real progress and the O3
+fixpoint converges.
 @End Reasoning
-
 @Implementation
-Main entry point for tail call optimization on a single function.
-
-Algorithm:
-1. Create optimization context
-2. Set current function pointer in context
-3. Collect all tail call sites
-4. Transform tail recursive calls into loops
-5. Optimize sibling tail calls
-6. Print statistics
-7. Clean up context
-
-Returns 1 on success, 0 on failure.
+Identifies and stamps tail calls in a single function. Returns 1 if any tail
+call was newly stamped, 0 otherwise.
 @End Implementation
-
 Process called "optimize_function_with_tail_call" that takes function_ptr as Integer returns Integer:
     If function_ptr is equal to 0:
         Return 0
     End If
 
-    Display "Starting tail call optimization"
-
-    Note: Get CFG from function
-    Let cfg_ptr be proc get_function_cfg from MIR with function_ptr
+    Let cfg_ptr be proc get_mir_function_cfg from MIR with function_ptr
     If cfg_ptr is equal to 0:
-        Display "Function has no CFG, skipping tail call optimization"
         Return 0
     End If
 
-    Note: Create optimization context
-    Let context_ptr be proc create_tail_call_context with cfg_ptr
-    If context_ptr is equal to 0:
-        Display "Failed to create tail call context"
-        Return 0
-    End If
+    Let stamped be proc stamp_tail_calls with cfg_ptr
 
-    Note: Set current function pointer in context
-    proc memory_set_int64 from Layout with context_ptr, 24, function_ptr
-
-    Note: Collect all tail call sites
-    Let tail_call_count be proc collect_tail_call_sites with context_ptr
-    Display "Identified " joined with tail_call_count joined with " tail call sites"
-
-    If tail_call_count is equal to 0:
-        Display "No tail calls found, skipping optimization"
-        proc destroy_tail_call_context with context_ptr
+    If stamped is greater than 0:
+        Let stamped_str be proc integer_to_string from StringUtils with stamped
+        Display "Tail call optimization stamped tail call sites: " joined with stamped_str
         Return 1
     End If
 
-    Note: Transform tail recursion to loops
-    Let recursion_success be proc transform_tail_recursion_to_loop with context_ptr
-    If recursion_success is equal to 0:
-        Display "Warning: Tail recursion transformation encountered issues"
-    End If
-
-    Note: Optimize sibling tail calls
-    Let sibling_count be proc optimize_sibling_tail_calls with context_ptr
-    Display "Marked " joined with sibling_count joined with " sibling tail calls"
-
-    Note: Print statistics
-    proc print_tail_call_stats with context_ptr
-
-    Note: Clean up
-    proc destroy_tail_call_context with context_ptr
-
-    Display "Tail call optimization complete"
-
-    Return 1
+    Return 0
 End Process
 
 @Reasoning
-The program-level driver applies the per-function pass across the MIR module while
-skipping external (declared but not defined) functions, which have no CFG to analyse
-and no body we are permitted to rewrite. Optimisation success is tallied per function
-so the pass-manager log can attribute regressions to specific units, not to "tail call
-optimisation" as a black box. The pass is intentionally non-fatal: a per-function
-failure increments the skip counter but does not abort, because tail-call optimisation
-is profitable but not load-bearing for correctness.
+Program-level driver. Applies the per-function pass across the MIR module,
+skipping external (declared-but-not-defined) functions. The pass is non-fatal:
+a per-function decline does not abort the program walk, because tail-call
+stamping is profitable but not load-bearing for correctness.
 @End Reasoning
-
 @Implementation
-Entry point for running tail call optimization pass on entire program.
-
-Iterates through all functions in the MIR program and applies tail call
-optimization to each non-external function.
-
-Returns 1 on success, 0 on failure.
+Runs tail call optimization across every non-external function of a MIRProgram.
+Returns 1 on success.
 @End Implementation
-
 Process called "run_tail_call_pass" that takes program_ptr as Integer returns Integer:
     If program_ptr is equal to 0:
         Return 0
     End If
 
-    Note: Get all functions from program
-    Let functions be proc get_program_functions from MIR with program_ptr
+    Let functions be proc get_program_functions from MIRNodes with program_ptr
     If functions is equal to 0:
         Return 0
     End If
@@ -1340,70 +217,50 @@ Process called "run_tail_call_pass" that takes program_ptr as Integer returns In
     Let optimized_count be 0
     Let i be 0
 
-    Display "Running tail call optimization pass on " joined with func_count joined with " functions"
-
-    Note: Optimize each function
     While i is less than func_count:
-        Let func_ptr be proc get from List with functions, i
-
+        Let func_ptr be proc list_get from List with functions, i
         If func_ptr is not equal to 0:
-            Note: Skip external functions
             Let is_external be proc is_external_function from MIR with func_ptr
-
             If is_external is equal to 0:
-                Let success be proc optimize_function_with_tail_call with func_ptr
-                If success is equal to 1:
+                Let changed be proc optimize_function_with_tail_call with func_ptr
+                If changed is equal to 1:
                     Set optimized_count to optimized_count plus 1
                 End If
             End If
         End If
-
         Set i to i plus 1
     End While
-
-    Display "Tail call optimization completed for " joined with optimized_count joined with " functions"
 
     Return 1
 End Process
 
 @Reasoning
-Profitability gating is cheap because the only signal needed is "does this function
-contain a call?" — if it doesn't, neither identification nor transformation can do useful
-work and we save the cost of constructing a context. We tie enablement to -O1 because the
-transformation changes debuggability (the recursive frame chain becomes a single iterating
-frame) and -O0 should preserve the source-level call shape for step-debugging.
+Profitability gate. Tail-call stamping changes debuggability (a recursive frame
+chain becomes a single iterating frame at the LIR layer), so it is enabled at
+-O1 and above and disabled at -O0 to preserve the source-level call shape for
+step-debugging. The only further signal needed is "does this function contain a
+call?": with no call there is nothing to stamp.
 @End Reasoning
-
 @Implementation
-Profitability check for tail call optimization.
-
-Tail call optimization is generally always beneficial when applicable:
-- Reduces stack usage (prevents stack overflow)
-- Eliminates return overhead for sibling calls
-- No significant code size increase
-- No performance degradation
-
-We run the pass if:
-1. Optimization level > or equal to 1 (enabled for -O1 and above)
-2. Function contains at least one call instruction
-
-Returns 1 if should run, 0 otherwise.
+Returns 1 if the pass should run for this function at this optimization level,
+0 otherwise.
 @End Implementation
-
 Process called "should_run_tail_call" that takes function_ptr as Integer, optimization_level as Integer returns Integer:
-    Note: Always skip if optimization disabled
     If optimization_level is less than 1:
         Return 0
     End If
-
-    Note: Always beneficial if function has calls
-    If function_ptr is not equal to 0:
-        Let call_count be proc count_instructions_of_type from MIR with function_ptr, MIR.MIR_CALL
-        If call_count is greater than 0:
-            Return 1
-        End If
+    If function_ptr is equal to 0:
+        Return 0
     End If
 
+    Let call_count be proc count_instructions_of_type from MIRNodes with function_ptr, 20304
+    If call_count is greater than 0:
+        Return 1
+    End If
+    Let indirect_count be proc count_instructions_of_type from MIRNodes with function_ptr, 20305
+    If indirect_count is greater than 0:
+        Return 1
+    End If
     Return 0
 End Process
 
@@ -1412,17 +269,15 @@ Note: PASS METADATA
 Note: ============================================================
 
 @Implementation
-Returns the name of this optimization pass for display and logging.
+Returns the pass name string pointer.
 @End Implementation
-
-Process called "get_tail_call_pass_name" that takes nothing returns Integer:
-    Return proc create_from_literal from StringCore with "Tail Call Optimization"
+Process called "get_tail_call_pass_name" returns Integer:
+    Return "Tail Call Optimization"
 End Process
 
 @Implementation
-Returns a description of this optimization pass.
+Returns the pass description string pointer.
 @End Implementation
-
-Process called "get_tail_call_pass_description" that takes nothing returns Integer:
-    Return proc create_from_literal from StringCore with "Transforms tail recursion into loops and marks sibling tail calls for backend optimization"
+Process called "get_tail_call_pass_description" returns Integer:
+    Return "Stamps calls in tail position with the canonical is_tail_call flag for LIR jmp-vs-call selection"
 End Process

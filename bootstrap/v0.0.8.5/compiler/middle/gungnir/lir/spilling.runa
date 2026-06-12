@@ -1,4 +1,4 @@
-Note: 
+Note:
 Copyright 2025 Sybertnetics Artificial Intelligence Solutions
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -20,7 +20,7 @@ This file handles spill code insertion and register spilling management.
 This file performs the following tasks:
 - Process spill code insertion and register spilling management
 - Handle spill slot allocation and spill code generation
-- Manage spill optimization and spill code optimization
+- Manage spill cost calculation for allocator candidate selection
 - Process spill validation and spill verification
 
 This file is essential because of the following reasons:
@@ -29,25 +29,46 @@ This file is essential because of the following reasons:
 - Spill code support enables Runa compilation for complete register allocation
 
 This file consists of the following functions/features/operation types:
-- Spill code insertion and register spilling management
-- Spill slot allocation and spill code generation
-- Spill optimization and spill code optimization
-- Spill validation and spill verification
+- Spill slot allocation (delegating to lir.runa's frame accounting)
+- Spill STORE/LOAD insertion built from real LIROperand records
+- Chaitin spill-cost metric over the operand-record instruction model
+- Spill context lifecycle, verification, and debug printing
+
+Representation notes (task #473):
+- spill_costs and spill_offsets are keyed by vreg ids (INTEGERS), so they
+  are OrderedMaps: the previous Dictionary representation string-hashed
+  its keys (each integer key was dereferenced as a string pointer) and
+  crashed at runtime.
+- Spill stores/loads are constructed through the lir_nodes.runa
+  constructors (create_lir_store / create_lir_load) with REAL operand
+  records (create_register_operand / create_simple_memory_operand). The
+  previous implementation wrote raw register ids and displacements
+  directly into instruction slots that the rest of the pipeline reads as
+  OPERAND POINTERS, which made every inserted spill instruction garbage.
+- Def/use detection resolves instructions through
+  LIR.lir_resolve_instruction_base and inspects operand records
+  (register_id at 8, memory base/index at 24/32) - never raw slots.
+- The stack frame lives at LIRFunction offset 72 (the previous code read
+  offset 80, which is virtual_reg_count). Slot allocation delegates to
+  LIR.lir_allocate_spill_slot so the frame's spill_area_size and
+  spill_offsets map remain the single source of truth.
 
 Dependencies:
-- Requires liveness.runa for determining spill insertion points
-- Requires interference.runa for spill cost estimation (high-degree nodes)
-- Imports LIR types for instruction modification
-- Imports memory/layout.runa for stack frame management
-- Imports collections for spill slot tracking
+- Requires interference.runa for spill cost degree input
+- Imports LIR types and the frame spill-slot allocator
+- Imports LIRNodes for operand and instruction constructors
+- Imports memory/layout.runa for OWNED HEAP allocation (Tier 3)
+- Imports collections/ordered_map and collections/list for tracking
 :End Note
 
 Import "compiler/middle/gungnir/lir/lir.runa" as LIR
-Import "compiler/middle/gungnir/lir/liveness.runa" as Liveness
+Import "compiler/middle/gungnir/lir/lir_nodes.runa" as LIRNodes
 Import "compiler/middle/gungnir/lir/interference.runa" as Interference
 Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/core/memory_core.runa" as MemoryCore
 Import "compiler/frontend/primitives/collections/list.runa" as List
-Import "compiler/frontend/primitives/collections/dictionary.runa" as Dictionary
+Import "compiler/frontend/primitives/collections/ordered_map.runa" as OrderedMap
+Import "compiler/internal/string_utils.runa" as StringUtils
 
 Note: ============================================================================
 Note: Spill Code Insertion Overview
@@ -60,72 +81,39 @@ When register allocation cannot assign physical registers to all virtual
 registers (register pressure exceeds available registers), some virtual
 registers must be "spilled" to memory (stack).
 
-This file inserts spill stores (def → memory) and spill loads (memory → use).
+This file inserts spill stores (def → memory) and spill loads (memory → use)
+using the IMMEDIATE SPILLING strategy: a store after every definition of the
+spilled register and a reload into a FRESH virtual register before every
+use. The fresh reload registers have minimal live ranges (load → use), which
+is what guarantees the allocate/spill/retry loop terminates.
 
-INTEGRATION WITH LIVENESS:
---------------------------
-Liveness analysis is crucial for optimal spill code insertion:
-
-1. Spill stores inserted after DEF points
-2. Spill loads inserted before USE points
-3. Live range analysis identifies minimal spill/reload pairs
-
-After inserting spill code:
-1. Rerun liveness analysis (new loads/stores affect liveness)
-2. Rerun register allocation on remaining virtual registers
-
-SPILL STRATEGIES:
+SPILL CODE SHAPE:
 -----------------
-1. Immediate Spilling:
-   - Spill register at def, reload at each use
-   - Simple but generates many loads
+Before spilling %v100 (assuming spill slot at [rbp-8]):
+  %v100 = ADD %v10, %v20
+  ...
+  %v200 = MUL %v100, %v30
 
-2. Live Range Splitting:
-   - Split live range at spill points
-   - Create new virtual register for each segment
-   - Reduces number of spills/reloads
-
-3. Optimal Spilling (Belady's Algorithm):
-   - Spill register with furthest next use
-   - Minimizes total spill cost
+After spilling %v100:
+  %v100 = ADD %v10, %v20
+  STORE [rbp-8], %v100         ← spill store (after the def)
+  ...
+  %v300 = LOAD [rbp-8]         ← reload into fresh vreg (before the use)
+  %v200 = MUL %v300, %v30      ← use rewritten to the fresh vreg
 
 STACK FRAME LAYOUT:
 -------------------
-Spill slots are allocated in the function's stack frame:
-- StackFrame.spill_area_size tracks total spill space needed
-- StackFrame.spill_offsets maps virtual register → stack offset
-- Alignment requirements (typically 8 bytes for x86-64)
+Spill slots are allocated in the function's StackFrame by
+LIR.lir_allocate_spill_slot: spill_area_size grows by the aligned slot
+size and the frame's spill_offsets OrderedMap records
+vreg → negative RBP-relative offset. lir_finalize_stack_frame folds the
+spill area into the final frame size during prologue lowering.
 
-Example stack frame with spills:
-  [Return Address]
-  [Saved RBP]
-  [Callee-saved regs]
-  [Local variables]
-  [Spill slot 0]     ← Stack offset -24
-  [Spill slot 1]     ← Stack offset -32
-  [Spill slot 2]     ← Stack offset -40
-  [...]
-  [Outgoing args]
-
-SPILL CODE EXAMPLE:
--------------------
-Before spilling (virtual register %v100 needs physical register):
-  %v100 = ADD %v10, %v20
-  %v200 = MUL %v100, %v30
-
-After spilling %v100 (assuming spill slot at [rbp-24]):
-  %v100 = ADD %v10, %v20
-  STORE [rbp-24], %v100      ← Spill store
-  ...
-  %loaded = LOAD [rbp-24]      ← Spill load
-  %v200 = MUL %loaded, %v30
-
-SPILL COST ESTIMATION:
-----------------------
-Used by register allocation to choose spill candidates:
-- Spill cost = (num_loads + num_stores) × loop_nesting_depth
-- Prefer spilling registers with low usage frequency
-- Prefer spilling registers not in inner loops
+AFTER SPILLING:
+---------------
+The caller must rerun liveness analysis and interference construction
+(the inserted loads/stores change the program) and then rerun register
+allocation. See register_alloc.runa's usage example for the full loop.
 :End Note
 
 Note: ============================================================================
@@ -134,23 +122,23 @@ Note: ==========================================================================
 
 @Reasoning
 SpillContext tracks the state during spill code insertion. It maintains:
-- Spill slot allocations (vreg_id → stack offset)
-- Spill costs for prioritization
-- Insertion point tracking (where LOAD/STORE instructions are added)
-- Statistics for debugging
+- Which registers need spilling (spill_worklist, caller-owned)
+- Where each register is spilled (spill_offsets OrderedMap, context-owned)
+- Spill costs for prioritization (spill_costs OrderedMap, context-owned)
+- Statistics for verification and debugging
 
 This follows the same Tier 3 (OWNED HEAP) pattern as AllocationContext in
-register_alloc.runa - permanent data structures with explicit memory management.
+register_alloc.runa. destroy_spill_context releases the context-owned maps.
 @End Reasoning
 
 Type called "SpillContext":
     lir_function as Integer               Note: Pointer to LIRFunction being processed
-    stack_frame as Integer                Note: Pointer to StackFrame for spill offset allocation
-    spill_worklist as Integer             Note: List of virtual register IDs that need spilling
-    spill_costs as Integer                Note: Dictionary<vreg_id, cost> for spill prioritization
-    spill_offsets as Integer              Note: Dictionary<vreg_id, stack_offset> for allocated spills
-    next_spill_offset as Integer          Note: Next available spill slot offset (negative, grows down)
-    spill_alignment as Integer            Note: Alignment requirement for spill slots (typically 8)
+    stack_frame as Integer                Note: Pointer to StackFrame (created on demand)
+    spill_worklist as Integer             Note: List of virtual register IDs that need spilling (caller-owned)
+    spill_costs as Integer                Note: OrderedMap<vreg_id, cost> for spill prioritization
+    spill_offsets as Integer              Note: OrderedMap<vreg_id, stack_offset> for allocated spills
+    lowest_spill_offset as Integer        Note: Most negative offset allocated so far (0 until first slot)
+    spill_alignment as Integer            Note: Alignment requirement for spill slots (8 for x86-64 int/ptr)
     spills_inserted as Integer            Note: Count of spill stores inserted
     reloads_inserted as Integer           Note: Count of spill loads inserted
 End Type
@@ -162,23 +150,15 @@ Note: Spill Slot Allocation
 Note: ============================================================================
 
 @Reasoning
-Allocates a spill slot on the stack for a virtual register. Spill slots grow
-downward from the stack frame, similar to local variables.
+Allocates a spill slot on the stack for a virtual register, delegating the
+actual frame accounting to LIR.lir_allocate_spill_slot so the StackFrame's
+spill_area_size and spill_offsets map stay authoritative. The context
+mirrors the vreg → offset mapping for fast verification and re-use lookups
+(repeated requests for the same vreg return the existing slot instead of
+growing the frame).
 
-Each spill slot is aligned (typically 8 bytes for 64-bit values) and tracked
-in the StackFrame.spill_offsets dictionary for code generation.
-
-Stack layout (x86-64):
-  [Return Address]       ← RSP on entry
-  [Saved RBP]            ← RBP (if frame pointer used)
-  [Callee-saved regs]
-  [Local variables]      ← Positive offsets from locals base
-  [Spill slot 0]         ← Negative offset -8
-  [Spill slot 1]         ← Negative offset -16
-  [Spill slot 2]         ← Negative offset -24
-  [...]                  ← Grows downward
-
-Returns the negative stack offset for the spill slot.
+Returns the negative RBP-relative stack offset for the spill slot, or 0 on
+failure (0 is never a valid spill offset - slots start at -8).
 @End Reasoning
 
 Process called "allocate_spill_slot" that takes context as Integer, vreg_id as Integer, size as Integer returns Integer:
@@ -187,48 +167,118 @@ Process called "allocate_spill_slot" that takes context as Integer, vreg_id as I
         Return 0
     End If
 
-    Note: Get spill_offsets dictionary from context (offset 32)
-    Let spill_offsets be proc memory_get_int64 from Layout with context, 32
+    Let spill_offsets be proc memory_get_int64 from MemoryCore with context, 32
 
-    Note: Check if already allocated
-    Let existing_offset be proc get from Dictionary with spill_offsets, vreg_id
-    If existing_offset is not equal to 0:
-        Return existing_offset
+    Note: Check if already allocated (presence test, not value test)
+    If proc omap_contains from OrderedMap with spill_offsets, vreg_id is equal to 1:
+        Return proc omap_get from OrderedMap with spill_offsets, vreg_id
     End If
 
-    Note: Get alignment from context (offset 48)
-    Let alignment be proc memory_get_int64 from Layout with context, 48
+    Let lir_function be proc memory_get_int64 from MemoryCore with context, 0
 
-    Note: Get next spill offset (offset 40)
-    Let next_offset be proc memory_get_int64 from Layout with context, 40
-
-    Note: Align size to alignment boundary
-    Let aligned_size be size
-    Let remainder be size modulo by alignment
-    If remainder is not equal to 0:
-        Set aligned_size to size plus (alignment minus remainder)
+    Note: Delegate frame accounting (alignment + spill_area_size + frame map)
+    Let spill_offset be proc lir_allocate_spill_slot from LIR with lir_function, vreg_id, size
+    If spill_offset is equal to 0:
+        Display "allocate_spill_slot: frame allocation failed"
+        Return 0
     End If
 
-    Note: Allocate spill slot (grows downward, so subtract)
-    Let spill_offset be next_offset minus aligned_size
-    proc memory_set_int64 from Layout with context, 40, spill_offset
+    Note: Mirror into the context map
+    proc omap_set from OrderedMap with spill_offsets, vreg_id, spill_offset
 
-    Note: Store in spill_offsets dictionary
-    proc set from Dictionary with spill_offsets, vreg_id, spill_offset
-
-    Note: Update StackFrame.spill_offsets (from context, offset 8)
-    Let stack_frame be proc memory_get_int64 from Layout with context, 8
-    If stack_frame is not equal to 0:
-        Let frame_spill_offsets be proc memory_get_int64 from Layout with stack_frame, 72
-        proc set from Dictionary with frame_spill_offsets, vreg_id, spill_offset
-
-        Note: Update StackFrame.spill_area_size (offset 16)
-        Let current_spill_size be proc memory_get_int64 from Layout with stack_frame, 16
-        Let new_spill_size be current_spill_size plus aligned_size
-        proc memory_set_int64 from Layout with stack_frame, 16, new_spill_size
+    Note: Track the deepest slot for diagnostics
+    Let lowest be proc memory_get_int64 from MemoryCore with context, 40
+    If spill_offset is less than lowest:
+        proc memory_set_int64 from MemoryCore with context, 40, spill_offset
     End If
 
     Return spill_offset
+End Process
+
+Note: ============================================================================
+Note: Operand Register Rewriting
+Note: ============================================================================
+
+@Reasoning
+Replaces references to one register with another inside a single LIROperand
+record: the register_id of a REGISTER operand (offset 8) and the base and
+index registers of a MEMORY operand (offsets 24/32). IMMEDIATE operands
+carry no registers. Returns the number of references replaced.
+
+Operand records are shared between base instructions, typed wrappers, and
+argument lists, so the in-place rewrite updates every view at once - the
+same property apply_allocation relies on in register_alloc.runa.
+@End Reasoning
+
+Process called "replace_operand_register" that takes operand as Integer, old_reg as Integer, new_reg as Integer returns Integer:
+    If operand is equal to 0:
+        Return 0
+    End If
+
+    Let replaced be 0
+    Let operand_type be proc memory_get_int64 from MemoryCore with operand, 0
+
+    If operand_type is equal to LIRNodes.OPERAND_TYPE_REGISTER:
+        Let register_id be proc memory_get_int64 from MemoryCore with operand, 8
+        If register_id is equal to old_reg:
+            proc memory_set_int64 from MemoryCore with operand, 8, new_reg
+            Set replaced to replaced plus 1
+        End If
+        Return replaced
+    End If
+
+    If operand_type is equal to LIRNodes.OPERAND_TYPE_MEMORY:
+        Let base_register be proc memory_get_int64 from MemoryCore with operand, 24
+        If base_register is equal to old_reg:
+            proc memory_set_int64 from MemoryCore with operand, 24, new_reg
+            Set replaced to replaced plus 1
+        End If
+
+        Let index_register be proc memory_get_int64 from MemoryCore with operand, 32
+        If index_register is equal to old_reg:
+            proc memory_set_int64 from MemoryCore with operand, 32, new_reg
+            Set replaced to replaced plus 1
+        End If
+        Return replaced
+    End If
+
+    Return 0
+End Process
+
+@Reasoning
+Tests whether one LIROperand record READS the given register: a REGISTER
+operand whose register_id matches, or a MEMORY operand whose base or index
+register matches (address computation reads both). Returns 1 or 0.
+@End Reasoning
+
+Process called "operand_reads_register" that takes operand as Integer, reg_id as Integer returns Integer:
+    If operand is equal to 0:
+        Return 0
+    End If
+
+    Let operand_type be proc memory_get_int64 from MemoryCore with operand, 0
+
+    If operand_type is equal to LIRNodes.OPERAND_TYPE_REGISTER:
+        Let register_id be proc memory_get_int64 from MemoryCore with operand, 8
+        If register_id is equal to reg_id:
+            Return 1
+        End If
+        Return 0
+    End If
+
+    If operand_type is equal to LIRNodes.OPERAND_TYPE_MEMORY:
+        Let base_register be proc memory_get_int64 from MemoryCore with operand, 24
+        If base_register is equal to reg_id:
+            Return 1
+        End If
+        Let index_register be proc memory_get_int64 from MemoryCore with operand, 32
+        If index_register is equal to reg_id:
+            Return 1
+        End If
+        Return 0
+    End If
+
+    Return 0
 End Process
 
 Note: ============================================================================
@@ -236,17 +286,17 @@ Note: Spill Code Insertion - STORE
 Note: ============================================================================
 
 @Reasoning
-Inserts a spill STORE instruction after the definition of a virtual register.
+Inserts a spill STORE instruction after the definition of a virtual register:
 
-The spill store saves the virtual register value to its allocated stack slot:
   STORE [rbp + spill_offset], vreg
 
-This is inserted immediately after the instruction that defines the virtual
-register (the DEF point in liveness analysis).
-
-Memory addressing mode: base + displacement
-- Base: RBP (frame pointer, register ID 6)
-- Displacement: spill_offset (negative value)
+The instruction is built through LIRNodes.create_lir_store with a real
+memory operand ([RBP + displacement] via create_simple_memory_operand) and
+a real register operand for the source, so liveness, interference,
+allocation application, and the backend all read it through the standard
+operand-record model. Fresh operand records are created per insertion -
+operand records are mutated in place by later passes and must never be
+shared across distinct instructions.
 
 Returns 1 on success, 0 on failure.
 @End Reasoning
@@ -257,9 +307,8 @@ Process called "insert_spill_store" that takes context as Integer, block as Inte
         Return 0
     End If
 
-    Note: Get block's instruction list (offset 16)
-    Let instructions be proc memory_get_int64 from Layout with block, 16
-    Let instruction_count be proc memory_get_int64 from Layout with block, 24
+    Let instructions be proc memory_get_int64 from MemoryCore with block, 16
+    Let instruction_count be proc memory_get_int64 from MemoryCore with block, 24
 
     Note: Validate instruction index
     If instruction_index is less than 0 or instruction_index is greater than instruction_count:
@@ -267,41 +316,32 @@ Process called "insert_spill_store" that takes context as Integer, block as Inte
         Return 0
     End If
 
-    Note: Create STORE instruction: STORE [rbp + spill_offset], vreg
-    Note: LIRInstruction structure (see lir_nodes.runa):
-    Note:   - opcode (offset 0, 8 bytes)
-    Note:   - result_reg (offset 8, 8 bytes)
-    Note:   - operand1 (offset 16, 8 bytes) - base register (RBP)
-    Note:   - operand2 (offset 24, 8 bytes) - displacement (spill_offset)
-    Note:   - operand3 (offset 32, 8 bytes) - source register (vreg_id)
-    Note:   Total: 64 bytes minimum per instruction
+    Note: Build STORE [RBP + spill_offset], vreg from real operand records
+    Let address_operand be proc create_simple_memory_operand from LIRNodes with LIR.LIR_REG_RBP, spill_offset, 8
+    If address_operand is equal to 0:
+        Display "insert_spill_store: address operand allocation failed"
+        Return 0
+    End If
 
-    Let store_instruction be proc allocate from Layout with 64
+    Let source_operand be proc create_register_operand from LIRNodes with vreg_id, 8
+    If source_operand is equal to 0:
+        Display "insert_spill_store: source operand allocation failed"
+        Return 0
+    End If
 
-    Note: Set opcode to LIR_STORE (30601)
-    proc memory_set_int64 from Layout with store_instruction, 0, 30601
+    Let store_instruction be proc create_lir_store from LIRNodes with address_operand, source_operand, 8
+    If store_instruction is equal to 0:
+        Display "insert_spill_store: store construction failed"
+        Return 0
+    End If
 
-    Note: Result register is 0 (STORE has no result)
-    proc memory_set_int64 from Layout with store_instruction, 8, 0
-
-    Note: Operand1: base register (RBP = 6)
-    proc memory_set_int64 from Layout with store_instruction, 16, 6
-
-    Note: Operand2: displacement (spill_offset)
-    proc memory_set_int64 from Layout with store_instruction, 24, spill_offset
-
-    Note: Operand3: source register (vreg_id)
-    proc memory_set_int64 from Layout with store_instruction, 32, vreg_id
-
-    Note: Insert after the definition instruction (instruction_index + 1)
-    proc insert from List with instructions, instruction_index plus 1, store_instruction
-
-    Note: Update instruction count
-    proc memory_set_int64 from Layout with block, 24, instruction_count plus 1
+    Note: Insert after the defining instruction
+    proc list_insert from List with instructions, instruction_index plus 1, store_instruction
+    proc memory_set_int64 from MemoryCore with block, 24, instruction_count plus 1
 
     Note: Increment spills_inserted counter (context offset 56)
-    Let spills_count be proc memory_get_int64 from Layout with context, 56
-    proc memory_set_int64 from Layout with context, 56, spills_count plus 1
+    Let spills_count be proc memory_get_int64 from MemoryCore with context, 56
+    proc memory_set_int64 from MemoryCore with context, 56, spills_count plus 1
 
     Return 1
 End Process
@@ -311,13 +351,18 @@ Note: Spill Code Insertion - LOAD
 Note: ============================================================================
 
 @Reasoning
-Inserts a spill LOAD instruction before a use of a virtual register.
+Inserts a spill LOAD before a use of a spilled virtual register and rewrites
+that use to read the freshly loaded value:
 
-The spill load restores the virtual register value from its stack slot:
   temp_vreg = LOAD [rbp + spill_offset]
+  <use instruction, vreg_id replaced by temp_vreg>
 
-This creates a new virtual register to hold the loaded value,
-which will be allocated during the next register allocation pass.
+The fresh virtual register inherits the spilled register's class (so float
+spills reload into FPR-class vregs) and has a minimal live range, which is
+what makes the spill/retry loop converge. The use instruction's operand
+records are rewritten through replace_operand_register: register operands
+and memory base/index registers alike, including a MEMORY operand sitting
+in the RESULT slot (a store through [vreg] READS vreg for the address).
 
 Returns the new virtual register ID on success, 0 on failure.
 @End Reasoning
@@ -328,77 +373,81 @@ Process called "insert_spill_load" that takes context as Integer, block as Integ
         Return 0
     End If
 
-    Note: Get LIR function from context (offset 0)
-    Let lir_function be proc memory_get_int64 from Layout with context, 0
+    Let lir_function be proc memory_get_int64 from MemoryCore with context, 0
     If lir_function is equal to 0:
         Display "insert_spill_load: null lir_function"
         Return 0
     End If
 
-    Note: Get block's instruction list (offset 16)
-    Let instructions be proc memory_get_int64 from Layout with block, 16
-    Let instruction_count be proc memory_get_int64 from Layout with block, 24
+    Let instructions be proc memory_get_int64 from MemoryCore with block, 16
+    Let instruction_count be proc memory_get_int64 from MemoryCore with block, 24
 
     Note: Validate instruction index
-    If instruction_index is less than 0 or instruction_index is greater than instruction_count:
+    If instruction_index is less than 0 or instruction_index is greater than or equal to instruction_count:
         Display "insert_spill_load: invalid instruction index"
         Return 0
     End If
 
-    Note: Create new virtual register for the loaded value
+    Note: Create a fresh virtual register of the SAME class for the reload
     Let reg_class be proc lir_get_virtual_register_class from LIR with lir_function, vreg_id
-    Let temp_vreg be proc lir_create_virtual_register from LIR with lir_function, reg_class, 64
+    Let temp_vreg be proc lir_create_virtual_register from LIR with lir_function, reg_class, 8
     If temp_vreg is equal to 0:
-        Display "insert_spill_load: failed to create register"
+        Display "insert_spill_load: failed to create reload register"
         Return 0
     End If
 
-    Note: Create LOAD instruction: temp_vreg = LOAD [rbp + spill_offset]
-    Let load_instruction be proc allocate from Layout with 64
+    Note: Build temp_vreg = LOAD [RBP + spill_offset] from real operand records
+    Let destination_operand be proc create_register_operand from LIRNodes with temp_vreg, 8
+    If destination_operand is equal to 0:
+        Display "insert_spill_load: destination operand allocation failed"
+        Return 0
+    End If
 
-    Note: Set opcode to LIR_LOAD (30600)
-    proc memory_set_int64 from Layout with load_instruction, 0, 30600
+    Let address_operand be proc create_simple_memory_operand from LIRNodes with LIR.LIR_REG_RBP, spill_offset, 8
+    If address_operand is equal to 0:
+        Display "insert_spill_load: address operand allocation failed"
+        Return 0
+    End If
 
-    Note: Result register is temp_vreg
-    proc memory_set_int64 from Layout with load_instruction, 8, temp_vreg
+    Let load_instruction be proc create_lir_load from LIRNodes with destination_operand, address_operand, 8
+    If load_instruction is equal to 0:
+        Display "insert_spill_load: load construction failed"
+        Return 0
+    End If
 
-    Note: Operand1: base register (RBP = 6)
-    proc memory_set_int64 from Layout with load_instruction, 16, 6
-
-    Note: Operand2: displacement (spill_offset)
-    proc memory_set_int64 from Layout with load_instruction, 24, spill_offset
-
-    Note: Operand3: unused for LOAD
-    proc memory_set_int64 from Layout with load_instruction, 32, 0
-
-    Note: Insert BEFORE the use instruction (at instruction_index)
-    proc insert from List with instructions, instruction_index, load_instruction
-
-    Note: Update instruction count
-    proc memory_set_int64 from Layout with block, 24, instruction_count plus 1
+    Note: Insert BEFORE the use instruction
+    proc list_insert from List with instructions, instruction_index, load_instruction
+    proc memory_set_int64 from MemoryCore with block, 24, instruction_count plus 1
 
     Note: Increment reloads_inserted counter (context offset 64)
-    Let reloads_count be proc memory_get_int64 from Layout with context, 64
-    proc memory_set_int64 from Layout with context, 64, reloads_count plus 1
+    Let reloads_count be proc memory_get_int64 from MemoryCore with context, 64
+    proc memory_set_int64 from MemoryCore with context, 64, reloads_count plus 1
 
-    Note: Replace vreg_id with temp_vreg in the use instruction
-    Note: The use instruction is now at instruction_index + 1 (shifted by insert)
-    Let use_instruction be proc get from List with instructions, instruction_index plus 1
-
-    Note: Update operands that reference vreg_id
-    Let op1 be proc memory_get_int64 from Layout with use_instruction, 16
-    If op1 is equal to vreg_id:
-        proc memory_set_int64 from Layout with use_instruction, 16, temp_vreg
+    Note: Rewrite the use instruction (shifted to instruction_index + 1)
+    Let use_instruction be proc list_get from List with instructions, instruction_index plus 1
+    Let base be proc lir_resolve_instruction_base from LIR with use_instruction
+    If base is equal to 0:
+        Display "insert_spill_load: unresolvable use instruction"
+        Return 0
     End If
 
-    Let op2 be proc memory_get_int64 from Layout with use_instruction, 24
-    If op2 is equal to vreg_id:
-        proc memory_set_int64 from Layout with use_instruction, 24, temp_vreg
-    End If
+    Note: Operand slots 1-3 read the register directly or through memory
+    Let operand1 be proc memory_get_int64 from MemoryCore with base, 16
+    proc replace_operand_register with operand1, vreg_id, temp_vreg
 
-    Let op3 be proc memory_get_int64 from Layout with use_instruction, 32
-    If op3 is equal to vreg_id:
-        proc memory_set_int64 from Layout with use_instruction, 32, temp_vreg
+    Let operand2 be proc memory_get_int64 from MemoryCore with base, 24
+    proc replace_operand_register with operand2, vreg_id, temp_vreg
+
+    Let operand3 be proc memory_get_int64 from MemoryCore with base, 32
+    proc replace_operand_register with operand3, vreg_id, temp_vreg
+
+    Note: A MEMORY operand in the result slot READS its base/index registers
+    Let result be proc memory_get_int64 from MemoryCore with base, 8
+    If result is not equal to 0:
+        Let result_type be proc memory_get_int64 from MemoryCore with result, 0
+        If result_type is equal to LIRNodes.OPERAND_TYPE_MEMORY:
+            proc replace_operand_register with result, vreg_id, temp_vreg
+        End If
     End If
 
     Return temp_vreg
@@ -409,90 +458,107 @@ Note: Spill Cost Calculation
 Note: ============================================================================
 
 @Reasoning
-Calculates the spill cost for a virtual register. Lower cost means better
-candidate for spilling.
+Calculates the Chaitin spill metric for a virtual register. LOWER means a
+BETTER spill candidate. register_alloc.potential_spill_phase picks the
+minimum over the remaining uncolorable nodes.
 
 Cost factors:
-1. Use frequency: More uses = higher cost (expensive to reload repeatedly)
-2. Def frequency: More defs = higher cost (expensive to store repeatedly)
-3. Loop nesting depth: Uses in inner loops = much higher cost
-4. Interference degree: High degree = lower cost (frees more registers)
+1. Def/use frequency, each occurrence weighted by (1 + its block's
+   loop_depth): values touched in inner loops are expensive to spill
+   because every reload/store executes per iteration.
+2. Interference degree as the divisor: spilling a high-degree node frees
+   more of the graph, so the same frequency costs less.
 
-Formula: cost = (num_defs + num_uses) * avg_loop_depth / interference_degree
+Formula: cost = (Σ weighted defs + Σ weighted uses) × (total_loop_depth + 1)
+                / degree
 
-This heuristic prefers spilling:
-- Registers used infrequently
-- Registers not in hot loops
-- Registers with many interferences (high degree in interference graph)
+Occurrences are detected through the operand-record model: instructions
+resolve through lir_resolve_instruction_base; a def is a REGISTER result
+operand with a matching id; a use is a matching register operand, a memory
+base/index, or a memory RESULT operand's base/index.
 
-Returns the computed spill cost (higher = worse for spilling).
+Returns the computed spill cost (higher = worse for spilling). Errors
+return 999999 so a malformed query is never chosen as a candidate.
 @End Reasoning
 
 Process called "calculate_spill_cost" that takes lir_function as Integer, interference_graph as Integer, vreg_id as Integer returns Integer:
     If lir_function is equal to 0:
         Display "calculate_spill_cost: null lir_function"
-        Return 999999  Note: Very high cost if error
+        Return 999999
     End If
 
-    Note: Count DEF and USE occurrences across all instructions
     Let def_count be 0
     Let use_count be 0
     Let total_loop_depth be 0
 
-    Note: Get blocks from LIRFunction (offset 32)
-    Let blocks be proc memory_get_int64 from Layout with lir_function, 32
-    Let block_count be proc memory_get_int64 from Layout with lir_function, 40
+    Let blocks be proc memory_get_int64 from MemoryCore with lir_function, 32
+    Let block_count be proc memory_get_int64 from MemoryCore with lir_function, 40
 
     Let b be 0
     While b is less than block_count:
-        Let block be proc get from List with blocks, b
-        Let instructions be proc memory_get_int64 from Layout with block, 16
-        Let instruction_count be proc memory_get_int64 from Layout with block, 24
-        Let loop_depth be proc memory_get_int64 from Layout with block, 80
+        Let block be proc list_get from List with blocks, b
+        If block is not equal to 0:
+            Let instructions be proc memory_get_int64 from MemoryCore with block, 16
+            Let instruction_count be proc memory_get_int64 from MemoryCore with block, 24
+            Let loop_depth be proc memory_get_int64 from MemoryCore with block, 80
 
-        Let i be 0
-        While i is less than instruction_count:
-            Let instruction be proc get from List with instructions, i
+            Let i be 0
+            While i is less than instruction_count:
+                Let instruction be proc list_get from List with instructions, i
+                Let base be proc lir_resolve_instruction_base from LIR with instruction
 
-            Note: Check if vreg_id is the result (DEF)
-            Let result_reg be proc memory_get_int64 from Layout with instruction, 8
-            If result_reg is equal to vreg_id:
-                Set def_count to def_count plus (1 plus loop_depth)
-                Set total_loop_depth to total_loop_depth plus loop_depth
-            End If
+                If base is not equal to 0:
+                    Note: DEF: REGISTER result operand with matching id
+                    Let result be proc memory_get_int64 from MemoryCore with base, 8
+                    If result is not equal to 0:
+                        Let result_type be proc memory_get_int64 from MemoryCore with result, 0
+                        If result_type is equal to LIRNodes.OPERAND_TYPE_REGISTER:
+                            Let result_reg be proc memory_get_int64 from MemoryCore with result, 8
+                            If result_reg is equal to vreg_id:
+                                Set def_count to def_count plus (1 plus loop_depth)
+                                Set total_loop_depth to total_loop_depth plus loop_depth
+                            End If
+                        End If
+                        If result_type is equal to LIRNodes.OPERAND_TYPE_MEMORY:
+                            Note: Memory result reads its address registers
+                            If proc operand_reads_register with result, vreg_id is equal to 1:
+                                Set use_count to use_count plus (1 plus loop_depth)
+                                Set total_loop_depth to total_loop_depth plus loop_depth
+                            End If
+                        End If
+                    End If
 
-            Note: Check if vreg_id is an operand (USE)
-            Let op1 be proc memory_get_int64 from Layout with instruction, 16
-            If op1 is equal to vreg_id:
-                Set use_count to use_count plus (1 plus loop_depth)
-                Set total_loop_depth to total_loop_depth plus loop_depth
-            End If
+                    Note: USES: operand slots 1-3
+                    Let operand1 be proc memory_get_int64 from MemoryCore with base, 16
+                    If proc operand_reads_register with operand1, vreg_id is equal to 1:
+                        Set use_count to use_count plus (1 plus loop_depth)
+                        Set total_loop_depth to total_loop_depth plus loop_depth
+                    End If
 
-            Let op2 be proc memory_get_int64 from Layout with instruction, 24
-            If op2 is equal to vreg_id:
-                Set use_count to use_count plus (1 plus loop_depth)
-                Set total_loop_depth to total_loop_depth plus loop_depth
-            End If
+                    Let operand2 be proc memory_get_int64 from MemoryCore with base, 24
+                    If proc operand_reads_register with operand2, vreg_id is equal to 1:
+                        Set use_count to use_count plus (1 plus loop_depth)
+                        Set total_loop_depth to total_loop_depth plus loop_depth
+                    End If
 
-            Let op3 be proc memory_get_int64 from Layout with instruction, 32
-            If op3 is equal to vreg_id:
-                Set use_count to use_count plus (1 plus loop_depth)
-                Set total_loop_depth to total_loop_depth plus loop_depth
-            End If
+                    Let operand3 be proc memory_get_int64 from MemoryCore with base, 32
+                    If proc operand_reads_register with operand3, vreg_id is equal to 1:
+                        Set use_count to use_count plus (1 plus loop_depth)
+                        Set total_loop_depth to total_loop_depth plus loop_depth
+                    End If
+                End If
 
-            Set i to i plus 1
-        End While
+                Set i to i plus 1
+            End While
+        End If
 
         Set b to b plus 1
     End While
 
-    Note: Get interference degree (number of neighbors in interference graph)
+    Note: Interference degree (number of neighbors in the graph)
     Let interference_degree be 0
     If interference_graph is not equal to 0:
-        Let neighbors be proc get from Dictionary with interference_graph, vreg_id
-        If neighbors is not equal to 0:
-            Set interference_degree to proc size from Dictionary with neighbors
-        End If
+        Set interference_degree to proc get_node_degree from Interference with interference_graph, vreg_id
     End If
 
     Note: Avoid division by zero
@@ -500,10 +566,9 @@ Process called "calculate_spill_cost" that takes lir_function as Integer, interf
         Set interference_degree to 1
     End If
 
-    Note: Calculate cost: (defs + uses) * total_loop_depth / degree
     Let frequency be def_count plus use_count
     If frequency is equal to 0:
-        Set frequency to 1  Note: Minimum frequency
+        Set frequency to 1
     End If
 
     Let cost be (frequency multiplied by (total_loop_depth plus 1)) divided by interference_degree
@@ -516,18 +581,21 @@ Note: Find Spill Insertion Points
 Note: ============================================================================
 
 @Reasoning
-Uses liveness analysis to find optimal insertion points for spill stores and
-spill loads.
-
 For each virtual register in the spill worklist:
-1. Find all DEF points (instructions that write to the register)
-2. Find all USE points (instructions that read from the register)
-3. Insert STORE after each DEF
-4. Insert LOAD before each USE
+1. Allocate its spill slot (frame-accounted, idempotent per vreg)
+2. Walk every block's instructions BACKWARD so insertions (store at i+1,
+   load at i) never disturb the indices still to be visited, and freshly
+   inserted spill instructions are never themselves re-scanned
+3. Insert a STORE after each definition and a LOAD (into a fresh vreg,
+   with the use rewritten) before each use
 
-This implements "immediate spilling" strategy - spill at def, reload at use.
-More sophisticated strategies (live range splitting, optimal spilling) can be
-added later as optimizations.
+An instruction that both uses and defines the register (e.g. v = v + 1)
+receives both: the store lands at i+1 first, then the load insertion at i
+shifts it to i+2, yielding the correct LOAD / inst / STORE order.
+
+Definition detection: a REGISTER result operand with a matching id.
+Use detection: operand_reads_register over operand slots 1-3 plus a
+memory RESULT operand (its address registers are reads).
 
 Returns 1 on success, 0 on failure.
 @End Reasoning
@@ -538,78 +606,98 @@ Process called "find_spill_insertion_points" that takes context as Integer retur
         Return 0
     End If
 
-    Note: Get LIR function from context (offset 0)
-    Let lir_function be proc memory_get_int64 from Layout with context, 0
+    Let lir_function be proc memory_get_int64 from MemoryCore with context, 0
     If lir_function is equal to 0:
         Display "find_spill_insertion_points: null lir_function"
         Return 0
     End If
 
-    Note: Get spill worklist from context (offset 16)
-    Let spill_worklist be proc memory_get_int64 from Layout with context, 16
-    Let worklist_size be proc size from List with spill_worklist
+    Let spill_worklist be proc memory_get_int64 from MemoryCore with context, 16
+    Let worklist_size be proc list_length from List with spill_worklist
 
-    Note: Get blocks from LIRFunction (offset 32)
-    Let blocks be proc memory_get_int64 from Layout with lir_function, 32
-    Let block_count be proc memory_get_int64 from Layout with lir_function, 40
+    Let blocks be proc memory_get_int64 from MemoryCore with lir_function, 32
+    Let block_count be proc memory_get_int64 from MemoryCore with lir_function, 40
 
-    Note: Process each virtual register in spill worklist
     Let w be 0
     While w is less than worklist_size:
-        Let vreg_id be proc get from List with spill_worklist, w
+        Let vreg_id be proc list_get from List with spill_worklist, w
 
-        Note: Allocate spill slot for this virtual register (8 bytes for 64-bit)
+        Note: Allocate spill slot for this virtual register (8 bytes, 64-bit)
         Let spill_offset be proc allocate_spill_slot with context, vreg_id, 8
         If spill_offset is equal to 0:
             Display "find_spill_insertion_points: failed to allocate spill slot"
             Return 0
         End If
 
-        Note: Find all DEF and USE points for this vreg
         Let b be 0
         While b is less than block_count:
-            Let block be proc get from List with blocks, b
-            Let instructions be proc memory_get_int64 from Layout with block, 16
-            Let instruction_count be proc memory_get_int64 from Layout with block, 24
+            Let block be proc list_get from List with blocks, b
+            If block is not equal to 0:
+                Let instructions be proc memory_get_int64 from MemoryCore with block, 16
+                Let instruction_count be proc memory_get_int64 from MemoryCore with block, 24
 
-            Note: Iterate from end to beginning to handle insertions correctly
-            Let i be instruction_count minus 1
-            While i is greater than or equal to 0:
-                Let instruction be proc get from List with instructions, i
+                Note: Iterate backward so insertions don't disturb pending indices
+                Let i be instruction_count minus 1
+                While i is greater than or equal to 0:
+                    Let instruction be proc list_get from List with instructions, i
+                    Let base be proc lir_resolve_instruction_base from LIR with instruction
 
-                Note: Check if this instruction DEFines vreg_id
-                Let result_reg be proc memory_get_int64 from Layout with instruction, 8
-                If result_reg is equal to vreg_id:
-                    Note: Insert spill STORE after this instruction
-                    proc insert_spill_store with context, block, i, vreg_id, spill_offset
-                End If
+                    If base is not equal to 0:
+                        Note: DEF check: REGISTER result operand matching vreg_id
+                        Let is_def be 0
+                        Let result be proc memory_get_int64 from MemoryCore with base, 8
+                        If result is not equal to 0:
+                            Let result_type be proc memory_get_int64 from MemoryCore with result, 0
+                            If result_type is equal to LIRNodes.OPERAND_TYPE_REGISTER:
+                                Let result_reg be proc memory_get_int64 from MemoryCore with result, 8
+                                If result_reg is equal to vreg_id:
+                                    Set is_def to 1
+                                End If
+                            End If
+                        End If
 
-                Note: Check if this instruction USEs vreg_id (check after DEF to handle same-instruction def-use)
-                Let has_use be 0
+                        If is_def is equal to 1:
+                            proc insert_spill_store with context, block, i, vreg_id, spill_offset
+                        End If
 
-                Let op1 be proc memory_get_int64 from Layout with instruction, 16
-                If op1 is equal to vreg_id:
-                    Set has_use to 1
-                End If
+                        Note: USE check: operands 1-3 plus memory result address
+                        Let has_use be 0
 
-                Let op2 be proc memory_get_int64 from Layout with instruction, 24
-                If op2 is equal to vreg_id and has_use is equal to 0:
-                    Set has_use to 1
-                End If
+                        Let operand1 be proc memory_get_int64 from MemoryCore with base, 16
+                        If proc operand_reads_register with operand1, vreg_id is equal to 1:
+                            Set has_use to 1
+                        End If
 
-                Let op3 be proc memory_get_int64 from Layout with instruction, 32
-                If op3 is equal to vreg_id and has_use is equal to 0:
-                    Set has_use to 1
-                End If
+                        Let operand2 be proc memory_get_int64 from MemoryCore with base, 24
+                        If proc operand_reads_register with operand2, vreg_id is equal to 1:
+                            Set has_use to 1
+                        End If
 
-                If has_use is equal to 1:
-                    Note: Insert spill LOAD before this instruction
-                    Note: The LOAD creates a vreg and replaces vreg_id in the instruction
-                    proc insert_spill_load with context, block, i, vreg_id, spill_offset
-                End If
+                        Let operand3 be proc memory_get_int64 from MemoryCore with base, 32
+                        If proc operand_reads_register with operand3, vreg_id is equal to 1:
+                            Set has_use to 1
+                        End If
 
-                Set i to i minus 1
-            End While
+                        If has_use is equal to 0:
+                            If result is not equal to 0:
+                                Let result_type2 be proc memory_get_int64 from MemoryCore with result, 0
+                                If result_type2 is equal to LIRNodes.OPERAND_TYPE_MEMORY:
+                                    If proc operand_reads_register with result, vreg_id is equal to 1:
+                                        Set has_use to 1
+                                    End If
+                                End If
+                            End If
+                        End If
+
+                        If has_use is equal to 1:
+                            Note: Reload into a fresh vreg and rewrite this use
+                            proc insert_spill_load with context, block, i, vreg_id, spill_offset
+                        End If
+                    End If
+
+                    Set i to i minus 1
+                End While
+            End If
 
             Set b to b plus 1
         End While
@@ -621,19 +709,18 @@ Process called "find_spill_insertion_points" that takes context as Integer retur
 End Process
 
 Note: ============================================================================
-Note: Create Spill Context
+Note: Spill Context Lifecycle
 Note: ============================================================================
 
 @Reasoning
 Creates and initializes a SpillContext for spill code insertion.
 
-The context tracks all state needed during spilling:
-- Which registers need spilling (spill_worklist)
-- Where each register is spilled (spill_offsets)
-- Spill costs for prioritization
-- Statistics for debugging
+The stack frame is resolved from LIRFunction offset 72 (stack_frame) and
+CREATED via lir_create_stack_frame when the function has none yet - spill
+code cannot exist without a frame to address into. The two tracking maps
+are OrderedMaps because their keys are vreg ids.
 
-Tier 3 (OWNED HEAP) allocation - context owned by caller and freed after use.
+Tier 3 (OWNED HEAP) allocation - released by destroy_spill_context.
 @End Reasoning
 
 Process called "create_spill_context" that takes lir_function as Integer, spill_worklist as Integer returns Integer:
@@ -642,39 +729,71 @@ Process called "create_spill_context" that takes lir_function as Integer, spill_
         Return 0
     End If
 
-    Note: Allocate SpillContext (72 bytes)
     Let context be proc allocate from Layout with 72
+    If context is equal to 0:
+        Display "create_spill_context: allocation failed"
+        Return 0
+    End If
 
-    Note: Set lir_function (offset 0)
-    proc memory_set_int64 from Layout with context, 0, lir_function
+    proc memory_set_int64 from MemoryCore with context, 0, lir_function
 
-    Note: Get and set stack_frame from LIRFunction (offset 80 in LIRFunction)
-    Let stack_frame be proc memory_get_int64 from Layout with lir_function, 80
-    proc memory_set_int64 from Layout with context, 8, stack_frame
+    Note: Resolve the stack frame (LIRFunction offset 72), creating it on demand
+    Let stack_frame be proc memory_get_int64 from MemoryCore with lir_function, 72
+    If stack_frame is equal to 0:
+        Set stack_frame to proc lir_create_stack_frame from LIR with lir_function
+        If stack_frame is equal to 0:
+            Display "create_spill_context: stack frame creation failed"
+            proc deallocate from Layout with context
+            Return 0
+        End If
+    End If
+    proc memory_set_int64 from MemoryCore with context, 8, stack_frame
 
-    Note: Set spill_worklist (offset 16)
-    proc memory_set_int64 from Layout with context, 16, spill_worklist
+    proc memory_set_int64 from MemoryCore with context, 16, spill_worklist
 
-    Note: Create spill_costs dictionary (offset 24)
-    Let spill_costs be proc create from Dictionary
-    proc memory_set_int64 from Layout with context, 24, spill_costs
+    Let spill_costs be proc omap_create from OrderedMap
+    proc memory_set_int64 from MemoryCore with context, 24, spill_costs
 
-    Note: Create spill_offsets dictionary (offset 32)
-    Let spill_offsets be proc create from Dictionary
-    proc memory_set_int64 from Layout with context, 32, spill_offsets
+    Let spill_offsets be proc omap_create from OrderedMap
+    proc memory_set_int64 from MemoryCore with context, 32, spill_offsets
 
-    Note: Initialize next_spill_offset to -8 (first spill slot, offset 40)
-    Note: Spill slots grow downward from stack frame
-    proc memory_set_int64 from Layout with context, 40, -8
+    Note: lowest_spill_offset starts at 0 (no slots allocated yet)
+    proc memory_set_int64 from MemoryCore with context, 40, 0
 
-    Note: Set spill_alignment to 8 bytes (offset 48)
-    proc memory_set_int64 from Layout with context, 48, 8
+    Note: spill_alignment is 8 bytes for 64-bit values
+    proc memory_set_int64 from MemoryCore with context, 48, 8
 
-    Note: Initialize counters to 0 (offsets 56, 64)
-    proc memory_set_int64 from Layout with context, 56, 0  Note: spills_inserted
-    proc memory_set_int64 from Layout with context, 64, 0  Note: reloads_inserted
+    Note: Statistics counters
+    proc memory_set_int64 from MemoryCore with context, 56, 0
+    proc memory_set_int64 from MemoryCore with context, 64, 0
 
     Return context
+End Process
+
+@Reasoning
+Releases a SpillContext: the two context-owned OrderedMaps and the record
+itself. The spill worklist is caller-owned and the stack frame belongs to
+the LIRFunction, so neither is touched.
+@End Reasoning
+
+Process called "destroy_spill_context" that takes context as Integer returns Integer:
+    If context is equal to 0:
+        Return 0
+    End If
+
+    Let spill_costs be proc memory_get_int64 from MemoryCore with context, 24
+    If spill_costs is not equal to 0:
+        proc omap_destroy from OrderedMap with spill_costs
+    End If
+
+    Let spill_offsets be proc memory_get_int64 from MemoryCore with context, 32
+    If spill_offsets is not equal to 0:
+        proc omap_destroy from OrderedMap with spill_offsets
+    End If
+
+    proc deallocate from Layout with context
+
+    Return 1
 End Process
 
 Note: ============================================================================
@@ -682,24 +801,20 @@ Note: Main Entry Point - Insert Spill Code
 Note: ============================================================================
 
 @Reasoning
-Main entry point for spill code insertion. Called by register allocation when
-the spill worklist is non-empty.
+Main entry point for spill code insertion. Called with the spill worklist
+produced by register_alloc.allocate_registers when coloring failed.
 
 Algorithm:
-1. Create spill context
-2. Calculate spill costs for all registers in worklist
-3. Find insertion points using liveness analysis
-4. Insert spill stores (after DEFs) and spill loads (before USEs)
-5. Update stack frame with spill area size
-6. Return success
+1. Create spill context (resolves/creates the stack frame)
+2. Find insertion points and insert spill stores (after defs) and
+   reloads (before uses, into fresh vregs)
+3. Verify the inserted code (every worklist entry has a slot, the frame
+   spill area grew)
+4. Release the context and report success
 
-After spilling, the caller must:
-1. Rerun liveness analysis (new LOAD/STORE instructions affect liveness)
-2. Rerun interference graph construction
-3. Rerun register allocation on remaining virtual registers
-
-This implements immediate spilling strategy. More sophisticated strategies
-(live range splitting, Belady's optimal) can be added as future optimizations.
+After spilling, the caller must rerun liveness analysis and interference
+construction (the new instructions change the program) and rerun register
+allocation - see register_alloc.runa's usage example.
 
 Returns 1 on success, 0 on failure.
 @End Reasoning
@@ -715,41 +830,30 @@ Process called "insert_spill_code" that takes lir_function as Integer, spill_wor
         Return 0
     End If
 
-    Let worklist_size be proc size from List with spill_worklist
+    Let worklist_size be proc list_length from List with spill_worklist
     If worklist_size is equal to 0:
-        Note: No registers to spill, success
         Return 1
     End If
 
-    Note: Create spill context
     Let context be proc create_spill_context with lir_function, spill_worklist
     If context is equal to 0:
         Display "insert_spill_code: failed to create spill context"
         Return 0
     End If
 
-    Note: Find insertion points and insert spill/reload code
     Let result be proc find_spill_insertion_points with context
     If result is equal to 0:
         Display "insert_spill_code: failed to find insertion points"
+        proc destroy_spill_context with context
         Return 0
     End If
 
-    Note: Get statistics from context
-    Let spills_count be proc memory_get_int64 from Layout with context, 56
-    Let reloads_count be proc memory_get_int64 from Layout with context, 64
+    Note: Self-check the inserted code before declaring success
+    Let verified be proc verify_spill_code with context
 
-    Note: Display spill statistics
-    Display "Spill code insertion complete:"
-    Display "  Registers spilled: "
-    Display worklist_size
-    Display "  Spill stores inserted: "
-    Display spills_count
-    Display "  Spill loads inserted: "
-    Display reloads_count
+    proc destroy_spill_context with context
 
-    Note: Success
-    Return 1
+    Return verified
 End Process
 
 Note: ============================================================================
@@ -758,16 +862,9 @@ Note: ==========================================================================
 
 @Reasoning
 Calculates spill costs for all virtual registers in the spill worklist and
-stores them in the SpillContext.spill_costs dictionary.
-
-This is useful for prioritizing which registers to spill when multiple
-candidates exist. Lower cost = better spilling candidate.
-
-While the current implementation uses immediate spilling (spills everything
-in the worklist), future optimizations can use these costs to:
-- Prioritize spilling order
-- Split live ranges intelligently
-- Implement Belady's optimal spilling algorithm
+stores them in the SpillContext.spill_costs map. Used when a caller wants
+to rank an entire worklist at once (the allocator's potential-spill phase
+instead queries calculate_spill_cost per candidate).
 
 Returns 1 on success, 0 on failure.
 @End Reasoning
@@ -778,29 +875,24 @@ Process called "calculate_all_spill_costs" that takes context as Integer, interf
         Return 0
     End If
 
-    Note: Get LIR function from context (offset 0)
-    Let lir_function be proc memory_get_int64 from Layout with context, 0
+    Let lir_function be proc memory_get_int64 from MemoryCore with context, 0
     If lir_function is equal to 0:
         Display "calculate_all_spill_costs: null lir_function"
         Return 0
     End If
 
-    Note: Get spill worklist from context (offset 16)
-    Let spill_worklist be proc memory_get_int64 from Layout with context, 16
-    Let worklist_size be proc size from List with spill_worklist
+    Let spill_worklist be proc memory_get_int64 from MemoryCore with context, 16
+    Let worklist_size be proc list_length from List with spill_worklist
 
-    Note: Get spill_costs dictionary from context (offset 24)
-    Let spill_costs be proc memory_get_int64 from Layout with context, 24
+    Let spill_costs be proc memory_get_int64 from MemoryCore with context, 24
 
-    Note: Calculate cost for each register in worklist
     Let w be 0
     While w is less than worklist_size:
-        Let vreg_id be proc get from List with spill_worklist, w
+        Let vreg_id be proc list_get from List with spill_worklist, w
 
         Let cost be proc calculate_spill_cost with lir_function, interference_graph, vreg_id
 
-        Note: Store cost in dictionary
-        proc set from Dictionary with spill_costs, vreg_id, cost
+        proc omap_set from OrderedMap with spill_costs, vreg_id, cost
 
         Set w to w plus 1
     End While
@@ -813,8 +905,9 @@ Note: Print Spill Information
 Note: ============================================================================
 
 @Reasoning
-Debug function to print spill slot allocations and statistics.
-Useful for understanding spilling behavior and debugging spill-related issues.
+Debug function to print spill slot allocations and statistics. Integer
+values are rendered through StringUtils.integer_to_string because Display
+on a raw Integer treats it as a string pointer.
 @End Reasoning
 
 Process called "print_spill_info" that takes context as Integer returns Integer:
@@ -827,37 +920,37 @@ Process called "print_spill_info" that takes context as Integer returns Integer:
     Display "Spill Information"
     Display "========================================="
 
-    Note: Get spill_offsets from context (offset 32)
-    Let spill_offsets be proc memory_get_int64 from Layout with context, 32
-    Let num_spills be proc size from Dictionary with spill_offsets
+    Let spill_offsets be proc memory_get_int64 from MemoryCore with context, 32
+    Let num_spills be proc omap_size from OrderedMap with spill_offsets
 
-    Display "Total spilled registers: "
-    Display num_spills
+    Display "Total spilled registers:"
+    Let num_str be proc integer_to_string from StringUtils with num_spills
+    Display num_str
 
-    Note: Print each spill slot allocation
-    Let keys be proc keys from Dictionary with spill_offsets
-    Let i be 0
-    While i is less than num_spills:
-        Let vreg_id be proc get from List with keys, i
-        Let spill_offset be proc get from Dictionary with spill_offsets, vreg_id
+    Let entry be proc omap_first from OrderedMap with spill_offsets
+    While entry is not equal to 0:
+        Let vreg_id be proc omap_entry_key from OrderedMap with entry
+        Let spill_offset be proc omap_entry_value from OrderedMap with entry
 
-        Display "  vreg "
-        Display vreg_id
-        Display " → stack offset "
-        Display spill_offset
+        Display "  vreg -> stack offset:"
+        Let vreg_str be proc integer_to_string from StringUtils with vreg_id
+        Display vreg_str
+        Let off_str be proc integer_to_string from StringUtils with spill_offset
+        Display off_str
 
-        Set i to i plus 1
+        Set entry to proc omap_entry_next from OrderedMap with entry
     End While
 
-    Note: Print statistics
-    Let spills_count be proc memory_get_int64 from Layout with context, 56
-    Let reloads_count be proc memory_get_int64 from Layout with context, 64
+    Let spills_count be proc memory_get_int64 from MemoryCore with context, 56
+    Let reloads_count be proc memory_get_int64 from MemoryCore with context, 64
 
-    Display "Spill stores inserted: "
-    Display spills_count
+    Display "Spill stores inserted:"
+    Let stores_str be proc integer_to_string from StringUtils with spills_count
+    Display stores_str
 
-    Display "Spill loads inserted: "
-    Display reloads_count
+    Display "Spill loads inserted:"
+    Let loads_str be proc integer_to_string from StringUtils with reloads_count
+    Display loads_str
 
     Display "========================================="
 
@@ -869,11 +962,14 @@ Note: Verify Spill Code
 Note: ============================================================================
 
 @Reasoning
-Verification function to check that spill code insertion was performed correctly:
-1. All registers in spill worklist have allocated spill slots
-2. Spill stores were inserted after DEF points
-3. Spill loads were inserted before USE points
-4. Stack frame spill area size was updated correctly
+Verification function to check that spill code insertion was performed
+correctly:
+1. Every register in the spill worklist has an allocated spill slot
+   (presence-tested with omap_contains - offsets are negative, but the
+   sentinel-free test keeps the check exact)
+2. Spill stores/loads were actually inserted when the worklist is non-empty
+   (informational warnings when defs or uses were genuinely absent)
+3. The stack frame's spill area size grew to cover the slots
 
 Returns 1 if all checks pass, 0 if errors found.
 @End Reasoning
@@ -886,95 +982,96 @@ Process called "verify_spill_code" that takes context as Integer returns Integer
 
     Let errors_found be 0
 
-    Note: Get spill worklist from context (offset 16)
-    Let spill_worklist be proc memory_get_int64 from Layout with context, 16
-    Let worklist_size be proc size from List with spill_worklist
+    Let spill_worklist be proc memory_get_int64 from MemoryCore with context, 16
+    Let worklist_size be proc list_length from List with spill_worklist
 
-    Note: Get spill_offsets from context (offset 32)
-    Let spill_offsets be proc memory_get_int64 from Layout with context, 32
+    Let spill_offsets be proc memory_get_int64 from MemoryCore with context, 32
 
-    Note: Check that all registers in worklist have spill slots
+    Note: Check that all registers in the worklist have spill slots
     Let w be 0
     While w is less than worklist_size:
-        Let vreg_id be proc get from List with spill_worklist, w
-        Let spill_offset be proc get from Dictionary with spill_offsets, vreg_id
+        Let vreg_id be proc list_get from List with spill_worklist, w
 
-        If spill_offset is equal to 0:
-            Display "ERROR: vreg "
-            Display vreg_id
-            Display " in spill worklist has no allocated spill slot"
+        If proc omap_contains from OrderedMap with spill_offsets, vreg_id is equal to 0:
+            Display "verify_spill_code: vreg in worklist has no allocated spill slot:"
+            Let vreg_str be proc integer_to_string from StringUtils with vreg_id
+            Display vreg_str
             Set errors_found to errors_found plus 1
         End If
 
         Set w to w plus 1
     End While
 
-    Note: Check that at least some spill code was inserted
-    Let spills_count be proc memory_get_int64 from Layout with context, 56
-    Let reloads_count be proc memory_get_int64 from Layout with context, 64
+    Note: Check that spill code was inserted
+    Let spills_count be proc memory_get_int64 from MemoryCore with context, 56
+    Let reloads_count be proc memory_get_int64 from MemoryCore with context, 64
 
     If spills_count is equal to 0 and worklist_size is greater than 0:
-        Display "WARNING: No spill stores inserted despite non-empty worklist"
-        Note: This could be valid if all defs are from parameters/constants
+        Display "verify_spill_code: WARNING - no spill stores inserted (no defs found)"
     End If
 
     If reloads_count is equal to 0 and worklist_size is greater than 0:
-        Display "WARNING: No spill loads inserted despite non-empty worklist"
-        Note: This could be valid if values are never used after spilling
+        Display "verify_spill_code: WARNING - no spill loads inserted (no uses found)"
     End If
 
-    Note: Check stack frame spill area was updated
-    Let stack_frame be proc memory_get_int64 from Layout with context, 8
+    Note: Check stack frame spill area was updated (StackFrame offset 16)
+    Let stack_frame be proc memory_get_int64 from MemoryCore with context, 8
     If stack_frame is not equal to 0:
-        Let spill_area_size be proc memory_get_int64 from Layout with stack_frame, 16
+        Let spill_area_size be proc memory_get_int64 from MemoryCore with stack_frame, 16
         If spill_area_size is equal to 0 and worklist_size is greater than 0:
-            Display "ERROR: Stack frame spill area size is 0 but registers were spilled"
+            Display "verify_spill_code: stack frame spill area is 0 but registers were spilled"
             Set errors_found to errors_found plus 1
         End If
     End If
 
     If errors_found is greater than 0:
-        Display "Spill code verification FAILED with "
-        Display errors_found
-        Display " errors"
+        Display "verify_spill_code: FAILED with errors:"
+        Let err_str be proc integer_to_string from StringUtils with errors_found
+        Display err_str
         Return 0
     End If
 
-    Display "Spill code verification PASSED"
     Return 1
 End Process
 
 Note: ============================================================================
-Note: End of spilling.runa - Production-Grade Implementation Complete
+Note: Usage Example and Integration
 Note: ============================================================================
 
 Note:
-IMPLEMENTATION SUMMARY:
-- SpillContext type definition (72 bytes, 9 fields)
-- 11 complete functions with zero placeholders
-- Immediate spilling strategy (spill at def, reload at use)
-- Tier 3 (OWNED HEAP) memory architecture compliance
-- Complete spill cost calculation
-- Verification and debug functions
-- Production-perfect code ready for immediate use
+USAGE EXAMPLE:
+--------------
+Called from the allocator's spill-and-retry loop:
+
+    Import "compiler/middle/gungnir/lir/spilling.runa" as Spilling
+
+    Let spill_success be proc insert_spill_code from Spilling with lir_function, spill_worklist
+    If spill_success is equal to 0:
+        Display "Spill code insertion failed"
+        Return 0
+    End If
+
+    Note: The program changed - rerun liveness, interference, allocation
+    Let liveness_ok be proc compute_function_liveness from Liveness with lir_function
+    Let graph be proc build_interference_graph from Interference with lir_function
+    Let context be proc allocate_registers from RegisterAlloc with lir_function, graph
 
 INTEGRATION:
-- Called by register_alloc.runa when spill_worklist is non-empty
-- Uses liveness analysis to find optimal insertion points
-- Updates stack frame with spill area size
-- Requires rerun of liveness + register allocation after spilling
+------------
+- Called by the register allocation pipeline when
+  AllocationContext.spill_worklist (offset 40) is non-empty
+- Spill slots are accounted in the LIRFunction's StackFrame via
+  LIR.lir_allocate_spill_slot; lir_finalize_stack_frame folds the spill
+  area into the final frame size
+- The Chaitin spill metric calculate_spill_cost is consumed by
+  register_alloc.potential_spill_phase for candidate selection
 
-FUNCTIONS IMPLEMENTED:
-1. allocate_spill_slot - Allocate stack space for spilled register
-2. insert_spill_store - Insert STORE instruction after DEF
-3. insert_spill_load - Insert LOAD instruction before USE
-4. calculate_spill_cost - Calculate spill cost for prioritization
-5. find_spill_insertion_points - Find all DEF/USE points and insert code
-6. create_spill_context - Initialize SpillContext
-7. insert_spill_code - Main entry point (called by register allocator)
-8. calculate_all_spill_costs - Batch cost calculation
-9. print_spill_info - Debug output
-10. verify_spill_code - Correctness verification
-
-Total: ~900 lines of production-perfect code with comprehensive documentation.
+COMPILATION PIPELINE:
+---------------------
+1. LIR construction (lir_builder.runa)
+2. Liveness analysis (liveness.runa)
+3. Interference graph (interference.runa)
+4. Register allocation (register_alloc.runa)
+5. **SPILL CODE INSERTION** (this file, on demand)
+6. Backend code generation
 :End Note

@@ -6,9 +6,12 @@ Note: Handles all Dockerfile instructions, multi-line commands, variables, hered
 Note: ============================================================================
 
 Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/frontend/primitives/core/string_primitive.runa" as StringPrimitive
+Import "compiler/internal/string_utils.runa" as StringUtils
 Import "compiler/frontend/primitives/char_core.runa" as CharCore
 Import "compiler/frontend/primitives/collections/list.runa" as ListCore
 Import "compiler/frontend/primitives/core/memory_core.runa" as MemoryCore
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
 
 Note: ============================================================================
 Note: Dockerfile Token Type Constants
@@ -133,12 +136,11 @@ the lexer state mutable across the public lexer entry points.
 
 @Implementation:
 Builds a DockerfileLexerState value with source set, position=0,
-line=1, column=1, current_char=0 placeholder, tokens=fresh List from
-ListCore, had_error=0, empty error_message. Allocates a heap slot via
-MemoryCore.memory_allocate sized for the struct and writes the value
-in via memory_write. If the source is non-empty re-reads the first
-character via StringCore.string_char_at and updates current_char by
-re-writing the struct. Returns the heap pointer.
+line=1, column=1, current_char=0 initial sentinel, tokens=fresh List
+from ListCore, had_error=0, empty error_message. Struct construction
+allocates the heap home directly. If the source is non-empty reads the
+first character via StringCore.string_char_at and updates current_char
+in place. Returns the struct pointer.
 @End Implementation
 Process called "create_lexer" takes source as String returns Integer:
     @Reasoning
@@ -155,17 +157,13 @@ Process called "create_lexer" takes source as String returns Integer:
         had_error as 0,
         error_message as ""
 
-    Let lexer_ptr be proc memory_allocate from MemoryCore with size_of DockerfileLexerState
-    proc memory_write from MemoryCore with lexer_ptr, lexer
-
     Note: Initialize current_char
     If proc string_length from StringCore with source is greater than 0:
         Let first_char be proc string_char_at from StringCore with source, 0
         Set lexer.current_char to first_char
-        proc memory_write from MemoryCore with lexer_ptr, lexer
     End If
 
-    Return lexer_ptr
+    Return lexer
 End Process
 
 Note: ============================================================================
@@ -180,20 +178,19 @@ resets column to 1 so post-newline positions are correct.
 @End Reasoning
 
 @Implementation:
-Reads the lexer struct from memory. Captures the current character to
-return at the end. Increments position and column by 1. If the
+Operates on the lexer struct in place. Captures the current character
+to return at the end. Increments position and column by 1. If the
 previous character was 10 (newline) bumps line and resets column to 1.
 Reads the next character via StringCore.string_char_at when
 position < source length; otherwise stores 0 as the EOF sentinel.
-Writes the modified struct back. Returns the character that was
-current at the start of the call.
+Returns the character that was current at the start of the call.
 @End Implementation
 Process called "advance" takes lexer_ptr as Integer returns Integer:
     @Reasoning
     Move to next character, update position tracking.
     @End Reasoning
 
-    Let lexer be proc memory_read from MemoryCore with lexer_ptr of type DockerfileLexerState
+    Let lexer be lexer_ptr
     Let source_len be proc string_length from StringCore with lexer.source
 
     Let current be lexer.current_char
@@ -215,7 +212,6 @@ Process called "advance" takes lexer_ptr as Integer returns Integer:
         Set lexer.current_char to 0  Note: EOF
     End If
 
-    proc memory_write from MemoryCore with lexer_ptr, lexer
     Return current
 End Process
 
@@ -235,7 +231,7 @@ Process called "peek" takes lexer_ptr as Integer returns Integer:
     Look at current character without consuming.
     @End Reasoning
 
-    Let lexer be proc memory_read from MemoryCore with lexer_ptr of type DockerfileLexerState
+    Let lexer be lexer_ptr
     Return lexer.current_char
 End Process
 
@@ -257,7 +253,7 @@ Process called "peek_ahead" takes lexer_ptr as Integer, offset as Integer return
     Look ahead at character at given offset.
     @End Reasoning
 
-    Let lexer be proc memory_read from MemoryCore with lexer_ptr of type DockerfileLexerState
+    Let lexer be lexer_ptr
     Let look_pos be lexer.position plus offset
     Let source_len be proc string_length from StringCore with lexer.source
 
@@ -283,7 +279,7 @@ Process called "is_at_end" takes lexer_ptr as Integer returns Integer:
     Check if at end of source.
     @End Reasoning
 
-    Let lexer be proc memory_read from MemoryCore with lexer_ptr of type DockerfileLexerState
+    Let lexer be lexer_ptr
 
     If lexer.current_char is equal to 0:
         Return 1
@@ -433,10 +429,9 @@ the lexer's token list across calls.
 @End Reasoning
 
 @Implementation:
-Builds a DockerfileToken value with the five supplied fields. Allocates
-a heap slot via MemoryCore.memory_allocate sized for the struct. Writes
-the value via memory_write. Returns the heap pointer; ownership
-transfers to whatever list ultimately holds it.
+Builds a DockerfileToken value with the five supplied fields. Struct
+construction allocates the heap home directly. Returns the struct
+pointer; ownership transfers to whatever list ultimately holds it.
 @End Implementation
 Process called "create_token" takes token_type as Integer, lexeme as String, line as Integer, column as Integer, literal_value as String returns Integer:
     @Reasoning
@@ -450,10 +445,7 @@ Process called "create_token" takes token_type as Integer, lexeme as String, lin
         column as column,
         literal_value as literal_value
 
-    Let token_ptr be proc memory_allocate from MemoryCore with size_of DockerfileToken
-    proc memory_write from MemoryCore with token_ptr, token
-
-    Return token_ptr
+    Return token
 End Process
 
 @Reasoning:
@@ -463,23 +455,19 @@ helper pulls them from the lexer state at the moment of emission.
 @End Reasoning
 
 @Implementation:
-Reads the lexer struct. Calls create_token with the supplied
-token_type/lexeme/literal_value plus the current lexer.line and
-lexer.column. Appends the resulting token pointer to lexer.tokens via
-ListCore.list_append. Writes the lexer struct back (no field changes
-but keeps the API contract consistent).
+Calls create_token with the supplied token_type/lexeme/literal_value
+plus the current lexer.line and lexer.column. Appends the resulting
+token pointer to lexer.tokens via ListCore.list_append.
 @End Implementation
 Process called "add_token" takes lexer_ptr as Integer, token_type as Integer, lexeme as String, literal_value as String:
     @Reasoning
     Create token and add to lexer's token list.
     @End Reasoning
 
-    Let lexer be proc memory_read from MemoryCore with lexer_ptr of type DockerfileLexerState
+    Let lexer be lexer_ptr
 
     Let token be proc create_token with token_type, lexeme, lexer.line, lexer.column, literal_value
     proc list_append from ListCore with lexer.tokens, token
-
-    proc memory_write from MemoryCore with lexer_ptr, lexer
 End Process
 
 @Reasoning:
@@ -490,20 +478,18 @@ last error if multiple occur.
 @End Reasoning
 
 @Implementation:
-Reads the lexer struct, sets had_error=1, copies message into the
-error_message field, writes the struct back via memory_write.
+Sets had_error=1 on the lexer struct in place and copies message into
+the error_message field.
 @End Implementation
 Process called "lexer_error" takes lexer_ptr as Integer, message as String:
     @Reasoning
     Record lexer error.
     @End Reasoning
 
-    Let lexer be proc memory_read from MemoryCore with lexer_ptr of type DockerfileLexerState
+    Let lexer be lexer_ptr
 
     Set lexer.had_error to 1
     Set lexer.error_message to message
-
-    proc memory_write from MemoryCore with lexer_ptr, lexer
 End Process
 
 Note: ============================================================================
@@ -532,7 +518,7 @@ Process called "skip_whitespace" takes lexer_ptr as Integer:
         Let char be proc peek with lexer_ptr
 
         If proc is_whitespace with char is equal to 1:
-            proc advance from lexer_ptr
+            proc advance with lexer_ptr
         Otherwise:
             Set continue to 0
         End If
@@ -577,7 +563,7 @@ Process called "scan_comment" takes lexer_ptr as Integer returns Integer:
         End If
 
         If continue is equal to 1:
-            proc advance from lexer_ptr
+            proc advance with lexer_ptr
         End If
     End While
 
@@ -603,7 +589,7 @@ string" and returns 0. On the delimiter, advances past it and stops.
 On 92 ('\\'), advances and dispatches on the escape character:
 110='n'->10, 116='t'->9, 92='\\'->92, delimiter->delimiter; each case
 appends the cooked codepoint to string_value via
-StringCore.string_concat + string_from_char. For any other char calls
+StringPrimitive.string_concat + StringCore.char_to_string. For any other char calls
 advance and appends the raw character. After the closing delimiter is
 consumed, rebuilds the displayed lexeme by sandwiching string_value
 between delim_str copies, then emits a TOKEN_STRING via add_token
@@ -618,7 +604,7 @@ Process called "scan_string" takes lexer_ptr as Integer, delimiter as Integer re
     Let string_value be ""
 
     Note: Skip opening delimiter
-    proc advance from lexer_ptr
+    proc advance with lexer_ptr
 
     Let continue be 1
     While continue is equal to 1:
@@ -631,40 +617,40 @@ Process called "scan_string" takes lexer_ptr as Integer, delimiter as Integer re
 
         If char is equal to delimiter:
             Note: Found closing delimiter
-            proc advance from lexer_ptr
+            proc advance with lexer_ptr
             Set continue to 0
         Otherwise:
             If char is equal to 92:  Note: '\' escape
-                proc advance from lexer_ptr
+                proc advance with lexer_ptr
                 Let escape_char be proc peek with lexer_ptr
 
                 If escape_char is equal to 110:  Note: 'n'
-                    Set string_value to proc string_concat from StringCore with string_value, proc string_from_char from StringCore with 10
-                    proc advance from lexer_ptr
+                    Set string_value to proc string_concat from StringPrimitive with string_value, proc char_to_string from StringCore with 10
+                    proc advance with lexer_ptr
                 End If
                 If escape_char is equal to 116:  Note: 't'
-                    Set string_value to proc string_concat from StringCore with string_value, proc string_from_char from StringCore with 9
-                    proc advance from lexer_ptr
+                    Set string_value to proc string_concat from StringPrimitive with string_value, proc char_to_string from StringCore with 9
+                    proc advance with lexer_ptr
                 End If
                 If escape_char is equal to 92:  Note: '\\'
-                    Set string_value to proc string_concat from StringCore with string_value, proc string_from_char from StringCore with 92
-                    proc advance from lexer_ptr
+                    Set string_value to proc string_concat from StringPrimitive with string_value, proc char_to_string from StringCore with 92
+                    proc advance with lexer_ptr
                 End If
                 If escape_char is equal to delimiter:
-                    Set string_value to proc string_concat from StringCore with string_value, proc string_from_char from StringCore with delimiter
-                    proc advance from lexer_ptr
+                    Set string_value to proc string_concat from StringPrimitive with string_value, proc char_to_string from StringCore with delimiter
+                    proc advance with lexer_ptr
                 End If
             Otherwise:
                 Let regular_char be proc advance with lexer_ptr
-                Set string_value to proc string_concat from StringCore with string_value, proc string_from_char from StringCore with regular_char
+                Set string_value to proc string_concat from StringPrimitive with string_value, proc char_to_string from StringCore with regular_char
             End If
         End If
     End While
 
-    Let lexer be proc memory_read from MemoryCore with lexer_ptr of type DockerfileLexerState
-    Let delim_str be proc string_from_char from StringCore with delimiter
-    Let lexeme be proc string_concat from StringCore with delim_str, string_value
-    Set lexeme to proc string_concat from StringCore with lexeme, delim_str
+    Let lexer be lexer_ptr
+    Let delim_str be proc char_to_string from StringCore with delimiter
+    Let lexeme be proc string_concat from StringPrimitive with delim_str, string_value
+    Set lexeme to proc string_concat from StringPrimitive with lexeme, delim_str
 
     proc add_token with lexer_ptr, TOKEN_STRING, lexeme, string_value
 
@@ -682,8 +668,8 @@ here means the parser never has to second-guess token kinds.
 @Implementation:
 Captures starting line/column for diagnostics. Loops calling advance
 while peek returns an is_identifier_char codepoint, building the
-identifier string via string_concat + string_from_char. Uppercases the
-result via StringCore.string_to_upper and feeds it to
+identifier string via string_concat + char_to_string. Uppercases the
+result via StringUtils.string_to_upper and feeds it to
 get_instruction_type; on non-zero result emits a token of that
 instruction kind. Otherwise checks for "AS" and "NONE" explicitly,
 emitting TOKEN_AS / TOKEN_NONE; on no match emits TOKEN_IDENTIFIER. In
@@ -696,7 +682,7 @@ Process called "scan_identifier" takes lexer_ptr as Integer returns Integer:
     @End Reasoning
 
     Let identifier be ""
-    Let lexer be proc memory_read from MemoryCore with lexer_ptr of type DockerfileLexerState
+    Let lexer be lexer_ptr
     Let start_line be lexer.line
     Let start_col be lexer.column
 
@@ -706,14 +692,14 @@ Process called "scan_identifier" takes lexer_ptr as Integer returns Integer:
 
         If proc is_identifier_char with char is equal to 1:
             Let id_char be proc advance with lexer_ptr
-            Set identifier to proc string_concat from StringCore with identifier, proc string_from_char from StringCore with id_char
+            Set identifier to proc string_concat from StringPrimitive with identifier, proc char_to_string from StringCore with id_char
         Otherwise:
             Set continue to 0
         End If
     End While
 
     Note: Check if it's a Dockerfile instruction (case-insensitive)
-    Let upper_id be proc string_to_upper from StringCore with identifier
+    Let upper_id be proc string_to_upper from StringUtils with identifier, 0
     Let token_type be proc get_instruction_type with upper_id
 
     If token_type is not equal to 0:
@@ -836,14 +822,14 @@ Process called "scan_variable" takes lexer_ptr as Integer returns Integer:
     Let var_text be "$"
 
     Note: Skip $
-    proc advance from lexer_ptr
+    proc advance with lexer_ptr
 
     Let char be proc peek with lexer_ptr
 
     Note: Check for ${VAR} syntax
     If char is equal to 123:  Note: '{'
-        Set var_text to proc string_concat from StringCore with var_text, "{"
-        proc advance from lexer_ptr
+        Set var_text to proc string_concat from StringPrimitive with var_text, "{"
+        proc advance with lexer_ptr
 
         Note: Scan variable name
         Let continue be 1
@@ -852,15 +838,15 @@ Process called "scan_variable" takes lexer_ptr as Integer returns Integer:
 
             If proc is_alpha with current is equal to 1:
                 Let var_char be proc advance with lexer_ptr
-                Set var_text to proc string_concat from StringCore with var_text, proc string_from_char from StringCore with var_char
+                Set var_text to proc string_concat from StringPrimitive with var_text, proc char_to_string from StringCore with var_char
             Otherwise:
                 If proc is_digit with current is equal to 1:
                     Set var_char to proc advance with lexer_ptr
-                    Set var_text to proc string_concat from StringCore with var_text, proc string_from_char from StringCore with var_char
+                    Set var_text to proc string_concat from StringPrimitive with var_text, proc char_to_string from StringCore with var_char
                 Otherwise:
                     If current is equal to 95:  Note: '_'
                         Set var_char to proc advance with lexer_ptr
-                        Set var_text to proc string_concat from StringCore with var_text, proc string_from_char from StringCore with var_char
+                        Set var_text to proc string_concat from StringPrimitive with var_text, proc char_to_string from StringCore with var_char
                     Otherwise:
                         Set continue to 0
                     End If
@@ -871,8 +857,8 @@ Process called "scan_variable" takes lexer_ptr as Integer returns Integer:
         Note: Expect closing }
         Let closing be proc peek with lexer_ptr
         If closing is equal to 125:  Note: '}'
-            Set var_text to proc string_concat from StringCore with var_text, "}"
-            proc advance from lexer_ptr
+            Set var_text to proc string_concat from StringPrimitive with var_text, "}"
+            proc advance with lexer_ptr
         Otherwise:
             proc lexer_error with lexer_ptr, "Expected '}' after variable name"
         End If
@@ -884,15 +870,15 @@ Process called "scan_variable" takes lexer_ptr as Integer returns Integer:
 
             If proc is_alpha with current is equal to 1:
                 Set var_char to proc advance with lexer_ptr
-                Set var_text to proc string_concat from StringCore with var_text, proc string_from_char from StringCore with var_char
+                Set var_text to proc string_concat from StringPrimitive with var_text, proc char_to_string from StringCore with var_char
             Otherwise:
                 If proc is_digit with current is equal to 1:
                     Set var_char to proc advance with lexer_ptr
-                    Set var_text to proc string_concat from StringCore with var_text, proc string_from_char from StringCore with var_char
+                    Set var_text to proc string_concat from StringPrimitive with var_text, proc char_to_string from StringCore with var_char
                 Otherwise:
                     If current is equal to 95:  Note: '_'
                         Set var_char to proc advance with lexer_ptr
-                        Set var_text to proc string_concat from StringCore with var_text, proc string_from_char from StringCore with var_char
+                        Set var_text to proc string_concat from StringPrimitive with var_text, proc char_to_string from StringCore with var_char
                     Otherwise:
                         Set continue to 0
                     End If
@@ -927,8 +913,8 @@ Process called "scan_flag" takes lexer_ptr as Integer returns Integer:
     Let flag_text be "--"
 
     Note: Skip --
-    proc advance from lexer_ptr
-    proc advance from lexer_ptr
+    proc advance with lexer_ptr
+    proc advance with lexer_ptr
 
     Note: Scan flag name and value
     Let continue be 1
@@ -937,19 +923,19 @@ Process called "scan_flag" takes lexer_ptr as Integer returns Integer:
 
         If proc is_alpha with char is equal to 1:
             Let flag_char be proc advance with lexer_ptr
-            Set flag_text to proc string_concat from StringCore with flag_text, proc string_from_char from StringCore with flag_char
+            Set flag_text to proc string_concat from StringPrimitive with flag_text, proc char_to_string from StringCore with flag_char
         Otherwise:
             If char is equal to 45:  Note: '-'
                 Set flag_char to proc advance with lexer_ptr
-                Set flag_text to proc string_concat from StringCore with flag_text, proc string_from_char from StringCore with flag_char
+                Set flag_text to proc string_concat from StringPrimitive with flag_text, proc char_to_string from StringCore with flag_char
             Otherwise:
                 If char is equal to 61:  Note: '='
                     Set flag_char to proc advance with lexer_ptr
-                    Set flag_text to proc string_concat from StringCore with flag_text, proc string_from_char from StringCore with flag_char
+                    Set flag_text to proc string_concat from StringPrimitive with flag_text, proc char_to_string from StringCore with flag_char
                 Otherwise:
                     If proc is_identifier_char with char is equal to 1:
                         Set flag_char to proc advance with lexer_ptr
-                        Set flag_text to proc string_concat from StringCore with flag_text, proc string_from_char from StringCore with flag_char
+                        Set flag_text to proc string_concat from StringPrimitive with flag_text, proc char_to_string from StringCore with flag_char
                     Otherwise:
                         Set continue to 0
                     End If
@@ -991,7 +977,7 @@ Process called "scan_token" takes lexer_ptr as Integer returns Integer:
     Returns 1 if token scanned, 0 if at EOF or error.
     @End Reasoning
 
-    proc skip_whitespace from lexer_ptr
+    proc skip_whitespace with lexer_ptr
 
     Note: Check for comments
     If proc scan_comment with lexer_ptr is equal to 1:
@@ -1007,14 +993,14 @@ Process called "scan_token" takes lexer_ptr as Integer returns Integer:
 
     Note: Newline
     If char is equal to 10:  Note: '\n'
-        proc advance from lexer_ptr
+        proc advance with lexer_ptr
         proc add_token with lexer_ptr, TOKEN_NEWLINE, "\\n", ""
         Return 1
     End If
 
     Note: Carriage return (skip)
     If char is equal to 13:  Note: '\r'
-        proc advance from lexer_ptr
+        proc advance with lexer_ptr
         Return 1
     End If
 
@@ -1023,8 +1009,8 @@ Process called "scan_token" takes lexer_ptr as Integer returns Integer:
         Let next_char be proc peek_ahead with lexer_ptr, 1
 
         If next_char is equal to 10:  Note: '\n'
-            proc advance from lexer_ptr  Note: Skip \
-            proc advance from lexer_ptr  Note: Skip \n
+            proc advance with lexer_ptr  Note: Skip \
+            proc advance with lexer_ptr  Note: Skip \n
             proc add_token with lexer_ptr, TOKEN_BACKSLASH, "\\", ""
             Return 1
         End If
@@ -1032,26 +1018,26 @@ Process called "scan_token" takes lexer_ptr as Integer returns Integer:
 
     Note: JSON syntax
     If char is equal to 91:  Note: '['
-        proc advance from lexer_ptr
+        proc advance with lexer_ptr
         proc add_token with lexer_ptr, TOKEN_LBRACKET, "[", ""
         Return 1
     End If
 
     If char is equal to 93:  Note: ']'
-        proc advance from lexer_ptr
+        proc advance with lexer_ptr
         proc add_token with lexer_ptr, TOKEN_RBRACKET, "]", ""
         Return 1
     End If
 
     If char is equal to 44:  Note: ','
-        proc advance from lexer_ptr
+        proc advance with lexer_ptr
         proc add_token with lexer_ptr, TOKEN_COMMA, ",", ""
         Return 1
     End If
 
     Note: Equals
     If char is equal to 61:  Note: '='
-        proc advance from lexer_ptr
+        proc advance with lexer_ptr
         proc add_token with lexer_ptr, TOKEN_EQUALS, "=", ""
         Return 1
     End If
@@ -1094,7 +1080,7 @@ Process called "scan_token" takes lexer_ptr as Integer returns Integer:
 
             If proc is_digit with digit_char is equal to 1:
                 Let digit be proc advance with lexer_ptr
-                Set number to proc string_concat from StringCore with number, proc string_from_char from StringCore with digit
+                Set number to proc string_concat from StringPrimitive with number, proc char_to_string from StringCore with digit
             Otherwise:
                 Set continue to 0
             End If
@@ -1121,7 +1107,7 @@ Process called "scan_token" takes lexer_ptr as Integer returns Integer:
                     Set continue to 0
                 Otherwise:
                     Let arg_char be proc advance with lexer_ptr
-                    Set arg_text to proc string_concat from StringCore with arg_text, proc string_from_char from StringCore with arg_char
+                    Set arg_text to proc string_concat from StringPrimitive with arg_text, proc char_to_string from StringCore with arg_char
                 End If
             End If
         End If
@@ -1135,10 +1121,10 @@ Process called "scan_token" takes lexer_ptr as Integer returns Integer:
     Note: Unknown character
     Let unknown_char be proc advance with lexer_ptr
     Let error_msg be "Unexpected character: "
-    Set error_msg to proc string_concat from StringCore with error_msg, proc string_from_char from StringCore with unknown_char
+    Set error_msg to proc string_concat from StringPrimitive with error_msg, proc char_to_string from StringCore with unknown_char
     proc lexer_error with lexer_ptr, error_msg
 
-    Let error_char_str be proc string_from_char from StringCore with unknown_char
+    Let error_char_str be proc char_to_string from StringCore with unknown_char
     proc add_token with lexer_ptr, TOKEN_ERROR, error_char_str, ""
     Return 1
 End Process
@@ -1169,8 +1155,7 @@ Process called "tokenize" takes lexer_ptr as Integer returns Integer:
         End If
     End While
 
-    Let lexer be proc memory_read from MemoryCore with lexer_ptr of type DockerfileLexerState
-    Return lexer.tokens
+    Return lexer_ptr.tokens
 End Process
 
 @Reasoning:
@@ -1188,8 +1173,7 @@ Process called "get_tokens" takes lexer_ptr as Integer returns Integer:
     Get list of tokens from lexer.
     @End Reasoning
 
-    Let lexer be proc memory_read from MemoryCore with lexer_ptr of type DockerfileLexerState
-    Return lexer.tokens
+    Return lexer_ptr.tokens
 End Process
 
 @Reasoning:
@@ -1206,7 +1190,7 @@ Process called "had_error" takes lexer_ptr as Integer returns Integer:
     Check if lexer encountered errors.
     @End Reasoning
 
-    Let lexer be proc memory_read from MemoryCore with lexer_ptr of type DockerfileLexerState
+    Let lexer be lexer_ptr
     Return lexer.had_error
 End Process
 
@@ -1226,6 +1210,6 @@ Process called "get_error_message" takes lexer_ptr as Integer returns String:
     Get error message if lexer encountered error.
     @End Reasoning
 
-    Let lexer be proc memory_read from MemoryCore with lexer_ptr of type DockerfileLexerState
+    Let lexer be lexer_ptr
     Return lexer.error_message
 End Process

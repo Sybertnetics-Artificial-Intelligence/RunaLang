@@ -30,29 +30,41 @@ This file is essential because of the following reasons:
 
 This file consists of the following functions/features/operation types:
 - Ownership state computation (Owned, Moved, Borrowed)
-- Move analysis and ownership transfer tracking
+- Move analysis and ownership transfer tracking (move-claim evidence:
+  OD-2 deallocator calls always consume their pointer argument; COPY /
+  CALL-argument / RETURN transfers move when the value's type is non-Copy)
 - Partial move handling for struct fields
-- Ownership error detection (use-after-move, double-move)
+- Flow-sensitive ownership error detection (use-after-move, double-move)
+
+Reconciled to the canonical MIR contract (task #432 cleanup bundle,
+task #458): all struct access goes through mir.runa / cfg.runa /
+mir_nodes.runa canonical accessors per the post-OD-1 prefix-embedded
+layouts; heap deallocation is recognized per OD-2
+(MIRNodes.is_deallocation_call - allocation needs no dedicated arm here
+because every registered SSA value starts OWNED, which is exactly the
+state a fresh allocation result has). Integer-keyed maps use
+collections/ordered_map because collections/dictionary string-hashes
+its keys (integer keys crash at runtime).
 
 Dependencies:
-- compiler/middle/gungnir/mir/mir.runa (MIR structures, instructions)
-- compiler/middle/analysis/lifetime_analysis.runa (Lifetime regions)
-- compiler/middle/analysis/control_flow.runa (CFG)
+- compiler/middle/gungnir/mir/mir.runa (MIR structures, canonical accessors)
+- compiler/middle/gungnir/mir/mir_nodes.runa (call payload accessors, OD-2)
+- compiler/middle/gungnir/mir/cfg.runa (block accessors, use enumeration)
 - compiler/frontend/primitives/memory/layout.runa (OWNED HEAP allocation - Tier 3)
-- compiler/frontend/primitives/collections/list.runa (move lists)
-- compiler/frontend/primitives/collections/dictionary.runa (state mappings)
-- compiler/frontend/primitives/collections/set.runa (borrow sets)
-- compiler/frontend/primitives/core/string_core.runa (debug printing)
+- compiler/frontend/primitives/collections/list.runa (move/borrow/error lists)
+- compiler/frontend/primitives/collections/ordered_map.runa (integer-keyed state maps)
+- compiler/frontend/primitives/core/string_core.runa (error message strings)
+- compiler/internal/string_utils.runa (integer formatting, concatenation)
 :End Note
 
 Import "compiler/middle/gungnir/mir/mir.runa" as MIR
-Import "compiler/middle/analysis/lifetime_analysis.runa" as LifetimeAnalysis
-Import "compiler/middle/analysis/control_flow.runa" as CFG
+Import "compiler/middle/gungnir/mir/mir_nodes.runa" as MIRNodes
+Import "compiler/middle/gungnir/mir/cfg.runa" as MirCFG
 Import "compiler/frontend/primitives/memory/layout.runa" as Layout
 Import "compiler/frontend/primitives/collections/list.runa" as List
-Import "compiler/frontend/primitives/collections/dictionary.runa" as Dictionary
-Import "compiler/frontend/primitives/collections/set.runa" as Set
+Import "compiler/frontend/primitives/collections/ordered_map.runa" as OrderedMap
 Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/internal/string_utils.runa" as StringUtils
 
 Note: ============================================================================
 Note: OWNERSHIP STATE CONSTANTS
@@ -80,23 +92,26 @@ Ownership states:
 Fields:
 - value_id: SSA value or variable ID being tracked
 - state: Current ownership state (OWNED/MOVED/BORROWED/PARTIAL_MOVE)
-- moved_at: Instruction where value was moved (if MOVED)
-- borrowed_by: List of active borrow IDs (if BORROWED)
-- partial_moves: Dictionary mapping field_id -> moved status
+- moved_at: Instruction where value was FIRST moved (if MOVED); later
+  moves of the same value are double-moves and keep the original site
+  so error reports name the true transfer point
+- borrowed_by: List of borrowing instructions (if BORROWED)
+- partial_moves: Integer-keyed ordered map field_id -> moved flag
+  (collections/dictionary string-hashes keys; integer keys crash)
 - move_path: Path where value was moved (for error reporting)
 - can_use: Boolean: value is usable in current state
 - parent_value: Parent value ID (for field tracking)
 
 Memory: Tier 3 (OWNED HEAP)
-Size: 8 fields × 8 bytes = 64 bytes
+Size: 8 fields x 8 bytes = 64 bytes
 @End Reasoning
 
 Type called "OwnershipState":
     value_id as Integer         Note: SSA value or variable ID
     state as Integer            Note: State constant
-    moved_at as Integer         Note: Instruction where moved
-    borrowed_by as Integer      Note: List of active borrows
-    partial_moves as Integer    Note: Dictionary field_id -> moved
+    moved_at as Integer         Note: Instruction where first moved
+    borrowed_by as Integer      Note: List of borrowing instructions
+    partial_moves as Integer    Note: OrderedMap field_id -> moved
     move_path as Integer        Note: Pointer to move path string
     can_use as Integer          Note: Boolean: usable
     parent_value as Integer     Note: Parent value (for fields)
@@ -107,27 +122,34 @@ Note: Field offsets: 0, 8, 16, 24, 32, 40, 48, 56
 @Reasoning
 OwnershipInfo tracks ownership states for a basic block.
 
-Contains ownership state at block entry and exit, + operations
-that occur within the block.
+Contains ownership state codes at block entry and exit, plus the move and
+borrow operations that occur within the block. state_in/state_out map
+value ids to STATE CODES (not OwnershipState records): the dataflow only
+needs the lattice point per value per block boundary, and sharing mutable
+OwnershipState records across blocks would let one block's transfer
+corrupt another's view. The moves and borrows lists are FLAT PAIR lists
+(value_id at slot 2N, instruction pointer at slot 2N+1) so the transfer
+function and the double-move detector know WHICH value each operation
+affected - a CALL can move an argument that appears in no header slot.
 
 Fields:
 - block_id: Basic block ID
-- state_in: Dictionary value_id -> OwnershipState (entry)
-- state_out: Dictionary value_id -> OwnershipState (exit)
-- moves: List of move operations in block
-- borrows: List of borrow operations in block
+- state_in: OrderedMap value_id -> state code (entry)
+- state_out: OrderedMap value_id -> state code (exit)
+- moves: Flat pair List (value_id, move instruction) in block order
+- borrows: Flat pair List (value_id, borrow instruction) in block order
 - errors: List of ownership errors found
 
 Memory: Tier 3 (OWNED HEAP)
-Size: 6 fields × 8 bytes = 48 bytes
+Size: 6 fields x 8 bytes = 48 bytes
 @End Reasoning
 
 Type called "OwnershipInfo":
     block_id as Integer         Note: Basic block ID
-    state_in as Integer         Note: Dictionary value_id -> OwnershipState
-    state_out as Integer        Note: Dictionary value_id -> OwnershipState
-    moves as Integer            Note: List of move operations
-    borrows as Integer          Note: List of borrow operations
+    state_in as Integer         Note: OrderedMap value_id -> state code
+    state_out as Integer        Note: OrderedMap value_id -> state code
+    moves as Integer            Note: Flat pair List of move operations
+    borrows as Integer          Note: Flat pair List of borrow operations
     errors as Integer           Note: List of errors
 End Type
 
@@ -136,25 +158,28 @@ Note: Field offsets: 0, 8, 16, 24, 32, 40
 @Reasoning
 OwnershipAnalysis is the main ownership tracking container.
 
-Tracks ownership states across entire function, using data flow
+Tracks ownership states across an entire function, using data flow
 analysis to propagate states through control flow.
 
 Fields:
-- block_to_ownership: Dictionary block_id -> OwnershipInfo
-- value_to_state: Dictionary value_id -> current OwnershipState
+- block_to_ownership: OrderedMap block_id -> OwnershipInfo
+- value_to_state: OrderedMap value_id -> OwnershipState (flow-insensitive
+  summary: a value is MOVED here when ANY path moves it; the
+  flow-sensitive verdicts live in the per-block state maps and the
+  detection walks)
 - lifetime_analysis: Pointer to LifetimeAnalysis (for integration)
 - cfg: Pointer to CFG
 - move_count: Statistics: total moves tracked
 - borrow_count: Statistics: total borrows tracked
-- error_list: List of ownership errors
+- error_list: List of ownership error message strings
 
 Memory: Tier 3 (OWNED HEAP)
-Size: 7 fields × 8 bytes = 56 bytes
+Size: 7 fields x 8 bytes = 56 bytes
 @End Reasoning
 
 Type called "OwnershipAnalysis":
-    block_to_ownership as Integer   Note: Dictionary block_id -> OwnershipInfo
-    value_to_state as Integer       Note: Dictionary value_id -> OwnershipState
+    block_to_ownership as Integer   Note: OrderedMap block_id -> OwnershipInfo
+    value_to_state as Integer       Note: OrderedMap value_id -> OwnershipState
     lifetime_analysis as Integer    Note: Pointer to LifetimeAnalysis
     cfg as Integer                  Note: Pointer to CFG
     move_count as Integer           Note: Total moves
@@ -197,8 +222,8 @@ Process called "create_ownership_state" that takes value_id as Integer returns I
     Let borrowed_by be proc create from List
     proc memory_set_int64 from Layout with state, 24, borrowed_by
 
-    Note: Create empty partial moves dictionary
-    Let partial_moves be proc create from Dictionary
+    Note: Create empty partial-moves map (integer field ids -> ordered_map)
+    Let partial_moves be proc omap_create from OrderedMap
     proc memory_set_int64 from Layout with state, 32, partial_moves
 
     Note: No move path yet
@@ -230,13 +255,13 @@ Process called "create_ownership_info" that takes block_id as Integer returns In
     Note: Set block ID
     proc memory_set_int64 from Layout with info, 0, block_id
 
-    Note: Create state dictionaries
-    Let state_in be proc create from Dictionary
-    Let state_out be proc create from Dictionary
+    Note: Create entry/exit state maps (integer value ids -> ordered_map)
+    Let state_in be proc omap_create from OrderedMap
+    Let state_out be proc omap_create from OrderedMap
     proc memory_set_int64 from Layout with info, 8, state_in
     proc memory_set_int64 from Layout with info, 16, state_out
 
-    Note: Create operation lists
+    Note: Create operation pair lists and the error list
     Let moves be proc create from List
     Let borrows be proc create from List
     Let errors be proc create from List
@@ -261,12 +286,12 @@ Process called "create_ownership_analysis" that takes cfg as Integer, lifetime_a
         Return 0
     End If
 
-    Note: Create block ownership mapping
-    Let block_to_ownership be proc create from Dictionary
+    Note: Create block ownership mapping (integer block ids -> ordered_map)
+    Let block_to_ownership be proc omap_create from OrderedMap
     proc memory_set_int64 from Layout with oa, 0, block_to_ownership
 
-    Note: Create value state mapping
-    Let value_to_state be proc create from Dictionary
+    Note: Create value state mapping (integer value ids -> ordered_map)
+    Let value_to_state be proc omap_create from OrderedMap
     proc memory_set_int64 from Layout with oa, 8, value_to_state
 
     Note: Set lifetime analysis
@@ -287,31 +312,404 @@ Process called "create_ownership_analysis" that takes cfg as Integer, lifetime_a
 End Process
 
 Note: ============================================================================
+Note: OWNERSHIP LATTICE
+Note: ============================================================================
+
+@Reasoning
+The four ownership states form a lattice ordered by severity: a merge of
+two control-flow paths must take the MORE restrictive verdict so the
+analysis never claims a moved value is usable. Severity ranks (low to
+high): OWNED(0) < BORROWED(2) < PARTIAL_MOVE(3) < MOVED(1). The state
+CODES are fixed public constants, so the rank is computed here instead of
+reordering the constants.
+@End Reasoning
+
+Process called "ownership_state_rank" that takes state as Integer returns Integer:
+    If state is equal to 1:
+        Return 3 Note: MOVED is the most restrictive
+    End If
+    If state is equal to 3:
+        Return 2 Note: PARTIAL_MOVE
+    End If
+    If state is equal to 2:
+        Return 1 Note: BORROWED
+    End If
+    Return 0 Note: OWNED (and any unknown code defaults to least restrictive)
+End Process
+
+@Reasoning
+Conservative join for the dataflow merge and for in-place escalation:
+returns whichever input state is more restrictive by rank. Used at CFG
+merge points (a value moved on ANY incoming path is MOVED after the
+merge) and by the trackers so a MOVED value is never downgraded to
+BORROWED or PARTIAL_MOVE by a later, weaker event.
+@End Reasoning
+
+Process called "merge_ownership_states" that takes state_a as Integer, state_b as Integer returns Integer:
+    Let rank_a be ownership_state_rank(state_a)
+    Let rank_b be ownership_state_rank(state_b)
+    If rank_b is greater than rank_a:
+        Return state_b
+    End If
+    Return state_a
+End Process
+
+Note: ============================================================================
+Note: TYPE-DRIVEN MOVE CLASSIFICATION
+Note: ============================================================================
+
+@Reasoning
+Returns the HIRTypeInfo pointer for an SSA value by resolving the value's
+defining instruction through the function's value_to_instruction registry
+(MIR.lookup_defining_instruction) and reading the canonical type slot
+(MIRNode type_info at header offset 40). Returns 0 when the value has no
+registered definition (function parameters, or MIR built without
+register_value_definition) or the definition carries no type - the
+classifier below treats that absence as "no move claim".
+@End Reasoning
+
+Process called "get_value_type" that takes mir_function as Integer, value_id as Integer returns Integer:
+    If mir_function is equal to 0:
+        Return 0
+    End If
+    If value_id is equal to 0:
+        Return 0
+    End If
+
+    Let def_inst be proc lookup_defining_instruction from MIR with mir_function, value_id
+    If def_inst is equal to 0:
+        Return 0
+    End If
+
+    Return proc get_mir_node_type from MIR with def_inst
+End Process
+
+@Reasoning
+Classifies a HIRTypeInfo as Copy (bitwise duplication leaves the source
+fully usable) or non-Copy (assignment transfers ownership). The rules
+follow Runa's value semantics:
+
+- Unknown type (0): COPY. An ownership-transfer claim needs evidence;
+  with no type metadata the analysis must not invent moves, or every
+  integer reuse would be reported as use-after-move. Heap pointers
+  without type metadata are still tracked soundly through the OD-2
+  deallocator rule, which consumes its pointer argument unconditionally.
+- HIR_BASIC_TYPE (13000): COPY for the machine scalars (Integer, Float,
+  Boolean, Char) - EXCEPT "String", which owns heap storage and moves.
+- Resolved primitive kinds (band extension 2026-06-09): TYPE_INTEGER
+  (13015), TYPE_FLOAT (13016), TYPE_BOOLEAN (13018) are machine scalars
+  and COPY; TYPE_STRING (13017) owns heap storage and is NON-COPY (the
+  kind-resolved form of the "String" name rule above).
+- HIR_POINTER_TYPE (13012): COPY. A raw pointer is a machine word;
+  duplicating it does not transfer ownership of the pointee (pointee
+  lifetime is governed by the OD-2 allocate/deallocate events).
+- HIR_REFERENCE_TYPE (13011): COPY. A reference is a borrow, not an
+  owner; duplicating it never transfers ownership of the referent.
+- HIR_FUNCTION_TYPE (13004): COPY (function addresses are immutable code
+  references).
+- HIR_TYPE_PARAMETER (13009): COPY. An unresolved generic parameter
+  carries no ownership evidence; claiming moves for it would fabricate
+  use-after-move reports for every monomorphic scalar instantiation.
+- HIR_NEVER_TYPE (13014): COPY. No value of the never type exists at
+  runtime, so there is nothing to transfer.
+- Everything else (arrays 13006, resolved generics 13001 such as List/
+  Dictionary instantiations, unions 13002, optionals 13005, tuples
+  13007, records 13008, slices 13013, enums/ADTs 13019): NON-COPY.
+  Moves are the default for owning aggregates; Copy is the scalar
+  exception.
+@End Reasoning
+
+Process called "is_copy_type" that takes type_info as Integer returns Integer:
+    If type_info is equal to 0:
+        Return 1
+    End If
+
+    Let type_kind be proc memory_get_int64 from Layout with type_info, 0
+
+    Note: HIR_BASIC_TYPE (13000): scalars copy; String owns heap and moves
+    If type_kind is equal to 13000:
+        Let type_name be proc memory_get_int64 from Layout with type_info, 8
+        If type_name is not equal to 0:
+            If proc string_equals from StringCore with type_name, "String" is equal to 1:
+                Return 0
+            End If
+        End If
+        Return 1
+    End If
+
+    Note: Resolved primitive kinds: Integer/Float/Boolean copy,
+    Note: String (13017) owns heap storage and moves
+    If type_kind is equal to 13015:
+        Return 1
+    End If
+    If type_kind is equal to 13016:
+        Return 1
+    End If
+    If type_kind is equal to 13018:
+        Return 1
+    End If
+    If type_kind is equal to 13017:
+        Return 0
+    End If
+
+    Note: HIR_POINTER_TYPE (13012): raw pointers are word copies
+    If type_kind is equal to 13012:
+        Return 1
+    End If
+
+    Note: HIR_REFERENCE_TYPE (13011): references are borrows, not owners
+    If type_kind is equal to 13011:
+        Return 1
+    End If
+
+    Note: HIR_FUNCTION_TYPE (13004): function references copy
+    If type_kind is equal to 13004:
+        Return 1
+    End If
+
+    Note: HIR_TYPE_PARAMETER (13009): no ownership evidence, no move claim
+    If type_kind is equal to 13009:
+        Return 1
+    End If
+
+    Note: HIR_NEVER_TYPE (13014): no runtime value exists to transfer
+    If type_kind is equal to 13014:
+        Return 1
+    End If
+
+    Note: Owning aggregates (arrays, container generics, unions,
+    Note: optionals, tuples, records, slices, enums/ADTs)
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: INSTRUCTION EFFECT DERIVATION
+Note: ============================================================================
+
+@Reasoning
+Single source of truth for "which SSA values does this instruction MOVE".
+The scan phase, the transfer function, and both detection walks all
+consume this derivation, so the move semantics cannot drift between
+phases. Per the canonical contract (plan 1.1/1.2) and OD-2:
+
+- OD-2 deallocator CALL (MIRNodes.is_deallocation_call): consumes its
+  FIRST argument unconditionally - deallocation IS the definitive
+  ownership transfer for heap pointers, independent of type metadata.
+- MIR_COPY (20008, OD-5): source use in header operand1 (offset 16);
+  moves when the source type is non-Copy.
+- CALL (20304) / CALL_INDIRECT (20305) / INVOKE (20700): every argument
+  in the prefix-embedded arguments List (read through the MIRNodes call
+  accessors - call uses live ONLY in that List, never in header slots)
+  moves when its type is non-Copy. The indirect callee value itself is a
+  function reference and copies.
+- RETURN (20303): the returned value (header operand1 mirror of ext 72)
+  moves to the caller when non-Copy.
+
+The caller owns the returned List and must destroy it.
+@End Reasoning
+
+Process called "instruction_move_sources" that takes mir_function as Integer, inst as Integer returns Integer:
+    Let sources be proc create from List
+    If sources is equal to 0:
+        Return 0
+    End If
+    If inst is equal to 0:
+        Return sources
+    End If
+
+    Note: OD-2 deallocation: pointer argument 0 is always consumed
+    If proc is_deallocation_call from MIRNodes with inst is equal to 1:
+        Let dealloc_args be proc get_call_arguments from MIRNodes with inst
+        Let dealloc_argc be proc get_call_argument_count from MIRNodes with inst
+        If dealloc_args is not equal to 0:
+            If dealloc_argc is greater than 0:
+                Let freed_ptr be proc get from List with dealloc_args, 0
+                If freed_ptr is not equal to 0:
+                    proc append from List with sources, freed_ptr
+                End If
+            End If
+        End If
+        Return sources
+    End If
+
+    Let opcode be proc get_mir_node_opcode from MIR with inst
+
+    Note: MIR_COPY (20008, OD-5): dest = value_id@8, source = operand1
+    If opcode is equal to 20008:
+        Let copy_src be proc get_mir_node_operand from MIR with inst, 1
+        If copy_src is not equal to 0:
+            Let copy_src_type be get_value_type(mir_function, copy_src)
+            If is_copy_type(copy_src_type) is equal to 0:
+                proc append from List with sources, copy_src
+            End If
+        End If
+        Return sources
+    End If
+
+    Note: Call kinds: non-Copy arguments move into the callee
+    Let is_call_kind be 0
+    If opcode is equal to 20304:
+        Set is_call_kind to 1
+    End If
+    If opcode is equal to 20305:
+        Set is_call_kind to 1
+    End If
+    If opcode is equal to 20700:
+        Set is_call_kind to 1
+    End If
+    If is_call_kind is equal to 1:
+        Let call_args be proc get_call_arguments from MIRNodes with inst
+        Let call_argc be proc get_call_argument_count from MIRNodes with inst
+        If call_args is not equal to 0:
+            Let a be 0
+            While a is less than call_argc:
+                Let arg_value be proc get from List with call_args, a
+                If arg_value is not equal to 0:
+                    Let arg_type be get_value_type(mir_function, arg_value)
+                    If is_copy_type(arg_type) is equal to 0:
+                        proc append from List with sources, arg_value
+                    End If
+                End If
+                Set a to a plus 1
+            End While
+        End If
+        Return sources
+    End If
+
+    Note: RETURN: the returned value moves to the caller when non-Copy
+    If opcode is equal to 20303:
+        Let ret_value be proc get_mir_node_operand from MIR with inst, 1
+        If ret_value is not equal to 0:
+            Let ret_type be get_value_type(mir_function, ret_value)
+            If is_copy_type(ret_type) is equal to 0:
+                proc append from List with sources, ret_value
+            End If
+        End If
+        Return sources
+    End If
+
+    Return sources
+End Process
+
+@Reasoning
+Returns the SSA value an instruction BORROWS, or 0 when it borrows
+nothing. ADDRESS_OF (20205) is the canonical borrow former: taking the
+address of a value creates a reference to it without transferring
+ownership (the addressed use sits in header operand1, the slot the
+canonical memory-band constructors mirror it into).
+@End Reasoning
+
+Process called "instruction_borrow_source" that takes inst as Integer returns Integer:
+    If inst is equal to 0:
+        Return 0
+    End If
+
+    Let opcode be proc get_mir_node_opcode from MIR with inst
+    If opcode is equal to 20205:
+        Return proc get_mir_node_operand from MIR with inst, 1
+    End If
+
+    Return 0
+End Process
+
+@Reasoning
+Enumerates the SSA values an instruction USES, for the use-after-move
+check. CFG.get_instruction_used_values covers header operand slots and
+phi incoming values, but call-family uses live ONLY in the
+prefix-embedded arguments List (create_mir_call leaves the header operand
+slots zero), so those are appended explicitly here. The DEBUG band
+(20800-20804) is excluded entirely: a debug annotation referencing a
+moved value is metadata, not a program use, and must not be reported.
+
+The caller owns the returned List and must destroy it.
+@End Reasoning
+
+Process called "instruction_value_uses" that takes inst as Integer returns Integer:
+    If inst is equal to 0:
+        Return proc create from List
+    End If
+
+    Let opcode be proc get_mir_node_opcode from MIR with inst
+
+    Note: DEBUG band carries no program uses
+    If opcode is greater than or equal to 20800:
+        If opcode is less than or equal to 20804:
+            Return proc create from List
+        End If
+    End If
+
+    Let uses be proc get_instruction_used_values from MirCFG with inst
+    If uses is equal to 0:
+        Set uses to proc create from List
+    End If
+
+    Note: Call-family argument uses live only in the arguments List
+    Let is_call_kind be 0
+    If opcode is equal to 20304:
+        Set is_call_kind to 1
+    End If
+    If opcode is equal to 20305:
+        Set is_call_kind to 1
+    End If
+    If opcode is equal to 20700:
+        Set is_call_kind to 1
+    End If
+    If is_call_kind is equal to 1:
+        Let call_args be proc get_call_arguments from MIRNodes with inst
+        Let call_argc be proc get_call_argument_count from MIRNodes with inst
+        If call_args is not equal to 0:
+            Let a be 0
+            While a is less than call_argc:
+                Let arg_value be proc get from List with call_args, a
+                If arg_value is not equal to 0:
+                    proc append from List with uses, arg_value
+                End If
+                Set a to a plus 1
+            End While
+        End If
+    End If
+
+    Return uses
+End Process
+
+Note: ============================================================================
 Note: OWNERSHIP STATE COMPUTATION
 Note: ============================================================================
 
 @Reasoning
 Main entry point for ownership analysis.
 
-Computes ownership states across entire function using data flow:
-1. Initialize all values as OWNED
-2. Scan instructions for moves and borrows
-3. Propagate states through CFG
-4. Detect errors (use-after-move, double-move)
+Computes ownership states across the entire function using data flow:
+1. Create per-block OwnershipInfo records
+2. Initialize the function's registered SSA values as OWNED
+3. Scan instructions, recording move and borrow operations (per-block
+   ordered pair lists plus the flow-insensitive summary map)
+4. Propagate entry/exit state maps through the CFG to a fixed point
+5. Detect errors flow-sensitively (use-after-move, double-move)
 
 Returns: 1 if successful, 0 if error
 @End Reasoning
 
 Process called "compute_ownership_states" that takes oa as Integer, mir_function as Integer returns Integer:
-    If oa is equal to 0 or mir_function is equal to 0:
+    If oa is equal to 0:
+        Display "compute_ownership_states: null inputs"
+        Return 0
+    End If
+    If mir_function is equal to 0:
         Display "compute_ownership_states: null inputs"
         Return 0
     End If
 
-    Note: Get CFG
-    Let mir_cfg be proc memory_get_int64 from Layout with mir_function, 8
-    Let blocks be proc memory_get_int64 from Layout with mir_cfg, 16
-    Let block_count be proc memory_get_int64 from Layout with mir_cfg, 24
+    Note: Get CFG and blocks through the canonical accessors
+    Let mir_cfg be proc get_mir_function_cfg from MIR with mir_function
+    If mir_cfg is equal to 0:
+        Return 0
+    End If
+    Let blocks be proc get_mir_cfg_blocks from MirCFG with mir_cfg
+    If blocks is equal to 0:
+        Return 0
+    End If
+    Let block_count be proc length from List with blocks
 
     Note: Get ownership structures
     Let block_to_ownership be proc memory_get_int64 from Layout with oa, 0
@@ -321,111 +719,77 @@ Process called "compute_ownership_states" that takes oa as Integer, mir_function
     Let b be 0
     While b is less than block_count:
         Let block be proc get from List with blocks, b
-        Let block_id be proc memory_get_int64 from Layout with block, 0
+        Let block_id be proc get_mir_basic_block_id from MirCFG with block
 
         Let ownership_info be create_ownership_info(block_id)
-        proc set from Dictionary with block_to_ownership, block_id, ownership_info
+        proc omap_set from OrderedMap with block_to_ownership, block_id, ownership_info
 
         Set b to b plus 1
     End While
 
-    Note: Phase 2: Initialize all SSA values as OWNED
+    Note: Phase 2: Initialize the function's registered SSA values as OWNED
     Let local_values be proc memory_get_int64 from Layout with mir_function, 40
     Let value_count be proc memory_get_int64 from Layout with mir_function, 48
 
-    Let v be 0
-    While v is less than value_count:
-        Let value_id be proc get from List with local_values, v
-        Let state be create_ownership_state(value_id)
-        proc set from Dictionary with value_to_state, value_id, state
-        Set v to v plus 1
-    End While
+    If local_values is not equal to 0:
+        Let v be 0
+        While v is less than value_count:
+            Let value_id be proc get from List with local_values, v
+            If value_id is not equal to 0:
+                Let existing be proc omap_get from OrderedMap with value_to_state, value_id
+                If existing is equal to 0:
+                    Let state be create_ownership_state(value_id)
+                    proc omap_set from OrderedMap with value_to_state, value_id, state
+                End If
+            End If
+            Set v to v plus 1
+        End While
+    End If
 
-    Note: Phase 3: Scan instructions for moves and borrows
+    Note: Phase 3: Scan instructions, recording moves and borrows in block
+    Note: order (the pair lists preserve order for the transfer function
+    Note: and the flow-sensitive detection walks)
     Set b to 0
     While b is less than block_count:
-        Set block to proc get from List with blocks, b
-        Set block_id to proc memory_get_int64 from Layout with block, 0
+        Let scan_block be proc get from List with blocks, b
+        Let scan_block_id be proc get_mir_basic_block_id from MirCFG with scan_block
 
-        Let instructions be proc memory_get_int64 from Layout with block, 16
-        Let inst_count be proc memory_get_int64 from Layout with block, 24
+        Let instructions be proc get_block_instructions from MIR with scan_block
+        Let inst_count be proc get_block_instruction_count from MIR with scan_block
 
-        Let i be 0
-        While i is less than inst_count:
-            Let inst be proc get from List with instructions, i
-            Let opcode be proc memory_get_int64 from Layout with inst, 0
+        If instructions is not equal to 0:
+            Let i be 0
+            While i is less than inst_count:
+                Let inst be proc get from List with instructions, i
 
-            Note: Check for move operations (ASSIGN, MOVE opcodes)
-            If opcode is equal to 20001 or opcode is equal to 20002:
-                Let dest be proc memory_get_int64 from Layout with inst, 8
-                Let src be proc memory_get_int64 from Layout with inst, 16
-
-                Note: Check if source type is Copy
-                Let src_type be get_value_type(mir_function, src)
-                Let is_copy be is_copy_type(src_type)
-
-                If is_copy is equal to 0:
-                    Note: Not Copy type, this is a move
-                    track_move_operation(oa, src, dest, inst, block_id)
-                End If
-            End If
-
-            Note: ADDRESS_OF creates borrow
-            If opcode is equal to 20205:
-                Let operand1 be proc memory_get_int64 from Layout with inst, 16
-                track_borrow_operation(oa, operand1, inst, block_id)
-            End If
-
-            Note: CALL may move arguments
-            If opcode is equal to 20304:
-                Note: Arguments passed by value are moved into function
-                Note: Arguments passed by reference are borrowed
-
-                Note: Get all operands (arguments) for this call
-                Note: Operand1 (offset 16) = callee
-                Note: Operand2 (offset 24) = first argument
-                Note: Operand3 (offset 32) = second argument
-
-                Note: Process first argument
-                Let arg1 be proc memory_get_int64 from Layout with inst, 24
-                If arg1 is not equal to 0:
-                    Note: Conservative move tracking for function arguments
-                    Note: Arguments passed by value are moved into the function
-                    Note: This conservative approach assumes all non-primitive arguments are moved
-                    Note: Primitive types (integers, floats, bools) are copied by value, not moved
-                    Note: For precise tracking, type metadata would distinguish Copy vs Move types
-                    track_move_operation(oa, arg1, inst, block_id)
+                Let move_sources be instruction_move_sources(mir_function, inst)
+                If move_sources is not equal to 0:
+                    Let move_total be proc length from List with move_sources
+                    Let m be 0
+                    While m is less than move_total:
+                        Let moved_value be proc get from List with move_sources, m
+                        track_move_operation(oa, moved_value, inst, scan_block_id)
+                        Set m to m plus 1
+                    End While
+                    proc destroy from List with move_sources
                 End If
 
-                Note: Process second argument
-                Let arg2 be proc memory_get_int64 from Layout with inst, 32
-                If arg2 is not equal to 0:
-                    track_move_operation(oa, arg2, inst, block_id)
+                Let borrow_value be instruction_borrow_source(inst)
+                If borrow_value is not equal to 0:
+                    track_borrow_operation(oa, borrow_value, inst, scan_block_id)
                 End If
 
-                Note: For calls with more than 2 arguments, they are stored in an argument list
-                Note: This would require accessing the extended operand list structure
-                Note: Currently handling the most common case (0-2 arguments)
-            End If
-
-            Note: RETURN moves returned value
-            If opcode is equal to 20303:
-                Set operand1 to proc memory_get_int64 from Layout with inst, 16
-                If operand1 is not equal to 0:
-                    track_move_operation(oa, operand1, inst, block_id)
-                End If
-            End If
-
-            Set i to i plus 1
-        End While
+                Set i to i plus 1
+            End While
+        End If
 
         Set b to b plus 1
     End While
 
-    Note: Phase 4: Propagate ownership states through CFG
+    Note: Phase 4: Propagate ownership states through the CFG
     propagate_ownership_states(oa, mir_function)
 
-    Note: Phase 5: Detect ownership errors
+    Note: Phase 5: Detect ownership errors flow-sensitively
     detect_use_after_move(oa, mir_function)
     detect_double_move(oa, mir_function)
 
@@ -440,44 +804,52 @@ Note: ==========================================================================
 Tracks a move operation for a value.
 
 When a value is moved:
-1. State changes from OWNED to MOVED
-2. Record the instruction where move occurred
-3. Mark value as unusable
-4. Add to move list for block
+1. The summary state changes to MOVED (escalation only - a second move
+   keeps the FIRST move site in moved_at so double-move reports name the
+   original transfer; the second move itself is detected by
+   detect_double_move's flow-sensitive walk)
+2. The value becomes unusable in the summary
+3. The (value, instruction) pair is appended to the block's ordered move
+   list for the transfer function and the detection walks
 
 Returns: 1 if successful
 @End Reasoning
 
 Process called "track_move_operation" that takes oa as Integer, value_id as Integer, inst as Integer, block_id as Integer returns Integer:
-    If oa is equal to 0 or value_id is equal to 0:
+    If oa is equal to 0:
+        Return 0
+    End If
+    If value_id is equal to 0:
         Return 0
     End If
 
     Note: Get value state
     Let value_to_state be proc memory_get_int64 from Layout with oa, 8
-    Let state be proc get from Dictionary with value_to_state, value_id
+    Let state be proc omap_get from OrderedMap with value_to_state, value_id
 
     If state is equal to 0:
         Note: Create state if doesn't exist
         Set state to create_ownership_state(value_id)
-        proc set from Dictionary with value_to_state, value_id, state
+        proc omap_set from OrderedMap with value_to_state, value_id, state
     End If
 
-    Note: Update state to MOVED
-    proc memory_set_int64 from Layout with state, 8, 1 Note: OWNERSHIP_MOVED
-
-    Note: Record where moved
-    proc memory_set_int64 from Layout with state, 16, inst
+    Note: Escalate to MOVED; preserve the FIRST move site for reporting
+    Let current_state be proc memory_get_int64 from Layout with state, 8
+    If current_state is not equal to 1:
+        proc memory_set_int64 from Layout with state, 8, 1 Note: OWNERSHIP_MOVED
+        proc memory_set_int64 from Layout with state, 16, inst
+    End If
 
     Note: Mark as unusable
     proc memory_set_int64 from Layout with state, 48, 0
 
-    Note: Add to block's move list
+    Note: Append the (value, instruction) pair to the block's move list
     Let block_to_ownership be proc memory_get_int64 from Layout with oa, 0
-    Let ownership_info be proc get from Dictionary with block_to_ownership, block_id
+    Let ownership_info be proc omap_get from OrderedMap with block_to_ownership, block_id
 
     If ownership_info is not equal to 0:
         Let moves be proc memory_get_int64 from Layout with ownership_info, 24
+        proc append from List with moves, value_id
         proc append from List with moves, inst
     End If
 
@@ -492,43 +864,55 @@ End Process
 Tracks a borrow operation for a value.
 
 When a value is borrowed:
-1. State changes to BORROWED (or stays OWNED if shared borrow)
-2. Add borrow ID to borrowed_by list
-3. Value remains usable but with restrictions
+1. The summary state escalates to BORROWED by lattice rank - it never
+   DOWNGRADES a MOVED or PARTIAL_MOVE verdict (the historical
+   implementation overwrote the state unconditionally, erasing move
+   evidence whenever a borrow followed a move)
+2. The borrowing instruction is appended to the state's borrowed_by list
+3. The (value, instruction) pair is appended to the block's ordered
+   borrow list
 
 Returns: 1 if successful
 @End Reasoning
 
 Process called "track_borrow_operation" that takes oa as Integer, value_id as Integer, inst as Integer, block_id as Integer returns Integer:
-    If oa is equal to 0 or value_id is equal to 0:
+    If oa is equal to 0:
+        Return 0
+    End If
+    If value_id is equal to 0:
         Return 0
     End If
 
     Note: Get value state
     Let value_to_state be proc memory_get_int64 from Layout with oa, 8
-    Let state be proc get from Dictionary with value_to_state, value_id
+    Let state be proc omap_get from OrderedMap with value_to_state, value_id
 
     If state is equal to 0:
         Set state to create_ownership_state(value_id)
-        proc set from Dictionary with value_to_state, value_id, state
+        proc omap_set from OrderedMap with value_to_state, value_id, state
     End If
 
     Note: Add to borrowed_by list
     Let borrowed_by be proc memory_get_int64 from Layout with state, 24
     proc append from List with borrowed_by, inst
 
-    Note: Update state to BORROWED
-    proc memory_set_int64 from Layout with state, 8, 2 Note: OWNERSHIP_BORROWED
+    Note: Escalate to BORROWED (never downgrades MOVED/PARTIAL_MOVE)
+    Let current_state be proc memory_get_int64 from Layout with state, 8
+    Let merged be merge_ownership_states(current_state, 2)
+    proc memory_set_int64 from Layout with state, 8, merged
 
-    Note: Still usable (with restrictions)
-    proc memory_set_int64 from Layout with state, 48, 1
+    Note: Usable while merely borrowed
+    If merged is equal to 2:
+        proc memory_set_int64 from Layout with state, 48, 1
+    End If
 
-    Note: Add to block's borrow list
+    Note: Append the (value, instruction) pair to the block's borrow list
     Let block_to_ownership be proc memory_get_int64 from Layout with oa, 0
-    Let ownership_info be proc get from Dictionary with block_to_ownership, block_id
+    Let ownership_info be proc omap_get from OrderedMap with block_to_ownership, block_id
 
     If ownership_info is not equal to 0:
         Let borrows be proc memory_get_int64 from Layout with ownership_info, 32
+        proc append from List with borrows, value_id
         proc append from List with borrows, inst
     End If
 
@@ -543,38 +927,42 @@ End Process
 Handles partial moves for struct fields.
 
 When a field is moved from a struct:
-1. Parent struct becomes PARTIAL_MOVE
-2. Track which fields are moved
-3. Other fields remain usable
-4. Parent struct itself unusable
+1. The field is marked moved in the parent's partial_moves map
+2. The parent escalates to PARTIAL_MOVE by lattice rank (a parent that
+   is already fully MOVED stays MOVED)
+3. The parent struct itself becomes unusable as a whole; unmoved fields
+   remain individually accessible
 
 Returns: 1 if successful
 @End Reasoning
 
 Process called "check_partial_move" that takes oa as Integer, parent_value as Integer, field_id as Integer, inst as Integer returns Integer:
-    If oa is equal to 0 or parent_value is equal to 0:
+    If oa is equal to 0:
+        Return 0
+    End If
+    If parent_value is equal to 0:
         Return 0
     End If
 
     Note: Get parent state
     Let value_to_state be proc memory_get_int64 from Layout with oa, 8
-    Let parent_state be proc get from Dictionary with value_to_state, parent_value
+    Let parent_state be proc omap_get from OrderedMap with value_to_state, parent_value
 
     If parent_state is equal to 0:
         Set parent_state to create_ownership_state(parent_value)
-        proc set from Dictionary with value_to_state, parent_value, parent_state
+        proc omap_set from OrderedMap with value_to_state, parent_value, parent_state
     End If
 
-    Note: Get partial moves dictionary
+    Note: Mark field as moved in the integer-keyed partial-moves map
     Let partial_moves be proc memory_get_int64 from Layout with parent_state, 32
+    proc omap_set from OrderedMap with partial_moves, field_id, 1
 
-    Note: Mark field as moved
-    proc set from Dictionary with partial_moves, field_id, 1
+    Note: Escalate parent to PARTIAL_MOVE (a fully MOVED parent stays MOVED)
+    Let current_state be proc memory_get_int64 from Layout with parent_state, 8
+    Let merged be merge_ownership_states(current_state, 3)
+    proc memory_set_int64 from Layout with parent_state, 8, merged
 
-    Note: Update parent state to PARTIAL_MOVE
-    proc memory_set_int64 from Layout with parent_state, 8, 3 Note: OWNERSHIP_PARTIAL_MOVE
-
-    Note: Parent itself is unusable
+    Note: Parent as a whole is unusable
     proc memory_set_int64 from Layout with parent_state, 48, 0
 
     Return 1
@@ -585,142 +973,141 @@ Note: OWNERSHIP STATE PROPAGATION
 Note: ============================================================================
 
 @Reasoning
-Propagates ownership states through control flow graph.
+Propagates ownership states through the control flow graph:
 
-Uses data flow analysis:
-- state_out[B] = transfer(state_in[B], B)
-- state_in[B] = merge(state_out[P] for P in predecessors[B])
+- state_in[B]  = join over predecessors P of state_out[P]
+- state_out[B] = join(state_in[B], effects of B's recorded moves/borrows)
 
-Fixed-point iteration until convergence.
+Both joins are ESCALATE-ONLY by lattice rank (merge_ownership_states), so
+every map entry can only climb the four-point lattice; the iteration is
+monotone and terminates at the unique fixed point without an artificial
+iteration cap (a cap could stop early on a large function and silently
+publish an unsound partial result). A value absent from a map is OWNED -
+the maps record only deviations from the default.
 
 Returns: 1 if successful
 @End Reasoning
 
 Process called "propagate_ownership_states" that takes oa as Integer, mir_function as Integer returns Integer:
-    If oa is equal to 0 or mir_function is equal to 0:
+    If oa is equal to 0:
+        Return 0
+    End If
+    If mir_function is equal to 0:
         Return 0
     End If
 
-    Note: Get CFG
-    Let mir_cfg be proc memory_get_int64 from Layout with mir_function, 8
-    Let blocks be proc memory_get_int64 from Layout with mir_cfg, 16
-    Let block_count be proc memory_get_int64 from Layout with mir_cfg, 24
+    Note: Get CFG and blocks through the canonical accessors
+    Let mir_cfg be proc get_mir_function_cfg from MIR with mir_function
+    If mir_cfg is equal to 0:
+        Return 0
+    End If
+    Let blocks be proc get_mir_cfg_blocks from MirCFG with mir_cfg
+    If blocks is equal to 0:
+        Return 0
+    End If
+    Let block_count be proc length from List with blocks
 
     Let block_to_ownership be proc memory_get_int64 from Layout with oa, 0
 
-    Note: Fixed-point iteration
+    Note: Monotone fixed-point iteration (escalate-only joins terminate)
     Let changed be 1
-    Let iteration be 0
-    Let max_iterations be 100
-
     While changed is equal to 1:
-        If iteration is greater than or equal to max_iterations:
-            Set changed to 0
-        Otherwise:
-                Set changed to 0
-                Set iteration to iteration plus 1
+        Set changed to 0
 
-                Note: For each block
-                Let b be 0
-                While b is less than block_count:
-                    Let block be proc get from List with blocks, b
-                    Let block_id be proc memory_get_int64 from Layout with block, 0
+        Let b be 0
+        While b is less than block_count:
+            Let block be proc get from List with blocks, b
+            Let block_id be proc get_mir_basic_block_id from MirCFG with block
 
-                    Let ownership_info be proc get from Dictionary with block_to_ownership, block_id
-                    If ownership_info is equal to 0:
-                        Set b to b plus 1
-                        Continue
-                    End If
+            Let ownership_info be proc omap_get from OrderedMap with block_to_ownership, block_id
+            If ownership_info is not equal to 0:
+                Let state_in be proc memory_get_int64 from Layout with ownership_info, 8
+                Let state_out be proc memory_get_int64 from Layout with ownership_info, 16
 
-                    Note: Merge states from predecessors
-                    Let state_in be proc memory_get_int64 from Layout with ownership_info, 8
-                    Let predecessors be proc memory_get_int64 from Layout with block, 32
-                    Let pred_count be proc memory_get_int64 from Layout with block, 40
-
-                    Note: If no predecessors, skip merging
-                    If pred_count is equal to 0:
-                        Set b to b plus 1
-                        Continue
-                    End If
-
-                    Note: Merge all predecessor state_out into our state_in
+                Note: Merge: join every predecessor's state_out into state_in
+                Let predecessors be proc get_block_predecessors from MIR with block
+                If predecessors is not equal to 0:
+                    Let pred_count be proc length from List with predecessors
                     Let p be 0
                     While p is less than pred_count:
                         Let pred_id be proc get from List with predecessors, p
-                        Let pred_info be proc get from Dictionary with block_to_ownership, pred_id
+                        Let pred_info be proc omap_get from OrderedMap with block_to_ownership, pred_id
 
                         If pred_info is not equal to 0:
                             Let pred_state_out be proc memory_get_int64 from Layout with pred_info, 16
+                            Let pred_entry be proc omap_first from OrderedMap with pred_state_out
+                            While pred_entry is not equal to 0:
+                                Let merge_value_id be proc omap_entry_key from OrderedMap with pred_entry
+                                Let pred_state be proc omap_entry_value from OrderedMap with pred_entry
 
-                            Note: Merge states (conservative: if moved in any path, mark as moved)
-                            Note: Iterate through all values in predecessor's state_out
-                            Let pred_keys be proc keys from Dictionary with pred_state_out
-                            Let key_count be proc length from List with pred_keys
-
-                            Let k be 0
-                            While k is less than key_count:
-                                Let value_id be proc get from List with pred_keys, k
-                                Let pred_value_state be proc get from Dictionary with pred_state_out, value_id
-
-                                If pred_value_state is not equal to 0:
-                                    Note: Check if value already has state in state_in
-                                    Let current_state be proc get from Dictionary with state_in, value_id
-
-                                    If current_state is equal to 0:
-                                        Note: First predecessor - copy state
-                                        Note: Clone OwnershipState
-                                        Let new_state be create_ownership_state(value_id)
-                                        Let pred_state_value be proc memory_get_int64 from Layout with pred_value_state, 8
-                                        proc memory_set_int64 from Layout with new_state, 8, pred_state_value
-                                        Let pred_moved_at be proc memory_get_int64 from Layout with pred_value_state, 16
-                                        proc memory_set_int64 from Layout with new_state, 16, pred_moved_at
-                                        proc set from Dictionary with state_in, value_id, new_state
-                                        Set changed to 1
-                                    Otherwise:
-                                        Note: Merge with existing state (conservative)
-                                        Let current_state_value be proc memory_get_int64 from Layout with current_state, 8
-                                        Set pred_state_value to proc memory_get_int64 from Layout with pred_value_state, 8
-
-                                        Note: Conservative merge: MOVED takes precedence
-                                        Note: State values: OWNED=0, MOVED=1, BORROWED=2, PARTIAL_MOVE=3
-                                        Let merged_state be current_state_value
-
-                                        Note: If either path has MOVED, result is MOVED
-                                        If pred_state_value is equal to 1 or current_state_value is equal to 1:
-                                            Set merged_state to 1
-                                        Otherwise:
-                                            Note: If either has PARTIAL_MOVE, result is PARTIAL_MOVE
-                                            If pred_state_value is equal to 3 or current_state_value is equal to 3:
-                                                Set merged_state to 3
-                                            Otherwise:
-                                                Note: If either has BORROWED, result is BORROWED
-                                                If pred_state_value is equal to 2 or current_state_value is equal to 2:
-                                                    Set merged_state to 2
-                                                End If
-                                            End If
-                                        End If
-
-                                        Note: Update state if changed
-                                        If merged_state is not equal to current_state_value:
-                                            proc memory_set_int64 from Layout with current_state, 8, merged_state
-                                            Set changed to 1
-                                        End If
-                                    End If
+                                Let in_state be proc omap_get from OrderedMap with state_in, merge_value_id
+                                Let merged_in be merge_ownership_states(in_state, pred_state)
+                                If merged_in is not equal to in_state:
+                                    proc omap_set from OrderedMap with state_in, merge_value_id, merged_in
+                                    Set changed to 1
                                 End If
 
-                                Set k to k plus 1
+                                Set pred_entry to proc omap_entry_next from OrderedMap with pred_entry
                             End While
                         End If
 
                         Set p to p plus 1
                     End While
+                End If
 
-                    Note: Transfer function: apply block's effects
-                    Note: state_out = state_in after applying moves/borrows
+                Note: Transfer part 1: join state_in into state_out
+                Let in_entry be proc omap_first from OrderedMap with state_in
+                While in_entry is not equal to 0:
+                    Let in_value_id be proc omap_entry_key from OrderedMap with in_entry
+                    Let in_code be proc omap_entry_value from OrderedMap with in_entry
 
-                    Set b to b plus 1
+                    Let out_state be proc omap_get from OrderedMap with state_out, in_value_id
+                    Let merged_out be merge_ownership_states(out_state, in_code)
+                    If merged_out is not equal to out_state:
+                        proc omap_set from OrderedMap with state_out, in_value_id, merged_out
+                        Set changed to 1
+                    End If
+
+                    Set in_entry to proc omap_entry_next from OrderedMap with in_entry
                 End While
-        End If
+
+                Note: Transfer part 2: apply the block's recorded effects.
+                Note: A move anywhere in the block leaves the value MOVED
+                Note: at exit; a borrow escalates an OWNED exit to BORROWED
+                Let moves be proc memory_get_int64 from Layout with ownership_info, 24
+                If moves is not equal to 0:
+                    Let move_len be proc length from List with moves
+                    Let m be 0
+                    While m is less than move_len:
+                        Let moved_value be proc get from List with moves, m
+                        Let out_move_state be proc omap_get from OrderedMap with state_out, moved_value
+                        If out_move_state is not equal to 1:
+                            proc omap_set from OrderedMap with state_out, moved_value, 1
+                            Set changed to 1
+                        End If
+                        Set m to m plus 2
+                    End While
+                End If
+
+                Let borrows be proc memory_get_int64 from Layout with ownership_info, 32
+                If borrows is not equal to 0:
+                    Let borrow_len be proc length from List with borrows
+                    Let r be 0
+                    While r is less than borrow_len:
+                        Let borrowed_value be proc get from List with borrows, r
+                        Let out_borrow_state be proc omap_get from OrderedMap with state_out, borrowed_value
+                        Let merged_borrow be merge_ownership_states(out_borrow_state, 2)
+                        If merged_borrow is not equal to out_borrow_state:
+                            proc omap_set from OrderedMap with state_out, borrowed_value, merged_borrow
+                            Set changed to 1
+                        End If
+                        Set r to r plus 2
+                    End While
+                End If
+            End If
+
+            Set b to b plus 1
+        End While
     End While
 
     Return 1
@@ -731,65 +1118,177 @@ Note: OWNERSHIP ERROR DETECTION
 Note: ============================================================================
 
 @Reasoning
-Detects use-after-move errors.
+Builds an ownership error message of the shape "<prefix><value id><suffix>"
+so reports name the offending SSA value. Raw integers are formatted
+through StringUtils.integer_to_string (Display of a raw integer is not
+supported by the bootstrap chain) and joined with string_concat. The
+returned string is owned by the error list it is appended to.
+@End Reasoning
 
-Scans all instructions for uses of moved values.
+Process called "make_ownership_error_message" that takes prefix as Integer, value_id as Integer, suffix as Integer returns Integer:
+    Let id_text be proc integer_to_string from StringUtils with value_id
+    Let head be proc string_concat from StringUtils with prefix, id_text
+    Let full be proc string_concat from StringUtils with head, suffix
+    Return full
+End Process
+
+@Reasoning
+Seeds a detection walk's running state map from a block's state_in map.
+Each walk needs its OWN mutable copy: applying instruction effects to the
+shared state_in would corrupt the fixed-point result for every later
+caller. A value absent from the copy is OWNED (omap_get returns 0, which
+IS the OWNED code), so only deviations are copied. The caller owns the
+returned map and must omap_destroy it.
+@End Reasoning
+
+Process called "copy_state_map" that takes source_map as Integer returns Integer:
+    Let copy be proc omap_create from OrderedMap
+    If copy is equal to 0:
+        Return 0
+    End If
+    If source_map is equal to 0:
+        Return copy
+    End If
+
+    Let entry be proc omap_first from OrderedMap with source_map
+    While entry is not equal to 0:
+        Let entry_key be proc omap_entry_key from OrderedMap with entry
+        Let entry_value be proc omap_entry_value from OrderedMap with entry
+        proc omap_set from OrderedMap with copy, entry_key, entry_value
+        Set entry to proc omap_entry_next from OrderedMap with entry
+    End While
+
+    Return copy
+End Process
+
+@Reasoning
+Applies one instruction's ownership effects to a detection walk's running
+state map: every move source escalates to MOVED, a borrow source
+escalates to BORROWED (never downgrading). Derives the effects through
+instruction_move_sources / instruction_borrow_source - the same single
+source of truth the scan phase and the transfer function use.
+@End Reasoning
+
+Process called "apply_instruction_effects" that takes mir_function as Integer, inst as Integer, running as Integer returns Integer:
+    Let move_sources be instruction_move_sources(mir_function, inst)
+    If move_sources is not equal to 0:
+        Let move_total be proc length from List with move_sources
+        Let m be 0
+        While m is less than move_total:
+            Let moved_value be proc get from List with move_sources, m
+            proc omap_set from OrderedMap with running, moved_value, 1
+            Set m to m plus 1
+        End While
+        proc destroy from List with move_sources
+    End If
+
+    Let borrow_value be instruction_borrow_source(inst)
+    If borrow_value is not equal to 0:
+        Let current be proc omap_get from OrderedMap with running, borrow_value
+        Let merged be merge_ownership_states(current, 2)
+        If merged is not equal to current:
+            proc omap_set from OrderedMap with running, borrow_value, merged
+        End If
+    End If
+
+    Return 1
+End Process
+
+@Reasoning
+Detects use-after-move errors flow-sensitively.
+
+For each block, the walk seeds a running state map from the block's
+fixed-point state_in, then visits instructions in order: every value the
+instruction USES is checked against the running state BEFORE the
+instruction's own effects are applied (so the move instruction itself is
+not reported as a use of the value it moves), and the effects are applied
+afterwards. A use whose running state is MOVED is a definite
+use-after-move; PARTIAL_MOVE is a use of a partially moved value. Uses
+are enumerated through instruction_value_uses (header operands, phi
+incomings, and call argument lists; the DEBUG band is metadata and is
+exempt).
 
 Returns: Number of errors found
 @End Reasoning
 
 Process called "detect_use_after_move" that takes oa as Integer, mir_function as Integer returns Integer:
-    If oa is equal to 0 or mir_function is equal to 0:
+    If oa is equal to 0:
+        Return 0
+    End If
+    If mir_function is equal to 0:
         Return 0
     End If
 
     Let error_count be 0
 
-    Note: Get CFG
-    Let mir_cfg be proc memory_get_int64 from Layout with mir_function, 8
-    Let blocks be proc memory_get_int64 from Layout with mir_cfg, 16
-    Let block_count be proc memory_get_int64 from Layout with mir_cfg, 24
+    Note: Get CFG and blocks through the canonical accessors
+    Let mir_cfg be proc get_mir_function_cfg from MIR with mir_function
+    If mir_cfg is equal to 0:
+        Return 0
+    End If
+    Let blocks be proc get_mir_cfg_blocks from MirCFG with mir_cfg
+    If blocks is equal to 0:
+        Return 0
+    End If
+    Let block_count be proc length from List with blocks
 
-    Let value_to_state be proc memory_get_int64 from Layout with oa, 8
+    Let block_to_ownership be proc memory_get_int64 from Layout with oa, 0
     Let error_list be proc memory_get_int64 from Layout with oa, 48
 
-    Note: Scan all instructions
     Let b be 0
     While b is less than block_count:
         Let block be proc get from List with blocks, b
-        Let instructions be proc memory_get_int64 from Layout with block, 16
-        Let inst_count be proc memory_get_int64 from Layout with block, 24
+        Let block_id be proc get_mir_basic_block_id from MirCFG with block
 
-        Let i be 0
-        While i is less than inst_count:
-            Let inst be proc get from List with instructions, i
+        Let ownership_info be proc omap_get from OrderedMap with block_to_ownership, block_id
+        Let state_in be 0
+        If ownership_info is not equal to 0:
+            Set state_in to proc memory_get_int64 from Layout with ownership_info, 8
+        End If
 
-            Note: Check operands for moved values
-            Let operand1 be proc memory_get_int64 from Layout with inst, 16
-            If operand1 is not equal to 0:
-                Let state be proc get from Dictionary with value_to_state, operand1
-                If state is not equal to 0:
-                    Let state_value be proc memory_get_int64 from Layout with state, 8
-                    Let can_use be proc memory_get_int64 from Layout with state, 48
+        Let running be copy_state_map(state_in)
 
-                    Note: If MOVED and trying to use
-                    If state_value is equal to 1 and can_use is equal to 0:
-                        Let error_msg be proc from_c_string from StringCore with "Use-after-move error: value used after being moved"
-                        proc append from List with error_list, error_msg
-                        Set error_count to error_count plus 1
-                    End If
+        Let instructions be proc get_block_instructions from MIR with block
+        Let inst_count be proc get_block_instruction_count from MIR with block
 
-                    Note: Check PARTIAL_MOVE
-                    If state_value is equal to 3:
-                        Set error_msg to proc from_c_string from StringCore with "Use of partially moved value"
-                        proc append from List with error_list, error_msg
-                        Set error_count to error_count plus 1
-                    End If
+        If instructions is not equal to 0:
+            Let i be 0
+            While i is less than inst_count:
+                Let inst be proc get from List with instructions, i
+
+                Note: Check uses against the running state BEFORE effects
+                Let uses be instruction_value_uses(inst)
+                If uses is not equal to 0:
+                    Let use_total be proc length from List with uses
+                    Let u be 0
+                    While u is less than use_total:
+                        Let used_value be proc get from List with uses, u
+                        Let used_state be proc omap_get from OrderedMap with running, used_value
+
+                        If used_state is equal to 1:
+                            Let moved_msg be make_ownership_error_message("Use-after-move: value ", used_value, " used after being moved")
+                            proc append from List with error_list, moved_msg
+                            Set error_count to error_count plus 1
+                        End If
+
+                        If used_state is equal to 3:
+                            Let partial_msg be make_ownership_error_message("Use of partially moved value ", used_value, "")
+                            proc append from List with error_list, partial_msg
+                            Set error_count to error_count plus 1
+                        End If
+
+                        Set u to u plus 1
+                    End While
+                    proc destroy from List with uses
                 End If
-            End If
 
-            Set i to i plus 1
-        End While
+                apply_instruction_effects(mir_function, inst, running)
+
+                Set i to i plus 1
+            End While
+        End If
+
+        proc omap_destroy from OrderedMap with running
 
         Set b to b plus 1
     End While
@@ -798,62 +1297,95 @@ Process called "detect_use_after_move" that takes oa as Integer, mir_function as
 End Process
 
 @Reasoning
-Detects double-move errors.
+Detects double-move errors flow-sensitively.
 
-Attempting to move a value that's already moved is an error.
+Walks each block exactly like detect_use_after_move, but the check fires
+on the instruction's MOVE SOURCES: a value this instruction moves whose
+running state is already MOVED has been moved twice on some path. The
+first move is exempt by construction - the running state only becomes
+MOVED after the first moving instruction's effects are applied (the
+historical implementation re-read the post-scan summary, in which EVERY
+moved value was already MOVED, and therefore reported every single move
+as a double-move).
 
 Returns: Number of errors found
 @End Reasoning
 
 Process called "detect_double_move" that takes oa as Integer, mir_function as Integer returns Integer:
-    If oa is equal to 0 or mir_function is equal to 0:
+    If oa is equal to 0:
+        Return 0
+    End If
+    If mir_function is equal to 0:
         Return 0
     End If
 
     Let error_count be 0
 
-    Note: Get block ownership info
+    Note: Get CFG and blocks through the canonical accessors
+    Let mir_cfg be proc get_mir_function_cfg from MIR with mir_function
+    If mir_cfg is equal to 0:
+        Return 0
+    End If
+    Let blocks be proc get_mir_cfg_blocks from MirCFG with mir_cfg
+    If blocks is equal to 0:
+        Return 0
+    End If
+    Let block_count be proc length from List with blocks
+
     Let block_to_ownership be proc memory_get_int64 from Layout with oa, 0
-    Let value_to_state be proc memory_get_int64 from Layout with oa, 8
     Let error_list be proc memory_get_int64 from Layout with oa, 48
 
-    Note: Check each move
-    Let block_keys be proc keys from Dictionary with block_to_ownership
-    Let block_key_count be proc length from List with block_keys
+    Let b be 0
+    While b is less than block_count:
+        Let block be proc get from List with blocks, b
+        Let block_id be proc get_mir_basic_block_id from MirCFG with block
 
-    Let bk be 0
-    While bk is less than block_key_count:
-        Let block_id be proc get from List with block_keys, bk
-        Let ownership_info be proc get from Dictionary with block_to_ownership, block_id
-
+        Let ownership_info be proc omap_get from OrderedMap with block_to_ownership, block_id
+        Let state_in be 0
         If ownership_info is not equal to 0:
-            Let moves be proc memory_get_int64 from Layout with ownership_info, 24
-            Let move_count be proc length from List with moves
+            Set state_in to proc memory_get_int64 from Layout with ownership_info, 8
+        End If
 
-            Let m be 0
-            While m is less than move_count:
-                Let move_inst be proc get from List with moves, m
-                Let operand1 be proc memory_get_int64 from Layout with move_inst, 16
+        Let running be copy_state_map(state_in)
 
-                If operand1 is not equal to 0:
-                    Let state be proc get from Dictionary with value_to_state, operand1
-                    If state is not equal to 0:
-                        Let state_value be proc memory_get_int64 from Layout with state, 8
+        Let instructions be proc get_block_instructions from MIR with block
+        Let inst_count be proc get_block_instruction_count from MIR with block
 
-                        Note: If already moved, this is double-move
-                        If state_value is equal to 1:
-                            Let error_msg be proc from_c_string from StringCore with "Double-move error: value moved twice"
-                            proc append from List with error_list, error_msg
+        If instructions is not equal to 0:
+            Let i be 0
+            While i is less than inst_count:
+                Let inst be proc get from List with instructions, i
+
+                Note: A move source already MOVED on entry to this
+                Note: instruction has been moved twice
+                Let move_sources be instruction_move_sources(mir_function, inst)
+                If move_sources is not equal to 0:
+                    Let move_total be proc length from List with move_sources
+                    Let m be 0
+                    While m is less than move_total:
+                        Let moved_value be proc get from List with move_sources, m
+                        Let prior_state be proc omap_get from OrderedMap with running, moved_value
+
+                        If prior_state is equal to 1:
+                            Let double_msg be make_ownership_error_message("Double-move: value ", moved_value, " moved twice")
+                            proc append from List with error_list, double_msg
                             Set error_count to error_count plus 1
                         End If
-                    End If
+
+                        Set m to m plus 1
+                    End While
+                    proc destroy from List with move_sources
                 End If
 
-                Set m to m plus 1
+                apply_instruction_effects(mir_function, inst, running)
+
+                Set i to i plus 1
             End While
         End If
 
-        Set bk to bk plus 1
+        proc omap_destroy from OrderedMap with running
+
+        Set b to b plus 1
     End While
 
     Return error_count
@@ -864,8 +1396,8 @@ Verifies ownership invariants.
 
 Checks:
 1. All values have valid ownership states
-2. No invalid state transitions
-3. Partial moves are consistent
+2. A MOVED value records the instruction it was moved at
+3. A PARTIAL_MOVE value records at least one moved field
 
 Returns: 1 if valid, 0 if errors
 @End Reasoning
@@ -881,21 +1413,22 @@ Process called "verify_ownership_invariants" that takes oa as Integer returns In
     Let value_to_state be proc memory_get_int64 from Layout with oa, 8
     Let error_list be proc memory_get_int64 from Layout with oa, 48
 
-    Let value_keys be proc keys from Dictionary with value_to_state
-    Let value_count be proc length from List with value_keys
-
-    Let v be 0
-    While v is less than value_count:
-        Let value_id be proc get from List with value_keys, v
-        Let state be proc get from Dictionary with value_to_state, value_id
+    Let entry be proc omap_first from OrderedMap with value_to_state
+    While entry is not equal to 0:
+        Let state be proc omap_entry_value from OrderedMap with entry
 
         If state is not equal to 0:
             Let state_value be proc memory_get_int64 from Layout with state, 8
 
             Note: Check state is valid
-            If state_value is less than 0 or state_value is greater than 3:
-                Let error_msg be proc from_c_string from StringCore with "Invalid ownership state"
-                proc append from List with error_list, error_msg
+            If state_value is less than 0:
+                Let invalid_msg be proc string_duplicate from StringCore with "Invalid ownership state"
+                proc append from List with error_list, invalid_msg
+                Return 0
+            End If
+            If state_value is greater than 3:
+                Let range_msg be proc string_duplicate from StringCore with "Invalid ownership state"
+                proc append from List with error_list, range_msg
                 Return 0
             End If
 
@@ -903,8 +1436,8 @@ Process called "verify_ownership_invariants" that takes oa as Integer returns In
             If state_value is equal to 1:
                 Let moved_at be proc memory_get_int64 from Layout with state, 16
                 If moved_at is equal to 0:
-                    Set error_msg to proc from_c_string from StringCore with "Moved state without move location"
-                    proc append from List with error_list, error_msg
+                    Let moved_msg be proc string_duplicate from StringCore with "Moved state without move location"
+                    proc append from List with error_list, moved_msg
                     Return 0
                 End If
             End If
@@ -912,18 +1445,20 @@ Process called "verify_ownership_invariants" that takes oa as Integer returns In
             Note: If PARTIAL_MOVE, must have partial_moves entries
             If state_value is equal to 3:
                 Let partial_moves be proc memory_get_int64 from Layout with state, 32
-                Let pm_keys be proc keys from Dictionary with partial_moves
-                Let pm_count be proc length from List with pm_keys
+                Let pm_count be 0
+                If partial_moves is not equal to 0:
+                    Set pm_count to proc omap_size from OrderedMap with partial_moves
+                End If
 
                 If pm_count is equal to 0:
-                    Set error_msg to proc from_c_string from StringCore with "Partial move state without moved fields"
-                    proc append from List with error_list, error_msg
+                    Let partial_msg be proc string_duplicate from StringCore with "Partial move state without moved fields"
+                    proc append from List with error_list, partial_msg
                     Return 0
                 End If
             End If
         End If
 
-        Set v to v plus 1
+        Set entry to proc omap_entry_next from OrderedMap with entry
     End While
 
     Display "Ownership invariants satisfied"
@@ -942,6 +1477,9 @@ Displays:
 - Values by ownership state
 - Move and borrow statistics
 - Errors found
+
+All integers are formatted through StringUtils.integer_to_string before
+display (the bootstrap chain does not support Display of a raw integer).
 @End Reasoning
 
 Process called "print_ownership_analysis" that takes oa as Integer returns Integer:
@@ -956,11 +1494,13 @@ Process called "print_ownership_analysis" that takes oa as Integer returns Integ
     Let move_count be proc memory_get_int64 from Layout with oa, 32
     Let borrow_count be proc memory_get_int64 from Layout with oa, 40
 
-    Display "Total Moves: "
-    Display move_count
+    Let move_text be proc integer_to_string from StringUtils with move_count
+    Let move_line be proc string_concat from StringUtils with "Total Moves: ", move_text
+    Display move_line
 
-    Display "Total Borrows: "
-    Display borrow_count
+    Let borrow_text be proc integer_to_string from StringUtils with borrow_count
+    Let borrow_line be proc string_concat from StringUtils with "Total Borrows: ", borrow_text
+    Display borrow_line
 
     Note: Count by ownership state
     Let owned_count be 0
@@ -969,41 +1509,48 @@ Process called "print_ownership_analysis" that takes oa as Integer returns Integ
     Let partial_move_count be 0
 
     Let value_to_state be proc memory_get_int64 from Layout with oa, 8
-    Let value_keys be proc keys from Dictionary with value_to_state
-    Let value_count be proc length from List with value_keys
-
-    Let v be 0
-    While v is less than value_count:
-        Let value_id be proc get from List with value_keys, v
-        Let state be proc get from Dictionary with value_to_state, value_id
+    Let entry be proc omap_first from OrderedMap with value_to_state
+    While entry is not equal to 0:
+        Let state be proc omap_entry_value from OrderedMap with entry
 
         If state is not equal to 0:
             Let state_value be proc memory_get_int64 from Layout with state, 8
 
             If state_value is equal to 0:
                 Set owned_count to owned_count plus 1
-            Otherwise If state_value is equal to 1:
+            End If
+            If state_value is equal to 1:
                 Set moved_count to moved_count plus 1
-            Otherwise If state_value is equal to 2:
+            End If
+            If state_value is equal to 2:
                 Set borrowed_count to borrowed_count plus 1
-            Otherwise If state_value is equal to 3:
+            End If
+            If state_value is equal to 3:
                 Set partial_move_count to partial_move_count plus 1
             End If
         End If
 
-        Set v to v plus 1
+        Set entry to proc omap_entry_next from OrderedMap with entry
     End While
 
     Display ""
     Display "Values by State:"
-    Display "  OWNED: "
-    Display owned_count
-    Display "  MOVED: "
-    Display moved_count
-    Display "  BORROWED: "
-    Display borrowed_count
-    Display "  PARTIAL_MOVE: "
-    Display partial_move_count
+
+    Let owned_text be proc integer_to_string from StringUtils with owned_count
+    Let owned_line be proc string_concat from StringUtils with "  OWNED: ", owned_text
+    Display owned_line
+
+    Let moved_text be proc integer_to_string from StringUtils with moved_count
+    Let moved_line be proc string_concat from StringUtils with "  MOVED: ", moved_text
+    Display moved_line
+
+    Let borrowed_text be proc integer_to_string from StringUtils with borrowed_count
+    Let borrowed_line be proc string_concat from StringUtils with "  BORROWED: ", borrowed_text
+    Display borrowed_line
+
+    Let partial_text be proc integer_to_string from StringUtils with partial_move_count
+    Let partial_line be proc string_concat from StringUtils with "  PARTIAL_MOVE: ", partial_text
+    Display partial_line
 
     Note: Print errors
     Let error_list be proc memory_get_int64 from Layout with oa, 48
@@ -1011,14 +1558,15 @@ Process called "print_ownership_analysis" that takes oa as Integer returns Integ
 
     If error_count is greater than 0:
         Display ""
-        Display "Ownership Errors: "
-        Display error_count
+        Let error_text be proc integer_to_string from StringUtils with error_count
+        Let error_line be proc string_concat from StringUtils with "Ownership Errors: ", error_text
+        Display error_line
 
         Let e be 0
         While e is less than error_count:
             Let error_msg be proc get from List with error_list, e
-            Display "  - "
-            Display error_msg
+            Let bullet_line be proc string_concat from StringUtils with "  - ", error_msg
+            Display bullet_line
             Set e to e plus 1
         End While
     Otherwise:

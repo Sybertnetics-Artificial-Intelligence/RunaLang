@@ -1,0 +1,479 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+Licensed under Apache 2.0
+:End Note
+
+Note:
+Task #468 gate probe for the profile-guided optimization layer
+(compiler/middle/analysis/profile_guided.runa) on the canonical MIR
+contract (MIR_RECONCILIATION_PLAN.md Part 1).
+
+Builds a diamond MIRFunction by hand through the canonical constructors,
+plus a small callee function registered in a MIRProgram, then drives the
+COMPLETE PGO pipeline in driver order and asserts every retargeted access
+pattern end to end:
+
+  probe function "pgo_probe_fn" (block ids 0-3):
+    b0 (entry): v1 = CONST 1; v2 = CONST 0; v3 = LT v1, v2;
+                BRANCH v3 ? b1 : b2 (20301)
+    b1 (hot):   v4 = CALL pgo_probe_callee (resolvable, name-pointer form);
+                v5 = CALL pgo_unknown_fn (unresolvable); JUMP b3
+    b2 (cold):  JUMP b3
+    b3 (exit):  RETURN v1
+  callee "pgo_probe_callee": single block, 2 instructions (CONST + RETURN)
+
+  profile (ordered_map sections per the load_profile_data contract):
+    blocks  (1000): b0=1000, b1=990, b2=10, stale id 99=5
+    edges   (1001): b0->b1=990, b0->b2=10, stale 99->b0=3
+    calls   (1002): call1=990, stale ptr 12345=7
+    b3 is deliberately UNPROFILED so compute_block_frequencies must
+    estimate it from its predecessors (flow conservation: 990 + 10 = 1000).
+
+Verified behaviors:
+  - load_profile_data section ingestion + total_samples seeding (2005)
+  - integrate_profile_into_mir stale-entry pruning against the real CFG
+    (3 blocks + 2 edges + 1 call site matched = 6; stale entries removed)
+  - compute_block_frequencies predecessor estimation (b3 -> 1000) and
+    total_samples recomputation (3000)
+  - compute_branch_probabilities from profiled edge frequencies via the
+    MIRBranch ext targets (true 99 percent / false 1 percent)
+  - identify_hot_blocks 90-percent-coverage rule (hot = {b0, b3, b1},
+    realized cutoff 990) and identify_cold_blocks (cold = {b2}, cutoff 30)
+  - identify_hot_paths entry trace following max-frequency successors
+    ([b0, b1, b3], exec 2990, priority 9, is_hot)
+  - validate_profile_data consistency pass
+  - compute_inline_decisions dual-form callee resolution (name-pointer
+    form resolves to the MIRFunction POINTER per OD-4; unknown callee gets
+    the conservative no-inline treatment), real callee sizing through
+    CallGraph.get_function_instruction_count (cost 2), and the
+    benefit-minus-cost gate (990 calls * 10 - 2 = 9898 -> inline)
+  - estimate_optimization_benefit 60-percent cap
+  - apply_pgo_hints stamping MIRBranch weight_true@96 / weight_false@104
+  - optimize_code_layout entry/hot/normal/cold reorder of the canonical
+    MIRCFG blocks List ([b0, b1, b3, b2]) and its no-op idempotence
+  - IN-PIPELINE real callee costing (task #475): a genuine
+    OptimizationContext built through Optimization.create_optimization_context
+    with the MIRProgram threaded into slot 136, profile_data installed at
+    slot 88, then driven through apply_profile_guided_optimizations -
+    the PGA retained at ctx@128 must carry an inline decision whose
+    cost_benefit reflects the REAL callee size (990*10 - 2 = 9898, NOT
+    the conservative-100 value 9800), the opaque callee must keep the
+    conservative -90, and both decisions must be merged into
+    ctx.inlining_candidates (slot 96)
+
+Conventions: canonical tests/test_utils.runa harness; PASS = the
+"ALL TESTS PASSED" summary plus exit 0; the process exit code is the
+failed-assertion count.
+:End Note
+
+Import "tests/test_utils.runa" as T
+Import "compiler/middle/analysis/profile_guided.runa" as ProfileGuided
+Import "compiler/middle/transformations/optimization.runa" as Optimization
+Import "compiler/middle/gungnir/mir/mir.runa" as MIR
+Import "compiler/middle/gungnir/mir/mir_nodes.runa" as MIRNodes
+Import "compiler/middle/gungnir/mir/cfg.runa" as MirCFG
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/collections/list.runa" as List
+Import "compiler/frontend/primitives/collections/set.runa" as Set
+Import "compiler/frontend/primitives/collections/ordered_map.runa" as OrderedMap
+
+@Reasoning
+Builds the probe program described in the file header using ONLY the
+canonical creators (MIR.create_mir_function, MIR.create_mir_basic_block,
+MIR.create_mir_program, MIRNodes.create_mir_*) and canonical wiring
+(MIR.add_block_to_cfg, MIR.set_cfg_entry_block / set_cfg_exit_block,
+MIR.add_cfg_edge, MirCFG.add_instruction_to_block). The resolvable call's
+callee slot carries the callee MIRFunction's interned NAME POINTER
+(MIRFunction offset 0), exercising the task #461 direct-call contract's
+name-pointer form; the unresolvable call carries a string literal no
+program function owns. Pointers needed by the assertions are written into
+the caller-provided out buffer:
+  0 func   8 b0   16 b1   24 b2   32 b3   40 branch
+  48 call1 (resolvable)   56 call2 (unresolvable)
+  64 callee_func   72 program
+Returns the MIRFunction pointer, or 0 on any construction failure.
+@End Reasoning
+
+Process called "build_pgo_probe" that takes out_slots as Integer returns Integer:
+    Let func be proc create_mir_function from MIR with "pgo_probe_fn", 0, 0
+    If func is equal to 0:
+        Return 0
+    End If
+    Let cfg be proc get_mir_function_cfg from MIR with func
+    If cfg is equal to 0:
+        Return 0
+    End If
+
+    Note: Diamond: b0 -> {b1, b2} -> b3 with canonically allocated ids.
+    Let id0 be proc allocate_block_id from MIR with cfg
+    Let b0 be proc create_mir_basic_block from MIR with id0, 0
+    Let id1 be proc allocate_block_id from MIR with cfg
+    Let b1 be proc create_mir_basic_block from MIR with id1, 0
+    Let id2 be proc allocate_block_id from MIR with cfg
+    Let b2 be proc create_mir_basic_block from MIR with id2, 0
+    Let id3 be proc allocate_block_id from MIR with cfg
+    Let b3 be proc create_mir_basic_block from MIR with id3, 0
+    If b0 is equal to 0 or b1 is equal to 0 or b2 is equal to 0 or b3 is equal to 0:
+        Return 0
+    End If
+
+    proc add_block_to_cfg from MIR with cfg, b0
+    proc add_block_to_cfg from MIR with cfg, b1
+    proc add_block_to_cfg from MIR with cfg, b2
+    proc add_block_to_cfg from MIR with cfg, b3
+    proc set_cfg_entry_block from MIR with cfg, b0
+    proc set_cfg_exit_block from MIR with cfg, b3
+
+    proc memory_set_int64 from Layout with out_slots, 8, b0
+    proc memory_set_int64 from Layout with out_slots, 16, b1
+    proc memory_set_int64 from Layout with out_slots, 24, b2
+    proc memory_set_int64 from Layout with out_slots, 32, b3
+
+    Note: b0: v1 = CONST 1; v2 = CONST 0; v3 = LT v1, v2; BRANCH v3 ? b1 : b2
+    Let const1 be proc create_mir_const from MIRNodes with 1, 1, 0, 0, 0
+    proc add_instruction_to_block from MirCFG with b0, const1
+    Let const2 be proc create_mir_const from MIRNodes with 2, 0, 0, 0, 0
+    proc add_instruction_to_block from MirCFG with b0, const2
+    Let cmp_inst be proc create_mir_binary_op from MIRNodes with 20102, 3, 1, 2, 0
+    proc add_instruction_to_block from MirCFG with b0, cmp_inst
+    Let branch_inst be proc create_mir_branch from MIRNodes with 3, id1, id2, 50, 50
+    proc add_instruction_to_block from MirCFG with b0, branch_inst
+    proc memory_set_int64 from Layout with out_slots, 40, branch_inst
+
+    Note: Callee function with a 2-instruction body (CONST + RETURN) so
+    Note: the inlining cost model sees a real size of 2.
+    Let callee_func be proc create_mir_function from MIR with "pgo_probe_callee", 0, 0
+    If callee_func is equal to 0:
+        Return 0
+    End If
+    Let callee_cfg be proc get_mir_function_cfg from MIR with callee_func
+    Let cid0 be proc allocate_block_id from MIR with callee_cfg
+    Let cb0 be proc create_mir_basic_block from MIR with cid0, 0
+    If cb0 is equal to 0:
+        Return 0
+    End If
+    proc add_block_to_cfg from MIR with callee_cfg, cb0
+    proc set_cfg_entry_block from MIR with callee_cfg, cb0
+    proc set_cfg_exit_block from MIR with callee_cfg, cb0
+    Let callee_const be proc create_mir_const from MIRNodes with 1, 42, 0, 0, 0
+    proc add_instruction_to_block from MirCFG with cb0, callee_const
+    Let callee_ret be proc create_mir_return from MIRNodes with 1, 0
+    proc add_instruction_to_block from MirCFG with cb0, callee_ret
+    proc memory_set_int64 from Layout with out_slots, 64, callee_func
+
+    Note: b1: v4 = CALL pgo_probe_callee (callee slot = the callee's
+    Note: interned name POINTER, the direct-call name form); v5 = CALL of
+    Note: a name no program function owns (unresolvable); JUMP b3.
+    Let callee_name_ptr be proc memory_get_int64 from Layout with callee_func, 0
+    Let call1 be proc create_mir_call from MIRNodes with 4, callee_name_ptr, 0, 0, 0, 0, 0
+    proc add_instruction_to_block from MirCFG with b1, call1
+    proc memory_set_int64 from Layout with out_slots, 48, call1
+    Let unknown_name be "pgo_unknown_fn"
+    Let call2 be proc create_mir_call from MIRNodes with 5, unknown_name, 0, 0, 0, 0, 0
+    proc add_instruction_to_block from MirCFG with b1, call2
+    proc memory_set_int64 from Layout with out_slots, 56, call2
+    Let jump1 be proc create_mir_jump from MIRNodes with id3
+    proc add_instruction_to_block from MirCFG with b1, jump1
+
+    Note: b2: JUMP b3
+    Let jump2 be proc create_mir_jump from MIRNodes with id3
+    proc add_instruction_to_block from MirCFG with b2, jump2
+
+    Note: b3: RETURN v1
+    Let ret_inst be proc create_mir_return from MIRNodes with 1, 0
+    proc add_instruction_to_block from MirCFG with b3, ret_inst
+
+    Note: CFG edges through the canonical id-keyed wiring.
+    proc add_cfg_edge from MIR with cfg, id0, id1
+    proc add_cfg_edge from MIR with cfg, id0, id2
+    proc add_cfg_edge from MIR with cfg, id1, id3
+    proc add_cfg_edge from MIR with cfg, id2, id3
+
+    Note: Register the SSA definitions (canonical hygiene; the inline
+    Note: resolver also consults lookup_defining_instruction).
+    proc register_value_definition from MIR with func, 1, const1
+    proc register_value_definition from MIR with func, 2, const2
+    proc register_value_definition from MIR with func, 3, cmp_inst
+    proc register_value_definition from MIR with func, 4, call1
+    proc register_value_definition from MIR with func, 5, call2
+
+    Note: MIRProgram holding both functions (functions List at offset 0,
+    Note: cached function_count at offset 8).
+    Let program be proc create_mir_program from MIR with 0
+    If program is equal to 0:
+        Return 0
+    End If
+    Let program_functions be proc memory_get_int64 from Layout with program, 0
+    proc append from List with program_functions, func
+    proc append from List with program_functions, callee_func
+    proc memory_set_int64 from Layout with program, 8, 2
+    proc memory_set_int64 from Layout with out_slots, 72, program
+
+    proc memory_set_int64 from Layout with out_slots, 0, func
+    Return func
+End Process
+
+Process called "main" returns Integer:
+    Let results be proc create_test_results from T
+    proc begin_suite from T with results, "pgo_probe (task #468 gate)"
+
+    Let out_slots be proc allocate from Layout with 80
+    Let zi be 0
+    While zi is less than 80:
+        proc memory_set_int64 from Layout with out_slots, zi, 0
+        Set zi to zi plus 8
+    End While
+
+    Let func be build_pgo_probe(out_slots)
+    proc assert_not_null from T with results, "probe MIR program built", func
+
+    Let b0 be proc memory_get_int64 from Layout with out_slots, 8
+    Let b1 be proc memory_get_int64 from Layout with out_slots, 16
+    Let b2 be proc memory_get_int64 from Layout with out_slots, 24
+    Let b3 be proc memory_get_int64 from Layout with out_slots, 32
+    Let branch_inst be proc memory_get_int64 from Layout with out_slots, 40
+    Let call1 be proc memory_get_int64 from Layout with out_slots, 48
+    Let call2 be proc memory_get_int64 from Layout with out_slots, 56
+    Let callee_func be proc memory_get_int64 from Layout with out_slots, 64
+    Let program be proc memory_get_int64 from Layout with out_slots, 72
+
+    Let id0 be proc get_mir_basic_block_id from MirCFG with b0
+    Let id1 be proc get_mir_basic_block_id from MirCFG with b1
+    Let id2 be proc get_mir_basic_block_id from MirCFG with b2
+    Let id3 be proc get_mir_basic_block_id from MirCFG with b3
+
+    Note: --- profile container (the load_profile_data section contract) ---
+    Note: b3 is deliberately unprofiled; one stale block, edge, and call
+    Note: entry each exercise integrate_profile_into_mir's pruning.
+    Let profile_map be proc omap_create from OrderedMap
+
+    Let blocks_section be proc omap_create from OrderedMap
+    proc omap_set from OrderedMap with blocks_section, id0, 1000
+    proc omap_set from OrderedMap with blocks_section, id1, 990
+    proc omap_set from OrderedMap with blocks_section, id2, 10
+    proc omap_set from OrderedMap with blocks_section, 99, 5
+    proc omap_set from OrderedMap with profile_map, 1000, blocks_section
+
+    Let edges_section be proc omap_create from OrderedMap
+    Let edge_key_01 be id0 multiplied by 1000000 plus id1
+    Let edge_key_02 be id0 multiplied by 1000000 plus id2
+    Let stale_edge_key be 99 multiplied by 1000000 plus id0
+    proc omap_set from OrderedMap with edges_section, edge_key_01, 990
+    proc omap_set from OrderedMap with edges_section, edge_key_02, 10
+    proc omap_set from OrderedMap with edges_section, stale_edge_key, 3
+    proc omap_set from OrderedMap with profile_map, 1001, edges_section
+
+    Let calls_section be proc omap_create from OrderedMap
+    proc omap_set from OrderedMap with calls_section, call1, 990
+    proc omap_set from OrderedMap with calls_section, 12345, 7
+    proc omap_set from OrderedMap with profile_map, 1002, calls_section
+
+    Note: --- load_profile_data: ingestion + total_samples seed ---
+    Let pd be proc load_profile_data from ProfileGuided with func, profile_map
+    proc assert_not_null from T with results, "ProfileData created", pd
+    Let seeded_total be proc memory_get_int64 from Layout with pd, 56
+    proc assert_equal from T with results, "total_samples seeded with ingested block sum", seeded_total, 2005
+
+    Let pga be proc create_profile_guided_analysis from ProfileGuided with func, pd
+    proc assert_not_null from T with results, "PGA workspace created", pga
+
+    Note: --- integrate_profile_into_mir: stale pruning against the CFG ---
+    Let matched be proc integrate_profile_into_mir from ProfileGuided with pga
+    proc assert_equal from T with results, "3 blocks + 2 edges + 1 call matched", matched, 6
+    Let block_freqs be proc memory_get_int64 from Layout with pd, 8
+    Let edge_freqs be proc memory_get_int64 from Layout with pd, 16
+    Let call_freqs be proc memory_get_int64 from Layout with pd, 24
+    Let stale_block_freq be proc omap_get from OrderedMap with block_freqs, 99
+    proc assert_equal from T with results, "stale block 99 pruned", stale_block_freq, 0
+    Let kept_block_freq be proc omap_get from OrderedMap with block_freqs, id0
+    proc assert_equal from T with results, "live block b0 retained at 1000", kept_block_freq, 1000
+    Let stale_edge_freq be proc omap_get from OrderedMap with edge_freqs, stale_edge_key
+    proc assert_equal from T with results, "stale edge 99->b0 pruned", stale_edge_freq, 0
+    Let kept_edge_freq be proc omap_get from OrderedMap with edge_freqs, edge_key_01
+    proc assert_equal from T with results, "live edge b0->b1 retained at 990", kept_edge_freq, 990
+    Let stale_call_freq be proc omap_get from OrderedMap with call_freqs, 12345
+    proc assert_equal from T with results, "stale call site pruned", stale_call_freq, 0
+    Let kept_call_freq be proc omap_get from OrderedMap with call_freqs, call1
+    proc assert_equal from T with results, "live call site retained at 990", kept_call_freq, 990
+
+    Note: --- compute_block_frequencies: predecessor estimation ---
+    Let freq_result be proc compute_block_frequencies from ProfileGuided with pga
+    proc assert_equal from T with results, "frequency propagation ran", freq_result, 1
+    Let b3_freq be proc omap_get from OrderedMap with block_freqs, id3
+    proc assert_equal from T with results, "unprofiled b3 estimated from preds (990 + 10)", b3_freq, 1000
+    Let recomputed_total be proc memory_get_int64 from Layout with pd, 56
+    proc assert_equal from T with results, "total_samples recomputed over the CFG", recomputed_total, 3000
+
+    Note: --- compute_branch_probabilities: ext targets + edge flow ---
+    Let resolved_branches be proc compute_branch_probabilities from ProfileGuided with pga
+    proc assert_equal from T with results, "one conditional branch resolved", resolved_branches, 1
+    Let branch_probs_map be proc memory_get_int64 from Layout with pga, 64
+    Let bp be proc omap_get from OrderedMap with branch_probs_map, branch_inst
+    proc assert_not_null from T with results, "BranchProbability record present", bp
+    Let bp_true_count be proc memory_get_int64 from Layout with bp, 8
+    proc assert_equal from T with results, "true-edge count is 990", bp_true_count, 990
+    Let bp_false_count be proc memory_get_int64 from Layout with bp, 16
+    proc assert_equal from T with results, "false-edge count is 10", bp_false_count, 10
+    Let bp_true_prob be proc memory_get_int64 from Layout with bp, 24
+    proc assert_equal from T with results, "true probability is 99", bp_true_prob, 99
+    Let bp_false_prob be proc memory_get_int64 from Layout with bp, 32
+    proc assert_equal from T with results, "false probability is 1", bp_false_prob, 1
+    Let pd_branch_map be proc memory_get_int64 from Layout with pd, 32
+    Let pd_true_prob be proc omap_get from OrderedMap with pd_branch_map, branch_inst
+    proc assert_equal from T with results, "ProfileData branch map carries 99", pd_true_prob, 99
+
+    Note: --- identify_hot_blocks: 90-percent coverage rule ---
+    Let hot_count be proc identify_hot_blocks from ProfileGuided with pga
+    proc assert_equal from T with results, "three hot blocks cover 90 percent", hot_count, 3
+    Let hot_set be proc memory_get_int64 from Layout with pga, 16
+    Let b0_hot be proc contains from Set with hot_set, id0
+    proc assert_equal from T with results, "b0 is hot", b0_hot, 1
+    Let b1_hot be proc contains from Set with hot_set, id1
+    proc assert_equal from T with results, "b1 is hot", b1_hot, 1
+    Let b3_hot be proc contains from Set with hot_set, id3
+    proc assert_equal from T with results, "b3 is hot", b3_hot, 1
+    Let b2_hot be proc contains from Set with hot_set, id2
+    proc assert_equal from T with results, "b2 is not hot", b2_hot, 0
+    Let hot_cutoff be proc memory_get_int64 from Layout with pd, 40
+    proc assert_equal from T with results, "realized hot cutoff is 990", hot_cutoff, 990
+
+    Note: --- identify_cold_blocks: 1-percent floor ---
+    Let cold_count be proc identify_cold_blocks from ProfileGuided with pga
+    proc assert_equal from T with results, "one cold block", cold_count, 1
+    Let cold_set be proc memory_get_int64 from Layout with pga, 24
+    Let b2_cold be proc contains from Set with cold_set, id2
+    proc assert_equal from T with results, "b2 is cold", b2_cold, 1
+    Let cold_cutoff be proc memory_get_int64 from Layout with pd, 48
+    proc assert_equal from T with results, "cold cutoff is 1 percent of 3000", cold_cutoff, 30
+
+    Note: --- identify_hot_paths: max-frequency successor trace ---
+    Let paths be proc identify_hot_paths from ProfileGuided with pga, 4
+    proc assert_equal from T with results, "one path covers every hot block", paths, 1
+    Let hot_paths_list be proc memory_get_int64 from Layout with pga, 32
+    Let path_count be proc length from List with hot_paths_list
+    proc assert_equal from T with results, "hot_paths holds one record", path_count, 1
+    Let hp be proc list_get from List with hot_paths_list, 0
+    Let hp_len be proc memory_get_int64 from Layout with hp, 40
+    proc assert_equal from T with results, "path length is 3", hp_len, 3
+    Let hp_blocks be proc memory_get_int64 from Layout with hp, 8
+    Let hp_b0 be proc list_get from List with hp_blocks, 0
+    proc assert_equal from T with results, "path starts at b0", hp_b0, id0
+    Let hp_b1 be proc list_get from List with hp_blocks, 1
+    proc assert_equal from T with results, "path follows the hot edge to b1", hp_b1, id1
+    Let hp_b2 be proc list_get from List with hp_blocks, 2
+    proc assert_equal from T with results, "path ends at b3", hp_b2, id3
+    Let hp_exec be proc memory_get_int64 from Layout with hp, 16
+    proc assert_equal from T with results, "path execution count is 2990", hp_exec, 2990
+    Let hp_is_hot be proc memory_get_int64 from Layout with hp, 24
+    proc assert_equal from T with results, "path is flagged hot", hp_is_hot, 1
+    Let hp_priority be proc memory_get_int64 from Layout with hp, 32
+    proc assert_equal from T with results, "path priority is 9 of 10", hp_priority, 9
+
+    Note: --- validate_profile_data ---
+    Let valid be proc validate_profile_data from ProfileGuided with pga
+    proc assert_equal from T with results, "profile validates", valid, 1
+
+    Note: --- compute_inline_decisions: dual-form resolution + cost model ---
+    Let decisions be proc compute_inline_decisions from ProfileGuided with pga, 0, 100, program
+    proc assert_equal from T with results, "two call sites produced decisions", decisions, 2
+    Let candidates be proc memory_get_int64 from Layout with pga, 56
+    Let d1 be proc list_get from List with candidates, 0
+    Let d1_site be proc memory_get_int64 from Layout with d1, 0
+    proc assert_equal from T with results, "decision 1 keyed on call1", d1_site, call1
+    Let d1_callee be proc memory_get_int64 from Layout with d1, 8
+    proc assert_equal from T with results, "name-pointer callee resolved to the MIRFunction (OD-4)", d1_callee, callee_func
+    Let d1_priority be proc memory_get_int64 from Layout with d1, 16
+    proc assert_equal from T with results, "priority 99 from 990 calls", d1_priority, 99
+    Let d1_cb be proc memory_get_int64 from Layout with d1, 24
+    proc assert_equal from T with results, "cost_benefit 990*10 minus real size 2", d1_cb, 9898
+    Let d1_should be proc memory_get_int64 from Layout with d1, 32
+    proc assert_equal from T with results, "hot resolvable call marked inline", d1_should, 1
+    Let d1_reason be proc memory_get_int64 from Layout with d1, 40
+    proc assert_not_null from T with results, "decision 1 carries a reason", d1_reason
+
+    Let d2 be proc list_get from List with candidates, 1
+    Let d2_callee be proc memory_get_int64 from Layout with d2, 8
+    proc assert_equal from T with results, "unknown callee stays unresolved", d2_callee, 0
+    Let d2_should be proc memory_get_int64 from Layout with d2, 32
+    proc assert_equal from T with results, "unresolved callee never inlined", d2_should, 0
+    Let d2_cb be proc memory_get_int64 from Layout with d2, 24
+    proc assert_equal from T with results, "conservative 100-cost on opaque callee", d2_cb, -90
+    Let d2_reason be proc memory_get_int64 from Layout with d2, 40
+    proc assert_not_null from T with results, "decision 2 carries a reason", d2_reason
+
+    Note: --- estimate_optimization_benefit: 60-percent cap ---
+    Let benefit be proc estimate_optimization_benefit from ProfileGuided with pga
+    proc assert_equal from T with results, "benefit estimate capped at 60", benefit, 60
+
+    Note: --- apply_pgo_hints: MIRBranch weight_true@96 / weight_false@104 ---
+    Let annotated be proc apply_pgo_hints from ProfileGuided with pga
+    proc assert_equal from T with results, "one branch annotated", annotated, 1
+    Let weight_true be proc memory_get_int64 from Layout with branch_inst, 96
+    proc assert_equal from T with results, "weight_true stamped 99", weight_true, 99
+    Let weight_false be proc memory_get_int64 from Layout with branch_inst, 104
+    proc assert_equal from T with results, "weight_false stamped 1", weight_false, 1
+
+    Note: --- optimize_code_layout: entry / hot / normal / cold reorder ---
+    Let cfg be proc get_mir_function_cfg from MIR with func
+    Let layout_changed be proc optimize_code_layout from ProfileGuided with pga
+    proc assert_equal from T with results, "layout reorder reported a change", layout_changed, 1
+    Let blocks be proc get_mir_cfg_blocks from MirCFG with cfg
+    Let blocks_len be proc length from List with blocks
+    proc assert_equal from T with results, "reorder preserves the block count", blocks_len, 4
+    Let lay0 be proc list_get from List with blocks, 0
+    proc assert_equal from T with results, "entry b0 stays first", lay0, b0
+    Let lay1 be proc list_get from List with blocks, 1
+    proc assert_equal from T with results, "hot b1 second", lay1, b1
+    Let lay2 be proc list_get from List with blocks, 2
+    proc assert_equal from T with results, "hot b3 third", lay2, b3
+    Let lay3 be proc list_get from List with blocks, 3
+    proc assert_equal from T with results, "cold b2 moved last", lay3, b2
+    Let layout_again be proc optimize_code_layout from ProfileGuided with pga
+    proc assert_equal from T with results, "second layout pass is a no-op", layout_again, 0
+
+    Note: --- IN-PIPELINE real callee costing (task #475) ---
+    Note: Build a genuine OptimizationContext exactly as optimize_function
+    Note: does (mir_program threaded into slot 136 by the constructor),
+    Note: install the profile at slot 88, and drive the full PGO wiring
+    Note: function. The decisions computed INSIDE the pipeline must use
+    Note: the real callee size (cost 2 -> cost_benefit 9898), proving
+    Note: apply_profile_guided_optimizations no longer passes mir=0 to
+    Note: compute_inline_decisions (which would yield the conservative
+    Note: 100 cost and cost_benefit 9800).
+    Let opt_ctx be proc create_optimization_context from Optimization with func, 1, program
+    proc assert_not_null from T with results, "OptimizationContext built with program in slot 136", opt_ctx
+    Let ctx_program be proc memory_get_int64 from Layout with opt_ctx, 136
+    proc assert_equal from T with results, "ctx slot 136 carries the MIRProgram", ctx_program, program
+    proc memory_set_int64 from Layout with opt_ctx, 88, pd
+
+    Let pipeline_changed be proc apply_profile_guided_optimizations from Optimization with opt_ctx
+    proc assert_equal from T with results, "in-pipeline PGO reported changes", pipeline_changed, 1
+
+    Let pipeline_pga be proc memory_get_int64 from Layout with opt_ctx, 128
+    proc assert_not_null from T with results, "PGA retained on ctx slot 128", pipeline_pga
+    Let pipeline_candidates be proc memory_get_int64 from Layout with pipeline_pga, 56
+    Let pipeline_decisions be proc length from List with pipeline_candidates
+    proc assert_equal from T with results, "in-pipeline run produced two decisions", pipeline_decisions, 2
+
+    Let p1 be proc list_get from List with pipeline_candidates, 0
+    Let p1_callee be proc memory_get_int64 from Layout with p1, 8
+    proc assert_equal from T with results, "in-pipeline callee resolved through ctx mir_program", p1_callee, callee_func
+    Let p1_cb be proc memory_get_int64 from Layout with p1, 24
+    proc assert_equal from T with results, "in-pipeline cost is REAL size 2, not conservative 100", p1_cb, 9898
+    Let p1_should be proc memory_get_int64 from Layout with p1, 32
+    proc assert_equal from T with results, "in-pipeline resolvable call marked inline", p1_should, 1
+
+    Let p2 be proc list_get from List with pipeline_candidates, 1
+    Let p2_cb be proc memory_get_int64 from Layout with p2, 24
+    proc assert_equal from T with results, "in-pipeline opaque callee keeps conservative -90", p2_cb, -90
+
+    Let merged_candidates be proc memory_get_int64 from Layout with opt_ctx, 96
+    Let merged_count be proc length from List with merged_candidates
+    proc assert_equal from T with results, "decisions merged into ctx.inlining_candidates", merged_count, 2
+
+    proc print_summary from T with results
+
+    Let failed be proc get_failed from T with results
+    proc destroy_test_results from T with results
+    Return failed
+End Process

@@ -7,9 +7,11 @@ Note: ==========================================================================
 
 Import "compiler/frontend/lexical/lexer.runa" as LexerCore
 Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/frontend/primitives/core/string_primitive.runa" as StringPrimitive
 Import "compiler/frontend/primitives/char_core.runa" as CharCore
 Import "compiler/frontend/primitives/collections/list.runa" as ListCore
 Import "compiler/frontend/primitives/core/memory_core.runa" as MemoryCore
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
 
 Note: ============================================================================
 Note: Lua Token Type Constants
@@ -91,15 +93,16 @@ Note: Lua Lexer State
 Note: ============================================================================
 
 @Reasoning:
-Unlike other lexers in this tree, the Lua lexer uses a value-of-type struct
-(reading/writing via memory_read/memory_write) rather than raw offsets. The
-current_char cache mirrors the JS lexer pattern; an embedded tokens list
-makes scan_token side-effect-driven (each scan APPENDS rather than returning).
+The Lua lexer uses a value-of-type struct with typed field access rather
+than raw offsets. The current_char cache mirrors the JS lexer pattern; an
+embedded tokens list makes scan_token side-effect-driven (each scan
+APPENDS rather than returning).
 @End Reasoning
 @Implementation:
-Field-based access via memory_read/memory_write; the actual byte offsets
-are managed by the type system (StringCore handles source as a String, and
-the integer fields follow). 8 fields total.
+Struct construction allocates the heap home directly; helpers receive the
+struct pointer and rebind it with a typed Let so field offsets are managed
+by the type system. Mutations through the typed binding write in place. 8
+fields total.
 @End Implementation
 Type called "LuaLexerState":
     source as String
@@ -144,9 +147,9 @@ current_char cache initialized to source[0]. The tokens list is created
 ahead of time so scan_token can blindly append without first allocating.
 @End Reasoning
 @Implementation:
-Construct value-of-type LuaLexerState; allocate via MemoryCore; write back.
-If source is non-empty, read the first byte and update current_char then
-write again. Returns the pointer.
+Construct value-of-type LuaLexerState; struct construction allocates the
+heap home directly. If source is non-empty, read the first byte and update
+current_char in place. Returns the struct pointer.
 @End Implementation
 Process called "create_lexer" takes source as String returns Integer:
     @Reasoning
@@ -164,17 +167,13 @@ Process called "create_lexer" takes source as String returns Integer:
         had_error as 0,
         error_message as ""
 
-    Let lexer_ptr be proc memory_allocate from MemoryCore with size_of LuaLexerState
-    proc memory_write from MemoryCore with lexer_ptr, lexer
-
     Note: Initialize current_char
     If proc string_length from StringCore with source is greater than 0:
         Let first_char be proc string_char_at from StringCore with source, 0
         Set lexer.current_char to first_char
-        proc memory_write from MemoryCore with lexer_ptr, lexer
     End If
 
-    Return lexer_ptr
+    Return lexer
 End Process
 
 Note: ============================================================================
@@ -187,9 +186,10 @@ updates state to point at the next character. This "return-the-consumed"
 shape lets scan helpers capture the byte in one call.
 @End Reasoning
 @Implementation:
-Read state; cache current; increment position and column; if current was
-LF increment line and reset column. Reload current_char from source at
-the new position, or 0 on EOF. Write state back. Return the cached value.
+Bind state with a typed Let; cache current; increment position and column;
+if current was LF increment line and reset column. Reload current_char
+from source at the new position, or 0 on EOF. Mutations write in place
+through the typed binding. Return the cached value.
 @End Implementation
 Process called "advance" takes lexer_ptr as Integer returns Integer:
     @Reasoning
@@ -198,7 +198,7 @@ Process called "advance" takes lexer_ptr as Integer returns Integer:
     Returns the current character before advancing.
     @End Reasoning
 
-    Let lexer be proc memory_read from MemoryCore with lexer_ptr of type LuaLexerState
+    Let lexer as LuaLexerState be lexer_ptr
     Let source_len be proc string_length from StringCore with lexer.source
 
     Let current be lexer.current_char
@@ -220,7 +220,6 @@ Process called "advance" takes lexer_ptr as Integer returns Integer:
         Set lexer.current_char to 0  Note: EOF
     End If
 
-    proc memory_write from MemoryCore with lexer_ptr, lexer
     Return current
 End Process
 
@@ -229,14 +228,14 @@ Just reads the cached current_char field; no source-buffer access needed
 because advance keeps the cache fresh.
 @End Reasoning
 @Implementation:
-memory_read state; return current_char field.
+Bind state with a typed Let; return current_char field.
 @End Implementation
 Process called "peek" takes lexer_ptr as Integer returns Integer:
     @Reasoning
     Look at the current character without consuming it.
     @End Reasoning
 
-    Let lexer be proc memory_read from MemoryCore with lexer_ptr of type LuaLexerState
+    Let lexer as LuaLexerState be lexer_ptr
     Return lexer.current_char
 End Process
 
@@ -246,15 +245,15 @@ Multi-byte lookahead used by scan helpers (e.g. `..` concat, `...` vararg,
 current_char cache because the cache only covers position 0.
 @End Reasoning
 @Implementation:
-Read state. Compute position + offset. If within source_len, read source
-byte; otherwise return 0 (EOF).
+Bind state with a typed Let. Compute position + offset. If within
+source_len, read source byte; otherwise return 0 (EOF).
 @End Implementation
 Process called "peek_ahead" takes lexer_ptr as Integer, offset as Integer returns Integer:
     @Reasoning
     Look ahead at a character at the given offset without consuming it.
     @End Reasoning
 
-    Let lexer be proc memory_read from MemoryCore with lexer_ptr of type LuaLexerState
+    Let lexer as LuaLexerState be lexer_ptr
     Let look_pos be lexer.position plus offset
     Let source_len be proc string_length from StringCore with lexer.source
 
@@ -272,14 +271,14 @@ against source_len. Source files with embedded NUL bytes would falsely
 trigger this check, but Lua source NULs aren't valid input.
 @End Reasoning
 @Implementation:
-Read state; return 1 if current_char is 0, else 0.
+Bind state with a typed Let; return 1 if current_char is 0, otherwise 0.
 @End Implementation
 Process called "is_at_end" takes lexer_ptr as Integer returns Integer:
     @Reasoning
     Check if we've reached the end of the source.
     @End Reasoning
 
-    Let lexer be proc memory_read from MemoryCore with lexer_ptr of type LuaLexerState
+    Let lexer as LuaLexerState be lexer_ptr
 
     If lexer.current_char is equal to 0:
         Return 1
@@ -454,8 +453,8 @@ Allocates a LuaToken on the heap with the supplied fields. literal_value
 is "" for tokens with no separate decoded form.
 @End Reasoning
 @Implementation:
-Construct value-of-type LuaToken; allocate via MemoryCore; write back;
-return pointer.
+Construct value-of-type LuaToken; struct construction allocates the heap
+home directly; return the struct pointer.
 @End Implementation
 Process called "create_token" takes token_type as Integer, lexeme as String, line as Integer, column as Integer, literal_value as String returns Integer:
     @Reasoning
@@ -469,10 +468,7 @@ Process called "create_token" takes token_type as Integer, lexeme as String, lin
         column as column,
         literal_value as literal_value
 
-    Let token_ptr be proc memory_allocate from MemoryCore with size_of LuaToken
-    proc memory_write from MemoryCore with token_ptr, token
-
-    Return token_ptr
+    Return token
 End Process
 
 @Reasoning:
@@ -481,20 +477,18 @@ and append it to the lexer's tokens list. Centralizes the
 "create-and-append" idiom every scan_ helper uses.
 @End Reasoning
 @Implementation:
-Read state; create_token with current line/column; append to lexer.tokens
-via list_append.
+Bind state with a typed Let; create_token with current line/column;
+append to lexer.tokens via list_append.
 @End Implementation
 Process called "add_token" takes lexer_ptr as Integer, token_type as Integer, lexeme as String, literal_value as String:
     @Reasoning
     Create a token and add it to the lexer's token list.
     @End Reasoning
 
-    Let lexer be proc memory_read from MemoryCore with lexer_ptr of type LuaLexerState
+    Let lexer as LuaLexerState be lexer_ptr
 
     Let token be proc create_token with token_type, lexeme, lexer.line, lexer.column, literal_value
     proc list_append from ListCore with lexer.tokens, token
-
-    proc memory_write from MemoryCore with lexer_ptr, lexer
 End Process
 
 Note: ============================================================================
@@ -506,19 +500,17 @@ Records a lexer-level error. Sets had_error=1 and stores the message so
 the parser can decide whether to attempt recovery or abort.
 @End Reasoning
 @Implementation:
-Read state; set had_error and error_message; write state back.
+Bind state with a typed Let; set had_error and error_message in place.
 @End Implementation
 Process called "lexer_error" takes lexer_ptr as Integer, message as String:
     @Reasoning
     Record a lexer error.
     @End Reasoning
 
-    Let lexer be proc memory_read from MemoryCore with lexer_ptr of type LuaLexerState
+    Let lexer as LuaLexerState be lexer_ptr
 
     Set lexer.had_error to 1
     Set lexer.error_message to message
-
-    proc memory_write from MemoryCore with lexer_ptr, lexer
 End Process
 
 Note: ============================================================================
@@ -543,7 +535,7 @@ Process called "skip_whitespace" takes lexer_ptr as Integer:
         Let char be proc peek with lexer_ptr
 
         If proc is_whitespace with char is equal to 1:
-            proc advance from lexer_ptr
+            proc advance with lexer_ptr
         Otherwise:
             Set continue to 0
         End If
@@ -579,8 +571,8 @@ Process called "scan_comment" takes lexer_ptr as Integer returns Integer:
     End If
 
     Note: Advance past --
-    proc advance from lexer_ptr
-    proc advance from lexer_ptr
+    proc advance with lexer_ptr
+    proc advance with lexer_ptr
 
     Note: Check for block comment --[[ or --[=[
     Let third_char be proc peek with lexer_ptr
@@ -588,14 +580,14 @@ Process called "scan_comment" takes lexer_ptr as Integer returns Integer:
     If third_char is equal to 91:  Note: '['
         Note: Count the number of '=' signs
         Let eq_count be 0
-        proc advance from lexer_ptr  Note: Skip '['
+        proc advance with lexer_ptr  Note: Skip '['
 
         Let continue_eq be 1
         While continue_eq is equal to 1:
             Let eq_char be proc peek with lexer_ptr
             If eq_char is equal to 61:  Note: '='
                 Set eq_count to eq_count plus 1
-                proc advance from lexer_ptr
+                proc advance with lexer_ptr
             Otherwise:
                 Set continue_eq to 0
             End If
@@ -603,7 +595,7 @@ Process called "scan_comment" takes lexer_ptr as Integer returns Integer:
 
         Let opening_bracket be proc peek with lexer_ptr
         If opening_bracket is equal to 91:  Note: '['
-            proc advance from lexer_ptr  Note: Skip second '['
+            proc advance with lexer_ptr  Note: Skip second '['
 
             Note: Scan until we find ']' + matching '=' + ']'
             Let found_end be 0
@@ -641,18 +633,18 @@ Process called "scan_comment" takes lexer_ptr as Integer returns Integer:
                             Note: Found the end, skip all chars
                             Let skip_count be 0
                             While skip_count is less than or equal to temp_offset:
-                                proc advance from lexer_ptr
+                                proc advance with lexer_ptr
                                 Set skip_count to skip_count plus 1
                             End While
                             Set found_end to 1
                         Otherwise:
-                            proc advance from lexer_ptr
+                            proc advance with lexer_ptr
                         End If
                     Otherwise:
-                        proc advance from lexer_ptr
+                        proc advance with lexer_ptr
                     End If
                 Otherwise:
-                    proc advance from lexer_ptr
+                    proc advance with lexer_ptr
                 End If
             End While
 
@@ -674,7 +666,7 @@ Process called "scan_comment" takes lexer_ptr as Integer returns Integer:
         End If
 
         If continue is equal to 1:
-            proc advance from lexer_ptr
+            proc advance with lexer_ptr
         End If
     End While
 
@@ -702,7 +694,7 @@ Process called "scan_number" takes lexer_ptr as Integer returns Integer:
     Lua supports: 123, 0x1A, 3.14, 2.5e10, 0x1.2p3
     @End Reasoning
 
-    Let lexer be proc memory_read from MemoryCore with lexer_ptr of type LuaLexerState
+    Let lexer as LuaLexerState be lexer_ptr
     Let start_pos be lexer.position
     Let number_str be ""
 
@@ -715,10 +707,10 @@ Process called "scan_number" takes lexer_ptr as Integer returns Integer:
         If next_char is equal to 120:  Note: 'x'
             Note: Hexadecimal number
             Let hex_char be proc advance with lexer_ptr
-            Set number_str to proc string_from_char from StringCore with hex_char
+            Set number_str to proc char_to_string from StringCore with hex_char
 
             Let x_char be proc advance with lexer_ptr
-            Set number_str to proc string_concat from StringCore with number_str, proc string_from_char from StringCore with x_char
+            Set number_str to proc string_concat from StringPrimitive with number_str, proc char_to_string from StringCore with x_char
 
             Note: Scan hex digits
             Let continue be 1
@@ -727,7 +719,7 @@ Process called "scan_number" takes lexer_ptr as Integer returns Integer:
 
                 If proc is_hex_digit with current is equal to 1:
                     Let digit be proc advance with lexer_ptr
-                    Set number_str to proc string_concat from StringCore with number_str, proc string_from_char from StringCore with digit
+                    Set number_str to proc string_concat from StringPrimitive with number_str, proc char_to_string from StringCore with digit
                 Otherwise:
                     Set continue to 0
                 End If
@@ -737,7 +729,7 @@ Process called "scan_number" takes lexer_ptr as Integer returns Integer:
             Let dot_char be proc peek with lexer_ptr
             If dot_char is equal to 46:  Note: '.'
                 Let dot be proc advance with lexer_ptr
-                Set number_str to proc string_concat from StringCore with number_str, proc string_from_char from StringCore with dot
+                Set number_str to proc string_concat from StringPrimitive with number_str, proc char_to_string from StringCore with dot
 
                 Note: Scan fractional hex digits
                 Let continue_frac be 1
@@ -746,7 +738,7 @@ Process called "scan_number" takes lexer_ptr as Integer returns Integer:
 
                     If proc is_hex_digit with frac_char is equal to 1:
                         Let frac_digit be proc advance with lexer_ptr
-                        Set number_str to proc string_concat from StringCore with number_str, proc string_from_char from StringCore with frac_digit
+                        Set number_str to proc string_concat from StringPrimitive with number_str, proc char_to_string from StringCore with frac_digit
                     Otherwise:
                         Set continue_frac to 0
                     End If
@@ -757,17 +749,17 @@ Process called "scan_number" takes lexer_ptr as Integer returns Integer:
             Let exp_char be proc peek with lexer_ptr
             If exp_char is equal to 112:  Note: 'p'
                 Let p_char be proc advance with lexer_ptr
-                Set number_str to proc string_concat from StringCore with number_str, proc string_from_char from StringCore with p_char
+                Set number_str to proc string_concat from StringPrimitive with number_str, proc char_to_string from StringCore with p_char
 
                 Note: Check for sign
                 Let sign_char be proc peek with lexer_ptr
                 If sign_char is equal to 43:  Note: '+'
                     Let sign be proc advance with lexer_ptr
-                    Set number_str to proc string_concat from StringCore with number_str, proc string_from_char from StringCore with sign
+                    Set number_str to proc string_concat from StringPrimitive with number_str, proc char_to_string from StringCore with sign
                 End If
                 If sign_char is equal to 45:  Note: '-'
                     Set sign to proc advance with lexer_ptr
-                    Set number_str to proc string_concat from StringCore with number_str, proc string_from_char from StringCore with sign
+                    Set number_str to proc string_concat from StringPrimitive with number_str, proc char_to_string from StringCore with sign
                 End If
 
                 Note: Scan exponent digits
@@ -777,14 +769,13 @@ Process called "scan_number" takes lexer_ptr as Integer returns Integer:
 
                     If proc is_digit with exp_digit_char is equal to 1:
                         Let exp_digit be proc advance with lexer_ptr
-                        Set number_str to proc string_concat from StringCore with number_str, proc string_from_char from StringCore with exp_digit
+                        Set number_str to proc string_concat from StringPrimitive with number_str, proc char_to_string from StringCore with exp_digit
                     Otherwise:
                         Set continue_exp to 0
                     End If
                 End While
             End If
 
-            Let lexer_updated be proc memory_read from MemoryCore with lexer_ptr of type LuaLexerState
             proc add_token with lexer_ptr, TOKEN_NUMBER, number_str, number_str
             Return 1
         End If
@@ -792,10 +783,10 @@ Process called "scan_number" takes lexer_ptr as Integer returns Integer:
         If next_char is equal to 88:  Note: 'X'
             Note: Hexadecimal number (uppercase X)
             Set hex_char to proc advance with lexer_ptr
-            Set number_str to proc string_from_char from StringCore with hex_char
+            Set number_str to proc char_to_string from StringCore with hex_char
 
             Set x_char to proc advance with lexer_ptr
-            Set number_str to proc string_concat from StringCore with number_str, proc string_from_char from StringCore with x_char
+            Set number_str to proc string_concat from StringPrimitive with number_str, proc char_to_string from StringCore with x_char
 
             Note: Scan hex digits
             Set continue to 1
@@ -804,13 +795,12 @@ Process called "scan_number" takes lexer_ptr as Integer returns Integer:
 
                 If proc is_hex_digit with current is equal to 1:
                     Set digit to proc advance with lexer_ptr
-                    Set number_str to proc string_concat from StringCore with number_str, proc string_from_char from StringCore with digit
+                    Set number_str to proc string_concat from StringPrimitive with number_str, proc char_to_string from StringCore with digit
                 Otherwise:
                     Set continue to 0
                 End If
             End While
 
-            Set lexer_updated to proc memory_read from MemoryCore with lexer_ptr
             proc add_token with lexer_ptr, TOKEN_NUMBER, number_str, number_str
             Return 1
         End If
@@ -823,7 +813,7 @@ Process called "scan_number" takes lexer_ptr as Integer returns Integer:
 
         If proc is_digit with current is equal to 1:
             Set digit to proc advance with lexer_ptr
-            Set number_str to proc string_concat from StringCore with number_str, proc string_from_char from StringCore with digit
+            Set number_str to proc string_concat from StringPrimitive with number_str, proc char_to_string from StringCore with digit
         Otherwise:
             Set continue_int to 0
         End If
@@ -836,7 +826,7 @@ Process called "scan_number" takes lexer_ptr as Integer returns Integer:
         Let after_dot be proc peek_ahead with lexer_ptr, 1
         If after_dot is not equal to 46:
             Set dot to proc advance with lexer_ptr
-            Set number_str to proc string_concat from StringCore with number_str, proc string_from_char from StringCore with dot
+            Set number_str to proc string_concat from StringPrimitive with number_str, proc char_to_string from StringCore with dot
 
             Note: Scan fractional digits
             Set continue_frac to 1
@@ -845,7 +835,7 @@ Process called "scan_number" takes lexer_ptr as Integer returns Integer:
 
                 If proc is_digit with frac_char is equal to 1:
                     Set frac_digit to proc advance with lexer_ptr
-                    Set number_str to proc string_concat from StringCore with number_str, proc string_from_char from StringCore with frac_digit
+                    Set number_str to proc string_concat from StringPrimitive with number_str, proc char_to_string from StringCore with frac_digit
                 Otherwise:
                     Set continue_frac to 0
                 End If
@@ -857,17 +847,17 @@ Process called "scan_number" takes lexer_ptr as Integer returns Integer:
     Set exp_char to proc peek with lexer_ptr
     If exp_char is equal to 101:  Note: 'e'
         Let e_char be proc advance with lexer_ptr
-        Set number_str to proc string_concat from StringCore with number_str, proc string_from_char from StringCore with e_char
+        Set number_str to proc string_concat from StringPrimitive with number_str, proc char_to_string from StringCore with e_char
 
         Note: Check for sign
         Set sign_char to proc peek with lexer_ptr
         If sign_char is equal to 43:  Note: '+'
             Set sign to proc advance with lexer_ptr
-            Set number_str to proc string_concat from StringCore with number_str, proc string_from_char from StringCore with sign
+            Set number_str to proc string_concat from StringPrimitive with number_str, proc char_to_string from StringCore with sign
         End If
         If sign_char is equal to 45:  Note: '-'
             Set sign to proc advance with lexer_ptr
-            Set number_str to proc string_concat from StringCore with number_str, proc string_from_char from StringCore with sign
+            Set number_str to proc string_concat from StringPrimitive with number_str, proc char_to_string from StringCore with sign
         End If
 
         Note: Scan exponent digits
@@ -877,7 +867,7 @@ Process called "scan_number" takes lexer_ptr as Integer returns Integer:
 
             If proc is_digit with exp_digit_char is equal to 1:
                 Set exp_digit to proc advance with lexer_ptr
-                Set number_str to proc string_concat from StringCore with number_str, proc string_from_char from StringCore with exp_digit
+                Set number_str to proc string_concat from StringPrimitive with number_str, proc char_to_string from StringCore with exp_digit
             Otherwise:
                 Set continue_exp to 0
             End If
@@ -886,17 +876,17 @@ Process called "scan_number" takes lexer_ptr as Integer returns Integer:
 
     If exp_char is equal to 69:  Note: 'E'
         Set e_char to proc advance with lexer_ptr
-        Set number_str to proc string_concat from StringCore with number_str, proc string_from_char from StringCore with e_char
+        Set number_str to proc string_concat from StringPrimitive with number_str, proc char_to_string from StringCore with e_char
 
         Note: Check for sign
         Set sign_char to proc peek with lexer_ptr
         If sign_char is equal to 43:  Note: '+'
             Set sign to proc advance with lexer_ptr
-            Set number_str to proc string_concat from StringCore with number_str, proc string_from_char from StringCore with sign
+            Set number_str to proc string_concat from StringPrimitive with number_str, proc char_to_string from StringCore with sign
         End If
         If sign_char is equal to 45:  Note: '-'
             Set sign to proc advance with lexer_ptr
-            Set number_str to proc string_concat from StringCore with number_str, proc string_from_char from StringCore with sign
+            Set number_str to proc string_concat from StringPrimitive with number_str, proc char_to_string from StringCore with sign
         End If
 
         Note: Scan exponent digits
@@ -906,14 +896,13 @@ Process called "scan_number" takes lexer_ptr as Integer returns Integer:
 
             If proc is_digit with exp_digit_char is equal to 1:
                 Set exp_digit to proc advance with lexer_ptr
-                Set number_str to proc string_concat from StringCore with number_str, proc string_from_char from StringCore with exp_digit
+                Set number_str to proc string_concat from StringPrimitive with number_str, proc char_to_string from StringCore with exp_digit
             Otherwise:
                 Set continue_exp to 0
             End If
         End While
     End If
 
-    Set lexer_updated to proc memory_read from MemoryCore with lexer_ptr
     proc add_token with lexer_ptr, TOKEN_NUMBER, number_str, number_str
     Return 1
 End Process
@@ -950,7 +939,7 @@ Process called "scan_string" takes lexer_ptr as Integer, delimiter as Integer re
     Let string_value be ""
 
     Note: Skip opening delimiter
-    proc advance from lexer_ptr
+    proc advance with lexer_ptr
 
     Let continue be 1
     While continue is equal to 1:
@@ -963,59 +952,59 @@ Process called "scan_string" takes lexer_ptr as Integer, delimiter as Integer re
 
         If char is equal to delimiter:
             Note: Found closing delimiter
-            proc advance from lexer_ptr
+            proc advance with lexer_ptr
             Set continue to 0
         Otherwise:
             If char is equal to 92:  Note: '\'
                 Note: Escape sequence
-                proc advance from lexer_ptr
+                proc advance with lexer_ptr
                 Let escape_char be proc peek with lexer_ptr
 
                 If escape_char is equal to 97:  Note: 'a' (bell)
-                    Set string_value to proc string_concat from StringCore with string_value, proc string_from_char from StringCore with 7
-                    proc advance from lexer_ptr
+                    Set string_value to proc string_concat from StringPrimitive with string_value, proc char_to_string from StringCore with 7
+                    proc advance with lexer_ptr
                 Otherwise If escape_char is equal to 98:  Note: 'b' (backspace)
-                    Set string_value to proc string_concat from StringCore with string_value, proc string_from_char from StringCore with 8
-                    proc advance from lexer_ptr
+                    Set string_value to proc string_concat from StringPrimitive with string_value, proc char_to_string from StringCore with 8
+                    proc advance with lexer_ptr
                 Otherwise If escape_char is equal to 102:  Note: 'f' (form feed)
-                    Set string_value to proc string_concat from StringCore with string_value, proc string_from_char from StringCore with 12
-                    proc advance from lexer_ptr
+                    Set string_value to proc string_concat from StringPrimitive with string_value, proc char_to_string from StringCore with 12
+                    proc advance with lexer_ptr
                 Otherwise If escape_char is equal to 110:  Note: 'n' (newline)
-                    Set string_value to proc string_concat from StringCore with string_value, proc string_from_char from StringCore with 10
-                    proc advance from lexer_ptr
+                    Set string_value to proc string_concat from StringPrimitive with string_value, proc char_to_string from StringCore with 10
+                    proc advance with lexer_ptr
                 Otherwise If escape_char is equal to 114:  Note: 'r' (carriage return)
-                    Set string_value to proc string_concat from StringCore with string_value, proc string_from_char from StringCore with 13
-                    proc advance from lexer_ptr
+                    Set string_value to proc string_concat from StringPrimitive with string_value, proc char_to_string from StringCore with 13
+                    proc advance with lexer_ptr
                 Otherwise If escape_char is equal to 116:  Note: 't' (tab)
-                    Set string_value to proc string_concat from StringCore with string_value, proc string_from_char from StringCore with 9
-                    proc advance from lexer_ptr
+                    Set string_value to proc string_concat from StringPrimitive with string_value, proc char_to_string from StringCore with 9
+                    proc advance with lexer_ptr
                 Otherwise If escape_char is equal to 118:  Note: 'v' (vertical tab)
-                    Set string_value to proc string_concat from StringCore with string_value, proc string_from_char from StringCore with 11
-                    proc advance from lexer_ptr
+                    Set string_value to proc string_concat from StringPrimitive with string_value, proc char_to_string from StringCore with 11
+                    proc advance with lexer_ptr
                 Otherwise If escape_char is equal to 92:  Note: '\\' (backslash)
-                    Set string_value to proc string_concat from StringCore with string_value, proc string_from_char from StringCore with 92
-                    proc advance from lexer_ptr
+                    Set string_value to proc string_concat from StringPrimitive with string_value, proc char_to_string from StringCore with 92
+                    proc advance with lexer_ptr
                 Otherwise If escape_char is equal to 34:  Note: '\"' (double quote)
-                    Set string_value to proc string_concat from StringCore with string_value, proc string_from_char from StringCore with 34
-                    proc advance from lexer_ptr
+                    Set string_value to proc string_concat from StringPrimitive with string_value, proc char_to_string from StringCore with 34
+                    proc advance with lexer_ptr
                 Otherwise If escape_char is equal to 39:  Note: '\'' (single quote)
-                    Set string_value to proc string_concat from StringCore with string_value, proc string_from_char from StringCore with 39
-                    proc advance from lexer_ptr
+                    Set string_value to proc string_concat from StringPrimitive with string_value, proc char_to_string from StringCore with 39
+                    proc advance with lexer_ptr
                 Otherwise If escape_char is equal to 10:  Note: '\n' (literal newline)
-                    Set string_value to proc string_concat from StringCore with string_value, proc string_from_char from StringCore with 10
-                    proc advance from lexer_ptr
+                    Set string_value to proc string_concat from StringPrimitive with string_value, proc char_to_string from StringCore with 10
+                    proc advance with lexer_ptr
                 Otherwise:
                 Note: Regular character
                 Let regular_char be proc advance with lexer_ptr
-                Set string_value to proc string_concat from StringCore with string_value, proc string_from_char from StringCore with regular_char
+                Set string_value to proc string_concat from StringPrimitive with string_value, proc char_to_string from StringCore with regular_char
                 End If
             End If
         End If
     End While
 
-    Let lexer be proc memory_read from MemoryCore with lexer_ptr of type LuaLexerState
-    Let lexeme be proc string_concat from StringCore with (proc string_from_char from StringCore with delimiter), string_value
-    Set lexeme to proc string_concat from StringCore with lexeme, proc string_from_char from StringCore with delimiter
+    Let lexer as LuaLexerState be lexer_ptr
+    Let lexeme be proc string_concat from StringPrimitive with (proc char_to_string from StringCore with delimiter), string_value
+    Set lexeme to proc string_concat from StringPrimitive with lexeme, proc char_to_string from StringCore with delimiter
 
     proc add_token with lexer_ptr, TOKEN_STRING, lexeme, string_value
     Return 1
@@ -1041,7 +1030,7 @@ Process called "scan_long_string" takes lexer_ptr as Integer returns Integer:
     Let regular_char be 0
 
     Note: Skip opening [
-    proc advance from lexer_ptr
+    proc advance with lexer_ptr
 
     Note: Count the number of '=' signs
     Let eq_count be 0
@@ -1050,7 +1039,7 @@ Process called "scan_long_string" takes lexer_ptr as Integer returns Integer:
         Let eq_char be proc peek with lexer_ptr
         If eq_char is equal to 61:  Note: '='
             Set eq_count to eq_count plus 1
-            proc advance from lexer_ptr
+            proc advance with lexer_ptr
         Otherwise:
             Set continue_eq to 0
         End If
@@ -1063,7 +1052,7 @@ Process called "scan_long_string" takes lexer_ptr as Integer returns Integer:
         Return 0
     End If
 
-    proc advance from lexer_ptr  Note: Skip second [
+    proc advance with lexer_ptr  Note: Skip second [
 
     Let string_value be ""
 
@@ -1103,21 +1092,21 @@ Process called "scan_long_string" takes lexer_ptr as Integer returns Integer:
                     Note: Found the end, skip all chars
                     Let skip_count be 0
                     While skip_count is less than or equal to temp_offset:
-                        proc advance from lexer_ptr
+                        proc advance with lexer_ptr
                         Set skip_count to skip_count plus 1
                     End While
                     Set found_end to 1
                 Otherwise:
                     Set regular_char to proc advance with lexer_ptr
-                    Set string_value to proc string_concat from StringCore with string_value, proc string_from_char from StringCore with regular_char
+                    Set string_value to proc string_concat from StringPrimitive with string_value, proc char_to_string from StringCore with regular_char
                 End If
             Otherwise:
                 Set regular_char to proc advance with lexer_ptr
-                Set string_value to proc string_concat from StringCore with string_value, proc string_from_char from StringCore with regular_char
+                Set string_value to proc string_concat from StringPrimitive with string_value, proc char_to_string from StringCore with regular_char
             End If
         Otherwise:
             Set regular_char to proc advance with lexer_ptr
-            Set string_value to proc string_concat from StringCore with string_value, proc string_from_char from StringCore with regular_char
+            Set string_value to proc string_concat from StringPrimitive with string_value, proc char_to_string from StringCore with regular_char
         End If
     End While
 
@@ -1125,19 +1114,19 @@ Process called "scan_long_string" takes lexer_ptr as Integer returns Integer:
     Let lexeme be "["
     Let eq_index be 0
     While eq_index is less than eq_count:
-        Set lexeme to proc string_concat from StringCore with lexeme, "="
+        Set lexeme to proc string_concat from StringPrimitive with lexeme, "="
         Set eq_index to eq_index plus 1
     End While
-    Set lexeme to proc string_concat from StringCore with lexeme, "["
-    Set lexeme to proc string_concat from StringCore with lexeme, string_value
-    Set lexeme to proc string_concat from StringCore with lexeme, "]"
+    Set lexeme to proc string_concat from StringPrimitive with lexeme, "["
+    Set lexeme to proc string_concat from StringPrimitive with lexeme, string_value
+    Set lexeme to proc string_concat from StringPrimitive with lexeme, "]"
 
     Let eq_index_2 be 0
     While eq_index_2 is less than eq_count:
-        Set lexeme to proc string_concat from StringCore with lexeme, "="
+        Set lexeme to proc string_concat from StringPrimitive with lexeme, "="
         Set eq_index_2 to eq_index_2 plus 1
     End While
-    Set lexeme to proc string_concat from StringCore with lexeme, "]"
+    Set lexeme to proc string_concat from StringPrimitive with lexeme, "]"
 
     proc add_token with lexer_ptr, TOKEN_STRING, lexeme, string_value
     Return 1
@@ -1170,7 +1159,7 @@ Process called "scan_identifier" takes lexer_ptr as Integer returns Integer:
 
         If proc is_identifier_continue with char is equal to 1:
             Let id_char be proc advance with lexer_ptr
-            Set identifier to proc string_concat from StringCore with identifier, proc string_from_char from StringCore with id_char
+            Set identifier to proc string_concat from StringPrimitive with identifier, proc char_to_string from StringCore with id_char
         Otherwise:
             Set continue to 0
         End If
@@ -1296,7 +1285,7 @@ Process called "scan_token" takes lexer_ptr as Integer returns Integer:
     Returns 1 if a token was scanned, 0 if at EOF or error.
     @End Reasoning
 
-    proc skip_whitespace from lexer_ptr
+    proc skip_whitespace with lexer_ptr
 
     Note: Check for comments
     If proc scan_comment with lexer_ptr is equal to 1:
@@ -1312,25 +1301,25 @@ Process called "scan_token" takes lexer_ptr as Integer returns Integer:
 
     Note: Single-character tokens
     If char is equal to 40:  Note: '('
-        proc advance from lexer_ptr
+        proc advance with lexer_ptr
         proc add_token with lexer_ptr, TOKEN_LPAREN, "(", ""
         Return 1
     End If
 
     If char is equal to 41:  Note: ')'
-        proc advance from lexer_ptr
+        proc advance with lexer_ptr
         proc add_token with lexer_ptr, TOKEN_RPAREN, ")", ""
         Return 1
     End If
 
     If char is equal to 123:  Note: '{'
-        proc advance from lexer_ptr
+        proc advance with lexer_ptr
         proc add_token with lexer_ptr, TOKEN_LBRACE, "{", ""
         Return 1
     End If
 
     If char is equal to 125:  Note: '}'
-        proc advance from lexer_ptr
+        proc advance with lexer_ptr
         proc add_token with lexer_ptr, TOKEN_RBRACE, "}", ""
         Return 1
     End If
@@ -1347,42 +1336,42 @@ Process called "scan_token" takes lexer_ptr as Integer returns Integer:
             Return proc scan_long_string with lexer_ptr
         End If
 
-        proc advance from lexer_ptr
+        proc advance with lexer_ptr
         proc add_token with lexer_ptr, TOKEN_LBRACKET, "[", ""
         Return 1
     End If
 
     If char is equal to 93:  Note: ']'
-        proc advance from lexer_ptr
+        proc advance with lexer_ptr
         proc add_token with lexer_ptr, TOKEN_RBRACKET, "]", ""
         Return 1
     End If
 
     If char is equal to 59:  Note: ';'
-        proc advance from lexer_ptr
+        proc advance with lexer_ptr
         proc add_token with lexer_ptr, TOKEN_SEMICOLON, ";", ""
         Return 1
     End If
 
     If char is equal to 44:  Note: ','
-        proc advance from lexer_ptr
+        proc advance with lexer_ptr
         proc add_token with lexer_ptr, TOKEN_COMMA, ",", ""
         Return 1
     End If
 
     If char is equal to 35:  Note: '#' (length operator)
-        proc advance from lexer_ptr
+        proc advance with lexer_ptr
         proc add_token with lexer_ptr, TOKEN_HASH, "#", ""
         Return 1
     End If
 
     Note: Multi-character tokens
     If char is equal to 58:  Note: ':'
-        proc advance from lexer_ptr
+        proc advance with lexer_ptr
         Set next_char to proc peek with lexer_ptr
 
         If next_char is equal to 58:  Note: '::'
-            proc advance from lexer_ptr
+            proc advance with lexer_ptr
             proc add_token with lexer_ptr, TOKEN_DOUBLE_COLON, "::", ""
             Return 1
         End If
@@ -1398,15 +1387,15 @@ Process called "scan_token" takes lexer_ptr as Integer returns Integer:
             Let third_char be proc peek_ahead with lexer_ptr, 2
 
             If third_char is equal to 46:  Note: '...' (vararg)
-                proc advance from lexer_ptr
-                proc advance from lexer_ptr
-                proc advance from lexer_ptr
+                proc advance with lexer_ptr
+                proc advance with lexer_ptr
+                proc advance with lexer_ptr
                 proc add_token with lexer_ptr, TOKEN_DOT_DOT_DOT, "...", ""
                 Return 1
             End If
 
-            proc advance from lexer_ptr
-            proc advance from lexer_ptr
+            proc advance with lexer_ptr
+            proc advance with lexer_ptr
             proc add_token with lexer_ptr, TOKEN_DOT_DOT, "..", ""
             Return 1
         End If
@@ -1416,17 +1405,17 @@ Process called "scan_token" takes lexer_ptr as Integer returns Integer:
             Return proc scan_number with lexer_ptr
         End If
 
-        proc advance from lexer_ptr
+        proc advance with lexer_ptr
         proc add_token with lexer_ptr, TOKEN_DOT, ".", ""
         Return 1
     End If
 
     If char is equal to 61:  Note: '='
-        proc advance from lexer_ptr
+        proc advance with lexer_ptr
         Set next_char to proc peek with lexer_ptr
 
         If next_char is equal to 61:  Note: '=='
-            proc advance from lexer_ptr
+            proc advance with lexer_ptr
             proc add_token with lexer_ptr, TOKEN_EQ_EQ, "==", ""
             Return 1
         End If
@@ -1436,11 +1425,11 @@ Process called "scan_token" takes lexer_ptr as Integer returns Integer:
     End If
 
     If char is equal to 126:  Note: '~'
-        proc advance from lexer_ptr
+        proc advance with lexer_ptr
         Set next_char to proc peek with lexer_ptr
 
         If next_char is equal to 61:  Note: '~=' (not equal)
-            proc advance from lexer_ptr
+            proc advance with lexer_ptr
             proc add_token with lexer_ptr, TOKEN_TILDE_EQ, "~=", ""
             Return 1
         End If
@@ -1450,17 +1439,17 @@ Process called "scan_token" takes lexer_ptr as Integer returns Integer:
     End If
 
     If char is equal to 60:  Note: '<'
-        proc advance from lexer_ptr
+        proc advance with lexer_ptr
         Set next_char to proc peek with lexer_ptr
 
         If next_char is equal to 61:  Note: '<='
-            proc advance from lexer_ptr
+            proc advance with lexer_ptr
             proc add_token with lexer_ptr, TOKEN_LT_EQ, "<=", ""
             Return 1
         End If
 
         If next_char is equal to 60:  Note: '<<' (left shift)
-            proc advance from lexer_ptr
+            proc advance with lexer_ptr
             proc add_token with lexer_ptr, TOKEN_LT_LT, "<<", ""
             Return 1
         End If
@@ -1470,17 +1459,17 @@ Process called "scan_token" takes lexer_ptr as Integer returns Integer:
     End If
 
     If char is equal to 62:  Note: '>'
-        proc advance from lexer_ptr
+        proc advance with lexer_ptr
         Set next_char to proc peek with lexer_ptr
 
         If next_char is equal to 61:  Note: '>='
-            proc advance from lexer_ptr
+            proc advance with lexer_ptr
             proc add_token with lexer_ptr, TOKEN_GT_EQ, ">=", ""
             Return 1
         End If
 
         If next_char is equal to 62:  Note: '>>' (right shift)
-            proc advance from lexer_ptr
+            proc advance with lexer_ptr
             proc add_token with lexer_ptr, TOKEN_GT_GT, ">>", ""
             Return 1
         End If
@@ -1490,7 +1479,7 @@ Process called "scan_token" takes lexer_ptr as Integer returns Integer:
     End If
 
     If char is equal to 43:  Note: '+'
-        proc advance from lexer_ptr
+        proc advance with lexer_ptr
         proc add_token with lexer_ptr, TOKEN_PLUS, "+", ""
         Return 1
     End If
@@ -1503,23 +1492,23 @@ Process called "scan_token" takes lexer_ptr as Integer returns Integer:
             Return proc scan_comment with lexer_ptr
         End If
 
-        proc advance from lexer_ptr
+        proc advance with lexer_ptr
         proc add_token with lexer_ptr, TOKEN_MINUS, "-", ""
         Return 1
     End If
 
     If char is equal to 42:  Note: '*'
-        proc advance from lexer_ptr
+        proc advance with lexer_ptr
         proc add_token with lexer_ptr, TOKEN_STAR, "*", ""
         Return 1
     End If
 
     If char is equal to 47:  Note: '/'
-        proc advance from lexer_ptr
+        proc advance with lexer_ptr
         Set next_char to proc peek with lexer_ptr
 
         If next_char is equal to 47:  Note: '//' (floor division)
-            proc advance from lexer_ptr
+            proc advance with lexer_ptr
             proc add_token with lexer_ptr, TOKEN_SLASH_SLASH, "//", ""
             Return 1
         End If
@@ -1529,25 +1518,25 @@ Process called "scan_token" takes lexer_ptr as Integer returns Integer:
     End If
 
     If char is equal to 37:  Note: '%'
-        proc advance from lexer_ptr
+        proc advance with lexer_ptr
         proc add_token with lexer_ptr, TOKEN_PERCENT, "%", ""
         Return 1
     End If
 
     If char is equal to 94:  Note: '^'
-        proc advance from lexer_ptr
+        proc advance with lexer_ptr
         proc add_token with lexer_ptr, TOKEN_CARET, "^", ""
         Return 1
     End If
 
     If char is equal to 38:  Note: '&' (bitwise AND)
-        proc advance from lexer_ptr
+        proc advance with lexer_ptr
         proc add_token with lexer_ptr, TOKEN_AMPERSAND, "&", ""
         Return 1
     End If
 
     If char is equal to 124:  Note: '|' (bitwise OR)
-        proc advance from lexer_ptr
+        proc advance with lexer_ptr
         proc add_token with lexer_ptr, TOKEN_PIPE, "|", ""
         Return 1
     End If
@@ -1574,10 +1563,10 @@ Process called "scan_token" takes lexer_ptr as Integer returns Integer:
     Note: Unknown character
     Let unknown_char be proc advance with lexer_ptr
     Let error_msg be "Unexpected character: "
-    Set error_msg to proc string_concat from StringCore with error_msg, proc string_from_char from StringCore with unknown_char
+    Set error_msg to proc string_concat from StringPrimitive with error_msg, proc char_to_string from StringCore with unknown_char
     proc lexer_error with lexer_ptr, error_msg
 
-    proc add_token with lexer_ptr, TOKEN_ERROR, proc string_from_char from StringCore with unknown_char, ""
+    proc add_token with lexer_ptr, TOKEN_ERROR, proc char_to_string from StringCore with unknown_char, ""
     Return 1
 End Process
 
@@ -1604,7 +1593,7 @@ Process called "tokenize" takes lexer_ptr as Integer returns Integer:
         End If
     End While
 
-    Let lexer be proc memory_read from MemoryCore with lexer_ptr of type LuaLexerState
+    Let lexer as LuaLexerState be lexer_ptr
     Return lexer.tokens
 End Process
 
@@ -1621,7 +1610,7 @@ Process called "get_tokens" takes lexer_ptr as Integer returns Integer:
     Get the list of tokens from the lexer.
     @End Reasoning
 
-    Let lexer be proc memory_read from MemoryCore with lexer_ptr of type LuaLexerState
+    Let lexer as LuaLexerState be lexer_ptr
     Return lexer.tokens
 End Process
 
@@ -1637,7 +1626,7 @@ Process called "had_error" takes lexer_ptr as Integer returns Integer:
     Check if the lexer encountered any errors.
     @End Reasoning
 
-    Let lexer be proc memory_read from MemoryCore with lexer_ptr of type LuaLexerState
+    Let lexer as LuaLexerState be lexer_ptr
     Return lexer.had_error
 End Process
 
@@ -1653,6 +1642,6 @@ Process called "get_error_message" takes lexer_ptr as Integer returns String:
     Get the error message if the lexer encountered an error.
     @End Reasoning
 
-    Let lexer be proc memory_read from MemoryCore with lexer_ptr of type LuaLexerState
+    Let lexer as LuaLexerState be lexer_ptr
     Return lexer.error_message
 End Process

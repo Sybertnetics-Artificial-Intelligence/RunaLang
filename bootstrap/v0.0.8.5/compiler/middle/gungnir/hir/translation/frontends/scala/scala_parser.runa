@@ -194,6 +194,9 @@ metadata that the fixed schema doesn't capture (modifiers, generic
 bounds, annotations).
 @End Reasoning
 Process called "set_node_attribute" takes node as Integer, key as String, value as String:
+    If node is equal to 0:
+        Return
+    End If
     Let node_obj as ASTNode be node
     proc hashtable_set from HashTable with node_obj.attributes, key, value
 End Process
@@ -204,6 +207,9 @@ Looks up key in node.attributes; returns the stored value or empty
 string if absent (hash_value default).
 @End Reasoning
 Process called "get_node_attribute" takes node as Integer, key as String returns String:
+    If node is equal to 0:
+        Return ""
+    End If
     Let node_obj as ASTNode be node
     Return proc hashtable_get from HashTable with node_obj.attributes, key
 End Process
@@ -217,6 +223,13 @@ so token-position queries don't dive into the lexer per call.
 Process called "advance_token" takes parser as Integer:
     Let parser_obj as ScalaParser be parser
     Set parser_obj.current_token to proc next_scala_token with parser_obj.lexer
+
+    Note: Comments are trivia for the parser - consume until a real token arrives
+    While parser_obj.current_token is equal to TOKEN_COMMENT_LINE or parser_obj.current_token is equal to TOKEN_COMMENT_BLOCK:
+        Set parser_obj.current_token to proc next_scala_token with parser_obj.lexer
+    End While
+
+    Set parser_obj.current_token_value to proc get_lexer_lexeme with parser_obj.lexer
     Set parser_obj.position to proc get_lexer_position with parser_obj.lexer
     Set parser_obj.line to proc get_lexer_line with parser_obj.lexer
     Set parser_obj.column to proc get_lexer_column with parser_obj.lexer
@@ -238,8 +251,14 @@ Process called "peek_token" takes parser as Integer returns Integer:
     Let saved_column be lexer_obj.column
     Let saved_char be lexer_obj.current_char
     Let saved_error be lexer_obj.error_message
+    Let saved_lexeme be lexer_obj.current_lexeme
 
     Let next_token be proc next_scala_token with parser_obj.lexer
+
+    Note: Mirror advance_token's comment skipping so lookahead sees real tokens
+    While next_token is equal to TOKEN_COMMENT_LINE or next_token is equal to TOKEN_COMMENT_BLOCK:
+        Set next_token to proc next_scala_token with parser_obj.lexer
+    End While
 
     Note: Restore the complete lexer cursor state
     Set lexer_obj.position to saved_position
@@ -247,6 +266,7 @@ Process called "peek_token" takes parser as Integer returns Integer:
     Set lexer_obj.column to saved_column
     Set lexer_obj.current_char to saved_char
     Set lexer_obj.error_message to saved_error
+    Set lexer_obj.current_lexeme to saved_lexeme
 
     Return next_token
 End Process
@@ -336,6 +356,15 @@ Process called "parse_scala_compilation_unit" takes parser as Integer returns In
 
     Note: Parse top-level declarations
     While parser_obj.current_token is not equal to TOKEN_EOF:
+        Note: Skip statement separators between declarations
+        While proc consume_token with parser, TOKEN_SEMICOLON or proc consume_token with parser, TOKEN_NEWLINE:
+            Note: Separator consumed - keep scanning
+        End While
+
+        If parser_obj.current_token is equal to TOKEN_EOF:
+            Break
+        End If
+
         Let decl be proc parse_top_level_declaration with parser
         If decl is not equal to 0:
             proc add_child with program, decl
@@ -345,6 +374,30 @@ Process called "parse_scala_compilation_unit" takes parser as Integer returns In
     End While
 
     Return program
+End Process
+
+Note: Attach parsed modifiers to a declaration node as attributes
+@Reasoning:
+parse_modifiers returns the modifier keywords in source order, but the
+declaration parsers previously discarded the list, leaving the semantic
+layer blind to sealed/abstract/implicit/lazy markers it must enforce
+(sealed-hierarchy exhaustiveness, abstract-member checks, implicit
+registration). Each modifier becomes a "name" -> "true" attribute on
+the node so any downstream pass can test for a modifier with one
+attribute read.
+@End Reasoning
+Process called "apply_modifiers_to_node" takes node as Integer, modifiers as Integer:
+    If modifiers is equal to 0:
+        Return
+    End If
+
+    Let modifier_count be proc list_length from List with modifiers
+    Let modifier_index be 0
+    While modifier_index is less than modifier_count:
+        Let modifier_name be proc list_get from List with modifiers, modifier_index
+        proc set_node_attribute with node, modifier_name, "true"
+        Set modifier_index to modifier_index plus 1
+    End While
 End Process
 
 Note: Parse package declaration
@@ -451,6 +504,16 @@ Process called "parse_qualified_identifier" takes parser as Integer returns Inte
     End While
 
     proc set_node_attribute with result, "name", full_name
+
+    Note: Record the final path segment separately - import handling needs
+    Note: the member name ("C" in "a.b.C") without re-splitting the string
+    Let part_count be proc list_length from List with name_parts
+    If part_count is greater than 0:
+        Let last_index be part_count minus 1
+        Let last_part be proc list_get from List with name_parts, last_index
+        proc set_node_attribute with result, "member", last_part
+    End If
+
     Return result
 End Process
 
@@ -632,6 +695,9 @@ Process called "parse_class_declaration" takes parser as Integer, modifiers as I
     Let class_node be proc create_ast_node with AST_CLASS, parser_obj.current_token_value
     proc advance_token with parser
 
+    Note: Record the declaration modifiers (sealed, abstract, final, ...)
+    proc apply_modifiers_to_node with class_node, modifiers
+
     Note: Parse type parameters
     If proc match_token with parser, TOKEN_LEFT_BRACKET:
         Let type_params be proc parse_type_parameter_list with parser
@@ -652,6 +718,7 @@ Process called "parse_class_declaration" takes parser as Integer, modifiers as I
     If proc consume_token with parser, TOKEN_EXTENDS:
         Let parent_type be proc parse_type with parser
         If parent_type is not equal to 0:
+            proc set_node_attribute with parent_type, "extends", "true"
             proc add_child with class_node, parent_type
         End If
     End If
@@ -660,6 +727,7 @@ Process called "parse_class_declaration" takes parser as Integer, modifiers as I
     While proc consume_token with parser, TOKEN_WITH:
         Let mixin_type be proc parse_type with parser
         If mixin_type is not equal to 0:
+            proc set_node_attribute with mixin_type, "mixin", "true"
             proc add_child with class_node, mixin_type
         End If
     End While
@@ -713,10 +781,14 @@ Process called "parse_object_declaration" takes parser as Integer, modifiers as 
     Let object_node be proc create_ast_node with AST_OBJECT, parser_obj.current_token_value
     proc advance_token with parser
 
+    Note: Record the declaration modifiers
+    proc apply_modifiers_to_node with object_node, modifiers
+
     Note: Parse extends clause
     If proc consume_token with parser, TOKEN_EXTENDS:
         Let parent_type be proc parse_type with parser
         If parent_type is not equal to 0:
+            proc set_node_attribute with parent_type, "extends", "true"
             proc add_child with object_node, parent_type
         End If
     End If
@@ -725,6 +797,7 @@ Process called "parse_object_declaration" takes parser as Integer, modifiers as 
     While proc consume_token with parser, TOKEN_WITH:
         Let mixin_type be proc parse_type with parser
         If mixin_type is not equal to 0:
+            proc set_node_attribute with mixin_type, "mixin", "true"
             proc add_child with object_node, mixin_type
         End If
     End While
@@ -762,6 +835,9 @@ Process called "parse_trait_declaration" takes parser as Integer, modifiers as I
     Let trait_node be proc create_ast_node with AST_TRAIT, parser_obj.current_token_value
     proc advance_token with parser
 
+    Note: Record the declaration modifiers
+    proc apply_modifiers_to_node with trait_node, modifiers
+
     Note: Parse type parameters
     If proc match_token with parser, TOKEN_LEFT_BRACKET:
         Let type_params be proc parse_type_parameter_list with parser
@@ -774,6 +850,7 @@ Process called "parse_trait_declaration" takes parser as Integer, modifiers as I
     If proc consume_token with parser, TOKEN_EXTENDS:
         Let parent_type be proc parse_type with parser
         If parent_type is not equal to 0:
+            proc set_node_attribute with parent_type, "extends", "true"
             proc add_child with trait_node, parent_type
         End If
     End If
@@ -782,6 +859,7 @@ Process called "parse_trait_declaration" takes parser as Integer, modifiers as I
     While proc consume_token with parser, TOKEN_WITH:
         Let mixin_type be proc parse_type with parser
         If mixin_type is not equal to 0:
+            proc set_node_attribute with mixin_type, "mixin", "true"
             proc add_child with trait_node, mixin_type
         End If
     End While
@@ -843,6 +921,16 @@ as separate clauses. Each constraint becomes an attribute on the node.
 Process called "parse_type_parameter" takes parser as Integer returns Integer:
     Let parser_obj as ScalaParser be parser
 
+    Note: Parse variance annotations - Scala writes them as prefixes (+T, -T)
+    Let variance_marker be ""
+    If proc match_token with parser, TOKEN_PLUS:
+        Set variance_marker to "covariant"
+        proc advance_token with parser
+    Otherwise If proc match_token with parser, TOKEN_MINUS:
+        Set variance_marker to "contravariant"
+        proc advance_token with parser
+    End If
+
     If not proc match_token with parser, TOKEN_IDENTIFIER:
         proc add_parser_error with parser, "Expected type parameter name"
         Return 0
@@ -851,13 +939,8 @@ Process called "parse_type_parameter" takes parser as Integer returns Integer:
     Let type_param be proc create_ast_node with AST_TYPE_PARAMETER, parser_obj.current_token_value
     proc advance_token with parser
 
-    Note: Parse variance annotations
-    If proc match_token with parser, TOKEN_PLUS:
-        proc set_node_attribute with type_param, "variance", "covariant"
-        proc advance_token with parser
-    Otherwise If proc match_token with parser, TOKEN_MINUS:
-        proc set_node_attribute with type_param, "variance", "contravariant"
-        proc advance_token with parser
+    If not proc string_equals from StringCore with variance_marker, "":
+        proc set_node_attribute with type_param, "variance", variance_marker
     End If
 
     Note: Parse upper bound (<:)
@@ -890,8 +973,8 @@ Process called "parse_type_parameter" takes parser as Integer returns Integer:
         End If
     End If
 
-    Note: Parse context bound (:)
-    If proc match_token with parser, TOKEN_CONTEXT_BOUND:
+    Note: Parse context bound (:) - the lexer emits a plain colon here
+    If proc match_token with parser, TOKEN_CONTEXT_BOUND or proc match_token with parser, TOKEN_COLON:
         proc advance_token with parser
         Let context_bound be proc parse_type with parser
         If context_bound is not equal to 0:
@@ -1111,6 +1194,29 @@ Process called "parse_class_body" takes parser as Integer returns Integer:
 
     Let body be proc create_ast_node with AST_BLOCK, "class_body"
 
+    Note: Optional self-type annotation - "self: Type =>" as the first body item.
+    Note: Unambiguous here because no class member begins with a bare
+    Note: identifier followed by ':' (members start with keywords).
+    If proc match_token with parser, TOKEN_IDENTIFIER:
+        Let lookahead be proc peek_token with parser
+        If lookahead is equal to TOKEN_COLON:
+            Let self_name be parser_obj.current_token_value
+            proc advance_token with parser
+            proc advance_token with parser
+
+            Let self_type_node be proc parse_type with parser
+            If self_type_node is not equal to 0:
+                proc set_node_attribute with self_type_node, "self_type", "true"
+                proc set_node_attribute with self_type_node, "self_name", self_name
+                proc add_child with body, self_type_node
+            End If
+
+            If not proc consume_token with parser, TOKEN_DOUBLE_ARROW:
+                proc add_parser_error with parser, "Expected '=>' after self-type annotation"
+            End If
+        End If
+    End If
+
     While not proc match_token with parser, TOKEN_RIGHT_BRACE and not proc match_token with parser, TOKEN_EOF:
         Note: Skip optional semicolons and newlines
         While proc consume_token with parser, TOKEN_SEMICOLON or proc consume_token with parser, TOKEN_NEWLINE:
@@ -1190,6 +1296,9 @@ Process called "parse_function_declaration" takes parser as Integer, modifiers a
     Let function_node be proc create_ast_node with AST_FUNCTION, parser_obj.current_token_value
     proc advance_token with parser
 
+    Note: Record the declaration modifiers
+    proc apply_modifiers_to_node with function_node, modifiers
+
     Note: Parse type parameters
     If proc match_token with parser, TOKEN_LEFT_BRACKET:
         Let type_params be proc parse_type_parameter_list with parser
@@ -1253,6 +1362,9 @@ Process called "parse_val_declaration" takes parser as Integer, modifiers as Int
     Let val_node be proc create_ast_node with AST_VAL_DECLARATION, parser_obj.current_token_value
     proc advance_token with parser
 
+    Note: Record the declaration modifiers
+    proc apply_modifiers_to_node with val_node, modifiers
+
     Note: Parse type annotation
     If proc consume_token with parser, TOKEN_COLON:
         Let val_type be proc parse_type with parser
@@ -1293,6 +1405,9 @@ Process called "parse_var_declaration" takes parser as Integer, modifiers as Int
 
     Let var_node be proc create_ast_node with AST_VAR_DECLARATION, parser_obj.current_token_value
     proc advance_token with parser
+
+    Note: Record the declaration modifiers
+    proc apply_modifiers_to_node with var_node, modifiers
 
     Note: Parse type annotation
     If proc consume_token with parser, TOKEN_COLON:
@@ -1335,6 +1450,9 @@ Process called "parse_type_alias" takes parser as Integer, modifiers as Integer 
     Let type_alias be proc create_ast_node with AST_TYPE_ALIAS, parser_obj.current_token_value
     proc advance_token with parser
 
+    Note: Record the declaration modifiers
+    proc apply_modifiers_to_node with type_alias, modifiers
+
     Note: Parse type parameters
     If proc match_token with parser, TOKEN_LEFT_BRACKET:
         Let type_params be proc parse_type_parameter_list with parser
@@ -1376,8 +1494,17 @@ Process called "parse_expression_precedence" takes parser as Integer, min_preced
         Return 0
     End If
 
+    Note: Postfix forms bind tighter than every infix operator
+    Set left to proc parse_postfix_expression with parser, left
+
     While true:
         Let precedence be proc get_operator_precedence with parser
+        Note: Precedence 0 means "not a binary operator" - without this
+        Note: break the climber would consume ANY following token as an
+        Note: operator whenever min_precedence is 0
+        If precedence is equal to 0:
+            Break
+        End If
         If precedence is less than min_precedence:
             Break
         End If
@@ -1444,8 +1571,153 @@ Process called "parse_operator" takes parser as Integer returns Integer:
     Let parser_obj as ScalaParser be parser
     Let operator_name be proc get_token_name with parser_obj.current_token
     Let operator_node be proc create_ast_node with AST_IDENTIFIER, operator_name
+    proc set_node_attribute with operator_node, "operator", "true"
     proc advance_token with parser
     Return operator_node
+End Process
+
+Note: Decide whether '(' begins a lambda parameter list
+@Reasoning:
+"(a: Int) => body" and "(a + b)" both begin with '(' - one token of
+lookahead cannot separate them. The decisive token is the one AFTER
+the matching ')': '=>' means lambda. This scanner raw-walks tokens
+from the lexer (depth-counting nested parens/brackets are irrelevant:
+only paren depth matters for finding the match) and then restores the
+complete lexer cursor exactly the way peek_token does, so the parse
+position is untouched regardless of the verdict. The walk is bounded
+by EOF.
+@End Reasoning
+Process called "is_lambda_parameter_list" takes parser as Integer returns Integer:
+    Let parser_obj as ScalaParser be parser
+    Let lexer_obj as ScalaLexer be parser_obj.lexer
+
+    Let saved_position be lexer_obj.position
+    Let saved_line be lexer_obj.line
+    Let saved_column be lexer_obj.column
+    Let saved_char be lexer_obj.current_char
+    Let saved_error be lexer_obj.error_message
+    Let saved_lexeme be lexer_obj.current_lexeme
+
+    Note: The current token is '(' - scan from depth 1 to its match
+    Let depth be 1
+    Let verdict be 0
+    Let scanning be 1
+    While scanning is equal to 1:
+        Let scanned be proc next_scala_token with parser_obj.lexer
+
+        If scanned is equal to TOKEN_EOF:
+            Set scanning to 0
+        Otherwise If scanned is equal to TOKEN_LEFT_PAREN:
+            Set depth to depth plus 1
+        Otherwise If scanned is equal to TOKEN_RIGHT_PAREN:
+            Set depth to depth minus 1
+            If depth is equal to 0:
+                Note: The token after the matching ')' decides
+                Let decider be proc next_scala_token with parser_obj.lexer
+                While decider is equal to TOKEN_COMMENT_LINE or decider is equal to TOKEN_COMMENT_BLOCK:
+                    Set decider to proc next_scala_token with parser_obj.lexer
+                End While
+                If decider is equal to TOKEN_DOUBLE_ARROW:
+                    Set verdict to 1
+                End If
+                Set scanning to 0
+            End If
+        End If
+    End While
+
+    Note: Restore the complete lexer cursor state
+    Set lexer_obj.position to saved_position
+    Set lexer_obj.line to saved_line
+    Set lexer_obj.column to saved_column
+    Set lexer_obj.current_char to saved_char
+    Set lexer_obj.error_message to saved_error
+    Set lexer_obj.current_lexeme to saved_lexeme
+
+    Return verdict
+End Process
+
+Note: Parse postfix forms after a primary expression
+@Reasoning:
+Scala's highest-binding expression forms are postfix on a receiver:
+member selection and method invocation ("recv.name", "recv.name(args)",
+"recv.name[T](args)") and the match expression ("scrutinee match
+{ cases }"). The primary-expression parser cannot see these because
+they begin only after a complete receiver has been parsed, so the
+precedence climber routes every parsed primary through this loop
+before considering infix operators. Method calls become
+AST_METHOD_CALL nodes whose value is the method name, child 0 is the
+receiver, an optional AST_LIST_LITERAL tagged "type_arguments"
+carries explicit type arguments, and an optional AST_LIST_LITERAL
+tagged "arguments" carries the actual arguments. A selection without
+an argument list is recorded with the "field_access" attribute so the
+semantic layer can distinguish parameterless invocation from
+zero-argument application.
+@End Reasoning
+Process called "parse_postfix_expression" takes parser as Integer, expr as Integer returns Integer:
+    Let parser_obj as ScalaParser be parser
+    Let result be expr
+
+    While true:
+        If proc match_token with parser, TOKEN_DOT:
+            proc advance_token with parser
+
+            If not proc match_token with parser, TOKEN_IDENTIFIER:
+                proc add_parser_error with parser, "Expected member name after '.'"
+                Return result
+            End If
+
+            Let method_call be proc create_ast_node with AST_METHOD_CALL, parser_obj.current_token_value
+            proc advance_token with parser
+            proc add_child with method_call, result
+
+            Note: Explicit method type arguments - recv.name[T1, T2](...)
+            If proc match_token with parser, TOKEN_LEFT_BRACKET:
+                proc advance_token with parser
+                Let type_args be proc create_ast_node with AST_LIST_LITERAL, "type_arguments"
+
+                While not proc match_token with parser, TOKEN_RIGHT_BRACKET and not proc match_token with parser, TOKEN_EOF:
+                    Let type_arg be proc parse_type with parser
+                    If type_arg is not equal to 0:
+                        proc add_child with type_args, type_arg
+                    End If
+
+                    If not proc match_token with parser, TOKEN_RIGHT_BRACKET:
+                        If not proc consume_token with parser, TOKEN_COMMA:
+                            proc add_parser_error with parser, "Expected ',' or ']'"
+                            Break
+                        End If
+                    End If
+                End While
+
+                If not proc consume_token with parser, TOKEN_RIGHT_BRACKET:
+                    proc add_parser_error with parser, "Expected ']'"
+                End If
+
+                proc add_child with method_call, type_args
+            End If
+
+            Note: Argument list - absent means field-style selection
+            If proc match_token with parser, TOKEN_LEFT_PAREN:
+                Let args be proc parse_argument_list with parser
+                If args is not equal to 0:
+                    proc add_child with method_call, args
+                End If
+            Otherwise:
+                proc set_node_attribute with method_call, "field_access", "true"
+            End If
+
+            Set result to method_call
+        Otherwise If proc match_token with parser, TOKEN_MATCH:
+            Set result to proc parse_match_expression with parser, result
+            If result is equal to 0:
+                Return 0
+            End If
+        Otherwise:
+            Break
+        End If
+    End While
+
+    Return result
 End Process
 
 Note: Parse primary expression
@@ -1458,7 +1730,47 @@ forward references.
 Process called "parse_primary_expression" takes parser as Integer returns Integer:
     Let parser_obj as ScalaParser be parser
 
-    Note: Handle literals
+    Note: Handle prefix unary operators (-, +, !, ~)
+    If proc match_token with parser, TOKEN_MINUS or proc match_token with parser, TOKEN_PLUS or
+       proc match_token with parser, TOKEN_NOT or proc match_token with parser, TOKEN_BITWISE_NOT:
+        Let unary_op_name be proc get_token_name with parser_obj.current_token
+        proc advance_token with parser
+
+        Let unary_operand be proc parse_primary_expression with parser
+        If unary_operand is equal to 0:
+            proc add_parser_error with parser, "Expected operand after unary operator"
+            Return 0
+        End If
+
+        Note: Postfix binds tighter than prefix - "-x.abs" negates x.abs
+        Set unary_operand to proc parse_postfix_expression with parser, unary_operand
+
+        Let unary_node be proc create_ast_node with AST_UNARY_OP, unary_op_name
+        proc add_child with unary_node, unary_operand
+        Return unary_node
+    End If
+
+    Note: Handle literals. true/false/null lex as KEYWORD tokens
+    Note: (TOKEN_TRUE/TOKEN_FALSE/TOKEN_NULL) but are literal values in
+    Note: Scala's grammar, so they are mapped to literal nodes here.
+    If proc match_token with parser, TOKEN_TRUE:
+        Let true_literal be proc create_ast_node with AST_LITERAL, "true"
+        proc set_node_attribute with true_literal, "literal_type", "BOOLEAN_LITERAL"
+        proc advance_token with parser
+        Return true_literal
+    End If
+    If proc match_token with parser, TOKEN_FALSE:
+        Let false_literal be proc create_ast_node with AST_LITERAL, "false"
+        proc set_node_attribute with false_literal, "literal_type", "BOOLEAN_LITERAL"
+        proc advance_token with parser
+        Return false_literal
+    End If
+    If proc match_token with parser, TOKEN_NULL:
+        Let null_literal be proc create_ast_node with AST_LITERAL, "null"
+        proc set_node_attribute with null_literal, "literal_type", "NULL_LITERAL"
+        proc advance_token with parser
+        Return null_literal
+    End If
     If proc is_literal_token with parser_obj.current_token:
         Let literal be proc create_ast_node with AST_LITERAL, parser_obj.current_token_value
         proc set_node_attribute with literal, "literal_type", proc get_token_name with parser_obj.current_token
@@ -1487,9 +1799,31 @@ Process called "parse_primary_expression" takes parser as Integer returns Intege
         Return identifier
     End If
 
-    Note: Handle parenthesized expressions
-    If proc consume_token with parser, TOKEN_LEFT_PAREN:
+    Note: Handle '(' - lambda parameter list, tuple, or parenthesized expression
+    If proc match_token with parser, TOKEN_LEFT_PAREN:
+        Let starts_lambda be proc is_lambda_parameter_list with parser
+        If starts_lambda is equal to 1:
+            Return proc parse_lambda_expression with parser
+        End If
+
+        proc advance_token with parser
         Let expr be proc parse_expression with parser
+
+        Note: A comma turns the parenthesised form into a tuple literal
+        If proc match_token with parser, TOKEN_COMMA:
+            Let tuple_node be proc create_ast_node with AST_TUPLE, ""
+            If expr is not equal to 0:
+                proc add_child with tuple_node, expr
+            End If
+            While proc consume_token with parser, TOKEN_COMMA:
+                Let element be proc parse_expression with parser
+                If element is not equal to 0:
+                    proc add_child with tuple_node, element
+                End If
+            End While
+            Set expr to tuple_node
+        End If
+
         If not proc consume_token with parser, TOKEN_RIGHT_PAREN:
             proc add_parser_error with parser, "Expected ')'"
         End If
@@ -1504,11 +1838,6 @@ Process called "parse_primary_expression" takes parser as Integer returns Intege
     Note: Handle if expressions
     If proc match_token with parser, TOKEN_IF:
         Return proc parse_if_expression with parser
-    End If
-
-    Note: Handle match expressions
-    If proc match_token with parser, TOKEN_MATCH:
-        Return proc parse_match_expression with parser
     End If
 
     Note: Handle for expressions
@@ -1529,12 +1858,6 @@ Process called "parse_primary_expression" takes parser as Integer returns Intege
     Note: Handle new expressions
     If proc match_token with parser, TOKEN_NEW:
         Return proc parse_new_expression with parser
-    End If
-
-    Note: Handle lambda expressions
-    If proc match_token with parser, TOKEN_LEFT_PAREN:
-        Note: Could be lambda parameters
-        Return proc parse_lambda_expression with parser
     End If
 
     proc add_parser_error with parser, "Expected expression"
@@ -1695,13 +2018,16 @@ End Process
 Note: Parse match expression
 @Reasoning:
 "expr match { case pat => body ... }" - pattern-matching expression.
-Returns the body of the first matching case. Exhaustiveness is checked
-by the type system later (case classes form sealed hierarchies).
+The scrutinee is parsed by the caller (the postfix loop) because
+'match' is a postfix form: it can only follow a complete receiver
+expression. This routine consumes the 'match' keyword and the braced
+case-clause list, attaching the already-parsed scrutinee as child 0.
+Exhaustiveness is checked by the type system later (case classes form
+sealed hierarchies).
 @End Reasoning
-Process called "parse_match_expression" takes parser as Integer returns Integer:
+Process called "parse_match_expression" takes parser as Integer, scrutinee as Integer returns Integer:
     Let parser_obj as ScalaParser be parser
 
-    Let scrutinee be proc parse_expression with parser
     If scrutinee is equal to 0:
         proc add_parser_error with parser, "Expected expression before 'match'"
         Return 0
@@ -1798,9 +2124,30 @@ Process called "parse_pattern" takes parser as Integer returns Integer:
         Return proc create_ast_node with AST_WILDCARD_PATTERN, "_"
     End If
 
-    Note: Handle literal patterns
+    Note: Handle literal patterns. true/false/null lex as keyword tokens
+    Note: but are literal patterns in Scala's grammar.
+    If proc match_token with parser, TOKEN_TRUE:
+        Let true_pattern be proc create_ast_node with AST_LITERAL_PATTERN, "true"
+        proc set_node_attribute with true_pattern, "literal_type", "BOOLEAN_LITERAL"
+        proc advance_token with parser
+        Return true_pattern
+    End If
+    If proc match_token with parser, TOKEN_FALSE:
+        Let false_pattern be proc create_ast_node with AST_LITERAL_PATTERN, "false"
+        proc set_node_attribute with false_pattern, "literal_type", "BOOLEAN_LITERAL"
+        proc advance_token with parser
+        Return false_pattern
+    End If
+    If proc match_token with parser, TOKEN_NULL:
+        Let null_pattern be proc create_ast_node with AST_LITERAL_PATTERN, "null"
+        proc set_node_attribute with null_pattern, "literal_type", "NULL_LITERAL"
+        proc advance_token with parser
+        Return null_pattern
+    End If
     If proc is_literal_token with parser_obj.current_token:
         Let literal_pattern be proc create_ast_node with AST_LITERAL_PATTERN, parser_obj.current_token_value
+        Let literal_kind be proc get_token_name with parser_obj.current_token
+        proc set_node_attribute with literal_pattern, "literal_type", literal_kind
         proc advance_token with parser
         Return literal_pattern
     End If
@@ -1922,6 +2269,7 @@ Process called "parse_for_expression" takes parser as Integer returns Integer:
 
     Note: Parse yield or do body
     If proc consume_token with parser, TOKEN_YIELD:
+        proc set_node_attribute with for_expr, "yield", "true"
         Let yield_expr be proc parse_expression with parser
         If yield_expr is not equal to 0:
             proc add_child with for_expr, yield_expr
@@ -2157,6 +2505,9 @@ External accessor for node.node_type. Used by downstream HIR translators
 to dispatch on node kind without depending on AST struct internals.
 @End Reasoning
 Process called "get_ast_node_type" takes node as Integer returns Integer:
+    If node is equal to 0:
+        Return AST_ERROR
+    End If
     Let node_obj as ASTNode be node
     Return node_obj.node_type
 End Process
@@ -2166,6 +2517,9 @@ Note: Get AST node value
 External accessor for node.value (string lexeme or literal payload).
 @End Reasoning
 Process called "get_ast_node_value" takes node as Integer returns String:
+    If node is equal to 0:
+        Return ""
+    End If
     Let node_obj as ASTNode be node
     Return node_obj.value
 End Process
@@ -2176,6 +2530,9 @@ External accessor for node.children list pointer. Consumers traverse
 via get_ast_child_count / get_ast_child rather than the raw list.
 @End Reasoning
 Process called "get_ast_node_children" takes node as Integer returns Integer:
+    If node is equal to 0:
+        Return proc list_create from List
+    End If
     Let node_obj as ASTNode be node
     Return node_obj.children
 End Process
@@ -2186,6 +2543,9 @@ Returns the number of children in node.children. Used as the loop
 bound for child iteration.
 @End Reasoning
 Process called "get_ast_child_count" takes node as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
     Let node_obj as ASTNode be node
     Return proc list_length from List with node_obj.children
 End Process
@@ -2196,6 +2556,9 @@ Returns the child at the given index in node.children. Bounds-unsafe -
 callers must respect get_ast_child_count first.
 @End Reasoning
 Process called "get_ast_child" takes node as Integer, index as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
     Let node_obj as ASTNode be node
     Return proc list_get from List with node_obj.children, index
 End Process

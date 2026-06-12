@@ -1,0 +1,524 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+Devirtualization + vectorization probe (task #471 gate of the MIR
+reconciliation plan). Three suites, all built by hand through the
+canonical MIR construction API:
+
+  1. devirt_direct - an indirect call (MIR_CALL_INDIRECT 20305, callee
+     slot = SSA value id per the task #461 lowering contract) whose
+     callee value flows CONST -> COPY -> call, where the CONST is a
+     function-typed (HIRTypeInfo kind 13004) constant carrying an
+     HIRSymbolInfo payload (symbol name at offset 8 - the producer
+     contract whole_program_analysis decodes). After the pass the call
+     is MIR_CALL 20304 with the target NAME in the callee slot (ext 80)
+     and is_indirect (ext 112) cleared. A second indirect call whose
+     callee has NO defining instruction (a parameter-like value) is
+     honestly unresolvable and must be left exactly as it was. The
+     verifier accepts the transformed function.
+
+  2. vect_accept - a counted single-block loop (preheader B0, loop B1,
+     exit B2): i from 0 to 8 step 1, body c[i] = a[i] + b[i] over three
+     DISTINCT ALLOCA arrays (provably disjoint), latch test LT on the
+     updated IV. Every gate passes (unit stride, consecutive accesses,
+     trip count 8 = 2 x VF 4, no loop-carried dependence, all data ops
+     widenable). After the pass: both loads are MIR_VECTOR_LOAD 20610,
+     the store is MIR_VECTOR_STORE 20611, the add is MIR_VECTOR_ADD
+     20600 (all carrying their ORIGINAL result ids), the IV step
+     constant became VF = 4, no scalar LOAD/STORE/data-ADD remains in
+     the loop, and the verifier accepts the function.
+
+  3. vect_reject - the same loop shape over ONE array with a distance-1
+     loop-carried dependence (a[i+1] = a[i] + a[i]). The legality gate
+     must reject: no vector opcode appears anywhere in the function and
+     the scalar body is byte-for-byte untouched.
+:End Note
+
+Import "tests/test_utils.runa" as T
+Import "compiler/middle/gungnir/mir/mir.runa" as MIR
+Import "compiler/middle/gungnir/mir/mir_nodes.runa" as MIRNodes
+Import "compiler/middle/gungnir/mir/cfg.runa" as CFG
+Import "compiler/middle/gungnir/mir/mir_verifier.runa" as MIRVerifier
+Import "compiler/middle/gungnir/mir/optimizations/devirtualization.runa" as Devirt
+Import "compiler/middle/gungnir/mir/optimizations/vectorization.runa" as Vect
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/collections/list.runa" as List
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+
+Process called "make_type_info" returns Integer:
+    Note: Shared HIRTypeInfo stand-in: kind at 0, flags at 8, size at 16
+    Let type_info be Layout.allocate(24)
+    If type_info is equal to 0:
+        Return 0
+    End If
+    Layout.memory_set_int64(type_info, 0, 1)
+    Layout.memory_set_int64(type_info, 8, 0)
+    Layout.memory_set_int64(type_info, 16, 8)
+    Return type_info
+End Process
+
+Process called "make_function_type_info" returns Integer:
+    Note: HIRTypeInfo with kind HIR_FUNCTION_TYPE (13004) - the marker the
+    Note: devirtualizer requires before decoding the CONST payload
+    Let type_info be Layout.allocate(24)
+    If type_info is equal to 0:
+        Return 0
+    End If
+    Layout.memory_set_int64(type_info, 0, 13004)
+    Layout.memory_set_int64(type_info, 8, 0)
+    Layout.memory_set_int64(type_info, 16, 8)
+    Return type_info
+End Process
+
+Process called "count_opcode_in_cfg" that takes cfg as Integer, opcode as Integer returns Integer:
+    Let blocks be CFG.get_mir_cfg_blocks(cfg)
+    Let block_count be List.length(blocks)
+    Let found be 0
+    Let i be 0
+    While i is less than block_count:
+        Let block_ptr be List.get(blocks, i)
+        If block_ptr is not equal to 0:
+            Let insts be MIR.get_block_instructions(block_ptr)
+            If insts is not equal to 0:
+                Let inst_count be List.length(insts)
+                Let j be 0
+                While j is less than inst_count:
+                    Let inst be List.get(insts, j)
+                    Let op be MIR.get_mir_node_opcode(inst)
+                    If op is equal to opcode:
+                        Set found to found plus 1
+                    End If
+                    Set j to j plus 1
+                End While
+            End If
+        End If
+        Set i to i plus 1
+    End While
+    Return found
+End Process
+
+Note: ============================================================================
+Note: SUITE 1: direct devirtualization
+Note: ============================================================================
+
+Process called "run_devirt_direct" that takes results as Integer returns Integer:
+    T.begin_suite(results, "devirt_direct")
+
+    Let type_info be make_type_info()
+    Let fn_type be make_function_type_info()
+
+    Note: HIRSymbolInfo stand-in: symbol id at 0, name pointer at 8
+    Let target_name be StringCore.create_from_literal("t471_devirt_target")
+    Let symbol be Layout.allocate(16)
+    Layout.memory_set_int64(symbol, 0, 0)
+    Layout.memory_set_int64(symbol, 8, target_name)
+
+    Let fn be MIR.create_mir_function("t471_devirt_probe", type_info, 0)
+    T.assert_not_null(results, "devirt probe function constructed", fn)
+    Let cfg be MIR.get_mir_function_cfg(fn)
+
+    Let entry_block be MIR.create_mir_basic_block(0, 0)
+    MIR.add_block_to_cfg(cfg, entry_block)
+    MIR.set_cfg_entry_block(cfg, entry_block)
+    MIR.set_cfg_exit_block(cfg, entry_block)
+    Layout.memory_set_int64(cfg, 48, 1)
+    Layout.memory_set_int64(fn, 56, 1000)
+
+    Note: fp = CONST<fn_type>(symbol) vid 100; cp = COPY(100) vid 101
+    Let fp_const be MIRNodes.create_mir_const(100, symbol, fn_type, 0, 0)
+    MIR.add_instruction_to_block(entry_block, fp_const)
+    MIR.register_value_definition(fn, 100, fp_const)
+
+    Let fp_copy be MIRNodes.create_mir_copy(101, 100)
+    MIR.add_instruction_to_block(entry_block, fp_copy)
+    MIR.register_value_definition(fn, 101, fp_copy)
+
+    Note: r1 = CALL_INDIRECT callee vid 101 (resolvable through the copy)
+    Let args1 be List.create()
+    Let call1 be MIRNodes.create_mir_call(102, 101, args1, 0, type_info, 1, 0)
+    MIR.add_instruction_to_block(entry_block, call1)
+    MIR.register_value_definition(fn, 102, call1)
+
+    Note: r2 = CALL_INDIRECT callee vid 999 (no defining instruction:
+    Note: honestly unresolvable, must stay indirect)
+    Let args2 be List.create()
+    Let call2 be MIRNodes.create_mir_call(103, 999, args2, 0, type_info, 1, 0)
+    MIR.add_instruction_to_block(entry_block, call2)
+    MIR.register_value_definition(fn, 103, call2)
+
+    Let ret be MIRNodes.create_mir_return(0, 0)
+    MIR.add_instruction_to_block(entry_block, ret)
+
+    Note: Pre-transform shape sanity
+    Let pre_op1 be MIR.get_mir_node_opcode(call1)
+    T.assert_equal(results, "resolvable call starts indirect", pre_op1, 20305)
+    Let pre_op2 be MIR.get_mir_node_opcode(call2)
+    T.assert_equal(results, "unresolvable call starts indirect", pre_op2, 20305)
+
+    Note: ---- run the pass ----
+    Let devirt_rc be Devirt.optimize_function_with_devirtualization(fn)
+    T.assert_equal(results, "devirtualization pass returns success", devirt_rc, 1)
+
+    Note: Resolvable call: direct named call, is_indirect cleared
+    Let post_op1 be MIR.get_mir_node_opcode(call1)
+    T.assert_equal(results, "resolvable call rewritten to MIR_CALL", post_op1, 20304)
+    Let post_callee be Layout.memory_get_int64(call1, 80)
+    T.assert_equal(results, "callee slot carries the target NAME", post_callee, target_name)
+    Let post_indirect be Layout.memory_get_int64(call1, 112)
+    T.assert_equal(results, "is_indirect cleared on the direct call", post_indirect, 0)
+    Let post_result be MIR.get_mir_node_value_id(call1)
+    T.assert_equal(results, "direct call kept its result id", post_result, 102)
+
+    Note: Unresolvable call: untouched
+    Let post_op2 be MIR.get_mir_node_opcode(call2)
+    T.assert_equal(results, "unresolvable call left indirect", post_op2, 20305)
+    Let post_callee2 be Layout.memory_get_int64(call2, 80)
+    T.assert_equal(results, "unresolvable callee slot untouched", post_callee2, 999)
+    Let post_indirect2 be Layout.memory_get_int64(call2, 112)
+    T.assert_equal(results, "unresolvable is_indirect untouched", post_indirect2, 1)
+
+    Note: The verifier accepts the transformed function
+    Let verify_rc be MIRVerifier.verify_mir_function(fn)
+    T.assert_equal(results, "verifier accepts post-devirt function", verify_rc, 1)
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: SHARED LOOP BUILDER FOR THE VECTORIZATION SUITES
+Note: ============================================================================
+
+@Reasoning
+Builds the counted-loop skeleton both vectorization suites share:
+
+  B0 (preheader): c0=CONST 0 (200), c8=CONST 8 (201), cscale=CONST 8
+                  (202), c1=CONST 1 (206), allocas, jump B1
+  B1 (loop):      i = PHI[(B0,200),(B1,211)] (210)
+                  off  = MUL(210, 202)  (212)   - i * 8 bytes
+                  <suite-specific body>
+                  i'   = ADD(210, 206)  (211)
+                  cond = LT(211, 201)   (219)
+                  BRANCH(219, B1, B2)
+  B2 (exit):      RETURN
+
+The suite-specific body is appended by the caller between the offset
+computation and the IV update, which is why this helper returns the
+loop block pointer and stops after emitting `off`.
+
+The out record (96 bytes) carries: fn@0, cfg@8, loop_block@16,
+type_info@24, off_vid@32 (212), iv_vid@40 (210), alloca vids at
+48/56/64 (203/204/205), update/cmp/branch are appended by
+finish_vect_loop.
+@End Reasoning
+
+Process called "build_vect_loop_skeleton" that takes name as Integer, out as Integer returns Integer:
+    Let type_info be make_type_info()
+    Let fn be MIR.create_mir_function(name, type_info, 0)
+    If fn is equal to 0:
+        Return 0
+    End If
+    Let cfg be MIR.get_mir_function_cfg(fn)
+
+    Let pre_block be MIR.create_mir_basic_block(0, 0)
+    Let loop_block be MIR.create_mir_basic_block(1, 0)
+    Let exit_block be MIR.create_mir_basic_block(2, 0)
+    MIR.add_block_to_cfg(cfg, pre_block)
+    MIR.add_block_to_cfg(cfg, loop_block)
+    MIR.add_block_to_cfg(cfg, exit_block)
+    MIR.set_cfg_entry_block(cfg, pre_block)
+    MIR.set_cfg_exit_block(cfg, exit_block)
+    Layout.memory_set_int64(cfg, 48, 3)
+    Layout.memory_set_int64(fn, 56, 1000)
+
+    MIR.add_cfg_edge(cfg, 0, 1)
+    MIR.add_cfg_edge(cfg, 1, 1)
+    MIR.add_cfg_edge(cfg, 1, 2)
+
+    Note: B0 constants and arrays
+    Let c0 be MIRNodes.create_mir_const(200, 0, type_info, 0, 0)
+    MIR.add_instruction_to_block(pre_block, c0)
+    MIR.register_value_definition(fn, 200, c0)
+
+    Let c8 be MIRNodes.create_mir_const(201, 8, type_info, 0, 0)
+    MIR.add_instruction_to_block(pre_block, c8)
+    MIR.register_value_definition(fn, 201, c8)
+
+    Let cscale be MIRNodes.create_mir_const(202, 8, type_info, 0, 0)
+    MIR.add_instruction_to_block(pre_block, cscale)
+    MIR.register_value_definition(fn, 202, cscale)
+
+    Let c1 be MIRNodes.create_mir_const(206, 1, type_info, 0, 0)
+    MIR.add_instruction_to_block(pre_block, c1)
+    MIR.register_value_definition(fn, 206, c1)
+
+    Let arr_a be MIRNodes.create_mir_alloca(203, type_info, 0, 8)
+    MIR.add_instruction_to_block(pre_block, arr_a)
+    MIR.register_value_definition(fn, 203, arr_a)
+
+    Let arr_b be MIRNodes.create_mir_alloca(204, type_info, 0, 8)
+    MIR.add_instruction_to_block(pre_block, arr_b)
+    MIR.register_value_definition(fn, 204, arr_b)
+
+    Let arr_c be MIRNodes.create_mir_alloca(205, type_info, 0, 8)
+    MIR.add_instruction_to_block(pre_block, arr_c)
+    MIR.register_value_definition(fn, 205, arr_c)
+
+    Let pre_jump be MIRNodes.create_mir_jump(1)
+    MIR.add_instruction_to_block(pre_block, pre_jump)
+
+    Note: B1 IV phi and byte-offset computation
+    Let iv_phi be MIRNodes.create_mir_phi_node(210, type_info, loop_block)
+    MIRNodes.add_phi_incoming(iv_phi, 0, 200)
+    MIRNodes.add_phi_incoming(iv_phi, 1, 211)
+    MIR.add_instruction_to_block(loop_block, iv_phi)
+    MIR.register_value_definition(fn, 210, iv_phi)
+
+    Let off_mul be MIRNodes.create_mir_binary_op(20004, 212, 210, 202, type_info)
+    MIR.add_instruction_to_block(loop_block, off_mul)
+    MIR.register_value_definition(fn, 212, off_mul)
+
+    Note: B2 return
+    Let ret be MIRNodes.create_mir_return(0, 0)
+    MIR.add_instruction_to_block(exit_block, ret)
+
+    Layout.memory_set_int64(out, 0, fn)
+    Layout.memory_set_int64(out, 8, cfg)
+    Layout.memory_set_int64(out, 16, loop_block)
+    Layout.memory_set_int64(out, 24, type_info)
+    Layout.memory_set_int64(out, 32, 212)
+    Layout.memory_set_int64(out, 40, 210)
+    Layout.memory_set_int64(out, 48, 203)
+    Layout.memory_set_int64(out, 56, 204)
+    Layout.memory_set_int64(out, 64, 205)
+    Return 1
+End Process
+
+Process called "finish_vect_loop" that takes out as Integer returns Integer:
+    Note: Appends the IV update (211), the latch test LT(211, 201) (219),
+    Note: and BRANCH(219, B1, B2) to the loop block.
+    Let fn be Layout.memory_get_int64(out, 0)
+    Let loop_block be Layout.memory_get_int64(out, 16)
+    Let type_info be Layout.memory_get_int64(out, 24)
+
+    Let iv_update be MIRNodes.create_mir_binary_op(20002, 211, 210, 206, type_info)
+    MIR.add_instruction_to_block(loop_block, iv_update)
+    MIR.register_value_definition(fn, 211, iv_update)
+
+    Let cmp be MIRNodes.create_mir_binary_op(20102, 219, 211, 201, type_info)
+    MIR.add_instruction_to_block(loop_block, cmp)
+    MIR.register_value_definition(fn, 219, cmp)
+
+    Let latch_branch be MIRNodes.create_mir_branch(219, 1, 2, 80, 20)
+    MIR.add_instruction_to_block(loop_block, latch_branch)
+
+    Layout.memory_set_int64(out, 72, iv_update)
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: SUITE 2: vectorization accepts the independent-iteration loop
+Note: ============================================================================
+
+Process called "run_vect_accept" that takes results as Integer returns Integer:
+    T.begin_suite(results, "vect_accept")
+
+    Let out be Layout.allocate(96)
+    Let built be build_vect_loop_skeleton("t471_vect_accept", out)
+    T.assert_equal(results, "accept-loop skeleton constructed", built, 1)
+
+    Let fn be Layout.memory_get_int64(out, 0)
+    Let cfg be Layout.memory_get_int64(out, 8)
+    Let loop_block be Layout.memory_get_int64(out, 16)
+    Let type_info be Layout.memory_get_int64(out, 24)
+
+    Note: Body: c[i] = a[i] + b[i] over three disjoint allocas
+    Let addr_a be MIRNodes.create_mir_binary_op(20002, 213, 203, 212, type_info)
+    MIR.add_instruction_to_block(loop_block, addr_a)
+    MIR.register_value_definition(fn, 213, addr_a)
+
+    Let ld_a be MIRNodes.create_mir_load(214, 213, 0, type_info, 0)
+    MIR.add_instruction_to_block(loop_block, ld_a)
+    MIR.register_value_definition(fn, 214, ld_a)
+
+    Let addr_b be MIRNodes.create_mir_binary_op(20002, 215, 204, 212, type_info)
+    MIR.add_instruction_to_block(loop_block, addr_b)
+    MIR.register_value_definition(fn, 215, addr_b)
+
+    Let ld_b be MIRNodes.create_mir_load(216, 215, 0, type_info, 0)
+    MIR.add_instruction_to_block(loop_block, ld_b)
+    MIR.register_value_definition(fn, 216, ld_b)
+
+    Let sum be MIRNodes.create_mir_binary_op(20002, 217, 214, 216, type_info)
+    MIR.add_instruction_to_block(loop_block, sum)
+    MIR.register_value_definition(fn, 217, sum)
+
+    Let addr_c be MIRNodes.create_mir_binary_op(20002, 218, 205, 212, type_info)
+    MIR.add_instruction_to_block(loop_block, addr_c)
+    MIR.register_value_definition(fn, 218, addr_c)
+
+    Let st be MIRNodes.create_mir_store(218, 217, 0, type_info, 0)
+    MIR.add_instruction_to_block(loop_block, st)
+
+    finish_vect_loop(out)
+
+    Note: Pre-transform shape sanity
+    Let pre_loads be count_opcode_in_cfg(cfg, 20200)
+    T.assert_equal(results, "two scalar loads before the pass", pre_loads, 2)
+    Let pre_stores be count_opcode_in_cfg(cfg, 20201)
+    T.assert_equal(results, "one scalar store before the pass", pre_stores, 1)
+
+    Note: ---- run the pass ----
+    Let vect_rc be Vect.optimize_function_with_vectorization(fn)
+    T.assert_equal(results, "vectorization pass returns success", vect_rc, 1)
+
+    Note: Widened body: 2 VECTOR_LOAD, 1 VECTOR_STORE, 1 VECTOR_ADD
+    Let vloads be count_opcode_in_cfg(cfg, 20610)
+    T.assert_equal(results, "both loads widened to VECTOR_LOAD", vloads, 2)
+    Let vstores be count_opcode_in_cfg(cfg, 20611)
+    T.assert_equal(results, "store widened to VECTOR_STORE", vstores, 1)
+    Let vadds be count_opcode_in_cfg(cfg, 20600)
+    T.assert_equal(results, "data add widened to VECTOR_ADD", vadds, 1)
+
+    Note: No scalar memory op remains; the address adds and IV update stay
+    Note: scalar (3 address ADDs + IV update = 4 scalar ADDs)
+    Let post_loads be count_opcode_in_cfg(cfg, 20200)
+    T.assert_equal(results, "no scalar load remains", post_loads, 0)
+    Let post_stores be count_opcode_in_cfg(cfg, 20201)
+    T.assert_equal(results, "no scalar store remains", post_stores, 0)
+    Let post_adds be count_opcode_in_cfg(cfg, 20002)
+    T.assert_equal(results, "address/IV adds stayed scalar", post_adds, 4)
+
+    Note: The widened records kept their ORIGINAL result ids and the
+    Note: function's definition registry points at the replacements
+    Let def_214 be MIR.lookup_defining_instruction(fn, 214)
+    T.assert_not_null(results, "vid 214 still defined", def_214)
+    Let def_214_op be MIR.get_mir_node_opcode(def_214)
+    T.assert_equal(results, "vid 214 now defined by VECTOR_LOAD", def_214_op, 20610)
+    Let def_217 be MIR.lookup_defining_instruction(fn, 217)
+    Let def_217_op be MIR.get_mir_node_opcode(def_217)
+    T.assert_equal(results, "vid 217 now defined by VECTOR_ADD", def_217_op, 20600)
+
+    Note: IV step constant became VF = 4 through a FRESH constant; the
+    Note: original CONST 1 record is untouched
+    Let iv_update be Layout.memory_get_int64(out, 72)
+    Let new_step_vid be MIR.get_mir_node_operand(iv_update, 2)
+    T.assert_not_equal(results, "IV step operand rewired off the old const", new_step_vid, 206)
+    Let step_def be MIR.lookup_defining_instruction(fn, new_step_vid)
+    T.assert_not_null(results, "fresh step constant registered", step_def)
+    Let step_value be MIRNodes.get_const_value(step_def)
+    T.assert_equal(results, "IV now steps by the vector factor", step_value, 4)
+    Let old_c1 be MIR.lookup_defining_instruction(fn, 206)
+    Let old_c1_value be MIRNodes.get_const_value(old_c1)
+    T.assert_equal(results, "original stride constant untouched", old_c1_value, 1)
+
+    Note: Ext mirror coherence on the rewired update (binary right at 88)
+    Let ext_right be Layout.memory_get_int64(iv_update, 88)
+    T.assert_equal(results, "update ext mirror matches header operand", ext_right, new_step_vid)
+
+    Note: The verifier accepts the transformed function
+    Let verify_rc be MIRVerifier.verify_mir_function(fn)
+    T.assert_equal(results, "verifier accepts post-vectorization function", verify_rc, 1)
+
+    Layout.deallocate(out)
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: SUITE 3: vectorization rejects the loop-carried dependence
+Note: ============================================================================
+
+Process called "run_vect_reject" that takes results as Integer returns Integer:
+    T.begin_suite(results, "vect_reject")
+
+    Let out be Layout.allocate(96)
+    Let built be build_vect_loop_skeleton("t471_vect_reject", out)
+    T.assert_equal(results, "reject-loop skeleton constructed", built, 1)
+
+    Let fn be Layout.memory_get_int64(out, 0)
+    Let cfg be Layout.memory_get_int64(out, 8)
+    Let loop_block be Layout.memory_get_int64(out, 16)
+    Let type_info be Layout.memory_get_int64(out, 24)
+
+    Note: Body: a[i+1] = a[i] + a[i] - a distance-1 loop-carried RAW
+    Note: dependence on the single array a (vid 203)
+    Let addr_i be MIRNodes.create_mir_binary_op(20002, 213, 203, 212, type_info)
+    MIR.add_instruction_to_block(loop_block, addr_i)
+    MIR.register_value_definition(fn, 213, addr_i)
+
+    Let ld be MIRNodes.create_mir_load(214, 213, 0, type_info, 0)
+    MIR.add_instruction_to_block(loop_block, ld)
+    MIR.register_value_definition(fn, 214, ld)
+
+    Let sum be MIRNodes.create_mir_binary_op(20002, 217, 214, 214, type_info)
+    MIR.add_instruction_to_block(loop_block, sum)
+    MIR.register_value_definition(fn, 217, sum)
+
+    Note: addr_next = addr_i + 8 (one element ahead: a[i+1])
+    Let addr_next be MIRNodes.create_mir_binary_op(20002, 218, 213, 202, type_info)
+    MIR.add_instruction_to_block(loop_block, addr_next)
+    MIR.register_value_definition(fn, 218, addr_next)
+
+    Let st be MIRNodes.create_mir_store(218, 217, 0, type_info, 0)
+    MIR.add_instruction_to_block(loop_block, st)
+
+    finish_vect_loop(out)
+
+    Note: ---- run the pass ----
+    Let vect_rc be Vect.optimize_function_with_vectorization(fn)
+    T.assert_equal(results, "vectorization pass completes on the reject loop", vect_rc, 1)
+
+    Note: The legality gate refused: NO vector opcode anywhere, the scalar
+    Note: body is untouched, and the IV still steps by 1
+    Let vloads be count_opcode_in_cfg(cfg, 20610)
+    T.assert_equal(results, "no VECTOR_LOAD emitted", vloads, 0)
+    Let vstores be count_opcode_in_cfg(cfg, 20611)
+    T.assert_equal(results, "no VECTOR_STORE emitted", vstores, 0)
+    Let vadds be count_opcode_in_cfg(cfg, 20600)
+    T.assert_equal(results, "no VECTOR_ADD emitted", vadds, 0)
+    Let post_loads be count_opcode_in_cfg(cfg, 20200)
+    T.assert_equal(results, "scalar load untouched", post_loads, 1)
+    Let post_stores be count_opcode_in_cfg(cfg, 20201)
+    T.assert_equal(results, "scalar store untouched", post_stores, 1)
+
+    Let iv_update be Layout.memory_get_int64(out, 72)
+    Let step_vid be MIR.get_mir_node_operand(iv_update, 2)
+    T.assert_equal(results, "IV step operand untouched", step_vid, 206)
+
+    Note: The untransformed function still verifies
+    Let verify_rc be MIRVerifier.verify_mir_function(fn)
+    T.assert_equal(results, "verifier accepts the untransformed function", verify_rc, 1)
+
+    Layout.deallocate(out)
+    Return 1
+End Process
+
+Process called "main" returns Integer:
+    Let results be T.create_test_results()
+
+    run_devirt_direct(results)
+    run_vect_accept(results)
+    run_vect_reject(results)
+
+    T.print_summary(results)
+    Let passed be T.all_passed(results)
+    T.destroy_test_results(results)
+
+    If passed is equal to 1:
+        Return 0
+    End If
+    Return 1
+End Process

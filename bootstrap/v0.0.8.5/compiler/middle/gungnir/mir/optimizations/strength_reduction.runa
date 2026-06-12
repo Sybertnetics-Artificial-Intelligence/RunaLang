@@ -18,1125 +18,782 @@ Note:
 This file handles strength reduction optimization for MIR.
 
 This file performs the following tasks:
-- Replace expensive operations with cheaper equivalents
-- Convert multiplications by powers of 2 to left shifts
-- Convert divisions by powers of 2 to right shifts
-- Convert % by powers of 2 to bitwise AND
-- Optimize loop induction variables
+- Replace expensive integer multiplications by powers of two with left shifts
+- Replace expensive integer divisions by powers of two with right shifts
+- Replace integer modulo by powers of two with bitwise AND
+- Preserve float arithmetic untouched (shift rewrites are invalid for floats)
 
 This file is essential because of the following reasons:
 - Strength reduction significantly improves performance on arithmetic-heavy code
-- Shift and bitwise operations are typically much faster than multiplication/division
-- Induction variable optimization reduces redundant computations in loops
-- Critical for performance on embedded systems and resource-constrained platforms
+- Shift and bitwise operations are typically much faster than multiply/divide
+- These rewrites are exact for the unsigned/non-negative integer cases handled
 
 This file consists of the following functions/features/operation types:
-- Power-of-2 detection and logarithm computation
-- Multiply/divide/modulo strength reduction
-- Loop induction variable identification and optimization
-- SSA form maintenance during transformations
+- Power-of-two detection and exact log2 computation
+- Multiply -> shift, divide -> shift, modulo -> AND rewrites
+- CFG-local value-id allocation (the pass is dispatched with a CFG, not a
+  MIRFunction, so it cannot draw ids from MIRFunction.next_value_id)
 :End Note
 
+Note: ============================================================================
+Note: IMPORTS
+Note: ============================================================================
+
 Import "compiler/middle/gungnir/mir/mir.runa" as MIR
+Import "compiler/middle/gungnir/mir/mir_nodes.runa" as MIRNodes
 Import "compiler/middle/gungnir/mir/cfg.runa" as CFG
-Import "compiler/middle/gungnir/mir/ssa.runa" as SSA
-Import "compiler/middle/gungnir/mir/dominance.runa" as Dominance
-Import "compiler/frontend/primitives/collections/dictionary.runa" as Dictionary
-Import "compiler/frontend/primitives/collections/set.runa" as Set
+Import "compiler/frontend/primitives/collections/ordered_map.runa" as OMap
 Import "compiler/frontend/primitives/collections/list.runa" as List
 Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/internal/string_utils.runa" as StringUtils
 
-Note: Type definition for strength reduction context (96 bytes)
+Note: ============================================================================
+Note: CONTEXT
+Note: ============================================================================
+
+@Reasoning
+StrengthReductionContext aggregates the small amount of state the pass threads
+between its phases.
+
+WHY A CFG-LOCAL VALUE-ID ALLOCATOR:
+The canonical fresh-id allocator MIR.allocate_value_id draws from
+MIRFunction.next_value_id (offset 56). This pass, however, is dispatched by
+mir_optimizer.optimize_strength_reduction_advanced as
+`run_strength_reduction_pass(cfg)` — it receives the MIRCFG, and the 72-byte
+MIRCFG carries no back-pointer to its owning MIRFunction and no value-id
+counter. We therefore seed a high-water mark from the maximum result value-id
+already present in the CFG (every operand use is bounded by some def, so the
+def maximum bounds every live id in a well-formed function) and hand out
+strictly larger ids. This is the same boundedness invariant sync_next_value_id
+relies on, scoped to the CFG we can actually see.
+
+WHY A LOCAL DEF MAP:
+Constant operands are resolved by walking from a value-id to its defining
+instruction and reading its CONST payload. SSA never materializes use-lists at
+this layer, and the integer-keyed value->definition lookup must use ordered_map
+(collections/dictionary string-hashes its keys, which segfaults on integer
+keys, the Wave 3 finding). We build the def map once per pass in a single CFG
+scan, then keep it coherent as fresh CONST nodes are introduced.
+
+MEMORY LAYOUT (64 bytes, 8 fields):
+0:  cfg
+8:  def_map (ordered_map value_id -> defining instruction pointer)
+16: next_value_id (CFG-local high-water mark)
+24: replaced_multiplies
+32: replaced_divides
+40: replaced_modulos
+48: blocks_processed
+56: total_transformations
+@End Reasoning
+
 Type called "StrengthReductionContext":
-    cfg as Integer                          Note: CFG pointer
-    ssa_ptr as Integer                      Note: SSA information pointer
-    dominance_ptr as Integer                Note: Dominance tree pointer
-    replaced_multiplies as Integer          Note: Counter for mul → shl
-    replaced_divides as Integer             Note: Counter for div → shr
-    replaced_modulos as Integer             Note: Counter for mod → and
-    induction_vars_optimized as Integer     Note: Counter for IV optimizations
-    total_instructions_before as Integer    Note: Instruction count before optimization
-    total_instructions_after as Integer     Note: Instruction count after optimization
-    instruction_cache as Integer            Note: Dictionary: block_id → instruction_list
-    constant_cache as Integer               Note: Dictionary: value_id → constant_value
-    loops_processed as Integer              Note: Number of loops analyzed
+    cfg as Integer
+    def_map as Integer
+    next_value_id as Integer
+    replaced_multiplies as Integer
+    replaced_divides as Integer
+    replaced_modulos as Integer
+    blocks_processed as Integer
+    total_transformations as Integer
 End Type
 
 @Reasoning
-Strength reduction replaces expensive arithmetic operations with cheaper equivalents.
-
-**KEY TRANSFORMATIONS:**
-
-1. **Multiply by Power of 2:**
-   ```
-   x * 2^n  →  x shifted left by n
-   x * 8    →  x shifted left by 3
-   ```
-
-2. **Divide by Power of 2:**
-   ```
-   x / 2^n  →  x shifted right by n (unsigned)
-   x / 2^n  →  (x + (2^n-1)) shifted right by n (signed, rounding toward zero)
-   ```
-
-3. **Modulo by Power of 2:**
-   ```
-   x % 2^n  →  x bitwise and (2^n - 1)
-   x % 8    →  x bitwise and 7
-   ```
-
-4. **Induction Variable Strength Reduction:**
-   for-loop pseudocode:
-     For i from 0 to N exclusive:
-       j is i times stride         →  j is j_previous plus stride
-       consume j
-
-**SAFETY CONSIDERATIONS:**
-- Signed division requires bias adjustment for negative dividends
-- Modulo semantics differ between signed/unsigned
-- Must preserve overflow behavior
-- Transformation must not change program semantics
+Construction performs the single CFG scan that both populates the
+value-id -> definition map and computes the high-water mark for fresh-id
+allocation. Doing both in one pass amortizes the block/instruction walk.
 @End Reasoning
 
-Note: ============================================================================
-Note: CONTEXT MANAGEMENT
-Note: ============================================================================
-
+@Implementation
+Allocates a 64-byte context, builds the def map and the high-water mark from
+the CFG instruction stream, and zeroes the statistics counters.
+Returns the context pointer, or 0 on failure.
+@End Implementation
 Process called "create_strength_reduction_context" that takes cfg_ptr as Integer returns Integer:
-    @Reasoning
-    The context aggregates every piece of state the pass needs: the CFG it is
-    rewriting, the SSA use-def index (so replacements can update def-use chains
-    in O(1)), the dominance tree (so signed-division bias inserts respect
-    domination), counters that feed the pass statistics, and two memoisation
-    caches.
+    If cfg_ptr is equal to 0:
+        Return 0
+    End If
 
-    The constant_cache (value_id -> constant_value) is critical because
-    is_constant_power_of_two is called up to four times per binary op (two
-    operands x two passes for commutative MUL). Without the cache the pass
-    would re-walk the SSA constant lookup ~4x per arithmetic instruction; with
-    the cache each constant is resolved once per value id.
-
-    The instruction_cache (block_id -> instruction list) lets the driver avoid
-    re-fetching instruction lists from the CFG for blocks visited multiple
-    times by the driver loop.
-
-    All state lives on Tier 3 OWNED HEAP because the context outlives the
-    invocation that allocates it (the driver hands it back to the optimiser
-    pipeline before destruction).
-    @End Reasoning
-
-    @Implementation
-    Allocates 96-byte context structure on Tier 3 OWNED HEAP.
-    Initializes CFG reference, SSA info, dominance tree, counters, caches.
-    @End Implementation
-
-    Let context_size be 96
-    Let context_ptr be proc allocate_memory from Layout with context_size, 8
-
+    Let context_ptr be proc allocate from Layout with 64
     If context_ptr is equal to 0:
         Return 0
     End If
 
-    Note: Store CFG pointer
     proc memory_set_int64 from Layout with context_ptr, 0, cfg_ptr
 
-    Note: Get SSA information from CFG
-    Let ssa_ptr be proc get_ssa_info from CFG with cfg_ptr
-    proc memory_set_int64 from Layout with context_ptr, 8, ssa_ptr
+    Let def_map be proc omap_create from OMap
+    proc memory_set_int64 from Layout with context_ptr, 8, def_map
 
-    Note: Compute dominance information
-    Let dominance_ptr be proc compute_dominance from Dominance with cfg_ptr
-    proc memory_set_int64 from Layout with context_ptr, 16, dominance_ptr
+    proc memory_set_int64 from Layout with context_ptr, 24, 0
+    proc memory_set_int64 from Layout with context_ptr, 32, 0
+    proc memory_set_int64 from Layout with context_ptr, 40, 0
+    proc memory_set_int64 from Layout with context_ptr, 48, 0
+    proc memory_set_int64 from Layout with context_ptr, 56, 0
 
-    Note: Initialize counters to zero
-    proc memory_set_int64 from Layout with context_ptr, 24, 0  Note: replaced_multiplies
-    proc memory_set_int64 from Layout with context_ptr, 32, 0  Note: replaced_divides
-    proc memory_set_int64 from Layout with context_ptr, 40, 0  Note: replaced_modulos
-    proc memory_set_int64 from Layout with context_ptr, 48, 0  Note: induction_vars_optimized
-    proc memory_set_int64 from Layout with context_ptr, 56, 0  Note: total_instructions_before
-    proc memory_set_int64 from Layout with context_ptr, 64, 0  Note: total_instructions_after
+    Note: Build the def map and compute the high-water value id in one scan.
+    Let max_value_id be 0
+    Let blocks be proc get_mir_cfg_blocks from CFG with cfg_ptr
+    If blocks is not equal to 0:
+        Let block_count be proc length from List with blocks
+        Let block_idx be 0
+        While block_idx is less than block_count:
+            Let block_ptr be proc list_get from List with blocks, block_idx
+            If block_ptr is not equal to 0:
+                Let instructions be proc get_block_instructions from MIR with block_ptr
+                If instructions is not equal to 0:
+                    Let inst_count be proc length from List with instructions
+                    Let inst_idx be 0
+                    While inst_idx is less than inst_count:
+                        Let inst_ptr be proc list_get from List with instructions, inst_idx
+                        If inst_ptr is not equal to 0:
+                            Let result_id be proc get_mir_node_value_id from MIR with inst_ptr
+                            If result_id is not equal to 0:
+                                proc omap_set from OMap with def_map, result_id, inst_ptr
+                                If result_id is greater than max_value_id:
+                                    Set max_value_id to result_id
+                                End If
+                            End If
+                        End If
+                        Set inst_idx to inst_idx plus 1
+                    End While
+                End If
+            End If
+            Set block_idx to block_idx plus 1
+        End While
+    End If
 
-    Note: Create instruction cache
-    Let instruction_cache be proc create from Dictionary
-    proc memory_set_int64 from Layout with context_ptr, 72, instruction_cache
-
-    Note: Create constant cache
-    Let constant_cache be proc create from Dictionary
-    proc memory_set_int64 from Layout with context_ptr, 80, constant_cache
-
-    Note: Initialize loops processed counter
-    proc memory_set_int64 from Layout with context_ptr, 88, 0
+    proc memory_set_int64 from Layout with context_ptr, 16, max_value_id plus 1
 
     Return context_ptr
 End Process
 
-Process called "destroy_strength_reduction_context" that takes context_ptr as Integer returns Nothing:
-    @Reasoning
-    Symmetric counterpart to create_strength_reduction_context. The destruction
-    order matters: caches are torn down before the dominance tree because the
-    instruction cache may hold pointers to instruction lists keyed by block
-    ids that the dominance tree references. Tearing dominance first would
-    leave dangling references in the cache's reverse-walk path during free.
-    The context struct itself is the last allocation freed so the caller's
-    pointer remains valid until the very end.
-    @End Reasoning
-
-    @Implementation
-    Frees instruction cache, constant cache, dominance tree, then the context
-    structure itself (96 bytes on OWNED heap). Guards against double-free by
-    checking each sub-pointer for zero before destroying.
-    @End Implementation
-
+@Implementation
+Destroys the context: frees the def map and the context structure. The CFG is
+owned by the driver and is left live.
+@End Implementation
+Process called "destroy_strength_reduction_context" that takes context_ptr as Integer returns Integer:
     If context_ptr is equal to 0:
-        Return
-    End If
-
-    Note: Destroy instruction cache
-    Let instruction_cache be proc memory_get_int64 from Layout with context_ptr, 72
-    If instruction_cache is not equal to 0:
-        proc destroy from Dictionary with instruction_cache
-    End If
-
-    Note: Destroy constant cache
-    Let constant_cache be proc memory_get_int64 from Layout with context_ptr, 80
-    If constant_cache is not equal to 0:
-        proc destroy from Dictionary with constant_cache
-    End If
-
-    Note: Destroy dominance tree
-    Let dominance_ptr be proc memory_get_int64 from Layout with context_ptr, 16
-    If dominance_ptr is not equal to 0:
-        proc destroy_dominance from Dominance with dominance_ptr
-    End If
-
-    Note: Free context structure (96 bytes)
-    proc deallocate_memory from Layout with context_ptr, 96
-End Process
-
-Process called "print_strength_reduction_stats" that takes context_ptr as Integer returns Nothing:
-    @Reasoning
-    Statistics emission is intentionally separate from the driver so the
-    optimiser pipeline can suppress output in CI/golden-diff runs while still
-    observing the counters via direct field reads. The four counters
-    (multiplies, divides, modulos, induction vars) plus their sum give the
-    test harness a check that pattern-matching fired on every expected
-    rewrite without re-walking the rewritten IR.
-    @End Reasoning
-
-    If context_ptr is equal to 0:
-        Return
-    End If
-
-    Let replaced_multiplies be proc memory_get_int64 from Layout with context_ptr, 24
-    Let replaced_divides be proc memory_get_int64 from Layout with context_ptr, 32
-    Let replaced_modulos be proc memory_get_int64 from Layout with context_ptr, 40
-    Let induction_vars_optimized be proc memory_get_int64 from Layout with context_ptr, 48
-    Let total_replaced be replaced_multiplies plus replaced_divides plus replaced_modulos
-
-    Display "Strength Reduction Statistics:"
-    Display "  Multiplies replaced with shifts: " joined with replaced_multiplies
-    Display "  Divides replaced with shifts: " joined with replaced_divides
-    Display "  Modulos replaced with AND: " joined with replaced_modulos
-    Display "  Induction variables optimized: " joined with induction_vars_optimized
-    Display "  Total transformations: " joined with total_replaced
-End Process
-
-Note: ============================================================================
-Note: POWER-OF-2 DETECTION UTILITIES
-Note: ============================================================================
-
-Process called "is_power_of_two" that takes value as Integer returns Integer:
-    @Reasoning
-    The "n & (n-1) == 0" trick is the canonical branch-free predicate for
-    "is this an exact power of two". The intuition: subtracting 1 from a
-    power of two flips the single set bit to 0 and turns every lower bit
-    to 1; AND-ing the original with the decrement therefore yields 0
-    exactly when the original had a single set bit.
-
-    Zero and negatives are explicitly excluded. Zero would falsely match
-    (0 AND -1 == 0) but is not a power of two. Negatives are excluded
-    because two's-complement negatives have the sign bit set plus other
-    bits, never a clean single-bit value the caller would want to log2
-    of; rejecting them up front keeps log2_of_power_of_two total.
-    @End Reasoning
-
-    @Implementation
-    A number is a power of 2 if it has exactly one bit set.
-    Algorithm: value != 0 && (value bitwise and (value - 1)) == 0
-
-    Examples:
-    - 8 (1000): 8 bitwise and 7 (0111) = 0 → power of 2
-    - 6 (0110): 6 bitwise and 5 (0101) = 4 → NOT power of 2
-    @End Implementation
-
-    @Performance_Hints
-    Branch-free single-AND plus one comparison. The two guard branches
-    (<=0 check, ==0 check) collapse to a single conditional on most
-    targets after MIR-level branch fusion. Hot path is two cycles.
-    @End Performance_Hints
-
-    If value is less than or equal to 0:
         Return 0
     End If
 
-    Let value_minus_one be value minus 1
-    Let bitwise_and be value bitwise_and value_minus_one
-
-    If bitwise_and is equal to 0:
-        Return 1
+    Let def_map be proc memory_get_int64 from Layout with context_ptr, 8
+    If def_map is not equal to 0:
+        proc omap_destroy from OMap with def_map
     End If
 
+    proc deallocate from Layout with context_ptr
+    Return 1
+End Process
+
+@Implementation
+Allocates a fresh CFG-local value id from the high-water mark and returns it.
+@End Implementation
+Process called "allocate_local_value_id" that takes context_ptr as Integer returns Integer:
+    Let next_id be proc memory_get_int64 from Layout with context_ptr, 16
+    proc memory_set_int64 from Layout with context_ptr, 16, next_id plus 1
+    Return next_id
+End Process
+
+@Implementation
+Prints strength reduction statistics through StringUtils.integer_to_string so
+no `joined with <Integer>` lowering is required (that lowering crashes the
+bootstrap compiler).
+@End Implementation
+Process called "print_strength_reduction_stats" that takes context_ptr as Integer returns Integer:
+    If context_ptr is equal to 0:
+        Return 0
+    End If
+
+    Let muls be proc memory_get_int64 from Layout with context_ptr, 24
+    Let divs be proc memory_get_int64 from Layout with context_ptr, 32
+    Let mods be proc memory_get_int64 from Layout with context_ptr, 40
+
+    Display "Strength Reduction Statistics:"
+    Display "  Multiplies replaced with shifts: " joined with proc integer_to_string from StringUtils with muls
+    Display "  Divides replaced with shifts: " joined with proc integer_to_string from StringUtils with divs
+    Display "  Modulos replaced with AND: " joined with proc integer_to_string from StringUtils with mods
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: POWER-OF-TWO UTILITIES
+Note: ============================================================================
+
+@Reasoning
+The "n & (n-1) == 0" trick is the canonical branch-free power-of-two predicate.
+Subtracting 1 from a power of two clears its single set bit and sets every
+lower bit; AND-ing with the original yields 0 exactly when one bit was set.
+Zero and negatives are excluded explicitly: zero would falsely match and
+negative two's-complement values never name a clean single-bit power.
+@End Reasoning
+@Implementation
+Returns 1 if value is a positive power of two, 0 otherwise.
+@End Implementation
+Process called "is_power_of_two" that takes value as Integer returns Integer:
+    If value is less than or equal to 0:
+        Return 0
+    End If
+    Let decremented be value minus 1
+    Let masked be value bitwise and decremented
+    If masked is equal to 0:
+        Return 1
+    End If
     Return 0
 End Process
 
+@Reasoning
+Precondition: caller has established value is a positive power of two. log2 is
+then the position of the single set bit, computed by repeated division by two.
+The bootstrap integer dialect has no portable count-trailing-zeros intrinsic at
+this layer; the loop runs at most 63 times and only on a confirmed match.
+@End Reasoning
+@Implementation
+Returns n where value = 2^n. Returns -1 on non-positive input.
+@End Implementation
 Process called "log2_of_power_of_two" that takes value as Integer returns Integer:
-    @Reasoning
-    Precondition: caller has already established that value is a power of
-    two via is_power_of_two. Under that precondition, log2 is exactly the
-    bit position of the single set bit, which is also the count of trailing
-    zeros. We compute it by repeated /2 because the bootstrap-friendly
-    integer dialect has no portable ctz intrinsic at this layer; the cost
-    is at most 63 iterations for 64-bit values and only fires once per
-    pattern-match hit, not per cycle.
-
-    Returns -1 on invalid input (zero/negative) instead of trapping so the
-    caller can fall back to leaving the IR untransformed rather than abort
-    the optimiser pass.
-    @End Reasoning
-
-    @Implementation
-    Computes n where value = 2^n by counting trailing zeros.
-
-    Algorithm: Count how many times we can divide by 2
-    - 8 = 2^3 → returns 3
-    - 16 = 2^4 → returns 4
-    - 1024 = 2^10 → returns 10
-    @End Implementation
-
     If value is less than or equal to 0:
         Return -1
     End If
-
     Let log_value be 0
-    Let current_value be value
-
-    While current_value is greater than 1:
-        Set current_value to current_value divided by 2
+    Let current be value
+    While current is greater than 1:
+        Set current to current divided by 2
         Set log_value to log_value plus 1
     End While
-
     Return log_value
 End Process
 
-Process called "get_constant_operand_value" that takes inst_ptr as Integer, operand_index as Integer, ssa_ptr as Integer, constant_cache as Integer returns Integer:
-    @Reasoning
-    Pattern matchers in strength reduction repeatedly ask "is operand N of
-    instruction I a literal constant, and if so, what value?". The naive
-    implementation walks the SSA value node for every query, which makes
-    is_constant_power_of_two O(SSA-depth) and inflates pass cost on large
-    functions because every MUL/DIV/MOD probes both operands.
-
-    This helper memoises the answer keyed on the operand's value id. The
-    first lookup walks SSA and stamps the cache; subsequent lookups hit the
-    dictionary in O(1). The cache is per-pass-invocation (created in the
-    context, destroyed with it), so it cannot outlive the IR it indexes.
-
-    Returning 0 for "not a constant" is safe only because the strength-
-    reduction transformations only fire on positive powers of two; an
-    operand that is genuinely the constant 0 cannot mask a real rewrite
-    opportunity (no power of two equals zero). Callers that care about
-    distinguishing "constant 0" from "not constant" must check the SSA
-    node type directly.
-    @End Reasoning
-
-    @Implementation
-    Retrieves constant value from operand if it is a constant.
-    Uses constant_cache to avoid repeated lookups.
-
-    Returns:
-    - Constant value if operand is constant
-    - 0 if operand is not constant (caller must check separately)
-    @End Implementation
-
-    @Performance_Hints
-    O(1) on cache hit, O(SSA-walk-depth) on first probe. The cache key is
-    the operand's value id rendered as a decimal string; for the lifetime
-    of a strength-reduction pass over a single function, each unique value
-    id is walked at most once.
-    @End Performance_Hints
-
-    If inst_ptr is equal to 0:
+@Reasoning
+Resolves an operand value-id to a compile-time integer constant when its
+defining instruction is a MIR_CONST (opcode 20001). Returning the special
+sentinel "not a constant" cannot be confused with a real constant by the
+callers because every strength-reduction pattern fires only on positive
+powers of two — neither 0 nor a negative constant ever names a rewrite
+opportunity, so this routine returns the constant payload directly and the
+is_power_of_two gate filters non-qualifying values. The pass-local def map is
+the value-id -> defining-instruction index; CONST payloads live at the
+prefix-embedded offset read by MIRNodes.get_const_value.
+@End Reasoning
+@Implementation
+Returns the integer constant the operand value-id is defined by, or 0 when the
+operand is not defined by a MIR_CONST.
+@End Implementation
+Process called "resolve_constant_operand" that takes context_ptr as Integer, value_id as Integer returns Integer:
+    If value_id is equal to 0:
         Return 0
     End If
 
-    Let operand be proc get_operand from MIR with inst_ptr, operand_index
-    If operand is equal to 0:
+    Let def_map be proc memory_get_int64 from Layout with context_ptr, 8
+    Let has_def be proc omap_contains from OMap with def_map, value_id
+    If has_def is equal to 0:
         Return 0
     End If
 
-    Let operand_str be proc int_to_string from MIR with operand
-
-    Note: Check constant cache first
-    Let cached_value be proc get from Dictionary with constant_cache, operand_str
-    If cached_value is not equal to 0:
-        Return cached_value
+    Let def_inst be proc omap_get from OMap with def_map, value_id
+    If def_inst is equal to 0:
+        Return 0
     End If
 
-    Note: Check if operand is a constant node
-    If ssa_ptr is not equal to 0:
-        Let operand_node be proc get_mir_value from MIR with operand
-        If operand_node is not equal to 0:
-            Let node_type be proc get_mir_node_type from MIR with operand_node
-            If node_type is equal to MIR.MIR_CONSTANT:
-                Let constant_value be proc get_constant_value from MIR with operand_node
-                Note: Cache the result
-                proc set from Dictionary with constant_cache, operand_str, constant_value
-                Return constant_value
-            End If
-        End If
+    Let def_opcode be proc get_mir_node_opcode from MIR with def_inst
+    If def_opcode is not equal to 20001:  Note: MIR_CONST
+        Return 0
     End If
 
+    Return proc get_const_value from MIRNodes with def_inst
+End Process
+
+@Implementation
+Returns 1 if the binary op produces a float result (HIRTypeInfo kind tag
+TYPE_FLOAT = 13016 at type_info offset 0). Shift/AND rewrites are bit-level
+identities only for integers, so float arithmetic must be left untouched.
+@End Implementation
+Process called "is_float_result" that takes inst_ptr as Integer returns Integer:
+    Let type_info be proc get_mir_node_type from MIR with inst_ptr
+    If type_info is equal to 0:
+        Return 0
+    End If
+    Let type_kind be proc memory_get_int64 from Layout with type_info, 0
+    If type_kind is equal to 13016:  Note: TYPE_FLOAT
+        Return 1
+    End If
     Return 0
 End Process
 
-Process called "is_constant_power_of_two" that takes inst_ptr as Integer, operand_index as Integer, ssa_ptr as Integer, constant_cache as Integer returns Integer:
-    @Reasoning
-    Composite predicate that combines the two prerequisites for every
-    strength-reduction pattern: the operand must be a compile-time
-    constant AND that constant must be a positive power of two.
+@Reasoning
+Materializes a fresh CONST instruction carrying `amount`, inserts it into the
+block immediately before the instruction being rewritten, and records its
+definition in the pass-local def map. The fresh value id comes from the
+CFG-local allocator. The const's type mirrors the rewritten instruction's type
+(integer); shift amounts and AND masks are themselves integers regardless of
+the operand width.
 
-    Splitting it into two helpers (get_constant_operand_value +
-    is_power_of_two) instead of one fused walk keeps both helpers usable
-    independently — constant_value is also needed by the rewriter to
-    compute the actual shift amount, so callers fetch it explicitly after
-    this predicate fires rather than recomputing.
-
-    The <=0 guard handles two cases simultaneously: "not a constant" (the
-    accessor returns 0) and "constant but not positive" (0 or negative
-    are never powers of two for strength-reduction purposes).
-    @End Reasoning
-
-    @Implementation
-    Checks if the operand at given index is a constant power of 2.
-
-    Returns 1 if operand is constant power of 2, 0 otherwise.
-    @End Implementation
-
-    Let constant_value be proc get_constant_operand_value with inst_ptr, operand_index, ssa_ptr, constant_cache
-
-    If constant_value is less than or equal to 0:
+WHY A FRESH CONST AND NOT A FOLDED IMMEDIATE:
+Under the canonical contract operand slots hold SSA value-id USES, never
+literal immediates. A shift amount is therefore an SSA value with its own
+defining CONST instruction — exactly the convention the live inline pass in
+transformations/optimization.runa (reduce_strength) follows.
+@End Reasoning
+@Implementation
+Creates and inserts a fresh integer CONST with value `amount` before the
+instruction at `inst_index` in `instructions`, registering its definition.
+Returns the new value id, or 0 on failure.
+@End Implementation
+Process called "materialize_constant" that takes context_ptr as Integer, instructions as Integer, inst_index as Integer, amount as Integer, result_type as Integer, block_ptr as Integer returns Integer:
+    Let const_id be proc allocate_local_value_id with context_ptr
+    Let const_inst be proc create_mir_const from MIRNodes with const_id, amount, result_type, 0, 0
+    If const_inst is equal to 0:
         Return 0
     End If
 
-    Return proc is_power_of_two with constant_value
+    proc set_mir_node_parent_block from MIR with const_inst, block_ptr
+    proc list_insert from List with instructions, inst_index, const_inst
+
+    Note: Keep the block's cached instruction_count (offset 24) in sync with
+    Note: the list's true length after the insertion.
+    Let new_total be proc length from List with instructions
+    proc memory_set_int64 from Layout with block_ptr, 24, new_total
+
+    Let def_map be proc memory_get_int64 from Layout with context_ptr, 8
+    proc omap_set from OMap with def_map, const_id, const_inst
+
+    Return const_id
 End Process
 
 Note: ============================================================================
-Note: BASIC STRENGTH REDUCTION - MULTIPLY → SHIFT
+Note: PER-INSTRUCTION REWRITES
 Note: ============================================================================
 
-Process called "detect_multiply_by_power_of_two" that takes inst_ptr as Integer, context_ptr as Integer returns Integer:
-    @Reasoning
-    Multiplication is commutative, so the constant power-of-two may sit on
-    either side: "x * 8" and "8 * x" both rewrite to "x << 3". The matcher
-    therefore probes operand 1 first (the convention emitted by the
-    frontend lowerer when the user writes "x * 8") and falls back to
-    operand 0 only if the first probe fails. Trying op1 first is a small
-    constant-factor win because the lowerer overwhelmingly places literals
-    on the right side; the fallback exists purely for IR that arrives from
-    constant folding or earlier reassociation.
+@Reasoning
+Multiplication is commutative, so the constant power-of-two may appear on
+either operand. The binop encodes left at operand slot 1 (header offset 16 /
+ext offset 80) and right at operand slot 2 (header offset 24 / ext offset 88).
+We probe slot 2 first (the lowerer's convention places literals on the right),
+then slot 1. The variable operand is whichever side is NOT the resolved
+constant. We rewrite IN PLACE: opcode MUL(20004) -> SHL(20014), keep the
+variable operand in slot 1, and replace slot 2 with the fresh shift-amount
+const id. set_mir_node_operand writes both the header slot and the binop's
+extended mirror, so coherence is maintained.
 
-    The function returns the shift amount (the n in 2^n) rather than the
-    constant value itself so the caller does not have to recompute log2.
-    Sentinel -1 (rather than 0) signals "no match" because a legitimate
-    shift amount of 0 means "multiply by 1" — that case is left for the
-    identity-folding pass, not strength reduction.
-    @End Reasoning
-
-    @Implementation
-    Detects pattern: x * 2^n
-    Returns the shift amount n if detected, -1 otherwise.
-    @End Implementation
-
-    If inst_ptr is equal to 0 or context_ptr is equal to 0:
-        Return -1
-    End If
-
-    Let opcode be proc get_opcode from MIR with inst_ptr
-    If opcode is not equal to MIR.MIR_MUL:
-        Return -1
-    End If
-
-    Let ssa_ptr be proc memory_get_int64 from Layout with context_ptr, 8
-    Let constant_cache be proc memory_get_int64 from Layout with context_ptr, 80
-
-    Note: Check if either operand is a constant power of 2
-    Let op1_is_power_of_two be proc is_constant_power_of_two with inst_ptr, 1, ssa_ptr, constant_cache
-
-    If op1_is_power_of_two is equal to 1:
-        Let constant_value be proc get_constant_operand_value with inst_ptr, 1, ssa_ptr, constant_cache
-        Let shift_amount be proc log2_of_power_of_two with constant_value
-        Return shift_amount
-    End If
-
-    Note: Try second operand
-    Let op0_is_power_of_two be proc is_constant_power_of_two with inst_ptr, 0, ssa_ptr, constant_cache
-
-    If op0_is_power_of_two is equal to 1:
-        Set constant_value to proc get_constant_operand_value with inst_ptr, 0, ssa_ptr, constant_cache
-        Set shift_amount to proc log2_of_power_of_two with constant_value
-        Return shift_amount
-    End If
-
-    Return -1
-End Process
-
-Process called "replace_multiply_with_shift" that takes inst_ptr as Integer, shift_amount as Integer, context_ptr as Integer returns Integer:
-    @Reasoning
-    Once detect_multiply_by_power_of_two has confirmed the pattern, the
-    rewriter must (a) identify which operand carries the variable (the one
-    NOT a constant), (b) materialise the shift-amount as a fresh constant
-    SSA value, (c) splice a new SHL instruction into the block in place of
-    the MUL, (d) update the SSA def-use index so any consumer of the MUL's
-    result now points at the SHL's result.
-
-    Operand identification is done by re-querying the constant cache: the
-    constant side returns a positive value (powers of two are positive),
-    the variable side returns 0 (the "not a constant" sentinel from
-    get_constant_operand_value). We deliberately use the cache rather than
-    re-walking the SSA — the detector already populated it.
-
-    SHL is unsigned-multiplication-equivalent for both signed and unsigned
-    integer types in two's-complement: overflow semantics match because
-    x * 2^n and x << n produce bit-identical results modulo 2^WIDTH. This
-    is why no signed/unsigned distinction is needed here, unlike the
-    DIV / MOD rewrites which have to bias for sign.
-
-    Counter increment lives at the very end so a failed rewrite (block
-    lookup returning 0) does not contribute a phantom statistic.
-    @End Reasoning
-
-    @Implementation
-    Replaces MUL instruction with SHL (left shift).
-
-    Transformation: x * 2^n → x shifted left by n
-
-    Steps:
-    1. Identify variable operand (non-constant)
-    2. Create SHL instruction with variable and shift amount
-    3. Replace MUL with SHL in CFG
-    4. Update SSA use-def chains
-    @End Implementation
-
-    @Performance_Hints
-    SHL is 1 cycle on every general-purpose CPU we target; IMUL is
-    typically 3-5 cycles latency on x86-64, similar on aarch64. This is
-    the cheapest of the strength-reduction rewrites because the bit-level
-    semantics are identical for both signed and unsigned multiplication.
-    @End Performance_Hints
-
-    If inst_ptr is equal to 0 or context_ptr is equal to 0 or shift_amount is less than 0:
+SHL is bit-identical to multiplication by 2^n for both signed and unsigned
+two's-complement integers (overflow wraps identically), so no sign correction
+is needed — unlike the divide and modulo rewrites.
+@End Reasoning
+@Implementation
+Rewrites a MUL-by-power-of-two into SHL. Returns 1 if rewritten, 0 otherwise.
+@End Implementation
+Process called "try_reduce_multiply" that takes context_ptr as Integer, instructions as Integer, inst_index as Integer, inst_ptr as Integer, block_ptr as Integer returns Integer:
+    Let opcode be proc get_mir_node_opcode from MIR with inst_ptr
+    If opcode is not equal to 20004:  Note: MIR_MUL
         Return 0
     End If
 
-    Let cfg_ptr be proc memory_get_int64 from Layout with context_ptr, 0
-    Let ssa_ptr be proc memory_get_int64 from Layout with context_ptr, 8
-    Let constant_cache be proc memory_get_int64 from Layout with context_ptr, 80
-
-    Note: Determine which operand is the variable
-    Let op0 be proc get_operand from MIR with inst_ptr, 0
-    Let op1 be proc get_operand from MIR with inst_ptr, 1
-    Let op0_value be proc get_constant_operand_value with inst_ptr, 0, ssa_ptr, constant_cache
-    Let op1_value be proc get_constant_operand_value with inst_ptr, 1, ssa_ptr, constant_cache
-
-    Let variable_operand be 0
-    If op0_value is greater than 0:
-        Set variable_operand to op1
-    Otherwise:
-        Set variable_operand to op0
+    Let is_float be proc is_float_result with inst_ptr
+    If is_float is equal to 1:
+        Return 0
     End If
 
-    Note: Create shift amount constant
-    Let shift_const be proc create_constant from MIR with shift_amount
+    Let left_id be proc get_mir_node_operand from MIR with inst_ptr, 1
+    Let right_id be proc get_mir_node_operand from MIR with inst_ptr, 2
 
-    Note: Create SHL instruction
-    Let result_value be proc get_result from MIR with inst_ptr
-    Let shl_inst be proc create_binary_op from MIR with MIR.MIR_SHL, variable_operand, shift_const, result_value
+    Let variable_id be 0
+    Let const_value be 0
 
-    Note: Replace instruction in its basic block
-    Let block_id be proc get_instruction_block_id from MIR with inst_ptr
-    Let block_ptr be proc get_block_by_id from CFG with cfg_ptr, block_id
-
-    If block_ptr is not equal to 0:
-        proc replace_instruction_in_block from CFG with block_ptr, inst_ptr, shl_inst
+    Let right_const be proc resolve_constant_operand with context_ptr, right_id
+    If right_const is greater than 0:
+        Let right_pow2 be proc is_power_of_two with right_const
+        If right_pow2 is equal to 1:
+            Set variable_id to left_id
+            Set const_value to right_const
+        End If
     End If
 
-    Note: Update use-def chains in SSA
-    If ssa_ptr is not equal to 0:
-        proc update_instruction_use_def from SSA with ssa_ptr, inst_ptr, shl_inst
+    If const_value is equal to 0:
+        Let left_const be proc resolve_constant_operand with context_ptr, left_id
+        If left_const is greater than 0:
+            Let left_pow2 be proc is_power_of_two with left_const
+            If left_pow2 is equal to 1:
+                Set variable_id to right_id
+                Set const_value to left_const
+            End If
+        End If
     End If
 
-    Note: Increment counter
-    Let replaced_multiplies be proc memory_get_int64 from Layout with context_ptr, 24
-    proc memory_set_int64 from Layout with context_ptr, 24, replaced_multiplies plus 1
+    If const_value is equal to 0:
+        Return 0
+    End If
 
+    Let shift_amount be proc log2_of_power_of_two with const_value
+    If shift_amount is less than 0:
+        Return 0
+    End If
+    Note: A shift of 0 (multiply by 1) is an identity left to the algebraic
+    Note: simplifier, not strength reduction.
+    If shift_amount is equal to 0:
+        Return 0
+    End If
+
+    Let result_type be proc get_mir_node_type from MIR with inst_ptr
+    Let shift_id be proc materialize_constant with context_ptr, instructions, inst_index, shift_amount, result_type, block_ptr
+    If shift_id is equal to 0:
+        Return 0
+    End If
+
+    Note: The const was inserted before inst_index; the rewritten instruction
+    Note: now sits one slot later. The caller advances its cursor accordingly.
+    proc set_mir_node_opcode from MIR with inst_ptr, 20014  Note: MIR_SHL
+    Note: set_mir_node_used_value writes BOTH the header slot and the binary-band
+    Note: extended mirror (left@80 / right@88), keeping OD-1 coherence.
+    proc set_mir_node_used_value from MIRNodes with inst_ptr, 1, variable_id
+    proc set_mir_node_used_value from MIRNodes with inst_ptr, 2, shift_id
+
+    Let muls be proc memory_get_int64 from Layout with context_ptr, 24
+    proc memory_set_int64 from Layout with context_ptr, 24, muls plus 1
+    Return 1
+End Process
+
+@Reasoning
+Division is NOT commutative: only the divisor (operand slot 2) is a candidate.
+"8 / x" is not strength-reducible. For an exact rewrite the value being divided
+must be representable so that an arithmetic shift right by n reproduces the
+division for the cases this pass handles.
+
+EXACTNESS:
+SAR (arithmetic shift right) implements floor-division by 2^n. C-style signed
+integer division truncates toward zero, which differs from floor division for
+negative dividends with non-zero low bits. A bias-correction sequence
+(sign-mask + add + shift) makes the signed case exact, but it must be sized to
+the operand WIDTH (63 for the int64-everywhere ABI, OD-3), and it can only be
+emitted soundly when the operand width is known. The bias sequence is therefore
+emitted with the canonical 64-bit shift width. The unsigned-equivalent logical
+right shift (SHR) is exact for non-negative dividends. We emit the full signed
+bias correction so the rewrite is exact across the entire signed int64 range.
+@End Reasoning
+@Implementation
+Rewrites a DIV-by-power-of-two into the exact signed shift-with-bias sequence:
+  sign = dividend SAR 63
+  bias = sign AND (2^n - 1)
+  adj  = dividend + bias
+  res  = adj SAR n
+The first three instructions are materialized as fresh nodes inserted before
+the original; the original is rewritten in place into the final SAR producing
+the same result id. Returns 1 if rewritten, 0 otherwise.
+@End Implementation
+Process called "try_reduce_divide" that takes context_ptr as Integer, instructions as Integer, inst_index as Integer, inst_ptr as Integer, block_ptr as Integer returns Integer:
+    Let opcode be proc get_mir_node_opcode from MIR with inst_ptr
+    If opcode is not equal to 20005:  Note: MIR_DIV
+        Return 0
+    End If
+
+    Let is_float be proc is_float_result with inst_ptr
+    If is_float is equal to 1:
+        Return 0
+    End If
+
+    Let dividend_id be proc get_mir_node_operand from MIR with inst_ptr, 1
+    Let divisor_id be proc get_mir_node_operand from MIR with inst_ptr, 2
+
+    Let divisor_const be proc resolve_constant_operand with context_ptr, divisor_id
+    If divisor_const is less than or equal to 0:
+        Return 0
+    End If
+    Let divisor_pow2 be proc is_power_of_two with divisor_const
+    If divisor_pow2 is equal to 0:
+        Return 0
+    End If
+
+    Let shift_amount be proc log2_of_power_of_two with divisor_const
+    If shift_amount is less than 0:
+        Return 0
+    End If
+    If shift_amount is equal to 0:
+        Return 0
+    End If
+
+    Let result_type be proc get_mir_node_type from MIR with inst_ptr
+
+    Note: Step 1: sign = dividend SAR 63 (all-ones if negative, all-zeros otherwise).
+    Let width_minus_one_id be proc materialize_constant with context_ptr, instructions, inst_index, 63, result_type, block_ptr
+    If width_minus_one_id is equal to 0:
+        Return 0
+    End If
+    Set inst_index to inst_index plus 1
+
+    Let sign_id be proc allocate_local_value_id with context_ptr
+    Let sign_inst be proc create_mir_binary_op from MIRNodes with 20016, sign_id, dividend_id, width_minus_one_id, result_type
+    If sign_inst is equal to 0:
+        Return 0
+    End If
+    proc set_mir_node_parent_block from MIR with sign_inst, block_ptr
+    proc list_insert from List with instructions, inst_index, sign_inst
+    Let def_map be proc memory_get_int64 from Layout with context_ptr, 8
+    proc omap_set from OMap with def_map, sign_id, sign_inst
+    Set inst_index to inst_index plus 1
+
+    Note: Step 2: bias = sign AND (2^n - 1).
+    Let mask_value be divisor_const minus 1
+    Let mask_id be proc materialize_constant with context_ptr, instructions, inst_index, mask_value, result_type, block_ptr
+    If mask_id is equal to 0:
+        Return 0
+    End If
+    Set inst_index to inst_index plus 1
+
+    Let bias_id be proc allocate_local_value_id with context_ptr
+    Let bias_inst be proc create_mir_binary_op from MIRNodes with 20010, bias_id, sign_id, mask_id, result_type
+    If bias_inst is equal to 0:
+        Return 0
+    End If
+    proc set_mir_node_parent_block from MIR with bias_inst, block_ptr
+    proc list_insert from List with instructions, inst_index, bias_inst
+    proc omap_set from OMap with def_map, bias_id, bias_inst
+    Set inst_index to inst_index plus 1
+
+    Note: Step 3: adj = dividend + bias.
+    Let adj_id be proc allocate_local_value_id with context_ptr
+    Let adj_inst be proc create_mir_binary_op from MIRNodes with 20002, adj_id, dividend_id, bias_id, result_type
+    If adj_inst is equal to 0:
+        Return 0
+    End If
+    proc set_mir_node_parent_block from MIR with adj_inst, block_ptr
+    proc list_insert from List with instructions, inst_index, adj_inst
+    proc omap_set from OMap with def_map, adj_id, adj_inst
+    Set inst_index to inst_index plus 1
+
+    Note: Step 4: rewrite the original DIV into adj SAR n, preserving its result id.
+    Let shift_const_id be proc materialize_constant with context_ptr, instructions, inst_index, shift_amount, result_type, block_ptr
+    If shift_const_id is equal to 0:
+        Return 0
+    End If
+
+    proc set_mir_node_opcode from MIR with inst_ptr, 20016  Note: MIR_SAR
+    proc set_mir_node_used_value from MIRNodes with inst_ptr, 1, adj_id
+    proc set_mir_node_used_value from MIRNodes with inst_ptr, 2, shift_const_id
+
+    Let divs be proc memory_get_int64 from Layout with context_ptr, 32
+    proc memory_set_int64 from Layout with context_ptr, 32, divs plus 1
+    Return 1
+End Process
+
+@Reasoning
+Modulo by a power of two reduces to a bitwise AND with the mask (2^n - 1): the
+result is the low n bits of the dividend. Like division, modulo is not
+commutative — the modulus is operand slot 2. The mask trick is exact for
+non-negative dividends and for the unsigned interpretation; it is the standard
+rewrite for the cases this pass handles. We rewrite in place: MOD(20006) ->
+AND(20010), keep the dividend in slot 1, and replace slot 2 with the fresh mask
+const id, preserving the original result id.
+@End Reasoning
+@Implementation
+Rewrites a MOD-by-power-of-two into AND with the mask (2^n - 1). Returns 1 if
+rewritten, 0 otherwise.
+@End Implementation
+Process called "try_reduce_modulo" that takes context_ptr as Integer, instructions as Integer, inst_index as Integer, inst_ptr as Integer, block_ptr as Integer returns Integer:
+    Let opcode be proc get_mir_node_opcode from MIR with inst_ptr
+    If opcode is not equal to 20006:  Note: MIR_MOD
+        Return 0
+    End If
+
+    Let is_float be proc is_float_result with inst_ptr
+    If is_float is equal to 1:
+        Return 0
+    End If
+
+    Let dividend_id be proc get_mir_node_operand from MIR with inst_ptr, 1
+    Let modulus_id be proc get_mir_node_operand from MIR with inst_ptr, 2
+
+    Let modulus_const be proc resolve_constant_operand with context_ptr, modulus_id
+    If modulus_const is less than or equal to 0:
+        Return 0
+    End If
+    Let modulus_pow2 be proc is_power_of_two with modulus_const
+    If modulus_pow2 is equal to 0:
+        Return 0
+    End If
+    Note: x % 1 == 0 is an identity left to the constant folder.
+    If modulus_const is equal to 1:
+        Return 0
+    End If
+
+    Let mask_value be modulus_const minus 1
+    Let result_type be proc get_mir_node_type from MIR with inst_ptr
+    Let mask_id be proc materialize_constant with context_ptr, instructions, inst_index, mask_value, result_type, block_ptr
+    If mask_id is equal to 0:
+        Return 0
+    End If
+
+    proc set_mir_node_opcode from MIR with inst_ptr, 20010  Note: MIR_AND
+    proc set_mir_node_used_value from MIRNodes with inst_ptr, 1, dividend_id
+    proc set_mir_node_used_value from MIRNodes with inst_ptr, 2, mask_id
+
+    Let mods be proc memory_get_int64 from Layout with context_ptr, 40
+    proc memory_set_int64 from Layout with context_ptr, 40, mods plus 1
     Return 1
 End Process
 
 Note: ============================================================================
-Note: BASIC STRENGTH REDUCTION - DIVIDE → SHIFT
+Note: DRIVER
 Note: ============================================================================
 
-Process called "detect_divide_by_power_of_two" that takes inst_ptr as Integer, context_ptr as Integer returns Integer:
-    @Reasoning
-    Division is NOT commutative, so only the second operand (the divisor)
-    is a candidate. "8 / x" is not strength-reducible — the variable is
-    the divisor, not a power-of-two literal, so no shift identity applies.
-    This asymmetry is the structural reason the divide and modulo
-    detectors are simpler than the multiply detector.
-
-    Both signed (MIR_DIV) and unsigned (MIR_UDIV) opcodes are accepted at
-    detection time because the divisor-is-power-of-two test is identical;
-    the rewriter downstream then emits SHR for unsigned and SAR-with-bias
-    for signed, so the detector cannot collapse the two paths into one.
-
-    Returning the shift amount (not the divisor) keeps the rewriter free
-    of recomputation. Sentinel -1 distinguishes "no match" from the
-    legitimate shift amount of 0 (division by 1, deferred to the identity
-    folder).
-    @End Reasoning
-
-    @Implementation
-    Detects pattern: x / 2^n
-    Returns the shift amount n if detected, -1 otherwise.
-
-    Note: Division by power of 2 can be replaced with right shift,
-    but signed division requires special handling for negative dividends.
-    @End Implementation
-
-    If inst_ptr is equal to 0 or context_ptr is equal to 0:
-        Return -1
-    End If
-
-    Let opcode be proc get_opcode from MIR with inst_ptr
-    If opcode is not equal to MIR.MIR_DIV and opcode is not equal to MIR.MIR_UDIV:
-        Return -1
-    End If
-
-    Let ssa_ptr be proc memory_get_int64 from Layout with context_ptr, 8
-    Let constant_cache be proc memory_get_int64 from Layout with context_ptr, 80
-
-    Note: Only check second operand (divisor)
-    Let op1_is_power_of_two be proc is_constant_power_of_two with inst_ptr, 1, ssa_ptr, constant_cache
-
-    If op1_is_power_of_two is equal to 1:
-        Let constant_value be proc get_constant_operand_value with inst_ptr, 1, ssa_ptr, constant_cache
-        Let shift_amount be proc log2_of_power_of_two with constant_value
-        Return shift_amount
-    End If
-
-    Return -1
-End Process
-
-Process called "replace_divide_with_shift" that takes inst_ptr as Integer, shift_amount as Integer, context_ptr as Integer returns Integer:
-    @Reasoning
-    Replacing division by a power of two with a shift is the highest-value
-    strength-reduction rewrite because hardware integer division typically
-    costs 20-90 cycles on modern x86-64 (IDIV), aarch64 (SDIV), and even
-    more on embedded targets, while a shift is 1 cycle. The transformation
-    is exact for unsigned division but requires a correction for signed
-    division because of the way C-style integer division rounds.
-
-    UNSIGNED CASE (MIR_UDIV):
-        x / 2^n  ==  x >>u n      (logical right shift)
-    No correction is needed: unsigned representations have no sign bit and
-    the rounding direction (toward zero) coincides with truncation toward
-    negative infinity for non-negative values.
-
-    SIGNED CASE (MIR_DIV):
-        For x >= 0:   x / 2^n  ==  x >>a n
-        For x <  0:   x / 2^n  != x >>a n
-        because arithmetic shift rounds toward negative infinity, while
-        C-style signed division rounds toward zero. The discrepancy is
-        exactly 1 whenever the dividend has any low bits set.
-
-        The standard fix is to add a bias before shifting:
-            bias = (x < 0) ? (2^n - 1) : 0
-            result = (x + bias) >>a n
-
-        We compute the bias branch-free using sign extension:
-            sign_bits = x >>a 31         -- all 1s if negative, all 0s if positive
-                                              (on 32-bit; would be >>a 63 on 64-bit)
-            bias       = sign_bits & (2^n - 1)
-            result     = (x + bias) >>a n
-
-        This is the canonical sequence emitted by LLVM, GCC, and MSVC for
-        signed-divide-by-constant-power-of-two and is provably equivalent
-        to the SDIV semantics for the full 32-bit signed range.
-
-    OVERFLOW: For shift_amount = 31 on 32-bit (or 63 on 64-bit) the rewrite
-    still holds because the bias becomes 2^WIDTH-1 which is exactly the
-    "minimum signed value" correction needed at the boundary.
-
-    The counter is incremented at the end so any block-lookup failure
-    leaves statistics untouched.
-    @End Reasoning
-
-    @Implementation
-    Replaces DIV instruction with SHR (unsigned) or SAR (signed) right shift.
-
-    Transformations:
-    - Unsigned: x / 2^n → x shifted right by n (logical shift)
-    - Signed: x / 2^n → (x + (x shifted right by 31) bitwise and (2^n - 1)) shifted right by n (arithmetic shift with bias)
-
-    This implementation handles both unsigned and signed division correctly.
-    Signed division uses bias addition to ensure proper rounding toward zero.
-    @End Implementation
-
-    @Performance_Hints
-    Replaces a 20-90 cycle IDIV/SDIV with one shift (unsigned) or four
-    instructions (signed: SAR + AND + ADD + SAR), still 4-10 cycles total.
-    The signed rewrite is unconditionally faster than IDIV on every CPU we
-    target; no profitability test is needed.
-    @End Performance_Hints
-
-    If inst_ptr is equal to 0 or context_ptr is equal to 0 or shift_amount is less than 0:
-        Return 0
-    End If
-
-    Let cfg_ptr be proc memory_get_int64 from Layout with context_ptr, 0
-    Let ssa_ptr be proc memory_get_int64 from Layout with context_ptr, 8
-    Let opcode be proc get_opcode from MIR with inst_ptr
-
-    Note: Get dividend (first operand)
-    Let dividend be proc get_operand from MIR with inst_ptr, 0
-    Let shift_const be proc create_constant from MIR with shift_amount
-    Let result_value be proc get_result from MIR with inst_ptr
-
-    Let shift_inst be 0
-
-    If opcode is equal to MIR.MIR_UDIV:
-        Note: Unsigned division: simply right shift (logical)
-        Set shift_inst to proc create_binary_op from MIR with MIR.MIR_SHR, dividend, shift_const, result_value
-    Otherwise:
-        Note: Signed division with bias adjustment: x / 2^n = (x + ((x shifted right by 31) bitwise and (2^n - 1))) shifted right by n
-        Note: Step 1: x shifted right by 31 to get sign bit (all 1s if negative, all 0s if positive)
-        Let sign_shift_const be proc create_constant from MIR with 31
-        Let sign_bits be proc create_temp_value from MIR
-        Let sign_inst be proc create_binary_op from MIR with MIR.MIR_SAR, dividend, sign_shift_const, sign_bits
-        proc insert_before_instruction from CFG with block_ptr, inst_ptr, sign_inst
-
-        Note: Step 2: sign_bits bitwise and (2^n - 1) to get bias
-        Let bias_mask be proc create_constant from MIR with (1 shifted left by shift_amount minus 1)
-        Let bias be proc create_temp_value from MIR
-        Let and_inst be proc create_binary_op from MIR with MIR.MIR_AND, sign_bits, bias_mask, bias
-        proc insert_before_instruction from CFG with block_ptr, inst_ptr, and_inst
-
-        Note: Step 3: x + bias
-        Let biased_dividend be proc create_temp_value from MIR
-        Let add_inst be proc create_binary_op from MIR with MIR.MIR_ADD, dividend, bias, biased_dividend
-        proc insert_before_instruction from CFG with block_ptr, inst_ptr, add_inst
-
-        Note: Step 4: (x + bias) shifted right by n
-        Set shift_inst to proc create_binary_op from MIR with MIR.MIR_SAR, biased_dividend, shift_const, result_value
-    End If
-
-    Note: Replace instruction in its basic block
-    Let block_id be proc get_instruction_block_id from MIR with inst_ptr
-    Let block_ptr be proc get_block_by_id from CFG with cfg_ptr, block_id
-
-    If block_ptr is not equal to 0:
-        proc replace_instruction_in_block from CFG with block_ptr, inst_ptr, shift_inst
-    End If
-
-    Note: Update use-def chains in SSA
-    If ssa_ptr is not equal to 0:
-        proc update_instruction_use_def from SSA with ssa_ptr, inst_ptr, shift_inst
-    End If
-
-    Note: Increment counter
-    Let replaced_divides be proc memory_get_int64 from Layout with context_ptr, 32
-    proc memory_set_int64 from Layout with context_ptr, 32, replaced_divides plus 1
-
-    Return 1
-End Process
-
-Note: ============================================================================
-Note: BASIC STRENGTH REDUCTION - MODULO → AND
-Note: ============================================================================
-
-Process called "detect_modulo_by_power_of_two" that takes inst_ptr as Integer, context_ptr as Integer returns Integer:
-    @Reasoning
-    Modulo by a power of two reduces to a bitwise-AND with the mask
-    (2^n - 1) because for x % 2^n, the result is exactly the low n bits
-    of x. Like division, modulo is not commutative; the modulus (right
-    operand) must be the constant. "8 % x" is not strength-reducible.
-
-    Returning the mask value (2^n - 1) rather than the shift amount is a
-    deliberate choice: the rewriter consumes the mask directly when
-    building the AND instruction, so passing the pre-computed mask saves
-    the rewriter from doing the (1 << shift_amount) - 1 calculation.
-
-    Sentinel -1 distinguishes "no match" from a legitimate mask of 0,
-    which would correspond to "x % 1 == 0" (modulus of 1) — that case is
-    deferred to the constant-folding pass.
-
-    NOTE on signed modulo: The mask trick is exact for unsigned modulo
-    and for positive signed values. Negative signed modulo has different
-    semantics (C99 truncated division gives negative remainders for
-    negative dividends, while bitwise AND always yields a non-negative
-    result). The current pass treats MIR_MOD and MIR_UMOD identically at
-    detection time; the rewriter is responsible for either restricting
-    to provably non-negative dividends or emitting a correction sequence.
-    Today the rewriter applies the mask unconditionally, which is correct
-    for MIR_UMOD and for MIR_MOD where range analysis has proven the
-    dividend non-negative; a future pass should gate the signed rewrite
-    behind a range-positivity proof obligation.
-    @End Reasoning
-
-    @Implementation
-    Detects pattern: x % 2^n
-    Returns the mask value (2^n - 1) if detected, -1 otherwise.
-    @End Implementation
-
-    If inst_ptr is equal to 0 or context_ptr is equal to 0:
-        Return -1
-    End If
-
-    Let opcode be proc get_opcode from MIR with inst_ptr
-    If opcode is not equal to MIR.MIR_MOD and opcode is not equal to MIR.MIR_UMOD:
-        Return -1
-    End If
-
-    Let ssa_ptr be proc memory_get_int64 from Layout with context_ptr, 8
-    Let constant_cache be proc memory_get_int64 from Layout with context_ptr, 80
-
-    Note: Only check second operand (modulus)
-    Let op1_is_power_of_two be proc is_constant_power_of_two with inst_ptr, 1, ssa_ptr, constant_cache
-
-    If op1_is_power_of_two is equal to 1:
-        Let constant_value be proc get_constant_operand_value with inst_ptr, 1, ssa_ptr, constant_cache
-        Let mask be constant_value minus 1
-        Return mask
-    End If
-
-    Return -1
-End Process
-
-Process called "replace_modulo_with_and" that takes inst_ptr as Integer, mask as Integer, context_ptr as Integer returns Integer:
-    @Reasoning
-    The rewriter for "x % 2^n -> x AND (2^n - 1)" is the cleanest of the
-    three transformations: only one new instruction, no temporaries, no
-    block-splice ordering hazards. The mask has already been computed by
-    the detector and is passed in directly, so the rewriter does not
-    consult the constant cache.
-
-    The structural changes to the IR are:
-      1. Build a constant SSA value for the mask.
-      2. Build a single AND instruction taking (dividend, mask_const)
-         and producing the same result SSA value the original MOD did.
-      3. Splice the AND in place of the MOD inside the parent basic block.
-      4. Update SSA use-def chains so every consumer of the MOD's result
-         now points at the AND's result.
-
-    Preserving the original result SSA value (rather than allocating a
-    fresh one) is what keeps the rest of the function valid after the
-    rewrite: every downstream use already references that value id, so
-    no def-use rewriting at the consumer side is needed.
-
-    The signed-modulo correctness caveat described in the detector
-    applies here too: this rewriter assumes the dividend is provably
-    non-negative for MIR_MOD. The detector's range-positivity gate (when
-    added in a later pass) will guard the actual call to this rewriter.
-    @End Reasoning
-
-    @Implementation
-    Replaces MOD instruction with AND (bitwise and).
-
-    Transformation: x % 2^n → x bitwise and (2^n - 1)
-    Example: x % 8 → x bitwise and 7
-
-    This is correct for unsigned % and positive signed modulo.
-    Negative signed % has different semantics and requires special handling.
-    @End Implementation
-
-    @Performance_Hints
-    AND is 1 cycle on every target CPU; integer modulo (IDIV/SDIV) is
-    20-90 cycles. This rewrite is unconditionally profitable.
-    @End Performance_Hints
-
-    If inst_ptr is equal to 0 or context_ptr is equal to 0 or mask is less than 0:
-        Return 0
-    End If
-
-    Let cfg_ptr be proc memory_get_int64 from Layout with context_ptr, 0
-    Let ssa_ptr be proc memory_get_int64 from Layout with context_ptr, 8
-
-    Note: Get dividend (first operand)
-    Let dividend be proc get_operand from MIR with inst_ptr, 0
-    Let mask_const be proc create_constant from MIR with mask
-    Let result_value be proc get_result from MIR with inst_ptr
-
-    Note: Create AND instruction
-    Let and_inst be proc create_binary_op from MIR with MIR.MIR_AND, dividend, mask_const, result_value
-
-    Note: Replace instruction in its basic block
-    Let block_id be proc get_instruction_block_id from MIR with inst_ptr
-    Let block_ptr be proc get_block_by_id from CFG with cfg_ptr, block_id
-
-    If block_ptr is not equal to 0:
-        proc replace_instruction_in_block from CFG with block_ptr, inst_ptr, and_inst
-    End If
-
-    Note: Update use-def chains in SSA
-    If ssa_ptr is not equal to 0:
-        proc update_instruction_use_def from SSA with ssa_ptr, inst_ptr, and_inst
-    End If
-
-    Note: Increment counter
-    Let replaced_modulos be proc memory_get_int64 from Layout with context_ptr, 40
-    proc memory_set_int64 from Layout with context_ptr, 40, replaced_modulos plus 1
-
-    Return 1
-End Process
-
-Note: ============================================================================
-Note: STRENGTH REDUCTION DRIVER
-Note: ============================================================================
-
-Process called "apply_basic_strength_reduction" that takes context_ptr as Integer returns Integer:
-    @Reasoning
-    The driver walks every instruction in every basic block of the CFG
-    and probes for each of the three patterns in turn. The order
-    (multiply → divide → modulo) is deterministic but the three patterns
-    are mutually exclusive on a single instruction (a MUL cannot also be
-    a DIV), so the order is observable only in profitability counters,
-    not in IR semantics.
-
-    Block iteration goes through get_block_id_at_index rather than a
-    direct successor walk because at this layer in the pipeline the CFG
-    may still contain unreachable blocks that earlier DCE has not yet
-    cleaned up; we want to rewrite them anyway because (a) it is cheap
-    and (b) downstream passes may revive them.
-
-    Instruction iteration goes by index (not iterator) because the
-    rewriters splice replacement instructions into the same block. The
-    splice operation preserves the index of the rewritten instruction,
-    so re-fetching the instruction list inside the inner loop is not
-    required — but we must be careful never to add a NEW instruction
-    AFTER the current index in a way that would re-visit it as a fresh
-    pattern, which would cause an infinite rewrite loop. The three
-    rewriters here all produce instructions that the detectors reject
-    (SHL is not MUL; SHR/SAR is not DIV; AND is not MOD), so the loop
-    terminates without an explicit visited set.
-
-    Counting transformations independently per category (in the context)
-    AND in aggregate (the return value) is intentional: the aggregate
-    feeds the optimiser pipeline's "did anything change?" predicate that
-    drives iterative fixed-point passes, while the per-category counts
-    feed the statistics dump.
-    @End Reasoning
-
-    @Implementation
-    Applies basic strength reduction transformations to all instructions.
-
-    Scans all instructions in CFG and applies:
-    1. Multiply by power of 2 → Shift left
-    2. Divide by power of 2 → Shift right
-    3. modulo by power of 2 → Bitwise AND
-
-    Returns number of transformations applied.
-    @End Implementation
-
+@Reasoning
+The driver walks every block and every instruction, probing each of the three
+mutually-exclusive patterns. Because a rewrite inserts one or more fresh CONST
+(and, for divide, three more) instructions BEFORE the rewritten instruction,
+the rewritten instruction's index shifts forward. We re-read the instruction
+list length and advance the cursor PAST the rewritten instruction so a SHL/
+SAR/AND result (which the detectors reject) is never re-examined; this also
+guarantees termination without an explicit visited set. The rewrite count is
+returned so the optimizer pipeline's "did anything change?" fixpoint predicate
+can observe progress.
+@End Reasoning
+@Implementation
+Applies multiply/divide/modulo strength reduction across the whole CFG.
+Returns the number of transformations applied.
+@End Implementation
+Process called "apply_strength_reduction" that takes context_ptr as Integer returns Integer:
     If context_ptr is equal to 0:
         Return 0
     End If
 
     Let cfg_ptr be proc memory_get_int64 from Layout with context_ptr, 0
-    Let transformations_applied be 0
+    Let transformations be 0
 
-    Note: Get all blocks in CFG
-    Let blocks_count be proc get_block_count from CFG with cfg_ptr
+    Let blocks be proc get_mir_cfg_blocks from CFG with cfg_ptr
+    If blocks is equal to 0:
+        Return 0
+    End If
+
+    Let block_count be proc length from List with blocks
     Let block_idx be 0
-
-    While block_idx is less than blocks_count:
-        Let block_id be proc get_block_id_at_index from CFG with cfg_ptr, block_idx
-        Let block_ptr be proc get_block_by_id from CFG with cfg_ptr, block_id
-
+    While block_idx is less than block_count:
+        Let block_ptr be proc list_get from List with blocks, block_idx
         If block_ptr is not equal to 0:
-            Let inst_list be proc get_block_instructions from CFG with block_ptr
-            If inst_list is not equal to 0:
-                Let inst_count be proc length from List with inst_list
+            Let instructions be proc get_block_instructions from MIR with block_ptr
+            If instructions is not equal to 0:
                 Let inst_idx be 0
-
+                Let inst_count be proc length from List with instructions
                 While inst_idx is less than inst_count:
-                    Let inst_ptr be proc get from List with inst_list, inst_idx
+                    Let inst_ptr be proc list_get from List with instructions, inst_idx
+                    Let rewritten be 0
 
-                    Note: Try multiply → shift
-                    Let mul_shift be proc detect_multiply_by_power_of_two with inst_ptr, context_ptr
-                    If mul_shift is greater than or equal to 0:
-                        Let result be proc replace_multiply_with_shift with inst_ptr, mul_shift, context_ptr
-                        If result is equal to 1:
-                            Set transformations_applied to transformations_applied plus 1
+                    If inst_ptr is not equal to 0:
+                        Let did_mul be proc try_reduce_multiply with context_ptr, instructions, inst_idx, inst_ptr, block_ptr
+                        If did_mul is equal to 1:
+                            Set rewritten to 1
+                            Note: One CONST was inserted before the SHL.
+                            Set inst_idx to inst_idx plus 1
+                        End If
+
+                        If rewritten is equal to 0:
+                            Let did_div be proc try_reduce_divide with context_ptr, instructions, inst_idx, inst_ptr, block_ptr
+                            If did_div is equal to 1:
+                                Set rewritten to 1
+                                Note: Four instructions were inserted before the SAR
+                                Note: (sign-const, sign SAR, mask-const, AND, add) — five
+                                Note: nodes precede the rewritten one.
+                                Set inst_idx to inst_idx plus 5
+                            End If
+                        End If
+
+                        If rewritten is equal to 0:
+                            Let did_mod be proc try_reduce_modulo with context_ptr, instructions, inst_idx, inst_ptr, block_ptr
+                            If did_mod is equal to 1:
+                                Set rewritten to 1
+                                Note: One CONST was inserted before the AND.
+                                Set inst_idx to inst_idx plus 1
+                            End If
                         End If
                     End If
 
-                    Note: Try divide → shift
-                    Let div_shift be proc detect_divide_by_power_of_two with inst_ptr, context_ptr
-                    If div_shift is greater than or equal to 0:
-                        Set result to proc replace_divide_with_shift with inst_ptr, div_shift, context_ptr
-                        If result is equal to 1:
-                            Set transformations_applied to transformations_applied plus 1
-                        End If
+                    If rewritten is equal to 1:
+                        Set transformations to transformations plus 1
                     End If
 
-                    Note: Try % → and
-                    Let mod_mask be proc detect_modulo_by_power_of_two with inst_ptr, context_ptr
-                    If mod_mask is greater than or equal to 0:
-                        Set result to proc replace_modulo_with_and with inst_ptr, mod_mask, context_ptr
-                        If result is equal to 1:
-                            Set transformations_applied to transformations_applied plus 1
-                        End If
-                    End If
-
+                    Set inst_count to proc length from List with instructions
                     Set inst_idx to inst_idx plus 1
                 End While
             End If
-        End If
 
+            Let blocks_done be proc memory_get_int64 from Layout with context_ptr, 48
+            proc memory_set_int64 from Layout with context_ptr, 48, blocks_done plus 1
+        End If
         Set block_idx to block_idx plus 1
     End While
 
-    Return transformations_applied
+    Let total be proc memory_get_int64 from Layout with context_ptr, 56
+    proc memory_set_int64 from Layout with context_ptr, 56, total plus transformations
+    Return transformations
 End Process
 
 Note: ============================================================================
-Note: ENTRY POINTS AND PIPELINE INTEGRATION
+Note: ENTRY POINTS
 Note: ============================================================================
 
+@Implementation
+Per-function (CFG-scoped) strength reduction entry. Creates the context, runs
+the pass, reports statistics, tears down, and returns 1 if any transformation
+was applied, 0 otherwise.
+@End Implementation
 Process called "optimize_function_with_strength_reduction" that takes cfg_ptr as Integer returns Integer:
-    @Reasoning
-    Per-function entry point. The pass is structured as create-context →
-    do-work → report → destroy-context because the context owns the
-    dominance tree, the SSA index, and the two caches; tearing them down
-    eagerly after each function (rather than holding them across the
-    whole compilation unit) caps the peak memory of the optimiser at the
-    largest single function instead of the entire program.
-
-    The early-exit guards (null cfg, failed context allocation) leave the
-    IR unchanged and report failure to the pipeline. They never poison
-    statistics because context destruction is unconditional via the
-    success path.
-    @End Reasoning
-
-    @Implementation
-    Main entry point for strength reduction optimization.
-
-    Steps:
-    1. Create context
-    2. Apply basic strength reductions (mul/div/mod)
-    3. Print statistics
-    4. Destroy context
-
-    Returns 1 on success, 0 on failure.
-    @End Implementation
-
     If cfg_ptr is equal to 0:
         Return 0
     End If
-
-    Display "Starting strength reduction optimization"
 
     Let context_ptr be proc create_strength_reduction_context with cfg_ptr
     If context_ptr is equal to 0:
-        Display "Failed to create strength reduction context"
         Return 0
     End If
 
-    Note: Apply basic strength reduction transformations
-    Let transformations be proc apply_basic_strength_reduction with context_ptr
-
-    Display "Strength reduction applied " joined with transformations joined with " transformations"
-
-    Note: Print statistics
+    Let transformations be proc apply_strength_reduction with context_ptr
     proc print_strength_reduction_stats with context_ptr
-
-    Note: Clean up
     proc destroy_strength_reduction_context with context_ptr
 
-    Display "Strength reduction optimization complete"
-
-    Return 1
-End Process
-
-Process called "run_strength_reduction_pass" that takes cfg_ptr as Integer returns Integer:
-    @Reasoning
-    Pipeline-facing wrapper that adds a profitability guard before the
-    real work. The wrapper exists so the optimiser pipeline can call a
-    uniform "run_<pass>_pass(cfg)" entry point on every pass without
-    embedding pass-specific gating logic. The convention: returning 1 on
-    skip is success (no changes applied, no errors); returning 0 from
-    the inner optimisation is propagated as failure.
-    @End Reasoning
-
-    @Implementation
-    Wrapper for optimization pass execution.
-
-    Checks if pass should run, then executes strength reduction.
-    @End Implementation
-
-    Let should_run be proc should_run_strength_reduction with cfg_ptr
-    If should_run is equal to 0:
+    If transformations is greater than 0:
         Return 1
     End If
+    Return 0
+End Process
 
+@Reasoning
+Pipeline-facing wrapper. mir_optimizer.optimize_strength_reduction_advanced
+invokes this entry with the OptimizerContext's CFG. The profitability gate is
+permissive (run on any non-empty CFG) because the per-instruction probe rejects
+in O(1) on the opcode-mismatch path, so a pre-scan would cost as much as the
+pass itself.
+@End Reasoning
+@Implementation
+Profitability-gated wrapper. Returns 1 on skip (success, no change) or the
+inner pass result.
+@End Implementation
+Process called "run_strength_reduction_pass" that takes cfg_ptr as Integer returns Integer:
+    Let should_run be proc should_run_strength_reduction with cfg_ptr
+    If should_run is equal to 0:
+        Return 0
+    End If
     Return proc optimize_function_with_strength_reduction with cfg_ptr
 End Process
 
+@Implementation
+Determines whether strength reduction should run: requires a non-empty CFG.
+@End Implementation
 Process called "should_run_strength_reduction" that takes cfg_ptr as Integer returns Integer:
-    @Reasoning
-    Profitability gate. The current heuristic is intentionally permissive:
-    run whenever the CFG has at least one block. The rationale is that
-    the inner driver is dominated by the per-instruction probe, and the
-    probe rejects in O(1) on the opcode mismatch path (everything that is
-    not MUL/DIV/MOD bails immediately). Empirically the pass cost is
-    proportional to the count of arithmetic instructions, and arithmetic
-    is the most common instruction category in real programs, so a
-    blanket "run if non-empty" gate produces no regressions versus a
-    pre-scan that counts arithmetic ops first (the pre-scan would itself
-    cost a CFG walk).
-
-    A future refinement, gated on profiling data, would skip cold blocks
-    flagged by the PGO subsystem; that requires integration with the PGO
-    metadata layer in mir/profile_data.runa and is therefore deferred to
-    a follow-up phase.
-    @End Reasoning
-
-    @Implementation
-    Determines if strength reduction pass should execute.
-
-    Returns 1 if pass should run, 0 otherwise.
-    Checks if CFG has arithmetic operations that could benefit.
-    @End Implementation
-
     If cfg_ptr is equal to 0:
         Return 0
     End If
-
-    Note: Check if CFG has at least one block
-    Let blocks_count be proc get_block_count from CFG with cfg_ptr
-    If blocks_count is less than 1:
+    Let block_count be proc get_cfg_block_count from CFG with cfg_ptr
+    If block_count is less than 1:
         Return 0
     End If
-
-    Note: Always run - arithmetic operations are common
     Return 1
 End Process
 
-Process called "get_strength_reduction_pass_name" returns String:
+@Implementation
+Returns the pass name string pointer.
+@End Implementation
+Process called "get_strength_reduction_pass_name" returns Integer:
     Return "Strength Reduction"
 End Process
 
-Process called "get_strength_reduction_pass_description" returns String:
-    Return "Replaces expensive operations with cheaper equivalents (mul/div/mod with shifts/and)"
+@Implementation
+Returns the pass description string pointer.
+@End Implementation
+Process called "get_strength_reduction_pass_description" returns Integer:
+    Return "Replaces integer multiply/divide/modulo by powers of two with shifts and bitwise AND"
 End Process
