@@ -1,0 +1,133 @@
+Note:
+Diagnostics + intentional-recovery subsystem probe (Task #491 diagnostics batch).
+
+This probe exercises the REAL behavior of the reconciled diagnostics and
+recovery modules — not merely that they link — to prove the phantom-API
+retargets preserved semantics:
+
+  1. ErrorInfo construction + error_formatter rendering: build a diagnostic with
+     a message, format it through the formatter, and assert the rendered
+     message string is recovered intact (proves errors.error_info_create stores
+     the message and error_formatter reads/renders it).
+
+  2. Source map position round-trip: register a mapping (source 10:5 ->
+     generated 2:8), look the compiled position back up, and assert the source
+     line/column are recovered exactly.
+
+  3. Source Map v3 Base64-VLQ encoding: encode the map to JSON and assert the
+     "mappings" field is non-empty VLQ text (proves source_map_encode_mappings
+     and the VLQ encoder actually emit segments rather than an empty string).
+
+  4. Recovery scenario: build an error context for a syntax error and tear it
+     down (proves intentional_recovery/error_context create + destroy work end
+     to end on the reconciled module).
+
+PASS criterion: every assertion passes and the suite prints its summary with a
+clean exit code.
+:End Note
+
+Import "tests/test_utils.runa" as TestUtils
+Import "compiler/frontend/diagnostics/errors.runa" as Errors
+Import "compiler/frontend/diagnostics/error_formatter.runa" as Formatter
+Import "compiler/frontend/diagnostics/source_map.runa" as SourceMap
+Import "compiler/frontend/intentional_recovery/error_context.runa" as ErrorContext
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/frontend/primitives/core/string_primitive.runa" as StringPrimitive
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+
+Constant ERROR_TYPE_SYNTAX_ERROR as Integer is 100
+Constant SOURCE_MAP_FORMAT_JSON as Integer is 1
+Constant CONTEXT_TYPE_SYNTAX as Integer is 2
+
+Process called "main" returns Integer:
+    Let results be proc create_test_results from TestUtils
+    proc begin_suite from TestUtils with results, "diagnostics_subsystem_probe"
+
+    Note: A 256 KiB arena backs all temporary diagnostic formatting.
+    Let arena be proc arena_create from Layout with 262144
+    proc assert_not_null from TestUtils with results, "formatting arena allocates", arena
+
+    Note: ---- 1. ErrorInfo + formatter rendering ----
+    Let message be proc create_from_literal from StringCore with "unexpected token ';'"
+    Let error_info be proc error_info_create from Errors with ERROR_TYPE_SYNTAX_ERROR, 12, 4, message, arena
+    proc assert_not_null from TestUtils with results, "error_info_create builds an ErrorInfo", error_info
+
+    Note: The message must be stored verbatim at the ErrorInfo message field (offset 56).
+    Let stored_message be proc memory_get_qword from Memory with error_info, 56
+    proc assert_not_null from TestUtils with results, "ErrorInfo stores message", stored_message
+    Let stored_matches be proc string_equals from StringCore with stored_message, "unexpected token ';'"
+    proc assert_equal from TestUtils with results, "stored message equals input", stored_matches, 1
+
+    Let formatter be proc error_formatter_create from Formatter with arena
+    proc assert_not_null from TestUtils with results, "error_formatter_create builds a formatter", formatter
+
+    Note: Format with options=0 (defaults). The formatted_error struct stores the
+    Note: rendered message string at offset 16.
+    Let formatted be proc error_formatter_format_error from Formatter with formatter, error_info, 0, arena
+    proc assert_not_null from TestUtils with results, "format_error produces a formatted error", formatted
+
+    Let rendered_message be proc memory_get_qword from Memory with formatted, 16
+    proc assert_not_null from TestUtils with results, "formatted error carries a rendered message", rendered_message
+
+    Note: The original message text must survive into the rendered output (it may
+    Note: be wrapped in color codes, so assert containment rather than equality).
+    Let contains_message be proc string_index_of from StringPrimitive with rendered_message, "unexpected token ';'"
+    proc assert_greater_than_or_equal from TestUtils with results, "rendered output contains original message", contains_message, 0
+
+    Note: ---- 2. Source map position round-trip ----
+    Let src_file be proc create_from_literal from StringCore with "input.runa"
+    Let gen_file be proc create_from_literal from StringCore with "output.s"
+    Let smap be proc source_map_create from SourceMap with src_file, gen_file, arena
+    proc assert_not_null from TestUtils with results, "source_map_create builds a map", smap
+
+    Note: Map source line 10 col 5 -> generated line 2 col 8. add_mapping returns
+    Note: the new mapping's id; the first mapping in a fresh map has id 0, so a
+    Note: valid result is any non-negative id.
+    Let add_rc be proc source_map_add_mapping from SourceMap with smap, 10, 5, 2, 8, arena
+    proc assert_greater_than_or_equal from TestUtils with results, "add_mapping returns a valid mapping id", add_rc, 0
+
+    Note: Look up the source position for the generated position; expect 10:5.
+    Let found_loc be proc source_map_lookup_source from SourceMap with smap, 2, 8, arena
+    proc assert_not_null from TestUtils with results, "lookup_source finds the mapping", found_loc
+    Let found_line be proc memory_get_qword from Memory with found_loc, 0
+    Let found_col be proc memory_get_qword from Memory with found_loc, 8
+    proc assert_equal from TestUtils with results, "round-trip source line is 10", found_line, 10
+    proc assert_equal from TestUtils with results, "round-trip source column is 5", found_col, 5
+
+    Note: ---- 3. Base64-VLQ encoding emits real mappings ----
+    Let json be proc source_map_encode from SourceMap with smap, SOURCE_MAP_FORMAT_JSON, arena
+    proc assert_not_null from TestUtils with results, "JSON encode produces output", json
+
+    Note: The document must declare version 3 and a non-empty mappings field.
+    Let version_at be proc string_index_of from StringPrimitive with json, "\"version\":3"
+    proc assert_greater_than_or_equal from TestUtils with results, "encoded JSON declares version 3", version_at, 0
+
+    Note: An empty mappings field would render as "mappings":"" — assert the
+    Note: encoder produced actual VLQ characters between the quotes by locating
+    Note: the field and checking the byte after the opening quote is not the
+    Note: closing quote.
+    Let mappings_at be proc string_index_of from StringPrimitive with json, "\"mappings\":\""
+    proc assert_greater_than_or_equal from TestUtils with results, "encoded JSON has a mappings field", mappings_at, 0
+    Let value_start be mappings_at plus 12
+    Let first_vlq_byte be proc memory_get_byte from Memory with json, value_start
+    proc assert_not_equal from TestUtils with results, "mappings field is non-empty VLQ", first_vlq_byte, 34
+
+    Note: Decode the JSON back and confirm the version field round-trips to 3.
+    Let decoded be proc source_map_decode from SourceMap with json, SOURCE_MAP_FORMAT_JSON, arena
+    proc assert_not_null from TestUtils with results, "JSON decode rebuilds a map", decoded
+    Let decoded_version be proc memory_get_qword from Memory with decoded, 0
+    proc assert_equal from TestUtils with results, "decoded version is 3", decoded_version, 3
+
+    Note: ---- 4. Recovery scenario: build + tear down an error context ----
+    Let ctx be proc error_context_create from ErrorContext with error_info, CONTEXT_TYPE_SYNTAX, arena
+    proc assert_not_null from TestUtils with results, "error_context_create builds a context", ctx
+    proc error_context_destroy from ErrorContext with ctx
+
+    proc print_summary from TestUtils with results
+    Let ok be proc all_passed from TestUtils with results
+    If ok is equal to 1:
+        Return 0
+    End If
+    Return 1
+End Process

@@ -350,11 +350,11 @@ Process called "symbol_table_add_symbol" takes table as Integer, name as String,
         Return 0
     End If
 
-    Note: Check for duplicate symbol in current scope
+    Note: Check for an existing binding of this name (innermost currently visible)
     Let existing be proc hashtable_get from HashTable with symbols_table, name
 
     If existing is not equal to 0:
-        Note: Symbol already exists - check if same scope
+        Note: Symbol already exists - check if same scope (duplicate declaration)
         Let existing_scope be proc memory_get_qword from Memory with existing, 16
         If existing_scope is equal to scope_level:
             Return 0  Note: Duplicate symbol in same scope
@@ -386,7 +386,7 @@ Process called "symbol_table_add_symbol" takes table as Integer, name as String,
     proc memory_set_qword from Memory with symbol, 40, column               Note: column_number
     proc memory_set_qword from Memory with symbol, 48, 0                    Note: type_info (NULL)
     proc memory_set_qword from Memory with symbol, 56, 0                    Note: ownership_info (NULL)
-    proc memory_set_qword from Memory with symbol, 64, 0                    Note: parent_scope (NULL)
+    proc memory_set_qword from Memory with symbol, 64, existing             Note: shadowed (prior same-name binding, or 0)
     proc memory_set_qword from Memory with symbol, 72, 0                    Note: children (NULL)
     proc memory_set_qword from Memory with symbol, 80, 0                    Note: metadata (NULL)
     proc memory_set_qword from Memory with symbol, 88, 0                    Note: is_initialized (false)
@@ -461,76 +461,33 @@ Process called "symbol_table_lookup_symbol" takes table as Integer, name as Stri
     Note: Get current scope (offset 16)
     Let current_scope be proc memory_get_qword from Memory with table, 16
 
-    Note: Search for symbol by name in hashtable
-    Note: The hashtable stores symbols by name, but multiple symbols with same name
-    Note: can exist in different scopes. We need to find the most recent one
-    Note: that is visible from the current scope.
+    Note: The hashtable is keyed by name and always holds the INNERMOST binding
+    Note: for each name (add_symbol chains any prior binding via the shadowed link
+    Note: at Symbol offset 64, and exit_scope restores the shadowed binding when its
+    Note: scope is left). Walking that chain yields, in nesting order, every binding
+    Note: of this name that is still on the active scope stack.
 
-    Note: First, try direct hashtable lookup for exact name match
     Let symbol be proc hashtable_get from HashTable with symbols_table, name
 
-    If symbol is not equal to 0:
-        Note: Found a symbol with this name
-        Note: Check if this symbol is visible from current scope
-        Let symbol_scope be proc memory_get_qword from Memory with symbol, 16
-
-        Note: A symbol is visible if its scope_level <= current_scope
-        Note: This implements proper lexical scoping
-        If symbol_scope is less than or equal to current_scope:
-            Return symbol
-        End If
+    If symbol is equal to 0:
+        Return 0  Note: No binding of this name anywhere
     End If
 
-    Note: Direct lookup failed, need to search for symbol in parent scopes
-    Note: Iterate through all symbols to find best match
-    Note: This handles shadowing: inner scope symbols override outer scope symbols
-
-    Let entries be proc memory_get_qword from Memory with symbols_table, 0
-    Let capacity be proc memory_get_qword from Memory with symbols_table, 8
-
-    Let HASHTABLE_ENTRY_SIZE be 32
-    Let ENTRY_STATE_OCCUPIED be 1
-
-    Note: Track the best matching symbol (closest scope to current)
-    Let best_symbol be 0
-    Let best_scope_distance be 9999999  Note: Large number for comparison
-
-    Let i be 0
-    While i is less than capacity:
-        Let entry_offset be i multiplied by HASHTABLE_ENTRY_SIZE
-        Let entry_ptr be entries plus entry_offset
-        Let state be proc memory_get_qword from Memory with entry_ptr, 0
-
-        If state is equal to ENTRY_STATE_OCCUPIED:
-            Note: Get key and value from entry
-            Let key_ptr be proc memory_get_qword from Memory with entry_ptr, 16
-            Let value_ptr be proc memory_get_qword from Memory with entry_ptr, 24
-
-            Note: Compare key with search name
-            Let keys_match be proc string_equals from StringCore with key_ptr, name
-
-            If keys_match is equal to 1:
-                Note: Found a symbol with matching name
-                Let candidate_scope be proc memory_get_qword from Memory with value_ptr, 16
-
-                Note: Check if visible from current scope
-                If candidate_scope is less than or equal to current_scope:
-                    Note: Calculate scope distance (closer is better)
-                    Let scope_distance be current_scope minus candidate_scope
-
-                    Note: If this is closer than best so far, use it
-                    If scope_distance is less than best_scope_distance:
-                        Set best_symbol to value_ptr
-                        Set best_scope_distance to scope_distance
-                    End If
-                End If
-            End If
+    Note: Walk the shadow chain and return the innermost binding that is visible
+    Note: from the current scope. A binding is visible if its scope_level is <=
+    Note: the current scope (an ancestor scope or the current scope). The chain is
+    Note: ordered innermost-first, so the first visible binding is the correct one.
+    Let candidate be symbol
+    While candidate is not equal to 0:
+        Let candidate_scope be proc memory_get_qword from Memory with candidate, 16
+        If candidate_scope is less than or equal to current_scope:
+            Return candidate
         End If
-
-        Set i to i plus 1
+        Note: Inner binding is out of scope; fall through to its shadowed binding
+        Set candidate to proc memory_get_qword from Memory with candidate, 64
     End While
 
-    Return best_symbol
+    Return 0
 End Process
 
 Process called "symbol_table_enter_scope" takes table as Integer, scope_type as Integer, start_line as Integer returns Integer:
@@ -666,8 +623,69 @@ Process called "symbol_table_exit_scope" takes table as Integer returns Nothing:
         Return  Note: No scope to exit (already at global)
     End If
 
-    Note: Get parent_scope from scope_info (offset 8)
+    Note: Get the exited scope's own id (offset 0) and its parent (offset 8)
+    Let exited_scope_id be proc memory_get_qword from Memory with scope_info, 0
     Let parent_scope be proc memory_get_qword from Memory with scope_info, 8
+
+    Note: Restore shadowed bindings: any symbol whose innermost binding belongs to
+    Note: the scope being left must be removed and its shadowed (outer) binding
+    Note: reinstated as the active binding for that name. This keeps the name-keyed
+    Note: hashtable holding exactly the innermost ACTIVE binding per name.
+    Let symbols_table be proc memory_get_qword from Memory with table, 0
+
+    If symbols_table is not equal to 0:
+        Let entries be proc memory_get_qword from Memory with symbols_table, 0
+        Let capacity be proc memory_get_qword from Memory with symbols_table, 8
+
+        Let HASHTABLE_ENTRY_SIZE be 32
+        Let ENTRY_STATE_OCCUPIED be 1
+
+        Let i be 0
+        While i is less than capacity:
+            Let entry_offset be i multiplied by HASHTABLE_ENTRY_SIZE
+            Let entry_ptr be entries plus entry_offset
+            Let state be proc memory_get_qword from Memory with entry_ptr, 0
+
+            If state is equal to ENTRY_STATE_OCCUPIED:
+                Note: HashTable entry layout: state@0, key@8, value@16, hash@24
+                Let name_ptr be proc memory_get_qword from Memory with entry_ptr, 8
+                Let bound_symbol be proc memory_get_qword from Memory with entry_ptr, 16
+                Let bound_scope be proc memory_get_qword from Memory with bound_symbol, 16
+
+                If bound_scope is equal to exited_scope_id:
+                    Note: This binding's scope is being left; reinstate the shadow
+                    Let shadowed be proc memory_get_qword from Memory with bound_symbol, 64
+
+                    Note: Symbol being released no longer holds an outer link
+                    proc memory_set_qword from Memory with bound_symbol, 64, 0
+
+                    If shadowed is equal to 0:
+                        Note: No outer binding remains; delete the name entry
+                        proc hashtable_delete from HashTable with symbols_table, name_ptr
+                    Otherwise:
+                        Note: Reinstate the outer binding as the active value
+                        proc hashtable_set from HashTable with symbols_table, name_ptr, shadowed
+                    End If
+
+                    Note: Account for the symbol leaving the live symbol count
+                    Let symbol_count be proc memory_get_qword from Memory with table, 24
+                    If symbol_count is greater than 0:
+                        Set symbol_count to symbol_count minus 1
+                        proc memory_set_qword from Memory with table, 24, symbol_count
+                    End If
+
+                    Note: Release the owned symbol name and structure
+                    Let released_name be proc memory_get_qword from Memory with bound_symbol, 0
+                    If released_name is not equal to 0:
+                        proc deallocate from Layout with released_name
+                    End If
+                    proc deallocate from Layout with bound_symbol
+                End If
+            End If
+
+            Set i to i plus 1
+        End While
+    End If
 
     Note: Update current_scope to parent (offset 16)
     proc memory_set_qword from Memory with table, 16, parent_scope
@@ -763,9 +781,9 @@ Process called "symbol_table_get_symbols_in_scope" takes table as Integer, scope
 
     Note: HashTable entry structure (32 bytes):
     Note:   offset 0:  state (8 bytes) - 0=empty, 1=occupied, 2=deleted
-    Note:   offset 8:  hash (8 bytes)
-    Note:   offset 16: key (8 bytes) - pointer to key string
-    Note:   offset 24: value (8 bytes) - pointer to symbol
+    Note:   offset 8:  key (8 bytes) - pointer to key string
+    Note:   offset 16: value (8 bytes) - pointer to symbol
+    Note:   offset 24: hash (8 bytes)
     Let HASHTABLE_ENTRY_SIZE be 32
     Let ENTRY_STATE_OCCUPIED be 1
 
@@ -777,8 +795,8 @@ Process called "symbol_table_get_symbols_in_scope" takes table as Integer, scope
         Let state be proc memory_get_qword from Memory with entry_ptr, 0
 
         If state is equal to ENTRY_STATE_OCCUPIED:
-            Note: Get symbol pointer from entry value field (offset 24)
-            Let symbol_ptr be proc memory_get_qword from Memory with entry_ptr, 24
+            Note: Get symbol pointer from entry value field (offset 16)
+            Let symbol_ptr be proc memory_get_qword from Memory with entry_ptr, 16
 
             Note: Get scope_level from symbol (offset 16 in Symbol structure)
             Let symbol_scope_level be proc memory_get_qword from Memory with symbol_ptr, 16
@@ -1097,7 +1115,7 @@ Process called "symbol_table_release_borrow" takes table as Integer, borrow_id a
 
     If ownership_info is equal to 0:
         Note: Remove from registry even if no ownership info
-        proc hashtable_remove from HashTable with borrow_registry, borrow_id
+        proc hashtable_delete from HashTable with borrow_registry, borrow_id
         Return
     End If
 
@@ -1115,7 +1133,7 @@ Process called "symbol_table_release_borrow" takes table as Integer, borrow_id a
     End If
 
     Note: Remove borrow from registry
-    proc hashtable_remove from HashTable with borrow_registry, borrow_id
+    proc hashtable_delete from HashTable with borrow_registry, borrow_id
 
     Return
 End Process

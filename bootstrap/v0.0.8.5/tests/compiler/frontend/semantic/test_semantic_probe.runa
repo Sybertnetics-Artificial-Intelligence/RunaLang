@@ -1,0 +1,172 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+End-to-end probe of the v0.0.8.5 modular SEMANTIC subsystem (task #491).
+
+This test drives the real semantic passes and asserts their behavior rather than
+their mere existence:
+
+  symbol insert + lookup       -> symbol_table_add_symbol / symbol_table_lookup_symbol
+  scope nesting + shadowing    -> symbol_table_enter_scope / exit_scope, inner binding
+                                  shadows the outer one then the outer one is restored
+  duplicate-symbol detection   -> symbol_table_add_symbol rejects a same-scope redecl
+  type-check ACCEPT            -> type_checker_check_compatibility exact + coercion
+  type-check REJECT            -> type_checker_check_compatibility incompatible kinds
+  pattern binding              -> collect_pattern_bindings records an identifier pattern
+
+The Type structures are the minimal shape the type checker reads: type_id at
+offset 0 and type_kind at offset 8 (see type_checker.runa check_compatibility).
+The Symbol scope field lives at offset 16 and the symbol table tracks the active
+scope id at table offset 16; add_symbol is therefore called with the current
+scope id as its scope_level so the two number spaces agree (the convention shared
+with scope_analyzer, which keeps its scope id in lockstep with the table's).
+:End Note
+
+Import "compiler/frontend/semantic/symbol_table.runa" as SymbolTable
+Import "compiler/frontend/semantic/scope_analyzer.runa" as ScopeAnalyzer
+Import "compiler/frontend/semantic/type_checker.runa" as TypeChecker
+Import "compiler/frontend/semantic/pattern_analyzer.runa" as PatternAnalyzer
+Import "compiler/frontend/parsing/ast.runa" as AST
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/memory/layout.runa" as Memory
+Import "compiler/frontend/primitives/collections/hashtable.runa" as HashTable
+Import "runtime/core/memory/arena.runa" as Arena
+Import "tests/test_utils.runa" as TestUtils
+
+Note: Symbol type and basic type-kind constants (mirrored from the modules under
+Note: test for readability; the modules remain the single source of truth).
+Constant SYMBOL_TYPE_VARIABLE as Integer is 1
+Constant TYPE_KIND_INTEGER as Integer is 1
+Constant TYPE_KIND_FLOAT as Integer is 2
+Constant TYPE_KIND_STRING as Integer is 3
+Constant AST_IDENTIFIER_PATTERN as Integer is 5000
+
+Note: Build a minimal Type record: type_id at offset 0, type_kind at offset 8.
+Process called "make_type" takes type_id as Integer, type_kind as Integer returns Integer:
+    Let t be proc allocate from Layout with 160
+    If t is equal to 0:
+        Return 0
+    End If
+    proc memory_set_qword from Memory with t, 0, type_id
+    proc memory_set_qword from Memory with t, 8, type_kind
+    Return t
+End Process
+
+Note: Build an identifier pattern node carrying the given name in its value field.
+Process called "make_identifier_pattern" takes name as Integer returns Integer:
+    Let node be proc create_ast_node from AST with AST_IDENTIFIER_PATTERN, 1, 1
+    If node is equal to 0:
+        Return 0
+    End If
+    proc ast_node_set_value from AST with node, name, 0
+    Return node
+End Process
+
+Process called "main" returns Integer:
+    Let results be proc create_test_results from TestUtils
+    proc begin_suite from TestUtils with results, "semantic_subsystem_probe"
+
+    Let arena be proc arena_create from Arena with 65536
+    proc assert_not_null from TestUtils with results, "analysis arena builds", arena
+
+    Note: ---- Symbol table: create ----
+    Let table be proc symbol_table_create from SymbolTable with arena
+    proc assert_not_null from TestUtils with results, "symbol table builds", table
+
+    Note: ---- Insert + lookup in the global scope (scope id 0) ----
+    Let name_x be "x"
+    Let sym_x be proc symbol_table_add_symbol from SymbolTable with table, name_x, SYMBOL_TYPE_VARIABLE, 0, 10, 1
+    proc assert_not_null from TestUtils with results, "global x inserted", sym_x
+
+    Let found_x be proc symbol_table_lookup_symbol from SymbolTable with table, name_x, arena
+    proc assert_equal from TestUtils with results, "lookup finds the inserted x", found_x, sym_x
+
+    Note: A name that was never declared must not be found.
+    Let missing be proc symbol_table_lookup_symbol from SymbolTable with table, "nope", arena
+    proc assert_equal from TestUtils with results, "undeclared name not found", missing, 0
+
+    Note: ---- Duplicate-symbol detection in the same scope ----
+    Let dup be proc symbol_table_add_symbol from SymbolTable with table, name_x, SYMBOL_TYPE_VARIABLE, 0, 11, 1
+    proc assert_equal from TestUtils with results, "duplicate x in same scope rejected", dup, 0
+
+    Note: ---- Scope nesting + shadowing ----
+    Let inner_scope be proc symbol_table_enter_scope from SymbolTable with table, 2, 12
+    proc assert_true from TestUtils with results, "entered an inner scope", inner_scope
+
+    Note: Declaring x in the inner scope shadows the global x (not a duplicate).
+    Let inner_x be proc symbol_table_add_symbol from SymbolTable with table, name_x, SYMBOL_TYPE_VARIABLE, inner_scope, 13, 1
+    proc assert_not_null from TestUtils with results, "inner x inserted (shadows global)", inner_x
+
+    Note: From the inner scope, lookup must resolve to the inner binding.
+    Let inner_found be proc symbol_table_lookup_symbol from SymbolTable with table, name_x, arena
+    proc assert_equal from TestUtils with results, "inner lookup sees inner x", inner_found, inner_x
+
+    Note: Leaving the scope restores the outer binding.
+    proc symbol_table_exit_scope from SymbolTable with table
+    Let outer_again be proc symbol_table_lookup_symbol from SymbolTable with table, name_x, arena
+    proc assert_equal from TestUtils with results, "after exit, lookup sees global x again", outer_again, sym_x
+
+    Note: ---- Type checker: ACCEPT cases ----
+    Let scope_analyzer be proc scope_analyzer_create from ScopeAnalyzer with table, arena
+    proc assert_not_null from TestUtils with results, "scope analyzer builds", scope_analyzer
+
+    Let checker be proc type_checker_create from TypeChecker with table, scope_analyzer, arena
+    proc assert_not_null from TestUtils with results, "type checker builds", checker
+
+    Note: Identical type ids = exact match (compatibility level 3).
+    Let int_a be proc make_type with 100, TYPE_KIND_INTEGER
+    Let int_b be proc make_type with 100, TYPE_KIND_INTEGER
+    Let exact be proc type_checker_check_compatibility from TypeChecker with checker, int_a, int_b, arena
+    proc assert_equal from TestUtils with results, "Integer vs Integer is exact (3)", exact, 3
+
+    Note: Integer (kind 1) coerces to Float (kind 2) = level 2.
+    Let int_c be proc make_type with 101, TYPE_KIND_INTEGER
+    Let flt be proc make_type with 102, TYPE_KIND_FLOAT
+    Let coerce be proc type_checker_check_compatibility from TypeChecker with checker, int_c, flt, arena
+    proc assert_equal from TestUtils with results, "Integer coerces to Float (2)", coerce, 2
+
+    Note: ---- Type checker: REJECT case ----
+    Note: String (kind 3) and Integer (kind 1) share no compatibility relation.
+    Let str_t be proc make_type with 103, TYPE_KIND_STRING
+    Let int_d be proc make_type with 104, TYPE_KIND_INTEGER
+    Let incompatible be proc type_checker_check_compatibility from TypeChecker with checker, str_t, int_d, arena
+    proc assert_equal from TestUtils with results, "String vs Integer is incompatible (0)", incompatible, 0
+
+    Note: ---- Pattern binding ----
+    Let pattern_analyzer be proc create_pattern_analyzer from PatternAnalyzer with checker, table, scope_analyzer
+    proc assert_not_null from TestUtils with results, "pattern analyzer builds", pattern_analyzer
+
+    Let pattern be proc make_identifier_pattern with "y"
+    proc assert_not_null from TestUtils with results, "identifier pattern builds", pattern
+
+    Note: collect_pattern_bindings records the binding into a name-keyed hashtable.
+    Let bm be proc hashtable_create from HashTable
+    proc assert_not_null from TestUtils with results, "binding map builds", bm
+
+    Let collect_ok be proc collect_pattern_bindings from PatternAnalyzer with pattern_analyzer, pattern, bm
+    proc assert_equal from TestUtils with results, "identifier pattern binding collected", collect_ok, 1
+
+    Note: The collected binding must be retrievable from the map by its name.
+    Let bound be proc hashtable_has from HashTable with bm, "y"
+    proc assert_equal from TestUtils with results, "binding 'y' recorded in map", bound, 1
+
+    proc print_summary from TestUtils with results
+    Let failed be proc get_failed from TestUtils with results
+    proc destroy_test_results from TestUtils with results
+
+    Return failed
+End Process

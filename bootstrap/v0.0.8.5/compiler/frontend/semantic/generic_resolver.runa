@@ -161,10 +161,10 @@ Process called "generic_resolver_create" takes type_checker as Integer, symbol_t
     Let resolver be proc allocate from Layout with resolver_size
 
     Note: Create HashTable for generic registry
-    Let registry be proc create from HashTable with 256
+    Let registry be proc hashtable_create from HashTable with 256
 
     Note: Create HashTable for instantiation cache
-    Let cache be proc create from HashTable with 512
+    Let cache be proc hashtable_create from HashTable with 512
 
     proc memory_set_qword from Memory with resolver, 0, type_checker
     proc memory_set_qword from Memory with resolver, 8, symbol_table
@@ -213,13 +213,13 @@ Process called "generic_resolver_destroy" takes resolver as Integer returns Noth
     Note: Get and destroy generic registry
     Let registry be proc memory_get_qword from Memory with resolver, 16
     If registry is not equal to 0:
-        proc destroy from HashTable with registry
+        proc hashtable_destroy from HashTable with registry
     End If
 
     Note: Get and destroy instantiation cache
     Let cache be proc memory_get_qword from Memory with resolver, 40
     If cache is not equal to 0:
-        proc destroy from HashTable with cache
+        proc hashtable_destroy from HashTable with cache
     End If
 
     Note: Free resolver structure
@@ -271,7 +271,7 @@ Process called "generic_resolver_register_generic_type" takes resolver as Intege
     proc memory_set_qword from Memory with entry, 24, constraints
 
     Note: Add to registry
-    Let set_result be proc set from HashTable with registry, type_name, entry
+    Let set_result be proc hashtable_set from HashTable with registry, type_name, entry
 
     Return new_type_id
 End Process
@@ -327,7 +327,7 @@ Process called "generic_resolver_resolve_generic_type" takes resolver as Integer
 
     Note: Check cache for existing resolution
     Let cache_key be generic_type
-    Let cached_result be proc get from HashTable with cache, cache_key
+    Let cached_result be proc hashtable_get from HashTable with cache, cache_key
     If cached_result is not equal to 0:
         Note: Increment cache hits
         Let cache_hits be proc memory_get_qword from Memory with resolver, 80
@@ -355,7 +355,7 @@ Process called "generic_resolver_resolve_generic_type" takes resolver as Integer
 
     Note: Add to cache
     If resolved_type is not equal to 0:
-        proc set from HashTable with cache, cache_key, resolved_type
+        proc hashtable_set from HashTable with cache, cache_key, resolved_type
     End If
 
     Note: Decrement resolution depth
@@ -395,19 +395,85 @@ Process called "generic_resolver_instantiate_generic" takes resolver as Integer,
 
     Let cache be proc memory_get_qword from Memory with resolver, 40
 
+    Note: Look up the registered generic entry so we can bind its declared type
+    Note: parameters to the supplied concrete type arguments. The entry stores
+    Note: its parameter list at offset 16 and constraints at offset 24.
+    Let registry be proc memory_get_qword from Memory with resolver, 16
+    Let generic_entry be proc hashtable_get from HashTable with registry, generic_type
+
+    Note: Determine declared parameter count and supplied argument count
+    Let parameters be 0
+    Let parameter_count be 0
+    If generic_entry is not equal to 0:
+        Set parameters to proc memory_get_qword from Memory with generic_entry, 16
+        If parameters is not equal to 0:
+            Set parameter_count to proc size from List with parameters
+        End If
+    End If
+
+    Let argument_count be 0
+    If type_arguments is not equal to 0:
+        Set argument_count to proc size from List with type_arguments
+    End If
+
+    Note: Arity check: a known generic must receive exactly as many type
+    Note: arguments as it declares parameters. Reject mismatches.
+    If generic_entry is not equal to 0:
+        If parameter_count is not equal to argument_count:
+            Return 0
+        End If
+    End If
+
+    Note: Build the substitution map: one (parameter, argument) pair per declared
+    Note: parameter, each pair being 16 bytes (parameter type at 0, concrete type
+    Note: argument at 8). This is the concrete binding the rest of the pipeline
+    Note: applies when lowering the instantiated type. The map is owned by the
+    Note: instantiation record.
+    Let bindings be 0
+    If parameter_count is greater than 0:
+        Let bindings_size be parameter_count multiplied by 16
+        Set bindings to proc allocate from Layout with bindings_size
+
+        If bindings is equal to 0:
+            Return 0
+        End If
+
+        Let pair_index be 0
+        While pair_index is less than parameter_count:
+            Let parameter_type be proc get from List with parameters, pair_index
+            Let argument_type be proc get from List with type_arguments, pair_index
+
+            Let pair_offset be pair_index multiplied by 16
+            Let pair_ptr be bindings plus pair_offset
+            proc memory_set_qword from Memory with pair_ptr, 0, parameter_type
+            proc memory_set_qword from Memory with pair_ptr, 8, argument_type
+
+            Set pair_index to pair_index plus 1
+        End While
+    End If
+
     Note: Generate unique instantiation ID
     Let resolution_count be proc memory_get_qword from Memory with resolver, 72
     Let instantiation_id be resolution_count plus 1000
 
     Note: Create GenericInstantiation structure (72 bytes: 9 fields)
+    Note: 0=id, 8=generic_type, 16=type_arguments, 24=bindings map,
+    Note: 32=binding count, 40=resolved_type, 48=is_complete, 56/64 reserved
     Let instantiation_size be 72
     Let instantiation be proc allocate from Layout with instantiation_size
+
+    If instantiation is equal to 0:
+        If bindings is not equal to 0:
+            proc deallocate from Layout with bindings
+        End If
+        Return 0
+    End If
 
     proc memory_set_qword from Memory with instantiation, 0, instantiation_id
     proc memory_set_qword from Memory with instantiation, 8, generic_type
     proc memory_set_qword from Memory with instantiation, 16, type_arguments
-    proc memory_set_qword from Memory with instantiation, 24, 0
-    proc memory_set_qword from Memory with instantiation, 32, 0
+    proc memory_set_qword from Memory with instantiation, 24, bindings
+    proc memory_set_qword from Memory with instantiation, 32, parameter_count
     proc memory_set_qword from Memory with instantiation, 40, generic_type
     proc memory_set_qword from Memory with instantiation, 48, 1
     proc memory_set_qword from Memory with instantiation, 56, 0
@@ -415,7 +481,7 @@ Process called "generic_resolver_instantiate_generic" takes resolver as Integer,
 
     Note: Add to instantiation cache
     Let cache_key be instantiation_id
-    proc set from HashTable with cache, cache_key, instantiation
+    proc hashtable_set from HashTable with cache, cache_key, instantiation
 
     Return instantiation
 End Process
@@ -558,7 +624,7 @@ Process called "generic_resolver_unify_types" takes resolver as Integer, type1 a
     proc memory_set_qword from Memory with result, 8, 0
     proc memory_set_qword from Memory with result, 16, 0
     proc memory_set_qword from Memory with result, 24, 0
-    Let error_msg be proc string_create_static from StringCore with "Type unification failed"
+    Let error_msg be proc create_from_literal from StringCore with "Type unification failed"
     proc memory_set_qword from Memory with result, 32, error_msg
     proc memory_set_qword from Memory with result, 40, 0
 
@@ -694,7 +760,7 @@ Process called "generic_resolver_validate_constraints" takes resolver as Integer
     Let registry be proc memory_get_qword from Memory with resolver, 16
 
     Note: Extract constraints from generic_type by looking it up in registry
-    Let generic_entry be proc get from HashTable with registry, generic_type
+    Let generic_entry be proc hashtable_get from HashTable with registry, generic_type
 
     If generic_entry is equal to 0:
         Note: Generic type not found in registry
