@@ -59,6 +59,11 @@ Import "compiler/middle/analysis/alias_analysis.runa" as AliasAnalysis
 Import "compiler/middle/analysis/points_to.runa" as PointsTo
 Import "compiler/middle/lto/whole_program_analysis.runa" as WholeProgramAnalysis
 Import "compiler/middle/lto/cross_module_optimization.runa" as CrossModuleOptimization
+Import "compiler/middle/gungnir/mir/optimizations/sccp.runa" as SCCP
+Import "compiler/middle/gungnir/mir/optimizations/copy_prop.runa" as CopyProp
+Import "compiler/middle/gungnir/mir/optimizations/dce.runa" as DCE
+Import "compiler/middle/gungnir/mir/optimizations/strength_reduction.runa" as StrengthReduction
+Import "compiler/middle/gungnir/mir/optimizations/tail_call.runa" as TailCall
 Import "compiler/frontend/primitives/memory/layout.runa" as Layout
 Import "compiler/frontend/primitives/core/memory_core.runa" as MemoryCore
 Import "compiler/frontend/primitives/collections/list.runa" as List
@@ -931,254 +936,36 @@ This is a critical optimization that enables other passes.
 @End Reasoning
 
 Process called "eliminate_dead_code" that takes ctx as Integer returns Integer:
+    Note: Dead code elimination. Collapsed (#486) to delegate to the canonical
+    Note: modular pass optimizations/dce.runa (the CFG-taking mark-sweep core
+    Note: optimize_aggressive_dce; the run_aggressive_dce_pass wrapper expects a
+    Note: mir_optimizer OptimizerContext, not this transformations context, so
+    Note: we call the core directly). The standalone is strictly more correct
+    Note: than the former inline copy: its critical-instruction classifier adds
+    Note: STORE_FIELD (20204 - a memory write the inline would have wrongly
+    Note: deleted), DIV/MOD (20005/20006 - trapping ops that must survive even
+    Note: when their result is dead), and the DEBUG band (20800-20804), and it
+    Note: marks the CALL_INDIRECT callee (ext@80) as a live use - all of which
+    Note: the inline omitted. It builds its own def map from the CFG (value id
+    Note: -> defining instruction), so the ctx use-def chains are not consulted;
+    Note: we hand it only the CFG. It returns the count of instructions
+    Note: eliminated and re-syncs each block's instruction_count cache itself.
     Let cfg be proc memory_get_int64 from MemoryCore with ctx, 8
-    Let blocks be proc get_mir_cfg_blocks from CFG with cfg
-    Let block_count be proc length from List with blocks
+    Let removed_count be proc optimize_aggressive_dce from DCE with cfg
 
-    Note: Create worklist of live instructions
-    Let worklist be proc list_create from List
-
-    Note: Create set of marked live instructions
-    Let live_instructions be proc omap_create from OrderedMap
-
-    Note: Mark phase: find initially live instructions
-    Let i be 0
-    While i is less than block_count:
-        Let block be proc list_get from List with blocks, i
-        Let instructions be proc get_block_instructions from MIR with block
-        Let inst_count be proc length from List with instructions
-
-        Let j be 0
-        While j is less than inst_count:
-            Let inst be proc list_get from List with instructions, j
-            Let opcode be proc get_mir_node_opcode from MIR with inst
-
-            Note: Instructions with side effects are always live. Volatile
-            Note: loads are critical too: MIRLoad keeps is_volatile at
-            Note: extended offset 104, and a volatile load must never be
-            Note: dead-code eliminated.
-            Let is_critical be is_critical_instruction(opcode)
-            If is_critical is equal to 0:
-                If opcode is equal to 20200:
-                    Let load_is_volatile be proc memory_get_int64 from MemoryCore with inst, 104
-                    If load_is_volatile is not equal to 0:
-                        Set is_critical to 1
-                    End If
-                End If
-            End If
-            If is_critical is equal to 1:
-                proc omap_set from OrderedMap with live_instructions, inst, 1
-                proc append from List with worklist, inst
-            End If
-
-            Set j to j plus 1
-        End While
-
-        Set i to i plus 1
-    End While
-
-    Note: Propagate liveness backwards through use-def chains
-    Let use_def_chains be proc memory_get_int64 from MemoryCore with ctx, 48
-
-    While proc length from List with worklist is greater than 0:
-        Let live_inst be proc list_remove from List with worklist, 0
-
-        Note: Mark all operands' defining instructions as live
-        mark_operands_live(live_inst, use_def_chains, live_instructions, worklist)
-    End While
-
-    Note: Sweep phase: remove dead instructions
-    Let removed_count be 0
-
-    Set i to 0
-    While i is less than block_count:
-        Set block to proc list_get from List with blocks, i
-        Set instructions to proc get_block_instructions from MIR with block
-        Set inst_count to proc length from List with instructions
-
-        Note: Iterate backwards to safely remove
-        Set j to inst_count minus 1
-        While j is greater than or equal to 0:
-            Set inst to proc list_get from List with instructions, j
-            Let is_live be proc omap_get from OrderedMap with live_instructions, inst
-
-            If is_live is equal to 0:
-                Note: Instruction is dead, remove it
-                proc list_remove from List with instructions, j
-                Set removed_count to removed_count plus 1
-            End If
-
-            Set j to j minus 1
-        End While
-
-        Note: Re-sync the block's cached instruction_count (offset 24)
-        Note: with the instruction List after removals
-        Let remaining be proc length from List with instructions
-        proc memory_set_int64 from MemoryCore with block, 24, remaining
-
-        Set i to i plus 1
-    End While
-
-    Note: Update statistics
+    Note: Accumulate the eliminated count into the shared statistics struct
+    Note: (offset 0 = dead-code-eliminated counter) so print_optimization_statistics
+    Note: still reports the pass's work.
     Let statistics be proc memory_get_int64 from MemoryCore with ctx, 120
     Let current_dce be proc memory_get_int32 from MemoryCore with statistics, 0
     proc memory_set_int32 from MemoryCore with statistics, 0, current_dce plus removed_count
 
-    Note: Return 1 if any instructions were removed
     If removed_count is greater than 0:
         proc memory_set_int32 from MemoryCore with ctx, 80, 1
         Return 1
     End If
 
     Return 0
-End Process
-
-Note: ============================================================================
-Note: is_critical_instruction - Check if instruction has side effects
-Note: ============================================================================
-
-Process called "is_critical_instruction" that takes opcode as Integer returns Integer:
-    Note: MIR_STORE (20201) - writes to memory
-    If opcode is equal to 20201:
-        Return 1
-    End If
-
-    Note: MIR_RETURN (20303) - affects control flow
-    If opcode is equal to 20303:
-        Return 1
-    End If
-
-    Note: MIR_CALL (20304) - may have side effects
-    If opcode is equal to 20304:
-        Return 1
-    End If
-
-    Note: MIR_CALL_INDIRECT (20305) - may have side effects
-    If opcode is equal to 20305:
-        Return 1
-    End If
-
-    Note: MIR_BRANCH (20301) - affects control flow
-    If opcode is equal to 20301:
-        Return 1
-    End If
-
-    Note: MIR_JUMP (20302) - affects control flow
-    If opcode is equal to 20302:
-        Return 1
-    End If
-
-    Note: MIR_SWITCH (20306) - affects control flow
-    If opcode is equal to 20306:
-        Return 1
-    End If
-
-    Note: Atomic operations (20500-20511) - memory side effects and
-    Note: synchronization semantics; never dead
-    If opcode is greater than or equal to 20500 and opcode is less than or equal to 20511:
-        Return 1
-    End If
-
-    Note: MIR_VECTOR_STORE (20611) - writes to memory
-    If opcode is equal to 20611:
-        Return 1
-    End If
-
-    Note: Exception-handling band (20700-20706): INVOKE transfers control
-    Note: and may have callee side effects; LANDINGPAD / RESUME / THROW
-    Note: define the unwind path
-    If opcode is greater than or equal to 20700 and opcode is less than or equal to 20706:
-        Return 1
-    End If
-
-    Return 0
-End Process
-
-Note: ============================================================================
-Note: mark_operands_live - Mark defining instructions of operands as live
-Note: ============================================================================
-
-Process called "mark_operands_live" that takes inst as Integer, use_def_chains as Integer, live_instructions as Integer, worklist as Integer returns Integer:
-    Let opcode be proc get_mir_node_opcode from MIR with inst
-
-    Note: Canonical operand roles (OD-1): SSA value-id uses live in the
-    Note: header operand slots (16/24/32) for every instruction shape -
-    Note: LOAD address=operand1, STORE address=operand1 / value=operand2,
-    Note: RETURN value=operand1, BRANCH condition=operand1 - and phi uses
-    Note: live in the incoming pair List. The canonical collector covers
-    Note: all of those uniformly.
-    Let used_values be proc get_instruction_used_values from CFG with inst
-    If used_values is not equal to 0:
-        Let used_count be proc length from List with used_values
-        Let u be 0
-        While u is less than used_count:
-            Let used_value be proc list_get from List with used_values, u
-            mark_value_definition_live(used_value, use_def_chains, live_instructions, worklist)
-            Set u to u plus 1
-        End While
-        proc list_destroy from List with used_values
-    End If
-
-    Note: Call-family arguments live in the arguments List at extended
-    Note: offset 88 (MIR_CALL 20304, MIR_CALL_INDIRECT 20305,
-    Note: MIR_INVOKE 20700); their definitions must stay live as well
-    Let has_arg_list be 0
-    If opcode is equal to 20304:
-        Set has_arg_list to 1
-    End If
-    If opcode is equal to 20305:
-        Set has_arg_list to 1
-    End If
-    If opcode is equal to 20700:
-        Set has_arg_list to 1
-    End If
-
-    If has_arg_list is equal to 1:
-        Let arguments be proc get_call_arguments from MIRNodes with inst
-        If arguments is not equal to 0:
-            Let arg_count be proc length from List with arguments
-            Let a be 0
-            While a is less than arg_count:
-                Let arg_value be proc list_get from List with arguments, a
-                mark_value_definition_live(arg_value, use_def_chains, live_instructions, worklist)
-                Set a to a plus 1
-            End While
-        End If
-    End If
-
-    Return 1
-End Process
-
-Note: ============================================================================
-Note: mark_value_definition_live - Mark value's defining instruction as live
-Note: ============================================================================
-
-Process called "mark_value_definition_live" that takes value_id as Integer, use_def_chains as Integer, live_instructions as Integer, worklist as Integer returns Integer:
-    If value_id is equal to 0:
-        Return 0
-    End If
-
-    Note: Get use-def chain for this value
-    Let chain be proc omap_get from OrderedMap with use_def_chains, value_id
-
-    If chain is equal to 0:
-        Note: No definition (parameter or constant)
-        Return 0
-    End If
-
-    Note: Get defining instruction
-    Let defining_inst be proc memory_get_int64 from MemoryCore with chain, 8
-
-    Note: Check if already marked live
-    Let already_live be proc omap_get from OrderedMap with live_instructions, defining_inst
-
-    If already_live is equal to 0:
-        Note: Mark as live and add to worklist
-        proc omap_set from OrderedMap with live_instructions, defining_inst, 1
-        proc append from List with worklist, defining_inst
-    End If
-
-    Return 1
 End Process
 
 Note: ============================================================================
@@ -1449,429 +1236,26 @@ This is more powerful than simple constant folding as it considers control flow.
 @End Reasoning
 
 Process called "propagate_constants" that takes ctx as Integer returns Integer:
+    Note: Sparse conditional constant propagation. Collapsed (#486) to delegate
+    Note: to the canonical modular pass optimizations/sccp.runa, which is the
+    Note: single source of truth for the Wegman-Zadeck SCCP transform. The
+    Note: standalone is strictly more correct than the former inline copy: it
+    Note: adds the MIR_PHI (20300) lattice-meet arm the inline lacked AND folds
+    Note: constant conditional branches to unconditional jumps (removing the
+    Note: un-taken edge and the matching dead phi incoming), where the inline
+    Note: only replaced constant pure producers and physically removed
+    Note: unreachable blocks. The simplify_cfg pass that runs immediately after
+    Note: this in optimize_function collects the blocks the branch fold
+    Note: orphans, so the pipeline behavior is preserved. The standalone builds
+    Note: its own value-use map from the CFG (sparse re-enqueueing), so the
+    Note: ctx use_def_chains are not consulted - we hand it only the CFG.
     Let cfg be proc memory_get_int64 from MemoryCore with ctx, 8
-    Let blocks be proc get_mir_cfg_blocks from CFG with cfg
-    Let block_count be proc length from List with blocks
-    If block_count is equal to 0:
-        Return 0
-    End If
-
-    Note: Create lattice value map (0=UNKNOWN, 1=CONSTANT, 2=OVERDEFINED)
-    Let lattice_values be proc omap_create from OrderedMap
-
-    Note: Create constant value map
-    Let const_values be proc omap_create from OrderedMap
-
-    Note: Create reachable blocks set
-    Let reachable_blocks be proc omap_create from OrderedMap
-
-    Note: Create SSA value worklist
-    Let ssa_worklist be proc list_create from List
-
-    Note: Create CFG edge worklist
-    Let edge_worklist be proc list_create from List
-
-    Note: Add entry block to edge worklist (canonical entry slot at MIRCFG
-    Note: offset 0; fall back to the first registered block when the entry
-    Note: slot was never stamped)
-    Let entry_block be proc get_cfg_entry_block from MIR with cfg
-    If entry_block is equal to 0:
-        Set entry_block to proc list_get from List with blocks, 0
-    End If
-    proc append from List with edge_worklist, entry_block
-
-    Note: Initialize all SSA values to UNKNOWN (0)
-    initialize_lattice_values(ctx, lattice_values)
-
-    Note: Main worklist algorithm
-    While proc length from List with edge_worklist is greater than 0 or proc length from List with ssa_worklist is greater than 0:
-        Note: Process CFG edges
-        While proc length from List with edge_worklist is greater than 0:
-            Let block be proc list_remove from List with edge_worklist, 0
-
-            Note: Mark block as reachable
-            Let already_reachable be proc omap_get from OrderedMap with reachable_blocks, block
-            If already_reachable is equal to 0:
-                proc omap_set from OrderedMap with reachable_blocks, block, 1
-
-                Note: Add all instructions to SSA worklist
-                Let instructions be proc get_block_instructions from MIR with block
-                Let inst_count be proc length from List with instructions
-
-                Let j be 0
-                While j is less than inst_count:
-                    Let inst be proc list_get from List with instructions, j
-                    proc append from List with ssa_worklist, inst
-                    Set j to j plus 1
-                End While
-            End If
-        End While
-
-        Note: Process SSA values (terminators enqueue their reachable
-        Note: successor blocks onto edge_worklist; lattice transitions
-        Note: re-enqueue the changed value's uses onto ssa_worklist)
-        While proc length from List with ssa_worklist is greater than 0:
-            Set inst to proc list_remove from List with ssa_worklist, 0
-            evaluate_instruction_sccp(ctx, cfg, inst, lattice_values, const_values, edge_worklist, ssa_worklist)
-        End While
-    End While
-
-    Note: Replace constants and remove unreachable code
-    Let replaced_count be replace_constants_and_remove_unreachable(ctx, lattice_values, const_values, reachable_blocks)
-
-    Note: Update statistics
-    Let statistics be proc memory_get_int64 from MemoryCore with ctx, 120
-    Let current_propagated be proc memory_get_int32 from MemoryCore with statistics, 8
-    proc memory_set_int32 from MemoryCore with statistics, 8, current_propagated plus replaced_count
-
-    If replaced_count is greater than 0:
+    Let changed be proc run_sccp_pass from SCCP with cfg
+    If changed is equal to 1:
         proc memory_set_int32 from MemoryCore with ctx, 80, 1
         Return 1
     End If
-
     Return 0
-End Process
-
-Note: ============================================================================
-Note: initialize_lattice_values - Initialize SCCP lattice
-Note: ============================================================================
-
-Process called "initialize_lattice_values" that takes ctx as Integer, lattice_values as Integer returns Integer:
-    Let cfg be proc memory_get_int64 from MemoryCore with ctx, 8
-    Let blocks be proc get_mir_cfg_blocks from CFG with cfg
-    Let block_count be proc length from List with blocks
-
-    Let i be 0
-    While i is less than block_count:
-        Let block be proc list_get from List with blocks, i
-        Let instructions be proc get_block_instructions from MIR with block
-        Let inst_count be proc length from List with instructions
-
-        Let j be 0
-        While j is less than inst_count:
-            Let inst be proc list_get from List with instructions, j
-            Let result_id be proc get_mir_node_value_id from MIR with inst
-
-            If result_id is not equal to 0:
-                proc omap_set from OrderedMap with lattice_values, result_id, 0 Note: UNKNOWN
-            End If
-
-            Set j to j plus 1
-        End While
-
-        Set i to i plus 1
-    End While
-
-    Return 1
-End Process
-
-Note: ============================================================================
-Note: evaluate_instruction_sccp - Evaluate instruction for SCCP
-Note: ============================================================================
-
-Process called "evaluate_instruction_sccp" that takes ctx as Integer, cfg as Integer, inst as Integer, lattice_values as Integer, const_values as Integer, edge_worklist as Integer, ssa_worklist as Integer returns Integer:
-    Let opcode be proc get_mir_node_opcode from MIR with inst
-    Let result_id be proc get_mir_node_value_id from MIR with inst
-
-    Note: --- Terminators: enqueue reachable successor blocks ---
-
-    Note: MIR_JUMP (20302) - the single target (block ID at extended
-    Note: offset 72) is always reachable
-    If opcode is equal to 20302:
-        Let jump_target_id be proc get_jump_target from MIRNodes with inst
-        Let jump_target be proc get_block_by_id_from_cfg from CFG with cfg, jump_target_id
-        If jump_target is not equal to 0:
-            proc append from List with edge_worklist, jump_target
-        End If
-        Return 1
-    End If
-
-    Note: MIR_BRANCH (20301) - condition value id is header operand1;
-    Note: target block IDs live at extended offsets 80/88. A proven
-    Note: constant condition makes only the taken edge reachable
-    Note: (Wegman-Zadeck conditional pruning); otherwise both edges are
-    Note: enqueued. An UNKNOWN condition enqueues nothing yet - the branch
-    Note: is re-evaluated when the condition's lattice value changes.
-    If opcode is equal to 20301:
-        Let cond_id be proc get_mir_node_operand from MIR with inst, 1
-        Let cond_lattice be proc omap_get from OrderedMap with lattice_values, cond_id
-        Let true_id be proc get_branch_true_target from MIRNodes with inst
-        Let false_id be proc get_branch_false_target from MIRNodes with inst
-
-        If cond_lattice is equal to 1:
-            Let cond_value be proc omap_get from OrderedMap with const_values, cond_id
-            Let taken_id be false_id
-            If cond_value is not equal to 0:
-                Set taken_id to true_id
-            End If
-            Let taken_block be proc get_block_by_id_from_cfg from CFG with cfg, taken_id
-            If taken_block is not equal to 0:
-                proc append from List with edge_worklist, taken_block
-            End If
-        Otherwise:
-            If cond_lattice is equal to 2:
-                Let true_block be proc get_block_by_id_from_cfg from CFG with cfg, true_id
-                If true_block is not equal to 0:
-                    proc append from List with edge_worklist, true_block
-                End If
-                Let false_block be proc get_block_by_id_from_cfg from CFG with cfg, false_id
-                If false_block is not equal to 0:
-                    proc append from List with edge_worklist, false_block
-                End If
-            End If
-        End If
-        Return 1
-    End If
-
-    Note: MIR_SWITCH (20306) - a constant scrutinee selects exactly one
-    Note: case (or the default); otherwise every case and the default are
-    Note: reachable. Cases are a flat pair List (value, block_id).
-    If opcode is equal to 20306:
-        Let switch_value_id be proc get_mir_node_operand from MIR with inst, 1
-        Let switch_lattice be proc omap_get from OrderedMap with lattice_values, switch_value_id
-        Let case_count be proc get_switch_case_count from MIRNodes with inst
-        Let default_id be proc get_switch_default_block from MIRNodes with inst
-
-        If switch_lattice is equal to 1:
-            Let scrutinee be proc omap_get from OrderedMap with const_values, switch_value_id
-            Let matched_id be default_id
-            Let ci be 0
-            While ci is less than case_count:
-                Let case_value be proc get_switch_case_value from MIRNodes with inst, ci
-                If case_value is equal to scrutinee:
-                    Set matched_id to proc get_switch_case_block from MIRNodes with inst, ci
-                    Set ci to case_count
-                End If
-                Set ci to ci plus 1
-            End While
-            Let matched_block be proc get_block_by_id_from_cfg from CFG with cfg, matched_id
-            If matched_block is not equal to 0:
-                proc append from List with edge_worklist, matched_block
-            End If
-        Otherwise:
-            If switch_lattice is equal to 2:
-                Let ci be 0
-                While ci is less than case_count:
-                    Let case_block_id be proc get_switch_case_block from MIRNodes with inst, ci
-                    Let case_block be proc get_block_by_id_from_cfg from CFG with cfg, case_block_id
-                    If case_block is not equal to 0:
-                        proc append from List with edge_worklist, case_block
-                    End If
-                    Set ci to ci plus 1
-                End While
-                Let default_block be proc get_block_by_id_from_cfg from CFG with cfg, default_id
-                If default_block is not equal to 0:
-                    proc append from List with edge_worklist, default_block
-                End If
-            End If
-        End If
-        Return 1
-    End If
-
-    Note: MIR_RETURN (20303) / MIR_THROW (20703) - no successors, no result
-    If opcode is equal to 20303 or opcode is equal to 20703:
-        Return 1
-    End If
-
-    Note: --- Value-producing instructions ---
-
-    Note: MIR_CONST - constant value (numeric payload at extended offset 80)
-    If opcode is equal to 20001:
-        Let const_value be proc get_const_value from MIRNodes with inst
-        Let is_string_const be proc is_const_string from MIRNodes with inst
-        If is_string_const is equal to 1:
-            Note: String constants are addresses, not foldable integers
-            sccp_raise_lattice(ctx, lattice_values, const_values, result_id, 2, 0, ssa_worklist)
-        Otherwise:
-            sccp_raise_lattice(ctx, lattice_values, const_values, result_id, 1, const_value, ssa_worklist)
-        End If
-        Return 1
-    End If
-
-    Note: MIR_COPY (20008) - dest takes the source's lattice value
-    If opcode is equal to 20008:
-        Let src_id be proc get_mir_node_operand from MIR with inst, 1
-        Let src_lattice be proc omap_get from OrderedMap with lattice_values, src_id
-        If src_lattice is equal to 1:
-            Let src_value be proc omap_get from OrderedMap with const_values, src_id
-            sccp_raise_lattice(ctx, lattice_values, const_values, result_id, 1, src_value, ssa_worklist)
-        Otherwise:
-            If src_lattice is equal to 2:
-                sccp_raise_lattice(ctx, lattice_values, const_values, result_id, 2, 0, ssa_worklist)
-            End If
-        End If
-        Return 1
-    End If
-
-    Note: Binary arithmetic / bitwise band and comparisons - two operand
-    Note: uses in header slots 16/24. MIR_NEG / MIR_NOT (20007/20013) are
-    Note: unary (operand1 only).
-    Let is_two_operand be 0
-    If opcode is greater than or equal to 20002 and opcode is less than or equal to 20006:
-        Set is_two_operand to 1
-    End If
-    If opcode is greater than or equal to 20010 and opcode is less than or equal to 20016:
-        If opcode is not equal to 20013:
-            Set is_two_operand to 1
-        End If
-    End If
-    Let is_comparison be 0
-    If opcode is greater than or equal to 20100 and opcode is less than or equal to 20105:
-        Set is_comparison to 1
-        Set is_two_operand to 1
-    End If
-
-    Note: Unary negation / bitwise not
-    If opcode is equal to 20007 or opcode is equal to 20013:
-        Let unary_op_id be proc get_mir_node_operand from MIR with inst, 1
-        Let unary_lattice be proc omap_get from OrderedMap with lattice_values, unary_op_id
-        If unary_lattice is equal to 1:
-            Let unary_in be proc omap_get from OrderedMap with const_values, unary_op_id
-            Let unary_out be 0 minus unary_in
-            If opcode is equal to 20013:
-                Set unary_out to 0 minus unary_in minus 1
-            End If
-            sccp_raise_lattice(ctx, lattice_values, const_values, result_id, 1, unary_out, ssa_worklist)
-        Otherwise:
-            If unary_lattice is equal to 2:
-                sccp_raise_lattice(ctx, lattice_values, const_values, result_id, 2, 0, ssa_worklist)
-            End If
-        End If
-        Return 1
-    End If
-
-    If is_two_operand is equal to 1:
-        Let operand1_id be proc get_mir_node_operand from MIR with inst, 1
-        Let operand2_id be proc get_mir_node_operand from MIR with inst, 2
-
-        Let lattice1 be proc omap_get from OrderedMap with lattice_values, operand1_id
-        Let lattice2 be proc omap_get from OrderedMap with lattice_values, operand2_id
-
-        Note: If either operand is OVERDEFINED (2), result is OVERDEFINED
-        If lattice1 is equal to 2 or lattice2 is equal to 2:
-            sccp_raise_lattice(ctx, lattice_values, const_values, result_id, 2, 0, ssa_worklist)
-            Return 1
-        End If
-
-        Note: If both operands are CONSTANT (1), compute result
-        If lattice1 is equal to 1 and lattice2 is equal to 1:
-            Let const1 be proc omap_get from OrderedMap with const_values, operand1_id
-            Let const2 be proc omap_get from OrderedMap with const_values, operand2_id
-
-            If is_comparison is equal to 1:
-                Let cmp_result be evaluate_comparison_operation(opcode, const1, const2)
-                sccp_raise_lattice(ctx, lattice_values, const_values, result_id, 1, cmp_result, ssa_worklist)
-                Return 1
-            End If
-
-            Note: Same soundness guards as try_fold_instruction: no
-            Note: division/modulo by zero, no out-of-range shift counts,
-            Note: no right shift of a negative value
-            Let can_fold be 1
-            If opcode is equal to 20005 or opcode is equal to 20006:
-                If const2 is equal to 0:
-                    Set can_fold to 0
-                End If
-            End If
-            If opcode is greater than or equal to 20014 and opcode is less than or equal to 20016:
-                If const2 is less than 0:
-                    Set can_fold to 0
-                End If
-                If const2 is greater than 63:
-                    Set can_fold to 0
-                End If
-            End If
-            If opcode is equal to 20015 or opcode is equal to 20016:
-                If const1 is less than 0:
-                    Set can_fold to 0
-                End If
-            End If
-
-            If can_fold is equal to 0:
-                sccp_raise_lattice(ctx, lattice_values, const_values, result_id, 2, 0, ssa_worklist)
-                Return 1
-            End If
-
-            Let result_value be evaluate_binary_operation(opcode, const1, const2)
-            sccp_raise_lattice(ctx, lattice_values, const_values, result_id, 1, result_value, ssa_worklist)
-            Return 1
-        End If
-
-        Note: Otherwise result remains UNKNOWN (0)
-        Return 0
-    End If
-
-    Note: For all other value-producing instructions (loads, calls, phis,
-    Note: allocas, casts whose semantics are type-dependent, ...) the
-    Note: result is conservatively OVERDEFINED. Instructions with no
-    Note: result (result_id 0) are skipped.
-    If result_id is not equal to 0:
-        sccp_raise_lattice(ctx, lattice_values, const_values, result_id, 2, 0, ssa_worklist)
-    End If
-
-    Return 1
-End Process
-
-Note: ============================================================================
-Note: sccp_raise_lattice - Monotone lattice transition with use re-enqueueing
-Note: ============================================================================
-
-@Reasoning
-SCCP is a fixpoint over a three-level lattice (UNKNOWN 0 -> CONSTANT 1 ->
-OVERDEFINED 2). Every raise must re-enqueue the instructions that USE the
-changed value so they are re-evaluated with the new fact - that is what
-makes the algorithm sparse. The transition is monotone: a value never moves
-back down, and a CONSTANT that is recomputed to a DIFFERENT constant value
-is raised to OVERDEFINED (this happens at join points and for values
-flowing around loops). Monotonicity bounds the work at two raises per
-value, guaranteeing termination.
-@End Reasoning
-
-Process called "sccp_raise_lattice" that takes ctx as Integer, lattice_values as Integer, const_values as Integer, value_id as Integer, new_lattice as Integer, new_value as Integer, ssa_worklist as Integer returns Integer:
-    If value_id is equal to 0:
-        Return 0
-    End If
-
-    Let old_lattice be proc omap_get from OrderedMap with lattice_values, value_id
-    Let changed be 0
-
-    If new_lattice is greater than old_lattice:
-        proc omap_set from OrderedMap with lattice_values, value_id, new_lattice
-        If new_lattice is equal to 1:
-            proc omap_set from OrderedMap with const_values, value_id, new_value
-        End If
-        Set changed to 1
-    Otherwise:
-        If new_lattice is equal to 1 and old_lattice is equal to 1:
-            Let old_value be proc omap_get from OrderedMap with const_values, value_id
-            If old_value is not equal to new_value:
-                Note: Conflicting constants meet at OVERDEFINED
-                proc omap_set from OrderedMap with lattice_values, value_id, 2
-                Set changed to 1
-            End If
-        End If
-    End If
-
-    If changed is equal to 1:
-        Note: Re-enqueue every use of this value so it is re-evaluated
-        Note: with the raised lattice fact
-        Let use_def_chains be proc memory_get_int64 from MemoryCore with ctx, 48
-        Let chain be proc omap_get from OrderedMap with use_def_chains, value_id
-        If chain is not equal to 0:
-            Let uses be proc memory_get_int64 from MemoryCore with chain, 24
-            If uses is not equal to 0:
-                Let use_count be proc length from List with uses
-                Let u be 0
-                While u is less than use_count:
-                    Let using_inst be proc list_get from List with uses, u
-                    proc append from List with ssa_worklist, using_inst
-                    Set u to u plus 1
-                End While
-            End If
-        End If
-    End If
-
-    Return changed
 End Process
 
 Note: ============================================================================
@@ -1919,83 +1303,6 @@ Process called "evaluate_comparison_operation" that takes opcode as Integer, lef
 End Process
 
 Note: ============================================================================
-Note: replace_constants_and_remove_unreachable - Apply SCCP results
-Note: ============================================================================
-
-Process called "replace_constants_and_remove_unreachable" that takes ctx as Integer, lattice_values as Integer, const_values as Integer, reachable_blocks as Integer returns Integer:
-    Let cfg be proc memory_get_int64 from MemoryCore with ctx, 8
-    Let blocks be proc get_mir_cfg_blocks from CFG with cfg
-    Let block_count be proc length from List with blocks
-    Let mir_function be proc memory_get_int64 from MemoryCore with ctx, 0
-
-    Let replaced_count be 0
-
-    Let i be 0
-    While i is less than block_count:
-        Let block be proc list_get from List with blocks, i
-        Let is_reachable be proc omap_get from OrderedMap with reachable_blocks, block
-
-        Note: Remove unreachable blocks
-        If is_reachable is equal to 0:
-            Note: Block is unreachable, remove it
-            proc list_remove from List with blocks, i
-            Set block_count to block_count minus 1
-            Set i to i minus 1
-            Set replaced_count to replaced_count plus 1
-        Otherwise:
-            Note: Replace constant values in reachable blocks
-            Let instructions be proc get_block_instructions from MIR with block
-            Let inst_count be proc length from List with instructions
-
-            Let j be 0
-            While j is less than inst_count:
-                Let inst be proc list_get from List with instructions, j
-                Let opcode be proc get_mir_node_opcode from MIR with inst
-                Let result_id be proc get_mir_node_value_id from MIR with inst
-
-                Let lattice be proc omap_get from OrderedMap with lattice_values, result_id
-
-                Note: If result is a proven constant, replace the defining
-                Note: instruction with a fresh canonical MIRConst record.
-                Note: Only pure value computations are rewritten - calls,
-                Note: loads, atomics, and terminators keep their side
-                Note: effects even when their result is constant, and an
-                Note: instruction that already IS a const needs no rewrite.
-                If lattice is equal to 1:
-                    Let is_pure be is_pure_operation(opcode)
-                    If opcode is equal to 20008:
-                        Set is_pure to 1
-                    End If
-                    If is_pure is equal to 1:
-                        Let const_value be proc omap_get from OrderedMap with const_values, result_id
-                        Let result_type be proc get_mir_node_type from MIR with inst
-                        Let const_inst be proc create_mir_const from MIRNodes with result_id, const_value, result_type, 0, 0
-                        If const_inst is not equal to 0:
-                            Let parent_block be proc get_mir_node_parent_block from MIR with inst
-                            proc set_mir_node_parent_block from MIR with const_inst, parent_block
-                            proc list_set from List with instructions, j, const_inst
-                            proc register_value_definition from MIR with mir_function, result_id, const_inst
-                            Set replaced_count to replaced_count plus 1
-                        End If
-                    End If
-                End If
-
-                Set j to j plus 1
-            End While
-        End If
-
-        Set i to i plus 1
-    End While
-
-    Note: Re-sync the CFG's cached block_count (offset 24) after
-    Note: unreachable-block removal
-    Let remaining_blocks be proc length from List with blocks
-    proc memory_set_int64 from MemoryCore with cfg, 24, remaining_blocks
-
-    Return replaced_count
-End Process
-
-Note: ============================================================================
 Note: propagate_copies - Copy propagation pass
 Note: ============================================================================
 
@@ -2007,96 +1314,27 @@ This simplifies the program and enables other optimizations.
 @End Reasoning
 
 Process called "propagate_copies" that takes ctx as Integer returns Integer:
+    Note: Forward copy propagation. Collapsed (#486) to delegate to the
+    Note: canonical modular pass optimizations/copy_prop.runa, the single
+    Note: source of truth for the transform. The standalone is strictly more
+    Note: correct than the former inline copy: it collapses transitive copy
+    Note: chains (a=b; b=c; c=d -> every use rewritten directly to d in one
+    Note: pass, cycle-guarded) where the inline rewrote each copy's uses
+    Note: independently and relied on fixpoint iteration, and its
+    Note: rewrite_uses_in_instruction enumerates the full per-record use slot
+    Note: set (incl. call/invoke argument Lists, phi incoming pairs and the
+    Note: indirect callee) where the inline was bounded by the ctx use-def
+    Note: chains, which the canonical enumerator omits for those uses. Both
+    Note: leave dead copies for the DCE pass. The standalone detects the same
+    Note: two copy shapes (MIR_COPY 20008 + degenerate single-incoming PHI
+    Note: 20300) and builds its own copy map from the CFG, so the ctx use-def
+    Note: chains are not consulted - we hand it only the CFG.
     Let cfg be proc memory_get_int64 from MemoryCore with ctx, 8
-    Let blocks be proc get_mir_cfg_blocks from CFG with cfg
-    Let block_count be proc length from List with blocks
-
-    Let use_def_chains be proc memory_get_int64 from MemoryCore with ctx, 48
-    Let propagated_count be 0
-
-    Note: Find all copy instructions
-    Let copy_map be proc omap_create from OrderedMap
-
-    Let i be 0
-    While i is less than block_count:
-        Let block be proc list_get from List with blocks, i
-        Let instructions be proc get_block_instructions from MIR with block
-        Let inst_count be proc length from List with instructions
-
-        Let j be 0
-        While j is less than inst_count:
-            Let inst be proc list_get from List with instructions, j
-            Let opcode be proc get_mir_node_opcode from MIR with inst
-
-            Note: Detect copy instructions in the canonical opcode model:
-            Note: MIR_COPY (20008, OD-5) carries dest in the header
-            Note: value_id slot and source in operand1; a PHI (20300) with
-            Note: exactly one incoming pair is a copy in SSA form, its
-            Note: source being the single incoming value.
-
-            If opcode is equal to 20008:  Note: MIR_COPY
-                Let result_value be proc get_mir_node_value_id from MIR with inst
-                Let source_value be proc get_mir_node_operand from MIR with inst, 1
-                If result_value is not equal to 0 and source_value is not equal to 0:
-                    proc omap_set from OrderedMap with copy_map, result_value, source_value
-                End If
-            End If
-
-            If opcode is equal to 20300:  Note: MIR_PHI
-                Note: Degenerate single-incoming PHI = copy
-                Let incoming_count be proc get_phi_incoming_count from MIRNodes with inst
-                If incoming_count is equal to 1:
-                    Let phi_result be proc get_mir_node_value_id from MIR with inst
-                    Let phi_source be proc get_phi_incoming_value from MIRNodes with inst, 0
-                    If phi_result is not equal to 0 and phi_source is not equal to 0:
-                        proc omap_set from OrderedMap with copy_map, phi_result, phi_source
-                    End If
-                End If
-            End If
-
-            Set j to j plus 1
-        End While
-
-        Set i to i plus 1
-    End While
-
-    Note: Propagate copies through use-def chains. Walk the copy_map in
-    Note: insertion order via the OrderedMap cursor (deterministic; the
-    Note: value-id keys are integers).
-    Let copy_entry be proc omap_first from OrderedMap with copy_map
-    While copy_entry is not equal to 0:
-        Let dest_value be proc omap_entry_key from OrderedMap with copy_entry
-        Set source_value to proc omap_entry_value from OrderedMap with copy_entry
-
-        Note: Get use-def chain for destination
-        Let chain be proc omap_get from OrderedMap with use_def_chains, dest_value
-        If chain is not equal to 0:
-            Let uses be proc memory_get_int64 from MemoryCore with chain, 24
-            Let use_count be proc length from List with uses
-
-            Note: Replace all uses of dest with source
-            Let u be 0
-            While u is less than use_count:
-                Let using_inst be proc list_get from List with uses, u
-                replace_value_in_instruction(using_inst, dest_value, source_value)
-                Set propagated_count to propagated_count plus 1
-                Set u to u plus 1
-            End While
-        End If
-
-        Set copy_entry to proc omap_entry_next from OrderedMap with copy_entry
-    End While
-
-    Note: Update statistics
-    Let statistics be proc memory_get_int64 from MemoryCore with ctx, 120
-    Let current_copies be proc memory_get_int32 from MemoryCore with statistics, 12
-    proc memory_set_int32 from MemoryCore with statistics, 12, current_copies plus propagated_count
-
-    If propagated_count is greater than 0:
+    Let changed be proc run_copy_prop_pass from CopyProp with cfg
+    If changed is equal to 1:
         proc memory_set_int32 from MemoryCore with ctx, 80, 1
         Return 1
     End If
-
     Return 0
 End Process
 
@@ -4604,182 +3842,59 @@ This is crucial for functional programming patterns and prevents stack overflow.
 @End Implementation
 
 Process called "optimize_tail_calls" that takes ctx as Integer returns Integer:
+    Note: Tail-call stamping. Collapsed (#486) to delegate to the canonical
+    Note: modular pass optimizations/tail_call.runa, the single source of truth
+    Note: for the transform. The standalone stamp_tail_calls is byte-for-byte
+    Note: equivalent to the former inline scan: the same last-two-instruction
+    Note: scan, the same call opcodes (MIR_CALL 20304 / MIR_CALL_INDIRECT
+    Note: 20305) immediately followed by a MIR_RETURN (20303) whose returned
+    Note: value equals the call's result value-id (both-zero covers void), the
+    Note: same already-stamped guard for O3 fixpoint convergence, and the same
+    Note: is_tail_call stamp at the canonical MIRCall extended offset 120 for
+    Note: the LIR jmp-vs-call selector. The per-function entry takes the
+    Note: MIRFunction (ctx offset 0) and fetches the CFG itself, returning 1
+    Note: when at least one new tail call was stamped.
     Let mir_function be proc memory_get_int64 from MemoryCore with ctx, 0
-    Let cfg be proc memory_get_int64 from MemoryCore with ctx, 8
-    Let blocks be proc get_mir_cfg_blocks from CFG with cfg
-    Let block_count be proc length from List with blocks
-    Let optimized_count be 0
+    Let changed be proc optimize_function_with_tail_call from TailCall with mir_function
 
-    Note: Scan all blocks for tail call patterns
-    Let i be 0
-    While i is less than block_count:
-        Let block be proc list_get from List with blocks, i
-        Let instructions be proc get_block_instructions from MIR with block
-        Let inst_count be proc length from List with instructions
-
-        Note: Check if block ends with call followed by return
-        If inst_count is greater than or equal to 2:
-            Let call_inst be proc list_get from List with instructions, inst_count minus 2
-            Let ret_inst be proc list_get from List with instructions, inst_count minus 1
-
-            Let call_opcode be proc get_mir_node_opcode from MIR with call_inst
-            Let ret_opcode be proc get_mir_node_opcode from MIR with ret_inst
-
-            Note: MIR_CALL is 20304, MIR_CALL_INDIRECT is 20305,
-            Note: MIR_RETURN is 20303
-            Let is_call be 0
-            If call_opcode is equal to 20304:
-                Set is_call to 1
-            End If
-            If call_opcode is equal to 20305:
-                Set is_call to 1
-            End If
-
-            If is_call is equal to 1:
-                If ret_opcode is equal to 20303:
-                    Note: This is a tail-position call - confirm the return
-                    Note: feeds back exactly the call's result (both zero
-                    Note: covers the void-call + void-return shape)
-                    Let call_result be proc get_mir_node_value_id from MIR with call_inst
-                    Let ret_value be proc get_return_value from MIRNodes with ret_inst
-
-                    If call_result is equal to ret_value:
-                        Note: Confirmed tail call - stamp the canonical
-                        Note: is_tail_call flag (extended offset 120) for
-                        Note: the LIR jmp-vs-call selector. Already-stamped
-                        Note: calls are not recounted so the O3 pipeline
-                        Note: reaches a fixpoint.
-                        Let already_tail be proc is_tail_call from MIRNodes with call_inst
-                        If already_tail is equal to 0:
-                            proc memory_set_int64 from MemoryCore with call_inst, 120, 1
-                            Set optimized_count to (optimized_count plus 1)
-                        End If
-                    End If
-                End If
-            End If
-        End If
-
-        Set i to (i plus 1)
-    End While
-
-    Note: Update changed flag and statistics if any tail calls optimized
-    If optimized_count is greater than 0:
+    If changed is equal to 1:
+        Note: Reflect the work in the shared statistics struct (offset 28 =
+        Note: tail-call counter) and the ctx changed flag. The standalone
+        Note: returns a 0/1 indicator rather than the raw count, so the
+        Note: statistics counter advances by one per function that had any
+        Note: tail call newly stamped.
         Let statistics be proc memory_get_int64 from MemoryCore with ctx, 120
         Let current_tail be proc memory_get_int32 from MemoryCore with statistics, 28
-        proc memory_set_int32 from MemoryCore with statistics, 28, current_tail plus optimized_count
-        proc memory_set_int32 from MemoryCore with ctx, 80, 1
-    End If
-
-    Return optimized_count
-End Process
-
-Process called "reduce_strength" that takes ctx as Integer returns Integer:
-    Note: Strength reduction: replace expensive operations with cheaper
-    Note: equivalents. Example: x * 2 -> x shifted left by 1.
-    Note: Under the canonical contract operand slots hold SSA value-id
-    Note: USES, never immediates - so the shift amount must be
-    Note: materialized as a fresh CONST instruction with its own value id,
-    Note: inserted before the reduced instruction, and referenced as
-    Note: operand2 (header slot 24 and the binop's extended right slot 88).
-    Let cfg be proc memory_get_int64 from MemoryCore with ctx, 8
-    Let blocks be proc get_mir_cfg_blocks from CFG with cfg
-    Let block_count be proc length from List with blocks
-    Let mir_function be proc memory_get_int64 from MemoryCore with ctx, 0
-
-    Let reduced_count be 0
-
-    Let i be 0
-    While i is less than block_count:
-        Let block be proc list_get from List with blocks, i
-        Let instructions be proc get_block_instructions from MIR with block
-        Let inst_count be proc length from List with instructions
-
-        Let j be 0
-        While j is less than inst_count:
-            Let inst be proc list_get from List with instructions, j
-            Let opcode be proc get_mir_node_opcode from MIR with inst
-
-            Note: Multiplication by power of 2 (integer only - the shift
-            Note: rewrite is invalid for float multiplication; HIRTypeInfo
-            Note: kind tag TYPE_FLOAT = 13016 lives at type_info offset 0)
-            If opcode is equal to 20004:  Note: MIR_MUL
-                Let is_float_mul be 0
-                Let mul_type be proc get_mir_node_type from MIR with inst
-                If mul_type is not equal to 0:
-                    Let mul_type_kind be proc memory_get_int64 from MemoryCore with mul_type, 0
-                    If mul_type_kind is equal to 13016:
-                        Set is_float_mul to 1
-                    End If
-                End If
-
-                Let constant_values be proc memory_get_int64 from MemoryCore with ctx, 72
-                Let operand2 be proc get_mir_node_operand from MIR with inst, 2
-                Let const_val be proc omap_get from OrderedMap with constant_values, operand2
-
-                Note: Check if const_val is power of 2
-                Let is_pow2 be 0
-                If const_val is equal to 2 or const_val is equal to 4 or const_val is equal to 8 or const_val is equal to 16:
-                    Set is_pow2 to 1
-                End If
-
-                If is_float_mul is equal to 0 and is_pow2 is equal to 1:
-                    Note: Compute shift amount
-                    Let shift_amount be 1  Note: Default for *2
-                    If const_val is equal to 4:
-                        Set shift_amount to 2
-                    End If
-                    If const_val is equal to 8:
-                        Set shift_amount to 3
-                    End If
-                    If const_val is equal to 16:
-                        Set shift_amount to 4
-                    End If
-
-                    Note: Materialize the shift amount as a fresh CONST
-                    Note: with its own SSA value id, inserted before the
-                    Note: instruction being reduced
-                    Let shift_id be proc allocate_value_id from MIR with mir_function
-                    Let shift_const be proc create_mir_const from MIRNodes with shift_id, shift_amount, mul_type, 0, 0
-                    If shift_const is not equal to 0:
-                        proc set_mir_node_parent_block from MIR with shift_const, block
-                        proc list_insert from List with instructions, j, shift_const
-                        proc register_value_definition from MIR with mir_function, shift_id, shift_const
-                        proc omap_set from OrderedMap with constant_values, shift_id, shift_amount
-
-                        Note: Rewrite MUL -> SHL referencing the new const
-                        Note: (header operand2 and the binop ext right slot)
-                        proc set_mir_node_opcode from MIR with inst, 20014 Note: MIR_SHL
-                        proc set_mir_node_operand from MIR with inst, 2, shift_id
-                        proc memory_set_int64 from MemoryCore with inst, 88, shift_id
-
-                        Note: Account for the inserted const: the reduced
-                        Note: instruction now sits at j + 1
-                        Set inst_count to proc length from List with instructions
-                        Let new_inst_total be proc length from List with instructions
-                        proc memory_set_int64 from MemoryCore with block, 24, new_inst_total
-                        Set j to j plus 1
-
-                        Set reduced_count to reduced_count plus 1
-                    End If
-                End If
-            End If
-
-            Set j to j plus 1
-        End While
-
-        Set i to i plus 1
-    End While
-
-    Note: Update statistics
-    Let statistics be proc memory_get_int64 from MemoryCore with ctx, 120
-    Let current_strength be proc memory_get_int32 from MemoryCore with statistics, 40
-    proc memory_set_int32 from MemoryCore with statistics, 40, current_strength plus reduced_count
-
-    If reduced_count is greater than 0:
+        proc memory_set_int32 from MemoryCore with statistics, 28, current_tail plus 1
         proc memory_set_int32 from MemoryCore with ctx, 80, 1
         Return 1
     End If
 
+    Return 0
+End Process
+
+Process called "reduce_strength" that takes ctx as Integer returns Integer:
+    Note: Strength reduction. Collapsed (#486) to delegate to the canonical
+    Note: modular pass optimizations/strength_reduction.runa, the single source
+    Note: of truth for the transform. The standalone is FAR more complete than
+    Note: the former inline copy: the inline reduced only integer MUL by a
+    Note: hardcoded {2,4,8,16} probing operand2 alone, whereas the standalone
+    Note: reduces MUL by ANY power of two (full 64-bit range, probing the
+    Note: commutative left operand too), DIV by a power of two (exact signed
+    Note: shift-with-bias per the OD-3 int64 width), and MOD by a power of two
+    Note: (AND with the 2^n-1 mask) - none of which the inline handled. Both
+    Note: exclude FLOAT results and materialize the shift amount as a fresh
+    Note: CONST (operand slots stay SSA-use-only). The standalone resolves
+    Note: constants through its own CFG-local def map rather than the ctx
+    Note: constant_values map (which is only populated when a prior fold pass
+    Note: ran), so it finds strictly more reducible operations; we hand it only
+    Note: the CFG.
+    Let cfg be proc memory_get_int64 from MemoryCore with ctx, 8
+    Let changed be proc run_strength_reduction_pass from StrengthReduction with cfg
+    If changed is equal to 1:
+        proc memory_set_int32 from MemoryCore with ctx, 80, 1
+        Return 1
+    End If
     Return 0
 End Process
 
