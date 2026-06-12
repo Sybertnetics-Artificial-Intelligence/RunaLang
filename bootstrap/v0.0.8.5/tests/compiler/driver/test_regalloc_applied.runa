@@ -1,0 +1,296 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+Licensed under Apache 2.0
+:End Note
+
+Note:
+Task #483 regression test for compile_orchestrator's register-allocation
+step (Phase 7b of compile_program).
+
+THE BUG
+-------
+Before #483, compile_program's per-LIR-function loop did:
+
+    Let ig be build_interference_graph(lir_func)
+    If ig is not equal to 0:
+        allocate_registers(lir_func, ig)     Note: <-- result DISCARDED
+    End If
+
+allocate_registers returns an allocation CONTEXT exposing the coloring
+result (offset 24) and a spill_worklist (offset 40). Discarding it means:
+  * the spill_worklist was never inspected, so a function whose register
+    pressure exceeds the physical register file never had spill code
+    inserted -- the allocator's select phase simply gave up on those
+    values;
+  * apply_allocation was never called, so even for functions that DID
+    color cleanly, the virtual register ids (>= 1000) in the operand
+    records were never rewritten to physical register ids.
+Either way, virtual registers survived into the x86_64 backend, which
+treats them as fatal / emits garbage. This test guards the fix.
+
+WHAT IS EXERCISED
+-----------------
+This test builds, by hand through the canonical lir.runa / lir_nodes.runa
+construction API, a LIR function with FIFTEEN simultaneously-live GPR
+values (a 15-clique) against the fourteen allocatable x86-64 GPRs -- the
+identical forced-spill rig the #473 allocator probe uses, the smallest
+shape that GUARANTEES the select phase reports actual spills.
+
+It then runs the EXACT sequence compile_orchestrator's rewired Phase 7b
+now performs on every non-external LIR function, in the same order and
+with the same failure semantics:
+
+    1. build_interference_graph (runs liveness internally)
+    2. allocate_registers -> capture the context (NOT discard it)
+    3. spill-retry loop to CONVERGENCE: while context.spill_worklist
+       (offset 40) is non-empty, insert_spill_code, recompute liveness,
+       rebuild the interference graph, re-run allocate_registers
+    4. verify_allocation (every virtual reference covered, no interference
+       conflict, register-class agreement)
+    5. apply_allocation (rewrite every virtual id to a physical id in the
+       shared operand records)
+and asserts:
+
+    A. the spill loop converges (the pre-#483 code never even entered it);
+    B. at least one spill round actually ran (proves the forced-spill path
+       fired, not a trivially-colorable case);
+    C. verify_allocation returns 1 (the orchestrator propagates 0 as a
+       hard compile failure);
+    D. apply_allocation returns 1 (likewise propagated);
+    E. ZERO virtual-register references remain in any operand record --
+       the property whose violation the pre-#483 backend choked on.
+
+This is the integration contract of the Phase 7b code edited for #483;
+the #473 probe covers the allocator primitives in isolation, this covers
+the orchestrator's USE of them.
+
+Exit codes: 0 = all checks passed, 1 = a check failed.
+:End Note
+
+Import "tests/test_utils.runa" as T
+Import "compiler/middle/gungnir/lir/lir.runa" as LIR
+Import "compiler/middle/gungnir/lir/lir_nodes.runa" as LIRNodes
+Import "compiler/middle/gungnir/lir/liveness.runa" as Liveness
+Import "compiler/middle/gungnir/lir/interference.runa" as Interference
+Import "compiler/middle/gungnir/lir/register_alloc.runa" as RegisterAlloc
+Import "compiler/middle/gungnir/lir/spilling.runa" as Spilling
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/collections/list.runa" as List
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+
+Constant CLASS_GPR as Integer is 0
+Constant OPERAND_SIZE as Integer is 8
+
+Process called "reg_operand" that takes reg_id as Integer returns Integer:
+    Return LIRNodes.create_register_operand(reg_id, OPERAND_SIZE)
+End Process
+
+Process called "imm_operand" that takes value as Integer returns Integer:
+    Return LIRNodes.create_immediate_operand(value, OPERAND_SIZE)
+End Process
+
+Note:
+Counts the virtual register references (REGISTER operands with id >= 1000,
+or MEMORY operands whose base/index is >= 1000) remaining across the
+result slot and three operand slots of every base-resolved instruction.
+Zero after apply_allocation means the backend never sees a virtual id.
+:End Note
+Process called "count_operand_virtual_refs" that takes operand as Integer returns Integer:
+    If operand is equal to 0:
+        Return 0
+    End If
+
+    Let refs be 0
+    Let operand_type be proc memory_get_int64 from Layout with operand, 0
+
+    Note: OPERAND_TYPE_REGISTER = 1, OPERAND_TYPE_MEMORY = 3
+    If operand_type is equal to 1:
+        Let register_id be proc memory_get_int64 from Layout with operand, 8
+        If register_id is greater than or equal to 1000:
+            Set refs to refs plus 1
+        End If
+    End If
+
+    If operand_type is equal to 3:
+        Let base_register be proc memory_get_int64 from Layout with operand, 24
+        If base_register is greater than or equal to 1000:
+            Set refs to refs plus 1
+        End If
+        Let index_register be proc memory_get_int64 from Layout with operand, 32
+        If index_register is greater than or equal to 1000:
+            Set refs to refs plus 1
+        End If
+    End If
+
+    Return refs
+End Process
+
+Process called "count_virtual_refs" that takes lir_fn as Integer returns Integer:
+    Let total be 0
+    Let block_count be proc get_block_count from LIR with lir_fn
+
+    Let b be 0
+    While b is less than block_count:
+        Let block be proc lir_get_block from LIR with lir_fn, b
+        If block is not equal to 0:
+            Let inst_count be proc get_instruction_count from LIR with block
+            Let i be 0
+            While i is less than inst_count:
+                Let instruction be proc get_instruction from LIR with block, i
+                Let base be proc lir_resolve_instruction_base from LIR with instruction
+                If base is not equal to 0:
+                    Let result be proc memory_get_int64 from Layout with base, 8
+                    Set total to total plus count_operand_virtual_refs(result)
+                    Let operand1 be proc memory_get_int64 from Layout with base, 16
+                    Set total to total plus count_operand_virtual_refs(operand1)
+                    Let operand2 be proc memory_get_int64 from Layout with base, 24
+                    Set total to total plus count_operand_virtual_refs(operand2)
+                    Let operand3 be proc memory_get_int64 from Layout with base, 32
+                    Set total to total plus count_operand_virtual_refs(operand3)
+                End If
+                Set i to i plus 1
+            End While
+        End If
+        Set b to b plus 1
+    End While
+
+    Return total
+End Process
+
+Note:
+Builds the forced-spill rig: fifteen GPR values defined up front and each
+used afterward, so all fifteen are simultaneously live across the def/use
+frontier -- a 15-clique against K=14 allocatable GPRs. Returns the
+LIRFunction pointer.
+:End Note
+Process called "build_spill_function" returns Integer:
+    Let name be proc create_from_literal from StringCore with "regalloc_applied_483"
+    Let lir_fn be proc lir_create_function from LIR with name, 0, 0
+    If lir_fn is equal to 0:
+        Return 0
+    End If
+
+    Let b0 be proc lir_add_block from LIR with lir_fn, 1
+
+    Let vregs be proc list_create from List
+    Let i be 0
+    While i is less than 15:
+        Let vreg be proc lir_create_virtual_register from LIR with lir_fn, CLASS_GPR, OPERAND_SIZE
+        proc append from List with vregs, vreg
+        Let mov be proc create_lir_move from LIRNodes with reg_operand(vreg), imm_operand(i), OPERAND_SIZE
+        proc lir_append_instruction from LIR with lir_fn, b0, mov
+        Set i to i plus 1
+    End While
+
+    Set i to 0
+    While i is less than 15:
+        Let used_vreg be proc get from List with vregs, i
+        Let dest_vreg be proc lir_create_virtual_register from LIR with lir_fn, CLASS_GPR, OPERAND_SIZE
+        Let add be proc create_lir_binary_op from LIRNodes with LIR.LIR_ADD, reg_operand(dest_vreg), reg_operand(used_vreg), reg_operand(used_vreg), OPERAND_SIZE
+        proc lir_append_instruction from LIR with lir_fn, b0, add
+        Set i to i plus 1
+    End While
+
+    Let ret be proc create_lir_return from LIRNodes with 0
+    proc lir_append_instruction from LIR with lir_fn, b0, ret
+
+    Return lir_fn
+End Process
+
+Process called "main" returns Integer:
+    Let results be proc create_test_results from T
+
+    proc begin_suite from T with results, "regalloc applied through orchestrator Phase 7b (#483)"
+
+    Let lir_fn be build_spill_function()
+    proc assert_not_null from T with results, "forced-spill LIR function built", lir_fn
+    If lir_fn is equal to 0:
+        proc print_summary from T with results
+        proc destroy_test_results from T with results
+        Return 1
+    End If
+
+    Note: ============================================================
+    Note: Replicate compile_orchestrator Phase 7b EXACTLY (post-#483).
+    Note: ============================================================
+
+    Note: Step 1 + 2 -- interference graph, then capture (not discard) the
+    Note: allocation context.
+    Let ig be proc build_interference_graph from Interference with lir_fn
+    proc assert_not_null from T with results, "interference graph built", ig
+
+    Let context be proc allocate_registers from RegisterAlloc with lir_fn, ig
+    proc assert_not_null from T with results, "allocation context captured", context
+
+    Note: Step 3 -- the spill-retry loop the pre-#483 code never entered.
+    Let spill_worklist be proc memory_get_int64 from Layout with context, 40
+    Let spill_count be proc list_length from List with spill_worklist
+    proc assert_greater_than from T with results, "forced-spill path fired (worklist non-empty on first pass)", spill_count, 0
+
+    Let regalloc_failed be 0
+    Let spill_rounds be 0
+    While spill_count is greater than 0:
+        Set spill_rounds to spill_rounds plus 1
+        If spill_rounds is greater than 64:
+            Set regalloc_failed to 1
+            Set spill_count to 0
+        Otherwise:
+            Let spill_ok be proc insert_spill_code from Spilling with lir_fn, spill_worklist
+            If spill_ok is equal to 0:
+                Set regalloc_failed to 1
+                Set spill_count to 0
+            Otherwise:
+                Let liveness_ok be proc compute_function_liveness from Liveness with lir_fn
+                If liveness_ok is equal to 0:
+                    Set regalloc_failed to 1
+                    Set spill_count to 0
+                Otherwise:
+                    proc destroy_interference_graph from Interference with ig
+                    Set ig to proc build_interference_graph from Interference with lir_fn
+                    If ig is equal to 0:
+                        Set regalloc_failed to 1
+                        Set spill_count to 0
+                    Otherwise:
+                        Set context to proc allocate_registers from RegisterAlloc with lir_fn, ig
+                        If context is equal to 0:
+                            Set regalloc_failed to 1
+                            Set spill_count to 0
+                        Otherwise:
+                            Set spill_worklist to proc memory_get_int64 from Layout with context, 40
+                            Set spill_count to proc list_length from List with spill_worklist
+                        End If
+                    End If
+                End If
+            End If
+        End If
+    End While
+
+    proc assert_equal from T with results, "spill-retry loop converged (no failure)", regalloc_failed, 0
+    proc assert_greater_than from T with results, "at least one spill round ran", spill_rounds, 0
+
+    Note: Step 4 -- verify, then Step 5 -- apply. The orchestrator
+    Note: propagates a 0 from either as a hard compile error.
+    Let allocation be proc memory_get_int64 from Layout with context, 24
+    proc assert_not_null from T with results, "allocation map present", allocation
+
+    Let valid be proc verify_allocation from RegisterAlloc with lir_fn, allocation, ig
+    proc assert_equal from T with results, "verify_allocation passes (orchestrator gate C)", valid, 1
+
+    Let apply_ok be proc apply_allocation from RegisterAlloc with lir_fn, allocation
+    proc assert_equal from T with results, "apply_allocation succeeds (orchestrator gate D)", apply_ok, 1
+
+    Note: Step E -- the property the backend depends on: no virtual id left.
+    Let remaining be count_virtual_refs(lir_fn)
+    proc assert_equal from T with results, "no virtual-register references survive into backend", remaining, 0
+
+    proc destroy_interference_graph from Interference with ig
+
+    proc print_summary from T with results
+    Let passed be proc all_passed from T with results
+    proc destroy_test_results from T with results
+
+    If passed is equal to 1:
+        Return 0
+    End If
+    Return 1
+End Process

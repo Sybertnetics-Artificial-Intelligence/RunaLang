@@ -58,6 +58,8 @@ Import "compiler/middle/gungnir/lir/lir_builder.runa" as LIRBuilder
 Import "compiler/middle/gungnir/lir/instruction_select.runa" as InstrSelect
 Import "compiler/middle/gungnir/lir/interference.runa" as Interference
 Import "compiler/middle/gungnir/lir/register_alloc.runa" as RegisterAlloc
+Import "compiler/middle/gungnir/lir/liveness.runa" as Liveness
+Import "compiler/middle/gungnir/lir/spilling.runa" as Spilling
 Import "compiler/middle/gungnir/lir/peephole.runa" as Peephole
 Import "compiler/backend/machine_code/common/machine_code_interface.runa" as MachineCode
 Import "compiler/backend/machine_code/common/executable_format.runa" as ExecFormat
@@ -1690,10 +1692,117 @@ Process called "compile_program" that takes program as Integer, output_path as I
             Let is_external be __load(lir_func, 112)
             If is_external is equal to 0:
                 proc select_instructions from InstrSelect with lir_func
+                Note: 7b: register allocation.
+                Note: build_interference_graph runs liveness internally; the
+                Note: allocation context exposes allocation@24 and
+                Note: spill_worklist@40. A non-empty spill worklist means the
+                Note: select phase could not color every value with the
+                Note: available physical registers; we must insert spill
+                Note: stores/reloads (spilling.insert_spill_code), rebuild
+                Note: liveness + interference, and re-run allocation until the
+                Note: worklist drains (convergence is guaranteed because each
+                Note: spilled value's live range is shortened to single
+                Note: def/use slices). Only then do we verify the map covers
+                Note: every referenced virtual register and apply it in place,
+                Note: rewriting virtual register ids to physical ids in the
+                Note: shared operand records. allocate_registers returns 0 on
+                Note: internal failure; apply_allocation/verify_allocation
+                Note: return 0 on failure -- the x86_64 backend treats a stray
+                Note: virtual register as fatal, so any failure here aborts the
+                Note: compile rather than emitting garbage.
                 Let ig be proc build_interference_graph from Interference with lir_func
-                If ig is not equal to 0:
-                    proc allocate_registers from RegisterAlloc with lir_func, ig
+                If ig is equal to 0:
+                    Alert "[COMPILE ERROR] compile_program: interference graph construction failed"
+                    proc arena_destroy from Layout with arena
+                    Return 1
                 End If
+
+                Let context be proc allocate_registers from RegisterAlloc with lir_func, ig
+                If context is equal to 0:
+                    Alert "[COMPILE ERROR] compile_program: register allocation failed"
+                    proc destroy_interference_graph from Interference with ig
+                    proc arena_destroy from Layout with arena
+                    Return 1
+                End If
+
+                Let spill_worklist be proc memory_get_int64 from MemoryCore with context, 40
+                Let spill_count be proc list_length from List with spill_worklist
+                Let regalloc_failed be 0
+                Let spill_rounds be 0
+                While spill_count is greater than 0:
+                    Set spill_rounds to spill_rounds plus 1
+                    If spill_rounds is greater than 64:
+                        Note: Convergence guard: each round strictly shortens
+                        Note: live ranges, so a real allocator converges far
+                        Note: below this bound; exceeding it signals a defect.
+                        Alert "[COMPILE ERROR] compile_program: register allocation did not converge"
+                        Set regalloc_failed to 1
+                        Set spill_count to 0
+                    Otherwise:
+                        Let spill_ok be proc insert_spill_code from Spilling with lir_func, spill_worklist
+                        If spill_ok is equal to 0:
+                            Alert "[COMPILE ERROR] compile_program: spill code insertion failed"
+                            Set regalloc_failed to 1
+                            Set spill_count to 0
+                        Otherwise:
+                            Note: The program changed: rebuild liveness, graph, allocation.
+                            Let liveness_ok be proc compute_function_liveness from Liveness with lir_func
+                            If liveness_ok is equal to 0:
+                                Alert "[COMPILE ERROR] compile_program: post-spill liveness failed"
+                                Set regalloc_failed to 1
+                                Set spill_count to 0
+                            Otherwise:
+                                proc destroy_interference_graph from Interference with ig
+                                Set ig to proc build_interference_graph from Interference with lir_func
+                                If ig is equal to 0:
+                                    Alert "[COMPILE ERROR] compile_program: post-spill interference graph construction failed"
+                                    Set regalloc_failed to 1
+                                    Set spill_count to 0
+                                Otherwise:
+                                    Set context to proc allocate_registers from RegisterAlloc with lir_func, ig
+                                    If context is equal to 0:
+                                        Alert "[COMPILE ERROR] compile_program: post-spill register allocation failed"
+                                        Set regalloc_failed to 1
+                                        Set spill_count to 0
+                                    Otherwise:
+                                        Set spill_worklist to proc memory_get_int64 from MemoryCore with context, 40
+                                        Set spill_count to proc list_length from List with spill_worklist
+                                    End If
+                                End If
+                            End If
+                        End If
+                    End If
+                End While
+
+                If regalloc_failed is not equal to 0:
+                    If ig is not equal to 0:
+                        proc destroy_interference_graph from Interference with ig
+                    End If
+                    proc arena_destroy from Layout with arena
+                    Return 1
+                End If
+
+                Note: Allocation converged: verify the map covers every
+                Note: referenced virtual register and that no interfering
+                Note: values share a physical register, then rewrite operands.
+                Let allocation be proc memory_get_int64 from MemoryCore with context, 24
+                Let valid be proc verify_allocation from RegisterAlloc with lir_func, allocation, ig
+                If valid is equal to 0:
+                    Alert "[COMPILE ERROR] compile_program: register allocation verification failed"
+                    proc destroy_interference_graph from Interference with ig
+                    proc arena_destroy from Layout with arena
+                    Return 1
+                End If
+
+                Let apply_ok be proc apply_allocation from RegisterAlloc with lir_func, allocation
+                If apply_ok is equal to 0:
+                    Alert "[COMPILE ERROR] compile_program: register allocation apply failed"
+                    proc destroy_interference_graph from Interference with ig
+                    proc arena_destroy from Layout with arena
+                    Return 1
+                End If
+
+                proc destroy_interference_graph from Interference with ig
                 If opt_level is greater than or equal to BUILD_OPT_BASIC:
                     proc optimize_peephole from Peephole with lir_func
                 End If

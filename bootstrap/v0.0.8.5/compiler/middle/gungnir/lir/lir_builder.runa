@@ -865,7 +865,16 @@ Process called "lower_return" that takes builder as Integer, mir_node as Integer
         Return 0
     End If
 
+    Note: MIRReturn return_value_id mirrors into the header operand1 slot at
+    Note: 16 (the canonical RETURN header form); 0 means a void return.
     Let return_value_id be proc memory_get_int64 from Layout with mir_node, 16
+
+    Note: The RET record carries the operand that physically holds the
+    Note: returned value — the architectural return register (RAX/XMM0) the
+    Note: epilogue must preserve. For a void return the operand stays 0 so the
+    Note: epilogue lowers a bare ret. Build it BEFORE create_lir_return so the
+    Note: record receives the real operand instead of the missing-argument 0.
+    Let ret_value_operand be 0
 
     Note: Check if function returns a value
     If return_value_id is not equal to 0:
@@ -885,10 +894,18 @@ Process called "lower_return" that takes builder as Integer, mir_node as Integer
 
         Let move_inst be proc create_lir_move from LIRNodes with dest_operand, src_operand, size
         proc append_lir_instruction with builder, move_inst
+
+        Note: The return value the RET record carries is the architectural
+        Note: return register, a freshly built register operand (the move's
+        Note: dest operand is owned by the move record, so allocate a distinct
+        Note: one for the RET record's operand slot).
+        Set ret_value_operand to proc create_register_operand from LIRNodes with return_reg, size
     End If
 
-    Note: Create return instruction
-    Let ret_inst be proc create_lir_return from LIRNodes
+    Note: Create return instruction carrying the return-value operand (0 for
+    Note: void). create_lir_return takes the return_value operand as its sole
+    Note: argument and stores it into the RET record's operand1 slot.
+    Let ret_inst be proc create_lir_return from LIRNodes with ret_value_operand
     proc append_lir_instruction with builder, ret_inst
 
     Return 1
@@ -1039,10 +1056,23 @@ Process called "lower_call" that takes builder as Integer, mir_node as Integer r
         Set arg_index to arg_index plus 1
     End While
 
-    Note: Create call instruction. For FFI externals, the call carries the
-    Note: callee's convention_id (offset 64 of LIR call). For non-FFI calls the
+    Note: The architectural return register the call result lands in (RAX or
+    Note: XMM0 per convention/type). 0 when the call returns nothing. The LIR
+    Note: call record carries this so liveness sees the def without having to
+    Note: model the full ABI, and so the post-call move below reads the right
+    Note: source register.
+    Let return_reg be 0
+    If result_value_id is not equal to 0:
+        Let ret_is_float be proc is_float_type with return_type
+        Set return_reg to proc lir_get_return_register from LIR with calling_convention, ret_is_float
+    End If
+
+    Note: Create call instruction with ALL of its arguments: the callee name,
+    Note: the argument value-id List, the argument count, and the return
+    Note: register. For FFI externals, the call carries the callee's
+    Note: convention_id (offset 64 of LIR call). For non-FFI calls the
     Note: convention field remains 0 (default = caller's SysV/Win64).
-    Let call_inst be proc create_lir_call from LIRNodes with callee_name, argument_count, calling_convention
+    Let call_inst be proc create_lir_call from LIRNodes with callee_name, arguments, argument_count, return_reg
     If callee_is_external is equal to 1:
         Note: Override the LIR call's calling_convention slot (offset 64) with the
         Note: callee's recorded convention. The codegen backend reads this to
@@ -1051,10 +1081,10 @@ Process called "lower_call" that takes builder as Integer, mir_node as Integer r
     End If
     proc append_lir_instruction with builder, call_inst
 
-    Note: Retrieve return value if function returns something
+    Note: Retrieve return value if function returns something. return_reg was
+    Note: already resolved above (and stored into the call record); reuse it
+    Note: as the source of the result move.
     If result_value_id is not equal to 0:
-        Set is_float to proc is_float_type with return_type
-        Let return_reg be proc lir_get_return_register from LIR with calling_convention, is_float
         Let result_reg be proc get_or_create_register_for_value with builder, result_value_id, return_type
 
         Set size to proc get_type_size with return_type
@@ -1705,16 +1735,46 @@ Process called "lower_vector_op" that takes builder as Integer, mir_node as Inte
         Return 0
     End If
 
+    Note: Post-OD-1 MIRVectorOp: the header mirrors result into value_id at 8
+    Note: and operand1/2/3 into 16/24/32; the element type is at header 40. The
+    Note: third operand (FMA addend / insert lane) and the SIMD element type are
+    Note: read through the canonical accessors at the extended offsets.
     Let opcode be proc memory_get_int64 from Layout with mir_node, 0
     Let result_value_id be proc memory_get_int64 from Layout with mir_node, 8
     Let left_value_id be proc memory_get_int64 from Layout with mir_node, 16
     Let right_value_id be proc memory_get_int64 from Layout with mir_node, 24
+    Let third_value_id be proc get_vector_operand3 from MIRNodes with mir_node
     Let type_info be proc memory_get_int64 from Layout with mir_node, 40
 
     Note: Get vector element type and size
     Let size be proc get_type_size with type_info
     Let is_float be proc is_float_type with type_info
 
+    Let lir_function be proc memory_get_int64 from Layout with builder, 8
+
+    Note: VECTOR STORE produces NO value: its result id is 0. Routing 0 through
+    Note: get_or_create_register_for_value would allocate a bogus virtual
+    Note: register that nothing defines. A store reads the value-to-store
+    Note: (operand2) and writes it to the address operand (operand1); it is a
+    Note: store-form record with no result register.
+    If opcode is equal to MIR_VECTOR_STORE from MIR:
+        Let store_addr_reg be proc get_or_create_register_for_value with builder, left_value_id, type_info
+        Let store_value_reg be proc get_or_create_register_for_value with builder, right_value_id, type_info
+        Let store_addr_operand be proc create_register_operand from LIRNodes with store_addr_reg, size
+        Let store_value_operand be proc create_register_operand from LIRNodes with store_value_reg, size
+        Let vstore_inst be proc create_lir_store from LIRNodes with store_addr_operand, store_value_operand, size, size
+        Note: Retag the BASE instruction's opcode (slot 0 of the wrapper holds
+        Note: the base pointer; the base's slot 0 holds the opcode) from
+        Note: LIR_STORE to LIR_VSTORE so the backend selects the vector store.
+        Let vstore_base be proc lir_resolve_instruction_base from LIR with vstore_inst
+        If vstore_base is not equal to 0:
+            proc memory_set_int64 from Layout with vstore_base, 0, LIR_VSTORE from LIR
+        End If
+        proc append_lir_instruction with builder, vstore_inst
+        Return 1
+    End If
+
+    Note: All remaining vector opcodes define a result register.
     Let result_reg be proc get_or_create_register_for_value with builder, result_value_id, type_info
     Let left_reg be proc get_or_create_register_for_value with builder, left_value_id, type_info
     Let right_reg be proc get_or_create_register_for_value with builder, right_value_id, type_info
@@ -1723,7 +1783,184 @@ Process called "lower_vector_op" that takes builder as Integer, mir_node as Inte
     Let left_operand be proc create_register_operand from LIRNodes with left_reg, size
     Let right_operand be proc create_register_operand from LIRNodes with right_reg, size
 
-    Note: Map vector opcode to LIR SIMD instruction
+    Note: ----------------------------------------------------------------
+    Note: Unary vector ops: SQRT (sqrtps/sqrtpd) and BROADCAST
+    Note: (vbroadcastss / pshufd-imm0) each take one source operand.
+    Note: ----------------------------------------------------------------
+    If opcode is equal to MIR_VECTOR_SQRT from MIR:
+        Let sqrt_inst be proc create_lir_unary_op from LIRNodes with LIR_VSQRT from LIR, dest_operand, left_operand, size
+        proc append_lir_instruction with builder, sqrt_inst
+        Return 1
+    End If
+
+    If opcode is equal to MIR_VECTOR_BROADCAST from MIR:
+        Let bcast_inst be proc create_lir_unary_op from LIRNodes with LIR_VBROADCAST from LIR, dest_operand, left_operand, size
+        proc append_lir_instruction with builder, bcast_inst
+        Return 1
+    End If
+
+    Note: ----------------------------------------------------------------
+    Note: NEG: x86 SSE/AVX has no vector negate; lower as 0 - x. Zero a
+    Note: scratch vector by XORing it with itself (pxor / xorps), then
+    Note: subtract x from zero. Float lanes select the FP subtract.
+    Note: ----------------------------------------------------------------
+    If opcode is equal to MIR_VECTOR_NEG from MIR:
+        Let neg_zero_reg be proc lir_create_virtual_register from LIR with lir_function, LIR_REGCLASS_VEC from LIR, size
+        Let neg_zero_dst be proc create_register_operand from LIRNodes with neg_zero_reg, size
+        Let neg_zero_a be proc create_register_operand from LIRNodes with neg_zero_reg, size
+        Let neg_zero_b be proc create_register_operand from LIRNodes with neg_zero_reg, size
+        Let neg_zero_inst be proc create_lir_binary_op from LIRNodes with LIR_VXOR from LIR, neg_zero_dst, neg_zero_a, neg_zero_b, size
+        proc append_lir_instruction with builder, neg_zero_inst
+
+        Let neg_sub_op be LIR_VSUB from LIR
+        If is_float is equal to 1:
+            Set neg_sub_op to LIR_VFSUB from LIR
+        End If
+        Let neg_zero_src be proc create_register_operand from LIRNodes with neg_zero_reg, size
+        Let neg_inst be proc create_lir_binary_op from LIRNodes with neg_sub_op, dest_operand, neg_zero_src, left_operand, size
+        proc append_lir_instruction with builder, neg_inst
+        Return 1
+    End If
+
+    Note: ----------------------------------------------------------------
+    Note: ABS: no single SSE/AVX integer/float vector-abs op covers both
+    Note: lane kinds uniformly, so lower as max(x, -x): zero a scratch,
+    Note: negate x into it, then take the lane-wise maximum of x and -x.
+    Note: ----------------------------------------------------------------
+    If opcode is equal to MIR_VECTOR_ABS from MIR:
+        Let abs_zero_reg be proc lir_create_virtual_register from LIR with lir_function, LIR_REGCLASS_VEC from LIR, size
+        Let abs_zero_dst be proc create_register_operand from LIRNodes with abs_zero_reg, size
+        Let abs_zero_a be proc create_register_operand from LIRNodes with abs_zero_reg, size
+        Let abs_zero_b be proc create_register_operand from LIRNodes with abs_zero_reg, size
+        Let abs_zero_inst be proc create_lir_binary_op from LIRNodes with LIR_VXOR from LIR, abs_zero_dst, abs_zero_a, abs_zero_b, size
+        proc append_lir_instruction with builder, abs_zero_inst
+
+        Let abs_neg_reg be proc lir_create_virtual_register from LIR with lir_function, LIR_REGCLASS_VEC from LIR, size
+        Let abs_neg_dst be proc create_register_operand from LIRNodes with abs_neg_reg, size
+        Let abs_sub_op be LIR_VSUB from LIR
+        If is_float is equal to 1:
+            Set abs_sub_op to LIR_VFSUB from LIR
+        End If
+        Let abs_zero_src be proc create_register_operand from LIRNodes with abs_zero_reg, size
+        Let abs_x_src be proc create_register_operand from LIRNodes with left_reg, size
+        Let abs_neg_inst be proc create_lir_binary_op from LIRNodes with abs_sub_op, abs_neg_dst, abs_zero_src, abs_x_src, size
+        proc append_lir_instruction with builder, abs_neg_inst
+
+        Let abs_x_again be proc create_register_operand from LIRNodes with left_reg, size
+        Let abs_neg_again be proc create_register_operand from LIRNodes with abs_neg_reg, size
+        Let abs_max_inst be proc create_lir_binary_op from LIRNodes with LIR_VMAX from LIR, dest_operand, abs_x_again, abs_neg_again, size
+        proc append_lir_instruction with builder, abs_max_inst
+        Return 1
+    End If
+
+    Note: ----------------------------------------------------------------
+    Note: FMA: a*b+c. SSE has no fused multiply-add (FMA is an AVX2/FMA3
+    Note: extension with no dedicated LIR opcode here), so lower as the
+    Note: equivalent multiply-then-add: tmp = a*b; result = tmp + c. The
+    Note: addend is operand3 (FMA is the canonical ternary vector op).
+    Note: ----------------------------------------------------------------
+    If opcode is equal to MIR_VECTOR_FMA from MIR:
+        Let fma_mul_reg be proc lir_create_virtual_register from LIR with lir_function, LIR_REGCLASS_VEC from LIR, size
+        Let fma_mul_dst be proc create_register_operand from LIRNodes with fma_mul_reg, size
+        Let fma_mul_op be LIR_VMUL from LIR
+        Let fma_add_op be LIR_VADD from LIR
+        If is_float is equal to 1:
+            Set fma_mul_op to LIR_VFMUL from LIR
+            Set fma_add_op to LIR_VFADD from LIR
+        End If
+        Let fma_mul_inst be proc create_lir_binary_op from LIRNodes with fma_mul_op, fma_mul_dst, left_operand, right_operand, size
+        proc append_lir_instruction with builder, fma_mul_inst
+
+        Let fma_addend_reg be proc get_or_create_register_for_value with builder, third_value_id, type_info
+        Let fma_mul_src be proc create_register_operand from LIRNodes with fma_mul_reg, size
+        Let fma_addend_operand be proc create_register_operand from LIRNodes with fma_addend_reg, size
+        Let fma_add_inst be proc create_lir_binary_op from LIRNodes with fma_add_op, dest_operand, fma_mul_src, fma_addend_operand, size
+        proc append_lir_instruction with builder, fma_add_inst
+        Return 1
+    End If
+
+    Note: ----------------------------------------------------------------
+    Note: Horizontal reductions: REDUCE_{ADD,MUL,MIN,MAX} collapse all
+    Note: lanes of one source vector to a scalar in lane 0. Lower as a
+    Note: log2(width) shuffle/op tree: at each step shuffle the upper half
+    Note: of the live lanes down and apply the lane-wise reduction op,
+    Note: halving the live lane count, then extract lane 0. This is the
+    Note: standard SSE/AVX horizontal-reduction sequence (e.g. for ADD:
+    Note: repeated shufps + addps, finishing with a scalar extract).
+    Note: ----------------------------------------------------------------
+    Let is_reduce be 0
+    Let reduce_op be 0
+    If opcode is equal to MIR_VECTOR_REDUCE_ADD from MIR:
+        Set is_reduce to 1
+        Set reduce_op to LIR_VADD from LIR
+        If is_float is equal to 1:
+            Set reduce_op to LIR_VFADD from LIR
+        End If
+    End If
+    If opcode is equal to MIR_VECTOR_REDUCE_MUL from MIR:
+        Set is_reduce to 1
+        Set reduce_op to LIR_VMUL from LIR
+        If is_float is equal to 1:
+            Set reduce_op to LIR_VFMUL from LIR
+        End If
+    End If
+    If opcode is equal to MIR_VECTOR_REDUCE_MIN from MIR:
+        Set is_reduce to 1
+        Set reduce_op to LIR_VMIN from LIR
+    End If
+    If opcode is equal to MIR_VECTOR_REDUCE_MAX from MIR:
+        Set is_reduce to 1
+        Set reduce_op to LIR_VMAX from LIR
+    End If
+
+    If is_reduce is equal to 1:
+        Let lanes be proc get_vector_width from MIRNodes with mir_node
+        If lanes is less than 2:
+            Set lanes to 2
+        End If
+
+        Note: Accumulator starts as the full source vector; halve the live
+        Note: lane span each round, folding the high half onto the low half.
+        Let acc_reg be left_reg
+        Let span be lanes
+        While span is greater than 1:
+            Let half be span divided by 2
+
+            Note: Shuffle the high `half` lanes of the accumulator down into a
+            Note: scratch vector; the shuffle mask (high-half lane indices) is
+            Note: carried as the immediate operand of the shuffle.
+            Let shuf_reg be proc lir_create_virtual_register from LIR with lir_function, LIR_REGCLASS_VEC from LIR, size
+            Let shuf_dst be proc create_register_operand from LIRNodes with shuf_reg, size
+            Let shuf_src be proc create_register_operand from LIRNodes with acc_reg, size
+            Let shuf_mask be proc create_immediate_operand from LIRNodes with half, size
+            Let shuf_inst be proc create_lir_binary_op from LIRNodes with LIR_VSHUFFLE from LIR, shuf_dst, shuf_src, shuf_mask, size
+            proc append_lir_instruction with builder, shuf_inst
+
+            Note: Reduce the low half against the shuffled-down high half.
+            Let fold_reg be proc lir_create_virtual_register from LIR with lir_function, LIR_REGCLASS_VEC from LIR, size
+            Let fold_dst be proc create_register_operand from LIRNodes with fold_reg, size
+            Let fold_a be proc create_register_operand from LIRNodes with acc_reg, size
+            Let fold_b be proc create_register_operand from LIRNodes with shuf_reg, size
+            Let fold_inst be proc create_lir_binary_op from LIRNodes with reduce_op, fold_dst, fold_a, fold_b, size
+            proc append_lir_instruction with builder, fold_inst
+
+            Set acc_reg to fold_reg
+            Set span to half
+        End While
+
+        Note: Extract lane 0 of the fully folded accumulator into the scalar
+        Note: result register.
+        Let extract_src be proc create_register_operand from LIRNodes with acc_reg, size
+        Let extract_lane be proc create_immediate_operand from LIRNodes with 0, size
+        Let extract_inst be proc create_lir_binary_op from LIRNodes with LIR_VEXTRACT from LIR, dest_operand, extract_src, extract_lane, size
+        proc append_lir_instruction with builder, extract_inst
+        Return 1
+    End If
+
+    Note: ----------------------------------------------------------------
+    Note: Binary vector ops (arithmetic, bitwise, min/max, load, shuffle,
+    Note: extract, insert): map MIR opcode -> single LIR SIMD opcode.
+    Note: ----------------------------------------------------------------
     Let lir_opcode be 0
 
     If opcode is equal to MIR_VECTOR_ADD from MIR:
@@ -1758,6 +1995,14 @@ Process called "lower_vector_op" that takes builder as Integer, mir_node as Inte
         End If
     End If
 
+    If opcode is equal to MIR_VECTOR_MIN from MIR:
+        Set lir_opcode to LIR_VMIN from LIR
+    End If
+
+    If opcode is equal to MIR_VECTOR_MAX from MIR:
+        Set lir_opcode to LIR_VMAX from LIR
+    End If
+
     If opcode is equal to MIR_VECTOR_AND from MIR:
         Set lir_opcode to LIR_VAND from LIR
     End If
@@ -1772,10 +2017,6 @@ Process called "lower_vector_op" that takes builder as Integer, mir_node as Inte
 
     If opcode is equal to MIR_VECTOR_LOAD from MIR:
         Set lir_opcode to LIR_VLOAD from LIR
-    End If
-
-    If opcode is equal to MIR_VECTOR_STORE from MIR:
-        Set lir_opcode to LIR_VSTORE from LIR
     End If
 
     If opcode is equal to MIR_VECTOR_SHUFFLE from MIR:

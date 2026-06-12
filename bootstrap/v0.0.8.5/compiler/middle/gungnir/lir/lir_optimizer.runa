@@ -36,6 +36,7 @@ This file consists of the following functions/features/operation types:
 :End Note
 
 Import "compiler/middle/gungnir/lir/lir.runa" as LIR
+Import "compiler/middle/gungnir/lir/lir_nodes.runa" as LIRNodes
 Import "compiler/middle/gungnir/lir/peephole.runa" as Peephole
 Import "compiler/frontend/primitives/memory/layout.runa" as Layout
 Import "compiler/frontend/primitives/collections/list.runa" as List
@@ -211,12 +212,138 @@ Note: Run Dead Code Elimination Pass
 Note: ============================================================================
 
 @Reasoning
-Removes instructions whose results are never used. This is a simple
-local dead code elimination - more sophisticated versions will use
-liveness analysis results.
+Records the register ids an operand record READS into the used-register
+set. A register operand reads its own register; a memory operand reads
+its base and index registers (the values that form the effective
+address). Immediate operands read nothing.
 
-this marks instructions with unused results and removes them.
-Future enhancement: Full dead code elimination using liveness.
+Task #473 model: instruction slots hold LIROperand POINTERS, not raw
+register ids — the register id lives inside the operand record and is
+reached through the kind-checked LIRNodes accessors. The pre-#473 DCE
+read the slots as if they were register ids, so it both keyed the
+used-set on heap pointers (never matching a real register) and ignored
+the base/index registers that memory operands genuinely use.
+@End Reasoning
+
+Process called "dce_mark_operand_used" that takes used_regs as Integer, operand as Integer returns Integer:
+    If operand is equal to 0:
+        Return 0
+    End If
+
+    Let reg_id be proc get_operand_register_id from LIRNodes with operand
+    If reg_id is greater than 0:
+        proc omap_set from OrderedMap with used_regs, reg_id, 1
+    End If
+
+    Let base_reg be proc get_memory_base_register from LIRNodes with operand
+    If base_reg is greater than 0:
+        proc omap_set from OrderedMap with used_regs, base_reg, 1
+    End If
+
+    Let index_reg be proc get_memory_index_register from LIRNodes with operand
+    If index_reg is greater than 0:
+        proc omap_set from OrderedMap with used_regs, index_reg, 1
+    End If
+
+    Return 1
+End Process
+
+@Reasoning
+Classifies whether an LIR opcode carries a side effect that makes its
+instruction LIVE regardless of whether its result register is read. An
+instruction with no observable effect AND a dead result can be removed;
+one with a side effect must be kept even when its result is unused.
+
+Side-effecting opcodes:
+- Memory stores: LIR_STORE, LIR_VSTORE (writes to memory)
+- Control flow: LIR_JMP, LIR_BRANCH, LIR_RET, LIR_SYSCALL (terminators
+  and the syscall trap)
+- Calls: LIR_CALL, LIR_CALL_INDIRECT (arbitrary effects + clobbers)
+- Atomics: the whole 31000-31009 band (loads included — they synchronize
+  memory and an atomic load's ordering side effect must not be dropped)
+- Exceptions: the whole 31100-31106 band (control transfer / unwinding)
+- Structural markers: LIR_LABEL, LIR_INLINE_ASM, and the debug band
+  30901/30904/30905/30906 (jump targets and opaque/observable markers)
+
+Everything else (moves, arithmetic, bitwise, shifts, loads-to-register,
+compares, conversions, pure vector ops) is removable when its result is
+dead.
+@End Reasoning
+
+Process called "lir_opcode_has_side_effect" that takes opcode as Integer returns Integer:
+    Note: Memory stores
+    If opcode is equal to LIR_STORE from LIR:
+        Return 1
+    End If
+    If opcode is equal to LIR_VSTORE from LIR:
+        Return 1
+    End If
+
+    Note: Calls, return, syscall (30520-30523) and the conditional branch /
+    Note: unconditional jump terminators
+    If opcode is greater than or equal to LIR_CALL from LIR:
+        If opcode is less than or equal to LIR_SYSCALL from LIR:
+            Return 1
+        End If
+    End If
+    If opcode is equal to LIR_JMP from LIR:
+        Return 1
+    End If
+    If opcode is equal to LIR_BRANCH from LIR:
+        Return 1
+    End If
+
+    Note: Atomic band 31000-31009 (loads included: ordering is observable)
+    If opcode is greater than or equal to LIR_ATOMIC_LOAD from LIR:
+        If opcode is less than or equal to LIR_MFENCE from LIR:
+            Return 1
+        End If
+    End If
+
+    Note: Exception band 31100-31106
+    If opcode is greater than or equal to LIR_INVOKE from LIR:
+        If opcode is less than or equal to LIR_UNWIND from LIR:
+            Return 1
+        End If
+    End If
+
+    Note: Structural / observable markers
+    If opcode is equal to LIR_LABEL from LIR:
+        Return 1
+    End If
+    If opcode is equal to LIR_INLINE_ASM from LIR:
+        Return 1
+    End If
+    If opcode is equal to LIR_DEBUG_LOCATION from LIR:
+        Return 1
+    End If
+    If opcode is equal to LIR_DEBUG_VALUE from LIR:
+        Return 1
+    End If
+    If opcode is equal to LIR_DEBUG_DECLARE from LIR:
+        Return 1
+    End If
+    If opcode is equal to LIR_DEBUG_LABEL from LIR:
+        Return 1
+    End If
+
+    Return 0
+End Process
+
+@Reasoning
+Removes instructions whose result register is never read and which carry
+no side effect (mark-sweep dead code elimination at the LIR level, after
+register allocation has assigned the physical registers).
+
+Task #473 operand-record model: every instruction in a block List is
+resolved through lir_resolve_instruction_base (the List carries both bare
+LIRInstruction records and typed wrappers whose slot 0 is a base
+pointer). The result and operand slots hold LIROperand POINTERS; register
+ids are read out of those records through the kind-checked accessors. The
+USE set is collected from the operand records (register operands plus the
+base/index registers of memory operands), and an instruction is dead when
+its result register is absent from the USE set and the opcode has no side
+effect.
 
 Returns the number of instructions eliminated.
 @End Reasoning
@@ -253,30 +380,43 @@ Process called "run_dce_pass" that takes context as Integer returns Integer:
         Let instructions be proc memory_get_int64 from Layout with block, 16
         Let instruction_count be proc memory_get_int64 from Layout with block, 24
 
-        Note: Build set of used registers (keys are integers - operand record
-        Note: pointers - so the set is an OrderedMap; Dictionary string-hashes
-        Note: its keys and dereferences them as string pointers, task #473)
+        Note: Build set of registers READ anywhere in this block (keys are
+        Note: integer register ids - OrderedMap, not Dictionary, task #473).
         Let used_regs be proc omap_create from OrderedMap
 
-        Note: Mark all registers that are USEd
+        Note: Mark every register an operand record reads. The result slot
+        Note: (offset 8) is a DEF, not a use, so it is excluded; operand
+        Note: slots 16/24/32 are uses, and memory operands read base/index
+        Note: registers wherever they appear (including a store's address,
+        Note: which lives in the result slot for the store form - so the
+        Note: result operand IS scanned, but only for its base/index reads).
         Let i be 0
         While i is less than instruction_count:
             Let instruction be proc get from List with instructions, i
+            Let base be proc lir_resolve_instruction_base from LIR with instruction
+            If base is not equal to 0:
+                Note: result slot: a register here is a def (skip its register
+                Note: read) but a memory address here is a real use (base/index)
+                Let result_op be proc memory_get_int64 from Layout with base, 8
+                If result_op is not equal to 0:
+                    Let result_base_reg be proc get_memory_base_register from LIRNodes with result_op
+                    If result_base_reg is greater than 0:
+                        proc omap_set from OrderedMap with used_regs, result_base_reg, 1
+                    End If
+                    Let result_index_reg be proc get_memory_index_register from LIRNodes with result_op
+                    If result_index_reg is greater than 0:
+                        proc omap_set from OrderedMap with used_regs, result_index_reg, 1
+                    End If
+                End If
 
-            Note: Mark operands as used
-            Let op1 be proc memory_get_int64 from Layout with instruction, 16
-            If op1 is greater than 0:
-                proc omap_set from OrderedMap with used_regs, op1, 1
-            End If
+                Let op1 be proc memory_get_int64 from Layout with base, 16
+                proc dce_mark_operand_used with used_regs, op1
 
-            Let op2 be proc memory_get_int64 from Layout with instruction, 24
-            If op2 is greater than 0:
-                proc omap_set from OrderedMap with used_regs, op2, 1
-            End If
+                Let op2 be proc memory_get_int64 from Layout with base, 24
+                proc dce_mark_operand_used with used_regs, op2
 
-            Let op3 be proc memory_get_int64 from Layout with instruction, 32
-            If op3 is greater than 0:
-                proc omap_set from OrderedMap with used_regs, op3, 1
+                Let op3 be proc memory_get_int64 from Layout with base, 32
+                proc dce_mark_operand_used with used_regs, op3
             End If
 
             Set i to i plus 1
@@ -286,29 +426,24 @@ Process called "run_dce_pass" that takes context as Integer returns Integer:
         Set i to instruction_count minus 1
         While i is greater than or equal to 0:
             Set instruction to proc get from List with instructions, i
-            Let result_reg be proc memory_get_int64 from Layout with instruction, 8
-            Let opcode be proc memory_get_int64 from Layout with instruction, 0
+            Let base be proc lir_resolve_instruction_base from LIR with instruction
+            If base is not equal to 0:
+                Let opcode be proc memory_get_int64 from Layout with base, 0
+                Let has_side_effects be proc lir_opcode_has_side_effect with opcode
 
-            Note: If instruction defines a result that's never used, and has no side effects
-            If result_reg is greater than 0:
-                Let is_used be proc omap_get from OrderedMap with used_regs, result_reg
-                If is_used is equal to 0:
-                    Note: Check if instruction has side effects
-                    Let has_side_effects be 0
+                If has_side_effects is equal to 0:
+                    Note: The result register this instruction DEFINES.
+                    Let result_op be proc memory_get_int64 from Layout with base, 8
+                    Let result_reg be proc get_operand_register_id from LIRNodes with result_op
 
-                    Note: STORE, CALL, RET have side effects - don't remove
-                    If opcode is equal to 30601:  Note: LIR_STORE
-                        Set has_side_effects to 1
-                    End If
-                    If opcode is greater than or equal to 30520 and opcode is less than or equal to 30523:  Note: CALL/RET/SYSCALL
-                        Set has_side_effects to 1
-                    End If
-
-                    Note: Remove if no side effects
-                    If has_side_effects is equal to 0:
-                        proc remove_at from List with instructions, i
-                        Set instruction_count to instruction_count minus 1
-                        Set changes to changes plus 1
+                    Note: A real register def that nothing reads is dead.
+                    If result_reg is greater than 0:
+                        Let is_used be proc omap_get from OrderedMap with used_regs, result_reg
+                        If is_used is equal to 0:
+                            proc remove_at from List with instructions, i
+                            Set instruction_count to instruction_count minus 1
+                            Set changes to changes plus 1
+                        End If
                     End If
                 End If
             End If
@@ -356,6 +491,105 @@ The MOV can then be eliminated by dead code elimination.
 Returns the number of copies propagated.
 @End Reasoning
 
+@Reasoning
+Collapses a copy chain to its ultimate source register. copy_map holds
+dest_reg -> src_reg for every register-to-register move; following the
+chain (a = MOV b; b = MOV c => a resolves to c) yields the value the use
+should read. A visited bound (the map size) guards against a cyclic chain
+- which cannot arise from straight-line single-assignment moves, but the
+guard keeps the resolver total under any input.
+@End Reasoning
+
+Process called "copyprop_resolve_source" that takes copy_map as Integer, reg_id as Integer returns Integer:
+    Let current be reg_id
+    Let steps be 0
+    Let limit be proc omap_size from OrderedMap with copy_map
+
+    While proc omap_contains from OrderedMap with copy_map, current is equal to 1:
+        Set current to proc omap_get from OrderedMap with copy_map, current
+        Set steps to steps plus 1
+        If steps is greater than limit:
+            Note: Cycle guard: stop following the chain.
+            Return current
+        End If
+    End While
+
+    Return current
+End Process
+
+@Reasoning
+Rewrites every register an operand record READS so that a copy
+destination is replaced by its ultimate source. A register operand has
+its register_id (offset 8) rewritten; a memory operand has its base
+(offset 24) and index (offset 32) registers rewritten. The rewrite is an
+in-place edit of the LIROperand RECORD - the task #473 model - never an
+overwrite of the instruction's operand-pointer slot. Returns the number
+of register fields actually changed.
+@End Reasoning
+
+Process called "copyprop_rewrite_operand_uses" that takes copy_map as Integer, operand as Integer returns Integer:
+    If operand is equal to 0:
+        Return 0
+    End If
+
+    Let rewrites be 0
+
+    Let reg_id be proc get_operand_register_id from LIRNodes with operand
+    If reg_id is greater than 0:
+        If proc omap_contains from OrderedMap with copy_map, reg_id is equal to 1:
+            Let new_reg be proc copyprop_resolve_source with copy_map, reg_id
+            If new_reg is not equal to reg_id:
+                proc memory_set_int64 from Layout with operand, 8, new_reg
+                Set rewrites to rewrites plus 1
+            End If
+        End If
+    End If
+
+    Set rewrites to rewrites plus copyprop_rewrite_memory_regs(copy_map, operand)
+    Return rewrites
+End Process
+
+@Reasoning
+Rewrites only the base/index register READS of a memory operand (leaving a
+register operand's register_id alone). Used for the result slot, whose
+register form is a DEFINITION that must not be forwarded - but whose
+memory form (a store/load address) is a genuine USE whose address
+registers should follow the copy. A register operand returns 0 from both
+memory accessors, so this is a no-op on register defs.
+@End Reasoning
+
+Process called "copyprop_rewrite_memory_regs" that takes copy_map as Integer, operand as Integer returns Integer:
+    If operand is equal to 0:
+        Return 0
+    End If
+
+    Let rewrites be 0
+
+    Let base_reg be proc get_memory_base_register from LIRNodes with operand
+    If base_reg is greater than 0:
+        If proc omap_contains from OrderedMap with copy_map, base_reg is equal to 1:
+            Let new_base be proc copyprop_resolve_source with copy_map, base_reg
+            If new_base is not equal to base_reg:
+                proc memory_set_int64 from Layout with operand, 24, new_base
+                Set rewrites to rewrites plus 1
+            End If
+        End If
+    End If
+
+    Let index_reg be proc get_memory_index_register from LIRNodes with operand
+    If index_reg is greater than 0:
+        If proc omap_contains from OrderedMap with copy_map, index_reg is equal to 1:
+            Let new_index be proc copyprop_resolve_source with copy_map, index_reg
+            If new_index is not equal to index_reg:
+                proc memory_set_int64 from Layout with operand, 32, new_index
+                Set rewrites to rewrites plus 1
+            End If
+        End If
+    End If
+
+    Return rewrites
+End Process
+
 Process called "run_copy_propagation_pass" that takes context as Integer returns Integer:
     If context is equal to 0:
         Display "run_copy_propagation_pass: null context"
@@ -381,11 +615,14 @@ Process called "run_copy_propagation_pass" that takes context as Integer returns
     Let blocks be proc memory_get_int64 from Layout with lir_function, 32
     Let block_count be proc memory_get_int64 from Layout with lir_function, 40
 
-    Note: Build copy map: destination -> source (keys are integers - operand
-    Note: record pointers - so this is an OrderedMap, task #473)
+    Note: Build copy map: dest register id -> source register id. Keys are
+    Note: integer register ids - OrderedMap, not Dictionary (task #473). Task
+    Note: #473 model: instruction slots hold LIROperand POINTERS, so the MOV's
+    Note: dest and source register ids are read out of the operand records via
+    Note: the kind-checked accessors, NOT taken from the slots directly.
     Let copy_map be proc omap_create from OrderedMap
 
-    Note: For each block, find MOV instructions
+    Note: For each block, find register-to-register MOV instructions
     Let b be 0
     While b is less than block_count:
         Let block be proc get from List with blocks, b
@@ -395,16 +632,26 @@ Process called "run_copy_propagation_pass" that takes context as Integer returns
         Let i be 0
         While i is less than instruction_count:
             Let instruction be proc get from List with instructions, i
-            Let opcode be proc memory_get_int64 from Layout with instruction, 0
+            Let base be proc lir_resolve_instruction_base from LIR with instruction
+            If base is not equal to 0:
+                Let opcode be proc memory_get_int64 from Layout with base, 0
 
-            Note: LIR_MOV = 30001
-            If opcode is equal to 30001:
-                Let dest be proc memory_get_int64 from Layout with instruction, 8
-                Let src be proc memory_get_int64 from Layout with instruction, 16
+                If opcode is equal to LIR_MOV from LIR:
+                    Note: A copy forwards only when BOTH ends are registers
+                    Note: (reg<-reg). A move from/to memory or an immediate is
+                    Note: not a register copy and must not enter the map.
+                    Let dest_op be proc memory_get_int64 from Layout with base, 8
+                    Let src_op be proc memory_get_int64 from Layout with base, 16
+                    Let dest_reg be proc get_operand_register_id from LIRNodes with dest_op
+                    Let src_reg be proc get_operand_register_id from LIRNodes with src_op
 
-                Note: Record copy: dest = src
-                If dest is greater than 0 and src is greater than 0:
-                    proc omap_set from OrderedMap with copy_map, dest, src
+                    If dest_reg is greater than 0:
+                        If src_reg is greater than 0:
+                            If dest_reg is not equal to src_reg:
+                                proc omap_set from OrderedMap with copy_map, dest_reg, src_reg
+                            End If
+                        End If
+                    End If
                 End If
             End If
 
@@ -414,7 +661,10 @@ Process called "run_copy_propagation_pass" that takes context as Integer returns
         Set b to b plus 1
     End While
 
-    Note: Replace uses of copied registers with original sources
+    Note: Replace register USES (operand records) with the copy's ultimate
+    Note: source. The MOV result slot (a DEF) is left alone; only the operand
+    Note: slots 16/24/32 carry uses, and memory operands' base/index reads are
+    Note: rewritten in place inside the operand record.
     Set b to 0
     While b is less than block_count:
         Set block to proc get from List with blocks, b
@@ -424,35 +674,24 @@ Process called "run_copy_propagation_pass" that takes context as Integer returns
         Set i to 0
         While i is less than instruction_count:
             Set instruction to proc get from List with instructions, i
+            Let base be proc lir_resolve_instruction_base from LIR with instruction
+            If base is not equal to 0:
+                Note: A store's address operand lives in the result slot and is
+                Note: a genuine memory USE - rewrite its base/index registers
+                Note: ONLY. The register form of the result slot is a DEFINITION
+                Note: (e.g. an ADD's destination); forwarding it would corrupt
+                Note: the def, so the result slot uses the memory-only rewriter.
+                Let result_op be proc memory_get_int64 from Layout with base, 8
+                Set changes to changes plus copyprop_rewrite_memory_regs(copy_map, result_op)
 
-            Note: Check operand1
-            Let op1 be proc memory_get_int64 from Layout with instruction, 16
-            If op1 is greater than 0:
-                Let original be proc omap_get from OrderedMap with copy_map, op1
-                If original is greater than 0:
-                    proc memory_set_int64 from Layout with instruction, 16, original
-                    Set changes to changes plus 1
-                End If
-            End If
+                Let op1 be proc memory_get_int64 from Layout with base, 16
+                Set changes to changes plus copyprop_rewrite_operand_uses(copy_map, op1)
 
-            Note: Check operand2
-            Let op2 be proc memory_get_int64 from Layout with instruction, 24
-            If op2 is greater than 0:
-                Set original to proc omap_get from OrderedMap with copy_map, op2
-                If original is greater than 0:
-                    proc memory_set_int64 from Layout with instruction, 24, original
-                    Set changes to changes plus 1
-                End If
-            End If
+                Let op2 be proc memory_get_int64 from Layout with base, 24
+                Set changes to changes plus copyprop_rewrite_operand_uses(copy_map, op2)
 
-            Note: Check operand3
-            Let op3 be proc memory_get_int64 from Layout with instruction, 32
-            If op3 is greater than 0:
-                Set original to proc omap_get from OrderedMap with copy_map, op3
-                If original is greater than 0:
-                    proc memory_set_int64 from Layout with instruction, 32, original
-                    Set changes to changes plus 1
-                End If
+                Let op3 be proc memory_get_int64 from Layout with base, 32
+                Set changes to changes plus copyprop_rewrite_operand_uses(copy_map, op3)
             End If
 
             Set i to i plus 1

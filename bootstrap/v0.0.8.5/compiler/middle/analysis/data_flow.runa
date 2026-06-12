@@ -36,24 +36,30 @@ This file consists of the following functions/features/operation types:
 - Liveness computation for register allocation
 
 Dependencies:
-- compiler/middle/gungnir/mir/mir.runa (MIR structures, SSA values)
+- compiler/middle/gungnir/mir/mir.runa (MIR structures, SSA values, canonical accessors)
+- compiler/middle/gungnir/mir/mir_nodes.runa (call/phi extended-record accessors)
+- compiler/middle/gungnir/mir/cfg.runa (CFG accessors, instruction use extraction)
 - compiler/middle/gungnir/lir/lir.runa (LIR structures, virtual registers)
+- compiler/middle/gungnir/lir/liveness.runa (canonical ABI-correct LIR liveness)
 - compiler/middle/analysis/control_flow.runa (CFG structures)
 - compiler/frontend/primitives/memory/layout.runa (OWNED HEAP allocation - Tier 3)
 - compiler/frontend/primitives/collections/list.runa (instruction tracking)
-- compiler/frontend/primitives/collections/dictionary.runa (value mappings)
+- compiler/frontend/primitives/collections/ordered_map.runa (integer-keyed value/block maps)
 - compiler/frontend/primitives/collections/set.runa (liveness sets)
-- compiler/frontend/primitives/core/string_core.runa (debug printing)
+- compiler/internal/string_utils.runa (integer-to-string for diagnostics)
 :End Note
 
 Import "compiler/middle/gungnir/mir/mir.runa" as MIR
+Import "compiler/middle/gungnir/mir/mir_nodes.runa" as MIRNodes
+Import "compiler/middle/gungnir/mir/cfg.runa" as MirCFG
 Import "compiler/middle/gungnir/lir/lir.runa" as LIR
+Import "compiler/middle/gungnir/lir/liveness.runa" as LIRLiveness
 Import "compiler/middle/analysis/control_flow.runa" as CFG
 Import "compiler/frontend/primitives/memory/layout.runa" as Layout
 Import "compiler/frontend/primitives/collections/list.runa" as List
-Import "compiler/frontend/primitives/collections/dictionary.runa" as Dictionary
+Import "compiler/frontend/primitives/collections/ordered_map.runa" as OrderedMap
 Import "compiler/frontend/primitives/collections/set.runa" as Set
-Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/internal/string_utils.runa" as StringUtils
 
 Note: ============================================================================
 Note: DATA FLOW ANALYSIS TYPE DEFINITIONS
@@ -290,66 +296,67 @@ Process called "compute_reaching_definitions_mir" that takes mir_cfg as Integer 
         Return 0
     End If
 
-    Note: Get CFG fields
-    Let blocks be proc memory_get_int64 from Layout with mir_cfg, 16
-    Let block_count be proc memory_get_int64 from Layout with mir_cfg, 24
+    Note: Canonical MIRCFG: blocks List at offset 16, entry_block at offset 0.
+    Let blocks be proc get_mir_cfg_blocks from MirCFG with mir_cfg
+    If blocks is equal to 0:
+        Display "compute_reaching_definitions_mir: null blocks list"
+        Return 0
+    End If
+    Let block_count be proc length from List with blocks
     Let entry_block be proc memory_get_int64 from Layout with mir_cfg, 0
+    Let entry_id be 0
+    If entry_block is not equal to 0:
+        Set entry_id to proc get_mir_basic_block_id from MirCFG with entry_block
+    End If
 
     If block_count is equal to 0:
         Display "compute_reaching_definitions_mir: empty CFG"
         Return 0
     End If
 
-    Note: Create reaching definition info for each block
-    Let reach_infos be proc create from Dictionary
+    Note: Create reaching definition info for each block, keyed on the
+    Note: integer block_id through an ordered_map (collections/dictionary
+    Note: string-hashes its keys, which segfaults on integer keys).
+    Let reach_infos be proc omap_create from OrderedMap
 
     Let b be 0
     While b is less than block_count:
         Let block be proc get from List with blocks, b
-        Let block_id be proc memory_get_int64 from Layout with block, 0
+        Let block_id be proc get_mir_basic_block_id from MirCFG with block
 
         Let reach_info be create_reaching_def_info(block_id)
-        proc set from Dictionary with reach_infos, block_id, reach_info
+        proc omap_set from OrderedMap with reach_infos, block_id, reach_info
 
         Set b to b plus 1
     End While
 
-    Note: Compute gen/kill sets for each block
+    Note: Compute gen/kill sets for each block. A reaching definition is
+    Note: identified by the DEFINING INSTRUCTION pointer; gen[B] is the set
+    Note: of instructions in B that produce an SSA value (value_id != 0).
+    Note: In SSA every value is defined exactly once, so a block never
+    Note: redefines a value defined elsewhere — kill[B] is empty by SSA's
+    Note: single-assignment invariant (phi nodes merge, they do not kill).
     Set b to 0
     While b is less than block_count:
         Set block to proc get from List with blocks, b
-        Set block_id to proc memory_get_int64 from Layout with block, 0
-        Set reach_info to proc get from Dictionary with reach_infos, block_id
+        Set block_id to proc get_mir_basic_block_id from MirCFG with block
+        Set reach_info to proc omap_get from OrderedMap with reach_infos, block_id
 
         Let gen_set be proc memory_get_int64 from Layout with reach_info, 24
-        Let kill_set be proc memory_get_int64 from Layout with reach_info, 32
 
-        Note: Get instructions for this block
-        Let instructions be proc memory_get_int64 from Layout with block, 16
-        Let inst_count be proc memory_get_int64 from Layout with block, 24
+        Note: Canonical block: instruction List at offset 16, count at offset 24.
+        Let instructions be proc get_block_instructions from MIR with block
+        Let inst_count be proc get_block_instruction_count from MIR with block
 
-        Note: For each instruction in block
         Let i be 0
         While i is less than inst_count:
             Let inst be proc get from List with instructions, i
-            Let inst_ptr be inst
 
-            Note: Check if instruction defines a value
-            Note: Get result value (offset 8 in MIRNode)
-            Let result be proc memory_get_int64 from Layout with inst, 8
-            If result is not equal to 0:
-                Note: Get value_id (offset 0 in MIRValue)
-                Let value_id be proc memory_get_int64 from Layout with result, 0
-
-                Note: Add instruction to gen set
-                proc add from Set with gen_set, inst_ptr
-
-                Note: In SSA form, each value has exactly one definition
-                Note: Kill set includes all previous definitions of same variable
-                Note: However, in proper SSA, phi-nodes are the only multi-def points
-                Note: For reaching definitions, we track which def reaches a point
-                Note: Since SSA guarantees single definition, kill set is effectively empty
-                Note: for non-phi instructions (phi nodes merge multiple definitions)
+            Note: Canonical: SSA result value-id lives in the MIRNode header
+            Note: value_id slot (offset 8); 0 means non-producing.
+            Let value_id be proc get_mir_node_value_id from MIR with inst
+            If value_id is not equal to 0:
+                proc add from Set with gen_set, inst
             End If
 
             Set i to i plus 1
@@ -358,7 +365,7 @@ Process called "compute_reaching_definitions_mir" that takes mir_cfg as Integer 
         Set b to b plus 1
     End While
 
-    Note: Fixed-point iteration for reach_in/reach_out
+    Note: Fixed-point iteration for reach_in/reach_out (forward dataflow)
     Let changed be 1
     Let iteration be 0
 
@@ -369,45 +376,50 @@ Process called "compute_reaching_definitions_mir" that takes mir_cfg as Integer 
                 Set changed to 0
                 Set iteration to iteration plus 1
 
-                Note: For each block (except entry)
+                Note: For each block (except entry, whose reach_in is empty)
                 Set b to 0
                 While b is less than block_count:
                     Set block to proc get from List with blocks, b
-                    Set block_id to proc memory_get_int64 from Layout with block, 0
+                    Set block_id to proc get_mir_basic_block_id from MirCFG with block
 
-                    Note: Skip entry block on first iteration
-                    If block_id is equal to proc memory_get_int64 from Layout with entry_block, 0:
+                    Note: Skip entry block (reach_in[entry] = empty)
+                    If block_id is equal to entry_id:
                         Set b to b plus 1
                         Continue
                     End If
 
-                    Set reach_info to proc get from Dictionary with reach_infos, block_id
+                    Set reach_info to proc omap_get from OrderedMap with reach_infos, block_id
                     Let reach_in be proc memory_get_int64 from Layout with reach_info, 8
                     Let reach_out be proc memory_get_int64 from Layout with reach_info, 16
                     Let gen be proc memory_get_int64 from Layout with reach_info, 24
                     Let kill be proc memory_get_int64 from Layout with reach_info, 32
 
-                    Note: Compute new reach_in = ∪_{P ∈ pred[B]} reach_out[P]
+                    Note: Compute new reach_in = ∪_{P ∈ pred[B]} reach_out[P].
+                    Note: Predecessors are a List of block IDS (canonical
+                    Note: MIRBasicBlock offset 32); resolve each id to its
+                    Note: block then to its reach_info entry.
                     Let new_reach_in be proc create from Set
 
-                    Let predecessors be proc memory_get_int64 from Layout with block, 32
-                    Let pred_count be proc memory_get_int64 from Layout with block, 40
+                    Let predecessors be proc get_block_predecessors from MIR with block
+                    Let pred_count be proc get_block_predecessor_count from MIR with block
 
                     Let p be 0
                     While p is less than pred_count:
                         Let pred_id be proc get from List with predecessors, p
-                        Let pred_reach_info be proc get from Dictionary with reach_infos, pred_id
-                        Let pred_reach_out be proc memory_get_int64 from Layout with pred_reach_info, 16
+                        Let pred_reach_info be proc omap_get from OrderedMap with reach_infos, pred_id
+                        If pred_reach_info is not equal to 0:
+                            Let pred_reach_out be proc memory_get_int64 from Layout with pred_reach_info, 16
 
-                        Note: Union with predecessor's reach_out
-                        Let pred_reach_out_list be proc to_list from Set with pred_reach_out
-                        Let pred_size be proc length from List with pred_reach_out_list
-                        Let j be 0
-                        While j is less than pred_size:
-                            Let def_id be proc get from List with pred_reach_out_list, j
-                            proc add from Set with new_reach_in, def_id
-                            Set j to j plus 1
-                        End While
+                            Note: Union with predecessor's reach_out
+                            Let pred_reach_out_list be proc to_list from Set with pred_reach_out
+                            Let pred_size be proc length from List with pred_reach_out_list
+                            Let j be 0
+                            While j is less than pred_size:
+                                Let def_id be proc get from List with pred_reach_out_list, j
+                                proc add from Set with new_reach_in, def_id
+                                Set j to j plus 1
+                            End While
+                        End If
 
                         Set p to p plus 1
                     End While
@@ -419,7 +431,7 @@ Process called "compute_reaching_definitions_mir" that takes mir_cfg as Integer 
                         Set changed to 1
                     End If
 
-                    Note: Update reach_in
+                    Note: Update reach_in (replacing the prior set)
                     proc memory_set_int64 from Layout with reach_info, 8, new_reach_in
 
                     Note: Compute reach_out = gen ∪ (reach_in - kill)
@@ -463,7 +475,7 @@ Process called "compute_reaching_definitions_mir" that takes mir_cfg as Integer 
     End While
 
     Note: Fixed-point reached or max iterations
-    If iteration is equal to 100:
+    If iteration is greater than or equal to 100:
         Display "compute_reaching_definitions_mir: max iterations reached"
     End If
 
@@ -503,87 +515,131 @@ Process called "compute_live_variables_mir" that takes mir_cfg as Integer return
         Return 0
     End If
 
-    Note: Get CFG fields
-    Let blocks be proc memory_get_int64 from Layout with mir_cfg, 16
-    Let block_count be proc memory_get_int64 from Layout with mir_cfg, 24
-    Let exit_block be proc memory_get_int64 from Layout with mir_cfg, 8
+    Note: Canonical MIRCFG: blocks List at offset 16.
+    Let blocks be proc get_mir_cfg_blocks from MirCFG with mir_cfg
+    If blocks is equal to 0:
+        Display "compute_live_variables_mir: null blocks list"
+        Return 0
+    End If
+    Let block_count be proc length from List with blocks
 
     If block_count is equal to 0:
         Display "compute_live_variables_mir: empty CFG"
         Return 0
     End If
 
-    Note: Create liveness info for each block
-    Let liveness_infos be proc create from Dictionary
+    Note: Create liveness info for each block, keyed on the integer block_id
+    Note: through an ordered_map (collections/dictionary string-hashes its
+    Note: keys, which segfaults on integer keys — the Wave 3 crash class).
+    Let liveness_infos be proc omap_create from OrderedMap
 
     Let b be 0
     While b is less than block_count:
         Let block be proc get from List with blocks, b
-        Let block_id be proc memory_get_int64 from Layout with block, 0
+        Let block_id be proc get_mir_basic_block_id from MirCFG with block
 
         Let liveness be create_liveness_info(block_id)
-        proc set from Dictionary with liveness_infos, block_id, liveness
+        proc omap_set from OrderedMap with liveness_infos, block_id, liveness
 
         Set b to b plus 1
     End While
 
-    Note: Compute uses/defs sets for each block
+    Note: Compute uses/defs sets for each block.
+    Note: USE[B]  = value-ids read before any definition in B.
+    Note: DEF[B]  = value-ids written in B.
+    Note: Uses are extracted canonically: CFG.get_instruction_used_values
+    Note: enumerates header operand slots and PHI incoming values as raw
+    Note: SSA value-ids; call/invoke argument Lists carry additional uses
+    Note: at the prefix-embedded args slot, which that enumerator omits, so
+    Note: they are folded in here. The definition is the MIRNode header
+    Note: value_id (offset 8), 0 for non-producing instructions.
     Set b to 0
     While b is less than block_count:
         Set block to proc get from List with blocks, b
-        Set block_id to proc memory_get_int64 from Layout with block, 0
-        Set liveness to proc get from Dictionary with liveness_infos, block_id
+        Set block_id to proc get_mir_basic_block_id from MirCFG with block
+        Set liveness to proc omap_get from OrderedMap with liveness_infos, block_id
 
         Let uses be proc memory_get_int64 from Layout with liveness, 40
         Let defs be proc memory_get_int64 from Layout with liveness, 48
 
-        Note: Track which variables are defined (for this block)
+        Note: Track which variables are defined so far in this block (a
+        Note: later use of a locally-defined value is NOT a block-level use).
         Let defined_in_block be proc create from Set
 
-        Note: Get instructions for this block
-        Let instructions be proc memory_get_int64 from Layout with block, 16
-        Let inst_count be proc memory_get_int64 from Layout with block, 24
+        Note: Canonical block: instruction List at offset 16, count at offset 24.
+        Let instructions be proc get_block_instructions from MIR with block
+        Let inst_count be proc get_block_instruction_count from MIR with block
 
-        Note: For each instruction in block (forward pass for uses/defs)
         Let i be 0
         While i is less than inst_count:
             Let inst be proc get from List with instructions, i
 
-            Note: Get opcode (offset 0 in MIRNode)
-            Let opcode be proc memory_get_int64 from Layout with inst, 0
-
-            Note: Get operands (offset 16 in MIRNode, List of MIRValue pointers)
-            Let operands be proc memory_get_int64 from Layout with inst, 16
-            If operands is not equal to 0:
-                Let operand_count be proc length from List with operands
-
-                Note: For each operand (represents a use)
+            Note: Uses: header operand slots + phi incomings (canonical enumerator)
+            Let used_values be proc get_instruction_used_values from MirCFG with inst
+            If used_values is not equal to 0:
+                Let used_count be proc length from List with used_values
                 Let op_idx be 0
-                While op_idx is less than operand_count:
-                    Let operand be proc get from List with operands, op_idx
-                    If operand is not equal to 0:
-                        Note: Get value_id (offset 0 in MIRValue)
-                        Let value_id be proc memory_get_int64 from Layout with operand, 0
-
-                        Note: If not yet defined in this block, it's a use
+                While op_idx is less than used_count:
+                    Let value_id be proc get from List with used_values, op_idx
+                    If value_id is not equal to 0:
                         If proc contains from Set with defined_in_block, value_id is equal to 0:
                             proc add from Set with uses, value_id
                         End If
                     End If
-
                     Set op_idx to op_idx plus 1
                 End While
             End If
 
-            Note: Get result value (offset 8 in MIRNode, defines a value)
-            Let result be proc memory_get_int64 from Layout with inst, 8
-            If result is not equal to 0:
-                Note: Get value_id (offset 0 in MIRValue)
-                Set value_id to proc memory_get_int64 from Layout with result, 0
+            Note: Uses: call/invoke argument Lists (prefix-embedded args@88),
+            Note: which the header-slot enumerator does not cover.
+            Let opcode be proc get_mir_node_opcode from MIR with inst
+            If opcode is equal to 20304:
+                Set inst to inst Note: direct CALL
+                Let call_args be proc get_call_arguments from MIRNodes with inst
+                If call_args is not equal to 0:
+                    Let arg_count be proc get_call_argument_count from MIRNodes with inst
+                    Let ai be 0
+                    While ai is less than arg_count:
+                        Let arg_value be proc get from List with call_args, ai
+                        If arg_value is not equal to 0:
+                            If proc contains from Set with defined_in_block, arg_value is equal to 0:
+                                proc add from Set with uses, arg_value
+                            End If
+                        End If
+                        Set ai to ai plus 1
+                    End While
+                End If
+            Otherwise:
+                If opcode is equal to 20305:
+                    Note: CALL_INDIRECT — callee value-id is a use plus the args
+                    Let indirect_callee be proc get_call_callee from MIRNodes with inst
+                    If indirect_callee is not equal to 0:
+                        If proc contains from Set with defined_in_block, indirect_callee is equal to 0:
+                            proc add from Set with uses, indirect_callee
+                        End If
+                    End If
+                    Let icall_args be proc get_call_arguments from MIRNodes with inst
+                    If icall_args is not equal to 0:
+                        Let iarg_count be proc get_call_argument_count from MIRNodes with inst
+                        Let iai be 0
+                        While iai is less than iarg_count:
+                            Let iarg_value be proc get from List with icall_args, iai
+                            If iarg_value is not equal to 0:
+                                If proc contains from Set with defined_in_block, iarg_value is equal to 0:
+                                    proc add from Set with uses, iarg_value
+                                End If
+                            End If
+                            Set iai to iai plus 1
+                        End While
+                    End If
+                End If
+            End If
 
-                Note: This instruction defines value_id
-                proc add from Set with defs, value_id
-                proc add from Set with defined_in_block, value_id
+            Note: Definition: header value_id (offset 8); 0 = non-producing.
+            Let result_value be proc get_mir_node_value_id from MIR with inst
+            If result_value is not equal to 0:
+                proc add from Set with defs, result_value
+                proc add from Set with defined_in_block, result_value
             End If
 
             Set i to i plus 1
@@ -595,6 +651,8 @@ Process called "compute_live_variables_mir" that takes mir_cfg as Integer return
     Note: Fixed-point iteration for live_in/live_out (backward)
     Let changed be 1
     Let iteration be 0
+    Let value_id be 0
+    Let j be 0
 
     While changed is equal to 1:
         If iteration is greater than or equal to 100:
@@ -607,35 +665,40 @@ Process called "compute_live_variables_mir" that takes mir_cfg as Integer return
                 Set b to 0
                 While b is less than block_count:
                     Set block to proc get from List with blocks, b
-                    Set block_id to proc memory_get_int64 from Layout with block, 0
+                    Set block_id to proc get_mir_basic_block_id from MirCFG with block
 
-                    Set liveness to proc get from Dictionary with liveness_infos, block_id
+                    Set liveness to proc omap_get from OrderedMap with liveness_infos, block_id
                     Let live_in be proc memory_get_int64 from Layout with liveness, 8
                     Let live_out be proc memory_get_int64 from Layout with liveness, 16
                     Set uses to proc memory_get_int64 from Layout with liveness, 40
                     Set defs to proc memory_get_int64 from Layout with liveness, 48
 
-                    Note: Compute new live_out = ∪_{S ∈ succ[B]} live_in[S]
+                    Note: Compute new live_out = ∪_{S ∈ succ[B]} live_in[S].
+                    Note: Successors are a List of block IDS (canonical
+                    Note: MIRBasicBlock offset 48); look up each successor's
+                    Note: liveness by id through the ordered_map.
                     Let new_live_out be proc create from Set
 
-                    Let successors be proc memory_get_int64 from Layout with block, 48
-                    Let succ_count be proc memory_get_int64 from Layout with block, 56
+                    Let successors be proc get_block_successors from MIR with block
+                    Let succ_count be proc get_block_successor_count from MIR with block
 
                     Let s be 0
                     While s is less than succ_count:
                         Let succ_id be proc get from List with successors, s
-                        Let succ_liveness be proc get from Dictionary with liveness_infos, succ_id
-                        Let succ_live_in be proc memory_get_int64 from Layout with succ_liveness, 8
+                        Let succ_liveness be proc omap_get from OrderedMap with liveness_infos, succ_id
+                        If succ_liveness is not equal to 0:
+                            Let succ_live_in be proc memory_get_int64 from Layout with succ_liveness, 8
 
-                        Note: Union with successor's live_in
-                        Let succ_live_in_list be proc to_list from Set with succ_live_in
-                        Let succ_size be proc length from List with succ_live_in_list
-                        Let j be 0
-                        While j is less than succ_size:
-                            Set value_id to proc get from List with succ_live_in_list, j
-                            proc add from Set with new_live_out, value_id
-                            Set j to j plus 1
-                        End While
+                            Note: Union with successor's live_in
+                            Let succ_live_in_list be proc to_list from Set with succ_live_in
+                            Let succ_size be proc length from List with succ_live_in_list
+                            Set j to 0
+                            While j is less than succ_size:
+                                Set value_id to proc get from List with succ_live_in_list, j
+                                proc add from Set with new_live_out, value_id
+                                Set j to j plus 1
+                            End While
+                        End If
 
                         Set s to s plus 1
                     End While
@@ -695,7 +758,7 @@ Process called "compute_live_variables_mir" that takes mir_cfg as Integer return
     End While
 
     Note: Fixed-point reached or max iterations
-    If iteration is equal to 100:
+    If iteration is greater than or equal to 100:
         Display "compute_live_variables_mir: max iterations reached"
     End If
 
@@ -722,109 +785,127 @@ Process called "build_def_use_chains_mir" that takes mir_function as Integer ret
         Return 0
     End If
 
-    Note: Get MIR CFG
-    Let mir_cfg be proc memory_get_int64 from Layout with mir_function, 8
+    Note: Canonical MIRFunction cfg slot is offset 8.
+    Let mir_cfg be proc get_mir_function_cfg from MIR with mir_function
     If mir_cfg is equal to 0:
         Display "build_def_use_chains_mir: null CFG"
         Return 0
     End If
 
-    Note: Get blocks
-    Let blocks be proc memory_get_int64 from Layout with mir_cfg, 16
-    Let block_count be proc memory_get_int64 from Layout with mir_cfg, 24
+    Note: Canonical blocks List at MIRCFG offset 16.
+    Let blocks be proc get_mir_cfg_blocks from MirCFG with mir_cfg
+    If blocks is equal to 0:
+        Return proc omap_create from OrderedMap
+    End If
+    Let block_count be proc length from List with blocks
 
-    Note: Create block_id to block mapping for O(1) lookup
-    Let block_id_to_block be proc create from Dictionary
+    Note: def-use chains keyed on the SSA value-id (integer key), so the
+    Note: ordered_map is required (the string-hashing Dictionary segfaults
+    Note: on integer keys). Pass 1 creates one chain per defined value.
+    Let def_use_chains be proc omap_create from OrderedMap
+
     Let b be 0
     While b is less than block_count:
         Let block be proc get from List with blocks, b
-        Let block_id be proc memory_get_int64 from Layout with block, 0
-        proc set from Dictionary with block_id_to_block, block_id, block
-        Set b to b plus 1
-    End While
+        Let block_id be proc get_mir_basic_block_id from MirCFG with block
 
-    Note: Create def-use chains dictionary
-    Let def_use_chains be proc create from Dictionary
+        Let instructions be proc get_block_instructions from MIR with block
+        Let inst_count be proc get_block_instruction_count from MIR with block
 
-    Note: For each block
-    Set b to 0
-    While b is less than block_count:
-        Set block to proc get from List with blocks, b
-        Set block_id to proc memory_get_int64 from Layout with block, 0
-
-        Note: Get instructions
-        Let instructions be proc memory_get_int64 from Layout with block, 16
-        Let inst_count be proc memory_get_int64 from Layout with block, 24
-
-        Note: For each instruction
         Let i be 0
         While i is less than inst_count:
             Let inst be proc get from List with instructions, i
 
-            Note: Get result value (offset 8 in MIRNode)
-            Let result be proc memory_get_int64 from Layout with inst, 8
-            If result is not equal to 0:
-                Note: Get value_id (offset 0 in MIRValue)
-                Let value_id be proc memory_get_int64 from Layout with result, 0
-
-                Note: Create def-use chain for this value
+            Note: Canonical: the SSA result value-id is the header value_id
+            Note: (offset 8). 0 means the instruction produces no value.
+            Let value_id be proc get_mir_node_value_id from MIR with inst
+            If value_id is not equal to 0:
                 Let chain be create_def_use_chain(value_id, block_id)
-
-                Note: Get use_list (offset 24 in MIRValue)
-                Let use_list be proc memory_get_int64 from Layout with result, 24
-                If use_list is not equal to 0:
-                    Let use_count be proc length from List with use_list
-
-                    Note: Get chain fields
-                    Let chain_use_ids be proc memory_get_int64 from Layout with chain, 8
-                    Let chain_use_blocks be proc memory_get_int64 from Layout with chain, 24
-
-                    Note: For each use
-                    Let u be 0
-                    While u is less than use_count:
-                        Let use_inst be proc get from List with use_list, u
-                        proc append from List with chain_use_ids, use_inst
-
-                        Note: Find which block this use is in (O(N*M) search)
-                        Note: With block_id_to_block mapping above, we still need instruction search
-                        Let found_block be 0
-                        Let bb be 0
-                        While bb is less than block_count:
-                            If found_block is equal to 1:
-                                Set bb to block_count
-                            Otherwise:
-                                Let search_block be proc get from List with blocks, bb
-                                Let search_insts be proc memory_get_int64 from Layout with search_block, 16
-                                Let search_count be proc memory_get_int64 from Layout with search_block, 24
-
-                                Let si be 0
-                                While si is less than search_count:
-                                    If found_block is equal to 1:
-                                        Set si to search_count
-                                    Otherwise:
-                                        Let search_inst be proc get from List with search_insts, si
-                                        If search_inst is equal to use_inst:
-                                            Let use_block_id be proc memory_get_int64 from Layout with search_block, 0
-                                            proc append from List with chain_use_blocks, use_block_id
-                                            Set found_block to 1
-                                        End If
-                                        Set si to si plus 1
-                                    End If
-                                End While
-
-                                Set bb to bb plus 1
-                            End If
-                        End While
-
-                        Set u to u plus 1
-                    End While
-                End If
-
-                Note: Store chain in dictionary
-                proc set from Dictionary with def_use_chains, value_id, chain
+                proc omap_set from OrderedMap with def_use_chains, value_id, chain
             End If
 
             Set i to i plus 1
+        End While
+
+        Set b to b plus 1
+    End While
+
+    Note: Pass 2: for every instruction, enumerate the SSA value-ids it USES
+    Note: (header operand slots + phi incomings via the canonical enumerator,
+    Note: plus call/invoke argument Lists and the indirect callee) and append
+    Note: the using instruction pointer and its block id to each used value's
+    Note: chain. Post-OD-1, SSA use-lists are never materialized on MIRValue
+    Note: records, so the chain is constructed by this forward scan rather
+    Note: than by reading a use_list field.
+    Set b to 0
+    While b is less than block_count:
+        Set block to proc get from List with blocks, b
+        Set block_id to proc get_mir_basic_block_id from MirCFG with block
+
+        Let block_insts be proc get_block_instructions from MIR with block
+        Let block_inst_count be proc get_block_instruction_count from MIR with block
+
+        Let k be 0
+        While k is less than block_inst_count:
+            Let use_inst be proc get from List with block_insts, k
+
+            Note: Header-slot + phi uses through the canonical enumerator.
+            Let used_values be proc get_instruction_used_values from MirCFG with use_inst
+            If used_values is not equal to 0:
+                Let used_count be proc length from List with used_values
+                Let ui be 0
+                While ui is less than used_count:
+                    Let used_value be proc get from List with used_values, ui
+                    If used_value is not equal to 0:
+                        Let target_chain be proc omap_get from OrderedMap with def_use_chains, used_value
+                        If target_chain is not equal to 0:
+                            Let chain_use_ids be proc memory_get_int64 from Layout with target_chain, 8
+                            Let chain_use_blocks be proc memory_get_int64 from Layout with target_chain, 24
+                            proc append from List with chain_use_ids, use_inst
+                            proc append from List with chain_use_blocks, block_id
+                        End If
+                    End If
+                    Set ui to ui plus 1
+                End While
+            End If
+
+            Note: Call/invoke argument-List uses (prefix-embedded args@88) and
+            Note: the indirect callee value-id, which the header enumerator omits.
+            Let opcode be proc get_mir_node_opcode from MIR with use_inst
+            If opcode is equal to 20305:
+                Let indirect_callee be proc get_call_callee from MIRNodes with use_inst
+                If indirect_callee is not equal to 0:
+                    Let callee_chain be proc omap_get from OrderedMap with def_use_chains, indirect_callee
+                    If callee_chain is not equal to 0:
+                        Let callee_use_ids be proc memory_get_int64 from Layout with callee_chain, 8
+                        Let callee_use_blocks be proc memory_get_int64 from Layout with callee_chain, 24
+                        proc append from List with callee_use_ids, use_inst
+                        proc append from List with callee_use_blocks, block_id
+                    End If
+                End If
+            End If
+            If opcode is equal to 20304 or opcode is equal to 20305:
+                Let call_args be proc get_call_arguments from MIRNodes with use_inst
+                If call_args is not equal to 0:
+                    Let arg_count be proc get_call_argument_count from MIRNodes with use_inst
+                    Let ai be 0
+                    While ai is less than arg_count:
+                        Let arg_value be proc get from List with call_args, ai
+                        If arg_value is not equal to 0:
+                            Let arg_chain be proc omap_get from OrderedMap with def_use_chains, arg_value
+                            If arg_chain is not equal to 0:
+                                Let arg_use_ids be proc memory_get_int64 from Layout with arg_chain, 8
+                                Let arg_use_blocks be proc memory_get_int64 from Layout with arg_chain, 24
+                                proc append from List with arg_use_ids, use_inst
+                                proc append from List with arg_use_blocks, block_id
+                            End If
+                        End If
+                        Set ai to ai plus 1
+                    End While
+                End If
+            End If
+
+            Set k to k plus 1
         End While
 
         Set b to b plus 1
@@ -849,58 +930,86 @@ Process called "build_use_def_chains_mir" that takes mir_function as Integer ret
         Return 0
     End If
 
-    Note: Get MIR CFG
-    Let mir_cfg be proc memory_get_int64 from Layout with mir_function, 8
+    Note: Canonical MIRFunction cfg slot is offset 8.
+    Let mir_cfg be proc get_mir_function_cfg from MIR with mir_function
     If mir_cfg is equal to 0:
         Display "build_use_def_chains_mir: null CFG"
         Return 0
     End If
 
-    Note: Get blocks
-    Let blocks be proc memory_get_int64 from Layout with mir_cfg, 16
-    Let block_count be proc memory_get_int64 from Layout with mir_cfg, 24
+    Note: Canonical blocks List at MIRCFG offset 16.
+    Let blocks be proc get_mir_cfg_blocks from MirCFG with mir_cfg
+    If blocks is equal to 0:
+        Return proc omap_create from OrderedMap
+    End If
+    Let block_count be proc length from List with blocks
 
-    Note: Create use-def chains dictionary
-    Let use_def_chains be proc create from Dictionary
+    Note: Maps each used SSA value-id to its defining instruction. In SSA
+    Note: each value has exactly one definition, so the value-id is the
+    Note: natural key — resolved through MIR.lookup_defining_instruction,
+    Note: which consults the function's value_to_instruction registry. The
+    Note: ordered_map keys on the integer value-id (the string-hashing
+    Note: Dictionary segfaults on integer keys). Post-OD-1 there is no
+    Note: MIRValue operand record carrying a def pointer; the canonical
+    Note: enumerator yields value-id integers and the function registry is
+    Note: the source of truth for definitions.
+    Let use_def_chains be proc omap_create from OrderedMap
 
-    Note: For each block
     Let b be 0
     While b is less than block_count:
         Let block be proc get from List with blocks, b
 
-        Note: Get instructions
-        Let instructions be proc memory_get_int64 from Layout with block, 16
-        Let inst_count be proc memory_get_int64 from Layout with block, 24
+        Let instructions be proc get_block_instructions from MIR with block
+        Let inst_count be proc get_block_instruction_count from MIR with block
 
-        Note: For each instruction
         Let i be 0
         While i is less than inst_count:
             Let inst be proc get from List with instructions, i
 
-            Note: Get operands (uses)
-            Let operands be proc memory_get_int64 from Layout with inst, 16
-            If operands is not equal to 0:
-                Let operand_count be proc length from List with operands
-
-                Note: For each operand
-                Let op_idx be 0
-                While op_idx is less than operand_count:
-                    Let operand be proc get from List with operands, op_idx
-                    If operand is not equal to 0:
-                        Note: Get value_id (offset 0 in MIRValue)
-                        Let value_id be proc memory_get_int64 from Layout with operand, 0
-
-                        Note: Get def_instruction (offset 16 in MIRValue)
-                        Let def_inst be proc memory_get_int64 from Layout with operand, 16
-
-                        Note: Map this use to its definition
-                        Note: Key: (inst, operand_index), Value: def_inst
-                        Let use_key be inst multiplied by 1000 plus op_idx
-                        proc set from Dictionary with use_def_chains, use_key, def_inst
+            Note: Header-slot + phi uses through the canonical enumerator.
+            Let used_values be proc get_instruction_used_values from MirCFG with inst
+            If used_values is not equal to 0:
+                Let used_count be proc length from List with used_values
+                Let ui be 0
+                While ui is less than used_count:
+                    Let value_id be proc get from List with used_values, ui
+                    If value_id is not equal to 0:
+                        If proc omap_contains from OrderedMap with use_def_chains, value_id is equal to 0:
+                            Let def_inst be proc lookup_defining_instruction from MIR with mir_function, value_id
+                            proc omap_set from OrderedMap with use_def_chains, value_id, def_inst
+                        End If
                     End If
-
-                    Set op_idx to op_idx plus 1
+                    Set ui to ui plus 1
                 End While
+            End If
+
+            Note: Call/invoke argument-List uses and the indirect callee.
+            Let opcode be proc get_mir_node_opcode from MIR with inst
+            If opcode is equal to 20305:
+                Let indirect_callee be proc get_call_callee from MIRNodes with inst
+                If indirect_callee is not equal to 0:
+                    If proc omap_contains from OrderedMap with use_def_chains, indirect_callee is equal to 0:
+                        Let callee_def be proc lookup_defining_instruction from MIR with mir_function, indirect_callee
+                        proc omap_set from OrderedMap with use_def_chains, indirect_callee, callee_def
+                    End If
+                End If
+            End If
+            If opcode is equal to 20304 or opcode is equal to 20305:
+                Let call_args be proc get_call_arguments from MIRNodes with inst
+                If call_args is not equal to 0:
+                    Let arg_count be proc get_call_argument_count from MIRNodes with inst
+                    Let ai be 0
+                    While ai is less than arg_count:
+                        Let arg_value be proc get from List with call_args, ai
+                        If arg_value is not equal to 0:
+                            If proc omap_contains from OrderedMap with use_def_chains, arg_value is equal to 0:
+                                Let arg_def be proc lookup_defining_instruction from MIR with mir_function, arg_value
+                                proc omap_set from OrderedMap with use_def_chains, arg_value, arg_def
+                            End If
+                        End If
+                        Set ai to ai plus 1
+                    End While
+                End If
             End If
 
             Set i to i plus 1
@@ -917,20 +1026,23 @@ Note: LIR REGISTER LIVENESS ANALYSIS
 Note: ============================================================================
 
 @Reasoning
-Computes register liveness for LIR functions and populates the live_in and
-live_out fields of LIRBasicBlock structures.
+Computes register liveness for an LIR function and populates the live_in
+(offset 64) and live_out (offset 72) fields of every LIRBasicBlock.
 
-This is critical for register allocation. Unlike MIR (SSA form), LIR uses
-virtual registers that can be redefined, so liveness analysis is more complex.
+The canonical, ABI-correct LIR liveness lives in
+compiler/middle/gungnir/lir/liveness.runa (compute_function_liveness). That
+module is the production register-allocation liveness owner: it resolves the
+LIR instruction wrapper/base discriminator via lir_resolve_instruction_base
+(block instruction Lists carry both bare LIRInstruction records and typed
+wrappers — the opcode band 30000-30999 is the discriminator), models the
+full System V ABI clobber/use sets at calls and syscalls, uses proper
+register-sets, and emits the per-register live-range segments consumed by
+the interference graph and the Briggs allocator. This data-flow-module entry
+delegates to that single owner rather than maintaining a divergent,
+wrapper-unaware copy: a second liveness implementation risks producing
+results inconsistent with the allocator's view of the same function.
 
-Algorithm (backward data flow):
-1. For each block, compute uses/defs sets for virtual registers
-2. Fixed-point iteration:
-   - live_out[B] = ∪_{S ∈ succ[B]} live_in[S]
-   - live_in[B] = uses[B] ∪ (live_out[B] - defs[B])
-3. Populate LIRBasicBlock.live_in (offset 64) and live_out (offset 72)
-
-Returns: 1 if successful, 0 if error
+Returns: 1 if successful, 0 if error.
 @End Reasoning
 
 Process called "compute_lir_register_liveness" that takes lir_function as Integer returns Integer:
@@ -939,221 +1051,10 @@ Process called "compute_lir_register_liveness" that takes lir_function as Intege
         Return 0
     End If
 
-    Note: Get LIR blocks
-    Let blocks be proc memory_get_int64 from Layout with lir_function, 32
-    Let block_count be proc memory_get_int64 from Layout with lir_function, 40
-
-    If block_count is equal to 0:
-        Display "compute_lir_register_liveness: empty function"
-        Return 0
-    End If
-
-    Note: Create liveness info for each block
-    Let liveness_infos be proc create from Dictionary
-
-    Let b be 0
-    While b is less than block_count:
-        Let block be proc get from List with blocks, b
-        Let block_id be proc memory_get_int64 from Layout with block, 0
-
-        Let liveness be create_liveness_info(block_id)
-        proc set from Dictionary with liveness_infos, block_id, liveness
-
-        Set b to b plus 1
-    End While
-
-    Note: Compute uses/defs sets for each block
-    Set b to 0
-    While b is less than block_count:
-        Set block to proc get from List with blocks, b
-        Set block_id to proc memory_get_int64 from Layout with block, 0
-        Set liveness to proc get from Dictionary with liveness_infos, block_id
-
-        Let uses be proc memory_get_int64 from Layout with liveness, 40
-        Let defs be proc memory_get_int64 from Layout with liveness, 48
-
-        Note: Track which registers are defined in this block
-        Let defined_in_block be proc create from Set
-
-        Note: Get instructions
-        Let instructions be proc memory_get_int64 from Layout with block, 16
-        Let inst_count be proc memory_get_int64 from Layout with block, 24
-
-        Note: For each instruction (forward pass for uses/defs)
-        Let i be 0
-        While i is less than inst_count:
-            Let inst be proc get from List with instructions, i
-
-            Note: Get operands (offset 16 in LIRInstruction)
-            Let operands be proc memory_get_int64 from Layout with inst, 16
-            If operands is not equal to 0:
-                Let operand_count be proc length from List with operands
-
-                Note: For each operand (check for register uses)
-                Let op_idx be 0
-                While op_idx is less than operand_count:
-                    Let operand be proc get from List with operands, op_idx
-                    If operand is not equal to 0:
-                        Note: Get operand type (offset 0 in operand structure)
-                        Let operand_type be proc memory_get_int64 from Layout with operand, 0
-
-                        Note: If operand is a register (type 1 = register)
-                        If operand_type is equal to 1:
-                            Note: Get register ID (offset 8 in operand)
-                            Let reg_id be proc memory_get_int64 from Layout with operand, 8
-
-                            Note: Only track virtual registers (ID >= 1000)
-                            If reg_id is greater than or equal to 1000:
-                                Note: If not yet defined in this block, it's a use
-                                If proc contains from Set with defined_in_block, reg_id is equal to 0:
-                                    proc add from Set with uses, reg_id
-                                End If
-                            End If
-                        End If
-                    End If
-
-                    Set op_idx to op_idx plus 1
-                End While
-            End If
-
-            Note: Get result register (offset 8 in LIRInstruction)
-            Let result_reg be proc memory_get_int64 from Layout with inst, 8
-            If result_reg is greater than or equal to 1000:
-                Note: This instruction defines result_reg
-                proc add from Set with defs, result_reg
-                proc add from Set with defined_in_block, result_reg
-            End If
-
-            Set i to i plus 1
-        End While
-
-        Set b to b plus 1
-    End While
-
-    Note: Fixed-point iteration for live_in/live_out (backward)
-    Let changed be 1
-    Let iteration be 0
-
-    While changed is equal to 1:
-        If iteration is greater than or equal to 100:
-            Set changed to 0
-        Otherwise:
-                Set changed to 0
-                Set iteration to iteration plus 1
-
-                Note: For each block
-                Set b to 0
-                While b is less than block_count:
-                    Set block to proc get from List with blocks, b
-                    Set block_id to proc memory_get_int64 from Layout with block, 0
-
-                    Set liveness to proc get from Dictionary with liveness_infos, block_id
-                    Let live_in be proc memory_get_int64 from Layout with liveness, 8
-                    Let live_out be proc memory_get_int64 from Layout with liveness, 16
-                    Set uses to proc memory_get_int64 from Layout with liveness, 40
-                    Set defs to proc memory_get_int64 from Layout with liveness, 48
-
-                    Note: Compute new live_out = ∪_{S ∈ succ[B]} live_in[S]
-                    Let new_live_out be proc create from Set
-
-                    Let successors be proc memory_get_int64 from Layout with block, 48
-                    Let succ_count be proc memory_get_int64 from Layout with block, 56
-
-                    Let s be 0
-                    While s is less than succ_count:
-                        Let succ_id be proc get from List with successors, s
-                        Let succ_liveness be proc get from Dictionary with liveness_infos, succ_id
-                        Let succ_live_in be proc memory_get_int64 from Layout with succ_liveness, 8
-
-                        Note: Union with successor's live_in
-                        Let succ_live_in_list be proc to_list from Set with succ_live_in
-                        Let succ_size be proc length from List with succ_live_in_list
-                        Let j be 0
-                        While j is less than succ_size:
-                            Set reg_id to proc get from List with succ_live_in_list, j
-                            proc add from Set with new_live_out, reg_id
-                            Set j to j plus 1
-                        End While
-
-                        Set s to s plus 1
-                    End While
-
-                    Note: Check if live_out changed
-                    Let old_out_size be proc size from Set with live_out
-                    Let new_out_size be proc size from Set with new_live_out
-                    If old_out_size is not equal to new_out_size:
-                        Set changed to 1
-                    End If
-
-                    Note: Update live_out
-                    proc memory_set_int64 from Layout with liveness, 16, new_live_out
-
-                    Note: Compute live_in = uses ∪ (live_out - defs)
-                    Let new_live_in be proc create from Set
-
-                    Note: Add uses set
-                    Let uses_list be proc to_list from Set with uses
-                    Let uses_size be proc length from List with uses_list
-                    Set j to 0
-                    While j is less than uses_size:
-                        Set reg_id to proc get from List with uses_list, j
-                        proc add from Set with new_live_in, reg_id
-                        Set j to j plus 1
-                    End While
-
-                    Note: Add (live_out - defs)
-                    Let live_out_list be proc to_list from Set with new_live_out
-                    Let live_out_size be proc length from List with live_out_list
-                    Set j to 0
-                    While j is less than live_out_size:
-                        Set reg_id to proc get from List with live_out_list, j
-                        If proc contains from Set with defs, reg_id is equal to 0:
-                            proc add from Set with new_live_in, reg_id
-                        End If
-                        Set j to j plus 1
-                    End While
-
-                    Note: Check if live_in changed
-                    Let old_in_size be proc size from Set with live_in
-                    Let new_in_size be proc size from Set with new_live_in
-                    If old_in_size is not equal to new_in_size:
-                        Set changed to 1
-                    End If
-
-                    Note: Update live_in
-                    proc memory_set_int64 from Layout with liveness, 8, new_live_in
-
-                    Set b to b plus 1
-                End While
-        End If
-    End While
-
-    Note: Fixed-point reached or max iterations
-    If iteration is equal to 100:
-        Display "compute_lir_register_liveness: max iterations reached"
-        Return 0
-    End If
-
-    Note: Populate LIRBasicBlock.live_in and live_out fields
-    Set b to 0
-    While b is less than block_count:
-        Set block to proc get from List with blocks, b
-        Set block_id to proc memory_get_int64 from Layout with block, 0
-
-        Set liveness to proc get from Dictionary with liveness_infos, block_id
-        Set live_in to proc memory_get_int64 from Layout with liveness, 8
-        Set live_out to proc memory_get_int64 from Layout with liveness, 16
-
-        Note: Set LIRBasicBlock.live_in (offset 64)
-        proc memory_set_int64 from Layout with block, 64, live_in
-
-        Note: Set LIRBasicBlock.live_out (offset 72)
-        proc memory_set_int64 from Layout with block, 72, live_out
-
-        Set b to b plus 1
-    End While
-
-    Return 1
+    Note: Delegate to the canonical LIR liveness owner. It populates each
+    Note: LIRBasicBlock.live_in@64 / live_out@72 and computes the live-range
+    Note: segments, returning 1 on success and 0 on any failure.
+    Return proc compute_function_liveness from LIRLiveness with lir_function
 End Process
 
 Note: ============================================================================
@@ -1177,17 +1078,14 @@ Process called "verify_liveness" that takes liveness_infos as Integer returns In
         Return 0
     End If
 
-    Note: Get all block IDs from dictionary
-    Let block_ids be proc keys from Dictionary with liveness_infos
-    Let block_count be proc length from List with block_ids
-
     Let errors be 0
 
-    Note: For each block
-    Let b be 0
-    While b is less than block_count:
-        Let block_id be proc get from List with block_ids, b
-        Let liveness be proc get from Dictionary with liveness_infos, block_id
+    Note: Iterate the ordered_map of block_id -> LivenessInfo through the
+    Note: entry cursor (omap_first / omap_entry_next).
+    Let entry be proc omap_first from OrderedMap with liveness_infos
+    While entry is not equal to 0:
+        Let block_id be proc omap_entry_key from OrderedMap with entry
+        Let liveness be proc omap_entry_value from OrderedMap with entry
 
         Let live_in be proc memory_get_int64 from Layout with liveness, 8
         Let live_out be proc memory_get_int64 from Layout with liveness, 16
@@ -1224,13 +1122,13 @@ Process called "verify_liveness" that takes liveness_infos as Integer returns In
         Let computed_size be proc size from Set with computed_live_in
 
         If actual_size is not equal to computed_size:
-            Display "verify_liveness: block "
-            Display block_id
+            Let block_id_str be proc integer_to_string from StringUtils with block_id
+            Display proc string_concat from StringUtils with "verify_liveness: block ", block_id_str
             Display " live_in mismatch"
             Set errors to errors plus 1
         End If
 
-        Set b to b plus 1
+        Set entry to proc omap_entry_next from OrderedMap with entry
     End While
 
     If errors is equal to 0:
@@ -1259,18 +1157,17 @@ Process called "print_liveness_info" that takes liveness_infos as Integer return
 
     Display "=== Liveness Analysis Results ==="
 
-    Note: Get all block IDs from dictionary
-    Let block_ids be proc keys from Dictionary with liveness_infos
-    Let block_count be proc length from List with block_ids
+    Note: Iterate the ordered_map of block_id -> LivenessInfo through the
+    Note: entry cursor. Integer values are rendered through
+    Note: StringUtils.integer_to_string because Display on a raw Integer
+    Note: treats it as a string pointer (a crash).
+    Let entry be proc omap_first from OrderedMap with liveness_infos
+    While entry is not equal to 0:
+        Let block_id be proc omap_entry_key from OrderedMap with entry
+        Let liveness be proc omap_entry_value from OrderedMap with entry
 
-    Note: For each block
-    Let b be 0
-    While b is less than block_count:
-        Let block_id be proc get from List with block_ids, b
-        Let liveness be proc get from Dictionary with liveness_infos, block_id
-
-        Display "Block "
-        Display block_id
+        Let block_id_str be proc integer_to_string from StringUtils with block_id
+        Display proc string_concat from StringUtils with "Block ", block_id_str
         Display ":"
 
         Let live_in be proc memory_get_int64 from Layout with liveness, 8
@@ -1285,7 +1182,7 @@ Process called "print_liveness_info" that takes liveness_infos as Integer return
         Let i be 0
         While i is less than live_in_size:
             Let value_id be proc get from List with live_in_list, i
-            Display value_id
+            Display proc integer_to_string from StringUtils with value_id
             If i is less than (live_in_size minus 1):
                 Display ", "
             End If
@@ -1300,7 +1197,7 @@ Process called "print_liveness_info" that takes liveness_infos as Integer return
         Set i to 0
         While i is less than live_out_size:
             Set value_id to proc get from List with live_out_list, i
-            Display value_id
+            Display proc integer_to_string from StringUtils with value_id
             If i is less than (live_out_size minus 1):
                 Display ", "
             End If
@@ -1315,7 +1212,7 @@ Process called "print_liveness_info" that takes liveness_infos as Integer return
         Set i to 0
         While i is less than uses_size:
             Set value_id to proc get from List with uses_list, i
-            Display value_id
+            Display proc integer_to_string from StringUtils with value_id
             If i is less than (uses_size minus 1):
                 Display ", "
             End If
@@ -1330,7 +1227,7 @@ Process called "print_liveness_info" that takes liveness_infos as Integer return
         Set i to 0
         While i is less than defs_size:
             Set value_id to proc get from List with defs_list, i
-            Display value_id
+            Display proc integer_to_string from StringUtils with value_id
             If i is less than (defs_size minus 1):
                 Display ", "
             End If
@@ -1339,7 +1236,7 @@ Process called "print_liveness_info" that takes liveness_infos as Integer return
         Display "}"
 
         Display ""
-        Set b to b plus 1
+        Set entry to proc omap_entry_next from OrderedMap with entry
     End While
 
     Return 1
@@ -1365,17 +1262,22 @@ Process called "detect_uninitialized_variables_mir" that takes mir_function as I
         Return 0
     End If
 
-    Note: Get MIR CFG
-    Let mir_cfg be proc memory_get_int64 from Layout with mir_function, 8
+    Note: Canonical MIRFunction cfg slot is offset 8.
+    Let mir_cfg be proc get_mir_function_cfg from MIR with mir_function
     If mir_cfg is equal to 0:
         Return 0
     End If
 
-    Note: Get entry block
+    Note: Get entry block and its canonical id.
     Let entry_block be proc memory_get_int64 from Layout with mir_cfg, 0
-    Let entry_id be proc memory_get_int64 from Layout with entry_block, 0
+    Let entry_id be 0
+    If entry_block is not equal to 0:
+        Set entry_id to proc get_mir_basic_block_id from MirCFG with entry_block
+    End If
 
-    Note: Get parameters (these are initialized)
+    Note: Get parameters (these are initialized). Canonical MIRFunction
+    Note: parameters List at offset 16, parameter_count at offset 24, holding
+    Note: raw SSA value-ids.
     Let parameters be proc memory_get_int64 from Layout with mir_function, 16
     Let param_count be proc memory_get_int64 from Layout with mir_function, 24
 
@@ -1391,7 +1293,7 @@ Process called "detect_uninitialized_variables_mir" that takes mir_function as I
     Let uninitialized be proc create from List
 
     Note: Check entry block uses
-    Let entry_liveness be proc get from Dictionary with liveness_infos, entry_id
+    Let entry_liveness be proc omap_get from OrderedMap with liveness_infos, entry_id
     If entry_liveness is not equal to 0:
         Let uses be proc memory_get_int64 from Layout with entry_liveness, 40
         Let uses_list be proc to_list from Set with uses
@@ -1421,15 +1323,18 @@ Process called "detect_uninitialized_variables_mir" that takes mir_function as I
         Return uninitialized  Note: Return what we have (entry block only)
     End If
 
-    Note: Get all block IDs
-    Let all_blocks be proc memory_get_int64 from Layout with mir_cfg, 16
-    Let all_block_count be proc memory_get_int64 from Layout with mir_cfg, 24
+    Note: Canonical blocks List at MIRCFG offset 16.
+    Let all_blocks be proc get_mir_cfg_blocks from MirCFG with mir_cfg
+    If all_blocks is equal to 0:
+        Return uninitialized
+    End If
+    Let all_block_count be proc length from List with all_blocks
 
     Note: For each block
     Let b be 0
     While b is less than all_block_count:
         Let block be proc get from List with all_blocks, b
-        Let block_id be proc memory_get_int64 from Layout with block, 0
+        Let block_id be proc get_mir_basic_block_id from MirCFG with block
 
         Note: Skip entry block (already handled)
         If block_id is equal to entry_id:
@@ -1438,12 +1343,12 @@ Process called "detect_uninitialized_variables_mir" that takes mir_function as I
         End If
 
         Note: Get reaching def info for this block
-        Let reach_info be proc get from Dictionary with reaching_defs, block_id
+        Let reach_info be proc omap_get from OrderedMap with reaching_defs, block_id
         If reach_info is not equal to 0:
             Let reach_in be proc memory_get_int64 from Layout with reach_info, 8
 
             Note: Get block liveness if available
-            Let block_liveness be proc get from Dictionary with liveness_infos, block_id
+            Let block_liveness be proc omap_get from OrderedMap with liveness_infos, block_id
             If block_liveness is not equal to 0:
                 Set uses to proc memory_get_int64 from Layout with block_liveness, 40
                 Set uses_list to proc to_list from Set with uses
@@ -1459,17 +1364,18 @@ Process called "detect_uninitialized_variables_mir" that takes mir_function as I
                     Note: Check if value_id has a definition reaching this block
                     Let has_reaching_def be 0
 
-                    Note: Search reach_in set for any def of value_id
+                    Note: Search reach_in (a Set of defining INSTRUCTION
+                    Note: pointers) for any def whose canonical result value_id
+                    Note: (MIRNode header offset 8) equals value_id.
                     Let reach_in_list be proc to_list from Set with reach_in
                     Let reach_in_size be proc length from List with reach_in_list
                     Let j be 0
                     While j is less than reach_in_size:
                         Let def_inst be proc get from List with reach_in_list, j
 
-                        Note: Get result of def instruction
-                        Let def_result be proc memory_get_int64 from Layout with def_inst, 8
-                        If def_result is not equal to 0:
-                            Let def_value_id be proc memory_get_int64 from Layout with def_result, 0
+                        Note: The defining instruction's SSA result value-id.
+                        Let def_value_id be proc get_mir_node_value_id from MIR with def_inst
+                        If def_value_id is not equal to 0:
                             If def_value_id is equal to value_id:
                                 Set has_reaching_def to 1
                             End If

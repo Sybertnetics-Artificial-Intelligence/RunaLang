@@ -1,0 +1,440 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+LIR builder + LIR optimizer probe (tasks #485, #478, #484).
+
+Three suites assert the producer-side correctness the three fixes deliver,
+through the LIR record / operand accessors (never by trusting compile rc):
+
+  ITEM A (#485): lower a MIR direct call (callee + 2 args + float result)
+    and a MIR return through lir_builder, then assert the emitted LIR call
+    record carries the callee name, the argument value-id List, the
+    argument count, and a real return register (XMM0 for a float result),
+    and the LIR return record carries a non-zero return-value operand.
+    Pre-fix the call was built with three args (callee, count, convention),
+    so arguments@16 held the COUNT and arg_count@24 held the CONVENTION, and
+    the return record carried no value.
+
+  ITEM B (#478): lower a vector FMA, a vector MIN, and a vector STORE.
+    FMA must lower to a real LIR multiply + add (no opcode-0 garbage); MIN
+    must lower to LIR_VMIN; STORE must emit a store with NO bogus result
+    register (pre-fix VSTORE routed result-id 0 through
+    get_or_create_register_for_value, allocating vreg 1000).
+
+  ITEM C (#484): DCE removes a dead register def but keeps a store;
+    copy-prop forwards a register copy so a later use reads the copy's
+    source. Both assert via the operand records.
+:End Note
+
+Import "tests/test_utils.runa" as T
+Import "compiler/middle/gungnir/lir/lir.runa" as LIR
+Import "compiler/middle/gungnir/lir/lir_nodes.runa" as LIRNodes
+Import "compiler/middle/gungnir/lir/lir_builder.runa" as Builder
+Import "compiler/middle/gungnir/lir/lir_optimizer.runa" as Optimizer
+Import "compiler/middle/gungnir/mir/mir.runa" as MIR
+Import "compiler/middle/gungnir/mir/mir_nodes.runa" as MIRNodes
+Import "compiler/middle/gungnir/hir/hir.runa" as HIR
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/collections/list.runa" as List
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+
+Constant CLASS_GPR as Integer is 0
+Constant OPERAND_SIZE as Integer is 8
+
+Process called "reg_operand" that takes reg_id as Integer returns Integer:
+    Return LIRNodes.create_register_operand(reg_id, OPERAND_SIZE)
+End Process
+
+Process called "imm_operand" that takes value as Integer returns Integer:
+    Return LIRNodes.create_immediate_operand(value, OPERAND_SIZE)
+End Process
+
+Note:
+Scans every block of an LIR function for the FIRST instruction whose
+base-resolved opcode equals `want`. Returns the instruction (wrapper or
+bare) record, or 0 if none.
+:End Note
+Process called "find_first_opcode" that takes lir_fn as Integer, want as Integer returns Integer:
+    Let block_count be LIR.get_block_count(lir_fn)
+    Let b be 0
+    While b is less than block_count:
+        Let block be LIR.lir_get_block(lir_fn, b)
+        If block is not equal to 0:
+            Let n be LIR.get_instruction_count(block)
+            Let i be 0
+            While i is less than n:
+                Let inst be LIR.get_instruction(block, i)
+                Let base be LIR.lir_resolve_instruction_base(inst)
+                If base is not equal to 0:
+                    Let op be Layout.memory_get_int64(base, 0)
+                    If op is equal to want:
+                        Return inst
+                    End If
+                End If
+                Set i to i plus 1
+            End While
+        End If
+        Set b to b plus 1
+    End While
+    Return 0
+End Process
+
+Process called "count_opcode" that takes lir_fn as Integer, want as Integer returns Integer:
+    Let total be 0
+    Let block_count be LIR.get_block_count(lir_fn)
+    Let b be 0
+    While b is less than block_count:
+        Let block be LIR.lir_get_block(lir_fn, b)
+        If block is not equal to 0:
+            Let n be LIR.get_instruction_count(block)
+            Let i be 0
+            While i is less than n:
+                Let inst be LIR.get_instruction(block, i)
+                Let base be LIR.lir_resolve_instruction_base(inst)
+                If base is not equal to 0:
+                    Let op be Layout.memory_get_int64(base, 0)
+                    If op is equal to want:
+                        Set total to total plus 1
+                    End If
+                End If
+                Set i to i plus 1
+            End While
+        End If
+        Set b to b plus 1
+    End While
+    Return total
+End Process
+
+Process called "max_vreg_in_function" that takes lir_fn as Integer returns Integer:
+    Note: Largest register id appearing in any operand record (register form
+    Note: or memory base/index). Used to detect a bogus extra vreg.
+    Let best be 0
+    Let block_count be LIR.get_block_count(lir_fn)
+    Let b be 0
+    While b is less than block_count:
+        Let block be LIR.lir_get_block(lir_fn, b)
+        If block is not equal to 0:
+            Let n be LIR.get_instruction_count(block)
+            Let i be 0
+            While i is less than n:
+                Let inst be LIR.get_instruction(block, i)
+                Let base be LIR.lir_resolve_instruction_base(inst)
+                If base is not equal to 0:
+                    Let slot be 8
+                    While slot is less than or equal to 32:
+                        Let op be Layout.memory_get_int64(base, slot)
+                        If op is not equal to 0:
+                            Let r be LIRNodes.get_operand_register_id(op)
+                            If r is greater than best:
+                                Set best to r
+                            End If
+                        End If
+                        Set slot to slot plus 8
+                    End While
+                End If
+                Set i to i plus 1
+            End While
+        End If
+        Set b to b plus 1
+    End While
+    Return best
+End Process
+
+Note:
+ITEM A: build a MIR direct call `f(a0, a1)` returning a Float, plus a
+MIR return of that result, lower both through the builder, and assert the
+LIR call/return records carry full data.
+:End Note
+Process called "run_call_return_suite" that takes results as Integer returns Integer:
+    T.begin_suite(results, "lower call + return (#485)")
+
+    Note: A tiny MIR function shell: name at 0, return_type at 32.
+    Let fn_name be StringCore.create_from_literal("probe_caller")
+    Let float_ty be HIR.create_hir_type_info(HIR.TYPE_FLOAT)
+    Let mir_fn be Layout.allocate(128)
+    Layout.memory_set_int64(mir_fn, 0, fn_name)
+    Layout.memory_set_int64(mir_fn, 32, float_ty)
+
+    Let builder be Builder.create_lir_builder(mir_fn, 0)
+    T.assert_not_null(results, "builder created", builder)
+    If builder is equal to 0:
+        Return 0
+    End If
+
+    Note: One LIR block, made current.
+    Let lir_fn be Layout.memory_get_int64(builder, 8)
+    Let blk be LIR.lir_add_block(lir_fn, 1)
+    Layout.memory_set_int64(builder, 32, blk)
+
+    Note: Build the MIR call: result id 50, callee name, args [10, 20], float
+    Note: return type, direct (is_indirect 0), not tail.
+    Let callee_name be StringCore.create_from_literal("callee_fn")
+    Let args be List.list_create()
+    List.append(args, 10)
+    List.append(args, 20)
+    Let mir_call be MIRNodes.create_mir_call(50, callee_name, args, 2, float_ty, 0, 0)
+    T.assert_not_null(results, "mir call constructed", mir_call)
+
+    Let lc_ok be Builder.lower_call(builder, mir_call)
+    T.assert_equal(results, "lower_call succeeds", lc_ok, 1)
+
+    Note: Find the emitted LIR call (LIR_CALL = 30520). create_lir_call stores
+    Note: callee@8, arguments@16, arg_count@24, return_reg@32 in the wrapper.
+    Let lir_call be find_first_opcode(lir_fn, LIR.LIR_CALL)
+    T.assert_not_null(results, "LIR call emitted", lir_call)
+    If lir_call is not equal to 0:
+        Let w_callee be Layout.memory_get_int64(lir_call, 8)
+        Let w_args be Layout.memory_get_int64(lir_call, 16)
+        Let w_argc be Layout.memory_get_int64(lir_call, 24)
+        Let w_retreg be Layout.memory_get_int64(lir_call, 32)
+
+        T.assert_equal(results, "call carries callee name", w_callee, callee_name)
+        T.assert_equal(results, "call carries arguments List (not the count)", w_args, args)
+        T.assert_equal(results, "call carries argument count 2", w_argc, 2)
+        Note: Float return => XMM0 (16), a real, non-garbage return register.
+        T.assert_equal(results, "call carries XMM0 return register", w_retreg, LIR.LIR_REG_XMM0)
+    End If
+
+    Note: Now lower a MIR return of value 50 (float). create_mir_return puts
+    Note: the return value id in the header operand1 slot at 16.
+    Let mir_ret be MIRNodes.create_mir_return(50, float_ty)
+    T.assert_not_null(results, "mir return constructed", mir_ret)
+    Let lr_ok be Builder.lower_return(builder, mir_ret)
+    T.assert_equal(results, "lower_return succeeds", lr_ok, 1)
+
+    Let lir_ret be find_first_opcode(lir_fn, LIR.LIR_RET)
+    T.assert_not_null(results, "LIR return emitted", lir_ret)
+    If lir_ret is not equal to 0:
+        Let base be LIR.lir_resolve_instruction_base(lir_ret)
+        Note: create_lir_return stores the return-value operand at base+16.
+        Let ret_value_op be Layout.memory_get_int64(base, 16)
+        T.assert_not_null(results, "return record carries a value operand", ret_value_op)
+        If ret_value_op is not equal to 0:
+            Let ret_reg be LIRNodes.get_operand_register_id(ret_value_op)
+            T.assert_equal(results, "return value is the XMM0 return register", ret_reg, LIR.LIR_REG_XMM0)
+        End If
+    End If
+
+    Return 1
+End Process
+
+Note:
+ITEM B: lower a vector FMA, a vector MIN, and a vector STORE; assert real
+LIR vector opcodes and the absence of a bogus store result register.
+:End Note
+Process called "run_vector_suite" that takes results as Integer returns Integer:
+    T.begin_suite(results, "lower vector ops (#478)")
+
+    Let int_ty be HIR.create_hir_type_info(HIR.TYPE_INTEGER)
+
+    Note: ---- FMA: result 60 = op1(11) * op2(12) + op3(13), width 4 ---------
+    Let fn_name be StringCore.create_from_literal("probe_vec_fma")
+    Let mir_fn be Layout.allocate(128)
+    Layout.memory_set_int64(mir_fn, 0, fn_name)
+    Let builder be Builder.create_lir_builder(mir_fn, 0)
+    Let lir_fn be Layout.memory_get_int64(builder, 8)
+    Let blk be LIR.lir_add_block(lir_fn, 1)
+    Layout.memory_set_int64(builder, 32, blk)
+
+    Let mir_fma be MIRNodes.create_mir_vector_op(MIR.MIR_VECTOR_FMA, 60, 11, 12, 13, 4, int_ty, 0)
+    Let fma_ok be Builder.lower_vector_op(builder, mir_fma)
+    T.assert_equal(results, "lower_vector_op(FMA) succeeds", fma_ok, 1)
+
+    Note: FMA lowers to a multiply then an add (integer lanes: VMUL + VADD).
+    Note: No opcode-0 garbage instruction may appear.
+    T.assert_equal(results, "FMA emits a VMUL", count_opcode(lir_fn, LIR.LIR_VMUL), 1)
+    T.assert_equal(results, "FMA emits a VADD", count_opcode(lir_fn, LIR.LIR_VADD), 1)
+    T.assert_equal(results, "FMA emits no opcode-0 garbage", count_opcode(lir_fn, 0), 0)
+
+    Note: ---- MIN: result 61 = min(op1(14), op2(15)) ----------------------
+    Let fn2 be StringCore.create_from_literal("probe_vec_min")
+    Let mir_fn2 be Layout.allocate(128)
+    Layout.memory_set_int64(mir_fn2, 0, fn2)
+    Let builder2 be Builder.create_lir_builder(mir_fn2, 0)
+    Let lir_fn2 be Layout.memory_get_int64(builder2, 8)
+    Let blk2 be LIR.lir_add_block(lir_fn2, 1)
+    Layout.memory_set_int64(builder2, 32, blk2)
+
+    Let mir_min be MIRNodes.create_mir_vector_op(MIR.MIR_VECTOR_MIN, 61, 14, 15, 0, 4, int_ty, 0)
+    Let min_ok be Builder.lower_vector_op(builder2, mir_min)
+    T.assert_equal(results, "lower_vector_op(MIN) succeeds", min_ok, 1)
+    T.assert_equal(results, "MIN emits exactly one VMIN", count_opcode(lir_fn2, LIR.LIR_VMIN), 1)
+    T.assert_equal(results, "MIN emits no opcode-0 garbage", count_opcode(lir_fn2, 0), 0)
+
+    Note: ---- STORE: addr op1(16), value op2(17), result id 0 -------------
+    Let fn3 be StringCore.create_from_literal("probe_vec_store")
+    Let mir_fn3 be Layout.allocate(128)
+    Layout.memory_set_int64(mir_fn3, 0, fn3)
+    Let builder3 be Builder.create_lir_builder(mir_fn3, 0)
+    Let lir_fn3 be Layout.memory_get_int64(builder3, 8)
+    Let blk3 be LIR.lir_add_block(lir_fn3, 1)
+    Layout.memory_set_int64(builder3, 32, blk3)
+
+    Note: A store produces no value: its result id is 0. Two source value ids
+    Note: 16 and 17 map to vregs 1000 and 1001; if VSTORE wrongly allocated a
+    Note: result register for id 0, a THIRD vreg (1002) would appear.
+    Let mir_vstore be MIRNodes.create_mir_vector_op(MIR.MIR_VECTOR_STORE, 0, 16, 17, 0, 4, int_ty, 0)
+    Let vs_ok be Builder.lower_vector_op(builder3, mir_vstore)
+    T.assert_equal(results, "lower_vector_op(STORE) succeeds", vs_ok, 1)
+    T.assert_equal(results, "STORE emits one VSTORE", count_opcode(lir_fn3, LIR.LIR_VSTORE), 1)
+    Note: Exactly the two genuine source vregs exist (max id 1001); a bogus
+    Note: result register for value id 0 would push the max to 1002.
+    T.assert_equal(results, "STORE allocated no bogus result register", max_vreg_in_function(lir_fn3), 1001)
+
+    Return 1
+End Process
+
+Note:
+ITEM C: a hand-built LIR function exercises DCE (dead reg def removed,
+store kept) and copy propagation (a reg copy's source forwarded to a use).
+:End Note
+
+Note:
+DCE rig:
+    v1000 = MOV 7          (dead: nothing reads v1000)
+    STORE [v1001], v1002   (live: side effect, even though no result reg)
+    v1003 = ADD v1004, v1004  (read v1003 below, so kept)
+    v1005 = ADD v1003, v1003  (dead: v1005 never read, no side effect)
+Expected after DCE: the two dead defs (v1000 MOV, v1005 ADD) gone, STORE
+and the v1003 ADD kept.
+:End Note
+Process called "run_dce_suite" that takes results as Integer returns Integer:
+    T.begin_suite(results, "LIR DCE (#484)")
+
+    Let name be StringCore.create_from_literal("probe_dce")
+    Let lir_fn be LIR.lir_create_function(name, 0, 0)
+    Let b0 be LIR.lir_add_block(lir_fn, 1)
+
+    Let v1000 be LIR.lir_create_virtual_register(lir_fn, CLASS_GPR, OPERAND_SIZE)
+    Let v1001 be LIR.lir_create_virtual_register(lir_fn, CLASS_GPR, OPERAND_SIZE)
+    Let v1002 be LIR.lir_create_virtual_register(lir_fn, CLASS_GPR, OPERAND_SIZE)
+    Let v1003 be LIR.lir_create_virtual_register(lir_fn, CLASS_GPR, OPERAND_SIZE)
+    Let v1004 be LIR.lir_create_virtual_register(lir_fn, CLASS_GPR, OPERAND_SIZE)
+    Let v1005 be LIR.lir_create_virtual_register(lir_fn, CLASS_GPR, OPERAND_SIZE)
+
+    Note: dead def: v1000 = MOV 7
+    Let dead_mov be LIRNodes.create_lir_move(reg_operand(v1000), imm_operand(7), OPERAND_SIZE)
+    LIR.lir_append_instruction(lir_fn, b0, dead_mov)
+
+    Note: live store: [v1001] <- v1002  (no result register, side effect)
+    Let store_addr be LIRNodes.create_simple_memory_operand(v1001, 0, OPERAND_SIZE)
+    Let store_inst be LIRNodes.create_lir_store(store_addr, reg_operand(v1002), OPERAND_SIZE, OPERAND_SIZE)
+    LIR.lir_append_instruction(lir_fn, b0, store_inst)
+
+    Note: kept: v1003 = ADD v1004, v1004
+    Let add_kept be LIRNodes.create_lir_binary_op(LIR.LIR_ADD, reg_operand(v1003), reg_operand(v1004), reg_operand(v1004), OPERAND_SIZE)
+    LIR.lir_append_instruction(lir_fn, b0, add_kept)
+
+    Note: dead: v1005 = ADD v1003, v1003 (v1005 unread)
+    Let add_dead be LIRNodes.create_lir_binary_op(LIR.LIR_ADD, reg_operand(v1005), reg_operand(v1003), reg_operand(v1003), OPERAND_SIZE)
+    LIR.lir_append_instruction(lir_fn, b0, add_dead)
+
+    Let before_moves be count_opcode(lir_fn, LIR.LIR_MOV)
+    Let before_stores be count_opcode(lir_fn, LIR.LIR_STORE)
+    Let before_adds be count_opcode(lir_fn, LIR.LIR_ADD)
+    T.assert_equal(results, "before: 1 MOV", before_moves, 1)
+    T.assert_equal(results, "before: 1 STORE", before_stores, 1)
+    T.assert_equal(results, "before: 2 ADD", before_adds, 2)
+
+    Let ctx be Optimizer.create_optimization_context(lir_fn)
+    Note: run DCE alone (disable peephole + copy-prop so the count is exact)
+    Optimizer.set_optimization_enabled(ctx, 1, 0)
+    Optimizer.set_optimization_enabled(ctx, 3, 0)
+    Let removed be Optimizer.run_dce_pass(ctx)
+    T.assert_equal(results, "DCE removed exactly 2 dead defs", removed, 2)
+
+    T.assert_equal(results, "dead MOV removed", count_opcode(lir_fn, LIR.LIR_MOV), 0)
+    T.assert_equal(results, "store kept (side effect)", count_opcode(lir_fn, LIR.LIR_STORE), 1)
+    T.assert_equal(results, "only the read ADD kept", count_opcode(lir_fn, LIR.LIR_ADD), 1)
+
+    Return 1
+End Process
+
+Note:
+Copy-prop rig:
+    v1000 = MOV 5
+    v1001 = MOV v1000      (register copy: v1001 <- v1000)
+    v1002 = ADD v1001, v1001  (uses of the copy)
+After copy-prop, the ADD's operands must read v1000 (the copy's source),
+not v1001. Asserted by reading the register ids out of the ADD's left/right
+operand RECORDS.
+:End Note
+Process called "run_copyprop_suite" that takes results as Integer returns Integer:
+    T.begin_suite(results, "LIR copy propagation (#484)")
+
+    Let name be StringCore.create_from_literal("probe_copyprop")
+    Let lir_fn be LIR.lir_create_function(name, 0, 0)
+    Let b0 be LIR.lir_add_block(lir_fn, 1)
+
+    Let v1000 be LIR.lir_create_virtual_register(lir_fn, CLASS_GPR, OPERAND_SIZE)
+    Let v1001 be LIR.lir_create_virtual_register(lir_fn, CLASS_GPR, OPERAND_SIZE)
+    Let v1002 be LIR.lir_create_virtual_register(lir_fn, CLASS_GPR, OPERAND_SIZE)
+
+    Let mov_src be LIRNodes.create_lir_move(reg_operand(v1000), imm_operand(5), OPERAND_SIZE)
+    LIR.lir_append_instruction(lir_fn, b0, mov_src)
+
+    Note: register copy v1001 <- v1000
+    Let mov_copy be LIRNodes.create_lir_move(reg_operand(v1001), reg_operand(v1000), OPERAND_SIZE)
+    LIR.lir_append_instruction(lir_fn, b0, mov_copy)
+
+    Note: use of the copy: v1002 = ADD v1001, v1001
+    Let add_use be LIRNodes.create_lir_binary_op(LIR.LIR_ADD, reg_operand(v1002), reg_operand(v1001), reg_operand(v1001), OPERAND_SIZE)
+    LIR.lir_append_instruction(lir_fn, b0, add_use)
+
+    Note: Confirm the ADD reads v1001 before the pass.
+    Let add_base be LIR.lir_resolve_instruction_base(add_use)
+    Let left_op be Layout.memory_get_int64(add_base, 16)
+    Let right_op be Layout.memory_get_int64(add_base, 24)
+    T.assert_equal(results, "before: ADD left reads the copy v1001", LIRNodes.get_operand_register_id(left_op), v1001)
+    T.assert_equal(results, "before: ADD right reads the copy v1001", LIRNodes.get_operand_register_id(right_op), v1001)
+
+    Let ctx be Optimizer.create_optimization_context(lir_fn)
+    Optimizer.set_optimization_enabled(ctx, 1, 0)
+    Optimizer.set_optimization_enabled(ctx, 2, 0)
+    Let forwarded be Optimizer.run_copy_propagation_pass(ctx)
+    T.assert_greater_than(results, "copy-prop forwarded at least one use", forwarded, 0)
+
+    Note: After: both ADD operands must read the SOURCE v1000, in place.
+    T.assert_equal(results, "after: ADD left forwarded to source v1000", LIRNodes.get_operand_register_id(left_op), v1000)
+    T.assert_equal(results, "after: ADD right forwarded to source v1000", LIRNodes.get_operand_register_id(right_op), v1000)
+
+    Note: The MOV result (a DEF) must be untouched: the copy's own dest stays
+    Note: v1001 (copy-prop forwards USES, never rewrites a definition).
+    Let copy_base be LIR.lir_resolve_instruction_base(mov_copy)
+    Let copy_dest_op be Layout.memory_get_int64(copy_base, 8)
+    T.assert_equal(results, "copy def register unchanged", LIRNodes.get_operand_register_id(copy_dest_op), v1001)
+
+    Return 1
+End Process
+
+Process called "main" returns Integer:
+    Let results be T.create_test_results()
+
+    run_call_return_suite(results)
+    run_vector_suite(results)
+    run_dce_suite(results)
+    run_copyprop_suite(results)
+
+    T.print_summary(results)
+    Let passed be T.all_passed(results)
+    T.destroy_test_results(results)
+
+    If passed is equal to 1:
+        Return 0
+    End If
+    Return 1
+End Process

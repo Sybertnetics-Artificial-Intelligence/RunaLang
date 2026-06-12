@@ -55,6 +55,7 @@ Import "compiler/middle/gungnir/mir/cfg.runa" as CFG
 Import "compiler/middle/gungnir/mir/mir_verifier.runa" as MIRVerifier
 Import "compiler/middle/gungnir/mir/optimizations/devirtualization.runa" as Devirt
 Import "compiler/middle/gungnir/mir/optimizations/vectorization.runa" as Vect
+Import "compiler/middle/gungnir/mir/mir_optimizer.runa" as MirOpt
 Import "compiler/frontend/primitives/memory/layout.runa" as Layout
 Import "compiler/frontend/primitives/collections/list.runa" as List
 Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
@@ -506,12 +507,111 @@ Process called "run_vect_reject" that takes results as Integer returns Integer:
     Return 1
 End Process
 
+Note: ============================================================================
+Note: SUITE 4 (task #480): vectorization driven THROUGH the mir_optimizer bridge
+Note: ============================================================================
+
+@Reasoning
+Task #480 re-keyed mir_optimizer.optimize_vectorization to extract the
+MIRFunction from OptimizerContext offset 8 and pass it to the canonical
+vectorization entry (task #471 made that entry take the MIRFunction, not the
+bare CFG). This suite builds the same independent-iteration accept-loop, wraps
+it in a real OptimizerContext via MirOpt.create_optimizer_context(cfg, fn), and
+drives MirOpt.optimize_vectorization(ctx). The pass can only succeed if the
+bridge hands it the FUNCTION — the vectorization pass needs the function-scoped
+value-id allocator and definition registry to widen the loads/store and
+register the fresh VF stride constant. Before #480 the bridge passed the bare
+CFG (offset 0) where a MIRFunction was expected, which would crash or no-op.
+Asserting the widened opcodes appear (and the context's changed flag is set)
+proves the bridge now passes the function correctly.
+@End Reasoning
+Process called "run_vect_through_optimizer" that takes results as Integer returns Integer:
+    T.begin_suite(results, "vect_through_mir_optimizer_bridge")
+
+    Let out be Layout.allocate(96)
+    Let built be build_vect_loop_skeleton("t480_vect_bridge", out)
+    T.assert_equal(results, "bridge accept-loop skeleton constructed", built, 1)
+
+    Let fn be Layout.memory_get_int64(out, 0)
+    Let cfg be Layout.memory_get_int64(out, 8)
+    Let loop_block be Layout.memory_get_int64(out, 16)
+    Let type_info be Layout.memory_get_int64(out, 24)
+
+    Note: Body: c[i] = a[i] + b[i] over three disjoint allocas (identical to
+    Note: SUITE 2's accept-loop body)
+    Let addr_a be MIRNodes.create_mir_binary_op(20002, 213, 203, 212, type_info)
+    MIR.add_instruction_to_block(loop_block, addr_a)
+    MIR.register_value_definition(fn, 213, addr_a)
+
+    Let ld_a be MIRNodes.create_mir_load(214, 213, 0, type_info, 0)
+    MIR.add_instruction_to_block(loop_block, ld_a)
+    MIR.register_value_definition(fn, 214, ld_a)
+
+    Let addr_b be MIRNodes.create_mir_binary_op(20002, 215, 204, 212, type_info)
+    MIR.add_instruction_to_block(loop_block, addr_b)
+    MIR.register_value_definition(fn, 215, addr_b)
+
+    Let ld_b be MIRNodes.create_mir_load(216, 215, 0, type_info, 0)
+    MIR.add_instruction_to_block(loop_block, ld_b)
+    MIR.register_value_definition(fn, 216, ld_b)
+
+    Let sum be MIRNodes.create_mir_binary_op(20002, 217, 214, 216, type_info)
+    MIR.add_instruction_to_block(loop_block, sum)
+    MIR.register_value_definition(fn, 217, sum)
+
+    Let addr_c be MIRNodes.create_mir_binary_op(20002, 218, 205, 212, type_info)
+    MIR.add_instruction_to_block(loop_block, addr_c)
+    MIR.register_value_definition(fn, 218, addr_c)
+
+    Let st be MIRNodes.create_mir_store(218, 217, 0, type_info, 0)
+    MIR.add_instruction_to_block(loop_block, st)
+
+    finish_vect_loop(out)
+
+    Note: Pre-transform sanity: scalar memory ops present, no vector ops yet
+    Let pre_loads be count_opcode_in_cfg(cfg, 20200)
+    T.assert_equal(results, "two scalar loads before the bridge pass", pre_loads, 2)
+    Let pre_vloads be count_opcode_in_cfg(cfg, 20610)
+    T.assert_equal(results, "no vector load before the bridge pass", pre_vloads, 0)
+
+    Note: ---- build a real OptimizerContext (cfg@0, function@8) and drive the
+    Note: bridge entry the orchestrator actually calls ----
+    Let ctx be MirOpt.create_optimizer_context(cfg, fn)
+    T.assert_not_null(results, "optimizer context constructed", ctx)
+    Let ctx_fn be Layout.memory_get_int64(ctx, 8)
+    T.assert_equal(results, "context carries the function at offset 8", ctx_fn, fn)
+
+    Let bridge_rc be MirOpt.optimize_vectorization(ctx)
+    T.assert_equal(results, "bridge reports a transformation (passed the function)", bridge_rc, 1)
+
+    Note: The loop was actually widened — only possible if the bridge handed the
+    Note: pass the MIRFunction (it needs the function allocator/registry)
+    Let vloads be count_opcode_in_cfg(cfg, 20610)
+    T.assert_equal(results, "both loads widened to VECTOR_LOAD via the bridge", vloads, 2)
+    Let vstores be count_opcode_in_cfg(cfg, 20611)
+    T.assert_equal(results, "store widened to VECTOR_STORE via the bridge", vstores, 1)
+    Let vadds be count_opcode_in_cfg(cfg, 20600)
+    T.assert_equal(results, "data add widened to VECTOR_ADD via the bridge", vadds, 1)
+
+    Note: The bridge stamped the context's changed flag (offset 24)
+    Let changed_flag be MirOpt.has_changed(ctx)
+    T.assert_equal(results, "bridge marked the context changed", changed_flag, 1)
+
+    Note: The verifier accepts the transformed function
+    Let verify_rc be MIRVerifier.verify_mir_function(fn)
+    T.assert_equal(results, "verifier accepts post-bridge function", verify_rc, 1)
+
+    Layout.deallocate(out)
+    Return 1
+End Process
+
 Process called "main" returns Integer:
     Let results be T.create_test_results()
 
     run_devirt_direct(results)
     run_vect_accept(results)
     run_vect_reject(results)
+    run_vect_through_optimizer(results)
 
     T.print_summary(results)
     Let passed be T.all_passed(results)

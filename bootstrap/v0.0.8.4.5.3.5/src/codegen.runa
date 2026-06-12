@@ -2934,6 +2934,79 @@ Process called "codegen_generate_binary_op" takes codegen as Integer, expr as In
         End If
     End If
 
+    Note:
+    Short-circuit boolean lowering for the canonical `and` (TOKEN_AND=30) and
+    `or` (TOKEN_OR=31) operators. These are SEMANTICALLY DISTINCT from the
+    bitwise `bit_and`/`bit_or` operators (39/40): they must short-circuit and
+    must normalize the result to a 0/1 boolean regardless of the operand
+    magnitudes. Intercepted here, ahead of both the direct-operand fast path
+    and the generic stack fallback, because:
+      - The direct-operand path (below) never handled 30/31 at all, so a
+        truthy left like `1 and 0` left the left operand's value (1) sitting
+        in %rax untouched -- a miscompile of every bare-operand and/or.
+      - The generic fallback emitted bitwise andq/orq, which neither
+        short-circuits (so `0 and side_effect()` wrongly ran the side effect)
+        nor normalizes (so `2 and 3` produced 2, and `2 or 0` produced 2).
+
+    Canonical semantics implemented:
+      and: eval left; if left == 0 the result is 0 and right is NOT evaluated
+           (preserving side-effect ordering); otherwise result is (right != 0)
+           normalized to 0/1.
+      or : eval left; if left != 0 the result is 1 and right is NOT evaluated;
+           otherwise result is (right != 0) normalized to 0/1.
+
+    Each operator allocates one label_counter id (codegen offset 28) and emits
+    a unique pair of labels so nesting and repeated use never collide.
+    :End Note
+    If operator is equal to 30:
+        Let and_label be memory_get_int32(codegen, 28)
+        memory_set_int32(codegen, 28, and_label plus 1)
+        codegen_generate_expression(codegen, left)
+        emit_line(output_file, "    testq %rax, %rax")
+        file_write_buffered(output_file, "    jz .Land_false_", 0)
+        file_write_buffered(output_file, integer_to_string(and_label), 0)
+        file_write_buffered(output_file, "\n", 0)
+        codegen_generate_expression(codegen, right)
+        emit_line(output_file, "    testq %rax, %rax")
+        emit_line(output_file, "    setne %al")
+        emit_line(output_file, "    movzbq %al, %rax")
+        file_write_buffered(output_file, "    jmp .Land_done_", 0)
+        file_write_buffered(output_file, integer_to_string(and_label), 0)
+        file_write_buffered(output_file, "\n", 0)
+        file_write_buffered(output_file, ".Land_false_", 0)
+        file_write_buffered(output_file, integer_to_string(and_label), 0)
+        file_write_buffered(output_file, ":\n", 0)
+        emit_line(output_file, "    movq $0, %rax")
+        file_write_buffered(output_file, ".Land_done_", 0)
+        file_write_buffered(output_file, integer_to_string(and_label), 0)
+        file_write_buffered(output_file, ":\n", 0)
+        Return 0
+    End If
+    If operator is equal to 31:
+        Let or_label be memory_get_int32(codegen, 28)
+        memory_set_int32(codegen, 28, or_label plus 1)
+        codegen_generate_expression(codegen, left)
+        emit_line(output_file, "    testq %rax, %rax")
+        file_write_buffered(output_file, "    jne .Lor_true_", 0)
+        file_write_buffered(output_file, integer_to_string(or_label), 0)
+        file_write_buffered(output_file, "\n", 0)
+        codegen_generate_expression(codegen, right)
+        emit_line(output_file, "    testq %rax, %rax")
+        emit_line(output_file, "    setne %al")
+        emit_line(output_file, "    movzbq %al, %rax")
+        file_write_buffered(output_file, "    jmp .Lor_done_", 0)
+        file_write_buffered(output_file, integer_to_string(or_label), 0)
+        file_write_buffered(output_file, "\n", 0)
+        file_write_buffered(output_file, ".Lor_true_", 0)
+        file_write_buffered(output_file, integer_to_string(or_label), 0)
+        file_write_buffered(output_file, ":\n", 0)
+        emit_line(output_file, "    movq $1, %rax")
+        file_write_buffered(output_file, ".Lor_done_", 0)
+        file_write_buffered(output_file, integer_to_string(or_label), 0)
+        file_write_buffered(output_file, ":\n", 0)
+        Return 0
+    End If
+
     Note: OPTIMIZATION: For simple right operands (variables/integers), use direct register operations
     Let right_type be memory_get_int32(right, 0)
     Let use_direct_op be 0
@@ -3311,11 +3384,10 @@ Process called "codegen_generate_binary_op" takes codegen as Integer, expr as In
             emit_line(output_file, "    movq %rax, %rcx")
             emit_line(output_file, "    movq %rbx, %rax")
             emit_line(output_file, "    shrq %cl, %rax")
-        Otherwise If operator is equal to 30:  Note: TOKEN_AND
-            emit_line(output_file, "    andq %rbx, %rax")
-        Otherwise If operator is equal to 31:  Note: TOKEN_OR
-            emit_line(output_file, "    orq %rbx, %rax")
         End If
+        Note: Operators 30 (TOKEN_AND) and 31 (TOKEN_OR) never reach this
+        Note: fallback: codegen_generate_binary_op intercepts them earlier with
+        Note: their short-circuiting, 0/1-normalizing lowering and returns.
     End If
     Return 0
 End Process
@@ -8936,10 +9008,12 @@ Process called "codegen_generate_statement" takes codegen as Integer, stmt as In
                     file_write_buffered(output_file, integer_to_string(j), 0)
                     file_write_buffered(output_file, "\n", 0)
 
-                    Note: Create a local variable for the binding - allocate stack space properly
+                    Note: Create a local variable for the binding - allocate stack space properly.
+                    Note: Canonical codegen struct layout (see codegen_create): offset 16 =
+                    Note: variable_count, offset 20 = variable_capacity, offset 24 = stack_offset.
                     Set current_stack_offset to memory_get_int32(codegen, 24)  Note: codegen->stack_offset
                     Let new_stack_offset be current_stack_offset plus 8
-                    memory_set_integer(codegen, 16, new_stack_offset)
+                    memory_set_int32(codegen, 24, new_stack_offset)  Note: codegen->stack_offset
 
                     file_write_buffered(output_file, "    movq %rdx, -", 0)
                     file_write_buffered(output_file, integer_to_string(new_stack_offset), 0)
@@ -8950,10 +9024,10 @@ Process called "codegen_generate_statement" takes codegen as Integer, stmt as In
 
                     Note: Add the binding to the variable table with correct offset
                     Let variable_count be memory_get_int32(codegen, 16)  Note: codegen->variable_count (int)
-                    Let variable_capacity be memory_get_int32(codegen, 24)  Note: codegen->variable_capacity
+                    Let variable_capacity be memory_get_int32(codegen, 20)  Note: codegen->variable_capacity (int)
                     If variable_count is greater than or equal to variable_capacity:
                         Let new_capacity be variable_capacity multiplied by 2
-                        memory_set_integer(codegen, 24, new_capacity)
+                        memory_set_int32(codegen, 20, new_capacity)  Note: codegen->variable_capacity
                         Set variables to memory_get_pointer(codegen, 8)  Note: codegen->variables
                         Note: Task #457: the raw 3-parameter runtime reallocate
                         Note: was being called with only 2 arguments here,
@@ -8967,9 +9041,9 @@ Process called "codegen_generate_statement" takes codegen as Integer, stmt as In
                     Set variables to memory_get_pointer(codegen, 8)  Note: codegen->variables
                     Let var_idx_offset be variable_count multiplied by 32  Note: sizeof(Variable) = 32
                     memory_set_pointer(variables, var_idx_offset, string_duplicate(field_name))  Note: name
-                    memory_set_integer(variables, var_idx_offset plus 8, new_stack_offset)  Note: stack_offset
+                    memory_set_int32(variables, var_idx_offset plus 8, new_stack_offset)  Note: stack_offset (int)
                     memory_set_pointer(variables, var_idx_offset plus 16, string_duplicate("Integer"))  Note: type_name
-                    memory_set_int32(codegen, 12, variable_count plus 1)  Note: Increment variable_count
+                    memory_set_int32(codegen, 16, variable_count plus 1)  Note: codegen->variable_count
 
                     Set j to j plus 1
                 End While
@@ -8991,15 +9065,15 @@ Process called "codegen_generate_statement" takes codegen as Integer, stmt as In
                     Set variable_count to memory_get_int32(codegen, 16)  Note: codegen->variable_count (int)
                     Let var_idx be variable_count minus field_count plus j
                     Set variables to memory_get_pointer(codegen, 8)  Note: codegen->variables
-                    Set var_name to memory_get_integer(variables, var_idx multiplied by 24)
-                    Let var_type_name be memory_get_integer(variables, var_idx multiplied by 24 plus 16)
+                    Set var_name to memory_get_pointer(variables, var_idx multiplied by 32)  Note: sizeof(Variable) = 32
+                    Let var_type_name be memory_get_pointer(variables, var_idx multiplied by 32 plus 16)  Note: type_name
                     deallocate(var_name)
                     deallocate(var_type_name)
                     Set j to j plus 1
                 End While
                 Note: Remove from variable table
                 Set variable_count to memory_get_int32(codegen, 16)  Note: codegen->variable_count (int)
-                memory_set_integer(codegen, 12, variable_count minus field_count)
+                memory_set_int32(codegen, 16, variable_count minus field_count)  Note: codegen->variable_count
             End If
 
             Note: Jump to end
@@ -10307,9 +10381,16 @@ Process called "codegen_generate" takes codegen as Integer, program as Integer r
     emit_line(output_file, "    decq %rsi")
     emit_line(output_file, "")
     emit_line(output_file, "    # Handle zero case")
+    emit_line(output_file, "    # The convert loop leaves %rsi one position BELOW the first")
+    emit_line(output_file, "    # digit it wrote (the trailing decq), so .convert_done's incq")
+    emit_line(output_file, "    # lands on that first digit. The zero path must match: write")
+    emit_line(output_file, "    # '0' then decq so the shared incq points AT the '0'. Without")
+    emit_line(output_file, "    # the decq, incq overshoots past '0' onto the null terminator")
+    emit_line(output_file, "    # and print_integer(0) emits an empty string (bug #477).")
     emit_line(output_file, "    testq %rax, %rax")
     emit_line(output_file, "    jnz .convert_loop")
     emit_line(output_file, "    movb $48, (%rsi)  # '0' character")
+    emit_line(output_file, "    decq %rsi")
     emit_line(output_file, "    jmp .convert_done")
     emit_line(output_file, "")
     emit_line(output_file, ".convert_loop:")
@@ -10416,9 +10497,12 @@ Process called "codegen_generate" takes codegen as Integer, program as Integer r
     emit_line(output_file, "    decq %rsi")
     emit_line(output_file, "")
     emit_line(output_file, "    # Handle zero case")
+    emit_line(output_file, "    # Mirror the convert-loop trailing decq so .pin_convert_done's")
+    emit_line(output_file, "    # incq lands ON the '0' digit rather than past it (bug #477).")
     emit_line(output_file, "    testq %rax, %rax")
     emit_line(output_file, "    jnz .pin_convert_loop")
     emit_line(output_file, "    movb $48, (%rsi)  # '0' character")
+    emit_line(output_file, "    decq %rsi")
     emit_line(output_file, "    jmp .pin_convert_done")
     emit_line(output_file, "")
     emit_line(output_file, ".pin_convert_loop:")
