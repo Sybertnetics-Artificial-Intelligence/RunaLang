@@ -1,0 +1,258 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+End-to-end probe of the v0.0.8.5 modular LEXICAL subsystem (task #491).
+
+This test drives the real lexical recognizers on a representative Runa snippet
+that mixes every major lexical category and asserts the exact token output
+(token TYPE and, where meaningful, the LEXEME compared byte-for-byte):
+
+  keywords/identifiers  -> keywords.lookup_keyword over a real keyword table
+  integer literal       -> literals.tokenize_numeric_literal  ("42")
+  float literal         -> literals.tokenize_numeric_literal  ("3.14")
+  string literal        -> literals.tokenize_string_literal    ("hi")
+  string with escape    -> literals.process_escape_sequences   ("a\nb")
+  arithmetic operator   -> math_symbols.recognize_arithmetic_operator ('+')
+  comparison operator   -> math_symbols.recognize_comparison_operator ('==')
+  general operator       -> operators.tokenize_member_access ('.')
+  syntax transform      -> syntax_transformer.transform_token_stream (bitwise)
+
+The lexer-core driver (lexer.lexer_tokenize_all) additionally depends on the
+diagnostics and file-utility subsystems, which are reconciled in separate
+batches and do not yet build under the strict stage1. This probe therefore
+exercises the lexical subsystem's own tokenization logic directly through its
+public recognizer APIs — the same code the lexer dispatches to — so it is a
+faithful, dependency-isolated evidence-of-correctness check for the lexical
+batch rather than a check gated on another batch's debt.
+
+The literal tokenizers read the source pointer from a lexer-shaped struct at
+offset 0 and take the start position as an explicit parameter, so the probe
+constructs a minimal source-only lexer block and calls them directly.
+
+Token layout (lexer.runa / literals.runa):
+  offset 0  = token_type
+  offset 8  = value (lexeme pointer)
+  offset 32 = length
+:End Note
+
+Import "compiler/frontend/lexical/keywords.runa" as Keywords
+Import "compiler/frontend/lexical/literals.runa" as Literals
+Import "compiler/frontend/lexical/operators.runa" as Operators
+Import "compiler/frontend/lexical/math_symbols.runa" as MathSymbols
+Import "compiler/frontend/lexical/syntax_transformer.runa" as SyntaxTransformer
+Import "compiler/frontend/primitives/collections/list.runa" as List
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "tests/test_utils.runa" as TestUtils
+
+Note: Token types emitted by the lexical subsystem (single source of truth is
+Note: the modules under test; mirrored here as named constants for readability).
+Constant TOKEN_STRING_LITERAL as Integer is 100
+Constant TOKEN_INTEGER_LITERAL as Integer is 110
+Constant TOKEN_FLOAT_LITERAL as Integer is 111
+Constant TOKEN_LET as Integer is 300
+Constant TOKEN_BE as Integer is 389
+Constant TOKEN_COUNT as Integer is 615
+Constant TOKEN_PLUS as Integer is 500
+Constant TOKEN_EQUAL_EQUAL as Integer is 510
+Constant TOKEN_DOT as Integer is 630
+Constant TOKEN_BITWISE as Integer is 500
+Constant TOKEN_AND as Integer is 380
+
+Note: Build a minimal lexer block whose source pointer lives at offset 0, which
+Note: is all the literal tokenizers read from the lexer (start position is passed
+Note: explicitly). 32 bytes is ample for the single field they touch.
+Process called "make_source_lexer" takes source as Integer returns Integer:
+    Let lexer be proc allocate from Layout with 32
+    If lexer is equal to 0:
+        Return 0
+    End If
+    Let dummy be proc memory_set_int64 from Layout with lexer, 0, source
+    Return lexer
+End Process
+
+Process called "token_type_of" takes token as Integer returns Integer:
+    Return proc memory_get_int64 from Layout with token, 0
+End Process
+
+Note: Compare a token's lexeme VALUE (the NUL-terminated string at value@8) to
+Note: an expected string. Note that the token's length field (offset 32) records
+Note: the token's span in the SOURCE (which, for a string literal, includes the
+Note: surrounding quotes), whereas value@8 points at the processed content; this
+Note: helper therefore compares the value buffer's own content, not the source
+Note: span length.
+Process called "lexeme_matches" takes token as Integer, expected as Integer returns Integer:
+    If token is equal to 0:
+        Return 0
+    End If
+    Let value_ptr be proc memory_get_int64 from Layout with token, 8
+    If value_ptr is equal to 0:
+        Return 0
+    End If
+    Let value_len be proc string_length from StringCore with value_ptr
+    Let expected_len be proc string_length from StringCore with expected
+    If value_len is not equal to expected_len:
+        Return 0
+    End If
+    Let i be 0
+    While i is less than value_len:
+        Let a be proc memory_get_byte from Layout with value_ptr, i
+        Let e be proc memory_get_byte from Layout with expected, i
+        If a is not equal to e:
+            Return 0
+        End If
+        Set i to i plus 1
+    End While
+    Return 1
+End Process
+
+Note: Compare a raw byte buffer of given length against an expected string.
+Process called "bytes_match" takes buffer as Integer, length as Integer, expected as Integer returns Integer:
+    Let expected_len be proc string_length from StringCore with expected
+    If length is not equal to expected_len:
+        Return 0
+    End If
+    Let i be 0
+    While i is less than length:
+        Let a be proc memory_get_byte from Layout with buffer, i
+        Let e be proc memory_get_byte from Layout with expected, i
+        If a is not equal to e:
+            Return 0
+        End If
+        Set i to i plus 1
+    End While
+    Return 1
+End Process
+
+Process called "main" returns Integer:
+    Let results be proc create_test_results from TestUtils
+    proc begin_suite from TestUtils with results, "lexical_subsystem_probe"
+
+    Note: ---- Keyword table: keyword vs identifier classification ----
+    Let kw_table be proc create_keyword_table from Keywords
+    proc assert_not_null from TestUtils with results, "keyword table builds", kw_table
+
+    Let let_type be proc lookup_keyword from Keywords with kw_table, "Let"
+    proc assert_equal from TestUtils with results, "'Let' is keyword TOKEN_LET", let_type, TOKEN_LET
+
+    Note: keywords.runa registers the capitalized "Be"; lowercase "be" is a
+    Note: plain identifier (the lexer is case-sensitive).
+    Let be_type be proc lookup_keyword from Keywords with kw_table, "Be"
+    proc assert_equal from TestUtils with results, "'Be' is keyword TOKEN_BE", be_type, TOKEN_BE
+
+    Note: "count" is a registered collection-aggregation keyword (TOKEN_COUNT).
+    Let count_type be proc lookup_keyword from Keywords with kw_table, "count"
+    proc assert_equal from TestUtils with results, "'count' is keyword TOKEN_COUNT", count_type, TOKEN_COUNT
+
+    Note: A genuine non-keyword identifier returns 0.
+    Let id_type be proc lookup_keyword from Keywords with kw_table, "myFoo"
+    proc assert_equal from TestUtils with results, "'myFoo' is not a keyword (0)", id_type, 0
+
+    Let reserved be proc is_reserved_keyword from Keywords with "Process"
+    proc assert_equal from TestUtils with results, "'Process' is reserved", reserved, 1
+    Let not_reserved be proc is_reserved_keyword from Keywords with "myvar"
+    proc assert_equal from TestUtils with results, "'myvar' is not reserved", not_reserved, 0
+
+    Note: ---- Integer literal: "42" ----
+    Let int_src be "42"
+    Let int_lexer be proc make_source_lexer with int_src
+    Let int_tok be proc tokenize_numeric_literal from Literals with int_lexer, 0, 1, 1
+    proc assert_not_null from TestUtils with results, "integer token built", int_tok
+    Let int_type be proc token_type_of with int_tok
+    proc assert_equal from TestUtils with results, "int token type", int_type, TOKEN_INTEGER_LITERAL
+    Let int_lex_ok be proc lexeme_matches with int_tok, "42"
+    proc assert_equal from TestUtils with results, "int lexeme is 42", int_lex_ok, 1
+
+    Note: ---- Float literal: "3.14" ----
+    Let flt_src be "3.14"
+    Let flt_lexer be proc make_source_lexer with flt_src
+    Let flt_tok be proc tokenize_numeric_literal from Literals with flt_lexer, 0, 1, 1
+    proc assert_not_null from TestUtils with results, "float token built", flt_tok
+    Let flt_type be proc token_type_of with flt_tok
+    proc assert_equal from TestUtils with results, "float token type", flt_type, TOKEN_FLOAT_LITERAL
+    Let flt_lex_ok be proc lexeme_matches with flt_tok, "3.14"
+    proc assert_equal from TestUtils with results, "float lexeme is 3.14", flt_lex_ok, 1
+
+    Note: ---- String literal: "hi" (content excludes the quotes) ----
+    Let str_src be "\"hi\""
+    Let str_lexer be proc make_source_lexer with str_src
+    Let str_tok be proc tokenize_string_literal from Literals with str_lexer, 0, 1, 1
+    proc assert_not_null from TestUtils with results, "string token built", str_tok
+    Let str_type be proc token_type_of with str_tok
+    proc assert_equal from TestUtils with results, "string token type", str_type, TOKEN_STRING_LITERAL
+    Let str_lex_ok be proc lexeme_matches with str_tok, "hi"
+    proc assert_equal from TestUtils with results, "string lexeme is hi", str_lex_ok, 1
+
+    Note: ---- Escape processing: "a\nb" -> a, 0x0A, b (length 3) ----
+    Note: Raw content as it appears between quotes is the four bytes a \ n b.
+    Let raw_escape be "a\\nb"
+    Let raw_len be proc string_length from StringCore with raw_escape
+    Let processed be proc process_escape_sequences from Literals with raw_escape, raw_len
+    proc assert_not_null from TestUtils with results, "escape processing returns buffer", processed
+    Let b0 be proc memory_get_byte from Layout with processed, 0
+    Let b1 be proc memory_get_byte from Layout with processed, 1
+    Let b2 be proc memory_get_byte from Layout with processed, 2
+    proc assert_equal from TestUtils with results, "escape byte0 is 'a'", b0, 97
+    proc assert_equal from TestUtils with results, "escape byte1 is newline 0x0A", b1, 10
+    proc assert_equal from TestUtils with results, "escape byte2 is 'b'", b2, 98
+
+    Note: ---- Arithmetic operator recognition: '+' ----
+    Let plus_type be proc recognize_arithmetic_operator from MathSymbols with 43, 0
+    proc assert_equal from TestUtils with results, "'+' recognized as TOKEN_PLUS", plus_type, TOKEN_PLUS
+
+    Note: ---- Comparison operator recognition: '==' ----
+    Let eq_type be proc recognize_comparison_operator from MathSymbols with 61, 61
+    proc assert_equal from TestUtils with results, "'==' recognized as TOKEN_EQUAL_EQUAL", eq_type, TOKEN_EQUAL_EQUAL
+
+    Note: ---- Math operator symbol mapping ----
+    Let plus_sym be proc math_operator_type_to_string from MathSymbols with TOKEN_PLUS
+    Let plus_sym_ok be proc bytes_match with plus_sym, 1, "+"
+    proc assert_equal from TestUtils with results, "TOKEN_PLUS maps to '+'", plus_sym_ok, 1
+
+    Note: ---- General member-access operator: '.' (not followed by another dot) ----
+    Let dot_src be ".x"
+    Let dot_lexer be proc make_source_lexer with dot_src
+    Note: operators.tokenize_member_access reads source@0 and current_position@16;
+    Note: position 0 is the '.', and the next char is peeked at position + 1.
+    Let dot_tok be proc tokenize_member_access from Operators with dot_lexer, 46, 1, 1
+    proc assert_not_null from TestUtils with results, "member-access token built", dot_tok
+    Let dot_type be proc token_type_of with dot_tok
+    proc assert_equal from TestUtils with results, "'.' is TOKEN_DOT", dot_type, TOKEN_DOT
+
+    Note: ---- Syntax transformer: bitwise-and developer token -> canonical pair ----
+    Note: A TOKEN_BITWISE_AND developer token transforms to TOKEN_BITWISE, TOKEN_AND.
+    Note: Use the dedicated transform on an output list and check it emits 2 tokens.
+    Let out_list be proc create from List
+    proc assert_not_null from TestUtils with results, "transform output list", out_list
+    Let dev_token be proc create_token from SyntaxTransformer with TOKEN_AND, 0, 1, 1, 1
+    Let transform_ok be proc transform_bitwise_and from SyntaxTransformer with dev_token, out_list
+    proc assert_equal from TestUtils with results, "bitwise-and transform succeeds", transform_ok, 1
+    Let out_size be proc size from List with out_list
+    proc assert_equal from TestUtils with results, "transform emits 2 canonical tokens", out_size, 2
+    Let first_emitted be proc get from List with out_list, 0
+    Let first_type be proc token_type_of with first_emitted
+    proc assert_equal from TestUtils with results, "first emitted is TOKEN_BITWISE", first_type, TOKEN_BITWISE
+    Let second_emitted be proc get from List with out_list, 1
+    Let second_type be proc token_type_of with second_emitted
+    proc assert_equal from TestUtils with results, "second emitted is TOKEN_AND", second_type, TOKEN_AND
+
+    proc print_summary from TestUtils with results
+    Let failed be proc get_failed from TestUtils with results
+    proc destroy_test_results from TestUtils with results
+
+    Return failed
+End Process
