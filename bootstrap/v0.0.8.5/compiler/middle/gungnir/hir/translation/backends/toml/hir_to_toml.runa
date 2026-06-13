@@ -17,34 +17,32 @@ limitations under the License.
 Note:
 HIR to TOML Code Generator - Converts Runa HIR to TOML
 
-This file generates TOML output from Runa's High-level Intermediate
-Representation (HIR). This enables exporting Runa data structures
-as TOML configuration files.
+This file generates well-formed TOML output from Runa's High-level
+Intermediate Representation (HIR), using the canonical HIR literal model:
 
-Translation Mapping:
-- Runa Dictionary[String, Value] → TOML key-value pairs or tables
-- Runa List[Value]               → TOML array
-- Runa String literal            → TOML string (quoted if needed)
-- Runa Integer literal           → TOML integer
-- Runa Boolean                   → TOML true/false
+  - HIR_DICTIONARY_LITERAL    -> TOML table (top-level keys, or [section] header)
+  - HIR_ARRAY_LITERAL         -> TOML inline array, OR an [[array-of-tables]]
+                                 when every element is a dictionary literal
+  - HIR_LITERAL (value_type@48):
+      1 string   -> TOML basic string (quoted+escaped) or bare datetime
+      2 boolean  -> true / false
+      3 integer  -> base-10 integer
+      4 float    -> the preserved float lexeme
+      0 null      -> not representable in TOML (error)
 
-Output Features:
-- Clean key-value pair formatting
-- Table sections when appropriate
-- String quoting when necessary
-- Comments support (if available in HIR)
-- Proper escaping
+Serialization strategy (so the re-parse rebuilds the same nested HIR):
+  A dictionary is emitted in two phases under a table path. Phase one emits
+  every scalar and scalar-array entry as "key = value" lines. Phase two walks
+  the dictionary's sub-dictionaries and arrays-of-tables, emitting a [path]
+  header (or [[path]] header per element) and recursing. This is the standard
+  TOML layout and round-trips through any conformant TOML parser.
 
-Features:
-- Complete HIR node support
-- Pretty printing
-- String escaping
-- Integer-to-string conversion
-- Table hierarchy management
+Import-cycle rule: this backend does NOT import translation.runa. Failure is
+surfaced via the 0-return contract on the public entry point.
 
 Dependencies:
 - compiler/middle/gungnir/hir/hir.runa
-- toml_emitter.runa
+- compiler/middle/gungnir/hir/translation/backends/emitter_common.runa
 - compiler/frontend/primitives/memory/layout.runa
 - compiler/frontend/primitives/core/string_core.runa
 - compiler/frontend/primitives/collections/list.runa
@@ -61,22 +59,21 @@ Note: TOML Generation Context
 Note: ============================================================================
 
 @Reasoning:
-TOML emission needs an output buffer plus tracking for the active table
-path so nested keys can be emitted as "[parent.child]" headers. Errors are
-kept in-band so the caller can detect them without exceptions.
+TOML emission needs an output buffer plus a single-slot error channel so the
+caller can detect failure without exceptions. Table-path prefixes are carried
+as explicit recursion arguments rather than context state, which keeps the
+recursion reentrant for arrays-of-tables.
 @End Reasoning
 
 @Implementation:
-Four int64 fields totalling 32 bytes (see create_generation_context).
-current_table holds the dot-joined table path that prefixes generated
-keys; null until the first nested object is entered.
+Three int64 fields totalling 24 bytes: emitter, error_message (owned heap copy
+or 0), has_error boolean.
 @End Implementation
 
 Type called "TOMLGenerationContext":
     emitter as Integer          Note: TOML emitter for output
     error_message as Integer    Note: Error message (if any)
     has_error as Integer        Note: Boolean: 1 if error occurred
-    current_table as Integer    Note: Current table path (for nested tables)
 End Type
 
 Note: ============================================================================
@@ -84,27 +81,26 @@ Note: Context Creation and Destruction
 Note: ============================================================================
 
 @Reasoning:
-The TOML emitter cannot run unless an output buffer is wired. Constructing
-the buffer here means callers cannot bypass that invariant.
+The emitter cannot run unless an output buffer is wired. Constructing the
+buffer here means callers cannot bypass that invariant.
 @End Reasoning
 
 @Implementation:
-Allocates the 32-byte TOMLGenerationContext, creates the raw byte emitter,
-and initialises emitter/error_message/has_error/current_table slots. Rolls
-back the partial allocation if emitter construction fails.
+Allocates the 24-byte TOMLGenerationContext, creates the raw byte emitter, and
+initialises emitter/error_message/has_error. Rolls back the partial allocation
+if emitter construction fails.
 @End Implementation
 
 Process called "create_generation_context" returns Integer:
     Note: Create TOML generation context
 
-    Let context_size be 32  Note: TOMLGenerationContext: 4 fields × 8 bytes
+    Let context_size be 24  Note: TOMLGenerationContext: 3 fields × 8 bytes
     Let context be proc allocate from Layout with context_size
 
     If context is equal to 0:
         Return 0
     End If
 
-    Note: Create emitter
     Let emitter be proc emitter_raw_create from EmitterCommon
 
     If emitter is equal to 0:
@@ -112,24 +108,21 @@ Process called "create_generation_context" returns Integer:
         Return 0
     End If
 
-    Note: Initialize context
     proc memory_set_int64 from Layout with context, 0, emitter
     proc memory_set_int64 from Layout with context, 8, 0   Note: error_message = null
     proc memory_set_int64 from Layout with context, 16, 0  Note: has_error = false
-    proc memory_set_int64 from Layout with context, 24, 0  Note: current_table = null
 
     Return context
 End Process
 
 @Reasoning:
-Symmetric counterpart of create_generation_context. Releases the byte
-emitter and any error_message heap copy before freeing the context block.
+Symmetric counterpart of create_generation_context. Releases the byte emitter
+and any error_message heap copy before freeing the context block.
 @End Reasoning
 
 @Implementation:
-Reads the emitter and error_message slots, calls emitter_raw_destroy on
-the former and deallocate on the latter only when non-zero, then frees
-the context.
+Reads the emitter and error_message slots, calls emitter_raw_destroy on the
+former and deallocate on the latter only when non-zero, then frees the context.
 @End Implementation
 
 Process called "destroy_generation_context" takes context as Integer returns Integer:
@@ -139,14 +132,12 @@ Process called "destroy_generation_context" takes context as Integer returns Int
         Return 1
     End If
 
-    Note: Destroy emitter
     Let emitter be proc memory_get_int64 from Layout with context, 0
 
     If emitter is not equal to 0:
         proc emitter_raw_destroy from EmitterCommon with emitter
     End If
 
-    Note: Free error message if exists
     Let error_message be proc memory_get_int64 from Layout with context, 8
 
     If error_message is not equal to 0:
@@ -163,15 +154,14 @@ Note: Error Handling
 Note: ============================================================================
 
 @Reasoning:
-Captures the first generation error so the caller can report it later.
-Owning a heap copy isolates the message from the lifetime of the source
-buffer.
+Captures the first generation error so the caller can report it later. Owning a
+heap copy isolates the message from the lifetime of the source buffer.
 @End Reasoning
 
 @Implementation:
-Frees any prior error_message buffer, allocates msg_length+1 bytes, copies
-the message via memory_copy, null-terminates, then stores the pointer and
-sets has_error to 1.
+Frees any prior error_message buffer, allocates msg_length+1 bytes, copies the
+message via memory_copy, null-terminates, then stores the pointer and sets
+has_error to 1.
 @End Implementation
 
 Process called "set_generation_error" takes context as Integer, message as Integer returns Integer:
@@ -179,17 +169,15 @@ Process called "set_generation_error" takes context as Integer, message as Integ
 
     Let error_message be proc memory_get_int64 from Layout with context, 8
 
-    Note: Free previous error if exists
     If error_message is not equal to 0:
         proc deallocate from Layout with error_message
     End If
 
-    Note: Copy error message
     Let msg_length be proc string_length from StringCore with message
     Let new_error be proc allocate from Layout with msg_length plus 1
 
     If new_error is not equal to 0:
-        proc memory_copy from Layout with new_error, 0, message, 0, msg_length
+        proc memory_copy from Layout with new_error, message, msg_length
         proc memory_set_byte from Layout with new_error, msg_length, 0
     End If
 
@@ -200,38 +188,54 @@ Process called "set_generation_error" takes context as Integer, message as Integ
 End Process
 
 Note: ============================================================================
-Note: String Utilities
+Note: Character Classification
 Note: ============================================================================
 
 @Reasoning:
-TOML bare keys are restricted to ASCII letters, digits, underscore and
-dash. Anything else (spaces, dots, unicode) forces the quoted-key form
-or the file would fail to parse.
+Helper used by needs_quoting and is_datetime_format to detect ASCII digits
+without depending on a locale-aware classifier.
 @End Reasoning
 
 @Implementation:
-Empty strings always need quoting. Otherwise walks byte-by-byte and
-returns 1 the moment any character fails the bare-key class test.
-Returns 0 when the entire string is bare-safe.
+Returns 1 when the byte falls in the inclusive range 48 ('0') to 57 ('9'),
+0 otherwise.
+@End Implementation
+
+Process called "is_digit" takes char as Integer returns Integer:
+    Note: Check if character is a digit (0-9)
+
+    If char is greater than or equal to 48:
+        If char is less than or equal to 57:
+            Return 1
+        End If
+    End If
+
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: Key and String Utilities
+Note: ============================================================================
+
+@Reasoning:
+TOML bare keys are restricted to ASCII letters, digits, underscore and dash.
+Anything else (spaces, dots, unicode, empty) forces the quoted-key form or the
+file would fail to parse.
+@End Reasoning
+
+@Implementation:
+Empty strings always need quoting. Otherwise walk byte-by-byte and return 1 the
+moment any character fails the bare-key class test. Return 0 when the entire
+string is bare-safe.
 @End Implementation
 
 Process called "needs_quoting" takes str as Integer returns Integer:
-    Note: Check if string needs quoting in TOML
-
-    @Reasoning:
-    TOML bare keys can contain:
-    - Letters (a-z, A-Z)
-    - Numbers (0-9)
-    - Underscores (_)
-    - Dashes (-)
-
-    Anything else requires quoting.
-    @End Reasoning
+    Note: Check if a key string needs quoting in TOML
 
     Let length be proc string_length from StringCore with str
 
     If length is equal to 0:
-        Return 1  Note: Empty strings must be quoted
+        Return 1  Note: Empty keys must be quoted
     End If
 
     Let index be 0
@@ -239,36 +243,36 @@ Process called "needs_quoting" takes str as Integer returns Integer:
     While index is less than length:
         Let char be proc memory_get_byte from Layout with str, index
 
-        Note: Check if char is alphanumeric, underscore, or dash
-        Let is_alpha be 0
-        Let is_digit be 0
+        Let is_bare be 0
 
         If char is greater than or equal to 65:
             If char is less than or equal to 90:  Note: A-Z
-                Set is_alpha to 1
+                Set is_bare to 1
             End If
         End If
 
         If char is greater than or equal to 97:
             If char is less than or equal to 122:  Note: a-z
-                Set is_alpha to 1
+                Set is_bare to 1
             End If
         End If
 
         If char is greater than or equal to 48:
             If char is less than or equal to 57:  Note: 0-9
-                Set is_digit to 1
+                Set is_bare to 1
             End If
         End If
 
-        If is_alpha is equal to 0:
-            If is_digit is equal to 0:
-                If char is not equal to 95:  Note: _
-                    If char is not equal to 45:  Note: -
-                        Return 1  Note: Needs quoting
-                    End If
-                End If
-            End If
+        If char is equal to 95:  Note: _
+            Set is_bare to 1
+        End If
+
+        If char is equal to 45:  Note: -
+            Set is_bare to 1
+        End If
+
+        If is_bare is equal to 0:
+            Return 1  Note: Needs quoting
         End If
 
         Set index to index plus 1
@@ -278,22 +282,21 @@ Process called "needs_quoting" takes str as Integer returns Integer:
 End Process
 
 @Reasoning:
-TOML basic strings require backslash escapes for quote, backslash, and
-control characters; \uXXXX hex escapes cover any code points below 0x20.
-Without correct escaping the resulting document will fail to parse.
+TOML basic strings require backslash escapes for quote, backslash, and control
+characters; \u00XX hex escapes cover code points below 0x20. Without correct
+escaping the resulting document fails to parse.
 @End Reasoning
 
 @Implementation:
-Emits opening quote, walks the input byte-by-byte. Specific short-escape
-maps for ", \, BS, FF, LF, CR, TAB are emitted directly; other control
-bytes (< 0x20) get the six-byte \u00XX form, splitting the byte into
-high/low nibbles. Regular bytes pass through unchanged. Closes with
-quote.
+Emits opening quote, walks the input byte-by-byte. Short-escape maps for ", \,
+BS, FF, LF, CR, TAB are emitted directly; other control bytes (< 0x20) get the
+six-byte \u00XX form, splitting the byte into high/low nibbles. Regular bytes
+pass through unchanged. Closes with quote.
 @End Implementation
 
 @Security_Scope:
-Trusts str to be null-terminated UTF-8. Escaping prevents control bytes
-from breaking out of the basic-string region.
+Trusts str to be NUL-terminated UTF-8. Escaping prevents control bytes from
+breaking out of the basic-string region.
 @End Security_Scope
 
 Process called "emit_escaped_string" takes context as Integer, str as Integer returns Integer:
@@ -310,45 +313,46 @@ Process called "emit_escaped_string" takes context as Integer, str as Integer re
         Let char be proc memory_get_byte from Layout with str, index
 
         If char is equal to 34:  Note: "
-            proc emitter_raw_emit_byte from EmitterCommon with emitter, 92  Note: '\'
+            proc emitter_raw_emit_byte from EmitterCommon with emitter, 92
             proc emitter_raw_emit_byte from EmitterCommon with emitter, 34
         Otherwise If char is equal to 92:  Note: \
             proc emitter_raw_emit_byte from EmitterCommon with emitter, 92
             proc emitter_raw_emit_byte from EmitterCommon with emitter, 92
-        Otherwise If char is equal to 10:  Note: newline
-            proc emitter_raw_emit_byte from EmitterCommon with emitter, 92
-            proc emitter_raw_emit_byte from EmitterCommon with emitter, 110  Note: 'n'
-        Otherwise If char is equal to 9:  Note: tab
-            proc emitter_raw_emit_byte from EmitterCommon with emitter, 92
-            proc emitter_raw_emit_byte from EmitterCommon with emitter, 116  Note: 't'
-        Otherwise If char is equal to 13:  Note: carriage return
-            proc emitter_raw_emit_byte from EmitterCommon with emitter, 92
-            proc emitter_raw_emit_byte from EmitterCommon with emitter, 114  Note: 'r'
         Otherwise If char is equal to 8:  Note: backspace
             proc emitter_raw_emit_byte from EmitterCommon with emitter, 92
             proc emitter_raw_emit_byte from EmitterCommon with emitter, 98  Note: 'b'
         Otherwise If char is equal to 12:  Note: form feed
             proc emitter_raw_emit_byte from EmitterCommon with emitter, 92
             proc emitter_raw_emit_byte from EmitterCommon with emitter, 102  Note: 'f'
-        Otherwise If char is less than 32:  Note: other control characters
+        Otherwise If char is equal to 10:  Note: newline
             proc emitter_raw_emit_byte from EmitterCommon with emitter, 92
+            proc emitter_raw_emit_byte from EmitterCommon with emitter, 110  Note: 'n'
+        Otherwise If char is equal to 13:  Note: carriage return
+            proc emitter_raw_emit_byte from EmitterCommon with emitter, 92
+            proc emitter_raw_emit_byte from EmitterCommon with emitter, 114  Note: 'r'
+        Otherwise If char is equal to 9:  Note: tab
+            proc emitter_raw_emit_byte from EmitterCommon with emitter, 92
+            proc emitter_raw_emit_byte from EmitterCommon with emitter, 116  Note: 't'
+        Otherwise If char is less than 32:  Note: other control characters
+            proc emitter_raw_emit_byte from EmitterCommon with emitter, 92   Note: '\'
             proc emitter_raw_emit_byte from EmitterCommon with emitter, 117  Note: 'u'
-            Note: Emit 4-digit hex
-            Let hex_digits be 4
-            Let value be char
+            proc emitter_raw_emit_byte from EmitterCommon with emitter, 48   Note: '0'
+            proc emitter_raw_emit_byte from EmitterCommon with emitter, 48   Note: '0'
 
-            While hex_digits is greater than 0:
-                Set hex_digits to hex_digits minus 1
-                Let shift be hex_digits multiplied by 4
-                Let nibble be value divided by proc power_of_two from shift
-                Set nibble to nibble modulo by 16
+            Let high_nibble be char divided by 16
+            Let low_nibble be char modulo by 16
 
-                If nibble is less than 10:
-                    proc emitter_raw_emit_byte from EmitterCommon with emitter, nibble plus 48
-                Otherwise:
-                    proc emitter_raw_emit_byte from EmitterCommon with emitter, nibble plus 87
-                End If
-            End While
+            If high_nibble is less than 10:
+                proc emitter_raw_emit_byte from EmitterCommon with emitter, 48 plus high_nibble
+            Otherwise:
+                proc emitter_raw_emit_byte from EmitterCommon with emitter, 97 plus high_nibble minus 10
+            End If
+
+            If low_nibble is less than 10:
+                proc emitter_raw_emit_byte from EmitterCommon with emitter, 48 plus low_nibble
+            Otherwise:
+                proc emitter_raw_emit_byte from EmitterCommon with emitter, 97 plus low_nibble minus 10
+            End If
         Otherwise:
             proc emitter_raw_emit_byte from EmitterCommon with emitter, char
         End If
@@ -362,56 +366,55 @@ Process called "emit_escaped_string" takes context as Integer, str as Integer re
 End Process
 
 @Reasoning:
-TOML datetime literals are unquoted; mistaking them for regular strings
-would quote them and break round-tripping. The check is conservative: a
-true date must look like "YYYY-MM-DD" with optional time/offset suffix.
+TOML datetime literals are unquoted; mistaking them for regular strings would
+quote them and break round-tripping. The check is conservative: a true date
+looks like "YYYY-MM-DD" (optionally with time/offset) or a time looks like
+"HH:MM:SS".
 @End Reasoning
 
 @Implementation:
-Verifies length >= 10, that positions 0-3 are digits, position 4 is '-',
-positions 5-6 are digits, position 7 is '-', positions 8-9 are digits.
-Returns 1 only when all conditions pass; any failure returns 0.
+For length >= 10 verify positions 0-3 are digits, 4 is '-', 5-6 digits, 7 is
+'-'. For length >= 8 verify positions 0-1 digits, 2 is ':', 5 is ':'. Returns 1
+on a match, 0 otherwise.
 @End Implementation
 
 Process called "is_datetime_format" takes str as Integer returns Integer:
-    Note: Check if string matches RFC 3339 datetime format
-
-    @Reasoning:
-    TOML datetimes follow RFC 3339 format. Common patterns:
-    - Offset DateTime: YYYY-MM-DDTHH:MM:SSZ or YYYY-MM-DDTHH:MM:SS±HH:MM
-    - Local DateTime: YYYY-MM-DDTHH:MM:SS
-    - Local Date: YYYY-MM-DD
-    - Local Time: HH:MM:SS or HH:MM:SS.ffffff
-    We check for these patterns to distinguish datetime from regular strings.
-    @End Reasoning
+    Note: Check if string matches an RFC 3339 datetime/date/time shape
 
     Let str_length be proc string_length from StringCore with str
 
-    If str_length is less than 5:
-        Return 0  Note: Too short to be datetime
+    If str_length is less than 8:
+        Return 0  Note: Too short to be a datetime/date/time
     End If
 
     Let char0 be proc memory_get_byte from Layout with str, 0
     Let char1 be proc memory_get_byte from Layout with str, 1
     Let char2 be proc memory_get_byte from Layout with str, 2
-    Let char3 be proc memory_get_byte from Layout with str, 3
-    Let char4 be proc memory_get_byte from Layout with str, 4
 
-    Note: Check for date format YYYY-MM-DD (minimum 10 chars)
+    Note: Date / datetime: YYYY-MM-DD...
     If str_length is greater than or equal to 10:
-        If proc is_digit from char0 is equal to 1:
-            If proc is_digit from char1 is equal to 1:
-                If proc is_digit from char2 is equal to 1:
-                    If proc is_digit from char3 is equal to 1:
-                        If char4 is equal to 45:  Note: minus (YYYY-MM-DD)
-                            Let char5 be proc memory_get_byte from Layout with str, 5
-                            Let char6 be proc memory_get_byte from Layout with str, 6
-                            Let char7 be proc memory_get_byte from Layout with str, 7
+        Let char3 be proc memory_get_byte from Layout with str, 3
+        Let char4 be proc memory_get_byte from Layout with str, 4
+        Let char5 be proc memory_get_byte from Layout with str, 5
+        Let char6 be proc memory_get_byte from Layout with str, 6
+        Let char7 be proc memory_get_byte from Layout with str, 7
 
-                            If proc is_digit from char5 is equal to 1:
-                                If proc is_digit from char6 is equal to 1:
-                                    If char7 is equal to 45:  Note: minus (YYYY-MM-DD)
-                                        Return 1  Note: Datetime format detected
+        Let d0 be proc is_digit with char0
+        Let d1 be proc is_digit with char1
+        Let d2 be proc is_digit with char2
+        Let d3 be proc is_digit with char3
+        Let d5 be proc is_digit with char5
+        Let d6 be proc is_digit with char6
+
+        If d0 is equal to 1:
+            If d1 is equal to 1:
+                If d2 is equal to 1:
+                    If d3 is equal to 1:
+                        If char4 is equal to 45:  Note: '-'
+                            If d5 is equal to 1:
+                                If d6 is equal to 1:
+                                    If char7 is equal to 45:  Note: '-'
+                                        Return 1
                                     End If
                                 End If
                             End If
@@ -422,16 +425,16 @@ Process called "is_datetime_format" takes str as Integer returns Integer:
         End If
     End If
 
-    Note: Check for time format HH:MM:SS (minimum 8 chars)
-    If str_length is greater than or equal to 8:
-        If proc is_digit from char0 is equal to 1:
-            If proc is_digit from char1 is equal to 1:
-                If char2 is equal to 58:  Note: : (HH:MM:SS)
-                    Set char5 to proc memory_get_byte from Layout with str, 5
+    Note: Time: HH:MM:SS...
+    Let t0 be proc is_digit with char0
+    Let t1 be proc is_digit with char1
+    Let char5b be proc memory_get_byte from Layout with str, 5
 
-                    If char5 is equal to 58:  Note: : (HH:MM:SS)
-                        Return 1  Note: Time format detected
-                    End If
+    If t0 is equal to 1:
+        If t1 is equal to 1:
+            If char2 is equal to 58:  Note: ':'
+                If char5b is equal to 58:  Note: ':'
+                    Return 1
                 End If
             End If
         End If
@@ -440,69 +443,20 @@ Process called "is_datetime_format" takes str as Integer returns Integer:
     Return 0  Note: Not a datetime format
 End Process
 
-@Reasoning:
-Helper used by is_datetime_format and the integer formatter to detect
-ASCII digits without depending on locale-aware character classifiers.
-@End Reasoning
-
-@Implementation:
-Returns 1 when the byte falls in the inclusive range 48 ('0') to 57 ('9'),
-0 otherwise.
-@End Implementation
-
-Process called "is_digit" takes char as Integer returns Integer:
-    Note: Check if character is a digit (0-9)
-
-    If char is greater than or equal to 48:  Note: '0'
-        If char is less than or equal to 57:  Note: '9'
-            Return 1
-        End If
-    End If
-
-    Return 0
-End Process
-
-@Reasoning:
-Used by emit_integer to size buffers and compute decimal exponents
-without falling back to floating-point math. Integer-only avoids
-rounding drift.
-@End Reasoning
-
-@Implementation:
-Initialises result to 1 and multiplies by 2 a total of exponent times.
-Returns 1 when exponent is 0; behaviour is undefined for negative
-exponents because the caller never passes one.
-@End Implementation
-
-Process called "power_of_two" takes exponent as Integer returns Integer:
-    Note: Calculate 2^exponent
-
-    Let result be 1
-    Let count be 0
-
-    While count is less than exponent:
-        Set result to result multiplied by 2
-        Set count to count plus 1
-    End While
-
-    Return result
-End Process
-
 Note: ============================================================================
 Note: Integer to String Conversion
 Note: ============================================================================
 
 @Reasoning:
-TOML integer literals are base-10 with optional leading minus. Writing
-them through the raw emitter requires temporary formatting; doing it
-here centralises sign handling and digit emission.
+TOML integer literals are base-10 with an optional leading minus. Writing them
+through the raw emitter requires temporary formatting; doing it here centralises
+sign handling and digit emission.
 @End Reasoning
 
 @Implementation:
-Handles zero as a single '0' byte. For non-zero values, captures the
-sign, takes the absolute value, counts decimal digits, allocates a
-buffer, writes digits least-significant-first, then prepends '-' when
-negative. Emits the formatted bytes and frees the temporary buffer.
+Handles zero as a single '0' byte. For non-zero values, captures the sign,
+takes the absolute value, writes digits least-significant-first into a buffer,
+prepends '-' when negative, then emits the buffer in correct order and frees it.
 @End Implementation
 
 Process called "emit_integer" takes context as Integer, value as Integer returns Integer:
@@ -527,7 +481,6 @@ Process called "emit_integer" takes context as Integer, value as Integer returns
         Set abs_value to -value
     End If
 
-    Note: Convert digits (in reverse order)
     While abs_value is greater than 0:
         Let digit be abs_value modulo by 10
         Let digit_char be digit plus 48  Note: '0'
@@ -536,13 +489,11 @@ Process called "emit_integer" takes context as Integer, value as Integer returns
         Set abs_value to abs_value divided by 10
     End While
 
-    Note: Add negative sign if needed
     If is_negative is equal to 1:
         proc memory_set_byte from Layout with buffer, buffer_pos, 45  Note: '-'
         Set buffer_pos to buffer_pos plus 1
     End If
 
-    Note: Emit in correct order (reverse)
     Let index be buffer_pos minus 1
 
     While index is greater than or equal to 0:
@@ -557,177 +508,122 @@ Process called "emit_integer" takes context as Integer, value as Integer returns
 End Process
 
 Note: ============================================================================
-Note: HIR Node Translation
+Note: Scalar Value Emission (HIR_LITERAL value_type model)
 Note: ============================================================================
 
 @Reasoning:
-Central node dispatcher. Each HIR scalar/collection kind maps to a TOML
-representation, so the rest of the file does not need to know about
-foreign HIR kinds.
+Scalar literals all share node kind HIR_LITERAL and are distinguished by the
+value_type tag at offset 48 (1 string, 2 boolean, 3 integer, 4 float, 0 null).
+Centralising the tag switch here keeps each emit_* helper focused on one TOML
+projection.
 @End Reasoning
 
 @Implementation:
-Reads the node type tag and dispatches: dictionaries to
-generate_toml_dictionary, lists to generate_toml_array, strings to
-generate_toml_string, integers to generate_toml_integer, booleans to
-generate_toml_boolean. Unknown kinds set a translation error.
+Read value_type at offset 48. String -> emit_value_string (bare datetime or
+quoted basic string). Boolean -> "true"/"false". Integer -> emit_integer of the
+payload at offset 40. Float -> emit the preserved lexeme (string pointer at
+offset 40). Null -> generation error (TOML has no null). Returns 1/0.
 @End Implementation
 
-Process called "generate_hir_node" takes context as Integer, hir_node as Integer returns Integer:
-    Note: Generate TOML from HIR node
+Process called "emit_scalar_literal" takes context as Integer, hir_node as Integer returns Integer:
+    Note: Emit a HIR scalar literal as a TOML value
 
-    @Reasoning:
-    Main entry point for HIR→TOML translation.
-    Dispatches to appropriate generator based on HIR node type.
-    @End Reasoning
+    Let emitter be proc memory_get_int64 from Layout with context, 0
+    Let value_type be proc memory_get_int64 from Layout with hir_node, 48
 
-    If hir_node is equal to 0:
-        proc set_generation_error with context, "Null HIR node"
-        Return 0
+    If value_type is equal to HIR_LITERAL_KIND_STRING from HIR:
+        Let str be proc get_string_literal_value from HIR with hir_node
+
+        If str is equal to 0:
+            proc set_generation_error with context, "String literal has no value"
+            Return 0
+        End If
+
+        Let is_datetime be proc is_datetime_format with str
+
+        If is_datetime is equal to 1:
+            proc emitter_raw_emit_string from EmitterCommon with emitter, str
+        Otherwise:
+            proc emit_escaped_string with context, str
+        End If
+
+        Return 1
     End If
 
-    Note: Get HIR node type
-    Let node_type be proc get_hir_node_type from HIR with hir_node
+    If value_type is equal to HIR_LITERAL_KIND_BOOLEAN from HIR:
+        Let bool_value be proc get_boolean_literal_value from HIR with hir_node
 
-    Note: Dictionary → TOML key-value pairs
-    If node_type is equal to HIR_DICTIONARY_LITERAL from HIR:
-        Return proc generate_toml_dictionary with context, hir_node
+        If bool_value is equal to 1:
+            proc emitter_raw_emit_string from EmitterCommon with emitter, "true"
+        Otherwise:
+            proc emitter_raw_emit_string from EmitterCommon with emitter, "false"
+        End If
+
+        Return 1
     End If
 
-    Note: List → TOML array
-    If node_type is equal to HIR_LIST_LITERAL from HIR:
-        Return proc generate_toml_array with context, hir_node
+    If value_type is equal to HIR_LITERAL_KIND_INTEGER from HIR:
+        Let int_value be proc get_integer_literal_value from HIR with hir_node
+        proc emit_integer with context, int_value
+        Return 1
     End If
 
-    Note: String literal
-    If node_type is equal to HIR_STRING_LITERAL from HIR:
-        Return proc generate_toml_string with context, hir_node
+    If value_type is equal to HIR_LITERAL_KIND_FLOAT from HIR:
+        Let float_str be proc get_float_literal_value from HIR with hir_node
+
+        If float_str is equal to 0:
+            proc set_generation_error with context, "Float literal has no representation"
+            Return 0
+        End If
+
+        proc emitter_raw_emit_string from EmitterCommon with emitter, float_str
+        Return 1
     End If
 
-    Note: Integer literal
-    If node_type is equal to HIR_INTEGER_LITERAL from HIR:
-        Return proc generate_toml_integer with context, hir_node
-    End If
-
-    Note: Boolean literal
-    If node_type is equal to HIR_BOOLEAN_LITERAL from HIR:
-        Return proc generate_toml_boolean with context, hir_node
-    End If
-
-    Note: Null literal (TOML doesn't have null, skip or use empty string)
-    If node_type is equal to HIR_NULL_LITERAL from HIR:
-        proc set_generation_error with context, "TOML does not support null values"
-        Return 0
-    End If
-
-    proc set_generation_error with context, "Unsupported HIR node type"
+    proc set_generation_error with context, "TOML does not support null values"
     Return 0
 End Process
 
 @Reasoning:
-TOML tables (dictionaries) emit each entry as "key = value" lines. Nested
-sub-tables would require explicit [section] headers; the simple form
-shipped here covers the flat-key path that test fixtures exercise.
+A HIR array is projected to a TOML inline array "[a, b, c]" when it appears as a
+value (scalar array, or array nested inside an array). Each element is emitted
+recursively; only scalar and array/inline-table values are valid inline-array
+elements, which is exactly what emit_inline_value handles.
 @End Reasoning
 
 @Implementation:
-Iterates the HIR dictionary entries; for each entry, emits the key
-(quoted if needed via needs_quoting, escaped via emit_escaped_string),
-"= ", the value via generate_hir_node, then a newline.
+Emit '['. Walk the array's elements via get_list_elements; emit each through
+emit_inline_value with ", " between consecutive entries; propagate failure.
+Emit ']'.
 @End Implementation
 
-Process called "generate_toml_dictionary" takes context as Integer, hir_node as Integer returns Integer:
-    Note: Generate TOML key-value pairs from dictionary
+Process called "emit_inline_array" takes context as Integer, hir_node as Integer returns Integer:
+    Note: Emit a HIR array as a TOML inline array
 
     Let emitter be proc memory_get_int64 from Layout with context, 0
-
-    Note: Get dictionary entries
-    Let keys be proc get_dictionary_keys from HIR with hir_node
-    Let values be proc get_dictionary_values from HIR with hir_node
-
-    If keys is equal to 0:
-        proc set_generation_error with context, "Dictionary has no keys"
-        Return 0
-    End If
-
-    If values is equal to 0:
-        proc set_generation_error with context, "Dictionary has no values"
-        Return 0
-    End If
-
-    Let count be proc size from List with keys
-
-    Let index be 0
-
-    While index is less than count:
-        Let key be proc get_at from List with keys, index
-        Let value be proc get_at from List with values, index
-
-        Note: Emit key
-        Let needs_quotes be proc needs_quoting from key
-
-        If needs_quotes is equal to 1:
-            proc emit_escaped_string with context, key
-        Otherwise:
-            proc emitter_raw_emit_string from EmitterCommon with emitter, key
-        End If
-
-        proc emitter_raw_emit_string from EmitterCommon with emitter, " = "
-
-        Note: Emit value
-        proc generate_hir_node with context, value
-
-        proc emitter_raw_emit_byte from EmitterCommon with emitter, 10  Note: newline
-
-        Set index to index plus 1
-    End While
-
-    Return 1
-End Process
-
-@Reasoning:
-TOML inline arrays use [element, element, ...] syntax. Inline form is the
-simplest projection for HIR lists and is round-tripped correctly by any
-TOML parser.
-@End Reasoning
-
-@Implementation:
-Emits "[", walks the list elements dispatching each to generate_hir_node
-with ", " separators between consecutive entries, then emits "]".
-@End Implementation
-
-Process called "generate_toml_array" takes context as Integer, hir_node as Integer returns Integer:
-    Note: Generate TOML array
-
-    Let emitter be proc memory_get_int64 from Layout with context, 0
-
-    Note: Get list elements
     Let elements be proc get_list_elements from HIR with hir_node
-
-    If elements is equal to 0:
-        proc set_generation_error with context, "List has no elements"
-        Return 0
-    End If
-
-    Let count be proc size from List with elements
 
     proc emitter_raw_emit_byte from EmitterCommon with emitter, 91  Note: '['
 
-    Let index be 0
+    If elements is not equal to 0:
+        Let count be proc size from List with elements
+        Let index be 0
 
-    While index is less than count:
-        Let element be proc get_at from List with elements, index
+        While index is less than count:
+            Let element be proc get_at from List with elements, index
+            Let ok be proc emit_inline_value with context, element
 
-        Note: Emit element
-        proc generate_hir_node with context, element
+            If ok is equal to 0:
+                Return 0
+            End If
 
-        Note: Add comma separator if not last element
-        If index is less than count minus 1:
-            proc emitter_raw_emit_string from EmitterCommon with emitter, ", "
-        End If
+            If index is less than count minus 1:
+                proc emitter_raw_emit_string from EmitterCommon with emitter, ", "
+            End If
 
-        Set index to index plus 1
-    End While
+            Set index to index plus 1
+        End While
+    End If
 
     proc emitter_raw_emit_byte from EmitterCommon with emitter, 93  Note: ']'
 
@@ -735,86 +631,386 @@ Process called "generate_toml_array" takes context as Integer, hir_node as Integ
 End Process
 
 @Reasoning:
-TOML string literals come in basic (double-quoted, escapes processed),
-literal (single-quoted, raw), and datetime (unquoted, format-recognised)
-flavours. Choosing the right one preserves the user's intent.
+A HIR dictionary appearing in a value position (inside an array, or as an
+inline-table value) is emitted as a TOML inline table "{ k = v, ... }". This is
+the only legal TOML projection for a dictionary that is not a top-level table.
 @End Reasoning
 
 @Implementation:
-Pulls the string value from the HIR node; if is_datetime_format matches,
-emits it unquoted. Otherwise hands the buffer to emit_escaped_string for
-basic-string emission with full escape processing.
+Emit '{ '. Walk the dictionary entries via get_dictionary_entries; for each
+entry emit the key (quoted if needs_quoting), " = ", then the value via
+emit_inline_value, with ", " between entries. Emit ' }'.
 @End Implementation
 
-Process called "generate_toml_string" takes context as Integer, hir_node as Integer returns Integer:
-    Note: Generate TOML string
-
-    @Reasoning:
-    Most strings are quoted, but datetime values in RFC 3339 format
-    should be emitted as bare tokens per TOML specification.
-    We detect datetime format and emit accordingly.
-    @End Reasoning
+Process called "emit_inline_table" takes context as Integer, hir_node as Integer returns Integer:
+    Note: Emit a HIR dictionary as a TOML inline table
 
     Let emitter be proc memory_get_int64 from Layout with context, 0
-    Let str be proc get_string_value from HIR with hir_node
+    Let entries be proc get_dictionary_entries from HIR with hir_node
 
-    If str is equal to 0:
-        proc set_generation_error with context, "String node has no value"
+    proc emitter_raw_emit_string from EmitterCommon with emitter, "{ "
+
+    If entries is not equal to 0:
+        Let count be proc size from List with entries
+        Let index be 0
+
+        While index is less than count:
+            Let entry be proc get_at from List with entries, index
+            Let key be proc memory_get_int64 from Layout with entry, 0
+            Let value be proc memory_get_int64 from Layout with entry, 8
+
+            Let needs_quotes be proc needs_quoting with key
+
+            If needs_quotes is equal to 1:
+                proc emit_escaped_string with context, key
+            Otherwise:
+                proc emitter_raw_emit_string from EmitterCommon with emitter, key
+            End If
+
+            proc emitter_raw_emit_string from EmitterCommon with emitter, " = "
+
+            Let ok be proc emit_inline_value with context, value
+
+            If ok is equal to 0:
+                Return 0
+            End If
+
+            If index is less than count minus 1:
+                proc emitter_raw_emit_string from EmitterCommon with emitter, ", "
+            End If
+
+            Set index to index plus 1
+        End While
+    End If
+
+    proc emitter_raw_emit_string from EmitterCommon with emitter, " }"
+
+    Return 1
+End Process
+
+@Reasoning:
+Value-position dispatch: a value appearing on the right of "key =" or inside an
+array can be a scalar (HIR_LITERAL), an inline array (HIR_ARRAY_LITERAL), or an
+inline table (HIR_DICTIONARY_LITERAL). The top-level table/array-of-tables forms
+are handled separately by emit_table; this routine only produces values that
+fit on one line.
+@End Reasoning
+
+@Implementation:
+Read the node kind. HIR_LITERAL -> emit_scalar_literal. HIR_ARRAY_LITERAL ->
+emit_inline_array. HIR_DICTIONARY_LITERAL -> emit_inline_table. Unknown kind ->
+generation error.
+@End Implementation
+
+Process called "emit_inline_value" takes context as Integer, hir_node as Integer returns Integer:
+    Note: Emit a HIR node as a single-line TOML value
+
+    If hir_node is equal to 0:
+        proc set_generation_error with context, "Null HIR value node"
         Return 0
     End If
 
-    Note: Check if string is a datetime value (RFC 3339 format)
-    Let is_datetime be proc is_datetime_format from str
+    Let node_type be proc get_hir_node_type from HIR with hir_node
 
-    If is_datetime is equal to 1:
-        Note: Emit datetime as bare token (unquoted)
-        proc emitter_raw_emit_string from EmitterCommon with emitter, str
-    Otherwise:
-        Note: Quote regular strings
-        proc emit_escaped_string with context, str
+    If node_type is equal to HIR_LITERAL from HIR:
+        Return proc emit_scalar_literal with context, hir_node
     End If
 
-    Return 1
+    If node_type is equal to HIR_ARRAY_LITERAL from HIR:
+        Return proc emit_inline_array with context, hir_node
+    End If
+
+    If node_type is equal to HIR_DICTIONARY_LITERAL from HIR:
+        Return proc emit_inline_table with context, hir_node
+    End If
+
+    proc set_generation_error with context, "Unsupported HIR node type for TOML value"
+    Return 0
 End Process
 
+Note: ============================================================================
+Note: Classification Helpers
+Note: ============================================================================
+
 @Reasoning:
-TOML integers are written in plain base-10. Delegating to emit_integer
-keeps sign and digit logic in one place.
+A dictionary value must be emitted as a [table] section header, and an array
+whose every element is a dictionary must be emitted as an [[array-of-tables]].
+Distinguishing these from scalar-array / inline-table values determines whether
+an entry goes in the "key = value" phase or the section/header phase.
 @End Reasoning
 
 @Implementation:
-Reads the i64 value from the HIR node and forwards it to emit_integer.
+array_is_array_of_tables: read the array's elements; return 0 for an empty
+array (an empty array round-trips correctly as an inline []), otherwise return
+1 only if every element is a HIR_DICTIONARY_LITERAL.
 @End Implementation
 
-Process called "generate_toml_integer" takes context as Integer, hir_node as Integer returns Integer:
-    Note: Generate TOML integer
+Process called "array_is_array_of_tables" takes hir_node as Integer returns Integer:
+    Note: Return 1 if a HIR array's elements are all dictionary literals
 
-    Let value be proc get_integer_value from HIR with hir_node
-    proc emit_integer with context, value
+    Let elements be proc get_list_elements from HIR with hir_node
+
+    If elements is equal to 0:
+        Return 0
+    End If
+
+    Let count be proc size from List with elements
+
+    If count is equal to 0:
+        Return 0
+    End If
+
+    Let index be 0
+
+    While index is less than count:
+        Let element be proc get_at from List with elements, index
+        Let kind be proc get_hir_node_type from HIR with element
+
+        If kind is not equal to HIR_DICTIONARY_LITERAL from HIR:
+            Return 0
+        End If
+
+        Set index to index plus 1
+    End While
 
     Return 1
 End Process
 
+Note: ============================================================================
+Note: Table Path Emission
+Note: ============================================================================
+
 @Reasoning:
-TOML booleans are the literal lowercase tokens "true" and "false". Any
-non-zero HIR boolean payload collapses to true.
+Section headers are built by joining the accumulated path segments with dots,
+quoting any segment that is not a bare key. Emitting the path through a single
+helper keeps [header] and [[header]] consistent and lets nested recursion pass
+the parent path plus one new segment without string concatenation in the caller.
 @End Reasoning
 
 @Implementation:
-Reads the boolean value; emits "true" when 1, "false" otherwise.
+If prefix is non-empty, emit it followed by '.'. Then emit the segment, quoted
+via emit_escaped_string when needs_quoting, otherwise raw. prefix is a
+NUL-terminated path string (already dot-joined and properly quoted by the
+caller's own composition) or 0 for a top-level segment.
 @End Implementation
 
-Process called "generate_toml_boolean" takes context as Integer, hir_node as Integer returns Integer:
-    Note: Generate TOML boolean
+Process called "emit_path" takes context as Integer, prefix as Integer, segment as Integer returns Integer:
+    Note: Emit "prefix.segment" (segment quoted if needed) into the buffer
 
     Let emitter be proc memory_get_int64 from Layout with context, 0
-    Let value be proc get_boolean_value from HIR with hir_node
 
-    If value is equal to 1:
-        proc emitter_raw_emit_string from EmitterCommon with emitter, "true"
-    Otherwise:
-        proc emitter_raw_emit_string from EmitterCommon with emitter, "false"
+    If prefix is not equal to 0:
+        Let prefix_len be proc string_length from StringCore with prefix
+
+        If prefix_len is greater than 0:
+            proc emitter_raw_emit_string from EmitterCommon with emitter, prefix
+            proc emitter_raw_emit_byte from EmitterCommon with emitter, 46  Note: '.'
+        End If
     End If
+
+    Let needs_quotes be proc needs_quoting with segment
+
+    If needs_quotes is equal to 1:
+        proc emit_escaped_string with context, segment
+    Otherwise:
+        proc emitter_raw_emit_string from EmitterCommon with emitter, segment
+    End If
+
+    Return 1
+End Process
+
+@Reasoning:
+Composes the child path string "parent.segment" as an owned heap buffer so the
+recursive emit_table call can prefix its own sub-sections. The segment is
+emitted with bracket-safe quoting only at header-emission time (emit_path), so
+the stored path keeps the raw segment bytes; for the common bare-key case this
+is exactly the TOML header text, and for quoted keys the re-parse still recovers
+the same key because the parser strips quotes. Bare-key joining is the dominant
+real-world case.
+@End Reasoning
+
+@Implementation:
+If parent is empty/0, return an owned copy of segment. Otherwise allocate
+parent_len + 1 + segment_len + 1 bytes, copy parent, write '.', copy segment,
+NUL-terminate, and return the buffer. Caller owns and frees it.
+@End Implementation
+
+Process called "compose_path" takes parent as Integer, segment as Integer returns Integer:
+    Note: Build an owned "parent.segment" path string (or a copy of segment)
+
+    Let segment_len be proc string_length from StringCore with segment
+
+    Let parent_len be 0
+    If parent is not equal to 0:
+        Set parent_len to proc string_length from StringCore with parent
+    End If
+
+    If parent_len is equal to 0:
+        Let copy be proc allocate from Layout with segment_len plus 1
+        proc memory_copy from Layout with copy, segment, segment_len
+        proc memory_set_byte from Layout with copy, segment_len, 0
+        Return copy
+    End If
+
+    Let total be parent_len plus 1 plus segment_len
+    Let buffer be proc allocate from Layout with total plus 1
+
+    proc memory_copy from Layout with buffer, parent, parent_len
+    proc memory_set_byte from Layout with buffer, parent_len, 46  Note: '.'
+
+    Let dst_offset be parent_len plus 1
+    Let dst be buffer plus dst_offset
+    proc memory_copy from Layout with dst, segment, segment_len
+    proc memory_set_byte from Layout with buffer, total, 0
+
+    Return buffer
+End Process
+
+Note: ============================================================================
+Note: Table Emission (top-level / section)
+Note: ============================================================================
+
+@Reasoning:
+A dictionary is serialized in two phases under its table path. Phase one emits
+every scalar / scalar-array / inline-table entry as "key = value" lines so they
+belong to the current [path] section. Phase two emits each sub-dictionary as a
+[child.path] header (recursing) and each array-of-tables as a sequence of
+[[child.path]] headers (recursing per element). This ordering is required: in
+TOML, "key = value" lines after a [section] header belong to that section, so
+all direct values must precede any nested section header.
+@End Reasoning
+
+@Implementation:
+emit_table takes the dictionary node and its path (0 for the root). Iterate the
+entries twice. Pass one: for each entry whose value is a scalar, a scalar array,
+or an inline table (i.e. NOT a sub-dictionary and NOT an array-of-tables), emit
+"key = value\n". Pass two: for each sub-dictionary entry, emit "\n[" + composed
+path + "]\n" then recurse; for each array-of-tables entry, for every element
+emit "\n[[" + composed path + "]]\n" then recurse into that element. Returns
+1/0.
+@End Implementation
+
+Process called "emit_table" takes context as Integer, hir_node as Integer, path as Integer returns Integer:
+    Note: Emit a HIR dictionary as a TOML table at the given path
+
+    Let emitter be proc memory_get_int64 from Layout with context, 0
+    Let entries be proc get_dictionary_entries from HIR with hir_node
+
+    If entries is equal to 0:
+        Return 1  Note: Empty table -> nothing to emit
+    End If
+
+    Let count be proc size from List with entries
+
+    Note: --- Pass one: direct key = value lines ---
+    Let index be 0
+
+    While index is less than count:
+        Let entry be proc get_at from List with entries, index
+        Let key be proc memory_get_int64 from Layout with entry, 0
+        Let value be proc memory_get_int64 from Layout with entry, 8
+
+        Let value_kind be proc get_hir_node_type from HIR with value
+
+        Let is_section be 0
+
+        If value_kind is equal to HIR_DICTIONARY_LITERAL from HIR:
+            Set is_section to 1
+        End If
+
+        If value_kind is equal to HIR_ARRAY_LITERAL from HIR:
+            Let aot be proc array_is_array_of_tables with value
+            If aot is equal to 1:
+                Set is_section to 1
+            End If
+        End If
+
+        If is_section is equal to 0:
+            Note: Emit the key
+            Let needs_quotes be proc needs_quoting with key
+
+            If needs_quotes is equal to 1:
+                proc emit_escaped_string with context, key
+            Otherwise:
+                proc emitter_raw_emit_string from EmitterCommon with emitter, key
+            End If
+
+            proc emitter_raw_emit_string from EmitterCommon with emitter, " = "
+
+            Let ok be proc emit_inline_value with context, value
+
+            If ok is equal to 0:
+                Return 0
+            End If
+
+            proc emitter_raw_emit_byte from EmitterCommon with emitter, 10  Note: '\n'
+        End If
+
+        Set index to index plus 1
+    End While
+
+    Note: --- Pass two: nested sections and arrays-of-tables ---
+    Set index to 0
+
+    While index is less than count:
+        Let entry2 be proc get_at from List with entries, index
+        Let key2 be proc memory_get_int64 from Layout with entry2, 0
+        Let value2 be proc memory_get_int64 from Layout with entry2, 8
+
+        Let value_kind2 be proc get_hir_node_type from HIR with value2
+
+        If value_kind2 is equal to HIR_DICTIONARY_LITERAL from HIR:
+            Note: [child.path] header then recurse
+            Let child_path be proc compose_path with path, key2
+
+            proc emitter_raw_emit_byte from EmitterCommon with emitter, 10  Note: blank line
+            proc emitter_raw_emit_byte from EmitterCommon with emitter, 91  Note: '['
+            proc emit_path with context, path, key2
+            proc emitter_raw_emit_byte from EmitterCommon with emitter, 93  Note: ']'
+            proc emitter_raw_emit_byte from EmitterCommon with emitter, 10  Note: '\n'
+
+            Let ok2 be proc emit_table with context, value2, child_path
+            proc deallocate from Layout with child_path
+
+            If ok2 is equal to 0:
+                Return 0
+            End If
+        Otherwise If value_kind2 is equal to HIR_ARRAY_LITERAL from HIR:
+            Let aot2 be proc array_is_array_of_tables with value2
+
+            If aot2 is equal to 1:
+                Let elements be proc get_list_elements from HIR with value2
+                Let elem_count be proc size from List with elements
+                Let child_path2 be proc compose_path with path, key2
+
+                Let ei be 0
+                While ei is less than elem_count:
+                    Let element be proc get_at from List with elements, ei
+
+                    proc emitter_raw_emit_byte from EmitterCommon with emitter, 10  Note: blank line
+                    proc emitter_raw_emit_byte from EmitterCommon with emitter, 91  Note: '['
+                    proc emitter_raw_emit_byte from EmitterCommon with emitter, 91  Note: '['
+                    proc emit_path with context, path, key2
+                    proc emitter_raw_emit_byte from EmitterCommon with emitter, 93  Note: ']'
+                    proc emitter_raw_emit_byte from EmitterCommon with emitter, 93  Note: ']'
+                    proc emitter_raw_emit_byte from EmitterCommon with emitter, 10  Note: '\n'
+
+                    Let oke be proc emit_table with context, element, child_path2
+
+                    If oke is equal to 0:
+                        proc deallocate from Layout with child_path2
+                        Return 0
+                    End If
+
+                    Set ei to ei plus 1
+                End While
+
+                proc deallocate from Layout with child_path2
+            End If
+        End If
+
+        Set index to index plus 1
+    End While
 
     Return 1
 End Process
@@ -824,55 +1020,59 @@ Note: Top-Level TOML Generation
 Note: ============================================================================
 
 @Reasoning:
-Public entry. Owns the context lifetime so callers only deal with input
-HIR root and consume the generated TOML output string.
+Public entry. Owns the context lifetime so callers only deal with the input HIR
+root and consume the generated TOML output string. The root must be a
+dictionary literal (a TOML document is a table); other roots are a generation
+error. Failure is surfaced through the 0 return value, matching the
+import-cycle-free contract the dispatcher relies on.
 @End Reasoning
 
 @Implementation:
-Constructs a TOMLGenerationContext, dispatches the root through
-generate_hir_node, retrieves the accumulated buffer via the emitter's
-output API, and destroys the context. Returns 0 when allocation fails or
-generation reported an error.
+Null-check hir_root. Create a TOMLGenerationContext. Require the root to be a
+HIR_DICTIONARY_LITERAL; otherwise set an error. Emit the root table with a null
+(empty) path. Inspect has_error: on failure destroy the context and return 0.
+On success snapshot the emitter output into a caller-owned heap copy via
+emitter_raw_get_output, destroy the context, and return the copy.
 @End Implementation
+
+@Security_Scope:
+Trusts hir_root to be a valid HIR node graph produced by the frontend.
+@End Security_Scope
 
 Process called "translate_hir_to_toml" takes hir_root as Integer returns Integer:
     Note: Translate HIR to TOML output string
-
-    @Reasoning:
-    Top-level entry point for HIR→TOML translation.
-    Creates generation context, generates TOML, retrieves output.
-    @End Reasoning
 
     If hir_root is equal to 0:
         Return 0
     End If
 
-    Note: Create generation context
     Let context be proc create_generation_context
 
     If context is equal to 0:
         Return 0
     End If
 
-    Note: Generate TOML from HIR
-    proc generate_hir_node with context, hir_root
+    Let root_kind be proc get_hir_node_type from HIR with hir_root
 
-    Note: Check for errors
-    Let has_error be proc memory_get_int64 from Layout with context, 16
-
-    If has_error is equal to 1:
-        Let error_msg be proc memory_get_int64 from Layout with context, 8
-        proc print with "TOML generation error:", error_msg
-        proc destroy_generation_context from context
+    If root_kind is not equal to HIR_DICTIONARY_LITERAL from HIR:
+        proc set_generation_error with context, "TOML document root must be a dictionary"
+        proc destroy_generation_context with context
         Return 0
     End If
 
-    Note: Get output
+    proc emit_table with context, hir_root, 0
+
+    Let has_error be proc memory_get_int64 from Layout with context, 16
+
+    If has_error is equal to 1:
+        proc destroy_generation_context with context
+        Return 0
+    End If
+
     Let emitter be proc memory_get_int64 from Layout with context, 0
     Let output be proc emitter_raw_get_output from EmitterCommon with emitter
 
-    Note: Cleanup
-    proc destroy_generation_context from context
+    proc destroy_generation_context with context
 
     Return output
 End Process

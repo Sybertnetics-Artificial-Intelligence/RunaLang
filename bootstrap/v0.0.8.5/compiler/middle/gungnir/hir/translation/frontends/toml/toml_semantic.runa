@@ -1,0 +1,515 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+TOML Semantic Analyzer - Validates a TOML AST beyond grammar
+
+The TOML parser guarantees a syntactically well-formed, nested document and
+rejects duplicate keys at parse time. This pass enforces the remaining SEMANTIC
+rules a TOML consumer needs but the grammar alone does not express:
+
+  1. Key uniqueness within every table. The parser rejects duplicate bare keys
+     as it builds each table, but a corrupted or programmatically-constructed
+     AST could still carry duplicates; this analyzer re-checks every table's
+     keys list for content duplicates so a duplicate can never silently reach
+     HIR lowering.
+  2. Maximum nesting depth. Unbounded table/array nesting is a denial-of-service
+     vector for any recursive consumer; the analyzer enforces a configurable
+     depth limit measured in nested table/array levels.
+  3. Structural integrity. Every node's discriminant must be one of the nine
+     TOML kinds, table/inline-table nodes must carry parallel keys/children
+     lists of equal length, collection nodes must carry their backing lists,
+     and scalar nodes must carry their payload (string pointer for
+     string/float/datetime; the parser always sets these).
+
+This mirrors the four-file frontend convention (lexer / parser / semantic /
+to_hir) used by the json, dart and fsharp frontends: the semantic analyzer is a
+standalone validation stage that runs over the parser's AST before lowering.
+
+Dependencies:
+- toml_parser.runa (for the TOML AST shape and kind constants)
+- compiler/frontend/primitives/memory/layout.runa
+- compiler/frontend/primitives/core/string_core.runa
+- compiler/frontend/primitives/collections/list.runa
+:End Note
+
+Import "compiler/middle/gungnir/hir/translation/frontends/toml/toml_parser.runa" as Parser
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/frontend/primitives/collections/list.runa" as List
+
+Note: ============================================================================
+Note: Policy Constants
+Note: ============================================================================
+
+Note: Default maximum table/array nesting depth. Deep enough for any realistic
+Note: configuration document, shallow enough to bound recursive consumers.
+Constant DEFAULT_MAX_DEPTH as Integer is 512
+
+Note: ============================================================================
+Note: Analyzer State Structure
+Note: ============================================================================
+
+@Reasoning:
+The analyzer threads its configuration (depth limit) and its single-slot error
+channel through the recursive walk. Carrying max_depth on the analyzer rather
+than as a recursion argument lets a caller tune the limit once at construction;
+carrying error_message/has_error lets a deep validation failure surface to the
+top-level caller without an out-parameter on every recursive call.
+@End Reasoning
+
+@Implementation:
+Four 64-bit slots in declared order: error_message (owned heap NUL-terminated
+string or 0), has_error boolean, max_depth (nesting limit), error_line (source
+line of the offending node, 0 if none). Total size 32 bytes; offsets 0/8/16/24
+are referenced directly by the analyzer Processes.
+@End Implementation
+
+Type called "TOMLSemanticAnalyzer":
+    error_message as Integer    Note: Error message (owned), or 0
+    has_error as Integer        Note: Boolean: 1 if a validation error occurred
+    max_depth as Integer        Note: Maximum nesting depth permitted
+    error_line as Integer       Note: Source line of the offending node (0 if none)
+End Type
+
+Note: ============================================================================
+Note: Analyzer Creation and Destruction
+Note: ============================================================================
+
+@Reasoning:
+Constructs the analyzer with all fields zeroed except max_depth, which is
+seeded from the caller's argument so the default configuration is chosen by the
+caller passing the constant rather than baked in here. error_message=0 and
+has_error=0 mean the terminal success check is correct without any explicit
+clearing on the success path.
+@End Reasoning
+
+@Implementation:
+Allocate 32 bytes; return 0 on OOM. Zero error_message/has_error/error_line at
+offsets 0/8/24; write max_depth at offset 16 from the argument.
+@End Implementation
+
+Process called "create_toml_semantic_analyzer" takes max_depth as Integer returns Integer:
+    Note: Create TOML semantic analyzer with the given depth limit
+
+    Let analyzer_size be 32  Note: TOMLSemanticAnalyzer: 4 fields × 8 bytes
+    Let analyzer be proc allocate from Layout with analyzer_size
+
+    If analyzer is equal to 0:
+        Return 0
+    End If
+
+    proc memory_set_int64 from Layout with analyzer, 0, 0   Note: error_message = null
+    proc memory_set_int64 from Layout with analyzer, 8, 0   Note: has_error = false
+    proc memory_set_int64 from Layout with analyzer, 16, max_depth
+    proc memory_set_int64 from Layout with analyzer, 24, 0  Note: error_line = 0
+
+    Return analyzer
+End Process
+
+@Reasoning:
+Releases the owned error_message buffer (if any) before freeing the analyzer
+record. Null-tolerant so callers may invoke it unconditionally in cleanup
+paths.
+@End Reasoning
+
+@Implementation:
+If analyzer is 0, return 1. Read error_message at offset 0; if non-zero,
+deallocate it. Deallocate the analyzer block. Always returns 1.
+@End Implementation
+
+Process called "destroy_toml_semantic_analyzer" takes analyzer as Integer returns Integer:
+    Note: Destroy TOML semantic analyzer and free resources
+
+    If analyzer is equal to 0:
+        Return 1
+    End If
+
+    Let error_message be proc memory_get_int64 from Layout with analyzer, 0
+
+    If error_message is not equal to 0:
+        proc deallocate from Layout with error_message
+    End If
+
+    proc deallocate from Layout with analyzer
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Error Handling
+Note: ============================================================================
+
+@Reasoning:
+Latches a validation error: replaces any prior message with an owned heap copy,
+sets has_error=1, and records the offending node's source line so the caller
+can report a precise location. The walk short-circuits on the first error, so
+later overwrites are harmless.
+@End Reasoning
+
+@Implementation:
+Read offset 0 (error_message); if non-zero, deallocate. Compute msg_length via
+string_length, allocate msg_length+1, memory_copy the message and NUL-terminate.
+Store the buffer at offset 0, 1 at offset 8 (has_error), and the line at offset
+24. Returns 1.
+@End Implementation
+
+Process called "set_semantic_error" takes analyzer as Integer, message as Integer, line as Integer returns Integer:
+    Note: Record a semantic validation error
+
+    Let error_message be proc memory_get_int64 from Layout with analyzer, 0
+
+    If error_message is not equal to 0:
+        proc deallocate from Layout with error_message
+    End If
+
+    Let msg_length be proc string_length from StringCore with message
+    Let new_error be proc allocate from Layout with msg_length plus 1
+
+    If new_error is not equal to 0:
+        proc memory_copy from Layout with new_error, message, msg_length
+        proc memory_set_byte from Layout with new_error, msg_length, 0
+    End If
+
+    proc memory_set_int64 from Layout with analyzer, 0, new_error
+    proc memory_set_int64 from Layout with analyzer, 8, 1
+    proc memory_set_int64 from Layout with analyzer, 24, line
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: String Equality and Duplicate-Key Detection
+Note: ============================================================================
+
+@Reasoning:
+Key uniqueness is checked with an explicit content comparison rather than
+pointer identity because every key in a table's keys list is a distinct heap
+copy. A linear scan over the keys preceding index i is the correct cost model:
+TOML tables are typically small, so a per-table hash set would cost more to
+build than the O(n^2) scan saves. The scan stops at the first duplicate so the
+reported position is the earliest violation.
+@End Reasoning
+
+@Implementation:
+Compare two NUL-terminated strings byte-by-byte after a length check; return 1
+on full match, 0 otherwise.
+@End Implementation
+
+Process called "strings_equal" takes str1 as Integer, str2 as Integer returns Integer:
+    Note: Content equality of two NUL-terminated strings
+
+    Let len1 be proc string_length from StringCore with str1
+    Let len2 be proc string_length from StringCore with str2
+
+    If len1 is not equal to len2:
+        Return 0
+    End If
+
+    Let index be 0
+
+    While index is less than len1:
+        Let char1 be proc memory_get_byte from Layout with str1, index
+        Let char2 be proc memory_get_byte from Layout with str2, index
+
+        If char1 is not equal to char2:
+            Return 0
+        End If
+
+        Set index to index plus 1
+    End While
+
+    Return 1
+End Process
+
+@Reasoning:
+Returns the index of the first key in the keys List that duplicates an earlier
+key; -1 when all keys are unique. Used to validate every table node.
+@End Reasoning
+
+@Implementation:
+For each i from 1 to count-1 compare keys[i] against every earlier keys[j] via
+strings_equal. On the first content match return i. Return -1 if all keys are
+unique.
+@End Implementation
+
+Process called "find_duplicate_key_index" takes keys as Integer, count as Integer returns Integer:
+    Note: Return the index of the first duplicate key, or -1 if none
+
+    Let i be 1
+
+    While i is less than count:
+        Let key_i be proc get_at from List with keys, i
+        Let j be 0
+
+        While j is less than i:
+            Let key_j be proc get_at from List with keys, j
+            Let matches be proc strings_equal with key_i, key_j
+
+            If matches is equal to 1:
+                Return i
+            End If
+
+            Set j to j plus 1
+        End While
+
+        Set i to i plus 1
+    End While
+
+    Return -1
+End Process
+
+Note: ============================================================================
+Note: Recursive Validation
+Note: ============================================================================
+
+@Reasoning:
+Single recursive validator over the nine TOML node kinds. Centralising the
+depth check here (incrementing only when descending into a table, inline table,
+or array) means scalar nesting does not count against the limit and the limit
+measures true structural depth. Returning 1/0 (valid/invalid) plus the latched
+analyzer error keeps the contract identical to the sibling frontends' analyzers.
+@End Reasoning
+
+@Implementation:
+Null-guard the node (a null child is a structural error). Read node_type at
+offset 0 and line at offset 64. For DOCUMENT/TABLE/INLINE_TABLE: enforce
+depth+1 <= max_depth; read keys (offset 48) and children (offset 40), require
+both non-null and equal lengths, run find_duplicate_key_index and reject any
+duplicate, then recurse on every child at depth+1. For ARRAY: enforce depth,
+read children (offset 40), require non-null, recurse on every element at
+depth+1. STRING/FLOAT/DATETIME: require value_string (offset 8) non-null.
+INTEGER/BOOLEAN: structurally valid leaves (their payload is the integer slot,
+always present). Any unknown discriminant is a structural error. Returns 1 when
+the subtree is valid, 0 otherwise.
+@End Implementation
+
+Process called "validate_toml_node" takes analyzer as Integer, node as Integer, depth as Integer returns Integer:
+    Note: Recursively validate one TOML AST node
+
+    If node is equal to 0:
+        proc set_semantic_error with analyzer, "Null TOML node in AST", 0
+        Return 0
+    End If
+
+    Let node_type be proc memory_get_int64 from Layout with node, 0
+    Let line be proc memory_get_int64 from Layout with node, 64
+    Let max_depth be proc memory_get_int64 from Layout with analyzer, 16
+
+    Note: Table-shaped nodes: DOCUMENT, TABLE, INLINE_TABLE
+    Let is_table be 0
+    If node_type is equal to TOML_DOCUMENT from Parser:
+        Set is_table to 1
+    End If
+    If node_type is equal to TOML_TABLE from Parser:
+        Set is_table to 1
+    End If
+    If node_type is equal to TOML_INLINE_TABLE from Parser:
+        Set is_table to 1
+    End If
+
+    If is_table is equal to 1:
+        Let next_depth be depth plus 1
+
+        If next_depth is greater than max_depth:
+            proc set_semantic_error with analyzer, "TOML nesting depth exceeds maximum", line
+            Return 0
+        End If
+
+        Let keys be proc memory_get_int64 from Layout with node, 48
+        Let children be proc memory_get_int64 from Layout with node, 40
+
+        If keys is equal to 0:
+            proc set_semantic_error with analyzer, "Table node missing keys list", line
+            Return 0
+        End If
+
+        If children is equal to 0:
+            proc set_semantic_error with analyzer, "Table node missing children list", line
+            Return 0
+        End If
+
+        Let key_count be proc size from List with keys
+        Let child_count be proc size from List with children
+
+        If key_count is not equal to child_count:
+            proc set_semantic_error with analyzer, "Table keys and values count mismatch", line
+            Return 0
+        End If
+
+        Let dup_index be proc find_duplicate_key_index with keys, key_count
+
+        If dup_index is not equal to -1:
+            proc set_semantic_error with analyzer, "Duplicate key in table", line
+            Return 0
+        End If
+
+        Let index be 0
+        While index is less than child_count:
+            Let child be proc get_at from List with children, index
+            Let child_ok be proc validate_toml_node with analyzer, child, next_depth
+
+            If child_ok is equal to 0:
+                Return 0
+            End If
+
+            Set index to index plus 1
+        End While
+
+        Return 1
+    End If
+
+    Note: Array validation (includes arrays-of-tables: elements are tables)
+    If node_type is equal to TOML_ARRAY from Parser:
+        Let next_depth2 be depth plus 1
+
+        If next_depth2 is greater than max_depth:
+            proc set_semantic_error with analyzer, "TOML nesting depth exceeds maximum", line
+            Return 0
+        End If
+
+        Let elements be proc memory_get_int64 from Layout with node, 40
+
+        If elements is equal to 0:
+            proc set_semantic_error with analyzer, "Array node missing elements list", line
+            Return 0
+        End If
+
+        Let element_count be proc size from List with elements
+        Let ai be 0
+
+        While ai is less than element_count:
+            Let element be proc get_at from List with elements, ai
+            Let element_ok be proc validate_toml_node with analyzer, element, next_depth2
+
+            If element_ok is equal to 0:
+                Return 0
+            End If
+
+            Set ai to ai plus 1
+        End While
+
+        Return 1
+    End If
+
+    Note: String / float / datetime leaves carry a value_string payload
+    Let has_string_payload be 0
+    If node_type is equal to TOML_STRING from Parser:
+        Set has_string_payload to 1
+    End If
+    If node_type is equal to TOML_FLOAT from Parser:
+        Set has_string_payload to 1
+    End If
+    If node_type is equal to TOML_DATETIME from Parser:
+        Set has_string_payload to 1
+    End If
+
+    If has_string_payload is equal to 1:
+        Let value_string be proc memory_get_int64 from Layout with node, 8
+
+        If value_string is equal to 0:
+            proc set_semantic_error with analyzer, "Scalar node missing value", line
+            Return 0
+        End If
+
+        Return 1
+    End If
+
+    Note: Integer and boolean leaves use the integer payload slot, always present
+    If node_type is equal to TOML_INTEGER from Parser:
+        Return 1
+    End If
+
+    If node_type is equal to TOML_BOOLEAN from Parser:
+        Return 1
+    End If
+
+    proc set_semantic_error with analyzer, "Unknown TOML node type", line
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: Public Validation Entry Points
+Note: ============================================================================
+
+@Reasoning:
+Top-level validation over an existing AST with a caller-provided analyzer. The
+root is validated at depth 0; the recursion increments depth as it descends.
+Returns the analyzer's post-walk has_error inverted to a 1/0 valid flag so the
+caller has one boolean to gate lowering on.
+@End Reasoning
+
+@Implementation:
+Guard analyzer and root for null. Run validate_toml_node(analyzer, root, 0).
+Read has_error at offset 8; return 1 when has_error is 0 (valid) and 0
+otherwise. The detailed message remains on the analyzer for the caller to read.
+@End Implementation
+
+Process called "validate_toml_ast" takes analyzer as Integer, root as Integer returns Integer:
+    Note: Validate a TOML AST with an existing analyzer; returns 1 if valid
+
+    If analyzer is equal to 0:
+        Return 0
+    End If
+
+    If root is equal to 0:
+        Return 0
+    End If
+
+    proc validate_toml_node with analyzer, root, 0
+
+    Let has_error be proc memory_get_int64 from Layout with analyzer, 8
+
+    If has_error is equal to 1:
+        Return 0
+    End If
+
+    Return 1
+End Process
+
+@Reasoning:
+Convenience facade that owns the analyzer lifecycle for callers that only want
+a yes/no answer under the default depth limit. This is the entry point a
+pipeline stage calls when it has no reason to override the policy, keeping the
+common path a single call.
+@End Reasoning
+
+@Implementation:
+Guard root for null. Create an analyzer with DEFAULT_MAX_DEPTH; on OOM return 0.
+Run validate_toml_ast, capture the result, destroy the analyzer, return it.
+@End Implementation
+
+Process called "validate_toml_ast_default" takes root as Integer returns Integer:
+    Note: Validate a TOML AST under the default policy; returns 1 if valid
+
+    If root is equal to 0:
+        Return 0
+    End If
+
+    Let analyzer be proc create_toml_semantic_analyzer with DEFAULT_MAX_DEPTH
+
+    If analyzer is equal to 0:
+        Return 0
+    End If
+
+    Let result be proc validate_toml_ast with analyzer, root
+
+    proc destroy_toml_semantic_analyzer with analyzer
+
+    Return result
+End Process
+
+Note: End of TOML Semantic Analyzer
