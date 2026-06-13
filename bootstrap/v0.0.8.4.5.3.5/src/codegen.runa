@@ -1814,25 +1814,6 @@ Process called "codegen_collect_strings_from_statement" takes codegen as Integer
         Return 0
     End If
 
-    If stmt_type is equal to 6:  Note: STMT_WHILE
-        Note: This is the duplicate WHILE check, should be removed but keeping for now
-        Set while_stmt_ptr to stmt plus 8  Note: &stmt->data.while_stmt
-        Set condition to memory_get_pointer(while_stmt_ptr, 0)   Note: while_stmt.condition (offset 8)
-        Set body to memory_get_pointer(while_stmt_ptr, 8)        Note: while_stmt.body (offset 16)
-        Set body_count to memory_get_int32(while_stmt_ptr, 16) Note: while_stmt.body_count (offset 24)
-
-        codegen_collect_strings_from_expression(codegen, condition)
-
-        Set i to 0
-        While i is less than body_count:
-            Set stmt_offset to i multiplied by 8
-            Set stmt_ptr to memory_get_pointer(body, stmt_offset)
-            codegen_collect_strings_from_statement(codegen, stmt_ptr)
-            Set i to i plus 1
-        End While
-        Return 0
-    End If
-
     If stmt_type is equal to 12:  Note: STMT_FOR_EACH
         Note: For Each has: var_name(8), collection_expr(16), body(24), body_count(32)
         Let fe_collection be memory_get_pointer(stmt, 16)
@@ -6457,61 +6438,10 @@ Process called "codegen_generate_field_access" takes codegen as Integer, expr as
     Return 0
 End Process
 
-Note: Handle builtin call expressions
-Process called "codegen_generate_builtin_call" takes codegen as Integer, expr as Integer returns Integer:
-    Let output_file be memory_get_integer(codegen, 0)  Note: codegen->output_file
-    Let builtin_call_ptr be expr plus 8  Note: &expr->data.builtin_call
-    Let builtin_type be memory_get_int32(builtin_call_ptr, 0)  Note: builtin_call.builtin_type
-    Let arguments be memory_get_pointer(builtin_call_ptr, 8)     Note: builtin_call.arguments
-    Let arg_count be memory_get_int32(builtin_call_ptr, 16)    Note: builtin_call.argument_count
-
-    Note: Map builtin types to function names - split into ranges to avoid deep nesting limits
-    Let func_name be ""
-
-    Note: First generate all argument values onto stack
-    Let i be arg_count minus 1
-    While i is greater than or equal to 0:
-        Let arg_offset be i multiplied by 8
-        Let arg_expr be memory_get_pointer(arguments, arg_offset)
-        codegen_generate_expression(codegen, arg_expr)
-        file_write_buffered(output_file, "    pushq %rax\n", 0)
-        Set i to i minus 1
-    End While
-
-    Note: Pop arguments into the correct registers based on calling convention
-    If arg_count is greater than or equal to 1:
-        file_write_buffered(output_file, "    popq %rdi\n", 0)
-    End If
-    If arg_count is greater than or equal to 2:
-        file_write_buffered(output_file, "    popq %rsi\n", 0)
-    End If
-    If arg_count is greater than or equal to 3:
-        file_write_buffered(output_file, "    popq %rdx\n", 0)
-    End If
-    If arg_count is greater than or equal to 4:
-        file_write_buffered(output_file, "    popq %rcx\n", 0)
-    End If
-    If arg_count is greater than or equal to 5:
-        file_write_buffered(output_file, "    popq %r8\n", 0)
-    End If
-    If arg_count is greater than or equal to 6:
-        file_write_buffered(output_file, "    popq %r9\n", 0)
-    End If
-
-    Note: Map builtin_type to function name
-    Note: Since we don't have all builtins implemented, generate a generic name
-    Note: This allows compilation to proceed but these calls won't work at runtime
-    file_write_buffered(output_file, "    # Unimplemented builtin type ", 0)
-    file_write_buffered(output_file, integer_to_string(builtin_type), 0)
-    file_write_buffered(output_file, "\n", 0)
-    file_write_buffered(output_file, "    movq $0, %rax  # Placeholder return value\n", 0)
-
-    Return 0
-End Process
-
-Note: Generate code for expression - equivalent to codegen_generate_expression
-Note: Simplified codegen_generate_expression that replaces the massive 1155-line function
-Note: This will be inserted into codegen.runa to replace lines 1276-2431
+Note: Top-level expression dispatcher. Reads expr->type (int32 at offset 0) and
+Note: routes each expression kind either to a dedicated codegen_generate_* helper
+Note: or to an inline emitter below. This is the single authoritative dispatch
+Note: point for every EXPR_* node; all call sites funnel through here.
 
 Process called "codegen_generate_expression" takes codegen as Integer, expr as Integer returns Integer:
     Note: Safety check
@@ -6567,7 +6497,9 @@ Process called "codegen_generate_expression" takes codegen as Integer, expr as I
         codegen_generate_expression(codegen, cast_expr)
         Return 0
     Otherwise If expr_type is equal to 8:  Note: EXPR_BUILTIN_CALL
-        Note: Simplified builtin call for Stage 1
+        Note: Evaluate each argument, push to the stack in reverse, pop into the
+        Note: System V argument registers, map the builtin token to its runtime
+        Note: symbol, and emit the call. This is the live builtin-call emitter.
         Let builtin_call_ptr be expr plus 8  Note: Union at offset 4
         Let arguments be memory_get_pointer(builtin_call_ptr, 8)
         Let arg_count be memory_get_integer(builtin_call_ptr, 16)
@@ -6639,18 +6571,20 @@ Process called "codegen_generate_expression" takes codegen as Integer, expr as I
         Let types be memory_get_pointer(current_program, 16)
 
         Let variant_tag be 0
+        Let type_found be 0
+        Let variant_found be 0
         Set i to 0
         While i is less than type_count:
             Let type_ptr be memory_get_pointer_at_index(types, i)
             Let type_def_name be memory_get_pointer(type_ptr, 0)
             If string_equals(type_def_name, type_name) is equal to 1:
                 Note: Found the type, now find the variant
+                Set type_found to 1
                 Let variant_count be memory_get_int32(type_ptr, 24)
                 Let variants be memory_get_pointer(type_ptr, 16)
 
-                Note: Loop through all variants to find match
+                Note: Loop through all variants to find the named one
                 Let vi be 0
-                Let found_match be 0
                 While vi is less than variant_count:
                     Let variant_offset be vi multiplied by 32
                     Let variant_ptr be variants plus variant_offset
@@ -6658,24 +6592,36 @@ Process called "codegen_generate_expression" takes codegen as Integer, expr as I
 
                     If string_equals(vname, variant_name) is equal to 1:
                         Set variant_tag to memory_get_int32(variant_ptr, 20)
-                        Set found_match to 1
+                        Set variant_found to 1
                         Set vi to variant_count  Note: Break
                     Otherwise:
                         Set vi to vi plus 1
                     End If
                 End While
-
-                Note: If no match found, default to first variant (temporary workaround)
-                If found_match is equal to 0:
-                    If variant_count is greater than 0:
-                        Let first_variant_ptr be variants
-                        Set variant_tag to memory_get_int32(first_variant_ptr, 20)
-                    End If
-                End If
                 Set i to type_count  Note: Break
             End If
             Set i to i plus 1
         End While
+
+        Note: An unresolved type or variant name is a hard compile error: the
+        Note: discriminator tag cannot be determined, so emitting code would
+        Note: fabricate a wrong tag and silently mis-route every later match.
+        If type_found is equal to 0:
+            print_string("[CODEGEN ERROR] Unknown type '")
+            print_string(type_name)
+            print_string("' in variant constructor")
+            print_newline()
+            exit_with_code(1)
+        End If
+        If variant_found is equal to 0:
+            print_string("[CODEGEN ERROR] Type '")
+            print_string(type_name)
+            print_string("' has no variant named '")
+            print_string(variant_name)
+            print_string("'")
+            print_newline()
+            exit_with_code(1)
+        End If
 
         Note: Allocate variant (8 bytes for tag + field storage)
         Let alloc_size be 8  Note: Just tag for fieldless variants
@@ -8766,8 +8712,12 @@ Process called "codegen_generate_statement" takes codegen as Integer, stmt as In
                         file_write_buffered(output_file, "_end  # Not Integer, no match\n", 0)
                     End If
                 Otherwise:
-                    Note: For named types (variants/structs): check if it's a valid pointer
-                    Note: This is a simplified check - just verify it's a pointer-like value
+                    Note: For named types (variants/structs): discriminate by the
+                    Note: pointer-vs-immediate convention. Heap objects live at
+                    Note: addresses >= 4096 (the first page is never mapped), while
+                    Note: Integer immediates fall below it. Values >= the threshold
+                    Note: are treated as instances of this named type; values below
+                    Note: it cannot be, so we fall through to the next case.
                     file_write_buffered(output_file, "    movq $4096, %rbx  # Pointer threshold\n", 0)
                     file_write_buffered(output_file, "    cmpq %rbx, %rax  # Check if pointer-like\n", 0)
                     Note: If value < threshold, it's not a pointer (not this type) - jump to next case
@@ -11855,9 +11805,14 @@ Process called "codegen_inject_stack_probe" takes output_file as Integer, functi
     file_write_buffered(output_file, integer_to_string(frame_size), 0)
     file_write_buffered(output_file, ", %rax  # Reserve this function's frame for probe check\n", 0)
 
-    Note: Compare against a conservative stack limit
-    Note: In a full implementation, this would check against __stack_limit
-    emit_line(output_file, "    cmpq $0x100000, %rax  # Compare against 1MB limit")
+    Note: Compare the post-decrement stack pointer against a conservative absolute
+    Note: floor (1MB). This catches deep recursion that drives %rsp toward the low
+    Note: address space before it walks off the mapped stack. A per-thread limit
+    Note: derived from the runtime's recorded stack base/size is tracked under the
+    Note: runtime stack-bounds work (the runatime does not yet export a stack-limit
+    Note: symbol at this bootstrap tier); until that symbol exists the absolute
+    Note: floor is the available guard rather than referencing an undefined symbol.
+    emit_line(output_file, "    cmpq $0x100000, %rax  # Compare against 1MB absolute floor")
     emit_line(output_file, "    jb .stack_overflow_panic")
 
     Return 0
