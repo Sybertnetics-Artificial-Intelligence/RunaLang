@@ -15,1312 +15,1757 @@ limitations under the License.
 :End Note
 
 Note:
-HIR to F# Backend - High-level interface for F# code generation
+HIR -> F# Backend - Source-to-source F# generation from HIR.
 
-This module provides a high-level interface for converting HIR
-(High-level Intermediate Representation) to F# source code.
-It coordinates the code generation pipeline, optimization passes,
-and output formatting to produce clean, idiomatic F# code.
+This is the canonical single-file HIR-walking backend for F#, mirroring the
+shape of hir_to_lua.runa and hir_to_ruby.runa: it walks the HIR the F#
+frontend (fsharp_to_hir.runa) produces and emits idiomatic F# source text.
+There is deliberately NO HIR optimization or validation pass here - those are
+compiler middle-end concerns, not a source-to-source backend's, and including
+them would both duplicate middle-end logic and corrupt the round-trip identity
+this backend is built to preserve.
 
-Backend Pipeline:
-1. HIR validation and preprocessing
-2. F#-specific optimizations and transformations
-3. Code generation using the F# emitter
-4. Post-processing and formatting
-5. Output to files or strings
+CRITICAL - which HIR model this backend consumes:
+The F# frontend does NOT use the typed hir_nodes.runa (17xxx) producer model
+that the Lua/Ruby frontends use. It uses the hir.runa core model (node-type
+constants 10000-13xxx) built via create_hir_node / set_hir_node_value /
+add_hir_node, and for the compound expression/statement shapes it allocates
+arena "composite" records whose FIRST slot (offset 0) holds a pointer to the
+canonical 104-byte base HIRNode and whose subsequent slots hold the shape's
+operand pointers at fixed offsets. The frontend itself disambiguates a
+composite from a bare base node by testing whether slot 0 is a pointer
+(>= 65536) versus a small node-type constant; this backend reads nodes using
+exactly that same convention (see fs_base / fs_kind below) so it consumes
+precisely what the frontend emits.
 
-F# Backend Features:
-- Complete HIR to F# translation
-- F# idiom optimization (pipeline operators, pattern matching)
-- Module and namespace organization
-- Functional programming pattern preservation
-- Object-oriented construct translation
-- Error handling and diagnostics
-- Multiple output formats (string, file, AST)
+Composite record offsets (slot 0 = base HIRNode pointer in every case):
+  HIR_BINARY_EXPRESSION 10002: op@8  left@16  right@24
+  HIR_CALL_EXPRESSION   10005: callee@8  arguments(List)@16  argc@24
+  HIR_LAMBDA_EXPRESSION 10014: parameters(List)@8  paramc@16  body@24
+  HIR_MATCH_STATEMENT   11005: expr@8  arms(List)@24  armc@32
+  HIR_IF_STATEMENT      11003: cond@8  then@16  else@24
+  HIR_TRY_STATEMENT     11015: try@8  catches(List)@16  catchc@24  finally@32
+  HIR_WHILE_STATEMENT   11008: cond@8  body@16
+  HIR_FOR_STATEMENT     11007: itervar(token)@8  iterable@16  body@32
+  HIR_LET_STATEMENT     11000: var_name(string)@8  var_type@24  init@32  is_rec@40
+  HIR_WHEN_CLAUSE       11006: pattern@8  guard@16  body@24
 
-Optimization Passes:
-- Pipeline operator optimization
-- Pattern matching simplification
-- Tail recursion optimization
-- Function composition detection
-- Dead code elimination
-- Type inference refinement
-
-Dependencies:
-- fsharp_emitter.runa (F# code generation)
-- compiler/middle/gungnir/hir/hir.runa (HIR core types)
-- compiler/middle/gungnir/hir/hir_nodes.runa (HIR specialized nodes)
-- compiler/frontend/primitives/memory/layout.runa
-- compiler/frontend/primitives/collections/list.runa
-- compiler/frontend/primitives/core/string_core.runa
-- compiler/frontend/primitives/io/file_io.runa
+Bare base HIRNodes (value@40, value_type@48, children list@24, child_count@32):
+  HIR_LITERAL 10000, HIR_IDENTIFIER 10001, HIR_INTERPOLATED_STRING 10009,
+  HIR_ARRAY_LITERAL 10011, HIR_TUPLE_LITERAL 10012, HIR_RECORD_LITERAL 10013,
+  HIR_BLOCK_STATEMENT 11018, HIR_TYPE_DEFINITION 12001, HIR_RECORD_TYPE 13008,
+  HIR_ENUM_TYPE 13019, HIR_FIELD_DEFINITION 12006, HIR_VARIANT_DEFINITION 12007,
+  the pattern kinds 14000-14010, and the typed type nodes (HIR_TYPE_REF /
+  HIR_FUNCTION_TYPE / HIR_GENERIC_TYPE / HIR_TUPLE_TYPE) the frontend builds
+  via the hir_nodes.runa type producers and reads back with the matching
+  hir_get_* type accessors. The module root is HIR_MODULE (17000) carrying its
+  declarations in the children slot.
 :End Note
 
-Import "compiler/middle/gungnir/hir/translation/backends/fsharp/fsharp_emitter.runa" as FSharpEmitter
+Import "compiler/middle/gungnir/hir/translation/backends/fsharp/fsharp_emitter.runa" as Emitter
+Import "compiler/middle/gungnir/hir/translation/frontends/fsharp/fsharp_lexer.runa" as FSharpLexer
 Import "compiler/middle/gungnir/hir/hir.runa" as HIR
 Import "compiler/middle/gungnir/hir/hir_nodes.runa" as HIRNodes
 Import "compiler/frontend/primitives/memory/layout.runa" as Layout
 Import "compiler/frontend/primitives/collections/list.runa" as List
 Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
-Import "compiler/frontend/primitives/io/file_io.runa" as FileIO
+Import "compiler/internal/string_utils.runa" as StringUtils
 
 Note: ============================================================================
-Note: HIR to F# Backend Context
+Note: Code Generation Context
 Note: ============================================================================
 
 @Reasoning:
-FSharpBackend bundles every piece of state the HIR-to-F# pipeline must thread
-between validation, optimisation, emission, and IO: the input module, output
-sink, optimisation tier, diagnostic policy, and the arena that owns transient
-allocations. Encoding fields as Integer slots (raw 8-byte offsets) is the
-v0.0.8.5 convention used by all backends; offsets 0..72 here are wired into
-create_fsharp_backend's memory_set_int64 calls and every accessor in the file,
-so the field order and width below are load-bearing.
+Threads the entire HIR-to-F# generation through one struct so emission helpers
+manage nested indentation and accumulate errors without positional plumbing.
+hir_module is the module root; indent_level is bumped by indent/dedent and
+rendered through the emitter's fsharp_indent_string; errors collects messages
+and had_error short-circuits nothing destructive but is exposed for the driver
+to inspect.
 @End Reasoning
-Type called "FSharpBackend":
-    hir_module as Integer         Note: Input HIR module
-    output_path as Integer        Note: Output file path (optional)
-    optimization_level as Integer Note: Optimization level (0-3)
-    generate_comments as Integer  Note: Flag: generate explanatory comments
-    preserve_whitespace as Integer Note: Flag: preserve source whitespace
-    target_fsharp_version as Integer Note: Target F# language version
-    error_log as Integer          Note: List of compilation errors
-    warning_log as Integer        Note: List of compilation warnings
-    diagnostics_enabled as Integer Note: Flag: enable detailed diagnostics
-    arena as Integer              Note: Memory arena for backend operations
+@Implementation:
+Idiomatic value-of-type struct: construction allocates the heap home directly
+and the binding is the struct pointer. Helpers re-bind the pointer with a
+typed Let; field mutations write in place.
+@End Implementation
+Type called "FSharpCodeGenContext":
+    hir_module as Integer          Note: HIR module root being generated from
+    indent_level as Integer        Note: Current indentation level
+    errors as Integer              Note: List of generation error messages
+    had_error as Integer           Note: 1 if a generation error occurred
 End Type
 
-Note: ============================================================================
-Note: Backend Creation and Configuration
-Note: ============================================================================
-
 @Reasoning:
-The backend struct is laid out as a flat 80-byte block (ten int64 slots) instead of
-a heap-allocated graph because every field is either a pointer or a small integer
-and the layout offsets are referenced by hand throughout this file. Defaults are
-seeded inline: optimisation level 2, comment emission on, F# 8.0 target, and the
-diagnostics flag enabled so that add_error/add_warning surface early failures.
-The arena handle at offset 72 owns transient string and HIR allocations made
-during code generation; it is destroyed in destroy_fsharp_backend so the lifetime
-of intermediate F# emissions is bounded by the backend instance itself.
+The driver hands us only the HIR module pointer. Indent starts at 0. The errors
+list is eagerly created so emit helpers never null-check before appending.
 @End Reasoning
-@Implementation:
-A null return from allocate is propagated as 0 (failure) to the caller; on success
-the function returns the backend pointer directly so downstream calls can chain
-configuration via set_* helpers. The error_log and warning_log are created with
-proc create_list because diagnostics must accumulate across the pipeline before
-the backend is destroyed.
-@End Implementation
-Process called "create_fsharp_backend" takes hir_module as Integer returns Integer:
-    Note: Create F# backend instance
+Process called "create_codegen_context" takes hir_module as Integer returns Integer:
+    Let ctx be a value of type FSharpCodeGenContext with
+        hir_module as hir_module,
+        indent_level as 0,
+        errors as proc list_create from List,
+        had_error as 0
 
-    Let backend_size be 80  Note: FSharpBackend: 10 fields × 8 bytes
-    Let backend be proc allocate from Layout with backend_size
-
-    If backend is equal to 0:
-        Return 0
-    End If
-
-    proc memory_set_int64 from Layout with backend, 0, hir_module
-    proc memory_set_int64 from Layout with backend, 8, 0    Note: output_path = null
-    proc memory_set_int64 from Layout with backend, 16, 2   Note: optimization_level = 2 (default)
-    proc memory_set_int64 from Layout with backend, 24, 1   Note: generate_comments = true
-    proc memory_set_int64 from Layout with backend, 32, 0   Note: preserve_whitespace = false
-    proc memory_set_int64 from Layout with backend, 40, 8   Note: target_fsharp_version = F# 8.0
-
-    Let error_log be proc create_list from List
-    proc memory_set_int64 from Layout with backend, 48, error_log
-
-    Let warning_log be proc create_list from List
-    proc memory_set_int64 from Layout with backend, 56, warning_log
-
-    proc memory_set_int64 from Layout with backend, 64, 1   Note: diagnostics_enabled = true
-
-    Let arena be proc create_arena from Layout
-    proc memory_set_int64 from Layout with backend, 72, arena
-
-    Return backend
+    Return ctx
 End Process
 
 @Reasoning:
-The backend owns three heap resources beyond the struct itself: the error log,
-the warning log, and the arena holding transient HIR/string allocations. Each
-must be released in reverse-allocation order to avoid leaking on long-running
-toolchains that recycle backend instances per compilation unit. A null backend
-is treated as a no-op success because callers may invoke this in error paths
-where create_fsharp_backend itself failed.
+Recording an error appends the message and flips the had_error sentinel so the
+driver can report generation failures without the emitter producing partial
+corrupt output mid-stream.
 @End Reasoning
-Process called "destroy_fsharp_backend" takes backend as Integer returns Integer:
-    Note: Destroy F# backend and free resources
+Process called "codegen_error" takes ctx_ptr as Integer, message as String:
+    Let ctx as FSharpCodeGenContext be ctx_ptr
+    proc list_append from List with ctx.errors, message
+    Set ctx.had_error to 1
+End Process
 
-    If backend is equal to 0:
-        Return 1
+Process called "indent" takes ctx_ptr as Integer:
+    Let ctx as FSharpCodeGenContext be ctx_ptr
+    Set ctx.indent_level to ctx.indent_level plus 1
+End Process
+
+Process called "dedent" takes ctx_ptr as Integer:
+    Let ctx as FSharpCodeGenContext be ctx_ptr
+    If ctx.indent_level is greater than 0:
+        Set ctx.indent_level to ctx.indent_level minus 1
     End If
+End Process
 
-    Let error_log be proc memory_get_int64 from Layout with backend, 48
-    If error_log is not equal to 0:
-        proc destroy_list from List with error_log
-    End If
-
-    Let warning_log be proc memory_get_int64 from Layout with backend, 56
-    If warning_log is not equal to 0:
-        proc destroy_list from List with warning_log
-    End If
-
-    Let arena be proc memory_get_int64 from Layout with backend, 72
-    If arena is not equal to 0:
-        proc destroy_arena from Layout with arena
-    End If
-
-    proc deallocate from Layout with backend
-    Return 1
+Process called "get_indent" takes ctx_ptr as Integer returns String:
+    Let ctx as FSharpCodeGenContext be ctx_ptr
+    Return proc fsharp_indent_string from Emitter with ctx.indent_level
 End Process
 
 Note: ============================================================================
-Note: Backend Configuration
+Note: Node-model accessors (the F# frontend's hir.runa dual model)
 Note: ============================================================================
 
 @Reasoning:
-The output path field at offset 8 doubles as both a destination indicator and
-a feature flag: a non-zero value triggers file emission in
-generate_fsharp_code_from_hir, while zero forces string-only return. The
-caller is responsible for the lifetime of the path buffer; we store the
-pointer verbatim rather than copying so that string ownership remains with
-whatever driver constructed it.
+A node produced by the F# frontend is either a bare canonical HIRNode (its
+slot 0 is a small node-type constant) or an arena composite record (its slot 0
+is a POINTER to the base HIRNode). The frontend distinguishes them with the
+threshold test "slot 0 >= 65536 means pointer"; every HIR node-type constant
+this backend reasons about is far below 65536 and every live heap pointer is
+far above it, so the test is exact. fs_base returns the canonical base HIRNode
+in both cases, which is the node carrying the type tag, the value slot, the
+children list and the metadata dictionary.
 @End Reasoning
-Process called "set_output_path" takes backend as Integer, path as Integer returns Integer:
-    Note: Set output file path for generated F# code
-
-    proc memory_set_int64 from Layout with backend, 8, path
-    Return 1
-End Process
-
-@Reasoning:
-The optimisation tier drives a cumulative pipeline in optimize_hir_for_fsharp:
-level 1 enables pipeline+match rewrites, level 2 adds composition+tail-call
-recognition, and level 3 layers DCE and inference cleanup on top. Clamping
-out-of-range inputs to [0,3] is mandatory because higher numbers would skip
-unimplemented passes silently while negatives would disable optimisation in a
-way that violates the F# 8 emission contract.
-@End Reasoning
-Process called "set_optimization_level" takes backend as Integer, level as Integer returns Integer:
-    Note: Set optimization level (0=none, 1=basic, 2=standard, 3=aggressive)
-
-    If level is less than 0:
-        Set level to 0
+Process called "fs_base" takes node as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
     End If
-    If level is greater than 3:
-        Set level to 3
+    Let slot0 be proc memory_get_int64 from Layout with node, 0
+    If slot0 is greater than or equal to 65536:
+        Note: composite record - slot 0 is the base HIRNode pointer
+        Return slot0
     End If
-
-    proc memory_set_int64 from Layout with backend, 16, level
-    Return 1
+    Return node
 End Process
 
 @Reasoning:
-The comment-generation flag at offset 24 gates two distinct emissions: the
-HIR-derived inline commentary inside fsharp_emitter, and the post-process
-header banner added in post_process_fsharp_code. Production builds typically
-disable this to keep object output small, while debug runs enable it for
-provenance tracking back to HIR nodes.
+The node kind is the type tag on the base HIRNode (offset 0). Routing through
+fs_base first means callers may pass either a bare node or a composite record
+and always recover the correct kind.
 @End Reasoning
-Process called "set_generate_comments" takes backend as Integer, enabled as Integer returns Integer:
-    Note: Enable or disable comment generation
-
-    proc memory_set_int64 from Layout with backend, 24, enabled
-    Return 1
+Process called "fs_kind" takes node as Integer returns Integer:
+    Let base be proc fs_base with node
+    Return proc get_hir_node_type from HIR with base
 End Process
 
 @Reasoning:
-F# language version selection is consumed by fsharp_emitter when deciding
-between feature sets: pre-7 builds avoid task computation expressions, pre-6
-disables anonymous records, and pre-5 cannot emit nameof. The version is
-stored as an integer rather than a string so emission paths can branch with
-a single integer comparison rather than a string match per call site.
+The value payload (string pointer / int64 / float bits / boolean) lives on the
+base HIRNode at offset 40, written by set_hir_node_value. Reading through
+fs_base keeps the access correct for any composite that also carries a base
+value; only bare nodes use the value slot, and fs_base resolves to the base
+for both shapes so the read is always against the canonical value field.
 @End Reasoning
-Process called "set_target_fsharp_version" takes backend as Integer, version as Integer returns Integer:
-    Note: Set target F# language version
+Process called "fs_value" takes node as Integer returns Integer:
+    Let base be proc fs_base with node
+    If base is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Layout with base, 40
+End Process
 
-    proc memory_set_int64 from Layout with backend, 40, version
-    Return 1
+@Reasoning:
+The value_type tag (offset 48) classifies the value slot payload as string(1),
+boolean(2), integer(3), float(4) or null(0); the literal emitter switches on it.
+@End Reasoning
+Process called "fs_value_type" takes node as Integer returns Integer:
+    Let base be proc fs_base with node
+    If base is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Layout with base, 48
+End Process
+
+@Reasoning:
+Bare nodes store their children list at base offset 24 with the count at 32.
+Returning the list pointer (0 when no children were ever added) lets callers
+use the List API directly; fs_child_count returns the count for loop bounds.
+@End Reasoning
+Process called "fs_children" takes node as Integer returns Integer:
+    Let base be proc fs_base with node
+    If base is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Layout with base, 24
+End Process
+
+Process called "fs_child_count" takes node as Integer returns Integer:
+    Let children be proc fs_children with node
+    If children is equal to 0:
+        Return 0
+    End If
+    Return proc list_length from List with children
+End Process
+
+@Reasoning:
+Composite records hold their operand pointers at fixed slot offsets on the
+COMPOSITE pointer (not the base). This helper reads slot off the composite
+record directly; callers pass the composite (the value returned by the parent's
+children list, which is the composite itself, not its base).
+@End Reasoning
+Process called "fs_slot" takes node as Integer, offset as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Layout with node, offset
 End Process
 
 Note: ============================================================================
-Note: HIR Optimization Passes
+Note: Expression Generation
 Note: ============================================================================
 
 @Reasoning:
-The pass set is layered cumulatively so that lower levels are strict subsets of
-higher levels: a level-3 build re-runs every level-1 and level-2 transform before
-adding aggressive DCE and type-inference cleanup. Each sub-pass mutates hir_node
-in place and returns the (possibly substituted) root, which is why this
-dispatcher rebinds hir_node after every call rather than chaining returns. Level
-0 short-circuits before any work to give bit-identical output to the un-optimised
-emitter, which is required by the diagnostic mode that bisects optimisation bugs.
+Central dispatch from HIR node kind to a specialized F# expression generator.
+Literals and identifiers are checked first (the common cases). Unknown kinds
+record an error and return empty string so the caller still produces parseable
+output. The dispatch keys on fs_kind so both bare nodes and composite records
+route correctly.
 @End Reasoning
-Process called "optimize_hir_for_fsharp" takes backend as Integer, hir_node as Integer returns Integer:
-    Note: Apply F#-specific optimizations to HIR
-
-    Let optimization_level be proc memory_get_int64 from Layout with backend, 16
-
-    Note: Level 0: No optimizations
-    If optimization_level is equal to 0:
-        Return hir_node
+Process called "generate_expression" takes ctx_ptr as Integer, node as Integer returns String:
+    If node is equal to 0:
+        Return "()"
     End If
 
-    Note: Level 1: Basic optimizations
-    If optimization_level is greater than or equal to 1:
-        Set hir_node to proc optimize_pipeline_operators with backend, hir_node
-        Set hir_node to proc optimize_pattern_matching with backend, hir_node
+    Let kind be proc fs_kind with node
+
+    If kind is equal to HIR.HIR_LITERAL:
+        Return proc generate_literal with ctx_ptr, node
     End If
 
-    Note: Level 2: Standard optimizations
-    If optimization_level is greater than or equal to 2:
-        Set hir_node to proc optimize_function_composition with backend, hir_node
-        Set hir_node to proc optimize_tail_recursion with backend, hir_node
+    If kind is equal to HIR.HIR_IDENTIFIER:
+        Let name be proc fs_value with node
+        Return name
     End If
 
-    Note: Level 3: Aggressive optimizations
-    If optimization_level is greater than or equal to 3:
-        Set hir_node to proc eliminate_dead_code with backend, hir_node
-        Set hir_node to proc optimize_type_inference with backend, hir_node
+    If kind is equal to HIR.HIR_BINARY_EXPRESSION:
+        Return proc generate_binary_expression with ctx_ptr, node
     End If
 
-    Return hir_node
+    If kind is equal to HIR.HIR_CALL_EXPRESSION:
+        Return proc generate_call_expression with ctx_ptr, node
+    End If
+
+    If kind is equal to HIR.HIR_LAMBDA_EXPRESSION:
+        Return proc generate_lambda_expression with ctx_ptr, node
+    End If
+
+    If kind is equal to HIR.HIR_ARRAY_LITERAL:
+        Return proc generate_list_literal with ctx_ptr, node
+    End If
+
+    If kind is equal to HIR.HIR_TUPLE_LITERAL:
+        Return proc generate_tuple_literal with ctx_ptr, node
+    End If
+
+    If kind is equal to HIR.HIR_RECORD_LITERAL:
+        Return proc generate_record_literal with ctx_ptr, node
+    End If
+
+    If kind is equal to HIR.HIR_INTERPOLATED_STRING:
+        Return proc generate_interpolated_string with ctx_ptr, node
+    End If
+
+    If kind is equal to HIR.HIR_MATCH_STATEMENT:
+        Return proc generate_match_expression with ctx_ptr, node
+    End If
+
+    If kind is equal to HIR.HIR_IF_STATEMENT:
+        Return proc generate_if_expression with ctx_ptr, node
+    End If
+
+    If kind is equal to HIR.HIR_BLOCK_STATEMENT:
+        Return proc generate_block_expression with ctx_ptr, node
+    End If
+
+    If kind is equal to HIR.HIR_TRY_STATEMENT:
+        Return proc generate_try_statement with ctx_ptr, node
+    End If
+
+    If kind is equal to HIR.HIR_WHILE_STATEMENT:
+        Return proc generate_while_statement with ctx_ptr, node
+    End If
+
+    If kind is equal to HIR.HIR_FOR_STATEMENT:
+        Return proc generate_for_statement with ctx_ptr, node
+    End If
+
+    If kind is equal to HIR.HIR_LET_STATEMENT:
+        Return proc generate_let_inline with ctx_ptr, node
+    End If
+
+    proc codegen_error with ctx_ptr, "Unknown F# expression kind"
+    Return "()"
 End Process
 
 @Reasoning:
-Pipeline rewriting is a top-down walk: only HIR_CALL_EXPRESSION nodes are
-candidates for transform_to_pipeline, but children must still be visited so
-nested compositions like f(g(h(x))) can be unwound into x |> h |> g |> f. The
-in-place list_set update relies on the child list being mutable storage owned
-by the parent node; this is guaranteed by the HIR allocator contract.
+F# literal rendering switches on the value_type tag: integers and floats render
+their numeric text, strings render quoted+escaped, booleans render true/false
+(F# keywords), and the null/unit kind renders "()" (F# unit) - the canonical
+representation the frontend assigns to F# unit and null literals alike.
 @End Reasoning
-Process called "optimize_pipeline_operators" takes backend as Integer, hir_node as Integer returns Integer:
-    Note: Transform function calls to pipeline operators where appropriate
+Process called "generate_literal" takes ctx_ptr as Integer, node as Integer returns String:
+    Let vt be proc fs_value_type with node
+    Let v be proc fs_value with node
 
-    If hir_node is equal to 0:
-        Return 0
+    If vt is equal to HIRNodes.HIR_LITERAL_KIND_INTEGER:
+        Return proc integer_to_string from StringUtils with v
     End If
 
-    Let node_type be proc get_hir_node_type from hir_node
-
-    Note: Look for nested function calls that can become pipelines
-    If node_type is equal to HIR_CALL_EXPRESSION:
-        Return proc transform_to_pipeline with backend, hir_node
+    If vt is equal to HIRNodes.HIR_LITERAL_KIND_FLOAT:
+        Return proc float_to_string from StringUtils with v, 6, 0
     End If
 
-    Note: Recursively optimize children
-    Let children be proc get_hir_node_children from hir_node
-    Let child_count be proc get_hir_node_child_count from hir_node
-
-    Let i be 0
-    While i is less than child_count:
-        Let child be proc list_get from List with children, i
-        Let optimized_child be proc optimize_pipeline_operators with backend, child
-        proc list_set from List with children, i, optimized_child
-        Set i to i plus 1
-    End While
-
-    Return hir_node
-End Process
-
-@Reasoning:
-The pass targets HIR_MATCH_STATEMENT nodes specifically because F#'s match
-emission benefits from arm coalescing and unreachable-arm removal; the actual
-rewriting is delegated to simplify_match_patterns. Children are still walked
-so that match expressions nested inside lambdas, let-bindings, or other
-matches all receive the simplification, not just the top-level node.
-@End Reasoning
-Process called "optimize_pattern_matching" takes backend as Integer, hir_node as Integer returns Integer:
-    Note: Simplify and optimize pattern matching constructs
-
-    If hir_node is equal to 0:
-        Return 0
+    If vt is equal to HIRNodes.HIR_LITERAL_KIND_STRING:
+        Let escaped be proc escape_fsharp_string from Emitter with v
+        Let quoted be proc string_concat from StringUtils with "\"", escaped
+        Set quoted to proc string_concat from StringUtils with quoted, "\""
+        Return quoted
     End If
 
-    Let node_type be proc get_hir_node_type from hir_node
-
-    Note: Optimize match expressions
-    If node_type is equal to HIR_MATCH_STATEMENT:
-        Return proc simplify_match_patterns with backend, hir_node
-    End If
-
-    Note: Recursively optimize children
-    Let children be proc get_hir_node_children from hir_node
-    Let child_count be proc get_hir_node_child_count from hir_node
-
-    Let i be 0
-    While i is less than child_count:
-        Let child be proc list_get from List with children, i
-        Let optimized_child be proc optimize_pattern_matching with backend, child
-        proc list_set from List with children, i, optimized_child
-        Set i to i plus 1
-    End While
-
-    Return hir_node
-End Process
-
-@Reasoning:
-F# expresses function composition via the >> operator, which is idiomatically
-cheaper than explicit lambdas. This walker drives optimize_lambda_composition
-on HIR_LAMBDA_EXPRESSION nodes so the emitter can later print the composed
-form rather than the un-eta-reduced lambda. Children are visited even for
-non-lambda nodes since lambdas occur inside almost every other HIR shape.
-@End Reasoning
-Process called "optimize_function_composition" takes backend as Integer, hir_node as Integer returns Integer:
-    Note: Detect and optimize function composition patterns
-
-    If hir_node is equal to 0:
-        Return 0
-    End If
-
-    Let node_type be proc get_hir_node_type from hir_node
-
-    Note: Look for lambda expressions that can be composed
-    If node_type is equal to HIR_LAMBDA_EXPRESSION:
-        Return proc optimize_lambda_composition with backend, hir_node
-    End If
-
-    Note: Recursively optimize children
-    Let children be proc get_hir_node_children from hir_node
-    Let child_count be proc get_hir_node_child_count from hir_node
-
-    Let i be 0
-    While i is less than child_count:
-        Let child be proc list_get from List with children, i
-        Let optimized_child be proc optimize_function_composition with backend, child
-        proc list_set from List with children, i, optimized_child
-        Set i to i plus 1
-    End While
-
-    Return hir_node
-End Process
-
-@Reasoning:
-F# only guarantees tail-call elimination when functions are explicitly marked
-or when the JIT recognises the pattern. By tagging HIR_PROCESS_DEFINITION
-nodes whose body ends in a self-call (see optimize_recursive_function +
-check_tail_recursion), the emitter can choose between iterative loops, let-rec
-bindings, or the explicit [<TailCall>] attribute available in F# 8.
-@End Reasoning
-Process called "optimize_tail_recursion" takes backend as Integer, hir_node as Integer returns Integer:
-    Note: Optimize tail recursive functions
-
-    If hir_node is equal to 0:
-        Return 0
-    End If
-
-    Let node_type be proc get_hir_node_type from hir_node
-
-    Note: Optimize recursive function definitions
-    If node_type is equal to HIR_PROCESS_DEFINITION:
-        Return proc optimize_recursive_function with backend, hir_node
-    End If
-
-    Note: Recursively optimize children
-    Let children be proc get_hir_node_children from hir_node
-    Let child_count be proc get_hir_node_child_count from hir_node
-
-    Let i be 0
-    While i is less than child_count:
-        Let child be proc list_get from List with children, i
-        Let optimized_child be proc optimize_tail_recursion with backend, child
-        proc list_set from List with children, i, optimized_child
-        Set i to i plus 1
-    End While
-
-    Return hir_node
-End Process
-
-@Reasoning:
-DCE is a two-phase routine: analyze_variable_liveness builds the live-variable
-set across the whole subtree, then remove_dead_assignments prunes assignments
-whose targets are absent from that set. We pass the liveness set explicitly
-rather than recomputing it per-node because the analysis is O(N) per query
-and the pass would otherwise degrade to O(N^2).
-@End Reasoning
-Process called "eliminate_dead_code" takes backend as Integer, hir_node as Integer returns Integer:
-    Note: Remove unused variables and unreachable code
-
-    If hir_node is equal to 0:
-        Return 0
-    End If
-
-    Note: Perform liveness analysis and remove dead code
-    Let live_variables be proc analyze_variable_liveness with backend, hir_node
-    Return proc remove_dead_assignments with backend, hir_node, live_variables
-End Process
-
-@Reasoning:
-F# has powerful Hindley-Milner inference, so emitting fewer type annotations
-produces more idiomatic and resilient code. This pass delegates to
-remove_redundant_type_annotations which only strips annotations on
-declarations whose RHS is a literal whose F# type is fixed-by-syntax
-(integer, string, boolean) so we never blind the type checker on ambiguous
-numeric types like uint8 vs int.
-@End Reasoning
-Process called "optimize_type_inference" takes backend as Integer, hir_node as Integer returns Integer:
-    Note: Refine type annotations for better F# inference
-
-    If hir_node is equal to 0:
-        Return 0
-    End If
-
-    Note: Remove redundant type annotations that F# can infer
-    Return proc remove_redundant_type_annotations with backend, hir_node
-End Process
-
-Note: ============================================================================
-Note: HIR Validation and Preprocessing
-Note: ============================================================================
-
-@Reasoning:
-The validation entry point is intentionally thin: it owns the root-null check,
-then delegates the recursive structural pass to validate_hir_node_recursive and
-turns the boolean result into a backend-level error. Splitting the entry from the
-recursion lets the recursive helper return early without distinguishing 'root
-missing' from 'subtree malformed' to its callers - the entry guarantees the
-caller sees a precise diagnostic at the top level.
-@End Reasoning
-Process called "validate_hir_for_fsharp" takes backend as Integer, hir_node as Integer returns Integer:
-    Note: Validate HIR for F# code generation
-
-    If hir_node is equal to 0:
-        proc add_error with backend, "HIR root node is null"
-        Return 0
-    End If
-
-    Let validation_result be proc validate_hir_node_recursive with backend, hir_node
-
-    If validation_result is equal to 0:
-        proc add_error with backend, "HIR validation failed"
-        Return 0
-    End If
-
-    Return 1
-End Process
-
-@Reasoning:
-Validation is short-circuit recursive: any failure at the current node aborts
-the whole walk to keep diagnostics actionable (a single root failure should
-not produce dozens of cascading child errors). The validator never modifies
-the HIR; it only consults shape and emits errors via add_error, so the same
-HIR pointer can be safely passed to the subsequent optimisation phase if
-validation succeeds.
-@End Reasoning
-Process called "validate_hir_node_recursive" takes backend as Integer, hir_node as Integer returns Integer:
-    Note: Recursively validate HIR node structure
-
-    Let node_type be proc get_hir_node_type from hir_node
-
-    Note: Validate node-specific constraints
-    Let node_valid be proc validate_node_constraints with backend, hir_node
-
-    If node_valid is equal to 0:
-        Return 0
-    End If
-
-    Note: Validate children
-    Let children be proc get_hir_node_children from hir_node
-    Let child_count be proc get_hir_node_child_count from hir_node
-
-    Let i be 0
-    While i is less than child_count:
-        Let child be proc list_get from List with children, i
-        Let child_valid be proc validate_hir_node_recursive with backend, child
-
-        If child_valid is equal to 0:
-            Return 0
+    If vt is equal to HIRNodes.HIR_LITERAL_KIND_BOOLEAN:
+        If v is equal to 1:
+            Return "true"
         End If
+        Return "false"
+    End If
 
-        Set i to i plus 1
-    End While
-
-    Return 1
+    Note: value_type 0 is the null / unit kind; F# unit literal is ()
+    Return "()"
 End Process
 
 @Reasoning:
-Node-shape invariants enforced here mirror what fsharp_emitter assumes: every
-HIR_CALL_EXPRESSION must carry a callee at data-offset 8, every lambda must
-have a body at data-offset 24, and every match must have at least one arm
-(empty matches are warned, not errored, because some HIR pipelines produce
-exhaustive 'fun _ -> ()' shells before later passes populate them). These
-constants are wire-format with the HIR layout module.
+Binary expressions emit "left OP right" with single-space padding. The operator
+is the raw F# lexer token stored at composite slot 8; map_fsharp_operator turns
+it into the F# operator spelling. We do not parenthesize: the HIR tree already
+encodes F# precedence by construction (the parser built it that way), so adding
+parentheses would be redundant and would perturb the round-trip.
 @End Reasoning
-Process called "validate_node_constraints" takes backend as Integer, hir_node as Integer returns Integer:
-    Note: Validate specific node type constraints
+Process called "generate_binary_expression" takes ctx_ptr as Integer, node as Integer returns String:
+    Let operator be proc fs_slot with node, 8
+    Let left_node be proc fs_slot with node, 16
+    Let right_node be proc fs_slot with node, 24
 
-    Let node_type be proc get_hir_node_type from hir_node
+    Let left_code be proc generate_expression with ctx_ptr, left_node
+    Let right_code be proc generate_expression with ctx_ptr, right_node
+    Let op_str be proc fsharp_operator_spelling with operator
 
-    Note: Validate function calls have valid callees
-    If node_type is equal to HIR_CALL_EXPRESSION:
-        Let call_data be proc get_hir_node_data from hir_node
-        Let callee be proc memory_get_int64 from Layout with call_data, 8
+    Let result be proc string_concat from StringUtils with left_code, " "
+    Set result to proc string_concat from StringUtils with result, op_str
+    Set result to proc string_concat from StringUtils with result, " "
+    Set result to proc string_concat from StringUtils with result, right_code
 
-        If callee is equal to 0:
-            proc add_error with backend, "Function call missing callee"
-            Return 0
-        End If
-    End If
-
-    Note: Validate lambda expressions have bodies
-    If node_type is equal to HIR_LAMBDA_EXPRESSION:
-        Let lambda_data be proc get_hir_node_data from hir_node
-        Let body be proc memory_get_int64 from Layout with lambda_data, 24
-
-        If body is equal to 0:
-            proc add_error with backend, "Lambda expression missing body"
-            Return 0
-        End If
-    End If
-
-    Note: Validate match expressions have arms
-    If node_type is equal to HIR_MATCH_STATEMENT:
-        Let match_data be proc get_hir_node_data from hir_node
-        Let arm_count be proc memory_get_int64 from Layout with match_data, 32
-
-        If arm_count is equal to 0:
-            proc add_warning with backend, "Match expression has no arms"
-        End If
-    End If
-
-    Return 1
+    Return result
 End Process
 
 Note: ============================================================================
-Note: Code Generation Pipeline
+Note: Call / application
 Note: ============================================================================
 
 @Reasoning:
-The pipeline runs validate -> optimise -> emit -> post-process -> write in that
-fixed order because the optimiser presupposes structural validity, the emitter
-presupposes optimised HIR (it does not re-do dead-code elimination), and
-post-processing presupposes a syntactically complete F# string. The output file
-is written only when an output_path is set so the same entry point covers both
-in-memory string compilation and disk-output compilation. The final F# string is
-returned even when written to disk so callers can echo or hash the artefact.
+F# application is space-separated, curried: "callee arg1 arg2". The frontend
+materializes an F# application chain as a single CallExpression whose arguments
+list holds the applied arguments in order; we re-emit the curried space-applied
+form. Each argument that is itself a non-trivial expression is wrapped in
+parentheses so that "f (g x) y" round-trips rather than collapsing to the
+ambiguous "f g x y". A literal or identifier argument needs no parentheses.
 @End Reasoning
-@Implementation:
-Each phase that can fail logs its own diagnostic via add_error and short-circuits
-with a 0 return rather than continuing with a partial result; this keeps the
-backend's error_log authoritative for callers that read get_error_count after a
-failed compilation.
-@End Implementation
-Process called "generate_fsharp_code_from_hir" takes backend as Integer returns Integer:
-    Note: Generate F# code from HIR using the complete pipeline
+Process called "generate_call_expression" takes ctx_ptr as Integer, node as Integer returns String:
+    Let callee_node be proc fs_slot with node, 8
+    Let args_list be proc fs_slot with node, 16
 
-    Let hir_module be proc memory_get_int64 from Layout with backend, 0
-
-    Note: Step 1: Validate HIR
-    Let validation_result be proc validate_hir_for_fsharp with backend, hir_module
-
-    If validation_result is equal to 0:
-        Return 0  Note: Validation errors logged
+    Note: The F# frontend models an infix operator application "a + b" as a call
+    Note: whose callee is an identifier named with the operator symbol and exactly
+    Note: two arguments. To round-trip faithfully we re-emit such a call in its
+    Note: infix form "a + b" (which re-parses to the same call), rather than the
+    Note: prefix "+ a b" which is not the surface form the parser accepts.
+    Let argc be 0
+    If args_list is not equal to 0:
+        Set argc to proc list_length from List with args_list
     End If
 
-    Note: Step 2: Apply optimizations
-    Let optimized_hir be proc optimize_hir_for_fsharp with backend, hir_module
-
-    If optimized_hir is equal to 0:
-        proc add_error with backend, "HIR optimization failed"
-        Return 0
-    End If
-
-    Note: Step 3: Generate F# code
-    Let generated_code be proc generate_fsharp_code from FSharpEmitter with optimized_hir
-
-    If generated_code is equal to 0:
-        proc add_error with backend, "F# code generation failed"
-        Return 0
-    End If
-
-    Note: Step 4: Post-process code if needed
-    Let final_code be proc post_process_fsharp_code with backend, generated_code
-
-    Note: Step 5: Write to file if output path specified
-    Let output_path be proc memory_get_int64 from Layout with backend, 8
-
-    If output_path is not equal to 0:
-        Let write_result be proc write_string_to_file from FileIO with output_path, final_code
-
-        If write_result is equal to 0:
-            proc add_error with backend, "Failed to write F# code to file"
-            Return 0
-        End If
-    End If
-
-    Return final_code
-End Process
-
-@Reasoning:
-Post-processing is intentionally minimal: we only prepend a provenance header
-when comment generation is enabled. We deliberately avoid touching the
-emitter's body output here because the emitter is the only authority on F#
-formatting and any string-level rewriting would risk corrupting nested
-string literals, triple-quoted strings, or verbatim string forms.
-@End Reasoning
-Process called "post_process_fsharp_code" takes backend as Integer, code as Integer returns Integer:
-    Note: Apply post-processing to generated F# code
-
-    Let generate_comments be proc memory_get_int64 from Layout with backend, 24
-
-    Note: Add header comment if enabled
-    If generate_comments is equal to 1:
-        Let header_comment be "// Generated F# code from HIR\n// Timestamp: "
-        Let timestamp be proc get_current_timestamp from StringCore
-        Let commented_code be proc concatenate_strings from StringCore with header_comment, timestamp, "\n\n", code
-        Return commented_code
-    End If
-
-    Return code
-End Process
-
-Note: ============================================================================
-Note: Error and Warning Management
-Note: ============================================================================
-
-@Reasoning:
-Errors are accumulated rather than thrown so multiple diagnostics can surface
-from a single pipeline run. The diagnostics_enabled flag controls
-synchronous console echoing, which is useful for interactive runac sessions
-but suppressed in batch / IDE language-server modes where the LSP layer
-queries get_error_count and walks the list explicitly.
-@End Reasoning
-Process called "add_error" takes backend as Integer, message as Integer returns Integer:
-    Note: Add error message to error log
-
-    Let error_log be proc memory_get_int64 from Layout with backend, 48
-    proc list_append from List with error_log, message
-
-    Let diagnostics_enabled be proc memory_get_int64 from Layout with backend, 64
-
-    If diagnostics_enabled is equal to 1:
-        proc print_diagnostic with backend, "ERROR", message
-    End If
-
-    Return 1
-End Process
-
-@Reasoning:
-Warnings flow through the same diagnostic channel as errors but never abort
-compilation; they only inform the user about questionable but legal HIR
-shapes (e.g. empty match expressions, redundant type annotations stripped).
-Storing them on a separate list at offset 56 lets compile_hir_to_fsharp print
-counts independently and lets callers treat warnings-as-errors when desired.
-@End Reasoning
-Process called "add_warning" takes backend as Integer, message as Integer returns Integer:
-    Note: Add warning message to warning log
-
-    Let warning_log be proc memory_get_int64 from Layout with backend, 56
-    proc list_append from List with warning_log, message
-
-    Let diagnostics_enabled be proc memory_get_int64 from Layout with backend, 64
-
-    If diagnostics_enabled is equal to 1:
-        proc print_diagnostic with backend, "WARNING", message
-    End If
-
-    Return 1
-End Process
-
-@Reasoning:
-Compilation drivers use this count to decide whether to write the output
-file: compile_hir_to_fsharp suppresses file IO when any error has been
-recorded so partial / corrupt F# is never persisted. Querying the list
-length is O(1) for v0.0.8.5's array-backed List representation.
-@End Reasoning
-Process called "get_error_count" takes backend as Integer returns Integer:
-    Note: Get number of errors
-
-    Let error_log be proc memory_get_int64 from Layout with backend, 48
-    Return proc list_length from List with error_log
-End Process
-
-@Reasoning:
-Warning counts feed the summary printed at the end of compile_hir_to_fsharp,
-giving the operator visibility into HIR quality even when compilation
-ultimately succeeds. Like get_error_count, this is a thin accessor: the
-warning list ownership stays with the backend struct.
-@End Reasoning
-Process called "get_warning_count" takes backend as Integer returns Integer:
-    Note: Get number of warnings
-
-    Let warning_log be proc memory_get_int64 from Layout with backend, 56
-    Return proc list_length from List with warning_log
-End Process
-
-@Reasoning:
-The diagnostic formatter writes to stdout via four separate print_string
-calls rather than concatenating in memory; this avoids allocating a
-throwaway concatenated buffer per diagnostic, which would churn the
-compile-time arena on noisy HIR. The bracketed level prefix matches the
-format expected by the v0.0.8.5 IDE/LSP filter regex.
-@End Reasoning
-Process called "print_diagnostic" takes backend as Integer, level as Integer, message as Integer returns Integer:
-    Note: Print diagnostic message
-
-    proc print_string from StringCore with "["
-    proc print_string from StringCore with level
-    proc print_string from StringCore with "] "
-    proc print_string from StringCore with message
-    proc print_string from StringCore with "\n"
-
-    Return 1
-End Process
-
-Note: ============================================================================
-Note: High-level Backend Interface
-Note: ============================================================================
-
-@Reasoning:
-This entry hides the backend lifecycle from one-shot callers: it creates the
-backend, optionally binds the output_path, runs the pipeline, prints a
-human-readable summary, then destroys the backend before returning. The return
-contract differs from the string-mode helper: this function returns the
-generated-code pointer on success and 0 if any error was logged, so callers can
-distinguish 'compiled but emitted warnings' (non-zero pointer, warning_count>0)
-from 'compilation failed' (zero return).
-@End Reasoning
-@Implementation:
-The destruction of the backend at the end is unconditional even when result_code
-is non-zero, because the returned pointer is into a region that outlives the
-backend - generated F# source lives in its own buffer, not in the backend arena.
-@End Implementation
-Process called "compile_hir_to_fsharp" takes hir_module as Integer, output_path as Integer returns Integer:
-    Note: High-level interface for HIR to F# compilation
-
-    Let backend be proc create_fsharp_backend from hir_module
-
-    If backend is equal to 0:
-        Return 0
-    End If
-
-    If output_path is not equal to 0:
-        proc set_output_path with backend, output_path
-    End If
-
-    Let result_code be proc generate_fsharp_code_from_hir from backend
-
-    Let error_count be proc get_error_count from backend
-    Let warning_count be proc get_warning_count from backend
-
-    Note: Print summary
-    If error_count is greater than 0:
-        proc print_string from StringCore with "F# compilation completed with "
-        proc print_integer from StringCore with error_count
-        proc print_string from StringCore with " errors and "
-        proc print_integer from StringCore with warning_count
-        proc print_string from StringCore with " warnings.\n"
-
-    Otherwise:
-        proc print_string from StringCore with "F# compilation successful with "
-        proc print_integer from StringCore with warning_count
-        proc print_string from StringCore with " warnings.\n"
-    End If
-
-    proc destroy_fsharp_backend from backend
-
-    If error_count is greater than 0:
-        Return 0  Note: Compilation failed
-    End If
-
-    Return result_code
-End Process
-
-@Reasoning:
-The string-form entry point passes a null output path to suppress file IO,
-returning only the in-memory generated source. This is the entry point used
-by HermodIDE-style live preview where compilation results are streamed to a
-buffer rather than persisted to disk.
-@End Reasoning
-Process called "compile_hir_to_fsharp_string" takes hir_module as Integer returns Integer:
-    Note: Compile HIR to F# code and return as string
-
-    Return proc compile_hir_to_fsharp with hir_module, 0
-End Process
-
-@Reasoning:
-The file-form entry point normalises the return contract to 1/0 success
-because batch drivers and shell wrappers expect boolean exit semantics; the
-underlying compile_hir_to_fsharp returns the generated buffer pointer (or 0
-on failure), which is more useful for in-process callers but ambiguous on
-the command line.
-@End Reasoning
-Process called "compile_hir_to_fsharp_file" takes hir_module as Integer, output_file as Integer returns Integer:
-    Note: Compile HIR to F# code and write to file
-
-    Let result_code be proc compile_hir_to_fsharp with hir_module, output_file
-
-    If result_code is not equal to 0:
-        Return 1  Note: Success
-    End If
-
-    Return 0  Note: Failure
-End Process
-
-Note: ============================================================================
-Note: Optimization Helper Functions
-Note: ============================================================================
-
-@Reasoning:
-Only single-argument call chains are converted because F#'s |> operator
-applies its left operand as the final argument to the right operand;
-multi-argument calls would require currying or named-argument rewrites that
-the emitter does not yet support. The recursion on transformed_arg lets a
-chain f(g(h(x))) unwind one level per call until the leaf is reached.
-@End Reasoning
-Process called "transform_to_pipeline" takes backend as Integer, hir_node as Integer returns Integer:
-    Note: Transform nested function calls to F# pipeline operators (|>)
-    Note: Example: f(g(h(x))) becomes x |> h |> g |> f
-
-    If hir_node is equal to 0:
-        Return 0
-    End If
-
-    Let node_type be proc get_hir_node_type from HIR with hir_node
-
-    Note: Only transform function call nodes
-    If node_type is not equal to HIR_CALL:
-        Return hir_node
-    End If
-
-    Note: Get function and arguments
-    Let func be proc get_hir_call_function from HIR with hir_node
-    Let args be proc get_hir_call_arguments from HIR with hir_node
-
-    If args is equal to 0:
-        Return hir_node
-    End If
-
-    Let arg_count be proc get_list_size from List with args
-
-    Note: Pipeline only works for single-argument calls
-    If arg_count is not equal to 1:
-        Return hir_node
-    End If
-
-    Let arg be proc get_at from List with args, 0
-
-    Note: Check if argument is also a call (nesting)
-    Let arg_type be proc get_hir_node_type from HIR with arg
-
-    If arg_type is equal to HIR_CALL:
-        Note: This is a nested call - create pipeline
-        Note: Recursively transform the argument
-        Let transformed_arg be proc transform_to_pipeline with backend, arg
-
-        Note: Create pipeline node
-        Let pipeline be proc create_hir_pipeline from HIR with transformed_arg, func
-        Return pipeline
-    End If
-
-    Return hir_node
-End Process
-
-@Reasoning:
-Once a wildcard arm is encountered every subsequent arm is unreachable in
-F# semantics. The pass keeps the first wildcard intact and drops the
-remainder by ending the loop early (setting i to case_count is the v0.0.8.5
-idiom for short-circuiting a While). The optimised arms are wrapped in a
-fresh HIR_MATCH node so the original is not mutated, allowing other passes
-to reference the prior shape if needed.
-@End Reasoning
-Process called "simplify_match_patterns" takes backend as Integer, hir_node as Integer returns Integer:
-    Note: Simplify F# match expression patterns
-    Note: Combines redundant patterns, eliminates unreachable branches
-
-    If hir_node is equal to 0:
-        Return 0
-    End If
-
-    Let node_type be proc get_hir_node_type from HIR with hir_node
-
-    Note: Only process match/case nodes
-    If node_type is not equal to HIR_MATCH and node_type is not equal to HIR_CASE:
-        Return hir_node
-    End If
-
-    Note: Get match cases
-    Let cases be proc get_hir_match_cases from HIR with hir_node
-    If cases is equal to 0:
-        Return hir_node
-    End If
-
-    Note: Check for wildcard/default patterns that make subsequent patterns unreachable
-    Let case_count be proc get_list_size from List with cases
-    Let optimized_cases be proc create_list from List
-    Let found_wildcard be 0
-
-    Let i be 0
-    While i is less than case_count:
-        If found_wildcard is equal to 1:
-            Note: Skip unreachable cases after wildcard
-            Set i to case_count
-        Otherwise:
-            Let case_node be proc get_at from List with cases, i
-            Let pattern be proc get_hir_case_pattern from HIR with case_node
-
-            Note: Check if this is a wildcard pattern
-            Let is_wildcard be proc is_wildcard_pattern from pattern
-            If is_wildcard is equal to 1:
-                Set found_wildcard to 1
+    If argc is equal to 2:
+        Let callee_kind be proc fs_kind with callee_node
+        If callee_kind is equal to HIR.HIR_IDENTIFIER:
+            Let callee_name be proc fs_value with callee_node
+            Let is_op be proc fsharp_is_operator_symbol with callee_name
+            If is_op is equal to 1:
+                Let lhs be proc list_get from List with args_list, 0
+                Let rhs be proc list_get from List with args_list, 1
+                Let lhs_code be proc generate_argument with ctx_ptr, lhs
+                Let rhs_code be proc generate_argument with ctx_ptr, rhs
+                Let infix be proc string_concat from StringUtils with lhs_code, " "
+                Set infix to proc string_concat from StringUtils with infix, callee_name
+                Set infix to proc string_concat from StringUtils with infix, " "
+                Set infix to proc string_concat from StringUtils with infix, rhs_code
+                Return infix
             End If
+        End If
+    End If
 
-            proc append_to_list from List with optimized_cases, case_node
+    Let callee_code be proc generate_expression with ctx_ptr, callee_node
+    Let result be callee_code
+
+    If args_list is not equal to 0:
+        Let i be 0
+        While i is less than argc:
+            Let arg_node be proc list_get from List with args_list, i
+            Let arg_code be proc generate_argument with ctx_ptr, arg_node
+            Set result to proc string_concat from StringUtils with result, " "
+            Set result to proc string_concat from StringUtils with result, arg_code
             Set i to i plus 1
+        End While
+    End If
+
+    Return result
+End Process
+
+@Reasoning:
+A callee identifier name is an F# infix operator symbol when it is one of the
+symbolic operators the frontend produces as operator-named call callees. We match
+the exact operator spellings ("+" "-" "*" "/" "%" "**" "=" "<>" "<" ">" "<=" ">="
+"&&" "||" "|>" "<|" ">>" "<<" "@" "::") so an ordinary identifier callee (a real
+function name) is never mis-rendered as infix. The check is a string-equality
+cascade because the set is small and fixed.
+@End Reasoning
+Process called "fsharp_is_operator_symbol" takes name as Integer returns Integer:
+    If name is equal to 0:
+        Return 0
+    End If
+    Let symbols be a list containing "+", "-", "*", "/", "%", "**", "=", "<>", "<", ">", "<=", ">=", "&&", "||", "|>", "<|", ">>", "<<", "@", "::"
+    Let count be proc list_length from List with symbols
+    Let i be 0
+    While i is less than count:
+        Let sym be proc list_get from List with symbols, i
+        Let eq be proc string_equals from StringCore with name, sym
+        If eq is equal to 1:
+            Return 1
         End If
+        Set i to i plus 1
     End While
-
-    Note: Create optimized match node
-    Let optimized_match be proc create_hir_match from HIR with optimized_cases
-    Return optimized_match
-End Process
-
-@Reasoning:
-The pattern recognised is the eta-form fun x -> f (g x), which is precisely
-F#'s f << g operator. We only fire when the outer call has exactly one
-argument and that argument is itself a call, because otherwise the
-composition would change arity and break call-site semantics. The lambda's
-own parameter list is dropped by the emitter when it sees the composition
-node.
-@End Reasoning
-Process called "optimize_lambda_composition" takes backend as Integer, hir_node as Integer returns Integer:
-    Note: Optimize F# lambda composition (fun x -> f (g x)) to (f shifted left by g)
-
-    If hir_node is equal to 0:
-        Return 0
-    End If
-
-    Let node_type be proc get_hir_node_type from HIR with hir_node
-
-    Note: Only process lambda nodes
-    If node_type is not equal to HIR_LAMBDA:
-        Return hir_node
-    End If
-
-    Note: Get lambda body
-    Let body be proc get_hir_lambda_body from HIR with hir_node
-
-    If body is equal to 0:
-        Return hir_node
-    End If
-
-    Let body_type be proc get_hir_node_type from HIR with body
-
-    Note: Check if body is a call: fun x -> f (g x)
-    If body_type is equal to HIR_CALL:
-        Let outer_func be proc get_hir_call_function from HIR with body
-        Let outer_args be proc get_hir_call_arguments from HIR with body
-
-        If outer_args is not equal to 0:
-            Let arg_count be proc get_list_size from List with outer_args
-
-            If arg_count is equal to 1:
-                Let arg be proc get_at from List with outer_args, 0
-                Let arg_type be proc get_hir_node_type from HIR with arg
-
-                Note: Check if argument is also a call
-                If arg_type is equal to HIR_CALL:
-                    Let inner_func be proc get_hir_call_function from HIR with arg
-
-                    Note: Create composition: f shifted left by g
-                    Let composition be proc create_hir_composition from HIR with outer_func, inner_func
-                    Return composition
-                End If
-            End If
-        End If
-    End If
-
-    Return hir_node
-End Process
-
-@Reasoning:
-This pass does not transform the function body; it only sets an HIR attribute
-("tail_recursive", 1) that fsharp_emitter reads when deciding whether to emit
-[<TailCall>] or convert the recursion to a while-loop in F# 7- targets. We
-avoid attempting CPS conversion here because the F# compiler's own analyser
-is more sophisticated; we merely surface the hint.
-@End Reasoning
-Process called "optimize_recursive_function" takes backend as Integer, hir_node as Integer returns Integer:
-    Note: Detect and mark tail-recursive functions for F# tail call optimization
-
-    If hir_node is equal to 0:
-        Return 0
-    End If
-
-    Let node_type be proc get_hir_node_type from HIR with hir_node
-
-    Note: Only process function definitions
-    If node_type is not equal to HIR_FUNCTION:
-        Return hir_node
-    End If
-
-    Note: Get function body
-    Let body be proc get_hir_function_body from HIR with hir_node
-
-    If body is equal to 0:
-        Return hir_node
-    End If
-
-    Note: Check if function is tail-recursive
-    Let func_name be proc get_hir_function_name from HIR with hir_node
-    Let is_tail_recursive be proc check_tail_recursion with body, func_name
-
-    If is_tail_recursive is equal to 1:
-        Note: Mark function as tail-recursive for F# optimization
-        proc set_hir_function_attribute from HIR with hir_node, "tail_recursive", 1
-    End If
-
-    Return hir_node
-End Process
-
-@Reasoning:
-The detector is structurally scoped: it returns 1 only when the body node
-itself is a direct call whose callee identifier matches the function name.
-This is the precise pattern the F# emitter needs to know about for the
-TailCall attribute; the full dominator-based tail-position analysis lives
-in the middle/gungnir/analysis layer and is consulted separately by the
-gungnir HIR-to-MIR lowering.
-@End Reasoning
-Process called "check_tail_recursion" takes body as Integer, func_name as Integer returns Integer:
-    Note: Check if function body ends with recursive call in tail position
-
-    If body is equal to 0:
-        Return 0
-    End If
-
-    Let body_type be proc get_hir_node_type from HIR with body
-
-    Note: If body is a call, check if it's a self-call
-    If body_type is equal to HIR_CALL:
-        Let callee be proc get_hir_call_function from HIR with body
-
-        If callee is not equal to 0:
-            Let callee_type be proc get_hir_node_type from HIR with callee
-
-            If callee_type is equal to HIR_IDENTIFIER:
-                Let callee_name be proc get_hir_identifier_name from HIR with callee
-                Let is_self_call be proc string_equals from StringCore with callee_name, func_name
-
-                If is_self_call is equal to 1:
-                    Return 1  Note: Tail recursive
-                End If
-            End If
-        End If
-    End If
-
     Return 0
 End Process
 
 @Reasoning:
-The walker accumulates variable references (HIR_VARIABLE_REF) into a flat
-list rather than a set because v0.0.8.5's List supports O(1) append while a
-hash-set would require allocating a hash table for each subtree; duplicate
-entries are tolerated because remove_dead_assignments uses list_contains
-(membership) and not exact occurrence counts. Block statements have their
-liveness sets unioned upward to model that any reference inside a block
-keeps the variable live at the block's entry.
+An application argument is parenthesized unless it is an atom (identifier or
+literal) for which F#'s left-associative application already groups correctly.
+Compound arguments (calls, binary expressions, lambdas, matches, ifs, literals
+of collection kinds) must be parenthesized so currying boundaries survive the
+round-trip.
 @End Reasoning
-Process called "analyze_variable_liveness" takes backend as Integer, hir_node as Integer returns Integer:
-    Note: Perform liveness analysis to identify live variables at each program point
+Process called "generate_argument" takes ctx_ptr as Integer, node as Integer returns String:
+    Let kind be proc fs_kind with node
+    Let code be proc generate_expression with ctx_ptr, node
 
-    Note: Create set of live variables
-    Let live_vars be proc create_list from List
-
-    If hir_node is equal to 0:
-        Return live_vars
+    If kind is equal to HIR.HIR_LITERAL:
+        Return code
+    End If
+    If kind is equal to HIR.HIR_IDENTIFIER:
+        Return code
     End If
 
-    Let node_type be proc get_hir_node_type from HIR with hir_node
+    Let wrapped be proc string_concat from StringUtils with "(", code
+    Set wrapped to proc string_concat from StringUtils with wrapped, ")"
+    Return wrapped
+End Process
 
-    Note: Analyze based on node type
-    If node_type is equal to HIR_VARIABLE_REF:
-        Note: Variable use - mark as live
-        Let var_name be proc get_hir_variable_name from HIR with hir_node
-        proc append_to_list from List with live_vars, var_name
+Note: ============================================================================
+Note: Lambda
+Note: ============================================================================
+
+@Reasoning:
+F# lambdas are "fun p1 p2 -> body". Parameters are the composite's parameter
+list (each entry an HIR pattern node); we render each parameter via the pattern
+emitter so destructuring parameters round-trip. The body is a single expression
+(F# lambda bodies are expressions), emitted inline.
+@End Reasoning
+Process called "generate_lambda_expression" takes ctx_ptr as Integer, node as Integer returns String:
+    Let params_list be proc fs_slot with node, 8
+    Let body_node be proc fs_slot with node, 24
+
+    Let result be "fun"
+
+    If params_list is not equal to 0:
+        Let pc be proc list_length from List with params_list
+        Let i be 0
+        While i is less than pc:
+            Let param_node be proc list_get from List with params_list, i
+            Let param_code be proc generate_pattern with ctx_ptr, param_node
+            Set result to proc string_concat from StringUtils with result, " "
+            Set result to proc string_concat from StringUtils with result, param_code
+            Set i to i plus 1
+        End While
     End If
 
-    If node_type is equal to HIR_BLOCK:
-        Note: Analyze statements in block
-        Let statements be proc get_hir_block_statements from HIR with hir_node
+    Set result to proc string_concat from StringUtils with result, " -> "
+    Let body_code be proc generate_expression with ctx_ptr, body_node
+    Set result to proc string_concat from StringUtils with result, body_code
 
-        If statements is not equal to 0:
-            Let stmt_count be proc get_list_size from List with statements
-            Let i be 0
+    Return result
+End Process
 
-            While i is less than stmt_count:
-                Let stmt be proc get_at from List with statements, i
-                Let stmt_live be proc analyze_variable_liveness with backend, stmt
+Note: ============================================================================
+Note: Collection literals
+Note: ============================================================================
 
-                Note: Merge live variables
-                If stmt_live is not equal to 0:
-                    Let live_count be proc get_list_size from List with stmt_live
-                    Let j be 0
+@Reasoning:
+The frontend lowers BOTH F# lists [a; b] and arrays [|a; b|] to HIR_ARRAY_LITERAL
+(it cannot preserve the distinction in the node kind), so the backend emits the
+canonical F# list form "[a; b; c]" with semicolon separators. This round-trips
+through the frontend identically because the re-parse lowers the emitted list
+back to the same HIR_ARRAY_LITERAL node with the same element count.
+@End Reasoning
+Process called "generate_list_literal" takes ctx_ptr as Integer, node as Integer returns String:
+    Let elements be proc fs_children with node
+    Let result be "["
 
-                    While j is less than live_count:
-                        Let var be proc get_at from List with stmt_live, j
-                        proc append_to_list from List with live_vars, var
-                        Set j to j plus 1
-                    End While
+    If elements is not equal to 0:
+        Let count be proc list_length from List with elements
+        Let i be 0
+        While i is less than count:
+            Let elem be proc list_get from List with elements, i
+            Let elem_code be proc generate_expression with ctx_ptr, elem
+            If i is greater than 0:
+                Set result to proc string_concat from StringUtils with result, "; "
+            End If
+            Set result to proc string_concat from StringUtils with result, elem_code
+            Set i to i plus 1
+        End While
+    End If
+
+    Set result to proc string_concat from StringUtils with result, "]"
+    Return result
+End Process
+
+@Reasoning:
+F# tuples are comma-separated parenthesized "(a, b, c)". Element ordering and
+arity are preserved exactly (tuples of different arity are distinct types in F#).
+@End Reasoning
+Process called "generate_tuple_literal" takes ctx_ptr as Integer, node as Integer returns String:
+    Let elements be proc fs_children with node
+    Let result be "("
+
+    If elements is not equal to 0:
+        Let count be proc list_length from List with elements
+        Let i be 0
+        While i is less than count:
+            Let elem be proc list_get from List with elements, i
+            Let elem_code be proc generate_expression with ctx_ptr, elem
+            If i is greater than 0:
+                Set result to proc string_concat from StringUtils with result, ", "
+            End If
+            Set result to proc string_concat from StringUtils with result, elem_code
+            Set i to i plus 1
+        End While
+    End If
+
+    Set result to proc string_concat from StringUtils with result, ")"
+    Return result
+End Process
+
+@Reasoning:
+F# record construction is "{ Field1 = v1; Field2 = v2 }". Each child is an
+HIR_FIELD_INITIALIZER node from which we read the field name (a string in the
+field-init's "name" property) and the value expression (its "value" property),
+emitting "Name = value" entries separated by "; ".
+@End Reasoning
+Process called "generate_record_literal" takes ctx_ptr as Integer, node as Integer returns String:
+    Let fields be proc fs_children with node
+    Let result be "{ "
+
+    If fields is not equal to 0:
+        Let count be proc list_length from List with fields
+        Let i be 0
+        While i is less than count:
+            Let field be proc list_get from List with fields, i
+            Let fname be proc hir_get_field_init_name from HIRNodes with field
+            Let fvalue be proc hir_get_field_init_value from HIRNodes with field
+            Let value_code be proc generate_expression with ctx_ptr, fvalue
+
+            If i is greater than 0:
+                Set result to proc string_concat from StringUtils with result, "; "
+            End If
+            Set result to proc string_concat from StringUtils with result, fname
+            Set result to proc string_concat from StringUtils with result, " = "
+            Set result to proc string_concat from StringUtils with result, value_code
+            Set i to i plus 1
+        End While
+    End If
+
+    Set result to proc string_concat from StringUtils with result, " }"
+    Return result
+End Process
+
+@Reasoning:
+The frontend stores an interpolated string as a node whose children alternate
+HIR_LITERAL string segments and arbitrary hole expressions in source order. F#
+interpolated strings are $"...{expr}...": we emit the $"-prefixed opener, copy
+each literal segment's text verbatim into the string body, and wrap each hole
+expression in {braces}. The format spec (when the frontend attached the
+"format_spec" metadata) is appended after a colon inside the braces, matching
+F#'s {expr:format} interpolation syntax.
+@End Reasoning
+Process called "generate_interpolated_string" takes ctx_ptr as Integer, node as Integer returns String:
+    Let parts be proc fs_children with node
+    Let result be "$\""
+
+    If parts is not equal to 0:
+        Let count be proc list_length from List with parts
+        Let i be 0
+        While i is less than count:
+            Let part be proc list_get from List with parts, i
+            Let part_kind be proc fs_kind with part
+            If part_kind is equal to HIR.HIR_LITERAL:
+                Let seg be proc fs_value with part
+                Let escaped be proc escape_fsharp_string from Emitter with seg
+                Set result to proc string_concat from StringUtils with result, escaped
+            Otherwise:
+                Let hole_code be proc generate_expression with ctx_ptr, part
+                Set result to proc string_concat from StringUtils with result, "{"
+                Set result to proc string_concat from StringUtils with result, hole_code
+                Let spec be proc hir_get_metadata from HIRNodes with part, "format_spec"
+                If spec is not equal to 0:
+                    Set result to proc string_concat from StringUtils with result, ":"
+                    Set result to proc string_concat from StringUtils with result, spec
                 End If
+                Set result to proc string_concat from StringUtils with result, "}"
+            End If
+            Set i to i plus 1
+        End While
+    End If
 
+    Set result to proc string_concat from StringUtils with result, "\""
+    Return result
+End Process
+
+Note: ============================================================================
+Note: Match expression
+Note: ============================================================================
+
+@Reasoning:
+F# match is "match expr with | pat -> body | pat -> body". The discriminant is
+the match composite's expression slot (8); the arms list (slot 24) holds
+HIR_WHEN_CLAUSE composites each carrying a pattern, an optional guard, and a
+body. Each arm is emitted on its own indented line as "| pattern [when guard]
+-> body" so the layout-sensitive F# match round-trips.
+@End Reasoning
+Process called "generate_match_expression" takes ctx_ptr as Integer, node as Integer returns String:
+    Let expr_node be proc fs_slot with node, 8
+    Let arms be proc fs_slot with node, 24
+
+    Let expr_code be proc generate_expression with ctx_ptr, expr_node
+    Let result be proc string_concat from StringUtils with "match ", expr_code
+    Set result to proc string_concat from StringUtils with result, " with"
+
+    If arms is not equal to 0:
+        Let count be proc list_length from List with arms
+        Let i be 0
+        While i is less than count:
+            Let arm be proc list_get from List with arms, i
+            Let arm_code be proc generate_match_arm with ctx_ptr, arm
+            Set result to proc string_concat from StringUtils with result, "\n"
+            Let arm_indent be proc get_indent with ctx_ptr
+            Set result to proc string_concat from StringUtils with result, arm_indent
+            Set result to proc string_concat from StringUtils with result, arm_code
+            Set i to i plus 1
+        End While
+    End If
+
+    Return result
+End Process
+
+@Reasoning:
+A WHEN_CLAUSE composite stores pattern@8, guard@16 (0 when absent), body@24.
+We emit "| pattern [when guard] -> body". The pattern routes through the
+pattern emitter (so constructor/tuple/list/record patterns round-trip) and the
+guard and body route through the expression emitter.
+@End Reasoning
+Process called "generate_match_arm" takes ctx_ptr as Integer, node as Integer returns String:
+    Let pattern_node be proc fs_slot with node, 8
+    Let guard_node be proc fs_slot with node, 16
+    Let body_node be proc fs_slot with node, 24
+
+    Let pattern_code be proc generate_pattern with ctx_ptr, pattern_node
+    Let result be proc string_concat from StringUtils with "| ", pattern_code
+
+    If guard_node is not equal to 0:
+        Let guard_code be proc generate_expression with ctx_ptr, guard_node
+        Set result to proc string_concat from StringUtils with result, " when "
+        Set result to proc string_concat from StringUtils with result, guard_code
+    End If
+
+    Set result to proc string_concat from StringUtils with result, " -> "
+    Let body_code be proc generate_expression with ctx_ptr, body_node
+    Set result to proc string_concat from StringUtils with result, body_code
+
+    Return result
+End Process
+
+Note: ============================================================================
+Note: Pattern Generation
+Note: ============================================================================
+
+@Reasoning:
+Patterns are bare HIRNodes carrying the bound name / type name in the value slot
+(string) and sub-patterns in the children list. The dispatch covers every F#
+pattern shape the frontend produces: identifier (variable binding), wildcard,
+variant (discriminated-union constructor), tuple, array/list, record, guard,
+type-test, and or-patterns. The renderings match F# pattern syntax exactly so a
+re-parse reconstructs the same pattern kind.
+@End Reasoning
+Process called "generate_pattern" takes ctx_ptr as Integer, node as Integer returns String:
+    If node is equal to 0:
+        Return "_"
+    End If
+
+    Let kind be proc fs_kind with node
+
+    If kind is equal to HIR.HIR_IDENTIFIER_PATTERN:
+        Let name be proc fs_value with node
+        If name is equal to 0:
+            Return "_"
+        End If
+        Note: a record-field-pattern reuses identifier-pattern with a child
+        Note: sub-pattern; render "Name = subpat" when a sub-pattern is present
+        Let pc be proc fs_child_count with node
+        If pc is greater than 0:
+            Let children be proc fs_children with node
+            Let sub be proc list_get from List with children, 0
+            Let sub_code be proc generate_pattern with ctx_ptr, sub
+            Let res be proc string_concat from StringUtils with name, " = "
+            Set res to proc string_concat from StringUtils with res, sub_code
+            Return res
+        End If
+        Return name
+    End If
+
+    If kind is equal to HIR.HIR_WILDCARD_PATTERN:
+        Return "_"
+    End If
+
+    If kind is equal to HIR.HIR_LITERAL:
+        Return proc generate_literal with ctx_ptr, node
+    End If
+
+    If kind is equal to HIR.HIR_VARIANT_PATTERN:
+        Return proc generate_variant_pattern with ctx_ptr, node
+    End If
+
+    If kind is equal to HIR.HIR_TUPLE_PATTERN:
+        Return proc generate_tuple_pattern with ctx_ptr, node
+    End If
+
+    If kind is equal to HIR.HIR_ARRAY_PATTERN:
+        Return proc generate_list_pattern with ctx_ptr, node
+    End If
+
+    If kind is equal to HIR.HIR_RECORD_PATTERN:
+        Return proc generate_record_pattern with ctx_ptr, node
+    End If
+
+    If kind is equal to HIR.HIR_GUARD_PATTERN:
+        Return proc generate_guard_pattern with ctx_ptr, node
+    End If
+
+    If kind is equal to HIR.HIR_TYPE_PATTERN:
+        Return proc generate_type_pattern with ctx_ptr, node
+    End If
+
+    If kind is equal to HIR.HIR_OR_PATTERN:
+        Return proc generate_or_pattern with ctx_ptr, node
+    End If
+
+    proc codegen_error with ctx_ptr, "Unknown F# pattern kind"
+    Return "_"
+End Process
+
+@Reasoning:
+A discriminated-union constructor pattern is "Name" (nullary) or
+"Name (subpat1, subpat2)" (with arguments). The constructor name is the value
+slot; the sub-patterns are the children. A single sub-pattern emits "Name subpat"
+(F#'s single-argument constructor form needs no parens); multiple sub-patterns
+emit the parenthesized comma form.
+@End Reasoning
+Process called "generate_variant_pattern" takes ctx_ptr as Integer, node as Integer returns String:
+    Let name be proc fs_value with node
+    Let children be proc fs_children with node
+    Let count be proc fs_child_count with node
+
+    If count is equal to 0:
+        Return name
+    End If
+
+    If count is equal to 1:
+        Let sub be proc list_get from List with children, 0
+        Let sub_code be proc generate_pattern with ctx_ptr, sub
+        Let res be proc string_concat from StringUtils with name, " "
+        Set res to proc string_concat from StringUtils with res, sub_code
+        Return res
+    End If
+
+    Let result be proc string_concat from StringUtils with name, " ("
+    Let i be 0
+    While i is less than count:
+        Let sub be proc list_get from List with children, i
+        Let sub_code be proc generate_pattern with ctx_ptr, sub
+        If i is greater than 0:
+            Set result to proc string_concat from StringUtils with result, ", "
+        End If
+        Set result to proc string_concat from StringUtils with result, sub_code
+        Set i to i plus 1
+    End While
+    Set result to proc string_concat from StringUtils with result, ")"
+    Return result
+End Process
+
+@Reasoning:
+F# tuple patterns are comma-separated "(p1, p2, p3)" mirroring tuple values.
+@End Reasoning
+Process called "generate_tuple_pattern" takes ctx_ptr as Integer, node as Integer returns String:
+    Let children be proc fs_children with node
+    Let count be proc fs_child_count with node
+    Let result be "("
+    Let i be 0
+    While i is less than count:
+        Let sub be proc list_get from List with children, i
+        Let sub_code be proc generate_pattern with ctx_ptr, sub
+        If i is greater than 0:
+            Set result to proc string_concat from StringUtils with result, ", "
+        End If
+        Set result to proc string_concat from StringUtils with result, sub_code
+        Set i to i plus 1
+    End While
+    Set result to proc string_concat from StringUtils with result, ")"
+    Return result
+End Process
+
+@Reasoning:
+F# list patterns are semicolon-separated "[p1; p2]" mirroring list values.
+@End Reasoning
+Process called "generate_list_pattern" takes ctx_ptr as Integer, node as Integer returns String:
+    Let children be proc fs_children with node
+    Let count be proc fs_child_count with node
+    Let result be "["
+    Let i be 0
+    While i is less than count:
+        Let sub be proc list_get from List with children, i
+        Let sub_code be proc generate_pattern with ctx_ptr, sub
+        If i is greater than 0:
+            Set result to proc string_concat from StringUtils with result, "; "
+        End If
+        Set result to proc string_concat from StringUtils with result, sub_code
+        Set i to i plus 1
+    End While
+    Set result to proc string_concat from StringUtils with result, "]"
+    Return result
+End Process
+
+@Reasoning:
+F# record patterns are "{ Field1 = p1; Field2 = p2 }". Each child is an
+identifier-pattern carrying the field name in its value slot and the field's
+sub-pattern as its own child; generate_pattern already renders that
+identifier-pattern-with-child as "Name = subpat", so we just wrap the children
+in the record-pattern braces.
+@End Reasoning
+Process called "generate_record_pattern" takes ctx_ptr as Integer, node as Integer returns String:
+    Let children be proc fs_children with node
+    Let count be proc fs_child_count with node
+    Let result be "{ "
+    Let i be 0
+    While i is less than count:
+        Let sub be proc list_get from List with children, i
+        Let sub_code be proc generate_pattern with ctx_ptr, sub
+        If i is greater than 0:
+            Set result to proc string_concat from StringUtils with result, "; "
+        End If
+        Set result to proc string_concat from StringUtils with result, sub_code
+        Set i to i plus 1
+    End While
+    Set result to proc string_concat from StringUtils with result, " }"
+    Return result
+End Process
+
+@Reasoning:
+A guard pattern wraps an inner pattern (child 0) and a guard expression (child 1).
+At the F# match-arm level the guard is rendered via the "when" clause, but the
+frontend can also produce a standalone HIR_GUARD_PATTERN; we render it as
+"innerpat when guardexpr" which is exactly how F# spells a guarded pattern in
+arm position.
+@End Reasoning
+Process called "generate_guard_pattern" takes ctx_ptr as Integer, node as Integer returns String:
+    Let children be proc fs_children with node
+    Let count be proc fs_child_count with node
+    If count is less than 2:
+        If count is equal to 1:
+            Let only be proc list_get from List with children, 0
+            Return proc generate_pattern with ctx_ptr, only
+        End If
+        Return "_"
+    End If
+    Let inner be proc list_get from List with children, 0
+    Let guard be proc list_get from List with children, 1
+    Let inner_code be proc generate_pattern with ctx_ptr, inner
+    Let guard_code be proc generate_expression with ctx_ptr, guard
+    Let result be proc string_concat from StringUtils with inner_code, " when "
+    Set result to proc string_concat from StringUtils with result, guard_code
+    Return result
+End Process
+
+@Reasoning:
+A type-test pattern is F#'s ":? TypeName [as binder]". The tested type name is
+the value slot; an optional binder is child 0 (an identifier pattern). We emit
+":? TypeName" and append " as binder" when the binder child is present.
+@End Reasoning
+Process called "generate_type_pattern" takes ctx_ptr as Integer, node as Integer returns String:
+    Let type_name be proc fs_value with node
+    Let result be proc string_concat from StringUtils with ":? ", type_name
+
+    Let count be proc fs_child_count with node
+    If count is greater than 0:
+        Let children be proc fs_children with node
+        Let binder be proc list_get from List with children, 0
+        Let binder_code be proc generate_pattern with ctx_ptr, binder
+        Set result to proc string_concat from StringUtils with result, " as "
+        Set result to proc string_concat from StringUtils with result, binder_code
+    End If
+
+    Return result
+End Process
+
+@Reasoning:
+An or-pattern is F#'s "p1 | p2 | p3": alternatives separated by " | ". The
+children are the alternatives in source order.
+@End Reasoning
+Process called "generate_or_pattern" takes ctx_ptr as Integer, node as Integer returns String:
+    Let children be proc fs_children with node
+    Let count be proc fs_child_count with node
+    Let result be ""
+    Let i be 0
+    While i is less than count:
+        Let alt be proc list_get from List with children, i
+        Let alt_code be proc generate_pattern with ctx_ptr, alt
+        If i is greater than 0:
+            Set result to proc string_concat from StringUtils with result, " | "
+        End If
+        Set result to proc string_concat from StringUtils with result, alt_code
+        Set i to i plus 1
+    End While
+    Return result
+End Process
+
+Note: ============================================================================
+Note: If / Block / Try / While / For (expression position)
+Note: ============================================================================
+
+@Reasoning:
+F# "if c then t else e" is an expression. The frontend stores cond@8, then@16,
+else@24 (0 when the source had no else). We emit the single-line expression
+form; when there is no else branch we still emit "else ()" so the if has unit
+in both arms, which the frontend re-lowers to the same if shape.
+@End Reasoning
+Process called "generate_if_expression" takes ctx_ptr as Integer, node as Integer returns String:
+    Let cond_node be proc fs_slot with node, 8
+    Let then_node be proc fs_slot with node, 16
+    Let else_node be proc fs_slot with node, 24
+
+    Let cond_code be proc generate_expression with ctx_ptr, cond_node
+    Let then_code be proc generate_expression with ctx_ptr, then_node
+
+    Let result be proc string_concat from StringUtils with "if ", cond_code
+    Set result to proc string_concat from StringUtils with result, " then "
+    Set result to proc string_concat from StringUtils with result, then_code
+    Set result to proc string_concat from StringUtils with result, " else "
+
+    If else_node is not equal to 0:
+        Let else_code be proc generate_expression with ctx_ptr, else_node
+        Set result to proc string_concat from StringUtils with result, else_code
+    Otherwise:
+        Set result to proc string_concat from StringUtils with result, "()"
+    End If
+
+    Return result
+End Process
+
+@Reasoning:
+A block (F# "let ... in body" sequence) is the frontend's BLOCK_STATEMENT whose
+children are the let bindings followed by the trailing body expression. Each
+binding renders as a "let name = init in" line; the final non-binding child is
+the block's value. We emit each item on its own indented line and join them with
+F#'s newline-sequenced layout, which round-trips through the layout-aware parser.
+@End Reasoning
+Process called "generate_block_expression" takes ctx_ptr as Integer, node as Integer returns String:
+    Let children be proc fs_children with node
+    Let count be proc fs_child_count with node
+
+    Let result be ""
+    Let i be 0
+    While i is less than count:
+        Let child be proc list_get from List with children, i
+        Let child_kind be proc fs_kind with child
+        If i is greater than 0:
+            Set result to proc string_concat from StringUtils with result, "\n"
+            Let line_indent be proc get_indent with ctx_ptr
+            Set result to proc string_concat from StringUtils with result, line_indent
+        End If
+        If child_kind is equal to HIR.HIR_LET_STATEMENT:
+            Let binding_code be proc generate_let_inline with ctx_ptr, child
+            Set result to proc string_concat from StringUtils with result, binding_code
+        Otherwise:
+            Let expr_code be proc generate_expression with ctx_ptr, child
+            Set result to proc string_concat from StringUtils with result, expr_code
+        End If
+        Set i to i plus 1
+    End While
+
+    Return result
+End Process
+
+@Reasoning:
+An inline let-binding (inside a block or as an expression-position let) renders
+as "let [rec] name = init". The variable name is composite slot 8, the
+initializer slot 32, and the recursive flag slot 40 (1 when the source was
+"let rec"). The "in" keyword is omitted because F#'s lightweight (offside)
+syntax sequences bindings by layout, and the block emitter places each binding
+on its own line.
+@End Reasoning
+Process called "generate_let_inline" takes ctx_ptr as Integer, node as Integer returns String:
+    Let var_name be proc fs_slot with node, 8
+    Let init_node be proc fs_slot with node, 32
+    Let is_rec be proc fs_slot with node, 40
+
+    Let result be "let "
+    If is_rec is equal to 1:
+        Set result to proc string_concat from StringUtils with result, "rec "
+    End If
+    Set result to proc string_concat from StringUtils with result, var_name
+
+    If init_node is not equal to 0:
+        Let init_code be proc generate_function_or_value with ctx_ptr, init_node
+        Set result to proc string_concat from StringUtils with result, init_code
+    End If
+
+    Return result
+End Process
+
+@Reasoning:
+An F# "let f x y = body" binding lowers in the frontend to a let whose
+initializer is a LAMBDA expression. To round-trip the curried function-binding
+form (rather than "let f = fun x y -> body") we detect a lambda initializer and
+splice its parameters directly after the bound name: "let f x y = body". A
+non-lambda initializer renders as the plain "= value" value binding.
+@End Reasoning
+Process called "generate_function_or_value" takes ctx_ptr as Integer, node as Integer returns String:
+    Let kind be proc fs_kind with node
+
+    If kind is equal to HIR.HIR_LAMBDA_EXPRESSION:
+        Let params_list be proc fs_slot with node, 8
+        Let body_node be proc fs_slot with node, 24
+
+        Let result be ""
+        If params_list is not equal to 0:
+            Let pc be proc list_length from List with params_list
+            Let i be 0
+            While i is less than pc:
+                Let param_node be proc list_get from List with params_list, i
+                Let param_code be proc generate_pattern with ctx_ptr, param_node
+                Set result to proc string_concat from StringUtils with result, " "
+                Set result to proc string_concat from StringUtils with result, param_code
                 Set i to i plus 1
             End While
         End If
+        Set result to proc string_concat from StringUtils with result, " = "
+        Note: A match (or other multi-line) body must be indented one level beyond
+        Note: the binding so the F# offside rule keeps the arms inside the binding's
+        Note: scope; we push indentation around the body emission so the match arms
+        Note: align under the "let" rather than at column 0 (which would re-parse as
+        Note: a new top-level declaration).
+        proc indent with ctx_ptr
+        Let body_code be proc generate_expression with ctx_ptr, body_node
+        proc dedent with ctx_ptr
+        Set result to proc string_concat from StringUtils with result, body_code
+        Return result
     End If
 
-    Return live_vars
+    proc indent with ctx_ptr
+    Let value_code be proc generate_expression with ctx_ptr, node
+    proc dedent with ctx_ptr
+    Let res be proc string_concat from StringUtils with " = ", value_code
+    Return res
 End Process
 
 @Reasoning:
-Returning 0 (null) for a dead HIR_ASSIGNMENT instructs the caller to drop
-the node from its parent's child list - this is the v0.0.8.5 convention for
-HIR pruning since the walker pattern in optimize_hir_for_fsharp expects
-either a transformed node or a null sentinel. Live or non-assignment nodes
-are returned unchanged so the structural shape of the surrounding tree is
-preserved.
+F# "try body with | pat -> handler" / "try body finally cleanup". The composite
+stores try@8, catches(List)@16, finally@32. We emit the with-form when there are
+catch clauses and the finally-form when there is a finally block; both may be
+present, in which case the with-block is emitted first. Each catch clause is an
+HIR_CATCH node read through the catch accessors.
 @End Reasoning
-Process called "remove_dead_assignments" takes backend as Integer, hir_node as Integer, live_vars as Integer returns Integer:
-    Note: Remove assignments to variables that are never read
+Process called "generate_try_statement" takes ctx_ptr as Integer, node as Integer returns String:
+    Let try_body be proc fs_slot with node, 8
+    Let catches be proc fs_slot with node, 16
+    Let finally_node be proc fs_slot with node, 32
 
-    If hir_node is equal to 0:
-        Return 0
+    Let body_code be proc generate_expression with ctx_ptr, try_body
+    Let result be proc string_concat from StringUtils with "try ", body_code
+
+    Let catch_count be 0
+    If catches is not equal to 0:
+        Set catch_count to proc list_length from List with catches
     End If
 
-    Let node_type be proc get_hir_node_type from HIR with hir_node
+    If catch_count is greater than 0:
+        Set result to proc string_concat from StringUtils with result, " with"
+        Let i be 0
+        While i is less than catch_count:
+            Let catch be proc list_get from List with catches, i
+            Let catch_code be proc generate_catch_clause with ctx_ptr, catch
+            Set result to proc string_concat from StringUtils with result, "\n"
+            Let ci be proc get_indent with ctx_ptr
+            Set result to proc string_concat from StringUtils with result, ci
+            Set result to proc string_concat from StringUtils with result, catch_code
+            Set i to i plus 1
+        End While
+    End If
 
-    Note: Check if this is an assignment
-    If node_type is equal to HIR_ASSIGNMENT:
-        Let var_name be proc get_hir_assignment_target from HIR with hir_node
+    If finally_node is not equal to 0:
+        Let finally_code be proc generate_expression with ctx_ptr, finally_node
+        Set result to proc string_concat from StringUtils with result, "\n"
+        Let fi be proc get_indent with ctx_ptr
+        Set result to proc string_concat from StringUtils with result, fi
+        Set result to proc string_concat from StringUtils with result, "finally "
+        Set result to proc string_concat from StringUtils with result, finally_code
+    End If
 
-        Note: Check if variable is in live set
-        Let is_live be proc list_contains from List with live_vars, var_name
+    Return result
+End Process
 
-        If is_live is equal to 0:
-            Note: Dead assignment - return null to remove it
-            Return 0
+@Reasoning:
+An HIR_CATCH carries an exception type name, an optional bound variable, and a
+body, read through the canonical catch accessors. F# spells a handler arm as
+"| :? ExnType as var -> body" when a type is given, or "| var -> body" / "| _ ->
+body" otherwise. We reconstruct the closest F# handler-arm spelling that the
+frontend re-lowers to the same catch shape.
+@End Reasoning
+Process called "generate_catch_clause" takes ctx_ptr as Integer, node as Integer returns String:
+    Let exn_type be proc hir_get_catch_type from HIRNodes with node
+    Let exn_var be proc hir_get_catch_variable from HIRNodes with node
+    Let body be proc hir_get_catch_body from HIRNodes with node
+
+    Let result be "| "
+
+    If exn_type is not equal to 0:
+        Set result to proc string_concat from StringUtils with result, ":? "
+        Set result to proc string_concat from StringUtils with result, exn_type
+        If exn_var is not equal to 0:
+            Set result to proc string_concat from StringUtils with result, " as "
+            Set result to proc string_concat from StringUtils with result, exn_var
+        End If
+    Otherwise:
+        If exn_var is not equal to 0:
+            Set result to proc string_concat from StringUtils with result, exn_var
+        Otherwise:
+            Set result to proc string_concat from StringUtils with result, "_"
         End If
     End If
 
-    Return hir_node
+    Set result to proc string_concat from StringUtils with result, " -> "
+    Let body_code be proc generate_expression with ctx_ptr, body
+    Set result to proc string_concat from StringUtils with result, body_code
+
+    Return result
 End Process
 
 @Reasoning:
-Annotations are removed only when the initializer is a literal whose F#
-inferred type is unambiguous (see infer_type for the precise rules). We
-avoid touching annotations on numeric literals beyond the basic integer
-because F# defaults int literals to int32, and stripping an annotation on
-an int64 declaration would silently retype the value.
+F# "while cond do body". The composite stores cond@8, body@16. We emit the
+single-line "while cond do body" form which re-parses to the same while shape.
 @End Reasoning
-Process called "remove_redundant_type_annotations" takes backend as Integer, hir_node as Integer returns Integer:
-    Note: Remove F# type annotations that can be inferred by the compiler
+Process called "generate_while_statement" takes ctx_ptr as Integer, node as Integer returns String:
+    Let cond_node be proc fs_slot with node, 8
+    Let body_node be proc fs_slot with node, 16
 
-    If hir_node is equal to 0:
-        Return 0
+    Let cond_code be proc generate_expression with ctx_ptr, cond_node
+    Let body_code be proc generate_expression with ctx_ptr, body_node
+
+    Let result be proc string_concat from StringUtils with "while ", cond_code
+    Set result to proc string_concat from StringUtils with result, " do "
+    Set result to proc string_concat from StringUtils with result, body_code
+
+    Return result
+End Process
+
+@Reasoning:
+F# "for x in iterable do body". The composite stores the iterator-variable token
+at slot 8 (a raw F# lexer token whose text is the loop variable name), the
+iterable expression at slot 16, and the body at slot 32. We recover the loop
+variable name from the token text and emit the for-in form.
+@End Reasoning
+Process called "generate_for_statement" takes ctx_ptr as Integer, node as Integer returns String:
+    Let var_token be proc fs_slot with node, 8
+    Let iterable_node be proc fs_slot with node, 16
+    Let body_node be proc fs_slot with node, 32
+
+    Let var_name be proc fsharp_token_text with var_token
+    Let iterable_code be proc generate_expression with ctx_ptr, iterable_node
+    Let body_code be proc generate_expression with ctx_ptr, body_node
+
+    Let result be proc string_concat from StringUtils with "for ", var_name
+    Set result to proc string_concat from StringUtils with result, " in "
+    Set result to proc string_concat from StringUtils with result, iterable_code
+    Set result to proc string_concat from StringUtils with result, " do "
+    Set result to proc string_concat from StringUtils with result, body_code
+
+    Return result
+End Process
+
+Note: ============================================================================
+Note: Type Expression Generation
+Note: ============================================================================
+
+@Reasoning:
+Type expressions in val signatures, record field types and union payloads are
+the typed type nodes the frontend builds via the hir_nodes.runa type producers:
+HIR_TYPE_REF (named type, name in "name" property), HIR_FUNCTION_TYPE (arrow,
+parameter-types list + return type), HIR_GENERIC_TYPE (base name + argument
+list), HIR_TUPLE_TYPE (element list). We render the F# spellings: named type as
+its name, function type as "a -> b", generic as "Base<args>", tuple as
+"a * b * c".
+@End Reasoning
+Process called "generate_type_expression" takes ctx_ptr as Integer, node as Integer returns String:
+    If node is equal to 0:
+        Return ""
     End If
 
-    Let node_type be proc get_hir_node_type from HIR with hir_node
+    Let kind be proc fs_kind with node
 
-    Note: Check if this is a variable declaration with type annotation
-    If node_type is equal to HIR_VARIABLE_DECL:
-        Let has_annotation be proc get_hir_variable_type_annotation from HIR with hir_node
+    If kind is equal to HIRNodes.HIR_TYPE_REF:
+        Let name be proc hir_get_type_ref_name from HIRNodes with node
+        Return name
+    End If
 
-        If has_annotation is not equal to 0:
-            Note: Check if type can be inferred from initializer
-            Let initializer be proc get_hir_variable_initializer from HIR with hir_node
+    If kind is equal to HIRNodes.HIR_FUNCTION_TYPE:
+        Let params be proc hir_get_function_type_params from HIRNodes with node
+        Let ret be proc hir_get_function_type_return from HIRNodes with node
+        Let result be ""
+        If params is not equal to 0:
+            Let pc be proc list_length from List with params
+            Let i be 0
+            While i is less than pc:
+                Let p be proc list_get from List with params, i
+                Let p_code be proc generate_type_expression with ctx_ptr, p
+                Set result to proc string_concat from StringUtils with result, p_code
+                Set result to proc string_concat from StringUtils with result, " -> "
+                Set i to i plus 1
+            End While
+        End If
+        Let ret_code be proc generate_type_expression with ctx_ptr, ret
+        Set result to proc string_concat from StringUtils with result, ret_code
+        Return result
+    End If
 
-            If initializer is not equal to 0:
-                Let init_type be proc infer_type from initializer
-
-                If init_type is not equal to 0:
-                    Note: Type can be inferred - remove annotation
-                    proc remove_hir_variable_type_annotation from HIR with hir_node
+    If kind is equal to HIRNodes.HIR_GENERIC_TYPE:
+        Let base be proc hir_get_generic_base from HIRNodes with node
+        Let args be proc hir_get_generic_args from HIRNodes with node
+        Let result be base
+        If args is not equal to 0:
+            Set result to proc string_concat from StringUtils with result, "<"
+            Let ac be proc list_length from List with args
+            Let i be 0
+            While i is less than ac:
+                Let a be proc list_get from List with args, i
+                Let a_code be proc generate_type_expression with ctx_ptr, a
+                If i is greater than 0:
+                    Set result to proc string_concat from StringUtils with result, ", "
                 End If
-            End If
+                Set result to proc string_concat from StringUtils with result, a_code
+                Set i to i plus 1
+            End While
+            Set result to proc string_concat from StringUtils with result, ">"
         End If
+        Return result
     End If
 
-    Return hir_node
-End Process
-
-@Reasoning:
-The inference rules are restricted to three literal kinds whose F# type is
-fixed-by-grammar: integer literals are int, string literals are System.String,
-and boolean literals are bool. Returning 0 for anything else is deliberate -
-the caller (remove_redundant_type_annotations) interprets 0 as "do not strip",
-so non-literal initializers are left annotated rather than risk altering the
-declared type.
-@End Reasoning
-Process called "infer_type" takes hir_node as Integer returns Integer:
-    Note: Simple type inference for literals and obvious cases
-
-    If hir_node is equal to 0:
-        Return 0
+    Note: HIR_TUPLE_TYPE: elements are children of the tuple-type node
+    Let count be proc fs_child_count with node
+    If count is greater than 0:
+        Let children be proc fs_children with node
+        Let result be ""
+        Let i be 0
+        While i is less than count:
+            Let el be proc list_get from List with children, i
+            Let el_code be proc generate_type_expression with ctx_ptr, el
+            If i is greater than 0:
+                Set result to proc string_concat from StringUtils with result, " * "
+            End If
+            Set result to proc string_concat from StringUtils with result, el_code
+            Set i to i plus 1
+        End While
+        Return result
     End If
 
-    Let node_type be proc get_hir_node_type from HIR with hir_node
-
-    If node_type is equal to HIR_INTEGER_LITERAL:
-        Return HIR_TYPE_INT
-    End If
-
-    If node_type is equal to HIR_STRING_LITERAL:
-        Return HIR_TYPE_STRING
-    End If
-
-    If node_type is equal to HIR_BOOLEAN_LITERAL:
-        Return HIR_TYPE_BOOL
-    End If
-
-    Return 0  Note: Cannot infer
+    Return ""
 End Process
 
 Note: ============================================================================
-Note: DISPATCHER ENTRY POINT
+Note: Declaration Generation
 Note: ============================================================================
 
 @Reasoning:
-Single-arg wrapper matching the shape that translation.runa's central
-HIR -> target dispatcher expects: `proc hir_to_fsharp from
-FSharpEmitter with hir_root`. The underlying entry point
-generate_fsharp_code_from_hir takes a backend struct (not an HIR
-root) so this wrapper owns the backend's lifecycle: create the
-backend bound to hir_root, run the pipeline, capture the generated
-String pointer, destroy the backend, return the captured String.
+Top-level declaration dispatch. The frontend produces these top-level kinds:
+HIR_LET_STATEMENT (let binding / function), HIR_TYPE_DEFINITION (record /
+discriminated union / class / interface body), HIR_IMPORT (open directive),
+HIR_VARIABLE (val signature), and HIR_MODULE (nested module/namespace). Each is
+emitted as a standalone top-level F# declaration on its own line.
 @End Reasoning
-
-@Implementation:
-1. Null guard on hir_root returns 0.
-2. create_fsharp_backend(hir_root) builds the 80-byte backend
-   struct, registering the HIR root at offset 0 plus default
-   compilation settings (optimization_level=2, F# 8.0 target,
-   diagnostics enabled, fresh arena + error/warning logs).
-3. If backend allocation fails (returns 0), forward the failure.
-4. generate_fsharp_code_from_hir(backend) runs the full pipeline
-   (validate -> optimize -> generate -> postprocess) and returns a
-   caller-owned String pointer (or 0 on any pipeline failure).
-5. destroy_fsharp_backend releases the backend's owned resources
-   (error/warning logs, arena, the 80-byte struct) but the returned
-   String pointer is independent of the backend's arena so it
-   survives the teardown.
-6. Return the captured String pointer.
-@End Implementation
-
-Process called "hir_to_fsharp" takes hir_root as Integer returns Integer:
-    If hir_root is equal to 0:
-        Return 0
+Process called "generate_declaration" takes ctx_ptr as Integer, node as Integer returns String:
+    If node is equal to 0:
+        Return ""
     End If
 
-    Let backend be proc create_fsharp_backend with hir_root
-    If backend is equal to 0:
-        Return 0
+    Let kind be proc fs_kind with node
+
+    If kind is equal to HIR.HIR_LET_STATEMENT:
+        Let indent_str be proc get_indent with ctx_ptr
+        Let body be proc generate_let_inline with ctx_ptr, node
+        Let line be proc string_concat from StringUtils with indent_str, body
+        Set line to proc string_concat from StringUtils with line, "\n"
+        Return line
     End If
 
-    Let generated_code be proc generate_fsharp_code_from_hir with backend
-    proc destroy_fsharp_backend with backend
+    If kind is equal to HIR.HIR_TYPE_DEFINITION:
+        Return proc generate_type_definition with ctx_ptr, node
+    End If
 
-    Return generated_code
+    If kind is equal to HIRNodes.HIR_IMPORT:
+        Let indent_str be proc get_indent with ctx_ptr
+        Let name be proc fs_value with node
+        Let line be proc string_concat from StringUtils with indent_str, "open "
+        Set line to proc string_concat from StringUtils with line, name
+        Set line to proc string_concat from StringUtils with line, "\n"
+        Return line
+    End If
+
+    If kind is equal to HIRNodes.HIR_VARIABLE:
+        Return proc generate_val_signature with ctx_ptr, node
+    End If
+
+    If kind is equal to HIRNodes.HIR_MODULE:
+        Return proc generate_nested_module with ctx_ptr, node
+    End If
+
+    Note: any other top-level node is treated as an expression statement
+    Let indent_str be proc get_indent with ctx_ptr
+    Let expr_code be proc generate_expression with ctx_ptr, node
+    Let line be proc string_concat from StringUtils with indent_str, expr_code
+    Set line to proc string_concat from StringUtils with line, "\n"
+    Return line
 End Process
 
-Note: End of HIR to F# Backend
+@Reasoning:
+A "val" signature declares a value's type without a body: F# "val name : type".
+The variable node carries the name in its value slot and the declared type as
+its first child (a type node). When no type child is present we still emit
+"val name : obj" so the declaration is well-formed; the frontend re-lowers it to
+the same HIR_VARIABLE shape.
+@End Reasoning
+Process called "generate_val_signature" takes ctx_ptr as Integer, node as Integer returns String:
+    Let indent_str be proc get_indent with ctx_ptr
+    Let name be proc fs_value with node
+
+    Let line be proc string_concat from StringUtils with indent_str, "val "
+    Set line to proc string_concat from StringUtils with line, name
+    Set line to proc string_concat from StringUtils with line, " : "
+
+    Let count be proc fs_child_count with node
+    If count is greater than 0:
+        Let children be proc fs_children with node
+        Let type_node be proc list_get from List with children, 0
+        Let type_code be proc generate_type_expression with ctx_ptr, type_node
+        Set line to proc string_concat from StringUtils with line, type_code
+    Otherwise:
+        Set line to proc string_concat from StringUtils with line, "obj"
+    End If
+
+    Set line to proc string_concat from StringUtils with line, "\n"
+    Return line
+End Process
+
+@Reasoning:
+A type definition is "type Name = <body>". The body child is a record type, a
+discriminated union (enum) type, a class, an interface (protocol) or a type
+abbreviation. The name is in the type-definition node's value slot. We emit the
+"type Name =" header then dispatch on the body kind.
+@End Reasoning
+Process called "generate_type_definition" takes ctx_ptr as Integer, node as Integer returns String:
+    Let indent_str be proc get_indent with ctx_ptr
+    Let name be proc fs_value with node
+
+    Let header be proc string_concat from StringUtils with indent_str, "type "
+    Set header to proc string_concat from StringUtils with header, name
+    Set header to proc string_concat from StringUtils with header, " ="
+
+    Let count be proc fs_child_count with node
+    If count is equal to 0:
+        Set header to proc string_concat from StringUtils with header, "\n"
+        Return header
+    End If
+
+    Let children be proc fs_children with node
+    Let body be proc list_get from List with children, 0
+    Let body_kind be proc fs_kind with body
+
+    If body_kind is equal to HIR.HIR_RECORD_TYPE:
+        Let rec_code be proc generate_record_type with ctx_ptr, body
+        Let result be proc string_concat from StringUtils with header, " "
+        Set result to proc string_concat from StringUtils with result, rec_code
+        Set result to proc string_concat from StringUtils with result, "\n"
+        Return result
+    End If
+
+    If body_kind is equal to HIR.HIR_ENUM_TYPE:
+        Let union_code be proc generate_union_type with ctx_ptr, body
+        Let result be proc string_concat from StringUtils with header, union_code
+        Set result to proc string_concat from StringUtils with result, "\n"
+        Return result
+    End If
+
+    Note: abbreviation: the body is a type expression
+    Let abbr be proc generate_type_expression with ctx_ptr, body
+    Let result be proc string_concat from StringUtils with header, " "
+    Set result to proc string_concat from StringUtils with result, abbr
+    Set result to proc string_concat from StringUtils with result, "\n"
+    Return result
+End Process
+
+@Reasoning:
+An F# record type is "{ Field1 : T1; Field2 : T2 }". Each child is an
+HIR_FIELD_DEFINITION carrying the field name in its value slot and the field
+type as its first child. We render the brace-delimited semicolon-separated field
+list.
+@End Reasoning
+Process called "generate_record_type" takes ctx_ptr as Integer, node as Integer returns String:
+    Let fields be proc fs_children with node
+    Let count be proc fs_child_count with node
+    Let result be "{ "
+    Let i be 0
+    While i is less than count:
+        Let field be proc list_get from List with fields, i
+        Let fname be proc fs_value with field
+        If i is greater than 0:
+            Set result to proc string_concat from StringUtils with result, "; "
+        End If
+        Set result to proc string_concat from StringUtils with result, fname
+        Set result to proc string_concat from StringUtils with result, " : "
+
+        Let fcount be proc fs_child_count with field
+        If fcount is greater than 0:
+            Let fchildren be proc fs_children with field
+            Let ftype be proc list_get from List with fchildren, 0
+            Let ftype_code be proc generate_type_expression with ctx_ptr, ftype
+            Set result to proc string_concat from StringUtils with result, ftype_code
+        Otherwise:
+            Set result to proc string_concat from StringUtils with result, "obj"
+        End If
+
+        Set i to i plus 1
+    End While
+    Set result to proc string_concat from StringUtils with result, " }"
+    Return result
+End Process
+
+@Reasoning:
+An F# discriminated union is "| Case1 | Case2 of T". Each child is an
+HIR_VARIANT_DEFINITION carrying the case name in its value slot and an optional
+payload type as its first child. Each case is emitted on its own indented line
+as "| Name" or "| Name of T".
+@End Reasoning
+Process called "generate_union_type" takes ctx_ptr as Integer, node as Integer returns String:
+    Let cases be proc fs_children with node
+    Let count be proc fs_child_count with node
+    Let result be ""
+
+    proc indent with ctx_ptr
+    Let i be 0
+    While i is less than count:
+        Let case be proc list_get from List with cases, i
+        Let cname be proc fs_value with case
+
+        Set result to proc string_concat from StringUtils with result, "\n"
+        Let ci be proc get_indent with ctx_ptr
+        Set result to proc string_concat from StringUtils with result, ci
+        Set result to proc string_concat from StringUtils with result, "| "
+        Set result to proc string_concat from StringUtils with result, cname
+
+        Let ccount be proc fs_child_count with case
+        If ccount is greater than 0:
+            Let cchildren be proc fs_children with case
+            Let payload be proc list_get from List with cchildren, 0
+            Let payload_code be proc generate_type_expression with ctx_ptr, payload
+            Set result to proc string_concat from StringUtils with result, " of "
+            Set result to proc string_concat from StringUtils with result, payload_code
+        End If
+
+        Set i to i plus 1
+    End While
+    proc dedent with ctx_ptr
+
+    Return result
+End Process
+
+@Reasoning:
+A nested module/namespace is "module Name =" followed by its indented child
+declarations. The HIR_MODULE node carries the module name in its value slot and
+the contained declarations in its children list.
+@End Reasoning
+Process called "generate_nested_module" takes ctx_ptr as Integer, node as Integer returns String:
+    Let indent_str be proc get_indent with ctx_ptr
+    Let name be proc fs_value with node
+
+    Let result be indent_str
+    If name is not equal to 0:
+        Set result to proc string_concat from StringUtils with result, "module "
+        Set result to proc string_concat from StringUtils with result, name
+        Set result to proc string_concat from StringUtils with result, " =\n"
+    Otherwise:
+        Set result to ""
+    End If
+
+    Let children be proc fs_children with node
+    Let count be proc fs_child_count with node
+
+    Let body_indent be 0
+    If name is not equal to 0:
+        proc indent with ctx_ptr
+        Set body_indent to 1
+    End If
+
+    Let i be 0
+    While i is less than count:
+        Let child be proc list_get from List with children, i
+        Let child_code be proc generate_declaration with ctx_ptr, child
+        Set result to proc string_concat from StringUtils with result, child_code
+        Set i to i plus 1
+    End While
+
+    If body_indent is equal to 1:
+        proc dedent with ctx_ptr
+    End If
+
+    Return result
+End Process
+
+Note: ============================================================================
+Note: Top-Level Generation
+Note: ============================================================================
+
+@Reasoning:
+The translation entry returns a HIR_MODULE root whose single child is the
+translated program root (itself a HIR_MODULE for a multi-declaration file). We
+walk the outermost module's declarations; if a declaration is itself a module
+(the program-root wrapper), we recurse into its declarations so the flat F#
+chunk emits the actual top-level declarations in source order.
+@End Reasoning
+Process called "generate_module" takes ctx_ptr as Integer returns String:
+    Let ctx as FSharpCodeGenContext be ctx_ptr
+    Return proc generate_module_body with ctx_ptr, ctx.hir_module
+End Process
+
+@Reasoning:
+Emits one module's declarations. A child that is itself a HIR_MODULE carrying no
+name (the program-root wrapper the frontend inserts) is transparently flattened
+by recursing into its declarations; a named nested module is emitted as a real
+"module Name =" block via generate_declaration. This makes the wrapper invisible
+in the output while preserving genuine nested modules.
+@End Reasoning
+Process called "generate_module_body" takes ctx_ptr as Integer, module_node as Integer returns String:
+    If module_node is equal to 0:
+        Return ""
+    End If
+
+    Let declarations be proc fs_children with module_node
+    Let count be proc fs_child_count with module_node
+
+    Let result be ""
+    Let i be 0
+    While i is less than count:
+        Let decl be proc list_get from List with declarations, i
+        Let decl_kind be proc fs_kind with decl
+
+        If decl_kind is equal to HIRNodes.HIR_MODULE:
+            Let decl_name be proc fs_value with decl
+            If decl_name is equal to 0:
+                Note: anonymous program-root wrapper: flatten transparently
+                Let inner be proc generate_module_body with ctx_ptr, decl
+                Set result to proc string_concat from StringUtils with result, inner
+            Otherwise:
+                Let named be proc generate_declaration with ctx_ptr, decl
+                Set result to proc string_concat from StringUtils with result, named
+            End If
+        Otherwise:
+            Let decl_code be proc generate_declaration with ctx_ptr, decl
+            Set result to proc string_concat from StringUtils with result, decl_code
+        End If
+
+        Set i to i plus 1
+    End While
+
+    Return result
+End Process
+
+@Reasoning:
+Public entry used by the translation driver and the round-trip probe. Wraps the
+create-context + generate-module pair so callers don't manage the context
+lifecycle. The returned String holds the complete F# source.
+@End Reasoning
+Process called "generate_fsharp_code" takes hir_module as Integer returns String:
+    Let ctx be proc create_codegen_context with hir_module
+    Let code be proc generate_module with ctx
+    Return code
+End Process
+
+@Reasoning:
+Backward-compatible public name retained from the original backend interface:
+the driver may call either hir_to_fsharp or generate_fsharp_code; both produce
+the complete F# source string for the given HIR module root.
+@End Reasoning
+Process called "hir_to_fsharp" takes hir_root as Integer returns String:
+    Return proc generate_fsharp_code with hir_root
+End Process
+
+Note: ============================================================================
+Note: F# operator / token spelling recovery
+Note: ============================================================================
+
+@Reasoning:
+Binary expressions carry the original F# lexer token id in their operator slot.
+The F# lexer assigns small dense integer ids to its tokens; this cascade maps
+the operator token ids to their F# infix spellings. The mapping covers
+arithmetic, comparison, equality, logical, bitwise, the pipe operators (|> <|)
+and the composition operators (>> <<). The token ids are the F# lexer's
+published TOKEN_* constants, matched here by importing them so the spelling is
+anchored to the exact ids the frontend wrote. The fallback returns "+" so an
+unmapped operator degrades to syntactically valid F#.
+@End Reasoning
+Process called "fsharp_operator_spelling" takes token_id as Integer returns String:
+    If token_id is equal to TOKEN_PLUS from FSharpLexer:
+        Return "+"
+    End If
+    If token_id is equal to TOKEN_MINUS from FSharpLexer:
+        Return "-"
+    End If
+    If token_id is equal to TOKEN_MULTIPLY from FSharpLexer:
+        Return "*"
+    End If
+    If token_id is equal to TOKEN_DIVIDE from FSharpLexer:
+        Return "/"
+    End If
+    If token_id is equal to TOKEN_MODULO from FSharpLexer:
+        Return "%"
+    End If
+    If token_id is equal to TOKEN_POWER from FSharpLexer:
+        Return "**"
+    End If
+    If token_id is equal to TOKEN_EQUAL from FSharpLexer:
+        Return "="
+    End If
+    If token_id is equal to TOKEN_NOT_EQUAL from FSharpLexer:
+        Return "<>"
+    End If
+    If token_id is equal to TOKEN_LESS_THAN from FSharpLexer:
+        Return "<"
+    End If
+    If token_id is equal to TOKEN_GREATER_THAN from FSharpLexer:
+        Return ">"
+    End If
+    If token_id is equal to TOKEN_LESS_EQUAL from FSharpLexer:
+        Return "<="
+    End If
+    If token_id is equal to TOKEN_GREATER_EQUAL from FSharpLexer:
+        Return ">="
+    End If
+    If token_id is equal to TOKEN_AND_OP from FSharpLexer:
+        Return "&&"
+    End If
+    If token_id is equal to TOKEN_OR_OP from FSharpLexer:
+        Return "||"
+    End If
+    If token_id is equal to TOKEN_PIPE_RIGHT from FSharpLexer:
+        Return "|>"
+    End If
+    If token_id is equal to TOKEN_PIPE_LEFT from FSharpLexer:
+        Return "<|"
+    End If
+    If token_id is equal to TOKEN_COMPOSE_RIGHT from FSharpLexer:
+        Return ">>"
+    End If
+    If token_id is equal to TOKEN_COMPOSE_LEFT from FSharpLexer:
+        Return "<<"
+    End If
+    If token_id is equal to TOKEN_STRING_CONCAT from FSharpLexer:
+        Return "+"
+    End If
+
+    Return "+"
+End Process
+
+@Reasoning:
+The for-loop iterator variable is stored as a raw F# lexer token; its name is
+the token's text. Routing through the lexer's get_token_text accessor recovers
+the source identifier exactly, so the emitted "for name in ..." matches the
+original loop variable.
+@End Reasoning
+Process called "fsharp_token_text" takes token as Integer returns String:
+    If token is equal to 0:
+        Return "_"
+    End If
+    Let text be proc get_token_text from FSharpLexer with token
+    If text is equal to 0:
+        Return "_"
+    End If
+    Return text
+End Process
+
+Note: ============================================================================
+Note: Diagnostics accessors
+Note: ============================================================================
+
+@Reasoning:
+Predicate accessor for the had_error sentinel; returns the raw 0/1 integer
+because Boolean is Integer in the bootstrap layer. The driver consults this
+after generation to decide whether to surface diagnostics.
+@End Reasoning
+Process called "had_codegen_errors" takes ctx_ptr as Integer returns Integer:
+    Let ctx as FSharpCodeGenContext be ctx_ptr
+    Return ctx.had_error
+End Process
+
+@Reasoning:
+Exposes the accumulated error-message list pointer so the driver can iterate
+diagnostics; the list is owned by the context.
+@End Reasoning
+Process called "get_codegen_errors" takes ctx_ptr as Integer returns Integer:
+    Let ctx as FSharpCodeGenContext be ctx_ptr
+    Return ctx.errors
+End Process

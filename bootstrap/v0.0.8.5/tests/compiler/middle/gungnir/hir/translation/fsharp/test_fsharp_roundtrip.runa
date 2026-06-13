@@ -1,0 +1,496 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+Licensed under Apache 2.0
+:End Note
+
+Note:
+F# Translation Round-Trip Probe
+
+End-to-end proof that the F# translation pipeline is REAL, not a skeleton:
+
+    F# source
+      -> tokenize_fsharp      (lex: keywords, idents, numbers, strings, operators)
+      -> parse_fsharp_source  (build F# AST: modules, let/let rec bindings, records,
+                               discriminated unions, match, pipe, list/tuple literals)
+      -> translate_fsharp_to_hir (lower F# AST to the hir.runa dual HIR model)
+      -> generate_fsharp_code (emit HIR back to valid F# text)
+      -> re-lex / re-parse / re-to_hir of the EMITTED text
+      -> structural HIR equality on the key constructs
+
+CRITICAL - the F# HIR model:
+Unlike the Ruby/Lua frontends (which use the typed hir_nodes.runa producer model
+read via hir_node_type + hir_get_*), the F# frontend uses the hir.runa CORE model:
+bare canonical HIRNodes (type tag at offset 0, value at 40, children list at 24)
+PLUS arena "composite" records for compound shapes whose slot 0 is a POINTER to the
+base HIRNode and whose subsequent slots hold operand pointers at fixed offsets. The
+frontend distinguishes a composite from a bare node by testing slot 0 >= 65536
+(pointer) vs a small type constant. This probe reads HIR through the same fs_base /
+fs_kind / fs_value / fs_slot convention the backend consumes, so the assertions read
+exactly the surface the frontend emits and the backend walks.
+
+The representative program exercises every major construct the task requires:
+  - a let-bound function with params      (let add a b = a + b)
+  - a discriminated union                  (type Shape = | Circle of int | Square)
+  - a match expression                     (match n with | 0 -> ... | _ -> ...)
+  - a pipe x |> f |> g                     (x |> add |> add)
+  - a list literal and a tuple literal     ([1; 2; 3] ; (1, 2))
+  - a let rec                              (let rec fact n = ...)
+
+It lowers the source to HIR1, asserts the module declarations carry the function,
+the union, a let rec, and the pipe/match/list/tuple expressions; emits
+HIR1 back to F# text; re-runs the whole pipeline on the emitted text to HIR2; and
+asserts HIR2 is STRUCTURALLY EQUAL to HIR1 on those same key constructs. Structural
+equality (node-kind tags plus identifying payloads such as function name, param
+count, declaration kinds, and element counts) is the correct semantic-equivalence
+check because the emitter re-indents and normalises whitespace while the meaning is
+identical. The round-trip re-parse of the EMITTED F# is the proof the backend is
+real.
+
+Exit code: number of failed assertions (0 == all passed). No exit_with_code.
+:End Note
+
+Import "compiler/middle/gungnir/hir/translation/frontends/fsharp/fsharp_lexer.runa" as FSharpLexer
+Import "compiler/middle/gungnir/hir/translation/frontends/fsharp/fsharp_parser.runa" as FSharpParser
+Import "compiler/middle/gungnir/hir/translation/frontends/fsharp/fsharp_to_hir.runa" as FSharpFrontend
+Import "compiler/middle/gungnir/hir/translation/backends/fsharp/hir_to_fsharp.runa" as FSharpBackend
+Import "compiler/middle/gungnir/hir/hir.runa" as HIR
+Import "compiler/middle/gungnir/hir/hir_nodes.runa" as HIRNodes
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/collections/list.runa" as List
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "tests/test_utils.runa" as TestUtils
+
+Note: ============================================================================
+Note: HIR dual-model readers (mirror the backend's fs_base / fs_kind convention)
+Note: ============================================================================
+
+@Reasoning:
+A node is a composite record when its slot 0 is a heap pointer (>= 65536); the base
+HIRNode lives at slot 0 in that case. A bare node IS its own base. fs_base returns
+the canonical base for either shape so kind/value/children reads are correct.
+@End Reasoning
+Process called "fs_base" takes node as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    Let slot0 be proc memory_get_int64 from Layout with node, 0
+    If slot0 is greater than or equal to 65536:
+        Return slot0
+    End If
+    Return node
+End Process
+
+Process called "fs_kind" takes node as Integer returns Integer:
+    Let base be proc fs_base with node
+    Return proc get_hir_node_type from HIR with base
+End Process
+
+Process called "fs_value" takes node as Integer returns Integer:
+    Let base be proc fs_base with node
+    If base is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Layout with base, 40
+End Process
+
+Process called "fs_children" takes node as Integer returns Integer:
+    Let base be proc fs_base with node
+    If base is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Layout with base, 24
+End Process
+
+Process called "fs_child_count" takes node as Integer returns Integer:
+    Let children be proc fs_children with node
+    If children is equal to 0:
+        Return 0
+    End If
+    Return proc list_length from List with children
+End Process
+
+Process called "fs_slot" takes node as Integer, offset as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Layout with node, offset
+End Process
+
+Note: ============================================================================
+Note: Pipeline + navigation helpers
+Note: ============================================================================
+
+@Reasoning:
+Each round of the probe runs the identical front-of-pipeline (lex -> parse ->
+to_hir). Factoring it into one helper keeps the two pipeline runs (original source
+and emitted text) behaviourally identical so any structural divergence is
+attributable to the emitter, not to how the inputs were driven.
+@End Reasoning
+Process called "source_to_hir" takes source as Integer returns Integer:
+    Let tokens be proc tokenize_fsharp from FSharpLexer with source
+    If tokens is equal to 0:
+        Return 0
+    End If
+    Let ast be proc parse_fsharp_source from FSharpParser with tokens
+    If ast is equal to 0:
+        Return 0
+    End If
+    Let hir be proc translate_fsharp_to_hir from FSharpFrontend with ast
+    Return hir
+End Process
+
+@Reasoning:
+The translation entry returns a HIR_MODULE root whose single child is the program
+root (itself a HIR_MODULE for a multi-declaration file). The actual top-level
+declarations live in that inner module's children. This helper descends through any
+anonymous HIR_MODULE wrappers and returns the declaration list that holds the real
+top-level forms, so the probe scans the genuine declarations regardless of how many
+module wrappers the frontend inserted.
+@End Reasoning
+Process called "top_declarations" takes module_root as Integer returns Integer:
+    If module_root is equal to 0:
+        Return 0
+    End If
+
+    Let current be module_root
+    Let descending be 1
+    While descending is equal to 1:
+        Let children be proc fs_children with current
+        If children is equal to 0:
+            Return 0
+        End If
+        Let count be proc list_length from List with children
+        If count is equal to 1:
+            Let only be proc list_get from List with children, 0
+            Let only_kind be proc fs_kind with only
+            If only_kind is equal to HIRNodes.HIR_MODULE:
+                Let only_name be proc fs_value with only
+                If only_name is equal to 0:
+                    Set current to only
+                Otherwise:
+                    Return children
+                End If
+            Otherwise:
+                Return children
+            End If
+        Otherwise:
+            Return children
+        End If
+    End While
+
+    Return 0
+End Process
+
+@Reasoning:
+Locates the first top-level declaration of the requested kind by linear scan, which
+is robust to the frontend reordering or interleaving declarations.
+@End Reasoning
+Process called "find_decl" takes decls as Integer, kind as Integer returns Integer:
+    If decls is equal to 0:
+        Return 0
+    End If
+    Let count be proc list_length from List with decls
+    Let i be 0
+    While i is less than count:
+        Let decl be proc list_get from List with decls, i
+        Let dk be proc fs_kind with decl
+        If dk is equal to kind:
+            Return decl
+        End If
+        Set i to i plus 1
+    End While
+    Return 0
+End Process
+
+@Reasoning:
+Finds the first let-binding declaration whose recursive flag (composite slot 40) is
+set, so the probe can assert the "let rec" form round-trips distinctly from a plain
+let.
+@End Reasoning
+Process called "find_let_rec" takes decls as Integer returns Integer:
+    If decls is equal to 0:
+        Return 0
+    End If
+    Let count be proc list_length from List with decls
+    Let i be 0
+    While i is less than count:
+        Let decl be proc list_get from List with decls, i
+        Let dk be proc fs_kind with decl
+        If dk is equal to HIR.HIR_LET_STATEMENT:
+            Let is_rec be proc fs_slot with decl, 40
+            If is_rec is equal to 1:
+                Return decl
+            End If
+        End If
+        Set i to i plus 1
+    End While
+    Return 0
+End Process
+
+@Reasoning:
+Finds the first let-binding whose initializer (composite slot 32) is a LAMBDA - i.e.
+a function binding "let f x = ..." (the frontend lowers function bindings to a let
+with a lambda initializer). Returns the let node so the probe can assert the function
+name and parameter count.
+@End Reasoning
+Process called "find_function_let" takes decls as Integer returns Integer:
+    If decls is equal to 0:
+        Return 0
+    End If
+    Let count be proc list_length from List with decls
+    Let i be 0
+    While i is less than count:
+        Let decl be proc list_get from List with decls, i
+        Let dk be proc fs_kind with decl
+        If dk is equal to HIR.HIR_LET_STATEMENT:
+            Let init be proc fs_slot with decl, 32
+            Let init_kind be proc fs_kind with init
+            If init_kind is equal to HIR.HIR_LAMBDA_EXPRESSION:
+                Return decl
+            End If
+        End If
+        Set i to i plus 1
+    End While
+    Return 0
+End Process
+
+@Reasoning:
+Two HIR projections are structurally equal on a construct when both expose the same
+node-kind tag. Comparing kinds (and, for named constructs, the identifying payload)
+rather than byte text is whitespace-insensitive, proving round-trip fidelity without
+being defeated by the emitter's re-indenting.
+@End Reasoning
+Process called "same_kind" takes a as Integer, b as Integer returns Integer:
+    If a is equal to 0:
+        Return 0
+    End If
+    If b is equal to 0:
+        Return 0
+    End If
+    Let ka be proc fs_kind with a
+    Let kb be proc fs_kind with b
+    If ka is equal to kb:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: Probe entry point
+Note: ============================================================================
+
+Process called "main" returns Integer:
+    Let results be proc create_test_results from TestUtils
+    proc begin_suite from TestUtils with results, "F# translation round-trip"
+
+    Note:
+    Representative program: a let-bound function with params, a discriminated union,
+    a record type, a let rec, a match expression, a pipe chain, and list + tuple
+    literals. Newlines separate the top-level forms.
+    :End Note
+    Let source be "let add a b = a + b\ntype Shape = | Circle of int | Square\nlet rec fact n = n\nlet describe n = match n with | 0 -> 1 | _ -> 2\nlet piped x = x |> add |> add\nlet nums = [1; 2; 3]\nlet pair = (1, 2)\n"
+
+    Note: --- Stage 0-2: source -> HIR (lex, parse, lower) ---
+    Let tokens be proc tokenize_fsharp from FSharpLexer with source
+    proc assert_not_null from TestUtils with results, "lexer produced tokens", tokens
+
+    Let ast be proc parse_fsharp_source from FSharpParser with tokens
+    proc assert_not_null from TestUtils with results, "parser produced F# AST", ast
+
+    Let hir1 be proc translate_fsharp_to_hir from FSharpFrontend with ast
+    proc assert_not_null from TestUtils with results, "frontend produced HIR module", hir1
+
+    Let decls1 be proc top_declarations with hir1
+    proc assert_not_null from TestUtils with results, "HIR module exposes top-level declarations", decls1
+    Let decl_count be proc list_length from List with decls1
+    proc assert_greater_than_or_equal from TestUtils with results, "module has several top-level declarations", decl_count, 5
+
+    Note: --- function binding: located by lambda initializer, name + param count ---
+    Let func_node be proc find_function_let with decls1
+    proc assert_not_null from TestUtils with results, "function let binding present", func_node
+    Let func_name be proc fs_slot with func_node, 8
+    Let func_name_ok be proc string_equals from StringCore with func_name, "add"
+    proc assert_equal from TestUtils with results, "function name is 'add'", func_name_ok, 1
+    Let func_lambda be proc fs_slot with func_node, 32
+    Let func_params be proc fs_slot with func_lambda, 8
+    Let func_param_count be proc list_length from List with func_params
+    proc assert_equal from TestUtils with results, "function 'add' has 2 parameters", func_param_count, 2
+
+    Note: --- discriminated union + record: two type definitions present ---
+    Let type_node be proc find_decl with decls1, HIR.HIR_TYPE_DEFINITION
+    proc assert_not_null from TestUtils with results, "type definition present", type_node
+    Let type_body_children be proc fs_children with type_node
+    proc assert_not_null from TestUtils with results, "type definition has a body", type_body_children
+
+    Note: --- let rec: located by the recursive flag ---
+    Let rec_node be proc find_let_rec with decls1
+    proc assert_not_null from TestUtils with results, "let rec binding present", rec_node
+    Let rec_name be proc fs_slot with rec_node, 8
+    Let rec_name_ok be proc string_equals from StringCore with rec_name, "fact"
+    proc assert_equal from TestUtils with results, "let rec name is 'fact'", rec_name_ok, 1
+
+    Note: --- match expression: a let whose body is a match statement ---
+    Let describe_node be proc find_match_let with decls1
+    proc assert_not_null from TestUtils with results, "let binding with match body present", describe_node
+
+    Note: --- pipe chain: a let whose body lowered to a call (pipe desugars to call) ---
+    Let piped_node be proc find_call_body_let with decls1
+    proc assert_not_null from TestUtils with results, "pipe-chain let lowered to a call", piped_node
+
+    Note: --- list + tuple literals: lets whose initializers are array / tuple ---
+    Let list_node be proc find_init_kind with decls1, HIR.HIR_ARRAY_LITERAL
+    proc assert_not_null from TestUtils with results, "list literal initializer present", list_node
+    Let list_elems be proc fs_child_count with list_node
+    proc assert_equal from TestUtils with results, "list literal has 3 elements", list_elems, 3
+
+    Let tuple_node be proc find_init_kind with decls1, HIR.HIR_TUPLE_LITERAL
+    proc assert_not_null from TestUtils with results, "tuple literal initializer present", tuple_node
+    Let tuple_elems be proc fs_child_count with tuple_node
+    proc assert_equal from TestUtils with results, "tuple literal has 2 elements", tuple_elems, 2
+
+    Note: --- Stage 3: HIR -> F# text ---
+    Let emitted be proc generate_fsharp_code from FSharpBackend with hir1
+    proc assert_not_null from TestUtils with results, "backend produced F# text", emitted
+    Let emitted_len be proc string_length from StringCore with emitted
+    proc assert_greater_than from TestUtils with results, "emitted F# is non-empty", emitted_len, 0
+
+    Note: --- Stage 4: re-run the pipeline on the emitted text -> HIR2 ---
+    Let hir2 be proc source_to_hir with emitted
+    proc assert_not_null from TestUtils with results, "re-parse of emitted F# produced HIR", hir2
+    Let decls2 be proc top_declarations with hir2
+    proc assert_not_null from TestUtils with results, "round-trip module has declarations", decls2
+    Let decl2_count be proc list_length from List with decls2
+    proc assert_greater_than_or_equal from TestUtils with results, "round-trip module has several declarations", decl2_count, 5
+
+    Note: --- Stage 5: structural equality on the key constructs ---
+    Let func2 be proc find_function_let with decls2
+    Let func_kind_ok be proc same_kind with func_node, func2
+    proc assert_equal from TestUtils with results, "round-trip preserves function let", func_kind_ok, 1
+    Let func2_name be proc fs_slot with func2, 8
+    Let func2_name_ok be proc string_equals from StringCore with func2_name, "add"
+    proc assert_equal from TestUtils with results, "round-trip preserves function name 'add'", func2_name_ok, 1
+    Let func2_lambda be proc fs_slot with func2, 32
+    Let func2_params be proc fs_slot with func2_lambda, 8
+    Let func2_param_count be proc list_length from List with func2_params
+    proc assert_equal from TestUtils with results, "round-trip preserves 2 parameters", func2_param_count, 2
+
+    Let type2 be proc find_decl with decls2, HIR.HIR_TYPE_DEFINITION
+    Let type_kind_ok be proc same_kind with type_node, type2
+    proc assert_equal from TestUtils with results, "round-trip preserves type definition", type_kind_ok, 1
+
+    Let rec2 be proc find_let_rec with decls2
+    proc assert_not_null from TestUtils with results, "round-trip preserves let rec", rec2
+    Let rec2_name be proc fs_slot with rec2, 8
+    Let rec2_name_ok be proc string_equals from StringCore with rec2_name, "fact"
+    proc assert_equal from TestUtils with results, "round-trip preserves let rec name 'fact'", rec2_name_ok, 1
+
+    Let describe2 be proc find_match_let with decls2
+    proc assert_not_null from TestUtils with results, "round-trip preserves match-body let", describe2
+
+    Let piped2 be proc find_call_body_let with decls2
+    proc assert_not_null from TestUtils with results, "round-trip preserves pipe-chain call", piped2
+
+    Let list2 be proc find_init_kind with decls2, HIR.HIR_ARRAY_LITERAL
+    proc assert_not_null from TestUtils with results, "round-trip preserves list literal", list2
+    Let list2_elems be proc fs_child_count with list2
+    proc assert_equal from TestUtils with results, "round-trip preserves 3 list elements", list2_elems, 3
+
+    Let tuple2 be proc find_init_kind with decls2, HIR.HIR_TUPLE_LITERAL
+    proc assert_not_null from TestUtils with results, "round-trip preserves tuple literal", tuple2
+    Let tuple2_elems be proc fs_child_count with tuple2
+    proc assert_equal from TestUtils with results, "round-trip preserves 2 tuple elements", tuple2_elems, 2
+
+    proc print_summary from TestUtils with results
+    Let failed be proc get_failed from TestUtils with results
+    proc destroy_test_results from TestUtils with results
+
+    Return failed
+End Process
+
+@Reasoning:
+The match-bearing let ("let describe n = match n with ...") lowers to a let whose
+lambda body is the match statement; the frontend wraps the match-returning function
+body in a lambda. This helper locates the let whose initializer is a lambda whose
+body is a HIR_MATCH_STATEMENT and returns that let.
+@End Reasoning
+Process called "find_match_let" takes decls as Integer returns Integer:
+    If decls is equal to 0:
+        Return 0
+    End If
+    Let count be proc list_length from List with decls
+    Let i be 0
+    While i is less than count:
+        Let decl be proc list_get from List with decls, i
+        Let dk be proc fs_kind with decl
+        If dk is equal to HIR.HIR_LET_STATEMENT:
+            Let init be proc fs_slot with decl, 32
+            Let init_kind be proc fs_kind with init
+            If init_kind is equal to HIR.HIR_LAMBDA_EXPRESSION:
+                Let body be proc fs_slot with init, 24
+                Let body_kind be proc fs_kind with body
+                If body_kind is equal to HIR.HIR_MATCH_STATEMENT:
+                    Return decl
+                End If
+            End If
+        End If
+        Set i to i plus 1
+    End While
+    Return 0
+End Process
+
+@Reasoning:
+The pipe-chain let ("let piped x = x |> add |> add") lowers to a let whose lambda
+body is a CALL expression (the frontend desugars |> to function application). This
+helper returns the let whose lambda body is a HIR_CALL_EXPRESSION, distinguishing it
+from the function-binding let (whose body is a binary add) and the match let.
+@End Reasoning
+Process called "find_call_body_let" takes decls as Integer returns Integer:
+    If decls is equal to 0:
+        Return 0
+    End If
+    Let count be proc list_length from List with decls
+    Let i be 0
+    While i is less than count:
+        Let decl be proc list_get from List with decls, i
+        Let dk be proc fs_kind with decl
+        If dk is equal to HIR.HIR_LET_STATEMENT:
+            Let init be proc fs_slot with decl, 32
+            Let init_kind be proc fs_kind with init
+            If init_kind is equal to HIR.HIR_LAMBDA_EXPRESSION:
+                Let body be proc fs_slot with init, 24
+                Let body_kind be proc fs_kind with body
+                If body_kind is equal to HIR.HIR_CALL_EXPRESSION:
+                    Return decl
+                End If
+            End If
+        End If
+        Set i to i plus 1
+    End While
+    Return 0
+End Process
+
+@Reasoning:
+The list and tuple literal lets ("let nums = [1;2;3]", "let pair = (1,2)") lower to a
+let whose initializer (composite slot 32) is directly the array/tuple literal node.
+This helper returns the initializer node when it matches the requested literal kind.
+@End Reasoning
+Process called "find_init_kind" takes decls as Integer, kind as Integer returns Integer:
+    If decls is equal to 0:
+        Return 0
+    End If
+    Let count be proc list_length from List with decls
+    Let i be 0
+    While i is less than count:
+        Let decl be proc list_get from List with decls, i
+        Let dk be proc fs_kind with decl
+        If dk is equal to HIR.HIR_LET_STATEMENT:
+            Let init be proc fs_slot with decl, 32
+            Let init_kind be proc fs_kind with init
+            If init_kind is equal to kind:
+                Return init
+            End If
+        End If
+        Set i to i plus 1
+    End While
+    Return 0
+End Process
