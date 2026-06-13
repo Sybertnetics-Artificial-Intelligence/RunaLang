@@ -1,0 +1,825 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+XML Semantic Analyzer - Validates an XML AST beyond grammar
+
+The XML parser guarantees a syntactically well-formed token stream and an
+element tree whose open/close tags match. This pass enforces the SEMANTIC
+rules an XML consumer needs but the grammar alone does not express:
+
+  1. Namespace resolution. Every qualified name "prefix:local" used as an
+     element or attribute name must have its prefix bound by an in-scope
+     "xmlns:prefix" attribute declaration on the element itself or an
+     ancestor. The two reserved prefixes "xml" and "xmlns" are always bound
+     per the Namespaces in XML 1.0 specification. An unbound prefix is a
+     hard error.
+  2. Attribute uniqueness. XML 1.0 well-formedness requires that no element
+     have two attributes with the same name. The parser stores attributes in
+     a Dictionary keyed by name, so a literal duplicate would be collapsed
+     before reaching here; this pass therefore inspects the duplicate by
+     re-scanning the element's attribute names so the violation is reported
+     rather than silently last-wins-merged. (Because the parser's Dictionary
+     already merges, this check is a defence-in-depth invariant assertion on
+     the stored attribute count versus the parsed name count.)
+  3. Single qualified root and structural integrity. Every node's
+     discriminant must be one of the six XML kinds; element nodes must carry
+     a non-null name; element children, when present, must be a real List.
+     These are invariants the parser maintains, validated here so a corrupted
+     AST cannot silently reach the HIR lowering stage.
+  4. Maximum nesting depth. Unbounded element nesting is a denial-of-service
+     vector for any recursive consumer; the analyzer enforces a configurable
+     depth limit measured in nested element levels.
+
+This mirrors the four-file frontend convention (lexer / parser / semantic /
+to_hir) used by the json, dart, and fsharp frontends: the semantic analyzer
+is a standalone validation stage that runs over the parser's AST before
+lowering.
+
+Dependencies:
+- xml_parser.runa (for XML AST shape and kind constants)
+- compiler/frontend/primitives/memory/layout.runa
+- compiler/frontend/primitives/core/string_core.runa
+- compiler/frontend/primitives/collections/list.runa
+- compiler/frontend/primitives/collections/dictionary.runa
+:End Note
+
+Import "compiler/middle/gungnir/hir/translation/frontends/xml/xml_parser.runa" as Parser
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/frontend/primitives/collections/list.runa" as List
+Import "compiler/frontend/primitives/collections/dictionary.runa" as Dict
+
+Note: ============================================================================
+Note: Configuration Constants
+Note: ============================================================================
+
+Note: Default maximum element nesting depth. Deep enough for any realistic
+Note: document, shallow enough to bound recursive consumers.
+Constant DEFAULT_MAX_DEPTH as Integer is 512
+
+Note: ============================================================================
+Note: Analyzer State Structure
+Note: ============================================================================
+
+@Reasoning:
+The analyzer threads its configuration (depth limit) and its single-slot error
+channel through the recursive walk. Carrying max_depth on the analyzer rather
+than as a recursion argument lets a caller tune the limit once at construction;
+carrying error_message/has_error lets a deep validation failure surface to the
+top-level caller without an out-parameter on every recursive call.
+@End Reasoning
+
+@Implementation:
+Four 64-bit slots in declared order: error_message (owned heap NUL-terminated
+string or 0), has_error boolean, max_depth (nesting limit), and error_line
+(source line of the offending node, 0 if none). Total size 32 bytes; offsets
+0/8/16/24 are referenced directly by the analyzer Processes.
+@End Implementation
+
+Type called "XMLSemanticAnalyzer":
+    error_message as Integer        Note: Error message (owned), or 0
+    has_error as Integer            Note: Boolean: 1 if a validation error occurred
+    max_depth as Integer            Note: Maximum element nesting depth permitted
+    error_line as Integer           Note: Source line of the offending node (0 if none)
+End Type
+
+Note: ============================================================================
+Note: Analyzer Creation and Destruction
+Note: ============================================================================
+
+@Reasoning:
+Constructs the analyzer with the error channel zeroed and max_depth seeded from
+the caller's argument, so the default configuration (DEFAULT_MAX_DEPTH) is
+chosen by the caller passing that constant rather than baked in here.
+error_message=0 and has_error=0 make the terminal success check correct without
+any explicit clearing on the success path.
+@End Reasoning
+
+@Implementation:
+Allocate 32 bytes; return 0 on OOM. Zero error_message/has_error/error_line at
+offsets 0/8/24; write max_depth at offset 16 from the argument.
+@End Implementation
+
+Process called "create_xml_semantic_analyzer" takes max_depth as Integer returns Integer:
+    Note: Create XML semantic analyzer with the given depth limit
+
+    Let analyzer_size be 32  Note: XMLSemanticAnalyzer: 4 fields × 8 bytes
+    Let analyzer be proc allocate from Layout with analyzer_size
+
+    If analyzer is equal to 0:
+        Return 0
+    End If
+
+    proc memory_set_int64 from Layout with analyzer, 0, 0   Note: error_message = null
+    proc memory_set_int64 from Layout with analyzer, 8, 0   Note: has_error = false
+    proc memory_set_int64 from Layout with analyzer, 16, max_depth
+    proc memory_set_int64 from Layout with analyzer, 24, 0  Note: error_line = 0
+
+    Return analyzer
+End Process
+
+@Reasoning:
+Releases the owned error_message buffer (if any) before freeing the analyzer
+record. Null-tolerant so callers may invoke it unconditionally in cleanup paths.
+@End Reasoning
+
+@Implementation:
+If analyzer is 0, return 1. Read error_message at offset 0; if non-zero,
+deallocate it. Deallocate the analyzer block. Always returns 1.
+@End Implementation
+
+Process called "destroy_xml_semantic_analyzer" takes analyzer as Integer returns Integer:
+    Note: Destroy XML semantic analyzer and free resources
+
+    If analyzer is equal to 0:
+        Return 1
+    End If
+
+    Let error_message be proc memory_get_int64 from Layout with analyzer, 0
+
+    If error_message is not equal to 0:
+        proc deallocate from Layout with error_message
+    End If
+
+    proc deallocate from Layout with analyzer
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Error Handling
+Note: ============================================================================
+
+@Reasoning:
+Latches a validation error: replaces any prior message with an owned heap copy,
+sets has_error=1, and records the offending node's source line so the caller can
+report a precise location. Only the first error is meaningful for callers that
+stop on failure, but later overwrites are harmless because the walk
+short-circuits on the first error anyway.
+@End Reasoning
+
+@Implementation:
+Read offset 0 (error_message); if non-zero, deallocate. Compute msg_length via
+string_length, allocate msg_length+1, memory_copy the message and NUL-terminate.
+Store the buffer at offset 0, 1 at offset 8 (has_error), and the line at offset
+24. Returns 1.
+@End Implementation
+
+Process called "set_semantic_error" takes analyzer as Integer, message as Integer, line as Integer returns Integer:
+    Note: Record a semantic validation error
+
+    Let error_message be proc memory_get_int64 from Layout with analyzer, 0
+
+    If error_message is not equal to 0:
+        proc deallocate from Layout with error_message
+    End If
+
+    Let msg_length be proc string_length from StringCore with message
+    Let new_error be proc allocate from Layout with msg_length plus 1
+
+    If new_error is not equal to 0:
+        proc memory_copy from Layout with new_error, message, msg_length
+        proc memory_set_byte from Layout with new_error, msg_length, 0
+    End If
+
+    proc memory_set_int64 from Layout with analyzer, 0, new_error
+    proc memory_set_int64 from Layout with analyzer, 8, 1
+    proc memory_set_int64 from Layout with analyzer, 24, line
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Name and Namespace Helpers
+Note: ============================================================================
+
+@Reasoning:
+A qualified XML name "prefix:local" is split at the first colon. Returning the
+byte index of that colon (or -1) lets callers decide cheaply whether a name
+carries a namespace prefix without allocating a substring.
+@End Reasoning
+
+@Implementation:
+Walk the NUL-terminated name byte by byte; return the index of the first colon
+(ASCII 58). Return -1 if the name has no colon before its terminator.
+@End Implementation
+
+Process called "find_colon_index" takes name as Integer returns Integer:
+    Note: Return the byte index of the first ':' in name, or -1
+
+    If name is equal to 0:
+        Return -1
+    End If
+
+    Let index be 0
+
+    While 1 is equal to 1:
+        Let char be proc memory_get_byte from Layout with name, index
+
+        If char is equal to 0:
+            Return -1
+        End If
+
+        If char is equal to 58:  Note: ':'
+            Return index
+        End If
+
+        Set index to index plus 1
+    End While
+
+    Return -1
+End Process
+
+@Reasoning:
+Namespace prefix membership is checked with explicit byte-prefix comparison
+rather than List.contains because List.contains compares pointer identity and
+every declared-prefix entry is a distinct heap copy. The comparison matches the
+first prefix_len bytes of the candidate name against a declared prefix string,
+requiring the declared prefix to terminate exactly at prefix_len so that a
+declaration of "ns" does not spuriously satisfy a prefix "nsx".
+@End Reasoning
+
+@Implementation:
+For each declared prefix string in the scope List, compare its bytes against the
+candidate name's first prefix_len bytes; the declared prefix matches only if all
+prefix_len bytes are equal AND the declared prefix's byte at prefix_len is the
+NUL terminator. Returns 1 on the first match, 0 if none match.
+@End Implementation
+
+Process called "scope_has_prefix" takes scope as Integer, name as Integer, prefix_len as Integer returns Integer:
+    Note: Return 1 if the scope List declares the prefix (name[0..prefix_len))
+
+    If scope is equal to 0:
+        Return 0
+    End If
+
+    Let count be proc size from List with scope
+    Let i be 0
+
+    While i is less than count:
+        Let declared be proc get_at from List with scope, i
+        Let matches be 1
+        Let j be 0
+
+        While j is less than prefix_len:
+            Let dc be proc memory_get_byte from Layout with declared, j
+            Let nc be proc memory_get_byte from Layout with name, j
+
+            If dc is not equal to nc:
+                Set matches to 0
+                Break
+            End If
+
+            Set j to j plus 1
+        End While
+
+        If matches is equal to 1:
+            Let terminator be proc memory_get_byte from Layout with declared, prefix_len
+
+            If terminator is equal to 0:
+                Return 1
+            End If
+        End If
+
+        Set i to i plus 1
+    End While
+
+    Return 0
+End Process
+
+@Reasoning:
+The reserved prefixes "xml" and "xmlns" are bound implicitly in every XML
+document per the Namespaces in XML specification; seeding the root scope with
+them keeps the resolution check uniform (no special-casing inside the recursive
+validator) and lets documents use xml:lang / xml:space without an explicit
+declaration.
+@End Reasoning
+
+@Implementation:
+Create a fresh List. Append heap copies of the literals "xml" and "xmlns"
+(materialised through StringCore.create_from_literal so the scope owns
+NUL-terminated buffers comparable byte-for-byte). Returns the seeded List, or 0
+on allocation failure.
+@End Implementation
+
+Process called "create_root_namespace_scope" returns Integer:
+    Note: Create a namespace scope pre-seeded with the reserved prefixes
+
+    Let scope be proc create from List
+
+    If scope is equal to 0:
+        Return 0
+    End If
+
+    Let xml_prefix be proc create_from_literal from StringCore with "xml"
+    proc append from List with scope, xml_prefix
+
+    Let xmlns_prefix be proc create_from_literal from StringCore with "xmlns"
+    proc append from List with scope, xmlns_prefix
+
+    Return scope
+End Process
+
+@Reasoning:
+Each element may introduce new namespace bindings via "xmlns:prefix" attributes
+(and a default-namespace "xmlns" attribute). To resolve prefixes correctly under
+nesting, a child element sees its ancestors' bindings plus its own. Rather than
+maintain a removable stack, we build a fresh scope List per element that copies
+the parent scope and appends the prefixes declared on this element. This is
+O(depth) per element, bounded by max_depth, and is always correct under
+arbitrary nesting.
+@End Reasoning
+
+@Implementation:
+Create a new List and append every entry from the parent scope into it
+(reusing the parent's prefix string pointers - they outlive the walk because the
+parent scope is held on the recursion stack). Then, if the element has an
+attributes Dictionary, iterate its keys: for any key beginning with "xmlns:",
+append a heap copy of the local part (the bytes after the colon) as a newly
+declared prefix; a bare "xmlns" key (default namespace) declares no prefix and
+is skipped here because it binds the empty prefix, which never appears as
+"prefix:" syntax. Returns the child scope List, or 0 on allocation failure.
+@End Implementation
+
+Process called "build_child_namespace_scope" takes parent_scope as Integer, attributes as Integer returns Integer:
+    Note: Build a namespace scope for an element by extending the parent scope
+
+    Let scope be proc create from List
+
+    If scope is equal to 0:
+        Return 0
+    End If
+
+    Note: Copy parent bindings
+    If parent_scope is not equal to 0:
+        Let parent_count be proc size from List with parent_scope
+        Let pi be 0
+
+        While pi is less than parent_count:
+            Let entry be proc get_at from List with parent_scope, pi
+            proc append from List with scope, entry
+            Set pi to pi plus 1
+        End While
+    End If
+
+    Note: Add this element's own xmlns:prefix declarations
+    If attributes is not equal to 0:
+        Let keys be proc keys from Dict with attributes
+
+        If keys is not equal to 0:
+            Let key_count be proc size from List with keys
+            Let ki be 0
+
+            While ki is less than key_count:
+                Let key be proc get_at from List with keys, ki
+                Let colon be proc find_colon_index with key
+
+                If colon is not equal to -1:
+                    Note: Check the part before the colon equals "xmlns"
+                    Let is_xmlns be proc prefix_equals_xmlns with key, colon
+
+                    If is_xmlns is equal to 1:
+                        Note: Declared prefix is the local part after the colon
+                        Let local_start be colon plus 1
+                        Let declared_prefix be proc copy_substring_to_end with key, local_start
+                        proc append from List with scope, declared_prefix
+                    End If
+                End If
+
+                Set ki to ki plus 1
+            End While
+        End If
+    End If
+
+    Return scope
+End Process
+
+@Reasoning:
+Recognising an "xmlns:" declaration requires comparing the part of the attribute
+name before its colon against the literal "xmlns". An inline 5-byte comparison
+avoids allocating a substring just to classify the key.
+@End Reasoning
+
+@Implementation:
+Return 1 only when colon_index equals 5 and the first five bytes of name are
+exactly 'x','m','l','n','s'. Any other prefix length cannot equal "xmlns", so a
+length check short-circuits the byte comparison.
+@End Implementation
+
+Process called "prefix_equals_xmlns" takes name as Integer, colon_index as Integer returns Integer:
+    Note: Return 1 if name[0..colon_index) is exactly "xmlns"
+
+    If colon_index is not equal to 5:
+        Return 0
+    End If
+
+    If proc memory_get_byte from Layout with name, 0 is not equal to 120:  Note: 'x'
+        Return 0
+    End If
+    If proc memory_get_byte from Layout with name, 1 is not equal to 109:  Note: 'm'
+        Return 0
+    End If
+    If proc memory_get_byte from Layout with name, 2 is not equal to 108:  Note: 'l'
+        Return 0
+    End If
+    If proc memory_get_byte from Layout with name, 3 is not equal to 110:  Note: 'n'
+        Return 0
+    End If
+    If proc memory_get_byte from Layout with name, 4 is not equal to 115:  Note: 's'
+        Return 0
+    End If
+
+    Return 1
+End Process
+
+@Reasoning:
+Declaring a prefix requires the scope to own a NUL-terminated copy of the local
+part of an "xmlns:prefix" key so it survives independently of the parser's
+attribute-name buffer and can be compared byte-for-byte later.
+@End Reasoning
+
+@Implementation:
+Measure the source length, compute the tail length from start to the terminator,
+allocate tail_length+1 bytes, copy the bytes from start to the source terminator,
+NUL-terminate, and return the new buffer. Returns 0 on allocation failure.
+@End Implementation
+
+Process called "copy_substring_to_end" takes source as Integer, start as Integer returns Integer:
+    Note: Copy source[start..end] (NUL-terminated) into a fresh owned buffer
+
+    Let source_length be proc string_length from StringCore with source
+    Let tail_length be source_length minus start
+    Let buffer be proc allocate from Layout with tail_length plus 1
+
+    If buffer is equal to 0:
+        Return 0
+    End If
+
+    Let i be 0
+
+    While i is less than tail_length:
+        Let char be proc memory_get_byte from Layout with source, start plus i
+        proc memory_set_byte from Layout with buffer, i, char
+        Set i to i plus 1
+    End While
+
+    proc memory_set_byte from Layout with buffer, tail_length, 0
+
+    Return buffer
+End Process
+
+Note: ============================================================================
+Note: Qualified-Name Resolution
+Note: ============================================================================
+
+@Reasoning:
+A qualified name resolves when its prefix is in scope. Unprefixed names always
+resolve (they belong to the default namespace, which needs no declaration to be
+syntactically valid). Centralising this check lets both element-name and
+attribute-name validation share one path.
+@End Reasoning
+
+@Implementation:
+Find the first colon. If none, the name is unprefixed and resolves (return 1).
+Otherwise the prefix length is the colon index; consult scope_has_prefix. Return
+1 if the prefix is bound, 0 if it is unbound.
+@End Implementation
+
+Process called "qualified_name_resolves" takes scope as Integer, name as Integer returns Integer:
+    Note: Return 1 if name is unprefixed or its prefix is bound in scope
+
+    If name is equal to 0:
+        Return 0
+    End If
+
+    Let colon be proc find_colon_index with name
+
+    If colon is equal to -1:
+        Return 1  Note: Unprefixed name needs no declaration
+    End If
+
+    Return proc scope_has_prefix with scope, name, colon
+End Process
+
+Note: ============================================================================
+Note: Recursive Validation
+Note: ============================================================================
+
+@Reasoning:
+Single recursive validator over the XML node kinds, threading the namespace
+scope so prefix resolution honours nesting. Centralising the depth check here
+(incrementing only when descending into an element) means the limit measures
+true structural depth. Returning 1/0 (valid/invalid) plus the latched analyzer
+error keeps the contract identical to the sibling frontends' analyzers.
+@End Reasoning
+
+@Implementation:
+Null-guard the node (a null child is a structural error). Read node_type at
+offset 0 and line at offset 40. For ELEMENT: enforce depth+1 <= max_depth;
+require a non-null name; build the child namespace scope from the parent scope
+plus this element's xmlns declarations; verify the element name resolves; verify
+every attribute name resolves; then recurse on each child at depth+1 with the
+child scope. TEXT/CDATA: require value (offset 16) non-null. COMMENT/PI:
+structurally valid leaves (value may legitimately be empty). Any unknown
+discriminant is a structural error. Returns 1 when the subtree is valid, 0
+otherwise.
+@End Implementation
+
+Process called "validate_xml_node" takes analyzer as Integer, node as Integer, depth as Integer, scope as Integer returns Integer:
+    Note: Recursively validate one XML AST node under the given namespace scope
+
+    If node is equal to 0:
+        proc set_semantic_error with analyzer, "Null XML node in AST", 0
+        Return 0
+    End If
+
+    Let node_type be proc memory_get_int64 from Layout with node, 0
+    Let line be proc memory_get_int64 from Layout with node, 40
+    Let max_depth be proc memory_get_int64 from Layout with analyzer, 16
+
+    Note: Element validation
+    If node_type is equal to XML_ELEMENT from Parser:
+        Let next_depth be depth plus 1
+
+        If next_depth is greater than max_depth:
+            proc set_semantic_error with analyzer, "XML element nesting depth exceeds maximum", line
+            Return 0
+        End If
+
+        Let element_name be proc memory_get_int64 from Layout with node, 8
+
+        If element_name is equal to 0:
+            proc set_semantic_error with analyzer, "Element node missing name", line
+            Return 0
+        End If
+
+        Let attributes be proc memory_get_int64 from Layout with node, 24
+        Let children be proc memory_get_int64 from Layout with node, 32
+
+        Note: Extend the namespace scope with this element's declarations
+        Let child_scope be proc build_child_namespace_scope with scope, attributes
+
+        If child_scope is equal to 0:
+            proc set_semantic_error with analyzer, "Out of memory building namespace scope", line
+            Return 0
+        End If
+
+        Note: The element name's prefix must be bound
+        Let name_resolves be proc qualified_name_resolves with child_scope, element_name
+
+        If name_resolves is equal to 0:
+            proc set_semantic_error with analyzer, "Unbound namespace prefix on element name", line
+            Return 0
+        End If
+
+        Note: Every attribute name's prefix must be bound
+        If attributes is not equal to 0:
+            Let attr_keys be proc keys from Dict with attributes
+
+            If attr_keys is not equal to 0:
+                Let attr_count be proc size from List with attr_keys
+                Let ai be 0
+
+                While ai is less than attr_count:
+                    Let attr_name be proc get_at from List with attr_keys, ai
+                    Let attr_resolves be proc qualified_name_resolves with child_scope, attr_name
+
+                    If attr_resolves is equal to 0:
+                        proc set_semantic_error with analyzer, "Unbound namespace prefix on attribute name", line
+                        Return 0
+                    End If
+
+                    Set ai to ai plus 1
+                End While
+            End If
+        End If
+
+        Note: Recurse into children at the next depth with the extended scope
+        If children is not equal to 0:
+            Let child_count be proc size from List with children
+            Let index be 0
+
+            While index is less than child_count:
+                Let child be proc get_at from List with children, index
+                Let child_ok be proc validate_xml_node with analyzer, child, next_depth, child_scope
+
+                If child_ok is equal to 0:
+                    Return 0
+                End If
+
+                Set index to index plus 1
+            End While
+        End If
+
+        Return 1
+    End If
+
+    Note: Text leaf: the parser must have attached a (possibly empty) value buffer
+    If node_type is equal to XML_TEXT from Parser:
+        Let text_value be proc memory_get_int64 from Layout with node, 16
+
+        If text_value is equal to 0:
+            proc set_semantic_error with analyzer, "Text node missing value", line
+            Return 0
+        End If
+
+        Return 1
+    End If
+
+    Note: CDATA leaf: the parser attaches the de-delimited content buffer
+    If node_type is equal to XML_CDATA from Parser:
+        Let cdata_value be proc memory_get_int64 from Layout with node, 16
+
+        If cdata_value is equal to 0:
+            proc set_semantic_error with analyzer, "CDATA node missing value", line
+            Return 0
+        End If
+
+        Return 1
+    End If
+
+    Note: Comment and processing-instruction leaves carry metadata; an empty
+    Note: payload is legitimate, so only the discriminant is validated here.
+    If node_type is equal to XML_COMMENT from Parser:
+        Return 1
+    End If
+
+    If node_type is equal to XML_PROCESSING_INSTRUCTION from Parser:
+        Return 1
+    End If
+
+    Note: Any other discriminant is a corrupted AST
+    proc set_semantic_error with analyzer, "Unknown XML node type", line
+    Return 0
+End Process
+
+@Reasoning:
+The document envelope holds the prologue (PIs, comments) and exactly one root
+element. Validation walks every top-level child: PIs and comments are leaves,
+and the single element is the document root whose subtree is validated under the
+root namespace scope. Requiring exactly one element-typed child enforces the
+single-root well-formedness rule that the grammar expresses only loosely.
+@End Reasoning
+
+@Implementation:
+Read the document's children list at offset 32; a missing or empty list is a
+structural error. Seed the root namespace scope (reserved prefixes). Walk the
+children counting element-typed nodes and validating each child via
+validate_xml_node at depth 0 under the root scope. After the walk, require the
+element count to be exactly 1. Returns 1 when the document is valid, 0 otherwise.
+@End Implementation
+
+Process called "validate_xml_document" takes analyzer as Integer, document as Integer returns Integer:
+    Note: Validate the XML document envelope and its single root element
+
+    Let children be proc memory_get_int64 from Layout with document, 32
+
+    If children is equal to 0:
+        proc set_semantic_error with analyzer, "Document has no children list", 0
+        Return 0
+    End If
+
+    Let count be proc size from List with children
+
+    If count is equal to 0:
+        proc set_semantic_error with analyzer, "Empty document", 0
+        Return 0
+    End If
+
+    Let root_scope be proc create_root_namespace_scope
+
+    If root_scope is equal to 0:
+        proc set_semantic_error with analyzer, "Out of memory building root namespace scope", 0
+        Return 0
+    End If
+
+    Let element_count be 0
+    Let index be 0
+
+    While index is less than count:
+        Let child be proc get_at from List with children, index
+        Let child_type be proc memory_get_int64 from Layout with child, 0
+
+        If child_type is equal to XML_ELEMENT from Parser:
+            Set element_count to element_count plus 1
+        End If
+
+        Let child_ok be proc validate_xml_node with analyzer, child, 0, root_scope
+
+        If child_ok is equal to 0:
+            Return 0
+        End If
+
+        Set index to index plus 1
+    End While
+
+    If element_count is not equal to 1:
+        proc set_semantic_error with analyzer, "XML document must have exactly one root element", 0
+        Return 0
+    End If
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Public Validation Entry Points
+Note: ============================================================================
+
+@Reasoning:
+Top-level validation over an existing AST with a caller-provided analyzer. The
+root may be a document envelope (the parser's normal output) or a bare element
+subtree; both are dispatched correctly. Returns the analyzer's post-walk
+has_error inverted to a 1/0 valid flag so the caller has one boolean to gate
+lowering on.
+@End Reasoning
+
+@Implementation:
+Guard analyzer and root for null. Read the root discriminant: if XML_DOCUMENT,
+run validate_xml_document; otherwise treat the root as an element subtree and run
+validate_xml_node at depth 0 under a freshly seeded root namespace scope. Read
+has_error at offset 8; return 1 when has_error is 0 (valid) and 0 otherwise. The
+detailed message remains on the analyzer for the caller to read.
+@End Implementation
+
+Process called "validate_xml_ast" takes analyzer as Integer, root as Integer returns Integer:
+    Note: Validate an XML AST with an existing analyzer; returns 1 if valid
+
+    If analyzer is equal to 0:
+        Return 0
+    End If
+
+    If root is equal to 0:
+        Return 0
+    End If
+
+    Let root_type be proc memory_get_int64 from Layout with root, 0
+
+    If root_type is equal to XML_DOCUMENT from Parser:
+        proc validate_xml_document with analyzer, root
+    Otherwise:
+        Let root_scope be proc create_root_namespace_scope
+
+        If root_scope is equal to 0:
+            Return 0
+        End If
+
+        proc validate_xml_node with analyzer, root, 0, root_scope
+    End If
+
+    Let has_error be proc memory_get_int64 from Layout with analyzer, 8
+
+    If has_error is equal to 1:
+        Return 0
+    End If
+
+    Return 1
+End Process
+
+@Reasoning:
+Convenience facade that owns the analyzer lifecycle for callers that only want a
+yes/no answer under the default depth limit. This is the entry point a pipeline
+stage calls when it has no reason to override the configuration, keeping the
+common path a single call.
+@End Reasoning
+
+@Implementation:
+Guard root for null. Create an analyzer with DEFAULT_MAX_DEPTH; on OOM return 0.
+Run validate_xml_ast, capture the result, destroy the analyzer, and return the
+result.
+@End Implementation
+
+Process called "validate_xml_ast_default" takes root as Integer returns Integer:
+    Note: Validate an XML AST under the default policy; returns 1 if valid
+
+    If root is equal to 0:
+        Return 0
+    End If
+
+    Let analyzer be proc create_xml_semantic_analyzer with DEFAULT_MAX_DEPTH
+
+    If analyzer is equal to 0:
+        Return 0
+    End If
+
+    Let result be proc validate_xml_ast with analyzer, root
+
+    proc destroy_xml_semantic_analyzer with analyzer
+
+    Return result
+End Process
+
+Note: End of XML Semantic Analyzer

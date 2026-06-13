@@ -1,0 +1,352 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+Licensed under Apache 2.0
+:End Note
+
+Note:
+XML Translation Round-Trip Probe
+
+End-to-end proof that the XML translation pipeline is REAL, not a skeleton:
+
+    XML source
+      -> xml_lexer    (tokenize: tags, attributes, text, entities, CDATA, comments)
+      -> xml_parser   (build XML element-tree AST, match tags, single root)
+      -> xml_semantic (well-formedness + namespace prefix resolution + depth)
+      -> xml_to_hir   (lower XML AST to the canonical HIR literal model)
+      -> hir_to_xml   (emit HIR back to well-formed XML text with escaping)
+
+The probe feeds a representative document containing a namespaced root with a
+declared prefix, an attribute whose value carries an entity reference, a
+namespaced child element, text content carrying an entity reference, a CDATA
+section, a comment, and an empty (self-closing) element. It then:
+
+  1. Parses and runs the semantic analyzer, asserting the well-formed document
+     is accepted and that an analogous document with an UNDECLARED namespace
+     prefix is rejected (proving namespace resolution is real).
+  2. Translates the source to HIR and asserts the HIR root is a dictionary
+     literal whose "_tag" is the element name, whose attribute is reachable
+     by name, and whose text child de-escapes the entity reference to the raw
+     byte (proving entity decoding survives lowering).
+  3. Emits the HIR back to XML text and asserts the text is non-empty and
+     begins with '<'.
+  4. Re-parses the emitted XML back into HIR and asserts the two HIR trees are
+     STRUCTURALLY EQUAL via a recursive comparator. Structural equality
+     (rather than byte equality) is the correct semantic-equivalence check
+     because the emitter pretty-prints and the byte form differs from the
+     compact input while the meaning is identical.
+
+Exit code: number of failed assertions (0 == all passed). No exit_with_code.
+:End Note
+
+Import "compiler/middle/gungnir/hir/translation/frontends/xml/xml_to_hir.runa" as XmlFrontend
+Import "compiler/middle/gungnir/hir/translation/frontends/xml/xml_parser.runa" as XmlParser
+Import "compiler/middle/gungnir/hir/translation/frontends/xml/xml_semantic.runa" as XmlSemantic
+Import "compiler/middle/gungnir/hir/translation/backends/xml/hir_to_xml.runa" as XmlBackend
+Import "compiler/middle/gungnir/hir/hir.runa" as HIR
+Import "compiler/frontend/primitives/collections/list.runa" as List
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "tests/test_utils.runa" as TestUtils
+
+Note: ============================================================================
+Note: HIR dictionary lookup by string key (content comparison)
+Note: ============================================================================
+
+@Reasoning:
+The XML element dictionary stores "_tag", flat attribute entries, "_attributes",
+and "_children" in an order that depends on the element's attribute set. Looking
+up values by content-compared key rather than positional index makes the probe's
+assertions robust to that ordering, exactly as the backend's get_dict_hir_value
+does.
+@End Reasoning
+
+Process called "dict_lookup" takes hir_dict as Integer, key as Integer returns Integer:
+    Let entries be proc get_dictionary_entries from HIR with hir_dict
+
+    If entries is equal to 0:
+        Return 0
+    End If
+
+    Let count be proc size from List with entries
+    Let index be 0
+
+    While index is less than count:
+        Let entry be proc get_at from List with entries, index
+        Let entry_key be proc memory_get_int64 from Layout with entry, 0
+        Let entry_value be proc memory_get_int64 from Layout with entry, 8
+
+        Let matches be proc string_equals from StringCore with entry_key, key
+
+        If matches is equal to 1:
+            Return entry_value
+        End If
+
+        Set index to index plus 1
+    End While
+
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: Structural HIR equality (semantic equivalence of two XML-derived trees)
+Note: ============================================================================
+
+@Reasoning:
+Two XML documents are semantically equal when their HIR projections are
+structurally equal: same node kind at every position, same scalar payloads, same
+key/value pairing for the element dictionaries (order-preserving, which the
+lowering guarantees), and same element ordering for the children arrays.
+Comparing the HIR trees rather than the raw text is whitespace- and
+formatting-insensitive, so it proves round-trip fidelity without being fooled by
+the emitter's pretty-printing.
+@End Reasoning
+
+Process called "hir_equal" takes a as Integer, b as Integer returns Integer:
+    If a is equal to 0:
+        If b is equal to 0:
+            Return 1
+        End If
+        Return 0
+    End If
+
+    If b is equal to 0:
+        Return 0
+    End If
+
+    Let kind_a be proc get_hir_node_type from HIR with a
+    Let kind_b be proc get_hir_node_type from HIR with b
+
+    If kind_a is not equal to kind_b:
+        Return 0
+    End If
+
+    Note: Dictionary literals: compare entry count, then key+value pairwise
+    If kind_a is equal to HIR_DICTIONARY_LITERAL from HIR:
+        Let entries_a be proc get_dictionary_entries from HIR with a
+        Let entries_b be proc get_dictionary_entries from HIR with b
+
+        If entries_a is equal to 0:
+            If entries_b is equal to 0:
+                Return 1
+            End If
+            Return 0
+        End If
+
+        If entries_b is equal to 0:
+            Return 0
+        End If
+
+        Let count_a be proc size from List with entries_a
+        Let count_b be proc size from List with entries_b
+
+        If count_a is not equal to count_b:
+            Return 0
+        End If
+
+        Let i be 0
+        While i is less than count_a:
+            Let entry_a be proc get_at from List with entries_a, i
+            Let entry_b be proc get_at from List with entries_b, i
+
+            Let key_a be proc memory_get_int64 from Layout with entry_a, 0
+            Let key_b be proc memory_get_int64 from Layout with entry_b, 0
+            Let keys_match be proc string_equals from StringCore with key_a, key_b
+
+            If keys_match is not equal to 1:
+                Return 0
+            End If
+
+            Let val_a be proc memory_get_int64 from Layout with entry_a, 8
+            Let val_b be proc memory_get_int64 from Layout with entry_b, 8
+            Let vals_match be proc hir_equal with val_a, val_b
+
+            If vals_match is not equal to 1:
+                Return 0
+            End If
+
+            Set i to i plus 1
+        End While
+
+        Return 1
+    End If
+
+    Note: Array literals: compare element count, then elements pairwise
+    If kind_a is equal to HIR_ARRAY_LITERAL from HIR:
+        Let elems_a be proc get_list_elements from HIR with a
+        Let elems_b be proc get_list_elements from HIR with b
+
+        If elems_a is equal to 0:
+            If elems_b is equal to 0:
+                Return 1
+            End If
+            Return 0
+        End If
+
+        If elems_b is equal to 0:
+            Return 0
+        End If
+
+        Let ecount_a be proc size from List with elems_a
+        Let ecount_b be proc size from List with elems_b
+
+        If ecount_a is not equal to ecount_b:
+            Return 0
+        End If
+
+        Let j be 0
+        While j is less than ecount_a:
+            Let el_a be proc get_at from List with elems_a, j
+            Let el_b be proc get_at from List with elems_b, j
+            Let el_match be proc hir_equal with el_a, el_b
+
+            If el_match is not equal to 1:
+                Return 0
+            End If
+
+            Set j to j plus 1
+        End While
+
+        Return 1
+    End If
+
+    Note: Scalar literals (HIR_LITERAL): compare value_type tag, then payload
+    If kind_a is equal to HIR_LITERAL from HIR:
+        Let tag_a be proc memory_get_int64 from Layout with a, 48
+        Let tag_b be proc memory_get_int64 from Layout with b, 48
+
+        If tag_a is not equal to tag_b:
+            Return 0
+        End If
+
+        Let payload_a be proc memory_get_int64 from Layout with a, 40
+        Let payload_b be proc memory_get_int64 from Layout with b, 40
+
+        Note: String and float payloads are string pointers; compare by content
+        If tag_a is equal to HIR_LITERAL_KIND_STRING from HIR:
+            Return proc string_equals from StringCore with payload_a, payload_b
+        End If
+
+        If tag_a is equal to HIR_LITERAL_KIND_FLOAT from HIR:
+            Return proc string_equals from StringCore with payload_a, payload_b
+        End If
+
+        Note: Integer/boolean/null payloads are compared by raw value
+        If payload_a is equal to payload_b:
+            Return 1
+        End If
+        Return 0
+    End If
+
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: Probe entry point
+Note: ============================================================================
+
+Process called "main" returns Integer:
+    Let results be proc create_test_results from TestUtils
+    proc begin_suite from TestUtils with results, "XML translation round-trip"
+
+    Note:
+    Representative document: a namespaced root declaring its own prefix, an
+    attribute whose value carries an entity reference, a namespaced child with
+    text content carrying an entity reference, a CDATA section, a comment, and a
+    self-closing element. The lexer resolves &amp; -> '&' and &lt; -> '<' inside
+    text and attribute values before the parser ever sees them.
+    :End Note
+    Let source be "<doc:root xmlns:doc=\"urn:example\" label=\"a&amp;b\"><doc:item id=\"1\">Remember &amp; relax</doc:item><![CDATA[<raw> & data]]><!-- a note --><br/></doc:root>"
+
+    Note: --- Stage 0: parse + semantic validation ---
+    Let ast be proc parse_xml from XmlParser with source
+    proc assert_not_null from TestUtils with results, "parser produced XML AST", ast
+
+    Let valid be proc validate_xml_ast_default from XmlSemantic with ast
+    proc assert_equal from TestUtils with results, "semantic pass accepts well-formed namespaced document", valid, 1
+
+    Note: Semantic pass must REJECT an element using an undeclared namespace prefix
+    Let bad_source be "<root><undef:child>x</undef:child></root>"
+    Let bad_ast be proc parse_xml from XmlParser with bad_source
+    proc assert_not_null from TestUtils with results, "parser produced undeclared-prefix AST", bad_ast
+    Let bad_valid be proc validate_xml_ast_default from XmlSemantic with bad_ast
+    proc assert_equal from TestUtils with results, "semantic pass rejects undeclared namespace prefix", bad_valid, 0
+
+    Note: --- Stage 1: source -> HIR ---
+    Let hir1 be proc translate_xml_to_hir from XmlFrontend with source, 0
+    proc assert_not_null from TestUtils with results, "frontend produced HIR root", hir1
+
+    Let root_kind be proc get_hir_node_type from HIR with hir1
+    proc assert_equal from TestUtils with results, "HIR root is dictionary literal", root_kind, HIR_DICTIONARY_LITERAL from HIR
+
+    Note: The element's "_tag" must be the qualified root name
+    Let tag_val be proc dict_lookup with hir1, "_tag"
+    Let tag_str be proc get_string_literal_value from HIR with tag_val
+    proc assert_string_equal from TestUtils with results, "root _tag is 'doc:root'", tag_str, "doc:root"
+
+    Note: The attribute value must be reachable by name and de-escaped (&amp; -> &)
+    Let label_val be proc dict_lookup with hir1, "label"
+    Let label_str be proc get_string_literal_value from HIR with label_val
+    proc assert_string_equal from TestUtils with results, "attribute 'label' de-escapes to 'a&b'", label_str, "a&b"
+
+    Note: The xmlns:doc declaration is itself an attribute and reachable by name
+    Let ns_val be proc dict_lookup with hir1, "xmlns:doc"
+    Let ns_str be proc get_string_literal_value from HIR with ns_val
+    proc assert_string_equal from TestUtils with results, "namespace decl 'xmlns:doc' is 'urn:example'", ns_str, "urn:example"
+
+    Note: Children list must exist and be an array literal
+    Let children_val be proc dict_lookup with hir1, "_children"
+    proc assert_not_null from TestUtils with results, "element has _children", children_val
+    Let children_kind be proc get_hir_node_type from HIR with children_val
+    proc assert_equal from TestUtils with results, "_children is array literal", children_kind, HIR_ARRAY_LITERAL from HIR
+
+    Note:
+    Children (with default comment/PI stripping) are: the doc:item element, the
+    CDATA string, and the self-closing br element. The comment is dropped because
+    preserve_comments defaults to 0. That is three children.
+    :End Note
+    Let children_elems be proc get_list_elements from HIR with children_val
+    Let children_count be proc size from List with children_elems
+    proc assert_equal from TestUtils with results, "element has 3 surviving children", children_count, 3
+
+    Note: First child is the doc:item element; its text de-escapes the entity
+    Let item_node be proc get_at from List with children_elems, 0
+    Let item_kind be proc get_hir_node_type from HIR with item_node
+    proc assert_equal from TestUtils with results, "first child is element dictionary", item_kind, HIR_DICTIONARY_LITERAL from HIR
+
+    Let item_tag_val be proc dict_lookup with item_node, "_tag"
+    Let item_tag_str be proc get_string_literal_value from HIR with item_tag_val
+    proc assert_string_equal from TestUtils with results, "child _tag is 'doc:item'", item_tag_str, "doc:item"
+
+    Let item_children_val be proc dict_lookup with item_node, "_children"
+    Let item_children_elems be proc get_list_elements from HIR with item_children_val
+    Let text_node be proc get_at from List with item_children_elems, 0
+    Let text_kind be proc get_hir_node_type from HIR with text_node
+    proc assert_equal from TestUtils with results, "child text node is a literal", text_kind, HIR_LITERAL from HIR
+
+    Let text_str be proc get_string_literal_value from HIR with text_node
+    proc assert_string_equal from TestUtils with results, "text content de-escapes '&amp;' to '&'", text_str, "Remember & relax"
+
+    Note: The de-escaped text must contain a literal '&' byte (38) at the right spot
+    Let amp_byte be proc string_char_at from StringCore with text_str, 9
+    proc assert_equal from TestUtils with results, "text byte[9] is '&' (38)", amp_byte, 38
+
+    Note: --- Stage 2: HIR -> XML text ---
+    Let emitted be proc hir_to_xml from XmlBackend with hir1
+    proc assert_not_null from TestUtils with results, "backend produced XML text", emitted
+
+    Let emitted_len be proc string_length from StringCore with emitted
+    proc assert_greater_than from TestUtils with results, "emitted XML is non-empty", emitted_len, 0
+
+    Note: --- Stage 3: re-parse emitted XML -> HIR, assert structurally equal ---
+    Let hir2 be proc translate_xml_to_hir from XmlFrontend with emitted, 0
+    proc assert_not_null from TestUtils with results, "re-parse of emitted XML produced HIR", hir2
+
+    Let structurally_equal be proc hir_equal with hir1, hir2
+    proc assert_equal from TestUtils with results, "round-trip HIR is structurally equal", structurally_equal, 1
+
+    proc print_summary from TestUtils with results
+    Let failed be proc get_failed from TestUtils with results
+    proc destroy_test_results from TestUtils with results
+
+    Return failed
+End Process

@@ -208,7 +208,7 @@ Process called "set_generation_error" takes context as Integer, message as Integ
     Let new_error be proc allocate from Layout with msg_length plus 1
 
     If new_error is not equal to 0:
-        proc memory_copy from Layout with new_error, 0, message, 0, msg_length
+        proc memory_copy from Layout with new_error, message, msg_length
         proc memory_set_byte from Layout with new_error, msg_length, 0
     End If
 
@@ -293,8 +293,8 @@ Returns 0 for null nodes to keep call sites short.
 
 @Implementation:
 Reads the node type tag at offset 0 and compares it against the HIR's
-canonical "DictionaryLiteral" type code returned by get_hir_node_type.
-Returns 1 on match, 0 otherwise.
+canonical HIR_DICTIONARY_LITERAL constant (10019). Returns 1 on match,
+0 otherwise (including null inputs).
 @End Implementation
 
 Process called "is_dictionary_hir" takes hir_node as Integer returns Integer:
@@ -305,9 +305,8 @@ Process called "is_dictionary_hir" takes hir_node as Integer returns Integer:
     End If
 
     Let node_type be proc memory_get_int64 from Layout with hir_node, 0
-    Let expected_type be proc get_hir_node_type from HIR with "DictionaryLiteral"
 
-    If node_type is equal to expected_type:
+    If node_type is equal to HIR_DICTIONARY_LITERAL from HIR:
         Return 1
     End If
 
@@ -320,8 +319,11 @@ between get_string_literal_value and returning the raw node pointer.
 @End Reasoning
 
 @Implementation:
-Reads the node tag at offset 0 and compares with the StringLiteral code.
-Returns 1 on match, 0 otherwise (including null inputs).
+Scalar literals in the canonical HIR model all share node_type HIR_LITERAL
+(10000) and are distinguished by the value_type tag at offset 48. A string
+literal is HIR_LITERAL whose value_type is HIR_LITERAL_KIND_STRING (1).
+Returns 1 only when both the node tag and the value kind match; 0 otherwise
+(including null inputs).
 @End Implementation
 
 Process called "is_string_hir" takes hir_node as Integer returns Integer:
@@ -332,9 +334,14 @@ Process called "is_string_hir" takes hir_node as Integer returns Integer:
     End If
 
     Let node_type be proc memory_get_int64 from Layout with hir_node, 0
-    Let expected_type be proc get_hir_node_type from HIR with "StringLiteral"
 
-    If node_type is equal to expected_type:
+    If node_type is not equal to HIR_LITERAL from HIR:
+        Return 0
+    End If
+
+    Let value_kind be proc memory_get_int64 from Layout with hir_node, 48
+
+    If value_kind is equal to HIR_LITERAL_KIND_STRING from HIR:
         Return 1
     End If
 
@@ -347,8 +354,10 @@ each element as a sibling under the parent tag.
 @End Reasoning
 
 @Implementation:
-Reads the node tag at offset 0 and compares with the ListLiteral code.
-Returns 1 on match, 0 otherwise (including null inputs).
+HIR list literals carry node_type HIR_ARRAY_LITERAL (10011) - the same
+node kind create_hir_list_literal produces. Reads the node tag at offset 0
+and compares against HIR_ARRAY_LITERAL. Returns 1 on match, 0 otherwise
+(including null inputs).
 @End Implementation
 
 Process called "is_list_hir" takes hir_node as Integer returns Integer:
@@ -359,9 +368,8 @@ Process called "is_list_hir" takes hir_node as Integer returns Integer:
     End If
 
     Let node_type be proc memory_get_int64 from Layout with hir_node, 0
-    Let expected_type be proc get_hir_node_type from HIR with "ListLiteral"
 
-    If node_type is equal to expected_type:
+    If node_type is equal to HIR_ARRAY_LITERAL from HIR:
         Return 1
     End If
 
@@ -430,7 +438,7 @@ Process called "get_dict_string_value" takes hir_dict as Integer, key as Integer
 
             If matches is equal to 1:
                 Note: Found matching key, extract string value
-                Let is_string be proc is_string_hir from entry_value
+                Let is_string be proc is_string_hir with entry_value
 
                 If is_string is equal to 1:
                     Return proc get_string_literal_value from HIR with entry_value
@@ -534,7 +542,7 @@ Process called "generate_element" takes context as Integer, hir_node as Integer 
     This function generates the opening tag, attributes, children, and closing tag.
     @End Reasoning
 
-    Let is_dict be proc is_dictionary_hir from hir_node
+    Let is_dict be proc is_dictionary_hir with hir_node
 
     If is_dict is equal to 0:
         proc set_generation_error with context, "Expected dictionary HIR node for element"
@@ -554,7 +562,7 @@ Process called "generate_element" takes context as Integer, hir_node as Integer 
     Let children_hir be proc get_dict_hir_value with hir_node, "_children"
 
     Note: Emit opening tag
-    proc emit_indent from context
+    proc emit_indent with context
 
     Let emitter be proc memory_get_int64 from Layout with context, 0
     proc emit_char from Emitter with emitter, 60  Note: <
@@ -569,7 +577,7 @@ Process called "generate_element" takes context as Integer, hir_node as Integer 
     Let has_children be 0
 
     If children_hir is not equal to 0:
-        Let is_list be proc is_list_hir from children_hir
+        Let is_list be proc is_list_hir with children_hir
 
         If is_list is equal to 1:
             Let children_list be proc get_list_elements from HIR with children_hir
@@ -585,7 +593,7 @@ Process called "generate_element" takes context as Integer, hir_node as Integer 
     Note: Self-closing tag if no children
     If has_children is equal to 0:
         proc emit_string from Emitter with emitter, " />"
-        proc emit_newline from context
+        proc emit_newline with context
         Return 1
     End If
 
@@ -596,28 +604,47 @@ Process called "generate_element" takes context as Integer, hir_node as Integer 
     Set children_list to proc get_list_elements from HIR with children_hir
     Set child_count to proc size from List with children_list
 
-    Note: Check if children are all text (inline content)
-    Let all_text be 1
+    @Reasoning:
+    XML distinguishes element-only content from mixed content. In mixed content
+    (any text/string child alongside other nodes), every whitespace byte between
+    the tags is SIGNIFICANT character data. Pretty-printing such content by
+    injecting indentation and newlines would fabricate whitespace that a
+    re-parse cannot distinguish from authored text, breaking round-trip
+    fidelity. Therefore: if ANY child is a string (text) node the whole element
+    is emitted inline with no fabricated whitespace; only element-only content
+    (no text children) may be pretty-printed with indentation and newlines.
+    @End Reasoning
+
+    Note: Detect whether the element has any text (string) child -> mixed content
+    Let has_text be 0
     Let child_index be 0
 
     While child_index is less than child_count:
         Let child be proc get_at from List with children_list, child_index
-        Let is_string be proc is_string_hir from child
+        Let is_string be proc is_string_hir with child
 
-        If is_string is equal to 0:
-            Set all_text to 0
+        If is_string is equal to 1:
+            Set has_text to 1
             Break
         End If
 
         Set child_index to child_index plus 1
     End While
 
-    Note: Inline text content (no newlines/indentation)
-    If all_text is equal to 1:
+    Note: Mixed content (has text) -> emit every child inline, no fabricated whitespace
+    If has_text is equal to 1:
         Set child_index to 0
         While child_index is less than child_count:
             Set child to proc get_at from List with children_list, child_index
-            proc generate_text with context, child
+            Let child_is_string be proc is_string_hir with child
+
+            If child_is_string is equal to 1:
+                proc generate_text with context, child
+            Otherwise:
+                Note: Element/comment/PI child within mixed content - emit inline
+                proc generate_node_inline with context, child
+            End If
+
             Set child_index to child_index plus 1
         End While
 
@@ -625,13 +652,13 @@ Process called "generate_element" takes context as Integer, hir_node as Integer 
         proc emit_string from Emitter with emitter, "</"
         proc emit_string from Emitter with emitter, tag_name
         proc emit_char from Emitter with emitter, 62  Note: >
-        proc emit_newline from context
+        proc emit_newline with context
 
         Return 1
     End If
 
-    Note: Mixed/element children (use newlines and indentation)
-    proc emit_newline from context
+    Note: Element-only content (no text children) -> pretty-print with indentation
+    proc emit_newline with context
 
     Note: Increase indentation
     Let indent_level be proc memory_get_int64 from Layout with context, 8
@@ -651,11 +678,63 @@ Process called "generate_element" takes context as Integer, hir_node as Integer 
     proc memory_set_int64 from Layout with context, 8, indent_level
 
     Note: Closing tag
-    proc emit_indent from context
+    proc emit_indent with context
     proc emit_string from Emitter with emitter, "</"
     proc emit_string from Emitter with emitter, tag_name
     proc emit_char from Emitter with emitter, 62  Note: >
-    proc emit_newline from context
+    proc emit_newline with context
+
+    Return 1
+End Process
+
+@Reasoning:
+Companion to generate_node for use inside mixed content: it routes a non-text
+HIR node (element, comment, or PI) to its generator WITHOUT the leading
+emit_indent / trailing emit_newline that generate_node adds. This keeps mixed
+content free of fabricated whitespace so that emitting then re-parsing yields
+the same text nodes. To suppress the indentation a nested element would
+otherwise emit, pretty_print is temporarily disabled around the call and then
+restored, so structural punctuation is emitted but no surrounding whitespace.
+@End Reasoning
+
+@Implementation:
+Reads and saves the context's pretty_print flag (offset 24), forces it to 0,
+dispatches the node by kind (comment dict -> generate_comment, PI dict ->
+generate_processing_instruction, dictionary -> generate_element, otherwise no-op
+for an unsupported node), then restores the saved pretty_print flag. Returns 1.
+@End Implementation
+
+Process called "generate_node_inline" takes context as Integer, hir_node as Integer returns Integer:
+    Note: Emit a non-text child inline (no surrounding indentation/newline)
+
+    If hir_node is equal to 0:
+        Return 0
+    End If
+
+    Note: Suppress pretty-print whitespace for the duration of this subtree
+    Let saved_pretty be proc memory_get_int64 from Layout with context, 24
+    proc memory_set_int64 from Layout with context, 24, 0
+
+    Let is_dict be proc is_dictionary_hir with hir_node
+
+    If is_dict is equal to 1:
+        Let comment_value be proc get_dict_hir_value with hir_node, "_comment"
+
+        If comment_value is not equal to 0:
+            proc generate_comment with context, hir_node
+        Otherwise:
+            Let pi_value be proc get_dict_hir_value with hir_node, "_pi"
+
+            If pi_value is not equal to 0:
+                proc generate_processing_instruction with context, hir_node
+            Otherwise:
+                proc generate_element with context, hir_node
+            End If
+        End If
+    End If
+
+    Note: Restore the caller's pretty-print preference
+    proc memory_set_int64 from Layout with context, 24, saved_pretty
 
     Return 1
 End Process
@@ -674,7 +753,7 @@ emit_string and emit_attribute_value helpers.
 Process called "generate_attributes" takes context as Integer, attributes_hir as Integer returns Integer:
     Note: Generate XML attributes from HIR dictionary
 
-    Let is_dict be proc is_dictionary_hir from attributes_hir
+    Let is_dict be proc is_dictionary_hir with attributes_hir
 
     If is_dict is equal to 0:
         Return 0  Note: Not a dictionary, skip attributes
@@ -702,7 +781,7 @@ Process called "generate_attributes" takes context as Integer, attributes_hir as
         proc emit_char from Emitter with emitter, 34  Note: "
 
         Note: Get string value and emit with escaping
-        Let is_string be proc is_string_hir from attr_value_hir
+        Let is_string be proc is_string_hir with attr_value_hir
 
         If is_string is equal to 1:
             Let attr_value be proc get_string_literal_value from HIR with attr_value_hir
@@ -734,7 +813,7 @@ emitter's emit_escaped_text helper which handles the entity replacements.
 Process called "generate_text" takes context as Integer, hir_node as Integer returns Integer:
     Note: Generate XML text content from HIR string literal
 
-    Let is_string be proc is_string_hir from hir_node
+    Let is_string be proc is_string_hir with hir_node
 
     If is_string is equal to 0:
         proc set_generation_error with context, "Expected string HIR node for text"
@@ -775,7 +854,7 @@ Process called "generate_comment" takes context as Integer, hir_node as Integer 
         Return 0
     End If
 
-    Let is_string be proc is_string_hir from comment_value_hir
+    Let is_string be proc is_string_hir with comment_value_hir
 
     If is_string is equal to 0:
         Return 0
@@ -784,11 +863,11 @@ Process called "generate_comment" takes context as Integer, hir_node as Integer 
     Let emitter be proc memory_get_int64 from Layout with context, 0
     Let comment_text be proc get_string_literal_value from HIR with comment_value_hir
 
-    proc emit_indent from context
+    proc emit_indent with context
     proc emit_string from Emitter with emitter, "<!--"
     proc emit_string from Emitter with emitter, comment_text
     proc emit_string from Emitter with emitter, "-->"
-    proc emit_newline from context
+    proc emit_newline with context
 
     Return 1
 End Process
@@ -813,7 +892,7 @@ Process called "generate_processing_instruction" takes context as Integer, hir_n
         Return 0
     End If
 
-    Let is_string be proc is_string_hir from pi_value_hir
+    Let is_string be proc is_string_hir with pi_value_hir
 
     If is_string is equal to 0:
         Return 0
@@ -822,11 +901,11 @@ Process called "generate_processing_instruction" takes context as Integer, hir_n
     Let emitter be proc memory_get_int64 from Layout with context, 0
     Let pi_text be proc get_string_literal_value from HIR with pi_value_hir
 
-    proc emit_indent from context
+    proc emit_indent with context
     proc emit_string from Emitter with emitter, "<?"
     proc emit_string from Emitter with emitter, pi_text
     proc emit_string from Emitter with emitter, "?>"
-    proc emit_newline from context
+    proc emit_newline with context
 
     Return 1
 End Process
@@ -860,18 +939,18 @@ Process called "generate_node" takes context as Integer, hir_node as Integer ret
     End If
 
     Note: Check if string (text content)
-    Let is_string be proc is_string_hir from hir_node
+    Let is_string be proc is_string_hir with hir_node
 
     If is_string is equal to 1:
         Note: Text content in mixed children - emit on its own line with indent
-        proc emit_indent from context
+        proc emit_indent with context
         proc generate_text with context, hir_node
-        proc emit_newline from context
+        proc emit_newline with context
         Return 1
     End If
 
     Note: Check if dictionary (element, comment, or PI)
-    Let is_dict be proc is_dictionary_hir from hir_node
+    Let is_dict be proc is_dictionary_hir with hir_node
 
     If is_dict is equal to 1:
         Note: Check for special keys
@@ -900,16 +979,21 @@ Note: ==========================================================================
 
 @Reasoning:
 Public entry. Owns the lifecycle of an XMLGenContext, prepends the XML
-declaration when the include_declaration flag is set, and forwards
-internal errors to the higher-level translation_context.
+declaration when the include_declaration flag is set, and reports failure
+through the 0-return sentinel. The backend cannot import translation.runa
+(that module imports this emitter, so the reverse edge would be an import
+cycle), so error detail stays in the generation context's error_message
+slot and the caller observes failure as a 0 return.
 @End Reasoning
 
 @Implementation:
-Validates hir_root, constructs a generation context, optionally emits
-"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n", dispatches the root
-through generate_node, then either pushes the internal error string to
-add_translation_error or extracts the output buffer via the emitter's
-get_output. Always destroys the context before returning.
+Validates hir_root (0 -> return 0), constructs a generation context,
+optionally emits "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n", dispatches
+the root through generate_node, then either returns 0 when the context's
+has_error flag is set or extracts the output buffer via the emitter's
+get_output. Always destroys the context before returning. The
+translation_context parameter is retained only for dispatcher call-site ABI
+compatibility and is not threaded through.
 @End Implementation
 
 Process called "generate_xml_from_hir" takes hir_root as Integer, translation_context as Integer returns Integer:
@@ -921,8 +1005,16 @@ Process called "generate_xml_from_hir" takes hir_root as Integer, translation_co
     and returns generated XML string.
     @End Reasoning
 
+    Note:
+    This backend sits below translation.runa in the import graph (translation.runa
+    imports the per-language emitters), so importing it back to call
+    add_translation_error would create an import cycle. The canonical backend
+    contract is therefore the 0-return sentinel: a null/failed result is signalled
+    purely by returning 0, which the dispatcher's HIR -> target arm already
+    interprets as failure. The translation_context parameter is retained for
+    call-site ABI compatibility but is not threaded through.
+    :End Note
     If hir_root is equal to 0:
-        proc add_translation_error from Translation with translation_context, "Null HIR root"
         Return 0
     End If
 
@@ -930,7 +1022,6 @@ Process called "generate_xml_from_hir" takes hir_root as Integer, translation_co
     Let context be proc create_generation_context
 
     If context is equal to 0:
-        proc add_translation_error from Translation with translation_context, "Out of memory"
         Return 0
     End If
 
@@ -940,7 +1031,7 @@ Process called "generate_xml_from_hir" takes hir_root as Integer, translation_co
     If include_declaration is equal to 1:
         Let emitter be proc memory_get_int64 from Layout with context, 0
         proc emit_string from Emitter with emitter, "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
-        proc emit_newline from context
+        proc emit_newline with context
     End If
 
     Note: Generate XML from HIR
@@ -950,9 +1041,8 @@ Process called "generate_xml_from_hir" takes hir_root as Integer, translation_co
     Let has_error be proc memory_get_int64 from Layout with context, 48
 
     If has_error is equal to 1:
-        Let error_msg be proc memory_get_int64 from Layout with context, 40
-        proc add_translation_error from Translation with translation_context, error_msg
-        proc destroy_generation_context from context
+        Note: Error detail is held in context.error_message (offset 40); the 0-return sentinel is the backend's failure contract (no Translation import - see top note).
+        proc destroy_generation_context with context
         Return 0
     End If
 
@@ -961,7 +1051,7 @@ Process called "generate_xml_from_hir" takes hir_root as Integer, translation_co
     Let output be proc get_output from Emitter with emitter
 
     Note: Cleanup
-    proc destroy_generation_context from context
+    proc destroy_generation_context with context
 
     Return output
 End Process
