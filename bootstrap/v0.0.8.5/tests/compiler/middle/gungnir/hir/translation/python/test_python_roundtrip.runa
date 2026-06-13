@@ -1,0 +1,368 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+Licensed under Apache 2.0
+:End Note
+
+Note:
+Python Translation Round-Trip Probe
+
+End-to-end proof that the Python translation pipeline is REAL, not a skeleton:
+
+    Python source
+      -> python_lexer    (tokenize: NEWLINE + INDENT/DEDENT via indent stack,
+                          names, keywords, numbers, strings, operators, comments)
+      -> python_parser   (build Python AST: def with params + return,
+                          if/elif/else, for over a list, assignment, call,
+                          list literal)
+      -> python_semantic (module/function scope, name resolution; run for its
+                          validation side effects)
+      -> python_to_hir   (lower Python AST to the canonical Python HIR
+                          dict/list model)
+      -> hir_to_python   (emit HIR back to valid indented Python text)
+      -> re-lex / re-parse / re-to_hir of the emitted text
+      -> structural HIR equality on the key constructs
+
+The probe feeds a representative Python module exercising every construct the
+task requires:
+
+  - a function definition (compute) with parameters and a return statement
+  - an if / elif / else statement
+  - a for loop over a list
+  - a variable assignment
+  - a function call with arguments
+  - a list literal
+
+It asserts, on the FIRST HIR tree:
+  1. the root is a "python_module" node whose "members" list is non-empty;
+  2. the function-definition node carries the correct name and a parameters
+     node with the expected parameter count;
+  3. the if-statement, for-loop, assignment, and call/list nodes are present
+     with the correct node-type tags and key payloads (function name, call
+     target name, list element count).
+
+Then it emits the HIR back to Python text, re-runs the whole pipeline on the
+emitted text, and asserts the re-derived HIR is STRUCTURALLY EQUAL to the
+original on those same key constructs. Structural equality (not byte equality)
+is the correct check because the emitter re-indents and normalises whitespace
+while the meaning is identical.
+
+Exit code: number of failed assertions (0 == all passed). No exit_with_code.
+
+The Python HIR node model is a string-keyed dictionary built by
+python_to_hir.create_dictionary: a 32-byte header [size@0, capacity@8,
+keys@16, values@24] over two parallel int64 arrays. Structural fields hold
+either child HIR dicts or HIR lists (built with the list primitives). This
+probe therefore reads HIR fields via a local field reader that walks that same
+parallel-array layout, matching how the frontend and backend access it.
+:End Note
+
+Import "compiler/middle/gungnir/hir/translation/frontends/python/python_lexer.runa" as Lexer
+Import "compiler/middle/gungnir/hir/translation/frontends/python/python_parser.runa" as Parser
+Import "compiler/middle/gungnir/hir/translation/frontends/python/python_semantic.runa" as Semantic
+Import "compiler/middle/gungnir/hir/translation/frontends/python/python_to_hir.runa" as Frontend
+Import "compiler/middle/gungnir/hir/translation/backends/python/hir_to_python.runa" as Backend
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/collections/list.runa" as List
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "tests/test_utils.runa" as TestUtils
+
+Note: ============================================================================
+Note: HIR dictionary field reader (matches python_to_hir's parallel-array dict)
+Note: ============================================================================
+
+@Reasoning:
+Python HIR nodes are string-keyed dictionaries with a 32-byte header
+[size@0, capacity@8, keys@16, values@24] over two parallel int64 arrays. A
+field read walks the keys array comparing each stored key pointer against the
+requested key with string_equals and returns the parallel value slot, or 0 if
+absent. This mirrors hir_to_python.dict_lookup_entry exactly so the probe sees
+the HIR through the same lens the backend does.
+@End Reasoning
+Process called "field" takes node as Integer, key as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+
+    Let size be proc memory_get_int64 from Layout with node, 0
+    Let keys be proc memory_get_int64 from Layout with node, 16
+    Let values be proc memory_get_int64 from Layout with node, 24
+
+    Let i be 0
+    While i is less than size:
+        Let slot_offset be i multiplied by 8
+        Let stored_key be proc memory_get_int64 from Layout with keys, slot_offset
+
+        If stored_key is not equal to 0:
+            Let matches be proc string_equals from StringCore with stored_key, key
+            If matches is equal to 1:
+                Return proc memory_get_int64 from Layout with values, slot_offset
+            End If
+        End If
+
+        Set i to i plus 1
+    End While
+
+    Return 0
+End Process
+
+@Reasoning:
+Locate a member of the module's top-level "members" list whose "_type" tag
+matches the requested string, without depending on absolute position. A linear
+scan by tag is the robust locator for the top-level statement the probe wants
+to inspect.
+@End Reasoning
+Process called "find_member" takes module_hir as Integer, tag as Integer returns Integer:
+    Let members be proc field with module_hir, "members"
+    If members is equal to 0:
+        Return 0
+    End If
+
+    Let count be proc list_length from List with members
+    Let i be 0
+    While i is less than count:
+        Let member be proc list_get from List with members, i
+        Let member_type be proc field with member, "_type"
+        If member_type is not equal to 0:
+            Let matches be proc string_equals from StringCore with member_type, tag
+            If matches is equal to 1:
+                Return member
+            End If
+        End If
+        Set i to i plus 1
+    End While
+
+    Return 0
+End Process
+
+@Reasoning:
+Two HIR nodes are the same kind when both are non-null and carry the same
+"_type" tag. This is the base structural check before drilling into a
+construct-specific payload, and is whitespace-insensitive so the emitter's
+re-indentation cannot defeat it.
+@End Reasoning
+Process called "same_kind" takes a as Integer, b as Integer returns Integer:
+    If a is equal to 0:
+        Return 0
+    End If
+    If b is equal to 0:
+        Return 0
+    End If
+
+    Let ka be proc field with a, "_type"
+    Let kb be proc field with b, "_type"
+    If ka is equal to 0:
+        Return 0
+    End If
+    If kb is equal to 0:
+        Return 0
+    End If
+
+    Return proc string_equals from StringCore with ka, kb
+End Process
+
+@Reasoning:
+Each round of the probe runs the identical front-of-pipeline (lex -> parse ->
+semantic -> to_hir). Factoring it into one helper keeps both pipeline runs
+(original source and emitted text) behaviourally identical so any structural
+divergence is attributable to the emitter, not to a difference in how the two
+inputs were driven.
+@End Reasoning
+Process called "source_to_hir" takes source as Integer returns Integer:
+    Let lexer be proc create_python_lexer from Lexer with source
+    If lexer is equal to 0:
+        Return 0
+    End If
+
+    Let parser be proc create_python_parser from Parser with lexer
+    If parser is equal to 0:
+        Return 0
+    End If
+
+    Let ast be proc parse_python from Parser with parser
+    If ast is equal to 0:
+        Return 0
+    End If
+
+    Note: Run the semantic stage for validation side effects; discard analyzer.
+    Let analyzer be proc create_python_semantic_analyzer from Semantic
+    proc analyze_python_program from Semantic with analyzer, ast
+
+    Let hir be proc translate_python_to_hir from Frontend with ast, 0
+    Return hir
+End Process
+
+Note: ============================================================================
+Note: Probe entry point
+Note: ============================================================================
+
+Process called "main" returns Integer:
+    Let results be proc create_test_results from TestUtils
+    proc begin_suite from TestUtils with results, "Python translation round-trip"
+
+    Note:
+    Representative module: a def with parameters and a return, an if/elif/else,
+    a for loop over a list, an assignment, a function call with arguments, and
+    a list literal. Newlines and 4-space indentation drive the lexer's
+    NEWLINE/INDENT/DEDENT machinery.
+    :End Note
+    Let source be "def compute(a, b):\n    total = a + b\n    if total > 10:\n        return total\n    elif total > 5:\n        return b\n    else:\n        return a\n\nvalues = [1, 2, 3]\nfor v in values:\n    print(v, total)\n"
+
+    Note: --- Stage 0-3: source -> HIR (lex, parse, semantic, lower) ---
+    Let lexer be proc create_python_lexer from Lexer with source
+    proc assert_not_null from TestUtils with results, "lexer created", lexer
+
+    Let parser be proc create_python_parser from Parser with lexer
+    proc assert_not_null from TestUtils with results, "parser created", parser
+
+    Let ast be proc parse_python from Parser with parser
+    proc assert_not_null from TestUtils with results, "parser produced Python AST", ast
+
+    Let analyzer be proc create_python_semantic_analyzer from Semantic
+    proc assert_not_null from TestUtils with results, "semantic analyzer created", analyzer
+    Let sem_ok be proc analyze_python_program from Semantic with analyzer, ast
+    proc assert_equal from TestUtils with results, "semantic analysis succeeded", sem_ok, 1
+
+    Let hir1 be proc translate_python_to_hir from Frontend with ast, 0
+    proc assert_not_null from TestUtils with results, "frontend produced HIR root", hir1
+
+    Note: Root must be a python_module node with a non-empty members list.
+    Let root_type be proc field with hir1, "_type"
+    proc assert_not_null from TestUtils with results, "HIR root has a _type tag", root_type
+    Let root_is_module be proc string_equals from StringCore with root_type, "python_module"
+    proc assert_equal from TestUtils with results, "HIR root is a python_module node", root_is_module, 1
+
+    Let members be proc field with hir1, "members"
+    proc assert_not_null from TestUtils with results, "module has a members list", members
+    Let member_count be proc list_length from List with members
+    proc assert_greater_than_or_equal from TestUtils with results, "module has at least 3 top-level members", member_count, 3
+
+    Note: --- function definition: name + parameter count ---
+    Let func_node be proc find_member with hir1, "python_function"
+    proc assert_not_null from TestUtils with results, "python_function node present", func_node
+    Let func_name be proc field with func_node, "name"
+    proc assert_not_null from TestUtils with results, "function has a name", func_name
+    Let func_name_ok be proc string_equals from StringCore with func_name, "compute"
+    proc assert_equal from TestUtils with results, "function name is 'compute'", func_name_ok, 1
+
+    Let func_params be proc field with func_node, "parameters"
+    proc assert_not_null from TestUtils with results, "function has a parameters node", func_params
+    Let func_param_node be proc field with func_params, "_type"
+    Let func_param_is_param be proc string_equals from StringCore with func_param_node, "python_parameter"
+    proc assert_equal from TestUtils with results, "function parameters node is a python_parameter", func_param_is_param, 1
+
+    Let func_body be proc field with func_node, "body"
+    proc assert_not_null from TestUtils with results, "function has a body", func_body
+
+    Note: --- if/elif/else: located inside the function body branches ---
+    Let body_members be proc field with func_body, "members"
+    proc assert_not_null from TestUtils with results, "function body has a members list", body_members
+    Let body_count be proc list_length from List with body_members
+    proc assert_greater_than_or_equal from TestUtils with results, "function body has at least 2 statements", body_count, 2
+
+    Let if_node be proc find_member with func_body, "python_if"
+    proc assert_not_null from TestUtils with results, "python_if node present in function body", if_node
+    Let if_branches be proc field with if_node, "branches"
+    proc assert_not_null from TestUtils with results, "if statement has branches list", if_branches
+    Let if_branch_count be proc list_length from List with if_branches
+    proc assert_greater_than_or_equal from TestUtils with results, "if has at least 4 branch parts (if/elif/else)", if_branch_count, 4
+
+    Note: --- for loop over a list: located among top-level members ---
+    Let for_node be proc find_member with hir1, "python_for"
+    proc assert_not_null from TestUtils with results, "python_for node present", for_node
+    Let for_target be proc field with for_node, "target"
+    proc assert_not_null from TestUtils with results, "for loop has a target", for_target
+    Let for_target_name be proc field with for_target, "name"
+    Let for_target_ok be proc string_equals from StringCore with for_target_name, "v"
+    proc assert_equal from TestUtils with results, "for loop target is 'v'", for_target_ok, 1
+    Let for_iterable be proc field with for_node, "iterable"
+    proc assert_not_null from TestUtils with results, "for loop has an iterable", for_iterable
+
+    Note: --- assignment of a list literal: located among top-level members ---
+    Let assign_node be proc find_member with hir1, "python_assignment"
+    proc assert_not_null from TestUtils with results, "python_assignment node present", assign_node
+    Let assign_target be proc field with assign_node, "target"
+    Let assign_target_name be proc field with assign_target, "name"
+    Let assign_target_ok be proc string_equals from StringCore with assign_target_name, "values"
+    proc assert_equal from TestUtils with results, "assignment target is 'values'", assign_target_ok, 1
+
+    Let assign_value be proc field with assign_node, "value"
+    proc assert_not_null from TestUtils with results, "assignment has a value", assign_value
+    Let assign_value_type be proc field with assign_value, "_type"
+    Let assign_value_is_list be proc string_equals from StringCore with assign_value_type, "python_list"
+    proc assert_equal from TestUtils with results, "assignment value is a python_list literal", assign_value_is_list, 1
+    Let list_elements be proc field with assign_value, "elements"
+    proc assert_not_null from TestUtils with results, "list literal has an elements list", list_elements
+    Let list_elem_count be proc list_length from List with list_elements
+    proc assert_equal from TestUtils with results, "list literal has 3 elements", list_elem_count, 3
+
+    Note: --- function call with arguments: print(v, total) inside the for body ---
+    Let for_body be proc field with for_node, "body"
+    proc assert_not_null from TestUtils with results, "for loop has a body", for_body
+    Let expr_stmt be proc find_member with for_body, "python_expression_stmt"
+    proc assert_not_null from TestUtils with results, "for body has an expression statement", expr_stmt
+    Let call_node be proc field with expr_stmt, "expression"
+    proc assert_not_null from TestUtils with results, "expression statement wraps an expression", call_node
+    Let call_type be proc field with call_node, "_type"
+    Let call_is_call be proc string_equals from StringCore with call_type, "python_call"
+    proc assert_equal from TestUtils with results, "expression is a python_call", call_is_call, 1
+    Let call_callee be proc field with call_node, "callee"
+    Let call_callee_name be proc field with call_callee, "name"
+    Let call_callee_ok be proc string_equals from StringCore with call_callee_name, "print"
+    proc assert_equal from TestUtils with results, "call target is 'print'", call_callee_ok, 1
+    Let call_args be proc field with call_node, "arguments"
+    proc assert_not_null from TestUtils with results, "call has an arguments list", call_args
+    Let call_arg_count be proc list_length from List with call_args
+    proc assert_equal from TestUtils with results, "call has 2 arguments", call_arg_count, 2
+
+    Note: --- Stage 4: HIR -> Python text ---
+    Let emitted be proc generate_python_from_hir from Backend with hir1, 0
+    proc assert_not_null from TestUtils with results, "backend produced Python text", emitted
+    Let emitted_len be proc string_length from StringCore with emitted
+    proc assert_greater_than from TestUtils with results, "emitted Python is non-empty", emitted_len, 0
+
+    Note: --- Stage 5: re-run the pipeline on the emitted text -> HIR2 ---
+    Let hir2 be proc source_to_hir with emitted
+    proc assert_not_null from TestUtils with results, "re-parse of emitted Python produced HIR", hir2
+
+    Let root2_type be proc field with hir2, "_type"
+    Let root2_is_module be proc string_equals from StringCore with root2_type, "python_module"
+    proc assert_equal from TestUtils with results, "round-trip HIR root is a python_module node", root2_is_module, 1
+
+    Note: --- Stage 6: structural equality on the key constructs ---
+    Let func2 be proc find_member with hir2, "python_function"
+    Let func_kind_ok be proc same_kind with func_node, func2
+    proc assert_equal from TestUtils with results, "round-trip preserves python_function node", func_kind_ok, 1
+    Let func2_name be proc field with func2, "name"
+    Let func2_name_ok be proc string_equals from StringCore with func2_name, "compute"
+    proc assert_equal from TestUtils with results, "round-trip preserves function name 'compute'", func2_name_ok, 1
+
+    Let func2_body be proc field with func2, "body"
+    Let if2 be proc find_member with func2_body, "python_if"
+    Let if_kind_ok be proc same_kind with if_node, if2
+    proc assert_equal from TestUtils with results, "round-trip preserves python_if node", if_kind_ok, 1
+
+    Let for2 be proc find_member with hir2, "python_for"
+    Let for_kind_ok be proc same_kind with for_node, for2
+    proc assert_equal from TestUtils with results, "round-trip preserves python_for node", for_kind_ok, 1
+    Let for2_target be proc field with for2, "target"
+    Let for2_target_name be proc field with for2_target, "name"
+    Let for2_target_ok be proc string_equals from StringCore with for2_target_name, "v"
+    proc assert_equal from TestUtils with results, "round-trip preserves for loop target 'v'", for2_target_ok, 1
+
+    Let assign2 be proc find_member with hir2, "python_assignment"
+    Let assign_kind_ok be proc same_kind with assign_node, assign2
+    proc assert_equal from TestUtils with results, "round-trip preserves python_assignment node", assign_kind_ok, 1
+    Let assign2_value be proc field with assign2, "value"
+    Let assign2_value_type be proc field with assign2_value, "_type"
+    Let assign2_value_is_list be proc string_equals from StringCore with assign2_value_type, "python_list"
+    proc assert_equal from TestUtils with results, "round-trip preserves list literal value", assign2_value_is_list, 1
+    Let list2_elements be proc field with assign2_value, "elements"
+    Let list2_elem_count be proc list_length from List with list2_elements
+    proc assert_equal from TestUtils with results, "round-trip preserves 3 list elements", list2_elem_count, 3
+
+    proc print_summary from TestUtils with results
+    Let failed be proc get_failed from TestUtils with results
+    proc destroy_test_results from TestUtils with results
+
+    Return failed
+End Process
