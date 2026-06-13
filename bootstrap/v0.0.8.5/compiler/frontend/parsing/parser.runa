@@ -221,6 +221,11 @@ Process called "parser_create" takes token_stream as Integer, arena as Integer r
     Note: failed_recoveries = 0
     proc memory_set_qword from Layout with parser, 128, 0
 
+    Note: macro_expansion_depth = 0 (offset 136). This counter bounds recursive
+    Note: macro expansion (see MacroExpansion.get_macro_expansion_depth); it lives
+    Note: past the recovery counters inside the 144-byte ParserState allocation.
+    proc memory_set_qword from Layout with parser, 136, 0
+
     Note: Push global context onto context stack
     proc parser_push_context with parser, CONTEXT_GLOBAL, 1, 1
 
@@ -376,8 +381,45 @@ Process called "parser_parse_program" takes parser as Integer returns Integer:
         Let decl_node be proc parser_parse_declaration with parser
 
         If decl_node is not equal to 0:
-            proc append from List with children, decl_node
-            Set child_total to child_total plus 1
+            Note: Macro driver splice (task #498). A macro definition returns an
+            Note: empty AST_MACRO_DEFINITION marker (type 8000) — it registered
+            Note: itself in the context table and contributes no top-level node, so
+            Note: we drop the marker. A macro invocation returns an
+            Note: AST_MACRO_EXPANSION wrapper (type 8002) whose children are the
+            Note: expansion statements — we splice those children inline so
+            Note: downstream parsing/lowering sees them as hand-written siblings.
+            Let decl_kind be proc ast_node_get_type from AST with decl_node
+
+            If decl_kind is equal to 8000:
+                Note: Macro definition: registered, nothing to splice.
+            Otherwise:
+                If decl_kind is equal to 8002:
+                    Let spliced_children be proc ast_node_get_children from AST with decl_node
+                    Let spliced_count be proc ast_node_get_child_count from AST with decl_node
+
+                    If spliced_children is not equal to 0:
+                        Let splice_index be 0
+
+                        Loop forever:
+                            If splice_index is greater than or equal to spliced_count:
+                                Break
+                            End If
+
+                            Let spliced_child be proc get from List with spliced_children, splice_index
+
+                            If spliced_child is not equal to 0:
+                                proc append from List with children, spliced_child
+                                Set child_total to child_total plus 1
+                            End If
+
+                            Set splice_index to splice_index plus 1
+                        End While
+                    End If
+                Otherwise:
+                    proc append from List with children, decl_node
+                    Set child_total to child_total plus 1
+                End If
+            End If
         Otherwise:
             Note: Try to parse statement
             Let stmt_node be proc parser_parse_statement with parser
@@ -448,6 +490,134 @@ Process called "parser_parse_declaration" takes parser as Integer returns Intege
         Return 0
     End If
 
+    Note: Shared error-message slot reused across the declaration branches.
+    Let error_msg be 0
+
+    Note: Source position of the leading token, used for macro diagnostics
+    Note: (token line at offset 16, column at offset 24).
+    Let decl_line be proc memory_get_qword from Layout with current_token, 16
+    Let decl_column be proc memory_get_qword from Layout with current_token, 24
+
+    Note: ------------------------------------------------------------------
+    Note: Macro definition (top-level driver wiring, task #498).
+    Note: Form: `Macro name(params) [hygiene]: body End Macro`.
+    Note: "Macro" is detected by its value string (it is not a reserved global
+    Note: keyword, so it lexes as an identifier). On a match we parse the full
+    Note: definition via MacroExpansion.parse_macro_definition and register the
+    Note: produced MacroDefinition struct into the current parsing context's
+    Note: string-keyed variables table (offset 16), keyed by the macro NAME.
+    Note: That table is the string-safe HashTable created by parser_push_context,
+    Note: which is exactly what MacroExpansion.get_macro_definition searches; we
+    Note: never key macros by raw integer. The definition itself produces no
+    Note: top-level AST node, so we return a synthetic empty AST_MACRO_DEFINITION
+    Note: node that parser_parse_program splices out (zero children), keeping the
+    Note: definition invisible to downstream lowering while still signalling a
+    Note: successful declaration parse.
+    Note: ------------------------------------------------------------------
+    Let is_macro_def be proc string_equals from StringCore with token_value, proc create_from_literal from StringCore with "Macro"
+
+    If is_macro_def is equal to 1:
+        Let macro_def be proc parse_macro_definition from MacroExpansion with parser
+
+        If macro_def is equal to 0:
+            Set error_msg to proc create_from_literal from StringCore with "Failed to parse Macro definition"
+            proc parser_report_error from Parser with parser, 2, error_msg, decl_line, decl_column
+            Return 0
+        End If
+
+        Note: Register the macro by name in the current context's variables table.
+        Let def_context be proc parser_get_current_context with parser
+
+        If def_context is equal to 0:
+            Set error_msg to proc create_from_literal from StringCore with "No parsing context available to register macro definition"
+            proc parser_report_error from Parser with parser, 2, error_msg, decl_line, decl_column
+            Return 0
+        End If
+
+        Let macro_table be proc memory_get_qword from Layout with def_context, 16
+
+        If macro_table is equal to 0:
+            Set error_msg to proc create_from_literal from StringCore with "Current parsing context has no macro/name table"
+            proc parser_report_error from Parser with parser, 2, error_msg, decl_line, decl_column
+            Return 0
+        End If
+
+        Note: macro_def name is at offset 0 (a String pointer); register it.
+        Let def_name be proc memory_get_qword from Layout with macro_def, 0
+        proc hashtable_set from HashTable with macro_table, def_name, macro_def
+
+        Note: Return an empty AST_MACRO_DEFINITION marker so the program loop
+        Note: counts a successful parse but splices nothing into the AST.
+        Let def_marker be proc create_ast_node from AST with 8000, 0, 0
+
+        If def_marker is equal to 0:
+            Return 0
+        End If
+
+        Let def_children be proc create from List
+        proc ast_node_set_children from AST with def_marker, def_children
+        proc ast_node_set_child_count from AST with def_marker, 0
+        Return def_marker
+    End If
+
+    Note: ------------------------------------------------------------------
+    Note: Macro invocation in declaration position (task #498).
+    Note: A leading identifier that names a registered macro is a macro
+    Note: invocation. We look the name up via MacroExpansion.get_macro_definition
+    Note: (which walks the context stack innermost-to-outermost). If found, we
+    Note: parse the invocation (consuming `name(args)`), validate+expand it via
+    Note: MacroExpansion.expand_macro (argument arity is enforced inside
+    Note: validate_macro_expansion), and SPLICE the produced statements by
+    Note: returning an AST_MACRO_EXPANSION wrapper. parser_parse_program flattens
+    Note: that wrapper's children into the top-level declaration stream so the
+    Note: expansion is seen exactly as if hand-written. Nested/sequential macros
+    Note: are handled because the expansion body is itself parsed by the real
+    Note: statement parser (text-emitting macros re-enter the frontend) and the
+    Note: depth counter in expand_macro bounds recursion.
+    Note: ------------------------------------------------------------------
+    Let candidate_macro be proc get_macro_definition from MacroExpansion with parser, token_value
+
+    If candidate_macro is not equal to 0:
+        Let invocation be proc parse_macro_invocation from MacroExpansion with parser
+
+        If invocation is equal to 0:
+            Set error_msg to proc create_from_literal from StringCore with "Failed to parse macro invocation"
+            proc parser_report_error from Parser with parser, 2, error_msg, decl_line, decl_column
+            Return 0
+        End If
+
+        Note: Arguments list is at invocation offset 8.
+        Let invocation_args be proc memory_get_qword from Layout with invocation, 8
+
+        Let expansion be proc expand_macro from MacroExpansion with parser, candidate_macro, invocation_args
+
+        If expansion is equal to 0:
+            Note: Expansion failed: arity mismatch, depth overflow, or hygiene
+            Note: violation. Report with the macro name so the diagnostic is
+            Note: actionable rather than a silent drop.
+            Set error_msg to proc create_from_literal from StringCore with "Macro expansion failed (check argument arity and expansion depth)"
+            proc parser_report_error from Parser with parser, 2, error_msg, decl_line, decl_column
+            Return 0
+        End If
+
+        Note: Wrap the expansion body in an AST_MACRO_EXPANSION node whose
+        Note: children are the expansion statements, so the program loop can
+        Note: splice them inline. The expansion node (a block-style body) carries
+        Note: its statements in its own children list.
+        Let expansion_children be proc ast_node_get_children from AST with expansion
+        Let expansion_count be proc ast_node_get_child_count from AST with expansion
+
+        Let splice_node be proc create_ast_node from AST with 8002, 0, 0
+
+        If splice_node is equal to 0:
+            Return 0
+        End If
+
+        proc ast_node_set_children from AST with splice_node, expansion_children
+        proc ast_node_set_child_count from AST with splice_node, expansion_count
+        Return splice_node
+    End If
+
     Note: Check for Process keyword
     Let is_process be proc string_equals from StringCore with token_value, proc create_from_literal from StringCore with "Process"
 
@@ -457,7 +627,7 @@ Process called "parser_parse_declaration" takes parser as Integer returns Intege
 
         If process_node is equal to 0:
             Note: Process parsing failed - report error
-            Let error_msg be proc create_from_literal from StringCore with "Failed to parse process definition"
+            Set error_msg to proc create_from_literal from StringCore with "Failed to parse process definition"
             proc parser_report_error from Parser with parser, error_msg
             Return 0
         End If
