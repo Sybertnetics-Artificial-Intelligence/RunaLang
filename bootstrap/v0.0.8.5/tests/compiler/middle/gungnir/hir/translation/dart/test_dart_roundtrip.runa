@@ -1,0 +1,288 @@
+Note:
+Copyright 2026 Sybertnetics Artificial Intelligence Solutions
+Licensed under Apache 2.0
+:End Note
+
+Note:
+End-to-end roundtrip test for the Dart translation language.
+
+Pipeline exercised on every assertion:
+  Dart source
+    -> dart_lexer  (create_dart_lexer)
+    -> dart_parser (create_dart_parser / parse_program)   => Dart AST
+    -> dart_semantic (analyze_dart_program)                => zero errors
+    -> dart_to_hir (translate_dart_to_hir)                 => HIR module
+    -> hir_to_dart (generate_dart_from_hir)                => regenerated Dart
+    -> dart_lexer/dart_parser/dart_to_hir (second pass)    => HIR module'
+
+Correctness evidence: a STRUCTURAL HIR SIGNATURE is extracted from the
+HIR module produced by the first pass and compared, field by field,
+against the signature extracted from the HIR module produced by parsing
+and translating the regenerated Dart source. A pure compile/link cannot
+prove this; only a real translation produces a regenerated source that
+re-parses to the same HIR shape.
+
+The representative program deliberately spans the Dart constructs the
+brief calls out:
+  - a class with a method that has a named parameter and an optional
+    positional parameter,
+  - a top-level function with multiple return paths,
+  - an async function returning Future,
+  - if / for-in control flow,
+  - a var and a final local,
+  - a List literal and a Map literal,
+  - string interpolation.
+:End Note
+
+Import "tests/test_utils.runa" as T
+Import "compiler/middle/gungnir/hir/translation/frontends/dart/dart_lexer.runa" as Lexer
+Import "compiler/middle/gungnir/hir/translation/frontends/dart/dart_parser.runa" as Parser
+Import "compiler/middle/gungnir/hir/translation/frontends/dart/dart_semantic.runa" as Semantic
+Import "compiler/middle/gungnir/hir/translation/frontends/dart/dart_to_hir.runa" as ToHir
+Import "compiler/middle/gungnir/hir/translation/backends/dart/hir_to_dart.runa" as ToDart
+Import "compiler/middle/gungnir/hir/hir_nodes.runa" as HIR
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/frontend/primitives/collections/list.runa" as List
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+
+Note: ============================================================================
+Note: STRUCTURAL HIR SIGNATURE
+Note: ============================================================================
+Note:
+A signature is a fixed-layout record (8 Integer slots) summarizing the
+key constructs of a HIR module so two modules can be compared for
+structural equality. Slots:
+  0: top-level declaration count
+  1: number of HIR_CLASS declarations
+  2: number of HIR_FUNCTION declarations
+  3: number of HIR_VARIABLE declarations
+  4: number of HIR_METHOD members across all classes
+  5: 1 if a class named "Greeter" exists, else 0
+  6: number of final variables among top-level HIR_VARIABLE declarations
+  7: number of top-level function declarations whose name is non-empty
+:End Note
+
+Process called "make_signature" returns Integer:
+    Note: 8 slots * 8 bytes = 64 bytes, zero-initialized
+    Let sig be Layout.allocate(64)
+    Let i be 0
+    While i is less than 8:
+        Layout.memory_set_int64(sig, i multiplied by 8, 0)
+        Set i to i plus 1
+    End While
+    Return sig
+End Process
+
+Process called "sig_get" that takes sig as Integer, slot as Integer returns Integer:
+    Return Layout.memory_get_int64(sig, slot multiplied by 8)
+End Process
+
+Process called "sig_set" that takes sig as Integer, slot as Integer, value as Integer:
+    Layout.memory_set_int64(sig, slot multiplied by 8, value)
+End Process
+
+Process called "sig_inc" that takes sig as Integer, slot as Integer:
+    Let cur be sig_get(sig, slot)
+    sig_set(sig, slot, cur plus 1)
+End Process
+
+Note: Compute the structural signature of a HIR module produced by dart_to_hir.
+Process called "signature_of_module" that takes hir_module as Integer returns Integer:
+    Let sig be make_signature()
+    If hir_module is equal to 0:
+        Return sig
+    End If
+
+    Let decls be HIR.hir_get_declarations(hir_module)
+    If decls is equal to 0:
+        Return sig
+    End If
+
+    Let n be List.size(decls)
+    sig_set(sig, 0, n)
+
+    Let hir_class be HIR.HIR_CLASS
+    Let hir_function be HIR.HIR_FUNCTION
+    Let hir_variable be HIR.HIR_VARIABLE
+    Let hir_method be HIR.HIR_METHOD
+
+    Let i be 0
+    While i is less than n:
+        Let decl be List.get(decls, i)
+        Let kind be HIR.hir_node_type(decl)
+
+        If kind is equal to hir_class:
+            sig_inc(sig, 1)
+
+            Let cname be HIR.hir_get_class_name(decl)
+            If cname is not equal to 0:
+                Let is_greeter be StringCore.string_equals(cname, "Greeter")
+                If is_greeter is equal to 1:
+                    sig_set(sig, 5, 1)
+                End If
+            End If
+
+            Let members be HIR.hir_get_class_members(decl)
+            If members is not equal to 0:
+                Let m be 0
+                Let mcount be List.size(members)
+                While m is less than mcount:
+                    Let member be List.get(members, m)
+                    Let mkind be HIR.hir_node_type(member)
+                    If mkind is equal to hir_method:
+                        sig_inc(sig, 4)
+                    End If
+                    Set m to m plus 1
+                End While
+            End If
+        End If
+
+        If kind is equal to hir_function:
+            sig_inc(sig, 2)
+            Let fname be HIR.hir_get_function_name(decl)
+            If fname is not equal to 0:
+                Let flen be StringCore.string_length(fname)
+                If flen is greater than 0:
+                    sig_inc(sig, 7)
+                End If
+            End If
+        End If
+
+        If kind is equal to hir_variable:
+            sig_inc(sig, 3)
+            Let is_final be HIR.hir_is_variable_final(decl)
+            If is_final is equal to 1:
+                sig_inc(sig, 6)
+            End If
+        End If
+
+        Set i to i plus 1
+    End While
+
+    Return sig
+End Process
+
+Note: ============================================================================
+Note: PIPELINE
+Note: ============================================================================
+
+Process called "dart_to_hir_module" that takes source as String returns Integer:
+    Let lexer be Lexer.create_dart_lexer(source)
+    Let parser be Parser.create_dart_parser(lexer)
+    Let program be Parser.parse_program(parser)
+    If program is equal to 0:
+        Return 0
+    End If
+    Return ToHir.translate_dart_to_hir(program)
+End Process
+
+Process called "semantic_errors_of" that takes source as String returns Integer:
+    Let lexer be Lexer.create_dart_lexer(source)
+    Let parser be Parser.create_dart_parser(lexer)
+    Let program be Parser.parse_program(parser)
+    Let analyzer be Semantic.create_dart_semantic_analyzer()
+    Semantic.analyze_dart_program(analyzer, program)
+    Let errors be Semantic.get_errors(analyzer)
+    Return List.size(errors)
+End Process
+
+Note: ============================================================================
+Note: REPRESENTATIVE DART PROGRAM
+Note: ============================================================================
+Note:
+Held in a single process so both the assertion suites and any future
+caller share one source of truth. Covers class+method (named + optional
+positional params), top-level function with multiple returns, an async
+function returning Future, if + for-in, var + final, List + Map literals,
+and string interpolation.
+:End Note
+
+Process called "representative_program" returns String:
+    Return "class Greeter { String greet(String who, {String prefix = 'Hi'}, [String suffix = '!']) { return '${prefix}, ${who}${suffix}'; } } int classify(int n) { if (n > 0) { return 1; } return 0; } Future<int> total(List<int> xs) async { var sum = 0; for (var x in xs) { sum = sum + x; } final scores = [1, 2, 3]; final table = {'a': 1, 'b': 2}; return sum; }"
+End Process
+
+Note: ============================================================================
+Note: SUITES
+Note: ============================================================================
+
+Process called "test_frontend_clean" that takes results as Integer returns Integer:
+    T.begin_suite(results, "dart roundtrip: representative program is semantically clean")
+
+    Let src be representative_program()
+    Let errs be semantic_errors_of(src)
+    T.assert_equal(results, "RT representative program parses + analyzes clean", errs, 0)
+
+    Return 1
+End Process
+
+Process called "test_first_pass_shape" that takes results as Integer returns Integer:
+    T.begin_suite(results, "dart roundtrip: first-pass HIR structural shape")
+
+    Let src be representative_program()
+    Let hir1 be dart_to_hir_module(src)
+    T.assert_not_equal(results, "RT first-pass HIR module built", hir1, 0)
+
+    Let sig be signature_of_module(hir1)
+
+    T.assert_equal(results, "RT one Greeter class", sig_get(sig, 1), 1)
+    T.assert_equal(results, "RT Greeter named present", sig_get(sig, 5), 1)
+    T.assert_equal(results, "RT one method in class", sig_get(sig, 4), 1)
+    T.assert_equal(results, "RT two top-level functions", sig_get(sig, 2), 2)
+    T.assert_equal(results, "RT both functions named", sig_get(sig, 7), 2)
+
+    Return 1
+End Process
+
+Process called "test_roundtrip_structural_equality" that takes results as Integer returns Integer:
+    T.begin_suite(results, "dart roundtrip: HIR structural equality across regeneration")
+
+    Let src be representative_program()
+
+    Let hir1 be dart_to_hir_module(src)
+    T.assert_not_equal(results, "RT pass1 HIR module", hir1, 0)
+    Let sig1 be signature_of_module(hir1)
+
+    Note: HIR -> Dart source (the backend under test)
+    Let regenerated be ToDart.generate_dart_from_hir(hir1)
+    T.assert_not_equal(results, "RT regenerated source non-null", regenerated, 0)
+    Let regen_len be StringCore.string_length(regenerated)
+    T.assert_greater_than_or_equal(results, "RT regenerated source non-empty", regen_len, 1)
+
+    Note: Regenerated Dart must itself re-parse and re-translate.
+    Let hir2 be dart_to_hir_module(regenerated)
+    T.assert_not_equal(results, "RT pass2 HIR module from regenerated source", hir2, 0)
+    Let sig2 be signature_of_module(hir2)
+
+    Note: Structural HIR equality on every signature slot.
+    T.assert_equal(results, "RT eq decl count", sig_get(sig2, 0), sig_get(sig1, 0))
+    T.assert_equal(results, "RT eq class count", sig_get(sig2, 1), sig_get(sig1, 1))
+    T.assert_equal(results, "RT eq function count", sig_get(sig2, 2), sig_get(sig1, 2))
+    T.assert_equal(results, "RT eq variable count", sig_get(sig2, 3), sig_get(sig1, 3))
+    T.assert_equal(results, "RT eq method count", sig_get(sig2, 4), sig_get(sig1, 4))
+    T.assert_equal(results, "RT eq Greeter present", sig_get(sig2, 5), sig_get(sig1, 5))
+    T.assert_equal(results, "RT eq final var count", sig_get(sig2, 6), sig_get(sig1, 6))
+    T.assert_equal(results, "RT eq named function count", sig_get(sig2, 7), sig_get(sig1, 7))
+
+    Note: And the regenerated source is still semantically clean.
+    Let regen_errs be semantic_errors_of(regenerated)
+    T.assert_equal(results, "RT regenerated source analyzes clean", regen_errs, 0)
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: MAIN
+Note: ============================================================================
+
+Process called "main" returns Integer:
+    Let results be T.create_test_results()
+
+    test_frontend_clean(results)
+    test_first_pass_shape(results)
+    test_roundtrip_structural_equality(results)
+
+    T.print_summary(results)
+    Let exit_code be T.get_failed(results)
+    T.destroy_test_results(results)
+    Return exit_code
+End Process
