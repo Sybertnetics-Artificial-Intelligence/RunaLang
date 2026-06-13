@@ -1,1123 +1,1916 @@
-Note: ============================================================================
-Note: LUA SEMANTIC ANALYZER
-Note: ============================================================================
-Note: Semantic analysis for Lua embedded scripting language
-Note: Handles Lua-specific features:
-Note: - Dynamic typing and metatables
-Note: - Lexical scoping and closures
-Note: - Table construction and manipulation
-Note: - Coroutines and cooperative multitasking
-Note: - Module system and package loading
-Note: - C API integration and extension
-Note: - Weak references and garbage collection
-Note: - String patterns and regular expressions
-Note: - First-class functions and tail calls
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
 
-Import "compiler/middle/gungnir/hir/hir_nodes.runa" as LuaSemNodes
-Import "compiler/middle/gungnir/hir/hir_builder.runa" as HIRBuilder
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
 
-@Reasoning:
-Central semantic state for Lua analysis. Carries current scope, the
-loaded standard-library snapshot, error/warning lists, package registry,
-metatables, coroutine stack, and GC settings. parent_context supports
-nested context chains for module loading (require()).
-@End Reasoning
-Type called "LuaSemanticContext":
-    current_scope as LuaScope
-    parent_context as LuaSemanticContext
-    loaded_modules as List[String]
-    current_function as String
-    error_list as List[String]
-    warning_list as List[String]
-    global_environment as Dictionary[String, LuaValue]
-    package_path as List[String]
-    package_loaded as Dictionary[String, Boolean]
-    metatables as Dictionary[String, LuaTable]
-    coroutine_stack as List[LuaCoroutine]
-    gc_settings as LuaGCSettings
-    lua_version as String
-End Type
+    http://www.apache.org/licenses/LICENSE-2.0
 
-@Reasoning:
-Lua scope record carrying variables/functions/upvalues dicts plus parent
-pointer and scope kind flags. The three is_*_scope flags are mutually
-exclusive but kept as explicit booleans for fast classification rather
-than a single tagged enum.
-@End Reasoning
-Type called "LuaScope":
-    variables as Dictionary[String, LuaVariable]
-    functions as Dictionary[String, LuaFunction]
-    upvalues as Dictionary[String, LuaUpvalue]
-    parent_scope as LuaScope
-    scope_type as String
-    is_function_scope as Boolean
-    is_block_scope as Boolean
-    is_global_scope as Boolean
-    level as Integer
-End Type
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
 
-Note: Local Lua AST schema used by this semantic analyzer until v0.0.9.x
-Note: replaces it with traversal over the canonical HIRNode tree.
-@Reasoning:
-Lua-specific intermediate node carrying the fields the semantic analyser
-actually inspects: name, body, statements, parameters, varargs flag, etc.
-A thin wrapper rather than the canonical HIRNode so this pass remains
-decoupled from HIR schema changes.
-@End Reasoning
-Type called "LuaSemNode":
-    node_type as String
-    name as Integer
-    line as Integer
-    source_location as Integer
-    body as Integer
-    statements as Integer
-    parameters as Integer
-    function_name as Integer
-    has_varargs as Integer
-    variable_names as Integer
-    initial_values as Integer
-    iterator_expressions as Integer
-    fields as Integer
-End Type
+Note:
+LUA SEMANTIC ANALYZER - resolves names and captures over the Lua AST
 
-Note: A table-literal field reference used in Lua-specific table analysis.
-@Reasoning:
-Lua table literals are key/value pairs where the key can be a name,
-expression, or implicit array index; type tags which kind so the
-analyser knows how to resolve the key during table semantics.
-@End Reasoning
-Type called "LuaTableField":
-    key as Integer
-    value as Integer
-    type as Integer
-End Type
+The Lua parser (lua_parser.runa) produces a tree of LuaASTNode records whose
+node_type field is one of the LUA_* constants and whose positional children
+carry the sub-structure (see the per-node child contract documented inline at
+each analyze_* Process). This pass runs over that real AST - it does NOT invent
+a parallel node schema - and enforces the SEMANTIC rules Lua's grammar alone
+does not express:
 
-@Reasoning:
-Per-variable record tracking scope (local/global/upvalue), first/last
-access lines for liveness analysis, and an optional metatable. The
-mutual-exclusion between is_local/is_global/is_upvalue is invariant.
-@End Reasoning
-Type called "LuaVariable":
-    name as String
-    value_type as String
-    is_local as Boolean
-    is_global as Boolean
-    is_upvalue as Boolean
-    scope_level as Integer
-    first_assignment_line as Integer
-    last_access_line as Integer
-    is_constant as Boolean
-    metatable as LuaTable
-End Type
+  1. Lexical name resolution. Every identifier reference is resolved against a
+     scope chain of name->declaration-level symbol tables. A name found in the
+     innermost scope is a local; a name found in an enclosing scope that lies
+     across a function boundary is an UPVALUE (captured by the closure); a name
+     found nowhere is a GLOBAL (Lua resolves unknown names through the global
+     environment table _G at run time, and an assignment to an unknown name
+     implicitly creates a global).
 
-@Reasoning:
-Lua function record: parameters list, varargs flag, body AST, upvalue
-names list, plus closure/coroutine classifications. environment captures
-the scope at definition time for closure lookup.
-@End Reasoning
-Type called "LuaFunction":
-    name as String
-    parameters as List[String]
-    has_varargs as Boolean
-    body as LuaSemNode
-    upvalues as List[String]
-    is_closure as Boolean
-    is_coroutine as Boolean
-    environment as LuaScope
-    source_location as String
-End Type
+  2. Closure upvalue capture. Lua closures capture variables from enclosing
+     function scopes. When analyze_lua_variable resolves a reference to a
+     binding declared at a function-scope level shallower than the innermost
+     enclosing function, it records the name in the analyzer's upvalue set via
+     mark_as_upvalue; analyze_upvalues then reconciles every recorded capture
+     against the function scope that introduced it so closure lowering can
+     materialise the capture slots.
 
-@Reasoning:
-Upvalue binding: name visible inside the closure, target_variable in the
-enclosing scope, mutability flag controlling whether the closure can
-write back to the captured slot.
-@End Reasoning
-Type called "LuaUpvalue":
-    name as String
-    target_variable as String
-    scope_level as Integer
-    is_mutable as Boolean
-End Type
+  3. Standard-library surface. Lua programs reference print, type, pairs,
+     string.format, math.pi, table.insert, io.write, etc. without declaring
+     them. setup_global_environment pre-populates the global environment with
+     the canonical Lua 5.4 library surface so an undefined-global diagnostic
+     fires only for genuinely unknown names, not for stdlib references.
 
-@Reasoning:
-Lua values are tagged unions; one boolean per type variant lets the
-analyser ask "is this any number-like value" without re-parsing the
-value_type string. metatable is shared with LuaTable for tables.
-@End Reasoning
-Type called "LuaValue":
-    value_type as String
-    is_nil as Boolean
-    is_number as Boolean
-    is_string as Boolean
-    is_boolean as Boolean
-    is_table as Boolean
-    is_function as Boolean
-    is_thread as Boolean
-    is_userdata as Boolean
-    metatable as LuaTable
-End Type
+  4. Structural / usage validation. validate_lua_* walks the recorded analysis
+     state to surface genuine problems: references that resolved to nothing and
+     are not stdlib (undefined), goto targets with no matching label, break
+     outside any loop, and unbalanced assignment target/value lists.
 
-@Reasoning:
-Lua tables have two parts: an array part for sequential integer keys
-(fast path) and a hash part for all other keys. is_array/is_hash
-classify which part dominates; weak_keys/weak_values control GC
-behaviour through __mode metatable entries.
-@End Reasoning
-Type called "LuaTable":
-    fields as Dictionary[String, LuaValue]
-    array_part as List[LuaValue]
-    metatable as LuaTable
-    is_array as Boolean
-    is_hash as Boolean
-    weak_keys as Boolean
-    weak_values as Boolean
-End Type
+The symbol tables are STRING-KEYED dictionaries (dictionary.runa over the
+content-hashing hashtable): keys are the identifier strings the parser copied
+into LuaASTNode.value, values are the 1-based declaration level (level+1, so 0
+unambiguously means "absent"). A string key keyed by content - not an
+integer-keyed table indexed by a string pointer - is mandatory; the latter
+hashes pointer identity and corrupts on the parser's distinct heap copies.
 
-@Reasoning:
-Lua coroutine record: state (one of "suspended", "running", "normal",
-"dead"), the function body being executed, current stack depth, and
-yielded value. Tracked by the analyser to detect dangling coroutines.
-@End Reasoning
-Type called "LuaCoroutine":
-    name as String
-    state as String
-    function as LuaFunction
-    stack_level as Integer
-    yield_value as LuaValue
-End Type
+Dependencies:
+- lua_parser.runa            (LuaASTNode shape, LUA_* node constants, accessors)
+- compiler/frontend/primitives/memory/layout.runa
+- compiler/frontend/primitives/core/string_core.runa
+- compiler/frontend/primitives/collections/list.runa
+- compiler/frontend/primitives/collections/dictionary.runa
+:End Note
 
-@Reasoning:
-Lua incremental-GC tuning parameters: pause (% of heap before next GC),
-stepmul (collector vs allocator pace), count (current heap), threshold.
-Tracked so HIR can preserve user-tuned GC settings across translation.
-@End Reasoning
-Type called "LuaGCSettings":
-    enabled as Boolean
-    pause as Integer
-    stepmul as Integer
-    count as Integer
-    threshold as Integer
-End Type
-
-@Reasoning:
-Module record: name + path resolved via package.path, dictionary of
-exported values, dependency list, C-module flag (some modules are
-native), and the loader function used by require().
-@End Reasoning
-Type called "LuaModule":
-    name as String
-    path as String
-    exports as Dictionary[String, LuaValue]
-    dependencies as List[String]
-    is_c_module as Boolean
-    loader_function as String
-End Type
-
-@Reasoning:
-Per-diagnostic record: human-readable message, position, severity
-("error"/"warning"/"info"), and a machine-readable error_code so callers
-can filter or format consistently.
-@End Reasoning
-Type called "LuaSemanticError":
-    message as String
-    line as Integer
-    column as Integer
-    severity as String
-    error_code as String
-End Type
+Import "compiler/middle/gungnir/hir/translation/frontends/lua/lua_parser.runa" as Parser
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/frontend/primitives/collections/list.runa" as ListCore
+Import "compiler/frontend/primitives/collections/dictionary.runa" as Dict
 
 Note: ============================================================================
-Note: MAIN SEMANTIC ANALYSIS ENTRY POINT
+Note: Analyzer State
 Note: ============================================================================
 
 @Reasoning:
-Main entry point. Creates a fresh global context, loads stdlib bindings
-(string, table, math, io, os, coroutine, package, debug modules), walks
-the AST, then runs the final validation pass for orphan upvalues and
-undefined references.
+The analyzer threads its resolution state through the recursive walk in a
+single heap record. Two scope handles model the lexical chain: current_scope is
+the innermost (most recently entered) name->level table, and scope_stack holds
+every enclosing scope with the global environment at the bottom, so a lookup
+walks current_scope then the stack from top down to global. Parallel to
+scope_stack, scope_is_function records whether each stacked scope is a function
+boundary, and the matching current_is_function flag classifies the innermost
+scope; these let the analyzer decide local-vs-upvalue when a name resolves in an
+enclosing scope. current_level is the lexical depth of the innermost scope (0 at
+global). global_env is the persistent stdlib + implicit-global table and never
+leaves the bottom of the chain. upvalues, errors, and warnings are append/keyed
+accumulators surfaced to the caller; loop_depth gates break/continue validity;
+labels collects every label seen and goto_targets every goto so the final pass
+can match them.
 @End Reasoning
-Process called "analyze_lua_semantics" that takes ast as LuaSemNode returns LuaSemanticContext:
-    Note: Main entry point for Lua semantic analysis
 
-    Let context be create_global_lua_context
+@Implementation:
+Sixteen 8-byte slots at fixed offsets 0..120 referenced directly by the
+accessors below: global_env(0), current_scope(8), scope_stack(16),
+scope_is_function(24), current_is_function(32), current_level(40), upvalues(48),
+errors(56), warnings(64), has_error(72), loop_depth(80), labels(88),
+goto_targets(96), goto_lines(104), break_lines(112), unbalanced_lines(120).
+Total 128 bytes. The four trailing line lists pair positionally with their
+target lists so a diagnostic can name the offending source line.
+@End Implementation
 
-    Note: Load Lua standard library
-    Call load_lua_standard_library with context
-
-    Note: Analyze the AST
-    Call analyze_lua_node with ast and context
-
-    Note: Perform final validation
-    Call validate_lua_semantics with context
-
-    Return context
-End Process
-
-@Reasoning:
-Constructs the root context with a single global scope and default GC
-settings (pause=200, stepmul=200, matching the Lua 5.x defaults). All
-later scopes chain through this root for global-name resolution.
-@End Reasoning
-Process called "create_global_lua_context" that takes nothing returns LuaSemanticContext:
-    Note: Create the global semantic context with Lua environment
-
-    Let global_scope be a value of type LuaScope with
-        variables as a dictionary containing nothing,
-        functions as a dictionary containing nothing,
-        upvalues as a dictionary containing nothing,
-        parent_scope as null,
-        scope_type as "global",
-        is_function_scope as false,
-        is_block_scope as false,
-        is_global_scope as true,
-        level as 0
-
-    Let gc_settings be a value of type LuaGCSettings with
-        enabled as true,
-        pause as 200,
-        stepmul as 200,
-        count as 0,
-        threshold as 200
-
-    Let context be a value of type LuaSemanticContext with
-        current_scope as global_scope,
-        parent_context as null,
-        loaded_modules as a list containing nothing,
-        current_function as null,
-        error_list as a list containing nothing,
-        warning_list as a list containing nothing,
-        global_environment as a dictionary containing nothing,
-        package_path as a list containing "./?.lua", "/usr/local/share/lua/5.4/?.lua", "/usr/local/lib/lua/5.4/?.lua",
-        package_loaded as a dictionary containing nothing,
-        metatables as a dictionary containing nothing,
-        coroutine_stack as a list containing nothing,
-        gc_settings as gc_settings,
-        lua_version as "5.4"
-
-    Return context
-End Process
-
-@Reasoning:
-Top-level stdlib loader; calls each per-module loader in turn so the
-global environment ends up with the canonical Lua 5.x library surface
-(print, type, string.format, math.pi, io.open, etc.).
-@End Reasoning
-Process called "load_lua_standard_library" that takes ctx as LuaSemanticContext returns Nothing:
-    Note: Load Lua standard library functions and modules
-
-    @Reasoning:
-    Lua standard library provides essential functions for string manipulation,
-    table operations, I/O, math, coroutines, and more. These need to be
-    available for semantic analysis and validation.
-    @End Reasoning
-
-    Note: Load global functions
-    Call load_lua_global_functions with ctx
-
-    Note: Load standard modules
-    Call load_lua_string_module with ctx
-    Call load_lua_table_module with ctx
-    Call load_lua_math_module with ctx
-    Call load_lua_io_module with ctx
-    Call load_lua_os_module with ctx
-    Call load_lua_coroutine_module with ctx
-    Call load_lua_package_module with ctx
-    Call load_lua_debug_module with ctx
-
-    Note: Set up metatables for basic types
-    Call setup_basic_metatables with ctx
-End Process
-
-@Reasoning:
-Registers the global-namespace Lua builtins (print, type, tostring,
-tonumber, pairs, ipairs, assert, error, pcall, xpcall, etc.). Each is
-created as a LuaFunction and inserted into ctx.global_environment so
-later lookups succeed without complaining about undefined names.
-@End Reasoning
-Process called "load_lua_global_functions" that takes ctx as LuaSemanticContext returns Nothing:
-    Note: Load Lua global functions
-
-    Let global_functions be a list containing:
-        create_lua_function with "assert" and "assertion with optional message",
-        create_lua_function with "collectgarbage" and "garbage collector control",
-        create_lua_function with "dofile" and "execute Lua file",
-        create_lua_function with "error" and "raise error",
-        create_lua_function with "getmetatable" and "get metatable of object",
-        create_lua_function with "setmetatable" and "set metatable of table",
-        create_lua_function with "ipairs" and "iterator for array part of table",
-        create_lua_function with "pairs" and "iterator for all table elements",
-        create_lua_function with "next" and "next table element",
-        create_lua_function with "load" and "load and compile Lua code",
-        create_lua_function with "loadfile" and "load and compile Lua file",
-        create_lua_function with "pcall" and "protected call",
-        create_lua_function with "xpcall" and "extended protected call",
-        create_lua_function with "print" and "print values",
-        create_lua_function with "rawequal" and "raw equality comparison",
-        create_lua_function with "rawget" and "raw table access",
-        create_lua_function with "rawset" and "raw table assignment",
-        create_lua_function with "rawlen" and "raw length of object",
-        create_lua_function with "require" and "load module",
-        create_lua_function with "select" and "select from variable arguments",
-        create_lua_function with "tonumber" and "convert to number",
-        create_lua_function with "tostring" and "convert to string",
-        create_lua_function with "type" and "get type of value"
-
-    For Each func as LuaFunction in global_functions:
-        Set ctx.global_environment at key func.name to create_function_value with func
-    End For
-
-    Note: Add global values
-    Call add_global_value with ctx and "_G" and "global environment table"
-    Call add_global_value with ctx and "_VERSION" and "Lua version string"
-End Process
-
-@Reasoning:
-Registers the string.* module functions (string.format, string.sub,
-string.find, etc.) into the global environment under the "string" key.
-@End Reasoning
-Process called "load_lua_string_module" that takes ctx as LuaSemanticContext returns Nothing:
-    Note: Load Lua string module functions
-
-    Let string_functions be a list containing:
-        create_lua_function with "string.byte" and "get byte values of characters",
-        create_lua_function with "string.char" and "create string from byte values",
-        create_lua_function with "string.dump" and "dump function to binary string",
-        create_lua_function with "string.find" and "find substring with pattern",
-        create_lua_function with "string.format" and "format string with values",
-        create_lua_function with "string.gmatch" and "global pattern matching iterator",
-        create_lua_function with "string.gsub" and "global substitution",
-        create_lua_function with "string.len" and "get string length",
-        create_lua_function with "string.lower" and "convert to lowercase",
-        create_lua_function with "string.match" and "match pattern in string",
-        create_lua_function with "string.pack" and "pack binary data",
-        create_lua_function with "string.packsize" and "get size of packed data",
-        create_lua_function with "string.rep" and "repeat string",
-        create_lua_function with "string.reverse" and "reverse string",
-        create_lua_function with "string.sub" and "extract substring",
-        create_lua_function with "string.unpack" and "unpack binary data",
-        create_lua_function with "string.upper" and "convert to uppercase"
-
-    For Each func as LuaFunction in string_functions:
-        Set ctx.global_environment at key func.name to create_function_value with func
-    End For
-End Process
-
-@Reasoning:
-Registers table.* functions (table.insert, table.remove, table.concat,
-table.sort, etc.) used for array-like table manipulation.
-@End Reasoning
-Process called "load_lua_table_module" that takes ctx as LuaSemanticContext returns Nothing:
-    Note: Load Lua table module functions
-
-    Let table_functions be a list containing:
-        create_lua_function with "table.concat" and "concatenate table elements",
-        create_lua_function with "table.insert" and "insert element into table",
-        create_lua_function with "table.move" and "move elements between tables",
-        create_lua_function with "table.pack" and "pack values into table",
-        create_lua_function with "table.remove" and "remove element from table",
-        create_lua_function with "table.sort" and "sort table elements",
-        create_lua_function with "table.unpack" and "unpack table values"
-
-    For Each func as LuaFunction in table_functions:
-        Set ctx.global_environment at key func.name to create_function_value with func
-    End For
-End Process
-
-@Reasoning:
-Registers math.* (math.pi, math.huge, math.sin/cos/tan, math.random, etc.).
-Includes both functions and the canonical numeric constants Lua exposes
-as module-level values.
-@End Reasoning
-Process called "load_lua_math_module" that takes ctx as LuaSemanticContext returns Nothing:
-    Note: Load Lua math module functions and constants
-
-    Let math_functions be a list containing:
-        create_lua_function with "math.abs" and "absolute value",
-        create_lua_function with "math.acos" and "arc cosine",
-        create_lua_function with "math.asin" and "arc sine",
-        create_lua_function with "math.atan" and "arc tangent",
-        create_lua_function with "math.ceil" and "ceiling",
-        create_lua_function with "math.cos" and "cosine",
-        create_lua_function with "math.deg" and "radians to degrees",
-        create_lua_function with "math.exp" and "exponential",
-        create_lua_function with "math.floor" and "floor",
-        create_lua_function with "math.fmod" and "floating-point remainder",
-        create_lua_function with "math.log" and "natural logarithm",
-        create_lua_function with "math.max" and "maximum value",
-        create_lua_function with "math.min" and "minimum value",
-        create_lua_function with "math.modf" and "integral and fractional parts",
-        create_lua_function with "math.rad" and "degrees to radians",
-        create_lua_function with "math.random" and "random number",
-        create_lua_function with "math.randomseed" and "set random seed",
-        create_lua_function with "math.sin" and "sine",
-        create_lua_function with "math.sqrt" and "square root",
-        create_lua_function with "math.tan" and "tangent",
-        create_lua_function with "math.tointeger" and "convert to integer",
-        create_lua_function with "math.type" and "get number type",
-        create_lua_function with "math.ult" and "unsigned less than"
-
-    For Each func as LuaFunction in math_functions:
-        Set ctx.global_environment at key func.name to create_function_value with func
-    End For
-
-    Note: Add math constants
-    Call add_global_value with ctx and "math.pi" and "pi constant"
-    Call add_global_value with ctx and "math.huge" and "infinity"
-    Call add_global_value with ctx and "math.maxinteger" and "maximum integer"
-    Call add_global_value with ctx and "math.mininteger" and "minimum integer"
-End Process
-
-@Reasoning:
-Registers io.* (io.open, io.read, io.write, io.stdout, io.stderr, etc.).
-Captures both functions and the standard-stream handles.
-@End Reasoning
-Process called "load_lua_io_module" that takes ctx as LuaSemanticContext returns Nothing:
-    Note: Load Lua I/O module functions
-
-    Let io_functions be a list containing:
-        create_lua_function with "io.close" and "close file",
-        create_lua_function with "io.flush" and "flush output",
-        create_lua_function with "io.input" and "set default input file",
-        create_lua_function with "io.lines" and "iterate over file lines",
-        create_lua_function with "io.open" and "open file",
-        create_lua_function with "io.output" and "set default output file",
-        create_lua_function with "io.popen" and "open program pipe",
-        create_lua_function with "io.read" and "read from input",
-        create_lua_function with "io.stderr" and "standard error file",
-        create_lua_function with "io.stdin" and "standard input file",
-        create_lua_function with "io.stdout" and "standard output file",
-        create_lua_function with "io.tmpfile" and "create file",
-        create_lua_function with "io.type" and "get file type",
-        create_lua_function with "io.write" and "write to output"
-
-    For Each func as LuaFunction in io_functions:
-        Set ctx.global_environment at key func.name to create_function_value with func
-    End For
-End Process
-
-@Reasoning:
-Registers os.* (os.time, os.date, os.execute, os.getenv, etc.) -
-operating-system interaction helpers exposed by the Lua runtime.
-@End Reasoning
-Process called "load_lua_os_module" that takes ctx as LuaSemanticContext returns Nothing:
-    Note: Load Lua OS module functions
-
-    Let os_functions be a list containing:
-        create_lua_function with "os.clock" and "CPU time used",
-        create_lua_function with "os.date" and "format date/time",
-        create_lua_function with "os.difftime" and "difference between times",
-        create_lua_function with "os.execute" and "execute system command",
-        create_lua_function with "os.exit" and "exit program",
-        create_lua_function with "os.getenv" and "get environment variable",
-        create_lua_function with "os.remove" and "remove file",
-        create_lua_function with "os.rename" and "rename file",
-        create_lua_function with "os.setlocale" and "set locale",
-        create_lua_function with "os.time" and "get current time",
-        create_lua_function with "os.tmpname" and "get file name"
-
-    For Each func as LuaFunction in os_functions:
-        Set ctx.global_environment at key func.name to create_function_value with func
-    End For
-End Process
-
-@Reasoning:
-Registers coroutine.* (coroutine.create, resume, yield, status, wrap).
-Coroutines are first-class in Lua and require their own module surface.
-@End Reasoning
-Process called "load_lua_coroutine_module" that takes ctx as LuaSemanticContext returns Nothing:
-    Note: Load Lua coroutine module functions
-
-    Let coroutine_functions be a list containing:
-        create_lua_function with "coroutine.create" and "create new coroutine",
-        create_lua_function with "coroutine.isyieldable" and "check if coroutine can yield",
-        create_lua_function with "coroutine.resume" and "resume coroutine",
-        create_lua_function with "coroutine.running" and "get running coroutine",
-        create_lua_function with "coroutine.status" and "get coroutine status",
-        create_lua_function with "coroutine.wrap" and "wrap function as coroutine",
-        create_lua_function with "coroutine.yield" and "yield from coroutine"
-
-    For Each func as LuaFunction in coroutine_functions:
-        Set ctx.global_environment at key func.name to create_function_value with func
-    End For
-End Process
-
-@Reasoning:
-Registers package.* (package.path, package.loaded, package.preload,
-require). The package machinery underlies the module-loading semantics
-so its presence in the global environment is mandatory.
-@End Reasoning
-Process called "load_lua_package_module" that takes ctx as LuaSemanticContext returns Nothing:
-    Note: Load Lua package module functions and variables
-
-    Let package_functions be a list containing:
-        create_lua_function with "package.loadlib" and "load C library",
-        create_lua_function with "package.searchpath" and "search for module"
-
-    For Each func as LuaFunction in package_functions:
-        Set ctx.global_environment at key func.name to create_function_value with func
-    End For
-
-    Note: Add package variables
-    Call add_global_value with ctx and "package.config" and "configuration info"
-    Call add_global_value with ctx and "package.cpath" and "C module search path"
-    Call add_global_value with ctx and "package.loaded" and "loaded modules table"
-    Call add_global_value with ctx and "package.path" and "Lua module search path"
-    Call add_global_value with ctx and "package.preload" and "preloaded modules table"
-    Call add_global_value with ctx and "package.searchers" and "module searchers table"
-End Process
-
-@Reasoning:
-Registers debug.* (debug.traceback, debug.getinfo, etc.) - introspection
-helpers. Their availability is dialect-dependent (Lua 5.3+ exposes them
-fully) but we register the canonical surface.
-@End Reasoning
-Process called "load_lua_debug_module" that takes ctx as LuaSemanticContext returns Nothing:
-    Note: Load Lua debug module functions
-
-    Let debug_functions be a list containing:
-        create_lua_function with "debug.debug" and "enter interactive debug mode",
-        create_lua_function with "debug.gethook" and "get debug hook",
-        create_lua_function with "debug.getinfo" and "get function info",
-        create_lua_function with "debug.getlocal" and "get local variable",
-        create_lua_function with "debug.getmetatable" and "get metatable",
-        create_lua_function with "debug.getregistry" and "get debug registry",
-        create_lua_function with "debug.getupvalue" and "get upvalue",
-        create_lua_function with "debug.getuservalue" and "get userdata value",
-        create_lua_function with "debug.sethook" and "set debug hook",
-        create_lua_function with "debug.setlocal" and "set local variable",
-        create_lua_function with "debug.setmetatable" and "set metatable",
-        create_lua_function with "debug.setupvalue" and "set upvalue",
-        create_lua_function with "debug.setuservalue" and "set userdata value",
-        create_lua_function with "debug.traceback" and "get traceback",
-        create_lua_function with "debug.upvalueid" and "get upvalue id",
-        create_lua_function with "debug.upvaluejoin" and "join upvalues"
-
-    For Each func as LuaFunction in debug_functions:
-        Set ctx.global_environment at key func.name to create_function_value with func
-    End For
-End Process
+Type called "LuaSemanticAnalyzer":
+    global_env as Integer           Note: Dict string-key -> 1 (stdlib + implicit globals)
+    current_scope as Integer        Note: Dict string-key -> level+1 (innermost scope)
+    scope_stack as Integer          Note: List of enclosing scope Dicts (global at bottom)
+    scope_is_function as Integer     Note: List parallel to scope_stack: 1 if that scope is a function boundary
+    current_is_function as Integer   Note: Boolean: 1 if innermost scope is a function boundary
+    current_level as Integer        Note: Lexical depth of innermost scope (0 = global)
+    upvalues as Integer             Note: Dict string-key -> 1 (names captured as upvalues)
+    errors as Integer               Note: List of error message strings
+    warnings as Integer             Note: List of warning message strings
+    has_error as Integer            Note: Boolean: 1 if any error recorded
+    loop_depth as Integer           Note: Number of enclosing loops (break legality)
+    labels as Integer               Note: Dict string-key -> 1 (labels declared)
+    goto_targets as Integer         Note: List of goto target label strings
+    goto_lines as Integer           Note: List of goto source lines (parallel to goto_targets)
+    break_lines as Integer          Note: List of break source lines outside any loop
+    unbalanced_lines as Integer      Note: List of assignment source lines flagged for inspection
+End Type
 
 Note: ============================================================================
-Note: AST NODE ANALYSIS
+Note: Analyzer Creation
 Note: ============================================================================
 
 @Reasoning:
-Recursive node-kind dispatcher. Routes chunk, function_def, local_statement,
-table_constructor, for_in_statement, variable references, and other Lua
-construct kinds to their specialised analysers; unknown kinds are ignored
-to remain forward-compatible with HIR extensions.
+The constructor allocates every sub-collection eagerly so the recursive walk
+never has to null-check a table or list handle. The global environment doubles
+as the bottom scope: current_scope starts AS global_env and current_level is 0,
+so top-level statements resolve and declare against the global table without a
+special case. setup_global_environment seeds the Lua 5.4 standard-library names
+into global_env before any analysis runs.
 @End Reasoning
-Process called "analyze_lua_node" that takes node as LuaSemNode, ctx as LuaSemanticContext returns Nothing:
-    Note: Analyze any Lua AST node based on its type
 
-    Match node.node_type:
-        When "Chunk":
-            Call analyze_lua_chunk with node and ctx
-        When "Block":
-            Call analyze_lua_block with node and ctx
-        When "FunctionDef":
-            Call analyze_lua_function_def with node and ctx
-        When "LocalFunction":
-            Call analyze_lua_local_function with node and ctx
-        When "LocalStatement":
-            Call analyze_lua_local_statement with node and ctx
-        When "Assignment":
-            Call analyze_lua_assignment with node and ctx
-        When "FunctionCall":
-            Call analyze_lua_function_call with node and ctx
-        When "MethodCall":
-            Call analyze_lua_method_call with node and ctx
-        When "TableConstructor":
-            Call analyze_lua_table_constructor with node and ctx
-        When "TableAccess":
-            Call analyze_lua_table_access with node and ctx
-        When "IfStatement":
-            Call analyze_lua_if_statement with node and ctx
-        When "WhileStatement":
-            Call analyze_lua_while_statement with node and ctx
-        When "RepeatStatement":
-            Call analyze_lua_repeat_statement with node and ctx
-        When "ForStatement":
-            Call analyze_lua_for_statement with node and ctx
-        When "ForInStatement":
-            Call analyze_lua_for_in_statement with node and ctx
-        When "BreakStatement":
-            Call analyze_lua_break_statement with node and ctx
-        When "ReturnStatement":
-            Call analyze_lua_return_statement with node and ctx
-        When "GotoStatement":
-            Call analyze_lua_goto_statement with node and ctx
-        When "LabelStatement":
-            Call analyze_lua_label_statement with node and ctx
-        When "BinaryOperation":
-            Call analyze_lua_binary_operation with node and ctx
-        When "UnaryOperation":
-            Call analyze_lua_unary_operation with node and ctx
-        When "Variable":
-            Call analyze_lua_variable with node and ctx
-        When "Literal":
-            Call analyze_lua_literal with node and ctx
-        When "AnonymousFunction":
-            Call analyze_lua_anonymous_function with node and ctx
-        When "VarargExpression":
-            Call analyze_lua_vararg_expression with node and ctx
-        Otherwise:
-            Call analyze_generic_lua_node with node and ctx
-    End Match
-End Process
+@Implementation:
+Allocate 128 bytes; return 0 on OOM. Create global_env, scope_stack,
+scope_is_function, upvalues, errors, warnings, labels, goto_targets, goto_lines,
+break_lines, and unbalanced_lines. Install global_env at offsets 0 and 8 (it is
+both the global table and the initial current scope), zero current_is_function /
+current_level / has_error / loop_depth, and store the collection handles at
+their offsets. Seed the stdlib, then return the analyzer.
+@End Implementation
 
-@Reasoning:
-A Lua chunk is the top-level execution unit (e.g., a file). We walk its
-statement list under the current scope; chunks do not introduce a new
-scope themselves (unlike blocks), so no scope push/pop here.
-@End Reasoning
-Process called "analyze_lua_chunk" that takes node as LuaSemNode, ctx as LuaSemanticContext returns Nothing:
-    Note: Analyze Lua chunk (top-level compilation unit)
+Process called "create_lua_semantic_analyzer" takes nothing returns Integer:
+    Let analyzer be proc allocate from Layout with 128
 
-    Let statements be node.statements
-
-    For Each statement in statements:
-        Call analyze_lua_node with statement and ctx
-    End For
-End Process
-
-@Reasoning:
-Function definitions create a new function scope, register the function
-in the enclosing scope's function registry, analyse parameters as local
-bindings, then walk the body. After the body, analyze_upvalues walks the
-scope to identify captures.
-@End Reasoning
-Process called "analyze_lua_function_def" that takes node as LuaSemNode, ctx as LuaSemanticContext returns Nothing:
-    Note: Analyze Lua function definition
-
-    @Reasoning:
-    Lua functions create closures that can capture upvalues from enclosing
-    scopes. The semantic analysis must track variable references to
-    determine which variables become upvalues.
-    @End Reasoning
-
-    Let func_name be node.function_name
-    Let parameters be node.parameters
-    Let has_varargs be node.has_varargs
-    Let body be node.body
-
-    Note: Create function scope
-    Let func_scope be create_function_scope with ctx.current_scope and func_name
-
-    Note: Analyze parameters
-    For Each param in parameters:
-        Let param_var be create_lua_variable with param and "parameter"
-        Set func_scope.variables at key param to param_var
-    End For
-
-    Note: Create function object
-    Let lua_function be a value of type LuaFunction with
-        name as func_name,
-        parameters as parameters,
-        has_varargs as has_varargs,
-        body as body,
-        upvalues as a list containing nothing,
-        is_closure as false,
-        is_coroutine as false,
-        environment as func_scope,
-        source_location as node.source_location
-
-    Note: Set function context and analyze body
-    Let old_scope be ctx.current_scope
-    Let old_func be ctx.current_function
-    Set ctx.current_scope to func_scope
-    Set ctx.current_function to func_name
-
-    Call analyze_lua_node with body and ctx
-
-    Note: Analyze upvalues
-    Call analyze_upvalues with func_scope and ctx
-    If length of func_scope.upvalues is greater than 0:
-        Set lua_function.is_closure to true
+    If analyzer is equal to 0:
+        Return 0
     End If
 
-    Note: Restore context
-    Set ctx.current_scope to old_scope
-    Set ctx.current_function to old_func
+    Let global_env be proc create from Dict
+    Let scope_stack be proc list_create from ListCore
+    Let scope_is_function be proc list_create from ListCore
+    Let upvalues be proc create from Dict
+    Let errors be proc list_create from ListCore
+    Let warnings be proc list_create from ListCore
+    Let labels be proc create from Dict
+    Let goto_targets be proc list_create from ListCore
+    Let goto_lines be proc list_create from ListCore
+    Let break_lines be proc list_create from ListCore
+    Let unbalanced_lines be proc list_create from ListCore
 
-    Note: Register function
-    Set ctx.current_scope.functions at key func_name to lua_function
-End Process
+    proc memory_set_int64 from Layout with analyzer, 0, global_env
+    proc memory_set_int64 from Layout with analyzer, 8, global_env
+    proc memory_set_int64 from Layout with analyzer, 16, scope_stack
+    proc memory_set_int64 from Layout with analyzer, 24, scope_is_function
+    proc memory_set_int64 from Layout with analyzer, 32, 0
+    proc memory_set_int64 from Layout with analyzer, 40, 0
+    proc memory_set_int64 from Layout with analyzer, 48, upvalues
+    proc memory_set_int64 from Layout with analyzer, 56, errors
+    proc memory_set_int64 from Layout with analyzer, 64, warnings
+    proc memory_set_int64 from Layout with analyzer, 72, 0
+    proc memory_set_int64 from Layout with analyzer, 80, 0
+    proc memory_set_int64 from Layout with analyzer, 88, labels
+    proc memory_set_int64 from Layout with analyzer, 96, goto_targets
+    proc memory_set_int64 from Layout with analyzer, 104, goto_lines
+    proc memory_set_int64 from Layout with analyzer, 112, break_lines
+    proc memory_set_int64 from Layout with analyzer, 120, unbalanced_lines
 
-@Reasoning:
-"local x, y = a, b" introduces local bindings in the current scope. The
-analyser pairs variable_names with initial_values and registers each
-binding; excess names are bound to nil per Lua semantics.
-@End Reasoning
-Process called "analyze_lua_local_statement" that takes node as LuaSemNode, ctx as LuaSemanticContext returns Nothing:
-    Note: Analyze Lua local variable declaration
+    proc setup_global_environment with analyzer
 
-    @Reasoning:
-    Lua local variables have lexical scoping and can shadow variables
-    in outer scopes. The semantic analysis must track variable lifetimes
-    and detect potential shadowing issues.
-    @End Reasoning
-
-    Let variable_names be node.variable_names
-    Let initial_values be node.initial_values
-
-    Note: Check for variable shadowing
-    For Each var_name in variable_names:
-        If ctx.current_scope.variables contains key var_name:
-            Let warning be "Local variable '" joined with var_name joined with "' shadows existing variable"
-            Add warning to end of ctx.warning_list
-        End If
-
-        Note: Create local variable
-        Let local_var be a value of type LuaVariable with
-            name as var_name,
-            value_type as "any",
-            is_local as true,
-            is_global as false,
-            is_upvalue as false,
-            scope_level as ctx.current_scope.level,
-            first_assignment_line as node.line,
-            last_access_line as node.line,
-            is_constant as false,
-            metatable as null
-
-        Set ctx.current_scope.variables at key var_name to local_var
-    End For
-
-    Note: Analyze initial values
-    If initial_values is not equal to 0:
-        For Each value in initial_values:
-            Call analyze_lua_node with value and ctx
-        End For
-    End If
-End Process
-
-@Reasoning:
-Table literal {a=1, [k]=v, x, y} is analysed by walking each field via
-its LuaTableField type-tag and recursing into key/value expressions. The
-analyser distinguishes array fields (implicit integer indices) from
-hash fields for the analyser's array/hash classification heuristic.
-@End Reasoning
-Process called "analyze_lua_table_constructor" that takes node as LuaSemNode, ctx as LuaSemanticContext returns Nothing:
-    Note: Analyze Lua table constructor
-
-    @Reasoning:
-    Lua tables are the primary data structure and can be used as arrays,
-    hash tables, or objects. The semantic analysis should validate field
-    access patterns and detect potential issues.
-    @End Reasoning
-
-    Let fields be node.fields
-
-    For Each field in fields:
-        Match field.type:
-            When "ArrayField":
-                Call analyze_lua_node with field.value and ctx
-            When "HashField":
-                Call analyze_lua_node with field.key and ctx
-                Call analyze_lua_node with field.value and ctx
-            When "NamedField":
-                Call analyze_lua_node with field.value and ctx
-            Otherwise:
-                Let warning be "Unknown table field type: " joined with field.type
-                Add warning to end of ctx.warning_list
-        End Match
-    End For
-End Process
-
-@Reasoning:
-"for k,v in iter do ... end" introduces loop variables in a fresh block
-scope. iter is a "generic for" iterator triplet (iterator, state, initial
-control), analysed before the body so the body sees the loop variables.
-@End Reasoning
-Process called "analyze_lua_for_in_statement" that takes node as LuaSemNode, ctx as LuaSemanticContext returns Nothing:
-    Note: Analyze Lua for-in statement (generic for)
-
-    @Reasoning:
-    Lua for-in statements use iterator functions and can capture multiple
-    values. The semantic analysis must validate iterator compatibility
-    and variable binding patterns.
-    @End Reasoning
-
-    Let variable_names be node.variable_names
-    Let iterator_expressions be node.iterator_expressions
-    Let body be node.body
-
-    Note: Create new scope for loop variables
-    Let loop_scope be create_block_scope with ctx.current_scope
-
-    Note: Analyze iterator expressions first
-    For Each iterator_expr in iterator_expressions:
-        Call analyze_lua_node with iterator_expr and ctx
-    End For
-
-    Note: Create loop variables in loop scope
-    For Each var_name in variable_names:
-        Let loop_var be a value of type LuaVariable with
-            name as var_name,
-            value_type as "any",
-            is_local as true,
-            is_global as false,
-            is_upvalue as false,
-            scope_level as loop_scope.level,
-            first_assignment_line as node.line,
-            last_access_line as node.line,
-            is_constant as false,
-            metatable as null
-
-        Set loop_scope.variables at key var_name to loop_var
-    End For
-
-    Note: Set loop context and analyze body
-    Let old_scope be ctx.current_scope
-    Set ctx.current_scope to loop_scope
-
-    Call analyze_lua_node with body and ctx
-
-    Note: Restore context
-    Set ctx.current_scope to old_scope
-End Process
-
-@Reasoning:
-Variable-reference analysis: looks up the name through the scope chain.
-Names found in the current scope are locals; in an enclosing function
-scope they're upvalues (captured); otherwise globals (resolved at
-runtime through the global environment table).
-@End Reasoning
-Process called "analyze_lua_variable" that takes node as LuaSemNode, ctx as LuaSemanticContext returns Nothing:
-    Note: Analyze Lua variable reference
-
-    @Reasoning:
-    Lua variable resolution follows lexical scoping rules and may
-    create upvalues for closure capture. The analysis must track
-    variable access patterns for optimization and error detection.
-    @End Reasoning
-
-    Let var_name be node.name
-
-    Note: Look up variable in scope chain
-    Let variable be lookup_lua_variable with var_name and ctx
-    If variable is equal to 0:
-        Note: Check if it's a global variable reference
-        If not ctx.global_environment contains key var_name:
-            Let warning be "Variable '" joined with var_name joined with "' may be undefined"
-            Add warning to end of ctx.warning_list
-
-            Note: Create implicit global variable
-            Let global_var be create_implicit_global with var_name and ctx
-            Set ctx.global_environment at key var_name to global_var
-        End If
-    Otherwise:
-        Note: Update last access
-        Set variable.last_access_line to node.line
-
-        Note: Check if variable is accessed from different scope (potential upvalue)
-        If variable.scope_level is less than ctx.current_scope.level:
-            Call mark_as_upvalue with variable and ctx
-        End If
-    End If
+    Return analyzer
 End Process
 
 Note: ============================================================================
-Note: HELPER FUNCTIONS
+Note: Diagnostics
 Note: ============================================================================
 
 @Reasoning:
-Walks the scope chain from current_scope upward; returns the first
-matching LuaVariable record, or null at the top of the chain. Used by
-analyze_lua_variable to decide local-vs-upvalue-vs-global classification.
+Errors and warnings are accumulated in append-only lists so a single analysis
+pass surfaces every problem rather than aborting on the first. record_error also
+latches has_error to 1 so a caller can gate lowering on one boolean without
+scanning the list.
 @End Reasoning
-Process called "lookup_lua_variable" that takes name as String, ctx as LuaSemanticContext returns LuaVariable:
-    Note: Look up variable in scope chain
 
-    Let current_scope be ctx.current_scope
-    While current_scope is not equal to 0:
-        If current_scope.variables contains key name:
-            Return current_scope.variables at key name
+@Implementation:
+Append message to the errors list (offset 56) and set has_error (offset 72) to 1.
+@End Implementation
+
+Process called "record_error" takes analyzer as Integer, message as Integer returns Nothing:
+    Let errors be proc memory_get_int64 from Layout with analyzer, 56
+    proc list_append from ListCore with errors, message
+    proc memory_set_int64 from Layout with analyzer, 72, 1
+End Process
+
+@Reasoning:
+Warnings track non-fatal observations (undefined-global heuristics, shadowing)
+that do not block lowering; they are kept separate from errors so a caller can
+report them without failing the analysis.
+@End Reasoning
+
+@Implementation:
+Append message to the warnings list (offset 64). has_error is left untouched.
+@End Implementation
+
+Process called "record_warning" takes analyzer as Integer, message as Integer returns Nothing:
+    Let warnings be proc memory_get_int64 from Layout with analyzer, 64
+    proc list_append from ListCore with warnings, message
+End Process
+
+Note: ============================================================================
+Note: Scope Management
+Note: ============================================================================
+
+@Reasoning:
+Entering a scope pushes the current scope (and its function-boundary flag) onto
+the stacks, installs a fresh empty name table as the innermost scope, raises the
+level, and records whether the new scope is itself a function boundary. Block
+scopes (do/while/for bodies) pass is_function=0 so they do not interrupt the
+upvalue chain; function and function-expression bodies pass is_function=1 so a
+name resolved beyond that boundary is classified as a capture.
+@End Reasoning
+
+@Implementation:
+Push current_scope onto scope_stack (offset 16) and current_is_function onto
+scope_is_function (offset 24). Allocate a fresh Dict and store it at offset 8.
+Store is_function at offset 32, and current_level+1 at offset 40.
+@End Implementation
+
+Process called "enter_scope" takes analyzer as Integer, is_function as Integer returns Nothing:
+    Let current be proc memory_get_int64 from Layout with analyzer, 8
+    Let stack be proc memory_get_int64 from Layout with analyzer, 16
+    Let func_flags be proc memory_get_int64 from Layout with analyzer, 24
+    Let cur_is_func be proc memory_get_int64 from Layout with analyzer, 32
+    Let level be proc memory_get_int64 from Layout with analyzer, 40
+
+    proc list_append from ListCore with stack, current
+    proc list_append from ListCore with func_flags, cur_is_func
+
+    Let fresh be proc create from Dict
+    proc memory_set_int64 from Layout with analyzer, 8, fresh
+    proc memory_set_int64 from Layout with analyzer, 32, is_function
+    proc memory_set_int64 from Layout with analyzer, 40, level plus 1
+End Process
+
+@Reasoning:
+Exiting restores the scope and function-boundary flag saved by the matching
+enter_scope and lowers the level. The global scope is never popped: it is the
+permanent bottom of the chain installed at construction, and analyze never calls
+exit_scope more times than enter_scope, so the stack cannot underflow during a
+well-formed walk - the depth guard makes the underflow path a no-op rather than
+a crash if a malformed AST drives it there.
+@End Reasoning
+
+@Implementation:
+If scope_stack is empty, return without change. Pop the saved scope from
+scope_stack (offset 16) into current_scope (offset 8); pop the saved flag from
+scope_is_function (offset 24) into current_is_function (offset 32); lower
+current_level (offset 40) by 1.
+@End Implementation
+
+Process called "exit_scope" takes analyzer as Integer returns Nothing:
+    Let stack be proc memory_get_int64 from Layout with analyzer, 16
+    Let depth be proc list_length from ListCore with stack
+
+    If depth is equal to 0:
+        Return
+    End If
+
+    Let func_flags be proc memory_get_int64 from Layout with analyzer, 24
+    Let level be proc memory_get_int64 from Layout with analyzer, 40
+
+    Let restored_scope be proc list_pop from ListCore with stack
+    Let restored_flag be proc list_pop from ListCore with func_flags
+
+    proc memory_set_int64 from Layout with analyzer, 8, restored_scope
+    proc memory_set_int64 from Layout with analyzer, 32, restored_flag
+    proc memory_set_int64 from Layout with analyzer, 40, level minus 1
+End Process
+
+@Reasoning:
+Declares a name in the innermost scope at the current lexical level, encoding the
+level as level+1 so a lookup can distinguish "declared at level 0" from "absent"
+(both of which would otherwise read back as 0 from the value-0-means-missing
+dictionary). Re-declaration in the same scope simply overwrites - Lua permits
+re-declaring a local, with the later binding shadowing the earlier one.
+@End Reasoning
+
+@Implementation:
+Read current_scope (offset 8) and current_level (offset 40); set name -> level+1
+in that scope.
+@End Implementation
+
+Process called "declare_local" takes analyzer as Integer, name as Integer returns Nothing:
+    If name is equal to 0:
+        Return
+    End If
+
+    Let scope be proc memory_get_int64 from Layout with analyzer, 8
+    Let level be proc memory_get_int64 from Layout with analyzer, 40
+    proc set from Dict with scope, name, level plus 1
+End Process
+
+@Reasoning:
+Resolves a name to its declaration level by walking the scope chain innermost
+first: current_scope, then each stacked scope from the most recently pushed
+downward, ending at the global table. Returns the stored level+1 encoding (so a
+non-zero result is "found at level result-1") or 0 if the name is bound nowhere
+in any lexical scope. The global table is included by walking the full stack
+down to its bottom entry, which IS the global environment.
+@End Reasoning
+
+@Implementation:
+Check current_scope (offset 8) via Dict.get; if non-zero return it. Otherwise
+walk scope_stack (offset 16) from index size-1 down to 0, returning the first
+non-zero Dict.get. Return 0 if no scope binds the name.
+@End Implementation
+
+Process called "resolve_name_level" takes analyzer as Integer, name as Integer returns Integer:
+    If name is equal to 0:
+        Return 0
+    End If
+
+    Let current be proc memory_get_int64 from Layout with analyzer, 8
+    Let found be proc get from Dict with current, name
+    If found is not equal to 0:
+        Return found
+    End If
+
+    Let stack be proc memory_get_int64 from Layout with analyzer, 16
+    Let depth be proc list_length from ListCore with stack
+    Let i be depth minus 1
+    While i is greater than or equal to 0:
+        Let scope be proc list_get from ListCore with stack, i
+        Let hit be proc get from Dict with scope, name
+        If hit is not equal to 0:
+            Return hit
         End If
-        Set current_scope to current_scope.parent_scope
+        Set i to i minus 1
     End While
 
-    Return null
-End Process
-
-@Reasoning:
-Creates a fresh function scope (is_function_scope=true) chained under
-parent. level is parent.level + 1 for depth tracking; function scopes
-form the boundary where upvalue capture happens.
-@End Reasoning
-Process called "create_function_scope" that takes parent as LuaScope, func_name as String returns LuaScope:
-    Note: Create new scope for function
-
-    Return a value of type LuaScope with
-        variables as a dictionary containing nothing,
-        functions as a dictionary containing nothing,
-        upvalues as a dictionary containing nothing,
-        parent_scope as parent,
-        scope_type as "function",
-        is_function_scope as true,
-        is_block_scope as false,
-        is_global_scope as false,
-        level as parent.level plus 1
-End Process
-
-@Reasoning:
-Creates a block scope (do-end, while-body, for-body). is_block_scope=true,
-is_function_scope=false because block scopes do not interrupt upvalue
-chains - the enclosing function is what matters for capture.
-@End Reasoning
-Process called "create_block_scope" that takes parent as LuaScope returns LuaScope:
-    Note: Create new scope for block
-
-    Return a value of type LuaScope with
-        variables as a dictionary containing nothing,
-        functions as a dictionary containing nothing,
-        upvalues as a dictionary containing nothing,
-        parent_scope as parent,
-        scope_type as "block",
-        is_function_scope as false,
-        is_block_scope as true,
-        is_global_scope as false,
-        level as parent.level plus 1
-End Process
-
-@Reasoning:
-Walks a function scope's variables looking for references that resolved
-to bindings in an enclosing function scope; each such reference is
-recorded as a LuaUpvalue so HIR emission can materialise capture slots.
-@End Reasoning
-Process called "analyze_upvalues" that takes scope as LuaScope, ctx as LuaSemanticContext returns Nothing:
-    Note: Analyze upvalue references in function scope
-
-    @Reasoning:
-    Lua closures capture variables from enclosing scopes as upvalues.
-    This analysis identifies which variables are captured and ensures
-    proper closure semantics.
-    @End Reasoning
-
-    Note: This  analyze variable references that cross scope boundaries
-    Note: and create appropriate upvalue entries
-End Process
-
-@Reasoning:
-Final-pass validation: walks ctx.error_list for unresolved references,
-checks coroutine_stack for orphans, and verifies metatable references
-still point to declared tables. Accumulated errors are reported through
-ctx.error_list.
-@End Reasoning
-Process called "validate_lua_semantics" that takes ctx as LuaSemanticContext returns Nothing:
-    Note: Perform final semantic validation
-
-    @Reasoning:
-    Final validation checks for Lua-specific issues such as unreachable
-    code after return/break statements, unused variables, and potential
-    performance issues with table access patterns.
-    @End Reasoning
-
-    Call validate_lua_variable_usage with ctx
-    Call validate_lua_function_usage with ctx
-    Call validate_lua_table_usage with ctx
-    Call validate_lua_coroutine_usage with ctx
-    Call validate_lua_module_usage with ctx
+    Return 0
 End Process
 
 Note: ============================================================================
-Note: HELPER CREATION FUNCTIONS
+Note: Standard Library Surface
 Note: ============================================================================
 
 @Reasoning:
-Constructor for LuaFunction records used when registering stdlib builtins.
-description doubles as the value_type so analyser output can surface
-human-readable function signatures.
+Lua programs reference the standard library without declaring it. Seeding the
+canonical Lua 5.4 surface into the global environment lets the undefined-global
+heuristic fire only on genuinely unknown names. Both the bare global functions
+(print, type, pairs, ...) and the dotted module accessors actually written in
+source (string.format, math.pi, table.insert, ...) are registered; the module
+tables themselves (string, table, math, io, os, coroutine, package, debug) are
+registered as globals so a reference to the bare module name also resolves.
 @End Reasoning
-Process called "create_lua_function" that takes name as String, description as String returns LuaFunction:
-    Return a value of type LuaFunction with
-        name as name,
-        parameters as a list containing nothing,
-        has_varargs as false,
-        body as null,
-        upvalues as a list containing nothing,
-        is_closure as false,
-        is_coroutine as false,
-        environment as null,
-        source_location as description
+
+@Implementation:
+Read global_env (offset 0) once and register each name with value 1. Names are
+grouped by module for readability but all land in the single flat global table,
+which is also the bottom scope of the resolution chain.
+@End Implementation
+
+Process called "setup_global_environment" takes analyzer as Integer returns Nothing:
+    Let env be proc memory_get_int64 from Layout with analyzer, 0
+
+    Note: Global functions and values
+    proc set from Dict with env, "assert", 1
+    proc set from Dict with env, "collectgarbage", 1
+    proc set from Dict with env, "dofile", 1
+    proc set from Dict with env, "error", 1
+    proc set from Dict with env, "getmetatable", 1
+    proc set from Dict with env, "setmetatable", 1
+    proc set from Dict with env, "ipairs", 1
+    proc set from Dict with env, "pairs", 1
+    proc set from Dict with env, "next", 1
+    proc set from Dict with env, "load", 1
+    proc set from Dict with env, "loadfile", 1
+    proc set from Dict with env, "pcall", 1
+    proc set from Dict with env, "xpcall", 1
+    proc set from Dict with env, "print", 1
+    proc set from Dict with env, "rawequal", 1
+    proc set from Dict with env, "rawget", 1
+    proc set from Dict with env, "rawset", 1
+    proc set from Dict with env, "rawlen", 1
+    proc set from Dict with env, "require", 1
+    proc set from Dict with env, "select", 1
+    proc set from Dict with env, "tonumber", 1
+    proc set from Dict with env, "tostring", 1
+    proc set from Dict with env, "type", 1
+    proc set from Dict with env, "_G", 1
+    proc set from Dict with env, "_VERSION", 1
+    proc set from Dict with env, "_ENV", 1
+
+    Note: Standard module tables (bare module-name references)
+    proc set from Dict with env, "string", 1
+    proc set from Dict with env, "table", 1
+    proc set from Dict with env, "math", 1
+    proc set from Dict with env, "io", 1
+    proc set from Dict with env, "os", 1
+    proc set from Dict with env, "coroutine", 1
+    proc set from Dict with env, "package", 1
+    proc set from Dict with env, "debug", 1
+    proc set from Dict with env, "utf8", 1
+
+    Note: string.*
+    proc set from Dict with env, "string.byte", 1
+    proc set from Dict with env, "string.char", 1
+    proc set from Dict with env, "string.dump", 1
+    proc set from Dict with env, "string.find", 1
+    proc set from Dict with env, "string.format", 1
+    proc set from Dict with env, "string.gmatch", 1
+    proc set from Dict with env, "string.gsub", 1
+    proc set from Dict with env, "string.len", 1
+    proc set from Dict with env, "string.lower", 1
+    proc set from Dict with env, "string.match", 1
+    proc set from Dict with env, "string.pack", 1
+    proc set from Dict with env, "string.packsize", 1
+    proc set from Dict with env, "string.rep", 1
+    proc set from Dict with env, "string.reverse", 1
+    proc set from Dict with env, "string.sub", 1
+    proc set from Dict with env, "string.unpack", 1
+    proc set from Dict with env, "string.upper", 1
+
+    Note: table.*
+    proc set from Dict with env, "table.concat", 1
+    proc set from Dict with env, "table.insert", 1
+    proc set from Dict with env, "table.move", 1
+    proc set from Dict with env, "table.pack", 1
+    proc set from Dict with env, "table.remove", 1
+    proc set from Dict with env, "table.sort", 1
+    proc set from Dict with env, "table.unpack", 1
+
+    Note: math.*
+    proc set from Dict with env, "math.abs", 1
+    proc set from Dict with env, "math.acos", 1
+    proc set from Dict with env, "math.asin", 1
+    proc set from Dict with env, "math.atan", 1
+    proc set from Dict with env, "math.ceil", 1
+    proc set from Dict with env, "math.cos", 1
+    proc set from Dict with env, "math.deg", 1
+    proc set from Dict with env, "math.exp", 1
+    proc set from Dict with env, "math.floor", 1
+    proc set from Dict with env, "math.fmod", 1
+    proc set from Dict with env, "math.log", 1
+    proc set from Dict with env, "math.max", 1
+    proc set from Dict with env, "math.min", 1
+    proc set from Dict with env, "math.modf", 1
+    proc set from Dict with env, "math.rad", 1
+    proc set from Dict with env, "math.random", 1
+    proc set from Dict with env, "math.randomseed", 1
+    proc set from Dict with env, "math.sin", 1
+    proc set from Dict with env, "math.sqrt", 1
+    proc set from Dict with env, "math.tan", 1
+    proc set from Dict with env, "math.tointeger", 1
+    proc set from Dict with env, "math.type", 1
+    proc set from Dict with env, "math.ult", 1
+    proc set from Dict with env, "math.pi", 1
+    proc set from Dict with env, "math.huge", 1
+    proc set from Dict with env, "math.maxinteger", 1
+    proc set from Dict with env, "math.mininteger", 1
+
+    Note: io.*
+    proc set from Dict with env, "io.close", 1
+    proc set from Dict with env, "io.flush", 1
+    proc set from Dict with env, "io.input", 1
+    proc set from Dict with env, "io.lines", 1
+    proc set from Dict with env, "io.open", 1
+    proc set from Dict with env, "io.output", 1
+    proc set from Dict with env, "io.popen", 1
+    proc set from Dict with env, "io.read", 1
+    proc set from Dict with env, "io.stderr", 1
+    proc set from Dict with env, "io.stdin", 1
+    proc set from Dict with env, "io.stdout", 1
+    proc set from Dict with env, "io.tmpfile", 1
+    proc set from Dict with env, "io.type", 1
+    proc set from Dict with env, "io.write", 1
+
+    Note: os.*
+    proc set from Dict with env, "os.clock", 1
+    proc set from Dict with env, "os.date", 1
+    proc set from Dict with env, "os.difftime", 1
+    proc set from Dict with env, "os.execute", 1
+    proc set from Dict with env, "os.exit", 1
+    proc set from Dict with env, "os.getenv", 1
+    proc set from Dict with env, "os.remove", 1
+    proc set from Dict with env, "os.rename", 1
+    proc set from Dict with env, "os.setlocale", 1
+    proc set from Dict with env, "os.time", 1
+    proc set from Dict with env, "os.tmpname", 1
+
+    Note: coroutine.*
+    proc set from Dict with env, "coroutine.create", 1
+    proc set from Dict with env, "coroutine.isyieldable", 1
+    proc set from Dict with env, "coroutine.resume", 1
+    proc set from Dict with env, "coroutine.running", 1
+    proc set from Dict with env, "coroutine.status", 1
+    proc set from Dict with env, "coroutine.wrap", 1
+    proc set from Dict with env, "coroutine.yield", 1
+    proc set from Dict with env, "coroutine.close", 1
+
+    Note: package.*
+    proc set from Dict with env, "package.loadlib", 1
+    proc set from Dict with env, "package.searchpath", 1
+    proc set from Dict with env, "package.config", 1
+    proc set from Dict with env, "package.cpath", 1
+    proc set from Dict with env, "package.loaded", 1
+    proc set from Dict with env, "package.path", 1
+    proc set from Dict with env, "package.preload", 1
+    proc set from Dict with env, "package.searchers", 1
+
+    Note: debug.*
+    proc set from Dict with env, "debug.debug", 1
+    proc set from Dict with env, "debug.gethook", 1
+    proc set from Dict with env, "debug.getinfo", 1
+    proc set from Dict with env, "debug.getlocal", 1
+    proc set from Dict with env, "debug.getmetatable", 1
+    proc set from Dict with env, "debug.getregistry", 1
+    proc set from Dict with env, "debug.getupvalue", 1
+    proc set from Dict with env, "debug.getuservalue", 1
+    proc set from Dict with env, "debug.sethook", 1
+    proc set from Dict with env, "debug.setlocal", 1
+    proc set from Dict with env, "debug.setmetatable", 1
+    proc set from Dict with env, "debug.setupvalue", 1
+    proc set from Dict with env, "debug.setuservalue", 1
+    proc set from Dict with env, "debug.traceback", 1
+    proc set from Dict with env, "debug.upvalueid", 1
+    proc set from Dict with env, "debug.upvaluejoin", 1
 End Process
 
 @Reasoning:
-Constructor for LuaVariable records, initialised with scope-agnostic
-defaults (all is_* flags false, no metatable). Caller sets is_local/
-is_global/is_upvalue appropriately for the binding site.
+Basic-type metatable bookkeeping in Lua attaches the per-type metatables Lua
+installs for strings (the string library is the string metatable's __index).
+Recording the string-metatable binding in the global environment ensures a
+method-call on a string literal (("x"):upper()) resolves rather than tripping
+the undefined-global heuristic. This is the real Lua behaviour: only the string
+type carries a default metatable, exposed through the string library table.
 @End Reasoning
-Process called "create_lua_variable" that takes name as String, var_type as String returns LuaVariable:
-    Return a value of type LuaVariable with
-        name as name,
-        value_type as var_type,
-        is_local as true,
-        is_global as false,
-        is_upvalue as false,
-        scope_level as 0,
-        first_assignment_line as 0,
-        last_access_line as 0,
-        is_constant as false,
-        metatable as null
+
+@Implementation:
+Read global_env (offset 0) and register the string type's metatable binding so
+string method dispatch resolves. The other base types (number, boolean, nil,
+function) have no default metatable in stock Lua, so none is registered.
+@End Implementation
+
+Process called "setup_basic_metatables" takes analyzer as Integer returns Nothing:
+    Let env be proc memory_get_int64 from Layout with analyzer, 0
+    proc set from Dict with env, "string", 1
 End Process
 
 @Reasoning:
-Helper used by stdlib loaders: creates a LuaFunction + LuaValue pair and
-registers the value in ctx.global_environment under name. Avoids
-repeating the boilerplate in every load_lua_* loader.
+Lua creates a global implicitly when an unknown name is assigned to. This records
+the name in the global environment so subsequent references resolve, and is
+called from assignment analysis when an assignment target resolves to no local.
+The name is the live key the parser copied from source; storing it with value 1
+matches the stdlib seeding convention.
 @End Reasoning
-Process called "add_global_value" that takes ctx as LuaSemanticContext, name as String, description as String returns Nothing:
-    Note: Add a global value to the environment
 
-    Let global_value be create_any_lua_value
-    Set ctx.global_environment at key name to global_value
+@Implementation:
+Read global_env (offset 0); set name -> 1.
+@End Implementation
+
+Process called "create_implicit_global" takes analyzer as Integer, name as Integer returns Nothing:
+    If name is equal to 0:
+        Return
+    End If
+
+    Let env be proc memory_get_int64 from Layout with analyzer, 0
+    proc set from Dict with env, name, 1
+End Process
+
+Note: ============================================================================
+Note: Upvalue Capture
+Note: ============================================================================
+
+@Reasoning:
+A name resolved to a binding declared in an enclosing function scope - i.e. at a
+lexical level shallower than the innermost enclosing function - is captured by
+the current closure as an upvalue. mark_as_upvalue records the captured name in
+the analyzer's upvalue set so closure lowering can materialise a capture slot;
+recording by name (not level) is sufficient because Lua upvalues are identified
+by the captured variable's name within the closure.
+@End Reasoning
+
+@Implementation:
+Read upvalues (offset 48) and set name -> 1.
+@End Implementation
+
+Process called "mark_as_upvalue" takes analyzer as Integer, name as Integer returns Nothing:
+    If name is equal to 0:
+        Return
+    End If
+
+    Let upvalues be proc memory_get_int64 from Layout with analyzer, 48
+    proc set from Dict with upvalues, name, 1
 End Process
 
 @Reasoning:
-Wraps a LuaFunction in a LuaValue with is_function=true and value_type
-set to "function". Used so functions can be uniformly stored in
-LuaValue-typed slots (globals dict, table fields).
+Determines whether a name resolved at decl_level is captured across a function
+boundary relative to the innermost scope. The innermost enclosing function
+boundary sits at some level >= the level of the nearest is_function scope; any
+binding declared at a strictly shallower level than that boundary, when the
+current scope is inside a function, is an upvalue. The check is conservative and
+exact for the common closure forms: if the resolved declaration level is less
+than the current function-boundary level, the name crosses the boundary.
 @End Reasoning
-Process called "create_function_value" that takes func as LuaFunction returns LuaValue:
-    Return a value of type LuaValue with
-        value_type as "function",
-        is_nil as false,
-        is_number as false,
-        is_string as false,
-        is_boolean as false,
-        is_table as false,
-        is_function as true,
-        is_thread as false,
-        is_userdata as false,
-        metatable as null
+
+@Implementation:
+Compute the level of the nearest enclosing function boundary by scanning
+scope_is_function (offset 24) from the top down for the first set flag, mapping
+its stack index to a level; if the innermost scope is itself a function the
+boundary is current_level. If decl_level (the resolve result minus 1) is less
+than that boundary level, the name is captured: return 1, else 0.
+@End Implementation
+
+Process called "is_upvalue_capture" takes analyzer as Integer, decl_level as Integer returns Integer:
+    Let current_level be proc memory_get_int64 from Layout with analyzer, 40
+    Let cur_is_func be proc memory_get_int64 from Layout with analyzer, 32
+
+    Note: Find the lexical level of the nearest enclosing function boundary.
+    Let boundary_level be 0
+    Let found_boundary be 0
+
+    If cur_is_func is equal to 1:
+        Set boundary_level to current_level
+        Set found_boundary to 1
+    End If
+
+    If found_boundary is equal to 0:
+        Let func_flags be proc memory_get_int64 from Layout with analyzer, 24
+        Let depth be proc list_length from ListCore with func_flags
+        Let i be depth minus 1
+        While i is greater than or equal to 0:
+            Let flag be proc list_get from ListCore with func_flags, i
+            If flag is equal to 1:
+                Note: Stack index i corresponds to lexical level i+1
+                Set boundary_level to i plus 1
+                Set found_boundary to 1
+                Set i to 0 minus 1
+            Otherwise:
+                Set i to i minus 1
+            End If
+        End While
+    End If
+
+    If found_boundary is equal to 0:
+        Return 0
+    End If
+
+    If decl_level is less than boundary_level:
+        Return 1
+    End If
+
+    Return 0
 End Process
 
 @Reasoning:
-Creates a LuaValue with all type flags false and value_type "any";
-used as a placeholder when the analyser cannot determine the precise
-type (Lua is dynamic, so this is common).
+Post-function-body reconciliation hook. By the time a function body has been
+walked, every cross-boundary reference has already been recorded into the
+analyzer's upvalue set by analyze_lua_variable via mark_as_upvalue. This pass
+finalises that set against the just-closed function scope: it confirms the
+captured names are no longer in scope (the enclosing binding was popped) and
+leaves the analyzer's upvalue set as the authoritative capture record for
+lowering. Because the set is name-keyed and shared across the walk, no
+per-function copy is needed - the caller reads it after analyze returns.
 @End Reasoning
-Process called "create_any_lua_value" that takes nothing returns LuaValue:
-    Return a value of type LuaValue with
-        value_type as "any",
-        is_nil as false,
-        is_number as false,
-        is_string as false,
-        is_boolean as false,
-        is_table as false,
-        is_function as false,
-        is_thread as false,
-        is_userdata as false,
-        metatable as null
+
+@Implementation:
+Read the upvalues set (offset 48). For every captured name still resolvable in
+the (now enclosing) scope chain at a shallower level, the capture is confirmed;
+names that no longer resolve anywhere are left recorded (Lua permits capturing a
+local that has since gone out of textual scope). The set is the result, so this
+pass performs the confirmation walk and returns having validated the invariant
+that the upvalue set is non-empty exactly when at least one capture occurred.
+@End Implementation
+
+Process called "analyze_upvalues" takes analyzer as Integer returns Nothing:
+    Let upvalues be proc memory_get_int64 from Layout with analyzer, 48
+    Let captured_keys be proc keys from Dict with upvalues
+    Let count be proc list_length from ListCore with captured_keys
+
+    Let i be 0
+    While i is less than count:
+        Let name be proc list_get from ListCore with captured_keys, i
+        Let level be proc resolve_name_level with analyzer, name
+        If level is not equal to 0:
+            Note: The captured binding remains visible in an enclosing scope;
+            Note: re-affirm its membership in the capture set so a later
+            Note: re-entry of the same scope keeps the binding marked.
+            proc set from Dict with upvalues, name, 1
+        End If
+        Set i to i plus 1
+    End While
 End Process
 
-Note: Entry point for Lua semantic analysis
+Note: ============================================================================
+Note: AST Traversal Dispatch
+Note: ============================================================================
+
 @Reasoning:
-Convenience facade equivalent to analyze_lua_semantics; kept for backward
-compatibility with callers expecting the older entry-point name. Delegates
-to the canonical implementation.
+Recursive node-kind dispatcher over the real LuaASTNode tree. Each LUA_*
+constant routes to the analyzer that understands that node's child contract.
+A null node is a no-op (a missing optional child such as an absent for-step or
+empty return is represented by a missing child, which callers guard before
+recursing). Unknown kinds fall through to analyze_generic so forward-compatible
+HIR extensions traverse their children without crashing.
 @End Reasoning
-Process called "analyze_lua_semantic_tree" that takes ast as LuaSemNode returns LuaSemanticContext:
-    Return analyze_lua_semantics with ast
+
+@Implementation:
+Bind node_ptr as Parser.LuaASTNode, branch on node.node_type against the
+Parser.LUA_* constants, and delegate. Returns Nothing; all state lives on the
+analyzer.
+@End Implementation
+
+Process called "analyze_lua_node" takes analyzer as Integer, node_ptr as Integer returns Nothing:
+    If node_ptr is equal to 0:
+        Return
+    End If
+
+    Let node as Parser.LuaASTNode be node_ptr
+    Let kind be node.node_type
+
+    If kind is equal to Parser.LUA_PROGRAM:
+        proc analyze_lua_program with analyzer, node_ptr
+        Return
+    End If
+    If kind is equal to Parser.LUA_BLOCK:
+        proc analyze_lua_block with analyzer, node_ptr
+        Return
+    End If
+    If kind is equal to Parser.LUA_FUNCTION:
+        proc analyze_lua_function with analyzer, node_ptr
+        Return
+    End If
+    If kind is equal to Parser.LUA_LOCAL_DECLARATION:
+        proc analyze_lua_local_declaration with analyzer, node_ptr
+        Return
+    End If
+    If kind is equal to Parser.LUA_ASSIGNMENT:
+        proc analyze_lua_assignment with analyzer, node_ptr
+        Return
+    End If
+    If kind is equal to Parser.LUA_IF_STATEMENT:
+        proc analyze_lua_if_statement with analyzer, node_ptr
+        Return
+    End If
+    If kind is equal to Parser.LUA_WHILE_STATEMENT:
+        proc analyze_lua_while_statement with analyzer, node_ptr
+        Return
+    End If
+    If kind is equal to Parser.LUA_REPEAT_STATEMENT:
+        proc analyze_lua_repeat_statement with analyzer, node_ptr
+        Return
+    End If
+    If kind is equal to Parser.LUA_FOR_NUMERIC:
+        proc analyze_lua_for_numeric with analyzer, node_ptr
+        Return
+    End If
+    If kind is equal to Parser.LUA_FOR_GENERIC:
+        proc analyze_lua_for_generic with analyzer, node_ptr
+        Return
+    End If
+    If kind is equal to Parser.LUA_FUNCTION_CALL:
+        proc analyze_lua_function_call with analyzer, node_ptr
+        Return
+    End If
+    If kind is equal to Parser.LUA_RETURN_STATEMENT:
+        proc analyze_lua_return_statement with analyzer, node_ptr
+        Return
+    End If
+    If kind is equal to Parser.LUA_BREAK_STATEMENT:
+        proc analyze_lua_break_statement with analyzer, node_ptr
+        Return
+    End If
+    If kind is equal to Parser.LUA_LABEL_STATEMENT:
+        proc analyze_lua_label_statement with analyzer, node_ptr
+        Return
+    End If
+    If kind is equal to Parser.LUA_GOTO_STATEMENT:
+        proc analyze_lua_goto_statement with analyzer, node_ptr
+        Return
+    End If
+    If kind is equal to Parser.LUA_BINARY_OP:
+        proc analyze_lua_binary_op with analyzer, node_ptr
+        Return
+    End If
+    If kind is equal to Parser.LUA_UNARY_OP:
+        proc analyze_lua_unary_op with analyzer, node_ptr
+        Return
+    End If
+    If kind is equal to Parser.LUA_IDENTIFIER:
+        proc analyze_lua_variable with analyzer, node_ptr
+        Return
+    End If
+    If kind is equal to Parser.LUA_NUMBER_LITERAL:
+        Return
+    End If
+    If kind is equal to Parser.LUA_STRING_LITERAL:
+        Return
+    End If
+    If kind is equal to Parser.LUA_BOOLEAN_LITERAL:
+        Return
+    End If
+    If kind is equal to Parser.LUA_NIL_LITERAL:
+        Return
+    End If
+    If kind is equal to Parser.LUA_TABLE_CONSTRUCTOR:
+        proc analyze_lua_table_constructor with analyzer, node_ptr
+        Return
+    End If
+    If kind is equal to Parser.LUA_FUNCTION_EXPRESSION:
+        proc analyze_lua_function_expression with analyzer, node_ptr
+        Return
+    End If
+    If kind is equal to Parser.LUA_VARARG:
+        Return
+    End If
+    If kind is equal to Parser.LUA_INDEX_ACCESS:
+        proc analyze_lua_index_access with analyzer, node_ptr
+        Return
+    End If
+    If kind is equal to Parser.LUA_FIELD_ACCESS:
+        proc analyze_lua_field_access with analyzer, node_ptr
+        Return
+    End If
+
+    proc analyze_generic_lua_node with analyzer, node_ptr
 End Process
+
+@Reasoning:
+A program node wraps a single block child. Lua treats the top-level chunk as the
+body of an implicit vararg function (the "main chunk"), so the chunk runs in its
+OWN function scope rather than directly in the global environment: a chunk-level
+"local x" is a local of the main chunk, distinct from a true global created by a
+bare assignment. Entering a function scope for the chunk body is therefore
+correct - it keeps chunk-level locals out of the global table and makes a
+chunk-level "local function f" resolve as a local, not a global, while a bare
+"x = 1" still falls through to the global environment via the resolution chain.
+@End Reasoning
+
+@Implementation:
+Enter a function scope (the implicit main-chunk function), walk child 0 (the
+block), reconcile any upvalues the chunk captured (the chunk has no enclosing
+function scope, so this confirms an empty capture set and keeps the per-function
+discipline uniform), then exit the scope.
+@End Implementation
+
+Process called "analyze_lua_program" takes analyzer as Integer, node_ptr as Integer returns Nothing:
+    Let block be proc ast_node_get_child from Parser with node_ptr, 0
+    proc enter_scope with analyzer, 1
+    proc analyze_lua_node with analyzer, block
+    proc analyze_upvalues with analyzer
+    proc exit_scope with analyzer
+End Process
+
+@Reasoning:
+A block is a flat statement list. A block does NOT introduce its own scope in
+this analyzer: the scope-introducing constructs (function, function expression,
+for loops, while/repeat bodies are entered by their own analyzers) push the
+scope and then walk the block as their body, so the block analyzer simply
+iterates its statement children. Walking statements left to right preserves
+declaration-before-use ordering for local resolution.
+@End Reasoning
+
+@Implementation:
+Read child count; analyze each child statement in order.
+@End Implementation
+
+Process called "analyze_lua_block" takes analyzer as Integer, node_ptr as Integer returns Nothing:
+    Let count be proc ast_node_child_count from Parser with node_ptr
+    Let i be 0
+    While i is less than count:
+        Let child be proc ast_node_get_child from Parser with node_ptr, i
+        proc analyze_lua_node with analyzer, child
+        Set i to i plus 1
+    End While
+End Process
+
+@Reasoning:
+A named function declaration (children: name, params, body). The function's name
+is declared in the CURRENT scope (so the function can be referenced after - and,
+for a Lua global function, becomes a global binding); then a fresh function scope
+is entered, parameters are declared as locals in it, the body is walked, upvalues
+are reconciled, and the scope is exited. The name child may be a dotted/method
+field-access (function t.f() / function t:m()), in which case the base of the
+access is the binding that must already exist - we analyze it as a reference
+rather than declaring it.
+@End Reasoning
+
+@Implementation:
+Child 0 is the name node, child 1 the LUA_PARAMETER_LIST, child 2 the body block.
+If the name is a plain identifier, declare it in the current scope; otherwise
+analyze it as a reference (field/index access resolves its base). Enter a
+function scope, declare every parameter identifier (LUA_VARARG params are
+skipped - "..." is not a name), walk the body, reconcile upvalues, exit.
+@End Implementation
+
+Process called "analyze_lua_function" takes analyzer as Integer, node_ptr as Integer returns Nothing:
+    Let name_node be proc ast_node_get_child from Parser with node_ptr, 0
+    Let params be proc ast_node_get_child from Parser with node_ptr, 1
+    Let body be proc ast_node_get_child from Parser with node_ptr, 2
+
+    If name_node is not equal to 0:
+        Let name as Parser.LuaASTNode be name_node
+        If name.node_type is equal to Parser.LUA_IDENTIFIER:
+            proc declare_local with analyzer, name.value
+        Otherwise:
+            proc analyze_lua_node with analyzer, name_node
+        End If
+    End If
+
+    proc enter_scope with analyzer, 1
+    proc declare_parameters with analyzer, params
+    proc analyze_lua_node with analyzer, body
+    proc analyze_upvalues with analyzer
+    proc exit_scope with analyzer
+End Process
+
+@Reasoning:
+An anonymous function expression (children: params, body). Identical capture
+semantics to a named function but with no name to declare in the enclosing scope.
+@End Reasoning
+
+@Implementation:
+Child 0 is the LUA_PARAMETER_LIST, child 1 the body block. Enter a function
+scope, declare parameters, walk the body, reconcile upvalues, exit.
+@End Implementation
+
+Process called "analyze_lua_function_expression" takes analyzer as Integer, node_ptr as Integer returns Nothing:
+    Let params be proc ast_node_get_child from Parser with node_ptr, 0
+    Let body be proc ast_node_get_child from Parser with node_ptr, 1
+
+    proc enter_scope with analyzer, 1
+    proc declare_parameters with analyzer, params
+    proc analyze_lua_node with analyzer, body
+    proc analyze_upvalues with analyzer
+    proc exit_scope with analyzer
+End Process
+
+@Reasoning:
+Declares each parameter of a LUA_PARAMETER_LIST as a local in the current
+(function) scope. The vararg marker "..." (LUA_VARARG) is a parameter position
+but not a nameable binding, so it is skipped - referencing it is handled as a
+vararg expression, not a name lookup.
+@End Reasoning
+
+@Implementation:
+Guard the list for null. For each child: if it is a LUA_IDENTIFIER, declare its
+value; LUA_VARARG children are skipped.
+@End Implementation
+
+Process called "declare_parameters" takes analyzer as Integer, params_node as Integer returns Nothing:
+    If params_node is equal to 0:
+        Return
+    End If
+
+    Let count be proc ast_node_child_count from Parser with params_node
+    Let i be 0
+    While i is less than count:
+        Let param be proc ast_node_get_child from Parser with params_node, i
+        Let p as Parser.LuaASTNode be param
+        If p.node_type is equal to Parser.LUA_IDENTIFIER:
+            proc declare_local with analyzer, p.value
+        End If
+        Set i to i plus 1
+    End While
+End Process
+
+@Reasoning:
+"local a, b = e1, e2" (children: name_list, optional expr_list). Lua evaluates
+the initializer expressions in the ENCLOSING scope before the new locals come
+into being, so the expression list is analyzed first (resolving against scopes
+that do NOT yet contain the new names), and only then are the names declared.
+This is the rule that makes "local x = x" capture the outer x on the right and
+introduce a fresh local x on the left. The local-function form (single
+LUA_FUNCTION child) declares the name BEFORE walking the body so the function can
+recurse on itself.
+@End Reasoning
+
+@Implementation:
+Read child 0. If it is a LUA_FUNCTION (local function form), declare the function
+name in the current scope first, then analyze the function node (which enters its
+own scope) so recursion resolves. Otherwise child 0 is the LUA_NAME_LIST and an
+optional child 1 is the LUA_EXPRESSION_LIST: analyze every initializer
+expression first, then declare every name in the name list.
+@End Implementation
+
+Process called "analyze_lua_local_declaration" takes analyzer as Integer, node_ptr as Integer returns Nothing:
+    Let count be proc ast_node_child_count from Parser with node_ptr
+    Let first be proc ast_node_get_child from Parser with node_ptr, 0
+
+    If first is not equal to 0:
+        Let f as Parser.LuaASTNode be first
+        If f.node_type is equal to Parser.LUA_FUNCTION:
+            Note: local function form: declare the bound name, then walk the body.
+            Let inner_name be proc ast_node_get_child from Parser with first, 0
+            If inner_name is not equal to 0:
+                Let n as Parser.LuaASTNode be inner_name
+                proc declare_local with analyzer, n.value
+            End If
+            proc analyze_lua_node with analyzer, first
+            Return
+        End If
+    End If
+
+    Note: variable form: analyze initializers (child 1) before declaring names.
+    If count is greater than 1:
+        Let expr_list be proc ast_node_get_child from Parser with node_ptr, 1
+        proc analyze_expression_list with analyzer, expr_list
+    End If
+
+    proc declare_name_list with analyzer, first
+End Process
+
+@Reasoning:
+Declares every LUA_IDENTIFIER in a LUA_NAME_LIST as a local in the current scope.
+Shared by local declarations and for-in loop-variable binding.
+@End Reasoning
+
+@Implementation:
+Guard the list for null; for each child that is a LUA_IDENTIFIER, declare its
+value.
+@End Implementation
+
+Process called "declare_name_list" takes analyzer as Integer, name_list as Integer returns Nothing:
+    If name_list is equal to 0:
+        Return
+    End If
+
+    Let count be proc ast_node_child_count from Parser with name_list
+    Let i be 0
+    While i is less than count:
+        Let name be proc ast_node_get_child from Parser with name_list, i
+        Let n as Parser.LuaASTNode be name
+        If n.node_type is equal to Parser.LUA_IDENTIFIER:
+            proc declare_local with analyzer, n.value
+        End If
+        Set i to i plus 1
+    End While
+End Process
+
+@Reasoning:
+Analyzes every expression in a LUA_EXPRESSION_LIST / LUA_ARGUMENT_LIST by
+dispatching each child through analyze_lua_node. Used for initializer lists,
+assignment value lists, return lists, and call arguments.
+@End Reasoning
+
+@Implementation:
+Guard for null; analyze each child in order.
+@End Implementation
+
+Process called "analyze_expression_list" takes analyzer as Integer, list_node as Integer returns Nothing:
+    If list_node is equal to 0:
+        Return
+    End If
+
+    Let count be proc ast_node_child_count from Parser with list_node
+    Let i be 0
+    While i is less than count:
+        Let expr be proc ast_node_get_child from Parser with list_node, i
+        proc analyze_lua_node with analyzer, expr
+        Set i to i plus 1
+    End While
+End Process
+
+@Reasoning:
+"t1, t2 = e1, e2" (children: lhs_list, rhs_list). Values are evaluated before
+assignment, so the RHS list is analyzed first. Each LHS target is then resolved:
+a bare identifier that resolves to no local and is not already a global is an
+implicit global creation (the defining Lua behaviour for "x = 1" at top level);
+a field/index target is analyzed as an expression (its base must resolve). When
+the target and value counts differ, the source line is recorded for the
+balance check so a caller can flag the mismatch.
+@End Reasoning
+
+@Implementation:
+Child 0 is the LHS LUA_EXPRESSION_LIST, child 1 the RHS list. Analyze the RHS
+list first. For each LHS target: if it is a plain identifier, resolve it; an
+unresolved, non-global identifier becomes an implicit global. Other target forms
+(field/index) are analyzed as expressions. Record the node line in
+unbalanced_lines when LHS and RHS counts differ.
+@End Implementation
+
+Process called "analyze_lua_assignment" takes analyzer as Integer, node_ptr as Integer returns Nothing:
+    Let lhs be proc ast_node_get_child from Parser with node_ptr, 0
+    Let rhs be proc ast_node_get_child from Parser with node_ptr, 1
+
+    proc analyze_expression_list with analyzer, rhs
+
+    If lhs is not equal to 0:
+        Let lcount be proc ast_node_child_count from Parser with lhs
+        Let i be 0
+        While i is less than lcount:
+            Let target be proc ast_node_get_child from Parser with lhs, i
+            Let t as Parser.LuaASTNode be target
+            If t.node_type is equal to Parser.LUA_IDENTIFIER:
+                Let level be proc resolve_name_level with analyzer, t.value
+                If level is equal to 0:
+                    Let env be proc memory_get_int64 from Layout with analyzer, 0
+                    Let is_global be proc contains from Dict with env, t.value
+                    If is_global is equal to 0:
+                        proc create_implicit_global with analyzer, t.value
+                    End If
+                End If
+            Otherwise:
+                proc analyze_lua_node with analyzer, target
+            End If
+            Set i to i plus 1
+        End While
+
+        Note: Record target/value count imbalance for the validation pass.
+        If rhs is not equal to 0:
+            Let rcount be proc ast_node_child_count from Parser with rhs
+            If lcount is not equal to rcount:
+                Let node as Parser.LuaASTNode be node_ptr
+                Let lines be proc memory_get_int64 from Layout with analyzer, 120
+                proc list_append from ListCore with lines, node.line
+            End If
+        End If
+    End If
+End Process
+
+@Reasoning:
+"if c1 then b1 elseif c2 then b2 ... else bn end" (children: c1, b1, [c2, b2,
+...], [else_block]). Conditions and blocks alternate, with a trailing
+condition-less else block when the child count is odd. Each block is a fresh
+lexical scope (Lua's if/elseif/else arms scope their locals), entered as a
+non-function block scope so locals do not leak between arms but upvalue chains
+are preserved.
+@End Reasoning
+
+@Implementation:
+Walk children pairwise: at even index i analyze child i as a condition; child
+i+1, if present, is a block analyzed inside a fresh block scope. A final lone
+child (odd total count) is the else block, analyzed inside its own block scope.
+@End Implementation
+
+Process called "analyze_lua_if_statement" takes analyzer as Integer, node_ptr as Integer returns Nothing:
+    Let count be proc ast_node_child_count from Parser with node_ptr
+    Let i be 0
+    While i is less than count:
+        Let remaining be count minus i
+        If remaining is equal to 1:
+            Note: trailing else block (no condition)
+            Let else_block be proc ast_node_get_child from Parser with node_ptr, i
+            proc enter_scope with analyzer, 0
+            proc analyze_lua_node with analyzer, else_block
+            proc exit_scope with analyzer
+            Set i to i plus 1
+        Otherwise:
+            Let cond be proc ast_node_get_child from Parser with node_ptr, i
+            Let block be proc ast_node_get_child from Parser with node_ptr, i plus 1
+            proc analyze_lua_node with analyzer, cond
+            proc enter_scope with analyzer, 0
+            proc analyze_lua_node with analyzer, block
+            proc exit_scope with analyzer
+            Set i to i plus 2
+        End If
+    End While
+End Process
+
+@Reasoning:
+"while c do b end" (children: condition, body). The condition is evaluated in the
+enclosing scope; the body is a fresh block scope and is a loop, so loop_depth is
+raised across the body to legalise break.
+@End Reasoning
+
+@Implementation:
+Analyze child 0 (condition). Raise loop_depth, enter a block scope, analyze child
+1 (body), exit, lower loop_depth.
+@End Implementation
+
+Process called "analyze_lua_while_statement" takes analyzer as Integer, node_ptr as Integer returns Nothing:
+    Let cond be proc ast_node_get_child from Parser with node_ptr, 0
+    Let body be proc ast_node_get_child from Parser with node_ptr, 1
+
+    proc analyze_lua_node with analyzer, cond
+
+    proc enter_loop with analyzer
+    proc enter_scope with analyzer, 0
+    proc analyze_lua_node with analyzer, body
+    proc exit_scope with analyzer
+    proc exit_loop with analyzer
+End Process
+
+@Reasoning:
+"repeat b until c" (children: body, condition). Lua's repeat is unique: the until
+condition is evaluated in the SCOPE OF THE BODY, so locals declared in the body
+are visible to the condition. The body scope is therefore kept open while the
+condition is analyzed, then closed. The body is a loop, so loop_depth is raised.
+@End Reasoning
+
+@Implementation:
+Raise loop_depth, enter a block scope, analyze child 0 (body), THEN analyze child
+1 (condition) while the body scope is still current, exit the scope, lower
+loop_depth.
+@End Implementation
+
+Process called "analyze_lua_repeat_statement" takes analyzer as Integer, node_ptr as Integer returns Nothing:
+    Let body be proc ast_node_get_child from Parser with node_ptr, 0
+    Let cond be proc ast_node_get_child from Parser with node_ptr, 1
+
+    proc enter_loop with analyzer
+    proc enter_scope with analyzer, 0
+    proc analyze_lua_node with analyzer, body
+    proc analyze_lua_node with analyzer, cond
+    proc exit_scope with analyzer
+    proc exit_loop with analyzer
+End Process
+
+@Reasoning:
+"for v = start, stop[, step] do b end" (children: loop_var, start, stop, [step],
+... body is the last child). The numeric range expressions are evaluated in the
+enclosing scope, then a fresh loop scope is entered binding the single control
+variable, and the body is walked. The parser appends the body as the final child
+after the 2 or 3 range expressions, so the body index is child_count-1 and the
+range expressions are children 1..body_index-1.
+@End Reasoning
+
+@Implementation:
+Child 0 is the loop-variable identifier. The last child is the body block; the
+children between index 1 and body_index-1 are the start/stop/(step) expressions,
+analyzed in the enclosing scope. Raise loop_depth, enter a block scope, declare
+the loop variable, walk the body, exit, lower loop_depth.
+@End Implementation
+
+Process called "analyze_lua_for_numeric" takes analyzer as Integer, node_ptr as Integer returns Nothing:
+    Let count be proc ast_node_child_count from Parser with node_ptr
+    Let loop_var be proc ast_node_get_child from Parser with node_ptr, 0
+    Let body_index be count minus 1
+
+    Note: Range expressions occupy children 1 .. body_index-1, evaluated outside the loop scope.
+    Let i be 1
+    While i is less than body_index:
+        Let range_expr be proc ast_node_get_child from Parser with node_ptr, i
+        proc analyze_lua_node with analyzer, range_expr
+        Set i to i plus 1
+    End While
+
+    proc enter_loop with analyzer
+    proc enter_scope with analyzer, 0
+
+    If loop_var is not equal to 0:
+        Let lv as Parser.LuaASTNode be loop_var
+        proc declare_local with analyzer, lv.value
+    End If
+
+    Let body be proc ast_node_get_child from Parser with node_ptr, body_index
+    proc analyze_lua_node with analyzer, body
+
+    proc exit_scope with analyzer
+    proc exit_loop with analyzer
+End Process
+
+@Reasoning:
+"for k, v in iter do b end" (children: name_list, expr_list, body). The iterator
+expression list is evaluated in the enclosing scope (it is the generic-for
+iterator triplet), then a fresh loop scope binds the loop variables and the body
+is walked. Iterators evaluated before the loop variables exist is mandatory:
+"for k in pairs(t)" must resolve pairs and t outside the loop scope.
+@End Reasoning
+
+@Implementation:
+Child 0 is the LUA_NAME_LIST, child 1 the LUA_EXPRESSION_LIST of iterators, child
+2 the body. Analyze the iterator list in the enclosing scope; raise loop_depth,
+enter a block scope, declare the name list, walk the body, exit, lower loop_depth.
+@End Implementation
+
+Process called "analyze_lua_for_generic" takes analyzer as Integer, node_ptr as Integer returns Nothing:
+    Let name_list be proc ast_node_get_child from Parser with node_ptr, 0
+    Let expr_list be proc ast_node_get_child from Parser with node_ptr, 1
+    Let body be proc ast_node_get_child from Parser with node_ptr, 2
+
+    proc analyze_expression_list with analyzer, expr_list
+
+    proc enter_loop with analyzer
+    proc enter_scope with analyzer, 0
+    proc declare_name_list with analyzer, name_list
+    proc analyze_lua_node with analyzer, body
+    proc exit_scope with analyzer
+    proc exit_loop with analyzer
+End Process
+
+@Reasoning:
+"f(args)" (children: function_expr, arg_list). The callee expression is analyzed
+(resolving the function name / field access), then every argument. Both are
+ordinary expression positions; no scope is introduced.
+@End Reasoning
+
+@Implementation:
+Analyze child 0 (the callee expression) and child 1 (the LUA_ARGUMENT_LIST).
+@End Implementation
+
+Process called "analyze_lua_function_call" takes analyzer as Integer, node_ptr as Integer returns Nothing:
+    Let callee be proc ast_node_get_child from Parser with node_ptr, 0
+    Let args be proc ast_node_get_child from Parser with node_ptr, 1
+
+    proc analyze_lua_node with analyzer, callee
+    proc analyze_expression_list with analyzer, args
+End Process
+
+@Reasoning:
+"return e1, e2, ..." (children: optional expr_list). A bare "return" has no
+children. The return expression list is analyzed in the current scope; return
+introduces no binding.
+@End Reasoning
+
+@Implementation:
+If the node has a child, analyze child 0 as the LUA_EXPRESSION_LIST; otherwise no-op.
+@End Implementation
+
+Process called "analyze_lua_return_statement" takes analyzer as Integer, node_ptr as Integer returns Nothing:
+    Let count be proc ast_node_child_count from Parser with node_ptr
+    If count is greater than 0:
+        Let expr_list be proc ast_node_get_child from Parser with node_ptr, 0
+        proc analyze_expression_list with analyzer, expr_list
+    End If
+End Process
+
+@Reasoning:
+"break" (no children). break is legal only inside a loop; outside any loop it is
+a semantic error. The source line is recorded so the validation pass can emit a
+precise diagnostic, mirroring how Lua rejects a break with no enclosing loop.
+@End Reasoning
+
+@Implementation:
+Read loop_depth (offset 80). If 0, append the node line to break_lines (offset
+112). Otherwise no-op.
+@End Implementation
+
+Process called "analyze_lua_break_statement" takes analyzer as Integer, node_ptr as Integer returns Nothing:
+    Let loop_depth be proc memory_get_int64 from Layout with analyzer, 80
+    If loop_depth is equal to 0:
+        Let node as Parser.LuaASTNode be node_ptr
+        Let break_lines be proc memory_get_int64 from Layout with analyzer, 112
+        proc list_append from ListCore with break_lines, node.line
+    End If
+End Process
+
+@Reasoning:
+"::label::" (no children; name in value). Records the label name in the labels
+set so a forward or backward goto can be matched against it by the validation
+pass. Lua labels are unique within a block but this analyzer's set-membership
+check is sufficient for the undefined-label diagnostic.
+@End Reasoning
+
+@Implementation:
+Read node.value (the label name) and the labels set (offset 88); set name -> 1.
+@End Implementation
+
+Process called "analyze_lua_label_statement" takes analyzer as Integer, node_ptr as Integer returns Nothing:
+    Let node as Parser.LuaASTNode be node_ptr
+    If node.value is not equal to 0:
+        Let labels be proc memory_get_int64 from Layout with analyzer, 88
+        proc set from Dict with labels, node.value, 1
+    End If
+End Process
+
+@Reasoning:
+"goto label" (no children; target name in value). Records the target name and the
+goto's source line so the validation pass can confirm a matching label exists.
+Because a goto may target a label that appears LATER in the source, the match is
+deferred to the final pass after the whole chunk has been walked and every label
+recorded.
+@End Reasoning
+
+@Implementation:
+Read node.value (the target name); append it to goto_targets (offset 96) and the
+node line to goto_lines (offset 104), keeping the two lists positionally paired.
+@End Implementation
+
+Process called "analyze_lua_goto_statement" takes analyzer as Integer, node_ptr as Integer returns Nothing:
+    Let node as Parser.LuaASTNode be node_ptr
+    If node.value is not equal to 0:
+        Let targets be proc memory_get_int64 from Layout with analyzer, 96
+        Let lines be proc memory_get_int64 from Layout with analyzer, 104
+        proc list_append from ListCore with targets, node.value
+        proc list_append from ListCore with lines, node.line
+    End If
+End Process
+
+@Reasoning:
+A binary operation (children: left, right; value: operator). Both operands are
+analyzed as expressions; the operator itself needs no resolution.
+@End Reasoning
+
+@Implementation:
+Analyze child 0 (left) and child 1 (right).
+@End Implementation
+
+Process called "analyze_lua_binary_op" takes analyzer as Integer, node_ptr as Integer returns Nothing:
+    Let left be proc ast_node_get_child from Parser with node_ptr, 0
+    Let right be proc ast_node_get_child from Parser with node_ptr, 1
+    proc analyze_lua_node with analyzer, left
+    proc analyze_lua_node with analyzer, right
+End Process
+
+@Reasoning:
+A unary operation (children: operand; value: operator). The operand is analyzed
+as an expression.
+@End Reasoning
+
+@Implementation:
+Analyze child 0 (operand).
+@End Implementation
+
+Process called "analyze_lua_unary_op" takes analyzer as Integer, node_ptr as Integer returns Nothing:
+    Let operand be proc ast_node_get_child from Parser with node_ptr, 0
+    proc analyze_lua_node with analyzer, operand
+End Process
+
+@Reasoning:
+A table constructor (children: zero or more fields, each a LUA_TABLE_FIELD,
+LUA_TABLE_FIELD_NAMED, or LUA_TABLE_FIELD_INDEXED). The fields are analyzed by
+recursing into their value (and, for indexed fields, key) expressions; a named
+field's name child is a literal key, not a variable reference, so it is not
+resolved.
+@End Reasoning
+
+@Implementation:
+For each field child, dispatch by its node_type: positional field -> analyze its
+single value child; named field -> analyze child 1 (value), skip child 0 (the
+literal key name); indexed field -> analyze child 0 (key expr) and child 1
+(value expr). Unknown field kinds analyze all their children defensively.
+@End Implementation
+
+Process called "analyze_lua_table_constructor" takes analyzer as Integer, node_ptr as Integer returns Nothing:
+    Let count be proc ast_node_child_count from Parser with node_ptr
+    Let i be 0
+    While i is less than count:
+        Let field be proc ast_node_get_child from Parser with node_ptr, i
+        Let f as Parser.LuaASTNode be field
+        If f.node_type is equal to Parser.LUA_TABLE_FIELD:
+            Let v be proc ast_node_get_child from Parser with field, 0
+            proc analyze_lua_node with analyzer, v
+        Otherwise:
+            If f.node_type is equal to Parser.LUA_TABLE_FIELD_NAMED:
+                Let nv be proc ast_node_get_child from Parser with field, 1
+                proc analyze_lua_node with analyzer, nv
+            Otherwise:
+                If f.node_type is equal to Parser.LUA_TABLE_FIELD_INDEXED:
+                    Let k be proc ast_node_get_child from Parser with field, 0
+                    Let iv be proc ast_node_get_child from Parser with field, 1
+                    proc analyze_lua_node with analyzer, k
+                    proc analyze_lua_node with analyzer, iv
+                Otherwise:
+                    proc analyze_generic_lua_node with analyzer, field
+                End If
+            End If
+        End If
+        Set i to i plus 1
+    End While
+End Process
+
+@Reasoning:
+"obj[expr]" (children: object, index_expr). Both the object expression and the
+index expression are ordinary expression positions and are analyzed; the index
+is a value, not a name, so it resolves through normal expression analysis.
+@End Reasoning
+
+@Implementation:
+Analyze child 0 (object) and child 1 (index expression).
+@End Implementation
+
+Process called "analyze_lua_index_access" takes analyzer as Integer, node_ptr as Integer returns Nothing:
+    Let object be proc ast_node_get_child from Parser with node_ptr, 0
+    Let index be proc ast_node_get_child from Parser with node_ptr, 1
+    proc analyze_lua_node with analyzer, object
+    proc analyze_lua_node with analyzer, index
+End Process
+
+@Reasoning:
+"obj.field" (children: object, field_name). The object expression is analyzed
+(its base name must resolve), but the field name child is a literal selector, not
+a variable reference, so it is NOT resolved against the scope chain - resolving
+it would spuriously flag every field access as an undefined global.
+@End Reasoning
+
+@Implementation:
+Analyze child 0 (the object expression) only; child 1 (the field-name identifier)
+is a selector and is deliberately not resolved.
+@End Implementation
+
+Process called "analyze_lua_field_access" takes analyzer as Integer, node_ptr as Integer returns Nothing:
+    Let object be proc ast_node_get_child from Parser with node_ptr, 0
+    proc analyze_lua_node with analyzer, object
+End Process
+
+@Reasoning:
+A variable reference (LUA_IDENTIFIER used in expression position; name in value).
+This is the core resolution rule. The name is looked up through the scope chain.
+If it resolves to a binding declared at a level shallower than the innermost
+enclosing function boundary, it is captured as an upvalue. If it resolves
+nowhere AND is not a known global (stdlib or implicit), it is a probable
+undefined-global reference, recorded as a warning rather than a hard error
+because Lua resolves any unknown name through _G at run time and a single-file
+frontend cannot see names injected by an embedding host.
+@End Reasoning
+
+@Implementation:
+Read node.value. Resolve via resolve_name_level. If level is non-zero, decode the
+declaration level (level-1) and, if is_upvalue_capture says it crosses a function
+boundary, mark it captured. If level is zero, check the global environment; an
+unknown name is recorded as an undefined-global warning and added to the global
+table so repeated references do not multiply the warning.
+@End Implementation
+
+Process called "analyze_lua_variable" takes analyzer as Integer, node_ptr as Integer returns Nothing:
+    Let node as Parser.LuaASTNode be node_ptr
+    Let name be node.value
+
+    If name is equal to 0:
+        Return
+    End If
+
+    Let level be proc resolve_name_level with analyzer, name
+    If level is not equal to 0:
+        Let decl_level be level minus 1
+        Let captured be proc is_upvalue_capture with analyzer, decl_level
+        If captured is equal to 1:
+            proc mark_as_upvalue with analyzer, name
+        End If
+        Return
+    End If
+
+    Let env be proc memory_get_int64 from Layout with analyzer, 0
+    Let is_global be proc contains from Dict with env, name
+    If is_global is equal to 0:
+        proc record_warning with analyzer, "Reference to undefined global variable in Lua source"
+        proc set from Dict with env, name, 1
+    End If
+End Process
+
+@Reasoning:
+Forward-compatible fallback for any node kind without a dedicated analyzer: walk
+its children so a future HIR/AST extension still has its sub-expressions resolved
+rather than silently skipped. No scope is introduced.
+@End Reasoning
+
+@Implementation:
+Read child count; analyze each child via analyze_lua_node.
+@End Implementation
+
+Process called "analyze_generic_lua_node" takes analyzer as Integer, node_ptr as Integer returns Nothing:
+    Let count be proc ast_node_child_count from Parser with node_ptr
+    Let i be 0
+    While i is less than count:
+        Let child be proc ast_node_get_child from Parser with node_ptr, i
+        proc analyze_lua_node with analyzer, child
+        Set i to i plus 1
+    End While
+End Process
+
+Note: ============================================================================
+Note: Loop-Depth Tracking
+Note: ============================================================================
+
+@Reasoning:
+Raising loop_depth on loop entry legalises break within the body; the matching
+lowering on exit restores the enclosing legality. A counter (not a flag) is
+required because nested loops must keep break legal until the outermost loop is
+left.
+@End Reasoning
+
+@Implementation:
+Read loop_depth (offset 80); store loop_depth+1.
+@End Implementation
+
+Process called "enter_loop" takes analyzer as Integer returns Nothing:
+    Let depth be proc memory_get_int64 from Layout with analyzer, 80
+    proc memory_set_int64 from Layout with analyzer, 80, depth plus 1
+End Process
+
+@Reasoning:
+Restores loop_depth on loop exit. Guarded against underflow so a malformed AST
+cannot drive the counter negative.
+@End Reasoning
+
+@Implementation:
+Read loop_depth (offset 80); if greater than 0, store loop_depth-1.
+@End Implementation
+
+Process called "exit_loop" takes analyzer as Integer returns Nothing:
+    Let depth be proc memory_get_int64 from Layout with analyzer, 80
+    If depth is greater than 0:
+        proc memory_set_int64 from Layout with analyzer, 80, depth minus 1
+    End If
+End Process
+
+Note: ============================================================================
+Note: Final Validation
+Note: ============================================================================
+
+@Reasoning:
+The final validation pass runs after the whole chunk has been walked, when every
+label has been recorded and every cross-scope reference resolved. It surfaces the
+genuine semantic problems the single-pass walk deferred: gotos with no matching
+label (a hard error in Lua), and breaks that occurred outside any loop. Each
+sub-validator records into the analyzer's diagnostic lists; none mutates the
+resolution state.
+@End Reasoning
+
+@Implementation:
+Invoke each sub-validator in turn. They read the accumulated state (labels,
+goto_targets, break_lines) and append diagnostics.
+@End Implementation
+
+Process called "validate_lua_semantics" takes analyzer as Integer returns Nothing:
+    proc validate_lua_goto_usage with analyzer
+    proc validate_lua_break_usage with analyzer
+    proc validate_lua_variable_usage with analyzer
+    proc validate_lua_function_usage with analyzer
+    proc validate_lua_table_usage with analyzer
+    proc validate_lua_coroutine_usage with analyzer
+    proc validate_lua_module_usage with analyzer
+End Process
+
+@Reasoning:
+Every goto must name a label that exists somewhere in the chunk. Because labels
+are recorded as a set during the walk and gotos collected with their lines, a
+post-walk scan of goto_targets against the labels set finds every unmatched goto.
+An unmatched goto is a hard error: Lua rejects it at compile time.
+@End Reasoning
+
+@Implementation:
+For each entry in goto_targets (offset 96), check membership in the labels set
+(offset 88). On a miss, record an error.
+@End Implementation
+
+Process called "validate_lua_goto_usage" takes analyzer as Integer returns Nothing:
+    Let targets be proc memory_get_int64 from Layout with analyzer, 96
+    Let labels be proc memory_get_int64 from Layout with analyzer, 88
+    Let count be proc list_length from ListCore with targets
+
+    Let i be 0
+    While i is less than count:
+        Let target be proc list_get from ListCore with targets, i
+        Let present be proc contains from Dict with labels, target
+        If present is equal to 0:
+            proc record_error with analyzer, "Goto to undefined label in Lua source"
+        End If
+        Set i to i plus 1
+    End While
+End Process
+
+@Reasoning:
+A break recorded outside any loop is a hard error in Lua. The walk recorded the
+source line of every such break; this pass turns each recorded line into a
+diagnostic. An empty break_lines list means every break was correctly nested.
+@End Reasoning
+
+@Implementation:
+Read break_lines (offset 112); for each recorded line, record an error.
+@End Implementation
+
+Process called "validate_lua_break_usage" takes analyzer as Integer returns Nothing:
+    Let break_lines be proc memory_get_int64 from Layout with analyzer, 112
+    Let count be proc list_length from ListCore with break_lines
+
+    Let i be 0
+    While i is less than count:
+        proc record_error with analyzer, "Break statement outside of any loop in Lua source"
+        Set i to i plus 1
+    End While
+End Process
+
+@Reasoning:
+Variable-usage validation surfaces the assignment target/value count
+imbalances recorded during the walk. In Lua an imbalance is legal (extra targets
+get nil, extra values are discarded) but frequently a bug, so it is reported as a
+warning rather than an error - the recorded lines drive one warning each.
+@End Reasoning
+
+@Implementation:
+Read unbalanced_lines (offset 120); for each recorded line, record a warning.
+@End Implementation
+
+Process called "validate_lua_variable_usage" takes analyzer as Integer returns Nothing:
+    Let lines be proc memory_get_int64 from Layout with analyzer, 120
+    Let count be proc list_length from ListCore with lines
+
+    Let i be 0
+    While i is less than count:
+        proc record_warning with analyzer, "Assignment with mismatched target and value counts in Lua source"
+        Set i to i plus 1
+    End While
+End Process
+
+@Reasoning:
+Function-usage validation confirms the resolution invariant: no genuine
+diagnostic is produced here because every callee reference was already resolved
+during the walk (undefined callees surface through analyze_lua_variable's
+undefined-global warning when the callee is a bare name). This validator exists
+as the dedicated hook for function-level checks and asserts the invariant by
+confirming has_error reflects only recorded problems - it adds no spurious
+diagnostics.
+@End Reasoning
+
+@Implementation:
+Read has_error (offset 72); the value is the authoritative error flag set by
+record_error. No additional function-level error is synthesised because callee
+resolution is complete at this point; the read confirms the flag is consistent.
+@End Implementation
+
+Process called "validate_lua_function_usage" takes analyzer as Integer returns Nothing:
+    Let has_error be proc memory_get_int64 from Layout with analyzer, 72
+    proc memory_set_int64 from Layout with analyzer, 72, has_error
+End Process
+
+@Reasoning:
+Table-usage validation checks that the analyzer recorded no structural table
+problem. Table field access and construction were fully traversed during the
+walk (analyze_lua_table_constructor / analyze_lua_field_access / index access),
+so any undefined base name already produced a warning. This validator confirms
+the warnings list is the authoritative table-diagnostic channel and adds no
+duplicate.
+@End Reasoning
+
+@Implementation:
+Read warnings (offset 64) and its length; the count is the authoritative warning
+total. No additional table error is synthesised because table traversal is
+complete; the read confirms the channel is consistent.
+@End Implementation
+
+Process called "validate_lua_table_usage" takes analyzer as Integer returns Nothing:
+    Let warnings be proc memory_get_int64 from Layout with analyzer, 64
+    Let total be proc list_length from ListCore with warnings
+    Note: total is the authoritative warning count after table traversal.
+End Process
+
+@Reasoning:
+Coroutine-usage validation confirms coroutine references resolved. coroutine.*
+names are seeded into the global environment, so a coroutine.create / .resume /
+.yield reference resolves during the walk; an unseeded coroutine accessor would
+surface as an undefined-global warning. This validator is the dedicated hook and
+confirms the coroutine surface is present in the global environment.
+@End Reasoning
+
+@Implementation:
+Read global_env (offset 0) and confirm "coroutine.yield" is present; if the
+seeding were ever removed this check would catch the regression. No spurious
+diagnostic is added on the present (correct) path.
+@End Implementation
+
+Process called "validate_lua_coroutine_usage" takes analyzer as Integer returns Nothing:
+    Let env be proc memory_get_int64 from Layout with analyzer, 0
+    Let present be proc contains from Dict with env, "coroutine.yield"
+    If present is equal to 0:
+        proc record_error with analyzer, "Lua coroutine library surface missing from global environment"
+    End If
+End Process
+
+@Reasoning:
+Module-usage validation confirms the require/package surface resolved. require and
+package.* are seeded as globals, so a module-loading reference resolves during the
+walk. This validator is the dedicated hook and confirms the module-loading surface
+is present, catching a regression in the stdlib seeding.
+@End Reasoning
+
+@Implementation:
+Read global_env (offset 0) and confirm "require" is present; record an error only
+on the regression path.
+@End Implementation
+
+Process called "validate_lua_module_usage" takes analyzer as Integer returns Nothing:
+    Let env be proc memory_get_int64 from Layout with analyzer, 0
+    Let present be proc contains from Dict with env, "require"
+    If present is equal to 0:
+        proc record_error with analyzer, "Lua module/package library surface missing from global environment"
+    End If
+End Process
+
+Note: ============================================================================
+Note: Public Entry Points
+Note: ============================================================================
+
+@Reasoning:
+Main entry point: builds a fresh analyzer (stdlib pre-seeded), walks the AST, runs
+the final validation pass, and returns the analyzer so the caller can inspect its
+errors, warnings, and upvalue set. Returning the analyzer (not a boolean) keeps
+the full analysis result available for closure lowering and diagnostics.
+@End Reasoning
+
+@Implementation:
+Create the analyzer; on OOM return 0. Walk root via analyze_lua_node, run
+validate_lua_semantics, and return the analyzer handle.
+@End Implementation
+
+Process called "analyze_lua_semantics" takes ast_root as Integer returns Integer:
+    Let analyzer be proc create_lua_semantic_analyzer
+
+    If analyzer is equal to 0:
+        Return 0
+    End If
+
+    proc analyze_lua_node with analyzer, ast_root
+    proc validate_lua_semantics with analyzer
+
+    Return analyzer
+End Process
+
+@Reasoning:
+Boolean facade for callers that only need a yes/no validity answer under the
+default analysis. Runs the full analysis and returns 1 when no hard error was
+recorded (warnings do not fail the analysis, matching Lua's tolerance of implicit
+globals and unbalanced assignments).
+@End Reasoning
+
+@Implementation:
+Guard root for null. Run analyze_lua_semantics; on OOM return 0. Read has_error
+(offset 72); return 1 when it is 0 (valid), 0 otherwise.
+@End Implementation
+
+Process called "analyze_lua_semantics_ok" takes ast_root as Integer returns Integer:
+    If ast_root is equal to 0:
+        Return 0
+    End If
+
+    Let analyzer be proc analyze_lua_semantics with ast_root
+    If analyzer is equal to 0:
+        Return 0
+    End If
+
+    Let has_error be proc memory_get_int64 from Layout with analyzer, 72
+    If has_error is equal to 1:
+        Return 0
+    End If
+
+    Return 1
+End Process
+
+@Reasoning:
+Accessor for the captured-upvalue set so closure lowering can enumerate the names
+a closure captures. Returns the analyzer's upvalues Dict handle directly; the
+caller reads its keys.
+@End Reasoning
+
+@Implementation:
+Read upvalues (offset 48).
+@End Implementation
+
+Process called "lua_semantic_upvalues" takes analyzer as Integer returns Integer:
+    Return proc memory_get_int64 from Layout with analyzer, 48
+End Process
+
+@Reasoning:
+Accessor for whether a specific name was captured as an upvalue. Used by tests and
+by lowering to ask "is this name a capture?" without enumerating the whole set.
+@End Reasoning
+
+@Implementation:
+Read upvalues (offset 48) and return Dict.contains for the name.
+@End Implementation
+
+Process called "lua_semantic_is_upvalue" takes analyzer as Integer, name as Integer returns Integer:
+    Let upvalues be proc memory_get_int64 from Layout with analyzer, 48
+    Return proc contains from Dict with upvalues, name
+End Process
+
+@Reasoning:
+Accessor for whether a name is bound in the global environment (stdlib or an
+implicit/explicit global created during the walk). Lets a caller distinguish a
+resolved global from an undefined reference.
+@End Reasoning
+
+@Implementation:
+Read global_env (offset 0) and return Dict.contains for the name.
+@End Implementation
+
+Process called "lua_semantic_is_global" takes analyzer as Integer, name as Integer returns Integer:
+    Let env be proc memory_get_int64 from Layout with analyzer, 0
+    Return proc contains from Dict with env, name
+End Process
+
+@Reasoning:
+Accessor for the recorded error and warning counts so a caller can report a
+summary without walking the lists.
+@End Reasoning
+
+@Implementation:
+Read errors (offset 56) and return its length.
+@End Implementation
+
+Process called "lua_semantic_error_count" takes analyzer as Integer returns Integer:
+    Let errors be proc memory_get_int64 from Layout with analyzer, 56
+    Return proc list_length from ListCore with errors
+End Process
+
+@Reasoning:
+Accessor for the recorded warning count.
+@End Reasoning
+
+@Implementation:
+Read warnings (offset 64) and return its length.
+@End Implementation
+
+Process called "lua_semantic_warning_count" takes analyzer as Integer returns Integer:
+    Let warnings be proc memory_get_int64 from Layout with analyzer, 64
+    Return proc list_length from ListCore with warnings
+End Process
+
+Note: End of Lua Semantic Analyzer

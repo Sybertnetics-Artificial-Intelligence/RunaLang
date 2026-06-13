@@ -1,0 +1,152 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+Licensed under Apache 2.0
+:End Note
+
+Note:
+Lua Semantic Analyzer Probe
+
+End-to-end proof that the Lua semantic stage is REAL, not a skeleton:
+
+    Lua source
+      -> lua_lexer    (tokenize)
+      -> lua_parser   (build the real Lua AST: program/block/function/local/...)
+      -> lua_semantic (resolve names; classify local / upvalue / global)
+      -> assert on the resulting analyzer state
+
+The probe feeds a Lua chunk that forces every classification the analyzer must
+get right:
+
+    local outer = 10            -- a local in the chunk scope
+    local function closure()    -- a nested function (a new function boundary)
+        return outer + 1        -- references the enclosing 'outer' => UPVALUE
+    end
+    answer = closure()          -- assignment to an undeclared name => GLOBAL
+
+After analysis the probe asserts, by reading the analyzer's own accessors:
+
+  - the analysis produced a non-null analyzer and recorded zero hard ERRORS
+    (implicit globals and upvalue capture are valid Lua, not errors);
+  - 'outer', referenced inside the nested function but declared in the
+    enclosing scope, was CAPTURED AS AN UPVALUE (lua_semantic_is_upvalue);
+  - 'answer', assigned without declaration, was recorded as a GLOBAL
+    (lua_semantic_is_global);
+  - 'print' (stdlib) resolves as a global without producing an error;
+  - the upvalue set is non-empty (at least one capture occurred);
+  - a name that was never referenced ('nonexistent_xyz') is NOT a global,
+    confirming the global table reflects real program references, not noise.
+
+This exercises the genuine scope-chain walk, the function-boundary upvalue
+detection (mark_as_upvalue / analyze_upvalues), and the implicit-global creation
+path - the three behaviours the semantic stage exists to provide.
+
+Exit code: number of failed assertions (0 == all passed). No exit_with_code.
+:End Note
+
+Import "compiler/middle/gungnir/hir/translation/frontends/lua/lua_lexer.runa" as LuaLexer
+Import "compiler/middle/gungnir/hir/translation/frontends/lua/lua_parser.runa" as LuaParser
+Import "compiler/middle/gungnir/hir/translation/frontends/lua/lua_semantic.runa" as LuaSemantic
+Import "compiler/frontend/primitives/collections/dictionary.runa" as Dict
+Import "tests/test_utils.runa" as TestUtils
+
+Note: ============================================================================
+Note: Pipeline helper
+Note: ============================================================================
+
+@Reasoning:
+The probe runs the front of the pipeline (lex -> parse) to obtain the real Lua
+AST root, then hands it to the semantic analyzer. Factoring the lex/parse drive
+into one helper keeps the probe focused on the semantic assertions and ensures
+the AST handed to the analyzer is exactly what the production parser emits.
+@End Reasoning
+@Implementation:
+Build a lexer over the source, tokenize, wrap the tokens in a parser, drive a
+full parse_program to the Lua AST root, and return it. Returns 0 if any stage
+yields 0 so the caller can detect a pipeline failure before asserting.
+@End Implementation
+Process called "source_to_ast" takes source as Integer returns Integer:
+    Let lexer be proc create_lexer from LuaLexer with source
+    If lexer is equal to 0:
+        Return 0
+    End If
+
+    Let tokens be proc tokenize from LuaLexer with lexer
+    If tokens is equal to 0:
+        Return 0
+    End If
+
+    Let parser be proc create_parser from LuaParser with tokens
+    If parser is equal to 0:
+        Return 0
+    End If
+
+    Let ast be proc parse_program from LuaParser with parser
+    Return ast
+End Process
+
+Note: ============================================================================
+Note: Main
+Note: ============================================================================
+
+@Reasoning:
+A single representative chunk drives every semantic classification at once: a
+chunk-level local, a nested function that captures it (upvalue), and an
+undeclared assignment (implicit global). Reading the analyzer's accessors after
+analysis proves the resolution actually happened rather than trusting that the
+file merely compiled.
+@End Reasoning
+@Implementation:
+Parse the chunk to an AST, assert the AST is non-null, run analyze_lua_semantics,
+assert the analyzer is non-null and recorded zero errors, then assert the
+upvalue / global classifications via the public accessors. Return the failed
+count so the process exit code is 0 exactly when every assertion passed.
+@End Implementation
+Process called "main" returns Integer:
+    Let results be proc create_test_results from TestUtils
+    proc begin_suite from TestUtils with results, "Lua Semantic Analyzer Probe"
+
+    Let source be "local outer = 10\nlocal function closure()\nreturn outer + 1\nend\nanswer = closure()\nprint(answer)\n"
+
+    Note: --- Stage 1: parse to the real Lua AST ---
+    Let ast be proc source_to_ast with source
+    proc assert_not_null from TestUtils with results, "lex+parse produced a Lua AST", ast
+
+    Note: --- Stage 2: run the semantic analyzer over the AST ---
+    Let analyzer be proc analyze_lua_semantics from LuaSemantic with ast
+    proc assert_not_null from TestUtils with results, "semantic analysis produced an analyzer", analyzer
+
+    Note: --- Stage 3: no hard errors (implicit globals + upvalues are valid Lua) ---
+    Let error_count be proc lua_semantic_error_count from LuaSemantic with analyzer
+    proc assert_equal from TestUtils with results, "semantic analysis recorded zero errors", error_count, 0
+
+    Note: --- Stage 4: 'outer' captured as an upvalue across the function boundary ---
+    Let outer_is_upvalue be proc lua_semantic_is_upvalue from LuaSemantic with analyzer, "outer"
+    proc assert_equal from TestUtils with results, "'outer' captured as upvalue in nested function", outer_is_upvalue, 1
+
+    Note: --- Stage 5: the capture set is non-empty ---
+    Let upvalues be proc lua_semantic_upvalues from LuaSemantic with analyzer
+    Let upvalue_count be proc size from Dict with upvalues
+    proc assert_greater_than_or_equal from TestUtils with results, "at least one upvalue captured", upvalue_count, 1
+
+    Note: --- Stage 6: 'answer' (undeclared assignment) recorded as a global ---
+    Let answer_is_global be proc lua_semantic_is_global from LuaSemantic with analyzer, "answer"
+    proc assert_equal from TestUtils with results, "'answer' recorded as implicit global", answer_is_global, 1
+
+    Note: --- Stage 7: stdlib 'print' resolves as a global (pre-seeded) ---
+    Let print_is_global be proc lua_semantic_is_global from LuaSemantic with analyzer, "print"
+    proc assert_equal from TestUtils with results, "stdlib 'print' resolves as a global", print_is_global, 1
+
+    Note: --- Stage 8: 'closure' (a local function name) is NOT a global ---
+    Let closure_is_global be proc lua_semantic_is_global from LuaSemantic with analyzer, "closure"
+    proc assert_equal from TestUtils with results, "local function 'closure' is not a global", closure_is_global, 0
+
+    Note: --- Stage 9: a never-referenced name is not in the global table ---
+    Let phantom_is_global be proc lua_semantic_is_global from LuaSemantic with analyzer, "nonexistent_xyz"
+    proc assert_equal from TestUtils with results, "unreferenced name is not a global", phantom_is_global, 0
+
+    proc print_summary from TestUtils with results
+    Let failed be proc get_failed from TestUtils with results
+    proc destroy_test_results from TestUtils with results
+
+    Return failed
+End Process

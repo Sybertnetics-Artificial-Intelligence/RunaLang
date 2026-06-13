@@ -1,0 +1,302 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+Licensed under Apache 2.0
+:End Note
+
+Note:
+Lua Translation Round-Trip Probe
+
+End-to-end proof that the Lua translation pipeline is REAL, not a skeleton:
+
+    Lua source
+      -> lua_lexer    (tokenize: names, keywords, numbers, strings, operators)
+      -> lua_parser   (build Lua AST: functions, local/global assignment, tables,
+                       control flow, expressions with Lua precedence, varargs)
+      -> lua_to_hir   (lower Lua AST to the canonical hir_nodes producer model)
+      -> hir_to_lua   (emit HIR back to valid Lua text)
+      -> re-lex / re-parse / re-to_hir of the emitted text
+      -> structural HIR equality on the key constructs
+
+The probe feeds a representative Lua chunk that exercises every major construct
+the task requires:
+
+  - a function with params and a return        (function add(a, b) ... end)
+  - a local assignment                         (local total = ...)
+  - an if/then/else/end                        (if total > a then ... else ... end)
+  - a numeric for loop                         (for i = 1, 10 do ... end)
+  - a table constructor                        ({ x = 1, y = 2 })
+  - an arithmetic + concatenation expression   (a + b .. " items")
+
+It lowers the source to HIR1, asserts on HIR1 that the module declarations carry
+a function node whose name is "add", emits HIR1 back to Lua text, re-runs the
+whole pipeline on the emitted text to HIR2, and asserts HIR2 is STRUCTURALLY
+EQUAL to HIR1 on those same key constructs. Structural equality (node-kind tags
+plus identifying payloads) is the correct semantic-equivalence check because the
+emitter re-indents and normalises whitespace while the meaning is identical.
+
+The Lua HIR node model is the canonical hir_nodes producer surface: every node
+is an int-tagged record read via hir_node_type (the kind) and the hir_get_*
+accessors (structural fields). This probe therefore reads HIR fields via those
+same accessors the frontend emits and the backend consumes.
+
+Exit code: number of failed assertions (0 == all passed). No exit_with_code.
+:End Note
+
+Import "compiler/middle/gungnir/hir/translation/frontends/lua/lua_lexer.runa" as LuaLexer
+Import "compiler/middle/gungnir/hir/translation/frontends/lua/lua_parser.runa" as LuaParser
+Import "compiler/middle/gungnir/hir/translation/frontends/lua/lua_to_hir.runa" as LuaFrontend
+Import "compiler/middle/gungnir/hir/translation/backends/lua/hir_to_lua.runa" as LuaBackend
+Import "compiler/middle/gungnir/hir/hir_nodes.runa" as HIR
+Import "compiler/frontend/primitives/collections/list.runa" as List
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "tests/test_utils.runa" as TestUtils
+
+Note: ============================================================================
+Note: Pipeline helpers
+Note: ============================================================================
+
+@Reasoning:
+Each round of the probe runs the identical front-of-pipeline (lex -> parse ->
+to_hir). Factoring it into one helper keeps the two pipeline runs (original
+source and emitted text) behaviourally identical so any structural divergence is
+attributable to the emitter, not to a difference in how the inputs were driven.
+@End Reasoning
+@Implementation:
+Builds a lexer over the source, tokenizes, wraps the tokens in a parser, drives
+a full parse to the Lua AST root, then lowers the AST to HIR via
+translate_lua_to_hir and returns the HIR module. Returns 0 if any stage yields 0.
+@End Implementation
+Process called "source_to_hir" takes source as Integer returns Integer:
+    Let lexer be proc create_lexer from LuaLexer with source
+    If lexer is equal to 0:
+        Return 0
+    End If
+
+    Let tokens be proc tokenize from LuaLexer with lexer
+    If tokens is equal to 0:
+        Return 0
+    End If
+
+    Let parser be proc create_parser from LuaParser with tokens
+    If parser is equal to 0:
+        Return 0
+    End If
+
+    Let ast be proc parse_program from LuaParser with parser
+    If ast is equal to 0:
+        Return 0
+    End If
+
+    Let hir be proc translate_lua_to_hir from LuaFrontend with ast
+    Return hir
+End Process
+
+@Reasoning:
+The frontend adds the file body as a single top-level declaration on the module:
+a HIR block whose statements are the chunk's statements. To locate a construct
+by kind we read the module declarations, descend into that block's statements,
+and linear-scan for the first statement whose hir_node_type matches the
+requested kind. Linear scan (rather than fixed index) is robust to the frontend
+wrapping or reordering statements.
+@End Reasoning
+@Implementation:
+Reads hir_get_declarations(module) -> first declaration is the body block ->
+hir_get_block_statements(block) -> scan for hir_node_type == kind. Returns the
+first match or 0.
+@End Implementation
+Process called "find_in_body" takes module as Integer, kind as Integer returns Integer:
+    If module is equal to 0:
+        Return 0
+    End If
+
+    Let declarations be proc hir_get_declarations from HIR with module
+    If declarations is equal to 0:
+        Return 0
+    End If
+
+    Let decl_count be proc list_length from List with declarations
+    If decl_count is equal to 0:
+        Return 0
+    End If
+
+    Let body_block be proc list_get from List with declarations, 0
+    Let statements be proc hir_get_block_statements from HIR with body_block
+    If statements is equal to 0:
+        Return 0
+    End If
+
+    Let count be proc list_length from List with statements
+    Let i be 0
+    While i is less than count:
+        Let stmt be proc list_get from List with statements, i
+        Let stmt_kind be proc hir_node_type from HIR with stmt
+        If stmt_kind is equal to kind:
+            Return stmt
+        End If
+        Set i to i plus 1
+    End While
+
+    Return 0
+End Process
+
+@Reasoning:
+Two Lua chunks are structurally equal on a construct when both HIR projections
+expose the same node-kind tag. Comparing kinds (and, for named constructs, the
+identifying name payload) rather than byte text is whitespace-insensitive,
+proving round-trip fidelity without being defeated by the emitter's re-indenting.
+@End Reasoning
+Process called "same_kind" takes a as Integer, b as Integer returns Integer:
+    If a is equal to 0:
+        Return 0
+    End If
+    If b is equal to 0:
+        Return 0
+    End If
+    Let ka be proc hir_node_type from HIR with a
+    Let kb be proc hir_node_type from HIR with b
+    If ka is equal to kb:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: Probe entry point
+Note: ============================================================================
+
+Process called "main" returns Integer:
+    Let results be proc create_test_results from TestUtils
+    proc begin_suite from TestUtils with results, "Lua translation round-trip"
+
+    Note:
+    Representative chunk: a function with params + return, a local assignment,
+    an if/then/else/end, a numeric for loop, a table constructor, and an
+    arithmetic+concat expression. Newlines separate the statements.
+    :End Note
+    Let source be "function add(a, b)\nreturn a + b\nend\nlocal total = add(3, 4) + 5 .. \" items\"\nif total > 3 then\nlocal m = 1\nelse\nlocal n = 2\nend\nfor i = 1, 10 do\nlocal s = i\nend\nlocal t = { x = 1, y = 2 }\n"
+
+    Note: --- Stage 0-2: source -> HIR (lex, parse, lower) ---
+    Let lexer be proc create_lexer from LuaLexer with source
+    proc assert_not_null from TestUtils with results, "lexer created", lexer
+
+    Let tokens be proc tokenize from LuaLexer with lexer
+    proc assert_not_null from TestUtils with results, "lexer produced tokens", tokens
+
+    Let parser be proc create_parser from LuaParser with tokens
+    proc assert_not_null from TestUtils with results, "parser created", parser
+
+    Let ast be proc parse_program from LuaParser with parser
+    proc assert_not_null from TestUtils with results, "parser produced Lua AST", ast
+
+    Let hir1 be proc translate_lua_to_hir from LuaFrontend with ast
+    proc assert_not_null from TestUtils with results, "frontend produced HIR module", hir1
+
+    Note: Module must expose a non-empty declaration list (the file body block).
+    Let declarations be proc hir_get_declarations from HIR with hir1
+    proc assert_not_null from TestUtils with results, "HIR module has declarations", declarations
+    Let decl_count be proc list_length from List with declarations
+    proc assert_greater_than_or_equal from TestUtils with results, "module has at least one top-level declaration", decl_count, 1
+
+    Note: Body block has the chunk statements.
+    Let body_block be proc list_get from List with declarations, 0
+    Let body_kind be proc hir_node_type from HIR with body_block
+    Let body_is_block be 0
+    If body_kind is equal to HIR.HIR_BLOCK:
+        Set body_is_block to 1
+    End If
+    proc assert_equal from TestUtils with results, "module body is a HIR block", body_is_block, 1
+
+    Let body_statements be proc hir_get_block_statements from HIR with body_block
+    Let body_stmt_count be proc list_length from List with body_statements
+    proc assert_greater_than_or_equal from TestUtils with results, "body has at least 5 statements", body_stmt_count, 5
+
+    Note: --- function: located by kind, name payload checked ---
+    Let func_node be proc find_in_body with hir1, HIR.HIR_FUNCTION
+    proc assert_not_null from TestUtils with results, "function node present", func_node
+    Let func_name be proc hir_get_function_name from HIR with func_node
+    Let func_name_ok be proc string_equals from StringCore with func_name, "add"
+    proc assert_equal from TestUtils with results, "function name is 'add'", func_name_ok, 1
+    Let func_params be proc hir_get_parameters from HIR with func_node
+    Let func_param_list be proc hir_get_parameter_list from HIR with func_params
+    Let func_param_count be proc list_length from List with func_param_list
+    proc assert_equal from TestUtils with results, "function 'add' has 2 parameters", func_param_count, 2
+
+    Note: --- local variable: located by kind, name payload checked ---
+    Let var_node be proc find_in_body with hir1, HIR.HIR_VARIABLE
+    proc assert_not_null from TestUtils with results, "local variable node present", var_node
+    Let var_name be proc hir_get_variable_name from HIR with var_node
+    Let var_name_ok be proc string_equals from StringCore with var_name, "total"
+    proc assert_equal from TestUtils with results, "first local variable is 'total'", var_name_ok, 1
+
+    Note: --- if statement: located by kind ---
+    Let if_node be proc find_in_body with hir1, HIR.HIR_IF
+    proc assert_not_null from TestUtils with results, "if statement node present", if_node
+    Let if_cond be proc hir_get_if_condition from HIR with if_node
+    proc assert_not_null from TestUtils with results, "if statement has a condition", if_cond
+    Let if_else be proc hir_get_if_else from HIR with if_node
+    proc assert_not_null from TestUtils with results, "if statement has an else branch", if_else
+
+    Note: --- numeric for: located by kind ---
+    Let for_node be proc find_in_body with hir1, HIR.HIR_FOR
+    proc assert_not_null from TestUtils with results, "numeric for node present", for_node
+    Let for_body be proc hir_get_for_body from HIR with for_node
+    proc assert_not_null from TestUtils with results, "numeric for has a body", for_body
+
+    Note: --- the if condition is a binary expression (total > 3) ---
+    Let if_cond_kind be proc hir_node_type from HIR with if_cond
+    Let if_cond_is_binary be 0
+    If if_cond_kind is equal to HIR.HIR_BINARY_EXPR:
+        Set if_cond_is_binary to 1
+    End If
+    proc assert_equal from TestUtils with results, "if condition is a binary expression", if_cond_is_binary, 1
+
+    Note: --- Stage 3: HIR -> Lua text ---
+    Let emitted be proc generate_lua_code from LuaBackend with hir1
+    proc assert_not_null from TestUtils with results, "backend produced Lua text", emitted
+    Let emitted_len be proc string_length from StringCore with emitted
+    proc assert_greater_than from TestUtils with results, "emitted Lua is non-empty", emitted_len, 0
+
+    Note: --- Stage 4: re-run the pipeline on the emitted text -> HIR2 ---
+    Let hir2 be proc source_to_hir with emitted
+    proc assert_not_null from TestUtils with results, "re-parse of emitted Lua produced HIR", hir2
+
+    Note: Re-derived module also exposes a body block with statements.
+    Let decls2 be proc hir_get_declarations from HIR with hir2
+    Let decl2_count be proc list_length from List with decls2
+    proc assert_greater_than_or_equal from TestUtils with results, "round-trip module has a declaration", decl2_count, 1
+
+    Note: --- Stage 5: structural equality on the key constructs ---
+    Let func2 be proc find_in_body with hir2, HIR.HIR_FUNCTION
+    Let func_kind_ok be proc same_kind with func_node, func2
+    proc assert_equal from TestUtils with results, "round-trip preserves function node", func_kind_ok, 1
+    Let func2_name be proc hir_get_function_name from HIR with func2
+    Let func2_name_ok be proc string_equals from StringCore with func2_name, "add"
+    proc assert_equal from TestUtils with results, "round-trip preserves function name 'add'", func2_name_ok, 1
+    Let func2_params be proc hir_get_parameters from HIR with func2
+    Let func2_param_list be proc hir_get_parameter_list from HIR with func2_params
+    Let func2_param_count be proc list_length from List with func2_param_list
+    proc assert_equal from TestUtils with results, "round-trip preserves 2 parameters", func2_param_count, 2
+
+    Let var2 be proc find_in_body with hir2, HIR.HIR_VARIABLE
+    Let var_kind_ok be proc same_kind with var_node, var2
+    proc assert_equal from TestUtils with results, "round-trip preserves local variable node", var_kind_ok, 1
+    Let var2_name be proc hir_get_variable_name from HIR with var2
+    Let var2_name_ok be proc string_equals from StringCore with var2_name, "total"
+    proc assert_equal from TestUtils with results, "round-trip preserves local variable 'total'", var2_name_ok, 1
+
+    Let if2 be proc find_in_body with hir2, HIR.HIR_IF
+    Let if_kind_ok be proc same_kind with if_node, if2
+    proc assert_equal from TestUtils with results, "round-trip preserves if_statement node", if_kind_ok, 1
+    Let if2_else be proc hir_get_if_else from HIR with if2
+    proc assert_not_null from TestUtils with results, "round-trip preserves if else branch", if2_else
+
+    Let for2 be proc find_in_body with hir2, HIR.HIR_FOR
+    Let for_kind_ok be proc same_kind with for_node, for2
+    proc assert_equal from TestUtils with results, "round-trip preserves numeric for node", for_kind_ok, 1
+
+    proc print_summary from TestUtils with results
+    Let failed be proc get_failed from TestUtils with results
+    proc destroy_test_results from TestUtils with results
+
+    Return failed
+End Process
