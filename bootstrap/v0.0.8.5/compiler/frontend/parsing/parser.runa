@@ -353,8 +353,8 @@ Process called "parser_parse_program" takes parser as Integer returns Integer:
         Return 0
     End If
 
-    Note: Create root AST node (AST_PROGRAM = 3000)
-    Let root_node be proc create_ast_node from AST with 3000
+    Note: Create root AST node (AST_PROGRAM = 3500, line/column 0/0 for the synthetic root)
+    Let root_node be proc create_ast_node from AST with 3500, 0, 0
 
     If root_node is equal to 0:
         Return 0
@@ -362,6 +362,7 @@ Process called "parser_parse_program" takes parser as Integer returns Integer:
 
     Note: Create children list for program elements
     Let children be proc create from List
+    Let child_total be 0
 
     Note: Parse until end of token stream
     Loop forever:
@@ -376,12 +377,14 @@ Process called "parser_parse_program" takes parser as Integer returns Integer:
 
         If decl_node is not equal to 0:
             proc append from List with children, decl_node
+            Set child_total to child_total plus 1
         Otherwise:
             Note: Try to parse statement
             Let stmt_node be proc parser_parse_statement with parser
 
             If stmt_node is not equal to 0:
                 proc append from List with children, stmt_node
+                Set child_total to child_total plus 1
             Otherwise:
                 Note: Cannot parse - report error and synchronize
                 Let current_token be proc parser_current_token with parser
@@ -398,8 +401,10 @@ Process called "parser_parse_program" takes parser as Integer returns Integer:
         End If
     End While
 
-    Note: Attach children to root node
+    Note: Attach children to root node and record the child count so the AST
+    Note: child-count accessor reflects the parsed top-level element count.
     proc ast_node_set_children from AST with root_node, children
+    proc ast_node_set_child_count from AST with root_node, child_total
 
     Note: Set parser.ast_root (offset 40)
     proc memory_set_qword from Layout with parser, 40, root_node
@@ -464,9 +469,13 @@ Process called "parser_parse_declaration" takes parser as Integer returns Intege
     Let is_type be proc string_equals from StringCore with token_value, proc create_from_literal from StringCore with "Type"
 
     If is_type is equal to 1:
-        Note: Parse type definition
-        Let type_node be proc create_ast_node from AST with 3002
-        proc parser_consume_token with parser
+        Note: Parse type definition (struct or ADT) using StatementParsers.
+        Let type_node be proc parse_type_definition from StatementParsers with parser
+        If type_node is equal to 0:
+            Set error_msg to proc create_from_literal from StringCore with "Failed to parse Type definition"
+            proc parser_report_error from Parser with parser, error_msg
+            Return 0
+        End If
         Return type_node
     End If
 
@@ -474,9 +483,13 @@ Process called "parser_parse_declaration" takes parser as Integer returns Intege
     Let is_import be proc string_equals from StringCore with token_value, proc create_from_literal from StringCore with "Import"
 
     If is_import is equal to 1:
-        Note: Parse import statement
-        Let import_node be proc create_ast_node from AST with 3003
-        proc parser_consume_token with parser
+        Note: Parse import statement using StatementParsers.
+        Let import_node be proc parse_import_statement from StatementParsers with parser
+        If import_node is equal to 0:
+            Set error_msg to proc create_from_literal from StringCore with "Failed to parse Import statement"
+            proc parser_report_error from Parser with parser, error_msg
+            Return 0
+        End If
         Return import_node
     End If
 
@@ -1056,6 +1069,225 @@ Process called "parser_get_current_context" takes parser as Integer returns Inte
     Let context be proc stack_peek from Stack with context_stack
 
     Return context
+End Process
+
+Note: ============================================================================
+Note: Parser-State Introspection (used by expression-level error detection)
+Note: ============================================================================
+
+Process called "parser_advance" takes parser as Integer returns Integer:
+    Note: Advance the parser by one token. Synonym of parser_consume_token,
+    Note: returning the token that was current before advancing.
+    Return proc parser_consume_token with parser
+End Process
+
+Process called "parser_previous_token" takes parser as Integer returns Integer:
+    Note: Return the token immediately before the current one, or 0 at the start.
+    Note: The stream's current index points at the current token; the previous
+    Note: token is at index-1.
+    If parser is equal to 0:
+        Return 0
+    End If
+    Let token_stream be proc memory_get_qword from Layout with parser, 8
+    If token_stream is equal to 0:
+        Return 0
+    End If
+    Let position be proc stream_get_position from TokenStream with token_stream
+    If position is less than or equal to 0:
+        Return 0
+    End If
+    Let prev_position be position minus 1
+    Return proc stream_get_token_at from TokenStream with token_stream, prev_position
+End Process
+
+Process called "parser_save_position" takes parser as Integer returns Integer:
+    Note: Capture the current stream position so the parser can backtrack. Returns
+    Note: the absolute token index, which parser_restore_position accepts.
+    If parser is equal to 0:
+        Return 0
+    End If
+    Let token_stream be proc memory_get_qword from Layout with parser, 8
+    If token_stream is equal to 0:
+        Return 0
+    End If
+    Return proc stream_get_position from TokenStream with token_stream
+End Process
+
+Process called "parser_restore_position" takes parser as Integer, saved_position as Integer returns Integer:
+    Note: Restore a previously saved stream position and re-sync the parser's
+    Note: current_token cache to the token at that position.
+    If parser is equal to 0:
+        Return 0
+    End If
+    Let token_stream be proc memory_get_qword from Layout with parser, 8
+    If token_stream is equal to 0:
+        Return 0
+    End If
+    proc stream_set_position from TokenStream with token_stream, saved_position
+    Let restored_token be proc stream_current from TokenStream with token_stream
+    proc memory_set_qword from Layout with parser, 16, restored_token
+    Return 1
+End Process
+
+Process called "parser_get_depth" takes parser as Integer returns Integer:
+    Note: Structural nesting depth = number of contexts currently on the stack.
+    If parser is equal to 0:
+        Return 0
+    End If
+    Let context_stack be proc memory_get_qword from Layout with parser, 48
+    If context_stack is equal to 0:
+        Return 0
+    End If
+    Return proc stack_count from Stack with context_stack
+End Process
+
+Process called "parser_get_context" takes parser as Integer returns Integer:
+    Note: Type tag of the current parsing context (CONTEXT_GLOBAL/FUNCTION/...).
+    Note: Returns CONTEXT_GLOBAL (0) when no context is active.
+    If parser is equal to 0:
+        Return 0
+    End If
+    Let context be proc parser_get_current_context with parser
+    If context is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_qword from Layout with context, 0
+End Process
+
+Process called "parser_count_open_delimiters" takes parser as Integer, open_type as Integer, close_type as Integer returns Integer:
+    Note: Count delimiters of the given pair (open_type/close_type) that are open
+    Note: at the parser's current position. Scans the token stream from the start
+    Note: up to the current index, incrementing on each opener and decrementing on
+    Note: each closer; the running balance at the current position is the open
+    Note: depth. Never drops below 0 (extra closers do not underflow the count).
+    If parser is equal to 0:
+        Return 0
+    End If
+    Let token_stream be proc memory_get_qword from Layout with parser, 8
+    If token_stream is equal to 0:
+        Return 0
+    End If
+    Let position be proc stream_get_position from TokenStream with token_stream
+    Let depth be 0
+    Let index be 0
+    Loop forever:
+        If index is greater than or equal to position:
+            Break
+        End If
+        Let tok be proc stream_get_token_at from TokenStream with token_stream, index
+        If tok is not equal to 0:
+            Let tok_type be proc memory_get_qword from Layout with tok, 0
+            If tok_type is equal to open_type:
+                Set depth to depth plus 1
+            End If
+            If tok_type is equal to close_type:
+                If depth is greater than 0:
+                    Set depth to depth minus 1
+                End If
+            End If
+        End If
+        Set index to index plus 1
+    End While
+    Return depth
+End Process
+
+Process called "parser_get_paren_depth" takes parser as Integer returns Integer:
+    Note: Number of '(' that remain unmatched at the current position.
+    Return proc parser_count_open_delimiters with parser, 200, 201  Note: TOKEN_LEFT_PAREN / TOKEN_RIGHT_PAREN
+End Process
+
+Process called "parser_get_bracket_depth" takes parser as Integer returns Integer:
+    Note: Number of '[' that remain unmatched at the current position.
+    Return proc parser_count_open_delimiters with parser, 204, 205  Note: TOKEN_LEFT_BRACKET / TOKEN_RIGHT_BRACKET
+End Process
+
+Process called "parser_get_brace_depth" takes parser as Integer returns Integer:
+    Note: Number of '{' that remain unmatched at the current position.
+    Return proc parser_count_open_delimiters with parser, 202, 203  Note: TOKEN_LEFT_BRACE / TOKEN_RIGHT_BRACE
+End Process
+
+Process called "parser_get_arena" takes parser as Integer returns Integer:
+    Note: Return the parser's arena allocator (ParserState offset 0).
+    If parser is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_qword from Layout with parser, 0
+End Process
+
+Process called "parser_get_token_type" takes token as Integer returns Integer:
+    Note: Return the type tag of a token (Token offset 0). Accepts a token pointer,
+    Note: matching the token-level token_get_type accessor.
+    If token is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_qword from Layout with token, 0
+End Process
+
+Process called "parser_get_current_line" takes parser as Integer returns Integer:
+    Note: Return the source line of the parser's current token (Token offset 16),
+    Note: or 0 when there is no current token.
+    If parser is equal to 0:
+        Return 0
+    End If
+    Let current_token be proc memory_get_qword from Layout with parser, 16
+    If current_token is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_qword from Layout with current_token, 16
+End Process
+
+Process called "parser_skip_to_next_statement" takes parser as Integer returns Integer:
+    Note: Panic-mode recovery skip: advance past the malformed construct to the
+    Note: next statement boundary. Delegates to parser_synchronize.
+    Return proc parser_synchronize with parser
+End Process
+
+Process called "parser_report_warning" takes parser as Integer, message as Integer returns Integer:
+    Note: Record a non-fatal warning through the diagnostics engine. Unlike an
+    Note: error, a warning does not increment the parser's error_count and uses
+    Note: WARNING severity, so it does not by itself fail the parse.
+    If parser is equal to 0:
+        Return 0
+    End If
+
+    Let arena be proc memory_get_qword from Layout with parser, 0
+    Let diagnostics_engine be proc memory_get_qword from Layout with parser, 112
+
+    Note: Use the current token's position for the warning location.
+    Let line be 0
+    Let column be 0
+    Let current_token be proc memory_get_qword from Layout with parser, 16
+    If current_token is not equal to 0:
+        Set line to proc memory_get_qword from Layout with current_token, 16
+        Set column to proc memory_get_qword from Layout with current_token, 24
+    End If
+
+    If diagnostics_engine is not equal to 0:
+        If arena is not equal to 0:
+            Note: Build an ErrorInfo record with WARNING severity (15 fields × 8).
+            Let warn_info be proc arena_allocate from Arena with arena, 120
+            If warn_info is not equal to 0:
+                proc memory_set_qword from Layout with warn_info, 0, 0               Note: error_id
+                proc memory_set_qword from Layout with warn_info, 8, 2002            Note: error_code (PARSING_WARNING)
+                proc memory_set_qword from Layout with warn_info, 16, 2              Note: error_type (PARSING)
+                proc memory_set_qword from Layout with warn_info, 24, 2              Note: category (PARSING)
+                proc memory_set_qword from Layout with warn_info, 32, 0              Note: severity (WARNING = 0)
+                proc memory_set_qword from Layout with warn_info, 40, line           Note: line_number
+                proc memory_set_qword from Layout with warn_info, 48, column         Note: column_number
+                proc memory_set_qword from Layout with warn_info, 56, message        Note: message
+                proc memory_set_qword from Layout with warn_info, 64, 0              Note: context
+                proc memory_set_qword from Layout with warn_info, 72, 0              Note: suggestion
+                proc memory_set_qword from Layout with warn_info, 80, 0              Note: related_errors
+                proc memory_set_qword from Layout with warn_info, 88, 0              Note: source_file
+                proc memory_set_qword from Layout with warn_info, 96, 1              Note: phase (PARSING_PHASE)
+                proc memory_set_qword from Layout with warn_info, 104, 1             Note: is_recoverable
+                proc memory_set_qword from Layout with warn_info, 112, 100           Note: confidence
+                Let collect_result be proc diagnostics_engine_collect_error from Diagnostics with diagnostics_engine, warn_info, 1, arena
+            End If
+        End If
+    End If
+
+    Return 1
 End Process
 
 Note: ============================================================================

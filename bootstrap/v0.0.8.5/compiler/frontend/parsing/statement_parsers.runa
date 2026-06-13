@@ -58,6 +58,27 @@ Import "compiler/frontend/lexical/operators.runa" as Operators
 Import "compiler/frontend/lexical/delimiters.runa" as Delimiters
 Import "compiler/frontend/primitives/memory/layout.runa" as Layout
 Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/frontend/primitives/collections/list.runa" as List
+
+Note: ============================================================================
+Note: Parser-side token and ownership-operation constants referenced by statement
+Note: parsing. The process-signature keywords (called/takes) and the imperative
+Note: 'times' / mutable-borrow markers occupy the keyword-code gaps reserved for
+Note: them; the ownership-operation tags classify how a Let/Set/Constant statement
+Note: affects a variable's ownership state for the parser's ownership tracker.
+Note: ============================================================================
+Constant TOKEN_STRING as Integer is 100              Note: String literal class (TOKEN_STRING_LITERAL)
+Constant TOKEN_CALLED as Integer is 325              Note: 'called' keyword (Process called NAME ...)
+Constant TOKEN_TAKES as Integer is 326               Note: 'takes' keyword (... takes PARAM as TYPE)
+Constant TOKEN_TIMES as Integer is 327               Note: 'times' keyword (Repeat N times: ...)
+Constant TOKEN_MUTABLE as Integer is 328             Note: 'mutable' borrow marker in ownership operations
+
+Constant OWNERSHIP_BORROWED as Integer is 2          Note: Variable borrowed (shared reference)
+Constant OWNERSHIP_MUTABLE_BORROWED as Integer is 3  Note: Variable mutably borrowed
+Constant OWNERSHIP_MOVED as Integer is 4             Note: Ownership moved out of the variable
+Constant OWNERSHIP_CREATED as Integer is 10          Note: Variable freshly created (Let binding)
+Constant OWNERSHIP_MODIFIED as Integer is 11         Note: Variable mutated in place (Set)
+Constant OWNERSHIP_CONSTANT as Integer is 12         Note: Immutable constant binding
 
 Note: ============================================================================
 Note: Variable Declaration and Assignment Statements
@@ -277,8 +298,17 @@ Process called "parse_define_statement" takes parser as Integer returns Integer:
         Let next_token be proc parser_current_token from Parser with parser
         Let next_type be proc token_get_type from Parser with next_token
 
-        Note: If next token is a type keyword or identifier, it's a type annotation
-        Let is_type be proc is_type_keyword from Keywords with next_type
+        Note: If next token is a type name (identifier) or a memory-tier annotation
+        Note: marker (@ARC/@Owned/@Shared/@Arena/@Stack), this is a type annotation —
+        Note: matching the lead tokens parse_type_annotation accepts. Type names are
+        Note: lexed as identifiers; the type system resolves Integer/Float/etc.
+        Let is_type be 0
+        If next_type is equal to TOKEN_IDENTIFIER:
+            Set is_type to 1
+        End If
+        If next_type is equal to TOKEN_AT:
+            Set is_type to 1
+        End If
         If is_type is equal to 1:
             Note: This is a type annotation
             proc parser_restore_position from Parser with parser, saved_position
@@ -712,7 +742,7 @@ Process called "parse_when_clauses" takes parser as Integer returns Integer:
     End If
 
     Note: 1. Create empty list for When clauses
-    Let clauses be proc create_list from Layout
+    Let clauses be proc create from List
     If clauses is equal to 0:
         proc parser_report_error from Parser with parser, "Failed to create When clauses list"
         Return 0
@@ -736,12 +766,12 @@ Process called "parse_when_clauses" takes parser as Integer returns Integer:
         End If
 
         Note: Add to clauses list
-        proc list_append from Layout with clauses, when_clause
+        proc list_append from List with clauses, when_clause
     End While
 
     Note: 3. Return clauses list
     Note: Check that at least one clause was parsed
-    Let clause_count be proc list_length from Layout with clauses
+    Let clause_count be proc list_length from List with clauses
     If clause_count is equal to 0:
         Return 0
     End If
@@ -2097,7 +2127,7 @@ Process called "parse_inline_assembly" takes parser as Integer returns Integer:
     End If
 
     Note: 4. Parse assembly instruction strings
-    Let instructions be proc create_list from ListCore
+    Let instructions be proc create from List
     Loop forever:
         Let current_token be proc parser_current_token from Parser with parser
         If current_token is equal to 0:
@@ -2106,8 +2136,8 @@ Process called "parse_inline_assembly" takes parser as Integer returns Integer:
 
         Let token_type be proc token_get_type from Parser with current_token
         If token_type is equal to TOKEN_STRING:
-            Let instruction be proc parse_string_literal from ExpressionParsers with parser
-            proc list_append from ListCore with instructions, instruction
+            Let instruction be proc parse_literal_expression from ExpressionParsers with parser
+            proc list_append from List with instructions, instruction
         Otherwise:
             If token_type is equal to TOKEN_COLON:
                 Break
@@ -2126,7 +2156,7 @@ Process called "parse_inline_assembly" takes parser as Integer returns Integer:
         Set token_type to proc token_get_type from Parser with current_token
         If token_type is equal to TOKEN_COLON:
             proc parser_consume_token from Parser with parser
-            Set output_constraints to proc parse_assembly_constraints from Parser with parser
+            Set output_constraints to proc parse_assembly_constraints with parser
         End If
     End If
 
@@ -2137,7 +2167,7 @@ Process called "parse_inline_assembly" takes parser as Integer returns Integer:
         Set token_type to proc token_get_type from Parser with current_token
         If token_type is equal to TOKEN_COLON:
             proc parser_consume_token from Parser with parser
-            Set input_constraints to proc parse_assembly_constraints from Parser with parser
+            Set input_constraints to proc parse_assembly_constraints with parser
         End If
     End If
 
@@ -2148,7 +2178,7 @@ Process called "parse_inline_assembly" takes parser as Integer returns Integer:
         Set token_type to proc token_get_type from Parser with current_token
         If token_type is equal to TOKEN_COLON:
             proc parser_consume_token from Parser with parser
-            Set clobber_list to proc parse_assembly_clobbers from Parser with parser
+            Set clobber_list to proc parse_assembly_clobbers with parser
         End If
     End If
 
@@ -2174,6 +2204,214 @@ Process called "parse_inline_assembly" takes parser as Integer returns Integer:
 
     Note: 10. Return Inline Assembly AST node
     Return asm_block
+End Process
+
+Process called "parse_assembly_operand_list" takes parser as Integer returns Integer:
+    Note: Parse a comma-separated list of operand expressions for one inline-assembly
+    Note: section (outputs, inputs, or clobbers). Each operand is a full expression
+    Note: (typically a string-literal constraint or a register/clobber name). The
+    Note: list ends at a section-separating colon, an End keyword, or EOF. Returns a
+    Note: List of operand AST nodes (possibly empty).
+    If parser is equal to 0:
+        Return 0
+    End If
+
+    Let operands be proc create from List
+    If operands is equal to 0:
+        Return 0
+    End If
+
+    Loop forever:
+        Let current_token be proc parser_current_token from Parser with parser
+        If current_token is equal to 0:
+            Break
+        End If
+
+        Let token_type be proc token_get_type from Parser with current_token
+
+        Note: A colon starts the next section; End closes the block; EOF terminates.
+        If token_type is equal to TOKEN_COLON:
+            Break
+        End If
+        If token_type is equal to TOKEN_END:
+            Break
+        End If
+        If token_type is equal to TOKEN_EOF:
+            Break
+        End If
+
+        Note: Parse one operand expression and collect it.
+        Let operand be proc parse_expression from ExpressionParsers with parser
+        If operand is equal to 0:
+            Break
+        End If
+        proc list_append from List with operands, operand
+
+        Note: Consume a separating comma if present; otherwise the section is done.
+        Set current_token to proc parser_current_token from Parser with parser
+        If current_token is equal to 0:
+            Break
+        End If
+        Set token_type to proc token_get_type from Parser with current_token
+        If token_type is equal to TOKEN_COMMA:
+            proc parser_consume_token from Parser with parser
+            Continue
+        End If
+        Break
+    End While
+
+    Return operands
+End Process
+
+Process called "parse_assembly_constraints" takes parser as Integer returns Integer:
+    Note: Parse an inline-assembly output or input constraint list. Constraints share
+    Note: the comma-separated operand-list grammar.
+    Return proc parse_assembly_operand_list with parser
+End Process
+
+Process called "parse_assembly_clobbers" takes parser as Integer returns Integer:
+    Note: Parse an inline-assembly clobber list. Clobbers share the comma-separated
+    Note: operand-list grammar.
+    Return proc parse_assembly_operand_list with parser
+End Process
+
+Process called "parse_block_until_keyword" takes parser as Integer, stop_keyword as Integer returns Integer:
+    Note: Parse a sequence of statements until a single stopping keyword (or End/EOF)
+    Note: is seen, then wrap them in a block-statement node. The stopping token is NOT
+    Note: consumed (the caller dispatches on it). Returns a block-statement AST node.
+    If parser is equal to 0:
+        Return 0
+    End If
+
+    Let statements be proc create from List
+    If statements is equal to 0:
+        Return 0
+    End If
+
+    Let line be proc parser_get_current_line from Parser with parser
+
+    Loop forever:
+        Let current_token be proc parser_current_token from Parser with parser
+        If current_token is equal to 0:
+            Break
+        End If
+
+        Let token_type be proc token_get_type from Parser with current_token
+        If token_type is equal to stop_keyword:
+            Break
+        End If
+        If token_type is equal to TOKEN_END:
+            Break
+        End If
+        If token_type is equal to TOKEN_EOF:
+            Break
+        End If
+
+        Let statement be proc parse_single_statement with parser
+        If statement is equal to 0:
+            Note: Error recovery: skip the malformed statement and continue.
+            proc parser_skip_to_next_statement from Parser with parser
+            Continue
+        End If
+        proc list_append from List with statements, statement
+    End While
+
+    Let statement_count be proc list_length from List with statements
+    Return proc build_block_statement from ASTBuilder with statements, statement_count, line
+End Process
+
+Process called "parse_block_until_keywords" takes parser as Integer, stop_keyword_1 as Integer, stop_keyword_2 as Integer, stop_keyword_3 as Integer returns Integer:
+    Note: Parse a statement sequence until ANY of three stopping keywords (or EOF) is
+    Note: seen, then wrap in a block-statement node. The stopping token is NOT consumed.
+    Note: Used by Catch clauses, which can be followed by another Catch, a Finally, or
+    Note: End. Returns a block-statement AST node.
+    If parser is equal to 0:
+        Return 0
+    End If
+
+    Let statements be proc create from List
+    If statements is equal to 0:
+        Return 0
+    End If
+
+    Let line be proc parser_get_current_line from Parser with parser
+
+    Loop forever:
+        Let current_token be proc parser_current_token from Parser with parser
+        If current_token is equal to 0:
+            Break
+        End If
+
+        Let token_type be proc token_get_type from Parser with current_token
+        If token_type is equal to stop_keyword_1:
+            Break
+        End If
+        If token_type is equal to stop_keyword_2:
+            Break
+        End If
+        If token_type is equal to stop_keyword_3:
+            Break
+        End If
+        If token_type is equal to TOKEN_EOF:
+            Break
+        End If
+
+        Let statement be proc parse_single_statement with parser
+        If statement is equal to 0:
+            proc parser_skip_to_next_statement from Parser with parser
+            Continue
+        End If
+        proc list_append from List with statements, statement
+    End While
+
+    Let statement_count be proc list_length from List with statements
+    Return proc build_block_statement from ASTBuilder with statements, statement_count, line
+End Process
+
+Process called "parse_process_signature" takes parser as Integer returns Integer:
+    Note: Parse a Process method signature WITHOUT a body, as used inside a Protocol
+    Note: definition: `Process called name takes params returns type`. The signature
+    Note: has no colon and no body; the return type may be absent (void). Returns a
+    Note: process-definition node whose body child is 0.
+    If parser is equal to 0:
+        Return 0
+    End If
+
+    Note: 1. Expect and consume Process keyword.
+    Let process_consumed be proc parser_expect_token from Parser with parser, TOKEN_PROCESS
+    If process_consumed is equal to 0:
+        proc parser_report_error from Parser with parser, "Expected 'Process' keyword at start of protocol method signature"
+        Return 0
+    End If
+
+    Note: 2. Expect and consume called keyword.
+    Let called_consumed be proc parser_expect_token from Parser with parser, TOKEN_CALLED
+    If called_consumed is equal to 0:
+        proc parser_report_error from Parser with parser, "Expected 'called' keyword after 'Process'"
+        Return 0
+    End If
+
+    Note: 3. Parse method name.
+    Let method_name be proc parse_identifier with parser
+    If method_name is equal to 0:
+        proc parser_report_error from Parser with parser, "Expected method name after 'called' keyword"
+        Return 0
+    End If
+
+    Note: 4. Parse parameters (may be empty).
+    Let parameters be proc parse_parameter_list with parser
+
+    Note: 5. Parse return type (may be absent for a void method).
+    Let return_type be proc parse_return_type with parser
+
+    Note: 6. Build a process-definition node with no body (body child = 0).
+    Let signature be proc build_process_definition from ASTBuilder with method_name, parameters, return_type, 0
+    If signature is equal to 0:
+        proc parser_report_error from Parser with parser, "Failed to create protocol method signature AST node"
+        Return 0
+    End If
+
+    Return signature
 End Process
 
 Process called "parse_try_statement" takes parser as Integer returns Integer:
@@ -2224,14 +2462,14 @@ Process called "parse_try_statement" takes parser as Integer returns Integer:
     End If
 
     Note: 3. Parse try block
-    Let try_block be proc parse_block_until_keyword from Parser with parser, TOKEN_CATCH
+    Let try_block be proc parse_block_until_keyword with parser, TOKEN_CATCH
     If try_block is equal to 0:
         proc parser_report_error from Parser with parser, "Expected block after 'Try:'"
         Return 0
     End If
 
     Note: 4. Parse one or more Catch clauses
-    Let catch_clauses be proc create_list from ListCore
+    Let catch_clauses be proc create from List
     Loop forever:
         Let current_token be proc parser_current_token from Parser with parser
         If current_token is equal to 0:
@@ -2245,14 +2483,14 @@ Process called "parse_try_statement" takes parser as Integer returns Integer:
                 proc parser_report_error from Parser with parser, "Failed to parse Catch clause"
                 Return 0
             End If
-            proc list_append from ListCore with catch_clauses, catch_clause
+            proc list_append from List with catch_clauses, catch_clause
         Otherwise:
             Break
         End If
     End While
 
     Note: Check that we have at least one Catch clause
-    Let catch_count be proc list_length from ListCore with catch_clauses
+    Let catch_count be proc list_length from List with catch_clauses
     If catch_count is equal to 0:
         proc parser_report_error from Parser with parser, "Try statement requires at least one Catch clause"
         Return 0
@@ -2332,7 +2570,7 @@ Process called "parse_catch_clause" takes parser as Integer returns Integer:
         Set token_type to proc token_get_type from Parser with current_token
         If token_type is equal to TOKEN_LEFT_PAREN:
             proc parser_consume_token from Parser with parser
-            Set exception_type to proc parse_type_annotation from Parser with parser
+            Set exception_type to proc parse_type_annotation with parser
             Let right_paren be proc parser_expect_token from Parser with parser, TOKEN_RIGHT_PAREN
             If right_paren is equal to 0:
                 proc parser_report_error from Parser with parser, "Expected ')' after exception type"
@@ -2349,7 +2587,7 @@ Process called "parse_catch_clause" takes parser as Integer returns Integer:
     End If
 
     Note: 5. Parse catch block
-    Let catch_block be proc parse_block_until_keywords from Parser with parser, TOKEN_CATCH, TOKEN_FINALLY, TOKEN_END
+    Let catch_block be proc parse_block_until_keywords with parser, TOKEN_CATCH, TOKEN_FINALLY, TOKEN_END
     If catch_block is equal to 0:
         proc parser_report_error from Parser with parser, "Expected block after 'Catch:'"
         Return 0
@@ -2408,7 +2646,7 @@ Process called "parse_finally_clause" takes parser as Integer returns Integer:
     End If
 
     Note: 3. Parse finally block
-    Let finally_block be proc parse_block_until_keyword from Parser with parser, TOKEN_END
+    Let finally_block be proc parse_block_until_keyword with parser, TOKEN_END
     If finally_block is equal to 0:
         proc parser_report_error from Parser with parser, "Expected block after 'Finally:'"
         Return 0
@@ -2718,7 +2956,7 @@ Process called "parse_protocol_definition" takes parser as Integer returns Integ
     End If
 
     Note: 7. Parse protocol method signatures
-    Let methods be proc create_list from ListCore
+    Let methods be proc create from List
     Loop forever:
         Let current_token be proc parser_current_token from Parser with parser
         If current_token is equal to 0:
@@ -2731,12 +2969,12 @@ Process called "parse_protocol_definition" takes parser as Integer returns Integ
         End If
 
         If token_type is equal to TOKEN_PROCESS:
-            Let method_sig be proc parse_process_signature from Parser with parser
+            Let method_sig be proc parse_process_signature with parser
             If method_sig is equal to 0:
                 proc parser_report_error from Parser with parser, "Failed to parse protocol method signature"
                 Return 0
             End If
-            proc list_append from ListCore with methods, method_sig
+            proc list_append from List with methods, method_sig
         Otherwise:
             proc parser_consume_token from Parser with parser
         End If
@@ -3061,7 +3299,7 @@ Process called "parse_external_declaration" takes parser as Integer returns Inte
     End If
 
     Let library_keyword_value be proc token_get_value from Parser with library_keyword_token
-    Let lib_kw_str be proc string_create from StringCore with "library"
+    Let lib_kw_str be proc create_from_literal from StringCore with "library"
     Let lib_kw_match be proc string_equals from StringCore with library_keyword_value, lib_kw_str
     If lib_kw_match is equal to 0:
         proc parser_report_error from Parser with parser, "Expected 'library' after 'from' in External declaration"
@@ -3110,7 +3348,7 @@ Process called "parse_external_declaration" takes parser as Integer returns Inte
         End If
 
         Note: Check for 'aliased' clause: aliased as <string>
-        Let aliased_str be proc string_create from StringCore with "aliased"
+        Let aliased_str be proc create_from_literal from StringCore with "aliased"
         Let is_aliased be proc string_equals from StringCore with clause_value, aliased_str
         If is_aliased is equal to 1:
             proc parser_consume_token from Parser with parser
@@ -3138,7 +3376,7 @@ Process called "parse_external_declaration" takes parser as Integer returns Inte
         End If
 
         Note: Check for 'convention' clause: convention <c|stdcall|fastcall|cdecl|syscall|objc>
-        Let convention_str be proc string_create from StringCore with "convention"
+        Let convention_str be proc create_from_literal from StringCore with "convention"
         Let is_convention be proc string_equals from StringCore with clause_value, convention_str
         If is_convention is equal to 1:
             proc parser_consume_token from Parser with parser
@@ -3155,12 +3393,12 @@ Process called "parse_external_declaration" takes parser as Integer returns Inte
                 Return 0
             End If
 
-            Let c_str be proc string_create from StringCore with "c"
-            Let stdcall_str be proc string_create from StringCore with "stdcall"
-            Let fastcall_str be proc string_create from StringCore with "fastcall"
-            Let cdecl_str be proc string_create from StringCore with "cdecl"
-            Let syscall_str be proc string_create from StringCore with "syscall"
-            Let objc_str be proc string_create from StringCore with "objc"
+            Let c_str be proc create_from_literal from StringCore with "c"
+            Let stdcall_str be proc create_from_literal from StringCore with "stdcall"
+            Let fastcall_str be proc create_from_literal from StringCore with "fastcall"
+            Let cdecl_str be proc create_from_literal from StringCore with "cdecl"
+            Let syscall_str be proc create_from_literal from StringCore with "syscall"
+            Let objc_str be proc create_from_literal from StringCore with "objc"
 
             Let is_c be proc string_equals from StringCore with conv_value, c_str
             Let is_stdcall be proc string_equals from StringCore with conv_value, stdcall_str
@@ -3208,7 +3446,7 @@ Process called "parse_external_declaration" takes parser as Integer returns Inte
         End If
 
         Note: Check for 'link_type' clause: link_type <static|dynamic>
-        Let linktype_str be proc string_create from StringCore with "link_type"
+        Let linktype_str be proc create_from_literal from StringCore with "link_type"
         Let is_linktype be proc string_equals from StringCore with clause_value, linktype_str
         If is_linktype is equal to 1:
             proc parser_consume_token from Parser with parser
@@ -3225,8 +3463,8 @@ Process called "parse_external_declaration" takes parser as Integer returns Inte
                 Return 0
             End If
 
-            Let static_str be proc string_create from StringCore with "static"
-            Let dynamic_str be proc string_create from StringCore with "dynamic"
+            Let static_str be proc create_from_literal from StringCore with "static"
+            Let dynamic_str be proc create_from_literal from StringCore with "dynamic"
             Let is_static be proc string_equals from StringCore with lt_value, static_str
             Let is_dynamic be proc string_equals from StringCore with lt_value, dynamic_str
 
@@ -3247,7 +3485,7 @@ Process called "parse_external_declaration" takes parser as Integer returns Inte
         End If
 
         Note: Check for 'unsafe' flag (no argument)
-        Let unsafe_str be proc string_create from StringCore with "unsafe"
+        Let unsafe_str be proc create_from_literal from StringCore with "unsafe"
         Let is_unsafe be proc string_equals from StringCore with clause_value, unsafe_str
         If is_unsafe is equal to 1:
             Set flags to flags plus 1  Note: FFI_FLAG_UNSAFE
@@ -3256,7 +3494,7 @@ Process called "parse_external_declaration" takes parser as Integer returns Inte
         End If
 
         Note: Check for 'lazy_load' flag (no argument)
-        Let lazy_str be proc string_create from StringCore with "lazy_load"
+        Let lazy_str be proc create_from_literal from StringCore with "lazy_load"
         Let is_lazy be proc string_equals from StringCore with clause_value, lazy_str
         If is_lazy is equal to 1:
             Set flags to flags plus 2  Note: FFI_FLAG_LAZY_LOAD
@@ -3265,7 +3503,7 @@ Process called "parse_external_declaration" takes parser as Integer returns Inte
         End If
 
         Note: Check for 'framework' clause: framework <framework_string>  (macOS only)
-        Let framework_str be proc string_create from StringCore with "framework"
+        Let framework_str be proc create_from_literal from StringCore with "framework"
         Let is_framework be proc string_equals from StringCore with clause_value, framework_str
         If is_framework is equal to 1:
             proc parser_consume_token from Parser with parser
@@ -3289,7 +3527,7 @@ Process called "parse_external_declaration" takes parser as Integer returns Inte
 
         Note: Check for 'variadic' marker as a standalone clause (alternate variadic syntax).
         Note:     Spec extension Q2: also accepts `that takes ... as Variadic` (parsed as a regular param).
-        Let variadic_str be proc string_create from StringCore with "variadic"
+        Let variadic_str be proc create_from_literal from StringCore with "variadic"
         Let is_variadic_clause be proc string_equals from StringCore with clause_value, variadic_str
         If is_variadic_clause is equal to 1:
             Set flags to flags plus 4  Note: FFI_FLAG_VARIADIC
@@ -3319,7 +3557,7 @@ Process called "parse_external_declaration" takes parser as Integer returns Inte
             If param_type_node is not equal to 0:
                 Let param_type_name be proc memory_get_qword from Layout with param_type_node, 80
                 If param_type_name is not equal to 0:
-                    Let variadic_type_str be proc string_create from StringCore with "Variadic"
+                    Let variadic_type_str be proc create_from_literal from StringCore with "Variadic"
                     Let pt_is_variadic be proc string_equals from StringCore with param_type_name, variadic_type_str
                     If pt_is_variadic is equal to 1:
                         Note: Set variadic flag only once
@@ -3444,7 +3682,7 @@ Process called "parse_unsafe_block" takes parser as Integer returns Integer:
     End If
 
     Let block_value be proc token_get_value from Parser with block_token
-    Let block_str be proc string_create from StringCore with "Block"
+    Let block_str be proc create_from_literal from StringCore with "Block"
     Let block_match be proc string_equals from StringCore with block_value, block_str
     If block_match is equal to 0:
         proc parser_report_error from Parser with parser, "Expected 'Block' after 'Unsafe' keyword (Unsafe Block: ... End Unsafe)"
@@ -3488,6 +3726,182 @@ Process called "parse_unsafe_block" takes parser as Integer returns Integer:
     End If
 
     Return unsafe_node
+End Process
+
+Process called "parse_generic_parameters" takes parser as Integer returns Integer:
+    Note: Parse a bracket-delimited generic parameter list: [T], [T, U], [Key, Value].
+    Note: Each parameter is a single identifier wrapped in a basic-type node. The
+    Note: opening '[' must be the current token. Returns a block-statement node whose
+    Note: children are the parameter type nodes (empty list for []).
+    If parser is equal to 0:
+        Return 0
+    End If
+
+    Let open_consumed be proc parser_expect_token from Parser with parser, TOKEN_LEFT_BRACKET
+    If open_consumed is equal to 0:
+        proc parser_report_error from Parser with parser, "Expected '[' to open generic parameter list"
+        Return 0
+    End If
+
+    Let params be proc create from List
+    If params is equal to 0:
+        Return 0
+    End If
+
+    Let line be proc parser_get_current_line from Parser with parser
+
+    Loop forever:
+        Let current_token be proc parser_current_token from Parser with parser
+        If current_token is equal to 0:
+            Break
+        End If
+
+        Let token_type be proc token_get_type from Parser with current_token
+        If token_type is equal to TOKEN_RIGHT_BRACKET:
+            Break
+        End If
+        If token_type is equal to TOKEN_EOF:
+            Break
+        End If
+
+        If token_type is equal to TOKEN_IDENTIFIER:
+            Let param_value be proc token_get_value from Parser with current_token
+            proc parser_consume_token from Parser with parser
+            Let param_node be proc build_type_node from ASTBuilder with param_value
+            If param_node is not equal to 0:
+                proc list_append from List with params, param_node
+            End If
+        Otherwise:
+            proc parser_consume_token from Parser with parser
+        End If
+
+        Note: Consume a separating comma if present.
+        Set current_token to proc parser_current_token from Parser with parser
+        If current_token is equal to 0:
+            Break
+        End If
+        Set token_type to proc token_get_type from Parser with current_token
+        If token_type is equal to TOKEN_COMMA:
+            proc parser_consume_token from Parser with parser
+        End If
+    End While
+
+    Let close_consumed be proc parser_expect_token from Parser with parser, TOKEN_RIGHT_BRACKET
+    If close_consumed is equal to 0:
+        proc parser_report_error from Parser with parser, "Expected ']' to close generic parameter list"
+        Return 0
+    End If
+
+    Let param_count be proc list_length from List with params
+    Return proc build_block_statement from ASTBuilder with params, param_count, line
+End Process
+
+Process called "parse_type_body" takes parser as Integer returns Integer:
+    Note: Parse the body of a Type definition, which is either a struct (a sequence
+    Note: of `field_name as DataType` lines) or an algebraic data type (a sequence of
+    Note: `| Variant` / `| Variant as PayloadType` arms). The body runs until the
+    Note: closing End keyword (which is NOT consumed here). Returns a block-statement
+    Note: node whose children are the field/variant member nodes; each member is a
+    Note: parameter-style node carrying the member name and an optional type child.
+    If parser is equal to 0:
+        Return 0
+    End If
+
+    Let members be proc create from List
+    If members is equal to 0:
+        Return 0
+    End If
+
+    Let line be proc parser_get_current_line from Parser with parser
+
+    Loop forever:
+        Let current_token be proc parser_current_token from Parser with parser
+        If current_token is equal to 0:
+            Break
+        End If
+
+        Let token_type be proc token_get_type from Parser with current_token
+        If token_type is equal to TOKEN_END:
+            Break
+        End If
+        If token_type is equal to TOKEN_EOF:
+            Break
+        End If
+
+        Note: Algebraic-data-type variant arm: '| Variant' optionally 'as PayloadType'.
+        If token_type is equal to TOKEN_BITWISE_OR:
+            proc parser_consume_token from Parser with parser
+            Let variant_token be proc parser_current_token from Parser with parser
+            If variant_token is equal to 0:
+                Break
+            End If
+            Let variant_tt be proc token_get_type from Parser with variant_token
+            If variant_tt is not equal to TOKEN_IDENTIFIER:
+                proc parser_report_error from Parser with parser, "Expected variant name after '|' in Type definition"
+                Return 0
+            End If
+            Let variant_name be proc token_get_value from Parser with variant_token
+            proc parser_consume_token from Parser with parser
+
+            Note: Optional payload type after 'as'.
+            Let variant_payload be 0
+            Let after_variant be proc parser_current_token from Parser with parser
+            If after_variant is not equal to 0:
+                Let after_tt be proc token_get_type from Parser with after_variant
+                If after_tt is equal to TOKEN_AS:
+                    proc parser_consume_token from Parser with parser
+                    Let payload_token be proc parser_current_token from Parser with parser
+                    If payload_token is not equal to 0:
+                        Let payload_tt be proc token_get_type from Parser with payload_token
+                        If payload_tt is equal to TOKEN_IDENTIFIER:
+                            Let payload_value be proc token_get_value from Parser with payload_token
+                            proc parser_consume_token from Parser with parser
+                            Set variant_payload to proc build_type_node from ASTBuilder with payload_value
+                        End If
+                    End If
+                End If
+            End If
+
+            Let variant_node be proc build_parameter_node from ASTBuilder with variant_name, variant_payload
+            If variant_node is not equal to 0:
+                proc list_append from List with members, variant_node
+            End If
+            Continue
+        End If
+
+        Note: Struct field: 'field_name as DataType'.
+        If token_type is equal to TOKEN_IDENTIFIER:
+            Let field_name be proc token_get_value from Parser with current_token
+            proc parser_consume_token from Parser with parser
+
+            Let as_consumed be proc parser_expect_token from Parser with parser, TOKEN_AS
+            If as_consumed is equal to 0:
+                proc parser_report_error from Parser with parser, "Expected 'as' after field name in Type definition"
+                Return 0
+            End If
+
+            Let field_type_token be proc parser_current_token from Parser with parser
+            If field_type_token is equal to 0:
+                proc parser_report_error from Parser with parser, "Expected field type after 'as' in Type definition"
+                Return 0
+            End If
+            Let field_type_value be proc token_get_value from Parser with field_type_token
+            proc parser_consume_token from Parser with parser
+            Let field_type be proc build_type_node from ASTBuilder with field_type_value
+
+            Let field_node be proc build_parameter_node from ASTBuilder with field_name, field_type
+            If field_node is not equal to 0:
+                proc list_append from List with members, field_node
+            End If
+            Continue
+        End If
+
+        Note: Unrecognized token in body — skip to stay resilient.
+        proc parser_consume_token from Parser with parser
+    End While
+
+    Let member_count be proc list_length from List with members
+    Return proc build_block_statement from ASTBuilder with members, member_count, line
 End Process
 
 Process called "parse_type_definition" takes parser as Integer returns Integer:
@@ -3541,9 +3955,10 @@ Process called "parse_type_definition" takes parser as Integer returns Integer:
     Let current_token be proc parser_current_token from Parser with parser
     Let token_type be proc token_get_type from Parser with current_token
 
-    Note: Check for left angle bracket (generic parameters)
-    If token_type is equal to TOKEN_LEFT_ANGLE:
-        Set generic_params to proc parse_generic_parameters from TypeAnnotations with parser
+    Note: Check for opening bracket introducing generic parameters (Box[T, U]).
+    Note: Runa generic parameter lists are bracket-delimited.
+    If token_type is equal to TOKEN_LEFT_BRACKET:
+        Set generic_params to proc parse_generic_parameters with parser
         If generic_params is equal to 0:
             proc parser_report_error from Parser with parser, "Failed to parse generic parameters"
             Return 0
@@ -3558,7 +3973,7 @@ Process called "parse_type_definition" takes parser as Integer returns Integer:
     End If
 
     Note: 6. Parse type body
-    Let type_body be proc parse_type_body from TypeAnnotations with parser
+    Let type_body be proc parse_type_body with parser
     If type_body is equal to 0:
         proc parser_report_error from Parser with parser, "Expected type body after ':'"
         Return 0
@@ -3729,7 +4144,7 @@ Process called "parse_statement_sequence" takes parser as Integer returns Intege
     End If
 
     Note: 1. Create empty list for statements
-    Let statements be proc create_list from Layout
+    Let statements be proc create from List
     If statements is equal to 0:
         proc parser_report_error from Parser with parser, "Failed to create statement list"
         Return 0
@@ -3766,7 +4181,7 @@ Process called "parse_statement_sequence" takes parser as Integer returns Intege
         End If
 
         Note: Add statement to list
-        proc list_append from Layout with statements, statement
+        proc list_append from List with statements, statement
     End While
 
     Note: 3. Return statements list
@@ -4224,7 +4639,7 @@ Process called "parse_parameter_list" takes parser as Integer returns Integer:
     proc parser_consume_token from Parser with parser
 
     Note: Create list for parameters
-    Let parameters be proc create_list from Layout
+    Let parameters be proc create from List
     If parameters is equal to 0:
         proc parser_report_error from Parser with parser, "Failed to create parameter list"
         Return 0
@@ -4254,7 +4669,7 @@ Process called "parse_parameter_list" takes parser as Integer returns Integer:
         End If
 
         Note: Add to parameters list
-        proc list_append from Layout with parameters, param_node
+        proc list_append from List with parameters, param_node
 
         Note: Check for comma (more parameters) or end of parameter list
         Set current_token to proc parser_current_token from Parser with parser
