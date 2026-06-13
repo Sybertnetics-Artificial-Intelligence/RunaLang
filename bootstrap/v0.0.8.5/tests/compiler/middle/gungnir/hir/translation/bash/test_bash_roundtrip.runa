@@ -1,0 +1,555 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+Licensed under Apache 2.0
+:End Note
+
+Note:
+Bash Translation Round-Trip Probe
+
+End-to-end proof that the Bash translation pipeline is REAL, not a skeleton:
+
+    Bash source
+      -> bash_lexer    (tokenize: words, quoting, operators, redirections, keywords)
+      -> bash_parser   (build Bash AST: commands, pipelines, lists, control flow,
+                        function defs, assignments)
+      -> bash_to_hir   (lower Bash AST to the canonical bash HIR dict/list model)
+      -> hir_to_bash   (emit HIR back to valid Bash text)
+      -> re-lex / re-parse / re-to_hir of the emitted text
+      -> structural HIR equality on the key constructs
+
+Semantic-stage note: the bash translation pipeline that runs end to end is
+lexer -> parser -> to_hir -> backend, identical to the dart programming-language
+frontend, whose to_hir lowering likewise does not invoke its semantic analyzer.
+bash_semantic.runa is a struct-schema analyzer written against a planned
+enriched-HIRNode schema (see its own header comment) and is not wired onto the
+flat Integer AST the real parser emits; connecting it is deferred to the
+v0.0.9.x semantic-analysis layer. This probe therefore exercises the live
+pipeline, matching the sibling programming-language convention.
+
+The probe feeds a representative Bash script that exercises every major
+construct the task requires:
+
+  - a function definition (greet)
+  - an if statement with a test condition
+  - a for loop over a word list
+  - a variable assignment with an expansion reference
+  - a piped command
+
+It then asserts, on the FIRST HIR tree:
+  1. the root is a "script" node with the expected number of top-level commands;
+  2. the function-definition node carries the correct function name;
+  3. the if-statement, for-loop, variable-assignment, and pipeline nodes are
+     present with the correct node-type tags and key payloads (assignment
+     target name, command name inside the pipeline).
+
+Then it emits the HIR back to Bash text, re-runs the whole pipeline on the
+emitted text, and asserts the re-derived HIR is STRUCTURALLY EQUAL to the
+original on those same key constructs. Structural equality (rather than byte
+equality) is the correct semantic-equivalence check because the emitter
+re-indents and normalises whitespace while the meaning is identical.
+
+Exit code: number of failed assertions (0 == all passed). No exit_with_code.
+
+The bash HIR node model is a string-keyed hashtable (created by
+bash_to_hir.create_hir_dict) whose "node_type" key holds the canonical tag
+string and whose structural fields ("commands", "name", "items", etc.) hold
+either child HIR dicts or HIR lists. This probe therefore reads HIR fields via
+the same hashtable_get / list primitives the frontend and backend use, rather
+than the canonical HIR literal accessors used by the data-format languages.
+:End Note
+
+Import "compiler/middle/gungnir/hir/translation/frontends/bash/bash_lexer.runa" as BashLexer
+Import "compiler/middle/gungnir/hir/translation/frontends/bash/bash_parser.runa" as BashParser
+Import "compiler/middle/gungnir/hir/translation/frontends/bash/bash_to_hir.runa" as BashFrontend
+Import "compiler/middle/gungnir/hir/translation/backends/bash/hir_to_bash.runa" as BashBackend
+Import "compiler/frontend/primitives/collections/hashtable.runa" as Dict
+Import "compiler/frontend/primitives/collections/list.runa" as List
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "tests/test_utils.runa" as TestUtils
+
+Note: ============================================================================
+Note: Pipeline helpers
+Note: ============================================================================
+
+@Reasoning:
+Each round of the probe runs the identical front-of-pipeline (lex -> parse ->
+to_hir). Factoring it into one helper keeps the two pipeline runs (original
+source and emitted text) identical in behaviour so any structural divergence is
+attributable to the emitter, not to a difference in how the two inputs were
+driven.
+@End Reasoning
+
+@Implementation:
+Builds a lexer over the source, wraps it in a parser, drives a full parse to
+the Bash AST root, then lowers the AST to HIR via translate_bash_to_hir and
+returns the HIR root. Returns 0 if any stage yields 0.
+@End Implementation
+Process called "source_to_hir" takes source as Integer returns Integer:
+    Let lexer be proc create_bash_lexer from BashLexer with source
+    If lexer is equal to 0:
+        Return 0
+    End If
+
+    Let parser be proc create_parser from BashParser with lexer
+    If parser is equal to 0:
+        Return 0
+    End If
+
+    Let ast be proc parse from BashParser with parser
+    If ast is equal to 0:
+        Return 0
+    End If
+
+    Let hir be proc translate_bash_to_hir from BashFrontend with ast
+    Return hir
+End Process
+
+@Reasoning:
+HIR nodes are string-keyed hashtables, so reading a field is a hashtable_get
+with a string-literal key. Wrapping it keeps the assertions readable.
+@End Reasoning
+
+@Implementation:
+Forwards to Dict.hashtable_get(node, key). Returns 0 for a missing key or a
+null node.
+@End Implementation
+Process called "field" takes node as Integer, key as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    Return proc hashtable_get from Dict with node, key
+End Process
+
+@Reasoning:
+Locate the descendant of the HIR tree whose "node_type" matches a requested
+tag. The probe must find the function-definition, if-statement, for-loop,
+assignment, and pipeline regardless of how the parser nests them: top-level
+statements may be direct children of the script's "commands" list, or wrapped
+inside a "command_list" node's "items" list, or appear as the body of another
+construct. A bounded recursive search by tag is therefore the robust locator -
+it descends through the structural container fields (commands, items, body,
+then_body) that hold child statements without needing to model the exact
+nesting the parser chose.
+@End Reasoning
+
+@Implementation:
+If the node itself matches the tag, returns it. Otherwise recurses, in order,
+into: the "commands" list (script/pipeline), the "items" list (command_list),
+and the single-child structural fields "body" and "then_body". Returns the
+first match found in a depth-first walk, or 0 if no descendant matches. The
+walk only follows known structural container fields, so it terminates on the
+finite HIR tree.
+@End Implementation
+Process called "find_node" takes node as Integer, tag as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+
+    Let node_type be proc field with node, "node_type"
+    If node_type is not equal to 0:
+        If proc string_equals from StringCore with node_type, tag is equal to 1:
+            Return node
+        End If
+    End If
+
+    Note: Recurse through list-valued structural containers
+    Let commands be proc field with node, "commands"
+    If commands is not equal to 0:
+        Let cc be proc list_length from List with commands
+        Let i be 0
+        While i is less than cc:
+            Let child be proc list_get from List with commands, i
+            Let found be proc find_node with child, tag
+            If found is not equal to 0:
+                Return found
+            End If
+            Set i to i plus 1
+        End While
+    End If
+
+    Let items be proc field with node, "items"
+    If items is not equal to 0:
+        Let ic be proc list_length from List with items
+        Let j be 0
+        While j is less than ic:
+            Let item be proc list_get from List with items, j
+            Let found_i be proc find_node with item, tag
+            If found_i is not equal to 0:
+                Return found_i
+            End If
+            Set j to j plus 1
+        End While
+    End If
+
+    Note: Recurse through single-child structural fields
+    Let body be proc field with node, "body"
+    If body is not equal to 0:
+        Let found_b be proc find_node with body, tag
+        If found_b is not equal to 0:
+            Return found_b
+        End If
+    End If
+
+    Let then_body be proc field with node, "then_body"
+    If then_body is not equal to 0:
+        Let found_t be proc find_node with then_body, tag
+        If found_t is not equal to 0:
+            Return found_t
+        End If
+    End If
+
+    Return 0
+End Process
+
+@Reasoning:
+Two bash scripts are semantically equal on the constructs the task names when,
+for each key construct, both HIR projections expose the same node-type tag and
+the same identifying payload (function name, assignment target, pipeline
+command name). Comparing these specific fields rather than full byte text is
+whitespace- and indentation-insensitive, proving round-trip fidelity without
+being defeated by the emitter's re-indentation.
+@End Reasoning
+
+@Implementation:
+Returns 1 when both nodes are non-null and their "node_type" strings are equal.
+Used as the base structural check for each located construct before the probe
+drills into the construct-specific payload.
+@End Implementation
+Process called "same_kind" takes a as Integer, b as Integer returns Integer:
+    If a is equal to 0:
+        Return 0
+    End If
+    If b is equal to 0:
+        Return 0
+    End If
+
+    Let ka be proc field with a, "node_type"
+    Let kb be proc field with b, "node_type"
+    If ka is equal to 0:
+        Return 0
+    End If
+    If kb is equal to 0:
+        Return 0
+    End If
+
+    Return proc string_equals from StringCore with ka, kb
+End Process
+
+@Reasoning:
+The command-list join operator (&&, ||, ;, &) is the payload this probe
+must assert directly, because the four operators lower to a single
+"command_list" HIR shape and a symmetric re-parse equality check cannot
+tell them apart - that symmetry is exactly what previously hid the loss of
+the operator. The fix records each join operator in the command_list's
+parallel "operators" list, so the probe reads that tag directly. This
+helper locates the first command_list descendant and returns its first
+operator string (the operator joining the first two commands), or 0 if no
+command_list with operators is present.
+@End Reasoning
+
+@Implementation:
+Locates the top-most command_list via find_node, reads its "operators"
+list, and returns operators[0] (a canonical operator string) when the list
+is non-null and non-empty. Returns 0 otherwise so callers can assert
+presence as well as the specific spelling.
+@End Implementation
+Process called "first_operator" takes hir as Integer returns Integer:
+    Let list_node be proc find_node with hir, "command_list"
+    If list_node is equal to 0:
+        Return 0
+    End If
+
+    Let operators be proc field with list_node, "operators"
+    If operators is equal to 0:
+        Return 0
+    End If
+
+    Let op_count be proc list_length from List with operators
+    If op_count is equal to 0:
+        Return 0
+    End If
+
+    Return proc list_get from List with operators, 0
+End Process
+
+@Reasoning:
+Reduces an operator-spelling assertion to a 0/1 the test harness can check:
+the located operator string must be non-null AND equal to the expected
+spelling. Keeping it separate from first_operator lets the caller assert a
+clear failure both when no operator survived (null) and when the wrong
+operator survived (mismatch).
+@End Reasoning
+
+@Implementation:
+Returns 0 if op is 0 (no operator carried). Otherwise returns
+string_equals(op, expected): 1 when the carried operator matches the
+expected spelling, 0 when a different operator was carried.
+@End Implementation
+Process called "operator_is" takes op as Integer, expected as Integer returns Integer:
+    If op is equal to 0:
+        Return 0
+    End If
+    Return proc string_equals from StringCore with op, expected
+End Process
+
+Note: ============================================================================
+Note: Probe entry point
+Note: ============================================================================
+
+Process called "main" returns Integer:
+    Let results be proc create_test_results from TestUtils
+    proc begin_suite from TestUtils with results, "Bash translation round-trip"
+
+    Note:
+    Representative script: a function definition, an if with a test condition,
+    a for loop over a word list, a variable assignment with an expansion, and a
+    piped command. Newlines separate the top-level statements.
+    :End Note
+    Let source be "function greet { echo hello; }\nif test -f file; then echo yes; fi\nfor x in a b c; do echo $x; done\ncount=value\ncat data | grep needle\n"
+
+    Note: --- Stage 0-2: source -> HIR (lex, parse, lower) ---
+    Let lexer be proc create_bash_lexer from BashLexer with source
+    proc assert_not_null from TestUtils with results, "lexer created", lexer
+
+    Let parser be proc create_parser from BashParser with lexer
+    proc assert_not_null from TestUtils with results, "parser created", parser
+
+    Let ast be proc parse from BashParser with parser
+    proc assert_not_null from TestUtils with results, "parser produced Bash AST", ast
+
+    Let hir1 be proc translate_bash_to_hir from BashFrontend with ast
+    proc assert_not_null from TestUtils with results, "frontend produced HIR root", hir1
+
+    Note: Root must be a "script" node.
+    Let root_type be proc field with hir1, "node_type"
+    proc assert_not_null from TestUtils with results, "HIR root has node_type", root_type
+    Let root_is_script be proc string_equals from StringCore with root_type, "script"
+    proc assert_equal from TestUtils with results, "HIR root is a script node", root_is_script, 1
+
+    Note: Script has a non-empty top-level command list.
+    Let top_commands be proc field with hir1, "commands"
+    proc assert_not_null from TestUtils with results, "script has commands list", top_commands
+    Let top_count be proc list_length from List with top_commands
+    proc assert_greater_than_or_equal from TestUtils with results, "script has at least 5 top-level statements", top_count, 5
+
+    Note: --- function definition: located by tag, name payload checked ---
+    Let func_node be proc find_node with hir1, "function_definition"
+    proc assert_not_null from TestUtils with results, "function_definition node present", func_node
+    Let func_name be proc field with func_node, "name"
+    proc assert_not_null from TestUtils with results, "function has a name", func_name
+    Let func_name_ok be proc string_equals from StringCore with func_name, "greet"
+    proc assert_equal from TestUtils with results, "function name is 'greet'", func_name_ok, 1
+
+    Note: --- if statement: located by tag ---
+    Let if_node be proc find_node with hir1, "if_statement"
+    proc assert_not_null from TestUtils with results, "if_statement node present", if_node
+    Let if_cond be proc field with if_node, "condition"
+    proc assert_not_null from TestUtils with results, "if statement has a condition", if_cond
+
+    Note: --- for loop: located by tag, loop variable name checked ---
+    Let for_node be proc find_node with hir1, "for_loop"
+    proc assert_not_null from TestUtils with results, "for_loop node present", for_node
+    Let for_var be proc field with for_node, "variable"
+    proc assert_not_null from TestUtils with results, "for loop has a loop variable", for_var
+    Let for_var_ok be proc string_equals from StringCore with for_var, "x"
+    proc assert_equal from TestUtils with results, "for loop variable is 'x'", for_var_ok, 1
+
+    Note: --- variable assignment: located by tag, target name checked ---
+    Let assign_node be proc find_node with hir1, "variable_assignment"
+    proc assert_not_null from TestUtils with results, "variable_assignment node present", assign_node
+    Let assign_target be proc field with assign_node, "variable"
+    proc assert_not_null from TestUtils with results, "assignment has a target name", assign_target
+    Let assign_target_ok be proc string_equals from StringCore with assign_target, "count"
+    proc assert_equal from TestUtils with results, "assignment target is 'count'", assign_target_ok, 1
+
+    Note: --- pipeline: located by tag, first command name checked ---
+    Let pipe_node be proc find_node with hir1, "pipeline"
+    proc assert_not_null from TestUtils with results, "pipeline node present", pipe_node
+    Let pipe_cmds be proc field with pipe_node, "commands"
+    proc assert_not_null from TestUtils with results, "pipeline has a commands list", pipe_cmds
+    Let pipe_cmd_count be proc list_length from List with pipe_cmds
+    proc assert_greater_than_or_equal from TestUtils with results, "pipeline has at least 2 stages", pipe_cmd_count, 2
+    Let pipe_first be proc list_get from List with pipe_cmds, 0
+    Let pipe_first_name be proc field with pipe_first, "name"
+    Let pipe_first_word be proc field with pipe_first_name, "value"
+    proc assert_not_null from TestUtils with results, "pipeline first command has a name word", pipe_first_word
+    Let pipe_first_ok be proc string_equals from StringCore with pipe_first_word, "cat"
+    proc assert_equal from TestUtils with results, "pipeline first command is 'cat'", pipe_first_ok, 1
+
+    Note: --- Stage 4: HIR -> Bash text ---
+    Let emitted be proc generate_bash_from_hir from BashBackend with hir1
+    proc assert_not_null from TestUtils with results, "backend produced Bash text", emitted
+    Let emitted_len be proc string_length from StringCore with emitted
+    proc assert_greater_than from TestUtils with results, "emitted Bash is non-empty", emitted_len, 0
+    Let first_char be proc string_char_at from StringCore with emitted, 0
+    proc assert_equal from TestUtils with results, "emitted Bash begins with '#' (shebang)", first_char, 35
+
+    Note: --- Stage 5: re-run the pipeline on the emitted text -> HIR2 ---
+    Let hir2 be proc source_to_hir with emitted
+    proc assert_not_null from TestUtils with results, "re-parse of emitted Bash produced HIR", hir2
+
+    Note: Root of the re-derived tree is also a script node.
+    Let root2_type be proc field with hir2, "node_type"
+    Let root2_is_script be proc string_equals from StringCore with root2_type, "script"
+    proc assert_equal from TestUtils with results, "round-trip HIR root is a script node", root2_is_script, 1
+
+    Note: --- Stage 6: structural equality on the key constructs ---
+    Let func2 be proc find_node with hir2, "function_definition"
+    Let func_kind_ok be proc same_kind with func_node, func2
+    proc assert_equal from TestUtils with results, "round-trip preserves function_definition node", func_kind_ok, 1
+    Let func2_name be proc field with func2, "name"
+    Let func2_name_ok be proc string_equals from StringCore with func2_name, "greet"
+    proc assert_equal from TestUtils with results, "round-trip preserves function name 'greet'", func2_name_ok, 1
+
+    Let if2 be proc find_node with hir2, "if_statement"
+    Let if_kind_ok be proc same_kind with if_node, if2
+    proc assert_equal from TestUtils with results, "round-trip preserves if_statement node", if_kind_ok, 1
+
+    Let for2 be proc find_node with hir2, "for_loop"
+    Let for_kind_ok be proc same_kind with for_node, for2
+    proc assert_equal from TestUtils with results, "round-trip preserves for_loop node", for_kind_ok, 1
+    Let for2_var be proc field with for2, "variable"
+    Let for2_var_ok be proc string_equals from StringCore with for2_var, "x"
+    proc assert_equal from TestUtils with results, "round-trip preserves for loop variable 'x'", for2_var_ok, 1
+
+    Let assign2 be proc find_node with hir2, "variable_assignment"
+    Let assign_kind_ok be proc same_kind with assign_node, assign2
+    proc assert_equal from TestUtils with results, "round-trip preserves variable_assignment node", assign_kind_ok, 1
+    Let assign2_target be proc field with assign2, "variable"
+    Let assign2_target_ok be proc string_equals from StringCore with assign2_target, "count"
+    proc assert_equal from TestUtils with results, "round-trip preserves assignment target 'count'", assign2_target_ok, 1
+
+    Let pipe2 be proc find_node with hir2, "pipeline"
+    Let pipe_kind_ok be proc same_kind with pipe_node, pipe2
+    proc assert_equal from TestUtils with results, "round-trip preserves pipeline node", pipe_kind_ok, 1
+    Let pipe2_cmds be proc field with pipe2, "commands"
+    Let pipe2_first be proc list_get from List with pipe2_cmds, 0
+    Let pipe2_first_name be proc field with pipe2_first, "name"
+    Let pipe2_first_word be proc field with pipe2_first_name, "value"
+    Let pipe2_first_ok be proc string_equals from StringCore with pipe2_first_word, "cat"
+    proc assert_equal from TestUtils with results, "round-trip preserves pipeline first command 'cat'", pipe2_first_ok, 1
+
+    Note: ----------------------------------------------------------------
+    Note: Statement-drop regression (#511): a function whose body contains an
+    Note: assignment, FOLLOWED by additional top-level statements, must keep
+    Note: every following statement. Before the fix, the unconsumed '=' inside
+    Note: the body poisoned the top-level loop and dropped everything after the
+    Note: function. The script below has FOUR top-level statements: the function
+    Note: definition, then three plain commands. All four must survive, and the
+    Note: post-function assignment target must still be reachable.
+    Note: ----------------------------------------------------------------
+    Let nodrop_source be "function setup { config=on; echo $config; }\nsetup\nresult=ready\necho $result\n"
+    Let nodrop_hir be proc source_to_hir with nodrop_source
+    proc assert_not_null from TestUtils with results, "no-drop: pipeline produced HIR", nodrop_hir
+    Let nodrop_cmds be proc field with nodrop_hir, "commands"
+    proc assert_not_null from TestUtils with results, "no-drop: script has commands list", nodrop_cmds
+    Let nodrop_count be proc list_length from List with nodrop_cmds
+    proc assert_equal from TestUtils with results, "no-drop: all four top-level statements survive", nodrop_count, 4
+
+    Note: The function definition (first statement) is intact with its name.
+    Let nodrop_func be proc find_node with nodrop_hir, "function_definition"
+    proc assert_not_null from TestUtils with results, "no-drop: function_definition present", nodrop_func
+    Let nodrop_func_name be proc field with nodrop_func, "name"
+    Let nodrop_func_ok be proc string_equals from StringCore with nodrop_func_name, "setup"
+    proc assert_equal from TestUtils with results, "no-drop: function name is 'setup'", nodrop_func_ok, 1
+
+    Note: The post-function assignment (`result=ready`) survived and is reachable.
+    Let nodrop_assign be proc find_node with nodrop_hir, "variable_assignment"
+    proc assert_not_null from TestUtils with results, "no-drop: post-function assignment present", nodrop_assign
+
+    Note: The in-body assignment (`config=on`) lowered to an assignment node too,
+    Note: proving the function body itself parsed fully rather than truncating.
+    Let nodrop_func_body be proc field with nodrop_func, "body"
+    Let nodrop_body_assign be proc find_node with nodrop_func_body, "variable_assignment"
+    proc assert_not_null from TestUtils with results, "no-drop: in-body assignment parsed", nodrop_body_assign
+
+    Note: ----------------------------------------------------------------
+    Note: Declaration round-trip (#511): `local`/`declare`/`unset` now surface as
+    Note: command nodes that lower to HIR commands and re-emit faithfully.
+    Note: ----------------------------------------------------------------
+    Let decl_source be "function f { local x=1; declare y; }\n"
+    Let decl_hir be proc source_to_hir with decl_source
+    proc assert_not_null from TestUtils with results, "declaration: pipeline produced HIR", decl_hir
+    Let decl_func be proc find_node with decl_hir, "function_definition"
+    proc assert_not_null from TestUtils with results, "declaration: function present", decl_func
+    Let decl_emitted be proc generate_bash_from_hir from BashBackend with decl_hir
+    proc assert_not_null from TestUtils with results, "declaration: backend emitted text", decl_emitted
+    Let decl_hir2 be proc source_to_hir with decl_emitted
+    proc assert_not_null from TestUtils with results, "declaration: re-parse of emitted text produced HIR", decl_hir2
+    Let decl_func2 be proc find_node with decl_hir2, "function_definition"
+    Let decl_kind_ok be proc same_kind with decl_func, decl_func2
+    proc assert_equal from TestUtils with results, "declaration: round-trip preserves the function carrying local/declare", decl_kind_ok, 1
+
+    Note: ----------------------------------------------------------------
+    Note: Command-list operator preservation (#512): &&, ||, ;, & must each
+    Note: survive the full lex -> parse -> to_hir -> backend -> re-parse cycle
+    Note: as their own operator, NOT collapse to a single separator. These
+    Note: assertions read the carried operator tag in the command_list's
+    Note: "operators" list rather than re-parse structural equality, because
+    Note: symmetric structural equality is exactly what previously masked the
+    Note: loss (all four operators produced the same operator-less AST_LIST).
+    Note: Each operator is checked both after the initial lowering AND after
+    Note: the emit/re-parse round trip, and the cross-operator negative
+    Note: assertions prove `&&` does not degrade into `;`.
+    Note: ----------------------------------------------------------------
+
+    Note: --- && (short-circuit-and) ---
+    Let and_hir be proc source_to_hir with "a && b\n"
+    proc assert_not_null from TestUtils with results, "operator: && source produced HIR", and_hir
+    Let and_op be proc first_operator with and_hir
+    Let and_is_and be proc operator_is with and_op, "&&"
+    proc assert_equal from TestUtils with results, "operator: && lowered to '&&' tag", and_is_and, 1
+    Let and_not_semi be proc operator_is with and_op, ";"
+    proc assert_equal from TestUtils with results, "operator: && did NOT degrade to ';'", and_not_semi, 0
+    Let and_emitted be proc generate_bash_from_hir from BashBackend with and_hir
+    Let and_hir2 be proc source_to_hir with and_emitted
+    Let and_op2 be proc first_operator with and_hir2
+    Let and_rt_ok be proc operator_is with and_op2, "&&"
+    proc assert_equal from TestUtils with results, "operator: && round-trips as '&&'", and_rt_ok, 1
+
+    Note: --- || (short-circuit-or) ---
+    Let or_hir be proc source_to_hir with "a || b\n"
+    proc assert_not_null from TestUtils with results, "operator: || source produced HIR", or_hir
+    Let or_op be proc first_operator with or_hir
+    Let or_is_or be proc operator_is with or_op, "||"
+    proc assert_equal from TestUtils with results, "operator: || lowered to '||' tag", or_is_or, 1
+    Let or_not_semi be proc operator_is with or_op, ";"
+    proc assert_equal from TestUtils with results, "operator: || did NOT degrade to ';'", or_not_semi, 0
+    Let or_emitted be proc generate_bash_from_hir from BashBackend with or_hir
+    Let or_hir2 be proc source_to_hir with or_emitted
+    Let or_op2 be proc first_operator with or_hir2
+    Let or_rt_ok be proc operator_is with or_op2, "||"
+    proc assert_equal from TestUtils with results, "operator: || round-trips as '||'", or_rt_ok, 1
+
+    Note: --- ; (sequence) ---
+    Let seq_hir be proc source_to_hir with "a ; b\n"
+    proc assert_not_null from TestUtils with results, "operator: ; source produced HIR", seq_hir
+    Let seq_op be proc first_operator with seq_hir
+    Let seq_is_semi be proc operator_is with seq_op, ";"
+    proc assert_equal from TestUtils with results, "operator: ; lowered to ';' tag", seq_is_semi, 1
+    Let seq_emitted be proc generate_bash_from_hir from BashBackend with seq_hir
+    Let seq_hir2 be proc source_to_hir with seq_emitted
+    Let seq_op2 be proc first_operator with seq_hir2
+    Let seq_rt_ok be proc operator_is with seq_op2, ";"
+    proc assert_equal from TestUtils with results, "operator: ; round-trips as ';'", seq_rt_ok, 1
+
+    Note: --- & (background) ---
+    Let bg_hir be proc source_to_hir with "a & b\n"
+    proc assert_not_null from TestUtils with results, "operator: & source produced HIR", bg_hir
+    Let bg_op be proc first_operator with bg_hir
+    Let bg_is_amp be proc operator_is with bg_op, "&"
+    proc assert_equal from TestUtils with results, "operator: & lowered to '&' tag", bg_is_amp, 1
+    Let bg_not_semi be proc operator_is with bg_op, ";"
+    proc assert_equal from TestUtils with results, "operator: & did NOT degrade to ';'", bg_not_semi, 0
+    Let bg_emitted be proc generate_bash_from_hir from BashBackend with bg_hir
+    Let bg_hir2 be proc source_to_hir with bg_emitted
+    Let bg_op2 be proc first_operator with bg_hir2
+    Let bg_rt_ok be proc operator_is with bg_op2, "&"
+    proc assert_equal from TestUtils with results, "operator: & round-trips as '&'", bg_rt_ok, 1
+
+    proc print_summary from TestUtils with results
+    Let failed be proc get_failed from TestUtils with results
+    proc destroy_test_results from TestUtils with results
+
+    Return failed
+End Process

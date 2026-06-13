@@ -1,1143 +1,1570 @@
-Note: ============================================================================
-Note: BASH/SHELL SEMANTIC ANALYZER
-Note: ============================================================================
-Note: Semantic analysis for Bash/Shell Unix scripting language
-Note: Handles Bash-specific features:
-Note: - Variable scoping and environment variables
-Note: - Command substitution and process substitution
-Note: - Shell parameter expansion and pattern matching
-Note: - Built-in commands and external programs
-Note: - Redirection and pipeline operations
-Note: - Control structures and function definitions
-Note: - Array variables and associative arrays
-Note: - Signal handling and job control
-Note: - Shell options and configuration
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
 
-Import "compiler/middle/gungnir/hir/hir_nodes.runa" as BashASTNodes
-Import "compiler/middle/gungnir/hir/hir_builder.runa" as HIRBuilder
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
 
-@Reasoning:
-Single mutable root for the analyser's running state. Holds the active
-environment, a back-pointer to the enclosing context (function/subshell
-nesting), shell options, the current function name (used by "return" and
-local-scoping checks), error/warning accumulators, a stack snapshot of
-environments (for subshell rollback), function/alias tables, exported and
-readonly variable indices, the executable search path, and the job-
-control toggle. Each field is mutated as the AST walker descends.
-@End Reasoning
+    http://www.apache.org/licenses/LICENSE-2.0
 
-Type called "BashSemanticContext":
-    current_environment as BashEnvironment
-    parent_context as BashSemanticContext
-    shell_options as Dictionary[String, Boolean]
-    current_function as String
-    error_list as List[String]
-    warning_list as List[String]
-    variable_stack as List[BashEnvironment]
-    function_definitions as Dictionary[String, BashFunction]
-    alias_definitions as Dictionary[String, String]
-    exported_variables as List[String]
-    readonly_variables as List[String]
-    command_path as List[String]
-    job_control_enabled as Boolean
-End Type
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
 
-@Reasoning:
-A single scope frame. `variables` holds shell-visible bindings, while
-`local_variables` (populated only inside function bodies that used the
-`local` builtin) shadows the parent for the duration of that function.
-parent_env supports lexical lookup chain; is_function_scope distinguishes
-a function body from a script-level scope (controls whether `local` is
-legal); is_subshell flips the "child process" semantics where exports
-become snapshot copies rather than shared bindings.
-@End Reasoning
+Note:
+Bash / Shell Semantic Analyzer
 
-Type called "BashEnvironment":
-    variables as Dictionary[String, BashVariable]
-    local_variables as Dictionary[String, BashVariable]
-    parent_env as BashEnvironment
-    scope_type as String
-    is_function_scope as Boolean
-    is_subshell as Boolean
-End Type
+The Bash parser guarantees a syntactically well-formed script. This pass
+enforces the SEMANTIC rules a shell consumer needs but the grammar alone does
+not express, walking the REAL parser AST (flat integer-pointer nodes, see
+field-offset contract below) rather than any enriched language-specific node.
 
-Note: Local Bash AST node schema. The semantic analyzer was written against a
-Note: planned-but-never-shipped enriched HIRNode that carries language-specific
-Note: fields directly. Until the v0.0.9.x semantic-analysis layer connects to
-Note: the real generic HIRNode (node_type Integer + children traversal), this
-Note: local type lets the analyzer compile against the schema it expects.
-@Reasoning:
-Heterogeneous union-style record that covers every shape the Bash parser
-can produce: scripts, simple commands, assignments, function definitions,
-pipelines, parameter expansions, redirections. Each subkind reads only
-the fields relevant to it; the rest stay at their zero/nothing values.
-This flat schema is deliberately wide so the semantic analyser can
-dispatch on node_type without per-subkind allocations.
-@End Reasoning
+It performs:
 
-Type called "BashASTNode":
-    node_type as String
-    value as Integer
-    source_location as Integer
-    shebang as Integer
-    statements as Integer
-    commands as Integer
-    command_name as Integer
-    arguments as Integer
-    redirections as Integer
-    is_background as Integer
-    pattern as Integer
-    body as Integer
-    function_name as Integer
-    assignments as Integer
-    is_array_assignment as Integer
-    array_index as Integer
-    assignment_operator as Integer
-    expansion_type as Integer
-    modifier as Integer
-    replacement as Integer
-    variable_name as Integer
-    type as Integer
-    name as Integer
-    line as Integer
-    column as Integer
-End Type
+  1. Variable scope/assignment tracking. Bash variables are global by default;
+     a `local` builtin inside a function body narrows a name to that function's
+     scope. The analyzer threads a global scope dictionary plus a per-function
+     local scope dictionary so it can answer "is this name local or global?"
+     and detect references to never-assigned names.
+  2. Function definition, registration, and call resolution. Every
+     AST_FUNCTION_DEFINITION registers the function name; a later command whose
+     name matches a registered function resolves to that function rather than
+     an external program.
+  3. Command / builtin recognition. A name-keyed builtin index is seeded with
+     the POSIX/Bash builtins. Command resolution follows Bash's documented
+     order: function > builtin > external (PATH). An unresolved command is a
+     warning (PATH content at runtime may differ from analysis time).
+  4. Redirection and pipeline structural validation. Every AST_REDIRECTION must
+     carry exactly one target child; an AST_PIPELINE must have at least two
+     stages; structural violations become hard errors because they indicate a
+     corrupted AST the lowering stage must not see.
+  5. Loop / conditional structure validation. for/while/until/if/case nodes are
+     checked for their required minimum child arity so a malformed control
+     structure is caught before HIR lowering.
 
-@Reasoning:
-Carries everything Bash semantics needs about a variable beyond its raw
-value: type (string/integer/array), is_array vs is_associative
-discriminator, exported/readonly/local flags that influence assignment
-legality and child-process inheritance, and array storage (positional or
-keyed). first_assignment_line / last_access_line drive unused-variable
-diagnostics.
-@End Reasoning
+REAL PARSER AST CONTRACT (bash_parser.runa, hand-managed offsets):
+- node_type    @0   AST_* constant (Integer)
+- value        @8   pointer to associated string OR (for AST_REDIRECTION) an
+                    Integer operator token-type code
+- line         @16  source line
+- column       @24  source column
+- children     @32  pointer to heap array of child node pointers
+- child_count  @40  active child count
+- child_capacity @48 allocated slot count
+AST_NODE_SIZE = 56. Children are read with memory_get_int64 over the array at
+offset 32 (element i at children + i*8).
 
-Type called "BashVariable":
-    name as String
-    value as String
-    type as String
-    is_array as Boolean
-    is_associative as Boolean
-    is_exported as Boolean
-    is_readonly as Boolean
-    is_local as Boolean
-    array_values as List[String]
-    associative_values as Dictionary[String, String]
-    first_assignment_line as Integer
-    last_access_line as Integer
-End Type
+Dependencies:
+- bash_parser.runa (AST node-type constants + field-offset contract)
+- compiler/frontend/primitives/memory/layout.runa
+- compiler/frontend/primitives/core/string_core.runa
+- compiler/frontend/primitives/collections/list.runa
+- compiler/frontend/primitives/collections/dictionary.runa
+- compiler/internal/string_utils.runa
+:End Note
 
-@Reasoning:
-Per-function record stored in the context's function_definitions table.
-local_variables lists the names declared via `local` so the runtime can
-restore them on function return; is_exported toggles export -f semantics
-(make the function visible to subshells via the environment).
-@End Reasoning
-
-Type called "BashFunction":
-    name as String
-    body as BashASTNode
-    local_variables as List[String]
-    is_exported as Boolean
-    source_location as String
-End Type
-
-@Reasoning:
-Index entry for every command the analyser knows about — builtins,
-defined functions, aliases, and PATH-resolved externals. The four
-discriminator flags are mutually exclusive in practice but stored as
-separate booleans so the dispatcher can read whichever is interesting
-without a tag check. expected_args is reserved for builtins where the
-analyser can validate arity.
-@End Reasoning
-
-Type called "BashCommand":
-    command_name as String
-    command_type as String
-    is_builtin as Boolean
-    is_function as Boolean
-    is_alias as Boolean
-    is_external as Boolean
-    expected_args as List[String]
-    description as String
-End Type
-
-@Reasoning:
-A redirection element parsed from "2>&1", "> file", ">> file" etc.
-source_fd and target_fd model the two-sided fd-to-fd form (e.g., 2>&1),
-target holds a filename for the one-sided form, append_mode selects
-">>"/"<<" overstrike vs append. Combining both fd and file storage in
-one record lets a single iteration over redirections handle every form.
-@End Reasoning
-
-Type called "BashRedirection":
-    type as String
-    source_fd as Integer
-    target as String
-    target_fd as Integer
-    append_mode as Boolean
-End Type
-
-@Reasoning:
-Diagnostic record. severity is a string ("error"/"warning"/"note") rather
-than an enum because Bash error categories grow over time and a string
-avoids invalidating the schema. error_code (e.g., "BSH001") is the stable
-machine-readable handle that test harnesses match on.
-@End Reasoning
-
-Type called "BashSemanticError":
-    message as String
-    line as Integer
-    column as Integer
-    severity as String
-    error_code as String
-End Type
+Import "compiler/middle/gungnir/hir/translation/frontends/bash/bash_parser.runa" as Parser
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/frontend/primitives/collections/list.runa" as List
+Import "compiler/frontend/primitives/collections/dictionary.runa" as Dict
+Import "compiler/internal/string_utils.runa" as StringUtils
 
 Note: ============================================================================
-Note: MAIN SEMANTIC ANALYSIS ENTRY POINT
+Note: AST Field Offsets (mirror of the parser's hand-managed layout)
+Note: ============================================================================
+
+Constant NODE_TYPE_OFFSET as Integer is 0
+Constant NODE_VALUE_OFFSET as Integer is 8
+Constant NODE_LINE_OFFSET as Integer is 16
+Constant NODE_COLUMN_OFFSET as Integer is 24
+Constant NODE_CHILDREN_OFFSET as Integer is 32
+Constant NODE_CHILD_COUNT_OFFSET as Integer is 40
+
+Note: ============================================================================
+Note: Analyzer State Structure
 Note: ============================================================================
 
 @Reasoning:
-Public entry point: bootstraps a global context, loads the built-in
-command index, populates the standard POSIX environment (PATH, HOME, ...),
-walks the AST, then runs the cross-cutting final validation passes
-(unused variables, unreferenced functions, conflicting options, dangling
-redirections, job-control misuse). Order matters: load builtins before
-analysis so command resolution sees them, and run validate after analysis
-so it sees every binding.
+The analyzer threads six subsystem handles plus two flag slots through the
+recursive walk, mirroring the integer-offset discipline the sibling frontend
+analyzers (json/dart) use rather than a high-level struct: raw 64-bit slots
+keep the contract identical to the parser's flat-node convention and avoid the
+integer-keyed-Dict-on-string-keys SEGV class entirely (every Dict here is
+string-keyed).
+
+Slot meaning:
+- builtins       (Dict name->1) the seeded builtin/external command index
+- functions      (Dict name->1) functions registered as they are defined
+- global_scope   (Dict name->1) names bound at global (script) scope
+- current_locals (Dict name->1 OR 0) the active function body's `local` set;
+                  0 at script level where `local` is illegal
+- errors         (List of owned heap strings) hard semantic errors
+- warnings       (List of owned heap strings) non-fatal diagnostics
+- has_error      Boolean: 1 if any hard error was latched
+- in_function    Boolean: 1 while descending a function body (controls `local`
+                  legality and which scope an assignment writes to)
 @End Reasoning
 
-Process called "analyze_bash_semantics" that takes ast as BashASTNode returns BashSemanticContext:
-    Note: Main entry point for Bash semantic analysis
+@Implementation:
+Eight 8-byte slots at offsets 0/8/16/24/32/40/48/56; total size 64 bytes. The
+offsets are referenced directly by every accessor Process in this file.
+@End Implementation
 
-    @Reasoning:
-    Bash has complex semantic requirements including variable scoping,
-    command resolution, shell parameter expansion, and process management.
-    The analysis must handle both interactive and script execution contexts.
-    @End Reasoning
+Type called "BashSemanticAnalyzer":
+    builtins as Integer         Note: @0  Dict: builtin/external command name -> 1
+    functions as Integer        Note: @8  Dict: defined function name -> 1
+    global_scope as Integer     Note: @16 Dict: global variable name -> 1
+    current_locals as Integer   Note: @24 Dict: active function local set, or 0
+    errors as Integer           Note: @32 List of owned error strings
+    warnings as Integer         Note: @40 List of owned warning strings
+    has_error as Integer        Note: @48 Boolean: a hard error occurred
+    in_function as Integer       Note: @56 Boolean: inside a function body
+End Type
 
-    Let context be create_global_bash_context
-
-    Note: Load standard Bash built-in commands
-    Call load_bash_builtins with context
-
-    Note: Set up standard shell environment
-    Call setup_standard_environment with context
-
-    Note: Analyze the AST
-    Call analyze_bash_node with ast and context
-
-    Note: Perform final validation
-    Call validate_bash_semantics with context
-
-    Return context
-End Process
-
-@Reasoning:
-Initialises the root scope. The global environment has no parent, an
-empty variable map, and scope_type "global" (the only literal that
-matches the non-function/non-subshell case). Preloads command_path with
-the conventional system search dirs so subsequent external-command
-resolution doesn't fail before any /etc/profile-equivalent runs.
-@End Reasoning
-
-Process called "create_global_bash_context" that takes nothing returns BashSemanticContext:
-    Note: Create the global semantic context with Bash environment
-
-    Let global_env be a value of type BashEnvironment with
-        variables as a dictionary containing nothing,
-        local_variables as a dictionary containing nothing,
-        parent_env as null,
-        scope_type as "global",
-        is_function_scope as false,
-        is_subshell as false
-
-    Let context be a value of type BashSemanticContext with
-        current_environment as global_env,
-        parent_context as null,
-        shell_options as a dictionary containing nothing,
-        current_function as null,
-        error_list as a list containing nothing,
-        warning_list as a list containing nothing,
-        variable_stack as a list containing global_env,
-        function_definitions as a dictionary containing nothing,
-        alias_definitions as a dictionary containing nothing,
-        exported_variables as a list containing nothing,
-        readonly_variables as a list containing nothing,
-        command_path as a list containing "/bin", "/usr/bin", "/usr/local/bin",
-        job_control_enabled as true
-
-    Return context
-End Process
-
-@Reasoning:
-Single entry point that fans out to six per-category loaders (core,
-variable, control-flow, io, job-control, utility). Separating them lets
-future maintenance update one category without churning the others, and
-each loader's name documents its scope at the call site.
-@End Reasoning
-
-Process called "load_bash_builtins" that takes ctx as BashSemanticContext returns Nothing:
-    Note: Load standard Bash built-in commands
-
-    @Reasoning:
-    Bash has numerous built-in commands that affect the shell environment,
-    variable handling, and control flow. These need to be recognized
-    and validated during semantic analysis.
-    @End Reasoning
-
-    Note: Load core built-ins
-    Call load_core_builtins with ctx
-    Call load_variable_builtins with ctx
-    Call load_control_flow_builtins with ctx
-    Call load_io_builtins with ctx
-    Call load_job_control_builtins with ctx
-    Call load_utility_builtins with ctx
-End Process
-
-@Reasoning:
-Registers the irreducible Bash builtins that change shell control flow
-or process identity rather than performing I/O — :, source/., eval, exec,
-exit, return, break, continue, shift, set, unset. These are special
-because they cannot be implemented as external programs (they read or
-mutate shell state directly).
-@End Reasoning
-
-Process called "load_core_builtins" that takes ctx as BashSemanticContext returns Nothing:
-    Note: Load core Bash built-in commands
-
-    Let core_commands be a list containing:
-        create_bash_command with ":" and "null command" and true,
-        create_bash_command with "." and "source script" and true,
-        create_bash_command with "source" and "source script" and true,
-        create_bash_command with "eval" and "evaluate string as command" and true,
-        create_bash_command with "exec" and "replace shell with command" and true,
-        create_bash_command with "exit" and "exit shell" and true,
-        create_bash_command with "return" and "return from function" and true,
-        create_bash_command with "break" and "break from loop" and true,
-        create_bash_command with "continue" and "continue loop" and true,
-        create_bash_command with "shift" and "shift positional parameters" and true,
-        create_bash_command with "set" and "set shell options" and true,
-        create_bash_command with "unset" and "unset variables or functions" and true
-
-    For Each cmd in core_commands:
-        Call register_builtin_command with cmd and ctx
-    End For
-End Process
-
-@Reasoning:
-Registers builtins that act on variable bindings: declare/typeset/local
-(scope-aware declarations), export/readonly/unset, plus the input-side
-let/printf/read/mapfile/readarray that read or evaluate variable
-content. Keeping them grouped reflects that they all touch the shared
-variable map.
-@End Reasoning
-
-Process called "load_variable_builtins" that takes ctx as BashSemanticContext returns Nothing:
-    Note: Load variable-related built-in commands
-
-    Let variable_commands be a list containing:
-        create_bash_command with "declare" and "declare variables" and true,
-        create_bash_command with "typeset" and "declare variables (alias)" and true,
-        create_bash_command with "local" and "declare local variables" and true,
-        create_bash_command with "export" and "export variables" and true,
-        create_bash_command with "readonly" and "make variables readonly" and true,
-        create_bash_command with "unset" and "unset variables" and true,
-        create_bash_command with "let" and "arithmetic evaluation" and true,
-        create_bash_command with "printf" and "formatted output" and true,
-        create_bash_command with "read" and "read user input" and true,
-        create_bash_command with "mapfile" and "read lines into array" and true,
-        create_bash_command with "readarray" and "read lines into array (alias)" and true
-
-    For Each cmd in variable_commands:
-        Call register_builtin_command with cmd and ctx
-    End For
-End Process
-
-@Reasoning:
-Registers the reserved-word control structures (if/then/else/elif/fi,
-for/while/until/do/done, case/esac, function, select) as builtins even
-though they are syntactic constructs — doing so means an attempt to
-shadow them with an alias or function definition can be flagged with a
-clear "reserved word" diagnostic rather than a confusing "command not
-found".
-@End Reasoning
-
-Process called "load_control_flow_builtins" that takes ctx as BashSemanticContext returns Nothing:
-    Note: Load control flow built-in commands
-
-    Let control_commands be a list containing:
-        create_bash_command with "if" and "conditional execution" and true,
-        create_bash_command with "then" and "then clause" and true,
-        create_bash_command with "else" and "else clause" and true,
-        create_bash_command with "elif" and "else if clause" and true,
-        create_bash_command with "fi" and "end if" and true,
-        create_bash_command with "for" and "for loop" and true,
-        create_bash_command with "while" and "while loop" and true,
-        create_bash_command with "until" and "until loop" and true,
-        create_bash_command with "do" and "loop body" and true,
-        create_bash_command with "done" and "end loop" and true,
-        create_bash_command with "case" and "case statement" and true,
-        create_bash_command with "esac" and "end case" and true,
-        create_bash_command with "function" and "function definition" and true,
-        create_bash_command with "select" and "selection menu" and true
-
-    For Each cmd in control_commands:
-        Call register_builtin_command with cmd and ctx
-    End For
-End Process
-
-@Reasoning:
-Registers I/O-side commands: shell-internal (echo, printf, read) which
-are builtins because they need access to shell variables, plus common
-externals (cat, tee, head, tail, etc.) which are not is_builtin=true so
-the analyser knows to look them up on PATH.
-@End Reasoning
-
-Process called "load_io_builtins" that takes ctx as BashSemanticContext returns Nothing:
-    Note: Load I/O related built-in commands
-
-    Let io_commands be a list containing:
-        create_bash_command with "echo" and "display text" and true,
-        create_bash_command with "printf" and "formatted output" and true,
-        create_bash_command with "read" and "read input" and true,
-        create_bash_command with "cat" and "concatenate files" and false,
-        create_bash_command with "tee" and "write to multiple outputs" and false,
-        create_bash_command with "head" and "output first lines" and false,
-        create_bash_command with "tail" and "output last lines" and false,
-        create_bash_command with "grep" and "search text" and false,
-        create_bash_command with "sed" and "stream editor" and false,
-        create_bash_command with "awk" and "pattern processing" and false,
-        create_bash_command with "sort" and "sort lines" and false,
-        create_bash_command with "uniq" and "unique lines" and false
-
-    For Each cmd in io_commands:
-        Call register_builtin_command with cmd and ctx
-    End For
-End Process
-
-@Reasoning:
-Registers the job-control builtins (jobs, bg, fg, wait, kill, disown,
-suspend, kill -l). validate_job_control_usage cross-references the
-registry against the script's use of "&" and Ctrl-Z patterns to flag
-job-control-without-`set -m` mistakes.
-@End Reasoning
-
-Process called "load_job_control_builtins" that takes ctx as BashSemanticContext returns Nothing:
-    Note: Load job control built-in commands
-
-    Let job_commands be a list containing:
-        create_bash_command with "jobs" and "list active jobs" and true,
-        create_bash_command with "bg" and "put job in background" and true,
-        create_bash_command with "fg" and "bring job to foreground" and true,
-        create_bash_command with "nohup" and "run immune to hangups" and false,
-        create_bash_command with "disown" and "disown job" and true,
-        create_bash_command with "suspend" and "suspend shell" and true,
-        create_bash_command with "kill" and "terminate process" and true,
-        create_bash_command with "killall" and "terminate processes by name" and false,
-        create_bash_command with "pkill" and "kill processes by pattern" and false,
-        create_bash_command with "pgrep" and "find processes by pattern" and false,
-        create_bash_command with "wait" and "wait for process completion" and true
-
-    For Each cmd in job_commands:
-        Call register_builtin_command with cmd and ctx
-    End For
-End Process
-
-@Reasoning:
-Catch-all for builtins that don't fit the other categories: type/command/
-which (introspection), pwd/cd/pushd/popd/dirs (directory stack), times/
-ulimit/umask/trap/hash/help/history. Loading them last preserves
-deterministic ordering in case two categories ever register the same
-name (variable_builtins wins).
-@End Reasoning
-
-Process called "load_utility_builtins" that takes ctx as BashSemanticContext returns Nothing:
-    Note: Load utility built-in commands
-
-    Let utility_commands be a list containing:
-        create_bash_command with "cd" and "change directory" and true,
-        create_bash_command with "pwd" and "print working directory" and true,
-        create_bash_command with "dirs" and "directory stack" and true,
-        create_bash_command with "pushd" and "push directory" and true,
-        create_bash_command with "popd" and "pop directory" and true,
-        create_bash_command with "ls" and "list directory" and false,
-        create_bash_command with "mkdir" and "make directory" and false,
-        create_bash_command with "rmdir" and "remove directory" and false,
-        create_bash_command with "rm" and "remove files" and false,
-        create_bash_command with "cp" and "copy files" and false,
-        create_bash_command with "mv" and "move files" and false,
-        create_bash_command with "ln" and "link files" and false,
-        create_bash_command with "find" and "find files" and false,
-        create_bash_command with "which" and "locate command" and false,
-        create_bash_command with "whereis" and "locate program" and false,
-        create_bash_command with "type" and "display command type" and true,
-        create_bash_command with "command" and "execute command" and true,
-        create_bash_command with "builtin" and "execute builtin" and true
-
-    For Each cmd in utility_commands:
-        Call register_builtin_command with cmd and ctx
-    End For
-End Process
-
-@Reasoning:
-Seeds the global environment with the canonical inherited variables a
-real Bash session sees on startup (PATH, HOME, USER, SHELL, IFS, PS1,
-PS2, PWD, BASH_VERSION, etc.) so subsequent variable references resolve
-without producing spurious "undefined" errors. Also sets the default
-shell-option flags (set -B, set +H in non-interactive, etc.).
-@End Reasoning
-
-Process called "setup_standard_environment" that takes ctx as BashSemanticContext returns Nothing:
-    Note: Set up standard Bash environment variables
-
-    @Reasoning:
-    Bash has standard environment variables that affect its behavior
-    and are commonly used in scripts. These should be available
-    for semantic analysis.
-    @End Reasoning
-
-    Note: Standard shell variables
-    Call add_standard_variable with ctx and "BASH" and "/bin/bash"
-    Call add_standard_variable with ctx and "BASH_VERSION" and "5.0"
-    Call add_standard_variable with ctx and "HOME" and "/home/user"
-    Call add_standard_variable with ctx and "PATH" and "/usr/local/bin:/usr/bin:/bin"
-    Call add_standard_variable with ctx and "PWD" and "/current/directory"
-    Call add_standard_variable with ctx and "OLDPWD" and "/previous/directory"
-    Call add_standard_variable with ctx and "USER" and "user"
-    Call add_standard_variable with ctx and "SHELL" and "/bin/bash"
-    Call add_standard_variable with ctx and "TERM" and "xterm"
-    Call add_standard_variable with ctx and "LANG" and "en_US.UTF-8"
-    Call add_standard_variable with ctx and "LC_ALL" and "C"
-
-    Note: Special parameters
-    Call add_special_parameter with ctx and "$" and "shell PID"
-    Call add_special_parameter with ctx and "?" and "last exit status"
-    Call add_special_parameter with ctx and "!" and "background job PID"
-    Call add_special_parameter with ctx and "#" and "argument count"
-    Call add_special_parameter with ctx and "*" and "all arguments"
-    Call add_special_parameter with ctx and "@" and "all arguments (array)"
-    Call add_special_parameter with ctx and "0" and "script name"
-
-    Note: Set default shell options
-    Call set_shell_option with ctx and "errexit" and false
-    Call set_shell_option with ctx and "nounset" and false
-    Call set_shell_option with ctx and "pipefail" and false
-    Call set_shell_option with ctx and "xtrace" and false
-    Call set_shell_option with ctx and "verbose" and false
-End Process
+Constant ANALYZER_SIZE as Integer is 64
 
 Note: ============================================================================
-Note: AST NODE ANALYSIS
+Note: Analyzer Creation and Destruction
 Note: ============================================================================
 
 @Reasoning:
-Single string-keyed dispatch over every BashASTNode subkind the parser
-produces. The default "Otherwise" branch routes to analyze_generic_bash_-
-node so an unrecognised tag doesn't silently drop work — it gets a
-generic walk that at least recursively visits children. Twenty-four
-explicit subkinds enumerate the canonical surface area of Bash.
+Eager construction of the four dictionaries and two lists so every walk Process
+can assume non-null handles. The builtin index is seeded immediately so command
+resolution sees the full Bash builtin surface from the first command. global
+scope is seeded with the standard inherited environment variables (PATH, HOME,
+...) so references to them never produce spurious undefined-variable warnings.
+current_locals starts 0 (script scope has no local set) and in_function/has_error
+start 0.
 @End Reasoning
 
-Process called "analyze_bash_node" that takes node as BashASTNode, ctx as BashSemanticContext returns Nothing:
-    Note: Analyze any Bash AST node based on its type
+@Implementation:
+Allocate 64 bytes; return 0 on OOM. Create builtins/functions/global_scope Dicts
+and errors/warnings Lists. Store handles at offsets 0/8/16/32/40, write 0 to the
+current_locals/has_error/in_function slots (24/48/56). Seed builtins via
+seed_builtin_commands and the standard environment via seed_standard_environment.
+@End Implementation
 
-    Match node.node_type:
-        When "Script":
-            Call analyze_bash_script with node and ctx
-        When "Command":
-            Call analyze_bash_command with node and ctx
-        When "SimpleCommand":
-            Call analyze_bash_simple_command with node and ctx
-        When "Pipeline":
-            Call analyze_bash_pipeline with node and ctx
-        When "List":
-            Call analyze_bash_list with node and ctx
-        When "Assignment":
-            Call analyze_bash_assignment with node and ctx
-        When "FunctionDefinition":
-            Call analyze_bash_function_definition with node and ctx
-        When "IfStatement":
-            Call analyze_bash_if_statement with node and ctx
-        When "ForLoop":
-            Call analyze_bash_for_loop with node and ctx
-        When "WhileLoop":
-            Call analyze_bash_while_loop with node and ctx
-        When "UntilLoop":
-            Call analyze_bash_until_loop with node and ctx
-        When "CaseStatement":
-            Call analyze_bash_case_statement with node and ctx
-        When "CompoundCommand":
-            Call analyze_bash_compound_command with node and ctx
-        When "Subshell":
-            Call analyze_bash_subshell with node and ctx
-        When "CommandSubstitution":
-            Call analyze_bash_command_substitution with node and ctx
-        When "ProcessSubstitution":
-            Call analyze_bash_process_substitution with node and ctx
-        When "ArithmeticExpansion":
-            Call analyze_bash_arithmetic_expansion with node and ctx
-        When "ParameterExpansion":
-            Call analyze_bash_parameter_expansion with node and ctx
-        When "Redirection":
-            Call analyze_bash_redirection with node and ctx
-        When "HereDocument":
-            Call analyze_bash_here_document with node and ctx
-        When "WordExpansion":
-            Call analyze_bash_word_expansion with node and ctx
-        When "PatternMatching":
-            Call analyze_bash_pattern_matching with node and ctx
-        When "ArrayAccess":
-            Call analyze_bash_array_access with node and ctx
-        Otherwise:
-            Call analyze_generic_bash_node with node and ctx
-    End Match
+Process called "create_bash_semantic_analyzer" takes nothing returns Integer:
+    Note: Create a Bash semantic analyzer with seeded builtins and environment
+
+    Let analyzer be proc allocate from Layout with ANALYZER_SIZE
+
+    If analyzer is equal to 0:
+        Return 0
+    End If
+
+    Let builtins be proc create from Dict
+    Let functions be proc create from Dict
+    Let global_scope be proc create from Dict
+    Let errors be proc create from List
+    Let warnings be proc create from List
+
+    proc memory_set_int64 from Layout with analyzer, 0, builtins
+    proc memory_set_int64 from Layout with analyzer, 8, functions
+    proc memory_set_int64 from Layout with analyzer, 16, global_scope
+    proc memory_set_int64 from Layout with analyzer, 24, 0
+    proc memory_set_int64 from Layout with analyzer, 32, errors
+    proc memory_set_int64 from Layout with analyzer, 40, warnings
+    proc memory_set_int64 from Layout with analyzer, 48, 0
+    proc memory_set_int64 from Layout with analyzer, 56, 0
+
+    proc seed_builtin_commands with analyzer
+    proc seed_standard_environment with analyzer
+
+    Return analyzer
 End Process
 
 @Reasoning:
-Script root visitor: validates the shebang interpreter (if any) and then
-recurses through the top-level statement list. The shebang check exists
-because a "#!/usr/bin/python" shebang on a file the analyser was asked
-to treat as Bash is almost certainly a frontend error worth flagging.
+Releases the four dictionaries and two lists before freeing the analyzer block.
+The owned error/warning strings inside the lists are released first via
+free_string_list so no buffer leaks. Null-tolerant so callers can invoke it
+unconditionally in cleanup paths.
 @End Reasoning
 
-Process called "analyze_bash_script" that takes node as BashASTNode, ctx as BashSemanticContext returns Nothing:
-    Note: Analyze Bash script (top-level)
+@Implementation:
+If analyzer is 0 return 1. Read each subsystem handle; destroy the Dicts via
+Dict.destroy and the Lists via free_string_list (which deallocates each owned
+string then destroys the list). Deallocate the analyzer block. Always returns 1.
+@End Implementation
 
-    Let shebang be node.shebang
-    Let statements be node.statements
+Process called "destroy_bash_semantic_analyzer" takes analyzer as Integer returns Integer:
+    Note: Destroy a Bash semantic analyzer and free all owned resources
 
-    Note: Validate shebang if present
-    If shebang is not equal to 0:
-        Call validate_shebang with shebang and ctx
+    If analyzer is equal to 0:
+        Return 1
     End If
 
-    Note: Analyze all statements
-    For Each statement in statements:
-        Call analyze_bash_node with statement and ctx
-    End For
+    Let builtins be proc memory_get_int64 from Layout with analyzer, 0
+    Let functions be proc memory_get_int64 from Layout with analyzer, 8
+    Let global_scope be proc memory_get_int64 from Layout with analyzer, 16
+    Let current_locals be proc memory_get_int64 from Layout with analyzer, 24
+    Let errors be proc memory_get_int64 from Layout with analyzer, 32
+    Let warnings be proc memory_get_int64 from Layout with analyzer, 40
+
+    If builtins is not equal to 0:
+        proc destroy from Dict with builtins
+    End If
+
+    If functions is not equal to 0:
+        proc destroy from Dict with functions
+    End If
+
+    If global_scope is not equal to 0:
+        proc destroy from Dict with global_scope
+    End If
+
+    If current_locals is not equal to 0:
+        proc destroy from Dict with current_locals
+    End If
+
+    If errors is not equal to 0:
+        proc free_string_list with errors
+    End If
+
+    If warnings is not equal to 0:
+        proc free_string_list with warnings
+    End If
+
+    proc deallocate from Layout with analyzer
+
+    Return 1
 End Process
 
 @Reasoning:
-Walks a simple command's four facets in dependency order: pre-command
-inline assignments (FOO=bar cmd), command resolution, argument validation
-against the builtin's expected_args, expansion analysis on each argument
-(catches $undef under set -u), and redirection analysis. Inline
-assignments must come first because they affect the environment the
-command sees.
+Releases every owned string in a diagnostic list, then destroys the list itself.
+Each element is a heap copy produced by the latching helpers (record_error /
+record_warning), so each must be deallocated before the backing list storage is
+freed.
 @End Reasoning
 
-@Security_Scope:
-External commands are recorded but never executed by the analyser. The
-"command not found" diagnostic is best-effort — PATH may have a different
-content at runtime than was seeded into the standard environment.
-@End Security_Scope
+@Implementation:
+Read size; for each index 0..size-1 read the element and deallocate it if
+non-zero; then destroy the list via List.destroy. Returns 1.
+@End Implementation
 
-Process called "analyze_bash_simple_command" that takes node as BashASTNode, ctx as BashSemanticContext returns Nothing:
-    Note: Analyze simple Bash command
+Process called "free_string_list" takes string_list as Integer returns Integer:
+    Note: Deallocate every owned string in a list, then destroy the list
 
-    @Reasoning:
-    Simple commands are the core of Bash execution. They require checking
-    command existence, argument validation, variable expansion, and
-    redirection handling.
-    @End Reasoning
-
-    Let command_name be node.command_name
-    Let arguments be node.arguments
-    Let redirections be node.redirections
-    Let assignments be node.assignments
-
-    Note: Process variable assignments before command
-    If assignments is not equal to 0:
-        For Each assignment in assignments:
-            Call analyze_bash_assignment with assignment and ctx
-        End For
+    If string_list is equal to 0:
+        Return 1
     End If
 
-    Note: Resolve and validate command
-    Let command_info be resolve_bash_command with command_name and ctx
-    If command_info is equal to 0:
-        Let error be "Command not found: " joined with command_name
-        Add error to end of ctx.error_list
-        Return
-    End If
+    Let count be proc size from List with string_list
+    Let i be 0
 
-    Note: Validate command arguments
-    Call validate_command_arguments with command_info and arguments and ctx
-
-    Note: Analyze arguments for expansions
-    If arguments is not equal to 0:
-        For Each arg in arguments:
-            Call analyze_bash_word_expansion with arg and ctx
-        End For
-    End If
-
-    Note: Analyze redirections
-    If redirections is not equal to 0:
-        For Each redirection in redirections:
-            Call analyze_bash_redirection with redirection and ctx
-        End For
-    End If
-End Process
-
-@Reasoning:
-Validates a single assignment node: blocks writes to readonly variables,
-walks the value through analyze_bash_word_expansion (so embedded $VARs
-are visited), then dispatches on the operator. Three concrete operator
-forms — "=" (scalar), "+=" (append), "array_assign" (indexed write) — are
-supported; an unknown operator surfaces as an explicit diagnostic rather
-than failing silently.
-@End Reasoning
-
-Process called "analyze_bash_assignment" that takes node as BashASTNode, ctx as BashSemanticContext returns Nothing:
-    Note: Analyze Bash variable assignment
-
-    @Reasoning:
-    Bash assignments can create variables, arrays, or modify existing ones.
-    They need proper scoping rules and type checking for arrays vs scalars.
-    @End Reasoning
-
-    Let var_name be node.variable_name
-    Let value be node.value
-    Let is_array_assignment be node.is_array_assignment
-    Let array_index be node.array_index
-    Let assignment_operator be node.assignment_operator
-
-    Note: Check if variable is readonly
-    If is_readonly_variable with var_name and ctx:
-        Let error be "Cannot assign to readonly variable: " joined with var_name
-        Add error to end of ctx.error_list
-        Return
-    End If
-
-    Note: Analyze value expression
-    Call analyze_bash_word_expansion with value and ctx
-
-    Note: Handle different assignment types
-    Match assignment_operator:
-        When "=":
-            Call handle_simple_assignment with var_name and value and ctx
-        When "+=":
-            Call handle_append_assignment with var_name and value and ctx
-        When "array_assign":
-            Call handle_array_assignment with var_name and array_index and value and ctx
-        Otherwise:
-            Set error to "Unknown assignment operator: " joined with assignment_operator
-            Add error to end of ctx.error_list
-    End Match
-End Process
-
-@Reasoning:
-Function definition: emits a warning if the name shadows a builtin
-(because shadowing `cd` or `test` is a common scripting footgun),
-creates a child environment, swaps current_environment / current_-
-function for the body walk, restores them after, and registers the
-function in the global table. Save/restore is symmetric so a nested
-definition cannot corrupt the outer context's accounting.
-@End Reasoning
-
-Process called "analyze_bash_function_definition" that takes node as BashASTNode, ctx as BashSemanticContext returns Nothing:
-    Note: Analyze Bash function definition
-
-    @Reasoning:
-    Bash functions create new scopes, can shadow variables and commands,
-    and have special parameter handling rules that need validation.
-    @End Reasoning
-
-    Let func_name be node.function_name
-    Let body be node.body
-
-    Note: Check if function name conflicts with built-ins
-    If is_builtin_command with func_name and ctx:
-        Let warning be "Function '" joined with func_name joined with "' shadows built-in command"
-        Add warning to end of ctx.warning_list
-    End If
-
-    Note: Create function scope
-    Let func_env be create_function_environment with ctx.current_environment and func_name
-
-    Note: Create function object
-    Let bash_function be a value of type BashFunction with
-        name as func_name,
-        body as body,
-        local_variables as a list containing nothing,
-        is_exported as false,
-        source_location as node.source_location
-
-    Note: Set function context and analyze body
-    Let old_env be ctx.current_environment
-    Let old_func be ctx.current_function
-    Set ctx.current_environment to func_env
-    Set ctx.current_function to func_name
-
-    Call analyze_bash_node with body and ctx
-
-    Note: Restore context
-    Set ctx.current_environment to old_env
-    Set ctx.current_function to old_func
-
-    Note: Register function
-    Set ctx.function_definitions at key func_name to bash_function
-End Process
-
-@Reasoning:
-Pipeline analysis: walk each stage in order, run validate_pipeline_-
-compatibility when more than one stage exists (e.g., flag "echo |
-cd /tmp" — the second stage's cd is meaningless because subshell scope
-discards the cwd change), and warn on backgrounded pipelines when
-job_control_enabled is false (no way to manage them safely).
-@End Reasoning
-
-Process called "analyze_bash_pipeline" that takes node as BashASTNode, ctx as BashSemanticContext returns Nothing:
-    Note: Analyze Bash pipeline
-
-    @Reasoning:
-    Pipelines connect commands through stdin/stdout and can affect
-    exit status handling. Each command in the pipeline runs in
-    a separate process.
-    @End Reasoning
-
-    Let commands be node.commands
-    Let is_background be node.is_background
-
-    Note: Analyze each command in pipeline
-    For Each command in commands:
-        Call analyze_bash_node with command and ctx
-    End For
-
-    Note: Check for pipeline-specific issues
-    If length of commands is greater than 1:
-        Note: Validate that first command produces output
-        Call validate_pipeline_compatibility with commands and ctx
-    End If
-
-    Note: Handle background execution
-    If is_background:
-        If not ctx.job_control_enabled:
-            Let warning be "Background jobs may not work without job control"
-            Add warning to end of ctx.warning_list
+    While i is less than count:
+        Let element be proc get_at from List with string_list, i
+        If element is not equal to 0:
+            proc deallocate from Layout with element
         End If
-    End If
-End Process
-
-@Reasoning:
-Handles ${VAR}, ${VAR:-default}, ${VAR##pattern} and related forms.
-Looks up the underlying variable, records the access for unused-variable
-analysis, then validates the expansion modifier against the variable's
-type (array slicing on a scalar is a warning, prefix-strip on an array
-expands across all elements, etc.).
-@End Reasoning
-
-Process called "analyze_bash_parameter_expansion" that takes node as BashASTNode, ctx as BashSemanticContext returns Nothing:
-    Note: Analyze Bash parameter expansion
-
-    @Reasoning:
-    Parameter expansions can reference variables, perform substitutions,
-    and modify values. They need validation for variable existence
-    and proper syntax.
-    @End Reasoning
-
-    Let var_name be node.variable_name
-    Let expansion_type be node.expansion_type
-    Let modifier be node.modifier
-    Let pattern be node.pattern
-    Let replacement be node.replacement
-
-    Note: Check if variable exists
-    Let variable be lookup_bash_variable with var_name and ctx
-    If variable is equal to 0 and expansion_type is not equal to "default":
-        Let warning be "Variable '" joined with var_name joined with "' may be unset"
-        Add warning to end of ctx.warning_list
-    End If
-
-    Note: Validate expansion type and modifiers
-    Match expansion_type:
-        When "simple":
-            Note: Basic variable reference
-        When "default":
-            Call validate_default_expansion with var_name and modifier and ctx
-        When "assign":
-            Call validate_assign_expansion with var_name and modifier and ctx
-        When "substring":
-            Call validate_substring_expansion with var_name and pattern and ctx
-        When "replace":
-            Call validate_replace_expansion with var_name and pattern and replacement and ctx
-        When "length":
-            Call validate_length_expansion with var_name and ctx
-        When "keys":
-            Call validate_keys_expansion with var_name and ctx
-        Otherwise:
-            Let error be "Unknown parameter expansion type: " joined with expansion_type
-            Add error to end of ctx.error_list
-    End Match
-End Process
-
-Note: ============================================================================
-Note: HELPER FUNCTIONS
-Note: ============================================================================
-
-@Reasoning:
-Resolution order replicates Bash's documented hierarchy: alias > function
-> builtin > PATH-resolved external. Returning null only after all four
-fail keeps the analyser's "command not found" diagnostic accurate. The
-order matters: an alias for "ls" hides the external "ls" exactly the
-way a real shell would.
-@End Reasoning
-
-Process called "resolve_bash_command" that takes command_name as String, ctx as BashSemanticContext returns BashCommand:
-    Note: Resolve command name to command information
-
-    @Reasoning:
-    Bash command resolution follows a specific order: aliases, functions,
-    built-ins, and then PATH search. This needs to be accurately modeled
-    for proper semantic analysis.
-    @End Reasoning
-
-    Note: Check aliases first
-    If ctx.alias_definitions contains key command_name:
-        Let alias_target be ctx.alias_definitions at key command_name
-        Return create_alias_command with command_name and alias_target
-    End If
-
-    Note: Check functions
-    If ctx.function_definitions contains key command_name:
-        Return create_function_command with command_name
-    End If
-
-    Note: Check built-ins
-    If is_builtin_command with command_name and ctx:
-        Return lookup_builtin_command with command_name and ctx
-    End If
-
-    Note: Check external commands in PATH
-    Let external_cmd be search_path_for_command with command_name and ctx
-    If external_cmd is not equal to 0:
-        Return external_cmd
-    End If
-
-    Return null
-End Process
-
-@Reasoning:
-Walks the parent_env chain from current_environment up to the global
-scope, preferring local_variables over variables in each frame so a
-function's `local` declaration shadows an outer binding. Returns null
-only after the entire chain misses; the caller decides whether that
-warrants a diagnostic (it does under set -u, doesn't under default).
-@End Reasoning
-
-Process called "lookup_bash_variable" that takes name as String, ctx as BashSemanticContext returns BashVariable:
-    Note: Look up variable in environment chain
-
-    Let current_env be ctx.current_environment
-    While current_env is not equal to 0:
-        Note: Check local variables first
-        If current_env.local_variables contains key name:
-            Return current_env.local_variables at key name
-        End If
-
-        Note: Check regular variables
-        If current_env.variables contains key name:
-            Return current_env.variables at key name
-        End If
-
-        Set current_env to current_env.parent_env
+        Set i to i plus 1
     End While
 
-    Return null
-End Process
+    proc destroy from List with string_list
 
-@Reasoning:
-Factory for a fresh function-scope frame. Parent pointer holds the
-caller's environment so lookup_bash_variable can fall through to outer
-bindings; scope_type "function" and is_function_scope=true are what
-distinguish this frame from a global or subshell frame at later
-inspection.
-@End Reasoning
-
-Process called "create_function_environment" that takes parent as BashEnvironment, func_name as String returns BashEnvironment:
-    Note: Create new environment for function scope
-
-    Return a value of type BashEnvironment with
-        variables as a dictionary containing nothing,
-        local_variables as a dictionary containing nothing,
-        parent_env as parent,
-        scope_type as "function",
-        is_function_scope as true,
-        is_subshell as false
-End Process
-
-@Reasoning:
-Orchestrates the five whole-program checks that can only run after the
-AST walk is complete: variable usage (unused/undefined), function usage
-(unused/recursive), shell-option conflicts (`set -e` + ignored errors),
-redirection misuse (closed fd reuse), and job-control sanity. Each
-check appends to ctx.error_list / warning_list so the caller can present
-them together.
-@End Reasoning
-
-Process called "validate_bash_semantics" that takes ctx as BashSemanticContext returns Nothing:
-    Note: Perform final semantic validation
-
-    @Reasoning:
-    Final validation checks for Bash-specific issues such as undefined
-    variables, command resolution problems, and shell option conflicts.
-    @End Reasoning
-
-    Call validate_variable_usage with ctx
-    Call validate_function_usage with ctx
-    Call validate_shell_options with ctx
-    Call validate_redirection_usage with ctx
-    Call validate_job_control_usage with ctx
-End Process
-
-@Reasoning:
-Hook for the variable-access cross-check. Sweeps every variable in the
-environment chain comparing first_assignment_line and last_access_line:
-a variable that was assigned but never accessed becomes a "set but never
-used" warning, and one accessed before its first assignment is an error
-under set -u semantics.
-@End Reasoning
-
-Process called "validate_variable_usage" that takes ctx as BashSemanticContext returns Nothing:
-    Note: Validate variable usage patterns
-
-    Note: This  check for common variable usage issues
-    Note: Implementation depends on tracking variable access patterns
-End Process
-
-@Reasoning:
-Hook for the function-table cross-check. Walks function_definitions
-looking for recursion (function calls itself via the analysed call
-graph), unused definitions (no caller in the script), and shadowing
-patterns where one function silently redefines another with the same
-name.
-@End Reasoning
-
-Process called "validate_function_usage" that takes ctx as BashSemanticContext returns Nothing:
-    Note: Validate function definitions and calls
-
-    Note: Check for recursive functions, unused functions, etc.
-End Process
-
-@Reasoning:
-Hook for cross-option compatibility checks. Some option combinations
-are documented footguns: pipefail without errexit usually means the
-intended error-on-failure behaviour will not actually trigger, errtrace
-without errexit is a no-op, etc. Walks ctx.shell_options to flag those.
-@End Reasoning
-
-Process called "validate_shell_options" that takes ctx as BashSemanticContext returns Nothing:
-    Note: Validate shell option combinations
-
-    Note: Check for conflicting shell options
-End Process
-
-@Reasoning:
-Hook for the redirection cross-check. Scans every BashRedirection node
-collected during the walk for fd reuse without prior close, write to a
-read-only fd (e.g., 0>file is suspicious), and "command > file < file"
-self-input patterns that almost always indicate a typo.
-@End Reasoning
-
-Process called "validate_redirection_usage" that takes ctx as BashSemanticContext returns Nothing:
-    Note: Validate file redirection usage
-
-    Note: Check for file descriptor conflicts, permission issues
-End Process
-
-@Reasoning:
-Hook for confirming any use of bg/fg/jobs/disown/wait is paired with
-either job_control_enabled=true or set -m. Without `set -m` these
-builtins exit with an error at runtime — catching the misuse here
-saves a debugging cycle.
-@End Reasoning
-
-Process called "validate_job_control_usage" that takes ctx as BashSemanticContext returns Nothing:
-    Note: Validate job control operations
-
-    Note: Check job control is enabled when using bg/fg/jobs
+    Return 1
 End Process
 
 Note: ============================================================================
-Note: HELPER CREATION FUNCTIONS
+Note: Diagnostic Latching
 Note: ============================================================================
 
 @Reasoning:
-Factory used by the load_*_builtins loaders. command_type is always
-"builtin" here because external commands take a different code path
-through search_path_for_command. is_external is the negation of
-is_builtin to keep the flag set internally consistent; expected_args
-stays null because arity validation is per-builtin and not yet wired.
+Latches a hard semantic error: stores an owned heap copy of the message in the
+errors list and sets has_error. An owned copy is taken because callers
+frequently build the message with string_concat (already owned) but also pass
+string literals whose lifetime is not guaranteed past the call; copying keeps
+the list's ownership model uniform so free_string_list can deallocate every
+element unconditionally.
 @End Reasoning
 
-Process called "create_bash_command" that takes name as String, description as String, is_builtin as Boolean returns BashCommand:
-    Return a value of type BashCommand with
-        command_name as name,
-        command_type as "builtin",
-        is_builtin as is_builtin,
-        is_function as false,
-        is_alias as false,
-        is_external as not is_builtin,
-        expected_args as null,
-        description as description
+@Implementation:
+Duplicate the message via string_duplicate, append the copy to the errors list
+(offset 32), set has_error (offset 48) to 1. Returns 1.
+@End Implementation
+
+Process called "record_error" takes analyzer as Integer, message as Integer returns Integer:
+    Note: Latch a hard semantic error
+
+    Let errors be proc memory_get_int64 from Layout with analyzer, 32
+    Let owned be proc string_duplicate from StringCore with message
+    proc append from List with errors, owned
+    proc memory_set_int64 from Layout with analyzer, 48, 1
+    Return 1
 End Process
 
 @Reasoning:
-Helper for setup_standard_environment: every standard variable is
-exported (true in a real Bash shell), not readonly (the script can
-override most), not local, and string-typed. Recording it on the
-current environment's variables map mirrors how setenv-equivalent
-behaviour works in a real shell startup sequence.
+Latches a non-fatal warning. Same ownership discipline as record_error but does
+not set has_error, because a warning must not gate lowering.
 @End Reasoning
 
-Process called "add_standard_variable" that takes ctx as BashSemanticContext, name as String, value as String returns Nothing:
-    Let variable be a value of type BashVariable with
-        name as name,
-        value as value,
-        type as "string",
-        is_array as false,
-        is_associative as false,
-        is_exported as true,
-        is_readonly as false,
-        is_local as false,
-        array_values as null,
-        associative_values as null,
-        first_assignment_line as 0,
-        last_access_line as 0
+@Implementation:
+Duplicate the message, append to the warnings list (offset 40). Returns 1.
+@End Implementation
 
-    Set ctx.current_environment.variables at key name to variable
+Process called "record_warning" takes analyzer as Integer, message as Integer returns Integer:
+    Note: Latch a non-fatal warning
+
+    Let warnings be proc memory_get_int64 from Layout with analyzer, 40
+    Let owned be proc string_duplicate from StringCore with message
+    proc append from List with warnings, owned
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: AST Node Field Accessors (real flat layout)
+Note: ============================================================================
+
+@Reasoning:
+Centralised reads of the parser's hand-managed node fields keep every walk
+Process aligned with the offset contract instead of repeating literal offsets.
+A null node returns a safe zero so a corrupted child pointer is detectable by
+the caller rather than faulting here.
+@End Reasoning
+
+Process called "node_type" takes node as Integer returns Integer:
+    Note: Read a node's AST_* discriminant from offset 0
+
+    If node is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Layout with node, NODE_TYPE_OFFSET
+End Process
+
+Process called "node_value" takes node as Integer returns Integer:
+    Note: Read a node's associated value pointer/code from offset 8
+
+    If node is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Layout with node, NODE_VALUE_OFFSET
+End Process
+
+Process called "node_line" takes node as Integer returns Integer:
+    Note: Read a node's source line from offset 16
+
+    If node is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Layout with node, NODE_LINE_OFFSET
+End Process
+
+Process called "node_child_count" takes node as Integer returns Integer:
+    Note: Read a node's active child count from offset 40
+
+    If node is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Layout with node, NODE_CHILD_COUNT_OFFSET
 End Process
 
 @Reasoning:
-One-line dictionary write. Wrapping it as a function exists for two
-reasons: future validation (refuse unknown option names) and dispatching
-side effects (toggling pipefail can affect later analysis decisions).
+Reads the i-th child pointer out of the heap array at offset 32. Bounds-checked
+against child_count so an out-of-range index returns 0 rather than reading past
+the active region of the (possibly over-capacity) array.
 @End Reasoning
 
-Process called "set_shell_option" that takes ctx as BashSemanticContext, option as String, value as Boolean returns Nothing:
-    Set ctx.shell_options at key option to value
+@Implementation:
+Null-guard node; read child_count at offset 40; if index < 0 or index >=
+child_count return 0; read the children array pointer at offset 32; return the
+int64 at children + index*8.
+@End Implementation
+
+Process called "node_child" takes node as Integer, index as Integer returns Integer:
+    Note: Return the index-th child node pointer, 0 if out of range
+
+    If node is equal to 0:
+        Return 0
+    End If
+
+    Let count be proc memory_get_int64 from Layout with node, NODE_CHILD_COUNT_OFFSET
+
+    If index is less than 0:
+        Return 0
+    End If
+
+    If index is greater than or equal to count:
+        Return 0
+    End If
+
+    Let children be proc memory_get_int64 from Layout with node, NODE_CHILDREN_OFFSET
+
+    If children is equal to 0:
+        Return 0
+    End If
+
+    Let slot_offset be index multiplied by 8
+    Return proc memory_get_int64 from Layout with children, slot_offset
+End Process
+
+Note: ============================================================================
+Note: Builtin / Environment Seeding
+Note: ============================================================================
+
+@Reasoning:
+Seeds the name-keyed builtin index with the irreducible Bash builtins (control
+flow, variable handling, I/O, job control, directory/introspection) plus the
+common external utilities a real PATH would resolve. Both builtins and known
+externals are stored with value 1 because command resolution only needs the
+membership test; the function/external distinction is decided at resolve time
+(a defined function wins over a builtin which wins over an external). Storing
+known externals lets resolve_command answer "found" for `ls`/`grep`/etc. without
+a real filesystem probe, which is the correct best-effort behaviour for a static
+analyzer.
+@End Reasoning
+
+@Implementation:
+A sequence of Dict.set calls into the builtins dictionary (offset 0), each
+mapping a command name to 1. Returns 1.
+@End Implementation
+
+Process called "seed_builtin_commands" takes analyzer as Integer returns Integer:
+    Note: Seed the builtin/external command index
+
+    Let builtins be proc memory_get_int64 from Layout with analyzer, 0
+
+    Note: Core control-flow builtins
+    proc set from Dict with builtins, ":", 1
+    proc set from Dict with builtins, ".", 1
+    proc set from Dict with builtins, "source", 1
+    proc set from Dict with builtins, "eval", 1
+    proc set from Dict with builtins, "exec", 1
+    proc set from Dict with builtins, "exit", 1
+    proc set from Dict with builtins, "return", 1
+    proc set from Dict with builtins, "break", 1
+    proc set from Dict with builtins, "continue", 1
+    proc set from Dict with builtins, "shift", 1
+    proc set from Dict with builtins, "set", 1
+    proc set from Dict with builtins, "unset", 1
+    proc set from Dict with builtins, "trap", 1
+    proc set from Dict with builtins, "wait", 1
+
+    Note: Variable-handling builtins
+    proc set from Dict with builtins, "declare", 1
+    proc set from Dict with builtins, "typeset", 1
+    proc set from Dict with builtins, "local", 1
+    proc set from Dict with builtins, "export", 1
+    proc set from Dict with builtins, "readonly", 1
+    proc set from Dict with builtins, "let", 1
+    proc set from Dict with builtins, "read", 1
+    proc set from Dict with builtins, "mapfile", 1
+    proc set from Dict with builtins, "readarray", 1
+    proc set from Dict with builtins, "getopts", 1
+
+    Note: I/O builtins
+    proc set from Dict with builtins, "echo", 1
+    proc set from Dict with builtins, "printf", 1
+
+    Note: Directory / introspection builtins
+    proc set from Dict with builtins, "cd", 1
+    proc set from Dict with builtins, "pwd", 1
+    proc set from Dict with builtins, "pushd", 1
+    proc set from Dict with builtins, "popd", 1
+    proc set from Dict with builtins, "dirs", 1
+    proc set from Dict with builtins, "type", 1
+    proc set from Dict with builtins, "command", 1
+    proc set from Dict with builtins, "builtin", 1
+    proc set from Dict with builtins, "hash", 1
+    proc set from Dict with builtins, "alias", 1
+    proc set from Dict with builtins, "unalias", 1
+    proc set from Dict with builtins, "help", 1
+    proc set from Dict with builtins, "test", 1
+
+    Note: Job-control builtins
+    proc set from Dict with builtins, "jobs", 1
+    proc set from Dict with builtins, "bg", 1
+    proc set from Dict with builtins, "fg", 1
+    proc set from Dict with builtins, "disown", 1
+    proc set from Dict with builtins, "kill", 1
+    proc set from Dict with builtins, "suspend", 1
+
+    Note: Common external utilities (best-effort PATH membership)
+    proc set from Dict with builtins, "cat", 1
+    proc set from Dict with builtins, "grep", 1
+    proc set from Dict with builtins, "sed", 1
+    proc set from Dict with builtins, "awk", 1
+    proc set from Dict with builtins, "sort", 1
+    proc set from Dict with builtins, "uniq", 1
+    proc set from Dict with builtins, "head", 1
+    proc set from Dict with builtins, "tail", 1
+    proc set from Dict with builtins, "tee", 1
+    proc set from Dict with builtins, "ls", 1
+    proc set from Dict with builtins, "mkdir", 1
+    proc set from Dict with builtins, "rmdir", 1
+    proc set from Dict with builtins, "rm", 1
+    proc set from Dict with builtins, "cp", 1
+    proc set from Dict with builtins, "mv", 1
+    proc set from Dict with builtins, "ln", 1
+    proc set from Dict with builtins, "find", 1
+    proc set from Dict with builtins, "which", 1
+    proc set from Dict with builtins, "true", 1
+    proc set from Dict with builtins, "false", 1
+
+    Return 1
 End Process
 
 @Reasoning:
-Adds the supplied BashCommand to the analyser's builtin index. Kept
-separate from create_bash_command so the loaders read clearly as
-"create then register" rather than entangling allocation with table
-mutation.
+Seeds the global scope with the canonical inherited variables a real Bash
+session sees on startup so references to them resolve without producing spurious
+undefined-variable diagnostics. Each is stored mapping name -> 1 (presence is
+all the scope check needs).
 @End Reasoning
 
-Process called "register_builtin_command" that takes cmd as BashCommand, ctx as BashSemanticContext returns Nothing:
-    Note: Register builtin command for lookup
-    Note: Implementation  store in builtin command registry
+@Implementation:
+A sequence of Dict.set calls into the global_scope dictionary (offset 16).
+Returns 1.
+@End Implementation
+
+Process called "seed_standard_environment" takes analyzer as Integer returns Integer:
+    Note: Seed the global scope with standard inherited environment variables
+
+    Let global_scope be proc memory_get_int64 from Layout with analyzer, 16
+
+    proc set from Dict with global_scope, "BASH", 1
+    proc set from Dict with global_scope, "BASH_VERSION", 1
+    proc set from Dict with global_scope, "HOME", 1
+    proc set from Dict with global_scope, "PATH", 1
+    proc set from Dict with global_scope, "PWD", 1
+    proc set from Dict with global_scope, "OLDPWD", 1
+    proc set from Dict with global_scope, "USER", 1
+    proc set from Dict with global_scope, "SHELL", 1
+    proc set from Dict with global_scope, "TERM", 1
+    proc set from Dict with global_scope, "LANG", 1
+    proc set from Dict with global_scope, "LC_ALL", 1
+    proc set from Dict with global_scope, "IFS", 1
+    proc set from Dict with global_scope, "PS1", 1
+    proc set from Dict with global_scope, "PS2", 1
+    proc set from Dict with global_scope, "RANDOM", 1
+    proc set from Dict with global_scope, "SECONDS", 1
+    proc set from Dict with global_scope, "LINENO", 1
+    proc set from Dict with global_scope, "HOSTNAME", 1
+    proc set from Dict with global_scope, "REPLY", 1
+
+    Note: Positional / special parameters are always defined inside any shell
+    proc set from Dict with global_scope, "0", 1
+    proc set from Dict with global_scope, "1", 1
+    proc set from Dict with global_scope, "2", 1
+    proc set from Dict with global_scope, "3", 1
+    proc set from Dict with global_scope, "4", 1
+    proc set from Dict with global_scope, "5", 1
+    proc set from Dict with global_scope, "6", 1
+    proc set from Dict with global_scope, "7", 1
+    proc set from Dict with global_scope, "8", 1
+    proc set from Dict with global_scope, "9", 1
+    proc set from Dict with global_scope, "@", 1
+    proc set from Dict with global_scope, "star", 1
+    proc set from Dict with global_scope, "#", 1
+    proc set from Dict with global_scope, "?", 1
+    proc set from Dict with global_scope, "$", 1
+    proc set from Dict with global_scope, "!", 1
+    proc set from Dict with global_scope, "-", 1
+    proc set from Dict with global_scope, "_", 1
+
+    Return 1
 End Process
 
-Note: Entry point for Bash semantic analysis
+Note: ============================================================================
+Note: Scope / Variable Tracking
+Note: ============================================================================
+
 @Reasoning:
-Convenience public entry. Exists separately from analyze_bash_semantics
-so the universal-translation pipeline can pair "<lang>_semantic_tree"
-entry points uniformly across all frontend implementations.
+Binds a variable name into the correct scope. Inside a function body with an
+active local set the name is bound locally only when it was declared `local`
+(tracked by the caller setting current_locals); otherwise Bash assignment is
+global-by-default even inside a function, so it lands in global_scope. The
+membership-only model (value 1) is all the undefined-reference check needs.
 @End Reasoning
 
-Process called "analyze_bash_semantic_tree" that takes ast as BashASTNode returns BashSemanticContext:
-    Return analyze_bash_semantics with ast
+@Implementation:
+Read in_function (offset 56) and current_locals (offset 24). If both indicate an
+active local declaration is being recorded the name goes into current_locals;
+otherwise into global_scope (offset 16). Returns 1. `as_local` selects which.
+@End Implementation
+
+Process called "bind_variable" takes analyzer as Integer, name as Integer, as_local as Integer returns Integer:
+    Note: Bind a variable name into the local or global scope
+
+    If name is equal to 0:
+        Return 0
+    End If
+
+    Let current_locals be proc memory_get_int64 from Layout with analyzer, 24
+
+    If as_local is equal to 1:
+        If current_locals is not equal to 0:
+            proc set from Dict with current_locals, name, 1
+            Return 1
+        End If
+    End If
+
+    Let global_scope be proc memory_get_int64 from Layout with analyzer, 16
+    proc set from Dict with global_scope, name, 1
+    Return 1
 End Process
+
+@Reasoning:
+Resolves a variable reference against the active scope chain: the function's
+local set first (so a `local` declaration shadows an outer binding), then the
+global scope. Returns 1 when the name is bound anywhere reachable, 0 otherwise.
+The local set is only consulted when inside a function body.
+@End Reasoning
+
+@Implementation:
+If inside a function (offset 56 == 1) and current_locals (offset 24) is non-null,
+test Dict.contains on it; on hit return 1. Then test Dict.contains on
+global_scope (offset 16). Returns the global result (1/0).
+@End Implementation
+
+Process called "is_variable_defined" takes analyzer as Integer, name as Integer returns Integer:
+    Note: Return 1 if a variable name is bound in any reachable scope
+
+    If name is equal to 0:
+        Return 0
+    End If
+
+    Let in_function be proc memory_get_int64 from Layout with analyzer, 56
+    Let current_locals be proc memory_get_int64 from Layout with analyzer, 24
+
+    If in_function is equal to 1:
+        If current_locals is not equal to 0:
+            Let local_hit be proc contains from Dict with current_locals, name
+            If local_hit is equal to 1:
+                Return 1
+            End If
+        End If
+    End If
+
+    Let global_scope be proc memory_get_int64 from Layout with analyzer, 16
+    Return proc contains from Dict with global_scope, name
+End Process
+
+@Reasoning:
+Reports whether a variable name is bound specifically at local scope. Used by
+the probe and by `local` diagnostics to distinguish a function-local binding
+from a global one. Only meaningful inside a function body.
+@End Reasoning
+
+Process called "is_variable_local" takes analyzer as Integer, name as Integer returns Integer:
+    Note: Return 1 if a variable name is bound at the active function-local scope
+
+    If name is equal to 0:
+        Return 0
+    End If
+
+    Let current_locals be proc memory_get_int64 from Layout with analyzer, 24
+
+    If current_locals is equal to 0:
+        Return 0
+    End If
+
+    Return proc contains from Dict with current_locals, name
+End Process
+
+@Reasoning:
+Enters a fresh function-local context: installs a new local-set dictionary and
+sets in_function. Returns the PREVIOUS local-set handle so the caller can pass
+it back to exit_function_context for a symmetric save/restore. Centralising this
+here means analyze_function_definition and any caller (including the probe) share
+one definition of the function-scope discipline so it cannot drift.
+@End Reasoning
+
+@Implementation:
+Read the current local set (offset 24) as the saved handle; create a fresh Dict,
+store it at offset 24, set in_function (offset 56) to 1; return the saved handle.
+@End Implementation
+
+Process called "enter_function_context" takes analyzer as Integer returns Integer:
+    Note: Install a fresh function-local scope; return the previous local-set handle
+
+    Let saved_locals be proc memory_get_int64 from Layout with analyzer, 24
+    Let fresh_locals be proc create from Dict
+    proc memory_set_int64 from Layout with analyzer, 24, fresh_locals
+    proc memory_set_int64 from Layout with analyzer, 56, 1
+    Return saved_locals
+End Process
+
+@Reasoning:
+Exits the current function-local context: destroys the active local set (so its
+names do not leak) and restores the enclosing local-set handle plus the
+in_function flag. When restoring to a null saved handle (the script-level case),
+in_function is cleared; otherwise it stays set because the enclosing context was
+itself a function. Symmetric counterpart to enter_function_context.
+@End Reasoning
+
+@Implementation:
+Read the active local set (offset 24); if non-zero destroy it via Dict.destroy.
+Store saved_locals at offset 24. Set in_function (offset 56) to 1 when
+saved_locals is non-zero (still inside an enclosing function) else 0. Returns 1.
+@End Implementation
+
+Process called "exit_function_context" takes analyzer as Integer, saved_locals as Integer returns Integer:
+    Note: Destroy the active local scope and restore the enclosing context
+
+    Let active_locals be proc memory_get_int64 from Layout with analyzer, 24
+    If active_locals is not equal to 0:
+        proc destroy from Dict with active_locals
+    End If
+
+    proc memory_set_int64 from Layout with analyzer, 24, saved_locals
+
+    If saved_locals is not equal to 0:
+        proc memory_set_int64 from Layout with analyzer, 56, 1
+    Otherwise:
+        proc memory_set_int64 from Layout with analyzer, 56, 0
+    End If
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Command / Function Resolution
+Note: ============================================================================
+
+@Reasoning:
+Resolves a command name following Bash's documented order: a defined function
+wins, then a builtin/known-external. Returns 1 when the name resolves to either,
+0 otherwise. The analyzer does not model aliases (the parser does not emit alias
+definitions), so the chain is function > builtin/external.
+@End Reasoning
+
+@Implementation:
+Read functions (offset 8) and builtins (offset 0); if Dict.contains on functions
+returns 1, return 1; else return Dict.contains on builtins. A null/empty name
+returns 0.
+@End Implementation
+
+Process called "resolve_command" takes analyzer as Integer, name as Integer returns Integer:
+    Note: Return 1 if a command name resolves to a function or builtin/external
+
+    If name is equal to 0:
+        Return 0
+    End If
+
+    Let functions be proc memory_get_int64 from Layout with analyzer, 8
+    Let func_hit be proc contains from Dict with functions, name
+    If func_hit is equal to 1:
+        Return 1
+    End If
+
+    Let builtins be proc memory_get_int64 from Layout with analyzer, 0
+    Return proc contains from Dict with builtins, name
+End Process
+
+@Reasoning:
+Reports whether a command name resolves specifically to a defined function (as
+opposed to a builtin or external). Used by the probe to assert a function call
+was resolved to its definition rather than mistaken for an external program.
+@End Reasoning
+
+Process called "is_command_function" takes analyzer as Integer, name as Integer returns Integer:
+    Note: Return 1 if a command name resolves to a defined function
+
+    If name is equal to 0:
+        Return 0
+    End If
+
+    Let functions be proc memory_get_int64 from Layout with analyzer, 8
+    Return proc contains from Dict with functions, name
+End Process
+
+@Reasoning:
+Reports whether a command name resolves to a seeded builtin or known external.
+Used by the probe to assert command recognition independent of function
+resolution.
+@End Reasoning
+
+Process called "is_command_builtin" takes analyzer as Integer, name as Integer returns Integer:
+    Note: Return 1 if a command name resolves to a builtin or known external
+
+    If name is equal to 0:
+        Return 0
+    End If
+
+    Let builtins be proc memory_get_int64 from Layout with analyzer, 0
+    Return proc contains from Dict with builtins, name
+End Process
+
+Note: ============================================================================
+Note: AST Walk
+Note: ============================================================================
+
+@Reasoning:
+Single integer-dispatch over the real parser's AST_* discriminants, mirroring
+the parser's actual node kinds (not the retired BashASTNode string schema). Each
+arm performs the real semantic work for that kind and recurses where the kind
+has children. Unknown discriminants fall through to a generic child-walk so no
+subtree is silently dropped.
+@End Reasoning
+
+@Implementation:
+Null-guard the node. Read node_type. Branch on each AST_* constant from Parser:
+SCRIPT/LIST/PIPELINE/COMPOUND/SUBSHELL recurse over children (PIPELINE also
+validates stage count); COMMAND -> analyze_command; VARIABLE_ASSIGNMENT ->
+analyze_assignment; FUNCTION_DEFINITION -> analyze_function_definition;
+IF/WHILE/UNTIL/FOR/CASE -> the matching control-structure analyzer; VARIABLE /
+PARAMETER_EXPANSION -> analyze_variable_reference; REDIRECTION ->
+analyze_redirection; leaves (WORD/STRING/NUMBER/SPECIAL_VARIABLE/...) need no
+further work. Default -> walk_children.
+@End Implementation
+
+Process called "analyze_node" takes analyzer as Integer, node as Integer returns Integer:
+    Note: Analyze any Bash AST node by its real discriminant
+
+    If node is equal to 0:
+        Return 1
+    End If
+
+    Let kind be proc node_type with node
+
+    If kind is equal to AST_SCRIPT from Parser:
+        Return proc walk_children with analyzer, node
+    End If
+
+    If kind is equal to AST_LIST from Parser:
+        Return proc walk_children with analyzer, node
+    End If
+
+    If kind is equal to AST_PIPELINE from Parser:
+        Return proc analyze_pipeline with analyzer, node
+    End If
+
+    If kind is equal to AST_COMPOUND_COMMAND from Parser:
+        Return proc walk_children with analyzer, node
+    End If
+
+    If kind is equal to AST_SUBSHELL from Parser:
+        Return proc walk_children with analyzer, node
+    End If
+
+    If kind is equal to AST_COMMAND from Parser:
+        Return proc analyze_command with analyzer, node
+    End If
+
+    If kind is equal to AST_VARIABLE_ASSIGNMENT from Parser:
+        Return proc analyze_assignment with analyzer, node
+    End If
+
+    If kind is equal to AST_FUNCTION_DEFINITION from Parser:
+        Return proc analyze_function_definition with analyzer, node
+    End If
+
+    If kind is equal to AST_IF_STATEMENT from Parser:
+        Return proc analyze_if_statement with analyzer, node
+    End If
+
+    If kind is equal to AST_WHILE_STATEMENT from Parser:
+        Return proc analyze_loop with analyzer, node
+    End If
+
+    If kind is equal to AST_UNTIL_STATEMENT from Parser:
+        Return proc analyze_loop with analyzer, node
+    End If
+
+    If kind is equal to AST_FOR_STATEMENT from Parser:
+        Return proc analyze_for_statement with analyzer, node
+    End If
+
+    If kind is equal to AST_CASE_STATEMENT from Parser:
+        Return proc analyze_case_statement with analyzer, node
+    End If
+
+    If kind is equal to AST_VARIABLE from Parser:
+        Return proc analyze_variable_reference with analyzer, node
+    End If
+
+    If kind is equal to AST_PARAMETER_EXPANSION from Parser:
+        Return proc analyze_variable_reference with analyzer, node
+    End If
+
+    If kind is equal to AST_REDIRECTION from Parser:
+        Return proc analyze_redirection with analyzer, node
+    End If
+
+    Note: Leaf kinds (WORD/STRING/NUMBER/SPECIAL_VARIABLE/COMMAND_SUBSTITUTION/
+    Note: ARITHMETIC_EXPANSION/CASE_ITEM/PATTERN/...) carry no binding work
+    Note: themselves; any children they hold are still walked generically.
+    Return proc walk_children with analyzer, node
+End Process
+
+@Reasoning:
+Generic child walk: recurse analyze_node over every active child. Used by the
+structural container kinds and as the default so an unrecognised node still has
+its subtree analyzed.
+@End Reasoning
+
+@Implementation:
+Read child_count; for each index 0..count-1 read the child and recurse
+analyze_node. Returns 1.
+@End Implementation
+
+Process called "walk_children" takes analyzer as Integer, node as Integer returns Integer:
+    Note: Recurse over every child of a node
+
+    Let count be proc node_child_count with node
+    Let i be 0
+
+    While i is less than count:
+        Let child be proc node_child with node, i
+        proc analyze_node with analyzer, child
+        Set i to i plus 1
+    End While
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Command Analysis
+Note: ============================================================================
+
+@Reasoning:
+An AST_COMMAND node's first child is the command-name word; the rest are
+arguments and redirections. The analyzer resolves the command name (function >
+builtin/external) and handles the scope-mutating builtins `local`, `export`,
+`readonly`, `declare`, `typeset`, and `unset` specially: `local NAME[=...]` binds
+each following word's name into the function-local scope; the others bind into
+global scope. A name that does not resolve to any known command becomes a
+warning rather than an error because the runtime PATH may differ from analysis
+time. After name handling, redirection and expansion children are analyzed.
+@End Reasoning
+
+@Implementation:
+Read child 0 as the name word; read its value string. If 0, the command is
+empty -> error. Resolve the name; on miss record a warning. If the name is a
+declaration builtin (local/export/readonly/declare/typeset) bind every
+subsequent argument word's leading identifier into the appropriate scope (local
+for `local` when inside a function, global otherwise). Then recurse analyze_node
+over every child from index 1 so redirections and expansions are visited.
+Returns 1.
+@End Implementation
+
+Process called "analyze_command" takes analyzer as Integer, node as Integer returns Integer:
+    Note: Analyze a simple command node
+
+    Let count be proc node_child_count with node
+
+    If count is equal to 0:
+        proc record_error with analyzer, "Empty command node in AST"
+        Return 0
+    End If
+
+    Let name_node be proc node_child with node, 0
+    Let name be proc node_value with name_node
+
+    If name is equal to 0:
+        proc record_error with analyzer, "Command node missing command name"
+        Return 0
+    End If
+
+    Note: Declaration builtins mutate scope based on their arguments.
+    Let is_decl be proc is_declaration_builtin with name
+    If is_decl is equal to 1:
+        proc handle_declaration_command with analyzer, node, name
+    Otherwise:
+        Note: Resolve ordinary commands; an unresolved name is best-effort.
+        Let resolved be proc resolve_command with analyzer, name
+        If resolved is equal to 0:
+            Let msg be proc string_concat from StringUtils with "Command not found: ", name
+            proc record_warning with analyzer, msg
+            proc deallocate from Layout with msg
+        End If
+    End If
+
+    Note: Analyze arguments and redirections (children from index 1).
+    Let i be 1
+    While i is less than count:
+        Let child be proc node_child with node, i
+        proc analyze_node with analyzer, child
+        Set i to i plus 1
+    End While
+
+    Return 1
+End Process
+
+@Reasoning:
+Reports whether a command name is one of the scope-mutating declaration
+builtins. Centralising the set keeps analyze_command's scope-binding branch and
+any future caller aligned on the same membership.
+@End Reasoning
+
+@Implementation:
+string_equals the name against each of local/export/readonly/declare/typeset.
+Returns 1 on any match, 0 otherwise.
+@End Implementation
+
+Process called "is_declaration_builtin" takes name as Integer returns Integer:
+    Note: Return 1 if name is local/export/readonly/declare/typeset
+
+    Let is_local be proc string_equals from StringCore with name, "local"
+    If is_local is equal to 1:
+        Return 1
+    End If
+
+    Let is_export be proc string_equals from StringCore with name, "export"
+    If is_export is equal to 1:
+        Return 1
+    End If
+
+    Let is_readonly be proc string_equals from StringCore with name, "readonly"
+    If is_readonly is equal to 1:
+        Return 1
+    End If
+
+    Let is_declare be proc string_equals from StringCore with name, "declare"
+    If is_declare is equal to 1:
+        Return 1
+    End If
+
+    Let is_typeset be proc string_equals from StringCore with name, "typeset"
+    If is_typeset is equal to 1:
+        Return 1
+    End If
+
+    Return 0
+End Process
+
+@Reasoning:
+Handles `local NAME...`, `export NAME...`, `readonly NAME...`, `declare NAME...`,
+`typeset NAME...`: each subsequent argument word names a variable to bind. The
+leading identifier of an argument like `NAME=value` is extracted (everything
+before a `=`), so `local x=1` binds `x`. `local` binds into the function-local
+scope and is an error at script level (Bash rejects `local` outside a function);
+the others bind into global scope. Each extracted name is an owned heap string
+deallocated after binding.
+@End Reasoning
+
+@Implementation:
+Determine as_local = string_equals(name, "local"). If as_local and not
+in_function, record an error (local outside function). For each argument child
+from index 1, read its value; skip null; extract the identifier prefix via
+extract_assignment_name; bind it with bind_variable(as_local); deallocate the
+extracted name. Returns 1.
+@End Implementation
+
+Process called "handle_declaration_command" takes analyzer as Integer, node as Integer, name as Integer returns Integer:
+    Note: Bind variables named by a declaration builtin's arguments
+
+    Let as_local be proc string_equals from StringCore with name, "local"
+
+    If as_local is equal to 1:
+        Let in_function be proc memory_get_int64 from Layout with analyzer, 56
+        If in_function is equal to 0:
+            proc record_error with analyzer, "'local' used outside of a function"
+            Return 0
+        End If
+    End If
+
+    Let count be proc node_child_count with node
+    Let i be 1
+
+    While i is less than count:
+        Let arg be proc node_child with node, i
+        Let arg_value be proc node_value with arg
+
+        If arg_value is not equal to 0:
+            Let var_name be proc extract_assignment_name with arg_value
+            If var_name is not equal to 0:
+                proc bind_variable with analyzer, var_name, as_local
+                proc deallocate from Layout with var_name
+            End If
+        End If
+
+        Set i to i plus 1
+    End While
+
+    Return 1
+End Process
+
+@Reasoning:
+Extracts the identifier prefix of a declaration argument: everything before the
+first `=` if present, otherwise the whole word. `local x=1` yields "x"; `local x`
+yields "x". A leading-dash word (an option like `-r`/`-x` to declare/readonly) is
+skipped by returning 0 so options are not mistaken for variable names. The result
+is an owned heap copy the caller deallocates.
+@End Reasoning
+
+@Implementation:
+If the first byte is '-' (45) return 0 (an option flag). Scan for '=' (61) or NUL;
+the prefix length is the index of the first '='/NUL. Allocate prefix_len+1, copy
+the prefix, NUL-terminate, return the buffer. A zero-length prefix returns 0.
+@End Implementation
+
+Process called "extract_assignment_name" takes word as Integer returns Integer:
+    Note: Return an owned copy of the identifier prefix of a declaration argument
+
+    If word is equal to 0:
+        Return 0
+    End If
+
+    Let first_byte be proc memory_get_byte from Layout with word, 0
+
+    Note: Skip option flags (-r, -x, -a, ...) - not variable names.
+    If first_byte is equal to 45:
+        Return 0
+    End If
+
+    Note: Find the prefix length up to '=' or NUL.
+    Let prefix_len be 0
+    Let scanning be 1
+
+    While scanning is equal to 1:
+        Let b be proc memory_get_byte from Layout with word, prefix_len
+        If b is equal to 0:
+            Set scanning to 0
+        Otherwise:
+            If b is equal to 61:
+                Set scanning to 0
+            Otherwise:
+                Set prefix_len to prefix_len plus 1
+            End If
+        End If
+    End While
+
+    If prefix_len is equal to 0:
+        Return 0
+    End If
+
+    Let buffer be proc allocate from Layout with prefix_len plus 1
+    If buffer is equal to 0:
+        Return 0
+    End If
+
+    proc memory_copy from Layout with buffer, word, prefix_len
+    proc memory_set_byte from Layout with buffer, prefix_len, 0
+
+    Return buffer
+End Process
+
+Note: ============================================================================
+Note: Assignment Analysis
+Note: ============================================================================
+
+@Reasoning:
+An AST_VARIABLE_ASSIGNMENT node carries the variable name in its value field and
+the rvalue expression as its sole child. Bash assignment is global-by-default,
+even inside a function body, unless the name was already declared `local` in the
+active function. The analyzer therefore binds the name into the local scope when
+it is already a known local, otherwise into the global scope, then recurses into
+the rvalue so any embedded variable references / expansions are analyzed.
+@End Reasoning
+
+@Implementation:
+Read node value as var_name; if 0 record an error. Decide as_local: 1 when
+inside a function AND the name is already a known local (is_variable_local), else
+0. bind_variable(as_local). Then recurse analyze_node over the rvalue child
+(index 0) if present. Returns 1.
+@End Implementation
+
+Process called "analyze_assignment" takes analyzer as Integer, node as Integer returns Integer:
+    Note: Analyze a variable assignment node
+
+    Let var_name be proc node_value with node
+
+    If var_name is equal to 0:
+        proc record_error with analyzer, "Assignment node missing variable name"
+        Return 0
+    End If
+
+    Let as_local be 0
+    Let in_function be proc memory_get_int64 from Layout with analyzer, 56
+
+    If in_function is equal to 1:
+        Let already_local be proc is_variable_local with analyzer, var_name
+        If already_local is equal to 1:
+            Set as_local to 1
+        End If
+    End If
+
+    proc bind_variable with analyzer, var_name, as_local
+
+    Note: Analyze the rvalue expression for embedded references.
+    Let rvalue be proc node_child with node, 0
+    If rvalue is not equal to 0:
+        proc analyze_node with analyzer, rvalue
+    End If
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Function Definition Analysis
+Note: ============================================================================
+
+@Reasoning:
+An AST_FUNCTION_DEFINITION carries the function name in its value field and the
+body (a compound command) as its sole child. The analyzer warns if the name
+shadows a builtin (a common scripting footgun), registers the function so later
+calls resolve to it, then analyzes the body under a fresh function-local scope.
+A function defines a new `local` namespace: the analyzer saves the previous
+in_function flag and current_locals handle, installs a fresh local Dict and sets
+in_function, walks the body, then restores and destroys the temporary local set
+so nested/sequential definitions cannot leak locals into each other.
+@End Reasoning
+
+@Implementation:
+Read node value as func_name; if 0 record an error. If is_command_builtin warns
+about shadowing. Register func_name into the functions Dict (offset 8) BEFORE
+walking the body so the function can resolve recursive self-calls. Save old
+in_function (offset 56) and current_locals (offset 24); create a fresh local Dict
+and store it with in_function=1; analyze the body child (index 0); restore the
+saved flag/handle; destroy the temporary local Dict. Returns 1.
+@End Implementation
+
+Process called "analyze_function_definition" takes analyzer as Integer, node as Integer returns Integer:
+    Note: Analyze a function definition node
+
+    Let func_name be proc node_value with node
+
+    If func_name is equal to 0:
+        proc record_error with analyzer, "Function definition missing name"
+        Return 0
+    End If
+
+    Note: Warn on builtin shadowing.
+    Let shadows be proc is_command_builtin with analyzer, func_name
+    If shadows is equal to 1:
+        Let msg be proc string_concat from StringUtils with "Function shadows builtin command: ", func_name
+        proc record_warning with analyzer, msg
+        proc deallocate from Layout with msg
+    End If
+
+    Note: Register the function before walking the body (supports recursion).
+    Let functions be proc memory_get_int64 from Layout with analyzer, 8
+    proc set from Dict with functions, func_name, 1
+
+    Note: Enter a fresh function-local scope (save the enclosing local set).
+    Let saved_locals be proc enter_function_context with analyzer
+
+    Note: Analyze the function body (the compound-command child).
+    Let body be proc node_child with node, 0
+    If body is not equal to 0:
+        proc analyze_node with analyzer, body
+    End If
+
+    Note: Restore the enclosing scope and free the temporary local set.
+    proc exit_function_context with analyzer, saved_locals
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Control-Structure Analysis
+Note: ============================================================================
+
+@Reasoning:
+An AST_IF_STATEMENT must carry at least a condition and a then-body (2 children);
+the parser flattens elif/else into additional [cond, body] / [body] children, so
+any even-or-greater count is structurally valid and every child is walked. A
+count below 2 is a corrupted tree and a hard error.
+@End Reasoning
+
+@Implementation:
+Read child_count; if < 2 record an error and return 0. Otherwise walk_children.
+Returns 1.
+@End Implementation
+
+Process called "analyze_if_statement" takes analyzer as Integer, node as Integer returns Integer:
+    Note: Analyze an if statement node
+
+    Let count be proc node_child_count with node
+
+    If count is less than 2:
+        proc record_error with analyzer, "If statement missing condition or body"
+        Return 0
+    End If
+
+    Return proc walk_children with analyzer, node
+End Process
+
+@Reasoning:
+A while/until loop must carry a condition and a body (2 children). Both loop
+kinds share this shape so a single analyzer handles them. A count below 2 is a
+corrupted tree and a hard error; otherwise every child is walked.
+@End Reasoning
+
+@Implementation:
+Read child_count; if < 2 record an error and return 0. Otherwise walk_children.
+Returns 1.
+@End Implementation
+
+Process called "analyze_loop" takes analyzer as Integer, node as Integer returns Integer:
+    Note: Analyze a while/until loop node
+
+    Let count be proc node_child_count with node
+
+    If count is less than 2:
+        proc record_error with analyzer, "Loop missing condition or body"
+        Return 0
+    End If
+
+    Return proc walk_children with analyzer, node
+End Process
+
+@Reasoning:
+An AST_FOR_STATEMENT carries the induction variable name in its value field, the
+word list as the leading children, and the loop body as the final child. The
+induction variable is bound for the duration of the loop body, so the analyzer
+binds it (global-by-default, matching Bash's `for` semantics) before walking the
+children so references to it inside the body resolve. The body must be present
+(at least one child).
+@End Reasoning
+
+@Implementation:
+Read node value as loop_var; if non-zero bind it via bind_variable(0) (for-loop
+induction variables are not `local`). Read child_count; if 0 record an error.
+Otherwise walk_children. Returns 1.
+@End Implementation
+
+Process called "analyze_for_statement" takes analyzer as Integer, node as Integer returns Integer:
+    Note: Analyze a for-loop node
+
+    Let loop_var be proc node_value with node
+
+    If loop_var is not equal to 0:
+        Note: The induction variable is global-by-default like any for var.
+        proc bind_variable with analyzer, loop_var, 0
+    End If
+
+    Let count be proc node_child_count with node
+
+    If count is equal to 0:
+        proc record_error with analyzer, "For loop missing body"
+        Return 0
+    End If
+
+    Return proc walk_children with analyzer, node
+End Process
+
+@Reasoning:
+An AST_CASE_STATEMENT's first child is the discriminant word; subsequent children
+are AST_CASE_ITEM arms. At least the discriminant must be present. Every child is
+walked so the discriminant's expansions and each arm's commands are analyzed.
+@End Reasoning
+
+@Implementation:
+Read child_count; if 0 record an error and return 0. Otherwise walk_children.
+Returns 1.
+@End Implementation
+
+Process called "analyze_case_statement" takes analyzer as Integer, node as Integer returns Integer:
+    Note: Analyze a case statement node
+
+    Let count be proc node_child_count with node
+
+    If count is equal to 0:
+        proc record_error with analyzer, "Case statement missing discriminant"
+        Return 0
+    End If
+
+    Return proc walk_children with analyzer, node
+End Process
+
+Note: ============================================================================
+Note: Pipeline / Redirection Analysis
+Note: ============================================================================
+
+@Reasoning:
+An AST_PIPELINE node is only produced when at least one `|` was observed, so it
+must carry two or more stages; a single-stage pipeline is a corrupted tree
+(the parser returns the bare command instead). Each stage runs in its own
+process, so the analyzer simply walks every stage. A count below 2 is a hard
+error.
+@End Reasoning
+
+@Implementation:
+Read child_count; if < 2 record an error and return 0. Otherwise walk_children.
+Returns 1.
+@End Implementation
+
+Process called "analyze_pipeline" takes analyzer as Integer, node as Integer returns Integer:
+    Note: Analyze a pipeline node
+
+    Let count be proc node_child_count with node
+
+    If count is less than 2:
+        proc record_error with analyzer, "Pipeline must have at least two stages"
+        Return 0
+    End If
+
+    Return proc walk_children with analyzer, node
+End Process
+
+@Reasoning:
+An AST_REDIRECTION node stores the operator's token-type code in its value field
+(an Integer, not a string) and carries exactly one target child (a filename word
+or fd). Structural validation: the target child must be present, else the
+redirection is malformed. The target is then analyzed so an embedded expansion
+(e.g. `> $logfile`) is visited.
+@End Reasoning
+
+@Implementation:
+Read child_count; if 0 record an error and return 0. Read the target child
+(index 0); if 0 record an error. Otherwise analyze_node the target. Returns 1.
+@End Implementation
+
+Process called "analyze_redirection" takes analyzer as Integer, node as Integer returns Integer:
+    Note: Analyze a redirection node
+
+    Let count be proc node_child_count with node
+
+    If count is equal to 0:
+        proc record_error with analyzer, "Redirection missing target"
+        Return 0
+    End If
+
+    Let target be proc node_child with node, 0
+
+    If target is equal to 0:
+        proc record_error with analyzer, "Redirection target is null"
+        Return 0
+    End If
+
+    proc analyze_node with analyzer, target
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Variable Reference Analysis
+Note: ============================================================================
+
+@Reasoning:
+An AST_VARIABLE or AST_PARAMETER_EXPANSION node references a variable by the name
+in its value field. Bash does not error on an unset variable reference by default
+(it expands to the empty string), so an undefined reference is a warning, not an
+error. The analyzer records the warning so a `set -u`-minded consumer can act on
+it, but never blocks lowering. Special parameters (`?`, `@`, numeric positionals)
+are seeded into the global scope so they never warn.
+@End Reasoning
+
+@Implementation:
+Read node value as var_name; if 0 nothing to check, return 1. If
+is_variable_defined returns 0, record a warning naming the variable. Returns 1.
+@End Implementation
+
+Process called "analyze_variable_reference" takes analyzer as Integer, node as Integer returns Integer:
+    Note: Analyze a variable reference / parameter expansion node
+
+    Let var_name be proc node_value with node
+
+    If var_name is equal to 0:
+        Return 1
+    End If
+
+    Let defined be proc is_variable_defined with analyzer, var_name
+
+    If defined is equal to 0:
+        Let msg be proc string_concat from StringUtils with "Reference to possibly-unset variable: ", var_name
+        proc record_warning with analyzer, msg
+        proc deallocate from Layout with msg
+    End If
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Public Entry Points
+Note: ============================================================================
+
+@Reasoning:
+Top-level analysis over a parser AST with a caller-provided analyzer. Walks the
+whole tree from the root, then returns the analyzer's has_error inverted to a
+1/0 valid flag so the caller has one boolean to gate lowering on. The accumulated
+errors/warnings remain on the analyzer for the caller to read via the accessors.
+@End Reasoning
+
+@Implementation:
+Guard analyzer and root for null. Run analyze_node(analyzer, root). Read has_error
+(offset 48); return 1 when it is 0 (valid), 0 otherwise.
+@End Implementation
+
+Process called "analyze_bash_ast" takes analyzer as Integer, root as Integer returns Integer:
+    Note: Analyze a Bash AST with an existing analyzer; returns 1 if no hard errors
+
+    If analyzer is equal to 0:
+        Return 0
+    End If
+
+    If root is equal to 0:
+        Return 0
+    End If
+
+    proc analyze_node with analyzer, root
+
+    Let has_error be proc memory_get_int64 from Layout with analyzer, 48
+
+    If has_error is equal to 1:
+        Return 0
+    End If
+
+    Return 1
+End Process
+
+@Reasoning:
+Convenience facade that owns the analyzer lifecycle for callers that want a
+yes/no answer under the default configuration. Mirrors the json frontend's
+validate_*_default entry so the universal-translation pipeline can pair
+"<lang>_semantic" entry points uniformly.
+@End Reasoning
+
+@Implementation:
+Guard root for null. Create an analyzer; on OOM return 0. Run analyze_bash_ast,
+capture the result, destroy the analyzer, return the result.
+@End Implementation
+
+Process called "analyze_bash_ast_default" takes root as Integer returns Integer:
+    Note: Analyze a Bash AST under the default configuration; returns 1 if valid
+
+    If root is equal to 0:
+        Return 0
+    End If
+
+    Let analyzer be proc create_bash_semantic_analyzer
+
+    If analyzer is equal to 0:
+        Return 0
+    End If
+
+    Let result be proc analyze_bash_ast with analyzer, root
+
+    proc destroy_bash_semantic_analyzer with analyzer
+
+    Return result
+End Process
+
+@Reasoning:
+Accessor for the accumulated error count, letting a caller report or assert the
+number of hard errors after a walk without reaching into the analyzer's layout.
+@End Reasoning
+
+Process called "bash_semantic_error_count" takes analyzer as Integer returns Integer:
+    Note: Return the number of hard errors recorded
+
+    If analyzer is equal to 0:
+        Return 0
+    End If
+
+    Let errors be proc memory_get_int64 from Layout with analyzer, 32
+    Return proc size from List with errors
+End Process
+
+@Reasoning:
+Accessor for the accumulated warning count, paired with the error-count accessor
+for symmetric diagnostic reporting.
+@End Reasoning
+
+Process called "bash_semantic_warning_count" takes analyzer as Integer returns Integer:
+    Note: Return the number of warnings recorded
+
+    If analyzer is equal to 0:
+        Return 0
+    End If
+
+    Let warnings be proc memory_get_int64 from Layout with analyzer, 40
+    Return proc size from List with warnings
+End Process
+
+Note: End of Bash Semantic Analyzer

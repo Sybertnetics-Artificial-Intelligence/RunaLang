@@ -1,0 +1,308 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+Licensed under Apache 2.0
+:End Note
+
+Note:
+Bash Semantic Analyzer Probe
+
+End-to-end proof that the Bash SEMANTIC stage is REAL and consumes the actual
+parser AST (flat Integer-typed nodes), not a phantom struct-schema:
+
+    Bash source
+      -> bash_lexer    (tokenize)
+      -> bash_parser   (build the real flat-Integer AST)
+      -> bash_semantic (walk the REAL AST: scope tracking, function registration,
+                        command/call resolution, structural validation)
+
+Phase A feeds a representative Bash script (single-line with \n separators, the
+`function NAME { ... }` form the parser lowers to AST_FUNCTION_DEFINITION):
+
+    function greet { echo hello; }
+    name=world
+    greet world
+
+and asserts REAL semantic results, not just that analysis ran:
+
+  - the script yields three top-level statements (function def, assignment, call);
+  - function registration: after the walk the analyzer resolves `greet` to a
+    defined FUNCTION (is_command_function == 1) and NOT a builtin;
+  - command/builtin recognition: `echo` (inside the body) and the call to
+    `greet` resolve (is_command_builtin / resolve_command == 1);
+  - global scope: the top-level assignment `name=world` lands in GLOBAL scope so
+    `name` is visible after the walk (is_variable_defined == 1);
+  - whole-tree validity: zero hard errors on a well-formed script.
+
+Phase B feeds a real two-stage pipeline (`cat data | grep needle`) and asserts
+analyze_pipeline's structural check passes (>= 2 stages, zero errors) and both
+stages are recognized commands.
+
+Phase C verifies the local-vs-global scope discipline directly through the
+analyzer's scope path: a global binding is global and not local; entering a
+function context, binding a name locally makes it local AND visible inside the
+function, and exiting the context makes it disappear (locals do not leak to
+global scope); resolve_command honours the resolution order (known external
+resolves, unknown command does not).
+
+Phase D feeds the live parser the two forms #511 fixed: (1) a function whose
+body contains an assignment FOLLOWED by additional top-level statements - all
+statements survive (the statement-drop defect is gone); (2) a function body with
+`local x=1` and a bare `local y` - both surface as command nodes that the
+analyzer binds into the function-local scope, and a `local` used outside any
+function is a hard error. These are exercised through the REAL parsed AST end to
+end (parser -> semantic), no longer only through the analyzer's scope API.
+
+Exit code: number of failed assertions (0 == all passed). No exit_with_code.
+:End Note
+
+Import "compiler/middle/gungnir/hir/translation/frontends/bash/bash_lexer.runa" as BashLexer
+Import "compiler/middle/gungnir/hir/translation/frontends/bash/bash_parser.runa" as BashParser
+Import "compiler/middle/gungnir/hir/translation/frontends/bash/bash_semantic.runa" as BashSemantic
+Import "tests/test_utils.runa" as TestUtils
+
+Note: ============================================================================
+Note: Pipeline helper
+Note: ============================================================================
+
+@Reasoning:
+The probe needs the real parser AST root, not the HIR. This helper drives
+lexer -> parser -> parse to produce the flat-Integer AST root that the semantic
+analyzer consumes directly, mirroring the round-trip probe's front-of-pipeline
+wiring so any divergence is attributable to the semantic stage alone.
+@End Reasoning
+
+@Implementation:
+Build a lexer over the source, wrap it in a parser, drive a full parse to the
+Bash AST root, and return that root. Returns 0 if any stage yields 0.
+@End Implementation
+
+Process called "source_to_ast" takes source as Integer returns Integer:
+    Let lexer be proc create_bash_lexer from BashLexer with source
+    If lexer is equal to 0:
+        Return 0
+    End If
+
+    Let parser be proc create_parser from BashParser with lexer
+    If parser is equal to 0:
+        Return 0
+    End If
+
+    Let ast be proc parse from BashParser with parser
+    Return ast
+End Process
+
+Note: ============================================================================
+Note: Main
+Note: ============================================================================
+
+@Reasoning:
+Two phases. Phase A drives the full pipeline over a representative script and
+asserts the analyzer's post-walk facts (function registration, command
+resolution, global scope binding, no local leak, zero hard errors). Phase B
+unit-checks the scope primitives on a freshly constructed analyzer so the
+local/global distinction and the resolution order are verified in isolation,
+independent of the walk. Returning the failed-assertion count keeps the contract
+identical to the sibling bash round-trip probe (no exit_with_code).
+@End Reasoning
+
+@Implementation:
+Create test results; begin the suite. Phase A: parse a parser-clean script to its
+real AST, assert three top-level statements, run analyze_bash_ast, then assert
+is_command_function(greet), is_command_builtin(echo/greet via resolve_command),
+is_variable_defined(name)==1, analyze result==1, and error_count==0. Phase B:
+parse a real two-stage pipeline, assert it validates with zero errors and both
+stages are recognized. Phase C: on a fresh analyzer, exercise the scope path -
+global bind is global-not-local; enter_function_context + local bind is
+local-and-visible; exit_function_context makes the local vanish; resolve_command
+honours the resolution order. Print summary, return the failed count.
+@End Implementation
+
+Process called "main" returns Integer:
+    Let results be proc create_test_results from TestUtils
+    proc begin_suite from TestUtils with results, "Bash semantic analyzer"
+
+    Note: ----------------------------------------------------------------
+    Note: Phase A: full pipeline over a representative script
+    Note: ----------------------------------------------------------------
+    Note: Script: a function definition, a global assignment, and a call to
+    Note: the defined function. Phase D additionally exercises function bodies
+    Note: that contain assignments/declarations directly through the parsed AST.
+
+    Let source be "function greet { echo hello; }\nname=world\ngreet world\n"
+
+    Let ast be proc source_to_ast with source
+    proc assert_not_null from TestUtils with results, "parser produced an AST root", ast
+
+    Note: The script must yield three top-level statements: the function
+    Note: definition, the assignment, and the call. A regression in the parser
+    Note: that collapses these would make the downstream scope assertions
+    Note: vacuous, so the count is asserted explicitly.
+    Let top_count be proc node_child_count from BashSemantic with ast
+    proc assert_equal from TestUtils with results, "script has three top-level statements", top_count, 3
+
+    Let analyzer be proc create_bash_semantic_analyzer from BashSemantic
+    proc assert_not_null from TestUtils with results, "analyzer constructed", analyzer
+
+    Let valid be proc analyze_bash_ast from BashSemantic with analyzer, ast
+    proc assert_equal from TestUtils with results, "well-formed script analyzes with no hard errors", valid, 1
+
+    Let error_count be proc bash_semantic_error_count from BashSemantic with analyzer
+    proc assert_equal from TestUtils with results, "hard-error count is zero", error_count, 0
+
+    Note: Function registration: greet resolves to a DEFINED FUNCTION.
+    Let greet_is_func be proc is_command_function from BashSemantic with analyzer, "greet"
+    proc assert_equal from TestUtils with results, "function 'greet' registered as a function", greet_is_func, 1
+
+    Note: greet is NOT a builtin (it was user-defined).
+    Let greet_is_builtin be proc is_command_builtin from BashSemantic with analyzer, "greet"
+    proc assert_equal from TestUtils with results, "function 'greet' is not a builtin", greet_is_builtin, 0
+
+    Note: The call `greet world` resolves through the function path.
+    Let greet_resolves be proc resolve_command from BashSemantic with analyzer, "greet"
+    proc assert_equal from TestUtils with results, "call to 'greet' resolves", greet_resolves, 1
+
+    Note: Command/builtin recognition: echo (inside the body) is a builtin.
+    Let echo_is_builtin be proc is_command_builtin from BashSemantic with analyzer, "echo"
+    proc assert_equal from TestUtils with results, "command 'echo' recognized as builtin", echo_is_builtin, 1
+
+    Note: Global scope: the top-level assignment `name=world` lands in global
+    Note: scope, so after the walk (function body exited) `name` is visible.
+    Let name_defined be proc is_variable_defined from BashSemantic with analyzer, "name"
+    proc assert_equal from TestUtils with results, "global assignment 'name' visible at global scope", name_defined, 1
+
+    proc destroy_bash_semantic_analyzer from BashSemantic with analyzer
+
+    Note: ----------------------------------------------------------------
+    Note: Phase B: pipeline structural validation over a real parsed pipeline
+    Note: ----------------------------------------------------------------
+    Note: A multi-stage pipeline must validate cleanly and the analyzer must
+    Note: recognize each stage's command. This exercises analyze_pipeline's
+    Note: structural check (>= 2 stages) and command recognition on real AST.
+
+    Let pipe_source be "cat data | grep needle\n"
+    Let pipe_ast be proc source_to_ast with pipe_source
+    proc assert_not_null from TestUtils with results, "parser produced a pipeline AST", pipe_ast
+
+    Let pipe_analyzer be proc create_bash_semantic_analyzer from BashSemantic
+    Let pipe_valid be proc analyze_bash_ast from BashSemantic with pipe_analyzer, pipe_ast
+    proc assert_equal from TestUtils with results, "valid pipeline analyzes with no hard errors", pipe_valid, 1
+    Let pipe_errs be proc bash_semantic_error_count from BashSemantic with pipe_analyzer
+    proc assert_equal from TestUtils with results, "valid pipeline records zero hard errors", pipe_errs, 0
+    Let cat_known be proc is_command_builtin from BashSemantic with pipe_analyzer, "cat"
+    proc assert_equal from TestUtils with results, "pipeline stage 'cat' recognized", cat_known, 1
+    Let grep_known be proc is_command_builtin from BashSemantic with pipe_analyzer, "grep"
+    proc assert_equal from TestUtils with results, "pipeline stage 'grep' recognized", grep_known, 1
+    proc destroy_bash_semantic_analyzer from BashSemantic with pipe_analyzer
+
+    Note: ----------------------------------------------------------------
+    Note: Phase C: scope-primitive checks proving local vs global distinction
+    Note: ----------------------------------------------------------------
+
+    Let unit be proc create_bash_semantic_analyzer from BashSemantic
+    proc assert_not_null from TestUtils with results, "unit analyzer constructed", unit
+
+    Note: A global binding is visible globally but not as a local.
+    proc bind_variable from BashSemantic with unit, "gvar", 0
+    Let gvar_defined be proc is_variable_defined from BashSemantic with unit, "gvar"
+    proc assert_equal from TestUtils with results, "global-bound 'gvar' is defined", gvar_defined, 1
+    Let gvar_local be proc is_variable_local from BashSemantic with unit, "gvar"
+    proc assert_equal from TestUtils with results, "global-bound 'gvar' is not local", gvar_local, 0
+
+    Note: Drive a genuine function-local binding the way the walk does: enter a
+    Note: function context (fresh local set + in_function), bind a name locally,
+    Note: and assert it is seen as local AND not present in the global scope.
+    Let saved_locals be proc enter_function_context from BashSemantic with unit
+    proc bind_variable from BashSemantic with unit, "lvar", 1
+    Let lvar_is_local be proc is_variable_local from BashSemantic with unit, "lvar"
+    proc assert_equal from TestUtils with results, "locally-bound 'lvar' is local", lvar_is_local, 1
+    Let lvar_defined_in_func be proc is_variable_defined from BashSemantic with unit, "lvar"
+    proc assert_equal from TestUtils with results, "locally-bound 'lvar' is visible inside the function", lvar_defined_in_func, 1
+
+    Note: Exit the function context; the local must no longer be visible -
+    Note: proving locals do not leak to global scope.
+    proc exit_function_context from BashSemantic with unit, saved_locals
+    Let lvar_leaked be proc is_variable_defined from BashSemantic with unit, "lvar"
+    proc assert_equal from TestUtils with results, "function-local 'lvar' does not leak to global scope", lvar_leaked, 0
+
+    Note: resolve_command honours the resolution order: a known external
+    Note: resolves and an unknown command does not.
+    Let cat_builtin be proc is_command_builtin from BashSemantic with unit, "cat"
+    proc assert_equal from TestUtils with results, "known external 'cat' resolves as command", cat_builtin, 1
+    Let unknown_resolves be proc resolve_command from BashSemantic with unit, "definitely_not_a_command_xyz"
+    proc assert_equal from TestUtils with results, "unknown command does not resolve", unknown_resolves, 0
+
+    proc destroy_bash_semantic_analyzer from BashSemantic with unit
+
+    Note: ----------------------------------------------------------------
+    Note: Phase D: #511 fixes exercised through the REAL parsed AST
+    Note: ----------------------------------------------------------------
+
+    Note: D.1 - Statement-drop fix. A function whose body contains an assignment,
+    Note: followed by additional top-level statements, must keep every following
+    Note: statement. This script has FOUR top-level statements: the function
+    Note: definition and three plain commands. Before the fix the in-body '='
+    Note: poisoned the top-level loop and dropped everything after the function.
+    Let drop_source be "function setup { config=on; echo $config; }\nsetup\nresult=ready\necho $result\n"
+    Let drop_ast be proc source_to_ast with drop_source
+    proc assert_not_null from TestUtils with results, "D.1 parser produced an AST root", drop_ast
+    Let drop_count be proc node_child_count from BashSemantic with drop_ast
+    proc assert_equal from TestUtils with results, "D.1 all four top-level statements survive (no drop)", drop_count, 4
+
+    Note: The post-function assignment must be analyzable to global scope.
+    Let drop_analyzer be proc create_bash_semantic_analyzer from BashSemantic
+    Let drop_valid be proc analyze_bash_ast from BashSemantic with drop_analyzer, drop_ast
+    proc assert_equal from TestUtils with results, "D.1 script with in-body assignment analyzes cleanly", drop_valid, 1
+    Let drop_errs be proc bash_semantic_error_count from BashSemantic with drop_analyzer
+    proc assert_equal from TestUtils with results, "D.1 no hard errors on the no-drop script", drop_errs, 0
+    Note: `result` is a top-level (post-function) assignment -> global scope.
+    Let result_defined be proc is_variable_defined from BashSemantic with drop_analyzer, "result"
+    proc assert_equal from TestUtils with results, "D.1 post-function assignment 'result' bound at global scope", result_defined, 1
+    proc destroy_bash_semantic_analyzer from BashSemantic with drop_analyzer
+
+    Note: D.2 - `local`/`declare` inside a function surface as command nodes that
+    Note: the analyzer binds local. The body declares `local lx=1` and a bare
+    Note: `local ly`, plus a non-local assignment `gx=2`. After the walk: the
+    Note: function-local names must NOT have leaked to global scope, while the
+    Note: global-by-default assignment must be visible, and zero hard errors.
+    Let local_source be "function scope_demo { local lx=1; local ly; gx=2; }\nscope_demo\n"
+    Let local_ast be proc source_to_ast with local_source
+    proc assert_not_null from TestUtils with results, "D.2 parser produced an AST root", local_ast
+    Let local_top be proc node_child_count from BashSemantic with local_ast
+    proc assert_equal from TestUtils with results, "D.2 function-with-locals plus call survive as two statements", local_top, 2
+
+    Let local_analyzer be proc create_bash_semantic_analyzer from BashSemantic
+    Let local_valid be proc analyze_bash_ast from BashSemantic with local_analyzer, local_ast
+    proc assert_equal from TestUtils with results, "D.2 in-function local/declare analyze cleanly", local_valid, 1
+    Let local_errs be proc bash_semantic_error_count from BashSemantic with local_analyzer
+    proc assert_equal from TestUtils with results, "D.2 no hard errors for in-function local declarations", local_errs, 0
+
+    Note: `lx` and `ly` were bound LOCAL inside the function, so after the walk
+    Note: (function context exited) they must NOT be visible at global scope -
+    Note: proving they were bound local, not global, and did not leak.
+    Let lx_leaked be proc is_variable_defined from BashSemantic with local_analyzer, "lx"
+    proc assert_equal from TestUtils with results, "D.2 'local lx=1' bound local (does not leak to global)", lx_leaked, 0
+    Let ly_leaked be proc is_variable_defined from BashSemantic with local_analyzer, "ly"
+    proc assert_equal from TestUtils with results, "D.2 bare 'local ly' bound local (does not leak to global)", ly_leaked, 0
+    Note: `gx=2` is global-by-default even inside a function, so it IS visible.
+    Let gx_global be proc is_variable_defined from BashSemantic with local_analyzer, "gx"
+    proc assert_equal from TestUtils with results, "D.2 non-local in-function assignment 'gx' is global", gx_global, 1
+    proc destroy_bash_semantic_analyzer from BashSemantic with local_analyzer
+
+    Note: D.3 - `local` outside any function is a hard error, surfaced from a
+    Note: real parsed `local` command node (not the scope API).
+    Let bad_source be "local oops=1\n"
+    Let bad_ast be proc source_to_ast with bad_source
+    proc assert_not_null from TestUtils with results, "D.3 parser produced an AST root for top-level local", bad_ast
+    Let bad_analyzer be proc create_bash_semantic_analyzer from BashSemantic
+    Let bad_valid be proc analyze_bash_ast from BashSemantic with bad_analyzer, bad_ast
+    proc assert_equal from TestUtils with results, "D.3 'local' outside a function fails analysis", bad_valid, 0
+    Let bad_errs be proc bash_semantic_error_count from BashSemantic with bad_analyzer
+    proc assert_greater_than_or_equal from TestUtils with results, "D.3 'local' outside a function records a hard error", bad_errs, 1
+    proc destroy_bash_semantic_analyzer from BashSemantic with bad_analyzer
+
+    proc print_summary from TestUtils with results
+    Let failed be proc get_failed from TestUtils with results
+    proc destroy_test_results from TestUtils with results
+
+    Return failed
+End Process
