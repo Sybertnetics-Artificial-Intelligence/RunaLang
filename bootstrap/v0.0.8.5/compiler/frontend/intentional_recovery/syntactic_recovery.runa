@@ -48,6 +48,9 @@ Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
 Import "compiler/frontend/primitives/collections/list.runa" as List
 Import "compiler/frontend/primitives/collections/hashtable.runa" as Hashtable
 Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/frontend/primitives/collections/ordered_map.runa" as OrderedMap
+Import "compiler/internal/string_utils.runa" as StringUtils
+Import "compiler/internal/debug_utils.runa" as DebugUtils
 
 Constant SYNTACTIC_ERROR_MISSING_SEMICOLON as Integer is 1
 Constant SYNTACTIC_ERROR_MISSING_BRACE as Integer is 2
@@ -136,6 +139,20 @@ Type called "RecoveryResult":
     validation_errors as Integer       Note: OWNED minus validation errors
 End Type
 
+Process called "sr_log_debug" takes message as Integer returns Integer:
+    Note: Emit a recovery debug message through the shared compiler debug logger at
+    Note: DEBUG level. Source/line/column are not meaningful for these engine-level
+    Note: lifecycle traces, so they are passed as the recovery subsystem tag and 0.
+    Note: Returns the logger result (1 on success, 0 on failure).
+    If message is equal to 0:
+        Return 0
+    End If
+    Let source_tag be proc create_from_literal from StringCore with "syntactic_recovery"
+    Let result be proc debug_log_debug from DebugUtils with message, source_tag, 0, 0
+    proc memory_free from Layout with source_tag
+    Return result
+End Process
+
 Process called "syntactic_recovery_engine_create" takes arena as Integer returns Integer:
     Note:
     Creates a new syntactic recovery engine with proper memory management.
@@ -180,8 +197,10 @@ Process called "syntactic_recovery_engine_create" takes arena as Integer returns
         Return 0  Note: Allocation failed
     End If
 
-    Note: Create OWNED recovery_strategies hashtable (offset 0)
-    Let recovery_strategies be proc hashtable_create from Hashtable
+    Note: Create OWNED recovery_strategies map (offset 0). Keyed by integer
+    Note: strategy_id, so it uses the integer-safe ordered map rather than the string
+    Note: hashtable (which would hash the strategy_id as a string pointer).
+    Let recovery_strategies be proc omap_create from OrderedMap
     proc memory_set_qword from Memory with engine, 0, recovery_strategies
 
     Note: Create OWNED error_patterns hashtable (offset 8)
@@ -192,8 +211,10 @@ Process called "syntactic_recovery_engine_create" takes arena as Integer returns
     Let sync_points be proc list_create from List
     proc memory_set_qword from Memory with engine, 16, sync_points
 
-    Note: Create OWNED recovery_cache hashtable (offset 24)
-    Let recovery_cache be proc hashtable_create from Hashtable
+    Note: Create OWNED recovery_cache map (offset 24). Keyed by integer error_code /
+    Note: recovery_id / error_type, so it uses the integer-safe ordered map rather
+    Note: than the string hashtable (which would hash the integer key as a pointer).
+    Let recovery_cache be proc omap_create from OrderedMap
     proc memory_set_qword from Memory with engine, 24, recovery_cache
 
     Note: Store arena reference (offset 32)
@@ -254,7 +275,7 @@ Process called "syntactic_recovery_engine_destroy" takes engine as Integer retur
     Note: Destroy OWNED recovery_strategies hashtable (offset 0)
     Let recovery_strategies be proc memory_get_qword from Memory with engine, 0
     If recovery_strategies is not equal to 0:
-        proc hashtable_destroy from Hashtable with recovery_strategies
+        proc omap_destroy from OrderedMap with recovery_strategies
     End If
 
     Note: Destroy OWNED error_patterns hashtable (offset 8)
@@ -269,10 +290,10 @@ Process called "syntactic_recovery_engine_destroy" takes engine as Integer retur
         proc list_destroy from List with sync_points
     End If
 
-    Note: Destroy OWNED recovery_cache hashtable (offset 24)
+    Note: Destroy OWNED recovery_cache ordered map (offset 24)
     Let recovery_cache be proc memory_get_qword from Memory with engine, 24
     If recovery_cache is not equal to 0:
-        proc hashtable_destroy from Hashtable with recovery_cache
+        proc omap_destroy from OrderedMap with recovery_cache
     End If
 
     Note: Destroy OWNED error_handler if allocated (offset 72)
@@ -378,7 +399,7 @@ Process called "syntactic_recovery_analyze_error" takes engine as Integer, error
     Note: Check recovery cache for previous successful strategies
     Let recovery_cache be proc memory_get_qword from Memory with engine, 24
     Let cache_key be error_code
-    Let cached_strategy be proc hashtable_get from Hashtable with recovery_cache, cache_key
+    Let cached_strategy be proc omap_get from OrderedMap with recovery_cache, cache_key
 
     If cached_strategy is not equal to 0:
         Note: Use cached strategy with boosted confidence
@@ -485,16 +506,52 @@ Process called "syntactic_recovery_execute_strategy" takes engine as Integer, re
     Note: Get recovery_tokens list (offset 40)
     Let recovery_tokens be proc memory_get_qword from Memory with recovery, 40
 
-    Note: Execute recovery action based on type
-    Let success be 1  Note: Assume success
+    Note: Derive the edit position from the recovery's error context rather than
+    Note: assuming the start of input. The error_context (offset 32) holds a
+    Note: source_location (offset 16); SourceLocation carries column at offset 8.
+    Note: The column is the 1-indexed token position to act on; default to 0 when
+    Note: no location is attached.
+    Let error_context be proc memory_get_qword from Memory with recovery, 32
+    Let position be 0
+    If error_context is not equal to 0:
+        Let source_location be proc memory_get_qword from Memory with error_context, 16
+        If source_location is not equal to 0:
+            Set position to proc memory_get_qword from Memory with source_location, 8
+        End If
+    End If
+
+    Note: When the recovery carries concrete replacement/insertion tokens, use the
+    Note: first one's type and value; otherwise fall back to a statement-terminator
+    Note: default that satisfies the common missing-token case.
+    Let token_count be 0
+    If recovery_tokens is not equal to 0:
+        Set token_count to proc list_length from List with recovery_tokens
+    End If
+    Let first_token be 0
+    If token_count is greater than 0:
+        Set first_token to proc list_get from List with recovery_tokens, 0
+    End If
+
+    Note: Execute recovery action based on type. success starts at 1 and is cleared
+    Note: to 0 by any sub-action that fails, accumulating error_count as it goes.
+    Let success be 1
     Let error_count be 0
     Let warning_count be 0
 
     If recovery_action is equal to RECOVERY_ACTION_INSERT:
-        Note: Insert missing token
-        Let token_type be 1  Note: Default token type
-        Let token_value be proc create_from_literal from StringCore with ";"
-        Let position be 0
+        Note: Insert missing token. Use the supplied recovery token when present.
+        Let token_type be 1  Note: Default token type when no explicit token supplied
+        Let owns_value be 0
+        Let token_value be 0
+        If first_token is not equal to 0:
+            Set token_type to proc memory_get_qword from Memory with first_token, 0
+            Set token_value to proc memory_get_qword from Memory with first_token, 8
+        End If
+        If token_value is equal to 0:
+            Set token_value to proc create_from_literal from StringCore with ";"
+            Set owns_value to 1
+        End If
+
         Let insert_result be proc syntactic_recovery_insert_token with engine, token_type, token_value, position, arena
 
         If insert_result is equal to 0:
@@ -502,12 +559,13 @@ Process called "syntactic_recovery_execute_strategy" takes engine as Integer, re
             Set error_count to 1
         End If
 
-        proc memory_free from Layout with token_value
+        If owns_value is equal to 1:
+            proc memory_free from Layout with token_value
+        End If
     End If
 
     If recovery_action is equal to RECOVERY_ACTION_DELETE:
-        Note: Delete unexpected token
-        Set position to 0
+        Note: Delete the unexpected token at the error position.
         Let delete_result be proc syntactic_recovery_delete_token with engine, position, arena
 
         If delete_result is equal to 0:
@@ -517,10 +575,19 @@ Process called "syntactic_recovery_execute_strategy" takes engine as Integer, re
     End If
 
     If recovery_action is equal to RECOVERY_ACTION_REPLACE:
-        Note: Replace incorrect token
-        Set position to 0
+        Note: Replace the incorrect token with the supplied recovery token.
         Let new_token_type be 1
-        Let new_token_value be proc create_from_literal from StringCore with "replaced"
+        Let replace_owns_value be 0
+        Let new_token_value be 0
+        If first_token is not equal to 0:
+            Set new_token_type to proc memory_get_qword from Memory with first_token, 0
+            Set new_token_value to proc memory_get_qword from Memory with first_token, 8
+        End If
+        If new_token_value is equal to 0:
+            Set new_token_value to proc create_from_literal from StringCore with "replaced"
+            Set replace_owns_value to 1
+        End If
+
         Let replace_result be proc syntactic_recovery_replace_token with engine, position, new_token_type, new_token_value, arena
 
         If replace_result is equal to 0:
@@ -528,7 +595,9 @@ Process called "syntactic_recovery_execute_strategy" takes engine as Integer, re
             Set error_count to 1
         End If
 
-        proc memory_free from Layout with new_token_value
+        If replace_owns_value is equal to 1:
+            proc memory_free from Layout with new_token_value
+        End If
     End If
 
     If recovery_action is equal to RECOVERY_ACTION_SKIP:
@@ -569,8 +638,10 @@ Process called "syntactic_recovery_execute_strategy" takes engine as Integer, re
     Note: Set warning_count (offset 40)
     proc memory_set_qword from Memory with result, 40, warning_count
 
-    Note: Set recovery_time to 100 (offset 48)
-    proc memory_set_qword from Memory with result, 48, 100
+    Note: Record the recovery's own time estimate (recovery offset 72) as the
+    Note: result's recovery_time (offset 48) rather than a fixed constant.
+    Let recovery_time_estimate be proc memory_get_qword from Memory with recovery, 72
+    proc memory_set_qword from Memory with result, 48, recovery_time_estimate
 
     Note: Create OWNED next_actions list (offset 56)
     Let next_actions be proc list_create from List
@@ -815,7 +886,12 @@ Process called "syntactic_recovery_insert_token" takes engine as Integer, token_
     Note: Log insertion for debugging (if debug_logger exists)
     Let debug_logger be proc memory_get_qword from Memory with engine, 80
     If debug_logger is not equal to 0:
-        Note: Would log: "Inserted token type X at position Y"
+        Let msg be proc create_from_literal from StringCore with "Inserted token type "
+        Set msg to proc string_concat from StringUtils with msg, proc integer_to_string from StringUtils with token_type
+        Set msg to proc string_concat from StringUtils with msg, proc create_from_literal from StringCore with " at position "
+        Set msg to proc string_concat from StringUtils with msg, proc integer_to_string from StringUtils with position
+        proc sr_log_debug with msg
+        proc memory_free from Layout with msg
     End If
 
     Return insertion_success
@@ -868,7 +944,10 @@ Process called "syntactic_recovery_delete_token" takes engine as Integer, positi
     Note: Log deletion for debugging (if debug_logger exists)
     Let debug_logger be proc memory_get_qword from Memory with engine, 80
     If debug_logger is not equal to 0:
-        Note: Would log: "Deleted token at position X"
+        Let msg be proc create_from_literal from StringCore with "Deleted token at position "
+        Set msg to proc string_concat from StringUtils with msg, proc integer_to_string from StringUtils with position
+        proc sr_log_debug with msg
+        proc memory_free from Layout with msg
     End If
 
     Return deletion_success
@@ -948,7 +1027,12 @@ Process called "syntactic_recovery_replace_token" takes engine as Integer, posit
     Note: Log replacement for debugging (if debug_logger exists)
     Let debug_logger be proc memory_get_qword from Memory with engine, 80
     If debug_logger is not equal to 0:
-        Note: Would log: "Replaced token at position X with type Y"
+        Let msg be proc create_from_literal from StringCore with "Replaced token at position "
+        Set msg to proc string_concat from StringUtils with msg, proc integer_to_string from StringUtils with position
+        Set msg to proc string_concat from StringUtils with msg, proc create_from_literal from StringCore with " with type "
+        Set msg to proc string_concat from StringUtils with msg, proc integer_to_string from StringUtils with new_token_type
+        proc sr_log_debug with msg
+        proc memory_free from Layout with msg
     End If
 
     Return replacement_success
@@ -1023,7 +1107,13 @@ Process called "syntactic_recovery_skip_to_sync" takes engine as Integer, sync_p
     Note: Log skip for debugging (if debug_logger exists)
     Let debug_logger be proc memory_get_qword from Memory with engine, 80
     If debug_logger is not equal to 0:
-        Note: Would log: "Skipped to sync point type X with confidence Y"
+        Let sync_type be proc memory_get_qword from Memory with sync_point, 8
+        Let msg be proc create_from_literal from StringCore with "Skipped to sync point type "
+        Set msg to proc string_concat from StringUtils with msg, proc integer_to_string from StringUtils with sync_type
+        Set msg to proc string_concat from StringUtils with msg, proc create_from_literal from StringCore with " with confidence "
+        Set msg to proc string_concat from StringUtils with msg, proc integer_to_string from StringUtils with confidence
+        proc sr_log_debug with msg
+        proc memory_free from Layout with msg
     End If
 
     Return skip_success
@@ -1121,7 +1211,17 @@ Process called "syntactic_recovery_validate_recovery" takes engine as Integer, r
     Note: Log validation result for debugging (if debug_logger exists)
     Let debug_logger be proc memory_get_qword from Memory with engine, 80
     If debug_logger is not equal to 0:
-        Note: Would log: "Validation result: X (confidence: Y, errors: Z, warnings: W)"
+        Let msg be proc create_from_literal from StringCore with "Validation result: "
+        Set msg to proc string_concat from StringUtils with msg, proc integer_to_string from StringUtils with validation_passed
+        Set msg to proc string_concat from StringUtils with msg, proc create_from_literal from StringCore with " (confidence: "
+        Set msg to proc string_concat from StringUtils with msg, proc integer_to_string from StringUtils with confidence
+        Set msg to proc string_concat from StringUtils with msg, proc create_from_literal from StringCore with ", errors: "
+        Set msg to proc string_concat from StringUtils with msg, proc integer_to_string from StringUtils with error_count
+        Set msg to proc string_concat from StringUtils with msg, proc create_from_literal from StringCore with ", warnings: "
+        Set msg to proc string_concat from StringUtils with msg, proc integer_to_string from StringUtils with warning_count
+        Set msg to proc string_concat from StringUtils with msg, proc create_from_literal from StringCore with ")"
+        proc sr_log_debug with msg
+        proc memory_free from Layout with msg
     End If
 
     Return validation_passed
@@ -1216,14 +1316,19 @@ Process called "syntactic_recovery_register_strategy" takes engine as Integer, s
     Note: Set success_rate to 50 (offset 64)
     proc memory_set_qword from Memory with strategy, 64, 50
 
-    Note: Add strategy to recovery_strategies hashtable (offset 0)
+    Note: Add strategy to recovery_strategies map (offset 0)
     Let recovery_strategies be proc memory_get_qword from Memory with engine, 0
-    proc set from hashtable with recovery_strategies, strategy_id, strategy
+    proc omap_set from OrderedMap with recovery_strategies, strategy_id, strategy
 
     Note: Log registration for debugging (if debug_logger exists)
     Let debug_logger be proc memory_get_qword from Memory with engine, 80
     If debug_logger is not equal to 0:
-        Note: Would log: "Registered recovery strategy: X with ID: Y"
+        Let msg be proc create_from_literal from StringCore with "Registered recovery strategy: "
+        Set msg to proc string_concat from StringUtils with msg, strategy_name
+        Set msg to proc string_concat from StringUtils with msg, proc create_from_literal from StringCore with " with ID: "
+        Set msg to proc string_concat from StringUtils with msg, proc integer_to_string from StringUtils with strategy_id
+        proc sr_log_debug with msg
+        proc memory_free from Layout with msg
     End If
 
     Return strategy_id
@@ -1302,7 +1407,7 @@ Process called "syntactic_recovery_get_statistics" takes engine as Integer, aren
     Let recovery_strategies be proc memory_get_qword from Memory with engine, 0
     Let strategy_count be 0
     If recovery_strategies is not equal to 0:
-        Set strategy_count to proc size from hashtable with recovery_strategies
+        Set strategy_count to proc omap_size from OrderedMap with recovery_strategies
     End If
     proc memory_set_qword from Memory with stats, 40, strategy_count
 
@@ -1314,11 +1419,11 @@ Process called "syntactic_recovery_get_statistics" takes engine as Integer, aren
     End If
     proc memory_set_qword from Memory with stats, 48, sync_point_count
 
-    Note: Get recovery_cache hashtable count (offset 24)
+    Note: Get recovery_cache ordered-map count (offset 24)
     Let recovery_cache be proc memory_get_qword from Memory with engine, 24
     Let cache_count be 0
     If recovery_cache is not equal to 0:
-        Set cache_count to proc size from hashtable with recovery_cache
+        Set cache_count to proc omap_size from OrderedMap with recovery_cache
     End If
     proc memory_set_qword from Memory with stats, 56, cache_count
 
@@ -1360,11 +1465,11 @@ Process called "syntactic_recovery_learn_from_feedback" takes engine as Integer,
         Return  Note: NULL arena
     End If
 
-    Note: Get recovery_cache hashtable (offset 24)
+    Note: Get recovery_cache ordered map (offset 24)
     Let recovery_cache be proc memory_get_qword from Memory with engine, 24
 
     Note: Look up recovery by recovery_id
-    Let recovery be proc hashtable_get from Hashtable with recovery_cache, recovery_id
+    Let recovery be proc omap_get from OrderedMap with recovery_cache, recovery_id
 
     If recovery is equal to 0:
         Note: Recovery not found in cache, nothing to learn
@@ -1385,9 +1490,9 @@ Process called "syntactic_recovery_learn_from_feedback" takes engine as Integer,
         proc memory_set_qword from Memory with engine, 48, successful_recoveries
 
         Note: Boost confidence for this error_type + recovery_action combination
-        Let cached_strategy be proc hashtable_get from Hashtable with recovery_cache, error_type
+        Let cached_strategy be proc omap_get from OrderedMap with recovery_cache, error_type
         If cached_strategy is not equal to 0:
-            Note: Update strategy success rate (assuming offset 64)
+            Note: Update strategy success rate (RecoveryStrategy.success_rate at offset 64)
             Let success_rate be proc memory_get_qword from Memory with cached_strategy, 64
             Set success_rate to success_rate plus 5
             If success_rate is greater than 100:
@@ -1402,9 +1507,9 @@ Process called "syntactic_recovery_learn_from_feedback" takes engine as Integer,
         proc memory_set_qword from Memory with engine, 56, failed_recoveries
 
         Note: Decrease confidence for this error_type + recovery_action combination
-        Set cached_strategy to proc hashtable_get from Hashtable with recovery_cache, error_type
+        Set cached_strategy to proc omap_get from OrderedMap with recovery_cache, error_type
         If cached_strategy is not equal to 0:
-            Note: Update strategy success rate (assuming offset 64)
+            Note: Update strategy success rate (RecoveryStrategy.success_rate at offset 64)
             Set success_rate to proc memory_get_qword from Memory with cached_strategy, 64
             Set success_rate to success_rate minus 10
             If success_rate is less than 0:
@@ -1428,6 +1533,13 @@ Process called "syntactic_recovery_learn_from_feedback" takes engine as Integer,
     Note: Log learning for debugging (if debug_logger exists)
     Let debug_logger be proc memory_get_qword from Memory with engine, 80
     If debug_logger is not equal to 0:
-        Note: Would log: "Learned from recovery X: success=Y, new_avg_confidence=Z"
+        Let msg be proc create_from_literal from StringCore with "Learned from recovery "
+        Set msg to proc string_concat from StringUtils with msg, proc integer_to_string from StringUtils with recovery_id
+        Set msg to proc string_concat from StringUtils with msg, proc create_from_literal from StringCore with ": success="
+        Set msg to proc string_concat from StringUtils with msg, proc integer_to_string from StringUtils with was_successful
+        Set msg to proc string_concat from StringUtils with msg, proc create_from_literal from StringCore with ", new_avg_confidence="
+        Set msg to proc string_concat from StringUtils with msg, proc integer_to_string from StringUtils with new_average_confidence
+        proc sr_log_debug with msg
+        proc memory_free from Layout with msg
     End If
 End Process

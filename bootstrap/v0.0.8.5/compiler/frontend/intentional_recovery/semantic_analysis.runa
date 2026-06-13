@@ -48,7 +48,9 @@ Import "compiler/frontend/primitives/core/memory_core.runa"
 Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
 Import "compiler/frontend/primitives/collections/list.runa" as List
 Import "compiler/frontend/primitives/collections/hashtable.runa" as Hashtable
+Import "compiler/frontend/primitives/collections/ordered_map.runa" as OrderedMap
 Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/internal/debug_utils.runa" as DebugUtils
 Import "compiler/frontend/primitives/time/instant.runa" as Instant
 
 Constant SEMANTIC_ERROR_UNDEFINED_VARIABLE as Integer is 1
@@ -640,11 +642,14 @@ Process called "semantic_recovery_resolve_symbols" takes engine as Integer, erro
         Return 0  Note: NULL arena
     End If
 
-    Note: Allocate symbol resolution hashtable using ARENA
-    Let symbol_resolution be proc hashtable_create from Hashtable
+    Note: Allocate symbol resolution map. This map is keyed by small integer slot
+    Note: identifiers (1 = variable scope, 2 = function context), so it must use the
+    Note: integer-safe ordered map: the string hashtable hashes its key as a string
+    Note: pointer and would dereference the literal addresses 1/2 (segfault).
+    Let symbol_resolution be proc omap_create from OrderedMap
 
     If symbol_resolution is equal to 0:
-        Return 0  Note: Hashtable creation failed
+        Return 0  Note: Map creation failed
     End If
 
     Note: Get error info from error_context
@@ -654,14 +659,14 @@ Process called "semantic_recovery_resolve_symbols" takes engine as Integer, erro
     Let variable_scope be proc memory_get_qword from Memory with error_context, 56
     Let function_context be proc memory_get_qword from Memory with error_context, 64
 
-    Note: Symbol resolution maps symbol names to their definitions and scopes
-    Note: Insert scope and function context into resolution table
+    Note: Symbol resolution maps the recovered scope/context slots to their values.
+    Note: Slot 1 = variable scope, slot 2 = enclosing function context.
     If variable_scope is not equal to 0:
-        proc hashtable_set from Hashtable with symbol_resolution, 1, variable_scope
+        proc omap_set from OrderedMap with symbol_resolution, 1, variable_scope
     End If
 
     If function_context is not equal to 0:
-        proc hashtable_set from Hashtable with symbol_resolution, 2, function_context
+        proc omap_set from OrderedMap with symbol_resolution, 2, function_context
     End If
 
     Return symbol_resolution
@@ -877,28 +882,33 @@ Process called "semantic_recovery_validate_recovery" takes engine as Integer, re
         Return 0  Note: NULL arena, validation failed
     End If
 
-    Note: Assume validation passes unless we find issues
+    Note: validation_passed starts at 1 and is cleared to 0 by any failing rule,
+    Note: accumulating validation_errors as it goes.
     Let validation_passed be 1
     Let validation_errors be 0
 
-    Note: Get suggestion type (assuming suggestion is a hashtable with "type" key)
-    Let suggestion_type be proc hashtable_get from Hashtable with recovery_suggestion, 1
+    Note: A recovery suggestion is a Suggestion struct produced by the suggestion
+    Note: engine (see diagnostics/suggestion_engine.runa). Read its fields by their
+    Note: struct offsets rather than as a map: suggestion_type=8, confidence=16,
+    Note: error_code=24.
 
-    Note: Validate based on suggestion type
+    Note: Rule 1: the suggestion must carry a concrete suggestion type.
+    Let suggestion_type be proc memory_get_qword from Memory with recovery_suggestion, 8
     If suggestion_type is equal to 0:
         Set validation_passed to 0
         Set validation_errors to validation_errors plus 1
     End If
 
-    Note: Check if suggestion has required fields
-    Let suggestion_action be proc hashtable_get from Hashtable with recovery_suggestion, 2
+    Note: Rule 2: the suggestion must identify the error code it addresses, which
+    Note: drives the application action below.
+    Let suggestion_action be proc memory_get_qword from Memory with recovery_suggestion, 24
     If suggestion_action is equal to 0:
         Set validation_passed to 0
         Set validation_errors to validation_errors plus 1
     End If
 
-    Note: Validate confidence level (must be >= 30)
-    Let suggestion_confidence be proc hashtable_get from Hashtable with recovery_suggestion, 3
+    Note: Rule 3: confidence (a 0-100 percentage) must be at least 30 to be applied.
+    Let suggestion_confidence be proc memory_get_qword from Memory with recovery_suggestion, 16
     If suggestion_confidence is less than 30:
         Set validation_passed to 0
         Set validation_errors to validation_errors plus 1
@@ -907,7 +917,16 @@ Process called "semantic_recovery_validate_recovery" takes engine as Integer, re
     Note: Log validation result (if debug_logger exists)
     Let debug_logger be proc memory_get_qword from Memory with engine, 96
     If debug_logger is not equal to 0:
-        Note: Log validation result and error count
+        Note: Build the trace in the caller's arena (freed automatically); avoids
+        Note: pulling in the heavy string_utils module here.
+        Let passed_str be proc arena_integer_to_string from Layout with arena, validation_passed
+        Let errors_str be proc arena_integer_to_string from Layout with arena, validation_errors
+        Let log_msg be proc arena_string_duplicate from Layout with arena, "Semantic recovery validation: passed="
+        Set log_msg to proc arena_string_concat from Layout with arena, log_msg, passed_str
+        Set log_msg to proc arena_string_concat from Layout with arena, log_msg, ", errors="
+        Set log_msg to proc arena_string_concat from Layout with arena, log_msg, errors_str
+        Let log_source be proc arena_string_duplicate from Layout with arena, "semantic_analysis"
+        proc debug_log_debug from DebugUtils with log_msg, log_source, 0, 0
     End If
 
     Return validation_passed
@@ -960,8 +979,9 @@ Process called "semantic_recovery_apply_recovery" takes engine as Integer, recov
         Return 0  Note: Validation failed, cannot apply
     End If
 
-    Note: Get suggestion action type
-    Let suggestion_action be proc hashtable_get from Hashtable with recovery_suggestion, 2
+    Note: Get the error code the suggestion addresses (Suggestion.error_code at
+    Note: offset 24) to drive the application action.
+    Let suggestion_action be proc memory_get_qword from Memory with recovery_suggestion, 24
 
     Note: Apply recovery based on action type
     Let application_success be 1
@@ -1173,6 +1193,14 @@ Process called "semantic_recovery_learn_from_context" takes engine as Integer, a
     Note: Log learning for debugging (if debug_logger exists)
     Let debug_logger be proc memory_get_qword from Memory with engine, 96
     If debug_logger is not equal to 0:
-        Note: Log learning: analysis_type, success, new_avg_confidence
+        Note: Build the trace in the caller's arena (freed automatically).
+        Let success_str be proc arena_integer_to_string from Layout with arena, was_successful
+        Let conf_str be proc arena_integer_to_string from Layout with arena, new_average_confidence
+        Let log_msg be proc arena_string_duplicate from Layout with arena, "Semantic recovery learned: success="
+        Set log_msg to proc arena_string_concat from Layout with arena, log_msg, success_str
+        Set log_msg to proc arena_string_concat from Layout with arena, log_msg, ", new_avg_confidence="
+        Set log_msg to proc arena_string_concat from Layout with arena, log_msg, conf_str
+        Let log_source be proc arena_string_duplicate from Layout with arena, "semantic_analysis"
+        proc debug_log_debug from DebugUtils with log_msg, log_source, 0, 0
     End If
 End Process

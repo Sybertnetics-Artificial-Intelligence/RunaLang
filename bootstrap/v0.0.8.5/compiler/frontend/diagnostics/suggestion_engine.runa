@@ -41,6 +41,7 @@ Import "compiler/frontend/diagnostics/errors.runa" as Errors
 Import "compiler/frontend/diagnostics/source_map.runa"
 Import "compiler/frontend/primitives/memory/layout.runa"
 Import "compiler/frontend/primitives/collections/hashtable.runa" as Hashtable
+Import "compiler/frontend/primitives/collections/ordered_map.runa" as OrderedMap
 
 Import "compiler/frontend/primitives/collections/list.runa" as List
 
@@ -182,36 +183,38 @@ Process called "suggestion_engine_create" takes arena as Integer returns Integer
         Return 0  Note: Allocation failed
     End If
 
-    Note: Create OWNED error pattern database (1024-entry hashtable)
-    Let error_patterns be proc hashtable_create from Hashtable with 1024, arena
+    Note: Create OWNED error pattern database. Keyed by integer pattern_id /
+    Note: suggestion_id, so it uses the integer-safe ordered map (the string
+    Note: hashtable would hash the integer key as a pointer and dereference it).
+    Let error_patterns be proc omap_create from OrderedMap
     If error_patterns is equal to 0:
         proc memory_free from Layout with engine
         Return 0  Note: Pattern database creation failed
     End If
 
-    Note: Create OWNED suggestion cache (512-entry hashtable for fast lookups)
-    Let suggestion_cache be proc hashtable_create from Hashtable with 512, arena
+    Note: Create OWNED suggestion cache (integer error_code -> suggestions list).
+    Let suggestion_cache be proc omap_create from OrderedMap
     If suggestion_cache is equal to 0:
-        proc hashtable_destroy from Hashtable with error_patterns
+        proc omap_destroy from OrderedMap with error_patterns
         proc memory_free from Layout with engine
         Return 0  Note: Cache creation failed
     End If
 
-    Note: Create OWNED context analyzer (hashtable for context tracking)
-    Let context_analyzer be proc hashtable_create from Hashtable with 256, arena
+    Note: Create OWNED context analyzer (string-keyed context tracking table).
+    Let context_analyzer be proc hashtable_create from Hashtable
     If context_analyzer is equal to 0:
-        proc hashtable_destroy from Hashtable with suggestion_cache
-        proc hashtable_destroy from Hashtable with error_patterns
+        proc omap_destroy from OrderedMap with suggestion_cache
+        proc omap_destroy from OrderedMap with error_patterns
         proc memory_free from Layout with engine
         Return 0  Note: Context analyzer creation failed
     End If
 
-    Note: Create OWNED pattern matcher (hashtable for pattern matching)
-    Let pattern_matcher be proc hashtable_create from Hashtable with 256, arena
+    Note: Create OWNED pattern matcher (integer error_code -> pattern).
+    Let pattern_matcher be proc omap_create from OrderedMap
     If pattern_matcher is equal to 0:
         proc hashtable_destroy from Hashtable with context_analyzer
-        proc hashtable_destroy from Hashtable with suggestion_cache
-        proc hashtable_destroy from Hashtable with error_patterns
+        proc omap_destroy from OrderedMap with suggestion_cache
+        proc omap_destroy from OrderedMap with error_patterns
         proc memory_free from Layout with engine
         Return 0  Note: Pattern matcher creation failed
     End If
@@ -268,12 +271,12 @@ Process called "suggestion_engine_destroy" takes engine as Integer returns Nothi
 
     Note: Destroy OWNED error_patterns if exists
     If error_patterns is not equal to 0:
-        proc hashtable_destroy from Hashtable with error_patterns
+        proc omap_destroy from OrderedMap with error_patterns
     End If
 
     Note: Destroy OWNED suggestion_cache if exists
     If suggestion_cache is not equal to 0:
-        proc hashtable_destroy from Hashtable with suggestion_cache
+        proc omap_destroy from OrderedMap with suggestion_cache
     End If
 
     Note: Destroy OWNED context_analyzer if exists
@@ -283,7 +286,7 @@ Process called "suggestion_engine_destroy" takes engine as Integer returns Nothi
 
     Note: Destroy OWNED pattern_matcher if exists
     If pattern_matcher is not equal to 0:
-        proc hashtable_destroy from Hashtable with pattern_matcher
+        proc omap_destroy from OrderedMap with pattern_matcher
     End If
 
     Note: Free OWNED SuggestionEngine structure
@@ -324,7 +327,7 @@ Process called "suggestion_engine_analyze_error" takes engine as Integer, error_
 
     Note: Check suggestion cache first (offset 8)
     Let suggestion_cache be proc memory_get_qword from Memory with engine, 8
-    Let cached_suggestions be proc hashtable_get from Hashtable with suggestion_cache, error_code
+    Let cached_suggestions be proc omap_get from OrderedMap with suggestion_cache, error_code
 
     If cached_suggestions is not equal to 0:
         Note: Cache hit - increment counter (offset 56)
@@ -367,7 +370,7 @@ Process called "suggestion_engine_analyze_error" takes engine as Integer, error_
     proc memory_set_qword from Memory with engine, 40, suggestion_count
 
     Note: Cache the suggestions for future lookups
-    proc hashtable_set from Hashtable with suggestion_cache, error_code, suggestions
+    proc omap_set from OrderedMap with suggestion_cache, error_code, suggestions
 
     Return suggestions
 End Process
@@ -490,7 +493,7 @@ Process called "suggestion_engine_register_pattern" takes engine as Integer, pat
 
     Note: Add pattern to error_patterns hashtable (offset 0)
     Let error_patterns be proc memory_get_qword from Memory with engine, 0
-    proc hashtable_set from Hashtable with error_patterns, pattern_id, pattern
+    proc omap_set from OrderedMap with error_patterns, pattern_id, pattern
 
     Note: Increment pattern_count (offset 48)
     Set pattern_id to pattern_id plus 1
@@ -542,7 +545,7 @@ Process called "suggestion_engine_match_patterns" takes engine as Integer, error
     Let pattern_matcher be proc memory_get_qword from Memory with engine, 24
 
     Note: Look up patterns for this error_code
-    Let pattern_for_code be proc hashtable_get from Hashtable with pattern_matcher, error_code
+    Let pattern_for_code be proc omap_get from OrderedMap with pattern_matcher, error_code
     If pattern_for_code is not equal to 0:
         proc add from List with matches, pattern_for_code
     End If
@@ -629,26 +632,119 @@ Process called "suggestion_engine_generate_fix" takes engine as Integer, suggest
 
     Note: Import memory and string utilities
 
+    Note: Validate the source suggestion before deriving a fix from it.
+    If suggestion is equal to 0:
+        Return 0  Note: No suggestion to generate a fix from
+    End If
+
     Note: Create OWNED FixRecommendation structure (7 fields × 8 = 56 bytes)
     Let fix be proc allocate from Layout with 56
     If fix is equal to 0:
         Return 0  Note: Allocation failed
     End If
 
-    Note: Get suggestion_text from suggestion (offset 16)
-    Let suggestion_text be proc memory_get_qword from Memory with suggestion, 16
+    Note: Read real fields from the source Suggestion struct.
+    Note: Suggestion offsets: suggestion_type=8, confidence=16, message=32,
+    Note: fix_description=40, fix_code=48, fix_type=56.
+    Let suggestion_type be proc memory_get_qword from Memory with suggestion, 8
+    Let suggestion_confidence be proc memory_get_qword from Memory with suggestion, 16
+    Let suggestion_message be proc memory_get_qword from Memory with suggestion, 32
+    Let suggestion_fix_description be proc memory_get_qword from Memory with suggestion, 40
+    Let suggestion_fix_code be proc memory_get_qword from Memory with suggestion, 48
+    Let fix_type be proc memory_get_qword from Memory with suggestion, 56
 
-    Note: Generate fix_code (use suggestion_text as fix code)
-    Let fix_code be suggestion_text
+    Note: The fix code is the concrete replacement text carried by the suggestion.
+    Note: Fall back to the human-readable message when no explicit fix_code exists.
+    Let fix_code be suggestion_fix_code
+    If fix_code is equal to 0:
+        Set fix_code to suggestion_message
+    End If
 
-    Note: Initialize FixRecommendation fields (offsets: fix_id=0, fix_code=8, fix_description=16, confidence=24, is_validated=32, complexity=40, estimated_time=48)
-    proc memory_set_qword from Memory with fix, 0, 0                Note: fix_id (will be assigned)
+    Note: The fix description prefers the suggestion's own description, falling
+    Note: back to its message so a generated fix always carries explanatory text.
+    Let fix_description be suggestion_fix_description
+    If fix_description is equal to 0:
+        Set fix_description to suggestion_message
+    End If
+
+    Note: Map the suggestion's symbolic confidence rank (1=HIGH..4=UNCERTAIN) to a
+    Note: 0-100 percentage when it falls in the rank range; treat any value above
+    Note: the rank range as an already-percentage confidence and clamp it to 100.
+    Let confidence be 50
+    If suggestion_confidence is equal to SUGGESTION_CONFIDENCE_HIGH:
+        Set confidence to 95
+    Otherwise:
+        If suggestion_confidence is equal to SUGGESTION_CONFIDENCE_MEDIUM:
+            Set confidence to 75
+        Otherwise:
+            If suggestion_confidence is equal to SUGGESTION_CONFIDENCE_LOW:
+                Set confidence to 50
+            Otherwise:
+                If suggestion_confidence is equal to SUGGESTION_CONFIDENCE_UNCERTAIN:
+                    Set confidence to 25
+                Otherwise:
+                    If suggestion_confidence is greater than 100:
+                        Set confidence to 100
+                    Otherwise:
+                        If suggestion_confidence is greater than 4:
+                            Set confidence to suggestion_confidence
+                        End If
+                    End If
+                End If
+            End If
+        End If
+    End If
+
+    Note: Derive fix complexity (1=trivial..5=hardest) and estimated apply time in
+    Note: seconds from the kind of edit the fix performs. Inserts/deletes are the
+    Note: cheapest, replacements moderate, moves higher, refactors the most costly.
+    Let complexity be 3
+    Let estimated_time be 30
+    If fix_type is equal to FIX_TYPE_INSERT:
+        Set complexity to 1
+        Set estimated_time to 5
+    Otherwise:
+        If fix_type is equal to FIX_TYPE_DELETE:
+            Set complexity to 1
+            Set estimated_time to 5
+        Otherwise:
+            If fix_type is equal to FIX_TYPE_REPLACE:
+                Set complexity to 2
+                Set estimated_time to 15
+            Otherwise:
+                If fix_type is equal to FIX_TYPE_MOVE:
+                    Set complexity to 3
+                    Set estimated_time to 30
+                Otherwise:
+                    If fix_type is equal to FIX_TYPE_REFACTOR:
+                        Set complexity to 5
+                        Set estimated_time to 120
+                    End If
+                End If
+            End If
+        End If
+    End If
+
+    Note: Syntax-fix and type-conversion suggestions are inherently a little more
+    Note: involved than a bare edit, so nudge their complexity/time upward.
+    If suggestion_type is equal to SUGGESTION_TYPE_TYPE_CONVERSION:
+        Set complexity to complexity plus 1
+        If complexity is greater than 5:
+            Set complexity to 5
+        End If
+        Set estimated_time to estimated_time plus 15
+    End If
+
+    Note: Initialize FixRecommendation fields (de-facto runtime layout shared with
+    Note: validate_fix/apply_fix: fix_id=0, fix_code=8, fix_description=16,
+    Note: confidence=24, is_validated=32, complexity=40, estimated_time=48).
+    proc memory_set_qword from Memory with fix, 0, 0                Note: fix_id (assigned on registration)
     proc memory_set_qword from Memory with fix, 8, fix_code         Note: fix_code
-    proc memory_set_qword from Memory with fix, 16, suggestion_text Note: fix_description
-    proc memory_set_qword from Memory with fix, 24, 85              Note: confidence (85%)
-    proc memory_set_qword from Memory with fix, 32, 0               Note: is_validated (not yet)
-    proc memory_set_qword from Memory with fix, 40, 2               Note: complexity (2 = medium)
-    proc memory_set_qword from Memory with fix, 48, 60              Note: estimated_time (60 seconds)
+    proc memory_set_qword from Memory with fix, 16, fix_description Note: fix_description
+    proc memory_set_qword from Memory with fix, 24, confidence      Note: confidence (0-100)
+    proc memory_set_qword from Memory with fix, 32, 0              Note: is_validated (validate_fix sets this)
+    proc memory_set_qword from Memory with fix, 40, complexity      Note: complexity (1-5)
+    proc memory_set_qword from Memory with fix, 48, estimated_time  Note: estimated_time (seconds)
 
     Return fix
 End Process
@@ -946,7 +1042,7 @@ Process called "suggestion_engine_learn_from_feedback" takes engine as Integer, 
     Let error_patterns be proc memory_get_qword from Memory with engine, 0
 
     Note: Step 3: Look up the pattern associated with this suggestion_id
-    Let pattern be proc hashtable_get from Hashtable with error_patterns, suggestion_id
+    Let pattern be proc omap_get from OrderedMap with error_patterns, suggestion_id
 
     Note: Step 4: Update pattern success rate based on feedback
     If pattern is not equal to 0:

@@ -41,7 +41,8 @@ Import "compiler/frontend/diagnostics/source_map.runa"
 Import "compiler/frontend/diagnostics/suggestion_engine.runa"
 Import "compiler/frontend/primitives/memory/layout.runa"
 Import "compiler/frontend/primitives/collections/list.runa"
-Import "compiler/frontend/primitives/core/string_core.runa"
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/frontend/primitives/collections/ordered_map.runa" as OrderedMap
 Import "compiler/frontend/primitives/core/memory_core.runa"
 Import "compiler/internal/string_utils.runa" as StringUtils
 
@@ -242,8 +243,10 @@ Process called "error_formatter_create" takes arena as Integer returns Integer:
     proc memory_set_qword from Memory with color_scheme, 64, 0               Note: background_color = default
     proc memory_set_qword from Memory with color_scheme, 72, COLOR_WHITE     Note: text_color = white
 
-    Note: Step 5: Initialize OWNED style templates (hashtable for templates)
-    Let style_templates be proc hashtable_create from Hashtable
+    Note: Step 5: Initialize OWNED style templates. Keyed by integer template_id,
+    Note: so it uses the integer-safe ordered map rather than the string hashtable
+    Note: (which would hash the template_id as a string pointer and dereference it).
+    Let style_templates be proc omap_create from OrderedMap
 
     If style_templates is equal to 0:
         proc memory_free from Layout with color_scheme
@@ -318,7 +321,7 @@ Process called "error_formatter_destroy" takes formatter as Integer returns Noth
     Note: Step 4: Destroy OWNED style templates (offset 24)
     Let style_templates be proc memory_get_qword from Memory with formatter, 24
     If style_templates is not equal to 0:
-        proc hashtable_destroy from Hashtable with style_templates
+        proc omap_destroy from OrderedMap with style_templates
     End If
 
     Note: Step 5: Free OWNED ErrorFormatter structure
@@ -925,57 +928,247 @@ Process called "error_formatter_apply_syntax_highlighting" takes formatter as In
         End If
     End If
 
-    Note: Apply syntax highlighting based on language
-    Note: Using keyword-based highlighting for performance
-    Note: Full lexer/parser highlighting available via separate syntax highlighter module
+    Note: Word-boundary keyword highlighting.
+    Note: Scan the source character by character, accumulating identifier words.
+    Note: When a word boundary is reached, classify the complete word and color
+    Note: only exact keyword matches. This avoids the substring-corruption that a
+    Note: naive find/replace would cause (e.g. "If" inside "Notify", "Let" inside
+    Note: "Letter") and never re-colors text inside already-emitted escape codes.
 
-    Let result be proc ef_arena_str with "", arena
-
-    Note: Define keyword color (use info_color from scheme - offset 32)
-    Let keyword_color be proc memory_get_qword from Memory with color_scheme, 32
-
-    Note: Apply ANSI color for keywords (blue)
+    Note: ANSI color sequences for keyword spans (blue) and reset.
     Let keyword_prefix be proc ef_arena_str with "\x1b[34m", arena
     Let color_suffix be proc ef_arena_str with "\x1b[0m", arena
 
-    Note: Simplified highlighting: check for common Runa keywords
-    Let has_process be proc string_contains from StringUtils with source_code, "Process"
-    Let has_let be proc string_contains from StringUtils with source_code, "Let"
-    Let has_if be proc string_contains from StringUtils with source_code, "If"
-    Let has_return be proc string_contains from StringUtils with source_code, "Return"
-
-    Note: If any keywords found, apply basic highlighting
-    If has_process is equal to 1:
-        Note: Replace "Process" with colored version
-        Let colored_process be proc ef_arena_concat with keyword_prefix, "Process", arena
-        Set colored_process to proc ef_arena_concat with colored_process, color_suffix, arena
-        Set result to proc string_replace from StringUtils with source_code, "Process", colored_process, arena
-        Set source_code to result
+    Let src_len be proc string_length from StringCore with source_code
+    If src_len is equal to 0:
+        Return source_code  Note: Nothing to highlight
     End If
 
-    If has_let is equal to 1:
-        Let colored_let be proc ef_arena_concat with keyword_prefix, "Let", arena
-        Set colored_let to proc ef_arena_concat with colored_let, color_suffix, arena
-        Set result to proc string_replace from StringUtils with source_code, "Let", colored_let, arena
-        Set source_code to result
-    End If
+    Note: Output accumulator (ARENA) and pending identifier word accumulator (ARENA).
+    Let result be proc ef_arena_str with "", arena
+    Let word be proc ef_arena_str with "", arena
 
-    If has_if is equal to 1:
-        Let colored_if be proc ef_arena_concat with keyword_prefix, "If", arena
-        Set colored_if to proc ef_arena_concat with colored_if, color_suffix, arena
-        Set result to proc string_replace from StringUtils with source_code, "If", colored_if, arena
-        Set source_code to result
-    End If
+    Let i be 0
+    Let in_word be 0
+    While i is less than src_len:
+        Let ch be proc string_char_at from StringCore with source_code, i
 
-    If has_return is equal to 1:
-        Let colored_return be proc ef_arena_concat with keyword_prefix, "Return", arena
-        Set colored_return to proc ef_arena_concat with colored_return, color_suffix, arena
-        Set result to proc string_replace from StringUtils with source_code, "Return", colored_return, arena
-        Set source_code to result
+        Note: Identifier characters are A-Z, a-z, 0-9, and underscore.
+        Let is_upper be 0
+        If ch is greater than or equal to 65:
+            If ch is less than or equal to 90:
+                Set is_upper to 1
+            End If
+        End If
+        Let is_lower be 0
+        If ch is greater than or equal to 97:
+            If ch is less than or equal to 122:
+                Set is_lower to 1
+            End If
+        End If
+        Let is_digit be 0
+        If ch is greater than or equal to 48:
+            If ch is less than or equal to 57:
+                Set is_digit to 1
+            End If
+        End If
+        Let is_underscore be 0
+        If ch is equal to 95:
+            Set is_underscore to 1
+        End If
+
+        Let is_ident_char be 0
+        If is_upper is equal to 1:
+            Set is_ident_char to 1
+        End If
+        If is_lower is equal to 1:
+            Set is_ident_char to 1
+        End If
+        If is_digit is equal to 1:
+            Set is_ident_char to 1
+        End If
+        If is_underscore is equal to 1:
+            Set is_ident_char to 1
+        End If
+
+        If is_ident_char is equal to 1:
+            Note: Accumulate this character into the current word.
+            Let ch_str be proc char_to_string from StringCore with ch
+            Set word to proc ef_arena_concat with word, ch_str, arena
+            Set in_word to 1
+        Otherwise:
+            Note: Word boundary: flush any accumulated word, then emit this char.
+            If in_word is equal to 1:
+                Set result to proc ef_highlight_flush_word with result, word, keyword_prefix, color_suffix, arena
+                Set word to proc ef_arena_str with "", arena
+                Set in_word to 0
+            End If
+            Let sep_str be proc char_to_string from StringCore with ch
+            Set result to proc ef_arena_concat with result, sep_str, arena
+        End If
+
+        Set i to i plus 1
+    End While
+
+    Note: Flush trailing word if the source ended inside an identifier.
+    If in_word is equal to 1:
+        Set result to proc ef_highlight_flush_word with result, word, keyword_prefix, color_suffix, arena
     End If
 
     Note: Return ARENA pointer to highlighted code
-    Return source_code
+    Return result
+End Process
+
+Process called "ef_is_runa_keyword" takes word as Integer returns Integer:
+    Note: Returns 1 if the given identifier word is a canonical Runa keyword,
+    Note: 0 otherwise. Covers declaration, control-flow, type, operator, and
+    Note: literal keywords from the Runa language specification so the diagnostic
+    Note: highlighter colors the full keyword set rather than a sampled subset.
+    If word is equal to 0:
+        Return 0
+    End If
+
+    Note: Declaration / definition keywords
+    If proc string_equals from StringUtils with word, "Process" is equal to 1:
+        Return 1
+    End If
+    If proc string_equals from StringUtils with word, "Type" is equal to 1:
+        Return 1
+    End If
+    If proc string_equals from StringUtils with word, "Let" is equal to 1:
+        Return 1
+    End If
+    If proc string_equals from StringUtils with word, "Set" is equal to 1:
+        Return 1
+    End If
+    If proc string_equals from StringUtils with word, "Constant" is equal to 1:
+        Return 1
+    End If
+    If proc string_equals from StringUtils with word, "Define" is equal to 1:
+        Return 1
+    End If
+    If proc string_equals from StringUtils with word, "Import" is equal to 1:
+        Return 1
+    End If
+    If proc string_equals from StringUtils with word, "Export" is equal to 1:
+        Return 1
+    End If
+    If proc string_equals from StringUtils with word, "External" is equal to 1:
+        Return 1
+    End If
+
+    Note: Control-flow keywords
+    If proc string_equals from StringUtils with word, "If" is equal to 1:
+        Return 1
+    End If
+    If proc string_equals from StringUtils with word, "Otherwise" is equal to 1:
+        Return 1
+    End If
+    If proc string_equals from StringUtils with word, "Unless" is equal to 1:
+        Return 1
+    End If
+    If proc string_equals from StringUtils with word, "While" is equal to 1:
+        Return 1
+    End If
+    If proc string_equals from StringUtils with word, "For" is equal to 1:
+        Return 1
+    End If
+    If proc string_equals from StringUtils with word, "Each" is equal to 1:
+        Return 1
+    End If
+    If proc string_equals from StringUtils with word, "Match" is equal to 1:
+        Return 1
+    End If
+    If proc string_equals from StringUtils with word, "When" is equal to 1:
+        Return 1
+    End If
+    If proc string_equals from StringUtils with word, "Return" is equal to 1:
+        Return 1
+    End If
+    If proc string_equals from StringUtils with word, "Break" is equal to 1:
+        Return 1
+    End If
+    If proc string_equals from StringUtils with word, "Continue" is equal to 1:
+        Return 1
+    End If
+    If proc string_equals from StringUtils with word, "End" is equal to 1:
+        Return 1
+    End If
+
+    Note: Boolean / literal keywords
+    If proc string_equals from StringUtils with word, "true" is equal to 1:
+        Return 1
+    End If
+    If proc string_equals from StringUtils with word, "false" is equal to 1:
+        Return 1
+    End If
+    If proc string_equals from StringUtils with word, "null" is equal to 1:
+        Return 1
+    End If
+
+    Note: Structural / binding keywords
+    If proc string_equals from StringUtils with word, "called" is equal to 1:
+        Return 1
+    End If
+    If proc string_equals from StringUtils with word, "that" is equal to 1:
+        Return 1
+    End If
+    If proc string_equals from StringUtils with word, "takes" is equal to 1:
+        Return 1
+    End If
+    If proc string_equals from StringUtils with word, "returns" is equal to 1:
+        Return 1
+    End If
+    If proc string_equals from StringUtils with word, "be" is equal to 1:
+        Return 1
+    End If
+    If proc string_equals from StringUtils with word, "as" is equal to 1:
+        Return 1
+    End If
+    If proc string_equals from StringUtils with word, "to" is equal to 1:
+        Return 1
+    End If
+    If proc string_equals from StringUtils with word, "in" is equal to 1:
+        Return 1
+    End If
+    If proc string_equals from StringUtils with word, "is" is equal to 1:
+        Return 1
+    End If
+    If proc string_equals from StringUtils with word, "with" is equal to 1:
+        Return 1
+    End If
+    If proc string_equals from StringUtils with word, "from" is equal to 1:
+        Return 1
+    End If
+    If proc string_equals from StringUtils with word, "of" is equal to 1:
+        Return 1
+    End If
+
+    Note: Logical / comparison operator keywords
+    If proc string_equals from StringUtils with word, "and" is equal to 1:
+        Return 1
+    End If
+    If proc string_equals from StringUtils with word, "or" is equal to 1:
+        Return 1
+    End If
+    If proc string_equals from StringUtils with word, "not" is equal to 1:
+        Return 1
+    End If
+
+    Return 0
+End Process
+
+Process called "ef_highlight_flush_word" takes result as Integer, word as Integer, keyword_prefix as Integer, color_suffix as Integer, arena as Integer returns Integer:
+    Note: Appends a completed identifier word to the highlight accumulator,
+    Note: wrapping it in keyword-color escape codes when it is a canonical Runa
+    Note: keyword and emitting it verbatim otherwise. Returns the new ARENA
+    Note: accumulator pointer.
+    If proc ef_is_runa_keyword with word is equal to 1:
+        Let colored be proc ef_arena_concat with keyword_prefix, word, arena
+        Set colored to proc ef_arena_concat with colored, color_suffix, arena
+        Return proc ef_arena_concat with result, colored, arena
+    End If
+    Return proc ef_arena_concat with result, word, arena
 End Process
 
 Process called "error_formatter_generate_output" takes formatter as Integer, formatted_error as Integer, output_target as Integer, arena as Integer returns Integer:
@@ -1228,8 +1421,8 @@ Process called "error_formatter_register_style_template" takes formatter as Inte
         Return 0  Note: No style_templates hashtable
     End If
 
-    Note: Add template to style_templates hashtable
-    proc hashtable_set from Hashtable with style_templates, template_id, style_template
+    Note: Add template to style_templates ordered map
+    proc omap_set from OrderedMap with style_templates, template_id, style_template
 
     Note: Return template_id
     Return template_id
