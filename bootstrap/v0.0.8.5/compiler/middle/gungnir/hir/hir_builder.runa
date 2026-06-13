@@ -984,6 +984,13 @@ Process called "lower_literal" takes context as Integer, ast_node as Integer, li
         proc set_hir_node_type_info from HIR with hir_node, inferred_type
     End If
 
+    Note: HIR_LITERAL MIR contract: lower_hir_literal_post reads the literal value
+    Note: at offset 8 and the literal type at offset 16 to emit MIR_CONST. Mirror the
+    Note: value/type into those slots so a literal lowers to a constant (without this
+    Note: the post handler read the base node's line/column as the value/type).
+    proc memory_set_int64 from Layout with hir_node, 8, value
+    proc memory_set_int64 from Layout with hir_node, 16, inferred_type
+
     Return hir_node
 End Process
 
@@ -1042,6 +1049,15 @@ Process called "lower_identifier" takes context as Integer, ast_node as Integer,
         Let symbol_id be proc get_symbol_id with symbol
         proc set_hir_node_symbol_id from HIR with hir_node, symbol_id
 
+        Note: The MIR identifier post-handler resolves a use to its lowered MIR
+        Note: value by reading the identifier's resolved symbol id at offset 16
+        Note: (the HIR_IDENTIFIER contract) and looking it up in the builder's
+        Note: hir->mir value map (populated with the same symbol id when the
+        Note: defining parameter/Let was lowered). Store the id at offset 16 so a
+        Note: use of a parameter resolves to its alloca instead of failing
+        Note: undefined-identifier and aborting the function lowering.
+        proc memory_set_int64 from Layout with hir_node, 16, symbol_id
+
         Note: Get type from symbol
         Let symbol_type be proc get_symbol_type with symbol
         proc set_hir_node_type_info from HIR with hir_node, symbol_type
@@ -1098,10 +1114,18 @@ Process called "lower_binary_expression" takes context as Integer, ast_node as I
         Return 0
     End If
 
-    Note: Create base HIR node
-    Let base_hir be proc create_hir_node from HIR with HIR_BINARY_EXPRESSION from HIR, line, column
+    Note: Build the HIR_BINARY_EXPRESSION as a flat node (node_type @0). The
+    Note: contract every consumer reads is left @8, right @16, operator @24,
+    Note: result_type @32 (visit_expression_children visits left@8/right@16 in order,
+    Note: pushing each child result; lower_hir_binary_expression_post pops right then
+    Note: left, reads the operator @24, and emits the MIR binop). The
+    Note: create_hir_binary_expression WRAPPER put a base-node pointer at offset 0, so
+    Note: the visitor read a pointer as the node_type and never recursed into the
+    Note: operands — the binary expression (and its enclosing Let/Return) silently
+    Note: failed to lower.
+    Let binary_expr be proc create_hir_node from HIR with HIR_BINARY_EXPRESSION from HIR, line, column
 
-    If base_hir is equal to 0:
+    If binary_expr is equal to 0:
         Return 0
     End If
 
@@ -1112,16 +1136,15 @@ Process called "lower_binary_expression" takes context as Integer, ast_node as I
     Note: Infer result type based on operator and operand types
     Let result_type be proc infer_binary_result_type with context, operator, left_type, right_type
 
-    Note: Create specialized binary expression HIR node
-    Let binary_expr be proc create_hir_binary_expression from HIRNodes with base_hir, operator, left_hir, right_hir, result_type
+    proc memory_set_int64 from Layout with binary_expr, 8, left_hir
+    proc memory_set_int64 from Layout with binary_expr, 16, right_hir
+    proc memory_set_int64 from Layout with binary_expr, 24, operator
+    proc memory_set_int64 from Layout with binary_expr, 32, result_type
 
-    If binary_expr is equal to 0:
-        Return 0
-    End If
-
-    Note: Set result type on base HIR node
+    Note: Also record the result type in the base header type-info slot for passes
+    Note: that read get_hir_node_type_info.
     If result_type is not equal to 0:
-        proc set_hir_node_type_info from HIR with base_hir, result_type
+        proc set_hir_node_type_info from HIR with binary_expr, result_type
     End If
 
     Return binary_expr
@@ -1772,23 +1795,33 @@ Process called "lower_let_statement" takes context as Integer, ast_node as Integ
     Note: Add symbol to current scope
     proc add_symbol_to_scope with current_scope, var_symbol
 
-    Note: Create base HIR node
-    Let base_hir be proc create_hir_node from HIR with HIR_LET_STATEMENT from HIR, line, column
-
-    If base_hir is equal to 0:
-        Return 0
-    End If
-
-    Note: Attach symbol to HIR node
-    Let symbol_id be proc get_symbol_id with var_symbol
-    proc set_hir_node_symbol_id from HIR with base_hir, symbol_id
-
-    Note: Create specialized let statement HIR node
-    Let let_stmt be proc create_hir_let_statement from HIRNodes with base_hir, var_name, var_symbol, var_type, initializer_hir, is_mutable
+    Note: Build the HIR_LET_STATEMENT as a flat node so node_type is at offset 0
+    Note: (the visitor dispatches on node@0; the create_hir_let_statement WRAPPER put
+    Note: a base-node pointer there, so the Let was never lowered and the whole
+    Note: function silently dropped). The contract every consumer reads is:
+    Note: node_type 11000 @0, type_info @8, var_id (the variable's symbol id) @16,
+    Note: initializer @24 (lower_hir_let_statement_pre reads var_id@16 + type@8 and
+    Note: maps the symbol to a fresh alloca; visit_statement_children visits the
+    Note: initializer@24; the post stores the popped initializer value into the
+    Note: alloca).
+    Let let_stmt be proc create_hir_node from HIR with HIR_LET_STATEMENT from HIR, line, column
 
     If let_stmt is equal to 0:
         Return 0
     End If
+
+    Note: Attach symbol to the base header (offset 88) for diagnostics/other passes.
+    Let symbol_id be proc get_symbol_id with var_symbol
+    proc set_hir_node_symbol_id from HIR with let_stmt, symbol_id
+
+    Note: Store the MIR-contract fields. var_id@16 is the SAME symbol id a later use
+    Note: of the variable resolves to (lower_identifier stores the resolved id @16),
+    Note: so map_hir_to_mir_value(var_id -> alloca) in the pre handler lets the use
+    Note: find the alloca. type_info@8 sizes the alloca; initializer@24 is visited
+    Note: to produce the value the post stores.
+    proc memory_set_int64 from Layout with let_stmt, 8, var_type
+    proc memory_set_int64 from Layout with let_stmt, 16, symbol_id
+    proc memory_set_int64 from Layout with let_stmt, 24, initializer_hir
 
     Return let_stmt
 End Process
@@ -2237,8 +2270,11 @@ Process called "lower_return_statement" takes context as Integer, ast_node as In
         Return 0
     End If
 
-    Note: Store return value in base HIR node value field (offset 40)
-    proc memory_set_int64 from Layout with base_hir, 40, return_value_hir
+    Note: Store the return value at offset 8 — the HIR_RETURN_STATEMENT contract
+    Note: read by visit_statement_children (return_value @ offset 8) and the MIR
+    Note: return-statement lowering. (Offset 40 is the base node's generic value
+    Note: slot; the visitor never looks there for a return value.)
+    proc memory_set_int64 from Layout with base_hir, 8, return_value_hir
 
     Return base_hir
 End Process
@@ -2623,29 +2659,28 @@ Process called "lower_block_statement" takes context as Integer, ast_node as Int
         Return 0
     End If
 
+    Note: Allocate the block's statements list at offset 8 with the count at
+    Note: offset 16 — the HIR_BLOCK_STATEMENT contract every consumer reads
+    Note: (visit_statement_children walks statements@8 / stmt_count@16, and the MIR
+    Note: statement lowering reads the same). Storing the statements in the base
+    Note: children list at 24/32 instead (the prior behaviour) left offset 8 holding
+    Note: the base node's line value, which the visitor then dereferenced as a List
+    Note: pointer and crashed.
+    Let statements_list be proc create from List
+    proc memory_set_int64 from Layout with base_hir, 8, statements_list
+    proc memory_set_int64 from Layout with base_hir, 16, 0
+
     Note: Lower each statement in block
     Let i be 0
+    Let lowered_count be 0
     While i is less than statement_count:
         Let stmt_ast be proc get from List with statements_ast, i
         Let stmt_hir be proc lower_ast_node with context, stmt_ast
 
-        Note: Add lowered statement to block (store in children list)
         If stmt_hir is not equal to 0:
-            Note: Get children list from base_hir (offset 24)
-            Let children_list be proc memory_get_int64 from Layout with base_hir, 24
-            If children_list is equal to 0:
-                Note: Create children list if it doesn't exist
-                Set children_list to proc create from List
-                proc memory_set_int64 from Layout with base_hir, 24, children_list
-            End If
-
-            Note: Append statement to children list
-            proc append from List with children_list, stmt_hir
-
-            Note: Increment child count (offset 32)
-            Let child_count be proc memory_get_int64 from Layout with base_hir, 32
-            Set child_count to child_count plus 1
-            proc memory_set_int64 from Layout with base_hir, 32, child_count
+            proc append from List with statements_list, stmt_hir
+            Set lowered_count to lowered_count plus 1
+            proc memory_set_int64 from Layout with base_hir, 16, lowered_count
         End If
 
         Set i to i plus 1
@@ -2766,8 +2801,19 @@ Process called "lower_process_definition" takes context as Integer, ast_node as 
 
     Note: Get process information from ProcessDefinitionNode specialized structure
     Note: name at offset 80, parameters at offset 88, parameter_count at offset 96
-    Note: return_type at offset 104, body at offset 112
-    Let process_name be proc memory_get_int64 from Layout with ast_node, 80
+    Note: return_type at offset 104, body at offset 112. The name field holds the
+    Note: NAME node (an AST_IDENTIFIER from parse_process_name), not the raw string;
+    Note: unwrap its value (offset 40) to the actual name string so the MIR function
+    Note: symbol and codegen .globl/.type/label carry "compute" rather than a node
+    Note: pointer rendered as garbage bytes.
+    Let process_name_node be proc memory_get_int64 from Layout with ast_node, 80
+    Let process_name be process_name_node
+    If process_name_node is not equal to 0:
+        Let unwrapped_proc_name be proc ast_node_get_value from AST with process_name_node
+        If unwrapped_proc_name is not equal to 0:
+            Set process_name to unwrapped_proc_name
+        End If
+    End If
     Let parameters_ast be proc memory_get_int64 from Layout with ast_node, 88
     Let param_count be proc memory_get_int64 from Layout with ast_node, 96
     Let return_type_ast be proc memory_get_int64 from Layout with ast_node, 104
@@ -2801,8 +2847,21 @@ Process called "lower_process_definition" takes context as Integer, ast_node as 
     While i is less than param_count:
         Let param_ast be proc get from List with parameters_ast, i
 
-        Note: Parameter structure: name stored in value field, type in first child
-        Let param_name be proc ast_node_get_value from AST with param_ast
+        Note: Parameter structure (build_parameter_node, AST node 4009): the value
+        Note: field holds the parameter NAME node (an AST_IDENTIFIER built by
+        Note: parse_identifier), not the raw name string; the type annotation is the
+        Note: first child. Read the name node, then unwrap its value to get the actual
+        Note: name string so the parameter symbol is registered under the same string
+        Note: the body's identifier resolves against (storing the node pointer as the
+        Note: symbol name made every parameter use fail name resolution).
+        Let param_name_node be proc ast_node_get_value from AST with param_ast
+        Let param_name be param_name_node
+        If param_name_node is not equal to 0:
+            Let unwrapped_name be proc ast_node_get_value from AST with param_name_node
+            If unwrapped_name is not equal to 0:
+                Set param_name to unwrapped_name
+            End If
+        End If
         Let param_child_count be proc memory_get_int64 from Layout with param_ast, 32
         Let param_type_ast be 0
         If param_child_count is greater than 0:
@@ -2842,23 +2901,36 @@ Process called "lower_process_definition" takes context as Integer, ast_node as 
         Return 0
     End If
 
-    Note: Create base HIR node
-    Let base_hir be proc create_hir_node from HIR with HIR_PROCESS_DEFINITION from HIR, line, column
-
-    If base_hir is equal to 0:
-        Return 0
-    End If
-
-    Note: Attach process symbol
-    Let symbol_id be proc get_symbol_id with process_symbol
-    proc set_hir_node_symbol_id from HIR with base_hir, symbol_id
-
-    Note: Create specialized process definition HIR node
-    Let process_def be proc create_hir_process_definition from HIRNodes with base_hir, process_name, process_symbol, parameters_hir, param_count, return_type_hir, body_hir
+    Note: Build the HIR_PROCESS_DEFINITION node directly on a base HIRNode so its
+    Note: node_type lives at offset 0 — the single contract every HIR consumer
+    Note: relies on (the MIR visitor reads node_type @0 to dispatch the handler, and
+    Note: visit_declaration_children / lower_hir_process_definition_pre read the
+    Note: process fields at name@8 / parameters@16 / param_count@24 / return_type@32 /
+    Note: body@40). Returning the legacy create_hir_process_definition WRAPPER (which
+    Note: stores the base-node POINTER at offset 0) would make the visitor read a
+    Note: pointer as the node_type and never dispatch the function lowering, so no MIR
+    Note: function is emitted. The flat-node convention matches lower_return_statement
+    Note: and the rest of the HIR builders.
+    Let process_def be proc create_hir_node from HIR with HIR_PROCESS_DEFINITION from HIR, line, column
 
     If process_def is equal to 0:
         Return 0
     End If
+
+    Note: Attach process symbol id (offset 88 in the base HIRNode header).
+    Let symbol_id be proc get_symbol_id with process_symbol
+    proc set_hir_node_symbol_id from HIR with process_def, symbol_id
+
+    Note: Store the process-definition fields at the MIR-contract offsets. These
+    Note: overlay the base header's line/column (8/16) and the children/child_count/
+    Note: value slots (24/32/40); the process-definition node is a leaf-shaped
+    Note: declaration whose semantics come entirely from these specialized fields,
+    Note: so the overlay is intentional and matches the documented MIR layout.
+    proc memory_set_int64 from Layout with process_def, 8, process_name
+    proc memory_set_int64 from Layout with process_def, 16, parameters_hir
+    proc memory_set_int64 from Layout with process_def, 24, param_count
+    proc memory_set_int64 from Layout with process_def, 32, return_type_hir
+    proc memory_set_int64 from Layout with process_def, 40, body_hir
 
     Return process_def
 End Process

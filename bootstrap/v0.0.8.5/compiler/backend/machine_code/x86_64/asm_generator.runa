@@ -54,6 +54,7 @@ Import "compiler/frontend/primitives/collections/list.runa" as List
 Import "compiler/frontend/primitives/collections/dictionary.runa" as Dictionary
 Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
 Import "compiler/internal/string_utils.runa" as StringUtils
+Import "runtime/core/memory/chained_arena.runa" as ChainedArena
 
 Note: ============================================================================
 Note: x86_64 Assembly Generation Context
@@ -577,24 +578,59 @@ Process called "generate_x86_64_assembly" that takes lir_module as Integer, conf
         Return 0
     End If
 
-    Note: Create arena for generation temporaries
-    Let arena be Layout.allocate(8)
+    Note: Create a real CHAINED arena for generation temporaries. The StringBuffers
+    Note: that create_asm_context and asm_finalize build allocate through
+    Note: stringbuffer_create, which calls chained_arena_allocate from ChainedArena
+    Note: and therefore requires a ChainedArena structure — NOT a plain Layout arena
+    Note: and certainly not a bare 8-byte Layout.allocate (the prior code), which has
+    Note: no arena header and made every StringBuffer allocation dereference garbage,
+    Note: crashing asm_finalize on the first append.
+    Let arena be ChainedArena.chained_arena_create(262144, 8)
+    If arena is 0:
+        Return 0
+    End If
     Let ctx be create_asm_context(config, arena)
     If ctx is 0:
         Return 0
     End If
 
     Let output be __load(ctx, 0)
-    Let func_count be List.list_length(lir_module)
+
+    Note: lir_module is the LIRModule STRUCT produced by lir_create_module (lir.runa):
+    Note: name@0, functions List@8, external_functions@24. The functions to emit live
+    Note: in the List at offset 8 — NOT the struct itself. (The driver's compile_program
+    Note: reads the same offset 8 to count functions before codegen.) Treating the
+    Note: struct as a bare List read the name pointer as a list length and dereferenced
+    Note: garbage, crashing the per-function emit loop.
+    Let functions be __load(lir_module, 8)
+    Let func_count be 0
+    If functions is not 0:
+        Set func_count to List.list_length(functions)
+    End If
 
     Note: Emit each function
     Let fi be 0
     While fi is less than func_count:
-        Let lir_func be List.list_get(lir_module, fi)
+        Let lir_func be List.list_get(functions, fi)
         If lir_func is not 0:
             emit_function(ctx, lir_func)
         End If
         Set fi to fi plus 1
+    End While
+
+    Note: Emit external (declaration-only) functions so FFI symbols are declared.
+    Let ext_functions be __load(lir_module, 24)
+    Let ext_count be 0
+    If ext_functions is not 0:
+        Set ext_count to List.list_length(ext_functions)
+    End If
+    Let ei be 0
+    While ei is less than ext_count:
+        Let ext_func be List.list_get(ext_functions, ei)
+        If ext_func is not 0:
+            emit_function(ctx, ext_func)
+        End If
+        Set ei to ei plus 1
     End While
 
     Note: Emit string literals to .rodata

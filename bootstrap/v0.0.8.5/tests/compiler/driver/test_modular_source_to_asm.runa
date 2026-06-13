@@ -1,0 +1,107 @@
+Note:
+The #491 source->asm acceptance test. Drives a complete Runa source STRING through
+the v0.0.8.5 compiler's OWN modular frontend (lexer + parser) to an AST, then hands
+that AST to compile_program -- the full driver pipeline (AST -> HIR -> MIR ->
+optimize -> LIR -> instruction-select -> register-allocate -> peephole ->
+x86_64 codegen -> asm_finalize -> write_file). It then reads the emitted assembly
+file back and asserts a function symbol for the compiled Process is present, proving
+the entire source->asm path runs end to end through the modular frontend.
+
+This is the capstone of the frontend reconciliation: the token-type constant
+reconciliation (statement_parsers/expression_parsers mirror the lexer's emit values,
+TOKEN_IDENTIFIER=150 resolves the 200/LEFT_PAREN collision) lets the modular parser
+build the Process declaration, which lowers through HIR/MIR to a real MIR function,
+which the shared backend turns into assembly.
+:End Note
+
+Import "compiler/frontend/lexical/lexer.runa" as Lexer
+Import "compiler/frontend/lexical/lexer_factory.runa" as LexerFactory
+Import "compiler/frontend/lexical/token_stream.runa" as TokenStream
+Import "compiler/frontend/parsing/parser.runa" as Parser
+Import "compiler/driver/compile_orchestrator.runa" as CompileOrch
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/frontend/primitives/core/string_primitive.runa" as StringPrimitive
+Import "runtime/io/filesystem/file_operations.runa" as FileOps
+Import "tests/test_utils.runa" as TestUtils
+
+Constant MODE_CANON as Integer is 0
+
+Process called "main" returns Integer:
+    Let results be proc create_test_results from TestUtils
+    proc begin_suite from TestUtils with results, "modular_source_to_asm_e2e"
+
+    Note: ------------------------------------------------------------------
+    Note: Stage 1 -- a complete Process source string with a parameter, a Let
+    Note: binding, arithmetic, and a Return -- driven through the OWN modular lexer.
+    Note: ------------------------------------------------------------------
+    Let source be "Process called \"compute\" that takes a as Integer returns Integer:
+        Let b be a plus 1
+        Return b
+    End Process
+"
+    Let source_length be proc string_length from StringCore with source
+    proc assert_greater_than from TestUtils with results, "source_length_positive", source_length, 0
+
+    Let lexer be proc create_lexer_for_string from LexerFactory with source, source_length, MODE_CANON
+    proc assert_not_null from TestUtils with results, "lexer_created", lexer
+
+    Let token_stream be proc lexer_tokenize_all from Lexer with lexer
+    proc assert_not_null from TestUtils with results, "token_stream_produced", token_stream
+
+    Note: ------------------------------------------------------------------
+    Note: Stage 2 -- TokenStream -> modular parser -> AST_PROGRAM root.
+    Note: ------------------------------------------------------------------
+    Let parse_arena be proc arena_create from Layout with 65536
+    proc assert_not_null from TestUtils with results, "parse_arena_created", parse_arena
+
+    Let parser be proc parser_create from Parser with token_stream, parse_arena
+    proc assert_not_null from TestUtils with results, "parser_created", parser
+
+    Let ast_root be proc parser_parse_program from Parser with parser
+    proc assert_not_null from TestUtils with results, "ast_program_root_produced", ast_root
+
+    Note: The parser must have built the top-level Process declaration.
+    Let program_children be proc memory_get_qword from Layout with ast_root, 24
+    proc assert_not_null from TestUtils with results, "ast_program_children_list", program_children
+    Let child_count be proc memory_get_qword from Layout with ast_root, 32
+    proc assert_greater_than from TestUtils with results, "ast_program_child_count_positive", child_count, 0
+
+    Note: ------------------------------------------------------------------
+    Note: Stage 3 -- AST -> compile_program -> assembly file (the full driver
+    Note: pipeline: HIR -> MIR -> optimize -> LIR -> instruction-select ->
+    Note: register-allocate -> peephole -> x86_64 codegen -> asm_finalize ->
+    Note: write_file). O0 (no active build context) is the deterministic path.
+    Note: ------------------------------------------------------------------
+    proc set_active_build_context from CompileOrch with 0
+    Let output_path be "/tmp/test_modular_source_to_asm_out.s"
+    Let compile_rc be proc compile_program from CompileOrch with ast_root, output_path
+    proc assert_equal from TestUtils with results, "compile_program_succeeded", compile_rc, 0
+
+    Note: ------------------------------------------------------------------
+    Note: Stage 4 -- read the emitted assembly back and assert a function symbol
+    Note: for "compute" is present (the .globl/label the x86_64 generator emits for
+    Note: a public Process). This is the #491 source->asm acceptance: a function
+    Note: symbol reached codegen through the OWN modular frontend.
+    Note: ------------------------------------------------------------------
+    Let asm_text be proc read_file_data from FileOps with output_path
+    proc assert_not_null from TestUtils with results, "asm_file_read", asm_text
+
+    Let asm_len be proc string_length from StringCore with asm_text
+    proc assert_greater_than from TestUtils with results, "asm_non_empty", asm_len, 0
+
+    Note: The emitted symbol is the (possibly canonicalised) process name. Assert
+    Note: the function name substring appears in the assembly text. string_index_of
+    Note: returns a 0-based index (>= 0 on a hit, -1 on miss).
+    Let name_index be proc string_index_of from StringPrimitive with asm_text, "compute"
+    proc assert_greater_than from TestUtils with results, "asm_contains_function_symbol", name_index, -1
+
+    proc print_summary from TestUtils with results
+    Let failed be proc get_failed from TestUtils with results
+    proc destroy_test_results from TestUtils with results
+
+    If failed is equal to 0:
+        Return 0
+    End If
+    Return 1
+End Process
