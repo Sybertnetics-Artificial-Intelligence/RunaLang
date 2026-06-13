@@ -1,879 +1,2565 @@
-Note: Ruby Parser for Translation Translation System
-Note: Handles Ruby syntax including blocks, metaprogramming, mixins, monkey patching
+Note: ============================================================================
+Note: Ruby Parser - Complete recursive-descent AST generation for Ruby
+Note: Part of the RunaConvert Translation System
+Note: ============================================================================
+Note: Mirrors the dart/fsharp frontend convention exactly:
+Note:   - Integer handles only; arena-allocated nodes; module-qualified prims
+Note:   - Tokens pre-collected into a list for backtrack-free lookahead
+Note: .
+Note: AST NODE RECORD (40 bytes, 5 x i64) - the CONTRACT phase 2 consumes:
+Note:   offset 0  : node_type tag (one of the AST_* constants below)
+Note:   offset 8  : value (StringCore string handle: name / literal text /
+Note:               operator spelling; 0 when the node carries no scalar value)
+Note:   offset 16 : metadata (string-keyed Dictionary handle, lazily created;
+Note:               holds modifier flags such as "splat", "block", "kwarg",
+Note:               "modifier", "singleton", "exclusive"; 0 when none)
+Note:   offset 24 : children (ListCore list handle of child node handles)
+Note:   offset 32 : child_count (cached count maintained by add_node_child)
+Note: .
+Note: Per-node child layout is documented at each AST_* constant below and at
+Note: each parse_* production. All declaration/identifier names are carried in
+Note: the node's value slot (offset 8), NOT as a child identifier node.
+Note: ============================================================================
 
-Import "compiler/middle/gungnir/hir/translation/frontends/ruby/ruby_lexer.runa" as RubyLexer
+Import "compiler/middle/gungnir/hir/translation/frontends/ruby/ruby_lexer.runa" as Lexer
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/frontend/primitives/memory/layout.runa" as Arena
+Import "compiler/frontend/primitives/collections/list.runa" as ListOps
+Import "compiler/frontend/primitives/collections/dictionary.runa" as Dict
+Import "compiler/internal/string_utils.runa" as StringUtils
+
+Note: ============================================================================
+Note: AST Node Type Constants  (the node-layout contract for phase 2)
+Note: ============================================================================
+
+Note: --- Top level ---
+Constant AST_PROGRAM as Integer is 8200
+Note:   children: statements in source order
+
+Note: --- Declarations ---
+Constant AST_CLASS as Integer is 8210
+Note:   value: class name (constant path text). children:
+Note:     [0] optional AST_SUPERCLASS wrapper (present only when "< Base")
+Note:     [1..] body statements
+Note:   metadata "singleton"=1 for `class << self`
+Constant AST_MODULE as Integer is 8211
+Note:   value: module name. children: body statements
+Constant AST_METHOD as Integer is 8212
+Note:   value: method name (incl. trailing ? ! = or operator spelling). children:
+Note:     [0] AST_PARAM_LIST
+Note:     [1..] body statements
+Constant AST_SINGLETON_METHOD as Integer is 8213
+Note:   value: method name. children:
+Note:     [0] receiver expression (e.g. self / Constant)
+Note:     [1] AST_PARAM_LIST
+Note:     [2..] body statements
+Constant AST_PARAM_LIST as Integer is 8214
+Note:   children: AST_PARAM nodes
+Constant AST_PARAM as Integer is 8215
+Note:   value: parameter name. children: [0] optional default-value expression.
+Note:   metadata "splat"=1 (*a), "doublesplat"=1 (**a), "block"=1 (&blk),
+Note:            "kwarg"=1 (a:), "optional"=1 (has default)
+Constant AST_SUPERCLASS as Integer is 8216
+Note:   children: [0] superclass expression (constant path / expression)
+
+Note: --- Control flow ---
+Constant AST_IF as Integer is 8220
+Note:   children:
+Note:     [0] condition expression
+Note:     [1] AST_THEN_BLOCK (then-branch statements)
+Note:     [2] optional AST_ELSIF or AST_ELSE_BLOCK tail
+Note:   metadata "modifier"=1 for `expr if cond`
+Constant AST_UNLESS as Integer is 8221
+Note:   children: [0] condition, [1] then-block, [2] optional else-block
+Constant AST_WHILE as Integer is 8222
+Note:   children: [0] condition, [1] body block. metadata "modifier"=1
+Constant AST_UNTIL as Integer is 8223
+Note:   children: [0] condition, [1] body block. metadata "modifier"=1
+Constant AST_FOR as Integer is 8224
+Note:   children: [0] AST_TARGET_LIST loop vars, [1] iterable expr, [2] body block
+Constant AST_CASE as Integer is 8225
+Note:   children: [0] optional subject expr, [1..] AST_WHEN, optional AST_ELSE_BLOCK
+Constant AST_WHEN as Integer is 8226
+Note:   children: [0] AST_WHEN_GUARDS, [1] AST_THEN_BLOCK body
+Constant AST_WHEN_GUARDS as Integer is 8227
+Note:   children: guard expressions
+Constant AST_THEN_BLOCK as Integer is 8228
+Note:   children: statements of a branch body
+Constant AST_ELSE_BLOCK as Integer is 8229
+Note:   children: statements of an else body
+Constant AST_ELSIF as Integer is 8230
+Note:   children: [0] condition, [1] AST_THEN_BLOCK, [2] optional next elsif/else
+
+Note: --- Exception handling ---
+Constant AST_BEGIN as Integer is 8240
+Note:   children: [0] AST_THEN_BLOCK body, [1..] AST_RESCUE, optional AST_ELSE_BLOCK, optional AST_ENSURE
+Constant AST_RESCUE as Integer is 8241
+Note:   children: [0] AST_RESCUE_TYPES, [1] body block. value: bound var name (=> e), 0 when none
+Constant AST_RESCUE_TYPES as Integer is 8242
+Note:   children: exception-class expressions
+Constant AST_ENSURE as Integer is 8243
+Note:   children: body statements
+
+Note: --- Blocks / lambdas ---
+Constant AST_BLOCK as Integer is 8250
+Note:   children: [0] AST_PARAM_LIST, [1..] body. metadata "brace"=1 for { } form
+Constant AST_LAMBDA as Integer is 8251
+Note:   children: [0] AST_PARAM_LIST, [1..] body. metadata "arrow"=1 for -> form
+Constant AST_PROC as Integer is 8252
+Note:   children: [0] AST_PARAM_LIST, [1..] body
+
+Note: --- Statements / jumps ---
+Constant AST_RETURN as Integer is 8260
+Note:   children: [0] optional value expression
+Constant AST_BREAK as Integer is 8261
+Note:   children: [0] optional value expression
+Constant AST_NEXT as Integer is 8262
+Note:   children: [0] optional value expression
+Constant AST_YIELD as Integer is 8263
+Note:   children: argument expressions
+Constant AST_REDO as Integer is 8264
+Constant AST_RETRY as Integer is 8265
+Constant AST_ALIAS as Integer is 8266
+Note:   children: [0] new-name node, [1] old-name node
+Constant AST_UNDEF as Integer is 8267
+Note:   children: name nodes
+Constant AST_EXPR_STMT as Integer is 8268
+Note:   children: [0] the wrapped expression
+
+Note: --- Assignment ---
+Constant AST_ASSIGN as Integer is 8270
+Note:   value: operator spelling ("="). children: [0] target, [1] value
+Constant AST_MULTIPLE_ASSIGN as Integer is 8271
+Note:   children: [0] AST_TARGET_LIST, [1] AST_VALUE_LIST
+Constant AST_TARGET_LIST as Integer is 8272
+Note:   children: assignment target expressions (may include AST_SPLAT_ARG target)
+Constant AST_VALUE_LIST as Integer is 8273
+Note:   children: rhs value expressions
+Constant AST_OP_ASSIGN as Integer is 8274
+Note:   value: compound operator. children: [0] target, [1] value
+
+Note: --- Expressions ---
+Constant AST_BINARY_OP as Integer is 8280
+Note:   value: operator spelling. children: [0] left, [1] right
+Constant AST_UNARY_OP as Integer is 8281
+Note:   value: operator spelling. children: [0] operand
+Constant AST_TERNARY as Integer is 8282
+Note:   children: [0] condition, [1] true-expr, [2] false-expr
+Constant AST_RANGE as Integer is 8283
+Note:   children: [0] low, [1] high. metadata "exclusive"=1 for ...
+Constant AST_AND as Integer is 8284
+Note:   children: [0] left, [1] right (&& / and)
+Constant AST_OR as Integer is 8285
+Note:   children: [0] left, [1] right (|| / or)
+Constant AST_NOT as Integer is 8286
+Note:   children: [0] operand (! / not)
+Constant AST_DEFINED as Integer is 8287
+Note:   children: [0] operand of defined?
+
+Note: --- Calls / access ---
+Constant AST_METHOD_CALL as Integer is 8290
+Note:   value: method name. children:
+Note:     [0] receiver (AST_IDENTIFIER 0-value placeholder when implicit self),
+Note:     [1] AST_ARG_LIST,
+Note:     [2] optional AST_BLOCK
+Note:   metadata "safe"=1 for &. navigation
+Constant AST_ARG_LIST as Integer is 8291
+Note:   children: AST_ARG / AST_KWARG / AST_SPLAT_ARG / AST_BLOCK_ARG nodes
+Constant AST_ARG as Integer is 8292
+Note:   children: [0] argument expression
+Constant AST_KWARG as Integer is 8293
+Note:   value: keyword name. children: [0] value expression
+Constant AST_SPLAT_ARG as Integer is 8294
+Note:   children: [0] splatted expression. metadata "doublesplat"=1 for **
+Constant AST_BLOCK_ARG as Integer is 8295
+Note:   children: [0] block expression (&blk)
+Constant AST_INDEX as Integer is 8296
+Note:   children: [0] receiver, [1] AST_ARG_LIST of index expressions
+Constant AST_MEMBER as Integer is 8297
+Note:   value: member name. children: [0] receiver. metadata "safe"=1 for &.
+Constant AST_SCOPE_REF as Integer is 8298
+Note:   value: constant name. children: [0] scope expression (absent when ::Top)
+Constant AST_SUPER_CALL as Integer is 8299
+Note:   children: [0] optional AST_ARG_LIST, [1] optional AST_BLOCK. metadata "bare"=1 for zsuper
+
+Note: --- Primary / literals ---
+Constant AST_IDENTIFIER as Integer is 8310
+Note:   value: identifier name
+Constant AST_CONSTANT as Integer is 8311
+Note:   value: constant name (uppercase-led)
+Constant AST_INSTANCE_VAR as Integer is 8312
+Note:   value: @name (sigil included)
+Constant AST_CLASS_VAR as Integer is 8313
+Note:   value: @@name (sigil included)
+Constant AST_GLOBAL_VAR as Integer is 8314
+Note:   value: $name (sigil included)
+Constant AST_SELF as Integer is 8315
+Constant AST_NIL as Integer is 8316
+Constant AST_TRUE as Integer is 8317
+Constant AST_FALSE as Integer is 8318
+Constant AST_INTEGER as Integer is 8319
+Note:   value: integer lexeme text
+Constant AST_FLOAT as Integer is 8320
+Note:   value: float lexeme text
+Constant AST_STRING as Integer is 8321
+Note:   value: string lexeme text (delimiters included)
+Constant AST_STRING_INTERP as Integer is 8322
+Note:   value: raw interpolated-string lexeme text
+Constant AST_SYMBOL as Integer is 8323
+Note:   value: symbol lexeme text (leading : included)
+Constant AST_REGEXP as Integer is 8324
+Note:   value: regex lexeme text (slashes + flags included)
+Constant AST_ARRAY as Integer is 8325
+Note:   children: element expressions (may include AST_SPLAT_ARG)
+Constant AST_HASH as Integer is 8326
+Note:   children: AST_HASH_PAIR nodes
+Constant AST_HASH_PAIR as Integer is 8327
+Note:   children: [0] key expression, [1] value expression
+
+Note: ============================================================================
+Note: Parser Structure
+Note: ============================================================================
+
 @Reasoning:
-RubyParser carries the streaming token cursor plus a registry of all AST nodes created during the parse. Current_token is cached alongside position so token-type checks do not need to re-index the tokens list.
+The parser pre-tokenizes the entire source into a list (front-loaded lexing
+gives O(1) lookahead) and tracks a cursor over it. The 48-byte record holds
+the lexer (0), the cached current token (8), the token list (16), the cursor
+position (24), and the error list (32); the trailing slot (40) is reserved.
 @End Reasoning
-
-@Implementation:
-Four fields: tokens list pointer, position index, cached current_token (RubyToken), and ast_nodes registry list. position and current_token are kept in sync by advance().
-@End Implementation
-
 Type called "RubyParser":
-    tokens as Integer  Note: List of tokens
+    lexer as Integer
+    current_token as Integer
+    tokens as Integer
     position as Integer
-    current_token as RubyToken
-    ast_nodes as Integer  Note: List of created AST nodes
-End Type
-
-Note: Ruby AST node types
-Constant AST_PROGRAM as Integer is 100
-Constant AST_CLASS as Integer is 101
-Constant AST_MODULE as Integer is 102
-Constant AST_METHOD as Integer is 103
-Constant AST_BLOCK as Integer is 104
-Constant AST_IF as Integer is 105
-Constant AST_UNLESS as Integer is 106
-Constant AST_WHILE as Integer is 107
-Constant AST_UNTIL as Integer is 108
-Constant AST_FOR as Integer is 109
-Constant AST_CASE as Integer is 110
-Constant AST_WHEN as Integer is 111
-Constant AST_BEGIN_RESCUE as Integer is 112
-Constant AST_RESCUE as Integer is 113
-Constant AST_ENSURE as Integer is 114
-Constant AST_YIELD as Integer is 115
-Constant AST_LAMBDA as Integer is 116
-Constant AST_PROC as Integer is 117
-Constant AST_ASSIGNMENT as Integer is 118
-Constant AST_METHOD_CALL as Integer is 119
-Constant AST_SUPER_CALL as Integer is 120
-Constant AST_SELF as Integer is 121
-Constant AST_IDENTIFIER as Integer is 122
-Constant AST_CONSTANT as Integer is 123
-Constant AST_INSTANCE_VAR as Integer is 124
-Constant AST_CLASS_VAR as Integer is 125
-Constant AST_GLOBAL_VAR as Integer is 126
-Constant AST_SYMBOL as Integer is 127
-Constant AST_STRING as Integer is 128
-Constant AST_INTERPOLATED_STRING as Integer is 129
-Constant AST_NUMBER as Integer is 130
-Constant AST_ARRAY as Integer is 131
-Constant AST_HASH as Integer is 132
-Constant AST_RANGE as Integer is 133
-Constant AST_REGEXP as Integer is 134
-Constant AST_BINARY_OP as Integer is 135
-Constant AST_UNARY_OP as Integer is 136
-Constant AST_RETURN as Integer is 137
-Constant AST_BREAK as Integer is 138
-Constant AST_NEXT as Integer is 139
-Constant AST_ATTR_ACCESSOR as Integer is 140
-Constant AST_ATTR_READER as Integer is 141
-Constant AST_ATTR_WRITER as Integer is 142
-Constant AST_INCLUDE as Integer is 143
-Constant AST_EXTEND as Integer is 144
-Constant AST_ALIAS as Integer is 145
-Constant AST_UNDEF as Integer is 146
-
-@Reasoning:
-Unified AST node for every Ruby construct. The attributes dictionary carries shape-specific metadata that doesn't fit cleanly as children - e.g. visibility for methods, mixin lists for classes, the block-argument flag for method calls.
-@End Reasoning
-
-@Implementation:
-Six fields: AST_* type code, raw value string (identifier name, literal text), children list (variable arity), source line/column for diagnostics, and attributes dictionary for shape-specific metadata.
-@End Implementation
-
-Type called "RubyASTNode":
-    node_type as Integer
-    value as String
-    children as Integer  Note: List of child nodes
-    line as Integer
-    column as Integer
-    attributes as Integer  Note: Dictionary of node attributes
+    errors as Integer
+    reserved as Integer
 End Type
 
 @Reasoning:
-Factory: builds a RubyParser positioned at token 0 with an empty AST registry. Tokens list is borrowed - parser doesn't own it.
+Construction pre-tokenizes the whole source. The lexer's next_token needs the
+previous token type to resolve regex-vs-division and symbol-vs-colon, so the
+collection loop threads the last emitted type through. Every token (including
+the terminating EOF) is appended so lookahead scans always find a sentinel.
 @End Reasoning
+Process called "create_ruby_parser" takes lexer as Integer returns Integer:
+    Note: Create parser from a lexer, pre-collecting all tokens
 
-@Implementation:
-Constructs a RubyParser with tokens, position=0, current_token=tokens[0], and a fresh empty ast_nodes list.
-@End Implementation
+    Let parser be proc allocate from Arena with 48
+    proc memory_set_int64 from Memory with parser, 0, lexer
 
-Process called "create_ruby_parser" takes tokens as Integer returns Integer:
-    Note: Create new Ruby parser instance
+    Let tokens be proc list_create from ListOps
+    proc memory_set_int64 from Memory with parser, 16, tokens
 
-    Let parser be a value of type RubyParser with
-        tokens as tokens,
-        position as 0,
-        current_token as proc get_list_item with tokens, 0,
-        ast_nodes as proc create_list
+    Let prev_type be 0
+    While 1 is equal to 1:
+        Let token be proc next_token from Lexer with lexer, prev_type
+        proc list_append from ListOps with tokens, token
+
+        Let token_type be proc memory_get_int64 from Memory with token, 0
+        Set prev_type to token_type
+        If token_type is equal to TOKEN_EOF from Lexer:
+            Break
+        End If
+    End While
+
+    proc memory_set_int64 from Memory with parser, 24, 0
+
+    Let first_token be proc list_get from ListOps with tokens, 0
+    proc memory_set_int64 from Memory with parser, 8, first_token
+
+    Let errors be proc list_create from ListOps
+    proc memory_set_int64 from Memory with parser, 32, errors
+
+    proc memory_set_int64 from Memory with parser, 40, 0
 
     Return parser
 End Process
 
-@Reasoning:
-Top-level entry: builds an AST_PROGRAM root and accumulates top-level statements until EOF. Inter-statement newlines are skipped because Ruby uses newline as a statement terminator and a top-level scope has no other structural significance.
-@End Reasoning
+Note: ============================================================================
+Note: Token-Stream Utilities
+Note: ============================================================================
 
-@Implementation:
-Creates an AST_PROGRAM node, loops until TOKEN_EOF: skips TOKEN_NEWLINE, then parses one statement via parse_statement and appends as a child. Returns the program node.
-@End Implementation
+Process called "current_token_type" takes parser as Integer returns Integer:
+    Note: Type tag of the token at the cursor
 
-Process called "parse_ruby" takes parser as Integer returns Integer:
-    Note: Parse Ruby source into AST
-
-    Let program_node be proc create_ast_node with AST_PROGRAM, ""
-
-    Note: Parse top-level statements
-    While proc current_token_type with parser is not equal to TOKEN_EOF from RubyLexer:
-        Note: Skip newlines at top level
-        If proc current_token_type with parser is equal to TOKEN_NEWLINE from RubyLexer:
-            proc advance from parser
-            Continue
-        End If
-
-        Let statement be proc parse_statement from parser
-        If statement is not equal to 0:
-            proc add_child with program_node, statement
-        End If
-    End While
-
-    Return program_node
+    Let token be proc memory_get_int64 from Memory with parser, 8
+    Let token_type be proc memory_get_int64 from Memory with token, 0
+    Return token_type
 End Process
 
+Process called "current_lexeme" takes parser as Integer returns Integer:
+    Note: Lexeme string handle of the token at the cursor (0 if none)
+
+    Let token be proc memory_get_int64 from Memory with parser, 8
+    Let lexeme be proc memory_get_int64 from Memory with token, 8
+    Return lexeme
+End Process
+
+Process called "token_type_at" takes parser as Integer, index as Integer returns Integer:
+    Note: Type tag at an absolute token-list index, clamped to [0, last]
+
+    Let tokens be proc memory_get_int64 from Memory with parser, 16
+    Let token_count be proc list_length from ListOps with tokens
+
+    Let safe_index be index
+    If safe_index is less than 0:
+        Set safe_index to 0
+    End If
+    If safe_index is greater than or equal to token_count:
+        Set safe_index to token_count minus 1
+    End If
+
+    Let token be proc list_get from ListOps with tokens, safe_index
+    Let token_type be proc memory_get_int64 from Memory with token, 0
+    Return token_type
+End Process
+
+Process called "peek_token_type" takes parser as Integer, offset as Integer returns Integer:
+    Note: Type tag offset tokens ahead of the cursor (offset 0 = current)
+
+    Let position be proc memory_get_int64 from Memory with parser, 24
+    Return proc token_type_at with parser, position plus offset
+End Process
+
+Process called "advance_parser" takes parser as Integer returns Integer:
+    Note: Bump the cursor and refresh the cached current token (clamped at EOF)
+
+    Let position be proc memory_get_int64 from Memory with parser, 24
+    Let tokens be proc memory_get_int64 from Memory with parser, 16
+    Let token_count be proc list_length from ListOps with tokens
+
+    Set position to position plus 1
+    If position is greater than or equal to token_count:
+        Set position to token_count minus 1
+    End If
+
+    proc memory_set_int64 from Memory with parser, 24, position
+    Let token be proc list_get from ListOps with tokens, position
+    proc memory_set_int64 from Memory with parser, 8, token
+
+    Return 1
+End Process
+
+Process called "match_token" takes parser as Integer, expected_type as Integer returns Integer:
+    Note: 1 if the current token matches expected_type; never advances
+
+    Let token_type be proc current_token_type with parser
+    If token_type is equal to expected_type:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Process called "expect_token" takes parser as Integer, expected_type as Integer returns Integer:
+    Note: Consume the current token if it matches; else record an error
+
+    Let token_type be proc current_token_type with parser
+    If token_type is not equal to expected_type:
+        proc add_parse_error with parser, "Unexpected token"
+        Return 0
+    End If
+    proc advance_parser with parser
+    Return 1
+End Process
+
+Process called "add_parse_error" takes parser as Integer, message as Integer returns Integer:
+    Note: Append a diagnostic message to the parser's error list
+
+    Let errors be proc memory_get_int64 from Memory with parser, 32
+    proc list_append from ListOps with errors, message
+    Return 1
+End Process
+
+Process called "get_errors" takes parser as Integer returns Integer:
+    Note: Return the parser's accumulated error list
+
+    Return proc memory_get_int64 from Memory with parser, 32
+End Process
+
+Note: ============================================================================
+Note: AST Node Helpers  (identical record shape to dart/fsharp frontends)
+Note: ============================================================================
+
 @Reasoning:
-Statement-level dispatcher. Ruby has many keyword-led statement forms - class, module, def, if, unless, while, until, for, case, begin, return, break, next, yield, alias, undef, attr_accessor/reader/writer, include, extend. Each routes to a dedicated parse_* handler. Bare expression statements fall through to parse_expression.
+Allocates a 40-byte node, zeroing the value and metadata slots, creating an
+empty children list, and zeroing the child count. The allocator does not
+guarantee zeroed memory so every slot is initialised explicitly.
 @End Reasoning
+Process called "create_ast_node" takes node_type as Integer returns Integer:
+    Note: Create an AST node with the given type tag
 
-@Implementation:
-Match on current_token_type: TOKEN_CLASS -> parse_class, TOKEN_MODULE -> parse_module, TOKEN_DEF -> parse_method, TOKEN_IF -> parse_if, ... and so on. Default branch calls parse_expression and returns the resulting AST node.
-@End Implementation
+    Let node be proc allocate from Arena with 40
+    proc memory_set_int64 from Memory with node, 0, node_type
+    proc memory_set_int64 from Memory with node, 8, 0
+    proc memory_set_int64 from Memory with node, 16, 0
 
-Process called "parse_statement" takes parser as Integer returns Integer:
-    Note: Parse Ruby statement with complete syntax support
+    Let children be proc list_create from ListOps
+    proc memory_set_int64 from Memory with node, 24, children
+    proc memory_set_int64 from Memory with node, 32, 0
 
-    Let token_type be proc current_token_type from parser
+    Return node
+End Process
 
-    Match token_type:
-        When TOKEN_CLASS from RubyLexer:
-            Return proc parse_class from parser
-        When TOKEN_MODULE from RubyLexer:
-            Return proc parse_module from parser
-        When TOKEN_DEF from RubyLexer:
-            Return proc parse_method from parser
-        When TOKEN_IF from RubyLexer:
-            Return proc parse_if from parser
-        When TOKEN_UNLESS from RubyLexer:
-            Return proc parse_unless from parser
-        When TOKEN_WHILE from RubyLexer:
-            Return proc parse_while from parser
-        When TOKEN_UNTIL from RubyLexer:
-            Return proc parse_until from parser
-        When TOKEN_FOR from RubyLexer:
-            Return proc parse_for from parser
-        When TOKEN_CASE from RubyLexer:
-            Return proc parse_case from parser
-        When TOKEN_BEGIN from RubyLexer:
-            Return proc parse_begin_rescue from parser
-        When TOKEN_RETURN from RubyLexer:
-            Return proc parse_return from parser
-        When TOKEN_BREAK from RubyLexer:
-            Return proc parse_break from parser
-        When TOKEN_NEXT from RubyLexer:
-            Return proc parse_next from parser
-        When TOKEN_YIELD from RubyLexer:
-            Return proc parse_yield from parser
-        When TOKEN_ALIAS from RubyLexer:
-            Return proc parse_alias from parser
-        When TOKEN_UNDEF from RubyLexer:
-            Return proc parse_undef from parser
+Process called "create_value_node" takes node_type as Integer, value as Integer returns Integer:
+    Note: Create a node and set its primary value in one step
+
+    Let node be proc create_ast_node with node_type
+    proc memory_set_int64 from Memory with node, 8, value
+    Return node
+End Process
+
+Process called "add_node_child" takes node as Integer, child as Integer returns Integer:
+    Note: Append a child node; null children are skipped
+
+    If child is equal to 0:
+        Return 0
+    End If
+
+    Let children be proc memory_get_int64 from Memory with node, 24
+    proc list_append from ListOps with children, child
+
+    Let count be proc memory_get_int64 from Memory with node, 32
+    Set count to count plus 1
+    proc memory_set_int64 from Memory with node, 32, count
+
+    Return 1
+End Process
+
+Process called "set_node_value" takes node as Integer, value as Integer returns Integer:
+    Note: Set a node's primary value (string handle)
+
+    proc memory_set_int64 from Memory with node, 8, value
+    Return 1
+End Process
+
+Process called "set_node_metadata" takes node as Integer, key as Integer, value as Integer returns Integer:
+    Note: Attach a named metadata entry (lazily creating the dictionary)
+
+    If node is equal to 0:
+        Return 0
+    End If
+    If key is equal to 0:
+        Return 0
+    End If
+
+    Let metadata be proc memory_get_int64 from Memory with node, 16
+    If metadata is equal to 0:
+        Set metadata to proc create from Dict
+        If metadata is equal to 0:
+            Return 0
+        End If
+        proc memory_set_int64 from Memory with node, 16, metadata
+    End If
+
+    proc set from Dict with metadata, key, value
+    Return 1
+End Process
+
+Process called "ast_node_type" takes node as Integer returns Integer:
+    Note: Read a node's kind tag
+
+    If node is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with node, 0
+End Process
+
+Process called "ast_node_value" takes node as Integer returns Integer:
+    Note: Read a node's primary value (string handle, 0 if none)
+
+    If node is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with node, 8
+End Process
+
+Process called "ast_node_child_count" takes node as Integer returns Integer:
+    Note: Read a node's child count
+
+    If node is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with node, 32
+End Process
+
+Process called "ast_node_child" takes node as Integer, index as Integer returns Integer:
+    Note: Read the child at a position; 0 for out-of-range/null
+
+    If node is equal to 0:
+        Return 0
+    End If
+    If index is less than 0:
+        Return 0
+    End If
+
+    Let count be proc memory_get_int64 from Memory with node, 32
+    If index is greater than or equal to count:
+        Return 0
+    End If
+
+    Let children be proc memory_get_int64 from Memory with node, 24
+    If children is equal to 0:
+        Return 0
+    End If
+
+    Return proc list_get from ListOps with children, index
+End Process
+
+Process called "ast_node_metadata" takes node as Integer, key as Integer returns Integer:
+    Note: Read a named metadata entry (0 if absent)
+
+    If node is equal to 0:
+        Return 0
+    End If
+    Let metadata be proc memory_get_int64 from Memory with node, 16
+    If metadata is equal to 0:
+        Return 0
+    End If
+    Return proc get from Dict with metadata, key
+End Process
+
+Process called "ast_node_has_flag" takes node as Integer, flag as Integer returns Integer:
+    Note: 1 when a modifier flag is present and nonzero, else 0
+
+    Let value be proc ast_node_metadata with node, flag
+    If value is not equal to 0:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: Statement-Terminator Skipping
+Note: ============================================================================
+
+@Reasoning:
+Ruby separates statements with newlines or semicolons. This helper consumes a
+run of either so a production can call it between statements without caring
+which terminator form was used.
+@End Reasoning
+Process called "skip_terminators" takes parser as Integer returns Integer:
+    Note: Consume any run of newline / semicolon terminators
+
+    While 1 is equal to 1:
+        Let t be proc current_token_type with parser
+        If t is equal to TOKEN_NEWLINE from Lexer:
+            proc advance_parser with parser
         Otherwise:
-            Return proc parse_expression_statement from parser
-    End Match
+            If t is equal to TOKEN_SEMICOLON from Lexer:
+                proc advance_parser with parser
+            Otherwise:
+                Return 1
+            End If
+        End If
+    End While
+
+    Return 1
 End Process
 
 @Reasoning:
-Parses `class Name < Parent ... end`. Ruby classes can inherit from one superclass (optional after <). The body is a sequence of method definitions, attr_* macros, include/extend mixins, and other class-level statements.
+A block terminator is any token that closes a body without itself being a
+statement: end, else, elsif, when, rescue, ensure, the EOF sentinel, and the
+brace/bracket/paren closers used by block and collection bodies.
 @End Reasoning
+Process called "is_block_terminator" takes token_type as Integer returns Integer:
+    Note: Whether token_type ends a statement body
 
-@Implementation:
-Consumes TOKEN_CLASS, captures the class name identifier. If next token is "<", consumes it and captures the superclass name into the AST_CLASS node's attributes. Then loops parsing class-body statements via parse_statement until TOKEN_END.
-@End Implementation
+    If token_type is equal to TOKEN_END from Lexer:
+        Return 1
+    End If
+    If token_type is equal to TOKEN_ELSE from Lexer:
+        Return 1
+    End If
+    If token_type is equal to TOKEN_ELSIF from Lexer:
+        Return 1
+    End If
+    If token_type is equal to TOKEN_WHEN from Lexer:
+        Return 1
+    End If
+    If token_type is equal to TOKEN_RESCUE from Lexer:
+        Return 1
+    End If
+    If token_type is equal to TOKEN_ENSURE from Lexer:
+        Return 1
+    End If
+    If token_type is equal to TOKEN_EOF from Lexer:
+        Return 1
+    End If
+    If token_type is equal to TOKEN_RBRACE from Lexer:
+        Return 1
+    End If
+    If token_type is equal to TOKEN_RBRACKET from Lexer:
+        Return 1
+    End If
+    If token_type is equal to TOKEN_RPAREN from Lexer:
+        Return 1
+    End If
+    Return 0
+End Process
 
+Note: ============================================================================
+Note: Program Entry
+Note: ============================================================================
+
+@Reasoning:
+The compilation unit is a sequence of statements. Statement terminators are
+skipped between productions; EOF ends the program. A statement that fails to
+parse (returns 0) is reported and one token consumed to guarantee forward
+progress on malformed input.
+@End Reasoning
+Process called "parse_ruby" takes parser as Integer returns Integer:
+    Note: Parse a Ruby compilation unit into an AST_PROGRAM
+
+    Let program be proc create_ast_node with AST_PROGRAM
+
+    While 1 is equal to 1:
+        proc skip_terminators with parser
+        Let token_type be proc current_token_type with parser
+
+        If token_type is equal to TOKEN_EOF from Lexer:
+            Return program
+        End If
+
+        Let stmt be proc parse_statement with parser
+        If stmt is equal to 0:
+            proc add_parse_error with parser, "Unexpected token at top level"
+            proc advance_parser with parser
+        Otherwise:
+            proc add_node_child with program, stmt
+        End If
+    End While
+
+    Return program
+End Process
+
+Note: ============================================================================
+Note: Statements
+Note: ============================================================================
+
+@Reasoning:
+Statement dispatch. Declaration and control keywords route to their dedicated
+productions; everything else is an expression statement, then checked for a
+trailing statement modifier (`expr if cond`, `expr unless cond`, `expr while
+cond`, `expr until cond`, `expr rescue fallback`) - Ruby's postfix control
+forms. The modifier wraps the already-parsed expression.
+@End Reasoning
+Process called "parse_statement" takes parser as Integer returns Integer:
+    Note: Parse one statement, including trailing statement modifiers
+
+    Let token_type be proc current_token_type with parser
+
+    Let base be 0
+
+    If token_type is equal to TOKEN_DEF from Lexer:
+        Set base to proc parse_method with parser
+    Otherwise:
+    If token_type is equal to TOKEN_CLASS from Lexer:
+        Set base to proc parse_class with parser
+    Otherwise:
+    If token_type is equal to TOKEN_MODULE from Lexer:
+        Set base to proc parse_module with parser
+    Otherwise:
+    If token_type is equal to TOKEN_IF from Lexer:
+        Set base to proc parse_if with parser
+    Otherwise:
+    If token_type is equal to TOKEN_UNLESS from Lexer:
+        Set base to proc parse_unless with parser
+    Otherwise:
+    If token_type is equal to TOKEN_WHILE from Lexer:
+        Set base to proc parse_while with parser
+    Otherwise:
+    If token_type is equal to TOKEN_UNTIL from Lexer:
+        Set base to proc parse_until with parser
+    Otherwise:
+    If token_type is equal to TOKEN_FOR from Lexer:
+        Set base to proc parse_for with parser
+    Otherwise:
+    If token_type is equal to TOKEN_CASE from Lexer:
+        Set base to proc parse_case with parser
+    Otherwise:
+    If token_type is equal to TOKEN_BEGIN from Lexer:
+        Set base to proc parse_begin with parser
+    Otherwise:
+    If token_type is equal to TOKEN_RETURN from Lexer:
+        Set base to proc parse_return with parser
+    Otherwise:
+    If token_type is equal to TOKEN_BREAK from Lexer:
+        Set base to proc parse_break with parser
+    Otherwise:
+    If token_type is equal to TOKEN_NEXT from Lexer:
+        Set base to proc parse_next with parser
+    Otherwise:
+    If token_type is equal to TOKEN_ALIAS from Lexer:
+        Set base to proc parse_alias with parser
+    Otherwise:
+    If token_type is equal to TOKEN_UNDEF from Lexer:
+        Set base to proc parse_undef with parser
+    Otherwise:
+    If token_type is equal to TOKEN_REDO from Lexer:
+        proc advance_parser with parser
+        Set base to proc create_ast_node with AST_REDO
+    Otherwise:
+    If token_type is equal to TOKEN_RETRY from Lexer:
+        proc advance_parser with parser
+        Set base to proc create_ast_node with AST_RETRY
+    Otherwise:
+        Set base to proc parse_expression_statement with parser
+    End If
+    End If
+    End If
+    End If
+    End If
+    End If
+    End If
+    End If
+    End If
+    End If
+    End If
+    End If
+    End If
+    End If
+    End If
+    End If
+    End If
+
+    If base is equal to 0:
+        Return 0
+    End If
+
+    Set base to proc apply_statement_modifier with parser, base
+    Return base
+End Process
+
+@Reasoning:
+Applies a trailing statement modifier to an already-parsed statement.
+`stmt if cond` becomes an AST_IF with the modifier flag set, condition first
+and the statement as the then-branch; while/until/unless mirror this; rescue
+wraps the statement in an AST_BEGIN with a single catch-all AST_RESCUE whose
+body is the fallback expression. No modifier leaves the statement unchanged.
+@End Reasoning
+Process called "apply_statement_modifier" takes parser as Integer, stmt as Integer returns Integer:
+    Note: Wrap stmt in a postfix if/unless/while/until/rescue modifier if present
+
+    Let token_type be proc current_token_type with parser
+
+    If token_type is equal to TOKEN_IF from Lexer:
+        proc advance_parser with parser
+        Let cond be proc parse_expression with parser
+        Let node be proc create_ast_node with AST_IF
+        proc set_node_metadata with node, "modifier", 1
+        proc add_node_child with node, cond
+        Let then_block be proc create_ast_node with AST_THEN_BLOCK
+        proc add_node_child with then_block, stmt
+        proc add_node_child with node, then_block
+        Return node
+    End If
+
+    If token_type is equal to TOKEN_UNLESS from Lexer:
+        proc advance_parser with parser
+        Let cond be proc parse_expression with parser
+        Let node be proc create_ast_node with AST_UNLESS
+        proc set_node_metadata with node, "modifier", 1
+        proc add_node_child with node, cond
+        Let then_block be proc create_ast_node with AST_THEN_BLOCK
+        proc add_node_child with then_block, stmt
+        proc add_node_child with node, then_block
+        Return node
+    End If
+
+    If token_type is equal to TOKEN_WHILE from Lexer:
+        proc advance_parser with parser
+        Let cond be proc parse_expression with parser
+        Let node be proc create_ast_node with AST_WHILE
+        proc set_node_metadata with node, "modifier", 1
+        proc add_node_child with node, cond
+        Let body be proc create_ast_node with AST_THEN_BLOCK
+        proc add_node_child with body, stmt
+        proc add_node_child with node, body
+        Return node
+    End If
+
+    If token_type is equal to TOKEN_UNTIL from Lexer:
+        proc advance_parser with parser
+        Let cond be proc parse_expression with parser
+        Let node be proc create_ast_node with AST_UNTIL
+        proc set_node_metadata with node, "modifier", 1
+        proc add_node_child with node, cond
+        Let body be proc create_ast_node with AST_THEN_BLOCK
+        proc add_node_child with body, stmt
+        proc add_node_child with node, body
+        Return node
+    End If
+
+    If token_type is equal to TOKEN_RESCUE from Lexer:
+        proc advance_parser with parser
+        Let fallback be proc parse_expression with parser
+        Let begin_node be proc create_ast_node with AST_BEGIN
+        Let body be proc create_ast_node with AST_THEN_BLOCK
+        proc add_node_child with body, stmt
+        proc add_node_child with begin_node, body
+        Let rescue_node be proc create_ast_node with AST_RESCUE
+        Let rescue_types be proc create_ast_node with AST_RESCUE_TYPES
+        proc add_node_child with rescue_node, rescue_types
+        Let rescue_body be proc create_ast_node with AST_THEN_BLOCK
+        proc add_node_child with rescue_body, fallback
+        proc add_node_child with rescue_node, rescue_body
+        proc add_node_child with begin_node, rescue_node
+        Return begin_node
+    End If
+
+    Return stmt
+End Process
+
+@Reasoning:
+An expression statement wraps a full expression in AST_EXPR_STMT so the
+program/body child lists carry a uniform statement node kind. The wrapper is
+also where multiple assignment is detected: a primary followed by a comma at
+statement top level begins a multiple-assignment target list.
+@End Reasoning
+Process called "parse_expression_statement" takes parser as Integer returns Integer:
+    Note: Parse an expression (or multiple assignment) as a statement
+
+    Let expr be proc parse_expression with parser
+
+    Note: multiple assignment: lhs , lhs , ... = rhs , rhs
+    Let t be proc current_token_type with parser
+    If t is equal to TOKEN_COMMA from Lexer:
+        Let masgn be proc parse_multiple_assignment_tail with parser, expr
+        Let wrap be proc create_ast_node with AST_EXPR_STMT
+        proc add_node_child with wrap, masgn
+        Return wrap
+    End If
+
+    Let stmt be proc create_ast_node with AST_EXPR_STMT
+    proc add_node_child with stmt, expr
+    Return stmt
+End Process
+
+@Reasoning:
+Completes a multiple-assignment statement given the first target already
+parsed. Remaining targets are collected after each comma until the '='; then
+the comma-separated value list is parsed. Produces AST_MULTIPLE_ASSIGN with a
+target list and value list child.
+@End Reasoning
+Process called "parse_multiple_assignment_tail" takes parser as Integer, first_target as Integer returns Integer:
+    Note: Build an AST_MULTIPLE_ASSIGN from a leading target and the comma tail
+
+    Let target_list be proc create_ast_node with AST_TARGET_LIST
+    proc add_node_child with target_list, first_target
+
+    While 1 is equal to 1:
+        Let t be proc current_token_type with parser
+        If t is not equal to TOKEN_COMMA from Lexer:
+            Break
+        End If
+        proc advance_parser with parser
+
+        Note: splat target *rest
+        Let st be proc current_token_type with parser
+        If st is equal to TOKEN_STAR from Lexer:
+            proc advance_parser with parser
+            Let splat be proc create_ast_node with AST_SPLAT_ARG
+            Let inner be proc parse_primary with parser
+            proc add_node_child with splat, inner
+            proc add_node_child with target_list, splat
+        Otherwise:
+            Let tgt be proc parse_primary with parser
+            proc add_node_child with target_list, tgt
+        End If
+
+        Let after be proc current_token_type with parser
+        If after is equal to TOKEN_ASSIGN from Lexer:
+            Break
+        End If
+    End While
+
+    proc expect_token with parser, TOKEN_ASSIGN from Lexer
+
+    Let value_list be proc create_ast_node with AST_VALUE_LIST
+    While 1 is equal to 1:
+        Let v be proc parse_expression with parser
+        proc add_node_child with value_list, v
+        Let t be proc current_token_type with parser
+        If t is equal to TOKEN_COMMA from Lexer:
+            proc advance_parser with parser
+        Otherwise:
+            Break
+        End If
+    End While
+
+    Let masgn be proc create_ast_node with AST_MULTIPLE_ASSIGN
+    proc add_node_child with masgn, target_list
+    proc add_node_child with masgn, value_list
+    Return masgn
+End Process
+
+Note: ============================================================================
+Note: Body Parsing
+Note: ============================================================================
+
+@Reasoning:
+Parses a run of statements into the supplied container node until a block
+terminator (end/else/elsif/when/rescue/ensure/EOF/closers) is reached.
+Terminators between statements are skipped. Shared by every body production.
+@End Reasoning
+Process called "parse_body_into" takes parser as Integer, container as Integer returns Integer:
+    Note: Parse statements into container until a block terminator
+
+    While 1 is equal to 1:
+        proc skip_terminators with parser
+        Let t be proc current_token_type with parser
+        Let term be proc is_block_terminator with t
+        If term is equal to 1:
+            Return 1
+        End If
+
+        Let stmt be proc parse_statement with parser
+        If stmt is equal to 0:
+            proc add_parse_error with parser, "Unexpected token in body"
+            proc advance_parser with parser
+        Otherwise:
+            proc add_node_child with container, stmt
+        End If
+    End While
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Declarations
+Note: ============================================================================
+
+@Reasoning:
+Parses a class declaration: `class Name [< Super] ... end` or the singleton
+form `class << expr ... end`. The name is a (possibly scoped) constant path
+captured into the node value. A '<' introduces the superclass wrapper. The
+body is parsed up to the matching `end`.
+@End Reasoning
 Process called "parse_class" takes parser as Integer returns Integer:
-    Note: Parse Ruby class definition with inheritance and mixins
+    Note: Parse class / singleton-class declaration
 
-    proc expect with parser, TOKEN_CLASS from RubyLexer
+    proc advance_parser with parser
 
-    Let class_node be proc create_ast_node with AST_CLASS, ""
+    Let node be proc create_ast_node with AST_CLASS
 
-    Note: Parse class name
-    Let class_name be proc expect_identifier from parser
-    proc set_node_attribute with class_node, "name", class_name
+    Note: singleton class:  class << self
+    Let t be proc current_token_type with parser
+    If t is equal to TOKEN_LSHIFT from Lexer:
+        proc advance_parser with parser
+        proc set_node_metadata with node, "singleton", 1
+        Let recv be proc parse_expression with parser
+        Let recv_wrap be proc create_ast_node with AST_SUPERCLASS
+        proc add_node_child with recv_wrap, recv
+        proc add_node_child with node, recv_wrap
+    Otherwise:
+        Let name be proc parse_constant_path with parser
+        proc set_node_value with node, name
 
-    Note: Parse inheritance
-    If proc match with parser, TOKEN_LESS_THAN from RubyLexer is equal to 1:
-        proc advance from parser
-        Let superclass be proc parse_constant from parser
-        proc set_node_attribute with class_node, "superclass", superclass
+        Let lt be proc current_token_type with parser
+        If lt is equal to TOKEN_LESS_THAN from Lexer:
+            proc advance_parser with parser
+            Let super_expr be proc parse_expression with parser
+            Let super_wrap be proc create_ast_node with AST_SUPERCLASS
+            proc add_node_child with super_wrap, super_expr
+            proc add_node_child with node, super_wrap
+        End If
     End If
 
-    Note: Parse class body
-    proc skip_newlines from parser
-
-    While proc current_token_type with parser is not equal to TOKEN_END from RubyLexer and
-          proc current_token_type with parser is not equal to TOKEN_EOF from RubyLexer:
-
-        proc skip_newlines from parser
-
-        If proc current_token_type with parser is equal to TOKEN_END from RubyLexer:
-            Break
-        End If
-
-        Let statement be proc parse_statement from parser
-        If statement is not equal to 0:
-            proc add_child with class_node, statement
-        End If
-    End While
-
-    proc expect with parser, TOKEN_END from RubyLexer
-
-    Return class_node
+    proc parse_body_into with parser, node
+    proc expect_token with parser, TOKEN_END from Lexer
+    Return node
 End Process
 
 @Reasoning:
-Parses `module Name ... end`. Modules differ from classes in that they cannot be instantiated, only used as namespaces and as mixins via include/extend. The body shape is otherwise identical to a class body.
+Parses a module declaration: `module Name ... end`. The name is a constant
+path captured into the value slot; the body runs to `end`.
 @End Reasoning
-
-@Implementation:
-Consumes TOKEN_MODULE, captures the module name. Loops parsing body statements via parse_statement until TOKEN_END, attaching each as a child of the AST_MODULE node.
-@End Implementation
-
 Process called "parse_module" takes parser as Integer returns Integer:
-    Note: Parse Ruby module definition with mixins
+    Note: Parse module declaration
 
-    proc expect with parser, TOKEN_MODULE from RubyLexer
-
-    Let module_node be proc create_ast_node with AST_MODULE, ""
-
-    Note: Parse module name
-    Let module_name be proc expect_identifier from parser
-    proc set_node_attribute with module_node, "name", module_name
-
-    Note: Parse module body
-    proc skip_newlines from parser
-
-    While proc current_token_type with parser is not equal to TOKEN_END from RubyLexer and
-          proc current_token_type with parser is not equal to TOKEN_EOF from RubyLexer:
-
-        proc skip_newlines from parser
-
-        If proc current_token_type with parser is equal to TOKEN_END from RubyLexer:
-            Break
-        End If
-
-        Let statement be proc parse_statement from parser
-        If statement is not equal to 0:
-            proc add_child with module_node, statement
-        End If
-    End While
-
-    proc expect with parser, TOKEN_END from RubyLexer
-
-    Return module_node
+    proc advance_parser with parser
+    Let node be proc create_ast_node with AST_MODULE
+    Let name be proc parse_constant_path with parser
+    proc set_node_value with node, name
+    proc parse_body_into with parser, node
+    proc expect_token with parser, TOKEN_END from Lexer
+    Return node
 End Process
 
 @Reasoning:
-Parses `def name(params) ... end`. Ruby method names may end with ? (predicate) or ! (destructive). Parameters support defaults, splats (*args), double splats (**kwargs), block args (&block), and keyword arguments - parse_parameter_list handles all of these.
+Reads a constant path spelling (Foo, Foo::Bar, ::Top) and returns it as a
+single string handle. Scope operators and constant/identifier segments are
+concatenated so the class/module name survives as one value. A leading '::'
+is preserved.
 @End Reasoning
+Process called "parse_constant_path" takes parser as Integer returns Integer:
+    Note: Read a (possibly scoped) constant path into a single string
 
-@Implementation:
-Consumes TOKEN_DEF, captures the method-name identifier (preserving trailing ?/! as part of the name). Calls parse_parameter_list for the formals, then loops parsing body statements via parse_statement until TOKEN_END. Builds an AST_METHOD with parameters as a children sublist.
-@End Implementation
+    Let result be proc create_from_literal from StringCore with ""
 
+    Let lead be proc current_token_type with parser
+    If lead is equal to TOKEN_SCOPE from Lexer:
+        Set result to proc string_concat from StringUtils with result, "::"
+        proc advance_parser with parser
+    End If
+
+    While 1 is equal to 1:
+        Let t be proc current_token_type with parser
+        Let is_seg be 0
+        If t is equal to TOKEN_CONSTANT from Lexer:
+            Set is_seg to 1
+        End If
+        If t is equal to TOKEN_IDENTIFIER from Lexer:
+            Set is_seg to 1
+        End If
+        If is_seg is equal to 0:
+            Break
+        End If
+
+        Let seg be proc current_lexeme with parser
+        Set result to proc string_concat from StringUtils with result, seg
+        proc advance_parser with parser
+
+        Let nt be proc current_token_type with parser
+        If nt is equal to TOKEN_SCOPE from Lexer:
+            Set result to proc string_concat from StringUtils with result, "::"
+            proc advance_parser with parser
+        Otherwise:
+            Break
+        End If
+    End While
+
+    Return result
+End Process
+
+@Reasoning:
+Parses a method definition: `def [recv.] name [params] ... end`. A receiver
+prefix (`def self.foo`, `def Klass.bar`) produces an AST_SINGLETON_METHOD with
+the receiver as the first child; the plain form produces AST_METHOD. The name
+may be an identifier (with optional ? ! =) or an operator-method spelling.
+Parameters may be wrapped in parens or bare up to the line terminator. The
+body runs to `end`.
+@End Reasoning
 Process called "parse_method" takes parser as Integer returns Integer:
-    Note: Parse Ruby method definition with blocks and metaprogramming
+    Note: Parse a method definition (plain or singleton)
 
-    proc expect with parser, TOKEN_DEF from RubyLexer
+    proc advance_parser with parser
 
-    Let method_node be proc create_ast_node with AST_METHOD, ""
+    Note: optional singleton receiver:  self.foo  /  Const.foo
+    Let receiver be 0
+    Let t0 be proc current_token_type with parser
+    Let next0 be proc peek_token_type with parser, 1
 
-    Note: Parse method name (can include ? or !)
-    Let method_name be proc expect_identifier from parser
-    proc set_node_attribute with method_node, "name", method_name
-
-    Note: Parse parameters
-    If proc match with parser, TOKEN_LPAREN from RubyLexer is equal to 1:
-        proc advance from parser
-        Let params be proc parse_parameter_list from parser
-        proc set_node_attribute with method_node, "parameters", params
-        proc expect with parser, TOKEN_RPAREN from RubyLexer
-    Otherwise If proc current_token_type with parser is equal to TOKEN_IDENTIFIER from RubyLexer:
-        Note: Parameters without parentheses
-        Set params to proc parse_parameter_list from parser
-        proc set_node_attribute with method_node, "parameters", params
+    Let is_singleton be 0
+    If t0 is equal to TOKEN_SELF from Lexer:
+        If next0 is equal to TOKEN_DOT from Lexer:
+            Set is_singleton to 1
+        End If
+    End If
+    If t0 is equal to TOKEN_CONSTANT from Lexer:
+        If next0 is equal to TOKEN_DOT from Lexer:
+            Set is_singleton to 1
+        End If
     End If
 
-    Note: Parse method body
-    proc skip_newlines from parser
+    If is_singleton is equal to 1:
+        If t0 is equal to TOKEN_SELF from Lexer:
+            Set receiver to proc create_ast_node with AST_SELF
+            proc advance_parser with parser
+        Otherwise:
+            Let cname be proc current_lexeme with parser
+            Set receiver to proc create_value_node with AST_CONSTANT, cname
+            proc advance_parser with parser
+        End If
+        proc advance_parser with parser
+    End If
 
-    While proc current_token_type with parser is not equal to TOKEN_END from RubyLexer and
-          proc current_token_type with parser is not equal to TOKEN_EOF from RubyLexer:
+    Let method_name be proc parse_method_name with parser
 
-        proc skip_newlines from parser
+    Let node be 0
+    If is_singleton is equal to 1:
+        Set node to proc create_value_node with AST_SINGLETON_METHOD, method_name
+        proc add_node_child with node, receiver
+    Otherwise:
+        Set node to proc create_value_node with AST_METHOD, method_name
+    End If
 
-        If proc current_token_type with parser is equal to TOKEN_END from RubyLexer:
+    Let params be proc parse_method_parameters with parser
+    proc add_node_child with node, params
+
+    proc parse_body_into with parser, node
+    proc expect_token with parser, TOKEN_END from Lexer
+    Return node
+End Process
+
+@Reasoning:
+Reads a method name following `def`. Identifiers (with the setter '=' the
+lexer leaves separate) and operator-method spellings are valid. For a setter
+(`name=`) the '=' immediately following the identifier is folded into the
+name. The index methods `[]` and `[]=` are assembled from the bracket tokens.
+Other operator methods return their lexeme directly. The result is a single
+string handle.
+@End Reasoning
+Process called "parse_method_name" takes parser as Integer returns Integer:
+    Note: Read a method name (identifier, setter, or operator) as a string
+
+    Let t be proc current_token_type with parser
+
+    Let is_ident be 0
+    If t is equal to TOKEN_IDENTIFIER from Lexer:
+        Set is_ident to 1
+    End If
+    If t is equal to TOKEN_CONSTANT from Lexer:
+        Set is_ident to 1
+    End If
+
+    If is_ident is equal to 1:
+        Let name be proc current_lexeme with parser
+        proc advance_parser with parser
+        Note: setter form name=
+        Let nt be proc current_token_type with parser
+        If nt is equal to TOKEN_ASSIGN from Lexer:
+            Let with_eq be proc string_concat from StringUtils with name, "="
+            proc advance_parser with parser
+            Return with_eq
+        End If
+        Return name
+    End If
+
+    Note: index method [] or []=
+    If t is equal to TOKEN_LBRACKET from Lexer:
+        proc advance_parser with parser
+        Let rb be proc current_token_type with parser
+        If rb is equal to TOKEN_RBRACKET from Lexer:
+            proc advance_parser with parser
+            Let nt2 be proc current_token_type with parser
+            If nt2 is equal to TOKEN_ASSIGN from Lexer:
+                proc advance_parser with parser
+                Return proc create_from_literal from StringCore with "[]="
+            End If
+            Return proc create_from_literal from StringCore with "[]"
+        End If
+        Return proc create_from_literal from StringCore with "[]"
+    End If
+
+    Note: operator-method names: emit the operator lexeme
+    Let lex be proc current_lexeme with parser
+    proc advance_parser with parser
+    If lex is not equal to 0:
+        Return lex
+    End If
+    Return proc create_from_literal from StringCore with "op"
+End Process
+
+@Reasoning:
+Parses a method's formal parameters. Two forms: parenthesised `(a, b=1, *r,
+k:, **kw, &blk)` or bare parameters up to a newline/semicolon. Each parameter
+is delegated to parse_parameter. Returns an AST_PARAM_LIST (possibly empty).
+@End Reasoning
+Process called "parse_method_parameters" takes parser as Integer returns Integer:
+    Note: Parse a method parameter list (parenthesised or bare)
+
+    Let param_list be proc create_ast_node with AST_PARAM_LIST
+
+    Let t be proc current_token_type with parser
+
+    If t is equal to TOKEN_LPAREN from Lexer:
+        proc advance_parser with parser
+        While 1 is equal to 1:
+            Let pt be proc current_token_type with parser
+            If pt is equal to TOKEN_RPAREN from Lexer:
+                Break
+            End If
+            If pt is equal to TOKEN_EOF from Lexer:
+                Break
+            End If
+            Let param be proc parse_parameter with parser
+            proc add_node_child with param_list, param
+            Let ct be proc current_token_type with parser
+            If ct is equal to TOKEN_COMMA from Lexer:
+                proc advance_parser with parser
+            Otherwise:
+                Break
+            End If
+        End While
+        proc expect_token with parser, TOKEN_RPAREN from Lexer
+        Return param_list
+    End If
+
+    Note: bare parameter list - stop at terminator
+    If t is equal to TOKEN_NEWLINE from Lexer:
+        Return param_list
+    End If
+    If t is equal to TOKEN_SEMICOLON from Lexer:
+        Return param_list
+    End If
+
+    While 1 is equal to 1:
+        Let bt be proc current_token_type with parser
+        If bt is equal to TOKEN_NEWLINE from Lexer:
             Break
         End If
-
-        Let statement be proc parse_statement from parser
-        If statement is not equal to 0:
-            proc add_child with method_node, statement
+        If bt is equal to TOKEN_SEMICOLON from Lexer:
+            Break
+        End If
+        If bt is equal to TOKEN_EOF from Lexer:
+            Break
+        End If
+        Let param be proc parse_parameter with parser
+        proc add_node_child with param_list, param
+        Let ct be proc current_token_type with parser
+        If ct is equal to TOKEN_COMMA from Lexer:
+            proc advance_parser with parser
+        Otherwise:
+            Break
         End If
     End While
 
-    proc expect with parser, TOKEN_END from RubyLexer
-
-    Return method_node
+    Return param_list
 End Process
 
 @Reasoning:
-Parses the comma-separated parameter list inside a method def. Parens around the list are optional in Ruby - both `def foo(x, y)` and `def foo x, y` are valid - so the parser handles both shapes.
+Parses a single formal parameter and records its kind through metadata:
+  *a       -> splat
+  **a      -> doublesplat
+  &blk     -> block
+  a:       -> kwarg (keyword), with optional default after the colon
+  a = expr -> optional (positional with default)
+  a        -> required positional
+The name is captured into the parameter's value slot and any default-value
+expression is the parameter's first child.
 @End Reasoning
-
-@Implementation:
-If next token is "(", consume it and remember to expect ")". Loop: call parse_parameter, append result as child. Between parameters consume the TOKEN_COMMA. Terminate when ")", newline, or terminal keyword is reached. Consume the closing ")" if one was opened.
-@End Implementation
-
-Process called "parse_parameter_list" takes parser as Integer returns Integer:
-    Note: Parse Ruby method parameters including defaults, splats, blocks
-
-    Let params_list be proc create_list
-
-    If proc current_token_type with parser is not equal to TOKEN_IDENTIFIER from RubyLexer and
-       proc current_token_type with parser is not equal to TOKEN_MULTIPLY from RubyLexer and
-       proc current_token_type with parser is not equal to TOKEN_POWER from RubyLexer and
-       proc current_token_type with parser is not equal to TOKEN_AMPERSAND from RubyLexer:
-        Return params_list
-    End If
-
-    Note: Parse first parameter
-    Let param be proc parse_parameter from parser
-    proc add_to_list with params_list, param
-
-    Note: Parse remaining parameters
-    While proc match with parser, TOKEN_COMMA from RubyLexer is equal to 1:
-        proc advance from parser
-        Set param to proc parse_parameter from parser
-        proc add_to_list with params_list, param
-    End While
-
-    Return params_list
-End Process
-
-@Reasoning:
-Parses a single parameter, dispatching on leading sigil: * for splat (variadic positional), ** for double splat (variadic keyword), & for block argument. Otherwise a plain identifier, optionally followed by `= default`.
-@End Reasoning
-
-@Implementation:
-Inspects current token: TOKEN_STAR -> splat, TOKEN_DOUBLE_STAR -> double splat, TOKEN_AMP -> block param. Reads the identifier name. If next is "=", consumes it and parses the default value via parse_expression. Stores splat/double-splat/block flags and default in the parameter node's attributes.
-@End Implementation
-
 Process called "parse_parameter" takes parser as Integer returns Integer:
-    Note: Parse single Ruby parameter with splat and block support
+    Note: Parse one formal parameter, recording its kind via metadata
 
-    Let param_node be proc create_ast_node with AST_IDENTIFIER, ""
+    Let param be proc create_ast_node with AST_PARAM
 
-    Note: Handle splat parameters (*args)
-    If proc match with parser, TOKEN_MULTIPLY from RubyLexer is equal to 1:
-        proc advance from parser
-        proc set_node_attribute with param_node, "splat", "true"
+    Let t be proc current_token_type with parser
+
+    If t is equal to TOKEN_STAR from Lexer:
+        proc advance_parser with parser
+        proc set_node_metadata with param, "splat", 1
+        Let n be proc current_token_type with parser
+        If n is equal to TOKEN_IDENTIFIER from Lexer:
+            Let nm be proc current_lexeme with parser
+            proc set_node_value with param, nm
+            proc advance_parser with parser
+        End If
+        Return param
     End If
 
-    Note: Handle double splat parameters (**kwargs)
-    If proc match with parser, TOKEN_POWER from RubyLexer is equal to 1:
-        proc advance from parser
-        proc set_node_attribute with param_node, "double_splat", "true"
+    If t is equal to TOKEN_POWER from Lexer:
+        proc advance_parser with parser
+        proc set_node_metadata with param, "doublesplat", 1
+        Let n be proc current_token_type with parser
+        If n is equal to TOKEN_IDENTIFIER from Lexer:
+            Let nm be proc current_lexeme with parser
+            proc set_node_value with param, nm
+            proc advance_parser with parser
+        End If
+        Return param
     End If
 
-    Note: Handle block parameters (&block)
-    If proc match with parser, TOKEN_AMPERSAND from RubyLexer is equal to 1:
-        proc advance from parser
-        proc set_node_attribute with param_node, "block", "true"
+    If t is equal to TOKEN_AMP from Lexer:
+        proc advance_parser with parser
+        proc set_node_metadata with param, "block", 1
+        Let n be proc current_token_type with parser
+        If n is equal to TOKEN_IDENTIFIER from Lexer:
+            Let nm be proc current_lexeme with parser
+            proc set_node_value with param, nm
+            proc advance_parser with parser
+        End If
+        Return param
     End If
 
-    Note: Parse parameter name
-    Let param_name be proc expect_identifier from parser
-    proc set_node_attribute with param_node, "name", param_name
+    Note: plain identifier; then check for kwarg (name:) or default (= expr)
+    Let name be proc current_lexeme with parser
+    proc set_node_value with param, name
+    proc advance_parser with parser
 
-    Note: Handle default values
-    If proc match with parser, TOKEN_ASSIGN from RubyLexer is equal to 1:
-        proc advance from parser
-        Let default_value be proc parse_expression from parser
-        proc set_node_attribute with param_node, "default", default_value
+    Let nt be proc current_token_type with parser
+    If nt is equal to TOKEN_COLON from Lexer:
+        proc advance_parser with parser
+        proc set_node_metadata with param, "kwarg", 1
+        Note: optional default after keyword colon
+        Let dt be proc current_token_type with parser
+        Let has_default be proc kwarg_has_default with dt
+        If has_default is equal to 1:
+            Let dflt be proc parse_expression with parser
+            proc add_node_child with param, dflt
+            proc set_node_metadata with param, "optional", 1
+        End If
+        Return param
     End If
 
-    Return param_node
+    If nt is equal to TOKEN_ASSIGN from Lexer:
+        proc advance_parser with parser
+        proc set_node_metadata with param, "optional", 1
+        Let dflt be proc parse_expression with parser
+        proc add_node_child with param, dflt
+        Return param
+    End If
+
+    Return param
 End Process
 
 @Reasoning:
-Parses `if cond [then] body [elsif cond body...] [else body] end`. Ruby's optional `then` keyword is recognised but not required. Each elsif chains another condition/body pair; else handles the no-match fallthrough.
+After a keyword parameter's colon, a default value is present unless the next
+token closes the parameter list or separates parameters. Keeps parse_parameter
+from misreading a bare keyword param (`a:`) as having a default.
 @End Reasoning
+Process called "kwarg_has_default" takes token_type as Integer returns Integer:
+    Note: Whether a keyword parameter is followed by a default-value expression
 
-@Implementation:
-Consumes TOKEN_IF, parses condition via parse_expression. Optionally consumes TOKEN_THEN. Parses statements until TOKEN_ELSIF / TOKEN_ELSE / TOKEN_END. For each elsif, recursively builds a nested if-node into the else branch. For TOKEN_ELSE, parses statements until TOKEN_END.
-@End Implementation
+    If token_type is equal to TOKEN_COMMA from Lexer:
+        Return 0
+    End If
+    If token_type is equal to TOKEN_RPAREN from Lexer:
+        Return 0
+    End If
+    If token_type is equal to TOKEN_PIPE from Lexer:
+        Return 0
+    End If
+    If token_type is equal to TOKEN_NEWLINE from Lexer:
+        Return 0
+    End If
+    If token_type is equal to TOKEN_SEMICOLON from Lexer:
+        Return 0
+    End If
+    If token_type is equal to TOKEN_EOF from Lexer:
+        Return 0
+    End If
+    Return 1
+End Process
 
+Note: ============================================================================
+Note: Control Flow
+Note: ============================================================================
+
+@Reasoning:
+Parses `if cond [then] body [elsif ...] [else body] end`. The condition is an
+expression; an optional `then` keyword is consumed. The then-branch body runs
+until elsif/else/end. An elsif chain is parsed recursively as a nested AST_IF
+attached as the else child; a final else becomes an AST_ELSE_BLOCK.
+@End Reasoning
 Process called "parse_if" takes parser as Integer returns Integer:
-    Note: Parse Ruby if statement with elsif and else
+    Note: Parse an if/elsif/else/end statement
 
-    proc expect with parser, TOKEN_IF from RubyLexer
+    proc advance_parser with parser
+    Let node be proc create_ast_node with AST_IF
 
-    Let if_node be proc create_ast_node with AST_IF, ""
+    Let cond be proc parse_expression with parser
+    proc add_node_child with node, cond
 
-    Note: Parse condition
-    Let condition be proc parse_expression from parser
-    proc set_node_attribute with if_node, "condition", condition
+    proc consume_optional_then with parser
 
-    proc skip_newlines from parser
+    Let then_block be proc create_ast_node with AST_THEN_BLOCK
+    proc parse_body_into with parser, then_block
+    proc add_node_child with node, then_block
 
-    Note: Parse then body
-    Let then_body be proc create_list
-    While proc current_token_type with parser is not equal to TOKEN_ELSIF from RubyLexer and
-          proc current_token_type with parser is not equal to TOKEN_ELSE from RubyLexer and
-          proc current_token_type with parser is not equal to TOKEN_END from RubyLexer and
-          proc current_token_type with parser is not equal to TOKEN_EOF from RubyLexer:
+    proc parse_elsif_else_chain with parser, node
 
-        proc skip_newlines from parser
+    proc expect_token with parser, TOKEN_END from Lexer
+    Return node
+End Process
 
-        If proc current_token_type with parser is equal to TOKEN_ELSIF from RubyLexer or
-           proc current_token_type with parser is equal to TOKEN_ELSE from RubyLexer or
-           proc current_token_type with parser is equal to TOKEN_END from RubyLexer:
+@Reasoning:
+Attaches the elsif/else tail to an if node. An `elsif` produces a nested
+AST_ELSIF (condition + then-block + its own tail) added as the next child; an
+`else` produces an AST_ELSE_BLOCK body. The chain terminates at `end`
+(consumed by the caller).
+@End Reasoning
+Process called "parse_elsif_else_chain" takes parser as Integer, parent as Integer returns Integer:
+    Note: Parse the elsif/else tail of an if into parent
+
+    Let t be proc current_token_type with parser
+
+    If t is equal to TOKEN_ELSIF from Lexer:
+        proc advance_parser with parser
+        Let elsif_node be proc create_ast_node with AST_ELSIF
+        Let cond be proc parse_expression with parser
+        proc add_node_child with elsif_node, cond
+        proc consume_optional_then with parser
+        Let body be proc create_ast_node with AST_THEN_BLOCK
+        proc parse_body_into with parser, body
+        proc add_node_child with elsif_node, body
+        proc parse_elsif_else_chain with parser, elsif_node
+        proc add_node_child with parent, elsif_node
+        Return 1
+    End If
+
+    If t is equal to TOKEN_ELSE from Lexer:
+        proc advance_parser with parser
+        Let else_block be proc create_ast_node with AST_ELSE_BLOCK
+        proc parse_body_into with parser, else_block
+        proc add_node_child with parent, else_block
+        Return 1
+    End If
+
+    Return 1
+End Process
+
+@Reasoning:
+Consumes an optional `then` keyword (used after if/unless/when conditions).
+@End Reasoning
+Process called "consume_optional_then" takes parser as Integer returns Integer:
+    Note: Consume an optional 'then' keyword
+
+    Let t be proc current_token_type with parser
+    If t is equal to TOKEN_THEN from Lexer:
+        proc advance_parser with parser
+    End If
+    Return 1
+End Process
+
+@Reasoning:
+Parses `unless cond [then] body [else body] end`. Mirrors parse_if but with no
+elsif chain (Ruby `unless` has no `elsunless`); a trailing `else` is allowed.
+@End Reasoning
+Process called "parse_unless" takes parser as Integer returns Integer:
+    Note: Parse an unless/else/end statement
+
+    proc advance_parser with parser
+    Let node be proc create_ast_node with AST_UNLESS
+
+    Let cond be proc parse_expression with parser
+    proc add_node_child with node, cond
+
+    proc consume_optional_then with parser
+
+    Let then_block be proc create_ast_node with AST_THEN_BLOCK
+    proc parse_body_into with parser, then_block
+    proc add_node_child with node, then_block
+
+    Let t be proc current_token_type with parser
+    If t is equal to TOKEN_ELSE from Lexer:
+        proc advance_parser with parser
+        Let else_block be proc create_ast_node with AST_ELSE_BLOCK
+        proc parse_body_into with parser, else_block
+        proc add_node_child with node, else_block
+    End If
+
+    proc expect_token with parser, TOKEN_END from Lexer
+    Return node
+End Process
+
+@Reasoning:
+Parses `while cond [do] body end`. The optional `do` keyword is consumed. The
+body runs to `end`.
+@End Reasoning
+Process called "parse_while" takes parser as Integer returns Integer:
+    Note: Parse a while/end loop
+
+    proc advance_parser with parser
+    Let node be proc create_ast_node with AST_WHILE
+
+    Let cond be proc parse_expression with parser
+    proc add_node_child with node, cond
+
+    proc consume_optional_do with parser
+
+    Let body be proc create_ast_node with AST_THEN_BLOCK
+    proc parse_body_into with parser, body
+    proc add_node_child with node, body
+
+    proc expect_token with parser, TOKEN_END from Lexer
+    Return node
+End Process
+
+@Reasoning:
+Parses `until cond [do] body end`, identical in shape to while.
+@End Reasoning
+Process called "parse_until" takes parser as Integer returns Integer:
+    Note: Parse an until/end loop
+
+    proc advance_parser with parser
+    Let node be proc create_ast_node with AST_UNTIL
+
+    Let cond be proc parse_expression with parser
+    proc add_node_child with node, cond
+
+    proc consume_optional_do with parser
+
+    Let body be proc create_ast_node with AST_THEN_BLOCK
+    proc parse_body_into with parser, body
+    proc add_node_child with node, body
+
+    proc expect_token with parser, TOKEN_END from Lexer
+    Return node
+End Process
+
+@Reasoning:
+Consumes an optional `do` keyword after a while/until/for condition.
+@End Reasoning
+Process called "consume_optional_do" takes parser as Integer returns Integer:
+    Note: Consume an optional 'do' keyword
+
+    Let t be proc current_token_type with parser
+    If t is equal to TOKEN_DO from Lexer:
+        proc advance_parser with parser
+    End If
+    Return 1
+End Process
+
+@Reasoning:
+Parses `for var [, var] in iterable [do] body end`. The loop-variable list is
+captured into an AST_TARGET_LIST; the iterable is an expression; the body runs
+to `end`.
+@End Reasoning
+Process called "parse_for" takes parser as Integer returns Integer:
+    Note: Parse a for/in loop
+
+    proc advance_parser with parser
+    Let node be proc create_ast_node with AST_FOR
+
+    Let targets be proc create_ast_node with AST_TARGET_LIST
+    While 1 is equal to 1:
+        Let v be proc parse_primary with parser
+        proc add_node_child with targets, v
+        Let t be proc current_token_type with parser
+        If t is equal to TOKEN_COMMA from Lexer:
+            proc advance_parser with parser
+        Otherwise:
             Break
         End If
-
-        Let statement be proc parse_statement from parser
-        If statement is not equal to 0:
-            proc add_to_list with then_body, statement
-        End If
     End While
+    proc add_node_child with node, targets
 
-    proc set_node_attribute with if_node, "then_body", then_body
+    proc expect_token with parser, TOKEN_IN from Lexer
+    Let iterable be proc parse_expression with parser
+    proc add_node_child with node, iterable
 
-    Note: Parse elsif clauses
-    Let elsif_clauses be proc create_list
-    While proc match with parser, TOKEN_ELSIF from RubyLexer is equal to 1:
-        proc advance from parser
+    proc consume_optional_do with parser
 
-        Let elsif_condition be proc parse_expression from parser
-        proc skip_newlines from parser
+    Let body be proc create_ast_node with AST_THEN_BLOCK
+    proc parse_body_into with parser, body
+    proc add_node_child with node, body
 
-        Let elsif_body be proc create_list
-        While proc current_token_type with parser is not equal to TOKEN_ELSIF from RubyLexer and
-              proc current_token_type with parser is not equal to TOKEN_ELSE from RubyLexer and
-              proc current_token_type with parser is not equal to TOKEN_END from RubyLexer and
-              proc current_token_type with parser is not equal to TOKEN_EOF from RubyLexer:
-
-            proc skip_newlines from parser
-
-            If proc current_token_type with parser is equal to TOKEN_ELSIF from RubyLexer or
-               proc current_token_type with parser is equal to TOKEN_ELSE from RubyLexer or
-               proc current_token_type with parser is equal to TOKEN_END from RubyLexer:
-                Break
-            End If
-
-            Set statement to proc parse_statement from parser
-            If statement is not equal to 0:
-                proc add_to_list with elsif_body, statement
-            End If
-        End While
-
-        Let elsif_node be proc create_ast_node with AST_IF, ""
-        proc set_node_attribute with elsif_node, "condition", elsif_condition
-        proc set_node_attribute with elsif_node, "then_body", elsif_body
-        proc add_to_list with elsif_clauses, elsif_node
-    End While
-
-    proc set_node_attribute with if_node, "elsif_clauses", elsif_clauses
-
-    Note: Parse else clause
-    If proc match with parser, TOKEN_ELSE from RubyLexer is equal to 1:
-        proc advance from parser
-        proc skip_newlines from parser
-
-        Let else_body be proc create_list
-        While proc current_token_type with parser is not equal to TOKEN_END from RubyLexer and
-              proc current_token_type with parser is not equal to TOKEN_EOF from RubyLexer:
-
-            proc skip_newlines from parser
-
-            If proc current_token_type with parser is equal to TOKEN_END from RubyLexer:
-                Break
-            End If
-
-            Set statement to proc parse_statement from parser
-            If statement is not equal to 0:
-                proc add_to_list with else_body, statement
-            End If
-        End While
-
-        proc set_node_attribute with if_node, "else_body", else_body
-    End If
-
-    proc expect with parser, TOKEN_END from RubyLexer
-
-    Return if_node
+    proc expect_token with parser, TOKEN_END from Lexer
+    Return node
 End Process
 
 @Reasoning:
-Entry point for the precedence-climbing expression parser. Delegates to the lowest-precedence rule (parse_logical_or). All operator levels then ladder up from there.
+Parses `case [subject] when guards [then] body ... [else body] end`. The
+subject is optional. Each `when` collects comma-separated guard expressions
+into AST_WHEN_GUARDS and a then-block body. A final `else` becomes
+AST_ELSE_BLOCK.
 @End Reasoning
+Process called "parse_case" takes parser as Integer returns Integer:
+    Note: Parse a case/when/else/end statement
 
-@Implementation:
-Returns parse_logical_or(parser). The ladder is: or -> and -> equality -> comparison -> range -> add -> mul -> power -> unary -> method_call -> primary.
-@End Implementation
+    proc advance_parser with parser
+    Let node be proc create_ast_node with AST_CASE
+
+    Let t be proc current_token_type with parser
+    If t is not equal to TOKEN_NEWLINE from Lexer:
+        If t is not equal to TOKEN_WHEN from Lexer:
+            Let subject be proc parse_expression with parser
+            proc add_node_child with node, subject
+        End If
+    End If
+
+    proc skip_terminators with parser
+
+    While 1 is equal to 1:
+        Let wt be proc current_token_type with parser
+        If wt is not equal to TOKEN_WHEN from Lexer:
+            Break
+        End If
+        proc advance_parser with parser
+
+        Let when_node be proc create_ast_node with AST_WHEN
+        Let guards be proc create_ast_node with AST_WHEN_GUARDS
+        While 1 is equal to 1:
+            Let g be proc parse_expression with parser
+            proc add_node_child with guards, g
+            Let ct be proc current_token_type with parser
+            If ct is equal to TOKEN_COMMA from Lexer:
+                proc advance_parser with parser
+            Otherwise:
+                Break
+            End If
+        End While
+        proc add_node_child with when_node, guards
+
+        proc consume_optional_then with parser
+
+        Let body be proc create_ast_node with AST_THEN_BLOCK
+        proc parse_body_into with parser, body
+        proc add_node_child with when_node, body
+
+        proc add_node_child with node, when_node
+    End While
+
+    Let et be proc current_token_type with parser
+    If et is equal to TOKEN_ELSE from Lexer:
+        proc advance_parser with parser
+        Let else_block be proc create_ast_node with AST_ELSE_BLOCK
+        proc parse_body_into with parser, else_block
+        proc add_node_child with node, else_block
+    End If
+
+    proc expect_token with parser, TOKEN_END from Lexer
+    Return node
+End Process
+
+@Reasoning:
+Parses `begin body [rescue ...] [else body] [ensure body] end`. The protected
+body is an AST_THEN_BLOCK; each rescue clause collects its exception classes
+and optional bound variable; a trailing else and ensure are appended.
+@End Reasoning
+Process called "parse_begin" takes parser as Integer returns Integer:
+    Note: Parse a begin/rescue/else/ensure/end statement
+
+    proc advance_parser with parser
+    Let node be proc create_ast_node with AST_BEGIN
+
+    Let body be proc create_ast_node with AST_THEN_BLOCK
+    proc parse_body_into with parser, body
+    proc add_node_child with node, body
+
+    proc parse_rescue_clauses with parser, node
+
+    proc expect_token with parser, TOKEN_END from Lexer
+    Return node
+End Process
+
+@Reasoning:
+Parses the rescue/else/ensure tail of a begin block. Each `rescue` clause
+collects comma-separated exception-class expressions into AST_RESCUE_TYPES,
+an optional `=> var` binding stored in the rescue node's value, and a body.
+A final `else` runs when no exception was raised; `ensure` always runs.
+@End Reasoning
+Process called "parse_rescue_clauses" takes parser as Integer, parent as Integer returns Integer:
+    Note: Parse rescue / else / ensure clauses into parent
+
+    While 1 is equal to 1:
+        Let t be proc current_token_type with parser
+        If t is not equal to TOKEN_RESCUE from Lexer:
+            Break
+        End If
+        proc advance_parser with parser
+
+        Let rescue_node be proc create_ast_node with AST_RESCUE
+        Let types be proc create_ast_node with AST_RESCUE_TYPES
+
+        Note: optional exception class list (until => or terminator/then)
+        Let ct be proc current_token_type with parser
+        Let has_types be proc rescue_has_types with ct
+        If has_types is equal to 1:
+            While 1 is equal to 1:
+                Let cls be proc parse_expression with parser
+                proc add_node_child with types, cls
+                Let sep be proc current_token_type with parser
+                If sep is equal to TOKEN_COMMA from Lexer:
+                    proc advance_parser with parser
+                Otherwise:
+                    Break
+                End If
+            End While
+        End If
+        proc add_node_child with rescue_node, types
+
+        Note: optional => binding variable
+        Let at be proc current_token_type with parser
+        If at is equal to TOKEN_HASHROCKET from Lexer:
+            proc advance_parser with parser
+            Let var_name be proc current_lexeme with parser
+            proc set_node_value with rescue_node, var_name
+            proc advance_parser with parser
+        End If
+
+        proc consume_optional_then with parser
+
+        Let body be proc create_ast_node with AST_THEN_BLOCK
+        proc parse_body_into with parser, body
+        proc add_node_child with rescue_node, body
+
+        proc add_node_child with parent, rescue_node
+    End While
+
+    Let et be proc current_token_type with parser
+    If et is equal to TOKEN_ELSE from Lexer:
+        proc advance_parser with parser
+        Let else_block be proc create_ast_node with AST_ELSE_BLOCK
+        proc parse_body_into with parser, else_block
+        proc add_node_child with parent, else_block
+    End If
+
+    Let nt be proc current_token_type with parser
+    If nt is equal to TOKEN_ENSURE from Lexer:
+        proc advance_parser with parser
+        Let ensure_node be proc create_ast_node with AST_ENSURE
+        proc parse_body_into with parser, ensure_node
+        proc add_node_child with parent, ensure_node
+    End If
+
+    Return 1
+End Process
+
+@Reasoning:
+A rescue clause has an exception-class list unless the next token is the
+binding arrow, a terminator, or `then`. Keeps `rescue => e` and bare `rescue`
+from misparsing a body token as an exception class.
+@End Reasoning
+Process called "rescue_has_types" takes token_type as Integer returns Integer:
+    Note: Whether a rescue clause begins with exception-class expressions
+
+    If token_type is equal to TOKEN_HASHROCKET from Lexer:
+        Return 0
+    End If
+    If token_type is equal to TOKEN_NEWLINE from Lexer:
+        Return 0
+    End If
+    If token_type is equal to TOKEN_SEMICOLON from Lexer:
+        Return 0
+    End If
+    If token_type is equal to TOKEN_THEN from Lexer:
+        Return 0
+    End If
+    If token_type is equal to TOKEN_EOF from Lexer:
+        Return 0
+    End If
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Jump Statements
+Note: ============================================================================
+
+@Reasoning:
+Parses `return [expr]`. The value is optional - absent when the next token is
+a terminator or block terminator.
+@End Reasoning
+Process called "parse_return" takes parser as Integer returns Integer:
+    Note: Parse a return statement with optional value
+
+    proc advance_parser with parser
+    Let node be proc create_ast_node with AST_RETURN
+    Let t be proc current_token_type with parser
+    Let ends be proc starts_no_value with t
+    If ends is equal to 0:
+        Let v be proc parse_expression with parser
+        proc add_node_child with node, v
+    End If
+    Return node
+End Process
+
+Process called "parse_break" takes parser as Integer returns Integer:
+    Note: Parse a break statement with optional value
+
+    proc advance_parser with parser
+    Let node be proc create_ast_node with AST_BREAK
+    Let t be proc current_token_type with parser
+    Let ends be proc starts_no_value with t
+    If ends is equal to 0:
+        Let v be proc parse_expression with parser
+        proc add_node_child with node, v
+    End If
+    Return node
+End Process
+
+Process called "parse_next" takes parser as Integer returns Integer:
+    Note: Parse a next statement with optional value
+
+    proc advance_parser with parser
+    Let node be proc create_ast_node with AST_NEXT
+    Let t be proc current_token_type with parser
+    Let ends be proc starts_no_value with t
+    If ends is equal to 0:
+        Let v be proc parse_expression with parser
+        proc add_node_child with node, v
+    End If
+    Return node
+End Process
+
+@Reasoning:
+Parses `yield [args]`. Arguments may be parenthesised or bare; both are
+collected as child expressions of the AST_YIELD node.
+@End Reasoning
+Process called "parse_yield" takes parser as Integer returns Integer:
+    Note: Parse a yield statement with optional arguments
+
+    proc advance_parser with parser
+    Let node be proc create_ast_node with AST_YIELD
+
+    Let t be proc current_token_type with parser
+    If t is equal to TOKEN_LPAREN from Lexer:
+        proc advance_parser with parser
+        While 1 is equal to 1:
+            Let pt be proc current_token_type with parser
+            If pt is equal to TOKEN_RPAREN from Lexer:
+                Break
+            End If
+            Let a be proc parse_expression with parser
+            proc add_node_child with node, a
+            Let ct be proc current_token_type with parser
+            If ct is equal to TOKEN_COMMA from Lexer:
+                proc advance_parser with parser
+            Otherwise:
+                Break
+            End If
+        End While
+        proc expect_token with parser, TOKEN_RPAREN from Lexer
+        Return node
+    End If
+
+    Let ends be proc starts_no_value with t
+    If ends is equal to 0:
+        While 1 is equal to 1:
+            Let a be proc parse_expression with parser
+            proc add_node_child with node, a
+            Let ct be proc current_token_type with parser
+            If ct is equal to TOKEN_COMMA from Lexer:
+                proc advance_parser with parser
+            Otherwise:
+                Break
+            End If
+        End While
+    End If
+
+    Return node
+End Process
+
+@Reasoning:
+Parses `alias new old` where each name is a method name or symbol. Both names
+are captured as identifier/symbol nodes.
+@End Reasoning
+Process called "parse_alias" takes parser as Integer returns Integer:
+    Note: Parse an alias statement
+
+    proc advance_parser with parser
+    Let node be proc create_ast_node with AST_ALIAS
+
+    Let new_name be proc parse_alias_name with parser
+    proc add_node_child with node, new_name
+    Let old_name be proc parse_alias_name with parser
+    proc add_node_child with node, old_name
+
+    Return node
+End Process
+
+@Reasoning:
+Reads an alias/undef name: a bare identifier (or constant) becomes an
+AST_IDENTIFIER node; a symbol becomes an AST_SYMBOL node. Either way the
+spelling is captured into the node value.
+@End Reasoning
+Process called "parse_alias_name" takes parser as Integer returns Integer:
+    Note: Read one alias/undef name as an identifier or symbol node
+
+    Let t be proc current_token_type with parser
+    Let lex be proc current_lexeme with parser
+
+    If t is equal to TOKEN_SYMBOL from Lexer:
+        proc advance_parser with parser
+        Return proc create_value_node with AST_SYMBOL, lex
+    End If
+
+    proc advance_parser with parser
+    Return proc create_value_node with AST_IDENTIFIER, lex
+End Process
+
+@Reasoning:
+Parses `undef name [, name]` collecting each method name as a child.
+@End Reasoning
+Process called "parse_undef" takes parser as Integer returns Integer:
+    Note: Parse an undef statement
+
+    proc advance_parser with parser
+    Let node be proc create_ast_node with AST_UNDEF
+
+    While 1 is equal to 1:
+        Let nm be proc parse_alias_name with parser
+        proc add_node_child with node, nm
+        Let t be proc current_token_type with parser
+        If t is equal to TOKEN_COMMA from Lexer:
+            proc advance_parser with parser
+        Otherwise:
+            Break
+        End If
+    End While
+
+    Return node
+End Process
+
+@Reasoning:
+Whether a token cannot begin a value expression, used by return/break/next/
+yield to decide if an optional operand is present. Terminators, block
+terminators, and the postfix-modifier keywords all mean "no value follows".
+@End Reasoning
+Process called "starts_no_value" takes token_type as Integer returns Integer:
+    Note: Whether token_type cannot start a value expression
+
+    If token_type is equal to TOKEN_NEWLINE from Lexer:
+        Return 1
+    End If
+    If token_type is equal to TOKEN_SEMICOLON from Lexer:
+        Return 1
+    End If
+    If token_type is equal to TOKEN_EOF from Lexer:
+        Return 1
+    End If
+    Let bt be proc is_block_terminator with token_type
+    If bt is equal to 1:
+        Return 1
+    End If
+    If token_type is equal to TOKEN_IF from Lexer:
+        Return 1
+    End If
+    If token_type is equal to TOKEN_UNLESS from Lexer:
+        Return 1
+    End If
+    If token_type is equal to TOKEN_WHILE from Lexer:
+        Return 1
+    End If
+    If token_type is equal to TOKEN_UNTIL from Lexer:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: Expression Grammar (precedence climbing)
+Note: ============================================================================
+Note: Precedence, weakest to tightest, mirrors Ruby:
+Note:   assignment  (= += -= ... ||= &&=)            parse_assignment
+Note:   ternary     (?:)                              parse_ternary
+Note:   range       (.. ...)                          parse_range
+Note:   logical or  (|| or)                           parse_logical_or
+Note:   logical and (&& and)                          parse_logical_and
+Note:   not         (! not)                           parse_not
+Note:   equality    (== != === =~ !~ <=>)             parse_equality
+Note:   comparison  (< <= > >=)                        parse_comparison
+Note:   bit_or      (| ^)                              parse_bit_or
+Note:   bit_and     (&)                                parse_bit_and
+Note:   shift       (<< >>)                            parse_shift
+Note:   additive    (+ -)                              parse_additive
+Note:   multiplicative (* / %)                         parse_multiplicative
+Note:   unary       (- + ~)                            parse_unary
+Note:   power       (**)                               parse_power
+Note:   postfix     (. &. :: [] call block)            parse_postfix
+Note:   primary                                        parse_primary
+Note: This hand-written climber encodes Ruby precedence directly via the call
+Note: chain, independent of Runa's own operator precedence, so no Runa-grouping
+Note: assumptions apply. NOTE in Ruby shift (<< >>) binds TIGHTER than +/-,
+Note: which the call order (parse_shift -> parse_additive) reflects.
 
 Process called "parse_expression" takes parser as Integer returns Integer:
-    Note: Parse Ruby expression with operator precedence
+    Note: Parse a full expression (entry to the precedence climber)
 
-    Return proc parse_logical_or from parser
+    Return proc parse_assignment with parser
 End Process
 
 @Reasoning:
-Lowest-precedence binary operator level. Handles both `||` (high-priority OR) and the keyword `or` (very low priority). Both short-circuit; both build AST_BINARY_OP with operator value "||" or "or" so downstream lowering preserves the original syntax.
+Assignment is right-associative and the weakest binding. Parses a ternary-or-
+lower expression as the target, then if an assignment operator follows, parses
+the right side (recursively, for right-associativity) and builds an AST_ASSIGN
+(for plain =) or AST_OP_ASSIGN (for compound forms) carrying the operator
+spelling.
 @End Reasoning
+Process called "parse_assignment" takes parser as Integer returns Integer:
+    Note: Parse an assignment expression (right-associative)
 
-@Implementation:
-Calls parse_logical_and for the left operand, then loops while current token is TOKEN_OR or TOKEN_OR_KW. Advances past the operator, calls parse_logical_and for the right operand, wraps in an AST_BINARY_OP node, repeats.
-@End Implementation
+    Let left be proc parse_ternary with parser
 
-Process called "parse_logical_or" takes parser as Integer returns Integer:
-    Note: Parse logical OR expressions (||, or)
+    Let t be proc current_token_type with parser
+    Let is_asgn be proc is_assignment_op with t
+    If is_asgn is equal to 1:
+        Let op be proc current_lexeme with parser
+        proc advance_parser with parser
+        Let right be proc parse_assignment with parser
 
-    Let left be proc parse_logical_and from parser
-
-    While proc match with parser, TOKEN_OR_OR from RubyLexer is equal to 1 or
-          proc match with parser, TOKEN_OR from RubyLexer is equal to 1:
-
-        Let operator be proc current_token_value from parser
-        proc advance from parser
-
-        Let right be proc parse_logical_and from parser
-
-        Let binary_node be proc create_ast_node with AST_BINARY_OP, operator
-        proc add_child with binary_node, left
-        proc add_child with binary_node, right
-
-        Set left to binary_node
-    End While
+        Let node be 0
+        If t is equal to TOKEN_ASSIGN from Lexer:
+            Set node to proc create_value_node with AST_ASSIGN, op
+        Otherwise:
+            Set node to proc create_value_node with AST_OP_ASSIGN, op
+        End If
+        proc add_node_child with node, left
+        proc add_node_child with node, right
+        Return node
+    End If
 
     Return left
 End Process
 
 @Reasoning:
-Logical AND level. Handles both `&&` and keyword `and` - both short-circuit, both build AST_BINARY_OP. Precedence is above OR but below equality.
+Whether a token is an assignment operator (plain or compound). Drives the
+assignment production's decision to build an assignment node.
 @End Reasoning
+Process called "is_assignment_op" takes token_type as Integer returns Integer:
+    Note: Whether token_type is an assignment operator
 
-@Implementation:
-Calls parse_equality for the left operand. Loops while current token is TOKEN_AND or TOKEN_AND_KW: advance, recurse parse_equality, wrap into AST_BINARY_OP.
-@End Implementation
-
-Process called "parse_logical_and" takes parser as Integer returns Integer:
-    Note: Parse logical AND expressions (&&, and)
-
-    Let left be proc parse_equality from parser
-
-    While proc match with parser, TOKEN_AND_AND from RubyLexer is equal to 1 or
-          proc match with parser, TOKEN_AND from RubyLexer is equal to 1:
-
-        Let operator be proc current_token_value from parser
-        proc advance from parser
-
-        Let right be proc parse_equality from parser
-
-        Let binary_node be proc create_ast_node with AST_BINARY_OP, operator
-        proc add_child with binary_node, left
-        proc add_child with binary_node, right
-
-        Set left to binary_node
-    End While
-
-    Return left
+    If token_type is equal to TOKEN_ASSIGN from Lexer:
+        Return 1
+    End If
+    If token_type is equal to TOKEN_PLUS_ASSIGN from Lexer:
+        Return 1
+    End If
+    If token_type is equal to TOKEN_MINUS_ASSIGN from Lexer:
+        Return 1
+    End If
+    If token_type is equal to TOKEN_STAR_ASSIGN from Lexer:
+        Return 1
+    End If
+    If token_type is equal to TOKEN_SLASH_ASSIGN from Lexer:
+        Return 1
+    End If
+    If token_type is equal to TOKEN_PERCENT_ASSIGN from Lexer:
+        Return 1
+    End If
+    If token_type is equal to TOKEN_POWER_ASSIGN from Lexer:
+        Return 1
+    End If
+    If token_type is equal to TOKEN_AMP_ASSIGN from Lexer:
+        Return 1
+    End If
+    If token_type is equal to TOKEN_PIPE_ASSIGN from Lexer:
+        Return 1
+    End If
+    If token_type is equal to TOKEN_CARET_ASSIGN from Lexer:
+        Return 1
+    End If
+    If token_type is equal to TOKEN_LSHIFT_ASSIGN from Lexer:
+        Return 1
+    End If
+    If token_type is equal to TOKEN_RSHIFT_ASSIGN from Lexer:
+        Return 1
+    End If
+    If token_type is equal to TOKEN_AND_ASSIGN from Lexer:
+        Return 1
+    End If
+    If token_type is equal to TOKEN_OR_ASSIGN from Lexer:
+        Return 1
+    End If
+    Return 0
 End Process
 
 @Reasoning:
-Equality operators. Ruby distinguishes ==, !=, =~ (regex match), !~ (regex non-match), and ===  (case-equality). Each builds an AST_BINARY_OP with the original operator string preserved.
+Ternary conditional `cond ? a : b`. Parses a range-or-lower condition; if a
+'?' follows, parses the true and false branches (the ':' separates them) into
+an AST_TERNARY.
 @End Reasoning
+Process called "parse_ternary" takes parser as Integer returns Integer:
+    Note: Parse a ternary conditional expression
 
-@Implementation:
-Calls parse_comparison for the left operand, then loops while current token is in the equality set. Advances, recurses parse_comparison, wraps into AST_BINARY_OP with the operator value.
-@End Implementation
+    Let cond be proc parse_range with parser
 
-Process called "parse_equality" takes parser as Integer returns Integer:
-    Note: Parse equality expressions (==, !=, =~, !~)
+    Let t be proc current_token_type with parser
+    If t is equal to TOKEN_QUESTION from Lexer:
+        proc advance_parser with parser
+        Let true_expr be proc parse_ternary with parser
+        proc expect_token with parser, TOKEN_COLON from Lexer
+        Let false_expr be proc parse_ternary with parser
+        Let node be proc create_ast_node with AST_TERNARY
+        proc add_node_child with node, cond
+        proc add_node_child with node, true_expr
+        proc add_node_child with node, false_expr
+        Return node
+    End If
 
-    Let left be proc parse_comparison from parser
-
-    While proc match with parser, TOKEN_EQUAL from RubyLexer is equal to 1 or
-          proc match with parser, TOKEN_NOT_EQUAL from RubyLexer is equal to 1 or
-          proc match with parser, TOKEN_MATCH from RubyLexer is equal to 1 or
-          proc match with parser, TOKEN_NOT_MATCH from RubyLexer is equal to 1:
-
-        Let operator be proc current_token_value from parser
-        proc advance from parser
-
-        Let right be proc parse_comparison from parser
-
-        Let binary_node be proc create_ast_node with AST_BINARY_OP, operator
-        proc add_child with binary_node, left
-        proc add_child with binary_node, right
-
-        Set left to binary_node
-    End While
-
-    Return left
+    Return cond
 End Process
 
 @Reasoning:
-Ordering comparison operators including Ruby's spaceship <=> which returns -1/0/1. All non-associating in practice (a < b < c is a chained call rather than a transitive comparison), but the parser folds them left-to-right.
+Range expression `low..high` / `low...high`. Parses a logical-or-or-lower low
+bound; if a range operator follows, parses the high bound and builds an
+AST_RANGE with the exclusive flag set for the triple-dot form.
 @End Reasoning
-
-@Implementation:
-Calls parse_range for the left operand. Loops while current token is TOKEN_LT/LE/GT/GE/SPACESHIP: advance, recurse parse_range, wrap into AST_BINARY_OP.
-@End Implementation
-
-Process called "parse_comparison" takes parser as Integer returns Integer:
-    Note: Parse comparison expressions (<, <=, >, >=, <=>)
-
-    Let left be proc parse_range from parser
-
-    While proc match with parser, TOKEN_LESS_THAN from RubyLexer is equal to 1 or
-          proc match with parser, TOKEN_LESS_EQUAL from RubyLexer is equal to 1 or
-          proc match with parser, TOKEN_GREATER_THAN from RubyLexer is equal to 1 or
-          proc match with parser, TOKEN_GREATER_EQUAL from RubyLexer is equal to 1 or
-          proc match with parser, TOKEN_SPACESHIP from RubyLexer is equal to 1:
-
-        Let operator be proc current_token_value from parser
-        proc advance from parser
-
-        Let right be proc parse_range from parser
-
-        Let binary_node be proc create_ast_node with AST_BINARY_OP, operator
-        proc add_child with binary_node, left
-        proc add_child with binary_node, right
-
-        Set left to binary_node
-    End While
-
-    Return left
-End Process
-
-@Reasoning:
-Ruby range literals: `a..b` (inclusive) and `a...b` (exclusive of upper). Distinct precedence so 1..5 + 1 parses as 1..(5+1).
-@End Reasoning
-
-@Implementation:
-Calls parse_addition for the left operand. If next token is TOKEN_DOTDOT or TOKEN_DOTDOTDOT, advances, recurses parse_addition for the upper bound, wraps in AST_RANGE with inclusive/exclusive flag.
-@End Implementation
-
 Process called "parse_range" takes parser as Integer returns Integer:
-    Note: Parse range expressions (.., ...)
+    Note: Parse an inclusive/exclusive range expression
 
-    Let left be proc parse_addition from parser
+    Let low be proc parse_logical_or with parser
 
-    If proc match with parser, TOKEN_RANGE_INCLUSIVE from RubyLexer is equal to 1 or
-       proc match with parser, TOKEN_RANGE_EXCLUSIVE from RubyLexer is equal to 1:
-
-        Let operator be proc current_token_value from parser
-        proc advance from parser
-
-        Let right be proc parse_addition from parser
-
-        Let range_node be proc create_ast_node with AST_RANGE, operator
-        proc add_child with range_node, left
-        proc add_child with range_node, right
-
-        Return range_node
+    Let t be proc current_token_type with parser
+    If t is equal to TOKEN_RANGE_INCL from Lexer:
+        proc advance_parser with parser
+        Let high be proc parse_logical_or with parser
+        Let node be proc create_ast_node with AST_RANGE
+        proc add_node_child with node, low
+        proc add_node_child with node, high
+        Return node
+    End If
+    If t is equal to TOKEN_RANGE_EXCL from Lexer:
+        proc advance_parser with parser
+        Let high be proc parse_logical_or with parser
+        Let node be proc create_ast_node with AST_RANGE
+        proc set_node_metadata with node, "exclusive", 1
+        proc add_node_child with node, low
+        proc add_node_child with node, high
+        Return node
     End If
 
-    Return left
+    Return low
 End Process
 
 @Reasoning:
-Additive arithmetic level. Left-associative + and -. Sits above range and below multiplication.
+Logical OR (left-associative) over both the symbolic `||` and the low-
+precedence keyword `or`; both build an AST_OR node. Loops so `a || b || c`
+left-associates.
 @End Reasoning
+Process called "parse_logical_or" takes parser as Integer returns Integer:
+    Note: Parse a left-associative logical-or chain
 
-@Implementation:
-Calls parse_multiplication for the left operand. Loops while current token is TOKEN_PLUS or TOKEN_MINUS: advance, recurse parse_multiplication, wrap into AST_BINARY_OP.
-@End Implementation
+    Let left be proc parse_logical_and with parser
 
-Process called "parse_addition" takes parser as Integer returns Integer:
-    Note: Parse addition and subtraction expressions
-
-    Let left be proc parse_multiplication from parser
-
-    While proc match with parser, TOKEN_PLUS from RubyLexer is equal to 1 or
-          proc match with parser, TOKEN_MINUS from RubyLexer is equal to 1:
-
-        Let operator be proc current_token_value from parser
-        proc advance from parser
-
-        Let right be proc parse_multiplication from parser
-
-        Let binary_node be proc create_ast_node with AST_BINARY_OP, operator
-        proc add_child with binary_node, left
-        proc add_child with binary_node, right
-
-        Set left to binary_node
+    While 1 is equal to 1:
+        Let t be proc current_token_type with parser
+        Let is_or be 0
+        If t is equal to TOKEN_OR_OR from Lexer:
+            Set is_or to 1
+        End If
+        If t is equal to TOKEN_OR from Lexer:
+            Set is_or to 1
+        End If
+        If is_or is equal to 0:
+            Break
+        End If
+        proc advance_parser with parser
+        Let right be proc parse_logical_and with parser
+        Let node be proc create_ast_node with AST_OR
+        proc add_node_child with node, left
+        proc add_node_child with node, right
+        Set left to node
     End While
 
     Return left
 End Process
 
 @Reasoning:
-Multiplicative arithmetic level. Left-associative *, /, %. Sits above addition and below power.
+Logical AND (left-associative) over `&&` and keyword `and`, building AST_AND.
 @End Reasoning
+Process called "parse_logical_and" takes parser as Integer returns Integer:
+    Note: Parse a left-associative logical-and chain
 
-@Implementation:
-Calls parse_power for the left operand. Loops while current token is TOKEN_STAR / TOKEN_SLASH / TOKEN_PERCENT: advance, recurse parse_power, wrap into AST_BINARY_OP.
-@End Implementation
+    Let left be proc parse_not with parser
 
-Process called "parse_multiplication" takes parser as Integer returns Integer:
-    Note: Parse multiplication, division, and % expressions
-
-    Let left be proc parse_power from parser
-
-    While proc match with parser, TOKEN_MULTIPLY from RubyLexer is equal to 1 or
-          proc match with parser, TOKEN_DIVIDE from RubyLexer is equal to 1 or
-          proc match with parser, TOKEN_MODULO from RubyLexer is equal to 1:
-
-        Let operator be proc current_token_value from parser
-        proc advance from parser
-
-        Let right be proc parse_power from parser
-
-        Let binary_node be proc create_ast_node with AST_BINARY_OP, operator
-        proc add_child with binary_node, left
-        proc add_child with binary_node, right
-
-        Set left to binary_node
+    While 1 is equal to 1:
+        Let t be proc current_token_type with parser
+        Let is_and be 0
+        If t is equal to TOKEN_AND_AND from Lexer:
+            Set is_and to 1
+        End If
+        If t is equal to TOKEN_AND from Lexer:
+            Set is_and to 1
+        End If
+        If is_and is equal to 0:
+            Break
+        End If
+        proc advance_parser with parser
+        Let right be proc parse_not with parser
+        Let node be proc create_ast_node with AST_AND
+        proc add_node_child with node, left
+        proc add_node_child with node, right
+        Set left to node
     End While
 
     Return left
 End Process
 
 @Reasoning:
-Exponentiation operator **. Right-associative so 2**3**2 parses as 2**(3**2)=512, matching math convention.
+Logical NOT prefix (`!` and keyword `not`). Recurses to allow stacked `!!x`.
+Falls through to equality when no negation prefix is present.
 @End Reasoning
+Process called "parse_not" takes parser as Integer returns Integer:
+    Note: Parse a logical-not prefix expression
 
-@Implementation:
-Calls parse_unary for the left operand. If next token is TOKEN_DOUBLE_STAR, advances and recurses parse_power (NOT parse_unary) to get right-associativity, then wraps in AST_BINARY_OP with operator "**".
-@End Implementation
-
-Process called "parse_power" takes parser as Integer returns Integer:
-    Note: Parse power expressions (**)
-
-    Let left be proc parse_unary from parser
-
-    If proc match with parser, TOKEN_POWER from RubyLexer is equal to 1:
-        Let operator be proc current_token_value from parser
-        proc advance from parser
-
-        Note: Right associative
-        Let right be proc parse_power from parser
-
-        Let binary_node be proc create_ast_node with AST_BINARY_OP, operator
-        proc add_child with binary_node, left
-        proc add_child with binary_node, right
-
-        Return binary_node
+    Let t be proc current_token_type with parser
+    If t is equal to TOKEN_BANG from Lexer:
+        proc advance_parser with parser
+        Let operand be proc parse_not with parser
+        Let node be proc create_ast_node with AST_NOT
+        proc add_node_child with node, operand
+        Return node
     End If
+    If t is equal to TOKEN_NOT from Lexer:
+        proc advance_parser with parser
+        Let operand be proc parse_not with parser
+        Let node be proc create_ast_node with AST_NOT
+        proc add_node_child with node, operand
+        Return node
+    End If
+
+    Return proc parse_equality with parser
+End Process
+
+@Reasoning:
+Equality / pattern-match operators (== != === =~ !~ <=>), left-associative,
+building AST_BINARY_OP carrying the operator spelling.
+@End Reasoning
+Process called "parse_equality" takes parser as Integer returns Integer:
+    Note: Parse equality/match operators
+
+    Let left be proc parse_comparison with parser
+
+    While 1 is equal to 1:
+        Let t be proc current_token_type with parser
+        Let is_eq be 0
+        If t is equal to TOKEN_EQUAL_EQUAL from Lexer:
+            Set is_eq to 1
+        End If
+        If t is equal to TOKEN_NOT_EQUAL from Lexer:
+            Set is_eq to 1
+        End If
+        If t is equal to TOKEN_CASE_EQUAL from Lexer:
+            Set is_eq to 1
+        End If
+        If t is equal to TOKEN_MATCH from Lexer:
+            Set is_eq to 1
+        End If
+        If t is equal to TOKEN_NOT_MATCH from Lexer:
+            Set is_eq to 1
+        End If
+        If t is equal to TOKEN_SPACESHIP from Lexer:
+            Set is_eq to 1
+        End If
+        If is_eq is equal to 0:
+            Break
+        End If
+        Let op be proc current_lexeme with parser
+        proc advance_parser with parser
+        Let right be proc parse_comparison with parser
+        Set left to proc make_binary with op, left, right
+    End While
 
     Return left
 End Process
 
 @Reasoning:
-Unary prefix operators. ! / not are logical negation; -/+ are sign operations. Right-associative since --x means -(-x).
+Comparison operators (< <= > >=), left-associative.
 @End Reasoning
+Process called "parse_comparison" takes parser as Integer returns Integer:
+    Note: Parse relational comparison operators
 
-@Implementation:
-If current token is TOKEN_NOT / TOKEN_BANG / TOKEN_MINUS / TOKEN_PLUS: advance, recurse parse_unary, wrap in AST_UNARY_OP. Otherwise delegate to parse_method_call.
-@End Implementation
+    Let left be proc parse_bit_or with parser
 
+    While 1 is equal to 1:
+        Let t be proc current_token_type with parser
+        Let is_cmp be 0
+        If t is equal to TOKEN_LESS_THAN from Lexer:
+            Set is_cmp to 1
+        End If
+        If t is equal to TOKEN_LESS_EQUAL from Lexer:
+            Set is_cmp to 1
+        End If
+        If t is equal to TOKEN_GREATER_THAN from Lexer:
+            Set is_cmp to 1
+        End If
+        If t is equal to TOKEN_GREATER_EQUAL from Lexer:
+            Set is_cmp to 1
+        End If
+        If is_cmp is equal to 0:
+            Break
+        End If
+        Let op be proc current_lexeme with parser
+        proc advance_parser with parser
+        Let right be proc parse_bit_or with parser
+        Set left to proc make_binary with op, left, right
+    End While
+
+    Return left
+End Process
+
+@Reasoning:
+Bitwise OR / XOR (| ^), left-associative. Ruby groups | and ^ at the same
+level, both tighter than comparison and looser than &.
+@End Reasoning
+Process called "parse_bit_or" takes parser as Integer returns Integer:
+    Note: Parse bitwise or / xor
+
+    Let left be proc parse_bit_and with parser
+
+    While 1 is equal to 1:
+        Let t be proc current_token_type with parser
+        Let is_bor be 0
+        If t is equal to TOKEN_PIPE from Lexer:
+            Set is_bor to 1
+        End If
+        If t is equal to TOKEN_CARET from Lexer:
+            Set is_bor to 1
+        End If
+        If is_bor is equal to 0:
+            Break
+        End If
+        Let op be proc current_lexeme with parser
+        proc advance_parser with parser
+        Let right be proc parse_bit_and with parser
+        Set left to proc make_binary with op, left, right
+    End While
+
+    Return left
+End Process
+
+@Reasoning:
+Bitwise AND (&), left-associative, tighter than | and looser than shift.
+@End Reasoning
+Process called "parse_bit_and" takes parser as Integer returns Integer:
+    Note: Parse bitwise and
+
+    Let left be proc parse_shift with parser
+
+    While 1 is equal to 1:
+        Let t be proc current_token_type with parser
+        If t is not equal to TOKEN_AMP from Lexer:
+            Break
+        End If
+        Let op be proc current_lexeme with parser
+        proc advance_parser with parser
+        Let right be proc parse_shift with parser
+        Set left to proc make_binary with op, left, right
+    End While
+
+    Return left
+End Process
+
+@Reasoning:
+Shift operators (<< >>), left-associative. In Ruby shift binds tighter than
++/- (the opposite of the Runa-source precedence table), so this level sits
+between bit-and and additive in the climber - encoded directly by the call
+chain (parse_shift calls parse_additive).
+@End Reasoning
+Process called "parse_shift" takes parser as Integer returns Integer:
+    Note: Parse shift operators
+
+    Let left be proc parse_additive with parser
+
+    While 1 is equal to 1:
+        Let t be proc current_token_type with parser
+        Let is_sh be 0
+        If t is equal to TOKEN_LSHIFT from Lexer:
+            Set is_sh to 1
+        End If
+        If t is equal to TOKEN_RSHIFT from Lexer:
+            Set is_sh to 1
+        End If
+        If is_sh is equal to 0:
+            Break
+        End If
+        Let op be proc current_lexeme with parser
+        proc advance_parser with parser
+        Let right be proc parse_additive with parser
+        Set left to proc make_binary with op, left, right
+    End While
+
+    Return left
+End Process
+
+@Reasoning:
+Additive operators (+ -), left-associative.
+@End Reasoning
+Process called "parse_additive" takes parser as Integer returns Integer:
+    Note: Parse addition and subtraction
+
+    Let left be proc parse_multiplicative with parser
+
+    While 1 is equal to 1:
+        Let t be proc current_token_type with parser
+        Let is_add be 0
+        If t is equal to TOKEN_PLUS from Lexer:
+            Set is_add to 1
+        End If
+        If t is equal to TOKEN_MINUS from Lexer:
+            Set is_add to 1
+        End If
+        If is_add is equal to 0:
+            Break
+        End If
+        Let op be proc current_lexeme with parser
+        proc advance_parser with parser
+        Let right be proc parse_multiplicative with parser
+        Set left to proc make_binary with op, left, right
+    End While
+
+    Return left
+End Process
+
+@Reasoning:
+Multiplicative operators (* / %), left-associative.
+@End Reasoning
+Process called "parse_multiplicative" takes parser as Integer returns Integer:
+    Note: Parse multiplication, division, modulo
+
+    Let left be proc parse_unary with parser
+
+    While 1 is equal to 1:
+        Let t be proc current_token_type with parser
+        Let is_mul be 0
+        If t is equal to TOKEN_STAR from Lexer:
+            Set is_mul to 1
+        End If
+        If t is equal to TOKEN_SLASH from Lexer:
+            Set is_mul to 1
+        End If
+        If t is equal to TOKEN_PERCENT from Lexer:
+            Set is_mul to 1
+        End If
+        If is_mul is equal to 0:
+            Break
+        End If
+        Let op be proc current_lexeme with parser
+        proc advance_parser with parser
+        Let right be proc parse_unary with parser
+        Set left to proc make_binary with op, left, right
+    End While
+
+    Return left
+End Process
+
+@Reasoning:
+Unary prefix operators (- + ~). Logical not (!) is handled higher up at
+parse_not so it binds looser per Ruby; arithmetic/bitwise unary binds tighter
+than power's operand. Recurses to allow stacked unary. Builds AST_UNARY_OP.
+@End Reasoning
 Process called "parse_unary" takes parser as Integer returns Integer:
-    Note: Parse unary expressions (!, not, -, +)
+    Note: Parse arithmetic/bitwise unary prefix operators
 
-    If proc match with parser, TOKEN_NOT from RubyLexer is equal to 1 or
-       proc match with parser, TOKEN_MINUS from RubyLexer is equal to 1 or
-       proc match with parser, TOKEN_PLUS from RubyLexer is equal to 1:
+    Let t be proc current_token_type with parser
 
-        Let operator be proc current_token_value from parser
-        proc advance from parser
-
-        Let operand be proc parse_unary from parser
-
-        Let unary_node be proc create_ast_node with AST_UNARY_OP, operator
-        proc add_child with unary_node, operand
-
-        Return unary_node
+    Let is_un be 0
+    If t is equal to TOKEN_MINUS from Lexer:
+        Set is_un to 1
+    End If
+    If t is equal to TOKEN_PLUS from Lexer:
+        Set is_un to 1
+    End If
+    If t is equal to TOKEN_TILDE from Lexer:
+        Set is_un to 1
     End If
 
-    Return proc parse_method_call from parser
+    If is_un is equal to 1:
+        Let op be proc current_lexeme with parser
+        proc advance_parser with parser
+        Let operand be proc parse_unary with parser
+        Let node be proc create_value_node with AST_UNARY_OP, op
+        proc add_node_child with node, operand
+        Return node
+    End If
+
+    Return proc parse_power with parser
 End Process
 
 @Reasoning:
-Handles Ruby's method-call syntaxes: dot notation `obj.method(args) {block}`, parenless calls `method args`, safe-navigation `obj&.method`, and call chains. Each call may carry a block argument introduced by `do...end` or `{...}`.
+Exponentiation (**), right-associative and tighter than unary minus on its
+left operand. Parses a postfix operand, then if '**' follows recurses through
+parse_unary so the right side may itself be a signed power.
 @End Reasoning
+Process called "parse_power" takes parser as Integer returns Integer:
+    Note: Parse right-associative exponentiation
 
-@Implementation:
-Calls parse_primary for the receiver. Loops while next token is TOKEN_DOT, TOKEN_SAFE_NAV, or (when in call position) TOKEN_LPAREN. For each: capture method name, parse argument list, then if TOKEN_DO or TOKEN_LBRACE follows call parse_block. Wrap the cumulative AST_METHOD_CALL.
-@End Implementation
+    Let base be proc parse_postfix with parser
 
-Process called "parse_method_call" takes parser as Integer returns Integer:
-    Note: Parse method calls with blocks, dot notation, and chaining
+    Let t be proc current_token_type with parser
+    If t is equal to TOKEN_POWER from Lexer:
+        Let op be proc current_lexeme with parser
+        proc advance_parser with parser
+        Let exponent be proc parse_unary with parser
+        Set base to proc make_binary with op, base, exponent
+    End If
 
-    Let expr be proc parse_primary from parser
+    Return base
+End Process
 
-    While proc match with parser, TOKEN_DOT from RubyLexer is equal to 1 or
-          proc match with parser, TOKEN_DOUBLE_COLON from RubyLexer is equal to 1 or
-          proc match with parser, TOKEN_LBRACKET from RubyLexer is equal to 1 or
-          proc match with parser, TOKEN_LPAREN from RubyLexer is equal to 1 or
-          proc current_token_type with parser is equal to TOKEN_IDENTIFIER from RubyLexer:
+@Reasoning:
+Builds an AST_BINARY_OP node carrying the operator spelling with left and
+right children. Shared by every left-associative binary level so node
+construction lives in one place.
+@End Reasoning
+Process called "make_binary" takes op as Integer, left as Integer, right as Integer returns Integer:
+    Note: Construct a binary-operator node
 
-        If proc match with parser, TOKEN_DOT from RubyLexer is equal to 1:
-            proc advance from parser
-            Let method_name be proc expect_identifier from parser
+    Let node be proc create_value_node with AST_BINARY_OP, op
+    proc add_node_child with node, left
+    proc add_node_child with node, right
+    Return node
+End Process
 
-            Let call_node be proc create_ast_node with AST_METHOD_CALL, method_name
-            proc add_child with call_node, expr
+Note: ============================================================================
+Note: Postfix (member access, index, calls, blocks)
+Note: ============================================================================
 
-            Note: Parse arguments
-            If proc match with parser, TOKEN_LPAREN from RubyLexer is equal to 1:
-                proc advance from parser
-                Let args be proc parse_argument_list from parser
-                proc set_node_attribute with call_node, "arguments", args
-                proc expect with parser, TOKEN_RPAREN from RubyLexer
-            Otherwise If proc current_token_type with parser is not equal to TOKEN_NEWLINE from RubyLexer and
-                        proc current_token_type with parser is not equal to TOKEN_EOF from RubyLexer:
-                Note: Arguments without parentheses
-                Set args to proc parse_argument_list from parser
-                proc set_node_attribute with call_node, "arguments", args
+@Reasoning:
+Parses postfix chains on a primary: method/member access (`.m`, `&.m`, `::C`),
+indexing (`[i]`), and trailing blocks (`{ |x| }` or `do |x| end`). Loops so
+chains like `a.b(1)[2].c` build left to right. A '.' or '&.' followed by an
+identifier with a '(' becomes an AST_METHOD_CALL with that receiver; without
+parens it is an AST_MEMBER (which may still take a trailing block, turning it
+into a call). '::' followed by a constant builds an AST_SCOPE_REF.
+@End Reasoning
+Process called "parse_postfix" takes parser as Integer returns Integer:
+    Note: Parse postfix access/index/call/block chains
+
+    Let expr be proc parse_primary with parser
+
+    While 1 is equal to 1:
+        Let t be proc current_token_type with parser
+
+        If t is equal to TOKEN_DOT from Lexer:
+            Set expr to proc parse_member_or_call with parser, expr, 0
+        Otherwise:
+        If t is equal to TOKEN_SAFE_NAV from Lexer:
+            Set expr to proc parse_member_or_call with parser, expr, 1
+        Otherwise:
+        If t is equal to TOKEN_SCOPE from Lexer:
+            proc advance_parser with parser
+            Let cname be proc current_lexeme with parser
+            proc advance_parser with parser
+            Let after be proc current_token_type with parser
+            If after is equal to TOKEN_LPAREN from Lexer:
+                Let call be proc create_value_node with AST_METHOD_CALL, cname
+                proc add_node_child with call, expr
+                Let args be proc parse_paren_args with parser
+                proc add_node_child with call, args
+                Let blk be proc try_parse_block with parser
+                If blk is not equal to 0:
+                    proc add_node_child with call, blk
+                End If
+                Set expr to call
+            Otherwise:
+                Let scope_ref be proc create_value_node with AST_SCOPE_REF, cname
+                proc add_node_child with scope_ref, expr
+                Set expr to scope_ref
             End If
-
-            Note: Parse block
-            If proc match with parser, TOKEN_DO from RubyLexer is equal to 1 or
-               proc match with parser, TOKEN_LBRACE from RubyLexer is equal to 1:
-                Let block be proc parse_block from parser
-                proc set_node_attribute with call_node, "block", block
-            End If
-
-            Set expr to call_node
-
-        Otherwise If proc match with parser, TOKEN_LBRACKET from RubyLexer is equal to 1:
-            proc advance from parser
-            Let index be proc parse_expression from parser
-            proc expect with parser, TOKEN_RBRACKET from RubyLexer
-
-            Let index_node be proc create_ast_node with AST_METHOD_CALL, "[]"
-            proc add_child with index_node, expr
-            proc add_child with index_node, index
-
+        Otherwise:
+        If t is equal to TOKEN_LBRACKET from Lexer:
+            proc advance_parser with parser
+            Let index_node be proc create_ast_node with AST_INDEX
+            proc add_node_child with index_node, expr
+            Let arg_list be proc create_ast_node with AST_ARG_LIST
+            While 1 is equal to 1:
+                Let bt be proc current_token_type with parser
+                If bt is equal to TOKEN_RBRACKET from Lexer:
+                    Break
+                End If
+                Let idx be proc parse_expression with parser
+                Let arg be proc create_ast_node with AST_ARG
+                proc add_node_child with arg, idx
+                proc add_node_child with arg_list, arg
+                Let ct be proc current_token_type with parser
+                If ct is equal to TOKEN_COMMA from Lexer:
+                    proc advance_parser with parser
+                Otherwise:
+                    Break
+                End If
+            End While
+            proc expect_token with parser, TOKEN_RBRACKET from Lexer
+            proc add_node_child with index_node, arg_list
             Set expr to index_node
-
+        Otherwise:
+        If t is equal to TOKEN_LBRACE from Lexer:
+            Let blk be proc parse_block with parser
+            Set expr to proc attach_block with expr, blk
+        Otherwise:
+        If t is equal to TOKEN_DO from Lexer:
+            Let blk be proc parse_block with parser
+            Set expr to proc attach_block with expr, blk
         Otherwise:
             Break
+        End If
+        End If
+        End If
+        End If
+        End If
         End If
     End While
 
@@ -881,457 +2567,777 @@ Process called "parse_method_call" takes parser as Integer returns Integer:
 End Process
 
 @Reasoning:
-Atomic expression level. Recognises literals (number, string, symbol, regex), identifiers and constants, instance/class/global variables (with their @, @@, $ sigils), self, super, parenthesised expressions, array literals, hash literals, lambda/proc keywords.
+Handles `.name` / `&.name` after a receiver. If a paren argument list follows
+the name it is an AST_METHOD_CALL (receiver + args + optional block);
+otherwise an AST_MEMBER access that may still capture a trailing block (making
+it a zero-paren method call with a block). The safe flag records `&.`.
 @End Reasoning
+Process called "parse_member_or_call" takes parser as Integer, receiver as Integer, safe as Integer returns Integer:
+    Note: Parse a .member / .method(args) / &.method postfix
 
-@Implementation:
-Switch on current_token_type: NUMBER -> literal node, STRING -> literal/interpolated, SYMBOL -> AST_SYMBOL, IDENTIFIER -> AST_IDENTIFIER, AT-NAME -> AST_INSTANCE_VAR, AT-AT-NAME -> AST_CLASS_VAR, DOLLAR-NAME -> AST_GLOBAL_VAR, CONSTANT -> AST_CONSTANT, LPAREN -> recurse parse_expression and consume RPAREN, LBRACKET -> parse_array, LBRACE -> parse_hash, SELF -> AST_SELF, SUPER -> AST_SUPER_CALL.
-@End Implementation
+    proc advance_parser with parser
 
-Process called "parse_primary" takes parser as Integer returns Integer:
-    Note: Parse primary expressions (literals, identifiers, parentheses)
+    Let name be proc current_lexeme with parser
+    proc advance_parser with parser
 
-    Let token_type be proc current_token_type from parser
+    Let t be proc current_token_type with parser
 
-    Match token_type:
-        When TOKEN_NUMBER from RubyLexer:
-            Let value be proc current_token_value from parser
-            proc advance from parser
-            Return proc create_ast_node with AST_NUMBER, value
+    If t is equal to TOKEN_LPAREN from Lexer:
+        Let call be proc create_value_node with AST_METHOD_CALL, name
+        proc add_node_child with call, receiver
+        Let args be proc parse_paren_args with parser
+        proc add_node_child with call, args
+        If safe is equal to 1:
+            proc set_node_metadata with call, "safe", 1
+        End If
+        Let blk be proc try_parse_block with parser
+        If blk is not equal to 0:
+            proc add_node_child with call, blk
+        End If
+        Return call
+    End If
 
-        When TOKEN_STRING from RubyLexer:
-            Set value to proc current_token_value from parser
-            proc advance from parser
-            Return proc create_ast_node with AST_STRING, value
+    Note: member access without parens; a trailing block makes it a call
+    Let blk be proc try_parse_block with parser
+    If blk is not equal to 0:
+        Let call be proc create_value_node with AST_METHOD_CALL, name
+        proc add_node_child with call, receiver
+        Let empty_args be proc create_ast_node with AST_ARG_LIST
+        proc add_node_child with call, empty_args
+        proc add_node_child with call, blk
+        If safe is equal to 1:
+            proc set_node_metadata with call, "safe", 1
+        End If
+        Return call
+    End If
 
-        When TOKEN_INTERPOLATED_STRING from RubyLexer:
-            Set value to proc current_token_value from parser
-            proc advance from parser
-            Return proc create_ast_node with AST_INTERPOLATED_STRING, value
+    Let member be proc create_value_node with AST_MEMBER, name
+    proc add_node_child with member, receiver
+    If safe is equal to 1:
+        proc set_node_metadata with member, "safe", 1
+    End If
+    Return member
+End Process
 
-        When TOKEN_SYMBOL from RubyLexer:
-            Set value to proc current_token_value from parser
-            proc advance from parser
-            Return proc create_ast_node with AST_SYMBOL, value
+@Reasoning:
+Attaches a trailing block to a postfix target. When the target is already an
+AST_METHOD_CALL the block becomes its next child; otherwise (a bare
+identifier/member receiver like `each do ... end`) the target is wrapped into
+an AST_METHOD_CALL whose name is the receiver's value with an empty arg list
+and the block, so a block always hangs off a call node.
+@End Reasoning
+Process called "attach_block" takes target as Integer, block as Integer returns Integer:
+    Note: Attach a parsed block to a call/identifier target
 
-        When TOKEN_TRUE from RubyLexer:
-            proc advance from parser
-            Return proc create_ast_node with AST_IDENTIFIER, "true"
+    Let kind be proc ast_node_type with target
+    If kind is equal to AST_METHOD_CALL:
+        proc add_node_child with target, block
+        Return target
+    End If
 
-        When TOKEN_FALSE from RubyLexer:
-            proc advance from parser
-            Return proc create_ast_node with AST_IDENTIFIER, "false"
+    Note: wrap a bare identifier receiver into a call with the block
+    If kind is equal to AST_IDENTIFIER:
+        Let name be proc ast_node_value with target
+        Let call be proc create_value_node with AST_METHOD_CALL, name
+        Let no_recv be proc create_ast_node with AST_IDENTIFIER
+        proc add_node_child with call, no_recv
+        Let empty_args be proc create_ast_node with AST_ARG_LIST
+        proc add_node_child with call, empty_args
+        proc add_node_child with call, block
+        Return call
+    End If
 
-        When TOKEN_NIL from RubyLexer:
-            proc advance from parser
-            Return proc create_ast_node with AST_IDENTIFIER, "nil"
+    Note: wrap a member receiver into a call with the block
+    If kind is equal to AST_MEMBER:
+        Let name be proc ast_node_value with target
+        Let recv be proc ast_node_child with target, 0
+        Let call be proc create_value_node with AST_METHOD_CALL, name
+        proc add_node_child with call, recv
+        Let empty_args be proc create_ast_node with AST_ARG_LIST
+        proc add_node_child with call, empty_args
+        proc add_node_child with call, block
+        Return call
+    End If
 
-        When TOKEN_SELF from RubyLexer:
-            proc advance from parser
-            Return proc create_ast_node with AST_SELF, "self"
+    Note: any other target: surface the block via a call wrapping the target
+    Let call be proc create_ast_node with AST_METHOD_CALL
+    proc add_node_child with call, target
+    Let empty_args be proc create_ast_node with AST_ARG_LIST
+    proc add_node_child with call, empty_args
+    proc add_node_child with call, block
+    Return call
+End Process
 
-        When TOKEN_SUPER from RubyLexer:
-            proc advance from parser
-            Let super_node be proc create_ast_node with AST_SUPER_CALL, "super"
+@Reasoning:
+Parses a parenthesised argument list `( arg, kw: v, *splat, **dsplat, &blk )`.
+Each argument is classified: `name:` value is a keyword argument; `*e` /
+`**e` are splat / double-splat; `&e` is a block argument; otherwise a
+positional argument wrapping its expression. Returns an AST_ARG_LIST.
+@End Reasoning
+Process called "parse_paren_args" takes parser as Integer returns Integer:
+    Note: Parse a parenthesised argument list into an AST_ARG_LIST
 
-            Note: Parse super arguments
-            If proc match with parser, TOKEN_LPAREN from RubyLexer is equal to 1:
-                proc advance from parser
-                Let args be proc parse_argument_list from parser
-                proc set_node_attribute with super_node, "arguments", args
-                proc expect with parser, TOKEN_RPAREN from RubyLexer
-            End If
+    proc advance_parser with parser
+    Let arg_list be proc create_ast_node with AST_ARG_LIST
 
-            Return super_node
+    While 1 is equal to 1:
+        proc skip_terminators with parser
+        Let t be proc current_token_type with parser
+        If t is equal to TOKEN_RPAREN from Lexer:
+            Break
+        End If
+        If t is equal to TOKEN_EOF from Lexer:
+            Break
+        End If
 
-        When TOKEN_IDENTIFIER from RubyLexer:
-            Let name be proc current_token_value from parser
-            proc advance from parser
+        Let arg be proc parse_one_argument with parser
+        proc add_node_child with arg_list, arg
 
-            Note: Check for assignment
-            If proc match with parser, TOKEN_ASSIGN from RubyLexer is equal to 1:
-                proc advance from parser
-                Set value to proc parse_expression from parser
-
-                Let assign_node be proc create_ast_node with AST_ASSIGNMENT, "="
-                Let var_node be proc create_ast_node with AST_IDENTIFIER, name
-                proc add_child with assign_node, var_node
-                proc add_child with assign_node, value
-
-                Return assign_node
-            End If
-
-            Return proc create_ast_node with AST_IDENTIFIER, name
-
-        When TOKEN_LPAREN from RubyLexer:
-            proc advance from parser
-            Let expr be proc parse_expression from parser
-            proc expect with parser, TOKEN_RPAREN from RubyLexer
-            Return expr
-
-        When TOKEN_LBRACKET from RubyLexer:
-            Return proc parse_array from parser
-
-        When TOKEN_LBRACE from RubyLexer:
-            Return proc parse_hash from parser
-
+        proc skip_terminators with parser
+        Let ct be proc current_token_type with parser
+        If ct is equal to TOKEN_COMMA from Lexer:
+            proc advance_parser with parser
         Otherwise:
-            Return 0  Note: Invalid expression
-    End Match
-End Process
-
-@Reasoning:
-Parses `[a, b, c]` array literals. Trailing comma is permitted. Empty arrays `[]` are common. Splat elements `[*xs, y]` are valid - they become AST_SPLAT children that the lowering expands at runtime.
-@End Reasoning
-
-@Implementation:
-Consumes TOKEN_LBRACKET. Loops: if current token is TOKEN_RBRACKET, exit. Otherwise parse_expression and append as child. Consume TOKEN_COMMA between elements (tolerating trailing comma). Finally consume TOKEN_RBRACKET. Returns AST_ARRAY.
-@End Implementation
-
-Process called "parse_array" takes parser as Integer returns Integer:
-    Note: Parse Ruby array literals
-
-    proc expect with parser, TOKEN_LBRACKET from RubyLexer
-
-    Let array_node be proc create_ast_node with AST_ARRAY, ""
-
-    If proc current_token_type with parser is not equal to TOKEN_RBRACKET from RubyLexer:
-        Let element be proc parse_expression from parser
-        proc add_child with array_node, element
-
-        While proc match with parser, TOKEN_COMMA from RubyLexer is equal to 1:
-            proc advance from parser
-
-            If proc current_token_type with parser is equal to TOKEN_RBRACKET from RubyLexer:
-                Break  Note: Trailing comma
-            End If
-
-            Set element to proc parse_expression from parser
-            proc add_child with array_node, element
-        End While
-    End If
-
-    proc expect with parser, TOKEN_RBRACKET from RubyLexer
-
-    Return array_node
-End Process
-
-@Reasoning:
-Parses Ruby hash literals `{k => v, k => v}` or the shorthand `{key: value}` for symbol keys. Empty hashes `{}` are valid. The shorthand form is rewritten internally to the => form with a symbol key.
-@End Reasoning
-
-@Implementation:
-Consumes TOKEN_LBRACE. Loops parsing key-value pairs separated by commas: parse the key (either an expression for => form or a TOKEN_LABEL for symbol shorthand), then TOKEN_HASH_ROCKET or TOKEN_COLON, then parse_expression for the value. Each (key,value) becomes a child pair of AST_HASH.
-@End Implementation
-
-Process called "parse_hash" takes parser as Integer returns Integer:
-    Note: Parse Ruby hash literals with various key styles
-
-    proc expect with parser, TOKEN_LBRACE from RubyLexer
-
-    Let hash_node be proc create_ast_node with AST_HASH, ""
-
-    If proc current_token_type with parser is not equal to TOKEN_RBRACE from RubyLexer:
-        Let key be proc parse_expression from parser
-
-        Note: Handle hash arrow (=>) or colon (:) syntax
-        If proc match with parser, TOKEN_HASH_ARROW from RubyLexer is equal to 1:
-            proc advance from parser
-        Otherwise If proc match with parser, TOKEN_COLON from RubyLexer is equal to 1:
-            proc advance from parser
+            Break
         End If
+    End While
 
-        Let value be proc parse_expression from parser
-
-        proc add_child with hash_node, key
-        proc add_child with hash_node, value
-
-        While proc match with parser, TOKEN_COMMA from RubyLexer is equal to 1:
-            proc advance from parser
-
-            If proc current_token_type with parser is equal to TOKEN_RBRACE from RubyLexer:
-                Break  Note: Trailing comma
-            End If
-
-            Set key to proc parse_expression from parser
-
-            If proc match with parser, TOKEN_HASH_ARROW from RubyLexer is equal to 1:
-                proc advance from parser
-            Otherwise If proc match with parser, TOKEN_COLON from RubyLexer is equal to 1:
-                proc advance from parser
-            End If
-
-            Set value to proc parse_expression from parser
-
-            proc add_child with hash_node, key
-            proc add_child with hash_node, value
-        End While
-    End If
-
-    proc expect with parser, TOKEN_RBRACE from RubyLexer
-
-    Return hash_node
+    proc skip_terminators with parser
+    proc expect_token with parser, TOKEN_RPAREN from Lexer
+    Return arg_list
 End Process
 
 @Reasoning:
-Parses a Ruby block - either the `{ |params| body }` brace form or the `do |params| body end` keyword form. Optional block parameter list between pipes; body is a statement sequence.
+Classifies and parses one call argument. A `*` / `**` prefix builds a splat /
+double-splat arg; `&` builds a block arg; an identifier immediately followed
+by `:` is a keyword argument; otherwise a positional arg. Keyword detection
+uses one-token lookahead so a plain identifier expression is not misread.
 @End Reasoning
+Process called "parse_one_argument" takes parser as Integer returns Integer:
+    Note: Parse and classify a single call argument
 
-@Implementation:
-Detects opener (TOKEN_LBRACE or TOKEN_DO). If next token is TOKEN_PIPE, parses block parameters via parse_parameter_list until the closing pipe. Then parses statements via parse_statement until TOKEN_RBRACE (for { form) or TOKEN_END (for do form). Returns AST_BLOCK with parameters and body.
-@End Implementation
+    Let t be proc current_token_type with parser
 
+    If t is equal to TOKEN_STAR from Lexer:
+        proc advance_parser with parser
+        Let node be proc create_ast_node with AST_SPLAT_ARG
+        Let e be proc parse_expression with parser
+        proc add_node_child with node, e
+        Return node
+    End If
+
+    If t is equal to TOKEN_POWER from Lexer:
+        proc advance_parser with parser
+        Let node be proc create_ast_node with AST_SPLAT_ARG
+        proc set_node_metadata with node, "doublesplat", 1
+        Let e be proc parse_expression with parser
+        proc add_node_child with node, e
+        Return node
+    End If
+
+    If t is equal to TOKEN_AMP from Lexer:
+        proc advance_parser with parser
+        Let node be proc create_ast_node with AST_BLOCK_ARG
+        Let e be proc parse_expression with parser
+        proc add_node_child with node, e
+        Return node
+    End If
+
+    Note: keyword argument:  name: value
+    If t is equal to TOKEN_IDENTIFIER from Lexer:
+        Let next be proc peek_token_type with parser, 1
+        If next is equal to TOKEN_COLON from Lexer:
+            Let kw_name be proc current_lexeme with parser
+            proc advance_parser with parser
+            proc advance_parser with parser
+            Let node be proc create_value_node with AST_KWARG, kw_name
+            Let v be proc parse_expression with parser
+            proc add_node_child with node, v
+            Return node
+        End If
+    End If
+
+    Let arg be proc create_ast_node with AST_ARG
+    Let e be proc parse_expression with parser
+    proc add_node_child with arg, e
+    Return arg
+End Process
+
+@Reasoning:
+Optionally parses a trailing block after a call's argument list: a `{ ... }`
+brace block or a `do ... end` block. Returns 0 when neither follows.
+@End Reasoning
+Process called "try_parse_block" takes parser as Integer returns Integer:
+    Note: Parse an optional trailing block, or return 0
+
+    Let t be proc current_token_type with parser
+    If t is equal to TOKEN_LBRACE from Lexer:
+        Return proc parse_block with parser
+    End If
+    If t is equal to TOKEN_DO from Lexer:
+        Return proc parse_block with parser
+    End If
+    Return 0
+End Process
+
+@Reasoning:
+Parses a block in either `{ |params| body }` or `do |params| body end` form.
+The brace flag is recorded in metadata. Block parameters between pipes are
+parsed via parse_block_parameters into the first child AST_PARAM_LIST; the
+body follows. The brace form ends at '}', the do form at 'end'.
+@End Reasoning
 Process called "parse_block" takes parser as Integer returns Integer:
-    Note: Parse Ruby blocks (do...end or {...})
+    Note: Parse a { } or do..end block with optional |params|
 
-    Let is_brace_block be 0
+    Let t be proc current_token_type with parser
+    Let is_brace be 0
+    If t is equal to TOKEN_LBRACE from Lexer:
+        Set is_brace to 1
+    End If
+    proc advance_parser with parser
 
-    If proc match with parser, TOKEN_LBRACE from RubyLexer is equal to 1:
-        Set is_brace_block to 1
-        proc advance from parser
-    Otherwise If proc match with parser, TOKEN_DO from RubyLexer is equal to 1:
-        proc advance from parser
+    Let node be proc create_ast_node with AST_BLOCK
+    If is_brace is equal to 1:
+        proc set_node_metadata with node, "brace", 1
     End If
 
-    Let block_node be proc create_ast_node with AST_BLOCK, ""
+    proc skip_terminators with parser
 
-    Note: Parse block parameters
-    If proc match with parser, TOKEN_PIPE from RubyLexer is equal to 1:
-        proc advance from parser
+    Let params be proc parse_block_parameters with parser
+    proc add_node_child with node, params
 
-        Let params be proc create_list
-
-        If proc current_token_type with parser is equal to TOKEN_IDENTIFIER from RubyLexer:
-            Let param be proc expect_identifier from parser
-            proc add_to_list with params, param
-
-            While proc match with parser, TOKEN_COMMA from RubyLexer is equal to 1:
-                proc advance from parser
-                Set param to proc expect_identifier from parser
-                proc add_to_list with params, param
-            End While
-        End If
-
-        proc expect with parser, TOKEN_PIPE from RubyLexer
-        proc set_node_attribute with block_node, "parameters", params
-    End If
-
-    Note: Parse block body
-    proc skip_newlines from parser
-
-    If is_brace_block is equal to 1:
-        While proc current_token_type with parser is not equal to TOKEN_RBRACE from RubyLexer and
-              proc current_token_type with parser is not equal to TOKEN_EOF from RubyLexer:
-
-            Let statement be proc parse_statement from parser
-            If statement is not equal to 0:
-                proc add_child with block_node, statement
-            End If
-        End While
-
-        proc expect with parser, TOKEN_RBRACE from RubyLexer
-    Otherwise:
-        While proc current_token_type with parser is not equal to TOKEN_END from RubyLexer and
-              proc current_token_type with parser is not equal to TOKEN_EOF from RubyLexer:
-
-            proc skip_newlines from parser
-
-            If proc current_token_type with parser is equal to TOKEN_END from RubyLexer:
+    If is_brace is equal to 1:
+        While 1 is equal to 1:
+            proc skip_terminators with parser
+            Let bt be proc current_token_type with parser
+            If bt is equal to TOKEN_RBRACE from Lexer:
                 Break
             End If
-
-            Set statement to proc parse_statement from parser
-            If statement is not equal to 0:
-                proc add_child with block_node, statement
+            If bt is equal to TOKEN_EOF from Lexer:
+                Break
+            End If
+            Let stmt be proc parse_statement with parser
+            If stmt is equal to 0:
+                proc advance_parser with parser
+            Otherwise:
+                proc add_node_child with node, stmt
             End If
         End While
-
-        proc expect with parser, TOKEN_END from RubyLexer
+        proc expect_token with parser, TOKEN_RBRACE from Lexer
+    Otherwise:
+        proc parse_body_into with parser, node
+        proc expect_token with parser, TOKEN_END from Lexer
     End If
-
-    Return block_node
-End Process
-
-Note: Helper processes for parser functionality
-
-@Reasoning:
-Factory for every AST node the parser produces. Centralising construction here keeps the node shape (children list + attributes dict) invariant across all parse rules.
-@End Reasoning
-
-@Implementation:
-Constructs a RubyASTNode with the given node_type code and value string, fresh empty children list, line/column from the current parser position, and fresh empty attributes dictionary.
-@End Implementation
-
-Process called "create_ast_node" takes nt as Integer, node_value as String returns Integer:
-    Note: Create new AST node
-
-    Let node be a value of type RubyASTNode with
-        node_type as nt,
-        value as node_value,
-        children as proc create_list,
-        line as 0,
-        column as 0,
-        attributes as proc create_dict
 
     Return node
 End Process
 
 @Reasoning:
-Appends a child node onto a parent's children list. Centralised here so the list-append protocol is consistent across all parse rules.
+Parses an optional `|p1, p2, *rest, &blk|` block-parameter clause into an
+AST_PARAM_LIST. Returns an empty list when no pipe clause is present. Each
+parameter reuses parse_parameter so splat/block/default forms are handled
+uniformly with method parameters.
 @End Reasoning
+Process called "parse_block_parameters" takes parser as Integer returns Integer:
+    Note: Parse an optional |params| clause for a block
 
-@Implementation:
-Calls list_append on parent.children with the child node.
-@End Implementation
+    Let param_list be proc create_ast_node with AST_PARAM_LIST
 
-Process called "add_child" takes parent as Integer, child as Integer returns Integer:
-    Note: Add child node to parent
-    proc add_to_list with parent.children, child
-    Return 1
-End Process
-
-@Reasoning:
-Moves the parser cursor forward by one token and refreshes the cached current_token. All parse rules rely on this single advancement primitive so the cache stays consistent.
-@End Reasoning
-
-@Implementation:
-Increments parser.position. Reads parser.tokens at the new position and updates parser.current_token. If position is past the end, leaves current_token at the EOF sentinel.
-@End Implementation
-
-Process called "advance" takes parser as Integer returns Integer:
-    Note: Advance to next token
-
-    Set parser.position to parser.position plus 1
-
-    If parser.position is greater than or equal to proc get_list_size with parser.tokens:
-        Let eof_token be proc create_token from RubyLexer with TOKEN_EOF, "", 0, 0
-        Set parser.current_token to eof_token
-    Otherwise:
-        Set parser.current_token to proc get_list_item with parser.tokens, parser.position
+    Let t be proc current_token_type with parser
+    If t is not equal to TOKEN_PIPE from Lexer:
+        Return param_list
     End If
 
-    Return 1
-End Process
+    proc advance_parser with parser
 
-@Reasoning:
-Accessor for the cached current_token's type field. All parse-rule dispatchers call this before advancing.
-@End Reasoning
-
-@Implementation:
-Returns parser.current_token.token_type.
-@End Implementation
-
-Process called "current_token_type" takes parser as Integer returns Integer:
-    Note: Get current token type
-    Return parser.current_token.token_type
-End Process
-
-@Reasoning:
-Accessor for the cached current_token's lexeme/value field. Used when the parser needs to capture an identifier name, number literal, string literal, or operator string into an AST node.
-@End Reasoning
-
-@Implementation:
-Returns parser.current_token.value.
-@End Implementation
-
-Process called "current_token_value" takes parser as Integer returns String:
-    Note: Get current token value
-    Return parser.current_token.value
-End Process
-
-@Reasoning:
-Non-consuming token-type predicate. Pair with advance() to consume after a successful match.
-@End Reasoning
-
-@Implementation:
-Returns 1 if current_token_type equals token_type, 0 otherwise.
-@End Implementation
-
-Process called "match" takes parser as Integer, token_type as Integer returns Integer:
-    Note: Check if current token matches type
-    Return proc current_token_type with parser is equal to token_type
-End Process
-
-@Reasoning:
-Strict assertion: the next token MUST be of the requested type. On match, advances. On mismatch, records a parse error - typically used at mandatory grammar positions like closing brackets and required keywords.
-@End Reasoning
-
-@Implementation:
-Calls match. If true, calls advance and returns 1. Otherwise records an "expected X, got Y" error and returns 0.
-@End Implementation
-
-Process called "expect" takes parser as Integer, token_type as Integer returns Integer:
-    Note: Expect specific token type and advance
-
-    If proc current_token_type with parser is not equal to token_type:
-        Note: Parser error - expected different token
-        Return 0
-    End If
-
-    proc advance from parser
-    Return 1
-End Process
-
-@Reasoning:
-Specialised expect() for identifiers that also returns the identifier's name string. Used by parse_class, parse_module, parse_method and any other rule that needs to capture a name immediately after a keyword.
-@End Reasoning
-
-@Implementation:
-Verifies current_token_type is TOKEN_IDENTIFIER. Reads current_token_value into a local, calls advance, then returns the captured name. On type mismatch records an error and returns the empty string.
-@End Implementation
-
-Process called "expect_identifier" takes parser as Integer returns String:
-    Note: Expect identifier token and return its value
-
-    If proc current_token_type with parser is not equal to TOKEN_IDENTIFIER from RubyLexer:
-        Return ""  Note: Error
-    End If
-
-    Let value be proc current_token_value from parser
-    proc advance from parser
-    Return value
-End Process
-
-@Reasoning:
-Consumes any run of newline tokens. Used at block boundaries and between statements where blank lines are insignificant but the tokenizer still emits them.
-@End Reasoning
-
-@Implementation:
-While current_token_type is TOKEN_NEWLINE, calls advance. Returns 1 unconditionally.
-@End Implementation
-
-Process called "skip_newlines" takes parser as Integer returns Integer:
-    Note: Skip newline tokens
-
-    While proc current_token_type with parser is equal to TOKEN_NEWLINE from RubyLexer:
-        proc advance from parser
+    While 1 is equal to 1:
+        Let pt be proc current_token_type with parser
+        If pt is equal to TOKEN_PIPE from Lexer:
+            Break
+        End If
+        If pt is equal to TOKEN_EOF from Lexer:
+            Break
+        End If
+        Let param be proc parse_parameter with parser
+        proc add_node_child with param_list, param
+        Let ct be proc current_token_type with parser
+        If ct is equal to TOKEN_COMMA from Lexer:
+            proc advance_parser with parser
+        Otherwise:
+            Break
+        End If
     End While
 
+    proc expect_token with parser, TOKEN_PIPE from Lexer
+    Return param_list
+End Process
+
+Note: ============================================================================
+Note: Primary Expressions
+Note: ============================================================================
+
+@Reasoning:
+Parses a primary expression: literals, variables, keywords (self/nil/true/
+false/super/yield/lambda/proc/defined?), parenthesised groups, array and hash
+literals, and a bare identifier or constant that may begin a paren-less method
+call. An identifier directly followed by '(' is a method call with arguments;
+an uppercase constant followed by '(' is also treated as a call. Otherwise the
+identifier/constant becomes a leaf the postfix layer can extend.
+@End Reasoning
+Process called "parse_primary" takes parser as Integer returns Integer:
+    Note: Parse a primary expression (the tightest-binding grammar level)
+
+    Let t be proc current_token_type with parser
+    Let lex be proc current_lexeme with parser
+
+    Note: literals
+    If t is equal to TOKEN_INTEGER from Lexer:
+        proc advance_parser with parser
+        Return proc create_value_node with AST_INTEGER, lex
+    End If
+    If t is equal to TOKEN_FLOAT from Lexer:
+        proc advance_parser with parser
+        Return proc create_value_node with AST_FLOAT, lex
+    End If
+    If t is equal to TOKEN_STRING from Lexer:
+        proc advance_parser with parser
+        Return proc create_value_node with AST_STRING, lex
+    End If
+    If t is equal to TOKEN_STRING_INTERP from Lexer:
+        proc advance_parser with parser
+        Return proc create_value_node with AST_STRING_INTERP, lex
+    End If
+    If t is equal to TOKEN_SYMBOL from Lexer:
+        proc advance_parser with parser
+        Return proc create_value_node with AST_SYMBOL, lex
+    End If
+    If t is equal to TOKEN_REGEXP from Lexer:
+        proc advance_parser with parser
+        Return proc create_value_node with AST_REGEXP, lex
+    End If
+
+    Note: keyword constants
+    If t is equal to TOKEN_NIL from Lexer:
+        proc advance_parser with parser
+        Return proc create_ast_node with AST_NIL
+    End If
+    If t is equal to TOKEN_TRUE from Lexer:
+        proc advance_parser with parser
+        Return proc create_ast_node with AST_TRUE
+    End If
+    If t is equal to TOKEN_FALSE from Lexer:
+        proc advance_parser with parser
+        Return proc create_ast_node with AST_FALSE
+    End If
+    If t is equal to TOKEN_SELF from Lexer:
+        proc advance_parser with parser
+        Return proc create_ast_node with AST_SELF
+    End If
+
+    Note: variables
+    If t is equal to TOKEN_INSTANCE_VAR from Lexer:
+        proc advance_parser with parser
+        Return proc create_value_node with AST_INSTANCE_VAR, lex
+    End If
+    If t is equal to TOKEN_CLASS_VAR from Lexer:
+        proc advance_parser with parser
+        Return proc create_value_node with AST_CLASS_VAR, lex
+    End If
+    If t is equal to TOKEN_GLOBAL_VAR from Lexer:
+        proc advance_parser with parser
+        Return proc create_value_node with AST_GLOBAL_VAR, lex
+    End If
+
+    Note: defined?
+    If t is equal to TOKEN_DEFINED from Lexer:
+        proc advance_parser with parser
+        Let node be proc create_ast_node with AST_DEFINED
+        Let pt be proc current_token_type with parser
+        If pt is equal to TOKEN_LPAREN from Lexer:
+            proc advance_parser with parser
+            Let inner be proc parse_expression with parser
+            proc add_node_child with node, inner
+            proc expect_token with parser, TOKEN_RPAREN from Lexer
+        Otherwise:
+            Let inner be proc parse_unary with parser
+            proc add_node_child with node, inner
+        End If
+        Return node
+    End If
+
+    Note: super (with or without args)
+    If t is equal to TOKEN_SUPER from Lexer:
+        Return proc parse_super with parser
+    End If
+
+    Note: yield as an expression
+    If t is equal to TOKEN_YIELD from Lexer:
+        Return proc parse_yield with parser
+    End If
+
+    Note: lambda / proc keyword forms
+    If t is equal to TOKEN_LAMBDA from Lexer:
+        Return proc parse_lambda_keyword with parser, AST_LAMBDA
+    End If
+    If t is equal to TOKEN_PROC from Lexer:
+        Return proc parse_lambda_keyword with parser, AST_PROC
+    End If
+
+    Note: stabby lambda  -> (params) { body }
+    If t is equal to TOKEN_ARROW from Lexer:
+        Return proc parse_stabby_lambda with parser
+    End If
+
+    Note: parenthesised expression
+    If t is equal to TOKEN_LPAREN from Lexer:
+        proc advance_parser with parser
+        proc skip_terminators with parser
+        Let inner be proc parse_expression with parser
+        proc skip_terminators with parser
+        proc expect_token with parser, TOKEN_RPAREN from Lexer
+        Return inner
+    End If
+
+    Note: array literal
+    If t is equal to TOKEN_LBRACKET from Lexer:
+        Return proc parse_array with parser
+    End If
+
+    Note: hash literal
+    If t is equal to TOKEN_LBRACE from Lexer:
+        Return proc parse_hash with parser
+    End If
+
+    Note: leading :: top-level constant scope
+    If t is equal to TOKEN_SCOPE from Lexer:
+        proc advance_parser with parser
+        Let cname be proc current_lexeme with parser
+        proc advance_parser with parser
+        Let node be proc create_value_node with AST_SCOPE_REF, cname
+        Return node
+    End If
+
+    Note: identifier - possibly a paren method call
+    If t is equal to TOKEN_IDENTIFIER from Lexer:
+        proc advance_parser with parser
+        Let next be proc current_token_type with parser
+        If next is equal to TOKEN_LPAREN from Lexer:
+            Let call be proc create_value_node with AST_METHOD_CALL, lex
+            Let no_recv be proc create_ast_node with AST_IDENTIFIER
+            proc add_node_child with call, no_recv
+            Let args be proc parse_paren_args with parser
+            proc add_node_child with call, args
+            Let blk be proc try_parse_block with parser
+            If blk is not equal to 0:
+                proc add_node_child with call, blk
+            End If
+            Return call
+        End If
+        Return proc create_value_node with AST_IDENTIFIER, lex
+    End If
+
+    Note: constant - possibly a call
+    If t is equal to TOKEN_CONSTANT from Lexer:
+        proc advance_parser with parser
+        Let next be proc current_token_type with parser
+        If next is equal to TOKEN_LPAREN from Lexer:
+            Let call be proc create_value_node with AST_METHOD_CALL, lex
+            Let no_recv be proc create_ast_node with AST_IDENTIFIER
+            proc add_node_child with call, no_recv
+            Let args be proc parse_paren_args with parser
+            proc add_node_child with call, args
+            Let blk be proc try_parse_block with parser
+            If blk is not equal to 0:
+                proc add_node_child with call, blk
+            End If
+            Return call
+        End If
+        Return proc create_value_node with AST_CONSTANT, lex
+    End If
+
+    Note: unary minus/plus reaching here
+    If t is equal to TOKEN_MINUS from Lexer:
+        Return proc parse_unary with parser
+    End If
+    If t is equal to TOKEN_PLUS from Lexer:
+        Return proc parse_unary with parser
+    End If
+
+    Note: unknown - report and emit a placeholder identifier so callers progress
+    proc add_parse_error with parser, "Unexpected token in expression"
+    proc advance_parser with parser
+    Let err be proc create_ast_node with AST_IDENTIFIER
+    Return err
+End Process
+
+@Reasoning:
+Parses `super` in both zsuper (bare, forwards the current arguments) and
+explicit-argument forms. A following '(' opens an argument list; a bare super
+sets the "bare" flag. A trailing block may follow either form.
+@End Reasoning
+Process called "parse_super" takes parser as Integer returns Integer:
+    Note: Parse a super call (bare or with arguments)
+
+    proc advance_parser with parser
+    Let node be proc create_ast_node with AST_SUPER_CALL
+
+    Let t be proc current_token_type with parser
+    If t is equal to TOKEN_LPAREN from Lexer:
+        Let args be proc parse_paren_args with parser
+        proc add_node_child with node, args
+    Otherwise:
+        proc set_node_metadata with node, "bare", 1
+    End If
+
+    Let blk be proc try_parse_block with parser
+    If blk is not equal to 0:
+        proc add_node_child with node, blk
+    End If
+
+    Return node
+End Process
+
+@Reasoning:
+Parses the keyword lambda/proc forms `lambda { |x| ... }` / `proc do ... end`
+into AST_LAMBDA / AST_PROC. The trailing block supplies the parameters and
+body; its params are lifted to the first child and its statements follow, so
+lambda and block share one body representation.
+@End Reasoning
+Process called "parse_lambda_keyword" takes parser as Integer, node_kind as Integer returns Integer:
+    Note: Parse lambda { } / proc { } keyword forms
+
+    proc advance_parser with parser
+    Let node be proc create_ast_node with node_kind
+
+    Let t be proc current_token_type with parser
+    If t is equal to TOKEN_LBRACE from Lexer:
+        Let blk be proc parse_block with parser
+        proc lift_block_into with node, blk
+        Return node
+    End If
+    If t is equal to TOKEN_DO from Lexer:
+        Let blk be proc parse_block with parser
+        proc lift_block_into with node, blk
+        Return node
+    End If
+
+    Note: lambda/proc used as a bare value (e.g. passed via &)
+    Let empty_params be proc create_ast_node with AST_PARAM_LIST
+    proc add_node_child with node, empty_params
+    Return node
+End Process
+
+@Reasoning:
+Parses a stabby lambda `-> (params) { body }` or `-> { body }` into AST_LAMBDA
+with the arrow flag. Parameters, when present, are parenthesised; the body is
+a brace or do..end block whose params/statements are lifted into the lambda.
+@End Reasoning
+Process called "parse_stabby_lambda" takes parser as Integer returns Integer:
+    Note: Parse a -> stabby lambda
+
+    proc advance_parser with parser
+    Let node be proc create_ast_node with AST_LAMBDA
+    proc set_node_metadata with node, "arrow", 1
+
+    Note: optional parenthesised parameters
+    Let t be proc current_token_type with parser
+    If t is equal to TOKEN_LPAREN from Lexer:
+        proc advance_parser with parser
+        Let params be proc create_ast_node with AST_PARAM_LIST
+        While 1 is equal to 1:
+            Let pt be proc current_token_type with parser
+            If pt is equal to TOKEN_RPAREN from Lexer:
+                Break
+            End If
+            Let param be proc parse_parameter with parser
+            proc add_node_child with params, param
+            Let ct be proc current_token_type with parser
+            If ct is equal to TOKEN_COMMA from Lexer:
+                proc advance_parser with parser
+            Otherwise:
+                Break
+            End If
+        End While
+        proc expect_token with parser, TOKEN_RPAREN from Lexer
+        proc add_node_child with node, params
+
+        Let blk be proc parse_block with parser
+        proc append_block_body with node, blk
+        Return node
+    End If
+
+    Note: no parameter list - the block carries (possibly piped) params + body
+    Let blk be proc parse_block with parser
+    proc lift_block_into with node, blk
+    Return node
+End Process
+
+@Reasoning:
+Lifts a parsed block's parameter list (first child) and body statements (the
+rest) into a lambda/proc node so the lambda owns a uniform [params, body...]
+child layout matching AST_BLOCK.
+@End Reasoning
+Process called "lift_block_into" takes node as Integer, block as Integer returns Integer:
+    Note: Copy a block's params and body into a lambda/proc node
+
+    Let count be proc ast_node_child_count with block
+    Let i be 0
+    While i is less than count:
+        Let child be proc ast_node_child with block, i
+        proc add_node_child with node, child
+        Set i to i plus 1
+    End While
     Return 1
 End Process
 
 @Reasoning:
-Tiny constructor for the empty list used as RubyASTNode.children. Centralised so the list backing-store can change without touching every node creator.
+Appends only a block's body statements (children after the first param-list)
+to a node that already has its own parameter list, used by the stabby lambda
+with explicit parens.
 @End Reasoning
+Process called "append_block_body" takes node as Integer, block as Integer returns Integer:
+    Note: Append a block's body statements (skipping its param list) to node
 
-@Implementation:
-Allocates and returns a fresh empty list.
-@End Implementation
-
-Process called "create_list" returns Integer:
-    Note: Create list for storage
-    Return proc memory_allocate from Layout with 16
+    Let count be proc ast_node_child_count with block
+    Let i be 1
+    While i is less than count:
+        Let child be proc ast_node_child with block, i
+        proc add_node_child with node, child
+        Set i to i plus 1
+    End While
+    Return 1
 End Process
 
 @Reasoning:
-Tiny constructor for the empty dictionary used as RubyASTNode.attributes. Centralised so the dictionary backing-store can change without touching every node creator.
+Parses an array literal `[ e1, e2, ... ]`. Elements are full expressions; a
+splat element `*e` is wrapped in AST_SPLAT_ARG; a trailing comma and internal
+newlines are tolerated. Returns AST_ARRAY.
 @End Reasoning
+Process called "parse_array" takes parser as Integer returns Integer:
+    Note: Parse an array literal
 
-@Implementation:
-Allocates and returns a fresh empty dictionary.
-@End Implementation
+    proc advance_parser with parser
+    Let node be proc create_ast_node with AST_ARRAY
 
-Process called "create_dict" returns Integer:
-    Note: Create dictionary for storage
-    Return proc memory_allocate from Layout with 24
+    While 1 is equal to 1:
+        proc skip_terminators with parser
+        Let t be proc current_token_type with parser
+        If t is equal to TOKEN_RBRACKET from Lexer:
+            Break
+        End If
+        If t is equal to TOKEN_EOF from Lexer:
+            Break
+        End If
+
+        If t is equal to TOKEN_STAR from Lexer:
+            proc advance_parser with parser
+            Let splat be proc create_ast_node with AST_SPLAT_ARG
+            Let se be proc parse_expression with parser
+            proc add_node_child with splat, se
+            proc add_node_child with node, splat
+        Otherwise:
+            Let e be proc parse_expression with parser
+            proc add_node_child with node, e
+        End If
+
+        proc skip_terminators with parser
+        Let ct be proc current_token_type with parser
+        If ct is equal to TOKEN_COMMA from Lexer:
+            proc advance_parser with parser
+        Otherwise:
+            Break
+        End If
+    End While
+
+    proc skip_terminators with parser
+    proc expect_token with parser, TOKEN_RBRACKET from Lexer
+    Return node
 End Process
+
+@Reasoning:
+Parses a hash literal `{ k => v, sym: v, ... }`. Two key forms are accepted:
+the rocket form `key => value` and the symbol-shorthand `name: value` (where
+`name:` becomes a symbol key). Each pair is an AST_HASH_PAIR with key and value
+children. Returns AST_HASH.
+@End Reasoning
+Process called "parse_hash" takes parser as Integer returns Integer:
+    Note: Parse a hash literal
+
+    proc advance_parser with parser
+    Let node be proc create_ast_node with AST_HASH
+
+    While 1 is equal to 1:
+        proc skip_terminators with parser
+        Let t be proc current_token_type with parser
+        If t is equal to TOKEN_RBRACE from Lexer:
+            Break
+        End If
+        If t is equal to TOKEN_EOF from Lexer:
+            Break
+        End If
+
+        Let pair be proc create_ast_node with AST_HASH_PAIR
+
+        Note: symbol-shorthand key  name:
+        Let is_shorthand be 0
+        If t is equal to TOKEN_IDENTIFIER from Lexer:
+            Let next be proc peek_token_type with parser, 1
+            If next is equal to TOKEN_COLON from Lexer:
+                Set is_shorthand to 1
+            End If
+        End If
+        If t is equal to TOKEN_CONSTANT from Lexer:
+            Let next be proc peek_token_type with parser, 1
+            If next is equal to TOKEN_COLON from Lexer:
+                Set is_shorthand to 1
+            End If
+        End If
+
+        If is_shorthand is equal to 1:
+            Let key_name be proc current_lexeme with parser
+            Let sym_key be proc make_symbol_from_name with key_name
+            proc add_node_child with pair, sym_key
+            proc advance_parser with parser
+            proc advance_parser with parser
+            Let v be proc parse_expression with parser
+            proc add_node_child with pair, v
+        Otherwise:
+            Let key be proc parse_expression with parser
+            proc add_node_child with pair, key
+            proc expect_token with parser, TOKEN_HASHROCKET from Lexer
+            Let v be proc parse_expression with parser
+            proc add_node_child with pair, v
+        End If
+
+        proc add_node_child with node, pair
+
+        proc skip_terminators with parser
+        Let ct be proc current_token_type with parser
+        If ct is equal to TOKEN_COMMA from Lexer:
+            proc advance_parser with parser
+        Otherwise:
+            Break
+        End If
+    End While
+
+    proc skip_terminators with parser
+    proc expect_token with parser, TOKEN_RBRACE from Lexer
+    Return node
+End Process
+
+@Reasoning:
+Builds an AST_SYMBOL node from a bare name (used for hash symbol-shorthand
+keys), prefixing the leading ':' so the symbol value matches the lexer's
+symbol-token convention.
+@End Reasoning
+Process called "make_symbol_from_name" takes name as Integer returns Integer:
+    Note: Construct a symbol node from a bare name (prefix the colon)
+
+    Let colon be proc create_from_literal from StringCore with ":"
+    Let full be proc string_concat from StringUtils with colon, name
+    Return proc create_value_node with AST_SYMBOL, full
+End Process
+
+Note: ============================================================================
+Note: End of Ruby Parser
+Note: ============================================================================

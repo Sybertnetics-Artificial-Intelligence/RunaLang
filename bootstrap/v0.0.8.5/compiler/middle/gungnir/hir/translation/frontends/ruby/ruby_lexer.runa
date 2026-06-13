@@ -1,937 +1,2198 @@
-Note: Ruby Lexer for Translation Translation System
-Note: Handles Ruby syntax including blocks, symbols, string interpolation, metaprogramming
+Note: ============================================================================
+Note: Ruby Lexer - Complete tokenization for Ruby (MRI-compatible surface)
+Note: Part of the RunaConvert Translation System
+Note: ============================================================================
+Note: Mirrors the dart/fsharp frontend convention exactly:
+Note:   - Integer handles only (no String-typed struct fields)
+Note:   - Byte-addressable source scanning via StringCore.string_char_at
+Note:   - Arena-allocated lexer/token records with fixed field offsets
+Note:   - Module-qualified primitive calls (StringCore / Memory / Arena)
+Note: A token is a 32-byte record (4 x i64):
+Note:   offset 0  : token_type tag (one of the TOKEN_* constants below)
+Note:   offset 8  : lexeme (StringCore string handle, 0 when none)
+Note:   offset 16 : source line (1-based)
+Note:   offset 24 : source column (1-based)
+Note: ============================================================================
+
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/frontend/primitives/memory/layout.runa" as Arena
+
+Note: ============================================================================
+Note: Token Type Constants
+Note: ============================================================================
+Note: Numbered in the 8000 band so they never collide with another frontend's
+Note: token table that shares the translation namespace at link time.
+
+Note: Specials / literals
+Constant TOKEN_EOF as Integer is 8000
+Constant TOKEN_ERROR as Integer is 8001
+Constant TOKEN_NEWLINE as Integer is 8002
+Constant TOKEN_IDENTIFIER as Integer is 8003
+Constant TOKEN_CONSTANT as Integer is 8004
+Constant TOKEN_INSTANCE_VAR as Integer is 8005
+Constant TOKEN_CLASS_VAR as Integer is 8006
+Constant TOKEN_GLOBAL_VAR as Integer is 8007
+Constant TOKEN_INTEGER as Integer is 8008
+Constant TOKEN_FLOAT as Integer is 8009
+Constant TOKEN_STRING as Integer is 8010
+Constant TOKEN_SYMBOL as Integer is 8011
+Constant TOKEN_REGEXP as Integer is 8012
+Constant TOKEN_STRING_INTERP as Integer is 8013
+
+Note: Keywords
+Constant TOKEN_DEF as Integer is 8030
+Constant TOKEN_END as Integer is 8031
+Constant TOKEN_CLASS as Integer is 8032
+Constant TOKEN_MODULE as Integer is 8033
+Constant TOKEN_IF as Integer is 8034
+Constant TOKEN_ELSIF as Integer is 8035
+Constant TOKEN_ELSE as Integer is 8036
+Constant TOKEN_UNLESS as Integer is 8037
+Constant TOKEN_WHILE as Integer is 8038
+Constant TOKEN_UNTIL as Integer is 8039
+Constant TOKEN_FOR as Integer is 8040
+Constant TOKEN_IN as Integer is 8041
+Constant TOKEN_DO as Integer is 8042
+Constant TOKEN_BEGIN as Integer is 8043
+Constant TOKEN_RESCUE as Integer is 8044
+Constant TOKEN_ENSURE as Integer is 8045
+Constant TOKEN_THEN as Integer is 8046
+Constant TOKEN_RETURN as Integer is 8047
+Constant TOKEN_YIELD as Integer is 8048
+Constant TOKEN_NEXT as Integer is 8049
+Constant TOKEN_BREAK as Integer is 8050
+Constant TOKEN_REDO as Integer is 8051
+Constant TOKEN_RETRY as Integer is 8052
+Constant TOKEN_NIL as Integer is 8053
+Constant TOKEN_TRUE as Integer is 8054
+Constant TOKEN_FALSE as Integer is 8055
+Constant TOKEN_AND as Integer is 8056
+Constant TOKEN_OR as Integer is 8057
+Constant TOKEN_NOT as Integer is 8058
+Constant TOKEN_SELF as Integer is 8059
+Constant TOKEN_SUPER as Integer is 8060
+Constant TOKEN_CASE as Integer is 8061
+Constant TOKEN_WHEN as Integer is 8062
+Constant TOKEN_LAMBDA as Integer is 8063
+Constant TOKEN_PROC as Integer is 8064
+Constant TOKEN_ALIAS as Integer is 8065
+Constant TOKEN_UNDEF as Integer is 8066
+Constant TOKEN_DEFINED as Integer is 8067
+Constant TOKEN_BEGIN_UPPER as Integer is 8068
+Constant TOKEN_END_UPPER as Integer is 8069
+
+Note: Arithmetic / comparison / logical operators
+Constant TOKEN_PLUS as Integer is 8100
+Constant TOKEN_MINUS as Integer is 8101
+Constant TOKEN_STAR as Integer is 8102
+Constant TOKEN_SLASH as Integer is 8103
+Constant TOKEN_PERCENT as Integer is 8104
+Constant TOKEN_POWER as Integer is 8105
+Constant TOKEN_EQUAL_EQUAL as Integer is 8106
+Constant TOKEN_NOT_EQUAL as Integer is 8107
+Constant TOKEN_CASE_EQUAL as Integer is 8108
+Constant TOKEN_LESS_THAN as Integer is 8109
+Constant TOKEN_GREATER_THAN as Integer is 8110
+Constant TOKEN_LESS_EQUAL as Integer is 8111
+Constant TOKEN_GREATER_EQUAL as Integer is 8112
+Constant TOKEN_SPACESHIP as Integer is 8113
+Constant TOKEN_MATCH as Integer is 8114
+Constant TOKEN_NOT_MATCH as Integer is 8115
+Constant TOKEN_AND_AND as Integer is 8116
+Constant TOKEN_OR_OR as Integer is 8117
+Constant TOKEN_BANG as Integer is 8118
+Constant TOKEN_AMP as Integer is 8119
+Constant TOKEN_PIPE as Integer is 8120
+Constant TOKEN_CARET as Integer is 8121
+Constant TOKEN_TILDE as Integer is 8122
+Constant TOKEN_LSHIFT as Integer is 8123
+Constant TOKEN_RSHIFT as Integer is 8124
+Constant TOKEN_SAFE_NAV as Integer is 8125
+
+Note: Assignment operators
+Constant TOKEN_ASSIGN as Integer is 8140
+Constant TOKEN_PLUS_ASSIGN as Integer is 8141
+Constant TOKEN_MINUS_ASSIGN as Integer is 8142
+Constant TOKEN_STAR_ASSIGN as Integer is 8143
+Constant TOKEN_SLASH_ASSIGN as Integer is 8144
+Constant TOKEN_PERCENT_ASSIGN as Integer is 8145
+Constant TOKEN_POWER_ASSIGN as Integer is 8146
+Constant TOKEN_AMP_ASSIGN as Integer is 8147
+Constant TOKEN_PIPE_ASSIGN as Integer is 8148
+Constant TOKEN_CARET_ASSIGN as Integer is 8149
+Constant TOKEN_LSHIFT_ASSIGN as Integer is 8150
+Constant TOKEN_RSHIFT_ASSIGN as Integer is 8151
+Constant TOKEN_AND_ASSIGN as Integer is 8152
+Constant TOKEN_OR_ASSIGN as Integer is 8153
+
+Note: Punctuation
+Constant TOKEN_LPAREN as Integer is 8160
+Constant TOKEN_RPAREN as Integer is 8161
+Constant TOKEN_LBRACE as Integer is 8162
+Constant TOKEN_RBRACE as Integer is 8163
+Constant TOKEN_LBRACKET as Integer is 8164
+Constant TOKEN_RBRACKET as Integer is 8165
+Constant TOKEN_COMMA as Integer is 8166
+Constant TOKEN_DOT as Integer is 8167
+Constant TOKEN_SEMICOLON as Integer is 8168
+Constant TOKEN_COLON as Integer is 8169
+Constant TOKEN_SCOPE as Integer is 8170
+Constant TOKEN_ARROW as Integer is 8171
+Constant TOKEN_HASHROCKET as Integer is 8172
+Constant TOKEN_QUESTION as Integer is 8173
+Constant TOKEN_RANGE_INCL as Integer is 8174
+Constant TOKEN_RANGE_EXCL as Integer is 8175
+
+Note: ============================================================================
+Note: Lexer Structure
+Note: ============================================================================
 
 @Reasoning:
-Ruby's lexer must track line + column for diagnostics and cache the current character to avoid repeated charAt calls; bundling them in one struct keeps the per-character hot path tight.
+Ruby source is byte-addressable UTF-8; identifiers and keywords are ASCII so
+a byte cursor is sufficient. The lexer state is a 40-byte record (5 x i64):
+source handle (0), byte position (8, 0-based), current line (16, 1-based),
+current column (24, 1-based), and the cached source length (32). Caching the
+length avoids re-walking the buffer on every scan-loop bound test.
 @End Reasoning
 
-@Implementation:
-Six fields: source string, byte cursor, line, column, cached current_char, and the accumulating token list.
-@End Implementation
-
 Type called "RubyLexer":
-    source as String
+    source as Integer
     position as Integer
     line as Integer
     column as Integer
-    current_char as String
-    tokens as Integer  Note: List of tokens
+    length as Integer
 End Type
 
 @Reasoning:
-Tokens carry source line/column so the parser and downstream error reporter can pinpoint exact failure sites without consulting the lexer afterwards.
+Arena allocation matches the parser's lifetime: the lexer and every token it
+produces live exactly as long as the parse driver call, then are released as
+one arena batch. Initialising line/column to 1 and length once lets the
+scanners run without first-character special cases.
 @End Reasoning
+Process called "create_ruby_lexer" takes source as Integer returns Integer:
+    Note: Create Ruby lexer from a source string handle
 
-@Implementation:
-Four fields: token_type discriminator, the lexeme string, line, and column at the lexeme start.
-@End Implementation
-
-Type called "RubyToken":
-    token_type as Integer
-    value as String
-    line as Integer
-    column as Integer
-End Type
-
-Note: Ruby token types
-Constant TOKEN_EOF as Integer is 0
-Constant TOKEN_IDENTIFIER as Integer is 1
-Constant TOKEN_NUMBER as Integer is 2
-Constant TOKEN_STRING as Integer is 3
-Constant TOKEN_SYMBOL as Integer is 4
-Constant TOKEN_INTERPOLATED_STRING as Integer is 5
-
-Note: Ruby keywords
-Constant TOKEN_CLASS as Integer is 10
-Constant TOKEN_MODULE as Integer is 11
-Constant TOKEN_DEF as Integer is 12
-Constant TOKEN_END as Integer is 13
-Constant TOKEN_IF as Integer is 14
-Constant TOKEN_ELSIF as Integer is 15
-Constant TOKEN_ELSE as Integer is 16
-Constant TOKEN_UNLESS as Integer is 17
-Constant TOKEN_WHILE as Integer is 18
-Constant TOKEN_UNTIL as Integer is 19
-Constant TOKEN_FOR as Integer is 20
-Constant TOKEN_IN as Integer is 21
-Constant TOKEN_DO as Integer is 22
-Constant TOKEN_BREAK as Integer is 23
-Constant TOKEN_NEXT as Integer is 24
-Constant TOKEN_RETURN as Integer is 25
-Constant TOKEN_YIELD as Integer is 26
-Constant TOKEN_SUPER as Integer is 27
-Constant TOKEN_SELF as Integer is 28
-Constant TOKEN_TRUE as Integer is 29
-Constant TOKEN_FALSE as Integer is 30
-Constant TOKEN_NIL as Integer is 31
-Constant TOKEN_AND as Integer is 32
-Constant TOKEN_OR as Integer is 33
-Constant TOKEN_NOT as Integer is 34
-Constant TOKEN_BEGIN as Integer is 35
-Constant TOKEN_RESCUE as Integer is 36
-Constant TOKEN_ENSURE as Integer is 37
-Constant TOKEN_RAISE as Integer is 38
-Constant TOKEN_CASE as Integer is 39
-Constant TOKEN_WHEN as Integer is 40
-Constant TOKEN_THEN as Integer is 41
-Constant TOKEN_ALIAS as Integer is 42
-Constant TOKEN_UNDEF as Integer is 43
-
-Note: Ruby operators
-Constant TOKEN_PLUS as Integer is 50
-Constant TOKEN_MINUS as Integer is 51
-Constant TOKEN_MULTIPLY as Integer is 52
-Constant TOKEN_DIVIDE as Integer is 53
-Constant TOKEN_MODULO as Integer is 54
-Constant TOKEN_POWER as Integer is 55
-Constant TOKEN_ASSIGN as Integer is 56
-Constant TOKEN_PLUS_ASSIGN as Integer is 57
-Constant TOKEN_MINUS_ASSIGN as Integer is 58
-Constant TOKEN_MULTIPLY_ASSIGN as Integer is 59
-Constant TOKEN_DIVIDE_ASSIGN as Integer is 60
-Constant TOKEN_MODULO_ASSIGN as Integer is 61
-Constant TOKEN_POWER_ASSIGN as Integer is 62
-Constant TOKEN_EQUAL as Integer is 63
-Constant TOKEN_NOT_EQUAL as Integer is 64
-Constant TOKEN_LESS_THAN as Integer is 65
-Constant TOKEN_LESS_EQUAL as Integer is 66
-Constant TOKEN_GREATER_THAN as Integer is 67
-Constant TOKEN_GREATER_EQUAL as Integer is 68
-Constant TOKEN_SPACESHIP as Integer is 69
-Constant TOKEN_MATCH as Integer is 70
-Constant TOKEN_NOT_MATCH as Integer is 71
-Constant TOKEN_AND_AND as Integer is 72
-Constant TOKEN_OR_OR as Integer is 73
-Constant TOKEN_RANGE_INCLUSIVE as Integer is 74
-Constant TOKEN_RANGE_EXCLUSIVE as Integer is 75
-
-Note: Ruby punctuation
-Constant TOKEN_LPAREN as Integer is 80
-Constant TOKEN_RPAREN as Integer is 81
-Constant TOKEN_LBRACE as Integer is 82
-Constant TOKEN_RBRACE as Integer is 83
-Constant TOKEN_LBRACKET as Integer is 84
-Constant TOKEN_RBRACKET as Integer is 85
-Constant TOKEN_COMMA as Integer is 86
-Constant TOKEN_DOT as Integer is 87
-Constant TOKEN_DOUBLE_COLON as Integer is 88
-Constant TOKEN_ARROW as Integer is 89
-Constant TOKEN_HASH_ARROW as Integer is 90
-Constant TOKEN_SEMICOLON as Integer is 91
-Constant TOKEN_NEWLINE as Integer is 92
-Constant TOKEN_PIPE as Integer is 93
-Constant TOKEN_AMPERSAND as Integer is 94
-Constant TOKEN_QUESTION as Integer is 95
-Constant TOKEN_COLON as Integer is 96
-Constant TOKEN_AT as Integer is 97
-Constant TOKEN_DOUBLE_AT as Integer is 98
-
-@Reasoning:
-Initialising line=1 column=1 and seeding current_char from position 0 lets the per-character dispatcher in tokenize_ruby start without a special-case "first character" branch.
-@End Reasoning
-
-@Implementation:
-Construct a RubyLexer with the source string, position=0, line=1, column=1, current_char=source[0], and an empty token list.
-@End Implementation
-
-Process called "create_ruby_lexer" takes source as String returns Integer:
-    Note: Create new Ruby lexer instance
-
-    Let lexer be a value of type RubyLexer with
-        source as source,
-        position as 0,
-        line as 1,
-        column as 1,
-        current_char as proc char_at with source, 0,
-        tokens as proc create_list
+    Let lexer be proc allocate from Arena with 40
+    proc memory_set_int64 from Memory with lexer, 0, source
+    proc memory_set_int64 from Memory with lexer, 8, 0
+    proc memory_set_int64 from Memory with lexer, 16, 1
+    proc memory_set_int64 from Memory with lexer, 24, 1
+    Let len be proc string_length from StringCore with source
+    proc memory_set_int64 from Memory with lexer, 32, len
 
     Return lexer
 End Process
 
 @Reasoning:
-Newlines are syntactically meaningful in Ruby (they end statements), so the dispatcher emits TOKEN_NEWLINE explicitly rather than skipping with whitespace. Comments ('#'), strings ('"', '\''), symbols (':'), numbers, identifiers/keywords, and operator/punctuation prefixes each have a dedicated handler.
+A token is a 32-byte record holding the type tag (0), lexeme handle (8),
+source line (16), and column (24). Centralising construction keeps the token
+shape defined in exactly one place.
 @End Reasoning
+Process called "create_token" takes token_type as Integer, lexeme as Integer, line as Integer, column as Integer returns Integer:
+    Note: Create a token record with type and source metadata
 
-@Implementation:
-Loop while position < source length: skip horizontal whitespace; on newline emit TOKEN_NEWLINE; '#' -> skip_comment; quote chars -> tokenize_string; ':' -> tokenize_symbol; digit -> tokenize_number; alpha/_ -> tokenize_identifier; try tokenize_operator and tokenize_punctuation; '@' -> tokenize_instance_variable; unknown -> advance one. Emit TOKEN_EOF at end.
-@End Implementation
+    Let token be proc allocate from Arena with 32
+    proc memory_set_int64 from Memory with token, 0, token_type
+    proc memory_set_int64 from Memory with token, 8, lexeme
+    proc memory_set_int64 from Memory with token, 16, line
+    proc memory_set_int64 from Memory with token, 24, column
 
-@Performance_Hints:
-O(n) in source length; one token per logical lexeme. Continue-style loop avoids redundant dispatch checks after each handler.
-@End Performance_Hints
-
-@Security_Scope:
-Operates on untrusted Ruby source. The "unknown advance" fallback guarantees forward progress; the embedded #{} expression handler re-enters tokenize_ruby recursively, so deeply nested interpolation must be bounded by callers.
-@End Security_Scope
-
-Process called "tokenize_ruby" takes lexer as Integer returns Integer:
-    Note: Tokenize Ruby source code with complete syntax support
-
-    While lexer.position is less than length of lexer.source:
-        Note: Skip whitespace (except newlines which are significant in Ruby)
-        proc skip_whitespace from lexer
-
-        If lexer.current_char is equal to "\n":
-            proc add_token with lexer, TOKEN_NEWLINE, "\n"
-            proc advance from lexer
-            Continue
-        End If
-
-        Note: Handle comments
-        If lexer.current_char is equal to "#":
-            proc skip_comment from lexer
-            Continue
-        End If
-
-        Note: Handle string literals
-        If lexer.current_char is equal to "\"" or lexer.current_char is equal to "'":
-            proc tokenize_string from lexer
-            Continue
-        End If
-
-        Note: Handle interpolated strings
-        If lexer.current_char is equal to "\"":
-            proc tokenize_interpolated_string from lexer
-            Continue
-        End If
-
-        Note: Handle symbols
-        If lexer.current_char is equal to ":":
-            proc tokenize_symbol from lexer
-            Continue
-        End If
-
-        Note: Handle numbers
-        If proc is_digit with lexer.current_char is equal to 1:
-            proc tokenize_number from lexer
-            Continue
-        End If
-
-        Note: Handle identifiers and keywords
-        If proc is_alpha with lexer.current_char is equal to 1 or lexer.current_char is equal to "_":
-            proc tokenize_identifier from lexer
-            Continue
-        End If
-
-        Note: Handle operators
-        If proc tokenize_operator with lexer is equal to 1:
-            Continue
-        End If
-
-        Note: Handle punctuation
-        If proc tokenize_punctuation with lexer is equal to 1:
-            Continue
-        End If
-
-        Note: Handle instance variables (@var)
-        If lexer.current_char is equal to "@":
-            proc tokenize_instance_variable from lexer
-            Continue
-        End If
-
-        Note: Unexpected character
-        proc advance from lexer
-    End While
-
-    Note: Add EOF token
-    proc add_token with lexer, TOKEN_EOF, ""
-
-    Return lexer.tokens
+    Return token
 End Process
 
 @Reasoning:
-Ruby string literals support both '"' and '\'' delimiters with C-style backslash escapes; capturing the opening quote in a local lets the loop terminate on the matching closer without a second dispatcher.
+Copies the half-open byte range [start_pos, end_pos) of the source buffer
+into a freshly arena-allocated NUL-terminated string so each token owns a
+stable lexeme handle independent of cursor movement. A reversed range yields
+the empty string rather than corrupting memory.
 @End Reasoning
+Process called "ruby_substring" takes source as Integer, start_pos as Integer, end_pos as Integer returns Integer:
+    Note: Copy source bytes [start_pos, end_pos) into a new NUL-terminated string
 
-@Implementation:
-Save the opening quote character and skip past it. Loop until matching quote or end-of-source: on '\\' read the following character and substitute the appropriate escape sequence ('\n', '\t', '\r', '"', '\'', '\\'); other characters are appended verbatim. Skip the closing quote and emit TOKEN_STRING with the assembled value.
-@End Implementation
+    Let len be end_pos minus start_pos
+    If len is less than 0:
+        Set len to 0
+    End If
 
-@Security_Scope:
-Untrusted input. The loop's end-of-source check guarantees termination on an unterminated literal.
-@End Security_Scope
+    Let buffer be proc allocate from Arena with len plus 1
+    Let i be 0
+    While i is less than len:
+        Let ch be proc memory_get_byte from Memory with source, start_pos plus i
+        proc memory_set_byte from Memory with buffer, i, ch
+        Set i to i plus 1
+    End While
 
-Process called "tokenize_string" takes lexer as Integer returns Integer:
-    Note: Tokenize Ruby string literals with escape sequences
+    proc memory_set_byte from Memory with buffer, len, 0
+    Return buffer
+End Process
 
-    Let quote_char be lexer.current_char
-    Let value be ""
-    proc advance from lexer  Note: Skip opening quote
+Note: ============================================================================
+Note: Character Classification
+Note: ============================================================================
 
-    While lexer.current_char is not equal to quote_char and lexer.current_char is not equal to "":
-        If lexer.current_char is equal to "\\":
-            proc advance from lexer  Note: Skip backslash
+@Reasoning:
+Digit classifier for numeric-literal scanning and identifier tails. Tests the
+ASCII range 48..57 ('0'..'9').
+@End Reasoning
+Process called "is_digit" takes ch as Integer returns Integer:
+    Note: Check if a byte is an ASCII decimal digit
 
-            Note: Handle escape sequences
-            Match lexer.current_char:
-                When "n":
-                    Set value to proc string_concat with value, "\n"
-                When "t":
-                    Set value to proc string_concat with value, "\t"
-                When "r":
-                    Set value to proc string_concat with value, "\r"
-                When "\"":
-                    Set value to proc string_concat with value, "\""
-                When "'":
-                    Set value to proc string_concat with value, "'"
-                When "\\":
-                    Set value to proc string_concat with value, "\\"
-                Otherwise:
-                    Set value to proc string_concat with value, lexer.current_char
-            End Match
+    If ch is greater than or equal to 48:
+        If ch is less than or equal to 57:
+            Return 1
+        End If
+    End If
 
-            proc advance from lexer
+    Return 0
+End Process
+
+@Reasoning:
+Identifier-start classifier: Ruby identifiers begin with a letter or
+underscore. Uppercase-led names are constants, but that distinction is made
+by the caller after the full name is read; here we only test letter-ness.
+@End Reasoning
+Process called "is_alpha" takes ch as Integer returns Integer:
+    Note: Check if a byte is an ASCII letter or underscore
+
+    If ch is equal to 95:
+        Return 1
+    End If
+
+    If ch is greater than or equal to 65:
+        If ch is less than or equal to 90:
+            Return 1
+        End If
+    End If
+
+    If ch is greater than or equal to 97:
+        If ch is less than or equal to 122:
+            Return 1
+        End If
+    End If
+
+    Return 0
+End Process
+
+@Reasoning:
+Identifier-tail classifier: letters, digits, and underscore.
+@End Reasoning
+Process called "is_alnum" takes ch as Integer returns Integer:
+    Note: Check if a byte is alphanumeric or underscore
+
+    Let digit_check be proc is_digit with ch
+    If digit_check is equal to 1:
+        Return 1
+    End If
+
+    Let alpha_check be proc is_alpha with ch
+    Return alpha_check
+End Process
+
+@Reasoning:
+Uppercase classifier distinguishes Ruby constants (Foo, MAX) from local
+variables/methods. Tests the ASCII range 65..90 ('A'..'Z').
+@End Reasoning
+Process called "is_upper" takes ch as Integer returns Integer:
+    Note: Check if a byte is an ASCII uppercase letter
+
+    If ch is greater than or equal to 65:
+        If ch is less than or equal to 90:
+            Return 1
+        End If
+    End If
+
+    Return 0
+End Process
+
+@Reasoning:
+Hexadecimal classifier supports 0x... integer literals: 0..9, A..F, a..f.
+@End Reasoning
+Process called "is_hex_digit" takes ch as Integer returns Integer:
+    Note: Check if a byte is a hexadecimal digit
+
+    Let digit_check be proc is_digit with ch
+    If digit_check is equal to 1:
+        Return 1
+    End If
+
+    If ch is greater than or equal to 65:
+        If ch is less than or equal to 70:
+            Return 1
+        End If
+    End If
+
+    If ch is greater than or equal to 97:
+        If ch is less than or equal to 102:
+            Return 1
+        End If
+    End If
+
+    Return 0
+End Process
+
+@Reasoning:
+Horizontal-whitespace classifier. Newline is NOT treated as whitespace by
+this predicate because Ruby newlines are statement terminators that the
+scanner must surface as TOKEN_NEWLINE; only space (0x20), tab (0x09), and
+carriage return (0x0D) are skippable inter-token whitespace.
+@End Reasoning
+Process called "is_hspace" takes ch as Integer returns Integer:
+    Note: Check if a byte is horizontal whitespace (space, tab, CR)
+
+    If ch is equal to 32:
+        Return 1
+    End If
+
+    If ch is equal to 9:
+        Return 1
+    End If
+
+    If ch is equal to 13:
+        Return 1
+    End If
+
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: Cursor Utilities
+Note: ============================================================================
+
+@Reasoning:
+Read-only cursor accessor returning 0 (EOF sentinel) at or past the source
+length, matching how scanners detect end-of-input without a separate flag.
+@End Reasoning
+Process called "current_char" takes lexer as Integer returns Integer:
+    Note: Read the byte at the cursor without advancing
+
+    Let source be proc memory_get_int64 from Memory with lexer, 0
+    Let position be proc memory_get_int64 from Memory with lexer, 8
+    Let length be proc memory_get_int64 from Memory with lexer, 32
+
+    If position is greater than or equal to length:
+        Return 0
+    End If
+
+    Let ch be proc string_char_at from StringCore with source, position
+    Return ch
+End Process
+
+@Reasoning:
+Multi-byte lookahead for disambiguating multi-character operators ("**=",
+"<=>", "&.", "..." etc.) without committing the cursor. Returns 0 past EOF.
+@End Reasoning
+Process called "peek_char" takes lexer as Integer, offset as Integer returns Integer:
+    Note: Read the byte offset positions ahead of the cursor
+
+    Let source be proc memory_get_int64 from Memory with lexer, 0
+    Let position be proc memory_get_int64 from Memory with lexer, 8
+    Let length be proc memory_get_int64 from Memory with lexer, 32
+    Let peek_pos be position plus offset
+
+    If peek_pos is greater than or equal to length:
+        Return 0
+    End If
+
+    Let ch be proc string_char_at from StringCore with source, peek_pos
+    Return ch
+End Process
+
+@Reasoning:
+Cursor-advancing read that maintains line/column for diagnostics. A newline
+(0x0A) bumps line and resets column to 1; any other byte bumps column.
+Returns the byte that was at the original cursor.
+@End Reasoning
+Process called "advance_char" takes lexer as Integer returns Integer:
+    Note: Consume the current byte and update line/column counters
+
+    Let ch be proc current_char with lexer
+    Let position be proc memory_get_int64 from Memory with lexer, 8
+    Let column be proc memory_get_int64 from Memory with lexer, 24
+
+    Set position to position plus 1
+    proc memory_set_int64 from Memory with lexer, 8, position
+
+    If ch is equal to 10:
+        Let line be proc memory_get_int64 from Memory with lexer, 16
+        Set line to line plus 1
+        proc memory_set_int64 from Memory with lexer, 16, line
+        proc memory_set_int64 from Memory with lexer, 24, 1
+    Otherwise:
+        Set column to column plus 1
+        proc memory_set_int64 from Memory with lexer, 24, column
+    End If
+
+    Return ch
+End Process
+
+Note: ============================================================================
+Note: Whitespace and Comment Skipping
+Note: ============================================================================
+
+@Reasoning:
+Skips horizontal whitespace only. Backslash-newline line continuation is
+also consumed here: a backslash immediately followed by a newline joins the
+two physical lines into one logical line, so both bytes are skipped and the
+scan continues past the newline without emitting TOKEN_NEWLINE.
+@End Reasoning
+Process called "skip_hspace" takes lexer as Integer returns Integer:
+    Note: Skip spaces, tabs, CR, and backslash-newline continuations
+
+    While 1 is equal to 1:
+        Let ch be proc current_char with lexer
+        Let is_ws be proc is_hspace with ch
+
+        If is_ws is equal to 1:
+            proc advance_char with lexer
         Otherwise:
-            Set value to proc string_concat with value, lexer.current_char
-            proc advance from lexer
+            If ch is equal to 92:
+                Let nxt be proc peek_char with lexer, 1
+                If nxt is equal to 10:
+                    proc advance_char with lexer
+                    proc advance_char with lexer
+                Otherwise:
+                    Return 1
+                End If
+            Otherwise:
+                Return 1
+            End If
         End If
     End While
 
-    If lexer.current_char is equal to quote_char:
-        proc advance from lexer  Note: Skip closing quote
-    End If
-
-    proc add_token with lexer, TOKEN_STRING, value
     Return 1
 End Process
 
 @Reasoning:
-Ruby's "#{expr}" interpolation can nest braces and contain arbitrary expressions; tracking a brace counter and recursively tokenising the embedded code preserves token boundaries that the parser needs to reassemble the string at lowering time.
+Skips a Ruby '#' line comment up to (but not including) the terminating
+newline, so the main loop still surfaces that newline as TOKEN_NEWLINE and a
+comment never silently merges two statements.
 @End Reasoning
+Process called "skip_line_comment" takes lexer as Integer returns Integer:
+    Note: Skip a # comment to end of line, leaving the newline unconsumed
 
-@Implementation:
-Skip the opening quote. Loop until closing '"' or EOF: detect "#{" via current+peek, emit any accumulated literal text as TOKEN_STRING, then walk forward incrementing/decrementing a brace_count on '{'/'}'. Once brace_count drops to 0, slice the embedded expression text, build a sub-lexer to tokenise it, and emit a TOKEN_INTERPOLATED_STRING capturing the expression. Other characters accumulate verbatim.
-@End Implementation
+    While 1 is equal to 1:
+        Let ch be proc current_char with lexer
+        If ch is equal to 0:
+            Return 1
+        End If
+        If ch is equal to 10:
+            Return 1
+        End If
+        proc advance_char with lexer
+    End While
 
-@Performance_Hints:
-O(n) in source length; recursive sub-lexer adds linear cost per interpolation.
-@End Performance_Hints
+    Return 1
+End Process
 
-@Security_Scope:
-Recursive lexer call on the interpolated expression must terminate; the source-length bound on the inner brace-tracking loop prevents runaway scans on malformed input.
-@End Security_Scope
+@Reasoning:
+Detects whether the cursor sits at the start of a line on an "=begin"
+directive, which opens a Ruby block comment that runs until a line starting
+with "=end". The =begin/=end markers must be at column 1 in Ruby; this
+predicate is only consulted by next_token when the previous token was a
+newline (or at start of file), so the column-1 rule is satisfied by
+construction. Returns 1 when the next five bytes spell "=begin".
+@End Reasoning
+Process called "at_block_comment_open" takes lexer as Integer returns Integer:
+    Note: Check whether the cursor begins an =begin block-comment opener
 
-Process called "tokenize_interpolated_string" takes lexer as Integer returns Integer:
-    Note: Tokenize Ruby interpolated strings with #{} expressions
+    Let c0 be proc current_char with lexer
+    If c0 is not equal to 61:
+        Return 0
+    End If
+    Let c1 be proc peek_char with lexer, 1
+    If c1 is not equal to 98:
+        Return 0
+    End If
+    Let c2 be proc peek_char with lexer, 2
+    If c2 is not equal to 101:
+        Return 0
+    End If
+    Let c3 be proc peek_char with lexer, 3
+    If c3 is not equal to 103:
+        Return 0
+    End If
+    Let c4 be proc peek_char with lexer, 4
+    If c4 is not equal to 105:
+        Return 0
+    End If
+    Let c5 be proc peek_char with lexer, 5
+    If c5 is not equal to 110:
+        Return 0
+    End If
 
-    Let value be ""
-    proc advance from lexer  Note: Skip opening quote
+    Return 1
+End Process
 
-    While lexer.current_char is not equal to "\"" and lexer.current_char is not equal to "":
-        If lexer.current_char is equal to "#" and proc peek with lexer is equal to "{":
-            Note: Found interpolation - add current string part
-            If length of value is greater than 0:
-                proc add_token with lexer, TOKEN_STRING, value
-                Set value to ""
-            End If
+@Reasoning:
+Consumes an =begin ... =end block comment. The scan advances line by line;
+each time the cursor sits at the start of a line it tests for "=end" and, on
+match, drains that line and returns. EOF without a closing =end exits
+silently so malformed input cannot hang the lexer.
+@End Reasoning
+Process called "skip_block_comment" takes lexer as Integer returns Integer:
+    Note: Skip an =begin ... =end multi-line comment
 
-            Note: Skip #{
-            proc advance from lexer
-            proc advance from lexer
+    Note: Consume the =begin line entirely
+    While 1 is equal to 1:
+        Let ch be proc current_char with lexer
+        If ch is equal to 0:
+            Return 1
+        End If
+        If ch is equal to 10:
+            proc advance_char with lexer
+            Break
+        End If
+        proc advance_char with lexer
+    End While
 
-            Note: Tokenize the interpolated expression
-            Let brace_count be 1
-            Let expr_start be lexer.position
+    Note: Drain lines until one begins with =end
+    While 1 is equal to 1:
+        Let c be proc current_char with lexer
+        If c is equal to 0:
+            Return 1
+        End If
 
-            While brace_count is greater than 0 and lexer.current_char is not equal to "":
-                If lexer.current_char is equal to "{":
-                    Set brace_count to brace_count plus 1
-                Otherwise If lexer.current_char is equal to "}":
-                    Set brace_count to brace_count minus 1
+        Note: Test for "=end" at the start of this line
+        If c is equal to 61:
+            Let e1 be proc peek_char with lexer, 1
+            Let e2 be proc peek_char with lexer, 2
+            Let e3 be proc peek_char with lexer, 3
+            If e1 is equal to 101:
+                If e2 is equal to 110:
+                    If e3 is equal to 100:
+                        Note: Drain the rest of the =end line
+                        While 1 is equal to 1:
+                            Let d be proc current_char with lexer
+                            If d is equal to 0:
+                                Return 1
+                            End If
+                            If d is equal to 10:
+                                proc advance_char with lexer
+                                Return 1
+                            End If
+                            proc advance_char with lexer
+                        End While
+                    End If
                 End If
+            End If
+        End If
 
-                If brace_count is greater than 0:
-                    proc advance from lexer
+        Note: Not the closing line - drain it and continue
+        While 1 is equal to 1:
+            Let g be proc current_char with lexer
+            If g is equal to 0:
+                Return 1
+            End If
+            If g is equal to 10:
+                proc advance_char with lexer
+                Break
+            End If
+            proc advance_char with lexer
+        End While
+    End While
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Number Lexing
+Note: ============================================================================
+
+@Reasoning:
+Scans a Ruby numeric literal. Detects the kind by peeking the prefix:
+  - 0x / 0X : hexadecimal integer
+  - 0b / 0B : binary integer
+  - 0o / 0O : octal integer
+otherwise a decimal scan that may grow a fractional part (digit-after-dot is
+required so "1..5" tokenises as a range, not "1." followed by ".5") and an
+optional exponent. Underscores between digits are allowed and consumed.
+The resulting token is TOKEN_FLOAT when a '.' or exponent was seen, else
+TOKEN_INTEGER.
+@End Reasoning
+Process called "lex_number" takes lexer as Integer returns Integer:
+    Note: Lex an integer or float literal
+
+    Let source be proc memory_get_int64 from Memory with lexer, 0
+    Let start_pos be proc memory_get_int64 from Memory with lexer, 8
+    Let line be proc memory_get_int64 from Memory with lexer, 16
+    Let column be proc memory_get_int64 from Memory with lexer, 24
+
+    Let ch be proc current_char with lexer
+
+    Note: Radix-prefixed integers (0x / 0b / 0o)
+    If ch is equal to 48:
+        Let next_ch be proc peek_char with lexer, 1
+        Let is_radix be 0
+        If next_ch is equal to 120:
+            Set is_radix to 1
+        End If
+        If next_ch is equal to 88:
+            Set is_radix to 1
+        End If
+        If next_ch is equal to 98:
+            Set is_radix to 1
+        End If
+        If next_ch is equal to 66:
+            Set is_radix to 1
+        End If
+        If next_ch is equal to 111:
+            Set is_radix to 1
+        End If
+        If next_ch is equal to 79:
+            Set is_radix to 1
+        End If
+
+        If is_radix is equal to 1:
+            proc advance_char with lexer
+            proc advance_char with lexer
+            While 1 is equal to 1:
+                Set ch to proc current_char with lexer
+                Let is_hex be proc is_hex_digit with ch
+                If is_hex is equal to 1:
+                    proc advance_char with lexer
+                Otherwise:
+                    If ch is equal to 95:
+                        proc advance_char with lexer
+                    Otherwise:
+                        Break
+                    End If
                 End If
             End While
 
-            Note: Extract and tokenize the expression
-            Let expr_text be proc substring with lexer.source, expr_start, lexer.position minus expr_start
-            Let expr_lexer be proc create_ruby_lexer from expr_text
-            Let expr_tokens be proc tokenize_ruby from expr_lexer
+            Let radix_end be proc memory_get_int64 from Memory with lexer, 8
+            Let radix_lexeme be proc ruby_substring with source, start_pos, radix_end
+            Let radix_token be proc create_token with TOKEN_INTEGER, radix_lexeme, line, column
+            Return radix_token
+        End If
+    End If
 
-            Note: Add interpolation tokens
-            proc add_token with lexer, TOKEN_INTERPOLATED_STRING, expr_text
+    Let is_float be 0
 
-            proc advance from lexer  Note: Skip closing }
+    Note: Integer part
+    While 1 is equal to 1:
+        Set ch to proc current_char with lexer
+        Let is_dig be proc is_digit with ch
+        If is_dig is equal to 1:
+            proc advance_char with lexer
         Otherwise:
-            Set value to proc string_concat with value, lexer.current_char
-            proc advance from lexer
+            If ch is equal to 95:
+                proc advance_char with lexer
+            Otherwise:
+                Break
+            End If
         End If
     End While
 
-    If length of value is greater than 0:
-        proc add_token with lexer, TOKEN_STRING, value
-    End If
-
-    If lexer.current_char is equal to "\"":
-        proc advance from lexer  Note: Skip closing quote
-    End If
-
-    Return 1
-End Process
-
-@Reasoning:
-Ruby symbols accept two forms: bare ":foo" (identifier-like) and quoted ":\"complex string\""; branching on whether the byte after the colon is a quote covers both.
-@End Reasoning
-
-@Implementation:
-Skip the ':'. If the next char is a quote, consume bytes until the matching quote (no escape handling). Otherwise greedily consume identifier characters (alpha-numeric and underscore). Emit TOKEN_SYMBOL with the accumulated value.
-@End Implementation
-
-Process called "tokenize_symbol" takes lexer as Integer returns Integer:
-    Note: Tokenize Ruby symbols (:symbol, :"string symbol")
-
-    proc advance from lexer  Note: Skip colon
-
-    Let value be ""
-
-    Note: Handle quoted symbols
-    If lexer.current_char is equal to "\"" or lexer.current_char is equal to "'":
-        Let quote_char be lexer.current_char
-        proc advance from lexer
-
-        While lexer.current_char is not equal to quote_char and lexer.current_char is not equal to "":
-            Set value to proc string_concat with value, lexer.current_char
-            proc advance from lexer
-        End While
-
-        If lexer.current_char is equal to quote_char:
-            proc advance from lexer
+    Note: Fractional part (only if a digit follows the dot)
+    Set ch to proc current_char with lexer
+    If ch is equal to 46:
+        Let after_dot be proc peek_char with lexer, 1
+        Let frac_dig be proc is_digit with after_dot
+        If frac_dig is equal to 1:
+            Set is_float to 1
+            proc advance_char with lexer
+            While 1 is equal to 1:
+                Set ch to proc current_char with lexer
+                Let d2 be proc is_digit with ch
+                If d2 is equal to 1:
+                    proc advance_char with lexer
+                Otherwise:
+                    If ch is equal to 95:
+                        proc advance_char with lexer
+                    Otherwise:
+                        Break
+                    End If
+                End If
+            End While
         End If
+    End If
+
+    Note: Exponent
+    Set ch to proc current_char with lexer
+    If ch is equal to 101:
+        Set is_float to 1
+        proc advance_char with lexer
+        Set ch to proc current_char with lexer
+        If ch is equal to 43:
+            proc advance_char with lexer
+        End If
+        If ch is equal to 45:
+            proc advance_char with lexer
+        End If
+        While 1 is equal to 1:
+            Set ch to proc current_char with lexer
+            Let d3 be proc is_digit with ch
+            If d3 is equal to 1:
+                proc advance_char with lexer
+            Otherwise:
+                Break
+            End If
+        End While
     Otherwise:
-        Note: Handle regular symbols
-        While proc is_alpha_numeric with lexer.current_char is equal to 1 or lexer.current_char is equal to "_":
-            Set value to proc string_concat with value, lexer.current_char
-            proc advance from lexer
-        End While
+        If ch is equal to 69:
+            Set is_float to 1
+            proc advance_char with lexer
+            Set ch to proc current_char with lexer
+            If ch is equal to 43:
+                proc advance_char with lexer
+            End If
+            If ch is equal to 45:
+                proc advance_char with lexer
+            End If
+            While 1 is equal to 1:
+                Set ch to proc current_char with lexer
+                Let d4 be proc is_digit with ch
+                If d4 is equal to 1:
+                    proc advance_char with lexer
+                Otherwise:
+                    Break
+                End If
+            End While
+        End If
     End If
 
-    proc add_token with lexer, TOKEN_SYMBOL, value
-    Return 1
+    Let end_pos be proc memory_get_int64 from Memory with lexer, 8
+    Let lexeme be proc ruby_substring with source, start_pos, end_pos
+
+    Let kind be TOKEN_INTEGER
+    If is_float is equal to 1:
+        Set kind to TOKEN_FLOAT
+    End If
+
+    Let token be proc create_token with kind, lexeme, line, column
+    Return token
 End Process
 
+Note: ============================================================================
+Note: String Lexing
+Note: ============================================================================
+
 @Reasoning:
-Ruby numeric literals span integer, float (1.5), and scientific (1.5e10) forms; lexing the maximal valid prefix lets the parser/typechecker do the final classification.
+Scans a quoted string literal delimited by quote_char (single quote 0x27,
+double quote 0x22, or backtick 0x60). Escape sequences are consumed as a
+two-byte unit so an escaped delimiter (\" inside a double-quoted string) does
+not terminate the literal. The emitted token type is TOKEN_STRING_INTERP if
+a #{...} interpolation was seen in a double-quoted or backtick string (single
+quotes do not interpolate), otherwise TOKEN_STRING. The lexeme keeps the
+opening and closing delimiters so the parser can recover the exact form.
 @End Reasoning
+Process called "lex_string" takes lexer as Integer, quote_char as Integer returns Integer:
+    Note: Lex a '...' / "..." / `...` string literal
 
-@Implementation:
-Greedy-consume digits. If the next char is '.' AND the following byte is also a digit, consume the '.' (require digit-after-dot to avoid swallowing range operators) and the fractional digits. If 'e' or 'E' follows, consume it, an optional sign, then exponent digits. Emit TOKEN_NUMBER.
-@End Implementation
+    Let source be proc memory_get_int64 from Memory with lexer, 0
+    Let start_pos be proc memory_get_int64 from Memory with lexer, 8
+    Let line be proc memory_get_int64 from Memory with lexer, 16
+    Let column be proc memory_get_int64 from Memory with lexer, 24
 
-Process called "tokenize_number" takes lexer as Integer returns Integer:
-    Note: Tokenize Ruby numbers including integers, floats, and scientific notation
-
-    Let value be ""
-    Let has_dot be 0
-
-    Note: Handle integer part
-    While proc is_digit with lexer.current_char is equal to 1:
-        Set value to proc string_concat with value, lexer.current_char
-        proc advance from lexer
-    End While
-
-    Note: Handle decimal point
-    Let peek_ch be proc peek with lexer
-    If lexer.current_char is equal to "." and proc is_digit with peek_ch is equal to 1:
-        Set has_dot to 1
-        Set value to proc string_concat with value, lexer.current_char
-        proc advance from lexer
-
-        While proc is_digit with lexer.current_char is equal to 1:
-            Set value to proc string_concat with value, lexer.current_char
-            proc advance from lexer
-        End While
+    Note: interpolation only happens in double-quote / backtick forms
+    Let allows_interp be 0
+    If quote_char is equal to 34:
+        Set allows_interp to 1
+    End If
+    If quote_char is equal to 96:
+        Set allows_interp to 1
     End If
 
-    Note: Handle scientific notation
-    If lexer.current_char is equal to "e" or lexer.current_char is equal to "E":
-        Set value to proc string_concat with value, lexer.current_char
-        proc advance from lexer
+    proc advance_char with lexer
+    Let saw_interp be 0
 
-        If lexer.current_char is equal to "+" or lexer.current_char is equal to "-":
-            Set value to proc string_concat with value, lexer.current_char
-            proc advance from lexer
+    While 1 is equal to 1:
+        Let ch be proc current_char with lexer
+
+        If ch is equal to 0:
+            Break
         End If
 
-        While proc is_digit with lexer.current_char is equal to 1:
-            Set value to proc string_concat with value, lexer.current_char
-            proc advance from lexer
-        End While
-    End If
+        If ch is equal to quote_char:
+            proc advance_char with lexer
+            Break
+        End If
 
-    proc add_token with lexer, TOKEN_NUMBER, value
-    Return 1
-End Process
-
-@Reasoning:
-Ruby method names can end with '?' (predicate) or '!' (destructive variant); consuming a trailing sigil character keeps them as one lexeme, and a single classification pass identifies keywords post-scan.
-@End Reasoning
-
-@Implementation:
-Greedy-consume alphanumeric or underscore bytes. If the next char is '?' or '!', append it. Call get_keyword_type on the assembled name; if it returns 0 (no match), fall back to TOKEN_IDENTIFIER. Emit the chosen token.
-@End Implementation
-
-Process called "tokenize_identifier" takes lexer as Integer returns Integer:
-    Note: Tokenize Ruby identifiers and keywords
-
-    Let value be ""
-
-    While proc is_alpha_numeric with lexer.current_char is equal to 1 or lexer.current_char is equal to "_":
-        Set value to proc string_concat with value, lexer.current_char
-        proc advance from lexer
-    End While
-
-    Note: Handle method names ending with ? or !
-    If lexer.current_char is equal to "?" or lexer.current_char is equal to "!":
-        Set value to proc string_concat with value, lexer.current_char
-        proc advance from lexer
-    End If
-
-    Note: Check if it's a keyword
-    Let token_type be proc get_keyword_type from value
-    If token_type is equal to 0:
-        Set token_type to TOKEN_IDENTIFIER
-    End If
-
-    proc add_token with lexer, token_type, value
-    Return 1
-End Process
-
-@Reasoning:
-A single Match over the full Ruby keyword set keeps keyword classification O(1) per identifier with no per-call hash table allocation overhead.
-@End Reasoning
-
-@Implementation:
-Match the input word against the 33 Ruby keywords (class, module, def, end, if, elsif, else, unless, while, until, for, in, do, break, next, return, yield, super, self, true, false, nil, and, or, not, begin, rescue, ensure, raise, case, when, then, alias, undef) returning the matching token type. Non-matching words return 0.
-@End Implementation
-
-@Performance_Hints:
-Compiles to a sequence of string comparisons; O(k) where k is the number of keywords.
-@End Performance_Hints
-
-Process called "get_keyword_type" takes word as String returns Integer:
-    Note: Return token type for Ruby keywords
-
-    Match word:
-        When "class": Return TOKEN_CLASS
-        When "module": Return TOKEN_MODULE
-        When "def": Return TOKEN_DEF
-        When "end": Return TOKEN_END
-        When "if": Return TOKEN_IF
-        When "elsif": Return TOKEN_ELSIF
-        When "else": Return TOKEN_ELSE
-        When "unless": Return TOKEN_UNLESS
-        When "while": Return TOKEN_WHILE
-        When "until": Return TOKEN_UNTIL
-        When "for": Return TOKEN_FOR
-        When "in": Return TOKEN_IN
-        When "do": Return TOKEN_DO
-        When "break": Return TOKEN_BREAK
-        When "next": Return TOKEN_NEXT
-        When "return": Return TOKEN_RETURN
-        When "yield": Return TOKEN_YIELD
-        When "super": Return TOKEN_SUPER
-        When "self": Return TOKEN_SELF
-        When "true": Return TOKEN_TRUE
-        When "false": Return TOKEN_FALSE
-        When "nil": Return TOKEN_NIL
-        When "and": Return TOKEN_AND
-        When "or": Return TOKEN_OR
-        When "not": Return TOKEN_NOT
-        When "begin": Return TOKEN_BEGIN
-        When "rescue": Return TOKEN_RESCUE
-        When "ensure": Return TOKEN_ENSURE
-        When "raise": Return TOKEN_RAISE
-        When "case": Return TOKEN_CASE
-        When "when": Return TOKEN_WHEN
-        When "then": Return TOKEN_THEN
-        When "alias": Return TOKEN_ALIAS
-        When "undef": Return TOKEN_UNDEF
-        Otherwise: Return 0
-    End Match
-End Process
-
-@Reasoning:
-Ruby operators have compound assignment forms (+=, *=, **=) and multi-character variants (==, !=, =~, !~, <=>, &&, ||, .., ...); a giant Match on the first character handles each family with one-character lookahead.
-@End Reasoning
-
-@Implementation:
-For each operator-leading character (+ - * / % = ! < > & | .), peek the next byte and emit the appropriate longest-match token: assignment variants on trailing '=', range/spaceship/power on doubled '*' or '.', boolean on doubled '&' or '|'. Single-character form emits when no extension matches. Returns 1 on match, 0 when current_char isn't an operator-leading byte.
-@End Implementation
-
-@Performance_Hints:
-O(1) per token; at most 3 character lookaheads for "...", "<=>", "**=" forms.
-@End Performance_Hints
-
-Process called "tokenize_operator" takes lexer as Integer returns Integer:
-    Note: Tokenize Ruby operators including compound assignments
-
-    Match lexer.current_char:
-        When "+":
-            If proc peek with lexer is equal to "=":
-                proc add_token with lexer, TOKEN_PLUS_ASSIGN, "+="
-                proc advance from lexer
-                proc advance from lexer
-            Otherwise:
-                proc add_token with lexer, TOKEN_PLUS, "+"
-                proc advance from lexer
-            End If
-            Return 1
-
-        When "-":
-            If proc peek with lexer is equal to "=":
-                proc add_token with lexer, TOKEN_MINUS_ASSIGN, "-="
-                proc advance from lexer
-                proc advance from lexer
-            Otherwise:
-                proc add_token with lexer, TOKEN_MINUS, "-"
-                proc advance from lexer
-            End If
-            Return 1
-
-        When "*":
-            If proc peek with lexer is equal to "*":
-                proc advance from lexer
-                If proc peek with lexer is equal to "=":
-                    proc add_token with lexer, TOKEN_POWER_ASSIGN, "**="
-                    proc advance from lexer
-                    proc advance from lexer
-                Otherwise:
-                    proc add_token with lexer, TOKEN_POWER, "**"
-                    proc advance from lexer
-                End If
-            Otherwise If proc peek with lexer is equal to "=":
-                proc add_token with lexer, TOKEN_MULTIPLY_ASSIGN, "*="
-                proc advance from lexer
-                proc advance from lexer
-            Otherwise:
-                proc add_token with lexer, TOKEN_MULTIPLY, "*"
-                proc advance from lexer
-            End If
-            Return 1
-
-        When "/":
-            If proc peek with lexer is equal to "=":
-                proc add_token with lexer, TOKEN_DIVIDE_ASSIGN, "/="
-                proc advance from lexer
-                proc advance from lexer
-            Otherwise:
-                proc add_token with lexer, TOKEN_DIVIDE, "/"
-                proc advance from lexer
-            End If
-            Return 1
-
-        When "%":
-            If proc peek with lexer is equal to "=":
-                proc add_token with lexer, TOKEN_MODULO_ASSIGN, "%="
-                proc advance from lexer
-                proc advance from lexer
-            Otherwise:
-                proc add_token with lexer, TOKEN_MODULO, "%"
-                proc advance from lexer
-            End If
-            Return 1
-
-        When "=":
-            If proc peek with lexer is equal to "=":
-                proc add_token with lexer, TOKEN_EQUAL, "=="
-                proc advance from lexer
-                proc advance from lexer
-            Otherwise If proc peek with lexer is equal to "~":
-                proc add_token with lexer, TOKEN_MATCH, "=~"
-                proc advance from lexer
-                proc advance from lexer
-            Otherwise:
-                proc add_token with lexer, TOKEN_ASSIGN, "="
-                proc advance from lexer
-            End If
-            Return 1
-
-        When "!":
-            If proc peek with lexer is equal to "=":
-                proc add_token with lexer, TOKEN_NOT_EQUAL, "!="
-                proc advance from lexer
-                proc advance from lexer
-            Otherwise If proc peek with lexer is equal to "~":
-                proc add_token with lexer, TOKEN_NOT_MATCH, "!~"
-                proc advance from lexer
-                proc advance from lexer
-            Otherwise:
-                proc add_token with lexer, TOKEN_NOT, "!"
-                proc advance from lexer
-            End If
-            Return 1
-
-        When "<":
-            If proc peek with lexer is equal to "=":
-                If proc peek_ahead with lexer, 2 is equal to ">":
-                    proc add_token with lexer, TOKEN_SPACESHIP, "<=>"
-                    proc advance from lexer
-                    proc advance from lexer
-                    proc advance from lexer
-                Otherwise:
-                    proc add_token with lexer, TOKEN_LESS_EQUAL, "<="
-                    proc advance from lexer
-                    proc advance from lexer
-                End If
-            Otherwise:
-                proc add_token with lexer, TOKEN_LESS_THAN, "<"
-                proc advance from lexer
-            End If
-            Return 1
-
-        When ">":
-            If proc peek with lexer is equal to "=":
-                proc add_token with lexer, TOKEN_GREATER_EQUAL, ">="
-                proc advance from lexer
-                proc advance from lexer
-            Otherwise:
-                proc add_token with lexer, TOKEN_GREATER_THAN, ">"
-                proc advance from lexer
-            End If
-            Return 1
-
-        When "&":
-            If proc peek with lexer is equal to "&":
-                proc add_token with lexer, TOKEN_AND_AND, "&&"
-                proc advance from lexer
-                proc advance from lexer
-            Otherwise:
-                proc add_token with lexer, TOKEN_AMPERSAND, "&"
-                proc advance from lexer
-            End If
-            Return 1
-
-        When "|":
-            If proc peek with lexer is equal to "|":
-                proc add_token with lexer, TOKEN_OR_OR, "||"
-                proc advance from lexer
-                proc advance from lexer
-            Otherwise:
-                proc add_token with lexer, TOKEN_PIPE, "|"
-                proc advance from lexer
-            End If
-            Return 1
-
-        When ".":
-            If proc peek with lexer is equal to ".":
-                If proc peek_ahead with lexer, 2 is equal to ".":
-                    proc add_token with lexer, TOKEN_RANGE_EXCLUSIVE, "..."
-                    proc advance from lexer
-                    proc advance from lexer
-                    proc advance from lexer
-                Otherwise:
-                    proc add_token with lexer, TOKEN_RANGE_INCLUSIVE, ".."
-                    proc advance from lexer
-                    proc advance from lexer
-                End If
-            Otherwise:
-                proc add_token with lexer, TOKEN_DOT, "."
-                proc advance from lexer
-            End If
-            Return 1
-
+        If ch is equal to 92:
+            proc advance_char with lexer
+            proc advance_char with lexer
         Otherwise:
-            Return 0  Note: Not an operator
-    End Match
-End Process
-
-@Reasoning:
-Ruby treats "@var" as instance variables and "@@var" as class variables; lexing both as TOKEN_IDENTIFIER with the sigil preserved in the value lets the parser disambiguate downstream by looking at the leading sigil.
-@End Reasoning
-
-@Implementation:
-Skip the first '@'. If a second '@' follows, prepend "@@" to the value and skip it; otherwise prepend "@". Then greedy-consume alphanumeric or underscore bytes into the value. Emit TOKEN_IDENTIFIER with the full sigil+name.
-@End Implementation
-
-Process called "tokenize_instance_variable" takes lexer as Integer returns Integer:
-    Note: Tokenize Ruby instance and class variables (@var, @@var)
-
-    Let value be ""
-    proc advance from lexer  Note: Skip first @
-
-    If lexer.current_char is equal to "@":
-        Set value to "@@"
-        proc advance from lexer  Note: Skip second @
-    Otherwise:
-        Set value to "@"
-    End If
-
-    While proc is_alpha_numeric with lexer.current_char is equal to 1 or lexer.current_char is equal to "_":
-        Set value to proc string_concat with value, lexer.current_char
-        proc advance from lexer
+            If ch is equal to 35:
+                Let nxt be proc peek_char with lexer, 1
+                If nxt is equal to 123:
+                    If allows_interp is equal to 1:
+                        Set saw_interp to 1
+                    End If
+                    proc advance_char with lexer
+                    proc advance_char with lexer
+                    Note: consume balanced #{...} body
+                    Let depth be 1
+                    While depth is greater than 0:
+                        Let ic be proc current_char with lexer
+                        If ic is equal to 0:
+                            Break
+                        End If
+                        If ic is equal to 123:
+                            Set depth to depth plus 1
+                            proc advance_char with lexer
+                        Otherwise:
+                            If ic is equal to 125:
+                                Set depth to depth minus 1
+                                proc advance_char with lexer
+                            Otherwise:
+                                proc advance_char with lexer
+                            End If
+                        End If
+                    End While
+                Otherwise:
+                    proc advance_char with lexer
+                End If
+            Otherwise:
+                proc advance_char with lexer
+            End If
+        End If
     End While
 
-    proc add_token with lexer, TOKEN_IDENTIFIER, value
-    Return 1
-End Process
+    Let end_pos be proc memory_get_int64 from Memory with lexer, 8
+    Let lexeme be proc ruby_substring with source, start_pos, end_pos
 
-Note: Helper processes for lexer functionality
-
-@Reasoning:
-Every cursor mutation must also update line/column for diagnostics; concentrating that bookkeeping in one helper guarantees no caller forgets it.
-@End Reasoning
-
-@Implementation:
-Increment position. If we reached end-of-source set current_char to "". Otherwise refresh current_char from source[position]. If the new current_char is '\n', increment line and reset column to 1; otherwise increment column.
-@End Implementation
-
-Process called "advance" takes lexer as Integer returns Integer:
-    Note: Advance to next character in source
-
-    Set lexer.position to lexer.position plus 1
-
-    If lexer.position is greater than or equal to length of lexer.source:
-        Set lexer.current_char to ""
-    Otherwise:
-        Set lexer.current_char to proc char_at with lexer.source, lexer.position
+    Let kind be TOKEN_STRING
+    If saw_interp is equal to 1:
+        Set kind to TOKEN_STRING_INTERP
     End If
 
-    If lexer.current_char is equal to "\n":
-        Set lexer.line to lexer.line plus 1
-        Set lexer.column to 1
-    Otherwise:
-        Set lexer.column to lexer.column plus 1
-    End If
-
-    Return 1
+    Let token be proc create_token with kind, lexeme, line, column
+    Return token
 End Process
 
 @Reasoning:
-Operator tokenisation needs single-character lookahead to decide between "+" and "+=" etc.; a one-line helper that returns "" past end-of-source lets callers compare safely without bound-checking.
+Scans a %-literal in word/symbol-array form: %w(...) / %W(...) for string
+arrays and %i(...) / %I(...) for symbol arrays. The byte after the type
+letter selects the closing delimiter via matching_close. The lexeme keeps
+the entire %w(...) text so the parser can split it into elements. Emitted as
+TOKEN_STRING (word arrays lower to array-of-string literals downstream).
 @End Reasoning
+Process called "matching_close" takes open as Integer returns Integer:
+    Note: Map a %-literal opening delimiter to its closing delimiter
 
-@Implementation:
-Compute position+1; if out of bounds return ""; otherwise return source[position+1].
-@End Implementation
-
-Process called "peek" takes lexer as Integer returns String:
-    Note: Peek at next character without advancing
-
-    Let next_pos be lexer.position plus 1
-    If next_pos is greater than or equal to length of lexer.source:
-        Return ""
+    If open is equal to 40:
+        Return 41
     End If
-
-    Return proc char_at with lexer.source, next_pos
+    If open is equal to 91:
+        Return 93
+    End If
+    If open is equal to 123:
+        Return 125
+    End If
+    If open is equal to 60:
+        Return 62
+    End If
+    Return open
 End Process
 
-@Reasoning:
-Three-character operator forms like "<=>" and "..." need two-character lookahead; parameterising peek by offset handles both peek(2) cases without duplicating the bound check.
-@End Reasoning
+Process called "lex_percent_literal" takes lexer as Integer returns Integer:
+    Note: Lex a %w / %W / %i / %I array literal
 
-@Implementation:
-Compute position+offset; if out of bounds return ""; otherwise return source[position+offset].
-@End Implementation
+    Let source be proc memory_get_int64 from Memory with lexer, 0
+    Let start_pos be proc memory_get_int64 from Memory with lexer, 8
+    Let line be proc memory_get_int64 from Memory with lexer, 16
+    Let column be proc memory_get_int64 from Memory with lexer, 24
 
-Process called "peek_ahead" takes lexer as Integer, offset as Integer returns String:
-    Note: Peek ahead multiple characters
+    Note: consume '%' and the type letter (w/W/i/I)
+    proc advance_char with lexer
+    proc advance_char with lexer
 
-    Let peek_pos be lexer.position plus offset
-    If peek_pos is greater than or equal to length of lexer.source:
-        Return ""
-    End If
+    Let open be proc current_char with lexer
+    Let close be proc matching_close with open
+    proc advance_char with lexer
 
-    Return proc char_at with lexer.source, peek_pos
-End Process
-
-@Reasoning:
-Newlines are statement terminators in Ruby and must reach the parser; this helper skips only horizontal whitespace and carriage returns so the main dispatcher can react to '\n' separately.
-@End Reasoning
-
-@Implementation:
-Loop advancing while current_char is space (" "), tab ("\t"), or carriage return ("\r").
-@End Implementation
-
-Process called "skip_whitespace" takes lexer as Integer returns Integer:
-    Note: Skip whitespace characters except newlines
-
-    While lexer.current_char is equal to " " or
-          lexer.current_char is equal to "\t" or
-          lexer.current_char is equal to "\r":
-        proc advance from lexer
+    Let depth be 1
+    While depth is greater than 0:
+        Let ch be proc current_char with lexer
+        If ch is equal to 0:
+            Break
+        End If
+        If ch is equal to 92:
+            proc advance_char with lexer
+            proc advance_char with lexer
+        Otherwise:
+            If ch is equal to open:
+                If open is not equal to close:
+                    Set depth to depth plus 1
+                End If
+                proc advance_char with lexer
+            Otherwise:
+                If ch is equal to close:
+                    Set depth to depth minus 1
+                    proc advance_char with lexer
+                Otherwise:
+                    proc advance_char with lexer
+                End If
+            End If
+        End If
     End While
 
-    Return 1
+    Let end_pos be proc memory_get_int64 from Memory with lexer, 8
+    Let lexeme be proc ruby_substring with source, start_pos, end_pos
+    Let token be proc create_token with TOKEN_STRING, lexeme, line, column
+    Return token
 End Process
 
+Note: ============================================================================
+Note: Symbol Lexing
+Note: ============================================================================
+
 @Reasoning:
-Ruby '#' comments run from '#' to end-of-line; leaving the newline in place lets the dispatcher emit TOKEN_NEWLINE so the comment does not silently merge two statements.
+Scans a Ruby symbol following a ':' that is NOT a '::' scope operator. Three
+forms: :"quoted symbol", :ident (possibly with a trailing ? ! =), and
+operator symbols (:+, :==, :<=>, :[], :[]=). The caller has already verified
+the leading ':' is a symbol introducer (the byte before it is not value-
+producing and the byte after is a valid symbol start). The lexeme keeps the
+leading ':'.
 @End Reasoning
+Process called "is_operator_symbol_char" takes ch as Integer returns Integer:
+    Note: Check if a byte can appear in an operator-method symbol name
 
-@Implementation:
-Advance until current_char is '\n' or "" (EOF). The newline itself is left unconsumed.
-@End Implementation
+    If ch is equal to 43:
+        Return 1
+    End If
+    If ch is equal to 45:
+        Return 1
+    End If
+    If ch is equal to 42:
+        Return 1
+    End If
+    If ch is equal to 47:
+        Return 1
+    End If
+    If ch is equal to 37:
+        Return 1
+    End If
+    If ch is equal to 60:
+        Return 1
+    End If
+    If ch is equal to 62:
+        Return 1
+    End If
+    If ch is equal to 61:
+        Return 1
+    End If
+    If ch is equal to 33:
+        Return 1
+    End If
+    If ch is equal to 126:
+        Return 1
+    End If
+    If ch is equal to 38:
+        Return 1
+    End If
+    If ch is equal to 124:
+        Return 1
+    End If
+    If ch is equal to 94:
+        Return 1
+    End If
+    If ch is equal to 91:
+        Return 1
+    End If
+    If ch is equal to 93:
+        Return 1
+    End If
+    Return 0
+End Process
 
-Process called "skip_comment" takes lexer as Integer returns Integer:
-    Note: Skip Ruby comment until end of line
+Process called "lex_symbol" takes lexer as Integer returns Integer:
+    Note: Lex a :symbol literal (bare, quoted, or operator form)
 
-    While lexer.current_char is not equal to "\n" and lexer.current_char is not equal to "":
-        proc advance from lexer
+    Let source be proc memory_get_int64 from Memory with lexer, 0
+    Let start_pos be proc memory_get_int64 from Memory with lexer, 8
+    Let line be proc memory_get_int64 from Memory with lexer, 16
+    Let column be proc memory_get_int64 from Memory with lexer, 24
+
+    Note: consume the ':'
+    proc advance_char with lexer
+
+    Let ch be proc current_char with lexer
+
+    Note: quoted symbol :"..." or :'...'
+    If ch is equal to 34:
+        proc advance_char with lexer
+        While 1 is equal to 1:
+            Let q be proc current_char with lexer
+            If q is equal to 0:
+                Break
+            End If
+            If q is equal to 34:
+                proc advance_char with lexer
+                Break
+            End If
+            If q is equal to 92:
+                proc advance_char with lexer
+                proc advance_char with lexer
+            Otherwise:
+                proc advance_char with lexer
+            End If
+        End While
+        Let qend be proc memory_get_int64 from Memory with lexer, 8
+        Let qlex be proc ruby_substring with source, start_pos, qend
+        Let qtok be proc create_token with TOKEN_SYMBOL, qlex, line, column
+        Return qtok
+    End If
+
+    Note: identifier-form symbol
+    Let alpha be proc is_alpha with ch
+    If alpha is equal to 1:
+        While 1 is equal to 1:
+            Let c be proc current_char with lexer
+            Let an be proc is_alnum with c
+            If an is equal to 1:
+                proc advance_char with lexer
+            Otherwise:
+                Break
+            End If
+        End While
+        Note: optional trailing predicate/bang/setter sigil
+        Let trail be proc current_char with lexer
+        If trail is equal to 63:
+            proc advance_char with lexer
+        Otherwise:
+            If trail is equal to 33:
+                proc advance_char with lexer
+            Otherwise:
+                If trail is equal to 61:
+                    proc advance_char with lexer
+                End If
+            End If
+        End If
+        Let iend be proc memory_get_int64 from Memory with lexer, 8
+        Let ilex be proc ruby_substring with source, start_pos, iend
+        Let itok be proc create_token with TOKEN_SYMBOL, ilex, line, column
+        Return itok
+    End If
+
+    Note: operator-method symbol (:+, :==, :[]=, ...)
+    Let opc be proc is_operator_symbol_char with ch
+    If opc is equal to 1:
+        While 1 is equal to 1:
+            Let oc be proc current_char with lexer
+            Let isop be proc is_operator_symbol_char with oc
+            If isop is equal to 1:
+                proc advance_char with lexer
+            Otherwise:
+                Break
+            End If
+        End While
+        Let oend be proc memory_get_int64 from Memory with lexer, 8
+        Let olex be proc ruby_substring with source, start_pos, oend
+        Let otok be proc create_token with TOKEN_SYMBOL, olex, line, column
+        Return otok
+    End If
+
+    Note: lone ':' that did not introduce a symbol - emit a colon token
+    Let cend be proc memory_get_int64 from Memory with lexer, 8
+    Let clex be proc ruby_substring with source, start_pos, cend
+    Let ctok be proc create_token with TOKEN_COLON, clex, line, column
+    Return ctok
+End Process
+
+Note: ============================================================================
+Note: Variable Lexing (@ivar, @@cvar, $gvar)
+Note: ============================================================================
+
+@Reasoning:
+Scans an instance variable (@name), class variable (@@name), or global
+variable ($name). The sigil byte(s) are consumed first to choose the token
+type, then the identifier tail. The lexeme keeps the sigil so the parser and
+downstream lowering preserve the distinction. A lone '$' followed by a
+special global punctuation byte (e.g. $!, $~, $0) consumes that one byte.
+@End Reasoning
+Process called "lex_instance_or_class_var" takes lexer as Integer returns Integer:
+    Note: Lex @ivar or @@cvar
+
+    Let source be proc memory_get_int64 from Memory with lexer, 0
+    Let start_pos be proc memory_get_int64 from Memory with lexer, 8
+    Let line be proc memory_get_int64 from Memory with lexer, 16
+    Let column be proc memory_get_int64 from Memory with lexer, 24
+
+    proc advance_char with lexer
+    Let kind be TOKEN_INSTANCE_VAR
+    Let second be proc current_char with lexer
+    If second is equal to 64:
+        Set kind to TOKEN_CLASS_VAR
+        proc advance_char with lexer
+    End If
+
+    While 1 is equal to 1:
+        Let ch be proc current_char with lexer
+        Let an be proc is_alnum with ch
+        If an is equal to 1:
+            proc advance_char with lexer
+        Otherwise:
+            Break
+        End If
     End While
 
-    Return 1
+    Let end_pos be proc memory_get_int64 from Memory with lexer, 8
+    Let lexeme be proc ruby_substring with source, start_pos, end_pos
+    Let token be proc create_token with kind, lexeme, line, column
+    Return token
+End Process
+
+Process called "lex_global_var" takes lexer as Integer returns Integer:
+    Note: Lex $gvar (named or special)
+
+    Let source be proc memory_get_int64 from Memory with lexer, 0
+    Let start_pos be proc memory_get_int64 from Memory with lexer, 8
+    Let line be proc memory_get_int64 from Memory with lexer, 16
+    Let column be proc memory_get_int64 from Memory with lexer, 24
+
+    proc advance_char with lexer
+    Let ch be proc current_char with lexer
+    Let alpha be proc is_alpha with ch
+    If alpha is equal to 1:
+        While 1 is equal to 1:
+            Let c be proc current_char with lexer
+            Let an be proc is_alnum with c
+            If an is equal to 1:
+                proc advance_char with lexer
+            Otherwise:
+                Break
+            End If
+        End While
+    Otherwise:
+        Note: special global like $!, $~, $&, $0 - one byte
+        If ch is not equal to 0:
+            proc advance_char with lexer
+        End If
+    End If
+
+    Let end_pos be proc memory_get_int64 from Memory with lexer, 8
+    Let lexeme be proc ruby_substring with source, start_pos, end_pos
+    Let token be proc create_token with TOKEN_GLOBAL_VAR, lexeme, line, column
+    Return token
+End Process
+
+Note: ============================================================================
+Note: Identifier and Keyword Lexing
+Note: ============================================================================
+
+@Reasoning:
+Scans an identifier or keyword. Ruby method names may end with '?'
+(predicate) or '!' (bang); these trailing sigils are consumed so the name
+stays one lexeme. A '=' immediately following an identifier is NOT consumed
+here (that is a separate assignment/setter token decided by the parser). The
+assembled name is classified against the keyword set; an uppercase-led name
+that is not a keyword becomes TOKEN_CONSTANT, otherwise TOKEN_IDENTIFIER.
+@End Reasoning
+Process called "lex_identifier" takes lexer as Integer returns Integer:
+    Note: Lex an identifier, constant, or keyword
+
+    Let source be proc memory_get_int64 from Memory with lexer, 0
+    Let start_pos be proc memory_get_int64 from Memory with lexer, 8
+    Let line be proc memory_get_int64 from Memory with lexer, 16
+    Let column be proc memory_get_int64 from Memory with lexer, 24
+
+    Let first be proc current_char with lexer
+
+    While 1 is equal to 1:
+        Let ch be proc current_char with lexer
+        Let an be proc is_alnum with ch
+        If an is equal to 1:
+            proc advance_char with lexer
+        Otherwise:
+            Break
+        End If
+    End While
+
+    Note: trailing ? or ! makes a method name (e.g. empty?, save!)
+    Let tail be proc current_char with lexer
+    If tail is equal to 63:
+        proc advance_char with lexer
+    Otherwise:
+        If tail is equal to 33:
+            Note: only treat ! as a name tail, not !=, by checking it is not followed by =
+            Let after_bang be proc peek_char with lexer, 1
+            If after_bang is not equal to 61:
+                proc advance_char with lexer
+            End If
+        End If
+    End If
+
+    Let end_pos be proc memory_get_int64 from Memory with lexer, 8
+    Let lexeme be proc ruby_substring with source, start_pos, end_pos
+
+    Let keyword_type be proc match_ruby_keyword with lexeme
+    If keyword_type is not equal to 0:
+        Let kw_token be proc create_token with keyword_type, lexeme, line, column
+        Return kw_token
+    End If
+
+    Let kind be TOKEN_IDENTIFIER
+    Let up be proc is_upper with first
+    If up is equal to 1:
+        Set kind to TOKEN_CONSTANT
+    End If
+
+    Let token be proc create_token with kind, lexeme, line, column
+    Return token
 End Process
 
 @Reasoning:
-Every tokenize_* helper goes through this constructor so the RubyToken layout (type / value / line / column) is materialised in one site and any future field addition only touches one place.
+Open-coded keyword recogniser dispatched on the first byte to keep the common
+identifier fall-through fast. Covers every Ruby reserved word the parser
+distinguishes. Returns the matching TOKEN_* constant, or 0 (no keyword) so
+the caller falls back to identifier/constant classification.
 @End Reasoning
+Process called "match_ruby_keyword" takes text as Integer returns Integer:
+    Note: Map an identifier spelling to its keyword token, or 0
 
-@Implementation:
-Construct a RubyToken with the given type and value, copying the lexer's current line/column. Push the token onto lexer.tokens.
-@End Implementation
+    Let first_char be proc string_char_at from StringCore with text, 0
 
-Process called "add_token" takes lexer as Integer, token_type as Integer, value as String returns Integer:
-    Note: Add token to lexer's token list
+    Note: 'a' - alias, and
+    If first_char is equal to 97:
+        Let m be proc string_equals from StringCore with text, "alias"
+        If m is equal to 1:
+            Return TOKEN_ALIAS
+        End If
+        Set m to proc string_equals from StringCore with text, "and"
+        If m is equal to 1:
+            Return TOKEN_AND
+        End If
+    End If
 
-    Let token be a value of type RubyToken with
-        token_type as token_type,
-        value as value,
-        line as lexer.line,
-        column as lexer.column
+    Note: 'b' - begin, break, BEGIN
+    If first_char is equal to 98:
+        Let m be proc string_equals from StringCore with text, "begin"
+        If m is equal to 1:
+            Return TOKEN_BEGIN
+        End If
+        Set m to proc string_equals from StringCore with text, "break"
+        If m is equal to 1:
+            Return TOKEN_BREAK
+        End If
+    End If
 
-    proc add_to_list with lexer.tokens, token
-    Return 1
+    Note: 'B' - BEGIN
+    If first_char is equal to 66:
+        Let m be proc string_equals from StringCore with text, "BEGIN"
+        If m is equal to 1:
+            Return TOKEN_BEGIN_UPPER
+        End If
+    End If
+
+    Note: 'c' - class, case
+    If first_char is equal to 99:
+        Let m be proc string_equals from StringCore with text, "class"
+        If m is equal to 1:
+            Return TOKEN_CLASS
+        End If
+        Set m to proc string_equals from StringCore with text, "case"
+        If m is equal to 1:
+            Return TOKEN_CASE
+        End If
+    End If
+
+    Note: 'd' - def, do, defined?
+    If first_char is equal to 100:
+        Let m be proc string_equals from StringCore with text, "def"
+        If m is equal to 1:
+            Return TOKEN_DEF
+        End If
+        Set m to proc string_equals from StringCore with text, "do"
+        If m is equal to 1:
+            Return TOKEN_DO
+        End If
+        Set m to proc string_equals from StringCore with text, "defined?"
+        If m is equal to 1:
+            Return TOKEN_DEFINED
+        End If
+    End If
+
+    Note: 'e' - end, elsif, else, ensure, END
+    If first_char is equal to 101:
+        Let m be proc string_equals from StringCore with text, "end"
+        If m is equal to 1:
+            Return TOKEN_END
+        End If
+        Set m to proc string_equals from StringCore with text, "elsif"
+        If m is equal to 1:
+            Return TOKEN_ELSIF
+        End If
+        Set m to proc string_equals from StringCore with text, "else"
+        If m is equal to 1:
+            Return TOKEN_ELSE
+        End If
+        Set m to proc string_equals from StringCore with text, "ensure"
+        If m is equal to 1:
+            Return TOKEN_ENSURE
+        End If
+    End If
+
+    Note: 'E' - END
+    If first_char is equal to 69:
+        Let m be proc string_equals from StringCore with text, "END"
+        If m is equal to 1:
+            Return TOKEN_END_UPPER
+        End If
+    End If
+
+    Note: 'f' - for, false
+    If first_char is equal to 102:
+        Let m be proc string_equals from StringCore with text, "for"
+        If m is equal to 1:
+            Return TOKEN_FOR
+        End If
+        Set m to proc string_equals from StringCore with text, "false"
+        If m is equal to 1:
+            Return TOKEN_FALSE
+        End If
+    End If
+
+    Note: 'i' - if, in
+    If first_char is equal to 105:
+        Let m be proc string_equals from StringCore with text, "if"
+        If m is equal to 1:
+            Return TOKEN_IF
+        End If
+        Set m to proc string_equals from StringCore with text, "in"
+        If m is equal to 1:
+            Return TOKEN_IN
+        End If
+    End If
+
+    Note: 'l' - lambda
+    If first_char is equal to 108:
+        Let m be proc string_equals from StringCore with text, "lambda"
+        If m is equal to 1:
+            Return TOKEN_LAMBDA
+        End If
+    End If
+
+    Note: 'm' - module
+    If first_char is equal to 109:
+        Let m be proc string_equals from StringCore with text, "module"
+        If m is equal to 1:
+            Return TOKEN_MODULE
+        End If
+    End If
+
+    Note: 'n' - nil, next, not
+    If first_char is equal to 110:
+        Let m be proc string_equals from StringCore with text, "nil"
+        If m is equal to 1:
+            Return TOKEN_NIL
+        End If
+        Set m to proc string_equals from StringCore with text, "next"
+        If m is equal to 1:
+            Return TOKEN_NEXT
+        End If
+        Set m to proc string_equals from StringCore with text, "not"
+        If m is equal to 1:
+            Return TOKEN_NOT
+        End If
+    End If
+
+    Note: 'o' - or
+    If first_char is equal to 111:
+        Let m be proc string_equals from StringCore with text, "or"
+        If m is equal to 1:
+            Return TOKEN_OR
+        End If
+    End If
+
+    Note: 'p' - proc
+    If first_char is equal to 112:
+        Let m be proc string_equals from StringCore with text, "proc"
+        If m is equal to 1:
+            Return TOKEN_PROC
+        End If
+    End If
+
+    Note: 'r' - return, rescue, redo, retry
+    If first_char is equal to 114:
+        Let m be proc string_equals from StringCore with text, "return"
+        If m is equal to 1:
+            Return TOKEN_RETURN
+        End If
+        Set m to proc string_equals from StringCore with text, "rescue"
+        If m is equal to 1:
+            Return TOKEN_RESCUE
+        End If
+        Set m to proc string_equals from StringCore with text, "redo"
+        If m is equal to 1:
+            Return TOKEN_REDO
+        End If
+        Set m to proc string_equals from StringCore with text, "retry"
+        If m is equal to 1:
+            Return TOKEN_RETRY
+        End If
+    End If
+
+    Note: 's' - self, super
+    If first_char is equal to 115:
+        Let m be proc string_equals from StringCore with text, "self"
+        If m is equal to 1:
+            Return TOKEN_SELF
+        End If
+        Set m to proc string_equals from StringCore with text, "super"
+        If m is equal to 1:
+            Return TOKEN_SUPER
+        End If
+    End If
+
+    Note: 't' - then, true
+    If first_char is equal to 116:
+        Let m be proc string_equals from StringCore with text, "then"
+        If m is equal to 1:
+            Return TOKEN_THEN
+        End If
+        Set m to proc string_equals from StringCore with text, "true"
+        If m is equal to 1:
+            Return TOKEN_TRUE
+        End If
+    End If
+
+    Note: 'u' - unless, until, undef
+    If first_char is equal to 117:
+        Let m be proc string_equals from StringCore with text, "unless"
+        If m is equal to 1:
+            Return TOKEN_UNLESS
+        End If
+        Set m to proc string_equals from StringCore with text, "until"
+        If m is equal to 1:
+            Return TOKEN_UNTIL
+        End If
+        Set m to proc string_equals from StringCore with text, "undef"
+        If m is equal to 1:
+            Return TOKEN_UNDEF
+        End If
+    End If
+
+    Note: 'w' - while, when
+    If first_char is equal to 119:
+        Let m be proc string_equals from StringCore with text, "while"
+        If m is equal to 1:
+            Return TOKEN_WHILE
+        End If
+        Set m to proc string_equals from StringCore with text, "when"
+        If m is equal to 1:
+            Return TOKEN_WHEN
+        End If
+    End If
+
+    Note: 'y' - yield
+    If first_char is equal to 121:
+        Let m be proc string_equals from StringCore with text, "yield"
+        If m is equal to 1:
+            Return TOKEN_YIELD
+        End If
+    End If
+
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: Regex Lexing
+Note: ============================================================================
+
+@Reasoning:
+Scans a /.../ regular-expression literal. The caller decides (via the
+regex-context heuristic in next_token) that the leading '/' starts a regex
+rather than a division operator. Escapes are consumed two bytes at a time so
+\/ does not terminate the literal; a character class [...] is tracked so a
+'/' inside it is literal. Trailing flag letters (imxounse) are consumed into
+the lexeme. Emitted as TOKEN_REGEXP keeping the slashes and flags.
+@End Reasoning
+Process called "is_regex_flag" takes ch as Integer returns Integer:
+    Note: Check if a byte is a Ruby regex flag letter
+
+    If ch is equal to 105:
+        Return 1
+    End If
+    If ch is equal to 109:
+        Return 1
+    End If
+    If ch is equal to 120:
+        Return 1
+    End If
+    If ch is equal to 111:
+        Return 1
+    End If
+    If ch is equal to 117:
+        Return 1
+    End If
+    If ch is equal to 110:
+        Return 1
+    End If
+    If ch is equal to 115:
+        Return 1
+    End If
+    If ch is equal to 101:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Process called "lex_regex" takes lexer as Integer returns Integer:
+    Note: Lex a /regex/flags literal
+
+    Let source be proc memory_get_int64 from Memory with lexer, 0
+    Let start_pos be proc memory_get_int64 from Memory with lexer, 8
+    Let line be proc memory_get_int64 from Memory with lexer, 16
+    Let column be proc memory_get_int64 from Memory with lexer, 24
+
+    proc advance_char with lexer
+    Let in_class be 0
+
+    While 1 is equal to 1:
+        Let ch be proc current_char with lexer
+        If ch is equal to 0:
+            Break
+        End If
+        If ch is equal to 92:
+            proc advance_char with lexer
+            proc advance_char with lexer
+        Otherwise:
+            If ch is equal to 91:
+                Set in_class to 1
+                proc advance_char with lexer
+            Otherwise:
+                If ch is equal to 93:
+                    Set in_class to 0
+                    proc advance_char with lexer
+                Otherwise:
+                    If ch is equal to 47:
+                        If in_class is equal to 0:
+                            proc advance_char with lexer
+                            Break
+                        Otherwise:
+                            proc advance_char with lexer
+                        End If
+                    Otherwise:
+                        proc advance_char with lexer
+                    End If
+                End If
+            End If
+        End If
+    End While
+
+    Note: consume trailing flags
+    While 1 is equal to 1:
+        Let f be proc current_char with lexer
+        Let isf be proc is_regex_flag with f
+        If isf is equal to 1:
+            proc advance_char with lexer
+        Otherwise:
+            Break
+        End If
+    End While
+
+    Let end_pos be proc memory_get_int64 from Memory with lexer, 8
+    Let lexeme be proc ruby_substring with source, start_pos, end_pos
+    Let token be proc create_token with TOKEN_REGEXP, lexeme, line, column
+    Return token
+End Process
+
+Note: ============================================================================
+Note: Main Tokenizer
+Note: ============================================================================
+
+@Reasoning:
+Produces the next token. The previous token type is threaded in as prev_type
+so the scanner can resolve Ruby's two context-sensitive ambiguities without a
+separate parser pass:
+  - '/' after a value-producing token (identifier, literal, ')', ']') is
+    division; after anything else (start of expression) it opens a regex.
+  - A symbol introducer ':' is only a symbol when not preceded by a value and
+    when followed by a symbol-start byte; '::' is always the scope operator.
+prev_type is 0 at start of file. Horizontal whitespace and comments are
+skipped first; a logical newline surfaces as TOKEN_NEWLINE. EOF yields
+TOKEN_EOF with a 0 lexeme.
+@End Reasoning
+Process called "prev_is_value" takes prev_type as Integer returns Integer:
+    Note: Whether prev_type closes a value (so '/' divides, ':' is a colon)
+
+    If prev_type is equal to TOKEN_IDENTIFIER:
+        Return 1
+    End If
+    If prev_type is equal to TOKEN_CONSTANT:
+        Return 1
+    End If
+    If prev_type is equal to TOKEN_INTEGER:
+        Return 1
+    End If
+    If prev_type is equal to TOKEN_FLOAT:
+        Return 1
+    End If
+    If prev_type is equal to TOKEN_STRING:
+        Return 1
+    End If
+    If prev_type is equal to TOKEN_STRING_INTERP:
+        Return 1
+    End If
+    If prev_type is equal to TOKEN_SYMBOL:
+        Return 1
+    End If
+    If prev_type is equal to TOKEN_INSTANCE_VAR:
+        Return 1
+    End If
+    If prev_type is equal to TOKEN_CLASS_VAR:
+        Return 1
+    End If
+    If prev_type is equal to TOKEN_GLOBAL_VAR:
+        Return 1
+    End If
+    If prev_type is equal to TOKEN_RPAREN:
+        Return 1
+    End If
+    If prev_type is equal to TOKEN_RBRACKET:
+        Return 1
+    End If
+    If prev_type is equal to TOKEN_RBRACE:
+        Return 1
+    End If
+    If prev_type is equal to TOKEN_NIL:
+        Return 1
+    End If
+    If prev_type is equal to TOKEN_TRUE:
+        Return 1
+    End If
+    If prev_type is equal to TOKEN_FALSE:
+        Return 1
+    End If
+    If prev_type is equal to TOKEN_SELF:
+        Return 1
+    End If
+    If prev_type is equal to TOKEN_END:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Process called "next_token" takes lexer as Integer, prev_type as Integer returns Integer:
+    Note: Produce the next token; prev_type resolves regex/symbol ambiguity
+
+    Note: Skip horizontal whitespace and comments (including =begin/=end)
+    While 1 is equal to 1:
+        proc skip_hspace with lexer
+
+        Let ch be proc current_char with lexer
+
+        If ch is equal to 35:
+            proc skip_line_comment with lexer
+        Otherwise:
+            If ch is equal to 61:
+                Note: =begin block comment only at logical line start
+                Let bc be proc at_block_comment_open with lexer
+                If bc is equal to 1:
+                    Let col_here be proc memory_get_int64 from Memory with lexer, 24
+                    If col_here is equal to 1:
+                        proc skip_block_comment with lexer
+                    Otherwise:
+                        Break
+                    End If
+                Otherwise:
+                    Break
+                End If
+            Otherwise:
+                Break
+            End If
+        End If
+    End While
+
+    Let line be proc memory_get_int64 from Memory with lexer, 16
+    Let column be proc memory_get_int64 from Memory with lexer, 24
+    Let ch be proc current_char with lexer
+
+    Note: EOF
+    If ch is equal to 0:
+        Let eof_tok be proc create_token with TOKEN_EOF, 0, line, column
+        Return eof_tok
+    End If
+
+    Note: Newline (statement terminator)
+    If ch is equal to 10:
+        Let source be proc memory_get_int64 from Memory with lexer, 0
+        Let nl_start be proc memory_get_int64 from Memory with lexer, 8
+        proc advance_char with lexer
+        Let nl_end be proc memory_get_int64 from Memory with lexer, 8
+        Let nl_lex be proc ruby_substring with source, nl_start, nl_end
+        Let nl_tok be proc create_token with TOKEN_NEWLINE, nl_lex, line, column
+        Return nl_tok
+    End If
+
+    Note: Numbers
+    Let is_dig be proc is_digit with ch
+    If is_dig is equal to 1:
+        Let num_tok be proc lex_number with lexer
+        Return num_tok
+    End If
+
+    Note: Instance / class variables (@x, @@x)
+    If ch is equal to 64:
+        Let iv_tok be proc lex_instance_or_class_var with lexer
+        Return iv_tok
+    End If
+
+    Note: Global variable ($x)
+    If ch is equal to 36:
+        Let gv_tok be proc lex_global_var with lexer
+        Return gv_tok
+    End If
+
+    Note: %w / %W / %i / %I array literals
+    If ch is equal to 37:
+        Let pn be proc peek_char with lexer, 1
+        Let pv be proc prev_is_value with prev_type
+        If pv is equal to 0:
+            If pn is equal to 119:
+                Let pw_tok be proc lex_percent_literal with lexer
+                Return pw_tok
+            End If
+            If pn is equal to 87:
+                Let pW_tok be proc lex_percent_literal with lexer
+                Return pW_tok
+            End If
+            If pn is equal to 105:
+                Let pi_tok be proc lex_percent_literal with lexer
+                Return pi_tok
+            End If
+            If pn is equal to 73:
+                Let pI_tok be proc lex_percent_literal with lexer
+                Return pI_tok
+            End If
+        End If
+    End If
+
+    Note: Identifiers and keywords
+    Let alpha be proc is_alpha with ch
+    If alpha is equal to 1:
+        Let id_tok be proc lex_identifier with lexer
+        Return id_tok
+    End If
+
+    Note: Strings and backtick command literals
+    If ch is equal to 34:
+        Let s1 be proc lex_string with lexer, 34
+        Return s1
+    End If
+    If ch is equal to 39:
+        Let s2 be proc lex_string with lexer, 39
+        Return s2
+    End If
+    If ch is equal to 96:
+        Let s3 be proc lex_string with lexer, 96
+        Return s3
+    End If
+
+    Note: Symbol vs colon vs scope operator
+    If ch is equal to 58:
+        Let after be proc peek_char with lexer, 1
+        If after is equal to 58:
+            Note: '::' scope resolution operator
+            Let source be proc memory_get_int64 from Memory with lexer, 0
+            Let sc_start be proc memory_get_int64 from Memory with lexer, 8
+            proc advance_char with lexer
+            proc advance_char with lexer
+            Let sc_end be proc memory_get_int64 from Memory with lexer, 8
+            Let sc_lex be proc ruby_substring with source, sc_start, sc_end
+            Let sc_tok be proc create_token with TOKEN_SCOPE, sc_lex, line, column
+            Return sc_tok
+        End If
+        Let pv be proc prev_is_value with prev_type
+        Let after_alpha be proc is_alpha with after
+        Let after_op be proc is_operator_symbol_char with after
+        Let after_quote be 0
+        If after is equal to 34:
+            Set after_quote to 1
+        End If
+        Let symbolish be 0
+        If after_alpha is equal to 1:
+            Set symbolish to 1
+        End If
+        If after_op is equal to 1:
+            Set symbolish to 1
+        End If
+        If after_quote is equal to 1:
+            Set symbolish to 1
+        End If
+        If symbolish is equal to 1:
+            If pv is equal to 0:
+                Let sym_tok be proc lex_symbol with lexer
+                Return sym_tok
+            End If
+        End If
+        Note: plain colon (hash value separator, ternary else)
+        Let source2 be proc memory_get_int64 from Memory with lexer, 0
+        Let co_start be proc memory_get_int64 from Memory with lexer, 8
+        proc advance_char with lexer
+        Let co_end be proc memory_get_int64 from Memory with lexer, 8
+        Let co_lex be proc ruby_substring with source2, co_start, co_end
+        Let co_tok be proc create_token with TOKEN_COLON, co_lex, line, column
+        Return co_tok
+    End If
+
+    Note: Regex vs division
+    If ch is equal to 47:
+        Let pv be proc prev_is_value with prev_type
+        If pv is equal to 0:
+            Let rx_tok be proc lex_regex with lexer
+            Return rx_tok
+        End If
+    End If
+
+    Note: ---- Multi-character operators ----
+    Let next_ch be proc peek_char with lexer, 1
+    Let next2 be proc peek_char with lexer, 2
+    Let source be proc memory_get_int64 from Memory with lexer, 0
+
+    Note: Three-character: ... <=> **= <<= >>=
+    If ch is equal to 46:
+        If next_ch is equal to 46:
+            If next2 is equal to 46:
+                Let s be proc memory_get_int64 from Memory with lexer, 8
+                proc advance_char with lexer
+                proc advance_char with lexer
+                proc advance_char with lexer
+                Let e be proc memory_get_int64 from Memory with lexer, 8
+                Let lx be proc ruby_substring with source, s, e
+                Let tk be proc create_token with TOKEN_RANGE_EXCL, lx, line, column
+                Return tk
+            End If
+            Let s2 be proc memory_get_int64 from Memory with lexer, 8
+            proc advance_char with lexer
+            proc advance_char with lexer
+            Let e2 be proc memory_get_int64 from Memory with lexer, 8
+            Let lx2 be proc ruby_substring with source, s2, e2
+            Let tk2 be proc create_token with TOKEN_RANGE_INCL, lx2, line, column
+            Return tk2
+        End If
+    End If
+
+    If ch is equal to 60:
+        If next_ch is equal to 61:
+            If next2 is equal to 62:
+                Let s be proc memory_get_int64 from Memory with lexer, 8
+                proc advance_char with lexer
+                proc advance_char with lexer
+                proc advance_char with lexer
+                Let e be proc memory_get_int64 from Memory with lexer, 8
+                Let lx be proc ruby_substring with source, s, e
+                Let tk be proc create_token with TOKEN_SPACESHIP, lx, line, column
+                Return tk
+            End If
+        End If
+        If next_ch is equal to 60:
+            If next2 is equal to 61:
+                Let s be proc memory_get_int64 from Memory with lexer, 8
+                proc advance_char with lexer
+                proc advance_char with lexer
+                proc advance_char with lexer
+                Let e be proc memory_get_int64 from Memory with lexer, 8
+                Let lx be proc ruby_substring with source, s, e
+                Let tk be proc create_token with TOKEN_LSHIFT_ASSIGN, lx, line, column
+                Return tk
+            End If
+        End If
+    End If
+
+    If ch is equal to 62:
+        If next_ch is equal to 62:
+            If next2 is equal to 61:
+                Let s be proc memory_get_int64 from Memory with lexer, 8
+                proc advance_char with lexer
+                proc advance_char with lexer
+                proc advance_char with lexer
+                Let e be proc memory_get_int64 from Memory with lexer, 8
+                Let lx be proc ruby_substring with source, s, e
+                Let tk be proc create_token with TOKEN_RSHIFT_ASSIGN, lx, line, column
+                Return tk
+            End If
+        End If
+    End If
+
+    If ch is equal to 42:
+        If next_ch is equal to 42:
+            If next2 is equal to 61:
+                Let s be proc memory_get_int64 from Memory with lexer, 8
+                proc advance_char with lexer
+                proc advance_char with lexer
+                proc advance_char with lexer
+                Let e be proc memory_get_int64 from Memory with lexer, 8
+                Let lx be proc ruby_substring with source, s, e
+                Let tk be proc create_token with TOKEN_POWER_ASSIGN, lx, line, column
+                Return tk
+            End If
+        End If
+    End If
+
+    Note: Two-character operators
+    Let pair_token be proc lex_two_char_operator with lexer, ch, next_ch, line, column
+    If pair_token is not equal to 0:
+        Return pair_token
+    End If
+
+    Note: Single-character tokens
+    Let single_start be proc memory_get_int64 from Memory with lexer, 8
+    proc advance_char with lexer
+    Let single_end be proc memory_get_int64 from Memory with lexer, 8
+    Let lexeme be proc ruby_substring with source, single_start, single_end
+
+    Let single_token be proc single_char_token with ch, lexeme, line, column
+    Return single_token
 End Process
 
 @Reasoning:
-Numeric detection is needed by the dispatcher and by number/symbol/identifier scans; centralising it in one predicate avoids repeating the ASCII range test.
+Two-character operator recogniser, factored out of next_token to keep that
+dispatcher legible. Returns a token when the (ch, next_ch) pair forms a known
+two-character operator (consuming both bytes), or 0 to signal the caller to
+fall through to single-character handling. The three-character forms (...,
+<=>, **=, <<=, >>=) are handled in next_token before this is called, so the
+two-char cases here never shadow them.
 @End Reasoning
+Process called "lex_two_char_operator" takes lexer as Integer, ch as Integer, next_ch as Integer, line as Integer, column as Integer returns Integer:
+    Note: Recognise a two-character operator pair, or return 0
 
-@Implementation:
-Get the character's code point and return true iff it falls in 48..57 (ASCII '0' through '9').
-@End Implementation
+    Let source be proc memory_get_int64 from Memory with lexer, 0
 
-Process called "is_digit" takes char as String returns Integer:
-    Note: Check if character is a digit
-    Return proc char_code with char is greater than or equal to 48 and proc char_code with char is less than or equal to 57
+    Note: == === =~ =>
+    If ch is equal to 61:
+        If next_ch is equal to 61:
+            Let third be proc peek_char with lexer, 2
+            If third is equal to 61:
+                Let s be proc memory_get_int64 from Memory with lexer, 8
+                proc advance_char with lexer
+                proc advance_char with lexer
+                proc advance_char with lexer
+                Let e be proc memory_get_int64 from Memory with lexer, 8
+                Let lx be proc ruby_substring with source, s, e
+                Return proc create_token with TOKEN_CASE_EQUAL, lx, line, column
+            End If
+            Return proc emit_two with lexer, TOKEN_EQUAL_EQUAL, line, column
+        End If
+        If next_ch is equal to 126:
+            Return proc emit_two with lexer, TOKEN_MATCH, line, column
+        End If
+        If next_ch is equal to 62:
+            Return proc emit_two with lexer, TOKEN_HASHROCKET, line, column
+        End If
+    End If
+
+    Note: != !~
+    If ch is equal to 33:
+        If next_ch is equal to 61:
+            Return proc emit_two with lexer, TOKEN_NOT_EQUAL, line, column
+        End If
+        If next_ch is equal to 126:
+            Return proc emit_two with lexer, TOKEN_NOT_MATCH, line, column
+        End If
+    End If
+
+    Note: <= << <-style ; < handled single
+    If ch is equal to 60:
+        If next_ch is equal to 61:
+            Return proc emit_two with lexer, TOKEN_LESS_EQUAL, line, column
+        End If
+        If next_ch is equal to 60:
+            Return proc emit_two with lexer, TOKEN_LSHIFT, line, column
+        End If
+    End If
+
+    Note: >= >>
+    If ch is equal to 62:
+        If next_ch is equal to 61:
+            Return proc emit_two with lexer, TOKEN_GREATER_EQUAL, line, column
+        End If
+        If next_ch is equal to 62:
+            Return proc emit_two with lexer, TOKEN_RSHIFT, line, column
+        End If
+    End If
+
+    Note: ** *=
+    If ch is equal to 42:
+        If next_ch is equal to 42:
+            Return proc emit_two with lexer, TOKEN_POWER, line, column
+        End If
+        If next_ch is equal to 61:
+            Return proc emit_two with lexer, TOKEN_STAR_ASSIGN, line, column
+        End If
+    End If
+
+    Note: += -= ->
+    If ch is equal to 43:
+        If next_ch is equal to 61:
+            Return proc emit_two with lexer, TOKEN_PLUS_ASSIGN, line, column
+        End If
+    End If
+    If ch is equal to 45:
+        If next_ch is equal to 61:
+            Return proc emit_two with lexer, TOKEN_MINUS_ASSIGN, line, column
+        End If
+        If next_ch is equal to 62:
+            Return proc emit_two with lexer, TOKEN_ARROW, line, column
+        End If
+    End If
+
+    Note: /= %=
+    If ch is equal to 47:
+        If next_ch is equal to 61:
+            Return proc emit_two with lexer, TOKEN_SLASH_ASSIGN, line, column
+        End If
+    End If
+    If ch is equal to 37:
+        If next_ch is equal to 61:
+            Return proc emit_two with lexer, TOKEN_PERCENT_ASSIGN, line, column
+        End If
+    End If
+
+    Note: && &&= &. &=
+    If ch is equal to 38:
+        If next_ch is equal to 38:
+            Let third be proc peek_char with lexer, 2
+            If third is equal to 61:
+                Let s be proc memory_get_int64 from Memory with lexer, 8
+                proc advance_char with lexer
+                proc advance_char with lexer
+                proc advance_char with lexer
+                Let e be proc memory_get_int64 from Memory with lexer, 8
+                Let lx be proc ruby_substring with source, s, e
+                Return proc create_token with TOKEN_AND_ASSIGN, lx, line, column
+            End If
+            Return proc emit_two with lexer, TOKEN_AND_AND, line, column
+        End If
+        If next_ch is equal to 46:
+            Return proc emit_two with lexer, TOKEN_SAFE_NAV, line, column
+        End If
+        If next_ch is equal to 61:
+            Return proc emit_two with lexer, TOKEN_AMP_ASSIGN, line, column
+        End If
+    End If
+
+    Note: || ||= |=
+    If ch is equal to 124:
+        If next_ch is equal to 124:
+            Let third be proc peek_char with lexer, 2
+            If third is equal to 61:
+                Let s be proc memory_get_int64 from Memory with lexer, 8
+                proc advance_char with lexer
+                proc advance_char with lexer
+                proc advance_char with lexer
+                Let e be proc memory_get_int64 from Memory with lexer, 8
+                Let lx be proc ruby_substring with source, s, e
+                Return proc create_token with TOKEN_OR_ASSIGN, lx, line, column
+            End If
+            Return proc emit_two with lexer, TOKEN_OR_OR, line, column
+        End If
+        If next_ch is equal to 61:
+            Return proc emit_two with lexer, TOKEN_PIPE_ASSIGN, line, column
+        End If
+    End If
+
+    Note: ^=
+    If ch is equal to 94:
+        If next_ch is equal to 61:
+            Return proc emit_two with lexer, TOKEN_CARET_ASSIGN, line, column
+        End If
+    End If
+
+    Return 0
 End Process
 
 @Reasoning:
-Identifier-start detection requires ASCII letters; two range checks against the lowercase and uppercase letter blocks are tighter than table-driven approaches at this scale.
+Consumes exactly two bytes at the cursor and builds a token of the given type
+whose lexeme is those two bytes. Shared by every two-character operator case
+so the consume/slice pattern lives in one place.
 @End Reasoning
+Process called "emit_two" takes lexer as Integer, token_type as Integer, line as Integer, column as Integer returns Integer:
+    Note: Consume two bytes and emit a token of the given type
 
-@Implementation:
-Compute the character's code point and return true iff it falls in 65..90 (A-Z) or 97..122 (a-z).
-@End Implementation
-
-Process called "is_alpha" takes char as String returns Integer:
-    Note: Check if character is alphabetic
-    Let code be proc char_code from char
-    Return code is greater than or equal to 65 and code is less than or equal to 90 or
-           code is greater than or equal to 97 and code is less than or equal to 122
+    Let source be proc memory_get_int64 from Memory with lexer, 0
+    Let s be proc memory_get_int64 from Memory with lexer, 8
+    proc advance_char with lexer
+    proc advance_char with lexer
+    Let e be proc memory_get_int64 from Memory with lexer, 8
+    Let lx be proc ruby_substring with source, s, e
+    Return proc create_token with token_type, lx, line, column
 End Process
 
 @Reasoning:
-Identifier continuation includes both letters and digits; layering is_alpha_numeric atop the two simpler predicates keeps the alphabet definition centrally located.
+Single-character token classifier. Called after the cursor has already
+consumed the one byte (so the lexeme is materialised); maps the byte value to
+its punctuation/operator token type, or TOKEN_ERROR for an unrecognised byte
+so the parser can report it precisely.
 @End Reasoning
+Process called "single_char_token" takes ch as Integer, lexeme as Integer, line as Integer, column as Integer returns Integer:
+    Note: Map a single consumed byte to its token
 
-@Implementation:
-Return true if is_alpha(char) or is_digit(char) returns 1.
-@End Implementation
+    If ch is equal to 40:
+        Return proc create_token with TOKEN_LPAREN, lexeme, line, column
+    End If
+    If ch is equal to 41:
+        Return proc create_token with TOKEN_RPAREN, lexeme, line, column
+    End If
+    If ch is equal to 123:
+        Return proc create_token with TOKEN_LBRACE, lexeme, line, column
+    End If
+    If ch is equal to 125:
+        Return proc create_token with TOKEN_RBRACE, lexeme, line, column
+    End If
+    If ch is equal to 91:
+        Return proc create_token with TOKEN_LBRACKET, lexeme, line, column
+    End If
+    If ch is equal to 93:
+        Return proc create_token with TOKEN_RBRACKET, lexeme, line, column
+    End If
+    If ch is equal to 44:
+        Return proc create_token with TOKEN_COMMA, lexeme, line, column
+    End If
+    If ch is equal to 46:
+        Return proc create_token with TOKEN_DOT, lexeme, line, column
+    End If
+    If ch is equal to 59:
+        Return proc create_token with TOKEN_SEMICOLON, lexeme, line, column
+    End If
+    If ch is equal to 63:
+        Return proc create_token with TOKEN_QUESTION, lexeme, line, column
+    End If
+    If ch is equal to 43:
+        Return proc create_token with TOKEN_PLUS, lexeme, line, column
+    End If
+    If ch is equal to 45:
+        Return proc create_token with TOKEN_MINUS, lexeme, line, column
+    End If
+    If ch is equal to 42:
+        Return proc create_token with TOKEN_STAR, lexeme, line, column
+    End If
+    If ch is equal to 47:
+        Return proc create_token with TOKEN_SLASH, lexeme, line, column
+    End If
+    If ch is equal to 37:
+        Return proc create_token with TOKEN_PERCENT, lexeme, line, column
+    End If
+    If ch is equal to 61:
+        Return proc create_token with TOKEN_ASSIGN, lexeme, line, column
+    End If
+    If ch is equal to 33:
+        Return proc create_token with TOKEN_BANG, lexeme, line, column
+    End If
+    If ch is equal to 60:
+        Return proc create_token with TOKEN_LESS_THAN, lexeme, line, column
+    End If
+    If ch is equal to 62:
+        Return proc create_token with TOKEN_GREATER_THAN, lexeme, line, column
+    End If
+    If ch is equal to 38:
+        Return proc create_token with TOKEN_AMP, lexeme, line, column
+    End If
+    If ch is equal to 124:
+        Return proc create_token with TOKEN_PIPE, lexeme, line, column
+    End If
+    If ch is equal to 94:
+        Return proc create_token with TOKEN_CARET, lexeme, line, column
+    End If
+    If ch is equal to 126:
+        Return proc create_token with TOKEN_TILDE, lexeme, line, column
+    End If
 
-Process called "is_alpha_numeric" takes char as String returns Integer:
-    Note: Check if character is alphanumeric
-    Return proc is_alpha with char is equal to 1 or proc is_digit with char is equal to 1
+    Return proc create_token with TOKEN_ERROR, lexeme, line, column
 End Process
+
+Note: ============================================================================
+Note: End of Ruby Lexer
+Note: ============================================================================

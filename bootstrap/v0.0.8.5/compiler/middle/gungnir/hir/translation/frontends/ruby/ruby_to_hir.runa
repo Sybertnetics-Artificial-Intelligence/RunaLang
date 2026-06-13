@@ -1,1085 +1,2069 @@
-Note: Ruby to HIR Translator for Translation Translation System
-Note: Converts Ruby AST to High-level Intermediate Representation
+Note: ============================================================================
+Note: Ruby->HIR Translator - Complete translation from Ruby AST to HIR
+Note: ============================================================================
+Note: Part of the Translation translation system
+Note: Lowers the Ruby AST (40-byte node contract from ruby_parser) into the
+Note: hir_nodes producer surface, mirroring the lua/dart frontends. Ruby-only
+Note: operators and constructs are mapped to the nearest HIR_OP_* / HIR node and
+Note: tagged with a "ruby_operator" / "ruby_*" metadata key so hir_to_ruby can
+Note: recover the exact Ruby spelling on the way back out.
+Note: ============================================================================
 
-Import "compiler/middle/gungnir/hir/translation/frontends/ruby/ruby_parser.runa" as RubyParser
-Import "compiler/middle/gungnir/hir/translation/frontends/ruby/ruby_lexer.runa" as RubyLexer
-Import "compiler/middle/gungnir/hir/translation/frontends/ruby/ruby_semantic.runa" as RubySemantic
+Import "compiler/middle/gungnir/hir/translation/frontends/ruby/ruby_parser.runa" as Parser
+Import "compiler/middle/gungnir/hir/translation/frontends/ruby/ruby_lexer.runa" as Lexer
+Import "compiler/middle/gungnir/hir/hir_nodes.runa" as HIR
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/frontend/primitives/collections/list.runa" as ListCore
+Import "compiler/internal/string_utils.runa" as StringUtils
+
+Note: ============================================================================
+Note: Translation Context
+Note: ============================================================================
+
 @Reasoning:
-Ruby's translation needs three stacked context pointers (class / method / block) so nested defs, methods inside blocks, and closures can be linked back to their enclosing scope without re-walking the AST.
+Carries the bridge state between the Ruby AST and the emerging HIR module so
+every translate_* helper can accumulate diagnostics without re-walking the
+source. ast_root is the AST_PROGRAM node from ruby_parser; hir_module is the
+HIR root that translate_program populates. errors is an append-only list mutated
+by translation_error; had_error is set to 1 on the first error to short-circuit
+downstream consumers that test it.
 @End Reasoning
-
 @Implementation:
-Six 8-byte fields: symbol table dictionary, current lexical scope, accumulator list of HIR nodes, plus the three context pointers (class_context, method_context, block_context) used as a manual scope stack during translation.
+The context is an idiomatic value-of-type struct: construction allocates the
+heap home directly and the binding is the struct pointer. Helpers re-bind the
+pointer with a typed Let so field reads/writes are managed by the type system
+and mutations write in place - no read/write round-trips are required.
 @End Implementation
-
-Type called "RubyToHIRTranslator":
-    symbol_table as Integer  Note: Maps symbols to HIR nodes
-    current_scope as Integer  Note: Current scope context
-    hir_nodes as Integer  Note: List of generated HIR nodes
-    class_context as Integer  Note: Current class being translated
-    method_context as Integer  Note: Current method being translated
-    block_context as Integer  Note: Current block being translated
+Type called "RubyToHIRContext":
+    ast_root as Integer            Note: Ruby AST_PROGRAM root node
+    hir_module as Integer          Note: HIR module being constructed
+    errors as Integer              Note: List of translation error strings
+    had_error as Integer           Note: Boolean: 1 if error occurred
 End Type
 
+Note: ============================================================================
+Note: Context Creation and Management
+Note: ============================================================================
+
 @Reasoning:
-The translator must start in the "global" lexical scope with all three context pointers nulled so the first class/method/block entered initialises them rather than inheriting stale state.
+Builds a fresh translation context bound to the supplied AST root and a new
+HIR module named "ruby_module" - downstream renaming can override this once the
+actual Ruby file path is known. The errors list starts empty and had_error at 0.
 @End Reasoning
-
 @Implementation:
-Construct a RubyToHIRTranslator with an empty symbol-table dict, a fresh "global"-named scope, an empty hir_nodes accumulator, and class_context / method_context / block_context all set to 0.
+Constructs the HIR module via hir_create_module and names it via
+hir_set_module_name. Struct construction allocates the context's heap home
+directly; the binding returned is the pointer the caller receives.
 @End Implementation
+Process called "create_translation_context" takes ast_root as Integer returns Integer:
+    Let module_node be proc hir_create_module from HIR
+    proc hir_set_module_name from HIR with module_node, "ruby_module"
 
-Process called "create_ruby_to_hir_translator" returns Integer:
-    Note: Create new Ruby to HIR translator instance
+    Let ctx be a value of type RubyToHIRContext with
+        ast_root as ast_root,
+        hir_module as module_node,
+        errors as proc list_create from ListCore,
+        had_error as 0
 
-    Let translator be a value of type RubyToHIRTranslator with
-        symbol_table as proc create_dict,
-        current_scope as proc create_scope with "global",
-        hir_nodes as proc create_list,
-        class_context as 0,
-        method_context as 0,
-        block_context as 0
-
-    Return translator
+    Return ctx
 End Process
 
 @Reasoning:
-Ruby's AST has 40+ node kinds covering classes, modules, methods, control flow, exceptions, metaprogramming, and literals; a single dispatcher keeps every recursive call site funnel through one entry point.
+Translation errors are accumulated in the context's error list so the full
+batch can be reported instead of aborting on the first failure; this gives
+better diagnostics for source files with multiple issues. The had_error flag
+is the cheap "any errors at all?" query used by had_translation_errors.
 @End Reasoning
-
 @Implementation:
-Match on ast.node_type and route to the corresponding translate_* helper. Unknown tags fall through to create_hir_unknown so unsupported constructs survive as inspectable placeholders rather than silently disappearing.
+Re-bind the context pointer with a typed Let; append the message to the error
+list and set had_error to 1 in place.
 @End Implementation
+Process called "translation_error" takes ctx_ptr as Integer, message as String:
+    Let ctx as RubyToHIRContext be ctx_ptr
+    proc list_append from ListCore with ctx.errors, message
+    Set ctx.had_error to 1
+End Process
 
-Process called "translate_ruby_to_hir" takes translator as Integer, ast as Integer returns Integer:
-    Note: Translate Ruby AST to HIR with complete feature support
+Note: ============================================================================
+Note: Expression Translation
+Note: ============================================================================
 
-    Let node_type be ast.node_type
+@Reasoning:
+The expression dispatcher routes to a leaf-specific translator based on the
+AST node-type tag read via ast_node_type. Tag ordering puts literals and
+identifiers first (the most frequent leaves in real Ruby), then composite
+forms. Unknown tags record a translation error and return 0 so the caller can
+detect failure without crashing the whole translation.
+@End Reasoning
+Process called "translate_expression" takes ctx_ptr as Integer, expr_node as Integer returns Integer:
+    Let node_type be proc ast_node_type from Parser with expr_node
 
-    Match node_type:
-        When AST_PROGRAM from RubyParser:
-            Return proc translate_program with translator, ast
-        When AST_CLASS from RubyParser:
-            Return proc translate_class with translator, ast
-        When AST_MODULE from RubyParser:
-            Return proc translate_module with translator, ast
-        When AST_METHOD from RubyParser:
-            Return proc translate_method with translator, ast
-        When AST_BLOCK from RubyParser:
-            Return proc translate_block with translator, ast
-        When AST_IF from RubyParser:
-            Return proc translate_if with translator, ast
-        When AST_UNLESS from RubyParser:
-            Return proc translate_unless with translator, ast
-        When AST_WHILE from RubyParser:
-            Return proc translate_while with translator, ast
-        When AST_UNTIL from RubyParser:
-            Return proc translate_until with translator, ast
-        When AST_FOR from RubyParser:
-            Return proc translate_for with translator, ast
-        When AST_CASE from RubyParser:
-            Return proc translate_case with translator, ast
-        When AST_BEGIN_RESCUE from RubyParser:
-            Return proc translate_begin_rescue with translator, ast
-        When AST_RESCUE from RubyParser:
-            Return proc translate_rescue with translator, ast
-        When AST_ENSURE from RubyParser:
-            Return proc translate_ensure with translator, ast
-        When AST_YIELD from RubyParser:
-            Return proc translate_yield with translator, ast
-        When AST_LAMBDA from RubyParser:
-            Return proc translate_lambda with translator, ast
-        When AST_PROC from RubyParser:
-            Return proc translate_proc with translator, ast
-        When AST_ASSIGNMENT from RubyParser:
-            Return proc translate_assignment with translator, ast
-        When AST_METHOD_CALL from RubyParser:
-            Return proc translate_method_call with translator, ast
-        When AST_SUPER_CALL from RubyParser:
-            Return proc translate_super_call with translator, ast
-        When AST_SELF from RubyParser:
-            Return proc translate_self with translator, ast
-        When AST_IDENTIFIER from RubyParser:
-            Return proc translate_identifier with translator, ast
-        When AST_CONSTANT from RubyParser:
-            Return proc translate_constant with translator, ast
-        When AST_INSTANCE_VAR from RubyParser:
-            Return proc translate_instance_var with translator, ast
-        When AST_CLASS_VAR from RubyParser:
-            Return proc translate_class_var with translator, ast
-        When AST_GLOBAL_VAR from RubyParser:
-            Return proc translate_global_var with translator, ast
-        When AST_SYMBOL from RubyParser:
-            Return proc translate_symbol with translator, ast
-        When AST_STRING from RubyParser:
-            Return proc translate_string with translator, ast
-        When AST_INTERPOLATED_STRING from RubyParser:
-            Return proc translate_interpolated_string with translator, ast
-        When AST_NUMBER from RubyParser:
-            Return proc translate_number with translator, ast
-        When AST_ARRAY from RubyParser:
-            Return proc translate_array with translator, ast
-        When AST_HASH from RubyParser:
-            Return proc translate_hash with translator, ast
-        When AST_RANGE from RubyParser:
-            Return proc translate_range with translator, ast
-        When AST_BINARY_OP from RubyParser:
-            Return proc translate_binary_op with translator, ast
-        When AST_UNARY_OP from RubyParser:
-            Return proc translate_unary_op with translator, ast
-        When AST_RETURN from RubyParser:
-            Return proc translate_return with translator, ast
-        When AST_BREAK from RubyParser:
-            Return proc translate_break with translator, ast
-        When AST_NEXT from RubyParser:
-            Return proc translate_next with translator, ast
-        When AST_INCLUDE from RubyParser:
-            Return proc translate_include with translator, ast
-        When AST_EXTEND from RubyParser:
-            Return proc translate_extend with translator, ast
-        When AST_ALIAS from RubyParser:
-            Return proc translate_alias with translator, ast
-        When AST_UNDEF from RubyParser:
-            Return proc translate_undef with translator, ast
+    If node_type is equal to Parser.AST_INTEGER:
+        Return proc translate_integer_literal with ctx_ptr, expr_node
+    End If
+    If node_type is equal to Parser.AST_FLOAT:
+        Return proc translate_float_literal with ctx_ptr, expr_node
+    End If
+    If node_type is equal to Parser.AST_STRING:
+        Return proc translate_string_literal with ctx_ptr, expr_node
+    End If
+    If node_type is equal to Parser.AST_STRING_INTERP:
+        Return proc translate_string_interp with ctx_ptr, expr_node
+    End If
+    If node_type is equal to Parser.AST_SYMBOL:
+        Return proc translate_symbol with ctx_ptr, expr_node
+    End If
+    If node_type is equal to Parser.AST_REGEXP:
+        Return proc translate_regexp with ctx_ptr, expr_node
+    End If
+    If node_type is equal to Parser.AST_NIL:
+        Return proc hir_create_null_literal from HIR
+    End If
+    If node_type is equal to Parser.AST_TRUE:
+        Return proc hir_create_bool_literal from HIR with 1
+    End If
+    If node_type is equal to Parser.AST_FALSE:
+        Return proc hir_create_bool_literal from HIR with 0
+    End If
+    If node_type is equal to Parser.AST_SELF:
+        Return proc translate_self with ctx_ptr, expr_node
+    End If
+    If node_type is equal to Parser.AST_IDENTIFIER:
+        Return proc translate_identifier with ctx_ptr, expr_node
+    End If
+    If node_type is equal to Parser.AST_CONSTANT:
+        Return proc translate_constant with ctx_ptr, expr_node
+    End If
+    If node_type is equal to Parser.AST_INSTANCE_VAR:
+        Return proc translate_sigil_variable with ctx_ptr, expr_node, "instance_variable"
+    End If
+    If node_type is equal to Parser.AST_CLASS_VAR:
+        Return proc translate_sigil_variable with ctx_ptr, expr_node, "class_variable"
+    End If
+    If node_type is equal to Parser.AST_GLOBAL_VAR:
+        Return proc translate_sigil_variable with ctx_ptr, expr_node, "global_variable"
+    End If
+    If node_type is equal to Parser.AST_ARRAY:
+        Return proc translate_array with ctx_ptr, expr_node
+    End If
+    If node_type is equal to Parser.AST_HASH:
+        Return proc translate_hash with ctx_ptr, expr_node
+    End If
+    If node_type is equal to Parser.AST_BINARY_OP:
+        Return proc translate_binary_op with ctx_ptr, expr_node
+    End If
+    If node_type is equal to Parser.AST_UNARY_OP:
+        Return proc translate_unary_op with ctx_ptr, expr_node
+    End If
+    If node_type is equal to Parser.AST_AND:
+        Return proc translate_logical with ctx_ptr, expr_node, HIR.HIR_OP_LOGICAL_AND
+    End If
+    If node_type is equal to Parser.AST_OR:
+        Return proc translate_logical with ctx_ptr, expr_node, HIR.HIR_OP_LOGICAL_OR
+    End If
+    If node_type is equal to Parser.AST_NOT:
+        Return proc translate_not with ctx_ptr, expr_node
+    End If
+    If node_type is equal to Parser.AST_TERNARY:
+        Return proc translate_ternary with ctx_ptr, expr_node
+    End If
+    If node_type is equal to Parser.AST_RANGE:
+        Return proc translate_range with ctx_ptr, expr_node
+    End If
+    If node_type is equal to Parser.AST_METHOD_CALL:
+        Return proc translate_method_call with ctx_ptr, expr_node
+    End If
+    If node_type is equal to Parser.AST_INDEX:
+        Return proc translate_index with ctx_ptr, expr_node
+    End If
+    If node_type is equal to Parser.AST_MEMBER:
+        Return proc translate_member with ctx_ptr, expr_node
+    End If
+    If node_type is equal to Parser.AST_SCOPE_REF:
+        Return proc translate_scope_ref with ctx_ptr, expr_node
+    End If
+    If node_type is equal to Parser.AST_SUPER_CALL:
+        Return proc translate_super_call with ctx_ptr, expr_node
+    End If
+    If node_type is equal to Parser.AST_ASSIGN:
+        Return proc translate_assign with ctx_ptr, expr_node
+    End If
+    If node_type is equal to Parser.AST_OP_ASSIGN:
+        Return proc translate_op_assign with ctx_ptr, expr_node
+    End If
+    If node_type is equal to Parser.AST_LAMBDA:
+        Return proc translate_lambda with ctx_ptr, expr_node
+    End If
+    If node_type is equal to Parser.AST_PROC:
+        Return proc translate_proc with ctx_ptr, expr_node
+    End If
+    If node_type is equal to Parser.AST_BLOCK:
+        Return proc translate_block_closure with ctx_ptr, expr_node
+    End If
+    If node_type is equal to Parser.AST_DEFINED:
+        Return proc translate_defined with ctx_ptr, expr_node
+    End If
+    If node_type is equal to Parser.AST_YIELD:
+        Return proc translate_yield with ctx_ptr, expr_node
+    End If
+
+    proc translation_error with ctx_ptr, "Unknown Ruby expression type"
+    Return 0
+End Process
+
+@Reasoning:
+Ruby integer literals carry their lexeme verbatim in the value slot (e.g. "42",
+"0x1F", "1_000"). HIR's integer literal stores a native integer, so we parse the
+lexeme through string_to_integer which already handles Ruby's underscore-free
+decimal forms; non-decimal radixes round-trip via the lexeme metadata so the
+backend can re-emit the exact source spelling.
+@End Reasoning
+Process called "translate_integer_literal" takes ctx_ptr as Integer, node as Integer returns Integer:
+    Let lexeme be proc ast_node_value from Parser with node
+    Let ival be proc string_to_integer from StringUtils with lexeme
+    Let hir_int be proc hir_create_int_literal from HIR with ival
+    proc hir_set_metadata from HIR with hir_int, "ruby_int_lexeme", lexeme
+    Return hir_int
+End Process
+
+@Reasoning:
+Ruby float literals ("3.14", "1.0e10") map to HIR float literals. We parse the
+lexeme via string_to_float and retain the original lexeme in metadata so the
+backend reproduces the exact textual form rather than a reformatted float.
+@End Reasoning
+Process called "translate_float_literal" takes ctx_ptr as Integer, node as Integer returns Integer:
+    Let lexeme be proc ast_node_value from Parser with node
+    Let fval be proc string_to_float from StringUtils with lexeme
+    Let hir_float be proc hir_create_float_literal from HIR with fval
+    proc hir_set_metadata from HIR with hir_float, "ruby_float_lexeme", lexeme
+    Return hir_float
+End Process
+
+@Reasoning:
+Ruby string literals arrive with their delimiters still attached in the value
+slot (e.g. "\"hello\"" or "'hi'" or "%q{x}"). The HIR string literal stores raw
+character data, so we strip the surrounding delimiters via strip_string_delims
+and keep the original quote style in metadata for faithful re-emission.
+@End Reasoning
+Process called "translate_string_literal" takes ctx_ptr as Integer, node as Integer returns Integer:
+    Let lexeme be proc ast_node_value from Parser with node
+    Let inner be proc strip_string_delims with lexeme
+    Let hir_str be proc hir_create_string_literal from HIR with inner
+    proc hir_set_metadata from HIR with hir_str, "ruby_string_lexeme", lexeme
+    Return hir_str
+End Process
+
+@Reasoning:
+A double-quoted string carrying #{...} interpolation cannot be represented as a
+single HIR string literal without losing the embedded expressions. We keep the
+raw lexeme on a HIR string literal tagged "ruby_interp" so the backend re-emits
+the interpolation verbatim; the structural round-trip preserves the source while
+remaining a valid HIR expression node.
+@End Reasoning
+Process called "translate_string_interp" takes ctx_ptr as Integer, node as Integer returns Integer:
+    Let lexeme be proc ast_node_value from Parser with node
+    Let inner be proc strip_string_delims with lexeme
+    Let hir_str be proc hir_create_string_literal from HIR with inner
+    proc hir_set_metadata from HIR with hir_str, "ruby_interp", "true"
+    proc hir_set_metadata from HIR with hir_str, "ruby_string_lexeme", lexeme
+    Return hir_str
+End Process
+
+@Reasoning:
+Ruby symbols (:foo) are interned identifiers distinct from strings. HIR has no
+symbol literal, so we lower a symbol to a string literal carrying the symbol's
+name (sans leading colon) tagged "ruby_symbol" so the backend re-emits the
+colon-prefixed form. The string carrier preserves the symbol's textual identity
+for the structural round-trip.
+@End Reasoning
+Process called "translate_symbol" takes ctx_ptr as Integer, node as Integer returns Integer:
+    Let lexeme be proc ast_node_value from Parser with node
+    Let name be proc strip_leading_colon with lexeme
+    Let hir_sym be proc hir_create_string_literal from HIR with name
+    proc hir_set_metadata from HIR with hir_sym, "ruby_symbol", "true"
+    Return hir_sym
+End Process
+
+@Reasoning:
+Ruby regular-expression literals (/pat/flags) have no HIR counterpart; we carry
+the full lexeme on a string literal tagged "ruby_regexp" so the backend re-emits
+the slash-delimited form exactly. Treating it as a string carrier keeps it a
+valid HIR expression while losing nothing on the round-trip.
+@End Reasoning
+Process called "translate_regexp" takes ctx_ptr as Integer, node as Integer returns Integer:
+    Let lexeme be proc ast_node_value from Parser with node
+    Let hir_re be proc hir_create_string_literal from HIR with lexeme
+    proc hir_set_metadata from HIR with hir_re, "ruby_regexp", "true"
+    Return hir_re
+End Process
+
+@Reasoning:
+Ruby's "self" is the implicit receiver of the current method. HIR has no self
+node in the producer surface used here, so we lower self to an identifier named
+"self" tagged "ruby_self"; the backend recognises the tag and re-emits the
+keyword rather than a bare name.
+@End Reasoning
+Process called "translate_self" takes ctx_ptr as Integer, node as Integer returns Integer:
+    Let hir_id be proc hir_create_identifier from HIR with "self"
+    proc hir_set_metadata from HIR with hir_id, "ruby_self", "true"
+    Return hir_id
+End Process
+
+@Reasoning:
+A plain identifier resolves at runtime against the local scope or as a zero-arg
+method send; at translation time we record only the textual name. The parser
+emits an AST_IDENTIFIER with a 0 value as the implicit-self placeholder inside
+method calls, so we guard a missing name into the empty string.
+@End Reasoning
+Process called "translate_identifier" takes ctx_ptr as Integer, node as Integer returns Integer:
+    Let name be proc ast_node_value from Parser with node
+    If name is equal to 0:
+        Return proc hir_create_identifier from HIR with ""
+    End If
+    Return proc hir_create_identifier from HIR with name
+End Process
+
+@Reasoning:
+Ruby constants (uppercase-led names like Foo or MAX) are identifiers whose
+naming convention marks them as constants. We lower them to a HIR identifier
+tagged "ruby_constant" so semantic and backend passes can distinguish a constant
+reference from an ordinary local without re-classifying by first letter.
+@End Reasoning
+Process called "translate_constant" takes ctx_ptr as Integer, node as Integer returns Integer:
+    Let name be proc ast_node_value from Parser with node
+    Let hir_id be proc hir_create_identifier from HIR with name
+    proc hir_set_metadata from HIR with hir_id, "ruby_constant", "true"
+    Return hir_id
+End Process
+
+@Reasoning:
+Instance (@x), class (@@x) and global ($x) variables all carry their sigil in
+the lexeme. They behave as identifiers whose kind is fixed by the sigil, so we
+preserve the full sigilled name in a HIR identifier and tag the kind in
+"ruby_var_kind" metadata; keeping the sigil in the name means the backend
+re-emits the exact source token without reconstruction.
+@End Reasoning
+Process called "translate_sigil_variable" takes ctx_ptr as Integer, node as Integer, kind as String returns Integer:
+    Let name be proc ast_node_value from Parser with node
+    Let hir_id be proc hir_create_identifier from HIR with name
+    proc hir_set_metadata from HIR with hir_id, "ruby_var_kind", kind
+    Return hir_id
+End Process
+
+@Reasoning:
+Ruby array literals [a, b, *rest] carry their elements as direct children, with
+splat elements wrapped in AST_SPLAT_ARG. We translate each element into the HIR
+list literal in source order; a splat child is unwrapped to its inner expression
+and tagged via a wrapper identifier so the backend can re-prefix the star.
+@End Reasoning
+Process called "translate_array" takes ctx_ptr as Integer, node as Integer returns Integer:
+    Let hir_list be proc hir_create_list_literal from HIR
+    Let count be proc ast_node_child_count from Parser with node
+
+    Let i be 0
+    While i is less than count:
+        Let child be proc ast_node_child from Parser with node, i
+        Let child_type be proc ast_node_type from Parser with child
+
+        If child_type is equal to Parser.AST_SPLAT_ARG:
+            Let inner be proc ast_node_child from Parser with child, 0
+            Let inner_hir be proc translate_expression with ctx_ptr, inner
+            proc hir_set_metadata from HIR with inner_hir, "ruby_splat", "true"
+            proc hir_add_list_element from HIR with hir_list, inner_hir
         Otherwise:
-            Return proc create_hir_unknown from ast
-    End Match
-End Process
-
-@Reasoning:
-The Ruby AST_PROGRAM root is the entire .rb file; lifting it into an HIR module node with body="main" gives downstream consumers a uniform module-shaped envelope regardless of source.
-@End Reasoning
-
-@Implementation:
-Dictionary tagged node_type=module with name="main". Iterate every top-level child via translate_ruby_to_hir, push non-null results into the body statements List, attach at "body".
-@End Implementation
-
-Process called "translate_program" takes translator as Integer, ast as Integer returns Integer:
-    Note: Translate Ruby program to HIR module
-
-    Let hir_module be proc create_hir_dict
-    proc set_dict_value with hir_module, "node_type", "module"
-    proc set_dict_value with hir_module, "name", "main"
-
-    Let statements be proc create_list
-
-    Note: Translate all top-level statements
-    Let child_count be proc get_list_size with ast.children
-    Let index be 0
-
-    While index is less than child_count:
-        Let child be proc get_list_item with ast.children, index
-        Let hir_child be proc translate_ruby_to_hir with translator, child
-
-        If hir_child is not equal to 0:
-            proc add_to_list with statements, hir_child
+            Let elem_hir be proc translate_expression with ctx_ptr, child
+            proc hir_add_list_element from HIR with hir_list, elem_hir
         End If
 
-        Set index to index plus 1
+        Set i to i plus 1
     End While
 
-    proc set_dict_value with hir_module, "body", statements
-
-    Return hir_module
+    Return hir_list
 End Process
 
 @Reasoning:
-Ruby classes carry a name, optional superclass, mixins (include/extend), and a body whose own statements may further nest classes; saving and restoring class_context implements lexical-class tracking through arbitrarily deep nesting.
+Ruby hash literals { k => v, name: v } flatten into AST_HASH_PAIR children, each
+holding key (child 0) and value (child 1). The shorthand "name:" form already
+arrives as an AST_SYMBOL key from the parser. We translate each pair into a HIR
+map entry; symbol keys carry the "ruby_symbol" tag so the backend re-emits the
+"name:" shorthand when applicable.
 @End Reasoning
+Process called "translate_hash" takes ctx_ptr as Integer, node as Integer returns Integer:
+    Let hir_map be proc hir_create_map_literal from HIR
+    Let count be proc ast_node_child_count from Parser with node
 
-@Implementation:
-Dictionary tagged node_type=class. Copy the name attribute, recurse into the optional superclass. Save the current class_context, set it to this class, push a "class" lexical scope. Walk body children translating each; then extract include/extend statements via extract_mixins. Pop the scope and restore class_context.
-@End Implementation
+    Let i be 0
+    While i is less than count:
+        Let pair be proc ast_node_child from Parser with node, i
+        Let key_ast be proc ast_node_child from Parser with pair, 0
+        Let value_ast be proc ast_node_child from Parser with pair, 1
 
-@Performance_Hints:
-O(n) in class body length plus the cost of every nested translation; one allocation per HIR node.
-@End Performance_Hints
+        Let key_hir be proc translate_expression with ctx_ptr, key_ast
+        Let value_hir be proc translate_expression with ctx_ptr, value_ast
 
-Process called "translate_class" takes translator as Integer, ast as Integer returns Integer:
-    Note: Translate Ruby class with inheritance and mixins to HIR
+        proc hir_add_map_entry from HIR with hir_map, key_hir, value_hir
+        Set i to i plus 1
+    End While
 
-    Let hir_class be proc create_hir_dict
-    proc set_dict_value with hir_class, "node_type", "class"
+    Return hir_map
+End Process
 
-    Note: Get class name
-    Let class_name be proc get_node_attribute with ast, "name"
-    proc set_dict_value with hir_class, "name", class_name
+@Reasoning:
+Ruby binary operators (child 0 = left, child 1 = right, operator in value) map
+mostly 1:1 to HIR opcodes. The Ruby-only operators - power "**", string-spaceship
+"<=>", case-equality "===", pattern-match "=~" - have no native HIR opcode, so
+they lower to the nearest structural opcode and are tagged "ruby_operator" with
+their exact spelling so hir_to_ruby recovers the original token.
+@End Reasoning
+Process called "translate_binary_op" takes ctx_ptr as Integer, node as Integer returns Integer:
+    Let op_lexeme be proc ast_node_value from Parser with node
+    Let left_ast be proc ast_node_child from Parser with node, 0
+    Let right_ast be proc ast_node_child from Parser with node, 1
 
-    Note: Handle inheritance
-    Let superclass be proc get_node_attribute with ast, "superclass"
-    If superclass is not equal to 0:
-        Let hir_superclass be proc translate_ruby_to_hir with translator, superclass
-        proc set_dict_value with hir_class, "superclass", hir_superclass
+    Let left_hir be proc translate_expression with ctx_ptr, left_ast
+    Let right_hir be proc translate_expression with ctx_ptr, right_ast
+
+    Let hir_op be proc map_ruby_binop_to_hir with op_lexeme
+    Let hir_binary be proc hir_create_binary_expr from HIR with hir_op, left_hir, right_hir
+
+    Note: Tag every binary with its source spelling so the backend reproduces
+    Note: Ruby-only operators (** <=> === =~ !~) that share an HIR opcode.
+    proc hir_set_metadata from HIR with hir_binary, "ruby_operator", op_lexeme
+
+    Return hir_binary
+End Process
+
+@Reasoning:
+The operator-string -> HIR opcode mapping is an unrolled string_equals cascade
+because Ruby has a small fixed operator set and a hash lookup would force an
+allocation. Ruby's "**" (power) lowers to HIR_OP_MULTIPLY, "<=>"/"==="/"=~"/"!~"
+lower to HIR_OP_EQUAL as structural placeholders; all four are disambiguated by
+the "ruby_operator" metadata the caller attaches. "/"/"%" map exactly. Branch
+order roughly tracks expected frequency.
+@End Reasoning
+Process called "map_ruby_binop_to_hir" takes operator as Integer returns Integer:
+    If proc string_equals from StringCore with operator, "+" is equal to 1:
+        Return HIR.HIR_OP_ADD
+    End If
+    If proc string_equals from StringCore with operator, "-" is equal to 1:
+        Return HIR.HIR_OP_SUBTRACT
+    End If
+    If proc string_equals from StringCore with operator, "*" is equal to 1:
+        Return HIR.HIR_OP_MULTIPLY
+    End If
+    If proc string_equals from StringCore with operator, "/" is equal to 1:
+        Return HIR.HIR_OP_DIVIDE
+    End If
+    If proc string_equals from StringCore with operator, "%" is equal to 1:
+        Return HIR.HIR_OP_MODULO
+    End If
+    If proc string_equals from StringCore with operator, "**" is equal to 1:
+        Return HIR.HIR_OP_MULTIPLY
+    End If
+    If proc string_equals from StringCore with operator, "==" is equal to 1:
+        Return HIR.HIR_OP_EQUAL
+    End If
+    If proc string_equals from StringCore with operator, "!=" is equal to 1:
+        Return HIR.HIR_OP_NOT_EQUAL
+    End If
+    If proc string_equals from StringCore with operator, "<" is equal to 1:
+        Return HIR.HIR_OP_LESS_THAN
+    End If
+    If proc string_equals from StringCore with operator, ">" is equal to 1:
+        Return HIR.HIR_OP_GREATER_THAN
+    End If
+    If proc string_equals from StringCore with operator, "<=" is equal to 1:
+        Return HIR.HIR_OP_LESS_EQUAL
+    End If
+    If proc string_equals from StringCore with operator, ">=" is equal to 1:
+        Return HIR.HIR_OP_GREATER_EQUAL
+    End If
+    If proc string_equals from StringCore with operator, "<=>" is equal to 1:
+        Return HIR.HIR_OP_EQUAL
+    End If
+    If proc string_equals from StringCore with operator, "===" is equal to 1:
+        Return HIR.HIR_OP_EQUAL
+    End If
+    If proc string_equals from StringCore with operator, "=~" is equal to 1:
+        Return HIR.HIR_OP_EQUAL
+    End If
+    If proc string_equals from StringCore with operator, "!~" is equal to 1:
+        Return HIR.HIR_OP_NOT_EQUAL
+    End If
+    If proc string_equals from StringCore with operator, "&" is equal to 1:
+        Return HIR.HIR_OP_BITWISE_AND
+    End If
+    If proc string_equals from StringCore with operator, "|" is equal to 1:
+        Return HIR.HIR_OP_BITWISE_OR
+    End If
+    If proc string_equals from StringCore with operator, "^" is equal to 1:
+        Return HIR.HIR_OP_BITWISE_XOR
+    End If
+    If proc string_equals from StringCore with operator, "<<" is equal to 1:
+        Return HIR.HIR_OP_SHIFT_LEFT
+    End If
+    If proc string_equals from StringCore with operator, ">>" is equal to 1:
+        Return HIR.HIR_OP_SHIFT_RIGHT
+    End If
+    If proc string_equals from StringCore with operator, "&&" is equal to 1:
+        Return HIR.HIR_OP_LOGICAL_AND
+    End If
+    If proc string_equals from StringCore with operator, "||" is equal to 1:
+        Return HIR.HIR_OP_LOGICAL_OR
     End If
 
-    Note: Set class context
-    Let previous_class be translator.class_context
-    Set translator.class_context to hir_class
-
-    Note: Create class scope
-    proc push_scope with translator, "class"
-
-    Note: Translate class body
-    Let body_statements be proc create_list
-    Let child_count be proc get_list_size with ast.children
-    Let index be 0
-
-    While index is less than child_count:
-        Let child be proc get_list_item with ast.children, index
-        Let hir_child be proc translate_ruby_to_hir with translator, child
-
-        If hir_child is not equal to 0:
-            proc add_to_list with body_statements, hir_child
-        End If
-
-        Set index to index plus 1
-    End While
-
-    proc set_dict_value with hir_class, "body", body_statements
-
-    Note: Handle included modules and extended modules
-    proc extract_mixins with translator, hir_class, body_statements
-
-    Note: Restore previous context
-    proc pop_scope from translator
-    Set translator.class_context to previous_class
-
-    Return hir_class
+    Return HIR.HIR_OP_ADD  Note: Structural fallback; ruby_operator metadata is authoritative
 End Process
 
 @Reasoning:
-Ruby modules act as namespaces and mixin containers - structurally similar to classes but without inheritance or instantiation - so HIR represents them with a "module" tag distinct from class.
+Ruby unary operators are -, +, ~, and ! (logical not arrives separately as
+AST_NOT). The operator lexeme is in the value slot and the operand is child 0.
+Unary "+" has no HIR opcode and is an identity operation, so we lower it to the
+operand directly while tagging the result so the backend can re-prefix the plus.
 @End Reasoning
+Process called "translate_unary_op" takes ctx_ptr as Integer, node as Integer returns Integer:
+    Let op_lexeme be proc ast_node_value from Parser with node
+    Let operand_ast be proc ast_node_child from Parser with node, 0
+    Let operand_hir be proc translate_expression with ctx_ptr, operand_ast
 
-@Implementation:
-Dictionary tagged node_type=module. Copy the name attribute, push a "module" lexical scope, recursively translate body children into the body List, pop the scope.
-@End Implementation
-
-Process called "translate_module" takes translator as Integer, ast as Integer returns Integer:
-    Note: Translate Ruby module to HIR
-
-    Let hir_module be proc create_hir_dict
-    proc set_dict_value with hir_module, "node_type", "module"
-
-    Note: Get module name
-    Let module_name be proc get_node_attribute with ast, "name"
-    proc set_dict_value with hir_module, "name", module_name
-
-    Note: Create module scope
-    proc push_scope with translator, "module"
-
-    Note: Translate module body
-    Let body_statements be proc create_list
-    Let child_count be proc get_list_size with ast.children
-    Let index be 0
-
-    While index is less than child_count:
-        Let child be proc get_list_item with ast.children, index
-        Let hir_child be proc translate_ruby_to_hir with translator, child
-
-        If hir_child is not equal to 0:
-            proc add_to_list with body_statements, hir_child
-        End If
-
-        Set index to index plus 1
-    End While
-
-    proc set_dict_value with hir_module, "body", body_statements
-
-    Note: Restore previous scope
-    proc pop_scope from translator
-
-    Return hir_module
-End Process
-
-@Reasoning:
-Ruby methods need parameter list lowering (positional + splat + double-splat + block + defaults), implicit-return wrapping, and proper method_context tracking so nested yields and blocks resolve to the right enclosing method.
-@End Reasoning
-
-@Implementation:
-Dictionary tagged node_type=function with name and translated parameters. Save method_context, set it to this method, push a "method" scope. Translate body children, attach as "body". Run ensure_implicit_return to wrap the last statement in an implicit "return" node. Restore scope and method_context.
-@End Implementation
-
-Process called "translate_method" takes translator as Integer, ast as Integer returns Integer:
-    Note: Translate Ruby method with blocks and metaprogramming features
-
-    Let hir_method be proc create_hir_dict
-    proc set_dict_value with hir_method, "node_type", "function"
-
-    Note: Get method name
-    Let method_name be proc get_node_attribute with ast, "name"
-    proc set_dict_value with hir_method, "name", method_name
-
-    Note: Handle parameters
-    Let parameters be proc get_node_attribute with ast, "parameters"
-    If parameters is not equal to 0:
-        Let hir_params be proc translate_method_parameters with translator, parameters
-        proc set_dict_value with hir_method, "parameters", hir_params
+    If proc string_equals from StringCore with op_lexeme, "-" is equal to 1:
+        Return proc hir_create_unary_expr from HIR with HIR.HIR_OP_NEGATE, operand_hir
+    End If
+    If proc string_equals from StringCore with op_lexeme, "~" is equal to 1:
+        Return proc hir_create_unary_expr from HIR with HIR.HIR_OP_BITWISE_NOT, operand_hir
+    End If
+    If proc string_equals from StringCore with op_lexeme, "!" is equal to 1:
+        Return proc hir_create_unary_expr from HIR with HIR.HIR_OP_LOGICAL_NOT, operand_hir
     End If
 
-    Note: Set method context
-    Let previous_method be translator.method_context
-    Set translator.method_context to hir_method
-
-    Note: Create method scope
-    proc push_scope with translator, "method"
-
-    Note: Translate method body
-    Let body_statements be proc create_list
-    Let child_count be proc get_list_size with ast.children
-    Let index be 0
-
-    While index is less than child_count:
-        Let child be proc get_list_item with ast.children, index
-        Let hir_child be proc translate_ruby_to_hir with translator, child
-
-        If hir_child is not equal to 0:
-            proc add_to_list with body_statements, hir_child
-        End If
-
-        Set index to index plus 1
-    End While
-
-    proc set_dict_value with hir_method, "body", body_statements
-
-    Note: Handle implicit return
-    proc ensure_implicit_return with hir_method, body_statements
-
-    Note: Restore previous context
-    proc pop_scope from translator
-    Set translator.method_context to previous_method
-
-    Return hir_method
+    Note: Unary "+" is identity; re-prefix preserved by metadata on a negate-of-negate-free node.
+    Let hir_unary be proc hir_create_unary_expr from HIR with HIR.HIR_OP_NEGATE, operand_hir
+    proc hir_set_metadata from HIR with hir_unary, "ruby_unary", "plus"
+    Return hir_unary
 End Process
 
 @Reasoning:
-Ruby parameters come in five flavours that must be distinguished in HIR for correct call-site lowering: regular, splat (*args), double_splat (**kwargs), block (&blk), and optional defaults.
+Ruby's "and"/"&&" (AST_AND) and "or"/"||" (AST_OR) keyword/operator forms both
+produce short-circuit logical nodes with left at child 0 and right at child 1.
+We lower them to HIR binary logical-and / logical-or expressions; the caller
+passes the HIR opcode so one helper serves both.
 @End Reasoning
-
-@Implementation:
-For each parameter, create a Dictionary with name, then check the parser-set attributes splat/double_splat/block in order and tag the parameter with the first match (or "regular"). If a default value exists, recursively translate it and attach at "default".
-@End Implementation
-
-Process called "translate_method_parameters" takes translator as Integer, params as Integer returns Integer:
-    Note: Translate Ruby method parameters including splats and defaults
-
-    Let hir_params be proc create_list
-    Let param_count be proc get_list_size from params
-    Let index be 0
-
-    While index is less than param_count:
-        Let param be proc get_list_item with params, index
-        Let hir_param be proc create_hir_dict
-
-        Note: Get parameter name
-        Let param_name be proc get_node_attribute with param, "name"
-        proc set_dict_value with hir_param, "name", param_name
-
-        Note: Handle parameter types
-        If proc get_node_attribute with param, "splat" is not equal to 0:
-            proc set_dict_value with hir_param, "type", "splat"
-        Otherwise If proc get_node_attribute with param, "double_splat" is not equal to 0:
-            proc set_dict_value with hir_param, "type", "double_splat"
-        Otherwise If proc get_node_attribute with param, "block" is not equal to 0:
-            proc set_dict_value with hir_param, "type", "block"
-        Otherwise:
-            proc set_dict_value with hir_param, "type", "regular"
-        End If
-
-        Note: Handle default values
-        Let default_value be proc get_node_attribute with param, "default"
-        If default_value is not equal to 0:
-            Let hir_default be proc translate_ruby_to_hir with translator, default_value
-            proc set_dict_value with hir_param, "default", hir_default
-        End If
-
-        proc add_to_list with hir_params, hir_param
-        Set index to index plus 1
-    End While
-
-    Return hir_params
+Process called "translate_logical" takes ctx_ptr as Integer, node as Integer, hir_op as Integer returns Integer:
+    Let left_ast be proc ast_node_child from Parser with node, 0
+    Let right_ast be proc ast_node_child from Parser with node, 1
+    Let left_hir be proc translate_expression with ctx_ptr, left_ast
+    Let right_hir be proc translate_expression with ctx_ptr, right_ast
+    Return proc hir_create_binary_expr from HIR with hir_op, left_hir, right_hir
 End Process
 
 @Reasoning:
-A Ruby method call binds an optional receiver, a method name, an argument list, and an optional trailing block; capturing all four as discrete HIR fields lets the lowering stage dispatch send/call mechanics uniformly.
+Ruby's keyword "not" (AST_NOT) is a logical negation with the operand at child
+0; it maps directly to a HIR logical-not unary expression. The "not" keyword
+spelling versus "!" is recorded so the backend re-emits the original form.
 @End Reasoning
+Process called "translate_not" takes ctx_ptr as Integer, node as Integer returns Integer:
+    Let operand_ast be proc ast_node_child from Parser with node, 0
+    Let operand_hir be proc translate_expression with ctx_ptr, operand_ast
+    Let hir_not be proc hir_create_unary_expr from HIR with HIR.HIR_OP_LOGICAL_NOT, operand_hir
+    proc hir_set_metadata from HIR with hir_not, "ruby_not_keyword", "true"
+    Return hir_not
+End Process
 
-@Implementation:
-Dictionary tagged node_type=call. If the call node has a first child, translate it as receiver. Copy ast.value into "method". If arguments attribute present, translate via translate_arguments. If block attribute present, recursively translate as the block payload.
-@End Implementation
+@Reasoning:
+Ruby's ternary "c ? t : f" stores condition/then/else at children 0/1/2 and maps
+exactly to the HIR ternary expression node.
+@End Reasoning
+Process called "translate_ternary" takes ctx_ptr as Integer, node as Integer returns Integer:
+    Let cond_ast be proc ast_node_child from Parser with node, 0
+    Let then_ast be proc ast_node_child from Parser with node, 1
+    Let else_ast be proc ast_node_child from Parser with node, 2
 
-Process called "translate_method_call" takes translator as Integer, ast as Integer returns Integer:
-    Note: Translate Ruby method call with receivers, arguments, and blocks
+    Let cond_hir be proc translate_expression with ctx_ptr, cond_ast
+    Let then_hir be proc translate_expression with ctx_ptr, then_ast
+    Let else_hir be proc translate_expression with ctx_ptr, else_ast
 
-    Let hir_call be proc create_hir_dict
-    proc set_dict_value with hir_call, "node_type", "call"
+    Return proc hir_create_ternary_expr from HIR with cond_hir, then_hir, else_hir
+End Process
 
-    Note: Handle receiver
-    Let receiver_count be proc get_list_size with ast.children
-    If receiver_count is greater than 0:
-        Let receiver be proc get_list_item with ast.children, 0
-        Let hir_receiver be proc translate_ruby_to_hir with translator, receiver
-        proc set_dict_value with hir_call, "receiver", hir_receiver
-    End If
+@Reasoning:
+Ruby ranges (low..high inclusive, low...high exclusive) have no HIR range node,
+so we model a range as a two-argument call to a synthetic "Range" callee with
+the low and high bounds as arguments. The exclusivity is preserved in
+"ruby_range_exclusive" metadata (set from the parser's "exclusive" flag) so the
+backend re-emits ".." or "..." correctly.
+@End Reasoning
+Process called "translate_range" takes ctx_ptr as Integer, node as Integer returns Integer:
+    Let low_ast be proc ast_node_child from Parser with node, 0
+    Let high_ast be proc ast_node_child from Parser with node, 1
+    Let low_hir be proc translate_expression with ctx_ptr, low_ast
+    Let high_hir be proc translate_expression with ctx_ptr, high_ast
 
-    Note: Set method name
-    proc set_dict_value with hir_call, "method", ast.value
+    Let callee be proc hir_create_identifier from HIR with "Range"
+    Let hir_call be proc hir_create_call_expr from HIR with callee
+    proc hir_add_argument from HIR with hir_call, low_hir
+    proc hir_add_argument from HIR with hir_call, high_hir
+    proc hir_set_metadata from HIR with hir_call, "ruby_range", "true"
 
-    Note: Handle arguments
-    Let arguments be proc get_node_attribute with ast, "arguments"
-    If arguments is not equal to 0:
-        Let hir_args be proc translate_arguments with translator, arguments
-        proc set_dict_value with hir_call, "arguments", hir_args
-    End If
-
-    Note: Handle block
-    Let block be proc get_node_attribute with ast, "block"
-    If block is not equal to 0:
-        Let hir_block be proc translate_ruby_to_hir with translator, block
-        proc set_dict_value with hir_call, "block", hir_block
+    Let exclusive be proc ast_node_metadata with node, "exclusive"
+    If exclusive is not equal to 0:
+        proc hir_set_metadata from HIR with hir_call, "ruby_range_exclusive", "true"
     End If
 
     Return hir_call
 End Process
 
 @Reasoning:
-Ruby blocks "{|x| ...}" / "do |x| ... end" carry their own parameter list and capture the enclosing local scope; recording block_context lets nested yields and the new lexical scope cooperate correctly.
+A Ruby method call binds a receiver (child 0; an empty-value AST_IDENTIFIER for
+an implicit self), a method name (value slot), an AST_ARG_LIST (child 1), and an
+optional trailing AST_BLOCK (child 2). We build a HIR call whose callee is a
+member expression (receiver.method) when there is a real receiver, or a bare
+identifier when the receiver is implicit. Arguments are appended in order;
+keyword and splat args carry metadata. A trailing block is translated and
+attached as "ruby_block" metadata-tagged lambda.
 @End Reasoning
+Process called "translate_method_call" takes ctx_ptr as Integer, node as Integer returns Integer:
+    Let method_name be proc ast_node_value from Parser with node
+    Let receiver_ast be proc ast_node_child from Parser with node, 0
+    Let receiver_type be proc ast_node_type from Parser with receiver_ast
+    Let receiver_value be proc ast_node_value from Parser with receiver_ast
 
-@Implementation:
-Dictionary tagged node_type=block. Map each parameter name into a small "name"-only Dictionary attached at "parameters". Save block_context, set it to this block, push a "block" scope. Translate body children. Restore block_context and pop scope.
-@End Implementation
-
-Process called "translate_block" takes translator as Integer, ast as Integer returns Integer:
-    Note: Translate Ruby block with parameters and closure semantics
-
-    Let hir_block be proc create_hir_dict
-    proc set_dict_value with hir_block, "node_type", "block"
-
-    Note: Handle block parameters
-    Let parameters be proc get_node_attribute with ast, "parameters"
-    If parameters is not equal to 0:
-        Let hir_params be proc create_list
-        Let param_count be proc get_list_size from parameters
-        Let index be 0
-
-        While index is less than param_count:
-            Let param_name be proc get_list_item with parameters, index
-            Let hir_param be proc create_hir_dict
-            proc set_dict_value with hir_param, "name", param_name
-            proc add_to_list with hir_params, hir_param
-            Set index to index plus 1
-        End While
-
-        proc set_dict_value with hir_block, "parameters", hir_params
+    Note: Decide implicit-self (AST_IDENTIFIER with 0 value) vs real receiver.
+    Let implicit be 0
+    If receiver_type is equal to Parser.AST_IDENTIFIER:
+        If receiver_value is equal to 0:
+            Set implicit to 1
+        End If
     End If
 
-    Note: Set block context
-    Let previous_block be translator.block_context
-    Set translator.block_context to hir_block
+    Let callee be 0
+    If implicit is equal to 1:
+        Set callee to proc hir_create_identifier from HIR with method_name
+    Otherwise:
+        Let receiver_hir be proc translate_expression with ctx_ptr, receiver_ast
+        Set callee to proc hir_create_member_expr from HIR with receiver_hir, method_name
+        Let safe be proc ast_node_metadata with node, "safe"
+        If safe is not equal to 0:
+            proc hir_set_metadata from HIR with callee, "ruby_safe_nav", "true"
+        End If
+    End If
 
-    Note: Create block scope
-    proc push_scope with translator, "block"
+    Let hir_call be proc hir_create_call_expr from HIR with callee
 
-    Note: Translate block body
-    Let body_statements be proc create_list
-    Let child_count be proc get_list_size with ast.children
-    Set index to 0
+    Note: Arguments live in the AST_ARG_LIST at child 1 (if present).
+    Let arg_list be proc ast_node_child from Parser with node, 1
+    If arg_list is not equal to 0:
+        Let arg_list_type be proc ast_node_type from Parser with arg_list
+        If arg_list_type is equal to Parser.AST_ARG_LIST:
+            proc translate_arguments_into with ctx_ptr, hir_call, arg_list
+        End If
+    End If
 
-    While index is less than child_count:
-        Let child be proc get_list_item with ast.children, index
-        Let hir_child be proc translate_ruby_to_hir with translator, child
+    Note: A trailing block becomes a lambda attached via metadata-tagged argument.
+    Let block_ast be proc ast_node_child from Parser with node, 2
+    If block_ast is not equal to 0:
+        Let block_type be proc ast_node_type from Parser with block_ast
+        If block_type is equal to Parser.AST_BLOCK:
+            Let block_hir be proc translate_block_closure with ctx_ptr, block_ast
+            proc hir_set_metadata from HIR with hir_call, "ruby_has_block", "true"
+            proc hir_add_argument from HIR with hir_call, block_hir
+            proc hir_set_metadata from HIR with block_hir, "ruby_call_block", "true"
+        End If
+    End If
 
-        If hir_child is not equal to 0:
-            proc add_to_list with body_statements, hir_child
+    Return hir_call
+End Process
+
+@Reasoning:
+The AST_ARG_LIST holds AST_ARG (positional), AST_KWARG (keyword), AST_SPLAT_ARG
+(* / **) and AST_BLOCK_ARG (&blk) children. We append each as a HIR argument,
+tagging keyword args with "ruby_kwarg"=name, splat args with "ruby_splat" or
+"ruby_doublesplat", and block-pass args with "ruby_blockpass" so the backend
+reconstructs the precise call-site form.
+@End Reasoning
+Process called "translate_arguments_into" takes ctx_ptr as Integer, hir_call as Integer, arg_list as Integer returns Integer:
+    Let count be proc ast_node_child_count from Parser with arg_list
+
+    Let i be 0
+    While i is less than count:
+        Let arg be proc ast_node_child from Parser with arg_list, i
+        Let arg_type be proc ast_node_type from Parser with arg
+
+        If arg_type is equal to Parser.AST_ARG:
+            Let inner be proc ast_node_child from Parser with arg, 0
+            Let inner_hir be proc translate_expression with ctx_ptr, inner
+            proc hir_add_argument from HIR with hir_call, inner_hir
+        Otherwise If arg_type is equal to Parser.AST_KWARG:
+            Let kw_name be proc ast_node_value from Parser with arg
+            Let kw_value be proc ast_node_child from Parser with arg, 0
+            Let kw_hir be proc translate_expression with ctx_ptr, kw_value
+            proc hir_set_metadata from HIR with kw_hir, "ruby_kwarg", kw_name
+            proc hir_add_argument from HIR with hir_call, kw_hir
+        Otherwise If arg_type is equal to Parser.AST_SPLAT_ARG:
+            Let sp_inner be proc ast_node_child from Parser with arg, 0
+            Let sp_hir be proc translate_expression with ctx_ptr, sp_inner
+            Let dbl be proc ast_node_metadata with arg, "doublesplat"
+            If dbl is not equal to 0:
+                proc hir_set_metadata from HIR with sp_hir, "ruby_doublesplat", "true"
+            Otherwise:
+                proc hir_set_metadata from HIR with sp_hir, "ruby_splat", "true"
+            End If
+            proc hir_add_argument from HIR with hir_call, sp_hir
+        Otherwise If arg_type is equal to Parser.AST_BLOCK_ARG:
+            Let bp_inner be proc ast_node_child from Parser with arg, 0
+            Let bp_hir be proc translate_expression with ctx_ptr, bp_inner
+            proc hir_set_metadata from HIR with bp_hir, "ruby_blockpass", "true"
+            proc hir_add_argument from HIR with hir_call, bp_hir
+        Otherwise:
+            Let other_hir be proc translate_expression with ctx_ptr, arg
+            proc hir_add_argument from HIR with hir_call, other_hir
         End If
 
-        Set index to index plus 1
+        Set i to i plus 1
     End While
 
-    proc set_dict_value with hir_block, "body", body_statements
+    Return 1
+End Process
 
-    Note: Restore previous context
-    proc pop_scope from translator
-    Set translator.block_context to previous_block
+@Reasoning:
+Ruby index access obj[i, j] stores the receiver at child 0 and an AST_ARG_LIST
+of index expressions at child 1. HIR's index expression takes a single index, so
+we use the first index expression directly for the common single-key case and
+fall back to a list literal of all indices (tagged "ruby_multi_index") when
+there are several, preserving the multi-argument [] semantics.
+@End Reasoning
+Process called "translate_index" takes ctx_ptr as Integer, node as Integer returns Integer:
+    Let receiver_ast be proc ast_node_child from Parser with node, 0
+    Let receiver_hir be proc translate_expression with ctx_ptr, receiver_ast
+
+    Let arg_list be proc ast_node_child from Parser with node, 1
+    Let arg_count be 0
+    If arg_list is not equal to 0:
+        Set arg_count to proc ast_node_child_count from Parser with arg_list
+    End If
+
+    If arg_count is equal to 1:
+        Let only be proc ast_node_child from Parser with arg_list, 0
+        Let only_hir be proc index_arg_expression with ctx_ptr, only
+        Return proc hir_create_index_expr from HIR with receiver_hir, only_hir
+    End If
+
+    Note: Multiple index args -> pack into a list literal index, tagged for the backend.
+    Let multi be proc hir_create_list_literal from HIR
+    Let i be 0
+    While i is less than arg_count:
+        Let arg be proc ast_node_child from Parser with arg_list, i
+        Let arg_hir be proc index_arg_expression with ctx_ptr, arg
+        proc hir_add_list_element from HIR with multi, arg_hir
+        Set i to i plus 1
+    End While
+
+    Let hir_index be proc hir_create_index_expr from HIR with receiver_hir, multi
+    proc hir_set_metadata from HIR with hir_index, "ruby_multi_index", "true"
+    Return hir_index
+End Process
+
+@Reasoning:
+Index arguments may themselves be wrapped in AST_ARG (the parser routes some
+index lists through the argument machinery); this helper unwraps an AST_ARG to
+its inner expression so the index translator always works on the real key
+expression.
+@End Reasoning
+Process called "index_arg_expression" takes ctx_ptr as Integer, arg as Integer returns Integer:
+    Let arg_type be proc ast_node_type from Parser with arg
+    If arg_type is equal to Parser.AST_ARG:
+        Let inner be proc ast_node_child from Parser with arg, 0
+        Return proc translate_expression with ctx_ptr, inner
+    End If
+    Return proc translate_expression with ctx_ptr, arg
+End Process
+
+@Reasoning:
+A member access obj.name (AST_MEMBER) without a call stores the receiver at
+child 0 and the member name in the value slot. It maps directly to a HIR member
+expression; the safe-navigation form (&.) is preserved in metadata.
+@End Reasoning
+Process called "translate_member" takes ctx_ptr as Integer, node as Integer returns Integer:
+    Let member_name be proc ast_node_value from Parser with node
+    Let receiver_ast be proc ast_node_child from Parser with node, 0
+    Let receiver_hir be proc translate_expression with ctx_ptr, receiver_ast
+
+    Let hir_member be proc hir_create_member_expr from HIR with receiver_hir, member_name
+    Let safe be proc ast_node_metadata with node, "safe"
+    If safe is not equal to 0:
+        proc hir_set_metadata from HIR with hir_member, "ruby_safe_nav", "true"
+    End If
+    Return hir_member
+End Process
+
+@Reasoning:
+Scope resolution A::B references a constant under a namespace. The constant name
+is in the value slot and the optional scope expression is child 0 (absent for a
+leading ::Top reference). We model it as a member expression (scope.Name) tagged
+"ruby_scope" so the backend re-emits the "::" separator; a bare leading scope
+becomes a tagged identifier.
+@End Reasoning
+Process called "translate_scope_ref" takes ctx_ptr as Integer, node as Integer returns Integer:
+    Let const_name be proc ast_node_value from Parser with node
+    Let count be proc ast_node_child_count from Parser with node
+
+    If count is equal to 0:
+        Let hir_id be proc hir_create_identifier from HIR with const_name
+        proc hir_set_metadata from HIR with hir_id, "ruby_scope", "leading"
+        Return hir_id
+    End If
+
+    Let scope_ast be proc ast_node_child from Parser with node, 0
+    Let scope_hir be proc translate_expression with ctx_ptr, scope_ast
+    Let hir_member be proc hir_create_member_expr from HIR with scope_hir, const_name
+    proc hir_set_metadata from HIR with hir_member, "ruby_scope", "postfix"
+    Return hir_member
+End Process
+
+@Reasoning:
+Ruby's "super" dispatches to the same-named method on the superclass. The
+optional argument list is child 0 (absent for a bare "super"); we build a call
+to a synthetic "super" identifier carrying the arguments, tagging bare-super and
+keeping it distinct so the backend re-emits with or without parentheses.
+@End Reasoning
+Process called "translate_super_call" takes ctx_ptr as Integer, node as Integer returns Integer:
+    Let callee be proc hir_create_identifier from HIR with "super"
+    Let hir_call be proc hir_create_call_expr from HIR with callee
+    proc hir_set_metadata from HIR with hir_call, "ruby_super", "true"
+
+    Let bare be proc ast_node_metadata with node, "bare"
+    If bare is not equal to 0:
+        proc hir_set_metadata from HIR with hir_call, "ruby_super_bare", "true"
+        Return hir_call
+    End If
+
+    Let arg_list be proc ast_node_child from Parser with node, 0
+    If arg_list is not equal to 0:
+        Let arg_list_type be proc ast_node_type from Parser with arg_list
+        If arg_list_type is equal to Parser.AST_ARG_LIST:
+            proc translate_arguments_into with ctx_ptr, hir_call, arg_list
+        End If
+    End If
+
+    Return hir_call
+End Process
+
+@Reasoning:
+Plain Ruby assignment (target = value) stores the operator "=" in the value slot,
+the target at child 0 and the value at child 1. It maps to a HIR simple-assign
+expression. Index and member targets round-trip through their own translators.
+@End Reasoning
+Process called "translate_assign" takes ctx_ptr as Integer, node as Integer returns Integer:
+    Let target_ast be proc ast_node_child from Parser with node, 0
+    Let value_ast be proc ast_node_child from Parser with node, 1
+    Let target_hir be proc translate_expression with ctx_ptr, target_ast
+    Let value_hir be proc translate_expression with ctx_ptr, value_ast
+    Return proc hir_create_assign_expr from HIR with target_hir, HIR.HIR_ASSIGN_SIMPLE, value_hir
+End Process
+
+@Reasoning:
+Compound assignment (target += value, ||=, etc.) stores the compound operator in
+the value slot. HIR has dedicated compound-assign opcodes for the arithmetic
+forms; Ruby-only forms (||=, &&=, **=) lower to HIR_ASSIGN_SIMPLE structurally
+and carry the exact operator in "ruby_op_assign" metadata so the backend
+re-emits the original compound spelling.
+@End Reasoning
+Process called "translate_op_assign" takes ctx_ptr as Integer, node as Integer returns Integer:
+    Let op_lexeme be proc ast_node_value from Parser with node
+    Let target_ast be proc ast_node_child from Parser with node, 0
+    Let value_ast be proc ast_node_child from Parser with node, 1
+    Let target_hir be proc translate_expression with ctx_ptr, target_ast
+    Let value_hir be proc translate_expression with ctx_ptr, value_ast
+
+    Let hir_op be proc map_ruby_compound_assign with op_lexeme
+    Let hir_assign be proc hir_create_assign_expr from HIR with target_hir, hir_op, value_hir
+    proc hir_set_metadata from HIR with hir_assign, "ruby_op_assign", op_lexeme
+    Return hir_assign
+End Process
+
+@Reasoning:
+Maps Ruby's compound-assignment operator lexeme to the matching HIR assign
+opcode. The four arithmetic forms have exact opcodes; every other compound form
+(||=, &&=, **=, bitwise) falls back to HIR_ASSIGN_SIMPLE, with the original
+spelling preserved by the caller's "ruby_op_assign" metadata.
+@End Reasoning
+Process called "map_ruby_compound_assign" takes operator as Integer returns Integer:
+    If proc string_equals from StringCore with operator, "+=" is equal to 1:
+        Return HIR.HIR_ASSIGN_ADD
+    End If
+    If proc string_equals from StringCore with operator, "-=" is equal to 1:
+        Return HIR.HIR_ASSIGN_SUBTRACT
+    End If
+    If proc string_equals from StringCore with operator, "*=" is equal to 1:
+        Return HIR.HIR_ASSIGN_MULTIPLY
+    End If
+    If proc string_equals from StringCore with operator, "/=" is equal to 1:
+        Return HIR.HIR_ASSIGN_DIVIDE
+    End If
+    If proc string_equals from StringCore with operator, "%=" is equal to 1:
+        Return HIR.HIR_ASSIGN_MODULO
+    End If
+    If proc string_equals from StringCore with operator, "||=" is equal to 1:
+        Return HIR.HIR_ASSIGN_NULL_COALESCE
+    End If
+    Return HIR.HIR_ASSIGN_SIMPLE
+End Process
+
+@Reasoning:
+A stabby lambda (-> (a) { }) or lambda { } maps to a HIR lambda: child 0 is the
+AST_PARAM_LIST and children 1.. are the body statements. We add each parameter
+name to the lambda and attach a HIR block as the body via
+hir_set_lambda_block_body. The arrow vs keyword spelling is preserved in
+metadata so the backend re-emits the source form.
+@End Reasoning
+Process called "translate_lambda" takes ctx_ptr as Integer, node as Integer returns Integer:
+    Let hir_lambda be proc hir_create_lambda from HIR
+    proc add_param_list_to_callable with ctx_ptr, hir_lambda, node
+
+    Let body_block be proc translate_callable_body with ctx_ptr, node
+    proc hir_set_lambda_block_body from HIR with hir_lambda, body_block
+
+    Let arrow be proc ast_node_metadata with node, "arrow"
+    If arrow is not equal to 0:
+        proc hir_set_metadata from HIR with hir_lambda, "ruby_lambda_kind", "arrow"
+    Otherwise:
+        proc hir_set_metadata from HIR with hir_lambda, "ruby_lambda_kind", "keyword"
+    End If
+    Return hir_lambda
+End Process
+
+@Reasoning:
+Proc.new / proc { } (AST_PROC) shares the lambda's child layout (param list at
+0, body after). It lowers to a HIR lambda tagged "ruby_lambda_kind"="proc" so the
+backend distinguishes it from a true lambda - they differ in return/arity
+semantics that the tag records for faithful reproduction.
+@End Reasoning
+Process called "translate_proc" takes ctx_ptr as Integer, node as Integer returns Integer:
+    Let hir_lambda be proc hir_create_lambda from HIR
+    proc add_param_list_to_callable with ctx_ptr, hir_lambda, node
+
+    Let body_block be proc translate_callable_body with ctx_ptr, node
+    proc hir_set_lambda_block_body from HIR with hir_lambda, body_block
+
+    proc hir_set_metadata from HIR with hir_lambda, "ruby_lambda_kind", "proc"
+    Return hir_lambda
+End Process
+
+@Reasoning:
+A do..end / { } block attached to a method call (AST_BLOCK) is a closure with
+its own block parameters (param list at child 0) and body (children 1..). It
+lowers to a HIR lambda tagged "ruby_lambda_kind"="block", with the brace vs
+do..end form recorded so the backend re-emits the matching delimiter style.
+@End Reasoning
+Process called "translate_block_closure" takes ctx_ptr as Integer, node as Integer returns Integer:
+    Let hir_lambda be proc hir_create_lambda from HIR
+    proc add_param_list_to_callable with ctx_ptr, hir_lambda, node
+
+    Let body_block be proc translate_callable_body with ctx_ptr, node
+    proc hir_set_lambda_block_body from HIR with hir_lambda, body_block
+
+    proc hir_set_metadata from HIR with hir_lambda, "ruby_lambda_kind", "block"
+    Let brace be proc ast_node_metadata with node, "brace"
+    If brace is not equal to 0:
+        proc hir_set_metadata from HIR with hir_lambda, "ruby_block_brace", "true"
+    End If
+    Return hir_lambda
+End Process
+
+@Reasoning:
+The block-bearing AST forms (block/lambda/proc) all keep their parameter list as
+child 0. This shared helper walks that AST_PARAM_LIST and adds a HIR parameter
+for each name to the callable, preserving splat/kwarg/block kinds via metadata so
+the backend reconstructs the precise parameter spelling.
+@End Reasoning
+Process called "add_param_list_to_callable" takes ctx_ptr as Integer, callable as Integer, node as Integer returns Integer:
+    Let first_child be proc ast_node_child from Parser with node, 0
+    If first_child is equal to 0:
+        Return 0
+    End If
+    Let first_type be proc ast_node_type from Parser with first_child
+    If first_type is not equal to Parser.AST_PARAM_LIST:
+        Return 0
+    End If
+
+    proc add_parameters_from_list with ctx_ptr, callable, first_child
+    Return 1
+End Process
+
+@Reasoning:
+Block/lambda/proc bodies are the children after the parameter list (index 1
+onward). This helper collects those statements into a HIR block so the closure
+body is a single statement node, mirroring how function bodies are assembled.
+@End Reasoning
+Process called "translate_callable_body" takes ctx_ptr as Integer, node as Integer returns Integer:
+    Let hir_block be proc hir_create_block from HIR
+    Let count be proc ast_node_child_count from Parser with node
+
+    Let i be 1
+    While i is less than count:
+        Let child be proc ast_node_child from Parser with node, i
+        Let stmt_hir be proc translate_statement with ctx_ptr, child
+        If stmt_hir is not equal to 0:
+            proc hir_add_statement from HIR with hir_block, stmt_hir
+        End If
+        Set i to i plus 1
+    End While
 
     Return hir_block
 End Process
 
 @Reasoning:
-Ruby's if/elsif/else chains an arbitrary number of elsif clauses; capturing each elsif separately rather than nesting if-else in HIR preserves the source structure for back-translation and error reporting.
+"defined?(x)" has no HIR counterpart, so it lowers to a one-argument call to a
+synthetic "defined?" identifier carrying the operand. The "ruby_defined" tag lets
+the backend re-emit the keyword-with-parens form rather than an ordinary call.
 @End Reasoning
+Process called "translate_defined" takes ctx_ptr as Integer, node as Integer returns Integer:
+    Let operand_ast be proc ast_node_child from Parser with node, 0
+    Let operand_hir be proc translate_expression with ctx_ptr, operand_ast
+    Let callee be proc hir_create_identifier from HIR with "defined?"
+    Let hir_call be proc hir_create_call_expr from HIR with callee
+    proc hir_add_argument from HIR with hir_call, operand_hir
+    proc hir_set_metadata from HIR with hir_call, "ruby_defined", "true"
+    Return hir_call
+End Process
 
-@Implementation:
-Dictionary tagged node_type=conditional with translated condition. Translate then_body via translate_statement_list. For each elsif clause, recursively translate and append to the elsif_clauses List. If an else_body attribute exists, translate it via translate_statement_list and attach.
-@End Implementation
+@Reasoning:
+"yield args" hands control to the block attached to the surrounding method. The
+HIR yield statement carries the (possibly multiple) argument expressions packed
+into a list literal value when there are several, or the single expression
+directly. yield's args are direct children (not wrapped in AST_ARG).
+@End Reasoning
+Process called "translate_yield" takes ctx_ptr as Integer, node as Integer returns Integer:
+    Let hir_yield be proc hir_create_yield from HIR
+    Let count be proc ast_node_child_count from Parser with node
 
-Process called "translate_if" takes translator as Integer, ast as Integer returns Integer:
-    Note: Translate Ruby if statement with elsif and else clauses
-
-    Let hir_if be proc create_hir_dict
-    proc set_dict_value with hir_if, "node_type", "conditional"
-
-    Note: Translate condition
-    Let condition be proc get_node_attribute with ast, "condition"
-    Let hir_condition be proc translate_ruby_to_hir with translator, condition
-    proc set_dict_value with hir_if, "condition", hir_condition
-
-    Note: Translate then body
-    Let then_body be proc get_node_attribute with ast, "then_body"
-    Let hir_then_body be proc translate_statement_list with translator, then_body
-    proc set_dict_value with hir_if, "then_body", hir_then_body
-
-    Note: Handle elsif clauses
-    Let elsif_clauses be proc get_node_attribute with ast, "elsif_clauses"
-    If elsif_clauses is not equal to 0:
-        Let hir_elsif_clauses be proc create_list
-        Let elsif_count be proc get_list_size from elsif_clauses
-        Let index be 0
-
-        While index is less than elsif_count:
-            Let elsif_clause be proc get_list_item with elsif_clauses, index
-            Let hir_elsif be proc translate_ruby_to_hir with translator, elsif_clause
-            proc add_to_list with hir_elsif_clauses, hir_elsif
-            Set index to index plus 1
-        End While
-
-        proc set_dict_value with hir_if, "elsif_clauses", hir_elsif_clauses
+    If count is equal to 0:
+        Return hir_yield
     End If
 
-    Note: Handle else clause
-    Let else_body be proc get_node_attribute with ast, "else_body"
-    If else_body is not equal to 0:
-        Let hir_else_body be proc translate_statement_list with translator, else_body
-        proc set_dict_value with hir_if, "else_body", hir_else_body
+    If count is equal to 1:
+        Let only be proc ast_node_child from Parser with node, 0
+        Let only_hir be proc translate_expression with ctx_ptr, only
+        proc hir_set_return_value from HIR with hir_yield, only_hir
+        Return hir_yield
+    End If
+
+    Let values be proc hir_create_list_literal from HIR
+    Let i be 0
+    While i is less than count:
+        Let child be proc ast_node_child from Parser with node, i
+        Let child_hir be proc translate_expression with ctx_ptr, child
+        proc hir_add_list_element from HIR with values, child_hir
+        Set i to i plus 1
+    End While
+    proc hir_set_return_value from HIR with hir_yield, values
+    proc hir_set_metadata from HIR with hir_yield, "ruby_yield_multi", "true"
+    Return hir_yield
+End Process
+
+Note: ============================================================================
+Note: Statement Translation
+Note: ============================================================================
+
+@Reasoning:
+The statement dispatcher routes statement-position AST nodes to their specialised
+translators. Declarations (class/module/method), control flow, exception handling
+and the keyword statements (return/break/next/yield) are handled explicitly;
+AST_EXPR_STMT unwraps to an expression statement; everything else falls through
+to translate_expression so bare expressions in statement position still lower.
+@End Reasoning
+Process called "translate_statement" takes ctx_ptr as Integer, stmt_node as Integer returns Integer:
+    Let node_type be proc ast_node_type from Parser with stmt_node
+
+    If node_type is equal to Parser.AST_CLASS:
+        Return proc translate_class with ctx_ptr, stmt_node
+    End If
+    If node_type is equal to Parser.AST_MODULE:
+        Return proc translate_module with ctx_ptr, stmt_node
+    End If
+    If node_type is equal to Parser.AST_METHOD:
+        Return proc translate_method with ctx_ptr, stmt_node, 0
+    End If
+    If node_type is equal to Parser.AST_SINGLETON_METHOD:
+        Return proc translate_method with ctx_ptr, stmt_node, 1
+    End If
+    If node_type is equal to Parser.AST_IF:
+        Return proc translate_if with ctx_ptr, stmt_node, 0
+    End If
+    If node_type is equal to Parser.AST_UNLESS:
+        Return proc translate_if with ctx_ptr, stmt_node, 1
+    End If
+    If node_type is equal to Parser.AST_WHILE:
+        Return proc translate_while with ctx_ptr, stmt_node, 0
+    End If
+    If node_type is equal to Parser.AST_UNTIL:
+        Return proc translate_while with ctx_ptr, stmt_node, 1
+    End If
+    If node_type is equal to Parser.AST_FOR:
+        Return proc translate_for with ctx_ptr, stmt_node
+    End If
+    If node_type is equal to Parser.AST_CASE:
+        Return proc translate_case with ctx_ptr, stmt_node
+    End If
+    If node_type is equal to Parser.AST_BEGIN:
+        Return proc translate_begin with ctx_ptr, stmt_node
+    End If
+    If node_type is equal to Parser.AST_RETURN:
+        Return proc translate_return with ctx_ptr, stmt_node
+    End If
+    If node_type is equal to Parser.AST_BREAK:
+        Return proc translate_break with ctx_ptr, stmt_node
+    End If
+    If node_type is equal to Parser.AST_NEXT:
+        Return proc translate_next with ctx_ptr, stmt_node
+    End If
+    If node_type is equal to Parser.AST_YIELD:
+        Return proc translate_yield with ctx_ptr, stmt_node
+    End If
+    If node_type is equal to Parser.AST_MULTIPLE_ASSIGN:
+        Return proc translate_multiple_assign with ctx_ptr, stmt_node
+    End If
+    If node_type is equal to Parser.AST_ALIAS:
+        Return proc translate_alias with ctx_ptr, stmt_node
+    End If
+    If node_type is equal to Parser.AST_UNDEF:
+        Return proc translate_undef with ctx_ptr, stmt_node
+    End If
+    If node_type is equal to Parser.AST_EXPR_STMT:
+        Note:
+        The parser wraps every top-level/body statement in AST_EXPR_STMT. Some
+        wrapped inners are themselves statement-level constructs (multiple
+        assignment, class/module/method, control flow) rather than plain
+        expressions, so we recurse through translate_statement on the inner node:
+        statement-level inners get their proper lowering, and genuine
+        expression inners fall through to the expression-statement wrapper below.
+        :End Note
+        Let inner be proc ast_node_child from Parser with stmt_node, 0
+        Return proc translate_statement with ctx_ptr, inner
+    End If
+
+    Note: Bare expression in statement position -> expression statement wrapper.
+    Let expr_hir be proc translate_expression with ctx_ptr, stmt_node
+    Return proc hir_create_expression_statement from HIR with expr_hir
+End Process
+
+@Reasoning:
+A Ruby class has its name in the value slot, an optional AST_SUPERCLASS wrapper
+at child 0, and body statements thereafter; a "singleton" metadata flag marks the
+class << self form. We build a HIR class node, set the name, lower the superclass
+expression into the base class, and add each body member. Methods become class
+members; include/extend and other body statements are added as members too so the
+class body round-trips faithfully.
+@End Reasoning
+Process called "translate_class" takes ctx_ptr as Integer, node as Integer returns Integer:
+    Let hir_class be proc hir_create_class from HIR
+    Let class_name be proc ast_node_value from Parser with node
+    proc hir_set_class_name from HIR with hir_class, class_name
+
+    Let singleton be proc ast_node_metadata with node, "singleton"
+    If singleton is not equal to 0:
+        proc hir_set_metadata from HIR with hir_class, "ruby_singleton_class", "true"
+    End If
+
+    Let count be proc ast_node_child_count from Parser with node
+    Let body_start be 0
+
+    If count is greater than 0:
+        Let first be proc ast_node_child from Parser with node, 0
+        Let first_type be proc ast_node_type from Parser with first
+        If first_type is equal to Parser.AST_SUPERCLASS:
+            Let super_expr be proc ast_node_child from Parser with first, 0
+            Let super_hir be proc translate_expression with ctx_ptr, super_expr
+            proc hir_set_base_class from HIR with hir_class, super_hir
+            Set body_start to 1
+        End If
+    End If
+
+    Let i be body_start
+    While i is less than count:
+        Let member be proc ast_node_child from Parser with node, i
+        Let member_hir be proc translate_statement with ctx_ptr, member
+        If member_hir is not equal to 0:
+            proc hir_add_class_member from HIR with hir_class, member_hir
+        End If
+        Set i to i plus 1
+    End While
+
+    proc hir_set_metadata from HIR with hir_class, "ruby_kind", "class"
+    Return hir_class
+End Process
+
+@Reasoning:
+A Ruby module is a namespace/mixin container with its name in the value slot and
+body statements as children. HIR has no module node in this producer surface, so
+we model a module as a HIR class tagged "ruby_kind"="module"; the backend reads
+the tag to emit "module" rather than "class". Body members are added exactly as
+for a class.
+@End Reasoning
+Process called "translate_module" takes ctx_ptr as Integer, node as Integer returns Integer:
+    Let hir_mod be proc hir_create_class from HIR
+    Let mod_name be proc ast_node_value from Parser with node
+    proc hir_set_class_name from HIR with hir_mod, mod_name
+
+    Let count be proc ast_node_child_count from Parser with node
+    Let i be 0
+    While i is less than count:
+        Let member be proc ast_node_child from Parser with node, i
+        Let member_hir be proc translate_statement with ctx_ptr, member
+        If member_hir is not equal to 0:
+            proc hir_add_class_member from HIR with hir_mod, member_hir
+        End If
+        Set i to i plus 1
+    End While
+
+    proc hir_set_metadata from HIR with hir_mod, "ruby_kind", "module"
+    Return hir_mod
+End Process
+
+@Reasoning:
+A Ruby method (AST_METHOD) keeps its name in the value slot, an AST_PARAM_LIST at
+child 0, and body statements thereafter. A singleton method (AST_SINGLETON_METHOD)
+inserts the receiver expression at child 0, shifting the param list to child 1 and
+the body to child 2. We build a HIR function, set the name and parameters, lower
+the body into a HIR block, and apply Ruby's implicit-return semantics so the last
+expression becomes the function's return.
+@End Reasoning
+Process called "translate_method" takes ctx_ptr as Integer, node as Integer, is_singleton as Integer returns Integer:
+    Let hir_function be proc hir_create_function from HIR
+    Let method_name be proc ast_node_value from Parser with node
+    proc hir_set_function_name from HIR with hir_function, method_name
+
+    Let param_index be 0
+    Let body_index be 1
+    If is_singleton is equal to 1:
+        Note: child 0 is the receiver; param list is child 1, body from child 2.
+        Let receiver_ast be proc ast_node_child from Parser with node, 0
+        Let receiver_hir be proc translate_expression with ctx_ptr, receiver_ast
+        proc hir_set_metadata from HIR with hir_function, "ruby_singleton_method", "true"
+        Set param_index to 1
+        Set body_index to 2
+    End If
+
+    Let param_list be proc ast_node_child from Parser with node, param_index
+    If param_list is not equal to 0:
+        Let pl_type be proc ast_node_type from Parser with param_list
+        If pl_type is equal to Parser.AST_PARAM_LIST:
+            proc add_parameters_from_list with ctx_ptr, hir_function, param_list
+        End If
+    End If
+
+    Let hir_body be proc hir_create_block from HIR
+    Let count be proc ast_node_child_count from Parser with node
+    Let i be body_index
+    While i is less than count:
+        Let child be proc ast_node_child from Parser with node, i
+        Let stmt_hir be proc translate_statement with ctx_ptr, child
+        If stmt_hir is not equal to 0:
+            proc hir_add_statement from HIR with hir_body, stmt_hir
+        End If
+        Set i to i plus 1
+    End While
+
+    proc apply_implicit_return with ctx_ptr, hir_body
+    proc hir_set_function_body from HIR with hir_function, hir_body
+    Return hir_function
+End Process
+
+@Reasoning:
+Each AST_PARAM in the parameter list keeps its name in the value slot, an
+optional default value at child 0, and metadata flags (splat / doublesplat /
+block / kwarg / optional) describing its kind. We add a HIR parameter per entry,
+preserving the kind and the default expression in metadata so the backend
+reconstructs the precise parameter spelling (*a, **a, &blk, a:, a = expr).
+@End Reasoning
+Process called "add_parameters_from_list" takes ctx_ptr as Integer, callable as Integer, param_list as Integer returns Integer:
+    Let count be proc ast_node_child_count from Parser with param_list
+
+    Let i be 0
+    While i is less than count:
+        Let param be proc ast_node_child from Parser with param_list, i
+        Let param_name be proc ast_node_value from Parser with param
+
+        Let hir_param be proc hir_create_parameter from HIR
+        proc hir_set_parameter_name from HIR with hir_param, param_name
+
+        Let splat be proc ast_node_metadata with param, "splat"
+        If splat is not equal to 0:
+            proc hir_set_metadata from HIR with hir_param, "ruby_param_kind", "splat"
+        End If
+        Let dbl be proc ast_node_metadata with param, "doublesplat"
+        If dbl is not equal to 0:
+            proc hir_set_metadata from HIR with hir_param, "ruby_param_kind", "doublesplat"
+        End If
+        Let blk be proc ast_node_metadata with param, "block"
+        If blk is not equal to 0:
+            proc hir_set_metadata from HIR with hir_param, "ruby_param_kind", "block"
+        End If
+        Let kw be proc ast_node_metadata with param, "kwarg"
+        If kw is not equal to 0:
+            proc hir_set_metadata from HIR with hir_param, "ruby_param_kind", "kwarg"
+        End If
+
+        Note: A default value at child 0 marks an optional parameter.
+        Let default_ast be proc ast_node_child from Parser with param, 0
+        If default_ast is not equal to 0:
+            Let default_hir be proc translate_expression with ctx_ptr, default_ast
+            proc hir_set_parameter_default with hir_param, default_hir
+        End If
+
+        proc hir_add_parameter from HIR with callable, hir_param
+        Set i to i plus 1
+    End While
+
+    Return 1
+End Process
+
+@Reasoning:
+The HIR parameter surface has no dedicated default-value slot in the producers
+used here, so a parameter's default expression is stored in the parameter's
+"ruby_param_default" metadata as the HIR expression node. The backend reads it to
+re-emit "name = default"; keeping it in metadata avoids inventing a new producer.
+@End Reasoning
+Process called "hir_set_parameter_default" takes hir_param as Integer, default_hir as Integer returns Integer:
+    proc hir_set_metadata from HIR with hir_param, "ruby_param_has_default", "true"
+    proc hir_set_metadata from HIR with hir_param, "ruby_param_default", default_hir
+    Return 1
+End Process
+
+@Reasoning:
+Ruby if/elsif/else (AST_IF) stores the condition at child 0, an AST_THEN_BLOCK at
+child 1, and an optional AST_ELSIF or AST_ELSE_BLOCK tail at child 2; "unless"
+(AST_UNLESS) is the same shape with an inverted condition. We build a HIR if with
+the condition (negated for unless), the then-block, and the recursively-lowered
+elsif/else tail as the else branch, preserving the source structure for round-trip.
+@End Reasoning
+Process called "translate_if" takes ctx_ptr as Integer, node as Integer, is_unless as Integer returns Integer:
+    Let cond_ast be proc ast_node_child from Parser with node, 0
+    Let cond_hir be proc translate_expression with ctx_ptr, cond_ast
+
+    Let hir_if be proc hir_create_if from HIR
+
+    If is_unless is equal to 1:
+        Let negated be proc hir_create_unary_expr from HIR with HIR.HIR_OP_LOGICAL_NOT, cond_hir
+        proc hir_set_if_condition from HIR with hir_if, negated
+        proc hir_set_metadata from HIR with hir_if, "ruby_unless", "true"
+    Otherwise:
+        proc hir_set_if_condition from HIR with hir_if, cond_hir
+    End If
+
+    Let then_block_ast be proc ast_node_child from Parser with node, 1
+    Let then_block_hir be proc translate_then_block with ctx_ptr, then_block_ast
+    proc hir_set_if_then from HIR with hir_if, then_block_hir
+
+    Let tail be proc ast_node_child from Parser with node, 2
+    If tail is not equal to 0:
+        Let tail_hir be proc translate_if_tail with ctx_ptr, tail
+        If tail_hir is not equal to 0:
+            proc hir_set_if_else from HIR with hir_if, tail_hir
+        End If
+    End If
+
+    Let modifier be proc ast_node_metadata with node, "modifier"
+    If modifier is not equal to 0:
+        proc hir_set_metadata from HIR with hir_if, "ruby_modifier", "true"
     End If
 
     Return hir_if
 End Process
 
 @Reasoning:
-Ruby assignment is uniform across regular "=", compound ("+=", "||=", etc.), and multiple-assignment forms; storing the operator text plus translated LHS/RHS lets a single HIR shape cover all of them.
+The if-tail is either an AST_ELSIF (recursive condition/then/tail, rendered as a
+nested HIR if so the elsif chain is preserved) or an AST_ELSE_BLOCK (rendered as a
+plain HIR block). Dispatching here keeps translate_if free of the tail-shape
+detail.
 @End Reasoning
+Process called "translate_if_tail" takes ctx_ptr as Integer, tail as Integer returns Integer:
+    Let tail_type be proc ast_node_type from Parser with tail
 
-@Implementation:
-Dictionary tagged node_type=assignment with operator copied from ast.value. Translate children[0] as "target", children[1] as "value".
-@End Implementation
+    If tail_type is equal to Parser.AST_ELSIF:
+        Let cond_ast be proc ast_node_child from Parser with tail, 0
+        Let cond_hir be proc translate_expression with ctx_ptr, cond_ast
 
-Process called "translate_assignment" takes translator as Integer, ast as Integer returns Integer:
-    Note: Translate Ruby assignment with various operators
+        Let hir_if be proc hir_create_if from HIR
+        proc hir_set_if_condition from HIR with hir_if, cond_hir
 
-    Let hir_assign be proc create_hir_dict
-    proc set_dict_value with hir_assign, "node_type", "assignment"
+        Let then_block_ast be proc ast_node_child from Parser with tail, 1
+        Let then_block_hir be proc translate_then_block with ctx_ptr, then_block_ast
+        proc hir_set_if_then from HIR with hir_if, then_block_hir
 
-    Note: Get assignment operator
-    proc set_dict_value with hir_assign, "operator", ast.value
-
-    Note: Translate left side (variable)
-    Let child_count be proc get_list_size with ast.children
-    If child_count is greater than 0:
-        Let lhs be proc get_list_item with ast.children, 0
-        Let hir_lhs be proc translate_ruby_to_hir with translator, lhs
-        proc set_dict_value with hir_assign, "target", hir_lhs
-    End If
-
-    Note: Translate right side (value)
-    If child_count is greater than 1:
-        Let rhs be proc get_list_item with ast.children, 1
-        Let hir_rhs be proc translate_ruby_to_hir with translator, rhs
-        proc set_dict_value with hir_assign, "value", hir_rhs
-    End If
-
-    Return hir_assign
-End Process
-
-@Reasoning:
-Ruby array literals "[a, b, c]" carry their elements as direct children; the HIR shape mirrors that with a "node_type=array_literal" envelope and a children list of translated elements.
-@End Reasoning
-
-@Implementation:
-Dictionary tagged node_type=array_literal. Recursively translate every child and append to the elements List attached at "elements".
-@End Implementation
-
-Process called "translate_array" takes translator as Integer, ast as Integer returns Integer:
-    Note: Translate Ruby array literal to HIR
-
-    Let hir_array be proc create_hir_dict
-    proc set_dict_value with hir_array, "node_type", "array_literal"
-
-    Let elements be proc create_list
-    Let child_count be proc get_list_size with ast.children
-    Let index be 0
-
-    While index is less than child_count:
-        Let element be proc get_list_item with ast.children, index
-        Let hir_element be proc translate_ruby_to_hir with translator, element
-        proc add_to_list with elements, hir_element
-        Set index to index plus 1
-    End While
-
-    proc set_dict_value with hir_array, "elements", elements
-
-    Return hir_array
-End Process
-
-@Reasoning:
-The parser flattens hash literals "{k => v, ...}" into a child list of alternating key/value nodes; the translator reconstitutes them into discrete key/value pair Dictionaries so HIR consumers do not need to know the flattening trick.
-@End Reasoning
-
-@Implementation:
-Dictionary tagged node_type=hash_literal. Iterate children in steps of two; pair index/index+1 as key/value, recursively translate both, and append a Dictionary with key/value keys to the pairs List.
-@End Implementation
-
-Process called "translate_hash" takes translator as Integer, ast as Integer returns Integer:
-    Note: Translate Ruby hash literal to HIR
-
-    Let hir_hash be proc create_hir_dict
-    proc set_dict_value with hir_hash, "node_type", "hash_literal"
-
-    Let pairs be proc create_list
-    Let child_count be proc get_list_size with ast.children
-    Let index be 0
-
-    Note: Process key-value pairs
-    While index is less than child_count:
-        If index plus 1 is less than child_count:
-            Let key be proc get_list_item with ast.children, index
-            Let value be proc get_list_item with ast.children, index plus 1
-
-            Let hir_key be proc translate_ruby_to_hir with translator, key
-            Let hir_value be proc translate_ruby_to_hir with translator, value
-
-            Let pair be proc create_hir_dict
-            proc set_dict_value with pair, "key", hir_key
-            proc set_dict_value with pair, "value", hir_value
-
-            proc add_to_list with pairs, pair
+        Let next_tail be proc ast_node_child from Parser with tail, 2
+        If next_tail is not equal to 0:
+            Let next_hir be proc translate_if_tail with ctx_ptr, next_tail
+            If next_hir is not equal to 0:
+                proc hir_set_if_else from HIR with hir_if, next_hir
+            End If
         End If
 
-        Set index to index plus 2
+        proc hir_set_metadata from HIR with hir_if, "ruby_elsif", "true"
+        Return hir_if
+    End If
+
+    If tail_type is equal to Parser.AST_ELSE_BLOCK:
+        Return proc translate_then_block with ctx_ptr, tail
+    End If
+
+    Return 0
+End Process
+
+@Reasoning:
+An AST_THEN_BLOCK (or AST_ELSE_BLOCK) is a list of statement children. This helper
+lowers them into a single HIR block so a conditional branch is one statement node.
+@End Reasoning
+Process called "translate_then_block" takes ctx_ptr as Integer, block_node as Integer returns Integer:
+    Let hir_block be proc hir_create_block from HIR
+    If block_node is equal to 0:
+        Return hir_block
+    End If
+
+    Let count be proc ast_node_child_count from Parser with block_node
+    Let i be 0
+    While i is less than count:
+        Let child be proc ast_node_child from Parser with block_node, i
+        Let stmt_hir be proc translate_statement with ctx_ptr, child
+        If stmt_hir is not equal to 0:
+            proc hir_add_statement from HIR with hir_block, stmt_hir
+        End If
+        Set i to i plus 1
     End While
 
-    proc set_dict_value with hir_hash, "pairs", pairs
-
-    Return hir_hash
+    Return hir_block
 End Process
 
 @Reasoning:
-Ruby symbols ":foo" are interned immutable identifiers; preserving them as a distinct HIR kind (rather than collapsing to strings) keeps optimisation passes able to leverage their identity-equality property.
+Ruby while/until (condition at child 0, AST_THEN_BLOCK body at child 1) maps to a
+HIR while. "until" has post-test-free inverted polarity in Ruby's surface but is a
+pre-test loop-while-false, so we negate the condition (matching the lua repeat
+lowering convention) and tag "ruby_until" so the backend re-emits "until".
 @End Reasoning
+Process called "translate_while" takes ctx_ptr as Integer, node as Integer, is_until as Integer returns Integer:
+    Let cond_ast be proc ast_node_child from Parser with node, 0
+    Let cond_hir be proc translate_expression with ctx_ptr, cond_ast
 
-@Implementation:
-Dictionary tagged node_type=symbol with the symbol's lexeme copied to "value".
-@End Implementation
+    Let body_ast be proc ast_node_child from Parser with node, 1
+    Let body_hir be proc translate_then_block with ctx_ptr, body_ast
 
-Process called "translate_symbol" takes translator as Integer, ast as Integer returns Integer:
-    Note: Translate Ruby symbol to HIR
+    Let hir_while be proc hir_create_while from HIR
 
-    Let hir_symbol be proc create_hir_dict
-    proc set_dict_value with hir_symbol, "node_type", "symbol"
-    proc set_dict_value with hir_symbol, "value", ast.value
-
-    Return hir_symbol
-End Process
-
-@Reasoning:
-Ruby interpolated strings ""hello #{expr}"" mix literal text and embedded expressions; lifting them into a parts list with text/expression sub-nodes lets lowering emit appropriate string-build calls.
-@End Reasoning
-
-@Implementation:
-Dictionary tagged node_type=interpolated_string. Parse the raw value via parse_interpolation_parts into alternating text/expression parts. For each part: text -> wrap in a string_literal Dictionary; expression -> reparse via parse_ruby_expression and recursively translate. Attach the resulting list at "parts".
-@End Implementation
-
-@Security_Scope:
-Re-parsing embedded expressions requires that parse_ruby_expression treat its input as untrusted source code; misuse can let an attacker who controls the string trigger arbitrary parser behaviour.
-@End Security_Scope
-
-Process called "translate_interpolated_string" takes translator as Integer, ast as Integer returns Integer:
-    Note: Translate Ruby interpolated string to HIR
-
-    Let hir_interp be proc create_hir_dict
-    proc set_dict_value with hir_interp, "node_type", "interpolated_string"
-
-    Note: Parse interpolation expressions from the string
-    Let parts be proc parse_interpolation_parts with ast.value
-    Let hir_parts be proc create_list
-
-    Let part_count be proc get_list_size from parts
-    Let index be 0
-
-    While index is less than part_count:
-        Let part be proc get_list_item with parts, index
-        Let part_type be proc get_dict_value with part, "type"
-
-        If part_type is equal to "text":
-            Let text_node be proc create_hir_dict
-            proc set_dict_value with text_node, "node_type", "string_literal"
-            proc set_dict_value with text_node, "value", proc get_dict_value with part, "content"
-            proc add_to_list with hir_parts, text_node
-        Otherwise If part_type is equal to "expression":
-            Note: Parse the embedded expression
-            Let expr_text be proc get_dict_value with part, "content"
-            Let expr_ast be proc parse_ruby_expression from expr_text
-            Let hir_expr be proc translate_ruby_to_hir with translator, expr_ast
-            proc add_to_list with hir_parts, hir_expr
-        End If
-
-        Set index to index plus 1
-    End While
-
-    proc set_dict_value with hir_interp, "parts", hir_parts
-
-    Return hir_interp
-End Process
-
-@Reasoning:
-"yield" hands control to the block attached to the surrounding method call; HIR records the optional argument list so that the lowering stage can wire it to the block's parameters.
-@End Reasoning
-
-@Implementation:
-Dictionary tagged node_type=yield. If an arguments attribute is present, translate via translate_arguments and attach.
-@End Implementation
-
-Process called "translate_yield" takes translator as Integer, ast as Integer returns Integer:
-    Note: Translate Ruby yield statement to HIR
-
-    Let hir_yield be proc create_hir_dict
-    proc set_dict_value with hir_yield, "node_type", "yield"
-
-    Note: Handle yield arguments
-    Let arguments be proc get_node_attribute with ast, "arguments"
-    If arguments is not equal to 0:
-        Let hir_args be proc translate_arguments with translator, arguments
-        proc set_dict_value with hir_yield, "arguments", hir_args
-    End If
-
-    Return hir_yield
-End Process
-
-@Reasoning:
-"super" dispatches to the same-named method on the superclass; HIR captures only the arguments (the method name and receiver are implicit), since downstream lowering must reconstruct them from the lexical context.
-@End Reasoning
-
-@Implementation:
-Dictionary tagged node_type=super_call. If arguments attribute present, translate via translate_arguments and attach.
-@End Implementation
-
-Process called "translate_super_call" takes translator as Integer, ast as Integer returns Integer:
-    Note: Translate Ruby super call to HIR
-
-    Let hir_super be proc create_hir_dict
-    proc set_dict_value with hir_super, "node_type", "super_call"
-
-    Note: Handle super arguments
-    Let arguments be proc get_node_attribute with ast, "arguments"
-    If arguments is not equal to 0:
-        Let hir_args be proc translate_arguments with translator, arguments
-        proc set_dict_value with hir_super, "arguments", hir_args
-    End If
-
-    Return hir_super
-End Process
-
-@Reasoning:
-Ruby treats most "operators" as method calls on the LHS, but they appear in the AST as binary_op nodes; HIR keeps them tagged distinctly to let constant-folding and arithmetic-lowering passes match on operator text directly.
-@End Reasoning
-
-@Implementation:
-Dictionary tagged node_type=binary_operation with operator copied from ast.value. If at least two children exist, recursively translate children[0] as "left" and children[1] as "right".
-@End Implementation
-
-Process called "translate_binary_op" takes translator as Integer, ast as Integer returns Integer:
-    Note: Translate Ruby binary operation to HIR
-
-    Let hir_binop be proc create_hir_dict
-    proc set_dict_value with hir_binop, "node_type", "binary_operation"
-    proc set_dict_value with hir_binop, "operator", ast.value
-
-    Note: Translate operands
-    Let child_count be proc get_list_size with ast.children
-    If child_count is greater than or equal to 2:
-        Let left be proc get_list_item with ast.children, 0
-        Let right be proc get_list_item with ast.children, 1
-
-        Let hir_left be proc translate_ruby_to_hir with translator, left
-        Let hir_right be proc translate_ruby_to_hir with translator, right
-
-        proc set_dict_value with hir_binop, "left", hir_left
-        proc set_dict_value with hir_binop, "right", hir_right
-    End If
-
-    Return hir_binop
-End Process
-
-@Reasoning:
-In Ruby the variable kind is determined by the identifier's sigil/case: @x instance, @@x class, $x global, X (uppercase first) constant, plain lowercase local. Encoding the kind in HIR avoids re-classification by every downstream pass.
-@End Reasoning
-
-@Implementation:
-Dictionary tagged node_type=identifier with name copied from ast.value. Inspect the first character: "@" then "@" -> class_variable, "@" alone -> instance_variable, "$" -> global_variable, uppercase letter -> constant, anything else -> local_variable. Store the classification at "variable_type".
-@End Implementation
-
-Process called "translate_identifier" takes translator as Integer, ast as Integer returns Integer:
-    Note: Translate Ruby identifier to HIR
-
-    Let hir_id be proc create_hir_dict
-    proc set_dict_value with hir_id, "node_type", "identifier"
-    proc set_dict_value with hir_id, "name", ast.value
-
-    Note: Check for variable type based on naming convention
-    Let first_char be proc char_at with ast.value, 0
-
-    If first_char is equal to "@":
-        If proc char_at with ast.value, 1 is equal to "@":
-            proc set_dict_value with hir_id, "variable_type", "class_variable"
-        Otherwise:
-            proc set_dict_value with hir_id, "variable_type", "instance_variable"
-        End If
-    Otherwise If first_char is equal to "$":
-        proc set_dict_value with hir_id, "variable_type", "global_variable"
-    Otherwise If proc is_uppercase with first_char is equal to 1:
-        proc set_dict_value with hir_id, "variable_type", "constant"
+    If is_until is equal to 1:
+        Let negated be proc hir_create_unary_expr from HIR with HIR.HIR_OP_LOGICAL_NOT, cond_hir
+        proc hir_set_while_condition from HIR with hir_while, negated
+        proc hir_set_metadata from HIR with hir_while, "ruby_until", "true"
     Otherwise:
-        proc set_dict_value with hir_id, "variable_type", "local_variable"
+        proc hir_set_while_condition from HIR with hir_while, cond_hir
     End If
 
-    Return hir_id
-End Process
+    proc hir_set_while_body from HIR with hir_while, body_hir
 
-Note: Helper processes for Ruby to HIR translation
+    Let modifier be proc ast_node_metadata with node, "modifier"
+    If modifier is not equal to 0:
+        proc hir_set_metadata from HIR with hir_while, "ruby_modifier", "true"
+    End If
 
-@Reasoning:
-HIR Dictionaries follow a 32-byte block layout (count / capacity / keys ptr / values ptr); centralising the allocation in one helper keeps the size constant in one place.
-@End Reasoning
-
-@Implementation:
-Request a 32-byte block from Layout and return the raw pointer.
-@End Implementation
-
-Process called "create_hir_dict" returns Integer:
-    Note: Create HIR dictionary node
-    Return proc memory_allocate from Layout with 32
+    Return hir_while
 End Process
 
 @Reasoning:
-HIR Lists use a 16-byte header (count + storage pointer); the helper keeps the size constant adjacent to its sibling create_hir_dict.
+Ruby's "for x in collection" (AST_TARGET_LIST at child 0, iterable at child 1,
+AST_THEN_BLOCK body at child 2) maps to a HIR for-in. We bind the first target
+name as the for-in variable, lower the iterable, and lower the body block; a
+multi-target for is tagged so the backend re-emits the full target list.
 @End Reasoning
+Process called "translate_for" takes ctx_ptr as Integer, node as Integer returns Integer:
+    Let target_list be proc ast_node_child from Parser with node, 0
+    Let first_target be proc ast_node_child from Parser with target_list, 0
+    Let var_name be proc ast_node_value from Parser with first_target
 
-@Implementation:
-Request a 16-byte block from Layout and return the raw pointer.
-@End Implementation
+    Let iterable_ast be proc ast_node_child from Parser with node, 1
+    Let iterable_hir be proc translate_expression with ctx_ptr, iterable_ast
 
-Process called "create_list" returns Integer:
-    Note: Create list for HIR storage
-    Return proc memory_allocate from Layout with 16
+    Let body_ast be proc ast_node_child from Parser with node, 2
+    Let body_hir be proc translate_then_block with ctx_ptr, body_ast
+
+    Let hir_for be proc hir_create_for_in from HIR
+    proc hir_set_for_in_variable from HIR with hir_for, var_name
+    proc hir_set_for_in_iterable from HIR with hir_for, iterable_hir
+    proc hir_set_for_in_body from HIR with hir_for, body_hir
+
+    Let target_count be proc ast_node_child_count from Parser with target_list
+    If target_count is greater than 1:
+        proc hir_set_metadata from HIR with hir_for, "ruby_for_multi", "true"
+    End If
+
+    Return hir_for
 End Process
 
 @Reasoning:
-The translator's internal symbol-table dictionary uses a smaller 24-byte header than HIR Dictionaries because it does not need to track the same metadata.
+Ruby's case/when (optional subject at child 0, AST_WHEN clauses, optional
+AST_ELSE_BLOCK) has no HIR switch in this producer surface, so we lower it to a
+chain of HIR if statements: each AST_WHEN becomes an if whose condition is the
+subject compared against the guard(s), with the next when as the else branch and
+the trailing else as the innermost else. The whole chain is tagged "ruby_case" so
+the backend can re-emit case/when when it recognises the shape.
 @End Reasoning
+Process called "translate_case" takes ctx_ptr as Integer, node as Integer returns Integer:
+    Let count be proc ast_node_child_count from Parser with node
 
-@Implementation:
-Request a 24-byte block from Layout and return the raw pointer.
-@End Implementation
-
-Process called "create_dict" returns Integer:
-    Note: Create dictionary for storage
-    Return proc memory_allocate from Layout with 24
-End Process
-
-@Reasoning:
-if/elsif/else bodies are lists of statements; uniform translation through one helper keeps the conditional translator simple.
-@End Reasoning
-
-@Implementation:
-Allocate an output List, walk the source list translating each entry via translate_ruby_to_hir, append non-null results.
-@End Implementation
-
-Process called "translate_statement_list" takes translator as Integer, statements as Integer returns Integer:
-    Note: Translate list of Ruby statements to HIR
-
-    Let hir_statements be proc create_list
-    Let stmt_count be proc get_list_size from statements
-    Let index be 0
-
-    While index is less than stmt_count:
-        Let statement be proc get_list_item with statements, index
-        Let hir_stmt be proc translate_ruby_to_hir with translator, statement
-
-        If hir_stmt is not equal to 0:
-            proc add_to_list with hir_statements, hir_stmt
+    Note: Detect optional subject (child 0 is a WHEN if there is no subject).
+    Let subject_present be 0
+    Let first be proc ast_node_child from Parser with node, 0
+    If first is not equal to 0:
+        Let first_type be proc ast_node_type from Parser with first
+        If first_type is not equal to Parser.AST_WHEN:
+            If first_type is not equal to Parser.AST_ELSE_BLOCK:
+                Set subject_present to 1
+            End If
         End If
+    End If
 
-        Set index to index plus 1
+    Let subject_hir be 0
+    Let scan_start be 0
+    If subject_present is equal to 1:
+        Set subject_hir to proc translate_expression with ctx_ptr, first
+        Set scan_start to 1
+    End If
+
+    Note: Collect when clauses and the optional else block.
+    Let else_hir be 0
+    Let when_count be 0
+    Let scan be scan_start
+    While scan is less than count:
+        Let clause be proc ast_node_child from Parser with node, scan
+        Let clause_type be proc ast_node_type from Parser with clause
+        If clause_type is equal to Parser.AST_ELSE_BLOCK:
+            Set else_hir to proc translate_then_block with ctx_ptr, clause
+        Otherwise If clause_type is equal to Parser.AST_WHEN:
+            Set when_count to when_count plus 1
+        End If
+        Set scan to scan plus 1
     End While
 
-    Return hir_statements
-End Process
-
-@Reasoning:
-Ruby methods implicitly return the last expression evaluated; making that explicit in HIR (as a return node with implicit="true") lets downstream optimisers treat returns uniformly regardless of source style.
-@End Reasoning
-
-@Implementation:
-If the body has at least one statement and the last is not already a "return", construct an implicit-return Dictionary wrapping that statement (with implicit="true") and overwrite the last list entry with the wrapper.
-@End Implementation
-
-Process called "ensure_implicit_return" takes hir_method as Integer, body_statements as Integer returns Integer:
-    Note: Ensure Ruby's implicit return semantics in HIR
-
-    Let stmt_count be proc get_list_size from body_statements
-
-    If stmt_count is greater than 0:
-        Let last_stmt be proc get_list_item with body_statements, stmt_count minus 1
-        Let stmt_type be proc get_dict_value with last_stmt, "node_type"
-
-        Note: If last statement is not already a return, wrap it in implicit return
-        If stmt_type is not equal to "return":
-            Let implicit_return be proc create_hir_dict
-            proc set_dict_value with implicit_return, "node_type", "return"
-            proc set_dict_value with implicit_return, "value", last_stmt
-            proc set_dict_value with implicit_return, "implicit", "true"
-
-            Note: Replace last statement with implicit return
-            proc set_list_item with body_statements, stmt_count minus 1, implicit_return
+    Note: Build the if-chain right-to-left so each when's else is the next when.
+    Let current_else be else_hir
+    Let idx be count minus 1
+    While idx is greater than or equal to scan_start:
+        Let clause be proc ast_node_child from Parser with node, idx
+        Let clause_type be proc ast_node_type from Parser with clause
+        If clause_type is equal to Parser.AST_WHEN:
+            Let when_if be proc translate_when_clause with ctx_ptr, clause, subject_hir, current_else
+            Set current_else to when_if
         End If
-    End If
-
-    Return 1
-End Process
-
-@Reasoning:
-Ruby's mixin mechanism uses include/extend calls inside the class body; hoisting them into dedicated includes/extends lists on the class node makes the mixin graph directly queryable without rescanning the body.
-@End Reasoning
-
-@Implementation:
-Walk body_statements; sort statements whose node_type equals "include" into the includes List and "extend" into the extends List. After scanning, if either list is non-empty, attach it to hir_class at "includes" / "extends".
-@End Implementation
-
-Process called "extract_mixins" takes translator as Integer, hir_class as Integer, body_statements as Integer returns Integer:
-    Note: Extract include and extend statements from class body
-
-    Let includes be proc create_list
-    Let extends be proc create_list
-    Let stmt_count be proc get_list_size from body_statements
-    Let index be 0
-
-    While index is less than stmt_count:
-        Let stmt be proc get_list_item with body_statements, index
-        Let stmt_type be proc get_dict_value with stmt, "node_type"
-
-        If stmt_type is equal to "include":
-            proc add_to_list with includes, stmt
-        Otherwise If stmt_type is equal to "extend":
-            proc add_to_list with extends, stmt
-        End If
-
-        Set index to index plus 1
+        Set idx to idx minus 1
     End While
 
-    If proc get_list_size with includes is greater than 0:
-        proc set_dict_value with hir_class, "includes", includes
+    If current_else is equal to 0:
+        Set current_else to proc hir_create_block from HIR
     End If
 
-    If proc get_list_size with extends is greater than 0:
-        proc set_dict_value with hir_class, "extends", extends
+    proc hir_set_metadata from HIR with current_else, "ruby_case", "true"
+    Return current_else
+End Process
+
+@Reasoning:
+An AST_WHEN holds an AST_WHEN_GUARDS (child 0) and an AST_THEN_BLOCK body (child
+1). We build a HIR if whose condition is the disjunction of (subject === guard)
+tests - or, when there is no subject, the guards themselves - the then-block is the
+body, and the supplied else branch links the next clause. The "===" case-equality
+is tagged on each comparison so the backend re-emits case semantics.
+@End Reasoning
+Process called "translate_when_clause" takes ctx_ptr as Integer, clause as Integer, subject_hir as Integer, else_branch as Integer returns Integer:
+    Let guards be proc ast_node_child from Parser with clause, 0
+    Let body_ast be proc ast_node_child from Parser with clause, 1
+    Let body_hir be proc translate_then_block with ctx_ptr, body_ast
+
+    Let guard_count be proc ast_node_child_count from Parser with guards
+    Let condition be 0
+
+    Let i be 0
+    While i is less than guard_count:
+        Let guard be proc ast_node_child from Parser with guards, i
+        Let guard_hir be proc translate_expression with ctx_ptr, guard
+
+        Let test be 0
+        If subject_hir is not equal to 0:
+            Note: subject === guard ; share-by-structure: re-translate subject per test.
+            Set test to proc hir_create_binary_expr from HIR with HIR.HIR_OP_EQUAL, subject_hir, guard_hir
+            proc hir_set_metadata from HIR with test, "ruby_operator", "==="
+        Otherwise:
+            Set test to guard_hir
+        End If
+
+        If condition is equal to 0:
+            Set condition to test
+        Otherwise:
+            Set condition to proc hir_create_binary_expr from HIR with HIR.HIR_OP_LOGICAL_OR, condition, test
+        End If
+
+        Set i to i plus 1
+    End While
+
+    If condition is equal to 0:
+        Set condition to proc hir_create_bool_literal from HIR with 1
+    End If
+
+    Let hir_if be proc hir_create_if from HIR
+    proc hir_set_if_condition from HIR with hir_if, condition
+    proc hir_set_if_then from HIR with hir_if, body_hir
+    If else_branch is not equal to 0:
+        proc hir_set_if_else from HIR with hir_if, else_branch
+    End If
+    proc hir_set_metadata from HIR with hir_if, "ruby_when", "true"
+    Return hir_if
+End Process
+
+@Reasoning:
+Ruby's begin/rescue/else/ensure (AST_BEGIN) maps to HIR's try/catch/finally. The
+protected body is the AST_THEN_BLOCK at child 0; each AST_RESCUE becomes a HIR
+catch (its exception types and bound variable preserved); a trailing
+AST_ELSE_BLOCK is tagged onto the try as the no-exception branch; an AST_ENSURE
+becomes the finally block.
+@End Reasoning
+Process called "translate_begin" takes ctx_ptr as Integer, node as Integer returns Integer:
+    Let hir_try be proc hir_create_try from HIR
+
+    Let body_ast be proc ast_node_child from Parser with node, 0
+    Let body_hir be proc translate_then_block with ctx_ptr, body_ast
+    proc hir_set_try_block from HIR with hir_try, body_hir
+
+    Let count be proc ast_node_child_count from Parser with node
+    Let i be 1
+    While i is less than count:
+        Let clause be proc ast_node_child from Parser with node, i
+        Let clause_type be proc ast_node_type from Parser with clause
+
+        If clause_type is equal to Parser.AST_RESCUE:
+            Let hir_catch be proc translate_rescue with ctx_ptr, clause
+            proc hir_add_catch_clause from HIR with hir_try, hir_catch
+        Otherwise If clause_type is equal to Parser.AST_ELSE_BLOCK:
+            Let else_hir be proc translate_then_block with ctx_ptr, clause
+            proc hir_set_metadata from HIR with hir_try, "ruby_begin_else", "true"
+            proc attach_begin_else with hir_try, else_hir
+        Otherwise If clause_type is equal to Parser.AST_ENSURE:
+            Let ensure_hir be proc translate_then_block with ctx_ptr, clause
+            proc hir_set_finally_block from HIR with hir_try, ensure_hir
+        End If
+
+        Set i to i plus 1
+    End While
+
+    Return hir_try
+End Process
+
+@Reasoning:
+HIR's try node has no dedicated no-exception ("else") slot, so the begin/else body
+is stashed in "ruby_begin_else_body" metadata as the HIR block node. The backend
+reads it to re-emit the "else" clause of begin/rescue; metadata avoids inventing a
+new producer for a Ruby-specific feature.
+@End Reasoning
+Process called "attach_begin_else" takes hir_try as Integer, else_hir as Integer returns Integer:
+    proc hir_set_metadata from HIR with hir_try, "ruby_begin_else_body", else_hir
+    Return 1
+End Process
+
+@Reasoning:
+An AST_RESCUE holds an AST_RESCUE_TYPES list (child 0), an AST_THEN_BLOCK body
+(child 1), and an optional bound-variable name in its value slot. We build a HIR
+catch: the first exception type name becomes the catch type, the bound variable
+becomes the catch variable, the body becomes the catch body, and any additional
+exception types are preserved in metadata so multi-type rescues round-trip.
+@End Reasoning
+Process called "translate_rescue" takes ctx_ptr as Integer, clause as Integer returns Integer:
+    Let hir_catch be proc hir_create_catch from HIR
+
+    Let types_ast be proc ast_node_child from Parser with clause, 0
+    Let type_count be 0
+    If types_ast is not equal to 0:
+        Set type_count to proc ast_node_child_count from Parser with types_ast
+    End If
+
+    If type_count is greater than 0:
+        Let first_type be proc ast_node_child from Parser with types_ast, 0
+        Let type_name be proc ast_node_value from Parser with first_type
+        proc hir_set_catch_type from HIR with hir_catch, type_name
+
+        If type_count is greater than 1:
+            Let extra be proc build_extra_rescue_types with ctx_ptr, types_ast
+            proc hir_set_metadata from HIR with hir_catch, "ruby_rescue_extra_types", extra
+        End If
+    End If
+
+    Let bound_var be proc ast_node_value from Parser with clause
+    If bound_var is not equal to 0:
+        proc hir_set_catch_variable from HIR with hir_catch, bound_var
+    End If
+
+    Let body_ast be proc ast_node_child from Parser with clause, 1
+    Let body_hir be proc translate_then_block with ctx_ptr, body_ast
+    proc hir_set_catch_body from HIR with hir_catch, body_hir
+
+    Return hir_catch
+End Process
+
+@Reasoning:
+A rescue clause may name several exception classes (rescue A, B => e). The HIR
+catch type slot holds only the first; the remaining class names are joined with
+", " into a single string carried in metadata so the backend re-emits the full
+comma-separated rescue type list.
+@End Reasoning
+Process called "build_extra_rescue_types" takes ctx_ptr as Integer, types_ast as Integer returns Integer:
+    Let count be proc ast_node_child_count from Parser with types_ast
+    Let result be ""
+
+    Let i be 1
+    While i is less than count:
+        Let type_node be proc ast_node_child from Parser with types_ast, i
+        Let type_name be proc ast_node_value from Parser with type_node
+
+        If i is greater than 1:
+            Set result to proc string_concat from StringUtils with result, ", "
+        End If
+        Set result to proc string_concat from StringUtils with result, type_name
+        Set i to i plus 1
+    End While
+
+    Return result
+End Process
+
+@Reasoning:
+Ruby's "return [value]" wraps an optional value at child 0. A bare return becomes
+a HIR return with no value; a value return attaches the lowered expression. This
+mirrors the lua return lowering for a uniform HIR return shape.
+@End Reasoning
+Process called "translate_return" takes ctx_ptr as Integer, node as Integer returns Integer:
+    Let hir_return be proc hir_create_return from HIR
+    Let count be proc ast_node_child_count from Parser with node
+
+    If count is greater than 0:
+        Let value_ast be proc ast_node_child from Parser with node, 0
+        Let value_hir be proc translate_expression with ctx_ptr, value_ast
+        proc hir_set_return_value from HIR with hir_return, value_hir
+    End If
+
+    Return hir_return
+End Process
+
+@Reasoning:
+Ruby's "break [value]" maps to a HIR break. HIR break carries no payload, so a
+value-carrying break (break in a block returning a value) keeps its value in
+"ruby_break_value" metadata as the lowered expression so the backend re-emits it.
+@End Reasoning
+Process called "translate_break" takes ctx_ptr as Integer, node as Integer returns Integer:
+    Let hir_break be proc hir_create_break from HIR
+    Let count be proc ast_node_child_count from Parser with node
+    If count is greater than 0:
+        Let value_ast be proc ast_node_child from Parser with node, 0
+        Let value_hir be proc translate_expression with ctx_ptr, value_ast
+        proc hir_set_metadata from HIR with hir_break, "ruby_break_value", value_hir
+    End If
+    Return hir_break
+End Process
+
+@Reasoning:
+Ruby's "next [value]" continues to the next loop/block iteration; it maps to a HIR
+continue. An optional value is stashed in "ruby_next_value" metadata so a
+value-carrying next round-trips.
+@End Reasoning
+Process called "translate_next" takes ctx_ptr as Integer, node as Integer returns Integer:
+    Let hir_continue be proc hir_create_continue from HIR
+    Let count be proc ast_node_child_count from Parser with node
+    If count is greater than 0:
+        Let value_ast be proc ast_node_child from Parser with node, 0
+        Let value_hir be proc translate_expression with ctx_ptr, value_ast
+        proc hir_set_metadata from HIR with hir_continue, "ruby_next_value", value_hir
+    End If
+    proc hir_set_metadata from HIR with hir_continue, "ruby_next", "true"
+    Return hir_continue
+End Process
+
+@Reasoning:
+Multiple assignment "a, b = x, y" stores an AST_TARGET_LIST at child 0 and an
+AST_VALUE_LIST at child 1. We emit one HIR simple-assign expression per
+target/value pair wrapped as statements inside a HIR block, mirroring lua's
+multiple-assignment lowering; surplus targets bind to null, surplus values are
+dropped. The block is tagged so the backend can re-collapse to the comma form.
+@End Reasoning
+Process called "translate_multiple_assign" takes ctx_ptr as Integer, node as Integer returns Integer:
+    Let target_list be proc ast_node_child from Parser with node, 0
+    Let value_list be proc ast_node_child from Parser with node, 1
+
+    Let target_count be proc ast_node_child_count from Parser with target_list
+    Let value_count be 0
+    If value_list is not equal to 0:
+        Set value_count to proc ast_node_child_count from Parser with value_list
+    End If
+
+    Let hir_block be proc hir_create_block from HIR
+    proc hir_set_metadata from HIR with hir_block, "ruby_multiple_assign", "true"
+
+    Let i be 0
+    While i is less than target_count:
+        Let target_ast be proc ast_node_child from Parser with target_list, i
+        Let target_hir be proc translate_multiassign_target with ctx_ptr, target_ast
+
+        Let value_hir be 0
+        If i is less than value_count:
+            Let value_ast be proc ast_node_child from Parser with value_list, i
+            Set value_hir to proc translate_expression with ctx_ptr, value_ast
+        Otherwise:
+            Set value_hir to proc hir_create_null_literal from HIR
+        End If
+
+        Let assign_expr be proc hir_create_assign_expr from HIR with target_hir, HIR.HIR_ASSIGN_SIMPLE, value_hir
+        Let assign_stmt be proc hir_create_expression_statement from HIR with assign_expr
+        proc hir_add_statement from HIR with hir_block, assign_stmt
+        Set i to i plus 1
+    End While
+
+    Return hir_block
+End Process
+
+@Reasoning:
+A multiple-assignment target may be a splat (*rest) wrapped in AST_SPLAT_ARG; we
+unwrap it and tag the lowered target "ruby_splat" so the backend re-prefixes the
+star. Ordinary targets translate as expressions.
+@End Reasoning
+Process called "translate_multiassign_target" takes ctx_ptr as Integer, target_ast as Integer returns Integer:
+    Let target_type be proc ast_node_type from Parser with target_ast
+    If target_type is equal to Parser.AST_SPLAT_ARG:
+        Let inner be proc ast_node_child from Parser with target_ast, 0
+        Let inner_hir be proc translate_expression with ctx_ptr, inner
+        proc hir_set_metadata from HIR with inner_hir, "ruby_splat", "true"
+        Return inner_hir
+    End If
+    Return proc translate_expression with ctx_ptr, target_ast
+End Process
+
+@Reasoning:
+"alias new old" (AST_ALIAS) names a method synonym. HIR has no alias node, so it
+lowers to a call to a synthetic "alias_method" identifier with the new and old
+names (children 0 and 1, identifiers or symbols) as arguments, tagged
+"ruby_alias" so the backend re-emits the keyword form.
+@End Reasoning
+Process called "translate_alias" takes ctx_ptr as Integer, node as Integer returns Integer:
+    Let new_ast be proc ast_node_child from Parser with node, 0
+    Let old_ast be proc ast_node_child from Parser with node, 1
+    Let new_hir be proc translate_expression with ctx_ptr, new_ast
+    Let old_hir be proc translate_expression with ctx_ptr, old_ast
+
+    Let callee be proc hir_create_identifier from HIR with "alias_method"
+    Let hir_call be proc hir_create_call_expr from HIR with callee
+    proc hir_add_argument from HIR with hir_call, new_hir
+    proc hir_add_argument from HIR with hir_call, old_hir
+    proc hir_set_metadata from HIR with hir_call, "ruby_alias", "true"
+    Return proc hir_create_expression_statement from HIR with hir_call
+End Process
+
+@Reasoning:
+"undef name, ..." (AST_UNDEF) removes method definitions. With no HIR node, it
+lowers to a call to a synthetic "undef_method" identifier carrying each name as an
+argument, tagged "ruby_undef" so the backend re-emits "undef".
+@End Reasoning
+Process called "translate_undef" takes ctx_ptr as Integer, node as Integer returns Integer:
+    Let callee be proc hir_create_identifier from HIR with "undef_method"
+    Let hir_call be proc hir_create_call_expr from HIR with callee
+
+    Let count be proc ast_node_child_count from Parser with node
+    Let i be 0
+    While i is less than count:
+        Let name_ast be proc ast_node_child from Parser with node, i
+        Let name_hir be proc translate_expression with ctx_ptr, name_ast
+        proc hir_add_argument from HIR with hir_call, name_hir
+        Set i to i plus 1
+    End While
+
+    proc hir_set_metadata from HIR with hir_call, "ruby_undef", "true"
+    Return proc hir_create_expression_statement from HIR with hir_call
+End Process
+
+@Reasoning:
+Ruby methods implicitly return the value of their last evaluated expression. We
+make this explicit in HIR: if the last statement of a method body is an expression
+statement (not already a return/control statement), we replace it with a HIR
+return wrapping the inner expression, tagged "ruby_implicit_return" so the backend
+omits the explicit "return" keyword.
+@End Reasoning
+Process called "apply_implicit_return" takes ctx_ptr as Integer, hir_body as Integer returns Integer:
+    Let statements be proc hir_get_block_statements from HIR with hir_body
+    If statements is equal to 0:
+        Return 0
+    End If
+    Let count be proc list_length from ListCore with statements
+    If count is equal to 0:
+        Return 0
+    End If
+
+    Let last be proc list_get from ListCore with statements, count minus 1
+    Let last_type be proc hir_node_type from HIR with last
+
+    If last_type is equal to HIR.HIR_EXPR_STMT:
+        Let inner be proc hir_get_expression_statement_expr from HIR with last
+        Let hir_return be proc hir_create_return from HIR
+        proc hir_set_return_value from HIR with hir_return, inner
+        proc hir_set_metadata from HIR with hir_return, "ruby_implicit_return", "true"
+        proc list_set from ListCore with statements, count minus 1, hir_return
     End If
 
     Return 1
 End Process
 
+Note: ============================================================================
+Note: String-Lexeme Helpers
+Note: ============================================================================
+
 @Reasoning:
-The scope stack is updated through one helper so callers do not have to know the underlying scope linkage strategy.
+String and string-interp lexemes arrive with their delimiters attached. This
+helper returns the inner text by dropping the first and last character for the
+common single-char quote forms (" or '), leaving %-literals and edge cases as-is
+since the full lexeme is also retained in metadata for exact reproduction.
 @End Reasoning
+Process called "strip_string_delims" takes lexeme as Integer returns Integer:
+    Let len be proc string_length from StringCore with lexeme
+    If len is less than 2:
+        Return lexeme
+    End If
 
-@Implementation:
-Allocate a new scope of the given kind ("class", "module", "method", "block") linked to the translator's current scope, then make it current.
-@End Implementation
+    Let first be proc string_char_at from StringCore with lexeme, 0
+    Let is_quote be 0
+    If first is equal to 34:
+        Set is_quote to 1
+    End If
+    If first is equal to 39:
+        Set is_quote to 1
+    End If
+    If is_quote is equal to 0:
+        Return lexeme
+    End If
 
-Process called "push_scope" takes translator as Integer, scope_type as String returns Integer:
-    Note: Push new scope onto translator's scope stack
-    Note: Implementation  create new scope and link to parent
-    Return 1
+    Note: Build inner = chars [1 .. len-2].
+    Let result be ""
+    Let i be 1
+    While i is less than len minus 1:
+        Let ch be proc string_char_at from StringCore with lexeme, i
+        Let single be proc char_to_string from StringCore with ch
+        Set result to proc string_concat from StringUtils with result, single
+        Set i to i plus 1
+    End While
+
+    Return result
 End Process
 
 @Reasoning:
-Pop is the symmetric helper for push; centralising it keeps the stack discipline invariant - every push has exactly one matching pop in the translate_* helpers.
+Symbol lexemes (:foo) carry a leading colon. This helper returns the name without
+the colon by copying characters from index 1 onward; a malformed empty symbol
+returns the original lexeme unchanged.
 @End Reasoning
+Process called "strip_leading_colon" takes lexeme as Integer returns Integer:
+    Let len be proc string_length from StringCore with lexeme
+    If len is less than 1:
+        Return lexeme
+    End If
+    Let first be proc string_char_at from StringCore with lexeme, 0
+    If first is not equal to 58:
+        Return lexeme
+    End If
 
-@Implementation:
-Restore the translator's current scope pointer to the parent of the current scope.
-@End Implementation
+    Let result be ""
+    Let i be 1
+    While i is less than len:
+        Let ch be proc string_char_at from StringCore with lexeme, i
+        Let single be proc char_to_string from StringCore with ch
+        Set result to proc string_concat from StringUtils with result, single
+        Set i to i plus 1
+    End While
 
-Process called "pop_scope" takes translator as Integer returns Integer:
-    Note: Pop current scope from translator's scope stack
-    Note: Implementation  restore previous scope
-    Return 1
+    Return result
+End Process
+
+Note: ============================================================================
+Note: Top-Level Translation
+Note: ============================================================================
+
+@Reasoning:
+The AST_PROGRAM root holds the top-level statements of the .rb file. We translate
+each into HIR and add it as a top-level declaration on the HIR module so
+downstream module-level consumers (which iterate hir_get_declarations) see the
+file's statements directly, matching the lua/dart program lowering convention.
+@End Reasoning
+Process called "translate_program" takes ctx_ptr as Integer returns Integer:
+    Let ctx as RubyToHIRContext be ctx_ptr
+
+    Let program_ast be ctx.ast_root
+    Let count be proc ast_node_child_count from Parser with program_ast
+
+    Let i be 0
+    While i is less than count:
+        Let child be proc ast_node_child from Parser with program_ast, i
+        Let decl_hir be proc translate_statement with ctx_ptr, child
+        If decl_hir is not equal to 0:
+            proc hir_add_declaration from HIR with ctx.hir_module, decl_hir
+        End If
+        Set i to i plus 1
+    End While
+
+    Return ctx.hir_module
 End Process
 
 @Reasoning:
-Identifier classification needs to detect ASCII uppercase letters as the marker for Ruby constants; a tight code-point predicate is faster than a String comparison.
+Public entry point - builds a fresh translation context from the AST root and
+invokes translate_program. The context is not returned because callers at this
+layer do not need the diagnostic list; callers needing fine-grained error
+reporting construct the context manually via create_translation_context.
 @End Reasoning
-
-@Implementation:
-Get the integer code point of the input character and return 1 if it lies in 65..90 (A..Z), 0 otherwise.
-@End Implementation
-
-Process called "is_uppercase" takes char as String returns Integer:
-    Note: Check if character is uppercase
-    Let code be proc char_code from char
-    Return code is greater than or equal to 65 and code is less than or equal to 90
+Process called "translate_ruby_to_hir" takes ast_root as Integer returns Integer:
+    Let ctx be proc create_translation_context with ast_root
+    Let hir_module be proc translate_program with ctx
+    Return hir_module
 End Process
 
 @Reasoning:
-Public single-arg facade invoked by the translation dispatcher's
-LANG_RUBY arm. Wires the full source -> HIR pipeline: RubyLexer's
-create_ruby_lexer + tokenize_ruby produce the token list, RubyParser's
-create_ruby_parser wraps those tokens, parse_ruby walks them into an
-AST_PROGRAM root, the optional semantic pass (dynamic-type tracking,
-scope analysis) validates the AST without mutating its shape, and
-translate_ruby_to_hir lowers it into HIR through a freshly constructed
-RubyToHIRTranslator.
+Consults the had_error flag set by translation_error during the recursive walk.
+Returns the raw integer flag rather than computing list length because the flag
+costs an int-load while list length costs an indirection plus traversal.
 @End Reasoning
+Process called "had_translation_errors" takes ctx_ptr as Integer returns Integer:
+    Let ctx as RubyToHIRContext be ctx_ptr
+    Return ctx.had_error
+End Process
 
+@Reasoning:
+Returns the underlying List handle holding the error message strings. The list is
+owned by the context, so callers must not destroy or mutate it - they read the
+entries, format them for display, then destroy the context as a whole.
+@End Reasoning
+Process called "get_translation_errors" takes ctx_ptr as Integer returns Integer:
+    Let ctx as RubyToHIRContext be ctx_ptr
+    Return ctx.errors
+End Process
+
+@Reasoning:
+Public single-arg facade invoked by the translation dispatcher's LANG_RUBY arm.
+Wires the full source -> HIR pipeline: create_ruby_lexer builds the lexer state,
+create_ruby_parser pre-tokenizes the source and wraps the token stream, parse_ruby
+walks the tokens into an AST_PROGRAM root, and translate_ruby_to_hir lowers the AST
+into HIR.
+@End Reasoning
 @Implementation:
-lexer = RubyLexer.create_ruby_lexer(source); tokens = RubyLexer.tokenize_ruby(lexer);
-parser = RubyParser.create_ruby_parser(tokens); ast = RubyParser.parse_ruby(parser);
-if ast == 0 return 0; analyzer = RubySemantic.create_ruby_semantic_analyzer();
-if non-zero, run RubySemantic.analyze_ruby_ast(analyzer, ast) -- the result is
-discarded because the translator walks the same AST regardless and surfaces
-its own errors. translator = create_ruby_to_hir_translator; if 0 return 0;
-return translate_ruby_to_hir(translator, ast). Lifetimes are bounded by the
-calling translate_to_hir frame.
+On a lexer/parser failure (0 result) the wrapper short-circuits to 0 so downstream
+stages never see a half-formed module.
 @End Implementation
-
 Process called "ruby_to_hir_from_source" takes source_code as Integer returns Integer:
-    Let lexer be proc create_ruby_lexer from RubyLexer with source_code
+    Let lexer be proc create_ruby_lexer from Lexer with source_code
     If lexer is equal to 0:
         Return 0
     End If
-    Let tokens be proc tokenize_ruby from RubyLexer with lexer
-    If tokens is equal to 0:
-        Return 0
-    End If
 
-    Let parser be proc create_ruby_parser from RubyParser with tokens
+    Let parser be proc create_ruby_parser from Parser with lexer
     If parser is equal to 0:
         Return 0
     End If
-    Let ast be proc parse_ruby from RubyParser with parser
-    If ast is equal to 0:
+
+    Let ast_root be proc parse_ruby from Parser with parser
+    If ast_root is equal to 0:
         Return 0
     End If
 
-    Let analyzer be proc create_ruby_semantic_analyzer from RubySemantic
-    If analyzer is not equal to 0:
-        proc analyze_ruby_ast from RubySemantic with analyzer, ast
-    End If
-
-    Let translator be proc create_ruby_to_hir_translator
-    If translator is equal to 0:
-        Return 0
-    End If
-
-    Return proc translate_ruby_to_hir with translator, ast
+    Return proc translate_ruby_to_hir with ast_root
 End Process

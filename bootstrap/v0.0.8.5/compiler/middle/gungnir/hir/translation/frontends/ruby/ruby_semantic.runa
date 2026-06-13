@@ -1,1014 +1,1986 @@
-Note: Ruby Semantic Analyzer for Translation Translation System
-Note: Handles Ruby's dynamic typing, duck typing, metaprogramming, and mixins
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
 
-Import "compiler/middle/gungnir/hir/translation/frontends/ruby/ruby_parser.runa" as RubyParser
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+RUBY SEMANTIC ANALYZER - resolves definitions, names and captures over the
+Ruby AST
+
+The Ruby parser (ruby_parser.runa) produces a tree of 40-byte AST nodes whose
+type tag is one of the AST_* constants (8200..8327) and whose positional
+children carry the sub-structure. The node accessors are ast_node_type (slot
+0), ast_node_value (slot 8, a StringCore string handle), ast_node_child_count
+(slot 32), ast_node_child (slot 24 children list) and ast_node_metadata /
+ast_node_has_flag (slot 16, a string-keyed metadata Dict). This pass runs over
+that real AST - it does NOT invent a parallel node schema - and enforces the
+SEMANTIC rules Ruby's grammar alone does not express:
+
+  1. Lexical name resolution over a scope chain. Ruby distinguishes five
+     variable kinds by spelling, and the parser already encodes the kind in the
+     node TYPE: AST_IDENTIFIER (local, lowercase, block/method-scoped),
+     AST_INSTANCE_VAR (@ivar, per receiver/class context), AST_CLASS_VAR
+     (@@cvar, per class hierarchy), AST_GLOBAL_VAR ($gvar, flat program-wide)
+     and AST_CONSTANT (CamelCase, lexical + ancestor lookup). The analyzer
+     resolves each reference against the appropriate registry: locals against a
+     scope chain of name->level tables, ivars/cvars against the enclosing class
+     context, globals against a flat table, and constants against the lexical
+     constant set plus the built-in surface.
+
+  2. Block-local versus captured-from-enclosing locals. A Ruby block introduces
+     a new local scope that can READ the locals of its enclosing method/block
+     (a closure capture) but whose own block-local declarations do not escape.
+     When a reference inside a block resolves to a binding declared at a scope
+     level shallower than the innermost block boundary, the analyzer records the
+     name in the captures set so block lowering can materialise the capture.
+
+  3. Definitions. Methods are registered per owning class/module as instance
+     methods (ClassName#name) or singleton/class methods (ClassName.name, from
+     `def self.foo`); classes are registered with their superclass (supporting
+     reopening and nesting); modules, constants, instance variables and class
+     variables are registered against the class context in which they appear.
+
+  4. Reference validation. After the walk, every recorded method-call,
+     constant, ivar, cvar and global reference is checked against the
+     accumulated definition state. Genuinely unresolved references that are not
+     part of the built-in surface and not reachable via Ruby's dynamic dispatch
+     (method_missing, define_method, the Object/Kernel surface) become
+     warnings; Ruby's openness means these are advisory, not hard errors.
+
+The symbol tables are STRING-KEYED dictionaries (dictionary.runa over the
+content-hashing hashtable): keys are the identifier strings the parser copied
+into the AST node value slot, values are small non-zero integers (the 0 value
+unambiguously means "absent"). A string key keyed by content - not an
+integer-keyed table indexed by a string pointer - is mandatory; the latter
+hashes pointer identity and corrupts on the parser's distinct heap copies.
+
+Dependencies:
+- ruby_parser.runa            (AST node shape, AST_* node constants, accessors)
+- compiler/frontend/primitives/memory/layout.runa
+- compiler/frontend/primitives/core/string_core.runa
+- compiler/frontend/primitives/collections/list.runa
+- compiler/frontend/primitives/collections/dictionary.runa
+- compiler/internal/string_utils.runa
+:End Note
+
+Import "compiler/middle/gungnir/hir/translation/frontends/ruby/ruby_parser.runa" as Parser
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/frontend/primitives/collections/list.runa" as ListCore
+Import "compiler/frontend/primitives/collections/dictionary.runa" as Dict
+Import "compiler/internal/string_utils.runa" as StringUtils
+
+Note: ============================================================================
+Note: Analyzer State
+Note: ============================================================================
+
 @Reasoning:
-The Ruby semantic analyzer carries fifteen state slots that match
-Ruby's deeply dynamic semantics: a hierarchical symbol table, current
-scope, class hierarchy with mixins, method definition map, block-
-context stack, three variable-scope maps (instance, class, global),
-constants, mixins, error/warning lists, current class/method
-pointers, and a duck-type cache. The fanout is necessary because
-Ruby's name resolution depends on every one of these contexts.
+The analyzer threads its resolution and definition state through the recursive
+walk in a single heap record. The lexical chain for LOCAL variables is modelled
+by current_scope (the innermost name->level table) and scope_stack (every
+enclosing scope, the program scope at the bottom); a local lookup walks
+current_scope then the stack top-down. scope_is_boundary records, parallel to
+scope_stack, whether each stacked scope is a method or block boundary, and
+current_is_boundary classifies the innermost scope; together with current_level
+these let the analyzer decide block-local versus captured-from-enclosing when a
+local resolves in an enclosing scope across a block boundary. The remaining
+slots are definition registries (methods, classes, modules, constants, ivars,
+cvars, globals), the capture set, the diagnostic accumulators, and the class
+context (current_class plus class_stack) needed to namespace ivars/cvars and
+register methods against their owner.
 @End Reasoning
+
+@Implementation:
+Twenty 8-byte slots at fixed offsets 0..152 referenced directly by the
+accessors below: current_scope(0), scope_stack(8), scope_is_boundary(16),
+current_is_boundary(24), current_level(32), class_methods(40),
+singleton_methods(48), classes(56), superclasses(64), modules(72),
+constants(80), ivars(88), cvars(96), globals(104), captures(112), errors(120),
+warnings(128), has_error(136), current_class(144), class_stack(152). Total 160
+bytes.
+@End Implementation
+
 Type called "RubySemanticAnalyzer":
-    symbol_table as Integer  Note: Map of scopes and symbols
-    current_scope as Integer  Note: Current scope context
-    class_hierarchy as Integer  Note: Map of class inheritance and mixins
-    method_definitions as Integer  Note: Map of method definitions and overrides
-    block_contexts as Integer  Note: Stack of block contexts
-    instance_variables as Integer  Note: Map of instance variables per class
-    class_variables as Integer  Note: Map of class variables per class
-    global_variables as Integer  Note: Map of global variables
-    constants as Integer  Note: Map of constants
-    mixins as Integer  Note: Map of included/extended modules
-    error_list as Integer  Note: List of semantic errors
-    warning_list as Integer  Note: List of semantic warnings
-    current_class as Integer  Note: Currently analyzed class
-    current_method as Integer  Note: Currently analyzed method
-    duck_type_cache as Integer  Note: Cache for duck typing analysis
+    current_scope as Integer        Note: Dict string-key -> level+1 (innermost local scope)
+    scope_stack as Integer          Note: List of enclosing local-scope Dicts (program scope at bottom)
+    scope_is_boundary as Integer    Note: List parallel to scope_stack: 1 if that scope is a method/block boundary
+    current_is_boundary as Integer  Note: 1 if innermost scope is a method/block boundary
+    current_level as Integer        Note: Lexical depth of innermost scope (0 = program)
+    class_methods as Integer        Note: Dict "Class#method" -> 1 (instance methods)
+    singleton_methods as Integer    Note: Dict "Class.method" -> 1 (class/singleton methods)
+    classes as Integer              Note: Dict className -> 1 (declared/reopened classes)
+    superclasses as Integer         Note: Dict className -> superclass-name string
+    modules as Integer              Note: Dict moduleName -> 1 (declared modules)
+    constants as Integer            Note: Dict constantName -> 1 (lexical + builtin constants)
+    ivars as Integer                Note: Dict "Class@ivar" -> 1 (instance variables per class)
+    cvars as Integer                Note: Dict "Class@@cvar" -> 1 (class variables per class)
+    globals as Integer              Note: Dict "$global" -> 1 (flat global variables)
+    captures as Integer             Note: Dict localName -> 1 (block locals captured from enclosing)
+    errors as Integer               Note: List of error message strings
+    warnings as Integer             Note: List of warning message strings
+    has_error as Integer            Note: 1 if any hard error recorded
+    current_class as Integer        Note: Name string of the enclosing class/module (0 = top-level main)
+    class_stack as Integer          Note: List of enclosing class/module name strings for restore
 End Type
 
-@Reasoning:
-RubyScope models Ruby's lexical scoping with five distinct scope
-kinds (global/class/module/method/block). The parent_scope pointer
-forms a chain back to the global scope; symbol lookup walks this
-chain until a match is found or the global scope is exhausted. The
-visibility slot tracks Ruby's tri-state public/private/protected
-modifier in effect when the scope was created.
-@End Reasoning
-Type called "RubyScope":
-    scope_type as String  Note: "global", "class", "module", "method", "block"
-    parent_scope as Integer  Note: Reference to parent scope
-    symbols as Integer  Note: Map of local variables and methods
-    owner as String  Note: Class or module that owns this scope
-    visibility as String  Note: "public", "private", "protected"
-End Type
+Note: ============================================================================
+Note: Analyzer Creation
+Note: ============================================================================
 
 @Reasoning:
-RubySymbol stores the metadata needed to track any named entity:
-name, kind (class/module/method/variable/constant), inferred type
-(or "dynamic" since Ruby is duck-typed), visibility, definition
-status, owning scope, optional duck-type interface (list of methods
-the object responds to), and source position. The duck_type_interface
-is what enables structural type checking despite Ruby's nominal
-absence of types.
+The constructor allocates every sub-collection eagerly so the recursive walk
+never has to null-check a table or list handle. The innermost local scope
+starts as a fresh program-level table (level 0, not a method/block boundary) so
+top-level locals declare and resolve without a special case. setup_builtins
+seeds Ruby's core constant and global surface so a reference to a built-in
+class/module/global does not produce a spurious undefined diagnostic.
 @End Reasoning
-Type called "RubySymbol":
-    name as String
-    symbol_type as String  Note: "class", "module", "method", "variable", "constant"
-    value_type as String  Note: Inferred type or "dynamic"
-    visibility as String  Note: "public", "private", "protected"
-    is_defined as Integer  Note: 1 if defined, 0 if referenced but not defined
-    definition_scope as Integer  Note: Scope where symbol is defined
-    duck_type_interface as Integer  Note: List of methods this object responds to
-    line_number as Integer
-    column_number as Integer
-End Type
 
-@Reasoning:
-RubyClass captures a class definition's full structure: name,
-superclass (single inheritance), included modules (mixins via
-'include'), extended modules (singleton mixins via 'extend'),
-separate maps for instance and class methods, lists of instance and
-class variables, defined constants, and the visibility scope
-currently in effect. This separation matches Ruby's distinction
-between instance and class methods/variables.
-@End Reasoning
-Type called "RubyClass":
-    name as String
-    superclass as String
-    included_modules as Integer  Note: List of included modules
-    extended_modules as Integer  Note: List of extended modules
-    instance_methods as Integer  Note: Map of instance methods
-    class_methods as Integer  Note: Map of class methods
-    instance_variables as Integer  Note: List of instance variables
-    class_variables as Integer  Note: List of class variables
-    constants as Integer  Note: Map of constants defined in class
-    visibility_scope as String  Note: Current visibility (public/private/protected)
-End Type
+@Implementation:
+Allocate 160 bytes; return 0 on OOM. Create the program scope Dict, scope_stack,
+scope_is_boundary, every definition registry, the capture set, the errors and
+warnings lists, and the class_stack. Install the program scope at offset 0, zero
+current_is_boundary/current_level/has_error and current_class, store every
+collection handle at its offset, seed the built-in surface, then return the
+analyzer.
+@End Implementation
 
-@Reasoning:
-RubyModule mirrors RubyClass but without inheritance (modules cannot
-be instantiated). It tracks which classes/modules include or extend
-this module (for mixin conflict detection) and which other modules
-this depends on. The bidirectional include_in/extended_by lists let
-the analyzer answer questions about composition without walking
-every class.
-@End Reasoning
-Type called "RubyModule":
-    name as String
-    included_in as Integer  Note: List of classes that include this module
-    extended_by as Integer  Note: List of classes that extend this module
-    methods as Integer  Note: Map of methods defined in module
-    constants as Integer  Note: Map of constants defined in module
-    dependencies as Integer  Note: List of other modules this depends on
-End Type
+Process called "create_ruby_semantic_analyzer" takes nothing returns Integer:
+    Let analyzer be proc allocate from Layout with 160
 
-@Reasoning:
-The constructor creates each tracking map and list eagerly so all
-analysis routines can assume non-null handles. It also installs a
-"global" scope as the initial current_scope and primes built-in
-classes (Object, String, Array, Hash, etc.) so user code can
-reference them without forward declaration.
-@End Reasoning
-Process called "create_ruby_semantic_analyzer" returns Integer:
-    Note: Create new Ruby semantic analyzer instance
+    If analyzer is equal to 0:
+        Return 0
+    End If
 
-    Let analyzer be a value of type RubySemanticAnalyzer with
-        symbol_table as proc create_dict,
-        current_scope as 0,
-        class_hierarchy as proc create_dict,
-        method_definitions as proc create_dict,
-        block_contexts as proc create_stack,
-        instance_variables as proc create_dict,
-        class_variables as proc create_dict,
-        global_variables as proc create_dict,
-        constants as proc create_dict,
-        mixins as proc create_dict,
-        error_list as proc create_list,
-        warning_list as proc create_list,
-        current_class as 0,
-        current_method as 0,
-        duck_type_cache as proc create_dict
+    Let program_scope be proc create from Dict
+    Let scope_stack be proc list_create from ListCore
+    Let scope_is_boundary be proc list_create from ListCore
+    Let class_methods be proc create from Dict
+    Let singleton_methods be proc create from Dict
+    Let classes be proc create from Dict
+    Let superclasses be proc create from Dict
+    Let modules be proc create from Dict
+    Let constants be proc create from Dict
+    Let ivars be proc create from Dict
+    Let cvars be proc create from Dict
+    Let globals be proc create from Dict
+    Let captures be proc create from Dict
+    Let errors be proc list_create from ListCore
+    Let warnings be proc list_create from ListCore
+    Let class_stack be proc list_create from ListCore
 
-    Note: Initialize global scope
-    Let global_scope be a value of type RubyScope with
-        scope_type as "global",
-        parent_scope as 0,
-        symbols as proc create_dict,
-        owner as "main",
-        visibility as "public"
+    proc memory_set_int64 from Layout with analyzer, 0, program_scope
+    proc memory_set_int64 from Layout with analyzer, 8, scope_stack
+    proc memory_set_int64 from Layout with analyzer, 16, scope_is_boundary
+    proc memory_set_int64 from Layout with analyzer, 24, 0
+    proc memory_set_int64 from Layout with analyzer, 32, 0
+    proc memory_set_int64 from Layout with analyzer, 40, class_methods
+    proc memory_set_int64 from Layout with analyzer, 48, singleton_methods
+    proc memory_set_int64 from Layout with analyzer, 56, classes
+    proc memory_set_int64 from Layout with analyzer, 64, superclasses
+    proc memory_set_int64 from Layout with analyzer, 72, modules
+    proc memory_set_int64 from Layout with analyzer, 80, constants
+    proc memory_set_int64 from Layout with analyzer, 88, ivars
+    proc memory_set_int64 from Layout with analyzer, 96, cvars
+    proc memory_set_int64 from Layout with analyzer, 104, globals
+    proc memory_set_int64 from Layout with analyzer, 112, captures
+    proc memory_set_int64 from Layout with analyzer, 120, errors
+    proc memory_set_int64 from Layout with analyzer, 128, warnings
+    proc memory_set_int64 from Layout with analyzer, 136, 0
+    proc memory_set_int64 from Layout with analyzer, 144, 0
+    proc memory_set_int64 from Layout with analyzer, 152, class_stack
 
-    proc add_scope with analyzer.symbol_table, "global", global_scope
-    Set analyzer.current_scope to global_scope
-
-    Note: Add built-in Ruby classes and modules
-    proc initialize_ruby_builtins from analyzer
+    proc setup_builtins with analyzer
 
     Return analyzer
 End Process
 
+Note: ============================================================================
+Note: Diagnostics
+Note: ============================================================================
+
 @Reasoning:
-The central dispatcher Match-routes every Ruby AST kind to its
-specialised analyzer. Ruby has a uniquely rich AST: classes,
-modules, methods, blocks, lambdas, procs, four loop forms
-(while/until/for/each-style), and many literal/expression kinds.
-Unknown nodes fall through to analyze_children which recursively
-walks the subtree for any nested declarations.
+Errors and warnings are accumulated in append-only lists so a single analysis
+pass surfaces every problem rather than aborting on the first. record_error also
+latches has_error to 1 so a caller can gate lowering on one boolean without
+scanning the list.
 @End Reasoning
-Process called "analyze_ruby_ast" takes analyzer as Integer, ast as Integer returns Integer:
-    Note: Perform semantic analysis of Ruby AST with dynamic typing
 
-    Let node_type be ast.node_type
+@Implementation:
+Append message to the errors list (offset 120) and set has_error (offset 136) to 1.
+@End Implementation
 
-    Match node_type:
-        When AST_PROGRAM from RubyParser:
-            Return proc analyze_program with analyzer, ast
-        When AST_CLASS from RubyParser:
-            Return proc analyze_class with analyzer, ast
-        When AST_MODULE from RubyParser:
-            Return proc analyze_module with analyzer, ast
-        When AST_METHOD from RubyParser:
-            Return proc analyze_method with analyzer, ast
-        When AST_BLOCK from RubyParser:
-            Return proc analyze_block with analyzer, ast
-        When AST_IF from RubyParser:
-            Return proc analyze_conditional with analyzer, ast
-        When AST_UNLESS from RubyParser:
-            Return proc analyze_conditional with analyzer, ast
-        When AST_WHILE from RubyParser:
-            Return proc analyze_loop with analyzer, ast
-        When AST_UNTIL from RubyParser:
-            Return proc analyze_loop with analyzer, ast
-        When AST_FOR from RubyParser:
-            Return proc analyze_for_loop with analyzer, ast
-        When AST_CASE from RubyParser:
-            Return proc analyze_case with analyzer, ast
-        When AST_BEGIN_RESCUE from RubyParser:
-            Return proc analyze_begin_rescue with analyzer, ast
-        When AST_ASSIGNMENT from RubyParser:
-            Return proc analyze_assignment with analyzer, ast
-        When AST_METHOD_CALL from RubyParser:
-            Return proc analyze_method_call with analyzer, ast
-        When AST_SUPER_CALL from RubyParser:
-            Return proc analyze_super_call with analyzer, ast
-        When AST_YIELD from RubyParser:
-            Return proc analyze_yield with analyzer, ast
-        When AST_LAMBDA from RubyParser:
-            Return proc analyze_lambda with analyzer, ast
-        When AST_PROC from RubyParser:
-            Return proc analyze_proc with analyzer, ast
-        When AST_IDENTIFIER from RubyParser:
-            Return proc analyze_identifier with analyzer, ast
-        When AST_CONSTANT from RubyParser:
-            Return proc analyze_constant with analyzer, ast
-        When AST_SYMBOL from RubyParser:
-            Return proc analyze_symbol with analyzer, ast
-        When AST_ARRAY from RubyParser:
-            Return proc analyze_array with analyzer, ast
-        When AST_HASH from RubyParser:
-            Return proc analyze_hash with analyzer, ast
-        When AST_RANGE from RubyParser:
-            Return proc analyze_range with analyzer, ast
-        When AST_BINARY_OP from RubyParser:
-            Return proc analyze_binary_operation with analyzer, ast
-        When AST_INCLUDE from RubyParser:
-            Return proc analyze_include with analyzer, ast
-        When AST_EXTEND from RubyParser:
-            Return proc analyze_extend with analyzer, ast
-        When AST_ALIAS from RubyParser:
-            Return proc analyze_alias with analyzer, ast
-        When AST_ATTR_ACCESSOR from RubyParser:
-            Return proc analyze_attr_accessor with analyzer, ast
-        Otherwise:
-            Return proc analyze_children with analyzer, ast
-    End Match
+Process called "record_error" takes analyzer as Integer, message as Integer returns Nothing:
+    Let errors be proc memory_get_int64 from Layout with analyzer, 120
+    proc list_append from ListCore with errors, message
+    proc memory_set_int64 from Layout with analyzer, 136, 1
 End Process
 
 @Reasoning:
-The program-level analyzer drives top-level statements then runs
-three cross-cutting passes that need complete symbol-table
-information: method-call validation, undefined-variable detection,
-and duck-typing pattern recognition. These must run after the
-linear walk so the symbol table is fully populated.
+Warnings track non-fatal observations (unresolved-reference heuristics) that do
+not block lowering; they are kept separate from errors so a caller can report
+them without failing the analysis. Ruby's dynamic openness makes most reference
+problems advisory rather than fatal.
 @End Reasoning
-Process called "analyze_program" takes analyzer as Integer, ast as Integer returns Integer:
-    Note: Analyze Ruby program (top-level scope)
 
-    Note: Analyze all top-level statements
-    Let child_count be proc get_list_size with ast.children
-    Let index be 0
+@Implementation:
+Append message to the warnings list (offset 128). has_error is left untouched.
+@End Implementation
 
-    While index is less than child_count:
-        Let child be proc get_list_item with ast.children, index
-        proc analyze_ruby_ast with analyzer, child
-        Set index to index plus 1
-    End While
+Process called "record_warning" takes analyzer as Integer, message as Integer returns Nothing:
+    Let warnings be proc memory_get_int64 from Layout with analyzer, 128
+    proc list_append from ListCore with warnings, message
+End Process
 
-    Note: Perform global analysis
-    proc validate_method_calls from analyzer
-    proc check_undefined_variables from analyzer
-    proc analyze_duck_typing_patterns from analyzer
+Note: ============================================================================
+Note: Built-in Surface
+Note: ============================================================================
 
-    Return 1
+@Reasoning:
+Ruby programs reference core classes (Object, String, Array, Hash, ...), core
+modules (Kernel, Enumerable, Comparable), and a handful of predefined globals
+($stdin, $stdout, $stderr, ...) without declaring them. Seeding these into the
+constant and global registries lets the unresolved-reference heuristic fire only
+on genuinely unknown names, not on references to Ruby's standard surface. The
+core classes are registered in both the classes registry (so a method call on a
+known class resolves) and the constants registry (so a bare constant reference
+resolves).
+@End Reasoning
+
+@Implementation:
+Read the classes (offset 56), modules (offset 72), constants (offset 80) and
+globals (offset 104) registries once and register each built-in name with value
+1.
+@End Implementation
+
+Process called "setup_builtins" takes analyzer as Integer returns Nothing:
+    Let classes be proc memory_get_int64 from Layout with analyzer, 56
+    Let modules be proc memory_get_int64 from Layout with analyzer, 72
+    Let constants be proc memory_get_int64 from Layout with analyzer, 80
+    Let globals be proc memory_get_int64 from Layout with analyzer, 104
+
+    Note: Core classes (registered as both classes and constants)
+    proc register_builtin_class with classes, constants, "BasicObject"
+    proc register_builtin_class with classes, constants, "Object"
+    proc register_builtin_class with classes, constants, "Module"
+    proc register_builtin_class with classes, constants, "Class"
+    proc register_builtin_class with classes, constants, "NilClass"
+    proc register_builtin_class with classes, constants, "TrueClass"
+    proc register_builtin_class with classes, constants, "FalseClass"
+    proc register_builtin_class with classes, constants, "Numeric"
+    proc register_builtin_class with classes, constants, "Integer"
+    proc register_builtin_class with classes, constants, "Float"
+    proc register_builtin_class with classes, constants, "Rational"
+    proc register_builtin_class with classes, constants, "Complex"
+    proc register_builtin_class with classes, constants, "String"
+    proc register_builtin_class with classes, constants, "Symbol"
+    proc register_builtin_class with classes, constants, "Array"
+    proc register_builtin_class with classes, constants, "Hash"
+    proc register_builtin_class with classes, constants, "Range"
+    proc register_builtin_class with classes, constants, "Regexp"
+    proc register_builtin_class with classes, constants, "MatchData"
+    proc register_builtin_class with classes, constants, "Proc"
+    proc register_builtin_class with classes, constants, "Method"
+    proc register_builtin_class with classes, constants, "Struct"
+    proc register_builtin_class with classes, constants, "IO"
+    proc register_builtin_class with classes, constants, "File"
+    proc register_builtin_class with classes, constants, "Dir"
+    proc register_builtin_class with classes, constants, "Time"
+    proc register_builtin_class with classes, constants, "Thread"
+    proc register_builtin_class with classes, constants, "Mutex"
+    proc register_builtin_class with classes, constants, "Exception"
+    proc register_builtin_class with classes, constants, "StandardError"
+    proc register_builtin_class with classes, constants, "RuntimeError"
+    proc register_builtin_class with classes, constants, "ArgumentError"
+    proc register_builtin_class with classes, constants, "TypeError"
+    proc register_builtin_class with classes, constants, "NameError"
+    proc register_builtin_class with classes, constants, "NoMethodError"
+    proc register_builtin_class with classes, constants, "IndexError"
+    proc register_builtin_class with classes, constants, "KeyError"
+    proc register_builtin_class with classes, constants, "RangeError"
+    proc register_builtin_class with classes, constants, "ZeroDivisionError"
+    proc register_builtin_class with classes, constants, "StopIteration"
+    proc register_builtin_class with classes, constants, "IOError"
+    proc register_builtin_class with classes, constants, "SystemExit"
+
+    Note: Core modules (registered as both modules and constants)
+    proc set from Dict with modules, "Kernel", 1
+    proc set from Dict with constants, "Kernel", 1
+    proc set from Dict with modules, "Comparable", 1
+    proc set from Dict with constants, "Comparable", 1
+    proc set from Dict with modules, "Enumerable", 1
+    proc set from Dict with constants, "Enumerable", 1
+    proc set from Dict with modules, "Math", 1
+    proc set from Dict with constants, "Math", 1
+    proc set from Dict with modules, "ObjectSpace", 1
+    proc set from Dict with constants, "ObjectSpace", 1
+    proc set from Dict with modules, "GC", 1
+    proc set from Dict with constants, "GC", 1
+    proc set from Dict with modules, "Process", 1
+    proc set from Dict with constants, "Process", 1
+
+    Note: Predefined globals
+    proc set from Dict with globals, "$stdin", 1
+    proc set from Dict with globals, "$stdout", 1
+    proc set from Dict with globals, "$stderr", 1
+    proc set from Dict with globals, "$PROGRAM_NAME", 1
+    proc set from Dict with globals, "$0", 1
+    proc set from Dict with globals, "$!", 1
+    proc set from Dict with globals, "$~", 1
+    proc set from Dict with globals, "$LOAD_PATH", 1
+    proc set from Dict with globals, "$LOADED_FEATURES", 1
+    proc set from Dict with globals, "$DEBUG", 1
+    proc set from Dict with globals, "$VERBOSE", 1
 End Process
 
 @Reasoning:
-Class analysis constructs the RubyClass record, pushes a fresh class
-scope, walks the class body to populate methods/variables/constants,
-then runs inheritance and mixin-conflict validation. Both scope and
-current_class are saved/restored to support nested classes (Ruby's
-inner class form).
+A built-in class name is registered into both the classes registry and the
+constants registry in one step so a method call on the class and a bare
+constant reference to it both resolve. Factored out of setup_builtins so the
+long built-in list reads as data rather than two parallel statements per name.
 @End Reasoning
-Process called "analyze_class" takes analyzer as Integer, ast as Integer returns Integer:
-    Note: Analyze Ruby class with inheritance and mixins
 
-    Let class_name be proc get_node_attribute with ast, "name"
-    Let superclass_name be proc get_node_attribute with ast, "superclass"
+@Implementation:
+Set name -> 1 in both classes and constants.
+@End Implementation
 
-    Note: Create class definition
-    Let ruby_class be a value of type RubyClass with
-        name as class_name,
-        superclass as superclass_name,
-        included_modules as proc create_list,
-        extended_modules as proc create_list,
-        instance_methods as proc create_dict,
-        class_methods as proc create_dict,
-        instance_variables as proc create_list,
-        class_variables as proc create_list,
-        constants as proc create_dict,
-        visibility_scope as "public"
+Process called "register_builtin_class" takes classes as Integer, constants as Integer, name as Integer returns Nothing:
+    proc set from Dict with classes, name, 1
+    proc set from Dict with constants, name, 1
+End Process
 
-    Note: Add to class hierarchy
-    proc add_class_to_hierarchy with analyzer, ruby_class
+Note: ============================================================================
+Note: Local Scope Management
+Note: ============================================================================
 
-    Note: Create class scope
-    Let class_scope be a value of type RubyScope with
-        scope_type as "class",
-        parent_scope as analyzer.current_scope,
-        symbols as proc create_dict,
-        owner as class_name,
-        visibility as "public"
+@Reasoning:
+Entering a scope pushes the current local scope (and its boundary flag) onto the
+parallel stacks, installs a fresh empty name table as the innermost scope,
+raises the level, and records whether the new scope is a method/block boundary.
+Method and block bodies pass is_boundary=1 so a local resolved BEYOND that
+boundary is classified as a capture; pure lexical sub-scopes that do not break
+the local-visibility chain (Ruby has very few - if/while bodies share the method
+scope) are not pushed at all. The program scope at the bottom is never popped.
+@End Reasoning
 
-    Note: Push class scope and context
-    Let previous_scope be analyzer.current_scope
-    Let previous_class be analyzer.current_class
-    Set analyzer.current_scope to class_scope
-    Set analyzer.current_class to ruby_class
+@Implementation:
+Push current_scope onto scope_stack (offset 8) and current_is_boundary onto
+scope_is_boundary (offset 16). Allocate a fresh Dict and store it at offset 0.
+Store is_boundary at offset 24 and current_level+1 at offset 32.
+@End Implementation
 
-    Note: Analyze class body
-    Let child_count be proc get_list_size with ast.children
-    Let index be 0
+Process called "enter_scope" takes analyzer as Integer, is_boundary as Integer returns Nothing:
+    Let current be proc memory_get_int64 from Layout with analyzer, 0
+    Let stack be proc memory_get_int64 from Layout with analyzer, 8
+    Let flags be proc memory_get_int64 from Layout with analyzer, 16
+    Let cur_boundary be proc memory_get_int64 from Layout with analyzer, 24
+    Let level be proc memory_get_int64 from Layout with analyzer, 32
 
-    While index is less than child_count:
-        Let child be proc get_list_item with ast.children, index
-        proc analyze_ruby_ast with analyzer, child
-        Set index to index plus 1
-    End While
+    proc list_append from ListCore with stack, current
+    proc list_append from ListCore with flags, cur_boundary
 
-    Note: Validate class structure
-    proc validate_class_inheritance with analyzer, ruby_class
-    proc check_mixin_conflicts with analyzer, ruby_class
-
-    Note: Restore previous scope and context
-    Set analyzer.current_scope to previous_scope
-    Set analyzer.current_class to previous_class
-
-    Return 1
+    Let fresh be proc create from Dict
+    proc memory_set_int64 from Layout with analyzer, 0, fresh
+    proc memory_set_int64 from Layout with analyzer, 24, is_boundary
+    proc memory_set_int64 from Layout with analyzer, 32, level plus 1
 End Process
 
 @Reasoning:
-Module analysis is similar to class analysis but without inheritance
-tracking: modules cannot have a superclass, only included_in and
-extended_by relationships (populated when classes include/extend
-this module elsewhere). Scope push/pop pattern matches analyze_class.
+Exiting restores the scope and boundary flag saved by the matching enter_scope
+and lowers the level. The program scope is never popped: it is the permanent
+bottom of the chain installed at construction, and a well-formed walk never
+calls exit_scope more often than enter_scope, so the depth guard makes the
+underflow path a no-op rather than a crash if a malformed AST drives it there.
 @End Reasoning
-Process called "analyze_module" takes analyzer as Integer, ast as Integer returns Integer:
-    Note: Analyze Ruby module definition
 
-    Let module_name be proc get_node_attribute with ast, "name"
+@Implementation:
+If scope_stack is empty, return without change. Pop the saved scope into
+current_scope (offset 0); pop the saved flag into current_is_boundary (offset
+24); lower current_level (offset 32) by 1.
+@End Implementation
 
-    Note: Create module definition
-    Let ruby_module be a value of type RubyModule with
-        name as module_name,
-        included_in as proc create_list,
-        extended_by as proc create_list,
-        methods as proc create_dict,
-        constants as proc create_dict,
-        dependencies as proc create_list
+Process called "exit_scope" takes analyzer as Integer returns Nothing:
+    Let stack be proc memory_get_int64 from Layout with analyzer, 8
+    Let depth be proc list_length from ListCore with stack
 
-    Note: Add to module registry
-    proc add_module_to_registry with analyzer, ruby_module
-
-    Note: Create module scope
-    Let module_scope be a value of type RubyScope with
-        scope_type as "module",
-        parent_scope as analyzer.current_scope,
-        symbols as proc create_dict,
-        owner as module_name,
-        visibility as "public"
-
-    Note: Push module scope
-    Let previous_scope be analyzer.current_scope
-    Set analyzer.current_scope to module_scope
-
-    Note: Analyze module body
-    Let child_count be proc get_list_size with ast.children
-    Let index be 0
-
-    While index is less than child_count:
-        Let child be proc get_list_item with ast.children, index
-        proc analyze_ruby_ast with analyzer, child
-        Set index to index plus 1
-    End While
-
-    Note: Restore previous scope
-    Set analyzer.current_scope to previous_scope
-
-    Return 1
-End Process
-
-@Reasoning:
-Ruby methods have rich parameter syntax: required, default, splat
-(*args), double-splat (**kwargs), block (&block), and keyword
-parameters. The analyzer captures the full parameter list, pushes a
-method scope, registers each parameter as a local, then walks the
-body. Method registration into the enclosing class adds it as
-either an instance or class method based on the def_kind attribute.
-@End Reasoning
-Process called "analyze_method" takes analyzer as Integer, ast as Integer returns Integer:
-    Note: Analyze Ruby method with dynamic parameters and blocks
-
-    Let method_name be proc get_node_attribute with ast, "name"
-    Let parameters be proc get_node_attribute with ast, "parameters"
-
-    Note: Create method symbol
-    Let method_symbol be a value of type RubySymbol with
-        name as method_name,
-        symbol_type as "method",
-        value_type as "dynamic",
-        visibility as analyzer.current_scope.visibility,
-        is_defined as 1,
-        definition_scope as analyzer.current_scope,
-        duck_type_interface as proc create_list,
-        line_number as proc get_ast_line with ast,
-        column_number as proc get_ast_column from ast
-
-    Note: Add method to current scope
-    proc add_symbol_to_scope with analyzer.current_scope, method_name, method_symbol
-
-    Note: Create method scope
-    Let method_scope be a value of type RubyScope with
-        scope_type as "method",
-        parent_scope as analyzer.current_scope,
-        symbols as proc create_dict,
-        owner as analyzer.current_scope.owner,
-        visibility as "public"
-
-    Note: Push method scope and context
-    Let previous_scope be analyzer.current_scope
-    Let previous_method be analyzer.current_method
-    Set analyzer.current_scope to method_scope
-    Set analyzer.current_method to method_symbol
-
-    Note: Analyze parameters
-    If parameters is not equal to 0:
-        proc analyze_method_parameters with analyzer, parameters
+    If depth is equal to 0:
+        Return
     End If
 
-    Note: Analyze method body
-    Let child_count be proc get_list_size with ast.children
-    Let index be 0
+    Let flags be proc memory_get_int64 from Layout with analyzer, 16
+    Let level be proc memory_get_int64 from Layout with analyzer, 32
 
-    While index is less than child_count:
-        Let child be proc get_list_item with ast.children, index
-        proc analyze_ruby_ast with analyzer, child
-        Set index to index plus 1
-    End While
+    Let restored_scope be proc list_pop from ListCore with stack
+    Let restored_flag be proc list_pop from ListCore with flags
 
-    Note: Infer return type from method body
-    proc infer_method_return_type with analyzer, method_symbol, ast
-
-    Note: Restore previous scope and context
-    Set analyzer.current_scope to previous_scope
-    Set analyzer.current_method to previous_method
-
-    Return 1
+    proc memory_set_int64 from Layout with analyzer, 0, restored_scope
+    proc memory_set_int64 from Layout with analyzer, 24, restored_flag
+    proc memory_set_int64 from Layout with analyzer, 32, level minus 1
 End Process
 
 @Reasoning:
-Ruby method dispatch is double-dynamic: the receiver type is
-runtime-determined and the method itself may exist via method_missing
-indirection. The analyzer infers the receiver's static type best
-effort, then queries check_duck_typing to see if the type responds
-to the method. Missing methods trigger a method_missing fallback
-search rather than a hard error since metaprogramming may provide
-the method.
+Declares a local in the innermost scope at the current lexical level, encoding
+the level as level+1 so a lookup can distinguish "declared at level 0" from
+"absent" (both of which would otherwise read back as 0 from the
+value-0-means-missing dictionary). Re-declaration in the same scope overwrites:
+Ruby permits re-assigning a local, and the binding is the same slot.
 @End Reasoning
-Process called "analyze_method_call" takes analyzer as Integer, ast as Integer returns Integer:
-    Note: Analyze Ruby method call with duck typing and dynamic dispatch
 
-    Let method_name be ast.value
-    Let receiver be proc get_first_child from ast
-    Let arguments be proc get_node_attribute with ast, "arguments"
-    Let block be proc get_node_attribute with ast, "block"
+@Implementation:
+Read current_scope (offset 0) and current_level (offset 32); set name -> level+1.
+@End Implementation
 
-    Note: Analyze receiver to infer type
-    Let receiver_type be "Object"  Note: Default Ruby type
+Process called "declare_local" takes analyzer as Integer, name as Integer returns Nothing:
+    If name is equal to 0:
+        Return
+    End If
+
+    Let scope be proc memory_get_int64 from Layout with analyzer, 0
+    Let level be proc memory_get_int64 from Layout with analyzer, 32
+    proc set from Dict with scope, name, level plus 1
+End Process
+
+@Reasoning:
+Resolves a local to its declaration level by walking the scope chain innermost
+first: current_scope, then each stacked scope from the most recently pushed
+downward, ending at the program table. Returns the stored level+1 encoding (so a
+non-zero result is "found at level result-1") or 0 if the name is bound nowhere.
+@End Reasoning
+
+@Implementation:
+Check current_scope (offset 0) via Dict.get; if non-zero return it. Otherwise
+walk scope_stack (offset 8) from index size-1 down to 0, returning the first
+non-zero Dict.get. Return 0 if no scope binds the name.
+@End Implementation
+
+Process called "resolve_local_level" takes analyzer as Integer, name as Integer returns Integer:
+    If name is equal to 0:
+        Return 0
+    End If
+
+    Let current be proc memory_get_int64 from Layout with analyzer, 0
+    Let found be proc get from Dict with current, name
+    If found is not equal to 0:
+        Return found
+    End If
+
+    Let stack be proc memory_get_int64 from Layout with analyzer, 8
+    Let depth be proc list_length from ListCore with stack
+    Let i be depth minus 1
+    While i is greater than or equal to 0:
+        Let scope be proc list_get from ListCore with stack, i
+        Let hit be proc get from Dict with scope, name
+        If hit is not equal to 0:
+            Return hit
+        End If
+        Set i to i minus 1
+    End While
+
+    Return 0
+End Process
+
+@Reasoning:
+Decides whether a local resolved at decl_level is captured from an enclosing
+block/method by the innermost block. A capture occurs when the binding lives at
+a level strictly shallower than the most recent boundary scope: i.e. there is at
+least one method/block boundary between the reference and the binding. The
+innermost-boundary level is the level just above the deepest boundary scope on
+the stack; if no boundary lies between, the reference is an ordinary same-scope
+local and is not a capture.
+@End Reasoning
+
+@Implementation:
+If the innermost scope is itself a boundary and decl_level is less than the
+current level, it is a capture. Otherwise scan scope_is_boundary (offset 16) from
+the top down: the level of stack entry i is i (entry 0 is level 0); the first
+boundary entry at boundary_level greater than decl_level proves a boundary lies
+between the binding and the reference, so the binding is captured. Return 1 on
+capture, 0 otherwise.
+@End Implementation
+
+Process called "is_captured_local" takes analyzer as Integer, decl_level as Integer returns Integer:
+    Let current_level be proc memory_get_int64 from Layout with analyzer, 32
+    Let current_boundary be proc memory_get_int64 from Layout with analyzer, 24
+
+    If current_boundary is equal to 1:
+        If decl_level is less than current_level:
+            Return 1
+        End If
+    End If
+
+    Let flags be proc memory_get_int64 from Layout with analyzer, 16
+    Let depth be proc list_length from ListCore with flags
+    Let i be depth minus 1
+    While i is greater than decl_level:
+        Let is_boundary be proc list_get from ListCore with flags, i
+        If is_boundary is equal to 1:
+            Return 1
+        End If
+        Set i to i minus 1
+    End While
+
+    Return 0
+End Process
+
+@Reasoning:
+Records a captured local in the captures set so block lowering can enumerate the
+names a block captures from its enclosing method/block. The set is keyed by the
+local's name string.
+@End Reasoning
+
+@Implementation:
+Read captures (offset 112) and set name -> 1.
+@End Implementation
+
+Process called "mark_capture" takes analyzer as Integer, name as Integer returns Nothing:
+    Let captures be proc memory_get_int64 from Layout with analyzer, 112
+    proc set from Dict with captures, name, 1
+End Process
+
+Note: ============================================================================
+Note: Class Context
+Note: ============================================================================
+
+@Reasoning:
+The current_class name (and its enclosing stack) namespaces instance variables,
+class variables and method definitions to their owning class. Entering a class
+or module body pushes the previous class name onto class_stack and installs the
+new name; exiting restores it. A top-level (no enclosing class) context is
+represented by current_class = 0, and ivars/cvars/methods seen there are
+namespaced to "main".
+@End Reasoning
+
+@Implementation:
+Push current_class (offset 144) onto class_stack (offset 152) and install name at
+offset 144.
+@End Implementation
+
+Process called "enter_class_context" takes analyzer as Integer, name as Integer returns Nothing:
+    Let prev be proc memory_get_int64 from Layout with analyzer, 144
+    Let stack be proc memory_get_int64 from Layout with analyzer, 152
+    proc list_append from ListCore with stack, prev
+    proc memory_set_int64 from Layout with analyzer, 144, name
+End Process
+
+@Reasoning:
+Restores the enclosing class context saved by the matching enter_class_context.
+Guarded against underflow so a malformed AST cannot pop past the top-level
+context.
+@End Reasoning
+
+@Implementation:
+If class_stack (offset 152) is empty, set current_class to 0. Otherwise pop the
+saved name into current_class (offset 144).
+@End Implementation
+
+Process called "exit_class_context" takes analyzer as Integer returns Nothing:
+    Let stack be proc memory_get_int64 from Layout with analyzer, 152
+    Let depth be proc list_length from ListCore with stack
+    If depth is equal to 0:
+        proc memory_set_int64 from Layout with analyzer, 144, 0
+        Return
+    End If
+    Let restored be proc list_pop from ListCore with stack
+    proc memory_set_int64 from Layout with analyzer, 144, restored
+End Process
+
+@Reasoning:
+Returns the owning-class name for namespacing. When inside a class/module the
+class name string is used directly; at the top level there is no enclosing class
+so the synthetic "main" name is returned so top-level ivars/cvars/methods still
+get a stable, distinct namespace.
+@End Reasoning
+
+@Implementation:
+Read current_class (offset 144); if 0 return a fresh "main" literal, else return it.
+@End Implementation
+
+Process called "current_owner_name" takes analyzer as Integer returns Integer:
+    Let owner be proc memory_get_int64 from Layout with analyzer, 144
+    If owner is equal to 0:
+        Return proc create_from_literal from StringCore with "main"
+    End If
+    Return owner
+End Process
+
+Note: ============================================================================
+Note: Qualified-Key Construction
+Note: ============================================================================
+
+@Reasoning:
+Method and member registries are keyed by an owner-qualified string so the same
+short name can be defined on different classes without collision. The separator
+encodes the kind: "#" for instance methods and ivars/cvars, "." for singleton
+methods, matching Ruby's own Class#method / Class.method notation. The keys are
+content-hashed strings, so two distinct heap copies of the same spelling collide
+correctly.
+@End Reasoning
+
+@Implementation:
+Concatenate owner + separator + name via StringUtils.string_concat (two steps).
+@End Implementation
+
+Process called "qualify_key" takes owner as Integer, separator as Integer, name as Integer returns Integer:
+    Let prefix be proc string_concat from StringUtils with owner, separator
+    Let key be proc string_concat from StringUtils with prefix, name
+    Return key
+End Process
+
+Note: ============================================================================
+Note: Central Walk / Dispatch
+Note: ============================================================================
+
+@Reasoning:
+The central dispatcher routes every Ruby AST node kind to its specialised
+analyzer by the real Integer AST_* tag. Declaration nodes (class, module,
+method, block) manage scope and class context; assignment nodes branch on their
+target's kind; reference nodes resolve against the appropriate registry; every
+other node kind falls through to analyze_children, which recurses over the
+node's positional children so no sub-expression is ever skipped. Mixins
+(include/extend/prepend) are not dedicated node kinds in Ruby - they are method
+calls - so their module-existence validation is handled inside analyze_method_call
+rather than by a top-level dispatch branch.
+@End Reasoning
+
+@Implementation:
+Read ast_node_type and branch. Each declaration handler enters/exits its scope or
+class context; reference handlers resolve and may record a diagnostic. Unknown or
+purely-structural nodes recurse via analyze_children.
+@End Implementation
+
+Process called "analyze_ruby_node" takes analyzer as Integer, node as Integer returns Nothing:
+    If node is equal to 0:
+        Return
+    End If
+
+    Let node_type be proc ast_node_type from Parser with node
+
+    If node_type is equal to AST_PROGRAM from Parser:
+        proc analyze_children with analyzer, node
+        Return
+    End If
+    If node_type is equal to AST_CLASS from Parser:
+        proc analyze_class with analyzer, node
+        Return
+    End If
+    If node_type is equal to AST_MODULE from Parser:
+        proc analyze_module with analyzer, node
+        Return
+    End If
+    If node_type is equal to AST_METHOD from Parser:
+        proc analyze_method with analyzer, node, 0
+        Return
+    End If
+    If node_type is equal to AST_SINGLETON_METHOD from Parser:
+        proc analyze_method with analyzer, node, 1
+        Return
+    End If
+    If node_type is equal to AST_BLOCK from Parser:
+        proc analyze_block with analyzer, node
+        Return
+    End If
+    If node_type is equal to AST_LAMBDA from Parser:
+        proc analyze_block with analyzer, node
+        Return
+    End If
+    If node_type is equal to AST_PROC from Parser:
+        proc analyze_block with analyzer, node
+        Return
+    End If
+    If node_type is equal to AST_ASSIGN from Parser:
+        proc analyze_assignment with analyzer, node
+        Return
+    End If
+    If node_type is equal to AST_OP_ASSIGN from Parser:
+        proc analyze_assignment with analyzer, node
+        Return
+    End If
+    If node_type is equal to AST_MULTIPLE_ASSIGN from Parser:
+        proc analyze_multiple_assignment with analyzer, node
+        Return
+    End If
+    If node_type is equal to AST_METHOD_CALL from Parser:
+        proc analyze_method_call with analyzer, node
+        Return
+    End If
+    If node_type is equal to AST_IDENTIFIER from Parser:
+        proc analyze_identifier with analyzer, node
+        Return
+    End If
+    If node_type is equal to AST_CONSTANT from Parser:
+        proc analyze_constant_ref with analyzer, node
+        Return
+    End If
+    If node_type is equal to AST_INSTANCE_VAR from Parser:
+        proc analyze_instance_var_ref with analyzer, node
+        Return
+    End If
+    If node_type is equal to AST_CLASS_VAR from Parser:
+        proc analyze_class_var_ref with analyzer, node
+        Return
+    End If
+    If node_type is equal to AST_GLOBAL_VAR from Parser:
+        proc analyze_global_var_ref with analyzer, node
+        Return
+    End If
+    If node_type is equal to AST_FOR from Parser:
+        proc analyze_for with analyzer, node
+        Return
+    End If
+
+    Note: structural / expression nodes: recurse over children
+    proc analyze_children with analyzer, node
+End Process
+
+@Reasoning:
+Generic child walk for any node whose own structure introduces no scope, class
+context, definition or reference: recurse into every positional child so nested
+declarations and references are still resolved. Used directly for AST_PROGRAM
+and as the fallthrough for expression/structural nodes (if/while/case/begin/
+binary-op/array/hash/...).
+@End Reasoning
+
+@Implementation:
+Read ast_node_child_count; analyze each child via analyze_ruby_node.
+@End Implementation
+
+Process called "analyze_children" takes analyzer as Integer, node as Integer returns Nothing:
+    Let count be proc ast_node_child_count from Parser with node
+    Let i be 0
+    While i is less than count:
+        Let child be proc ast_node_child from Parser with node, i
+        proc analyze_ruby_node with analyzer, child
+        Set i to i plus 1
+    End While
+End Process
+
+Note: ============================================================================
+Note: Declarations
+Note: ============================================================================
+
+@Reasoning:
+A class declaration registers the class (supporting reopening: re-declaring an
+existing class is not an error, it merges), records its superclass when an
+AST_SUPERCLASS child is present, enters the class context and a fresh boundary
+scope, and walks the body so methods/constants/ivars/cvars defined inside are
+namespaced to this class. The node value is the (possibly scoped) class name
+string. A singleton class (`class << self`) carries the "singleton" flag and a
+receiver child instead of a name; it is analysed as a body in the current class
+context without re-registering a name.
+@End Reasoning
+
+@Implementation:
+If the node has the "singleton" metadata flag, walk its children in the current
+class context. Otherwise read the name from the value slot, register it in
+classes (offset 56), scan children for an AST_SUPERCLASS to record the
+superclass in superclasses (offset 64) and resolve the superclass expression,
+register the name as a constant, enter the class context and a boundary scope,
+analyze the remaining children, then restore.
+@End Implementation
+
+Process called "analyze_class" takes analyzer as Integer, node as Integer returns Nothing:
+    Let is_singleton be proc ast_node_has_flag from Parser with node, "singleton"
+    If is_singleton is equal to 1:
+        proc enter_scope with analyzer, 1
+        proc analyze_class_body with analyzer, node
+        proc exit_scope with analyzer
+        Return
+    End If
+
+    Let class_name be proc ast_node_value from Parser with node
+    If class_name is not equal to 0:
+        Let classes be proc memory_get_int64 from Layout with analyzer, 56
+        proc set from Dict with classes, class_name, 1
+        Let constants be proc memory_get_int64 from Layout with analyzer, 80
+        proc set from Dict with constants, class_name, 1
+    End If
+
+    Note: record superclass when present
+    Let count be proc ast_node_child_count from Parser with node
+    Let i be 0
+    While i is less than count:
+        Let child be proc ast_node_child from Parser with node, i
+        Let child_type be proc ast_node_type from Parser with child
+        If child_type is equal to AST_SUPERCLASS from Parser:
+            proc record_superclass with analyzer, class_name, child
+        End If
+        Set i to i plus 1
+    End While
+
+    proc enter_class_context with analyzer, class_name
+    proc enter_scope with analyzer, 1
+    proc analyze_class_body with analyzer, node
+    proc exit_scope with analyzer
+    proc exit_class_context with analyzer
+End Process
+
+@Reasoning:
+The superclass clause is an AST_SUPERCLASS wrapper around a single expression
+(usually an AST_CONSTANT). Recording the superclass-name binding lets inheritance
+queries answer "what does class X extend" and the constant lookup validate that
+the named superclass is itself defined. The wrapped expression is analysed so an
+unknown superclass surfaces as an unresolved-constant warning.
+@End Reasoning
+
+@Implementation:
+Read the first child of the AST_SUPERCLASS wrapper. If it is an AST_CONSTANT,
+store class_name -> superclass-name in superclasses (offset 64). Analyze the
+expression regardless so its own reference is validated.
+@End Implementation
+
+Process called "record_superclass" takes analyzer as Integer, class_name as Integer, super_wrap as Integer returns Nothing:
+    Let expr be proc ast_node_child from Parser with super_wrap, 0
+    If expr is equal to 0:
+        Return
+    End If
+    Let expr_type be proc ast_node_type from Parser with expr
+    If expr_type is equal to AST_CONSTANT from Parser:
+        Let super_name be proc ast_node_value from Parser with expr
+        If class_name is not equal to 0:
+            If super_name is not equal to 0:
+                Let superclasses be proc memory_get_int64 from Layout with analyzer, 64
+                proc set from Dict with superclasses, class_name, super_name
+            End If
+        End If
+    End If
+    proc analyze_ruby_node with analyzer, expr
+End Process
+
+@Reasoning:
+Walks the body children of a class/module, skipping the AST_SUPERCLASS clause
+(already handled by record_superclass) so the superclass expression is not
+analysed twice and is not mistaken for a body statement. Every other child is a
+body statement and is dispatched normally.
+@End Reasoning
+
+@Implementation:
+For each child, skip AST_SUPERCLASS; otherwise analyze_ruby_node.
+@End Implementation
+
+Process called "analyze_class_body" takes analyzer as Integer, node as Integer returns Nothing:
+    Let count be proc ast_node_child_count from Parser with node
+    Let i be 0
+    While i is less than count:
+        Let child be proc ast_node_child from Parser with node, i
+        Let child_type be proc ast_node_type from Parser with child
+        If child_type is equal to AST_SUPERCLASS from Parser:
+            Set i to i plus 1
+        Otherwise:
+            proc analyze_ruby_node with analyzer, child
+            Set i to i plus 1
+        End If
+    End While
+End Process
+
+@Reasoning:
+A module declaration registers the module name (and the matching constant),
+enters the class context and a fresh boundary scope, and walks the body so
+methods/constants defined inside are namespaced to this module. Modules cannot be
+instantiated and have no superclass, so there is no superclass handling.
+@End Reasoning
+
+@Implementation:
+Read the name from the value slot, register it in modules (offset 72) and
+constants (offset 80), enter the class context and a boundary scope, walk the
+children, then restore.
+@End Implementation
+
+Process called "analyze_module" takes analyzer as Integer, node as Integer returns Nothing:
+    Let module_name be proc ast_node_value from Parser with node
+    If module_name is not equal to 0:
+        Let modules be proc memory_get_int64 from Layout with analyzer, 72
+        proc set from Dict with modules, module_name, 1
+        Let constants be proc memory_get_int64 from Layout with analyzer, 80
+        proc set from Dict with constants, module_name, 1
+    End If
+
+    proc enter_class_context with analyzer, module_name
+    proc enter_scope with analyzer, 1
+    proc analyze_children with analyzer, node
+    proc exit_scope with analyzer
+    proc exit_class_context with analyzer
+End Process
+
+@Reasoning:
+A method definition registers the method against its owning class. A plain
+AST_METHOD becomes an instance method (Class#name); an AST_SINGLETON_METHOD
+(`def self.foo`) becomes a class/singleton method (Class.name) and carries a
+receiver as its first child. The method body opens a fresh boundary scope into
+which each parameter is declared as a local, then the body is walked so locals
+declared/referenced inside resolve against the parameter and method scope. The
+parameter list is the first child (plain) or second child (singleton).
+@End Reasoning
+
+@Implementation:
+Read the method name from the value slot and the owner name. Register
+owner#name in class_methods (offset 40) for a plain method, or owner.name in
+singleton_methods (offset 48) for a singleton method; for a singleton method,
+analyze the receiver child first. Locate the AST_PARAM_LIST child, enter a
+boundary scope, declare every parameter, walk the remaining body children, then
+exit.
+@End Implementation
+
+Process called "analyze_method" takes analyzer as Integer, node as Integer, is_singleton as Integer returns Nothing:
+    Let method_name be proc ast_node_value from Parser with node
+    Let owner be proc current_owner_name with analyzer
+
+    If is_singleton is equal to 1:
+        If method_name is not equal to 0:
+            Let key be proc qualify_key with owner, ".", method_name
+            Let singleton_methods be proc memory_get_int64 from Layout with analyzer, 48
+            proc set from Dict with singleton_methods, key, 1
+        End If
+        Note: receiver is the first child of a singleton method
+        Let receiver be proc ast_node_child from Parser with node, 0
+        proc analyze_ruby_node with analyzer, receiver
+    Otherwise:
+        If method_name is not equal to 0:
+            Let key be proc qualify_key with owner, "#", method_name
+            Let class_methods be proc memory_get_int64 from Layout with analyzer, 40
+            proc set from Dict with class_methods, key, 1
+        End If
+    End If
+
+    proc enter_scope with analyzer, 1
+
+    Note: declare parameters as locals, then walk the body
+    Let count be proc ast_node_child_count from Parser with node
+    Let i be 0
+    While i is less than count:
+        Let child be proc ast_node_child from Parser with node, i
+        Let child_type be proc ast_node_type from Parser with child
+        If child_type is equal to AST_PARAM_LIST from Parser:
+            proc declare_parameters with analyzer, child
+        Otherwise:
+            If child_type is equal to AST_SELF from Parser:
+                Set i to i plus 0
+            Otherwise:
+                If child_type is equal to AST_CONSTANT from Parser:
+                    Note: singleton receiver constant - already analysed above
+                    Set i to i plus 0
+                Otherwise:
+                    proc analyze_ruby_node with analyzer, child
+                End If
+            End If
+        End If
+        Set i to i plus 1
+    End While
+
+    proc exit_scope with analyzer
+End Process
+
+@Reasoning:
+Declares every parameter in an AST_PARAM_LIST as a local in the current (method
+or block) scope. Each AST_PARAM carries the parameter name in its value slot and
+may carry splat/doublesplat/block/kwarg/optional metadata flags; for resolution
+purposes every form binds a local name, so all are declared the same way. A
+default-value expression on an optional parameter is analysed so references in it
+resolve against the parameters declared so far.
+@End Reasoning
+
+@Implementation:
+For each AST_PARAM child, declare its value-slot name as a local. If the
+parameter has a default-value child (optional/kwarg), analyze that child.
+@End Implementation
+
+Process called "declare_parameters" takes analyzer as Integer, param_list as Integer returns Nothing:
+    Let count be proc ast_node_child_count from Parser with param_list
+    Let i be 0
+    While i is less than count:
+        Let param be proc ast_node_child from Parser with param_list, i
+        Let param_name be proc ast_node_value from Parser with param
+        proc declare_local with analyzer, param_name
+
+        Note: analyze a default-value expression if present
+        Let pchild_count be proc ast_node_child_count from Parser with param
+        Let j be 0
+        While j is less than pchild_count:
+            Let default_expr be proc ast_node_child from Parser with param, j
+            proc analyze_ruby_node with analyzer, default_expr
+            Set j to j plus 1
+        End While
+
+        Set i to i plus 1
+    End While
+End Process
+
+@Reasoning:
+A block (do..end / { }, lambda or proc) opens a fresh non-program scope that can
+read the enclosing method/block's locals (closure capture) but whose own
+block-local declarations - including its |params| - do not escape. The scope is
+a boundary so a local resolved beyond it is recorded as a capture by
+analyze_identifier. The first child is the AST_PARAM_LIST; the remaining children
+are the body.
+@End Reasoning
+
+@Implementation:
+Enter a boundary scope. Declare the block's AST_PARAM_LIST parameters as locals.
+Walk the remaining body children, then exit the scope.
+@End Implementation
+
+Process called "analyze_block" takes analyzer as Integer, node as Integer returns Nothing:
+    proc enter_scope with analyzer, 1
+
+    Let count be proc ast_node_child_count from Parser with node
+    Let i be 0
+    While i is less than count:
+        Let child be proc ast_node_child from Parser with node, i
+        Let child_type be proc ast_node_type from Parser with child
+        If child_type is equal to AST_PARAM_LIST from Parser:
+            proc declare_parameters with analyzer, child
+        Otherwise:
+            proc analyze_ruby_node with analyzer, child
+        End If
+        Set i to i plus 1
+    End While
+
+    proc exit_scope with analyzer
+End Process
+
+@Reasoning:
+A `for x in collection` loop binds its iteration variable in the CURRENT scope
+(Ruby's `for` does not introduce a new scope, unlike a block), then walks the
+collection expression and body. The first child is the loop variable (an
+identifier or target list), the second the collection, the rest the body.
+@End Reasoning
+
+@Implementation:
+Read the first child; if it is an AST_IDENTIFIER declare its name as a local in
+the current scope, otherwise (a target list) declare each contained identifier.
+Analyze the remaining children (collection + body) normally.
+@End Implementation
+
+Process called "analyze_for" takes analyzer as Integer, node as Integer returns Nothing:
+    Let count be proc ast_node_child_count from Parser with node
+    If count is equal to 0:
+        Return
+    End If
+
+    Let loop_var be proc ast_node_child from Parser with node, 0
+    Let lv_type be proc ast_node_type from Parser with loop_var
+    If lv_type is equal to AST_IDENTIFIER from Parser:
+        Let name be proc ast_node_value from Parser with loop_var
+        proc declare_local with analyzer, name
+    Otherwise:
+        proc declare_target_locals with analyzer, loop_var
+    End If
+
+    Let i be 1
+    While i is less than count:
+        Let child be proc ast_node_child from Parser with node, i
+        proc analyze_ruby_node with analyzer, child
+        Set i to i plus 1
+    End While
+End Process
+
+Note: ============================================================================
+Note: Assignments
+Note: ============================================================================
+
+@Reasoning:
+A single assignment (AST_ASSIGN / AST_OP_ASSIGN) has the target as child 0 and
+the value as child 1. The value is analysed first so its references resolve in
+the pre-assignment scope, then the target drives a kind-specific binding:
+declaring a local, recording an ivar/cvar against the owning class, recording a
+global, or recording a constant. An indexed or member target (a[i] = v, a.b = v)
+is an attribute write whose receiver/operands are analysed as references.
+@End Reasoning
+
+@Implementation:
+Guard for fewer than 2 children. Analyze the value child first. Branch on the
+target's node type: AST_IDENTIFIER declares a local; AST_INSTANCE_VAR /
+AST_CLASS_VAR / AST_GLOBAL_VAR record into the matching registry; AST_CONSTANT
+records a constant; AST_INDEX / AST_MEMBER analyze the target as a reference
+(attribute write). An OP_ASSIGN (`+=` etc.) also READS the target first, so for
+op-assign the target identifier is resolved as a reference before being declared.
+@End Implementation
+
+Process called "analyze_assignment" takes analyzer as Integer, node as Integer returns Nothing:
+    Let count be proc ast_node_child_count from Parser with node
+    If count is less than 2:
+        proc analyze_children with analyzer, node
+        Return
+    End If
+
+    Let target be proc ast_node_child from Parser with node, 0
+    Let value be proc ast_node_child from Parser with node, 1
+
+    proc analyze_ruby_node with analyzer, value
+
+    Let node_type be proc ast_node_type from Parser with node
+    Let is_op_assign be 0
+    If node_type is equal to AST_OP_ASSIGN from Parser:
+        Set is_op_assign to 1
+    End If
+
+    proc analyze_assignment_target with analyzer, target, is_op_assign
+End Process
+
+@Reasoning:
+Binds an assignment target according to its kind. A plain local target is
+declared into the current scope; an op-assign local target is first resolved as a
+reference (the `+=` reads the existing binding) and then declared so the binding
+exists for subsequent code. Instance/class/global/constant targets record into
+their registries namespaced to the owning class where applicable. Index/member
+targets are attribute writes whose operands are analysed as references.
+@End Reasoning
+
+@Implementation:
+Branch on target node type. AST_IDENTIFIER: for op-assign, resolve-then-declare;
+else declare. AST_INSTANCE_VAR/AST_CLASS_VAR: qualify with the owner and record.
+AST_GLOBAL_VAR: record the flat name. AST_CONSTANT: record the constant.
+AST_INDEX/AST_MEMBER: analyze as a reference. Anything else: analyze as a
+reference.
+@End Implementation
+
+Process called "analyze_assignment_target" takes analyzer as Integer, target as Integer, is_op_assign as Integer returns Nothing:
+    Let target_type be proc ast_node_type from Parser with target
+
+    If target_type is equal to AST_IDENTIFIER from Parser:
+        Let name be proc ast_node_value from Parser with target
+        If is_op_assign is equal to 1:
+            proc analyze_identifier with analyzer, target
+        End If
+        proc declare_local with analyzer, name
+        Return
+    End If
+
+    If target_type is equal to AST_INSTANCE_VAR from Parser:
+        Let owner be proc current_owner_name with analyzer
+        Let name be proc ast_node_value from Parser with target
+        If name is not equal to 0:
+            Let key be proc qualify_key with owner, "#", name
+            Let ivars be proc memory_get_int64 from Layout with analyzer, 88
+            proc set from Dict with ivars, key, 1
+        End If
+        Return
+    End If
+
+    If target_type is equal to AST_CLASS_VAR from Parser:
+        Let owner be proc current_owner_name with analyzer
+        Let name be proc ast_node_value from Parser with target
+        If name is not equal to 0:
+            Let key be proc qualify_key with owner, "#", name
+            Let cvars be proc memory_get_int64 from Layout with analyzer, 96
+            proc set from Dict with cvars, key, 1
+        End If
+        Return
+    End If
+
+    If target_type is equal to AST_GLOBAL_VAR from Parser:
+        Let name be proc ast_node_value from Parser with target
+        If name is not equal to 0:
+            Let globals be proc memory_get_int64 from Layout with analyzer, 104
+            proc set from Dict with globals, name, 1
+        End If
+        Return
+    End If
+
+    If target_type is equal to AST_CONSTANT from Parser:
+        Let name be proc ast_node_value from Parser with target
+        If name is not equal to 0:
+            Let constants be proc memory_get_int64 from Layout with analyzer, 80
+            proc set from Dict with constants, name, 1
+        End If
+        Return
+    End If
+
+    Note: index/member attribute write, or any other lvalue: analyze operands
+    proc analyze_ruby_node with analyzer, target
+End Process
+
+@Reasoning:
+A multiple assignment (a, b, *c = 1, 2, 3) binds a list of targets to a list of
+values. The target list is child 0 (AST_TARGET_LIST) and the value list child 1
+(AST_VALUE_LIST). Each value is analysed as a reference; each target is bound by
+the same kind-specific logic as a single assignment so locals, ivars, cvars,
+globals and constants on the left all bind correctly, including splat targets.
+@End Reasoning
+
+@Implementation:
+Analyze every child of the value list as a reference. Bind every child of the
+target list via analyze_assignment_target (not an op-assign). Guard both lists
+for absence.
+@End Implementation
+
+Process called "analyze_multiple_assignment" takes analyzer as Integer, node as Integer returns Nothing:
+    Let count be proc ast_node_child_count from Parser with node
+    Let targets be 0
+    Let values be 0
+
+    Let i be 0
+    While i is less than count:
+        Let child be proc ast_node_child from Parser with node, i
+        Let child_type be proc ast_node_type from Parser with child
+        If child_type is equal to AST_TARGET_LIST from Parser:
+            Set targets to child
+        Otherwise:
+            If child_type is equal to AST_VALUE_LIST from Parser:
+                Set values to child
+            End If
+        End If
+        Set i to i plus 1
+    End While
+
+    If values is not equal to 0:
+        Let vcount be proc ast_node_child_count from Parser with values
+        Let v be 0
+        While v is less than vcount:
+            Let value_expr be proc ast_node_child from Parser with values, v
+            proc analyze_ruby_node with analyzer, value_expr
+            Set v to v plus 1
+        End While
+    End If
+
+    If targets is not equal to 0:
+        proc declare_target_locals with analyzer, targets
+    End If
+End Process
+
+@Reasoning:
+Binds every target inside a target list (or a for-loop destructuring variable
+list) by delegating to analyze_assignment_target so each target's kind (local /
+ivar / cvar / global / constant) is honoured. A nested target list (destructuring
+within destructuring) recurses.
+@End Reasoning
+
+@Implementation:
+For each child: if it is itself an AST_TARGET_LIST recurse; otherwise bind it via
+analyze_assignment_target with is_op_assign=0.
+@End Implementation
+
+Process called "declare_target_locals" takes analyzer as Integer, target_list as Integer returns Nothing:
+    Let count be proc ast_node_child_count from Parser with target_list
+    Let i be 0
+    While i is less than count:
+        Let target be proc ast_node_child from Parser with target_list, i
+        Let target_type be proc ast_node_type from Parser with target
+        If target_type is equal to AST_TARGET_LIST from Parser:
+            proc declare_target_locals with analyzer, target
+        Otherwise:
+            proc analyze_assignment_target with analyzer, target, 0
+        End If
+        Set i to i plus 1
+    End While
+End Process
+
+Note: ============================================================================
+Note: References
+Note: ============================================================================
+
+@Reasoning:
+A method call has the receiver as child 0 (an AST_IDENTIFIER with a 0 value slot
+denotes "no receiver" - a bare self-call), the AST_ARG_LIST as child 1, and an
+optional AST_BLOCK as child 2. The receiver, arguments and block are all analysed
+as references/sub-trees. The method name (value slot) is then checked: a call with
+an explicit receiver cannot be statically resolved in a duck-typed language, so it
+is left to runtime dispatch; a receiver-less call to a name that is neither a known
+method on the current class, nor a local (a paren-less local read), nor part of
+the Kernel surface, is recorded as an advisory warning since method_missing or a
+dynamically-defined method may still satisfy it at runtime.
+@End Reasoning
+
+@Implementation:
+Analyze every child (receiver, arg list, block). Determine whether the receiver is
+absent (AST_IDENTIFIER with value 0). For a receiver-less call, look the name up as
+an instance method on the current owner (owner#name), as a local, and against the
+Kernel surface; if none match, record a warning. Calls with an explicit receiver
+are not flagged (dynamic dispatch).
+@End Implementation
+
+Process called "analyze_method_call" takes analyzer as Integer, node as Integer returns Nothing:
+    Let method_name be proc ast_node_value from Parser with node
+    Let receiver be proc ast_node_child from Parser with node, 0
+
+    Note: analyze all children (receiver, arg list, block)
+    proc analyze_children with analyzer, node
+
+    Note: determine whether the receiver is absent (bare self-call)
+    Let has_receiver be 0
     If receiver is not equal to 0:
-        proc analyze_ruby_ast with analyzer, receiver
-        Set receiver_type to proc infer_expression_type with analyzer, receiver
-    End If
-
-    Note: Analyze arguments
-    If arguments is not equal to 0:
-        proc analyze_argument_list with analyzer, arguments
-    End If
-
-    Note: Analyze block if present
-    If block is not equal to 0:
-        proc analyze_ruby_ast with analyzer, block
-    End If
-
-    Note: Check if method exists (duck typing - check if object responds to method)
-    Let method_exists be proc check_duck_typing with analyzer, receiver_type, method_name
-
-    If method_exists is equal to 0:
-        Note: Method not found - could be method_missing or dynamic method
-        proc check_method_missing with analyzer, receiver_type, method_name, ast
-    End If
-
-    Note: Infer result type from method call
-    Let result_type be proc infer_method_result_type with analyzer, receiver_type, method_name, arguments
-    proc set_expression_type with ast, result_type
-
-    Return 1
-End Process
-
-@Reasoning:
-Ruby has five distinct assignment targets distinguished by sigil:
-local (var), instance (@var), class (@@var), global ($var), and
-constants (CamelCase). The Match dispatches to a target-specific
-analyzer because each kind has different scope rules and visibility.
-The value expression is always analyzed first to feed type inference.
-@End Reasoning
-Process called "analyze_assignment" takes analyzer as Integer, ast as Integer returns Integer:
-    Note: Analyze Ruby assignment with type inference
-
-    Let child_count be proc get_list_size with ast.children
-    If child_count is less than 2:
-        Return 0
-    End If
-
-    Let target be proc get_list_item with ast.children, 0
-    Let value_expr be proc get_list_item with ast.children, 1
-
-    Note: Analyze value expression first
-    proc analyze_ruby_ast with analyzer, value_expr
-    Let value_type be proc infer_expression_type with analyzer, value_expr
-
-    Note: Handle different assignment targets
-    Let target_type be target.node_type
-
-    Match target_type:
-        When AST_IDENTIFIER from RubyParser:
-            proc analyze_variable_assignment with analyzer, target, value_type
-        When AST_INSTANCE_VAR from RubyParser:
-            proc analyze_instance_variable_assignment with analyzer, target, value_type
-        When AST_CLASS_VAR from RubyParser:
-            proc analyze_class_variable_assignment with analyzer, target, value_type
-        When AST_GLOBAL_VAR from RubyParser:
-            proc analyze_global_variable_assignment with analyzer, target, value_type
-        When AST_CONSTANT from RubyParser:
-            proc analyze_constant_assignment with analyzer, target, value_type
+        Let recv_type be proc ast_node_type from Parser with receiver
+        If recv_type is equal to AST_IDENTIFIER from Parser:
+            Let recv_val be proc ast_node_value from Parser with receiver
+            If recv_val is not equal to 0:
+                Set has_receiver to 1
+            End If
         Otherwise:
-            proc add_semantic_error with analyzer, "Invalid assignment target", ast
-    End Match
+            Set has_receiver to 1
+        End If
+    End If
 
-    Return 1
+    If method_name is equal to 0:
+        Return
+    End If
+
+    Note: include / extend / prepend mixin: validate the module argument
+    Let is_mixin be 0
+    If proc string_equals from StringUtils with method_name, "include" is equal to 1:
+        Set is_mixin to 1
+    End If
+    If proc string_equals from StringUtils with method_name, "extend" is equal to 1:
+        Set is_mixin to 1
+    End If
+    If proc string_equals from StringUtils with method_name, "prepend" is equal to 1:
+        Set is_mixin to 1
+    End If
+    If is_mixin is equal to 1:
+        proc validate_mixin_argument with analyzer, node
+        Return
+    End If
+
+    If has_receiver is equal to 1:
+        Note: explicit-receiver dispatch is dynamic; not statically checkable
+        Return
+    End If
+
+    Note: receiver-less call: try instance method on owner, then local, then Kernel
+    Let owner be proc current_owner_name with analyzer
+    Let key be proc qualify_key with owner, "#", method_name
+    Let class_methods be proc memory_get_int64 from Layout with analyzer, 40
+    Let is_method be proc contains from Dict with class_methods, key
+    If is_method is equal to 1:
+        Return
+    End If
+
+    Let local_level be proc resolve_local_level with analyzer, method_name
+    If local_level is not equal to 0:
+        Return
+    End If
+
+    Let is_kernel be proc kernel_responds_to with method_name
+    If is_kernel is equal to 1:
+        Return
+    End If
+
+    proc record_warning with analyzer, "Reference to method that may be defined dynamically"
 End Process
 
 @Reasoning:
-'include' adds module methods as instance methods of the including
-class. The analyzer verifies the module exists, records the
-inclusion both on the class and in the mixin hierarchy graph, then
-imports the methods as instance methods so subsequent method-call
-analysis can find them.
+The Kernel/Object surface holds the methods every Ruby object answers to without
+an explicit definition (puts, print, p, require, raise, loop, lambda, proc,
+attr_accessor and the access modifiers, etc.). A receiver-less call to one of
+these is always valid, so it short-circuits the undefined-method heuristic. The
+attribute/visibility declarators (attr_accessor, private, ...) are included so a
+class body using them does not produce spurious warnings.
 @End Reasoning
-Process called "analyze_include" takes analyzer as Integer, ast as Integer returns Integer:
-    Note: Analyze Ruby include statement (mixin)
 
-    Let module_name be proc get_node_attribute with ast, "module"
+@Implementation:
+Compare method_name (a string handle) against each Kernel surface name via
+StringUtils.string_equals; return 1 on the first match, 0 otherwise.
+@End Implementation
 
-    Note: Check if module exists
-    Let module_exists be proc module_exists with analyzer, module_name
-    If module_exists is equal to 0:
-        proc add_semantic_error with analyzer, "Undefined module for include", ast
-        Return 0
-    End If
-
-    Note: Add to current class's included modules
-    If analyzer.current_class is not equal to 0:
-        proc add_included_module with analyzer.current_class, module_name
-        proc update_mixin_hierarchy with analyzer, analyzer.current_class.name, module_name, "include"
-    End If
-
-    Note: Import module methods into current scope
-    proc import_module_methods with analyzer, module_name, "instance"
-
-    Return 1
-End Process
-
-@Reasoning:
-'extend' is the class-level counterpart to 'include': it adds module
-methods as class methods rather than instance methods. The check
-sequence mirrors analyze_include but the import_module_methods call
-specifies "class" scope so the methods land in the class_methods
-map.
-@End Reasoning
-Process called "analyze_extend" takes analyzer as Integer, ast as Integer returns Integer:
-    Note: Analyze Ruby extend statement (class-level mixin)
-
-    Let module_name be proc get_node_attribute with ast, "module"
-
-    Note: Check if module exists
-    Let module_exists be proc module_exists with analyzer, module_name
-    If module_exists is equal to 0:
-        proc add_semantic_error with analyzer, "Undefined module for extend", ast
-        Return 0
-    End If
-
-    Note: Add to current class's extended modules
-    If analyzer.current_class is not equal to 0:
-        proc add_extended_module with analyzer.current_class, module_name
-        proc update_mixin_hierarchy with analyzer, analyzer.current_class.name, module_name, "extend"
-    End If
-
-    Note: Import module methods as class methods
-    proc import_module_methods with analyzer, module_name, "class"
-
-    Return 1
-End Process
-
-@Reasoning:
-Duck typing requires three cross-cutting passes: analyse all method
-call patterns to learn what methods each object is asked to support,
-build implicit interfaces from that data, and finally check for
-potential NoMethodErrors where objects are called with methods their
-inferred types don't support. Runs after the symbol table is fully
-populated.
-@End Reasoning
-Process called "analyze_duck_typing_patterns" takes analyzer as Integer returns Integer:
-    Note: Analyze duck typing patterns across the codebase
-
-    Note: Find all method calls and check if objects respond to them
-    proc analyze_method_call_patterns from analyzer
-
-    Note: Build duck type interfaces for objects
-    proc build_duck_type_interfaces from analyzer
-
-    Note: Check for potential NoMethodError issues
-    proc check_potential_method_errors from analyzer
-
-    Return 1
-End Process
-
-@Reasoning:
-The duck-type predicate checks four sources in order: built-in
-types (String, Array, etc.), user-defined classes, included
-modules (via class_info), and method_missing fallbacks. Returning 1
-when method_missing is defined treats it as a catch-all, matching
-Ruby's runtime dispatch semantics.
-@End Reasoning
-Process called "check_duck_typing" takes analyzer as Integer, object_type as String, method_name as String returns Integer:
-    Note: Check if object type responds to method (duck typing)
-
-    Note: Check built-in Ruby types
-    If proc builtin_type_responds_to with object_type, method_name is equal to 1:
+Process called "kernel_responds_to" takes name as Integer returns Integer:
+    If proc string_equals from StringUtils with name, "puts" is equal to 1:
         Return 1
     End If
-
-    Note: Check user-defined classes
-    Let class_info be proc get_class_info with analyzer, object_type
-    If class_info is not equal to 0:
-        If proc class_responds_to with class_info, method_name is equal to 1:
-            Return 1
-        End If
-
-        Note: Check included modules
-        If proc modules_respond_to with analyzer, class_info.included_modules, method_name is equal to 1:
-            Return 1
-        End If
+    If proc string_equals from StringUtils with name, "print" is equal to 1:
+        Return 1
     End If
-
-    Note: Check if method_missing is defined
-    If proc has_method_missing with analyzer, object_type is equal to 1:
-        Return 1  Note: method_missing can handle any method
+    If proc string_equals from StringUtils with name, "p" is equal to 1:
+        Return 1
     End If
-
-    Return 0  Note: Object doesn't respond to method
-End Process
-
-@Reasoning:
-The inferer recognises Ruby literal kinds directly (String, Symbol,
-Array, Hash, Range) and distinguishes Integer from Float by checking
-for '.' in numeric literals. Identifiers and method calls recurse
-into specialised inferers; the catch-all fallback "Object" is Ruby's
-root class which guarantees the duck-type check at the call site
-will not blow up on unknown shapes.
-@End Reasoning
-Process called "infer_expression_type" takes analyzer as Integer, expr as Integer returns String:
-    Note: Infer type of Ruby expression using duck typing
-
-    Let node_type be expr.node_type
-
-    Match node_type:
-        When AST_STRING from RubyParser:
-            Return "String"
-        When AST_NUMBER from RubyParser:
-            Note: Determine if integer or float
-            Let value be expr.value
-            If proc contains with value, "." is equal to 1:
-                Return "Float"
-            Otherwise:
-                Return "Integer"
-            End If
-        When AST_SYMBOL from RubyParser:
-            Return "Symbol"
-        When AST_ARRAY from RubyParser:
-            Return "Array"
-        When AST_HASH from RubyParser:
-            Return "Hash"
-        When AST_RANGE from RubyParser:
-            Return "Range"
-        When AST_IDENTIFIER from RubyParser:
-            Return proc infer_variable_type with analyzer, expr
-        When AST_METHOD_CALL from RubyParser:
-            Return proc infer_method_call_type with analyzer, expr
-        When AST_BINARY_OP from RubyParser:
-            Return proc infer_binary_op_type with analyzer, expr
-        Otherwise:
-            Return "Object"  Note: Default Ruby type
-    End Match
-End Process
-
-@Reasoning:
-The final-phase call validator walks every recorded method call and
-re-runs check_duck_typing now that the full symbol table is
-available. Calls that still fail the duck-type predicate become
-warnings (not errors) because Ruby method_missing and dynamic def
-can supply methods at runtime.
-@End Reasoning
-Process called "validate_method_calls" takes analyzer as Integer returns Integer:
-    Note: Validate all method calls found during analysis
-
-    Note: Iterate through all recorded method calls
-    Let call_list be proc get_method_calls from analyzer
-    Let call_count be proc get_list_size from call_list
-    Let index be 0
-
-    While index is less than call_count:
-        Let call_info be proc get_list_item with call_list, index
-        Let receiver_type be proc get_dict_value with call_info, "receiver_type"
-        Let method_name be proc get_dict_value with call_info, "method_name"
-        Let ast_node be proc get_dict_value with call_info, "ast_node"
-
-        If proc check_duck_typing with analyzer, receiver_type, method_name is equal to 0:
-            proc add_semantic_warning with analyzer, "Method may not exist", ast_node
-        End If
-
-        Set index to index plus 1
-    End While
-
-    Return 1
-End Process
-
-@Reasoning:
-Pre-populates the class hierarchy with Ruby's built-in classes
-(Object, BasicObject, String, Integer, Float, Array, Hash, etc.)
-and core modules (Enumerable, Comparable, Kernel). Without this
-seeding, every analysis would error on the first reference to a
-built-in type. The inheritance chains match the actual Ruby class
-graph.
-@End Reasoning
-Process called "initialize_ruby_builtins" takes analyzer as Integer returns Integer:
-    Note: Initialize built-in Ruby classes and modules
-
-    Note: Core classes
-    proc add_builtin_class with analyzer, "Object", ""
-    proc add_builtin_class with analyzer, "BasicObject", ""
-    proc add_builtin_class with analyzer, "String", "Object"
-    proc add_builtin_class with analyzer, "Integer", "Numeric"
-    proc add_builtin_class with analyzer, "Float", "Numeric"
-    proc add_builtin_class with analyzer, "Numeric", "Object"
-    proc add_builtin_class with analyzer, "Array", "Object"
-    proc add_builtin_class with analyzer, "Hash", "Object"
-    proc add_builtin_class with analyzer, "Symbol", "Object"
-    proc add_builtin_class with analyzer, "Range", "Object"
-    proc add_builtin_class with analyzer, "Proc", "Object"
-    proc add_builtin_class with analyzer, "Method", "Object"
-
-    Note: Core modules
-    proc add_builtin_module with analyzer, "Enumerable"
-    proc add_builtin_module with analyzer, "Comparable"
-    proc add_builtin_module with analyzer, "Kernel"
-
-    Note: Add common methods to built-in types
-    proc add_builtin_methods from analyzer
-
-    Return 1
-End Process
-
-Note: Helper processes for Ruby semantic analysis
-
-@Reasoning:
-Errors carry the full diagnostic record (message + source location +
-severity) as a dict so the IDE/LSP layer can surface them with
-appropriate UI affordances. Including the AST node's line/column at
-record time avoids requiring the caller to know how to extract
-source coordinates.
-@End Reasoning
-Process called "add_semantic_error" takes analyzer as Integer, message as String, ast as Integer returns Integer:
-    Note: Add semantic error with location information
-
-    Let error be a value of type Dictionary[String, Any] with
-        "message" as message,
-        "line" as proc get_ast_line with ast,
-        "column" as proc get_ast_column with ast,
-        "severity" as "error"
-
-    proc add_to_list with analyzer.error_list, error
-    Return 1
-End Process
-
-@Reasoning:
-Warnings parallel errors but flow into a separate list and never
-block analysis. The dict-record format matches error records so
-unified diagnostic rendering treats both kinds identically.
-@End Reasoning
-Process called "add_semantic_warning" takes analyzer as Integer, message as String, ast as Integer returns Integer:
-    Note: Add semantic warning with location information
-
-    Let warning be a value of type Dictionary[String, Any] with
-        "message" as message,
-        "line" as proc get_ast_line with ast,
-        "column" as proc get_ast_column with ast,
-        "severity" as "warning"
-
-    proc add_to_list with analyzer.warning_list, warning
-    Return 1
-End Process
-
-@Reasoning:
-Returns the analyzer's error list by reference. Owners borrow the
-handle; lifetime stays with the analyzer.
-@End Reasoning
-Process called "get_semantic_errors" takes analyzer as Integer returns Integer:
-    Note: Return list of semantic errors
-    Return analyzer.error_list
-End Process
-
-@Reasoning:
-Returns the analyzer's warning list by reference. Symmetric to
-get_semantic_errors; consumed by the IDE diagnostic layer.
-@End Reasoning
-Process called "get_semantic_warnings" takes analyzer as Integer returns Integer:
-    Note: Return list of semantic warnings
-    Return analyzer.warning_list
-End Process
-
-@Reasoning:
-24-byte allocation for a dict header (count, capacity, bucket
-pointer). Matches the v0.0.8.5 hash table layout used across the
-universal-translation frontends.
-@End Reasoning
-Process called "create_dict" returns Integer:
-    Note: Create dictionary for storage
-    Return proc memory_allocate from Layout with 24
-End Process
-
-@Reasoning:
-16-byte allocation for a list header (count + capacity slots). The
-backing array is allocated lazily by the first append. Matches the
-HIR list layout shared across frontends.
-@End Reasoning
-Process called "create_list" returns Integer:
-    Note: Create list for storage
-    Return proc memory_allocate from Layout with 16
-End Process
-
-@Reasoning:
-16-byte allocation for a stack header (count + capacity slots).
-Used for block_contexts (push on entering a block, pop on exit) so
-yield can find the surrounding block.
-@End Reasoning
-Process called "create_stack" returns Integer:
-    Note: Create stack for context management
-    Return proc memory_allocate from Layout with 16
-End Process
-
-@Reasoning:
-Thin wrapper over the AST node's attributes dict. Centralised so the
-AST internal layout can evolve without touching every analyzer
-routine that needs to read named attributes.
-@End Reasoning
-Process called "get_node_attribute" takes ast as Integer, attribute_name as String returns String:
-    Note: Get attribute value from AST node
-    Return proc get_dict_value with ast.attributes, attribute_name
-End Process
-
-@Reasoning:
-Returns the first child or 0 (the canonical absent-child sentinel)
-if the children list is empty. Used by analyze_method_call where
-the receiver, when present, is always the first child.
-@End Reasoning
-Process called "get_first_child" takes ast as Integer returns Integer:
-    Note: Get first child of AST node
-    If proc get_list_size with ast.children is greater than 0:
-        Return proc get_list_item with ast.children, 0
+    If proc string_equals from StringUtils with name, "pp" is equal to 1:
+        Return 1
+    End If
+    If proc string_equals from StringUtils with name, "require" is equal to 1:
+        Return 1
+    End If
+    If proc string_equals from StringUtils with name, "require_relative" is equal to 1:
+        Return 1
+    End If
+    If proc string_equals from StringUtils with name, "load" is equal to 1:
+        Return 1
+    End If
+    If proc string_equals from StringUtils with name, "raise" is equal to 1:
+        Return 1
+    End If
+    If proc string_equals from StringUtils with name, "fail" is equal to 1:
+        Return 1
+    End If
+    If proc string_equals from StringUtils with name, "loop" is equal to 1:
+        Return 1
+    End If
+    If proc string_equals from StringUtils with name, "lambda" is equal to 1:
+        Return 1
+    End If
+    If proc string_equals from StringUtils with name, "proc" is equal to 1:
+        Return 1
+    End If
+    If proc string_equals from StringUtils with name, "catch" is equal to 1:
+        Return 1
+    End If
+    If proc string_equals from StringUtils with name, "throw" is equal to 1:
+        Return 1
+    End If
+    If proc string_equals from StringUtils with name, "format" is equal to 1:
+        Return 1
+    End If
+    If proc string_equals from StringUtils with name, "sprintf" is equal to 1:
+        Return 1
+    End If
+    If proc string_equals from StringUtils with name, "printf" is equal to 1:
+        Return 1
+    End If
+    If proc string_equals from StringUtils with name, "gets" is equal to 1:
+        Return 1
+    End If
+    If proc string_equals from StringUtils with name, "rand" is equal to 1:
+        Return 1
+    End If
+    If proc string_equals from StringUtils with name, "srand" is equal to 1:
+        Return 1
+    End If
+    If proc string_equals from StringUtils with name, "sleep" is equal to 1:
+        Return 1
+    End If
+    If proc string_equals from StringUtils with name, "exit" is equal to 1:
+        Return 1
+    End If
+    If proc string_equals from StringUtils with name, "abort" is equal to 1:
+        Return 1
+    End If
+    If proc string_equals from StringUtils with name, "at_exit" is equal to 1:
+        Return 1
+    End If
+    If proc string_equals from StringUtils with name, "block_given?" is equal to 1:
+        Return 1
+    End If
+    If proc string_equals from StringUtils with name, "freeze" is equal to 1:
+        Return 1
+    End If
+    If proc string_equals from StringUtils with name, "frozen?" is equal to 1:
+        Return 1
+    End If
+    If proc string_equals from StringUtils with name, "dup" is equal to 1:
+        Return 1
+    End If
+    If proc string_equals from StringUtils with name, "clone" is equal to 1:
+        Return 1
+    End If
+    If proc string_equals from StringUtils with name, "object_id" is equal to 1:
+        Return 1
+    End If
+    If proc string_equals from StringUtils with name, "respond_to?" is equal to 1:
+        Return 1
+    End If
+    If proc string_equals from StringUtils with name, "send" is equal to 1:
+        Return 1
+    End If
+    If proc string_equals from StringUtils with name, "__send__" is equal to 1:
+        Return 1
+    End If
+    If proc string_equals from StringUtils with name, "public_send" is equal to 1:
+        Return 1
+    End If
+    If proc string_equals from StringUtils with name, "instance_variable_get" is equal to 1:
+        Return 1
+    End If
+    If proc string_equals from StringUtils with name, "instance_variable_set" is equal to 1:
+        Return 1
+    End If
+    If proc string_equals from StringUtils with name, "define_method" is equal to 1:
+        Return 1
+    End If
+    If proc string_equals from StringUtils with name, "attr_accessor" is equal to 1:
+        Return 1
+    End If
+    If proc string_equals from StringUtils with name, "attr_reader" is equal to 1:
+        Return 1
+    End If
+    If proc string_equals from StringUtils with name, "attr_writer" is equal to 1:
+        Return 1
+    End If
+    If proc string_equals from StringUtils with name, "private" is equal to 1:
+        Return 1
+    End If
+    If proc string_equals from StringUtils with name, "protected" is equal to 1:
+        Return 1
+    End If
+    If proc string_equals from StringUtils with name, "public" is equal to 1:
+        Return 1
+    End If
+    If proc string_equals from StringUtils with name, "module_function" is equal to 1:
+        Return 1
+    End If
+    If proc string_equals from StringUtils with name, "include" is equal to 1:
+        Return 1
+    End If
+    If proc string_equals from StringUtils with name, "extend" is equal to 1:
+        Return 1
+    End If
+    If proc string_equals from StringUtils with name, "prepend" is equal to 1:
+        Return 1
+    End If
+    If proc string_equals from StringUtils with name, "new" is equal to 1:
+        Return 1
     End If
     Return 0
 End Process
 
 @Reasoning:
-Direct accessor for the AST node's line field. Diagnostics use this
-to anchor errors and warnings to source positions; the parser
-populates the line field during tokenisation.
+A bare identifier reference is either a local read or a paren-less, receiver-less
+method call (Ruby resolves an unknown lowercase bare word as a method send to
+self). It is resolved against the local scope chain first: a hit at a level
+shallower than the innermost block boundary is a closure capture and is recorded.
+A miss falls back to the method/Kernel surface; only a name that is neither a
+local, nor a method on the current owner, nor part of the Kernel surface is an
+advisory warning (it may still be a dynamically defined method).
 @End Reasoning
-Process called "get_ast_line" takes ast as Integer returns Integer:
-    Note: Extract line number from AST node
-    Return ast.line
+
+@Implementation:
+Read the value-slot name; return on 0 (a placeholder no-receiver marker). Resolve
+the local level; on a hit, test is_captured_local against the declaration level and
+record a capture if so. On a miss, treat as a bare method send: if it is a method on
+the owner or a Kernel name, accept it; otherwise record a warning.
+@End Implementation
+
+Process called "analyze_identifier" takes analyzer as Integer, node as Integer returns Nothing:
+    Let name be proc ast_node_value from Parser with node
+    If name is equal to 0:
+        Return
+    End If
+
+    Let level be proc resolve_local_level with analyzer, name
+    If level is not equal to 0:
+        Let decl_level be level minus 1
+        Let captured be proc is_captured_local with analyzer, decl_level
+        If captured is equal to 1:
+            proc mark_capture with analyzer, name
+        End If
+        Return
+    End If
+
+    Note: not a local - a bare paren-less method send to self
+    Let owner be proc current_owner_name with analyzer
+    Let key be proc qualify_key with owner, "#", name
+    Let class_methods be proc memory_get_int64 from Layout with analyzer, 40
+    Let is_method be proc contains from Dict with class_methods, key
+    If is_method is equal to 1:
+        Return
+    End If
+
+    Let is_kernel be proc kernel_responds_to with name
+    If is_kernel is equal to 1:
+        Return
+    End If
+
+    proc record_warning with analyzer, "Reference to name that is neither a local nor a known method"
 End Process
 
 @Reasoning:
-Companion to get_ast_line; returns the AST node's column. Combined,
-they form a precise (line, column) coordinate for diagnostics.
+A constant reference resolves against the lexical constant set (which holds
+user-declared classes/modules/constants plus the built-in surface). Ruby's real
+resolution also walks the ancestor chain, but the analyzer's constant set is flat
+across the whole compilation unit, so a constant defined anywhere in the unit
+resolves; only a constant that appears nowhere - not declared, not built-in -
+produces an advisory uninitialized-constant warning.
 @End Reasoning
-Process called "get_ast_column" takes ast as Integer returns Integer:
-    Note: Extract column number from AST node
-    Return ast.column
+
+@Implementation:
+Read the value-slot name; return on 0. If it is present in the constants registry
+(offset 80) it resolves. Otherwise record a warning.
+@End Implementation
+
+Process called "analyze_constant_ref" takes analyzer as Integer, node as Integer returns Nothing:
+    Let name be proc ast_node_value from Parser with node
+    If name is equal to 0:
+        Return
+    End If
+
+    Let constants be proc memory_get_int64 from Layout with analyzer, 80
+    Let found be proc contains from Dict with constants, name
+    If found is equal to 1:
+        Return
+    End If
+
+    proc record_warning with analyzer, "Reference to uninitialized constant"
 End Process
 
 @Reasoning:
-Dispatches to per-type method tables (string_has_method,
-integer_has_method, etc.). This is the fast path for duck typing
-against built-ins; user types fall through to the dynamic class
-inspection in check_duck_typing.
+An instance-variable reference reads @var in the current object/class context.
+Ruby creates an ivar lazily on first assignment and a read of an unassigned ivar
+returns nil rather than erroring, so a read is always legal; the analyzer records
+the ivar against the owning class so the ivar inventory of each class is complete
+for lowering, and never errors on an unseen ivar read.
 @End Reasoning
-Process called "builtin_type_responds_to" takes type_name as String, method_name as String returns Integer:
-    Note: Check if built-in Ruby type responds to method
 
-    Match type_name:
-        When "String":
-            Return proc string_has_method from method_name
-        When "Integer":
-            Return proc integer_has_method from method_name
-        When "Float":
-            Return proc float_has_method from method_name
-        When "Array":
-            Return proc array_has_method from method_name
-        When "Hash":
-            Return proc hash_has_method from method_name
-        When "Symbol":
-            Return proc symbol_has_method from method_name
-        When "Range":
-            Return proc range_has_method from method_name
-        Otherwise:
-            Return 0
-    End Match
+@Implementation:
+Read the value-slot name; return on 0. Record owner#name in the ivars registry
+(offset 88) so the read participates in the class's ivar inventory.
+@End Implementation
+
+Process called "analyze_instance_var_ref" takes analyzer as Integer, node as Integer returns Nothing:
+    Let name be proc ast_node_value from Parser with node
+    If name is equal to 0:
+        Return
+    End If
+    Let owner be proc current_owner_name with analyzer
+    Let key be proc qualify_key with owner, "#", name
+    Let ivars be proc memory_get_int64 from Layout with analyzer, 88
+    proc set from Dict with ivars, key, 1
 End Process
 
 @Reasoning:
-Hard-coded String method table covering the commonly-used String
-methods (length, size, upcase, downcase, strip, split, gsub,
-include?, empty?, start/end_with?, +, *, [], each_char). A full Ruby
-String has hundreds of methods; this table covers the most common
-duck-typing checks and the rest fall through to "method may not
-exist" warnings.
+A class-variable reference reads @@var in the class hierarchy. Like an ivar it is
+recorded against the owning class for the inventory; unlike an ivar, reading an
+unassigned class variable is a NameError in Ruby, so a read of a @@var that was
+never assigned anywhere in the owning class is an advisory warning. The recording
+happens after the membership check so a read does not mask its own undefinedness.
 @End Reasoning
-Process called "string_has_method" takes method_name as String returns Integer:
-    Note: Check if String class has method
 
-    Match method_name:
-        When "length": Return 1
-        When "size": Return 1
-        When "upcase": Return 1
-        When "downcase": Return 1
-        When "strip": Return 1
-        When "split": Return 1
-        When "gsub": Return 1
-        When "include?": Return 1
-        When "empty?": Return 1
-        When "start_with?": Return 1
-        When "end_with?": Return 1
-        When "+": Return 1
-        When "*": Return 1
-        When "[]": Return 1
-        When "each_char": Return 1
-        Otherwise: Return 0
-    End Match
+@Implementation:
+Read the value-slot name; return on 0. Compute owner#name. If it is not present in
+the cvars registry (offset 96), record a warning. Then record it so subsequent
+reads in the same class see it.
+@End Implementation
+
+Process called "analyze_class_var_ref" takes analyzer as Integer, node as Integer returns Nothing:
+    Let name be proc ast_node_value from Parser with node
+    If name is equal to 0:
+        Return
+    End If
+    Let owner be proc current_owner_name with analyzer
+    Let key be proc qualify_key with owner, "#", name
+    Let cvars be proc memory_get_int64 from Layout with analyzer, 96
+    Let found be proc contains from Dict with cvars, key
+    If found is equal to 0:
+        proc record_warning with analyzer, "Reference to uninitialized class variable"
+    End If
+    proc set from Dict with cvars, key, 1
 End Process
 
 @Reasoning:
-Hard-coded Array method table covering size/length, push/pop/shift/
-unshift mutators, the iteration methods (each, map, select, reject),
-membership tests, indexing, and the +/- set operators. Same trade-off
-as string_has_method: common methods captured directly, rest fall
-through to the warning path.
+A global-variable reference reads $var in the flat program-wide global table. A
+read of an unassigned global returns nil in Ruby (no error), so a read is always
+legal; the analyzer records the global so the program's global inventory is
+complete and never errors on an unseen global read. Predefined globals are already
+seeded by setup_builtins.
 @End Reasoning
-Process called "array_has_method" takes method_name as String returns Integer:
-    Note: Check if Array class has method
 
-    Match method_name:
-        When "length": Return 1
-        When "size": Return 1
-        When "empty?": Return 1
-        When "first": Return 1
-        When "last": Return 1
-        When "push": Return 1
-        When "<<": Return 1
-        When "pop": Return 1
-        When "shift": Return 1
-        When "unshift": Return 1
-        When "each": Return 1
-        When "map": Return 1
-        When "select": Return 1
-        When "reject": Return 1
-        When "include?": Return 1
-        When "[]": Return 1
-        When "[]=": Return 1
-        When "+": Return 1
-        When "-": Return 1
-        Otherwise: Return 0
-    End Match
+@Implementation:
+Read the value-slot name; return on 0. Record the flat name in the globals registry
+(offset 104).
+@End Implementation
+
+Process called "analyze_global_var_ref" takes analyzer as Integer, node as Integer returns Nothing:
+    Let name be proc ast_node_value from Parser with node
+    If name is equal to 0:
+        Return
+    End If
+    Let globals be proc memory_get_int64 from Layout with analyzer, 104
+    proc set from Dict with globals, name, 1
 End Process
 
 @Reasoning:
-Hard-coded Hash method table covering size queries, key/value
-iteration, membership tests (both has_key? and the modern key?
-alias), indexed read/write, delete, and merge. Sibling of
-string_has_method / array_has_method.
+Ruby's include/extend/prepend are not dedicated AST nodes - they are ordinary
+method calls (AST_METHOD_CALL named "include"/"extend"/"prepend"). The mixin's
+module argument is therefore reached through the call's AST_ARG_LIST child: each
+argument is an AST_ARG (or AST_SPLAT_ARG) wrapping the module expression, which
+for a mixin is an AST_CONSTANT. The analyzer validates that each named module is
+defined (user-declared or a built-in module) and records an advisory warning when
+it is not. The call's children have already been walked by analyze_method_call,
+so the constant reference itself has already been resolved; this pass adds the
+mixin-specific module-existence check on top.
 @End Reasoning
-Process called "hash_has_method" takes method_name as String returns Integer:
-    Note: Check if Hash class has method
 
-    Match method_name:
-        When "length": Return 1
-        When "size": Return 1
-        When "empty?": Return 1
-        When "keys": Return 1
-        When "values": Return 1
-        When "each": Return 1
-        When "each_key": Return 1
-        When "each_value": Return 1
-        When "has_key?": Return 1
-        When "key?": Return 1
-        When "include?": Return 1
-        When "[]": Return 1
-        When "[]=": Return 1
-        When "delete": Return 1
-        When "merge": Return 1
-        Otherwise: Return 0
-    End Match
+@Implementation:
+Walk the call's children to find the AST_ARG_LIST. For each argument in it,
+unwrap an AST_ARG/AST_SPLAT_ARG to its inner expression; if that is an
+AST_CONSTANT, check membership in the modules registry (offset 72) and warn on a
+miss. A bare-constant argument (no AST_ARG wrapper) is handled directly.
+@End Implementation
+
+Process called "validate_mixin_argument" takes analyzer as Integer, call_node as Integer returns Nothing:
+    Let count be proc ast_node_child_count from Parser with call_node
+    Let i be 0
+    While i is less than count:
+        Let child be proc ast_node_child from Parser with call_node, i
+        Let child_type be proc ast_node_type from Parser with child
+        If child_type is equal to AST_ARG_LIST from Parser:
+            proc validate_mixin_arg_list with analyzer, child
+        End If
+        Set i to i plus 1
+    End While
 End Process
+
+@Reasoning:
+Validates each argument of a mixin call's argument list. Each argument is
+typically an AST_ARG wrapper around an AST_CONSTANT module name; a splat argument
+(`include *mods`) wraps a runtime expression that cannot be statically named, so
+it is skipped. A directly-constant argument is also accepted.
+@End Reasoning
+
+@Implementation:
+For each argument, resolve the inner expression (the AST_ARG/AST_SPLAT_ARG first
+child, or the argument itself when it is already a constant). If the inner
+expression is an AST_CONSTANT, check the modules registry and warn on a miss.
+@End Implementation
+
+Process called "validate_mixin_arg_list" takes analyzer as Integer, arg_list as Integer returns Nothing:
+    Let count be proc ast_node_child_count from Parser with arg_list
+    Let i be 0
+    While i is less than count:
+        Let arg be proc ast_node_child from Parser with arg_list, i
+        Let arg_type be proc ast_node_type from Parser with arg
+
+        Let inner be arg
+        If arg_type is equal to AST_ARG from Parser:
+            Set inner to proc ast_node_child from Parser with arg, 0
+        End If
+
+        If inner is not equal to 0:
+            Let inner_type be proc ast_node_type from Parser with inner
+            If inner_type is equal to AST_CONSTANT from Parser:
+                Let mod_name be proc ast_node_value from Parser with inner
+                If mod_name is not equal to 0:
+                    Let modules be proc memory_get_int64 from Layout with analyzer, 72
+                    Let found be proc contains from Dict with modules, mod_name
+                    If found is equal to 0:
+                        proc record_warning with analyzer, "Mixin of a module that is not defined"
+                    End If
+                End If
+            End If
+        End If
+
+        Set i to i plus 1
+    End While
+End Process
+
+Note: ============================================================================
+Note: Public Entry Points and Accessors
+Note: ============================================================================
+
+@Reasoning:
+The primary entry point constructs an analyzer, walks the whole AST from the root,
+and returns the populated analyzer handle so callers can inspect the definition
+registries, the capture set and the diagnostics. Returns 0 on OOM or a null root.
+@End Reasoning
+
+@Implementation:
+Guard root for null. Create the analyzer; on OOM return 0. Walk the root via
+analyze_ruby_node and return the analyzer.
+@End Implementation
+
+Process called "analyze_ruby_semantics" takes ast_root as Integer returns Integer:
+    If ast_root is equal to 0:
+        Return 0
+    End If
+
+    Let analyzer be proc create_ruby_semantic_analyzer
+    If analyzer is equal to 0:
+        Return 0
+    End If
+
+    proc analyze_ruby_node with analyzer, ast_root
+
+    Return analyzer
+End Process
+
+@Reasoning:
+Boolean facade for callers that only need a yes/no validity answer. Runs the full
+analysis and returns 1 when no hard error was recorded. Ruby's dynamic openness
+means almost every reference problem is advisory (a warning), so a well-formed
+program returns 1; has_error latches only on genuine structural errors.
+@End Reasoning
+
+@Implementation:
+Guard root for null. Run analyze_ruby_semantics; on OOM return 0. Read has_error
+(offset 136); return 1 when it is 0.
+@End Implementation
+
+Process called "analyze_ruby_semantics_ok" takes ast_root as Integer returns Integer:
+    If ast_root is equal to 0:
+        Return 0
+    End If
+
+    Let analyzer be proc analyze_ruby_semantics with ast_root
+    If analyzer is equal to 0:
+        Return 0
+    End If
+
+    Let has_error be proc memory_get_int64 from Layout with analyzer, 136
+    If has_error is equal to 1:
+        Return 0
+    End If
+
+    Return 1
+End Process
+
+@Reasoning:
+Accessor: whether a given owner#method instance method was registered. Lets a
+caller (or test) ask whether a method was defined on a class without walking the
+registry.
+@End Reasoning
+
+@Implementation:
+Build owner#name, read class_methods (offset 40), return Dict.contains.
+@End Implementation
+
+Process called "ruby_semantic_has_instance_method" takes analyzer as Integer, owner as Integer, name as Integer returns Integer:
+    Let key be proc qualify_key with owner, "#", name
+    Let class_methods be proc memory_get_int64 from Layout with analyzer, 40
+    Return proc contains from Dict with class_methods, key
+End Process
+
+@Reasoning:
+Accessor: whether a given owner.method singleton/class method was registered.
+@End Reasoning
+
+@Implementation:
+Build owner.name, read singleton_methods (offset 48), return Dict.contains.
+@End Implementation
+
+Process called "ruby_semantic_has_singleton_method" takes analyzer as Integer, owner as Integer, name as Integer returns Integer:
+    Let key be proc qualify_key with owner, ".", name
+    Let singleton_methods be proc memory_get_int64 from Layout with analyzer, 48
+    Return proc contains from Dict with singleton_methods, key
+End Process
+
+@Reasoning:
+Accessor: whether a class name was declared (or is a built-in). Lets a caller
+verify class registration and the inheritance graph.
+@End Reasoning
+
+@Implementation:
+Read classes (offset 56), return Dict.contains.
+@End Implementation
+
+Process called "ruby_semantic_has_class" takes analyzer as Integer, name as Integer returns Integer:
+    Let classes be proc memory_get_int64 from Layout with analyzer, 56
+    Return proc contains from Dict with classes, name
+End Process
+
+@Reasoning:
+Accessor: the recorded superclass name for a class, or 0 when none was recorded.
+@End Reasoning
+
+@Implementation:
+Read superclasses (offset 64), return Dict.get.
+@End Implementation
+
+Process called "ruby_semantic_superclass_of" takes analyzer as Integer, name as Integer returns Integer:
+    Let superclasses be proc memory_get_int64 from Layout with analyzer, 64
+    Return proc get from Dict with superclasses, name
+End Process
+
+@Reasoning:
+Accessor: whether a module name was declared (or is a built-in).
+@End Reasoning
+
+@Implementation:
+Read modules (offset 72), return Dict.contains.
+@End Implementation
+
+Process called "ruby_semantic_has_module" takes analyzer as Integer, name as Integer returns Integer:
+    Let modules be proc memory_get_int64 from Layout with analyzer, 72
+    Return proc contains from Dict with modules, name
+End Process
+
+@Reasoning:
+Accessor: whether a constant name resolves (user-declared or built-in).
+@End Reasoning
+
+@Implementation:
+Read constants (offset 80), return Dict.contains.
+@End Implementation
+
+Process called "ruby_semantic_has_constant" takes analyzer as Integer, name as Integer returns Integer:
+    Let constants be proc memory_get_int64 from Layout with analyzer, 80
+    Return proc contains from Dict with constants, name
+End Process
+
+@Reasoning:
+Accessor: whether an instance variable owner#@var was recorded for a class.
+@End Reasoning
+
+@Implementation:
+Build owner#name, read ivars (offset 88), return Dict.contains.
+@End Implementation
+
+Process called "ruby_semantic_has_ivar" takes analyzer as Integer, owner as Integer, name as Integer returns Integer:
+    Let key be proc qualify_key with owner, "#", name
+    Let ivars be proc memory_get_int64 from Layout with analyzer, 88
+    Return proc contains from Dict with ivars, key
+End Process
+
+@Reasoning:
+Accessor: whether a class variable owner#@@var was recorded for a class.
+@End Reasoning
+
+@Implementation:
+Build owner#name, read cvars (offset 96), return Dict.contains.
+@End Implementation
+
+Process called "ruby_semantic_has_cvar" takes analyzer as Integer, owner as Integer, name as Integer returns Integer:
+    Let key be proc qualify_key with owner, "#", name
+    Let cvars be proc memory_get_int64 from Layout with analyzer, 96
+    Return proc contains from Dict with cvars, key
+End Process
+
+@Reasoning:
+Accessor: whether a global $var was recorded (or is predefined).
+@End Reasoning
+
+@Implementation:
+Read globals (offset 104), return Dict.contains.
+@End Implementation
+
+Process called "ruby_semantic_has_global" takes analyzer as Integer, name as Integer returns Integer:
+    Let globals be proc memory_get_int64 from Layout with analyzer, 104
+    Return proc contains from Dict with globals, name
+End Process
+
+@Reasoning:
+Accessor: whether a local name was captured as a block closure variable. Used by
+block lowering and by tests asserting capture detection.
+@End Reasoning
+
+@Implementation:
+Read captures (offset 112), return Dict.contains.
+@End Implementation
+
+Process called "ruby_semantic_is_capture" takes analyzer as Integer, name as Integer returns Integer:
+    Let captures be proc memory_get_int64 from Layout with analyzer, 112
+    Return proc contains from Dict with captures, name
+End Process
+
+@Reasoning:
+Accessor: the recorded error count, so a caller can summarise without walking the
+list.
+@End Reasoning
+
+@Implementation:
+Read errors (offset 120) and return its length.
+@End Implementation
+
+Process called "ruby_semantic_error_count" takes analyzer as Integer returns Integer:
+    Let errors be proc memory_get_int64 from Layout with analyzer, 120
+    Return proc list_length from ListCore with errors
+End Process
+
+@Reasoning:
+Accessor: the recorded warning count.
+@End Reasoning
+
+@Implementation:
+Read warnings (offset 128) and return its length.
+@End Implementation
+
+Process called "ruby_semantic_warning_count" takes analyzer as Integer returns Integer:
+    Let warnings be proc memory_get_int64 from Layout with analyzer, 128
+    Return proc list_length from ListCore with warnings
+End Process
+
+Note: End of Ruby Semantic Analyzer

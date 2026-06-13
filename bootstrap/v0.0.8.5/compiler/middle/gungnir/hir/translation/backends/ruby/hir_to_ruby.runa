@@ -1,1624 +1,1722 @@
-Note: HIR to Ruby Translator for Translation Translation System
-Note: Converts High-level Intermediate Representation to Ruby code
+Note: ============================================================================
+Note: HIR->Ruby Backend - Complete Ruby code generation from HIR
+Note: ============================================================================
+Note: Part of the Translation translation system
+Note: Generates idiomatic Ruby code from High-level Intermediate Representation.
+Note: Consumes exactly the node shapes the ruby_to_hir frontend emits, recovering
+Note: Ruby-only operators and constructs from the "ruby_*" metadata tags so the
+Note: source -> HIR -> source round-trip preserves Ruby semantics.
+Note: ============================================================================
 
+Import "compiler/middle/gungnir/hir/hir_nodes.runa" as HIR
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/frontend/primitives/collections/list.runa" as ListCore
+Import "compiler/internal/string_utils.runa" as StringUtils
+
+Note: ============================================================================
+Note: Code Generation Context
+Note: ============================================================================
 
 @Reasoning:
-Encapsulates the entire mutable state of an HIR-to-Ruby emission pass so
-translate_hir_to_ruby and its helpers can append text, track nesting, and
-decide method-vs-block syntax without a global. current_class and
-current_method are explicit (rather than implied by a stack) because Ruby
-generation rarely nests more than one of each and requires the names for
-self-referential constructs like alias_method and super.
+Threads the HIR-to-Ruby generation pipeline so emission helpers manage nested
+indentation and accumulate errors without positional parameters. hir_module is
+the dispatcher's root HIR node; indent_level is bumped by indent/dedent and
+rendered as indent_level copies of indent_string. errors collects messages;
+had_error short-circuits downstream emission once a generation error occurs.
 @End Reasoning
-
 @Implementation:
-output_buffer accumulates the emitted Ruby source via emit (string_concat).
-indentation_level is incremented by indent and decremented by dedent;
-emit_indent writes two spaces per level. current_class is set by
-translate_class and cleared on End class; current_method is set by
-translate_function and cleared on its End. requires_newline is a single-shot
-flag set by emit_newline so translate_statement_list can avoid double
-newlines after constructs that already terminated their own line.
+Idiomatic value-of-type struct: construction allocates the heap home directly
+and the binding is the struct pointer. Helpers re-bind the pointer with a typed
+Let; field mutations write in place so no read/write round-trips are needed.
 @End Implementation
-Type called "HIRToRubyTranslator":
-    output_buffer as String
-    indentation_level as Integer
-    current_class as String
-    current_method as String
-    requires_newline as Integer
+Type called "RubyCodeGenContext":
+    hir_module as Integer          Note: HIR module being generated from
+    indent_level as Integer        Note: Current indentation level
+    indent_string as String        Note: Indentation string (2 spaces, Ruby idiom)
+    errors as Integer              Note: List of generation errors
+    had_error as Integer           Note: Boolean: 1 if error occurred
 End Type
 
-@Reasoning:
-Factory ensuring every HIRToRubyTranslator starts in a clean state so a
-single backend invocation can never inherit leftover indentation or class
-context from a prior call. Zero-initializing requires_newline avoids the
-first statement emitting a leading blank line.
-@End Reasoning
-
-@Implementation:
-Constructs an HIRToRubyTranslator with output_buffer = "", indentation_level
-= 0, current_class = "", current_method = "", and requires_newline = 0.
-Returns the value directly; callers store it in a local and pass it by
-reference to all translate_* / emit_* helpers.
-@End Implementation
-Process called "create_hir_to_ruby_translator" returns Integer:
-    Note: Create new HIR to Ruby translator instance
-
-    Let translator be a value of type HIRToRubyTranslator with
-        output_buffer as "",
-        indentation_level as 0,
-        current_class as "",
-        current_method as "",
-        requires_newline as 0
-
-    Return translator
-End Process
-
 Note: ============================================================================
-Note: DISPATCHER ENTRY POINT
+Note: Context Creation and Management
 Note: ============================================================================
-Note: Single-arg wrapper matching the central dispatcher call shape in
-Note: translation.runa: `Return proc hir_to_ruby from RubyEmitter with hir_root`.
-Note: Constructs a fresh HIRToRubyTranslator and routes through
-Note: translate_hir_to_ruby which holds the actual translation pipeline.
-Note: Introduced in P2-F Round 2B alongside the demolition of the vestigial
-Note: ruby_emitter.runa shim.
-@Reasoning:
-Provides the dispatcher-shaped single-argument entry point so the central
-translation router in translation.runa can invoke the Ruby backend
-uniformly with every other language backend (Lua, Python, etc.) without
-backend-specific argument shapes. Failure to construct a translator
-returns 0 to surface allocation issues to the dispatcher rather than
-producing partial output.
-@End Reasoning
 
-@Implementation:
-Guards against a 0 hir_root by returning 0. Allocates a fresh translator
-via create_hir_to_ruby_translator; if that allocation returns 0, propagates
-the failure. Otherwise calls translate_hir_to_ruby with the new translator
-and the HIR root, returning the resulting Ruby code string.
-@End Implementation
-Process called "hir_to_ruby" takes hir_root as Integer returns Integer:
-    If hir_root is equal to 0:
-        Return 0
-    End If
-    Let translator be proc create_hir_to_ruby_translator
-    If translator is equal to 0:
-        Return 0
-    End If
-    Let ruby_code be proc translate_hir_to_ruby with translator, hir_root
-    Return ruby_code
+@Reasoning:
+The dispatcher hands us only the HIR module pointer. Indent level starts at 0
+with a 2-space step matching idiomatic Ruby. The errors list is eagerly created
+so downstream code never has to null-check before appending.
+@End Reasoning
+Process called "create_codegen_context" takes hir_module as Integer returns Integer:
+    Let ctx be a value of type RubyCodeGenContext with
+        hir_module as hir_module,
+        indent_level as 0,
+        indent_string as "  ",
+        errors as proc list_create from ListCore,
+        had_error as 0
+
+    Return ctx
 End Process
 
 @Reasoning:
-Central HIR-node dispatcher: every Ruby-emitting helper is reached by a
-single match on the "node_type" key set by the HIR builder. Keeping the
-dispatcher in one place means new HIR node kinds need exactly one new arm
-added here plus the dedicated translate_* helper, rather than scattered
-type checks across the file. The Otherwise arm emits a "# Unknown HIR
-node" comment so unsupported nodes degrade visibly rather than silently
-producing wrong code.
+Recording errors appends the message to the errors list and flips the had_error
+sentinel; downstream emit helpers short-circuit on had_error to avoid producing
+syntactically corrupted Ruby after a generation failure.
 @End Reasoning
+Process called "codegen_error" takes ctx_ptr as Integer, message as String:
+    Let ctx as RubyCodeGenContext be ctx_ptr
+    proc list_append from ListCore with ctx.errors, message
+    Set ctx.had_error to 1
+End Process
 
-@Implementation:
-Reads node_type via get_dict_value and matches on every supported HIR kind
-(module, class, function, block, conditional, loop, assignment, call,
-super_call, yield, return, break, next, identifier, string_literal,
-interpolated_string, number_literal, symbol, array_literal, hash_literal,
-range, binary_operation, unary_operation, include, extend, alias, attr_*).
-Returns translator.output_buffer after all recursive emission completes so
-the caller sees the accumulated Ruby source as the function result.
-@End Implementation
-Process called "translate_hir_to_ruby" takes translator as HIRToRubyTranslator, hir as Integer returns String:
-    Note: Translate HIR to Ruby code with complete language feature support
+Note: ============================================================================
+Note: Indentation Management
+Note: ============================================================================
 
-    Let node_type be proc get_dict_value with hir, "node_type"
+@Reasoning:
+Indentation is a struct field, not a global, because nested generator
+invocations recursively enter scopes (method-in-class, block-in-call). Mutating
+through the typed binding keeps the increment visible to sibling helpers.
+@End Reasoning
+Process called "indent" takes ctx_ptr as Integer:
+    Let ctx as RubyCodeGenContext be ctx_ptr
+    Set ctx.indent_level to ctx.indent_level plus 1
+End Process
 
-    Match node_type:
-        When "module":
-            proc translate_module with translator, hir
-        When "class":
-            proc translate_class with translator, hir
-        When "function":
-            proc translate_function with translator, hir
-        When "block":
-            proc translate_block with translator, hir
-        When "conditional":
-            proc translate_conditional with translator, hir
-        When "loop":
-            proc translate_loop with translator, hir
-        When "assignment":
-            proc translate_assignment with translator, hir
-        When "call":
-            proc translate_call with translator, hir
-        When "super_call":
-            proc translate_super_call with translator, hir
-        When "yield":
-            proc translate_yield with translator, hir
-        When "return":
-            proc translate_return with translator, hir
-        When "break":
-            proc translate_break with translator, hir
-        When "next":
-            proc translate_next with translator, hir
-        When "identifier":
-            proc translate_identifier with translator, hir
-        When "string_literal":
-            proc translate_string_literal with translator, hir
-        When "interpolated_string":
-            proc translate_interpolated_string with translator, hir
-        When "number_literal":
-            proc translate_number_literal with translator, hir
-        When "symbol":
-            proc translate_symbol with translator, hir
-        When "array_literal":
-            proc translate_array_literal with translator, hir
-        When "hash_literal":
-            proc translate_hash_literal with translator, hir
-        When "range":
-            proc translate_range with translator, hir
-        When "binary_operation":
-            proc translate_binary_operation with translator, hir
-        When "unary_operation":
-            proc translate_unary_operation with translator, hir
-        When "include":
-            proc translate_include with translator, hir
-        When "extend":
-            proc translate_extend with translator, hir
-        When "alias":
-            proc translate_alias with translator, hir
-        When "attr_accessor":
-            proc translate_attr_accessor with translator, hir
-        When "attr_reader":
-            proc translate_attr_reader with translator, hir
-        When "attr_writer":
-            proc translate_attr_writer with translator, hir
+@Reasoning:
+Floor-clamps at zero rather than allowing negative levels, which would corrupt
+get_indent's repetition loop. A buggy generator emitting a stray dedent must
+still produce parseable Ruby, hence the defensive guard.
+@End Reasoning
+Process called "dedent" takes ctx_ptr as Integer:
+    Let ctx as RubyCodeGenContext be ctx_ptr
+    If ctx.indent_level is greater than 0:
+        Set ctx.indent_level to ctx.indent_level minus 1
+    End If
+End Process
+
+@Reasoning:
+We materialize the indent string per call rather than caching it because
+indent_level changes constantly during nested emission; a cache would have to be
+invalidated on every indent/dedent.
+@End Reasoning
+Process called "get_indent" takes ctx_ptr as Integer returns String:
+    Let ctx as RubyCodeGenContext be ctx_ptr
+    Let indent be ""
+
+    Let count be 0
+    While count is less than ctx.indent_level:
+        Set indent to proc string_concat from StringUtils with indent, ctx.indent_string
+        Set count to count plus 1
+    End While
+
+    Return indent
+End Process
+
+Note: ============================================================================
+Note: Metadata Helpers
+Note: ============================================================================
+
+@Reasoning:
+A frequent backend idiom is "is this metadata flag set to the truthy string".
+Centralising the null-safe string-equality test against the HIR metadata read
+keeps the call sites terse and avoids repeating the 0-handle guard that
+string_equals already performs but which we want to read as a single predicate.
+@End Reasoning
+Process called "meta_is" takes node as Integer, key as String, expected as String returns Integer:
+    Let value be proc hir_get_metadata from HIR with node, key
+    Return proc string_equals from StringCore with value, expected
+End Process
+
+@Reasoning:
+Several constructs are marked present by a "true"-valued metadata flag. This
+predicate returns 1 when the named flag equals "true" so callers read as a
+boolean test without spelling out the comparison each time.
+@End Reasoning
+Process called "meta_flag" takes node as Integer, key as String returns Integer:
+    Return proc meta_is with node, key, "true"
+End Process
+
+Note: ============================================================================
+Note: String Escaping
+Note: ============================================================================
+
+@Reasoning:
+Order matters: backslashes must be doubled BEFORE any other escape inserts new
+backslashes. Then double-quotes, newlines and tabs are escaped. This covers the
+characters that would terminate a Ruby double-quoted literal or break its
+single-line invariant. Built char-by-char to avoid arena-requiring replace.
+@End Reasoning
+@Security_Scope:
+This is the primary sanitization barrier between untrusted source content and
+generated Ruby. Any new escape sequence must be added here before this generator
+can be considered safe for adversarial input.
+@End Security_Scope
+Process called "escape_ruby_string" takes str as Integer returns String:
+    Let result be ""
+    Let len be proc string_length from StringCore with str
+    Let i be 0
+
+    While i is less than len:
+        Let ch be proc string_char_at from StringCore with str, i
+
+        If ch is equal to 92:
+            Note: backslash
+            Set result to proc string_concat from StringUtils with result, "\\"
+            Set result to proc string_concat from StringUtils with result, "\\"
         Otherwise:
-            proc emit with translator, "# Unknown HIR node: "
-            proc emit with translator, node_type
-    End Match
-
-    Return translator.output_buffer
-End Process
-
-@Reasoning:
-HIR modules map cleanly to Ruby's `module ... end` construct (not class) so
-namespacing without instantiation is preserved across the round-trip. The
-body is emitted at one indent level deeper than the module header to
-respect Ruby's idiomatic two-space indentation as enforced by emit_indent.
-@End Reasoning
-
-@Implementation:
-Reads the "name" field, emits "module <name>" followed by newline, calls
-indent() to push one level, recursively emits the body via
-translate_statement_list (skipped when body is 0), then dedent() and a
-final "end" via emit_line. No tracking of nested modules is required
-because indent/dedent are scope-symmetric.
-@End Implementation
-Process called "translate_module" takes translator as HIRToRubyTranslator, hir as Integer returns Integer:
-    Note: Translate HIR module to Ruby module
-
-    Let module_name be proc get_dict_value with hir, "name"
-
-    proc emit with translator, "module "
-    proc emit with translator, module_name
-    proc emit_newline from translator
-
-    proc indent from translator
-
-    Note: Translate module body
-    Let body be proc get_dict_value with hir, "body"
-    If body is not equal to 0:
-        proc translate_statement_list with translator, body
-    End If
-
-    proc dedent from translator
-    proc emit_line with translator, "end"
-
-    Return 1
-End Process
-
-@Reasoning:
-Ruby class emission must couple single inheritance (the `<` operator) with
-mixin lists (include/extend) that appear after the class opener but before
-any methods. Updating translator.current_class lets nested constructs
-(method definitions, alias statements) reference the enclosing class by
-name without re-reading the HIR node.
-@End Reasoning
-
-@Implementation:
-Sets translator.current_class to the class name read from HIR, emits
-"class <name>". If a superclass HIR node exists, emits " < " and
-recursively translates it (rather than reading a name string, since the
-superclass can be a constant expression like Foo::Bar). After the header
-newline, indent(), then translate_mixins for include/extend lists, then
-translate_statement_list for the body. Dedent(), emit_line "end", and
-restore current_class to "" so subsequent top-level emission is correct.
-@End Implementation
-Process called "translate_class" takes translator as HIRToRubyTranslator, hir as Integer returns Integer:
-    Note: Translate HIR class to Ruby class with inheritance and mixins
-
-    Let class_name be proc get_dict_value with hir, "name"
-    Set translator.current_class to class_name
-
-    proc emit with translator, "class "
-    proc emit with translator, class_name
-
-    Note: Handle inheritance
-    Let superclass be proc get_dict_value with hir, "superclass"
-    If superclass is not equal to 0:
-        proc emit with translator, " < "
-        proc translate_hir_to_ruby with translator, superclass
-    End If
-
-    proc emit_newline from translator
-    proc indent from translator
-
-    Note: Handle mixins first
-    proc translate_mixins with translator, hir
-
-    Note: Translate class body
-    Let body be proc get_dict_value with hir, "body"
-    If body is not equal to 0:
-        proc translate_statement_list with translator, body
-    End If
-
-    proc dedent from translator
-    proc emit_line with translator, "end"
-
-    Set translator.current_class to ""
-
-    Return 1
-End Process
-
-@Reasoning:
-HIR "function" emits as Ruby `def ... end` whether at class scope (instance
-method), module scope (module method), or top level (private method on
-Object). Empty bodies become a `# Empty method` comment rather than no
-body so the resulting Ruby remains syntactically valid and the round-trip
-preserves the distinction between absent and empty.
-@End Reasoning
-
-@Implementation:
-Sets translator.current_method to the method name for downstream
-super-call resolution. Emits "def <name>". If parameters is non-zero,
-wraps them in "()" via translate_parameters. After header newline,
-indent(), then translate_statement_list on the body (or emits an empty
-method comment if body is 0). Dedent, emit_line "end", restore
-current_method to "".
-@End Implementation
-Process called "translate_function" takes translator as HIRToRubyTranslator, hir as Integer returns Integer:
-    Note: Translate HIR function to Ruby method
-
-    Let method_name be proc get_dict_value with hir, "name"
-    Set translator.current_method to method_name
-
-    proc emit with translator, "def "
-    proc emit with translator, method_name
-
-    Note: Handle parameters
-    Let parameters be proc get_dict_value with hir, "parameters"
-    If parameters is not equal to 0:
-        proc emit with translator, "("
-        proc translate_parameters with translator, parameters
-        proc emit with translator, ")"
-    End If
-
-    proc emit_newline from translator
-    proc indent from translator
-
-    Note: Translate method body
-    Let body be proc get_dict_value with hir, "body"
-    If body is not equal to 0:
-        proc translate_statement_list with translator, body
-    Otherwise:
-        Note: Empty method body
-        proc emit_line with translator, "# Empty method"
-    End If
-
-    proc dedent from translator
-    proc emit_line with translator, "end"
-
-    Set translator.current_method to ""
-
-    Return 1
-End Process
-
-@Reasoning:
-Ruby parameter lists carry four orthogonal annotations - splat (`*args`),
-double-splat (`**kwargs`), block (`&blk`), and default-valued (`x = expr`)
-- each requiring different sigil placement. Centralizing the per-parameter
-dispatch here keeps callers (translate_function, translate_block) free of
-sigil knowledge and ensures the leading comma is emitted only between
-parameters.
-@End Reasoning
-
-@Implementation:
-Iterates the parameter list by index. Emits ", " between parameters
-(index > 0). For each parameter reads "type" and "name". Matches on type:
-"splat" emits "*name", "double_splat" emits "**name", "block" emits
-"&name", and the default arm emits just "name" plus, if a "default" HIR
-node is attached, " = " followed by a recursive translate_hir_to_ruby on
-that default expression.
-@End Implementation
-Process called "translate_parameters" takes translator as HIRToRubyTranslator, params as Integer returns Integer:
-    Note: Translate HIR parameters to Ruby parameter syntax
-
-    Let param_count be proc get_list_size from params
-    Let index be 0
-
-    While index is less than param_count:
-        If index is greater than 0:
-            proc emit with translator, ", "
-        End If
-
-        Let param be proc get_list_item with params, index
-        Let param_type be proc get_dict_value with param, "type"
-        Let param_name be proc get_dict_value with param, "name"
-
-        Note: Handle different parameter types
-        Match param_type:
-            When "splat":
-                proc emit with translator, "*"
-                proc emit with translator, param_name
-            When "double_splat":
-                proc emit with translator, "**"
-                proc emit with translator, param_name
-            When "block":
-                proc emit with translator, "&"
-                proc emit with translator, param_name
+            If ch is equal to 34:
+                Note: double quote
+                Set result to proc string_concat from StringUtils with result, "\\"
+                Set result to proc string_concat from StringUtils with result, "\""
             Otherwise:
-                proc emit with translator, param_name
-
-                Note: Handle default values
-                Let default_value be proc get_dict_value with param, "default"
-                If default_value is not equal to 0:
-                    proc emit with translator, " = "
-                    proc translate_hir_to_ruby with translator, default_value
+                If ch is equal to 10:
+                    Note: newline
+                    Set result to proc string_concat from StringUtils with result, "\\"
+                    Set result to proc string_concat from StringUtils with result, "n"
+                Otherwise:
+                    If ch is equal to 9:
+                        Note: tab
+                        Set result to proc string_concat from StringUtils with result, "\\"
+                        Set result to proc string_concat from StringUtils with result, "t"
+                    Otherwise:
+                        Let single be proc char_to_string from StringCore with ch
+                        Set result to proc string_concat from StringUtils with result, single
+                    End If
                 End If
-        End Match
+            End If
+        End If
 
-        Set index to index plus 1
+        Set i to i plus 1
     End While
 
-    Return 1
+    Return result
+End Process
+
+Note: ============================================================================
+Note: Expression Generation
+Note: ============================================================================
+
+@Reasoning:
+Central dispatch from HIR node kind to a specialised expression generator. Order
+of checks tracks frequency (literals and identifiers first) so common cases
+short-circuit early. Unknown node kinds record a codegen error and return empty
+string so the caller still produces syntactically valid Ruby.
+@End Reasoning
+Process called "generate_expression" takes ctx_ptr as Integer, expr_node as Integer returns String:
+    Let node_type be proc hir_node_type from HIR with expr_node
+
+    If node_type is equal to HIR.HIR_INT_LITERAL:
+        Return proc generate_int_literal with ctx_ptr, expr_node
+    End If
+    If node_type is equal to HIR.HIR_FLOAT_LITERAL:
+        Return proc generate_float_literal with ctx_ptr, expr_node
+    End If
+    If node_type is equal to HIR.HIR_STRING_LITERAL:
+        Return proc generate_string_literal with ctx_ptr, expr_node
+    End If
+    If node_type is equal to HIR.HIR_BOOL_LITERAL:
+        Let bval be proc hir_get_bool_literal_value from HIR with expr_node
+        If bval is equal to 1:
+            Return "true"
+        End If
+        Return "false"
+    End If
+    If node_type is equal to HIR.HIR_NULL_LITERAL:
+        Return "nil"
+    End If
+    If node_type is equal to HIR.HIR_IDENTIFIER:
+        Return proc generate_identifier with ctx_ptr, expr_node
+    End If
+    If node_type is equal to HIR.HIR_BINARY_EXPR:
+        Return proc generate_binary_expression with ctx_ptr, expr_node
+    End If
+    If node_type is equal to HIR.HIR_UNARY_EXPR:
+        Return proc generate_unary_expression with ctx_ptr, expr_node
+    End If
+    If node_type is equal to HIR.HIR_TERNARY_EXPR:
+        Return proc generate_ternary_expression with ctx_ptr, expr_node
+    End If
+    If node_type is equal to HIR.HIR_CALL_EXPR:
+        Return proc generate_call_expression with ctx_ptr, expr_node
+    End If
+    If node_type is equal to HIR.HIR_INDEX_EXPR:
+        Return proc generate_index_expression with ctx_ptr, expr_node
+    End If
+    If node_type is equal to HIR.HIR_MEMBER_EXPR:
+        Return proc generate_member_expression with ctx_ptr, expr_node
+    End If
+    If node_type is equal to HIR.HIR_ASSIGN_EXPR:
+        Return proc generate_assign_expression with ctx_ptr, expr_node
+    End If
+    If node_type is equal to HIR.HIR_LAMBDA:
+        Return proc generate_lambda_expression with ctx_ptr, expr_node
+    End If
+    If node_type is equal to HIR.HIR_LIST_LITERAL:
+        Return proc generate_list_literal with ctx_ptr, expr_node
+    End If
+    If node_type is equal to HIR.HIR_MAP_LITERAL:
+        Return proc generate_map_literal with ctx_ptr, expr_node
+    End If
+
+    proc codegen_error with ctx_ptr, "Unknown Ruby expression type"
+    Return ""
 End Process
 
 @Reasoning:
-Ruby has two block syntaxes - `{ ... }` (single-line, high precedence) and
-`do ... end` (multi-line, low precedence) - and idiomatic Ruby uses the
-braces form only for trivial bodies. is_simple_block heuristically picks
-between them so the emitter matches conventional Ruby formatting rather
-than always defaulting to one form.
+Integer literals re-emit the original Ruby lexeme when the frontend preserved it
+in "ruby_int_lexeme" (so hex/underscore forms survive), falling back to the
+decimal string of the stored native integer when no lexeme is present.
 @End Reasoning
+Process called "generate_int_literal" takes ctx_ptr as Integer, node as Integer returns String:
+    Let lexeme be proc hir_get_metadata from HIR with node, "ruby_int_lexeme"
+    If lexeme is not equal to 0:
+        Return lexeme
+    End If
+    Let ival be proc hir_get_int_literal_value from HIR with node
+    Return proc integer_to_string from StringUtils with ival
+End Process
 
-@Implementation:
-Calls is_simple_block to decide. Single-line: emits "{ ", optionally
-"|params| " using translate_block_parameters, then statement list, then
-" }". Multi-line: emits "do", optionally " |params|", newline, indent,
-statement list, dedent, emit_line "end". Parameter pipes are emitted only
-when the parameters HIR node is non-zero.
-@End Implementation
-Process called "translate_block" takes translator as HIRToRubyTranslator, hir as Integer returns Integer:
-    Note: Translate HIR block to Ruby block
+@Reasoning:
+Float literals re-emit the original lexeme from "ruby_float_lexeme" when present
+so the exact textual form (trailing zeros, exponents) round-trips; otherwise the
+stored native float is formatted with six fractional digits.
+@End Reasoning
+Process called "generate_float_literal" takes ctx_ptr as Integer, node as Integer returns String:
+    Let lexeme be proc hir_get_metadata from HIR with node, "ruby_float_lexeme"
+    If lexeme is not equal to 0:
+        Return lexeme
+    End If
+    Let fval be proc hir_get_float_literal_value from HIR with node
+    Return proc float_to_string from StringUtils with fval, 6, 0
+End Process
 
-    Let parameters be proc get_dict_value with hir, "parameters"
-    Let body be proc get_dict_value with hir, "body"
+@Reasoning:
+String-carrier literals re-emit one of several Ruby forms based on the frontend
+tag: a symbol prints ":name", a regexp prints its preserved lexeme verbatim, an
+interpolated string prints its preserved lexeme verbatim (the #{} segments are
+inside), and a plain string is double-quoted with escaping. The original lexeme
+metadata is consulted first so the exact source spelling round-trips.
+@End Reasoning
+Process called "generate_string_literal" takes ctx_ptr as Integer, node as Integer returns String:
+    If proc meta_flag with node, "ruby_symbol" is equal to 1:
+        Let sym_name be proc hir_get_string_literal_value from HIR with node
+        Return proc string_concat from StringUtils with ":", sym_name
+    End If
 
-    Note: Determine block style based on complexity
-    Let is_single_line be proc is_simple_block from body
+    If proc meta_flag with node, "ruby_regexp" is equal to 1:
+        Return proc hir_get_string_literal_value from HIR with node
+    End If
 
-    If is_single_line is equal to 1:
-        proc emit with translator, "{ "
+    If proc meta_flag with node, "ruby_interp" is equal to 1:
+        Let interp_lexeme be proc hir_get_metadata from HIR with node, "ruby_string_lexeme"
+        If interp_lexeme is not equal to 0:
+            Return interp_lexeme
+        End If
+    End If
 
-        If parameters is not equal to 0:
-            proc emit with translator, "|"
-            proc translate_block_parameters with translator, parameters
-            proc emit with translator, "| "
+    Let sval be proc hir_get_string_literal_value from HIR with node
+    Let escaped be proc escape_ruby_string with sval
+    Let quoted be proc string_concat from StringUtils with "\"", escaped
+    Set quoted to proc string_concat from StringUtils with quoted, "\""
+    Return quoted
+End Process
+
+@Reasoning:
+HIR identifiers re-emit their stored name verbatim, which already carries Ruby
+sigils (@x, @@x, $x) and the "self" keyword unchanged. The frontend kept the full
+source token in the name, so no reconstruction from "ruby_var_kind"/"ruby_self"
+metadata is required - those tags exist for analysis, not re-spelling.
+@End Reasoning
+Process called "generate_identifier" takes ctx_ptr as Integer, node as Integer returns String:
+    Let name be proc hir_get_identifier_name from HIR with node
+    If name is equal to 0:
+        Return ""
+    End If
+    Return name
+End Process
+
+@Reasoning:
+Binary expressions emit "left OP right" with single-space padding. The exact Ruby
+operator spelling is recovered from "ruby_operator" metadata (so **, <=>, ===, =~,
+!~ that share an HIR opcode round-trip), falling back to the HIR-opcode mapping
+when no metadata is present. The HIR tree already encodes Ruby precedence, so no
+parentheses are inserted.
+@End Reasoning
+Process called "generate_binary_expression" takes ctx_ptr as Integer, node as Integer returns String:
+    Let operator be proc hir_get_binary_op from HIR with node
+    Let left_node be proc hir_get_binary_left from HIR with node
+    Let right_node be proc hir_get_binary_right from HIR with node
+
+    Let left_code be proc generate_expression with ctx_ptr, left_node
+    Let right_code be proc generate_expression with ctx_ptr, right_node
+
+    Let op_str be proc map_hir_operator_to_ruby with operator
+    Let ruby_op be proc hir_get_metadata from HIR with node, "ruby_operator"
+    If ruby_op is not equal to 0:
+        Set op_str to ruby_op
+    End If
+
+    Let result be proc string_concat from StringUtils with left_code, " "
+    Set result to proc string_concat from StringUtils with result, op_str
+    Set result to proc string_concat from StringUtils with result, " "
+    Set result to proc string_concat from StringUtils with result, right_code
+    Return result
+End Process
+
+@Reasoning:
+A linear cascade rather than a dictionary lookup because HIR operator codes are
+dense. Ruby spellings match HIR for arithmetic/comparison; logical and/or use the
+"&&"/"||" symbolic forms (the "ruby_operator" metadata overrides to the keyword
+"and"/"or" when the source used them). Fallback "+" keeps a missing mapping
+syntactically valid.
+@End Reasoning
+Process called "map_hir_operator_to_ruby" takes operator as Integer returns String:
+    If operator is equal to HIR.HIR_OP_ADD:
+        Return "+"
+    End If
+    If operator is equal to HIR.HIR_OP_SUBTRACT:
+        Return "-"
+    End If
+    If operator is equal to HIR.HIR_OP_MULTIPLY:
+        Return "*"
+    End If
+    If operator is equal to HIR.HIR_OP_DIVIDE:
+        Return "/"
+    End If
+    If operator is equal to HIR.HIR_OP_MODULO:
+        Return "%"
+    End If
+    If operator is equal to HIR.HIR_OP_INT_DIVIDE:
+        Return "/"
+    End If
+    If operator is equal to HIR.HIR_OP_EQUAL:
+        Return "=="
+    End If
+    If operator is equal to HIR.HIR_OP_NOT_EQUAL:
+        Return "!="
+    End If
+    If operator is equal to HIR.HIR_OP_LESS_THAN:
+        Return "<"
+    End If
+    If operator is equal to HIR.HIR_OP_GREATER_THAN:
+        Return ">"
+    End If
+    If operator is equal to HIR.HIR_OP_LESS_EQUAL:
+        Return "<="
+    End If
+    If operator is equal to HIR.HIR_OP_GREATER_EQUAL:
+        Return ">="
+    End If
+    If operator is equal to HIR.HIR_OP_LOGICAL_AND:
+        Return "&&"
+    End If
+    If operator is equal to HIR.HIR_OP_LOGICAL_OR:
+        Return "||"
+    End If
+    If operator is equal to HIR.HIR_OP_BITWISE_AND:
+        Return "&"
+    End If
+    If operator is equal to HIR.HIR_OP_BITWISE_OR:
+        Return "|"
+    End If
+    If operator is equal to HIR.HIR_OP_BITWISE_XOR:
+        Return "^"
+    End If
+    If operator is equal to HIR.HIR_OP_SHIFT_LEFT:
+        Return "<<"
+    End If
+    If operator is equal to HIR.HIR_OP_SHIFT_RIGHT:
+        Return ">>"
+    End If
+    Return "+"  Note: Default fallback
+End Process
+
+@Reasoning:
+Unary emission re-prefixes the HIR opcode's Ruby spelling: "-" for negate, "~" for
+bitwise not, and the "not" keyword vs "!" symbol for logical not (chosen by the
+"ruby_not_keyword" tag). A frontend-tagged identity "+" ("ruby_unary"="plus")
+re-prefixes "+". The "not " keyword form requires a trailing space.
+@End Reasoning
+Process called "generate_unary_expression" takes ctx_ptr as Integer, node as Integer returns String:
+    Let operator be proc hir_get_unary_op from HIR with node
+    Let operand_node be proc hir_get_unary_operand from HIR with node
+    Let operand_code be proc generate_expression with ctx_ptr, operand_node
+
+    If proc meta_is with node, "ruby_unary", "plus" is equal to 1:
+        Return proc string_concat from StringUtils with "+", operand_code
+    End If
+
+    If operator is equal to HIR.HIR_OP_NEGATE:
+        Return proc string_concat from StringUtils with "-", operand_code
+    End If
+    If operator is equal to HIR.HIR_OP_BITWISE_NOT:
+        Return proc string_concat from StringUtils with "~", operand_code
+    End If
+    If operator is equal to HIR.HIR_OP_LOGICAL_NOT:
+        If proc meta_flag with node, "ruby_not_keyword" is equal to 1:
+            Return proc string_concat from StringUtils with "not ", operand_code
+        End If
+        Return proc string_concat from StringUtils with "!", operand_code
+    End If
+
+    Return operand_code
+End Process
+
+@Reasoning:
+Ternary emission produces "cond ? then : else" with the canonical Ruby spacing.
+The HIR tree already reflects precedence so no parentheses are added.
+@End Reasoning
+Process called "generate_ternary_expression" takes ctx_ptr as Integer, node as Integer returns String:
+    Let cond_node be proc hir_get_ternary_condition from HIR with node
+    Let then_node be proc hir_get_ternary_then from HIR with node
+    Let else_node be proc hir_get_ternary_else from HIR with node
+
+    Let cond_code be proc generate_expression with ctx_ptr, cond_node
+    Let then_code be proc generate_expression with ctx_ptr, then_node
+    Let else_code be proc generate_expression with ctx_ptr, else_node
+
+    Let result be proc string_concat from StringUtils with cond_code, " ? "
+    Set result to proc string_concat from StringUtils with result, then_code
+    Set result to proc string_concat from StringUtils with result, " : "
+    Set result to proc string_concat from StringUtils with result, else_code
+    Return result
+End Process
+
+@Reasoning:
+Call emission has several Ruby-specific shapes recovered from metadata: a range
+call re-emits "low..high"/"low...high"; a "defined?" call re-emits the keyword
+form; a "super" call re-emits bare or parenthesised super; an "alias_method"/
+"undef_method" synthetic call re-emits the keyword statement. Otherwise it is an
+ordinary "callee(args)" with a trailing "do |params| ... end" block when the call
+carried one.
+@End Reasoning
+Process called "generate_call_expression" takes ctx_ptr as Integer, node as Integer returns String:
+    If proc meta_flag with node, "ruby_range" is equal to 1:
+        Return proc generate_range_call with ctx_ptr, node
+    End If
+    If proc meta_flag with node, "ruby_defined" is equal to 1:
+        Return proc generate_defined_call with ctx_ptr, node
+    End If
+    If proc meta_flag with node, "ruby_super" is equal to 1:
+        Return proc generate_super_call with ctx_ptr, node
+    End If
+    If proc meta_flag with node, "ruby_alias" is equal to 1:
+        Return proc generate_keyword_pair_call with ctx_ptr, node, "alias"
+    End If
+    If proc meta_flag with node, "ruby_undef" is equal to 1:
+        Return proc generate_undef_call with ctx_ptr, node
+    End If
+
+    Let callee_node be proc hir_get_call_callee from HIR with node
+    Let callee_code be proc generate_expression with ctx_ptr, callee_node
+
+    Note: Split arguments into ordinary args and the trailing call-block, if any.
+    Let args_list be proc hir_get_positional_args from HIR with node
+    Let arg_count be 0
+    If args_list is not equal to 0:
+        Set arg_count to proc list_length from ListCore with args_list
+    End If
+
+    Let block_node be 0
+    Let args_code be ""
+    Let emitted be 0
+
+    Let i be 0
+    While i is less than arg_count:
+        Let arg_node be proc list_get from ListCore with args_list, i
+
+        If proc meta_flag with arg_node, "ruby_call_block" is equal to 1:
+            Set block_node to arg_node
+        Otherwise:
+            Let arg_code be proc generate_argument with ctx_ptr, arg_node
+            If emitted is greater than 0:
+                Set args_code to proc string_concat from StringUtils with args_code, ", "
+            End If
+            Set args_code to proc string_concat from StringUtils with args_code, arg_code
+            Set emitted to emitted plus 1
         End If
 
-        proc translate_statement_list with translator, body
-        proc emit with translator, " }"
+        Set i to i plus 1
+    End While
+
+    Let result be callee_code
+    If emitted is greater than 0:
+        Set result to proc string_concat from StringUtils with result, "("
+        Set result to proc string_concat from StringUtils with result, args_code
+        Set result to proc string_concat from StringUtils with result, ")"
+    End If
+
+    If block_node is not equal to 0:
+        Let block_code be proc generate_call_block with ctx_ptr, block_node
+        Set result to proc string_concat from StringUtils with result, block_code
+    End If
+
+    Return result
+End Process
+
+@Reasoning:
+Each call argument re-prefixes its Ruby form from metadata: a splat arg gets "*",
+a double-splat gets "**", a keyword arg gets "name: ", a block-pass arg gets "&".
+Plain arguments emit their expression directly.
+@End Reasoning
+Process called "generate_argument" takes ctx_ptr as Integer, arg_node as Integer returns String:
+    Let kwarg be proc hir_get_metadata from HIR with arg_node, "ruby_kwarg"
+    If kwarg is not equal to 0:
+        Let kw_value be proc generate_expression with ctx_ptr, arg_node
+        Let kw_result be proc string_concat from StringUtils with kwarg, ": "
+        Set kw_result to proc string_concat from StringUtils with kw_result, kw_value
+        Return kw_result
+    End If
+
+    If proc meta_flag with arg_node, "ruby_doublesplat" is equal to 1:
+        Let ds_value be proc generate_expression with ctx_ptr, arg_node
+        Return proc string_concat from StringUtils with "**", ds_value
+    End If
+    If proc meta_flag with arg_node, "ruby_splat" is equal to 1:
+        Let sp_value be proc generate_expression with ctx_ptr, arg_node
+        Return proc string_concat from StringUtils with "*", sp_value
+    End If
+    If proc meta_flag with arg_node, "ruby_blockpass" is equal to 1:
+        Let bp_value be proc generate_expression with ctx_ptr, arg_node
+        Return proc string_concat from StringUtils with "&", bp_value
+    End If
+
+    Return proc generate_expression with ctx_ptr, arg_node
+End Process
+
+@Reasoning:
+A range call re-emits "low..high" (or "low...high" when the exclusive tag is set)
+from its two arguments, reproducing Ruby's range literal that the frontend lowered
+to a synthetic Range call.
+@End Reasoning
+Process called "generate_range_call" takes ctx_ptr as Integer, node as Integer returns String:
+    Let args_list be proc hir_get_positional_args from HIR with node
+    Let low be proc list_get from ListCore with args_list, 0
+    Let high be proc list_get from ListCore with args_list, 1
+
+    Let low_code be proc generate_expression with ctx_ptr, low
+    Let high_code be proc generate_expression with ctx_ptr, high
+
+    Let sep be ".."
+    If proc meta_flag with node, "ruby_range_exclusive" is equal to 1:
+        Set sep to "..."
+    End If
+
+    Let result be proc string_concat from StringUtils with low_code, sep
+    Set result to proc string_concat from StringUtils with result, high_code
+    Return result
+End Process
+
+@Reasoning:
+A defined? call re-emits "defined?(operand)" from its single argument, restoring
+the keyword-with-parens form the frontend preserved via the "ruby_defined" tag.
+@End Reasoning
+Process called "generate_defined_call" takes ctx_ptr as Integer, node as Integer returns String:
+    Let args_list be proc hir_get_positional_args from HIR with node
+    Let operand be proc list_get from ListCore with args_list, 0
+    Let operand_code be proc generate_expression with ctx_ptr, operand
+
+    Let result be proc string_concat from StringUtils with "defined?(", operand_code
+    Set result to proc string_concat from StringUtils with result, ")"
+    Return result
+End Process
+
+@Reasoning:
+A super call re-emits bare "super" when the "ruby_super_bare" tag is set, else
+"super(args)" from the call's arguments, reproducing Ruby's two super forms which
+differ in argument-forwarding semantics.
+@End Reasoning
+Process called "generate_super_call" takes ctx_ptr as Integer, node as Integer returns String:
+    If proc meta_flag with node, "ruby_super_bare" is equal to 1:
+        Return "super"
+    End If
+
+    Let args_list be proc hir_get_positional_args from HIR with node
+    Let arg_count be 0
+    If args_list is not equal to 0:
+        Set arg_count to proc list_length from ListCore with args_list
+    End If
+
+    Let args_code be ""
+    Let i be 0
+    While i is less than arg_count:
+        Let arg_node be proc list_get from ListCore with args_list, i
+        Let arg_code be proc generate_argument with ctx_ptr, arg_node
+        If i is greater than 0:
+            Set args_code to proc string_concat from StringUtils with args_code, ", "
+        End If
+        Set args_code to proc string_concat from StringUtils with args_code, arg_code
+        Set i to i plus 1
+    End While
+
+    Let result be proc string_concat from StringUtils with "super(", args_code
+    Set result to proc string_concat from StringUtils with result, ")"
+    Return result
+End Process
+
+@Reasoning:
+"alias new old" re-emits the keyword followed by the two name arguments separated
+by a space (Ruby's alias keyword takes bareword names without parentheses). The
+keyword is supplied by the caller so the same shape could serve related forms.
+@End Reasoning
+Process called "generate_keyword_pair_call" takes ctx_ptr as Integer, node as Integer, keyword as String returns String:
+    Let args_list be proc hir_get_positional_args from HIR with node
+    Let new_arg be proc list_get from ListCore with args_list, 0
+    Let old_arg be proc list_get from ListCore with args_list, 1
+
+    Let new_code be proc generate_expression with ctx_ptr, new_arg
+    Let old_code be proc generate_expression with ctx_ptr, old_arg
+
+    Let result be proc string_concat from StringUtils with keyword, " "
+    Set result to proc string_concat from StringUtils with result, new_code
+    Set result to proc string_concat from StringUtils with result, " "
+    Set result to proc string_concat from StringUtils with result, old_code
+    Return result
+End Process
+
+@Reasoning:
+"undef a, b, c" re-emits the keyword followed by the comma-separated name
+arguments, restoring Ruby's undef statement from the synthetic undef_method call.
+@End Reasoning
+Process called "generate_undef_call" takes ctx_ptr as Integer, node as Integer returns String:
+    Let args_list be proc hir_get_positional_args from HIR with node
+    Let arg_count be 0
+    If args_list is not equal to 0:
+        Set arg_count to proc list_length from ListCore with args_list
+    End If
+
+    Let names_code be ""
+    Let i be 0
+    While i is less than arg_count:
+        Let arg_node be proc list_get from ListCore with args_list, i
+        Let arg_code be proc generate_expression with ctx_ptr, arg_node
+        If i is greater than 0:
+            Set names_code to proc string_concat from StringUtils with names_code, ", "
+        End If
+        Set names_code to proc string_concat from StringUtils with names_code, arg_code
+        Set i to i plus 1
+    End While
+
+    Return proc string_concat from StringUtils with "undef ", names_code
+End Process
+
+@Reasoning:
+A trailing call block re-emits Ruby's "do |params| ... end" form. The block is a
+HIR lambda whose parameters become the pipe-delimited block parameters and whose
+body statements are emitted on their own indented lines, closing with "end". The
+do..end form is always valid regardless of body length, so it is preferred over
+the brace form for the multi-statement case.
+@End Reasoning
+Process called "generate_call_block" takes ctx_ptr as Integer, node as Integer returns String:
+    Let params_code be proc generate_block_params with ctx_ptr, node
+    Let body_node be proc hir_get_lambda_block_body from HIR with node
+
+    Let result be " do"
+    If proc string_equals from StringCore with params_code, "" is equal to 0:
+        Set result to proc string_concat from StringUtils with result, " |"
+        Set result to proc string_concat from StringUtils with result, params_code
+        Set result to proc string_concat from StringUtils with result, "|"
+    End If
+    Set result to proc string_concat from StringUtils with result, "\n"
+
+    proc indent with ctx_ptr
+    Let body_code be proc generate_statement with ctx_ptr, body_node
+    proc dedent with ctx_ptr
+    Set result to proc string_concat from StringUtils with result, body_code
+
+    Let end_indent be proc get_indent with ctx_ptr
+    Set result to proc string_concat from StringUtils with result, end_indent
+    Set result to proc string_concat from StringUtils with result, "end"
+    Return result
+End Process
+
+@Reasoning:
+Index access re-emits "object[index]". A multi-index access (tagged
+"ruby_multi_index") unpacks the list-literal index into comma-separated keys to
+reproduce Ruby's obj[a, b] form; a single index emits the lone key.
+@End Reasoning
+Process called "generate_index_expression" takes ctx_ptr as Integer, node as Integer returns String:
+    Let object_node be proc hir_get_index_object from HIR with node
+    Let index_node be proc hir_get_index_value from HIR with node
+    Let object_code be proc generate_expression with ctx_ptr, object_node
+
+    Let keys_code be ""
+    If proc meta_flag with node, "ruby_multi_index" is equal to 1:
+        Let elements be proc hir_get_list_elements from HIR with index_node
+        Let elem_count be proc list_length from ListCore with elements
+        Let i be 0
+        While i is less than elem_count:
+            Let elem be proc list_get from ListCore with elements, i
+            Let elem_code be proc generate_expression with ctx_ptr, elem
+            If i is greater than 0:
+                Set keys_code to proc string_concat from StringUtils with keys_code, ", "
+            End If
+            Set keys_code to proc string_concat from StringUtils with keys_code, elem_code
+            Set i to i plus 1
+        End While
     Otherwise:
-        proc emit with translator, "do"
+        Set keys_code to proc generate_expression with ctx_ptr, index_node
+    End If
 
-        If parameters is not equal to 0:
-            proc emit with translator, " |"
-            proc translate_block_parameters with translator, parameters
-            proc emit with translator, "|"
+    Let result be proc string_concat from StringUtils with object_code, "["
+    Set result to proc string_concat from StringUtils with result, keys_code
+    Set result to proc string_concat from StringUtils with result, "]"
+    Return result
+End Process
+
+@Reasoning:
+Member access re-emits "object.name", or "object&.name" for safe navigation, or
+"scope::Name" for a constant scope reference (tagged "ruby_scope"="postfix"). The
+member name is a String spliced directly.
+@End Reasoning
+Process called "generate_member_expression" takes ctx_ptr as Integer, node as Integer returns String:
+    Let object_node be proc hir_get_member_object from HIR with node
+    Let member_name be proc hir_get_member_name from HIR with node
+    Let object_code be proc generate_expression with ctx_ptr, object_node
+
+    Let sep be "."
+    If proc meta_is with node, "ruby_scope", "postfix" is equal to 1:
+        Set sep to "::"
+    Otherwise If proc meta_flag with node, "ruby_safe_nav" is equal to 1:
+        Set sep to "&."
+    End If
+
+    Let result be proc string_concat from StringUtils with object_code, sep
+    Set result to proc string_concat from StringUtils with result, member_name
+    Return result
+End Process
+
+@Reasoning:
+Assignment-as-expression re-emits "lhs OP rhs". The compound operator is recovered
+from "ruby_op_assign" metadata (so +=, ||=, **= round-trip), falling back to the
+HIR assign-opcode mapping and finally "=" for the simple case.
+@End Reasoning
+Process called "generate_assign_expression" takes ctx_ptr as Integer, node as Integer returns String:
+    Let lhs_node be proc hir_get_assign_lhs from HIR with node
+    Let rhs_node be proc hir_get_assign_rhs from HIR with node
+    Let op_code be proc hir_get_assign_op from HIR with node
+
+    Let lhs_code be proc generate_expression with ctx_ptr, lhs_node
+    Let rhs_code be proc generate_expression with ctx_ptr, rhs_node
+
+    Let op_str be proc map_hir_assign_to_ruby with op_code
+    Let ruby_op be proc hir_get_metadata from HIR with node, "ruby_op_assign"
+    If ruby_op is not equal to 0:
+        Set op_str to ruby_op
+    End If
+
+    Let result be proc string_concat from StringUtils with lhs_code, " "
+    Set result to proc string_concat from StringUtils with result, op_str
+    Set result to proc string_concat from StringUtils with result, " "
+    Set result to proc string_concat from StringUtils with result, rhs_code
+    Return result
+End Process
+
+@Reasoning:
+Maps the HIR assign opcode to its Ruby compound-operator spelling for the cases
+the frontend lowered without preserving a "ruby_op_assign" lexeme; the simple
+assign and any unmapped opcode default to "=".
+@End Reasoning
+Process called "map_hir_assign_to_ruby" takes op_code as Integer returns String:
+    If op_code is equal to HIR.HIR_ASSIGN_ADD:
+        Return "+="
+    End If
+    If op_code is equal to HIR.HIR_ASSIGN_SUBTRACT:
+        Return "-="
+    End If
+    If op_code is equal to HIR.HIR_ASSIGN_MULTIPLY:
+        Return "*="
+    End If
+    If op_code is equal to HIR.HIR_ASSIGN_DIVIDE:
+        Return "/="
+    End If
+    If op_code is equal to HIR.HIR_ASSIGN_MODULO:
+        Return "%="
+    End If
+    If op_code is equal to HIR.HIR_ASSIGN_NULL_COALESCE:
+        Return "||="
+    End If
+    Return "="
+End Process
+
+@Reasoning:
+A lambda expression re-emits Ruby's stabby "-> (params) { body }" form by default,
+or "lambda { |params| body }", "proc { |params| body }", or a do..end block based
+on the "ruby_lambda_kind" tag. The body statements are emitted inline within an
+always-valid multi-line braces/do delimiter.
+@End Reasoning
+Process called "generate_lambda_expression" takes ctx_ptr as Integer, node as Integer returns String:
+    Let kind be proc hir_get_metadata from HIR with node, "ruby_lambda_kind"
+    Let params_code be proc generate_block_params with ctx_ptr, node
+    Let body_node be proc hir_get_lambda_block_body from HIR with node
+
+    Let is_arrow be proc string_equals from StringCore with kind, "arrow"
+    Let is_proc be proc string_equals from StringCore with kind, "proc"
+
+    Let header be ""
+    Let closer be "}"
+    Let has_params be 0
+    If proc string_equals from StringCore with params_code, "" is equal to 0:
+        Set has_params to 1
+    End If
+
+    If is_arrow is equal to 1:
+        Set header to "->"
+        If has_params is equal to 1:
+            Set header to proc string_concat from StringUtils with header, " ("
+            Set header to proc string_concat from StringUtils with header, params_code
+            Set header to proc string_concat from StringUtils with header, ")"
         End If
-
-        proc emit_newline from translator
-        proc indent from translator
-
-        proc translate_statement_list with translator, body
-
-        proc dedent from translator
-        proc emit_line with translator, "end"
-    End If
-
-    Return 1
-End Process
-
-@Reasoning:
-Ruby `if/elsif/else/end` requires the elsif clauses to be flattened into a
-linear chain at emission - HIR can carry them either as a nested
-conditional or as an explicit elsif_clauses list, and this emitter assumes
-the latter shape produced by the Ruby frontend. Else is always last and
-optional.
-@End Reasoning
-
-@Implementation:
-Reads condition, then_body, else_body, elsif_clauses from the HIR node.
-Emits "if <cond>", newline, indent, then_body via
-translate_statement_list, dedent. For each elsif in elsif_clauses (a
-list), emits "elsif <cond>", newline, indent, body, dedent. If else_body
-is set, emit_line "else", indent, body, dedent. Final emit_line "end".
-@End Implementation
-Process called "translate_conditional" takes translator as HIRToRubyTranslator, hir as Integer returns Integer:
-    Note: Translate HIR conditional to Ruby if statement
-
-    Let condition be proc get_dict_value with hir, "condition"
-    Let then_body be proc get_dict_value with hir, "then_body"
-    Let else_body be proc get_dict_value with hir, "else_body"
-    Let elsif_clauses be proc get_dict_value with hir, "elsif_clauses"
-
-    proc emit with translator, "if "
-    proc translate_hir_to_ruby with translator, condition
-    proc emit_newline from translator
-
-    proc indent from translator
-    If then_body is not equal to 0:
-        proc translate_statement_list with translator, then_body
-    End If
-    proc dedent from translator
-
-    Note: Handle elsif clauses
-    If elsif_clauses is not equal to 0:
-        Let elsif_count be proc get_list_size from elsif_clauses
-        Let index be 0
-
-        While index is less than elsif_count:
-            Let elsif_clause be proc get_list_item with elsif_clauses, index
-            Let elsif_condition be proc get_dict_value with elsif_clause, "condition"
-            Let elsif_body be proc get_dict_value with elsif_clause, "then_body"
-
-            proc emit with translator, "elsif "
-            proc translate_hir_to_ruby with translator, elsif_condition
-            proc emit_newline from translator
-
-            proc indent from translator
-            If elsif_body is not equal to 0:
-                proc translate_statement_list with translator, elsif_body
-            End If
-            proc dedent from translator
-
-            Set index to index plus 1
-        End While
-    End If
-
-    Note: Handle else clause
-    If else_body is not equal to 0:
-        proc emit_line with translator, "else"
-        proc indent from translator
-        proc translate_statement_list with translator, else_body
-        proc dedent from translator
-    End If
-
-    proc emit_line with translator, "end"
-
-    Return 1
-End Process
-
-@Reasoning:
-Ruby method calls have four optional pieces - receiver, method name,
-arguments, and trailing block - and Ruby omits the parentheses around an
-empty argument list. Emitting "()" with zero arguments would still be
-valid Ruby but would change idiomatic round-tripped output, so we only
-emit parens when arg_count > 0.
-@End Reasoning
-
-@Implementation:
-Reads receiver, method (name), arguments, block from HIR. If receiver is
-non-zero, recursively translates it and emits ".". Always emits the
-method name. If arguments is non-zero, computes arg_count via
-get_list_size; only when it is > 0 emits "(", translate_arguments, ")".
-Finally if block is non-zero emits " " followed by translate_block.
-@End Implementation
-Process called "translate_call" takes translator as HIRToRubyTranslator, hir as Integer returns Integer:
-    Note: Translate HIR call to Ruby method call
-
-    Let receiver be proc get_dict_value with hir, "receiver"
-    Let method_name be proc get_dict_value with hir, "method"
-    Let arguments be proc get_dict_value with hir, "arguments"
-    Let block be proc get_dict_value with hir, "block"
-
-    Note: Handle receiver
-    If receiver is not equal to 0:
-        proc translate_hir_to_ruby with translator, receiver
-        proc emit with translator, "."
-    End If
-
-    proc emit with translator, method_name
-
-    Note: Handle arguments
-    If arguments is not equal to 0:
-        Let arg_count be proc get_list_size from arguments
-        If arg_count is greater than 0:
-            proc emit with translator, "("
-            proc translate_arguments with translator, arguments
-            proc emit with translator, ")"
-        End If
-    End If
-
-    Note: Handle block
-    If block is not equal to 0:
-        proc emit with translator, " "
-        proc translate_block with translator, block
-    End If
-
-    Return 1
-End Process
-
-@Reasoning:
-The HIR assignment node carries its operator as a string so compound forms
-(`+=`, `||=`, `&&=`, `-=`, etc.) round-trip without requiring a separate
-node kind per operator. We emit the target, the spaced operator, then the
-value - matching Ruby's whitespace conventions for both simple `=` and
-compound forms.
-@End Reasoning
-
-@Implementation:
-Reads target, value, operator from HIR. Recursively emits target,
-" <operator> ", then recursively emits value. No special-casing for
-chained assignment (`a = b = c`) because the HIR builder produces nested
-assignment nodes that recurse naturally through this code path.
-@End Implementation
-Process called "translate_assignment" takes translator as HIRToRubyTranslator, hir as Integer returns Integer:
-    Note: Translate HIR assignment to Ruby assignment
-
-    Let target be proc get_dict_value with hir, "target"
-    Let value be proc get_dict_value with hir, "value"
-    Let operator be proc get_dict_value with hir, "operator"
-
-    proc translate_hir_to_ruby with translator, target
-    proc emit with translator, " "
-    proc emit with translator, operator
-    proc emit with translator, " "
-    proc translate_hir_to_ruby with translator, value
-
-    Return 1
-End Process
-
-@Reasoning:
-Ruby array literals use square brackets with comma-separated elements.
-The empty-array case (`[]`) is naturally handled by the same path because
-the inner loop simply doesn't execute when the elements list is absent
-or empty, so no dedicated empty-case branch is needed.
-@End Reasoning
-
-@Implementation:
-Emits "[". Reads "elements" from HIR; if non-zero iterates by index,
-emitting ", " between elements (index > 0) and recursively translating
-each element. Closes with "]". The leading comma is gated by index > 0
-rather than a trailing comma to avoid invalid Ruby like `[1, 2, ]`.
-@End Implementation
-Process called "translate_array_literal" takes translator as HIRToRubyTranslator, hir as Integer returns Integer:
-    Note: Translate HIR array to Ruby array literal
-
-    proc emit with translator, "["
-
-    Let elements be proc get_dict_value with hir, "elements"
-    If elements is not equal to 0:
-        Let element_count be proc get_list_size from elements
-        Let index be 0
-
-        While index is less than element_count:
-            If index is greater than 0:
-                proc emit with translator, ", "
-            End If
-
-            Let element be proc get_list_item with elements, index
-            proc translate_hir_to_ruby with translator, element
-
-            Set index to index plus 1
-        End While
-    End If
-
-    proc emit with translator, "]"
-
-    Return 1
-End Process
-
-@Reasoning:
-Ruby hash syntax has two key-style conventions: `:key => value` (legacy,
-required for non-symbol keys) and the modern `key: value` (only valid
-when the key is a symbol). Emitting the modern form for symbol keys
-preserves idiomatic Ruby in the round-trip; falling back to `=>` for any
-other key type keeps the emitter correct for string, integer, and
-expression keys.
-@End Reasoning
-
-@Implementation:
-Emits "{". For each pair, reads key and value; checks key.node_type. If
-"symbol", emits the symbol's "value" field followed by ": " (modern
-syntax). Otherwise recursively translates the key and emits " => "
-(legacy syntax). Then recursively translates value. Pairs are separated
-by ", " (gated by index > 0). Closes with "}".
-@End Implementation
-Process called "translate_hash_literal" takes translator as HIRToRubyTranslator, hir as Integer returns Integer:
-    Note: Translate HIR hash to Ruby hash literal
-
-    proc emit with translator, "{"
-
-    Let pairs be proc get_dict_value with hir, "pairs"
-    If pairs is not equal to 0:
-        Let pair_count be proc get_list_size from pairs
-        Let index be 0
-
-        While index is less than pair_count:
-            If index is greater than 0:
-                proc emit with translator, ", "
-            End If
-
-            Let pair be proc get_list_item with pairs, index
-            Let key be proc get_dict_value with pair, "key"
-            Let value be proc get_dict_value with pair, "value"
-
-            Note: Use modern hash syntax for symbol keys when possible
-            Let key_type be proc get_dict_value with key, "node_type"
-            If key_type is equal to "symbol":
-                Let symbol_value be proc get_dict_value with key, "value"
-                proc emit with translator, symbol_value
-                proc emit with translator, ": "
-            Otherwise:
-                proc translate_hir_to_ruby with translator, key
-                proc emit with translator, " => "
-            End If
-
-            proc translate_hir_to_ruby with translator, value
-
-            Set index to index plus 1
-        End While
-    End If
-
-    proc emit with translator, "}"
-
-    Return 1
-End Process
-
-@Reasoning:
-Ruby symbols are immutable interned strings prefixed with `:` and the HIR
-stores the symbol's textual content (without the colon) under the "value"
-key. The emitter just prepends the sigil. No escaping is required because
-symbol values valid in the HIR are already drawn from the Ruby identifier
-alphabet plus operators.
-@End Reasoning
-
-@Implementation:
-Emits ":" then the symbol "value" via emit. No quoting is attempted -
-even though Ruby supports `:"with spaces"`, the HIR shape coming from
-ruby_parser never produces a quoted symbol so emitting unquoted is the
-correct round-trip.
-@End Implementation
-Process called "translate_symbol" takes translator as HIRToRubyTranslator, hir as Integer returns Integer:
-    Note: Translate HIR symbol to Ruby symbol
-
-    proc emit with translator, ":"
-    Let value be proc get_dict_value with hir, "value"
-    proc emit with translator, value
-
-    Return 1
-End Process
-
-@Reasoning:
-Plain (non-interpolated) string literals always use double quotes for
-emission so a single helper escapes special characters consistently. Using
-double quotes for all literals (rather than mixing with single quotes) is
-a deliberate normalization step - it loses the source's quote-style choice
-but ensures escape_ruby_string is the only escaping path needed.
-@End Reasoning
-
-@Implementation:
-Emits `"`, reads "value" from HIR, runs it through escape_ruby_string to
-backslash-escape `"`, `\`, `\n`, `\t`, `\r`, then emits the closing `"`.
-The escape pass is mandatory because user source may legitimately contain
-unescaped quotes inside single-quoted source literals that have already
-been decoded by the parser.
-@End Implementation
-
-@Security_Scope:
-Inputs may originate from untrusted source code. escape_ruby_string is
-the single point of containment so that no raw quote or backslash escapes
-the emitted literal and corrupts surrounding Ruby code.
-@End Security_Scope
-Process called "translate_string_literal" takes translator as HIRToRubyTranslator, hir as Integer returns Integer:
-    Note: Translate HIR string to Ruby string literal
-
-    proc emit with translator, "\""
-    Let value be proc get_dict_value with hir, "value"
-    Let escaped_value be proc escape_ruby_string from value
-    proc emit with translator, escaped_value
-    proc emit with translator, "\""
-
-    Return 1
-End Process
-
-@Reasoning:
-Ruby interpolated strings (`"...#{expr}..."`) are stored in HIR as a
-"parts" list interleaving literal text fragments with arbitrary
-expression nodes. Only literal segments are passed through
-escape_ruby_string; expression segments are wrapped in `#{...}` and
-translated recursively, preserving the dynamic-evaluation semantics.
-@End Reasoning
-
-@Implementation:
-Emits opening `"`. For each part: if its node_type is "string_literal",
-escape its value and emit raw. Otherwise wrap with `#{` and `}` around a
-recursive translate_hir_to_ruby call on the expression. Emits closing
-`"`. The all-literal case (no expression parts) still passes through
-because the parts list is just a sequence of string_literal nodes.
-@End Implementation
-
-@Security_Scope:
-Literal segments carry the same untrusted-source risk as plain string
-literals and are escaped via escape_ruby_string. Expression segments are
-translated as HIR and therefore re-emit via the same dispatcher that
-applied to all other code; they are not raw strings inserted into Ruby
-source.
-@End Security_Scope
-Process called "translate_interpolated_string" takes translator as HIRToRubyTranslator, hir as Integer returns Integer:
-    Note: Translate HIR interpolated string to Ruby interpolated string
-
-    proc emit with translator, "\""
-
-    Let parts be proc get_dict_value with hir, "parts"
-    If parts is not equal to 0:
-        Let part_count be proc get_list_size from parts
-        Let index be 0
-
-        While index is less than part_count:
-            Let part be proc get_list_item with parts, index
-            Let part_type be proc get_dict_value with part, "node_type"
-
-            If part_type is equal to "string_literal":
-                Let text_value be proc get_dict_value with part, "value"
-                Let escaped_text be proc escape_ruby_string from text_value
-                proc emit with translator, escaped_text
-            Otherwise:
-                proc emit with translator, "#{"
-                proc translate_hir_to_ruby with translator, part
-                proc emit with translator, "}"
-            End If
-
-            Set index to index plus 1
-        End While
-    End If
-
-    proc emit with translator, "\""
-
-    Return 1
-End Process
-
-@Reasoning:
-Numeric literals are stored as their already-stringified textual
-representation in the HIR (which preserves base prefixes like `0x`, `0o`,
-underscores like `1_000_000`, and scientific notation), so the emitter
-simply writes the stored text without re-parsing. Re-parsing would lose
-formatting like underscore separators on a round-trip.
-@End Reasoning
-
-@Implementation:
-Reads "value" from HIR and emits it verbatim. No type tag is read because
-Ruby does not require integer/float disambiguation at the literal level -
-`1` and `1.0` are distinguished purely by the textual form.
-@End Implementation
-Process called "translate_number_literal" takes translator as HIRToRubyTranslator, hir as Integer returns Integer:
-    Note: Translate HIR number to Ruby number literal
-
-    Let value be proc get_dict_value with hir, "value"
-    proc emit with translator, value
-
-    Return 1
-End Process
-
-@Reasoning:
-Operator precedence in Ruby requires explicit parentheses only when a
-child operation has lower precedence than its parent (e.g., `(a + b) * c`
-must keep parens, but `a * (b * c)` need not). needs_parentheses
-encapsulates this lookup so emission is purely structural - no parens
-are emitted otherwise to keep output readable.
-@End Reasoning
-
-@Implementation:
-Reads left, operator, right from HIR. Calls needs_parentheses with the
-HIR node and its operator string. If 1, emits "(". Recursively emits
-left, emits " <operator> ", recursively emits right. If parens were
-opened, closes with ")". Spacing around the operator is unconditional
-because all multi-character Ruby operators (`**`, `<=>`, `<<`) tolerate
-surrounding whitespace.
-@End Implementation
-Process called "translate_binary_operation" takes translator as HIRToRubyTranslator, hir as Integer returns Integer:
-    Note: Translate HIR binary operation to Ruby binary expression
-
-    Let left be proc get_dict_value with hir, "left"
-    Let operator be proc get_dict_value with hir, "operator"
-    Let right be proc get_dict_value with hir, "right"
-
-    Note: Handle operator precedence with parentheses when needed
-    Let needs_parens be proc needs_parentheses with hir, operator
-
-    If needs_parens is equal to 1:
-        proc emit with translator, "("
-    End If
-
-    proc translate_hir_to_ruby with translator, left
-    proc emit with translator, " "
-    proc emit with translator, operator
-    proc emit with translator, " "
-    proc translate_hir_to_ruby with translator, right
-
-    If needs_parens is equal to 1:
-        proc emit with translator, ")"
-    End If
-
-    Return 1
-End Process
-
-@Reasoning:
-Ruby ranges distinguish inclusive (`..`) and exclusive (`...`) endpoints,
-and the HIR carries the choice as the "operator" field rather than two
-node kinds. Defaulting to `..` for any non-"..." string keeps the
-emitter robust against frontends that omit the operator.
-@End Reasoning
-
-@Implementation:
-Reads start, end, operator from HIR. Recursively emits the start
-expression, emits "..." iff operator equals "..." otherwise "..", then
-recursively emits the end expression. No whitespace is inserted around
-the range operator because Ruby treats `1..10` and `1 .. 10` differently
-in argument position (the latter can be parsed as a call argument plus
-range).
-@End Implementation
-Process called "translate_range" takes translator as HIRToRubyTranslator, hir as Integer returns Integer:
-    Note: Translate HIR range to Ruby range
-
-    Let start_value be proc get_dict_value with hir, "start"
-    Let end_value be proc get_dict_value with hir, "end"
-    Let operator be proc get_dict_value with hir, "operator"
-
-    proc translate_hir_to_ruby with translator, start_value
-
-    Note: Use appropriate range operator
-    If operator is equal to "...":
-        proc emit with translator, "..."
+        Set header to proc string_concat from StringUtils with header, " {"
     Otherwise:
-        proc emit with translator, ".."
-    End If
-
-    proc translate_hir_to_ruby with translator, end_value
-
-    Return 1
-End Process
-
-@Reasoning:
-Identifier emission is intentionally a single emit of the stored name -
-Ruby's sigil-based name classification (`@`, `@@`, `$`) is preserved
-inside the HIR identifier's "name" field by the parser, so no
-classification logic belongs here.
-@End Reasoning
-
-@Implementation:
-Reads "name" from HIR and emits it via emit. Local variable, instance
-variable (`@x`), class variable (`@@x`), and global (`$x`) references all
-flow through this same path because the sigils are kept as part of the
-name string by the Ruby frontend.
-@End Implementation
-Process called "translate_identifier" takes translator as HIRToRubyTranslator, hir as Integer returns Integer:
-    Note: Translate HIR identifier to Ruby variable
-
-    Let name be proc get_dict_value with hir, "name"
-    proc emit with translator, name
-
-    Return 1
-End Process
-
-@Reasoning:
-Ruby methods return the value of their last expression implicitly, so an
-explicit `return` keyword is redundant in that position. The HIR carries
-an "implicit" flag (as a string "true") set by the Ruby frontend for any
-return that appears as the last statement of a method body; this emitter
-elides the keyword in that case to preserve idiomatic Ruby on round-trip.
-@End Reasoning
-
-@Implementation:
-Reads value and implicit from HIR. If implicit equals the string "true",
-recursively emits only the value (no `return` keyword). Otherwise emits
-"return"; if value is non-zero, emits " " followed by a recursive
-translation of the value. A `return` with no value is emitted as bare
-`return` and is valid Ruby (returns nil).
-@End Implementation
-Process called "translate_return" takes translator as HIRToRubyTranslator, hir as Integer returns Integer:
-    Note: Translate HIR return to Ruby return statement
-
-    Let value be proc get_dict_value with hir, "value"
-    Let is_implicit be proc get_dict_value with hir, "implicit"
-
-    Note: Handle implicit returns (Ruby's last expression semantics)
-    If is_implicit is equal to "true":
-        Note: Don't emit explicit return for implicit returns
-        proc translate_hir_to_ruby with translator, value
-    Otherwise:
-        proc emit with translator, "return"
-        If value is not equal to 0:
-            proc emit with translator, " "
-            proc translate_hir_to_ruby with translator, value
+        If is_proc is equal to 1:
+            Set header to "proc {"
+        Otherwise:
+            Set header to "lambda {"
+        End If
+        If has_params is equal to 1:
+            Set header to proc string_concat from StringUtils with header, " |"
+            Set header to proc string_concat from StringUtils with header, params_code
+            Set header to proc string_concat from StringUtils with header, "|"
         End If
     End If
 
-    Return 1
+    Let result be proc string_concat from StringUtils with header, "\n"
+
+    proc indent with ctx_ptr
+    Let body_code be proc generate_statement with ctx_ptr, body_node
+    proc dedent with ctx_ptr
+    Set result to proc string_concat from StringUtils with result, body_code
+
+    Let end_indent be proc get_indent with ctx_ptr
+    Set result to proc string_concat from StringUtils with result, end_indent
+    Set result to proc string_concat from StringUtils with result, closer
+    Return result
 End Process
 
 @Reasoning:
-Ruby's `yield` invokes the block argument passed to the enclosing method
-and uniquely omits parentheses when bare: `yield`, `yield x`, `yield x, y`
-are all valid without parens. We emit the bare form to remain idiomatic;
-parens are only needed when arguments collide with method-call precedence,
-which translate_arguments handles upstream when those arguments are
-emitted.
+Block/lambda parameters share the function-parameter machinery: we read the
+callable's parameter list and join the names with ", ", re-prefixing splat/
+doublesplat/block kinds from each parameter's "ruby_param_kind" tag so the block
+header reproduces *args / **kwargs / &blk.
 @End Reasoning
-
-@Implementation:
-Emits "yield". If arguments HIR is non-zero, emits " " then defers to
-translate_arguments which writes a comma-separated list. No `()` wrappers
-are added because yield's grammar accepts a bare argument list at
-statement position.
-@End Implementation
-Process called "translate_yield" takes translator as HIRToRubyTranslator, hir as Integer returns Integer:
-    Note: Translate HIR yield to Ruby yield statement
-
-    proc emit with translator, "yield"
-
-    Let arguments be proc get_dict_value with hir, "arguments"
-    If arguments is not equal to 0:
-        proc emit with translator, " "
-        proc translate_arguments with translator, arguments
+Process called "generate_block_params" takes ctx_ptr as Integer, node as Integer returns String:
+    Let params be proc hir_get_lambda_parameters from HIR with node
+    Let param_list be proc hir_get_parameter_list from HIR with params
+    Let param_count be 0
+    If param_list is not equal to 0:
+        Set param_count to proc list_length from ListCore with param_list
     End If
-
-    Return 1
-End Process
-
-@Reasoning:
-Ruby distinguishes `super` (forwards the caller's arguments verbatim) from
-`super()` (passes no arguments) - these have different semantics. The HIR
-carries arguments as a list whose presence (non-zero) signals the explicit
-form. Bare `super` is therefore emitted only when arguments is 0;
-emit `super()` for explicit empty argument lists too via this same path
-(arguments-list is present but empty).
-@End Reasoning
-
-@Implementation:
-Emits "super". If arguments is non-zero, emits "(", calls
-translate_arguments to fill the parenthesized list, then ")". An absent
-arguments field (0) leaves the bare `super` form.
-@End Implementation
-Process called "translate_super_call" takes translator as HIRToRubyTranslator, hir as Integer returns Integer:
-    Note: Translate HIR super call to Ruby super
-
-    proc emit with translator, "super"
-
-    Let arguments be proc get_dict_value with hir, "arguments"
-    If arguments is not equal to 0:
-        proc emit with translator, "("
-        proc translate_arguments with translator, arguments
-        proc emit with translator, ")"
-    End If
-
-    Return 1
-End Process
-
-@Reasoning:
-Ruby `include` mixes in instance methods from a module into the receiver
-class. translate_mixins emits include directives inside the class body
-before any methods so the resulting Ruby matches conventional ordering;
-this helper only writes the include line itself.
-@End Reasoning
-
-@Implementation:
-Emits "include ", reads the "module" name field from the HIR include
-node, emits it raw (module references in HIR are pre-stringified, e.g.
-"Comparable" or "ActiveSupport::Concern").
-@End Implementation
-Process called "translate_include" takes translator as HIRToRubyTranslator, hir as Integer returns Integer:
-    Note: Translate HIR include to Ruby include statement
-
-    proc emit with translator, "include "
-    Let module_name be proc get_dict_value with hir, "module"
-    proc emit with translator, module_name
-
-    Return 1
-End Process
-
-@Reasoning:
-Ruby `extend` mixes module methods as class (singleton) methods of the
-receiver, the dual of `include`. Same structural shape as
-translate_include but a different keyword - kept as a separate process
-so the dispatcher can pick the right one without inspecting node fields.
-@End Reasoning
-
-@Implementation:
-Emits "extend ", reads "module" from HIR, emits the module reference
-verbatim.
-@End Implementation
-Process called "translate_extend" takes translator as HIRToRubyTranslator, hir as Integer returns Integer:
-    Note: Translate HIR extend to Ruby extend statement
-
-    proc emit with translator, "extend "
-    Let module_name be proc get_dict_value with hir, "module"
-    proc emit with translator, module_name
-
-    Return 1
-End Process
-
-@Reasoning:
-Ruby's `attr_accessor` is a class-level macro generating both reader and
-writer methods for the named symbols. The HIR carries a list of attribute
-names that need to be emitted as `:name1, :name2, ...`. Delegated to
-translate_attribute_list so the same emission shape can be reused by the
-reader/writer-only variants if needed.
-@End Reasoning
-
-@Implementation:
-Emits "attr_accessor ", reads "attributes" list from HIR, defers to
-translate_attribute_list (defined in the shared helpers section) to emit
-the comma-separated symbol list.
-@End Implementation
-Process called "translate_attr_accessor" takes translator as HIRToRubyTranslator, hir as Integer returns Integer:
-    Note: Translate HIR attr_accessor to Ruby attr_accessor
-
-    proc emit with translator, "attr_accessor "
-    Let attributes be proc get_dict_value with hir, "attributes"
-    proc translate_attribute_list with translator, attributes
-
-    Return 1
-End Process
-
-Note: Helper processes for HIR to Ruby translation
-
-@Reasoning:
-A statement list is emitted as a sequence of indented lines. Some emitted
-constructs (if/end, def/end, do/end) already terminate with their own
-newline; if this helper unconditionally appended one, the output would
-contain blank lines between every multi-line construct. The
-requires_newline flag is the coordination mechanism: emit_newline sets it,
-and this loop consults it before adding another newline.
-@End Reasoning
-
-@Implementation:
-For each statement in the list: emits proper indentation via emit_indent,
-recursively translates the statement, then conditionally adds a newline
-only when requires_newline is still 0 (meaning the statement did not
-self-terminate). Resets requires_newline to 0 after each iteration so the
-next statement starts in a known state.
-@End Implementation
-Process called "translate_statement_list" takes translator as HIRToRubyTranslator, statements as Integer returns Integer:
-    Note: Translate list of HIR statements to Ruby statements
-
-    Let stmt_count be proc get_list_size from statements
-    Let index be 0
-
-    While index is less than stmt_count:
-        Let statement be proc get_list_item with statements, index
-
-        proc emit_indent from translator
-        proc translate_hir_to_ruby with translator, statement
-
-        Note: Add newline unless it's already handled
-        If translator.requires_newline is equal to 0:
-            proc emit_newline from translator
-        End If
-
-        Set translator.requires_newline to 0
-        Set index to index plus 1
-    End While
-
-    Return 1
-End Process
-
-@Reasoning:
-Argument lists at call sites are just comma-separated expressions. The
-caller (translate_call, translate_yield, translate_super_call) is
-responsible for emitting any surrounding `(...)`; this helper writes only
-the comma-separated payload so it can be reused in paren-less contexts
-like yield.
-@End Reasoning
-
-@Implementation:
-Iterates the args list by index. For each argument, emits ", " between
-items (index > 0) and recursively translates the argument expression via
-translate_hir_to_ruby. The leading comma is gated on index to prevent a
-leading separator before the first argument.
-@End Implementation
-Process called "translate_arguments" takes translator as HIRToRubyTranslator, args as Integer returns Integer:
-    Note: Translate HIR arguments to Ruby argument list
-
-    Let arg_count be proc get_list_size from args
-    Let index be 0
-
-    While index is less than arg_count:
-        If index is greater than 0:
-            proc emit with translator, ", "
-        End If
-
-        Let argument be proc get_list_item with args, index
-        proc translate_hir_to_ruby with translator, argument
-
-        Set index to index plus 1
-    End While
-
-    Return 1
-End Process
-
-@Reasoning:
-Ruby idiom places `include` and `extend` directives at the top of a class
-body, before constants and methods. translate_class invokes this helper
-immediately after entering the class body (post-indent) so the directives
-appear in the conventional position with one entry per line.
-@End Reasoning
-
-@Implementation:
-Iterates the "includes" list (if present) and, for each include node,
-emits indent, defers to translate_include, then newline. Then does the
-same for the "extends" list using translate_extend. The shared index
-local is intentionally reused (Set index to 0) before the second loop to
-restart counting cleanly.
-@End Implementation
-Process called "translate_mixins" takes translator as HIRToRubyTranslator, hir as Integer returns Integer:
-    Note: Translate class mixins (includes and extends)
-
-    Let includes be proc get_dict_value with hir, "includes"
-    If includes is not equal to 0:
-        Let include_count be proc get_list_size from includes
-        Let index be 0
-
-        While index is less than include_count:
-            Let include_stmt be proc get_list_item with includes, index
-            proc emit_indent from translator
-            proc translate_include with translator, include_stmt
-            proc emit_newline from translator
-            Set index to index plus 1
-        End While
-    End If
-
-    Let extends be proc get_dict_value with hir, "extends"
-    If extends is not equal to 0:
-        Let extend_count be proc get_list_size from extends
-        Set index to 0
-
-        While index is less than extend_count:
-            Let extend_stmt be proc get_list_item with extends, index
-            proc emit_indent from translator
-            proc translate_extend with translator, extend_stmt
-            proc emit_newline from translator
-            Set index to index plus 1
-        End While
-    End If
-
-    Return 1
-End Process
-
-@Reasoning:
-Single chokepoint for all text appended to the Ruby output. Centralizing
-buffer mutation here lets every other helper stay free of string_concat
-details and would also be the natural place to add buffer-resize
-optimization later without touching emission sites.
-@End Reasoning
-
-@Implementation:
-Concatenates text onto translator.output_buffer via string_concat and
-stores the new buffer back on the translator. Returns 1 unconditionally
-since the only failure mode (out-of-memory) is handled at the allocator
-level.
-@End Implementation
-Process called "emit" takes translator as HIRToRubyTranslator, text as String returns Integer:
-    Note: Emit text to output buffer
-    Set translator.output_buffer to proc string_concat with translator.output_buffer, text
-    Return 1
-End Process
-
-@Reasoning:
-Convenience for the very common "indent + text + newline" pattern used by
-block terminators (`end`), section markers, and any standalone statement.
-Removing the three-call boilerplate from every caller makes the emission
-sites read more linearly.
-@End Reasoning
-
-@Implementation:
-Sequences emit_indent, emit with the provided text, and emit_newline.
-Returns 1. Note that emit_newline sets requires_newline so
-translate_statement_list will skip the auto-newline after this call.
-@End Implementation
-Process called "emit_line" takes translator as HIRToRubyTranslator, text as String returns Integer:
-    Note: Emit line with proper indentation
-    proc emit_indent from translator
-    proc emit with translator, text
-    proc emit_newline from translator
-    Return 1
-End Process
-
-@Reasoning:
-Wraps the literal newline emission and atomically toggles the
-requires_newline flag so translate_statement_list knows the last write
-already ended a line. Without this flag, a construct like `end\n` followed
-by the loop's auto-newline would produce a blank line after every block.
-@End Reasoning
-
-@Implementation:
-Emits "\n" via emit and sets translator.requires_newline to 1. The flag
-is cleared by translate_statement_list once it has decided whether to
-suppress its own newline.
-@End Implementation
-Process called "emit_newline" takes translator as HIRToRubyTranslator returns Integer:
-    Note: Emit newline character
-    proc emit with translator, "\n"
-    Set translator.requires_newline to 1
-    Return 1
-End Process
-
-@Reasoning:
-Ruby's idiomatic indent is two spaces per nesting level. Emitting the
-spaces one-by-one (rather than building an indent string and concatenating
-it) is acceptable here because indentation_level is bounded by realistic
-source nesting (typically <10), so the loop is short and avoids managing
-a separate indent buffer.
-@End Reasoning
-
-@Implementation:
-Computes total_spaces = indentation_level * 2, then loops space_count
-from 0 to total_spaces - 1 emitting a single space each iteration. Note
-that translator.indentation_level is the field actually consulted; the
-suite field is called indentation_level (not indent_level) - the type
-declaration matches.
-@End Implementation
-Process called "emit_indent" takes translator as HIRToRubyTranslator returns Integer:
-    Note: Emit proper indentation
-
-    Let spaces_per_level be 2
-    Let total_spaces be translator.indentation_level multiplied by spaces_per_level
-    Let space_count be 0
-
-    While space_count is less than total_spaces:
-        proc emit with translator, " "
-        Set space_count to space_count plus 1
-    End While
-
-    Return 1
-End Process
-
-@Reasoning:
-Increments indentation level for the duration of a nested block. Paired
-with dedent so every translate_* helper that opens a body must close it,
-guaranteeing balanced indentation on output.
-@End Reasoning
-
-@Implementation:
-Adds 1 to translator.indentation_level. Has no effect on already-emitted
-output; only future emit_indent calls observe the new level.
-@End Implementation
-Process called "indent" takes translator as HIRToRubyTranslator returns Integer:
-    Note: Increase indentation level
-    Set translator.indentation_level to translator.indentation_level plus 1
-    Return 1
-End Process
-
-@Reasoning:
-Decrements indentation level. Guards against going below zero so a buggy
-caller emitting an extra dedent cannot underflow the level to a negative
-value (which would compute a very large total_spaces under integer
-arithmetic and emit a massive indent line).
-@End Reasoning
-
-@Implementation:
-Subtracts 1 from translator.indentation_level only when the current value
-is greater than 0. Otherwise leaves it at 0 silently.
-@End Implementation
-Process called "dedent" takes translator as HIRToRubyTranslator returns Integer:
-    Note: Decrease indentation level
-    If translator.indentation_level is greater than 0:
-        Set translator.indentation_level to translator.indentation_level minus 1
-    End If
-    Return 1
-End Process
-
-@Reasoning:
-Ruby double-quoted strings interpret backslash sequences, so the literal
-forms of `"`, `\`, newline, tab, and carriage return must each be
-re-escaped before emission. Single-character matching is used rather than
-regex because the surface alphabet is small and a switch is both faster
-and easier to audit for completeness.
-@End Reasoning
-
-@Implementation:
-Builds a result string by iterating text character-by-character. Match
-arms:
-- `"` => `\"`
-- `\` => `\\`
-- newline (LF) => `\n`
-- tab => `\t`
-- carriage return => `\r`
-- any other char => emitted as-is.
-Uses string_concat into result on each step. Returns the assembled
-escaped string.
-@End Implementation
-
-@Security_Scope:
-This is the security boundary for emitted string literals. Any
-unrecognized control character is passed through unchanged - that is safe
-inside a double-quoted Ruby string because Ruby does not have additional
-metacharacters beyond the five handled here. Embedded `#{...}` would still
-be interpolated by Ruby; callers must use translate_interpolated_string
-when interpolation is intended, not pass an already-interpolated string
-through this helper.
-@End Security_Scope
-Process called "escape_ruby_string" takes text as String returns String:
-    Note: Escape special characters in Ruby string
 
     Let result be ""
-    Let length be length of text
-    Let index be 0
-
-    While index is less than length:
-        Let char be proc char_at with text, index
-
-        Match char:
-            When "\"":
-                Set result to proc string_concat with result, "\\\""
-            When "\\":
-                Set result to proc string_concat with result, "\\\\"
-            When "\n":
-                Set result to proc string_concat with result, "\\n"
-            When "\t":
-                Set result to proc string_concat with result, "\\t"
-            When "\r":
-                Set result to proc string_concat with result, "\\r"
-            Otherwise:
-                Set result to proc string_concat with result, char
-        End Match
-
-        Set index to index plus 1
+    Let i be 0
+    While i is less than param_count:
+        Let param_node be proc list_get from ListCore with param_list, i
+        Let param_code be proc generate_parameter with ctx_ptr, param_node
+        If i is greater than 0:
+            Set result to proc string_concat from StringUtils with result, ", "
+        End If
+        Set result to proc string_concat from StringUtils with result, param_code
+        Set i to i plus 1
     End While
 
     Return result
 End Process
 
 @Reasoning:
-Heuristic gating between `{...}` and `do...end` block syntax. A body is
-"simple" if it has exactly one statement and that statement is one of the
-trivially-shaped kinds that look natural on a single line. Any other shape
-(including control structures, multi-statement bodies, or assignments) is
-classified as non-simple and translate_block uses `do...end`.
+A single parameter re-emits its Ruby spelling: the name re-prefixed with "*", "**"
+or "&" per "ruby_param_kind", suffixed with ":" for a keyword parameter, and a
+" = default" (or " default" for keyword) appended when the frontend stored a
+default expression in metadata.
 @End Reasoning
+Process called "generate_parameter" takes ctx_ptr as Integer, param_node as Integer returns String:
+    Let name be proc hir_get_parameter_name from HIR with param_node
+    Let kind be proc hir_get_metadata from HIR with param_node, "ruby_param_kind"
 
-@Implementation:
-Returns 1 immediately if body is 0 (empty block) since an empty brace
-form is fine. Otherwise rejects bodies with !=1 statement. Reads the
-node_type of the lone statement and matches: "call", "identifier",
-"string_literal", "number_literal", "binary_operation" map to single-line
-eligible (Return 1); all other types return 0.
-@End Implementation
-Process called "is_simple_block" takes body as Integer returns Integer:
-    Note: Determine if block body is simple enough for single-line syntax
-
-    If body is equal to 0:
-        Return 1
+    Let result be name
+    If proc string_equals from StringCore with kind, "splat" is equal to 1:
+        Set result to proc string_concat from StringUtils with "*", name
+    Otherwise If proc string_equals from StringCore with kind, "doublesplat" is equal to 1:
+        Set result to proc string_concat from StringUtils with "**", name
+    Otherwise If proc string_equals from StringCore with kind, "block" is equal to 1:
+        Set result to proc string_concat from StringUtils with "&", name
+    Otherwise If proc string_equals from StringCore with kind, "kwarg" is equal to 1:
+        Set result to proc string_concat from StringUtils with name, ":"
     End If
 
-    Let stmt_count be proc get_list_size from body
-    If stmt_count is not equal to 1:
-        Return 0  Note: Multiple statements require multi-line
+    If proc meta_flag with param_node, "ruby_param_has_default" is equal to 1:
+        Let default_hir be proc hir_get_metadata from HIR with param_node, "ruby_param_default"
+        If default_hir is not equal to 0:
+            Let default_code be proc generate_expression with ctx_ptr, default_hir
+            If proc string_equals from StringCore with kind, "kwarg" is equal to 1:
+                Set result to proc string_concat from StringUtils with result, " "
+                Set result to proc string_concat from StringUtils with result, default_code
+            Otherwise:
+                Set result to proc string_concat from StringUtils with result, " = "
+                Set result to proc string_concat from StringUtils with result, default_code
+            End If
+        End If
     End If
 
-    Let statement be proc get_list_item with body, 0
-    Let stmt_type be proc get_dict_value with statement, "node_type"
+    Return result
+End Process
 
-    Note: Simple statements that can be single-line
-    Match stmt_type:
-        When "call":
-            Return 1
-        When "identifier":
-            Return 1
-        When "string_literal":
-            Return 1
-        When "number_literal":
-            Return 1
-        When "binary_operation":
-            Return 1
+@Reasoning:
+Array literals re-emit "[e1, e2, *rest]" with splat elements re-prefixed with "*"
+from the "ruby_splat" tag the frontend set on splatted entries.
+@End Reasoning
+Process called "generate_list_literal" takes ctx_ptr as Integer, node as Integer returns String:
+    Let elements be proc hir_get_list_elements from HIR with node
+    Let element_count be proc list_length from ListCore with elements
+
+    Let elements_code be ""
+    Let i be 0
+    While i is less than element_count:
+        Let elem_node be proc list_get from ListCore with elements, i
+        Let elem_code be proc generate_expression with ctx_ptr, elem_node
+        If proc meta_flag with elem_node, "ruby_splat" is equal to 1:
+            Set elem_code to proc string_concat from StringUtils with "*", elem_code
+        End If
+
+        If i is greater than 0:
+            Set elements_code to proc string_concat from StringUtils with elements_code, ", "
+        End If
+        Set elements_code to proc string_concat from StringUtils with elements_code, elem_code
+        Set i to i plus 1
+    End While
+
+    Let result be proc string_concat from StringUtils with "[", elements_code
+    Set result to proc string_concat from StringUtils with result, "]"
+    Return result
+End Process
+
+@Reasoning:
+Hash literals re-emit "{ k => v, ... }". A symbol key emits the "name: value"
+shorthand (recovered from the key's "ruby_symbol" tag and its name), and any
+other key emits the explicit "key => value" rocket form.
+@End Reasoning
+Process called "generate_map_literal" takes ctx_ptr as Integer, node as Integer returns String:
+    Let entries be proc hir_get_map_entries from HIR with node
+    Let entry_count be proc list_length from ListCore with entries
+
+    Let entries_code be ""
+    Let i be 0
+    While i is less than entry_count:
+        Let entry be proc list_get from ListCore with entries, i
+        Let key_node be proc hir_get_map_entry_key from HIR with entry
+        Let value_node be proc hir_get_map_entry_value from HIR with entry
+        Let value_code be proc generate_expression with ctx_ptr, value_node
+
+        If i is greater than 0:
+            Set entries_code to proc string_concat from StringUtils with entries_code, ", "
+        End If
+
+        Let key_kind be proc hir_node_type from HIR with key_node
+        Let is_symbol_key be 0
+        If key_kind is equal to HIR.HIR_STRING_LITERAL:
+            If proc meta_flag with key_node, "ruby_symbol" is equal to 1:
+                Set is_symbol_key to 1
+            End If
+        End If
+
+        If is_symbol_key is equal to 1:
+            Let sym_name be proc hir_get_string_literal_value from HIR with key_node
+            Set entries_code to proc string_concat from StringUtils with entries_code, sym_name
+            Set entries_code to proc string_concat from StringUtils with entries_code, ": "
+            Set entries_code to proc string_concat from StringUtils with entries_code, value_code
         Otherwise:
-            Return 0
-    End Match
+            Let key_code be proc generate_expression with ctx_ptr, key_node
+            Set entries_code to proc string_concat from StringUtils with entries_code, key_code
+            Set entries_code to proc string_concat from StringUtils with entries_code, " => "
+            Set entries_code to proc string_concat from StringUtils with entries_code, value_code
+        End If
+
+        Set i to i plus 1
+    End While
+
+    Let result be proc string_concat from StringUtils with "{ ", entries_code
+    Set result to proc string_concat from StringUtils with result, " }"
+    Return result
+End Process
+
+Note: ============================================================================
+Note: Statement Generation
+Note: ============================================================================
+
+@Reasoning:
+Dispatch table for statement-kind to a specialised emitter. The class node serves
+both Ruby classes and modules (distinguished by the "ruby_kind" tag). The fallback
+treats the node as an expression statement, prepending indent and appending
+newline, since any non-statement HIR node reachable here is a side-effecting
+expression at statement position, which Ruby tolerates directly.
+@End Reasoning
+Process called "generate_statement" takes ctx_ptr as Integer, stmt_node as Integer returns String:
+    Let node_type be proc hir_node_type from HIR with stmt_node
+
+    If node_type is equal to HIR.HIR_BLOCK:
+        Return proc generate_block with ctx_ptr, stmt_node
+    End If
+    If node_type is equal to HIR.HIR_CLASS:
+        Return proc generate_class with ctx_ptr, stmt_node
+    End If
+    If node_type is equal to HIR.HIR_FUNCTION:
+        Return proc generate_method with ctx_ptr, stmt_node
+    End If
+    If node_type is equal to HIR.HIR_IF:
+        Return proc generate_if_statement with ctx_ptr, stmt_node
+    End If
+    If node_type is equal to HIR.HIR_WHILE:
+        Return proc generate_while_statement with ctx_ptr, stmt_node
+    End If
+    If node_type is equal to HIR.HIR_FOR_IN:
+        Return proc generate_for_in_statement with ctx_ptr, stmt_node
+    End If
+    If node_type is equal to HIR.HIR_TRY:
+        Return proc generate_try_statement with ctx_ptr, stmt_node
+    End If
+    If node_type is equal to HIR.HIR_RETURN:
+        Return proc generate_return_statement with ctx_ptr, stmt_node
+    End If
+    If node_type is equal to HIR.HIR_BREAK:
+        Return proc generate_break_statement with ctx_ptr, stmt_node
+    End If
+    If node_type is equal to HIR.HIR_CONTINUE:
+        Return proc generate_continue_statement with ctx_ptr, stmt_node
+    End If
+    If node_type is equal to HIR.HIR_YIELD:
+        Return proc generate_yield_statement with ctx_ptr, stmt_node
+    End If
+    If node_type is equal to HIR.HIR_EXPR_STMT:
+        Let inner be proc hir_get_expression_statement_expr from HIR with stmt_node
+        Let expr_code be proc generate_expression with ctx_ptr, inner
+        Let indent_es be proc get_indent with ctx_ptr
+        Let line_es be proc string_concat from StringUtils with indent_es, expr_code
+        Set line_es to proc string_concat from StringUtils with line_es, "\n"
+        Return line_es
+    End If
+
+    Note: Bare expression at statement position.
+    Let expr_code2 be proc generate_expression with ctx_ptr, stmt_node
+    Let indent2 be proc get_indent with ctx_ptr
+    Let result2 be proc string_concat from StringUtils with indent2, expr_code2
+    Set result2 to proc string_concat from StringUtils with result2, "\n"
+    Return result2
 End Process
 
 @Reasoning:
-Inferring whether a child binary operation needs parentheses in its
-parent context requires knowing both operators' precedence. By comparing
-the child operator's precedence against the parent's, we can drop
-redundant parens that would otherwise clutter idiomatic Ruby output.
-This is conservative: when uncertain (no parent context, unknown parent
-operator), no parens are emitted - Ruby's default precedence handles
-those cases correctly.
+A HIR block emits its statements in order with no separator; each generated
+statement already carries its own indentation and trailing newline. Blocks that
+carry the "ruby_multiple_assign" tag collapse back into a single comma-form
+"a, b = x, y" line; case-chain blocks ("ruby_case") and begin-else blocks pass
+through as ordinary statement sequences since their structure is encoded in the
+nested if/try nodes.
 @End Reasoning
-
-@Implementation:
-Returns 0 for null hir. Reads the parent node type via hir_get_node_type.
-HIR_BINARY_OP is constant 25; if the parent is not a binary op, no parens
-needed. Reads parent_op via hir_get_operator; if 0 (missing), no parens.
-Compares get_ruby_operator_precedence(operator) against
-get_ruby_operator_precedence(parent_op): if current < parent, the current
-operation binds looser than its context and requires parens to preserve
-associativity; otherwise no parens.
-@End Implementation
-Process called "needs_parentheses" takes hir as Integer, operator as String returns Integer:
-    Note: Determine if binary operation needs parentheses based on Ruby operator precedence
-    Note: Ruby precedence (high to low): **, unary +/-, *, /, %, +, -, <<, >>, &, |, ^, <=>, ==, !=, <, >, <=, >=, &&, ||, .., ..., ?:, =, and, or, not
-
-    Note: Get parent expression context to check precedence
-    Note: If no parent context or HIR is null, no parentheses needed
-    If hir is equal to 0:
-        Return 0
+Process called "generate_block" takes ctx_ptr as Integer, node as Integer returns String:
+    If proc meta_flag with node, "ruby_multiple_assign" is equal to 1:
+        Return proc generate_multiple_assign with ctx_ptr, node
     End If
 
-    Note: Check if parent is also a binary operation. The constant value 25
-    Note: comes from HIR.HIR_BINARY_OP; we inline it here because there is no
-    Note: HIR module Import in this file (which would cause a codegen "Unknown
-    Note: variable 'HIR'" error). Keeping the value in sync with the canonical
-    Note: definition in compiler/middle/gungnir/hir/translation/frontends/
-    Note: scala/scala_to_hir.runa is required.
-    Let parent_type be proc hir_get_node_type from HIR with hir
-    If parent_type is not equal to 25:
-        Return 0  Note: Parent is not binary op, no parentheses needed
+    Let statements be proc hir_get_block_statements from HIR with node
+    Let stmt_count be 0
+    If statements is not equal to 0:
+        Set stmt_count to proc list_length from ListCore with statements
     End If
 
-    Note: Get parent operator
-    Let parent_op be proc hir_get_operator from HIR with hir
-    If parent_op is equal to 0:
-        Return 0
-    End If
+    Let result be ""
+    Let i be 0
+    While i is less than stmt_count:
+        Let stmt_node be proc list_get from ListCore with statements, i
+        Let stmt_code be proc generate_statement with ctx_ptr, stmt_node
+        Set result to proc string_concat from StringUtils with result, stmt_code
+        Set i to i plus 1
+    End While
 
-    Note: Get precedence levels
-    Let current_prec be proc get_ruby_operator_precedence from operator
-    Let parent_prec be proc get_ruby_operator_precedence from parent_op
-
-    Note: If current has lower precedence than parent, needs parentheses
-    If current_prec is less than parent_prec:
-        Return 1
-    End If
-
-    Return 0
+    Return result
 End Process
 
 @Reasoning:
-Numeric precedence table for Ruby binary operators, returning higher
-values for tighter binding. Encoded as a sequence of string-equality
-checks rather than a hash lookup so the table is self-documenting,
-trivially auditable against the Ruby language spec, and free of
-dictionary overhead in this hot path (called twice per binary
-operation by needs_parentheses).
+A multiple-assignment block re-collapses its per-target assignment statements into
+Ruby's "a, b = x, y" comma form: the left side joins each assignment's lhs and the
+right side joins each rhs, both with ", ". This restores the source's parallel
+assignment from the structurally-expanded HIR.
 @End Reasoning
-
-@Implementation:
-Returns:
-- 14: `**` (exponentiation, highest precedence excluding unary)
-- 12: `*`, `/`, `%`
-- 11: `+`, `-`
-- 10: `<<`, `>>` (shifts)
--  9: `&` (bitwise AND)
--  8: `^` (bitwise XOR)
--  7: `|` (bitwise OR)
--  6: `<=>`, `..`, `...` (combined comparison / ranges)
--  5: `==`, `!=`, `<`, `>`, `<=`, `>=` (and unknown default)
--  4: `&&`
--  3: `||`
--  2: `and` (keyword form, low precedence)
--  1: `or` (keyword form, lowest precedence)
-Default Return 5 covers any operator not explicitly listed so unknown
-inputs sort with the comparison group instead of an extreme value, which
-keeps needs_parentheses safe against new operator strings.
-@End Implementation
-Process called "get_ruby_operator_precedence" takes operator as String returns Integer:
-    Note: Return precedence level for Ruby operators (higher number = higher precedence)
-
-    Note: Exponentiation (highest precedence)
-    If operator is equal to "**":
-        Return 14
+Process called "generate_multiple_assign" takes ctx_ptr as Integer, node as Integer returns String:
+    Let statements be proc hir_get_block_statements from HIR with node
+    Let stmt_count be 0
+    If statements is not equal to 0:
+        Set stmt_count to proc list_length from ListCore with statements
     End If
 
-    Note: Multiplication, division, modulo
-    If operator is equal to "*":
-        Return 12
-    End If
-    If operator is equal to "/":
-        Return 12
-    End If
-    If operator is equal to "%":
-        Return 12
+    Let lhs_code be ""
+    Let rhs_code be ""
+
+    Let i be 0
+    While i is less than stmt_count:
+        Let stmt be proc list_get from ListCore with statements, i
+        Let assign_expr be proc hir_get_expression_statement_expr from HIR with stmt
+        Let lhs_node be proc hir_get_assign_lhs from HIR with assign_expr
+        Let rhs_node be proc hir_get_assign_rhs from HIR with assign_expr
+
+        Let one_lhs be proc generate_expression with ctx_ptr, lhs_node
+        If proc meta_flag with lhs_node, "ruby_splat" is equal to 1:
+            Set one_lhs to proc string_concat from StringUtils with "*", one_lhs
+        End If
+        Let one_rhs be proc generate_expression with ctx_ptr, rhs_node
+
+        If i is greater than 0:
+            Set lhs_code to proc string_concat from StringUtils with lhs_code, ", "
+            Set rhs_code to proc string_concat from StringUtils with rhs_code, ", "
+        End If
+        Set lhs_code to proc string_concat from StringUtils with lhs_code, one_lhs
+        Set rhs_code to proc string_concat from StringUtils with rhs_code, one_rhs
+        Set i to i plus 1
+    End While
+
+    Let indent_s be proc get_indent with ctx_ptr
+    Let result be proc string_concat from StringUtils with indent_s, lhs_code
+    Set result to proc string_concat from StringUtils with result, " = "
+    Set result to proc string_concat from StringUtils with result, rhs_code
+    Set result to proc string_concat from StringUtils with result, "\n"
+    Return result
+End Process
+
+@Reasoning:
+A HIR class emits Ruby "class Name [< Super] ... end", or "module Name ... end"
+when tagged "ruby_kind"="module". The members (methods and other body statements)
+are emitted indented; the superclass, when present, is generated as an expression
+for the "< Super" clause. The singleton "class << self" form is re-emitted from
+its tag.
+@End Reasoning
+Process called "generate_class" takes ctx_ptr as Integer, node as Integer returns String:
+    Let class_name be proc hir_get_class_name from HIR with node
+
+    Let keyword be "class"
+    If proc meta_is with node, "ruby_kind", "module" is equal to 1:
+        Set keyword to "module"
     End If
 
-    Note: Addition, subtraction
-    If operator is equal to "+":
-        Return 11
-    End If
-    If operator is equal to "-":
-        Return 11
+    Let result be proc get_indent with ctx_ptr
+
+    If proc meta_flag with node, "ruby_singleton_class" is equal to 1:
+        Set result to proc string_concat from StringUtils with result, "class << "
+        Set result to proc string_concat from StringUtils with result, class_name
+        Set result to proc string_concat from StringUtils with result, "\n"
+    Otherwise:
+        Set result to proc string_concat from StringUtils with result, keyword
+        Set result to proc string_concat from StringUtils with result, " "
+        Set result to proc string_concat from StringUtils with result, class_name
+
+        Let base be proc hir_get_base_class from HIR with node
+        If base is not equal to 0:
+            Let base_code be proc generate_expression with ctx_ptr, base
+            Set result to proc string_concat from StringUtils with result, " < "
+            Set result to proc string_concat from StringUtils with result, base_code
+        End If
+        Set result to proc string_concat from StringUtils with result, "\n"
     End If
 
-    Note: Bitwise shift
-    If operator is equal to "<<":
-        Return 10
-    End If
-    If operator is equal to ">>":
-        Return 10
-    End If
-
-    Note: Bitwise AND
-    If operator is equal to "&":
-        Return 9
+    proc indent with ctx_ptr
+    Let members be proc hir_get_class_members from HIR with node
+    Let member_count be 0
+    If members is not equal to 0:
+        Set member_count to proc list_length from ListCore with members
     End If
 
-    Note: Bitwise XOR and OR
-    If operator is equal to "^":
-        Return 8
+    Let i be 0
+    While i is less than member_count:
+        Let member be proc list_get from ListCore with members, i
+        Let member_code be proc generate_statement with ctx_ptr, member
+        Set result to proc string_concat from StringUtils with result, member_code
+        Set i to i plus 1
+    End While
+    proc dedent with ctx_ptr
+
+    Let end_indent be proc get_indent with ctx_ptr
+    Set result to proc string_concat from StringUtils with result, end_indent
+    Set result to proc string_concat from StringUtils with result, "end\n"
+    Return result
+End Process
+
+@Reasoning:
+A HIR function emits Ruby "def name(params) body end". A singleton method (tagged
+"ruby_singleton_method") prefixes "self." onto the name to re-emit the
+"def self.name" form. Parameters are joined with their Ruby spellings and the body
+is generated indented. Ruby's implicit return means the final return (tagged
+"ruby_implicit_return") emits its bare value.
+@End Reasoning
+Process called "generate_method" takes ctx_ptr as Integer, node as Integer returns String:
+    Let func_name be proc hir_get_function_name from HIR with node
+    Let params_code be proc generate_method_params with ctx_ptr, node
+    Let body_node be proc hir_get_function_body from HIR with node
+
+    Let result be proc get_indent with ctx_ptr
+    Set result to proc string_concat from StringUtils with result, "def "
+    If proc meta_flag with node, "ruby_singleton_method" is equal to 1:
+        Set result to proc string_concat from StringUtils with result, "self."
     End If
-    If operator is equal to "|":
-        Return 7
+    Set result to proc string_concat from StringUtils with result, func_name
+    If proc string_equals from StringCore with params_code, "" is equal to 0:
+        Set result to proc string_concat from StringUtils with result, "("
+        Set result to proc string_concat from StringUtils with result, params_code
+        Set result to proc string_concat from StringUtils with result, ")"
+    End If
+    Set result to proc string_concat from StringUtils with result, "\n"
+
+    proc indent with ctx_ptr
+    Let body_code be proc generate_statement with ctx_ptr, body_node
+    proc dedent with ctx_ptr
+    Set result to proc string_concat from StringUtils with result, body_code
+
+    Let end_indent be proc get_indent with ctx_ptr
+    Set result to proc string_concat from StringUtils with result, end_indent
+    Set result to proc string_concat from StringUtils with result, "end\n"
+    Return result
+End Process
+
+@Reasoning:
+Method parameters reuse the parameter machinery: read the function's parameter
+list and join each parameter's Ruby spelling with ", ".
+@End Reasoning
+Process called "generate_method_params" takes ctx_ptr as Integer, node as Integer returns String:
+    Let params be proc hir_get_parameters from HIR with node
+    Let param_list be proc hir_get_parameter_list from HIR with params
+    Let param_count be 0
+    If param_list is not equal to 0:
+        Set param_count to proc list_length from ListCore with param_list
     End If
 
-    Note: Comparison operators
-    If operator is equal to "<=>":
-        Return 6
-    End If
-    If operator is equal to "==":
-        Return 5
-    End If
-    If operator is equal to "!=":
-        Return 5
-    End If
-    If operator is equal to "<":
-        Return 5
-    End If
-    If operator is equal to ">":
-        Return 5
-    End If
-    If operator is equal to "<=":
-        Return 5
-    End If
-    If operator is equal to ">=":
-        Return 5
+    Let result be ""
+    Let i be 0
+    While i is less than param_count:
+        Let param_node be proc list_get from ListCore with param_list, i
+        Let param_code be proc generate_parameter with ctx_ptr, param_node
+        If i is greater than 0:
+            Set result to proc string_concat from StringUtils with result, ", "
+        End If
+        Set result to proc string_concat from StringUtils with result, param_code
+        Set i to i plus 1
+    End While
+
+    Return result
+End Process
+
+@Reasoning:
+Ruby if/unless re-emits "if COND ... [elsif/else] ... end" (or "unless" with the
+condition's negation undone when the "ruby_unless" tag is set). The else branch may
+be a nested HIR if (an elsif, tagged "ruby_elsif", emitted as "elsif COND") or a
+plain block (the final else). Building the chain inline keeps the elsif structure.
+@End Reasoning
+Process called "generate_if_statement" takes ctx_ptr as Integer, node as Integer returns String:
+    Let condition_node be proc hir_get_if_condition from HIR with node
+    Let then_node be proc hir_get_if_then from HIR with node
+    Let else_node be proc hir_get_if_else from HIR with node
+
+    Let is_unless be proc meta_flag with node, "ruby_unless"
+
+    Let cond_code be ""
+    If is_unless is equal to 1:
+        Note: condition was negated by the frontend; recover the original operand.
+        Let inner_operand be proc hir_get_unary_operand from HIR with condition_node
+        Set cond_code to proc generate_expression with ctx_ptr, inner_operand
+    Otherwise:
+        Set cond_code to proc generate_expression with ctx_ptr, condition_node
     End If
 
-    Note: Logical AND
-    If operator is equal to "&&":
-        Return 4
-    End If
-    If operator is equal to "and":
-        Return 2
+    Let keyword be "if "
+    If is_unless is equal to 1:
+        Set keyword to "unless "
     End If
 
-    Note: Logical OR
-    If operator is equal to "||":
-        Return 3
-    End If
-    If operator is equal to "or":
-        Return 1
+    Let result be proc get_indent with ctx_ptr
+    Set result to proc string_concat from StringUtils with result, keyword
+    Set result to proc string_concat from StringUtils with result, cond_code
+    Set result to proc string_concat from StringUtils with result, "\n"
+
+    proc indent with ctx_ptr
+    Let then_code be proc generate_statement with ctx_ptr, then_node
+    proc dedent with ctx_ptr
+    Set result to proc string_concat from StringUtils with result, then_code
+
+    If else_node is not equal to 0:
+        Let tail_code be proc generate_if_tail with ctx_ptr, else_node
+        Set result to proc string_concat from StringUtils with result, tail_code
     End If
 
-    Note: Range operators
-    If operator is equal to "..":
-        Return 6
-    End If
-    If operator is equal to "...":
-        Return 6
+    Let end_indent be proc get_indent with ctx_ptr
+    Set result to proc string_concat from StringUtils with result, end_indent
+    Set result to proc string_concat from StringUtils with result, "end\n"
+    Return result
+End Process
+
+@Reasoning:
+The if-tail emits "elsif COND ... [tail]" for a nested HIR if tagged "ruby_elsif"
+(recursing for chained elsifs and a final else), or "else ... " for a plain block.
+This reconstructs Ruby's elsif/else chain without the trailing "end" (the outer if
+emits the single closing "end").
+@End Reasoning
+Process called "generate_if_tail" takes ctx_ptr as Integer, else_node as Integer returns String:
+    Let node_type be proc hir_node_type from HIR with else_node
+
+    If node_type is equal to HIR.HIR_IF:
+        If proc meta_flag with else_node, "ruby_elsif" is equal to 1:
+            Let condition_node be proc hir_get_if_condition from HIR with else_node
+            Let then_node be proc hir_get_if_then from HIR with else_node
+            Let inner_else be proc hir_get_if_else from HIR with else_node
+
+            Let cond_code be proc generate_expression with ctx_ptr, condition_node
+
+            Let result be proc get_indent with ctx_ptr
+            Set result to proc string_concat from StringUtils with result, "elsif "
+            Set result to proc string_concat from StringUtils with result, cond_code
+            Set result to proc string_concat from StringUtils with result, "\n"
+
+            proc indent with ctx_ptr
+            Let then_code be proc generate_statement with ctx_ptr, then_node
+            proc dedent with ctx_ptr
+            Set result to proc string_concat from StringUtils with result, then_code
+
+            If inner_else is not equal to 0:
+                Let next_code be proc generate_if_tail with ctx_ptr, inner_else
+                Set result to proc string_concat from StringUtils with result, next_code
+            End If
+            Return result
+        End If
     End If
 
-    Note: Default (unknown operator)
-    Return 5
+    Note: Plain else block.
+    Let else_indent be proc get_indent with ctx_ptr
+    Let result2 be proc string_concat from StringUtils with else_indent, "else\n"
+
+    proc indent with ctx_ptr
+    Let else_code be proc generate_statement with ctx_ptr, else_node
+    proc dedent with ctx_ptr
+    Set result2 to proc string_concat from StringUtils with result2, else_code
+    Return result2
+End Process
+
+@Reasoning:
+Ruby while/until re-emits "while COND ... end" or "until COND ... end". The until
+form recovers its original condition by unwrapping the frontend's logical-not
+negation, preserving the source boolean expression.
+@End Reasoning
+Process called "generate_while_statement" takes ctx_ptr as Integer, node as Integer returns String:
+    Let condition_node be proc hir_get_while_condition from HIR with node
+    Let body_node be proc hir_get_while_body from HIR with node
+
+    Let is_until be proc meta_flag with node, "ruby_until"
+
+    Let cond_code be ""
+    Let keyword be "while "
+    If is_until is equal to 1:
+        Set keyword to "until "
+        Let inner_operand be proc hir_get_unary_operand from HIR with condition_node
+        Set cond_code to proc generate_expression with ctx_ptr, inner_operand
+    Otherwise:
+        Set cond_code to proc generate_expression with ctx_ptr, condition_node
+    End If
+
+    Let result be proc get_indent with ctx_ptr
+    Set result to proc string_concat from StringUtils with result, keyword
+    Set result to proc string_concat from StringUtils with result, cond_code
+    Set result to proc string_concat from StringUtils with result, "\n"
+
+    proc indent with ctx_ptr
+    Let body_code be proc generate_statement with ctx_ptr, body_node
+    proc dedent with ctx_ptr
+    Set result to proc string_concat from StringUtils with result, body_code
+
+    Let end_indent be proc get_indent with ctx_ptr
+    Set result to proc string_concat from StringUtils with result, end_indent
+    Set result to proc string_concat from StringUtils with result, "end\n"
+    Return result
+End Process
+
+@Reasoning:
+Ruby's for-in re-emits "for var in iterable ... end" from the HIR for-in node's
+variable name, iterable expression and body block.
+@End Reasoning
+Process called "generate_for_in_statement" takes ctx_ptr as Integer, node as Integer returns String:
+    Let var_name be proc hir_get_for_in_variable from HIR with node
+    Let iterable_node be proc hir_get_for_in_iterable from HIR with node
+    Let body_node be proc hir_get_for_in_body from HIR with node
+
+    Let iterable_code be proc generate_expression with ctx_ptr, iterable_node
+
+    Let result be proc get_indent with ctx_ptr
+    Set result to proc string_concat from StringUtils with result, "for "
+    Set result to proc string_concat from StringUtils with result, var_name
+    Set result to proc string_concat from StringUtils with result, " in "
+    Set result to proc string_concat from StringUtils with result, iterable_code
+    Set result to proc string_concat from StringUtils with result, "\n"
+
+    proc indent with ctx_ptr
+    Let body_code be proc generate_statement with ctx_ptr, body_node
+    proc dedent with ctx_ptr
+    Set result to proc string_concat from StringUtils with result, body_code
+
+    Let end_indent be proc get_indent with ctx_ptr
+    Set result to proc string_concat from StringUtils with result, end_indent
+    Set result to proc string_concat from StringUtils with result, "end\n"
+    Return result
+End Process
+
+@Reasoning:
+A HIR try re-emits Ruby's "begin ... rescue ... [else] [ensure] end". The try body,
+each catch clause (as a "rescue [Types] [=> var]" block), the optional begin-else
+body (recovered from "ruby_begin_else_body" metadata) and the finally block (as
+"ensure") are emitted in Ruby's canonical clause order.
+@End Reasoning
+Process called "generate_try_statement" takes ctx_ptr as Integer, node as Integer returns String:
+    Let result be proc get_indent with ctx_ptr
+    Set result to proc string_concat from StringUtils with result, "begin\n"
+
+    Let try_block be proc hir_get_try_block from HIR with node
+    proc indent with ctx_ptr
+    Let try_code be proc generate_statement with ctx_ptr, try_block
+    proc dedent with ctx_ptr
+    Set result to proc string_concat from StringUtils with result, try_code
+
+    Let catches be proc hir_get_catch_clauses from HIR with node
+    Let catch_count be 0
+    If catches is not equal to 0:
+        Set catch_count to proc list_length from ListCore with catches
+    End If
+
+    Let i be 0
+    While i is less than catch_count:
+        Let catch_clause be proc list_get from ListCore with catches, i
+        Let catch_code be proc generate_rescue_clause with ctx_ptr, catch_clause
+        Set result to proc string_concat from StringUtils with result, catch_code
+        Set i to i plus 1
+    End While
+
+    Let else_body be proc hir_get_metadata from HIR with node, "ruby_begin_else_body"
+    If else_body is not equal to 0:
+        Let else_indent be proc get_indent with ctx_ptr
+        Set result to proc string_concat from StringUtils with result, else_indent
+        Set result to proc string_concat from StringUtils with result, "else\n"
+        proc indent with ctx_ptr
+        Let else_code be proc generate_statement with ctx_ptr, else_body
+        proc dedent with ctx_ptr
+        Set result to proc string_concat from StringUtils with result, else_code
+    End If
+
+    Let finally_block be proc hir_get_finally_block from HIR with node
+    If finally_block is not equal to 0:
+        Let ensure_indent be proc get_indent with ctx_ptr
+        Set result to proc string_concat from StringUtils with result, ensure_indent
+        Set result to proc string_concat from StringUtils with result, "ensure\n"
+        proc indent with ctx_ptr
+        Let ensure_code be proc generate_statement with ctx_ptr, finally_block
+        proc dedent with ctx_ptr
+        Set result to proc string_concat from StringUtils with result, ensure_code
+    End If
+
+    Let end_indent be proc get_indent with ctx_ptr
+    Set result to proc string_concat from StringUtils with result, end_indent
+    Set result to proc string_concat from StringUtils with result, "end\n"
+    Return result
+End Process
+
+@Reasoning:
+A HIR catch re-emits a Ruby "rescue [TypeList] [=> var]" clause: the catch type
+plus any extra rescue types (recovered from "ruby_rescue_extra_types" metadata)
+form the comma-separated type list, the catch variable becomes the "=> var"
+binding, and the catch body is emitted indented.
+@End Reasoning
+Process called "generate_rescue_clause" takes ctx_ptr as Integer, clause as Integer returns String:
+    Let result be proc get_indent with ctx_ptr
+    Set result to proc string_concat from StringUtils with result, "rescue"
+
+    Let type_name be proc hir_get_catch_type from HIR with clause
+    If type_name is not equal to 0:
+        Set result to proc string_concat from StringUtils with result, " "
+        Set result to proc string_concat from StringUtils with result, type_name
+
+        Let extra be proc hir_get_metadata from HIR with clause, "ruby_rescue_extra_types"
+        If extra is not equal to 0:
+            Set result to proc string_concat from StringUtils with result, ", "
+            Set result to proc string_concat from StringUtils with result, extra
+        End If
+    End If
+
+    Let var_name be proc hir_get_catch_variable from HIR with clause
+    If var_name is not equal to 0:
+        Set result to proc string_concat from StringUtils with result, " => "
+        Set result to proc string_concat from StringUtils with result, var_name
+    End If
+
+    Set result to proc string_concat from StringUtils with result, "\n"
+
+    Let body be proc hir_get_catch_body from HIR with clause
+    proc indent with ctx_ptr
+    Let body_code be proc generate_statement with ctx_ptr, body
+    proc dedent with ctx_ptr
+    Set result to proc string_concat from StringUtils with result, body_code
+    Return result
+End Process
+
+@Reasoning:
+Ruby's return re-emits "return [value]". An implicit return (tagged
+"ruby_implicit_return") emits only its bare value expression as the last line of a
+method, matching Ruby's last-expression-is-the-result semantics.
+@End Reasoning
+Process called "generate_return_statement" takes ctx_ptr as Integer, node as Integer returns String:
+    Let value_node be proc hir_get_return_value from HIR with node
+    Let indent_s be proc get_indent with ctx_ptr
+
+    If proc meta_flag with node, "ruby_implicit_return" is equal to 1:
+        If value_node is equal to 0:
+            Return proc string_concat from StringUtils with indent_s, "\n"
+        End If
+        Let value_code_i be proc generate_expression with ctx_ptr, value_node
+        Let line_i be proc string_concat from StringUtils with indent_s, value_code_i
+        Set line_i to proc string_concat from StringUtils with line_i, "\n"
+        Return line_i
+    End If
+
+    Let result be proc string_concat from StringUtils with indent_s, "return"
+    If value_node is not equal to 0:
+        Let value_code be proc generate_expression with ctx_ptr, value_node
+        Set result to proc string_concat from StringUtils with result, " "
+        Set result to proc string_concat from StringUtils with result, value_code
+    End If
+    Set result to proc string_concat from StringUtils with result, "\n"
+    Return result
+End Process
+
+@Reasoning:
+Ruby's break re-emits "break [value]"; a value-carrying break recovers its value
+from "ruby_break_value" metadata.
+@End Reasoning
+Process called "generate_break_statement" takes ctx_ptr as Integer, node as Integer returns String:
+    Let result be proc get_indent with ctx_ptr
+    Set result to proc string_concat from StringUtils with result, "break"
+
+    Let value_node be proc hir_get_metadata from HIR with node, "ruby_break_value"
+    If value_node is not equal to 0:
+        Let value_code be proc generate_expression with ctx_ptr, value_node
+        Set result to proc string_concat from StringUtils with result, " "
+        Set result to proc string_concat from StringUtils with result, value_code
+    End If
+    Set result to proc string_concat from StringUtils with result, "\n"
+    Return result
+End Process
+
+@Reasoning:
+A HIR continue tagged "ruby_next" re-emits Ruby's "next [value]". The optional
+carried value is recovered from "ruby_next_value" metadata.
+@End Reasoning
+Process called "generate_continue_statement" takes ctx_ptr as Integer, node as Integer returns String:
+    Let result be proc get_indent with ctx_ptr
+    Set result to proc string_concat from StringUtils with result, "next"
+
+    Let value_node be proc hir_get_metadata from HIR with node, "ruby_next_value"
+    If value_node is not equal to 0:
+        Let value_code be proc generate_expression with ctx_ptr, value_node
+        Set result to proc string_concat from StringUtils with result, " "
+        Set result to proc string_concat from StringUtils with result, value_code
+    End If
+    Set result to proc string_concat from StringUtils with result, "\n"
+    Return result
+End Process
+
+@Reasoning:
+A HIR yield re-emits Ruby's "yield [args]". The yield's value (stored as the
+return-value slot by the frontend) is a single expression or, when tagged
+"ruby_yield_multi", a list literal whose elements are the comma-separated yield
+arguments.
+@End Reasoning
+Process called "generate_yield_statement" takes ctx_ptr as Integer, node as Integer returns String:
+    Let value_node be proc hir_get_return_value from HIR with node
+    Let indent_s be proc get_indent with ctx_ptr
+
+    Let result be proc string_concat from StringUtils with indent_s, "yield"
+
+    If value_node is not equal to 0:
+        If proc meta_flag with node, "ruby_yield_multi" is equal to 1:
+            Let elements be proc hir_get_list_elements from HIR with value_node
+            Let elem_count be proc list_length from ListCore with elements
+            Let args_code be ""
+            Let i be 0
+            While i is less than elem_count:
+                Let elem be proc list_get from ListCore with elements, i
+                Let elem_code be proc generate_expression with ctx_ptr, elem
+                If i is greater than 0:
+                    Set args_code to proc string_concat from StringUtils with args_code, ", "
+                End If
+                Set args_code to proc string_concat from StringUtils with args_code, elem_code
+                Set i to i plus 1
+            End While
+            Set result to proc string_concat from StringUtils with result, " "
+            Set result to proc string_concat from StringUtils with result, args_code
+        Otherwise:
+            Let single_code be proc generate_expression with ctx_ptr, value_node
+            Set result to proc string_concat from StringUtils with result, " "
+            Set result to proc string_concat from StringUtils with result, single_code
+        End If
+    End If
+
+    Set result to proc string_concat from StringUtils with result, "\n"
+    Return result
+End Process
+
+Note: ============================================================================
+Note: Top-Level Generation
+Note: ============================================================================
+
+@Reasoning:
+Iterates the module's declaration list (the top-level statements added by the
+frontend's translate_program). Each declaration is generated as a statement so the
+result includes any leading keywords and trailing newlines, producing a flat Ruby
+script that runs in original declaration order.
+@End Reasoning
+Process called "generate_module" takes ctx_ptr as Integer returns String:
+    Let ctx as RubyCodeGenContext be ctx_ptr
+
+    Let declarations be proc hir_get_declarations from HIR with ctx.hir_module
+    Let decl_count be 0
+    If declarations is not equal to 0:
+        Set decl_count to proc list_length from ListCore with declarations
+    End If
+
+    Let result be ""
+    Let decl_index be 0
+    While decl_index is less than decl_count:
+        Let decl_node be proc list_get from ListCore with declarations, decl_index
+        Let decl_code be proc generate_statement with ctx_ptr, decl_node
+        Set result to proc string_concat from StringUtils with result, decl_code
+        Set decl_index to decl_index plus 1
+    End While
+
+    Return result
+End Process
+
+@Reasoning:
+Public entry point used by the translation driver. Wraps the create-context +
+generate-module pair so callers do not manage the context lifecycle. The returned
+String holds the complete Ruby source.
+@End Reasoning
+Process called "generate_ruby_code" takes hir_module as Integer returns String:
+    Let ctx be proc create_codegen_context with hir_module
+    Let code be proc generate_module with ctx
+    Return code
+End Process
+
+@Reasoning:
+Predicate accessor for the had_error sentinel. Returns the raw integer (0/1)
+because Boolean is implemented as Integer in the bootstrap layer.
+@End Reasoning
+Process called "had_codegen_errors" takes ctx_ptr as Integer returns Integer:
+    Let ctx as RubyCodeGenContext be ctx_ptr
+    Return ctx.had_error
+End Process
+
+@Reasoning:
+Exposes the accumulated errors list pointer so the driver can iterate diagnostic
+messages. The returned list is owned by the context.
+@End Reasoning
+Process called "get_codegen_errors" takes ctx_ptr as Integer returns Integer:
+    Let ctx as RubyCodeGenContext be ctx_ptr
+    Return ctx.errors
 End Process

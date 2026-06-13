@@ -1,0 +1,164 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+Licensed under Apache 2.0
+:End Note
+
+Note:
+Ruby Semantic Analyzer Probe
+
+End-to-end proof that the Ruby semantic stage is REAL, not a skeleton:
+
+    Ruby source
+      -> ruby_lexer    (tokenize)
+      -> ruby_parser   (build the real Ruby AST: program/class/method/block/...)
+      -> ruby_semantic (register definitions; resolve names; detect captures)
+      -> assert on the resulting analyzer state
+
+The probe feeds a Ruby program that forces every behaviour the analyzer must
+get right:
+
+    LIMIT = 100                       # a top-level CONSTANT definition
+    class Counter                     # a CLASS definition
+      def tally(items)                # an instance METHOD on Counter
+        total = 0                     # a method-LOCAL
+        items.each do |item|          # a BLOCK (a new local scope boundary)
+          total = total + item        # references the enclosing 'total' => CAPTURE
+        end
+        @count = total                # an INSTANCE VARIABLE on Counter
+        total
+      end
+    end
+
+After analysis the probe asserts, by reading the analyzer's own accessors, that
+each real semantic fact was recorded:
+
+  - the analysis produced a non-null analyzer and recorded zero hard ERRORS
+    (Ruby's openness makes reference problems advisory warnings, not errors);
+  - the class 'Counter' was registered (ruby_semantic_has_class);
+  - the instance method 'Counter#tally' was registered against its owner
+    (ruby_semantic_has_instance_method);
+  - the instance variable 'Counter@count' was recorded against the class
+    (ruby_semantic_has_ivar);
+  - the constant 'LIMIT' resolves (ruby_semantic_has_constant);
+  - the method-local 'total', referenced inside the block but declared in the
+    enclosing method, was CAPTURED by the block (ruby_semantic_is_capture);
+  - a name that was never defined ('nonexistent_xyz') is NOT a registered
+    instance method on Counter, confirming the registries reflect real program
+    definitions, not noise.
+
+This exercises the genuine scope-chain walk, the block-boundary capture detection
+(is_captured_local / mark_capture), the per-class definition registration
+(methods / ivars), and the constant resolution path - the behaviours the
+semantic stage exists to provide.
+
+Exit code: number of failed assertions (0 == all passed). No exit_with_code.
+:End Note
+
+Import "compiler/middle/gungnir/hir/translation/frontends/ruby/ruby_lexer.runa" as RubyLexer
+Import "compiler/middle/gungnir/hir/translation/frontends/ruby/ruby_parser.runa" as RubyParser
+Import "compiler/middle/gungnir/hir/translation/frontends/ruby/ruby_semantic.runa" as RubySemantic
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "tests/test_utils.runa" as TestUtils
+
+Note: ============================================================================
+Note: Pipeline helper
+Note: ============================================================================
+
+@Reasoning:
+The probe runs the front of the pipeline (lex -> parse) to obtain the real Ruby
+AST root, then hands it to the semantic analyzer. Factoring the lex/parse drive
+into one helper keeps the probe focused on the semantic assertions and ensures
+the AST handed to the analyzer is exactly what the production parser emits.
+@End Reasoning
+@Implementation:
+Build a lexer over the source, wrap it in a parser (which pre-tokenizes), drive a
+full parse_ruby to the Ruby AST root, and return it. Returns 0 if any stage
+yields 0 so the caller can detect a pipeline failure before asserting.
+@End Implementation
+Process called "source_to_ast" takes source as Integer returns Integer:
+    Let lexer be proc create_ruby_lexer from RubyLexer with source
+    If lexer is equal to 0:
+        Return 0
+    End If
+
+    Let parser be proc create_ruby_parser from RubyParser with lexer
+    If parser is equal to 0:
+        Return 0
+    End If
+
+    Let ast be proc parse_ruby from RubyParser with parser
+    Return ast
+End Process
+
+Note: ============================================================================
+Note: Main
+Note: ============================================================================
+
+@Reasoning:
+A single representative program drives every semantic behaviour at once: a
+top-level constant, a class with an instance method, a method-local, a block
+that captures that local, and an instance variable. Reading the analyzer's
+accessors after analysis proves the resolution and registration actually
+happened rather than trusting that the file merely compiled.
+@End Reasoning
+@Implementation:
+Parse the program to an AST, assert the AST is non-null, run
+analyze_ruby_semantics, assert the analyzer is non-null and recorded zero hard
+errors, then assert the class/method/ivar/constant registrations and the block
+capture via the public accessors. Return the failed count so the process exit
+code is 0 exactly when every assertion passed.
+@End Implementation
+Process called "main" returns Integer:
+    Let results be proc create_test_results from TestUtils
+    proc begin_suite from TestUtils with results, "Ruby Semantic Analyzer Probe"
+
+    Let source be "LIMIT = 100\nclass Counter\n  def tally(items)\n    total = 0\n    items.each do |item|\n      total = total + item\n    end\n    @count = total\n    total\n  end\nend\n"
+
+    Note: --- Stage 1: parse to the real Ruby AST ---
+    Let ast be proc source_to_ast with source
+    proc assert_not_null from TestUtils with results, "lex+parse produced a Ruby AST", ast
+
+    Note: --- Stage 2: run the semantic analyzer over the AST ---
+    Let analyzer be proc analyze_ruby_semantics from RubySemantic with ast
+    proc assert_not_null from TestUtils with results, "semantic analysis produced an analyzer", analyzer
+
+    Note: --- Stage 3: no hard errors (reference problems are advisory warnings) ---
+    Let error_count be proc ruby_semantic_error_count from RubySemantic with analyzer
+    proc assert_equal from TestUtils with results, "semantic analysis recorded zero errors", error_count, 0
+
+    Note: --- Stage 4: the class 'Counter' was registered ---
+    Let counter_name be proc create_from_literal from StringCore with "Counter"
+    Let has_class be proc ruby_semantic_has_class from RubySemantic with analyzer, counter_name
+    proc assert_equal from TestUtils with results, "class 'Counter' registered", has_class, 1
+
+    Note: --- Stage 5: instance method 'Counter#tally' registered against its owner ---
+    Let tally_name be proc create_from_literal from StringCore with "tally"
+    Let has_method be proc ruby_semantic_has_instance_method from RubySemantic with analyzer, counter_name, tally_name
+    proc assert_equal from TestUtils with results, "instance method 'Counter#tally' registered", has_method, 1
+
+    Note: --- Stage 6: instance variable 'Counter@count' recorded against the class ---
+    Let count_ivar be proc create_from_literal from StringCore with "@count"
+    Let has_ivar be proc ruby_semantic_has_ivar from RubySemantic with analyzer, counter_name, count_ivar
+    proc assert_equal from TestUtils with results, "instance variable 'Counter@count' recorded", has_ivar, 1
+
+    Note: --- Stage 7: the top-level constant 'LIMIT' resolves ---
+    Let limit_name be proc create_from_literal from StringCore with "LIMIT"
+    Let has_constant be proc ruby_semantic_has_constant from RubySemantic with analyzer, limit_name
+    proc assert_equal from TestUtils with results, "constant 'LIMIT' resolves", has_constant, 1
+
+    Note: --- Stage 8: the method-local 'total' was captured by the block ---
+    Let total_name be proc create_from_literal from StringCore with "total"
+    Let total_captured be proc ruby_semantic_is_capture from RubySemantic with analyzer, total_name
+    proc assert_equal from TestUtils with results, "method-local 'total' captured by the block", total_captured, 1
+
+    Note: --- Stage 9: a never-defined name is NOT a registered method on Counter ---
+    Let phantom_name be proc create_from_literal from StringCore with "nonexistent_xyz"
+    Let phantom_method be proc ruby_semantic_has_instance_method from RubySemantic with analyzer, counter_name, phantom_name
+    proc assert_equal from TestUtils with results, "undefined name is not a Counter method", phantom_method, 0
+
+    proc print_summary from TestUtils with results
+    Let failed be proc get_failed from TestUtils with results
+    proc destroy_test_results from TestUtils with results
+
+    Return failed
+End Process

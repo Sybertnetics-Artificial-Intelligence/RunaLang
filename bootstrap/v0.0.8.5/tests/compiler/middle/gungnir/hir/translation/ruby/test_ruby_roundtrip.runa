@@ -1,0 +1,501 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+Licensed under Apache 2.0
+:End Note
+
+Note:
+Ruby Translation Round-Trip Probe
+
+End-to-end proof that the Ruby translation pipeline is REAL, not a skeleton:
+
+    Ruby source
+      -> ruby_lexer   (tokenize: names, keywords, numbers, strings, symbols, operators)
+      -> ruby_parser  (build Ruby AST: def, if/elsif/else, blocks, assignments,
+                       method calls, arrays, hashes, expressions with Ruby precedence)
+      -> ruby_to_hir  (lower Ruby AST to the canonical hir_nodes producer model)
+      -> hir_to_ruby  (emit HIR back to valid Ruby text)
+      -> re-lex / re-parse / re-to_hir of the emitted text
+      -> structural HIR equality on the key constructs
+
+The probe feeds a representative Ruby program that exercises every major construct
+the task requires:
+
+  - a def with params and a return       (def add(a, b) ... return ... end)
+  - an if/elsif/else/end                  (if total > 10 ... elsif ... else ... end)
+  - an .each do |x| ... end block         (items.each do |x| ... end)
+  - a multiple assignment                 (a, b = 1, 2)
+  - a method call                         (puts total)
+  - an array + hash literal               ([1, 2, 3] ; { name: "ruby", n: 3 })
+
+It lowers the source to HIR1, asserts on HIR1 that the module declarations carry a
+function node named "add" with two parameters, an if/elsif/else, a call carrying a
+block, a multiple-assignment block, a method call, and the array/hash literals;
+emits HIR1 back to Ruby text, re-runs the whole pipeline on the emitted text to
+HIR2, and asserts HIR2 is STRUCTURALLY EQUAL to HIR1 on those same key constructs.
+Structural equality (node-kind tags plus identifying payloads such as method name,
+parameter count, control-flow kinds, block parameter, call target, and array/hash
+element counts) is the correct semantic-equivalence check because the emitter
+re-indents and normalises whitespace while the meaning is identical.
+
+The Ruby HIR node model is the canonical hir_nodes producer surface: every node is
+an int-tagged record read via hir_node_type (the kind) and the hir_get_* accessors
+(structural fields). This probe reads HIR fields via those same accessors the
+frontend emits and the backend consumes.
+
+Exit code: number of failed assertions (0 == all passed). No exit_with_code.
+:End Note
+
+Import "compiler/middle/gungnir/hir/translation/frontends/ruby/ruby_lexer.runa" as RubyLexer
+Import "compiler/middle/gungnir/hir/translation/frontends/ruby/ruby_parser.runa" as RubyParser
+Import "compiler/middle/gungnir/hir/translation/frontends/ruby/ruby_to_hir.runa" as RubyFrontend
+Import "compiler/middle/gungnir/hir/translation/backends/ruby/hir_to_ruby.runa" as RubyBackend
+Import "compiler/middle/gungnir/hir/hir_nodes.runa" as HIR
+Import "compiler/frontend/primitives/collections/list.runa" as List
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "tests/test_utils.runa" as TestUtils
+
+Note: ============================================================================
+Note: Pipeline helpers
+Note: ============================================================================
+
+@Reasoning:
+Each round of the probe runs the identical front-of-pipeline (lex -> parse ->
+to_hir). Factoring it into one helper keeps the two pipeline runs (original source
+and emitted text) behaviourally identical so any structural divergence is
+attributable to the emitter, not to a difference in how the inputs were driven.
+@End Reasoning
+@Implementation:
+Builds a lexer over the source, wraps it in a parser (which pre-tokenizes), drives
+a full parse to the Ruby AST_PROGRAM root, then lowers the AST to HIR via
+translate_ruby_to_hir and returns the HIR module. Returns 0 if any stage yields 0.
+@End Implementation
+Process called "source_to_hir" takes source as Integer returns Integer:
+    Let lexer be proc create_ruby_lexer from RubyLexer with source
+    If lexer is equal to 0:
+        Return 0
+    End If
+
+    Let parser be proc create_ruby_parser from RubyParser with lexer
+    If parser is equal to 0:
+        Return 0
+    End If
+
+    Let ast be proc parse_ruby from RubyParser with parser
+    If ast is equal to 0:
+        Return 0
+    End If
+
+    Let hir be proc translate_ruby_to_hir from RubyFrontend with ast
+    Return hir
+End Process
+
+@Reasoning:
+The Ruby frontend adds each top-level statement DIRECTLY as a module declaration
+(unlike the Lua frontend, which wraps the whole file body in one block). To locate
+a construct by kind we read the module declarations and linear-scan for the first
+declaration whose hir_node_type matches the requested kind. Linear scan (rather
+than fixed index) is robust to the frontend reordering or interleaving statements.
+@End Reasoning
+@Implementation:
+Reads hir_get_declarations(module) and scans for hir_node_type == kind. Returns the
+first match or 0.
+@End Implementation
+Process called "find_decl" takes module as Integer, kind as Integer returns Integer:
+    If module is equal to 0:
+        Return 0
+    End If
+
+    Let declarations be proc hir_get_declarations from HIR with module
+    If declarations is equal to 0:
+        Return 0
+    End If
+
+    Let count be proc list_length from List with declarations
+    Let i be 0
+    While i is less than count:
+        Let decl be proc list_get from List with declarations, i
+        Let decl_kind be proc hir_node_type from HIR with decl
+        If decl_kind is equal to kind:
+            Return decl
+        End If
+        Set i to i plus 1
+    End While
+
+    Return 0
+End Process
+
+@Reasoning:
+A method-call statement is wrapped by the frontend in an expression statement
+whose inner expression is the HIR call. This helper scans the module declarations
+for the first expression statement whose inner expression is a call expression and
+returns that call node, so the probe can assert on the call directly.
+@End Reasoning
+@Implementation:
+Scans declarations; for each HIR_EXPR_STMT reads the inner expression via
+hir_get_expression_statement_expr and returns it when its kind is HIR_CALL_EXPR.
+Returns 0 if none found.
+@End Implementation
+Process called "find_call_stmt" takes module as Integer returns Integer:
+    If module is equal to 0:
+        Return 0
+    End If
+
+    Let declarations be proc hir_get_declarations from HIR with module
+    If declarations is equal to 0:
+        Return 0
+    End If
+
+    Let count be proc list_length from List with declarations
+    Let i be 0
+    While i is less than count:
+        Let decl be proc list_get from List with declarations, i
+        Let decl_kind be proc hir_node_type from HIR with decl
+        If decl_kind is equal to HIR.HIR_EXPR_STMT:
+            Let inner be proc hir_get_expression_statement_expr from HIR with decl
+            Let inner_kind be proc hir_node_type from HIR with inner
+            If inner_kind is equal to HIR.HIR_CALL_EXPR:
+                Return inner
+            End If
+        End If
+        Set i to i plus 1
+    End While
+
+    Return 0
+End Process
+
+@Reasoning:
+A multiple-assignment lowers to a HIR block tagged "ruby_multiple_assign". This
+helper scans the module declarations for the first such block so the probe can
+assert the parallel-assignment structure round-trips.
+@End Reasoning
+Process called "find_multiple_assign" takes module as Integer returns Integer:
+    If module is equal to 0:
+        Return 0
+    End If
+
+    Let declarations be proc hir_get_declarations from HIR with module
+    If declarations is equal to 0:
+        Return 0
+    End If
+
+    Let count be proc list_length from List with declarations
+    Let i be 0
+    While i is less than count:
+        Let decl be proc list_get from List with declarations, i
+        Let decl_kind be proc hir_node_type from HIR with decl
+        If decl_kind is equal to HIR.HIR_BLOCK:
+            Let tag be proc hir_get_metadata from HIR with decl, "ruby_multiple_assign"
+            Let is_multi be proc string_equals from StringCore with tag, "true"
+            If is_multi is equal to 1:
+                Return decl
+            End If
+        End If
+        Set i to i plus 1
+    End While
+
+    Return 0
+End Process
+
+@Reasoning:
+Two Ruby programs are structurally equal on a construct when both HIR projections
+expose the same node-kind tag. Comparing kinds (and, for named constructs, the
+identifying payload) rather than byte text is whitespace-insensitive, proving
+round-trip fidelity without being defeated by the emitter's re-indenting.
+@End Reasoning
+Process called "same_kind" takes a as Integer, b as Integer returns Integer:
+    If a is equal to 0:
+        Return 0
+    End If
+    If b is equal to 0:
+        Return 0
+    End If
+    Let ka be proc hir_node_type from HIR with a
+    Let kb be proc hir_node_type from HIR with b
+    If ka is equal to kb:
+        Return 1
+    End If
+    Return 0
+End Process
+
+@Reasoning:
+The first argument carrying the call's trailing block is tagged "ruby_call_block".
+This helper returns that block (a HIR lambda) from a call node so the probe can
+assert the .each do |x| ... end block parameter round-trips.
+@End Reasoning
+Process called "find_call_block" takes call_node as Integer returns Integer:
+    If call_node is equal to 0:
+        Return 0
+    End If
+    Let args be proc hir_get_positional_args from HIR with call_node
+    If args is equal to 0:
+        Return 0
+    End If
+    Let count be proc list_length from List with args
+    Let i be 0
+    While i is less than count:
+        Let arg be proc list_get from List with args, i
+        Let tag be proc hir_get_metadata from HIR with arg, "ruby_call_block"
+        Let is_block be proc string_equals from StringCore with tag, "true"
+        If is_block is equal to 1:
+            Return arg
+        End If
+        Set i to i plus 1
+    End While
+    Return 0
+End Process
+
+@Reasoning:
+The first non-block argument of a call is its receiver-independent argument list
+head; for "[1,2,3].each" the call target is a member expression on an array
+literal. This helper returns the call's callee so the probe can assert the call
+target round-trips as a member access.
+@End Reasoning
+Process called "call_callee_kind" takes call_node as Integer returns Integer:
+    If call_node is equal to 0:
+        Return 0
+    End If
+    Let callee be proc hir_get_call_callee from HIR with call_node
+    Return proc hir_node_type from HIR with callee
+End Process
+
+Note: ============================================================================
+Note: Probe entry point
+Note: ============================================================================
+
+Process called "main" returns Integer:
+    Let results be proc create_test_results from TestUtils
+    proc begin_suite from TestUtils with results, "Ruby translation round-trip"
+
+    Note:
+    Representative program: a def with params + return, an if/elsif/else/end, an
+    .each do |x| block, a multiple assignment, a method call, and an array + hash
+    literal. Newlines separate the statements.
+    :End Note
+    Let source be "def add(a, b)\nreturn a + b\nend\ntotal = add(3, 4)\nif total > 10\nputs total\nelsif total > 5\nputs total\nelse\nputs 0\nend\nnums = [1, 2, 3]\nnums.each do |x|\nputs x\nend\na, b = 1, 2\nputs total\nopts = { name: \"ruby\", n: 3 }\n"
+
+    Note: --- Stage 0-2: source -> HIR (lex, parse, lower) ---
+    Let lexer be proc create_ruby_lexer from RubyLexer with source
+    proc assert_not_null from TestUtils with results, "lexer created", lexer
+
+    Let parser be proc create_ruby_parser from RubyParser with lexer
+    proc assert_not_null from TestUtils with results, "parser created", parser
+
+    Let ast be proc parse_ruby from RubyParser with parser
+    proc assert_not_null from TestUtils with results, "parser produced Ruby AST", ast
+
+    Let hir1 be proc translate_ruby_to_hir from RubyFrontend with ast
+    proc assert_not_null from TestUtils with results, "frontend produced HIR module", hir1
+
+    Note: Module must expose a non-empty declaration list (the top-level statements).
+    Let declarations be proc hir_get_declarations from HIR with hir1
+    proc assert_not_null from TestUtils with results, "HIR module has declarations", declarations
+    Let decl_count be proc list_length from List with declarations
+    proc assert_greater_than_or_equal from TestUtils with results, "module has several top-level declarations", decl_count, 5
+
+    Note: --- def: located by kind, name + param count checked ---
+    Let func_node be proc find_decl with hir1, HIR.HIR_FUNCTION
+    proc assert_not_null from TestUtils with results, "function node present", func_node
+    Let func_name be proc hir_get_function_name from HIR with func_node
+    Let func_name_ok be proc string_equals from StringCore with func_name, "add"
+    proc assert_equal from TestUtils with results, "function name is 'add'", func_name_ok, 1
+    Let func_params be proc hir_get_parameters from HIR with func_node
+    Let func_param_list be proc hir_get_parameter_list from HIR with func_params
+    Let func_param_count be proc list_length from List with func_param_list
+    proc assert_equal from TestUtils with results, "function 'add' has 2 parameters", func_param_count, 2
+
+    Note: --- if/elsif/else: located by kind, condition + else present ---
+    Let if_node be proc find_decl with hir1, HIR.HIR_IF
+    proc assert_not_null from TestUtils with results, "if statement node present", if_node
+    Let if_cond be proc hir_get_if_condition from HIR with if_node
+    proc assert_not_null from TestUtils with results, "if statement has a condition", if_cond
+    Let if_cond_kind be proc hir_node_type from HIR with if_cond
+    Let if_cond_is_binary be 0
+    If if_cond_kind is equal to HIR.HIR_BINARY_EXPR:
+        Set if_cond_is_binary to 1
+    End If
+    proc assert_equal from TestUtils with results, "if condition is a binary expression", if_cond_is_binary, 1
+    Let if_else be proc hir_get_if_else from HIR with if_node
+    proc assert_not_null from TestUtils with results, "if statement has an elsif/else tail", if_else
+    Note: the tail is the elsif (a nested HIR if tagged ruby_elsif).
+    Let elsif_kind be proc hir_node_type from HIR with if_else
+    Let elsif_is_if be 0
+    If elsif_kind is equal to HIR.HIR_IF:
+        Set elsif_is_if to 1
+    End If
+    proc assert_equal from TestUtils with results, "elsif tail is a nested if", elsif_is_if, 1
+
+    Note: --- .each do |x| block: a call carrying a block with one block param ---
+    Let call_block_stmt be proc find_call_with_block with hir1
+    proc assert_not_null from TestUtils with results, "call carrying a block present", call_block_stmt
+    Let block_node be proc find_call_block with call_block_stmt
+    proc assert_not_null from TestUtils with results, "trailing block present on call", block_node
+    Let block_params be proc hir_get_lambda_parameters from HIR with block_node
+    Let block_param_list be proc hir_get_parameter_list from HIR with block_params
+    Let block_param_count be proc list_length from List with block_param_list
+    proc assert_equal from TestUtils with results, "block has one parameter |x|", block_param_count, 1
+    Let each_callee_kind be proc call_callee_kind with call_block_stmt
+    Let each_is_member be 0
+    If each_callee_kind is equal to HIR.HIR_MEMBER_EXPR:
+        Set each_is_member to 1
+    End If
+    proc assert_equal from TestUtils with results, "block call target is a member access", each_is_member, 1
+
+    Note: --- multiple assignment: a block tagged ruby_multiple_assign, two targets ---
+    Let multi_node be proc find_multiple_assign with hir1
+    proc assert_not_null from TestUtils with results, "multiple-assignment node present", multi_node
+    Let multi_stmts be proc hir_get_block_statements from HIR with multi_node
+    Let multi_count be proc list_length from List with multi_stmts
+    proc assert_equal from TestUtils with results, "multiple assignment has 2 targets", multi_count, 2
+
+    Note: --- method call: an expression statement wrapping a call ---
+    Let call_node be proc find_call_stmt with hir1
+    proc assert_not_null from TestUtils with results, "method call node present", call_node
+
+    Note: --- array + hash literals: a variable's initializer is a list / map ---
+    Let array_found be proc find_initializer_kind with hir1, HIR.HIR_LIST_LITERAL
+    proc assert_not_null from TestUtils with results, "array literal initializer present", array_found
+    Let array_elems be proc hir_get_list_elements from HIR with array_found
+    Let array_count be proc list_length from List with array_elems
+    proc assert_equal from TestUtils with results, "array literal has 3 elements", array_count, 3
+
+    Let hash_found be proc find_initializer_kind with hir1, HIR.HIR_MAP_LITERAL
+    proc assert_not_null from TestUtils with results, "hash literal initializer present", hash_found
+    Let hash_entries be proc hir_get_map_entries from HIR with hash_found
+    Let hash_count be proc list_length from List with hash_entries
+    proc assert_equal from TestUtils with results, "hash literal has 2 entries", hash_count, 2
+
+    Note: --- Stage 3: HIR -> Ruby text ---
+    Let emitted be proc generate_ruby_code from RubyBackend with hir1
+    proc assert_not_null from TestUtils with results, "backend produced Ruby text", emitted
+    Let emitted_len be proc string_length from StringCore with emitted
+    proc assert_greater_than from TestUtils with results, "emitted Ruby is non-empty", emitted_len, 0
+
+    Note: --- Stage 4: re-run the pipeline on the emitted text -> HIR2 ---
+    Let hir2 be proc source_to_hir with emitted
+    proc assert_not_null from TestUtils with results, "re-parse of emitted Ruby produced HIR", hir2
+    Let decls2 be proc hir_get_declarations from HIR with hir2
+    Let decl2_count be proc list_length from List with decls2
+    proc assert_greater_than_or_equal from TestUtils with results, "round-trip module has declarations", decl2_count, 5
+
+    Note: --- Stage 5: structural equality on the key constructs ---
+    Let func2 be proc find_decl with hir2, HIR.HIR_FUNCTION
+    Let func_kind_ok be proc same_kind with func_node, func2
+    proc assert_equal from TestUtils with results, "round-trip preserves function node", func_kind_ok, 1
+    Let func2_name be proc hir_get_function_name from HIR with func2
+    Let func2_name_ok be proc string_equals from StringCore with func2_name, "add"
+    proc assert_equal from TestUtils with results, "round-trip preserves function name 'add'", func2_name_ok, 1
+    Let func2_params be proc hir_get_parameters from HIR with func2
+    Let func2_param_list be proc hir_get_parameter_list from HIR with func2_params
+    Let func2_param_count be proc list_length from List with func2_param_list
+    proc assert_equal from TestUtils with results, "round-trip preserves 2 parameters", func2_param_count, 2
+
+    Let if2 be proc find_decl with hir2, HIR.HIR_IF
+    Let if_kind_ok be proc same_kind with if_node, if2
+    proc assert_equal from TestUtils with results, "round-trip preserves if statement node", if_kind_ok, 1
+    Let if2_else be proc hir_get_if_else from HIR with if2
+    proc assert_not_null from TestUtils with results, "round-trip preserves elsif/else tail", if2_else
+
+    Let call_block2 be proc find_call_with_block with hir2
+    Let cb_kind_ok be proc same_kind with call_block_stmt, call_block2
+    proc assert_equal from TestUtils with results, "round-trip preserves block-bearing call", cb_kind_ok, 1
+    Let block2 be proc find_call_block with call_block2
+    proc assert_not_null from TestUtils with results, "round-trip preserves trailing block", block2
+    Let block2_params be proc hir_get_lambda_parameters from HIR with block2
+    Let block2_param_list be proc hir_get_parameter_list from HIR with block2_params
+    Let block2_param_count be proc list_length from List with block2_param_list
+    proc assert_equal from TestUtils with results, "round-trip preserves block parameter |x|", block2_param_count, 1
+
+    Let multi2 be proc find_multiple_assign with hir2
+    proc assert_not_null from TestUtils with results, "round-trip preserves multiple assignment", multi2
+    Let multi2_stmts be proc hir_get_block_statements from HIR with multi2
+    Let multi2_count be proc list_length from List with multi2_stmts
+    proc assert_equal from TestUtils with results, "round-trip preserves 2 assignment targets", multi2_count, 2
+
+    Let array2 be proc find_initializer_kind with hir2, HIR.HIR_LIST_LITERAL
+    proc assert_not_null from TestUtils with results, "round-trip preserves array literal", array2
+    Let array2_elems be proc hir_get_list_elements from HIR with array2
+    Let array2_count be proc list_length from List with array2_elems
+    proc assert_equal from TestUtils with results, "round-trip preserves 3 array elements", array2_count, 3
+
+    Let hash2 be proc find_initializer_kind with hir2, HIR.HIR_MAP_LITERAL
+    proc assert_not_null from TestUtils with results, "round-trip preserves hash literal", hash2
+    Let hash2_entries be proc hir_get_map_entries from HIR with hash2
+    Let hash2_count be proc list_length from List with hash2_entries
+    proc assert_equal from TestUtils with results, "round-trip preserves 2 hash entries", hash2_count, 2
+
+    proc print_summary from TestUtils with results
+    Let failed be proc get_failed from TestUtils with results
+    proc destroy_test_results from TestUtils with results
+
+    Return failed
+End Process
+
+@Reasoning:
+The .each block call appears as a bare method-call statement (an expression
+statement wrapping a HIR call) that carries a trailing block argument. This helper
+scans declarations for the first expression statement whose inner call carries a
+"ruby_call_block"-tagged argument and returns that call, distinguishing it from the
+plain "puts" calls that have no block.
+@End Reasoning
+Process called "find_call_with_block" takes module as Integer returns Integer:
+    If module is equal to 0:
+        Return 0
+    End If
+    Let declarations be proc hir_get_declarations from HIR with module
+    If declarations is equal to 0:
+        Return 0
+    End If
+    Let count be proc list_length from List with declarations
+    Let i be 0
+    While i is less than count:
+        Let decl be proc list_get from List with declarations, i
+        Let decl_kind be proc hir_node_type from HIR with decl
+        If decl_kind is equal to HIR.HIR_EXPR_STMT:
+            Let inner be proc hir_get_expression_statement_expr from HIR with decl
+            Let inner_kind be proc hir_node_type from HIR with inner
+            If inner_kind is equal to HIR.HIR_CALL_EXPR:
+                Let has_block be proc find_call_block with inner
+                If has_block is not equal to 0:
+                    Return inner
+                End If
+            End If
+        End If
+        Set i to i plus 1
+    End While
+    Return 0
+End Process
+
+@Reasoning:
+The array and hash literals are bound as the initializer (right-hand side) of an
+assignment expression statement. This helper scans declarations for the first
+expression statement whose inner assignment's right-hand side is a node of the
+requested kind (HIR_LIST_LITERAL or HIR_MAP_LITERAL) and returns that literal node.
+@End Reasoning
+Process called "find_initializer_kind" takes module as Integer, kind as Integer returns Integer:
+    If module is equal to 0:
+        Return 0
+    End If
+    Let declarations be proc hir_get_declarations from HIR with module
+    If declarations is equal to 0:
+        Return 0
+    End If
+    Let count be proc list_length from List with declarations
+    Let i be 0
+    While i is less than count:
+        Let decl be proc list_get from List with declarations, i
+        Let decl_kind be proc hir_node_type from HIR with decl
+        If decl_kind is equal to HIR.HIR_EXPR_STMT:
+            Let inner be proc hir_get_expression_statement_expr from HIR with decl
+            Let inner_kind be proc hir_node_type from HIR with inner
+            If inner_kind is equal to HIR.HIR_ASSIGN_EXPR:
+                Let rhs be proc hir_get_assign_rhs from HIR with inner
+                Let rhs_kind be proc hir_node_type from HIR with rhs
+                If rhs_kind is equal to kind:
+                    Return rhs
+                End If
+            End If
+        End If
+        Set i to i plus 1
+    End While
+    Return 0
+End Process
