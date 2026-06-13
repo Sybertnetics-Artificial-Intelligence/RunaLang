@@ -147,7 +147,7 @@ Process called "set_translation_error" takes context as Integer, message as Inte
     Let new_error be proc allocate from Layout with msg_length plus 1
 
     If new_error is not equal to 0:
-        proc memory_copy from Layout with new_error, 0, message, 0, msg_length
+        proc memory_copy from Layout with new_error, message, msg_length
         proc memory_set_byte from Layout with new_error, msg_length, 0
     End If
 
@@ -347,9 +347,11 @@ Process called "translate_expression_to_hir" takes context as Integer, expr_node
         Return proc translate_cast_expr with context, expr_node
     End If
 
-    Note: Unknown expression type - create error HIR node
+    Note: Unknown expression type - record the error and return a null HIR.
+    Note: A null result propagates the failure to translate_c_to_hir, which
+    Note: checks has_translation_error and returns 0 for the whole program.
     proc set_translation_error with context, "Unknown expression type encountered"
-    Return proc create_hir_error_node from HIR with "UnknownExpression"
+    Return 0
 End Process
 
 @Reasoning:
@@ -835,9 +837,18 @@ Process called "translate_statement_to_hir" takes context as Integer, stmt_node 
         Return proc translate_label_stmt with context, stmt_node
     End If
 
-    Note: Unknown statement type - create error HIR node
+    Note: Local variable declaration appearing in a block (C99 mixed
+    Note: declarations-and-statements). The parser emits a C_VARIABLE node
+    Note: inside a compound statement; it lowers through the same
+    Note: variable translator used for file-scope variables.
+    If node_type is equal to C_VARIABLE from Parser:
+        Return proc translate_variable_to_hir with context, stmt_node
+    End If
+
+    Note: Unknown statement type - record the error and return a null HIR.
+    Note: The null propagates up so translate_c_to_hir fails the program.
     proc set_translation_error with context, "Unknown statement type encountered"
-    Return proc create_hir_error_node from HIR with "UnknownStatement"
+    Return 0
 End Process
 
 @Reasoning:
@@ -1356,6 +1367,58 @@ Process called "translate_function_to_hir" takes context as Integer, func_node a
     Return hir_dict
 End Process
 
+@Reasoning:
+Struct/union/enum tag definition: `struct Tag { type field; ... };`. The
+parser produces a C_STRUCT node carrying the tag name and a child list of
+C_VARIABLE member declarations. The HIR records the tag name and a member
+list so a backend can re-emit the aggregate and a type checker can resolve
+member access against it.
+@End Reasoning
+@Implementation:
+Read tag name (offset 8) and member children (offset 32). Build an HIR
+dictionary tagged "c_struct" with the name and a "members" list; each
+member is translated through translate_variable_to_hir (members share the
+C_VARIABLE shape: name + type_info, no initializer).
+@End Implementation
+Process called "translate_struct_to_hir" takes context as Integer, struct_node as Integer returns Integer:
+    Note: Translate struct/union/enum definition to HIR
+
+    Let hir_dict be proc create_hir_dictionary_literal from HIR
+
+    Let type_value be proc create_hir_string_literal from HIR with "c_struct"
+    proc add_dictionary_entry from HIR with hir_dict, "_type", type_value
+
+    Let struct_name be proc memory_get_int64 from Layout with struct_node, 8
+
+    If struct_name is not equal to 0:
+        Let name_hir be proc create_hir_string_literal from HIR with struct_name
+        proc add_dictionary_entry from HIR with hir_dict, "name", name_hir
+    End If
+
+    Let members_hir be proc create_hir_list_literal from HIR
+    Let children be proc memory_get_int64 from Layout with struct_node, 32
+    Let count be proc size from List with children
+    Let index be 0
+
+    While index is less than count:
+        Let member_node be proc get_at from List with children, index
+        Let member_kind be proc memory_get_int64 from Layout with member_node, 0
+
+        If member_kind is equal to C_VARIABLE from Parser:
+            Let member_hir be proc translate_variable_to_hir with context, member_node
+            If member_hir is not equal to 0:
+                proc add_list_element from HIR with members_hir, member_hir
+            End If
+        End If
+
+        Set index to index plus 1
+    End While
+
+    proc add_dictionary_entry from HIR with hir_dict, "members", members_hir
+
+    Return hir_dict
+End Process
+
 Note: ============================================================================
 Note: Program Translation
 Note: ============================================================================
@@ -1418,6 +1481,15 @@ Process called "translate_program_to_hir" takes context as Integer, program_node
                 End If
             End If
 
+            Note: Struct/union/enum tag definition
+            If node_type is equal to C_STRUCT from Parser:
+                Let struct_hir be proc translate_struct_to_hir with context, decl_node
+
+                If struct_hir is not equal to 0:
+                    proc add_list_element from HIR with decls_hir, struct_hir
+                End If
+            End If
+
             Set index to index plus 1
         End While
 
@@ -1457,14 +1529,14 @@ Process called "translate_c_to_hir" takes c_ast as Integer returns Integer:
 
     Let hir_result be proc translate_program_to_hir with context, c_ast
 
-    Let has_error be proc has_translation_error from context
+    Let has_error be proc has_translation_error with context
 
     If has_error is equal to 1:
-        proc destroy_translation_context from context
+        proc destroy_translation_context with context
         Return 0
     End If
 
-    proc destroy_translation_context from context
+    proc destroy_translation_context with context
 
     Return hir_result
 End Process

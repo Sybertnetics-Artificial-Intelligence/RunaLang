@@ -148,6 +148,14 @@ Constant TOKEN_FLOAT_LITERAL as Integer is 142
 Constant TOKEN_CHAR_LITERAL as Integer is 143
 Constant TOKEN_STRING_LITERAL as Integer is 144
 
+Note: Preprocessor line terminator. The lexer emits this only while it is
+Note: inside a preprocessor directive line (pp_mode); outside directives a
+Note: newline is ordinary whitespace. This lets the directive parser bound a
+Note: macro body / pragma content / unknown directive to a single source line
+Note: exactly as the C preprocessor requires, without polluting the token
+Note: stream that the declaration/statement/expression parsers consume.
+Constant TOKEN_NEWLINE as Integer is 145
+
 Note: ============================================================================
 Note: Lexer State Structure
 Note: ============================================================================
@@ -161,12 +169,13 @@ without re-lexing. error_message is sticky on first lexing failure.
 @End Reasoning
 
 @Implementation:
-72-byte record (9 x i64) at offsets 0..64: source (StringCore handle),
+80-byte record (10 x i64) at offsets 0..72: source (StringCore handle),
 length (cached source byte count), position (byte cursor, 0-based),
 line (1-based), column (1-based), token_start (cursor at last token
 start), token_type (last emitted token type), token_lexeme (owned
 StringCore copy of last lexeme - freed by destroy_c_lexer),
-error_message (owned StringCore).
+error_message (owned StringCore), pp_mode (1 while lexing inside a
+preprocessor directive line, 0 otherwise).
 @End Implementation
 
 Type called "CLexer":
@@ -179,6 +188,7 @@ Type called "CLexer":
     token_type as Integer     Note: Current token type
     token_lexeme as Integer   Note: Current token lexeme
     error_message as Integer  Note: Error message (if any)
+    pp_mode as Integer        Note: 1 while inside a preprocessor directive line
 End Type
 
 Note: ============================================================================
@@ -208,7 +218,7 @@ Process called "create_c_lexer" takes source as Integer returns Integer:
     Track line and column for error reporting.
     @End Reasoning
 
-    Let lexer_size be 72  Note: CLexer: 9 fields × 8 bytes
+    Let lexer_size be 80  Note: CLexer: 10 fields × 8 bytes
     Let lexer be proc allocate from Layout with lexer_size
 
     If lexer is equal to 0:
@@ -226,6 +236,7 @@ Process called "create_c_lexer" takes source as Integer returns Integer:
     proc memory_set_int64 from Layout with lexer, 48, 0   Note: token_type = 0
     proc memory_set_int64 from Layout with lexer, 56, 0   Note: token_lexeme = null
     proc memory_set_int64 from Layout with lexer, 64, 0   Note: error_message = null
+    proc memory_set_int64 from Layout with lexer, 72, 0   Note: pp_mode = 0
 
     Return lexer
 End Process
@@ -403,7 +414,7 @@ and 'a'..'f' (97..102) via nested range checks.
 Process called "is_hex_digit" takes char as Integer returns Integer:
     Note: Check if character is hex digit (0-9, a-f, A-F)
 
-    Let is_dec be proc is_digit from char
+    Let is_dec be proc is_digit with char
 
     If is_dec is equal to 1:
         Return 1
@@ -468,24 +479,27 @@ is_alpha then is_digit; either returns 1 gives 1.
 Process called "is_alnum" takes char as Integer returns Integer:
     Note: Check if character is alphanumeric or underscore
 
-    Let alpha be proc is_alpha from char
+    Let alpha be proc is_alpha with char
 
     If alpha is equal to 1:
         Return 1
     End If
 
-    Let digit be proc is_digit from char
+    Let digit be proc is_digit with char
 
     Return digit
 End Process
 
 @Reasoning:
-C whitespace per spec: space, tab, LF, CR. Form-feed and vertical-tab
-are also whitespace in C99 but the practical corpus excludes them.
+C whitespace per the C99/C11 standard: space, horizontal tab, line feed,
+carriage return, form feed, and vertical tab. All six are recognised so
+the lexer skips every standard whitespace character a conforming C
+translation unit may contain.
 @End Reasoning
 
 @Implementation:
-Four equality checks against 32, 9, 10, 13.
+Six equality checks against 32 (space), 9 (tab), 10 (LF), 13 (CR),
+12 (form feed), and 11 (vertical tab).
 @End Implementation
 
 Process called "is_whitespace" takes char as Integer returns Integer:
@@ -507,6 +521,14 @@ Process called "is_whitespace" takes char as Integer returns Integer:
         Return 1
     End If
 
+    If char is equal to 12:  Note: form feed
+        Return 1
+    End If
+
+    If char is equal to 11:  Note: vertical tab
+        Return 1
+    End If
+
     Return 0
 End Process
 
@@ -516,25 +538,39 @@ Note: ==========================================================================
 
 @Reasoning:
 Inter-token whitespace skip. Consumes spaces/tabs/newlines/CRs via
-advance_char so line/column stay accurate.
+advance_char so line/column stay accurate. While inside a preprocessor
+directive line (pp_mode), a line-feed is NOT skipped: it terminates the
+directive and must surface as a TOKEN_NEWLINE so the directive parser can
+bound the macro body / pragma content to a single line.
 @End Reasoning
 
 @Implementation:
-Loop: peek + is_whitespace; on non-ws break; else advance_char.
+Reads pp_mode (offset 72). Loop: peek char; on a line-feed (10) while
+pp_mode is active, break so next_token can emit TOKEN_NEWLINE; otherwise
+if the char is whitespace, advance, else break.
 @End Implementation
 
 Process called "skip_whitespace" takes lexer as Integer returns Integer:
     Note: Skip whitespace characters
 
+    Let pp_mode be proc memory_get_int64 from Layout with lexer, 72
+
     While 1 is equal to 1:
-        Let char be proc peek_char from lexer
-        Let is_ws be proc is_whitespace from char
+        Let char be proc peek_char with lexer
+
+        If pp_mode is equal to 1:
+            If char is equal to 10:  Note: line feed terminates a directive line
+                Break
+            End If
+        End If
+
+        Let is_ws be proc is_whitespace with char
 
         If is_ws is equal to 0:
             Break
         End If
 
-        proc advance_char from lexer
+        proc advance_char with lexer
     End While
 
     Return 1
@@ -555,7 +591,7 @@ Process called "skip_line_comment" takes lexer as Integer returns Integer:
     Note: Skip // comment until end of line
 
     While 1 is equal to 1:
-        Let char be proc peek_char from lexer
+        Let char be proc peek_char with lexer
 
         If char is equal to 0:  Note: EOF
             Break
@@ -565,7 +601,7 @@ Process called "skip_line_comment" takes lexer as Integer returns Integer:
             Break
         End If
 
-        proc advance_char from lexer
+        proc advance_char with lexer
     End While
 
     Return 1
@@ -587,23 +623,23 @@ Process called "skip_block_comment" takes lexer as Integer returns Integer:
     Note: Skip /* */ block comment
 
     While 1 is equal to 1:
-        Let char be proc peek_char from lexer
+        Let char be proc peek_char with lexer
 
         If char is equal to 0:  Note: EOF
             Return 0  Note: Unterminated comment
         End If
 
         If char is equal to 42:  Note: *
-            proc advance_char from lexer
-            Let next_char be proc peek_char from lexer
+            proc advance_char with lexer
+            Let next_char be proc peek_char with lexer
 
             If next_char is equal to 47:  Note: /
-                proc advance_char from lexer
+                proc advance_char with lexer
                 Return 1  Note: Comment ended
             End If
         End If
 
-        proc advance_char from lexer
+        proc advance_char with lexer
     End While
 
     Return 1
@@ -862,14 +898,14 @@ Process called "scan_identifier" takes lexer as Integer returns Integer:
     proc memory_set_int64 from Layout with lexer, 40, position  Note: token_start
 
     While 1 is equal to 1:
-        Let char be proc peek_char from lexer
-        Let is_valid be proc is_alnum from char
+        Let char be proc peek_char with lexer
+        Let is_valid be proc is_alnum with char
 
         If is_valid is equal to 0:
             Break
         End If
 
-        proc advance_char from lexer
+        proc advance_char with lexer
     End While
 
     Let token_start be proc memory_get_int64 from Layout with lexer, 40
@@ -931,25 +967,25 @@ Process called "scan_number" takes lexer as Integer returns Integer:
     proc memory_set_int64 from Layout with lexer, 40, position
 
     Let is_float be 0
-    Let char be proc peek_char from lexer
+    Let char be proc peek_char with lexer
 
     Note: Check for hex literal (0x or 0X)
     If char is equal to 48:  Note: 0
-        proc advance_char from lexer
-        Let next_char be proc peek_char from lexer
+        proc advance_char with lexer
+        Let next_char be proc peek_char with lexer
 
         If next_char is equal to 120:  Note: x
-            proc advance_char from lexer
+            proc advance_char with lexer
 
             While 1 is equal to 1:
-                Let hex_char be proc peek_char from lexer
-                Let is_hex be proc is_hex_digit from hex_char
+                Let hex_char be proc peek_char with lexer
+                Let is_hex be proc is_hex_digit with hex_char
 
                 If is_hex is equal to 0:
                     Break
                 End If
 
-                proc advance_char from lexer
+                proc advance_char with lexer
             End While
 
             proc memory_set_int64 from Layout with lexer, 48, TOKEN_INTEGER
@@ -957,17 +993,17 @@ Process called "scan_number" takes lexer as Integer returns Integer:
         End If
 
         If next_char is equal to 88:  Note: X
-            proc advance_char from lexer
+            proc advance_char with lexer
 
             While 1 is equal to 1:
-                Set hex_char to proc peek_char from lexer
-                Set is_hex to proc is_hex_digit from hex_char
+                Set hex_char to proc peek_char with lexer
+                Set is_hex to proc is_hex_digit with hex_char
 
                 If is_hex is equal to 0:
                     Break
                 End If
 
-                proc advance_char from lexer
+                proc advance_char with lexer
             End While
 
             proc memory_set_int64 from Layout with lexer, 48, TOKEN_INTEGER
@@ -977,163 +1013,163 @@ Process called "scan_number" takes lexer as Integer returns Integer:
 
     Note: Scan digits
     While 1 is equal to 1:
-        Let digit_char be proc peek_char from lexer
-        Let is_dec be proc is_digit from digit_char
+        Let digit_char be proc peek_char with lexer
+        Let is_dec be proc is_digit with digit_char
 
         If is_dec is equal to 0:
             Break
         End If
 
-        proc advance_char from lexer
+        proc advance_char with lexer
     End While
 
     Note: Check for decimal point (float)
-    Let dot_char be proc peek_char from lexer
+    Let dot_char be proc peek_char with lexer
 
     If dot_char is equal to 46:  Note: .
         Set is_float to 1
-        proc advance_char from lexer
+        proc advance_char with lexer
 
         While 1 is equal to 1:
-            Let frac_char be proc peek_char from lexer
-            Set is_dec to proc is_digit from frac_char
+            Let frac_char be proc peek_char with lexer
+            Set is_dec to proc is_digit with frac_char
 
             If is_dec is equal to 0:
                 Break
             End If
 
-            proc advance_char from lexer
+            proc advance_char with lexer
         End While
     End If
 
     Note: Check for exponent (e or E)
-    Let exp_char be proc peek_char from lexer
+    Let exp_char be proc peek_char with lexer
 
     If exp_char is equal to 101:  Note: e
         Set is_float to 1
-        proc advance_char from lexer
+        proc advance_char with lexer
 
-        Let sign_char be proc peek_char from lexer
+        Let sign_char be proc peek_char with lexer
 
         If sign_char is equal to 43:  Note: +
-            proc advance_char from lexer
+            proc advance_char with lexer
         End If
 
         If sign_char is equal to 45:  Note: -
-            proc advance_char from lexer
+            proc advance_char with lexer
         End If
 
         While 1 is equal to 1:
-            Let exp_digit be proc peek_char from lexer
-            Set is_dec to proc is_digit from exp_digit
+            Let exp_digit be proc peek_char with lexer
+            Set is_dec to proc is_digit with exp_digit
 
             If is_dec is equal to 0:
                 Break
             End If
 
-            proc advance_char from lexer
+            proc advance_char with lexer
         End While
     End If
 
     If exp_char is equal to 69:  Note: E
         Set is_float to 1
-        proc advance_char from lexer
+        proc advance_char with lexer
 
-        Set sign_char to proc peek_char from lexer
+        Set sign_char to proc peek_char with lexer
 
         If sign_char is equal to 43:  Note: +
-            proc advance_char from lexer
+            proc advance_char with lexer
         End If
 
         If sign_char is equal to 45:  Note: -
-            proc advance_char from lexer
+            proc advance_char with lexer
         End If
 
         While 1 is equal to 1:
-            Set exp_digit to proc peek_char from lexer
-            Set is_dec to proc is_digit from exp_digit
+            Set exp_digit to proc peek_char with lexer
+            Set is_dec to proc is_digit with exp_digit
 
             If is_dec is equal to 0:
                 Break
             End If
 
-            proc advance_char from lexer
+            proc advance_char with lexer
         End While
     End If
 
     Note: Check for suffix (f, l, u, ll, ul, ull)
-    Let suffix_char be proc peek_char from lexer
+    Let suffix_char be proc peek_char with lexer
 
     If suffix_char is equal to 102:  Note: f
         Set is_float to 1
-        proc advance_char from lexer
+        proc advance_char with lexer
     End If
 
     If suffix_char is equal to 70:  Note: F
         Set is_float to 1
-        proc advance_char from lexer
+        proc advance_char with lexer
     End If
 
     If suffix_char is equal to 108:  Note: l or ll
-        proc advance_char from lexer
-        Let next_suffix be proc peek_char from lexer
+        proc advance_char with lexer
+        Let next_suffix be proc peek_char with lexer
 
         If next_suffix is equal to 108:  Note: second l
-            proc advance_char from lexer
+            proc advance_char with lexer
         End If
     End If
 
     If suffix_char is equal to 76:  Note: L or LL
-        proc advance_char from lexer
-        Set next_suffix to proc peek_char from lexer
+        proc advance_char with lexer
+        Set next_suffix to proc peek_char with lexer
 
         If next_suffix is equal to 76:  Note: second L
-            proc advance_char from lexer
+            proc advance_char with lexer
         End If
     End If
 
     If suffix_char is equal to 117:  Note: u or ul or ull
-        proc advance_char from lexer
-        Set next_suffix to proc peek_char from lexer
+        proc advance_char with lexer
+        Set next_suffix to proc peek_char with lexer
 
         If next_suffix is equal to 108:  Note: l
-            proc advance_char from lexer
-            Let third_suffix be proc peek_char from lexer
+            proc advance_char with lexer
+            Let third_suffix be proc peek_char with lexer
 
             If third_suffix is equal to 108:  Note: second l
-                proc advance_char from lexer
+                proc advance_char with lexer
             End If
         End If
 
         If next_suffix is equal to 76:  Note: L
-            proc advance_char from lexer
-            Set third_suffix to proc peek_char from lexer
+            proc advance_char with lexer
+            Set third_suffix to proc peek_char with lexer
 
             If third_suffix is equal to 76:  Note: second L
-                proc advance_char from lexer
+                proc advance_char with lexer
             End If
         End If
     End If
 
     If suffix_char is equal to 85:  Note: U or UL or ULL
-        proc advance_char from lexer
-        Set next_suffix to proc peek_char from lexer
+        proc advance_char with lexer
+        Set next_suffix to proc peek_char with lexer
 
         If next_suffix is equal to 108:  Note: l
-            proc advance_char from lexer
-            Set third_suffix to proc peek_char from lexer
+            proc advance_char with lexer
+            Set third_suffix to proc peek_char with lexer
 
             If third_suffix is equal to 108:  Note: second l
-                proc advance_char from lexer
+                proc advance_char with lexer
             End If
         End If
 
         If next_suffix is equal to 76:  Note: L
-            proc advance_char from lexer
-            Set third_suffix to proc peek_char from lexer
+            proc advance_char with lexer
+            Set third_suffix to proc peek_char with lexer
 
             If third_suffix is equal to 76:  Note: second L
-                proc advance_char from lexer
+                proc advance_char with lexer
             End If
         End If
     End If
@@ -1178,10 +1214,10 @@ Process called "scan_char_literal" takes lexer as Integer returns Integer:
     Let position be proc memory_get_int64 from Layout with lexer, 16
     proc memory_set_int64 from Layout with lexer, 40, position
 
-    proc advance_char from lexer  Note: skip opening '
+    proc advance_char with lexer  Note: skip opening '
 
     While 1 is equal to 1:
-        Let char be proc peek_char from lexer
+        Let char be proc peek_char with lexer
 
         If char is equal to 0:  Note: EOF
             Return TOKEN_ERROR
@@ -1192,16 +1228,16 @@ Process called "scan_char_literal" takes lexer as Integer returns Integer:
         End If
 
         If char is equal to 39:  Note: closing '
-            proc advance_char from lexer
+            proc advance_char with lexer
             Break
         End If
 
         If char is equal to 92:  Note: backslash (escape sequence)
-            proc advance_char from lexer
-            proc advance_char from lexer  Note: skip escaped character
+            proc advance_char with lexer
+            proc advance_char with lexer  Note: skip escaped character
         End If
 
-        proc advance_char from lexer
+        proc advance_char with lexer
     End While
 
     proc memory_set_int64 from Layout with lexer, 48, TOKEN_CHAR_LITERAL
@@ -1233,10 +1269,10 @@ Process called "scan_string_literal" takes lexer as Integer returns Integer:
     Let position be proc memory_get_int64 from Layout with lexer, 16
     proc memory_set_int64 from Layout with lexer, 40, position
 
-    proc advance_char from lexer  Note: skip opening "
+    proc advance_char with lexer  Note: skip opening "
 
     While 1 is equal to 1:
-        Let char be proc peek_char from lexer
+        Let char be proc peek_char with lexer
 
         If char is equal to 0:  Note: EOF
             Return TOKEN_ERROR
@@ -1247,16 +1283,16 @@ Process called "scan_string_literal" takes lexer as Integer returns Integer:
         End If
 
         If char is equal to 34:  Note: closing "
-            proc advance_char from lexer
+            proc advance_char with lexer
             Break
         End If
 
         If char is equal to 92:  Note: backslash (escape sequence)
-            proc advance_char from lexer
-            proc advance_char from lexer  Note: skip escaped character
+            proc advance_char with lexer
+            proc advance_char with lexer  Note: skip escaped character
         End If
 
-        proc advance_char from lexer
+        proc advance_char with lexer
     End While
 
     proc memory_set_int64 from Layout with lexer, 48, TOKEN_STRING_LITERAL
@@ -1289,22 +1325,26 @@ Process called "scan_preprocessor" takes lexer as Integer returns Integer:
     Let position be proc memory_get_int64 from Layout with lexer, 16
     proc memory_set_int64 from Layout with lexer, 40, position
 
-    proc advance_char from lexer  Note: skip #
+    Note: Entering a preprocessor directive line: enable pp_mode so the
+    Note: trailing newline is emitted as TOKEN_NEWLINE, bounding the directive.
+    proc memory_set_int64 from Layout with lexer, 72, 1
 
-    proc skip_whitespace from lexer
+    proc advance_char with lexer  Note: skip #
+
+    proc skip_whitespace with lexer
 
     Let dir_start be proc memory_get_int64 from Layout with lexer, 16
     Let source be proc memory_get_int64 from Layout with lexer, 0
 
     While 1 is equal to 1:
-        Let char be proc peek_char from lexer
-        Let is_valid be proc is_alpha from char
+        Let char be proc peek_char with lexer
+        Let is_valid be proc is_alpha with char
 
         If is_valid is equal to 0:
             Break
         End If
 
-        proc advance_char from lexer
+        proc advance_char with lexer
     End While
 
     Let dir_end be proc memory_get_int64 from Layout with lexer, 16
@@ -1416,9 +1456,9 @@ Process called "next_token" takes lexer as Integer returns Integer:
     @End Reasoning
 
     While 1 is equal to 1:
-        proc skip_whitespace from lexer
+        proc skip_whitespace with lexer
 
-        Let char be proc peek_char from lexer
+        Let char be proc peek_char with lexer
 
         If char is equal to 0:  Note: EOF
             proc memory_set_int64 from Layout with lexer, 48, TOKEN_EOF
@@ -1427,19 +1467,19 @@ Process called "next_token" takes lexer as Integer returns Integer:
 
         Note: Comments
         If char is equal to 47:  Note: /
-            Let next_char be proc peek_next_char from lexer
+            Let next_char be proc peek_next_char with lexer
 
             If next_char is equal to 47:  Note: //
-                proc advance_char from lexer
-                proc advance_char from lexer
-                proc skip_line_comment from lexer
+                proc advance_char with lexer
+                proc advance_char with lexer
+                proc skip_line_comment with lexer
                 Continue
             End If
 
             If next_char is equal to 42:  Note: /*
-                proc advance_char from lexer
-                proc advance_char from lexer
-                Let result be proc skip_block_comment from lexer
+                proc advance_char with lexer
+                proc advance_char with lexer
+                Let result be proc skip_block_comment with lexer
 
                 If result is equal to 0:
                     proc memory_set_int64 from Layout with lexer, 48, TOKEN_ERROR
@@ -1453,35 +1493,49 @@ Process called "next_token" takes lexer as Integer returns Integer:
         Break
     End While
 
-    Set char to proc peek_char from lexer
+    Set char to proc peek_char with lexer
+
+    Note: Preprocessor line terminator. skip_whitespace stops on a line-feed
+    Note: while pp_mode is active; emit it as TOKEN_NEWLINE, consume it, and
+    Note: leave pp_mode so subsequent lines tokenize normally.
+    Let pp_mode be proc memory_get_int64 from Layout with lexer, 72
+
+    If pp_mode is equal to 1:
+        If char is equal to 10:  Note: line feed
+            proc advance_char with lexer
+            proc memory_set_int64 from Layout with lexer, 72, 0  Note: leave pp_mode
+            proc memory_set_int64 from Layout with lexer, 48, TOKEN_NEWLINE
+            Return TOKEN_NEWLINE
+        End If
+    End If
 
     Note: Identifiers and keywords
-    Let is_id_start be proc is_alpha from char
+    Let is_id_start be proc is_alpha with char
 
     If is_id_start is equal to 1:
-        Return proc scan_identifier from lexer
+        Return proc scan_identifier with lexer
     End If
 
     Note: Numbers
-    Let is_num be proc is_digit from char
+    Let is_num be proc is_digit with char
 
     If is_num is equal to 1:
-        Return proc scan_number from lexer
+        Return proc scan_number with lexer
     End If
 
     Note: Character literals
     If char is equal to 39:  Note: '
-        Return proc scan_char_literal from lexer
+        Return proc scan_char_literal with lexer
     End If
 
     Note: String literals
     If char is equal to 34:  Note: "
-        Return proc scan_string_literal from lexer
+        Return proc scan_string_literal with lexer
     End If
 
     Note: Preprocessor directives
     If char is equal to 35:  Note: #
-        Return proc scan_preprocessor from lexer
+        Return proc scan_preprocessor with lexer
     End If
 
     Note: Single-character and multi-character operators/delimiters
@@ -1489,84 +1543,84 @@ Process called "next_token" takes lexer as Integer returns Integer:
     proc memory_set_int64 from Layout with lexer, 40, position
 
     If char is equal to 40:  Note: (
-        proc advance_char from lexer
+        proc advance_char with lexer
         proc memory_set_int64 from Layout with lexer, 48, TOKEN_LPAREN
         Return TOKEN_LPAREN
     End If
 
     If char is equal to 41:  Note: )
-        proc advance_char from lexer
+        proc advance_char with lexer
         proc memory_set_int64 from Layout with lexer, 48, TOKEN_RPAREN
         Return TOKEN_RPAREN
     End If
 
     If char is equal to 123:  Note: {
-        proc advance_char from lexer
+        proc advance_char with lexer
         proc memory_set_int64 from Layout with lexer, 48, TOKEN_LBRACE
         Return TOKEN_LBRACE
     End If
 
     If char is equal to 125:  Note: }
-        proc advance_char from lexer
+        proc advance_char with lexer
         proc memory_set_int64 from Layout with lexer, 48, TOKEN_RBRACE
         Return TOKEN_RBRACE
     End If
 
     If char is equal to 91:  Note: [
-        proc advance_char from lexer
+        proc advance_char with lexer
         proc memory_set_int64 from Layout with lexer, 48, TOKEN_LBRACKET
         Return TOKEN_LBRACKET
     End If
 
     If char is equal to 93:  Note: ]
-        proc advance_char from lexer
+        proc advance_char with lexer
         proc memory_set_int64 from Layout with lexer, 48, TOKEN_RBRACKET
         Return TOKEN_RBRACKET
     End If
 
     If char is equal to 59:  Note: ;
-        proc advance_char from lexer
+        proc advance_char with lexer
         proc memory_set_int64 from Layout with lexer, 48, TOKEN_SEMICOLON
         Return TOKEN_SEMICOLON
     End If
 
     If char is equal to 44:  Note: ,
-        proc advance_char from lexer
+        proc advance_char with lexer
         proc memory_set_int64 from Layout with lexer, 48, TOKEN_COMMA
         Return TOKEN_COMMA
     End If
 
     If char is equal to 63:  Note: ?
-        proc advance_char from lexer
+        proc advance_char with lexer
         proc memory_set_int64 from Layout with lexer, 48, TOKEN_QUESTION
         Return TOKEN_QUESTION
     End If
 
     If char is equal to 58:  Note: :
-        proc advance_char from lexer
+        proc advance_char with lexer
         proc memory_set_int64 from Layout with lexer, 48, TOKEN_COLON
         Return TOKEN_COLON
     End If
 
     If char is equal to 126:  Note: ~
-        proc advance_char from lexer
+        proc advance_char with lexer
         proc memory_set_int64 from Layout with lexer, 48, TOKEN_TILDE
         Return TOKEN_TILDE
     End If
 
     Note: Operators with multiple forms
     If char is equal to 43:  Note: plus or ++ or +=
-        proc advance_char from lexer
-        Set next_char to proc peek_char from lexer
+        proc advance_char with lexer
+        Set next_char to proc peek_char with lexer
 
         If next_char is equal to 43:  Note: ++
-            proc advance_char from lexer
+            proc advance_char with lexer
             proc memory_set_int64 from Layout with lexer, 48, TOKEN_PLUS_PLUS
             Return TOKEN_PLUS_PLUS
         End If
 
         If next_char is equal to 61:  Note: +=
-            proc advance_char from lexer
+            proc advance_char with lexer
             proc memory_set_int64 from Layout with lexer, 48, TOKEN_PLUS_EQUALS
             Return TOKEN_PLUS_EQUALS
         End If
@@ -1576,23 +1630,23 @@ Process called "next_token" takes lexer as Integer returns Integer:
     End If
 
     If char is equal to 45:  Note: minus or -- or -= or ->
-        proc advance_char from lexer
-        Set next_char to proc peek_char from lexer
+        proc advance_char with lexer
+        Set next_char to proc peek_char with lexer
 
         If next_char is equal to 45:  Note: --
-            proc advance_char from lexer
+            proc advance_char with lexer
             proc memory_set_int64 from Layout with lexer, 48, TOKEN_MINUS_MINUS
             Return TOKEN_MINUS_MINUS
         End If
 
         If next_char is equal to 61:  Note: -=
-            proc advance_char from lexer
+            proc advance_char with lexer
             proc memory_set_int64 from Layout with lexer, 48, TOKEN_MINUS_EQUALS
             Return TOKEN_MINUS_EQUALS
         End If
 
         If next_char is equal to 62:  Note: ->
-            proc advance_char from lexer
+            proc advance_char with lexer
             proc memory_set_int64 from Layout with lexer, 48, TOKEN_ARROW
             Return TOKEN_ARROW
         End If
@@ -1602,11 +1656,11 @@ Process called "next_token" takes lexer as Integer returns Integer:
     End If
 
     If char is equal to 42:  Note: multiplied by or *=
-        proc advance_char from lexer
-        Set next_char to proc peek_char from lexer
+        proc advance_char with lexer
+        Set next_char to proc peek_char with lexer
 
         If next_char is equal to 61:  Note: *=
-            proc advance_char from lexer
+            proc advance_char with lexer
             proc memory_set_int64 from Layout with lexer, 48, TOKEN_STAR_EQUALS
             Return TOKEN_STAR_EQUALS
         End If
@@ -1616,11 +1670,11 @@ Process called "next_token" takes lexer as Integer returns Integer:
     End If
 
     If char is equal to 47:  Note: divided by or /=
-        proc advance_char from lexer
-        Set next_char to proc peek_char from lexer
+        proc advance_char with lexer
+        Set next_char to proc peek_char with lexer
 
         If next_char is equal to 61:  Note: /=
-            proc advance_char from lexer
+            proc advance_char with lexer
             proc memory_set_int64 from Layout with lexer, 48, TOKEN_SLASH_EQUALS
             Return TOKEN_SLASH_EQUALS
         End If
@@ -1630,11 +1684,11 @@ Process called "next_token" takes lexer as Integer returns Integer:
     End If
 
     If char is equal to 37:  Note: modulo by or %=
-        proc advance_char from lexer
-        Set next_char to proc peek_char from lexer
+        proc advance_char with lexer
+        Set next_char to proc peek_char with lexer
 
         If next_char is equal to 61:  Note: %=
-            proc advance_char from lexer
+            proc advance_char with lexer
             proc memory_set_int64 from Layout with lexer, 48, TOKEN_PERCENT_EQUALS
             Return TOKEN_PERCENT_EQUALS
         End If
@@ -1644,11 +1698,11 @@ Process called "next_token" takes lexer as Integer returns Integer:
     End If
 
     If char is equal to 61:  Note: = or ==
-        proc advance_char from lexer
-        Set next_char to proc peek_char from lexer
+        proc advance_char with lexer
+        Set next_char to proc peek_char with lexer
 
         If next_char is equal to 61:  Note: ==
-            proc advance_char from lexer
+            proc advance_char with lexer
             proc memory_set_int64 from Layout with lexer, 48, TOKEN_EQUAL_EQUAL
             Return TOKEN_EQUAL_EQUAL
         End If
@@ -1658,11 +1712,11 @@ Process called "next_token" takes lexer as Integer returns Integer:
     End If
 
     If char is equal to 33:  Note: ! or !=
-        proc advance_char from lexer
-        Set next_char to proc peek_char from lexer
+        proc advance_char with lexer
+        Set next_char to proc peek_char with lexer
 
         If next_char is equal to 61:  Note: !=
-            proc advance_char from lexer
+            proc advance_char with lexer
             proc memory_set_int64 from Layout with lexer, 48, TOKEN_NOT_EQUAL
             Return TOKEN_NOT_EQUAL
         End If
@@ -1672,21 +1726,21 @@ Process called "next_token" takes lexer as Integer returns Integer:
     End If
 
     If char is equal to 60:  Note: is less than or is less than or equal to or shifted left by or <<=
-        proc advance_char from lexer
-        Set next_char to proc peek_char from lexer
+        proc advance_char with lexer
+        Set next_char to proc peek_char with lexer
 
         If next_char is equal to 61:  Note: <=
-            proc advance_char from lexer
+            proc advance_char with lexer
             proc memory_set_int64 from Layout with lexer, 48, TOKEN_LESS_EQUAL
             Return TOKEN_LESS_EQUAL
         End If
 
         If next_char is equal to 60:  Note: shifted left by or <<=
-            proc advance_char from lexer
-            Let third_char be proc peek_char from lexer
+            proc advance_char with lexer
+            Let third_char be proc peek_char with lexer
 
             If third_char is equal to 61:  Note: <<=
-                proc advance_char from lexer
+                proc advance_char with lexer
                 proc memory_set_int64 from Layout with lexer, 48, TOKEN_LESS_LESS_EQUALS
                 Return TOKEN_LESS_LESS_EQUALS
             End If
@@ -1700,21 +1754,21 @@ Process called "next_token" takes lexer as Integer returns Integer:
     End If
 
     If char is equal to 62:  Note: is greater than or is greater than or equal to or shifted right by or >>=
-        proc advance_char from lexer
-        Set next_char to proc peek_char from lexer
+        proc advance_char with lexer
+        Set next_char to proc peek_char with lexer
 
         If next_char is equal to 61:  Note: >=
-            proc advance_char from lexer
+            proc advance_char with lexer
             proc memory_set_int64 from Layout with lexer, 48, TOKEN_GREATER_EQUAL
             Return TOKEN_GREATER_EQUAL
         End If
 
         If next_char is equal to 62:  Note: shifted right by or >>=
-            proc advance_char from lexer
-            Set third_char to proc peek_char from lexer
+            proc advance_char with lexer
+            Set third_char to proc peek_char with lexer
 
             If third_char is equal to 61:  Note: >>=
-                proc advance_char from lexer
+                proc advance_char with lexer
                 proc memory_set_int64 from Layout with lexer, 48, TOKEN_GREATER_GREATER_EQUALS
                 Return TOKEN_GREATER_GREATER_EQUALS
             End If
@@ -1728,17 +1782,17 @@ Process called "next_token" takes lexer as Integer returns Integer:
     End If
 
     If char is equal to 38:  Note: bitwise and or && or &=
-        proc advance_char from lexer
-        Set next_char to proc peek_char from lexer
+        proc advance_char with lexer
+        Set next_char to proc peek_char with lexer
 
         If next_char is equal to 38:  Note: &&
-            proc advance_char from lexer
+            proc advance_char with lexer
             proc memory_set_int64 from Layout with lexer, 48, TOKEN_AMP_AMP
             Return TOKEN_AMP_AMP
         End If
 
         If next_char is equal to 61:  Note: &=
-            proc advance_char from lexer
+            proc advance_char with lexer
             proc memory_set_int64 from Layout with lexer, 48, TOKEN_AMP_EQUALS
             Return TOKEN_AMP_EQUALS
         End If
@@ -1748,17 +1802,17 @@ Process called "next_token" takes lexer as Integer returns Integer:
     End If
 
     If char is equal to 124:  Note: | or || or |=
-        proc advance_char from lexer
-        Set next_char to proc peek_char from lexer
+        proc advance_char with lexer
+        Set next_char to proc peek_char with lexer
 
         If next_char is equal to 124:  Note: ||
-            proc advance_char from lexer
+            proc advance_char with lexer
             proc memory_set_int64 from Layout with lexer, 48, TOKEN_PIPE_PIPE
             Return TOKEN_PIPE_PIPE
         End If
 
         If next_char is equal to 61:  Note: |=
-            proc advance_char from lexer
+            proc advance_char with lexer
             proc memory_set_int64 from Layout with lexer, 48, TOKEN_PIPE_EQUALS
             Return TOKEN_PIPE_EQUALS
         End If
@@ -1768,11 +1822,11 @@ Process called "next_token" takes lexer as Integer returns Integer:
     End If
 
     If char is equal to 94:  Note: bitwise xor or ^=
-        proc advance_char from lexer
-        Set next_char to proc peek_char from lexer
+        proc advance_char with lexer
+        Set next_char to proc peek_char with lexer
 
         If next_char is equal to 61:  Note: ^=
-            proc advance_char from lexer
+            proc advance_char with lexer
             proc memory_set_int64 from Layout with lexer, 48, TOKEN_CARET_EQUALS
             Return TOKEN_CARET_EQUALS
         End If
@@ -1782,13 +1836,13 @@ Process called "next_token" takes lexer as Integer returns Integer:
     End If
 
     If char is equal to 46:  Note: . (dot)
-        proc advance_char from lexer
+        proc advance_char with lexer
         proc memory_set_int64 from Layout with lexer, 48, TOKEN_DOT
         Return TOKEN_DOT
     End If
 
     Note: Unknown character
-    proc advance_char from lexer
+    proc advance_char with lexer
     proc memory_set_int64 from Layout with lexer, 48, TOKEN_ERROR
     Return TOKEN_ERROR
 End Process
@@ -1846,7 +1900,7 @@ Process called "get_token_lexeme" takes lexer as Integer returns Integer:
     End If
 
     If token_length is greater than 0:
-        proc memory_copy from Layout with lexeme, 0, source plus token_start, 0, token_length
+        proc memory_copy from Layout with lexeme, source plus token_start, token_length
     End If
 
     proc memory_set_byte from Layout with lexeme, token_length, 0

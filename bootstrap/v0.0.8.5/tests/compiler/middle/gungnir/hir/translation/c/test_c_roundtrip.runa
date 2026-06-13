@@ -1,0 +1,329 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+Licensed under Apache 2.0
+:End Note
+
+Note:
+C Translation Round-Trip Probe
+
+End-to-end proof that the C translation pipeline is REAL, not a skeleton:
+
+    C source
+      -> c_lexer    (tokenize: identifiers, keywords, numbers, chars, strings,
+                     operators, preprocessor directives)
+      -> c_parser   (build C AST: preprocessor lines, typedefs/structs, functions
+                     with pointer params, control flow incl. switch + for, locals)
+      -> c_to_hir   (lower C AST to the hir.runa dictionary/list literal HIR)
+      -> hir_to_c   (emit HIR back to valid C text)
+      -> re-lex / re-parse / re-to_hir of the emitted text
+      -> structural HIR equality on the key constructs
+
+The probe feeds a representative C program that exercises the constructs the
+task requires:
+
+  - a header-guard preprocessor chain    (#ifndef / #define / #endif)
+  - a system include and a macro          (#include <stdio.h>, #define MAX 100)
+  - a struct type definition              (struct Point { int x; int y; };)
+  - a global variable with initializer    (int origin = 0;)
+  - a function with pointer params,        (int classify(int* values, int n) { ... })
+    control flow (if/else, for loop,
+    switch/case/default) and local vars
+
+The C HIR node model is hir.runa's dictionary/list literal interchange shared by
+c_to_hir (producer) and hir_to_c (consumer): a dictionary is a
+HIR_DICTIONARY_LITERAL node whose entries List (16-byte [key, value] blocks)
+hangs at offset 24; a list is a HIR_ARRAY_LITERAL node whose elements List hangs
+at offset 24; string payloads are HIR string-literal nodes read with
+get_string_literal_value. This probe reads HIR fields through exactly that
+contract, so it exercises the precise shape the frontend emits and the backend
+consumes.
+
+It lowers the source to HIR1, asserts HIR1 carries a c_program whose declarations
+include a function named "classify" with 2 parameters, emits HIR1 back to C
+text, re-runs the whole pipeline on the emitted text to HIR2, and asserts HIR2
+is STRUCTURALLY EQUAL to HIR1 on those same key constructs. Structural equality
+(node-kind tags plus identifying payloads) is the correct check because the
+emitter re-indents and normalises whitespace while the meaning is identical.
+
+Exit code: number of failed assertions (0 == all passed). No exit_with_code.
+:End Note
+
+Import "compiler/middle/gungnir/hir/translation/frontends/c/c_parser.runa" as CParser
+Import "compiler/middle/gungnir/hir/translation/frontends/c/c_to_hir.runa" as CFrontend
+Import "compiler/middle/gungnir/hir/translation/backends/c/hir_to_c.runa" as CBackend
+Import "compiler/middle/gungnir/hir/hir.runa" as HIR
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/collections/list.runa" as List
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "tests/test_utils.runa" as TestUtils
+
+Note: ============================================================================
+Note: hir.runa dict/list literal decoders (mirror the producer/consumer contract)
+Note: ============================================================================
+
+@Reasoning:
+A C HIR dictionary is a HIR_DICTIONARY_LITERAL whose entries List hangs at the
+children slot (offset 24). Each entry is a 16-byte block: key (raw string handle)
+at offset 0, value (a child HIR node or HIR string literal) at offset 8. This
+decoder linear-scans those entries comparing the raw key with string_equals,
+returning the stored value. It is the exact lookup the backend's
+get_dictionary_value performs, so reading HIR through it proves the produced
+shape is the consumed shape.
+@End Reasoning
+Process called "dict_get" takes node as Integer, key as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+
+    Let entries be proc get_dictionary_entries from HIR with node
+    If entries is equal to 0:
+        Return 0
+    End If
+
+    Let count be proc size from List with entries
+    Let index be 0
+    While index is less than count:
+        Let entry be proc get_at from List with entries, index
+        If entry is not equal to 0:
+            Let entry_key be proc memory_get_int64 from Layout with entry, 0
+            Let matches be proc string_equals from StringCore with entry_key, key
+            If matches is equal to 1:
+                Return proc memory_get_int64 from Layout with entry, 8
+            End If
+        End If
+        Set index to index plus 1
+    End While
+
+    Return 0
+End Process
+
+@Reasoning:
+The "_type" discriminator and other string fields are stored as HIR string
+literal nodes, not raw char* handles. This helper looks the key up via dict_get
+and then extracts the underlying char* through get_string_literal_value, so the
+probe can compare type tags and names with string_equals.
+@End Reasoning
+Process called "dict_get_string" takes node as Integer, key as Integer returns Integer:
+    Let value_node be proc dict_get with node, key
+    If value_node is equal to 0:
+        Return 0
+    End If
+    Return proc get_string_literal_value from HIR with value_node
+End Process
+
+@Reasoning:
+A C HIR list is a HIR_ARRAY_LITERAL whose backing element List hangs at the
+children slot (offset 24). Returning that List lets the probe iterate
+declarations / parameters with List.size and List.get_at.
+@End Reasoning
+Process called "list_elements" takes node as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    Return proc get_list_elements from HIR with node
+End Process
+
+@Reasoning:
+Locates the first declaration in the program's "declarations" list whose "_type"
+string matches the requested kind. Linear scan rather than a fixed index is
+robust to the variable and preprocessor declarations that surround the function.
+@End Reasoning
+Process called "find_decl" takes program as Integer, type_name as Integer returns Integer:
+    If program is equal to 0:
+        Return 0
+    End If
+
+    Let declarations be proc dict_get with program, "declarations"
+    If declarations is equal to 0:
+        Return 0
+    End If
+
+    Let items be proc list_elements with declarations
+    If items is equal to 0:
+        Return 0
+    End If
+
+    Let count be proc size from List with items
+    Let index be 0
+    While index is less than count:
+        Let decl be proc get_at from List with items, index
+        Let decl_type be proc dict_get_string with decl, "_type"
+        If decl_type is not equal to 0:
+            Let matches be proc string_equals from StringCore with decl_type, type_name
+            If matches is equal to 1:
+                Return decl
+            End If
+        End If
+        Set index to index plus 1
+    End While
+
+    Return 0
+End Process
+
+@Reasoning:
+Two HIR projections are structurally equal on a construct when both expose the
+same "_type" tag. Comparing the kind tag (and, for named constructs, the name
+payload) is whitespace-insensitive, proving round-trip fidelity without being
+defeated by the emitter's re-indenting.
+@End Reasoning
+Process called "same_type" takes a as Integer, b as Integer returns Integer:
+    If a is equal to 0:
+        Return 0
+    End If
+    If b is equal to 0:
+        Return 0
+    End If
+
+    Let ta be proc dict_get_string with a, "_type"
+    Let tb be proc dict_get_string with b, "_type"
+    If ta is equal to 0:
+        Return 0
+    End If
+    If tb is equal to 0:
+        Return 0
+    End If
+
+    Return proc string_equals from StringCore with ta, tb
+End Process
+
+Note: ============================================================================
+Note: Pipeline helper
+Note: ============================================================================
+
+@Reasoning:
+Each round of the probe runs the identical front-of-pipeline (parse -> to_hir).
+Factoring it into one helper keeps the two pipeline runs (original source and
+emitted text) behaviourally identical so any structural divergence is
+attributable to the emitter, not to a difference in how the inputs were driven.
+@End Reasoning
+@Implementation:
+Builds a C parser over the source (the parser creates and owns its lexer and is
+primed with one lookahead token), drives a full parse to the C AST root, then
+lowers the AST to the hir.runa dictionary/list HIR via translate_c_to_hir.
+Returns 0 if any stage yields 0.
+@End Implementation
+Process called "source_to_hir" takes source as Integer returns Integer:
+    Let parser be proc create_c_parser from CParser with source
+    If parser is equal to 0:
+        Return 0
+    End If
+
+    Let ast be proc parse_program from CParser with parser
+    If ast is equal to 0:
+        Return 0
+    End If
+
+    Let hir be proc translate_c_to_hir from CFrontend with ast
+    Return hir
+End Process
+
+Note: ============================================================================
+Note: Probe entry point
+Note: ============================================================================
+
+Process called "main" returns Integer:
+    Let results be proc create_test_results from TestUtils
+    proc begin_suite from TestUtils with results, "C translation round-trip"
+
+    Note:
+    Representative program: a header-guard preprocessor chain, a system include,
+    an object macro, a struct type, a global variable with initializer, and a
+    function with pointer parameters whose body exercises if/else, a for loop, a
+    switch/case/default, and local variable declarations.
+    :End Note
+    Let source be "#ifndef CLASSIFY_H\n#define CLASSIFY_H\n#include <stdio.h>\n#define MAX 100\nstruct Point {\nint x;\nint y;\n};\nint origin = 0;\nint classify(int* values, int n) {\nint total = 0;\nint i = 0;\nfor (i = 0; i < n; i = i + 1) {\nint v = values[i];\nif (v > 0) {\ntotal = total + 1;\n} else {\ntotal = total - 1;\n}\nswitch (v) {\ncase 0:\ntotal = total + 10;\nbreak;\ndefault:\ntotal = total + 1;\n}\n}\nreturn total;\n}\n#endif\n"
+
+    Note: --- Stage 0-2: source -> HIR (parse, lower) ---
+    Let parser be proc create_c_parser from CParser with source
+    proc assert_not_null from TestUtils with results, "parser created", parser
+
+    Let ast be proc parse_program from CParser with parser
+    proc assert_not_null from TestUtils with results, "parser produced C AST", ast
+
+    Let hir1 be proc translate_c_to_hir from CFrontend with ast
+    proc assert_not_null from TestUtils with results, "frontend produced HIR program", hir1
+
+    Note: Program must be a dict node tagged "c_program".
+    Let prog_type be proc dict_get_string with hir1, "_type"
+    Let prog_type_ok be proc string_equals from StringCore with prog_type, "c_program"
+    proc assert_equal from TestUtils with results, "HIR root is a c_program", prog_type_ok, 1
+
+    Note: Program must expose a non-empty declarations list.
+    Let declarations be proc dict_get with hir1, "declarations"
+    proc assert_not_null from TestUtils with results, "program has declarations", declarations
+    Let decl_items be proc list_elements with declarations
+    proc assert_not_null from TestUtils with results, "declarations is a list", decl_items
+    Let decl_count be proc size from List with decl_items
+    proc assert_greater_than_or_equal from TestUtils with results, "at least two top-level declarations", decl_count, 2
+
+    Note: --- function: located by kind, name + parameter count checked ---
+    Let func_node be proc find_decl with hir1, "c_function"
+    proc assert_not_null from TestUtils with results, "function node present", func_node
+    Let func_name be proc dict_get_string with func_node, "name"
+    Let func_name_ok be proc string_equals from StringCore with func_name, "classify"
+    proc assert_equal from TestUtils with results, "function name is 'classify'", func_name_ok, 1
+
+    Let func_params be proc dict_get with func_node, "parameters"
+    proc assert_not_null from TestUtils with results, "function has a parameters list", func_params
+    Let func_param_elems be proc list_elements with func_params
+    Let func_param_count be proc size from List with func_param_elems
+    proc assert_equal from TestUtils with results, "function 'classify' has 2 parameters", func_param_count, 2
+
+    Note: --- function body must be a compound statement ---
+    Let func_body be proc dict_get with func_node, "body"
+    proc assert_not_null from TestUtils with results, "function has a body", func_body
+    Let body_type be proc dict_get_string with func_body, "_type"
+    Let body_type_ok be proc string_equals from StringCore with body_type, "compound"
+    proc assert_equal from TestUtils with results, "function body is a compound statement", body_type_ok, 1
+
+    Note: --- global variable declaration: located by kind ---
+    Let var_node be proc find_decl with hir1, "c_variable"
+    proc assert_not_null from TestUtils with results, "global variable node present", var_node
+    Let var_name be proc dict_get_string with var_node, "name"
+    Let var_name_ok be proc string_equals from StringCore with var_name, "origin"
+    proc assert_equal from TestUtils with results, "global variable name is 'origin'", var_name_ok, 1
+
+    Note: --- Stage 3: HIR -> C text ---
+    Let emitted be proc generate_c_from_hir from CBackend with hir1
+    proc assert_not_null from TestUtils with results, "backend produced C text", emitted
+    Let emitted_len be proc string_length from StringCore with emitted
+    proc assert_greater_than from TestUtils with results, "emitted C is non-empty", emitted_len, 0
+
+    Note: --- Stage 4: re-run the pipeline on the emitted text -> HIR2 ---
+    Let hir2 be proc source_to_hir with emitted
+    proc assert_not_null from TestUtils with results, "re-parse of emitted C produced HIR", hir2
+
+    Let prog2_type be proc dict_get_string with hir2, "_type"
+    Let prog2_type_ok be proc string_equals from StringCore with prog2_type, "c_program"
+    proc assert_equal from TestUtils with results, "round-trip root is a c_program", prog2_type_ok, 1
+
+    Note: --- Stage 5: structural equality on the key constructs ---
+    Let func2 be proc find_decl with hir2, "c_function"
+    Let func_type_ok be proc same_type with func_node, func2
+    proc assert_equal from TestUtils with results, "round-trip preserves function node", func_type_ok, 1
+    Let func2_name be proc dict_get_string with func2, "name"
+    Let func2_name_ok be proc string_equals from StringCore with func2_name, "classify"
+    proc assert_equal from TestUtils with results, "round-trip preserves function name 'classify'", func2_name_ok, 1
+    Let func2_params be proc dict_get with func2, "parameters"
+    Let func2_param_elems be proc list_elements with func2_params
+    Let func2_param_count be proc size from List with func2_param_elems
+    proc assert_equal from TestUtils with results, "round-trip preserves 2 parameters", func2_param_count, 2
+
+    Let func2_body be proc dict_get with func2, "body"
+    Let body2_type be proc dict_get_string with func2_body, "_type"
+    Let body2_type_ok be proc string_equals from StringCore with body2_type, "compound"
+    proc assert_equal from TestUtils with results, "round-trip preserves compound function body", body2_type_ok, 1
+
+    Let var2 be proc find_decl with hir2, "c_variable"
+    Let var_type_ok be proc same_type with var_node, var2
+    proc assert_equal from TestUtils with results, "round-trip preserves global variable node", var_type_ok, 1
+    Let var2_name be proc dict_get_string with var2, "name"
+    Let var2_name_ok be proc string_equals from StringCore with var2_name, "origin"
+    proc assert_equal from TestUtils with results, "round-trip preserves variable name 'origin'", var2_name_ok, 1
+
+    proc print_summary from TestUtils with results
+    Let failed be proc get_failed from TestUtils with results
+    proc destroy_test_results from TestUtils with results
+
+    Return failed
+End Process
