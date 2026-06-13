@@ -226,19 +226,35 @@ End Process
 One-token look-ahead. Used by the block-vs-flow disambiguation:
 "key:\n" indicates a block mapping; "key: value" indicates an inline
 form. The parser needs to peek past the colon to decide which path to
-take.
+take. Advancing the parser also advances the LEXER (next_token mutates the
+lexer's scan cursor), so a naive "save the current_token pointer, advance,
+restore the pointer" leaves the lexer permanently past the peeked token and
+silently drops it on the next real advance. To make the look-ahead truly
+non-destructive we snapshot the four mutable scan fields of the lexer
+(position, line, column, at_line_start) before advancing and restore them
+afterward; next_token never pushes or pops the indent stack, so those four
+fields fully capture the recoverable scan state.
 @End Reasoning
 
+@Implementation:
+Read the lexer at parser offset 0 and snapshot its position (offset 16), line
+(offset 24), column (offset 32), and at_line_start (offset 64). Save the
+current_token pointer at parser offset 8. Advance one token, read its type,
+then restore the parser's current_token pointer and write the four lexer scan
+fields back so the next real advance_token re-reads the same token this peek
+consumed.
+@End Implementation
+
 Process called "peek_next_token_type" takes parser as Integer returns Integer:
-    Note: Peek at next token type (lookahead by 1)
+    Note: Peek at next token type (lookahead by 1), non-destructively
 
-    @Reasoning:
-    For YAML nested mapping detection, we check if a scalar is followed by a colon.
-    We temporarily advance to get the next token, check its type, then restore.
-    This is safe because we maintain parser state carefully.
-    @End Reasoning
+    Let lexer be proc memory_get_int64 from Layout with parser, 0
 
-    Note: Save current token
+    Note: Snapshot the lexer's mutable scan state and the current token pointer
+    Let saved_position be proc memory_get_int64 from Layout with lexer, 16
+    Let saved_line be proc memory_get_int64 from Layout with lexer, 24
+    Let saved_column be proc memory_get_int64 from Layout with lexer, 32
+    Let saved_at_line_start be proc memory_get_int64 from Layout with lexer, 64
     Let saved_token be proc memory_get_int64 from Layout with parser, 8
 
     Note: Advance to next token
@@ -247,8 +263,12 @@ Process called "peek_next_token_type" takes parser as Integer returns Integer:
     Note: Get next token type
     Let next_type be proc peek_token_type with parser
 
-    Note: Restore original token
+    Note: Restore parser token pointer and the lexer scan cursor
     proc memory_set_int64 from Layout with parser, 8, saved_token
+    proc memory_set_int64 from Layout with lexer, 16, saved_position
+    proc memory_set_int64 from Layout with lexer, 24, saved_line
+    proc memory_set_int64 from Layout with lexer, 32, saved_column
+    proc memory_set_int64 from Layout with lexer, 64, saved_at_line_start
 
     Return next_type
 End Process
@@ -269,6 +289,36 @@ Process called "check_token_type" takes parser as Integer, expected_type as Inte
     End If
 
     Return 0
+End Process
+
+@Reasoning:
+YAML block structure is indentation-significant, and each token already
+carries the column (offset 32) at which it began on its line. A key's column
+is therefore the indentation of its mapping entry: top-level keys sit at
+column 1, a nested mapping's keys sit further right. The block-mapping parser
+uses this column to know when a nested mapping has ended (a following key at a
+shallower column belongs to an enclosing mapping, not to the nested one). A
+null current token reports column 0 so a missing token never looks like a
+continuation of any mapping.
+@End Reasoning
+
+@Implementation:
+Read current_token at parser offset 8; return 0 if null. Otherwise return the
+token's column field at token offset 32.
+@End Implementation
+
+Process called "peek_token_column" takes parser as Integer returns Integer:
+    Note: Column (1-indexed indentation) of the current token, or 0 if none
+
+    Let token be proc memory_get_int64 from Layout with parser, 8
+
+    If token is equal to 0:
+        Return 0
+    End If
+
+    Let column be proc memory_get_int64 from Layout with token, 32
+
+    Return column
 End Process
 
 @Reasoning:
@@ -816,6 +866,15 @@ Process called "parse_block_mapping" takes parser as Integer returns Integer:
     proc memory_set_int64 from Layout with node, 32, children
     proc memory_set_int64 from Layout with node, 40, keys
 
+    Note:
+    A block mapping spans only the run of keys sharing one indentation column.
+    mapping_indent is latched from the first key's column (offset 32 of its
+    token); a later key at a SHALLOWER column belongs to an enclosing mapping
+    and ends this one, so a nested mapping value never greedily absorbs its
+    parent's siblings. The sentinel -1 marks "first key not seen yet".
+    :End Note
+    Let mapping_indent be -1
+
     Note: Parse key-value pairs
     While 1 is equal to 1:
         Note: Check if we have a scalar followed by colon
@@ -828,6 +887,17 @@ Process called "parse_block_mapping" takes parser as Integer returns Integer:
         If token_type is equal to TOKEN_NEWLINE from Lexer:
             proc advance_token with parser
             Continue
+        End If
+
+        Note: Indentation guard: a key shallower than this mapping ends it
+        Let key_column be proc peek_token_column with parser
+
+        If mapping_indent is equal to -1:
+            Set mapping_indent to key_column
+        Otherwise:
+            If key_column is less than mapping_indent:
+                Break
+            End If
         End If
 
         Note: Parse key
@@ -848,6 +918,24 @@ Process called "parse_block_mapping" takes parser as Integer returns Integer:
         End If
 
         proc advance_token with parser  Note: consume :
+
+        Note:
+        A block-mapping value may be inline ("key: scalar") or it may be a
+        nested block collection that begins on the following line(s)
+        ("key:\n  - a\n  - b" or "key:\n  inner: 1"). In the nested case the
+        token immediately after the colon is one or more NEWLINEs; we must
+        skip them so parse_block_value dispatches on the DASH / nested-key
+        that actually starts the value rather than failing on the NEWLINE.
+        :End Note
+        While 1 is equal to 1:
+            Let value_is_newline be proc check_token_type with parser, TOKEN_NEWLINE from Lexer
+
+            If value_is_newline is equal to 1:
+                proc advance_token with parser
+            Otherwise:
+                Break
+            End If
+        End While
 
         Note: Parse value
         Let value_node be proc parse_block_value with parser
@@ -1260,8 +1348,13 @@ Process called "parse_yaml" takes source as Integer returns Integer:
     Let has_error be proc memory_get_int64 from Layout with parser, 24
 
     If has_error is equal to 1:
-        Let error_msg be proc memory_get_int64 from Layout with parser, 16
-        proc print with "YAML parse error:", error_msg
+        Note:
+        Surface the parse failure through the 0-return contract that
+        parse_yaml's callers (yaml_to_hir and the translation dispatcher)
+        rely on. The latched error_message remains on the parser until
+        destroy_yaml_parser frees it; the caller inspects the result, not a
+        printed diagnostic, so the parser stays free of console output.
+        :End Note
         proc destroy_yaml_parser with parser
         proc destroy_yaml_lexer from Lexer with lexer
         Return 0

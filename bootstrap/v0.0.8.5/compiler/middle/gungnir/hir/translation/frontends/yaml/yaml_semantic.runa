@@ -1,0 +1,535 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+YAML Semantic Analyzer - Validates a YAML AST beyond grammar
+
+The YAML parser guarantees a syntactically well-formed document and resolves
+every alias (*name) to the node its anchor (&name) introduced. This pass
+enforces the SEMANTIC rules a YAML consumer needs but the grammar alone does
+not express:
+
+  1. Duplicate-key policy. The YAML 1.2 spec says mapping keys must be unique;
+     many real-world loaders tolerate duplicates with last-wins semantics. This
+     analyzer makes the choice explicit and configurable: by default duplicate
+     keys are a hard error (the safest interoperable policy), but a caller may
+     opt into last-wins tolerance via the policy flag.
+  2. Maximum nesting depth. Unbounded nesting is a denial-of-service vector for
+     any recursive consumer; the analyzer enforces a configurable depth limit
+     measured in nested mapping/sequence levels. Because YAML anchors/aliases
+     can make the resolved graph share subtrees, an unresolved alias left in the
+     tree is itself a structural error caught here.
+  3. Structural integrity. Every node's discriminant must be one of the four
+     YAML kinds, mapping nodes must carry parallel keys/children lists of equal
+     length, collection nodes must carry their backing lists, and scalar nodes
+     must carry a value buffer. These are invariants the parser maintains,
+     validated here so a corrupted AST cannot silently reach the HIR lowering
+     stage.
+
+This mirrors the four-file frontend convention (lexer / parser / semantic /
+to_hir) used by the json, dart, and fsharp frontends: the semantic analyzer is
+a standalone validation stage that runs over the parser's AST before lowering.
+
+Dependencies:
+- yaml_parser.runa (for YAML AST shape and kind constants)
+- compiler/frontend/primitives/memory/layout.runa
+- compiler/frontend/primitives/core/string_core.runa
+- compiler/frontend/primitives/collections/list.runa
+:End Note
+
+Import "compiler/middle/gungnir/hir/translation/frontends/yaml/yaml_parser.runa" as Parser
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/frontend/primitives/collections/list.runa" as List
+
+Note: ============================================================================
+Note: Duplicate-Key Policy Constants
+Note: ============================================================================
+
+Constant DUPLICATE_KEY_REJECT as Integer is 0    Note: Duplicate mapping key is a hard error (default)
+Constant DUPLICATE_KEY_LAST_WINS as Integer is 1 Note: Duplicate mapping key tolerated; last occurrence wins
+
+Note: Default maximum mapping/sequence nesting depth. Deep enough for any
+Note: realistic configuration document, shallow enough to bound recursive consumers.
+Constant DEFAULT_MAX_DEPTH as Integer is 512
+
+Note: ============================================================================
+Note: Analyzer State Structure
+Note: ============================================================================
+
+@Reasoning:
+The analyzer threads its configuration (duplicate-key policy, depth limit) and
+its single-slot error channel through the recursive walk. Carrying max_depth on
+the analyzer rather than as a recursion argument lets a caller tune the limit
+once at construction; carrying error_message/has_error lets a deep validation
+failure surface to the top-level caller without an out-parameter on every
+recursive call.
+@End Reasoning
+
+@Implementation:
+Five 64-bit slots in declared order: error_message (owned heap NUL-terminated
+string or 0), has_error boolean, duplicate_key_policy (one of the
+DUPLICATE_KEY_* constants), max_depth (nesting limit), error_line (source line
+of the offending node, 0 if none). Total size 40 bytes; offsets 0/8/16/24/32
+are referenced directly by the analyzer Processes.
+@End Implementation
+
+Type called "YAMLSemanticAnalyzer":
+    error_message as Integer        Note: Error message (owned), or 0
+    has_error as Integer            Note: Boolean: 1 if a validation error occurred
+    duplicate_key_policy as Integer Note: DUPLICATE_KEY_REJECT or DUPLICATE_KEY_LAST_WINS
+    max_depth as Integer            Note: Maximum nesting depth permitted
+    error_line as Integer           Note: Source line of the offending node (0 if none)
+End Type
+
+Note: ============================================================================
+Note: Analyzer Creation and Destruction
+Note: ============================================================================
+
+@Reasoning:
+Constructs the analyzer with all fields zeroed except the two policy fields,
+which are seeded from the caller's arguments so the default configuration
+(reject duplicates, DEFAULT_MAX_DEPTH) is chosen by the caller passing those
+constants rather than baked in here. error_message=0 and has_error=0 mean the
+terminal success check is correct without any explicit clearing on the success
+path.
+@End Reasoning
+
+@Implementation:
+Allocate 40 bytes; return 0 on OOM. Zero error_message/has_error/error_line at
+offsets 0/8/32; write duplicate_key_policy at offset 16 and max_depth at
+offset 24 from the arguments.
+@End Implementation
+
+Process called "create_yaml_semantic_analyzer" takes duplicate_key_policy as Integer, max_depth as Integer returns Integer:
+    Note: Create YAML semantic analyzer with the given policy and depth limit
+
+    Let analyzer_size be 40  Note: YAMLSemanticAnalyzer: 5 fields × 8 bytes
+    Let analyzer be proc allocate from Layout with analyzer_size
+
+    If analyzer is equal to 0:
+        Return 0
+    End If
+
+    proc memory_set_int64 from Layout with analyzer, 0, 0   Note: error_message = null
+    proc memory_set_int64 from Layout with analyzer, 8, 0   Note: has_error = false
+    proc memory_set_int64 from Layout with analyzer, 16, duplicate_key_policy
+    proc memory_set_int64 from Layout with analyzer, 24, max_depth
+    proc memory_set_int64 from Layout with analyzer, 32, 0  Note: error_line = 0
+
+    Return analyzer
+End Process
+
+@Reasoning:
+Releases the owned error_message buffer (if any) before freeing the analyzer
+record. Null-tolerant so callers may invoke it unconditionally in cleanup
+paths.
+@End Reasoning
+
+@Implementation:
+If analyzer is 0, return 1. Read error_message at offset 0; if non-zero,
+deallocate it. Deallocate the analyzer block. Always returns 1.
+@End Implementation
+
+Process called "destroy_yaml_semantic_analyzer" takes analyzer as Integer returns Integer:
+    Note: Destroy YAML semantic analyzer and free resources
+
+    If analyzer is equal to 0:
+        Return 1
+    End If
+
+    Let error_message be proc memory_get_int64 from Layout with analyzer, 0
+
+    If error_message is not equal to 0:
+        proc deallocate from Layout with error_message
+    End If
+
+    proc deallocate from Layout with analyzer
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Error Handling
+Note: ============================================================================
+
+@Reasoning:
+Latches a validation error: replaces any prior message with an owned heap copy,
+sets has_error=1, and records the offending node's source line so the caller
+can report a precise location. Only the first error is meaningful for callers
+that stop on failure, but later overwrites are harmless because the walk
+short-circuits on the first error anyway.
+@End Reasoning
+
+@Implementation:
+Read offset 0 (error_message); if non-zero, deallocate. Compute msg_length via
+string_length, allocate msg_length+1, memory_copy the message and NUL-terminate.
+Store the buffer at offset 0, 1 at offset 8 (has_error), and the line at offset
+32. Returns 1.
+@End Implementation
+
+Process called "set_semantic_error" takes analyzer as Integer, message as Integer, line as Integer returns Integer:
+    Note: Record a semantic validation error
+
+    Let error_message be proc memory_get_int64 from Layout with analyzer, 0
+
+    If error_message is not equal to 0:
+        proc deallocate from Layout with error_message
+    End If
+
+    Let msg_length be proc string_length from StringCore with message
+    Let new_error be proc allocate from Layout with msg_length plus 1
+
+    If new_error is not equal to 0:
+        proc memory_copy from Layout with new_error, message, msg_length
+        proc memory_set_byte from Layout with new_error, msg_length, 0
+    End If
+
+    proc memory_set_int64 from Layout with analyzer, 0, new_error
+    proc memory_set_int64 from Layout with analyzer, 8, 1
+    proc memory_set_int64 from Layout with analyzer, 32, line
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: String Equality
+Note: ============================================================================
+
+@Reasoning:
+Mapping-key uniqueness is checked by content, not pointer identity: the parser
+stores each key as a distinct heap copy, so two textually equal keys are
+different pointers. A self-contained byte-comparison keeps the duplicate scan
+independent of the import surface and matches the json_semantic convention.
+@End Reasoning
+
+@Implementation:
+Measure both strings via string_length; on length mismatch return 0. Otherwise
+compare byte by byte; return 0 on the first mismatch, 1 if all bytes match.
+@End Implementation
+
+Process called "string_equals" takes str1 as Integer, str2 as Integer returns Integer:
+    Note: Check if two strings are equal by content
+
+    Let len1 be proc string_length from StringCore with str1
+    Let len2 be proc string_length from StringCore with str2
+
+    If len1 is not equal to len2:
+        Return 0
+    End If
+
+    Let index be 0
+
+    While index is less than len1:
+        Let char1 be proc memory_get_byte from Layout with str1, index
+        Let char2 be proc memory_get_byte from Layout with str2, index
+
+        If char1 is not equal to char2:
+            Return 0
+        End If
+
+        Set index to index plus 1
+    End While
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Duplicate-Key Detection
+Note: ============================================================================
+
+@Reasoning:
+Mapping member uniqueness is checked with an explicit content comparison
+(string_equals) rather than List.contains, because List.contains compares
+pointer identity and every key in the parser's keys list is a distinct heap
+copy. A linear scan over the keys preceding index i is the correct cost model:
+YAML mappings are typically small, and a per-mapping hash set would cost more to
+build than the O(n^2) scan saves for realistic member counts. The scan stops at
+the first duplicate so the reported line is the earliest violation.
+@End Reasoning
+
+@Implementation:
+Given the keys List and the count, for each i from 1 to count-1 compare keys[i]
+against every earlier keys[j] (j from 0 to i-1) via string_equals. On the first
+content match return i (the duplicate's index). Return -1 if all keys are
+unique.
+@End Implementation
+
+Process called "find_duplicate_key_index" takes keys as Integer, count as Integer returns Integer:
+    Note: Return the index of the first duplicate key, or -1 if none
+
+    Let i be 1
+
+    While i is less than count:
+        Let key_i be proc get_at from List with keys, i
+        Let j be 0
+
+        While j is less than i:
+            Let key_j be proc get_at from List with keys, j
+
+            Note: A null key pointer is a structural problem, not a duplicate; skip the compare
+            If key_i is not equal to 0:
+                If key_j is not equal to 0:
+                    Let matches be proc string_equals with key_i, key_j
+
+                    If matches is equal to 1:
+                        Return i
+                    End If
+                End If
+            End If
+
+            Set j to j plus 1
+        End While
+
+        Set i to i plus 1
+    End While
+
+    Return -1
+End Process
+
+Note: ============================================================================
+Note: Recursive Validation
+Note: ============================================================================
+
+@Reasoning:
+Single recursive validator over the four YAML node kinds. Centralising the
+depth check here (incrementing only when descending into a mapping or sequence)
+means scalar nesting does not count against the limit and the limit measures
+true structural depth. An unresolved YAML_ALIAS reaching this pass is a parser
+contract violation (the parser resolves every alias before returning), so it is
+reported as a structural error rather than silently accepted. Returning 1/0
+(valid/invalid) plus the latched analyzer error keeps the contract identical to
+the sibling frontends' analyzers.
+@End Reasoning
+
+@Implementation:
+Null-guard the node (a null child is a structural error). Read node_type at
+offset 0 and line at offset 64. For YAML_MAPPING: enforce depth+1 <= max_depth;
+read keys (offset 40) and children (offset 32), require both non-null, require
+equal lengths, run find_duplicate_key_index and apply the duplicate-key policy
+(reject => error; last-wins => tolerate), then recurse on every child value at
+depth+1. For YAML_SEQUENCE: enforce depth, read children (offset 32), require
+non-null, recurse on every element at depth+1. YAML_SCALAR: require value_string
+(offset 8) non-null. YAML_ALIAS: unresolved alias is a structural error. Any
+unknown discriminant is a structural error. Returns 1 when the subtree is valid,
+0 otherwise.
+@End Implementation
+
+Process called "validate_yaml_node" takes analyzer as Integer, node as Integer, depth as Integer returns Integer:
+    Note: Recursively validate one YAML AST node
+
+    If node is equal to 0:
+        proc set_semantic_error with analyzer, "Null YAML node in AST", 0
+        Return 0
+    End If
+
+    Let node_type be proc memory_get_int64 from Layout with node, 0
+    Let line be proc memory_get_int64 from Layout with node, 64
+    Let max_depth be proc memory_get_int64 from Layout with analyzer, 24
+
+    Note: Mapping validation
+    If node_type is equal to YAML_MAPPING from Parser:
+        Let next_depth be depth plus 1
+
+        If next_depth is greater than max_depth:
+            proc set_semantic_error with analyzer, "YAML nesting depth exceeds maximum", line
+            Return 0
+        End If
+
+        Let keys be proc memory_get_int64 from Layout with node, 40
+        Let children be proc memory_get_int64 from Layout with node, 32
+
+        If keys is equal to 0:
+            proc set_semantic_error with analyzer, "Mapping node missing keys list", line
+            Return 0
+        End If
+
+        If children is equal to 0:
+            proc set_semantic_error with analyzer, "Mapping node missing children list", line
+            Return 0
+        End If
+
+        Let key_count be proc size from List with keys
+        Let child_count be proc size from List with children
+
+        If key_count is not equal to child_count:
+            proc set_semantic_error with analyzer, "Mapping keys and values count mismatch", line
+            Return 0
+        End If
+
+        Note: Duplicate-key policy enforcement
+        Let dup_index be proc find_duplicate_key_index with keys, key_count
+        Let policy be proc memory_get_int64 from Layout with analyzer, 16
+
+        If dup_index is not equal to -1:
+            If policy is equal to DUPLICATE_KEY_REJECT:
+                proc set_semantic_error with analyzer, "Duplicate mapping key not allowed", line
+                Return 0
+            End If
+            Note: DUPLICATE_KEY_LAST_WINS tolerates the duplicate; lowering keeps order
+        End If
+
+        Note: Recurse into every value at the next depth
+        Let index be 0
+        While index is less than child_count:
+            Let child be proc get_at from List with children, index
+            Let child_ok be proc validate_yaml_node with analyzer, child, next_depth
+
+            If child_ok is equal to 0:
+                Return 0
+            End If
+
+            Set index to index plus 1
+        End While
+
+        Return 1
+    End If
+
+    Note: Sequence validation
+    If node_type is equal to YAML_SEQUENCE from Parser:
+        Let next_depth2 be depth plus 1
+
+        If next_depth2 is greater than max_depth:
+            proc set_semantic_error with analyzer, "YAML nesting depth exceeds maximum", line
+            Return 0
+        End If
+
+        Let elements be proc memory_get_int64 from Layout with node, 32
+
+        If elements is equal to 0:
+            proc set_semantic_error with analyzer, "Sequence node missing elements list", line
+            Return 0
+        End If
+
+        Let element_count be proc size from List with elements
+        Let ai be 0
+
+        While ai is less than element_count:
+            Let element be proc get_at from List with elements, ai
+            Let element_ok be proc validate_yaml_node with analyzer, element, next_depth2
+
+            If element_ok is equal to 0:
+                Return 0
+            End If
+
+            Set ai to ai plus 1
+        End While
+
+        Return 1
+    End If
+
+    Note: Scalar leaf: the parser always copies a value buffer (possibly empty but non-null)
+    If node_type is equal to YAML_SCALAR from Parser:
+        Let value_string be proc memory_get_int64 from Layout with node, 8
+
+        If value_string is equal to 0:
+            proc set_semantic_error with analyzer, "Scalar node missing value", line
+            Return 0
+        End If
+
+        Return 1
+    End If
+
+    Note:
+    An alias that survived to the semantic stage was not resolved by the parser,
+    which is a contract violation: the parser's resolve_aliases_in_node pass
+    rewrites every YAML_ALIAS into the kind of its target before returning.
+    :End Note
+    If node_type is equal to YAML_ALIAS from Parser:
+        proc set_semantic_error with analyzer, "Unresolved YAML alias in AST", line
+        Return 0
+    End If
+
+    Note: Any other discriminant is a corrupted AST
+    proc set_semantic_error with analyzer, "Unknown YAML node type", line
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: Public Validation Entry Points
+Note: ============================================================================
+
+@Reasoning:
+Top-level validation over an existing AST with a caller-provided analyzer. The
+root is validated at depth 0; the recursion increments depth as it descends, so
+a top-level scalar document (e.g. just a number) validates at depth 0 and a
+deeply nested document is bounded by max_depth. Returns the analyzer's post-walk
+has_error inverted to a 1/0 valid flag so the caller has one boolean to gate
+lowering on.
+@End Reasoning
+
+@Implementation:
+Guard analyzer and root for null. Run validate_yaml_node(analyzer, root, 0).
+Read has_error at offset 8; return 1 when has_error is 0 (valid) and 0 otherwise
+(invalid). The detailed message remains on the analyzer for the caller to read.
+@End Implementation
+
+Process called "validate_yaml_ast" takes analyzer as Integer, root as Integer returns Integer:
+    Note: Validate a YAML AST with an existing analyzer; returns 1 if valid
+
+    If analyzer is equal to 0:
+        Return 0
+    End If
+
+    If root is equal to 0:
+        Return 0
+    End If
+
+    proc validate_yaml_node with analyzer, root, 0
+
+    Let has_error be proc memory_get_int64 from Layout with analyzer, 8
+
+    If has_error is equal to 1:
+        Return 0
+    End If
+
+    Return 1
+End Process
+
+@Reasoning:
+Convenience facade that owns the analyzer lifecycle for callers that only want a
+yes/no answer under the default policy (reject duplicate keys, DEFAULT_MAX_DEPTH).
+This is the entry point a pipeline stage calls when it has no reason to override
+the policy, keeping the common path a single call.
+@End Reasoning
+
+@Implementation:
+Guard root for null. Create an analyzer with DUPLICATE_KEY_REJECT and
+DEFAULT_MAX_DEPTH; on OOM return 0. Run validate_yaml_ast, capture the result,
+destroy the analyzer, and return the result.
+@End Implementation
+
+Process called "validate_yaml_ast_default" takes root as Integer returns Integer:
+    Note: Validate a YAML AST under the default strict policy; returns 1 if valid
+
+    If root is equal to 0:
+        Return 0
+    End If
+
+    Let analyzer be proc create_yaml_semantic_analyzer with DUPLICATE_KEY_REJECT, DEFAULT_MAX_DEPTH
+
+    If analyzer is equal to 0:
+        Return 0
+    End If
+
+    Let result be proc validate_yaml_ast with analyzer, root
+
+    proc destroy_yaml_semantic_analyzer with analyzer
+
+    Return result
+End Process
+
+Note: End of YAML Semantic Analyzer

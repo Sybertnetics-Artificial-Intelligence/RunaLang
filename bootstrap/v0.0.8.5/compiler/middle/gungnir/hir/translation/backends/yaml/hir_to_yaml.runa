@@ -195,7 +195,7 @@ Process called "set_generation_error" takes context as Integer, message as Integ
     Let new_error be proc allocate from Layout with msg_length plus 1
 
     If new_error is not equal to 0:
-        proc memory_copy from Layout with new_error, 0, message, 0, msg_length
+        proc memory_copy from Layout with new_error, message, msg_length
         proc memory_set_byte from Layout with new_error, msg_length, 0
     End If
 
@@ -657,29 +657,37 @@ Process called "generate_hir_node" takes context as Integer, hir_node as Integer
         Return proc generate_yaml_mapping with context, hir_node, is_mapping_value
     End If
 
-    Note: List → YAML sequence
-    If node_type is equal to HIR_LIST_LITERAL from HIR:
+    Note: Array/List → YAML sequence
+    If node_type is equal to HIR_ARRAY_LITERAL from HIR:
         Return proc generate_yaml_sequence with context, hir_node, is_mapping_value
     End If
 
-    Note: String literal
-    If node_type is equal to HIR_STRING_LITERAL from HIR:
-        Return proc generate_yaml_string with context, hir_node
-    End If
+    Note:
+    Scalar literals all share node_type HIR_LITERAL and are distinguished by
+    the value_type tag carried at offset 48: 0 = null, 1 = string, 2 = boolean,
+    3 = integer, 4 = float. This is the canonical literal model from hir.runa.
+    :End Note
+    If node_type is equal to HIR_LITERAL from HIR:
+        Let value_kind be proc memory_get_int64 from Layout with hir_node, 48
 
-    Note: Integer literal
-    If node_type is equal to HIR_INTEGER_LITERAL from HIR:
-        Return proc generate_yaml_integer with context, hir_node
-    End If
+        If value_kind is equal to HIR_LITERAL_KIND_STRING from HIR:
+            Return proc generate_yaml_string with context, hir_node
+        End If
 
-    Note: Boolean literal
-    If node_type is equal to HIR_BOOLEAN_LITERAL from HIR:
-        Return proc generate_yaml_boolean with context, hir_node
-    End If
+        If value_kind is equal to HIR_LITERAL_KIND_BOOLEAN from HIR:
+            Return proc generate_yaml_boolean with context, hir_node
+        End If
 
-    Note: Null literal
-    If node_type is equal to HIR_NULL_LITERAL from HIR:
-        Return proc generate_yaml_null from context
+        If value_kind is equal to HIR_LITERAL_KIND_INTEGER from HIR:
+            Return proc generate_yaml_integer with context, hir_node
+        End If
+
+        If value_kind is equal to HIR_LITERAL_KIND_FLOAT from HIR:
+            Return proc generate_yaml_float with context, hir_node
+        End If
+
+        Note: value_kind 0 marks the null literal
+        Return proc generate_yaml_null with context
     End If
 
     proc set_generation_error with context, "Unsupported HIR node type"
@@ -705,21 +713,16 @@ Process called "generate_yaml_mapping" takes context as Integer, hir_node as Int
 
     Let emitter be proc memory_get_int64 from Layout with context, 0
 
-    Note: Get dictionary entries
-    Let keys be proc get_dictionary_keys from HIR with hir_node
-    Let values be proc get_dictionary_values from HIR with hir_node
+    Note: Get dictionary entries (each entry is a 16-byte block: key at 0, value at 8)
+    Let entries be proc get_dictionary_entries from HIR with hir_node
 
-    If keys is equal to 0:
-        proc set_generation_error with context, "Dictionary has no keys"
-        Return 0
+    If entries is equal to 0:
+        Note: Empty / missing entries list -> emit empty flow mapping
+        proc emitter_raw_emit_string from EmitterCommon with emitter, "{}"
+        Return 1
     End If
 
-    If values is equal to 0:
-        proc set_generation_error with context, "Dictionary has no values"
-        Return 0
-    End If
-
-    Let count be proc size from List with keys
+    Let count be proc size from List with entries
 
     If count is equal to 0:
         Note: Empty mapping
@@ -730,41 +733,48 @@ Process called "generate_yaml_mapping" takes context as Integer, hir_node as Int
     Note: If this is a mapping value, emit on new line with increased indent
     If is_mapping_value is equal to 1:
         proc emitter_raw_emit_byte from EmitterCommon with emitter, 10  Note: newline
-        proc increase_indent from context
+        proc increase_indent with context
     End If
 
     Let index be 0
 
     While index is less than count:
-        Note: Emit key
-        If is_mapping_value is equal to 0:
-            If index is greater than 0:
-                proc emitter_raw_emit_byte from EmitterCommon with emitter, 10  Note: newline
-            End If
-        Otherwise:
-            If index is greater than 0:
-                proc emitter_raw_emit_byte from EmitterCommon with emitter, 10  Note: newline
-            End If
+        Note: Every entry after the first opens on its own line
+        If index is greater than 0:
+            proc emitter_raw_emit_byte from EmitterCommon with emitter, 10  Note: newline
         End If
 
-        proc emit_indent from context
+        proc emit_indent with context
 
-        Let key be proc get_at from List with keys, index
-        Let value be proc get_at from List with values, index
+        Note: Read key and value from the entry block's fixed offsets
+        Let entry be proc get_at from List with entries, index
+        Let key be proc memory_get_int64 from Layout with entry, 0
+        Let value be proc memory_get_int64 from Layout with entry, 8
 
-        Note: Emit key string
-        proc emitter_raw_emit_string from EmitterCommon with emitter, key
+        Note: Emit key string (quoted only when ambiguous as a plain scalar)
+        Let key_needs_quotes be proc needs_quoting with key
+
+        If key_needs_quotes is equal to 1:
+            proc emit_escaped_string with context, key
+        Otherwise:
+            proc emitter_raw_emit_string from EmitterCommon with emitter, key
+        End If
+
         proc emitter_raw_emit_byte from EmitterCommon with emitter, 58  Note: ':'
         proc emitter_raw_emit_byte from EmitterCommon with emitter, 32  Note: space
 
         Note: Emit value
-        proc generate_hir_node with context, value, 1
+        Let value_result be proc generate_hir_node with context, value, 1
+
+        If value_result is equal to 0:
+            Return 0
+        End If
 
         Set index to index plus 1
     End While
 
     If is_mapping_value is equal to 1:
-        proc decrease_indent from context
+        proc decrease_indent with context
     End If
 
     Return 1
@@ -807,37 +817,35 @@ Process called "generate_yaml_sequence" takes context as Integer, hir_node as In
     Note: If this is a mapping value, emit on new line with increased indent
     If is_mapping_value is equal to 1:
         proc emitter_raw_emit_byte from EmitterCommon with emitter, 10  Note: newline
-        proc increase_indent from context
+        proc increase_indent with context
     End If
 
     Let index be 0
 
     While index is less than count:
-        Note: Emit list indicator
-        If is_mapping_value is equal to 0:
-            If index is greater than 0:
-                proc emitter_raw_emit_byte from EmitterCommon with emitter, 10  Note: newline
-            End If
-        Otherwise:
-            If index is greater than 0:
-                proc emitter_raw_emit_byte from EmitterCommon with emitter, 10  Note: newline
-            End If
+        Note: Every element after the first opens on its own line
+        If index is greater than 0:
+            proc emitter_raw_emit_byte from EmitterCommon with emitter, 10  Note: newline
         End If
 
-        proc emit_indent from context
+        proc emit_indent with context
         proc emitter_raw_emit_byte from EmitterCommon with emitter, 45  Note: '-'
         proc emitter_raw_emit_byte from EmitterCommon with emitter, 32  Note: space
 
         Let element be proc get_at from List with elements, index
 
         Note: Emit element
-        proc generate_hir_node with context, element, 0
+        Let element_result be proc generate_hir_node with context, element, 0
+
+        If element_result is equal to 0:
+            Return 0
+        End If
 
         Set index to index plus 1
     End While
 
     If is_mapping_value is equal to 1:
-        proc decrease_indent from context
+        proc decrease_indent with context
     End If
 
     Return 1
@@ -865,7 +873,7 @@ Process called "generate_yaml_string" takes context as Integer, hir_node as Inte
     @End Reasoning
 
     Let emitter be proc memory_get_int64 from Layout with context, 0
-    Let str be proc get_string_value from HIR with hir_node
+    Let str be proc get_string_literal_value from HIR with hir_node
 
     If str is equal to 0:
         proc set_generation_error with context, "String node has no value"
@@ -894,7 +902,7 @@ Process called "generate_yaml_string" takes context as Integer, hir_node as Inte
         proc emitter_raw_emit_byte from EmitterCommon with emitter, 10
 
         Note: Emit content with increased indentation
-        proc increase_indent from context
+        proc increase_indent with context
 
         Set index to 0
         Let line_start be 1
@@ -904,7 +912,7 @@ Process called "generate_yaml_string" takes context as Integer, hir_node as Inte
 
             Note: Emit indentation at line start
             If line_start is equal to 1:
-                proc emit_indent from context
+                proc emit_indent with context
                 Set line_start to 0
             End If
 
@@ -918,12 +926,12 @@ Process called "generate_yaml_string" takes context as Integer, hir_node as Inte
             Set index to index plus 1
         End While
 
-        proc decrease_indent from context
+        proc decrease_indent with context
         Return 1
     End If
 
     Note: Check if quoting is needed for single-line strings
-    Let needs_quotes be proc needs_quoting from str
+    Let needs_quotes be proc needs_quoting with str
 
     If needs_quotes is equal to 1:
         proc emit_escaped_string with context, str
@@ -946,8 +954,39 @@ Reads the i64 value from the HIR node and forwards it to emit_integer.
 Process called "generate_yaml_integer" takes context as Integer, hir_node as Integer returns Integer:
     Note: Generate YAML integer scalar
 
-    Let value be proc get_integer_value from HIR with hir_node
+    Let value be proc get_integer_literal_value from HIR with hir_node
     proc emit_integer with context, value
+
+    Return 1
+End Process
+
+@Reasoning:
+The HIR keeps the original lexical form of float literals (a NUL-terminated
+string pointer carried verbatim in the literal value slot) precisely so
+backends can reproduce the source precision without rounding through a
+double. Emitting that source string is the only round-trip-safe choice and
+mirrors the HIR-to-JSON backend's float handling.
+@End Reasoning
+
+@Implementation:
+Reads the float lexeme pointer via get_float_literal_value; a 0 payload is a
+malformed HIR node and is reported as a generation error. Otherwise the
+lexeme is forwarded verbatim through the raw emitter (a bare numeric scalar
+needs no quoting in YAML).
+@End Implementation
+
+Process called "generate_yaml_float" takes context as Integer, hir_node as Integer returns Integer:
+    Note: Generate YAML float scalar
+
+    Let emitter be proc memory_get_int64 from Layout with context, 0
+    Let float_str be proc get_float_literal_value from HIR with hir_node
+
+    If float_str is equal to 0:
+        proc set_generation_error with context, "Float literal missing string representation"
+        Return 0
+    End If
+
+    proc emitter_raw_emit_string from EmitterCommon with emitter, float_str
 
     Return 1
 End Process
@@ -965,7 +1004,7 @@ Process called "generate_yaml_boolean" takes context as Integer, hir_node as Int
     Note: Generate YAML boolean scalar
 
     Let emitter be proc memory_get_int64 from Layout with context, 0
-    Let value be proc get_boolean_value from HIR with hir_node
+    Let value be proc get_boolean_literal_value from HIR with hir_node
 
     If value is equal to 1:
         proc emitter_raw_emit_string from EmitterCommon with emitter, "true"
@@ -1030,24 +1069,32 @@ Process called "translate_hir_to_yaml" takes hir_root as Integer returns Integer
     End If
 
     Note: Generate YAML from HIR
-    proc generate_hir_node with context, hir_root, 0
+    Let gen_result be proc generate_hir_node with context, hir_root, 0
 
-    Note: Check for errors
+    Note:
+    Surface failure via the 0-return contract that the LANG_YAML dispatch arm
+    in translation.runa relies on. This backend sits below translation.runa in
+    the import graph and cannot import it to call add_translation_error without
+    creating an import cycle, so it never prints or forwards diagnostics here.
+    :End Note
     Let has_error be proc memory_get_int64 from Layout with context, 40
 
     If has_error is equal to 1:
-        Let error_msg be proc memory_get_int64 from Layout with context, 32
-        proc print with "YAML generation error:", error_msg
-        proc destroy_generation_context from context
+        proc destroy_generation_context with context
         Return 0
     End If
 
-    Note: Get output
+    If gen_result is equal to 0:
+        proc destroy_generation_context with context
+        Return 0
+    End If
+
+    Note: Get output (detach from emitter; output buffer is caller-owned)
     Let emitter be proc memory_get_int64 from Layout with context, 0
     Let output be proc emitter_raw_get_output from EmitterCommon with emitter
 
-    Note: Cleanup
-    proc destroy_generation_context from context
+    Note: Cleanup (output is owned by caller)
+    proc destroy_generation_context with context
 
     Return output
 End Process
