@@ -36,8 +36,10 @@ Dependencies:
 :End Note
 
 Import "compiler/middle/gungnir/hir/translation/frontends/go/go_parser.runa" as Parser
-Import "compiler/middle/gungnir/hir/hir.runa" as HIR
 Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/frontend/primitives/collections/list.runa" as List
+Import "compiler/frontend/primitives/collections/dictionary.runa" as Dict
 
 Note: ============================================================================
 Note: Translation Context
@@ -111,6 +113,136 @@ Process called "destroy_go_to_hir_context" takes context as Integer returns Inte
 End Process
 
 Note: ============================================================================
+Note: HIR Structured-Data Encoding (dictionary / list interchange)
+Note: ============================================================================
+
+Note:
+The Go translator emits HIR as a tree of tagged structured nodes — string
+keyed dictionaries and ordered lists — exactly the interchange shape the Go
+backend (hir_to_go) consumes. Each node carries a 1-word tag so the backend
+can distinguish a list from a dictionary, and a 1-word payload pointer to a
+real List primitive. Dictionary entries are 16-byte [key, value] blocks held
+in that List; list elements are stored directly. This mirrors the established
+dict-encoding used by the committed java/elixir/typescript frontends, but
+builds on the List primitive so the backend can iterate with List.size and
+List.get_at without a bespoke array walk.
+:End Note
+
+Constant GO_HIR_DICT as Integer is 1
+Constant GO_HIR_LIST as Integer is 2
+
+@Reasoning:
+A dictionary node is a 16-byte block: tag at offset 0 marks it as a
+dictionary so is_list_hir can reject it, and offset 8 holds a freshly
+created List that accumulates 16-byte key/value entry blocks. Creating the
+entries List eagerly keeps set_dict_value free of a lazy-create branch.
+@End Reasoning
+Process called "create_dict" returns Integer:
+    Note: Create a HIR dictionary-literal interchange node
+
+    Let node be proc allocate from Layout with 16
+    If node is equal to 0:
+        Return 0
+    End If
+
+    Let entries be proc create from List
+    proc memory_set_int64 from Layout with node, 0, GO_HIR_DICT
+    proc memory_set_int64 from Layout with node, 8, entries
+
+    Return node
+End Process
+
+@Reasoning:
+A list node mirrors the dictionary node: tag GO_HIR_LIST at offset 0 and a
+backing List at offset 8. Elements are appended verbatim (each an Integer
+pointer to a child HIR node or a string), so the backend reads them back via
+get_list_elements and iterates with List.size / List.get_at.
+@End Reasoning
+Process called "create_list" returns Integer:
+    Note: Create a HIR list-literal interchange node
+
+    Let node be proc allocate from Layout with 16
+    If node is equal to 0:
+        Return 0
+    End If
+
+    Let elements be proc create from List
+    proc memory_set_int64 from Layout with node, 0, GO_HIR_LIST
+    proc memory_set_int64 from Layout with node, 8, elements
+
+    Return node
+End Process
+
+@Reasoning:
+Stores a key/value pair in a dictionary node. The value may be a string
+pointer (used by callers that conceptually want set_dict_string) or a child
+HIR node pointer — both are 8-byte values, so a single append path serves
+both. Each entry is a dedicated 16-byte [key, value] block, the layout
+get_dict_value scans. A null dict or key is a no-op returning 0.
+@End Reasoning
+Process called "set_dict_value" takes dict as Integer, key as Integer, value as Integer returns Integer:
+    Note: Store a key/value pair into a HIR dictionary node
+
+    If dict is equal to 0:
+        Return 0
+    End If
+    If key is equal to 0:
+        Return 0
+    End If
+
+    Let entries be proc memory_get_int64 from Layout with dict, 8
+    If entries is equal to 0:
+        Set entries to proc create from List
+        proc memory_set_int64 from Layout with dict, 8, entries
+    End If
+
+    Let entry be proc allocate from Layout with 16
+    If entry is equal to 0:
+        Return 0
+    End If
+
+    proc memory_set_int64 from Layout with entry, 0, key
+    proc memory_set_int64 from Layout with entry, 8, value
+    proc append from List with entries, entry
+
+    Return 1
+End Process
+
+@Reasoning:
+String-valued dictionary set. Identical storage to set_dict_value — the
+value is a string pointer — but kept as a distinct name so call sites read
+intentionally and the producer surface matches the backend's symmetric
+get_dict_string reader.
+@End Reasoning
+Process called "set_dict_string" takes dict as Integer, key as Integer, value as Integer returns Integer:
+    Note: Store a string-valued key into a HIR dictionary node
+
+    Return proc set_dict_value with dict, key, value
+End Process
+
+@Reasoning:
+Appends an element to a list node's backing List. Null list short-circuits
+to 0; a null element is legal (an explicit empty slot). Returns the list so
+callers may rebind defensively, matching the committed add_to_list contract.
+@End Reasoning
+Process called "add_to_list" takes list as Integer, item as Integer returns Integer:
+    Note: Append an element to a HIR list node
+
+    If list is equal to 0:
+        Return 0
+    End If
+
+    Let elements be proc memory_get_int64 from Layout with list, 8
+    If elements is equal to 0:
+        Set elements to proc create from List
+        proc memory_set_int64 from Layout with list, 8, elements
+    End If
+
+    proc append from List with elements, item
+    Return list
+End Process
+
+Note: ============================================================================
 Note: Node Translation - Program and Declarations
 Note: ============================================================================
 
@@ -129,6 +261,102 @@ list. Attaches list under "declarations" key. Returns the program
 dict.
 @End Implementation
 
+@Reasoning:
+Top-level declaration dispatcher. The Go parser places package, import,
+function, method, type, var, and const declarations as direct children of
+the program node. This routine reads the child's node_type and routes to the
+matching translator, so translate_program can stay a flat iteration. Unknown
+node kinds return 0 and are filtered by the caller.
+@End Reasoning
+
+@Implementation:
+Reads node_type at offset 0 and compares against the parser's declaration
+node constants. A method (function with a receiver) is tagged GO_METHOD by
+the parser, so it routes to translate_method ahead of the plain-function
+branch. Returns the translated HIR dict, or 0 for null/unknown input.
+@End Implementation
+
+Process called "translate_declaration" takes context as Integer, node as Integer returns Integer:
+    Note: Dispatch a top-level Go declaration to its translator
+
+    If node is equal to 0:
+        Return 0
+    End If
+
+    Let node_type be proc memory_get_int64 from Layout with node, 0
+
+    If node_type is equal to GO_PACKAGE from Parser:
+        Return proc translate_package with context, node
+    End If
+
+    If node_type is equal to GO_IMPORT from Parser:
+        Return proc translate_import with context, node
+    End If
+
+    If node_type is equal to GO_METHOD from Parser:
+        Return proc translate_method with context, node
+    End If
+
+    If node_type is equal to GO_FUNCTION from Parser:
+        Return proc translate_function with context, node
+    End If
+
+    If node_type is equal to GO_TYPE_DECL from Parser:
+        Return proc translate_type_decl with context, node
+    End If
+
+    If node_type is equal to GO_VAR_DECL from Parser:
+        Return proc translate_var_decl with context, node
+    End If
+
+    If node_type is equal to GO_CONST_DECL from Parser:
+        Return proc translate_const_decl with context, node
+    End If
+
+    Return 0
+End Process
+
+@Reasoning:
+Translates a Go parameter-list node (parser kind GO_PARAMETER) into a HIR
+list of parameter dictionaries. Each child of the list node is an individual
+parameter, translated through translate_parameter so name and type travel
+into HIR uniformly. Producing a list (not a dict) lets the backend emit the
+parameters in source order.
+@End Reasoning
+
+@Implementation:
+Null guard. Creates a HIR list node. Reads the children List at offset 24;
+for each child, translate_parameter produces a parameter dict that is
+appended via add_to_list. Returns the populated list (empty if the function
+takes no parameters).
+@End Implementation
+
+Process called "translate_parameter_list" takes context as Integer, node as Integer returns Integer:
+    Note: Translate a Go parameter-list node to a HIR list
+
+    Let params_hir be proc create_list
+
+    If node is equal to 0:
+        Return params_hir
+    End If
+
+    Let children be proc memory_get_int64 from Layout with node, 24
+    If children is not equal to 0:
+        Let count be proc size from List with children
+        Let index be 0
+        While index is less than count:
+            Let param_node be proc get from List with children, index
+            Let param_hir be proc translate_parameter with context, param_node
+            If param_hir is not equal to 0:
+                proc add_to_list with params_hir, param_hir
+            End If
+            Set index to index plus 1
+        End While
+    End If
+
+    Return params_hir
+End Process
+
 Process called "translate_program" takes context as Integer, node as Integer returns Integer:
     Note: Translate GO_PROGRAM node to HIR
 
@@ -136,15 +364,15 @@ Process called "translate_program" takes context as Integer, node as Integer ret
         Return 0
     End If
 
-    Let program_hir be proc create_dict from HIR
+    Let program_hir be proc create_dict
 
-    proc set_dict_string from HIR with program_hir, "_type", "go_program"
+    proc set_dict_string with program_hir, "_type", "go_program"
 
     Note: Get children (package, imports, declarations)
     Let children be proc memory_get_int64 from Layout with node, 24
 
     If children is not equal to 0:
-        Let declarations_hir be proc create_list from HIR
+        Let declarations_hir be proc create_list
 
         Note: Translate each child declaration
         Let child_count be proc size from List with children
@@ -153,12 +381,12 @@ Process called "translate_program" takes context as Integer, node as Integer ret
             Let child be proc get from List with children, i
             Let child_hir be proc translate_declaration with context, child
             If child_hir is not equal to 0:
-                proc add_to_list from HIR with declarations_hir, child_hir
+                proc add_to_list with declarations_hir, child_hir
             End If
             Set i to i plus 1
         End While
 
-        proc set_dict_value from HIR with program_hir, "declarations", declarations_hir
+        proc set_dict_value with program_hir, "declarations", declarations_hir
     End If
 
     Return program_hir
@@ -182,13 +410,13 @@ Process called "translate_package" takes context as Integer, node as Integer ret
         Return 0
     End If
 
-    Let package_hir be proc create_dict from HIR
+    Let package_hir be proc create_dict
 
-    proc set_dict_string from HIR with package_hir, "_type", "go_package"
+    proc set_dict_string with package_hir, "_type", "go_package"
 
     Let package_name be proc memory_get_int64 from Layout with node, 8
     If package_name is not equal to 0:
-        proc set_dict_string from HIR with package_hir, "name", package_name
+        proc set_dict_string with package_hir, "name", package_name
     End If
 
     Return package_hir
@@ -214,28 +442,28 @@ Process called "translate_import" takes context as Integer, node as Integer retu
         Return 0
     End If
 
-    Let import_hir be proc create_dict from HIR
+    Let import_hir be proc create_dict
 
-    proc set_dict_string from HIR with import_hir, "_type", "go_import"
+    proc set_dict_string with import_hir, "_type", "go_import"
 
     Let import_path be proc memory_get_int64 from Layout with node, 16
     If import_path is not equal to 0:
-        proc set_dict_string from HIR with import_hir, "path", import_path
+        proc set_dict_string with import_hir, "path", import_path
     End If
 
     Let alias be proc memory_get_int64 from Layout with node, 8
     If alias is not equal to 0:
-        proc set_dict_string from HIR with import_hir, "alias", alias
+        proc set_dict_string with import_hir, "alias", alias
     End If
 
     Let attributes be proc memory_get_int64 from Layout with node, 32
     If attributes is not equal to 0:
         Note: Check for dot import attribute
-        Let is_dot_import be proc has_key from Dict with attributes, "dot_import"
+        Let is_dot_import be proc contains from Dict with attributes, "dot_import"
         If is_dot_import is equal to 1:
-            proc set_dict_string from HIR with import_hir, "dot_import", "true"
+            proc set_dict_string with import_hir, "dot_import", "true"
         Otherwise:
-            proc set_dict_string from HIR with import_hir, "dot_import", "false"
+            proc set_dict_string with import_hir, "dot_import", "false"
         End If
     End If
 
@@ -263,13 +491,13 @@ Process called "translate_function" takes context as Integer, node as Integer re
         Return 0
     End If
 
-    Let func_hir be proc create_dict from HIR
+    Let func_hir be proc create_dict
 
-    proc set_dict_string from HIR with func_hir, "_type", "go_function"
+    proc set_dict_string with func_hir, "_type", "go_function"
 
     Let func_name be proc memory_get_int64 from Layout with node, 8
     If func_name is not equal to 0:
-        proc set_dict_string from HIR with func_hir, "name", func_name
+        proc set_dict_string with func_hir, "name", func_name
     End If
 
     Note: Get children (parameters, return type, body)
@@ -281,21 +509,30 @@ Process called "translate_function" takes context as Integer, node as Integer re
         If child_count is greater than 0:
             Let params_node be proc get from List with children, 0
             Let params_hir be proc translate_parameter_list with context, params_node
-            proc set_dict_value from HIR with func_hir, "parameters", params_hir
+            proc set_dict_value with func_hir, "parameters", params_hir
         End If
 
-        Note: Second child is return type
+        Note: The body is the GO_BLOCK child (the parser only appends a
+        Note: return-type child when one is present, so a fixed index is
+        Note: ambiguous). The return type, when present, is the child
+        Note: between the parameters and the body.
         If child_count is greater than 1:
-            Let return_node be proc get from List with children, 1
-            Let return_hir be proc translate_type with context, return_node
-            proc set_dict_value from HIR with func_hir, "return_type", return_hir
-        End If
-
-        Note: Third child is function body
-        If child_count is greater than 2:
-            Let body_node be proc get from List with children, 2
-            Let body_hir be proc translate_block with context, body_node
-            proc set_dict_value from HIR with func_hir, "body", body_hir
+            Let last_idx be child_count minus 1
+            Let last_node be proc get from List with children, last_idx
+            Let last_type be proc memory_get_int64 from Layout with last_node, 0
+            If last_type is equal to GO_BLOCK from Parser:
+                Let body_hir be proc translate_block with context, last_node
+                proc set_dict_value with func_hir, "body", body_hir
+                If last_idx is greater than 1:
+                    Let return_node be proc get from List with children, 1
+                    Let return_hir be proc translate_return_type with context, return_node
+                    proc set_dict_value with func_hir, "return_type", return_hir
+                End If
+            Otherwise:
+                Let return_node2 be proc get from List with children, 1
+                Let return_hir2 be proc translate_return_type with context, return_node2
+                proc set_dict_value with func_hir, "return_type", return_hir2
+            End If
         End If
     End If
 
@@ -312,9 +549,10 @@ function is the receiver clause stored in the attributes dict.
 Reads name from offset 8 and attributes from offset 32. Pulls
 receiver_name and receiver_type from attributes; if both present
 builds a small receiver HIR dict and attaches under "receiver".
-Reads children at offset 24 and currently creates placeholder dicts
-for parameters, return_type, and body — full sub-translation is a
-known gap.
+Reads children at offset 24 and recursively translates parameters
+(translate_parameter_list), the optional return type (translate_type),
+and the body (translate_block), disambiguating the body as the
+GO_BLOCK child.
 @End Implementation
 
 Process called "translate_method" takes context as Integer, node as Integer returns Integer:
@@ -324,39 +562,59 @@ Process called "translate_method" takes context as Integer, node as Integer retu
         Return 0
     End If
 
-    Let method_hir be proc create_dict from HIR
+    Let method_hir be proc create_dict
 
-    proc set_dict_string from HIR with method_hir, "_type", "go_method"
+    proc set_dict_string with method_hir, "_type", "go_method"
 
     Let method_name be proc memory_get_int64 from Layout with node, 8
     If method_name is not equal to 0:
-        proc set_dict_string from HIR with method_hir, "name", method_name
+        proc set_dict_string with method_hir, "name", method_name
     End If
 
-    Note: Get receiver from attributes
+    Note: The receiver is stored by the parser as a "receiver" attribute
+    Note: holding a GO_PARAMETER node (name + type). Translate it through
+    Note: translate_parameter so the receiver dict matches a parameter dict.
     Let attributes be proc memory_get_int64 from Layout with node, 32
     If attributes is not equal to 0:
-        Let receiver_name be proc get from Dict with attributes, "receiver_name"
-        Let receiver_type be proc get from Dict with attributes, "receiver_type"
-        If receiver_name is not equal to 0 and receiver_type is not equal to 0:
-            Let receiver_hir be proc create_dict from HIR
-            proc set_dict_string from HIR with receiver_hir, "name", receiver_name
-            proc set_dict_string from HIR with receiver_hir, "type", receiver_type
-            proc set_dict_value from HIR with method_hir, "receiver", receiver_hir
+        Let receiver_node be proc get from Dict with attributes, "receiver"
+        If receiver_node is not equal to 0:
+            Let receiver_hir be proc translate_parameter with context, receiver_node
+            If receiver_hir is not equal to 0:
+                proc set_dict_value with method_hir, "receiver", receiver_hir
+            End If
         End If
     End If
 
-    Note: Get children (parameters, return type, body)
+    Note: Children mirror a function: [parameters, return type?, body].
+    Note: The body is the GO_BLOCK child; the return type, when present,
+    Note: sits between the parameters and the body.
     Let children be proc memory_get_int64 from Layout with node, 24
     If children is not equal to 0:
-        Let params_hir be proc create_list from HIR
-        proc set_dict_value from HIR with method_hir, "parameters", params_hir
+        Let child_count be proc size from List with children
+        If child_count is greater than 0:
+            Let params_node be proc get from List with children, 0
+            Let params_hir be proc translate_parameter_list with context, params_node
+            proc set_dict_value with method_hir, "parameters", params_hir
+        End If
 
-        Let return_type_hir be proc create_dict from HIR
-        proc set_dict_value from HIR with method_hir, "return_type", return_type_hir
-
-        Let body_hir be proc create_dict from HIR
-        proc set_dict_value from HIR with method_hir, "body", body_hir
+        If child_count is greater than 1:
+            Let last_idx be child_count minus 1
+            Let last_node be proc get from List with children, last_idx
+            Let last_type be proc memory_get_int64 from Layout with last_node, 0
+            If last_type is equal to GO_BLOCK from Parser:
+                Let body_hir be proc translate_block with context, last_node
+                proc set_dict_value with method_hir, "body", body_hir
+                If last_idx is greater than 1:
+                    Let return_node be proc get from List with children, 1
+                    Let return_hir be proc translate_return_type with context, return_node
+                    proc set_dict_value with method_hir, "return_type", return_hir
+                End If
+            Otherwise:
+                Let return_node2 be proc get from List with children, 1
+                Let return_hir2 be proc translate_return_type with context, return_node2
+                proc set_dict_value with method_hir, "return_type", return_hir2
+            End If
+        End If
     End If
 
     Return method_hir
@@ -381,35 +639,168 @@ Process called "translate_type_decl" takes context as Integer, node as Integer r
         Return 0
     End If
 
-    Let type_decl_hir be proc create_dict from HIR
+    Let type_decl_hir be proc create_dict
 
-    proc set_dict_string from HIR with type_decl_hir, "_type", "go_type_decl"
+    proc set_dict_string with type_decl_hir, "_type", "go_type_decl"
 
-    Let type_name be proc memory_get_int64 from Layout with node, 8
-    If type_name is not equal to 0:
-        proc set_dict_string from HIR with type_decl_hir, "name", type_name
+    Note: The parser wraps one or more type specs (each itself a
+    Note: GO_TYPE_DECL carrying the name at offset 8 and the underlying
+    Note: type as its first child) under an outer GO_TYPE_DECL. Descend to
+    Note: the first spec when the node has no name of its own.
+    Let spec be node
+    Let own_name be proc memory_get_int64 from Layout with node, 8
+    If own_name is equal to 0:
+        Let outer_children be proc memory_get_int64 from Layout with node, 24
+        If outer_children is not equal to 0:
+            Let outer_count be proc length from List with outer_children
+            If outer_count is greater than 0:
+                Set spec to proc get from List with outer_children, 0
+            End If
+        End If
     End If
 
-    Note: Get underlying type from children
-    Let children be proc memory_get_int64 from Layout with node, 24
+    Let type_name be proc memory_get_int64 from Layout with spec, 8
+    If type_name is not equal to 0:
+        proc set_dict_string with type_decl_hir, "name", type_name
+    End If
+
+    Note: Spec children: [underlying type]
+    Let children be proc memory_get_int64 from Layout with spec, 24
     If children is not equal to 0:
-        Let underlying_type_hir be proc translate_type with context, children
-        proc set_dict_value from HIR with type_decl_hir, "underlying_type", underlying_type_hir
+        Let child_count be proc length from List with children
+        If child_count is greater than 0:
+            Let underlying_node be proc get from List with children, 0
+            Let underlying_type_hir be proc translate_type with context, underlying_node
+            proc set_dict_value with type_decl_hir, "underlying_type", underlying_type_hir
+        End If
     End If
 
     Return type_decl_hir
 End Process
 
 @Reasoning:
-Translates `var name Type = initializer`. Both type and initializer
-are optional in Go's grammar; the implementation attaches placeholder
-dicts when children are present (full sub-translation deferred).
+Classifies a parser node type as a Go type-expression node. Var and
+const specs interleave an optional type with an optional initializer
+under the same children list, so the translator must distinguish a
+type node from an expression node by kind. The type-flavoured kinds
+are exactly the GO_*_TYPE family plus struct/interface type nodes.
 @End Reasoning
 
 @Implementation:
-Reads name from offset 8 and children at offset 24. When children
-present, attaches type_info and initializer placeholder dicts —
-full child translation pending refinement.
+Returns 1 when node_type matches any of the Go type-node constants
+(basic, pointer, array, slice, map, chan, func, struct, interface),
+otherwise 0.
+@End Implementation
+
+Process called "is_go_statement_node" takes node_type as Integer returns Integer:
+    Note: Return 1 if node_type denotes a Go statement node
+
+    If node_type is equal to GO_VAR_DECL from Parser:
+        Return 1
+    End If
+    If node_type is equal to GO_CONST_DECL from Parser:
+        Return 1
+    End If
+    If node_type is equal to GO_BLOCK from Parser:
+        Return 1
+    End If
+    If node_type is equal to GO_IF_STMT from Parser:
+        Return 1
+    End If
+    If node_type is equal to GO_FOR_STMT from Parser:
+        Return 1
+    End If
+    If node_type is equal to GO_SWITCH_STMT from Parser:
+        Return 1
+    End If
+    If node_type is equal to GO_SELECT_STMT from Parser:
+        Return 1
+    End If
+    If node_type is equal to GO_RETURN_STMT from Parser:
+        Return 1
+    End If
+    If node_type is equal to GO_BREAK_STMT from Parser:
+        Return 1
+    End If
+    If node_type is equal to GO_CONTINUE_STMT from Parser:
+        Return 1
+    End If
+    If node_type is equal to GO_FALLTHROUGH_STMT from Parser:
+        Return 1
+    End If
+    If node_type is equal to GO_GOTO_STMT from Parser:
+        Return 1
+    End If
+    If node_type is equal to GO_DEFER_STMT from Parser:
+        Return 1
+    End If
+    If node_type is equal to GO_GO_STMT from Parser:
+        Return 1
+    End If
+    If node_type is equal to GO_ASSIGN_STMT from Parser:
+        Return 1
+    End If
+    If node_type is equal to GO_SHORT_VAR_DECL from Parser:
+        Return 1
+    End If
+    If node_type is equal to GO_EXPR_STMT from Parser:
+        Return 1
+    End If
+
+    Return 0
+End Process
+
+Process called "is_go_type_node" takes node_type as Integer returns Integer:
+    Note: Return 1 if node_type denotes a Go type expression node
+
+    If node_type is equal to GO_BASIC_TYPE from Parser:
+        Return 1
+    End If
+    If node_type is equal to GO_POINTER_TYPE from Parser:
+        Return 1
+    End If
+    If node_type is equal to GO_ARRAY_TYPE from Parser:
+        Return 1
+    End If
+    If node_type is equal to GO_SLICE_TYPE from Parser:
+        Return 1
+    End If
+    If node_type is equal to GO_MAP_TYPE from Parser:
+        Return 1
+    End If
+    If node_type is equal to GO_CHAN_TYPE from Parser:
+        Return 1
+    End If
+    If node_type is equal to GO_FUNC_TYPE from Parser:
+        Return 1
+    End If
+    If node_type is equal to GO_STRUCT_TYPE from Parser:
+        Return 1
+    End If
+    If node_type is equal to GO_INTERFACE_TYPE from Parser:
+        Return 1
+    End If
+
+    Return 0
+End Process
+
+@Reasoning:
+Translates a Go `var` declaration. The parser wraps one or more var
+specs (each itself a GO_VAR_DECL carrying the variable name at offset
+8) under an outer GO_VAR_DECL node. This translator descends into the
+spec, reading the variable name and disambiguating the spec's children
+into an optional type (a type-flavoured node) and an optional
+initializer expression. The backend's go_var_decl shape carries
+name (string), type_info (HIR), and initializer (HIR).
+@End Reasoning
+
+@Implementation:
+If the node's own name slot (offset 8) is empty it is the outer
+wrapper, so the first spec child is used as the effective node;
+otherwise the node is already a spec. The spec's name comes from
+offset 8. Each child is classified via is_go_type_node: a type child
+is translated with translate_type into "type_info", any non-type
+child with translate_expression into "initializer".
 @End Implementation
 
 Process called "translate_var_decl" takes context as Integer, node as Integer returns Integer:
@@ -419,25 +810,47 @@ Process called "translate_var_decl" takes context as Integer, node as Integer re
         Return 0
     End If
 
-    Let var_hir be proc create_dict from HIR
+    Let var_hir be proc create_dict
 
-    proc set_dict_string from HIR with var_hir, "_type", "go_var_decl"
+    proc set_dict_string with var_hir, "_type", "go_var_decl"
 
-    Let var_name be proc memory_get_int64 from Layout with node, 8
-    If var_name is not equal to 0:
-        proc set_dict_string from HIR with var_hir, "name", var_name
+    Note: Resolve the effective spec node. The outer wrapper has no name
+    Note: of its own; the spec child carries name + type/init.
+    Let spec be node
+    Let own_name be proc memory_get_int64 from Layout with node, 8
+    If own_name is equal to 0:
+        Let outer_children be proc memory_get_int64 from Layout with node, 24
+        If outer_children is not equal to 0:
+            Let outer_count be proc length from List with outer_children
+            If outer_count is greater than 0:
+                Set spec to proc get from List with outer_children, 0
+            End If
+        End If
     End If
 
-    Note: Get type and initializer from children
-    Let children be proc memory_get_int64 from Layout with node, 24
-    If children is not equal to 0:
-        Note: First child is type (if present)
-        Let type_hir be proc create_dict from HIR
-        proc set_dict_value from HIR with var_hir, "type_info", type_hir
+    Let var_name be proc memory_get_int64 from Layout with spec, 8
+    If var_name is not equal to 0:
+        proc set_dict_string with var_hir, "name", var_name
+    End If
 
-        Note: Second child is initializer (if present)
-        Let init_hir be proc create_dict from HIR
-        proc set_dict_value from HIR with var_hir, "initializer", init_hir
+    Note: Spec children: optional type then optional initializer
+    Let children be proc memory_get_int64 from Layout with spec, 24
+    If children is not equal to 0:
+        Let child_count be proc length from List with children
+        Let index be 0
+        While index is less than child_count:
+            Let child be proc get from List with children, index
+            Let child_type be proc memory_get_int64 from Layout with child, 0
+            Let is_type be proc is_go_type_node with child_type
+            If is_type is equal to 1:
+                Let type_hir be proc translate_type with context, child
+                proc set_dict_value with var_hir, "type_info", type_hir
+            Otherwise:
+                Let init_hir be proc translate_expression with context, child
+                proc set_dict_value with var_hir, "initializer", init_hir
+            End If
+            Set index to index plus 1
+        End While
     End If
 
     Return var_hir
@@ -445,13 +858,19 @@ End Process
 
 @Reasoning:
 Translates `const name = value` and `const name Type = value` forms.
-Constants must have a value (Go grammar requirement). Same placeholder
-shape as var_decl — full child translation pending.
+Like var declarations, the parser wraps one or more const specs under
+an outer GO_CONST_DECL node; this translator descends into the spec,
+reads the name, and classifies the spec's children into an optional
+type and the constant value. The backend's go_const_decl shape carries
+name (string), type_info (HIR), and value (HIR).
 @End Reasoning
 
 @Implementation:
-Reads name from offset 8 and children at offset 24. When present
-attaches placeholder type_info and value dicts on the const HIR node.
+If the node has no name of its own it is the outer wrapper, so the
+first spec child becomes the effective node. The spec's name is read
+from offset 8. Each spec child is classified via is_go_type_node: a
+type child is translated with translate_type into "type_info", any
+other child with translate_expression into "value".
 @End Implementation
 
 Process called "translate_const_decl" takes context as Integer, node as Integer returns Integer:
@@ -461,23 +880,45 @@ Process called "translate_const_decl" takes context as Integer, node as Integer 
         Return 0
     End If
 
-    Let const_hir be proc create_dict from HIR
+    Let const_hir be proc create_dict
 
-    proc set_dict_string from HIR with const_hir, "_type", "go_const_decl"
+    proc set_dict_string with const_hir, "_type", "go_const_decl"
 
-    Let const_name be proc memory_get_int64 from Layout with node, 8
-    If const_name is not equal to 0:
-        proc set_dict_string from HIR with const_hir, "name", const_name
+    Let spec be node
+    Let own_name be proc memory_get_int64 from Layout with node, 8
+    If own_name is equal to 0:
+        Let outer_children be proc memory_get_int64 from Layout with node, 24
+        If outer_children is not equal to 0:
+            Let outer_count be proc length from List with outer_children
+            If outer_count is greater than 0:
+                Set spec to proc get from List with outer_children, 0
+            End If
+        End If
     End If
 
-    Note: Get type and value from children
-    Let children be proc memory_get_int64 from Layout with node, 24
-    If children is not equal to 0:
-        Let type_hir be proc create_dict from HIR
-        proc set_dict_value from HIR with const_hir, "type_info", type_hir
+    Let const_name be proc memory_get_int64 from Layout with spec, 8
+    If const_name is not equal to 0:
+        proc set_dict_string with const_hir, "name", const_name
+    End If
 
-        Let value_hir be proc create_dict from HIR
-        proc set_dict_value from HIR with const_hir, "value", value_hir
+    Note: Spec children: optional type then the constant value
+    Let children be proc memory_get_int64 from Layout with spec, 24
+    If children is not equal to 0:
+        Let child_count be proc length from List with children
+        Let index be 0
+        While index is less than child_count:
+            Let child be proc get from List with children, index
+            Let child_type be proc memory_get_int64 from Layout with child, 0
+            Let is_type be proc is_go_type_node with child_type
+            If is_type is equal to 1:
+                Let type_hir be proc translate_type with context, child
+                proc set_dict_value with const_hir, "type_info", type_hir
+            Otherwise:
+                Let value_hir be proc translate_expression with context, child
+                proc set_dict_value with const_hir, "value", value_hir
+            End If
+            Set index to index plus 1
+        End While
     End If
 
     Return const_hir
@@ -549,6 +990,56 @@ Process called "translate_type" takes context as Integer, node as Integer return
 End Process
 
 @Reasoning:
+A function's return signature is either a single type (`func f() int`)
+or a parenthesised result list (`func f() (int, error)`). The parser
+emits the single form as an ordinary type node and the multi form as a
+GO_PARAMETER node ("result_list") whose children are the individual
+result type nodes. This translator normalises both: a result list
+becomes a "result_list"-tagged HIR dict carrying an "elements" list of
+translated type HIRs, and any other node falls through to translate_type.
+@End Reasoning
+
+@Implementation:
+Reads node_type at offset 0. A GO_PARAMETER node is treated as a
+result list: each child type is translated via translate_type and
+appended to the "elements" list of a result_list dict. Otherwise the
+node is a single type and is translated via translate_type.
+@End Implementation
+
+Process called "translate_return_type" takes context as Integer, node as Integer returns Integer:
+    Note: Translate a function return signature (single type or result list)
+
+    If node is equal to 0:
+        Return 0
+    End If
+
+    Let node_type be proc memory_get_int64 from Layout with node, 0
+    If node_type is equal to GO_PARAMETER from Parser:
+        Let result_hir be proc create_dict
+        proc set_dict_string with result_hir, "_type", "result_list"
+
+        Let elements_hir be proc create_list
+        Let children be proc memory_get_int64 from Layout with node, 24
+        If children is not equal to 0:
+            Let count be proc length from List with children
+            Let index be 0
+            While index is less than count:
+                Let type_node be proc get from List with children, index
+                Let type_hir be proc translate_type with context, type_node
+                If type_hir is not equal to 0:
+                    proc add_to_list with elements_hir, type_hir
+                End If
+                Set index to index plus 1
+            End While
+        End If
+        proc set_dict_value with result_hir, "elements", elements_hir
+        Return result_hir
+    End If
+
+    Return proc translate_type with context, node
+End Process
+
+@Reasoning:
 Emits a "type" HIR dict for Go's named basic types (int, int8...int64,
 uint*, float32/64, string, bool, byte, rune, complex64/128). Only the
 name string is needed; the underlying width/signedness is encoded in
@@ -567,13 +1058,13 @@ Process called "translate_basic_type" takes context as Integer, node as Integer 
         Return 0
     End If
 
-    Let type_hir be proc create_dict from HIR
+    Let type_hir be proc create_dict
 
-    proc set_dict_string from HIR with type_hir, "_type", "type"
+    proc set_dict_string with type_hir, "_type", "type"
 
     Let type_name be proc memory_get_int64 from Layout with node, 8
     If type_name is not equal to 0:
-        proc set_dict_string from HIR with type_hir, "name", type_name
+        proc set_dict_string with type_hir, "name", type_name
     End If
 
     Return type_hir
@@ -586,8 +1077,8 @@ to-pointer nests through recursion.
 @End Reasoning
 
 @Implementation:
-Reads child at offset 24, recursively translates via translate_type,
-attaches as "base_type".
+Reads the first child of the children list (offset 24), recursively
+translates it via translate_type, and attaches it as "base_type".
 @End Implementation
 
 Process called "translate_pointer_type" takes context as Integer, node as Integer returns Integer:
@@ -597,30 +1088,34 @@ Process called "translate_pointer_type" takes context as Integer, node as Intege
         Return 0
     End If
 
-    Let pointer_hir be proc create_dict from HIR
+    Let pointer_hir be proc create_dict
 
-    proc set_dict_string from HIR with pointer_hir, "_type", "pointer_type"
+    proc set_dict_string with pointer_hir, "_type", "pointer_type"
 
-    Note: Get base type from children
+    Note: Children list: [base type]
     Let children be proc memory_get_int64 from Layout with node, 24
     If children is not equal to 0:
-        Let base_type_hir be proc translate_type with context, children
-        proc set_dict_value from HIR with pointer_hir, "base_type", base_type_hir
+        Let child_count be proc length from List with children
+        If child_count is greater than 0:
+            Let base_node be proc get from List with children, 0
+            Let base_type_hir be proc translate_type with context, base_node
+            proc set_dict_value with pointer_hir, "base_type", base_type_hir
+        End If
     End If
 
     Return pointer_hir
 End Process
 
 @Reasoning:
-Emits "array_type" HIR for Go fixed-size arrays `[N]T`. Size is a
-constant expression; element_type is recursively translated. Current
-implementation uses placeholder dicts; full sub-translation pending.
+Emits "array_type" HIR for Go fixed-size arrays `[N]T`. The first
+child is the size (a constant expression) and the second is the
+element type, both recursively translated.
 @End Reasoning
 
 @Implementation:
-Reads children at offset 24. Attaches placeholder size and
-element_type dicts. The size expression is technically computable at
-compile time but is treated as a generic expression here.
+Children list holds [size_expression, element_type]. The size is
+translated via translate_expression into "size" and the element type
+via translate_type into "element_type".
 @End Implementation
 
 Process called "translate_array_type" takes context as Integer, node as Integer returns Integer:
@@ -630,20 +1125,24 @@ Process called "translate_array_type" takes context as Integer, node as Integer 
         Return 0
     End If
 
-    Let array_hir be proc create_dict from HIR
+    Let array_hir be proc create_dict
 
-    proc set_dict_string from HIR with array_hir, "_type", "array_type"
+    proc set_dict_string with array_hir, "_type", "array_type"
 
-    Note: Get size and element type from children
+    Note: Children: [size expression, element type]
     Let children be proc memory_get_int64 from Layout with node, 24
     If children is not equal to 0:
-        Note: First child is size expression
-        Let size_hir be proc create_dict from HIR
-        proc set_dict_value from HIR with array_hir, "size", size_hir
-
-        Note: Second child is element type
-        Let element_type_hir be proc create_dict from HIR
-        proc set_dict_value from HIR with array_hir, "element_type", element_type_hir
+        Let child_count be proc length from List with children
+        If child_count is greater than 0:
+            Let size_node be proc get from List with children, 0
+            Let size_hir be proc translate_expression with context, size_node
+            proc set_dict_value with array_hir, "size", size_hir
+        End If
+        If child_count is greater than 1:
+            Let elem_node be proc get from List with children, 1
+            Let element_type_hir be proc translate_type with context, elem_node
+            proc set_dict_value with array_hir, "element_type", element_type_hir
+        End If
     End If
 
     Return array_hir
@@ -656,8 +1155,8 @@ in the type representation.
 @End Reasoning
 
 @Implementation:
-Reads child at offset 24, recursively translates via translate_type,
-attaches as "element_type".
+Reads the first child of the children list (offset 24), recursively
+translates it via translate_type, and attaches it as "element_type".
 @End Implementation
 
 Process called "translate_slice_type" takes context as Integer, node as Integer returns Integer:
@@ -667,15 +1166,19 @@ Process called "translate_slice_type" takes context as Integer, node as Integer 
         Return 0
     End If
 
-    Let slice_hir be proc create_dict from HIR
+    Let slice_hir be proc create_dict
 
-    proc set_dict_string from HIR with slice_hir, "_type", "slice_type"
+    proc set_dict_string with slice_hir, "_type", "slice_type"
 
-    Note: Get element type from children
+    Note: Children list: [element type]
     Let children be proc memory_get_int64 from Layout with node, 24
     If children is not equal to 0:
-        Let element_type_hir be proc translate_type with context, children
-        proc set_dict_value from HIR with slice_hir, "element_type", element_type_hir
+        Let child_count be proc length from List with children
+        If child_count is greater than 0:
+            Let elem_node be proc get from List with children, 0
+            Let element_type_hir be proc translate_type with context, elem_node
+            proc set_dict_value with slice_hir, "element_type", element_type_hir
+        End If
     End If
 
     Return slice_hir
@@ -687,8 +1190,9 @@ types are children of the map node.
 @End Reasoning
 
 @Implementation:
-Reads children at offset 24. Currently attaches placeholder key_type
-and value_type dicts (full recursive translation pending).
+Children list holds [key_type, value_type]. Each is recursively
+translated via translate_type and attached under "key_type" and
+"value_type" respectively.
 @End Implementation
 
 Process called "translate_map_type" takes context as Integer, node as Integer returns Integer:
@@ -698,20 +1202,24 @@ Process called "translate_map_type" takes context as Integer, node as Integer re
         Return 0
     End If
 
-    Let map_hir be proc create_dict from HIR
+    Let map_hir be proc create_dict
 
-    proc set_dict_string from HIR with map_hir, "_type", "map_type"
+    proc set_dict_string with map_hir, "_type", "map_type"
 
-    Note: Get key and value types from children
+    Note: Children: [key type, value type]
     Let children be proc memory_get_int64 from Layout with node, 24
     If children is not equal to 0:
-        Note: First child is key type
-        Let key_type_hir be proc create_dict from HIR
-        proc set_dict_value from HIR with map_hir, "key_type", key_type_hir
-
-        Note: Second child is value type
-        Let value_type_hir be proc create_dict from HIR
-        proc set_dict_value from HIR with map_hir, "value_type", value_type_hir
+        Let child_count be proc length from List with children
+        If child_count is greater than 0:
+            Let key_node be proc get from List with children, 0
+            Let key_type_hir be proc translate_type with context, key_node
+            proc set_dict_value with map_hir, "key_type", key_type_hir
+        End If
+        If child_count is greater than 1:
+            Let value_node be proc get from List with children, 1
+            Let value_type_hir be proc translate_type with context, value_node
+            proc set_dict_value with map_hir, "value_type", value_type_hir
+        End If
     End If
 
     Return map_hir
@@ -737,27 +1245,32 @@ Process called "translate_chan_type" takes context as Integer, node as Integer r
         Return 0
     End If
 
-    Let chan_hir be proc create_dict from HIR
+    Let chan_hir be proc create_dict
 
-    proc set_dict_string from HIR with chan_hir, "_type", "chan_type"
+    proc set_dict_string with chan_hir, "_type", "chan_type"
 
     Note: Get direction from attributes
     Let attributes be proc memory_get_int64 from Layout with node, 32
     If attributes is not equal to 0:
         Let direction be proc get from Dict with attributes, "direction"
         If direction is not equal to 0:
-            proc set_dict_string from HIR with channel_hir, "direction", direction
+            proc set_dict_string with chan_hir, "direction", direction
         Otherwise:
-            proc set_dict_string from HIR with channel_hir, "direction", "bidirectional"
+            proc set_dict_string with chan_hir, "direction", "bidirectional"
         End If
-        proc set_dict_string from HIR with chan_hir, "direction", "bidirectional"
+    Otherwise:
+        proc set_dict_string with chan_hir, "direction", "bidirectional"
     End If
 
-    Note: Get element type from children
+    Note: Children list: [element type]
     Let children be proc memory_get_int64 from Layout with node, 24
     If children is not equal to 0:
-        Let element_type_hir be proc translate_type with context, children
-        proc set_dict_value from HIR with chan_hir, "element_type", element_type_hir
+        Let child_count be proc length from List with children
+        If child_count is greater than 0:
+            Let elem_node be proc get from List with children, 0
+            Let element_type_hir be proc translate_type with context, elem_node
+            proc set_dict_value with chan_hir, "element_type", element_type_hir
+        End If
     End If
 
     Return chan_hir
@@ -782,14 +1295,14 @@ Process called "translate_struct_type" takes context as Integer, node as Integer
         Return 0
     End If
 
-    Let struct_hir be proc create_dict from HIR
+    Let struct_hir be proc create_dict
 
-    proc set_dict_string from HIR with struct_hir, "_type", "struct_type"
+    proc set_dict_string with struct_hir, "_type", "struct_type"
 
     Note: Get fields from children
     Let children be proc memory_get_int64 from Layout with node, 24
     If children is not equal to 0:
-        Let fields_hir be proc create_list from HIR
+        Let fields_hir be proc create_list
 
         Let field_count be proc size from List with children
         Let i be 0
@@ -797,12 +1310,12 @@ Process called "translate_struct_type" takes context as Integer, node as Integer
             Let field be proc get from List with children, i
             Let field_hir be proc translate_field with context, field
             If field_hir is not equal to 0:
-                proc add_to_list from HIR with fields_hir, field_hir
+                proc add_to_list with fields_hir, field_hir
             End If
             Set i to i plus 1
         End While
 
-        proc set_dict_value from HIR with struct_hir, "fields", fields_hir
+        proc set_dict_value with struct_hir, "fields", fields_hir
     End If
 
     Return struct_hir
@@ -827,14 +1340,14 @@ Process called "translate_interface_type" takes context as Integer, node as Inte
         Return 0
     End If
 
-    Let interface_hir be proc create_dict from HIR
+    Let interface_hir be proc create_dict
 
-    proc set_dict_string from HIR with interface_hir, "_type", "interface_type"
+    proc set_dict_string with interface_hir, "_type", "interface_type"
 
     Note: Get methods from children
     Let children be proc memory_get_int64 from Layout with node, 24
     If children is not equal to 0:
-        Let methods_hir be proc create_list from HIR
+        Let methods_hir be proc create_list
 
         Let method_count be proc size from List with children
         Let i be 0
@@ -842,12 +1355,12 @@ Process called "translate_interface_type" takes context as Integer, node as Inte
             Let method be proc get from List with children, i
             Let method_hir be proc translate_method with context, method
             If method_hir is not equal to 0:
-                proc add_to_list from HIR with methods_hir, method_hir
+                proc add_to_list with methods_hir, method_hir
             End If
             Set i to i plus 1
         End While
 
-        proc set_dict_value from HIR with interface_hir, "methods", methods_hir
+        proc set_dict_value with interface_hir, "methods", methods_hir
     End If
 
     Return interface_hir
@@ -860,8 +1373,10 @@ return type are children.
 @End Reasoning
 
 @Implementation:
-Reads children at offset 24. Currently attaches placeholder
-parameters list and return_type dict — full sub-translation pending.
+Children list holds [parameter_list] and, when present, a trailing
+[return_type]. The parameter list is translated via
+translate_parameter_list into "parameters"; the optional return type
+via translate_type into "return_type".
 @End Implementation
 
 Process called "translate_func_type" takes context as Integer, node as Integer returns Integer:
@@ -871,18 +1386,24 @@ Process called "translate_func_type" takes context as Integer, node as Integer r
         Return 0
     End If
 
-    Let func_type_hir be proc create_dict from HIR
+    Let func_type_hir be proc create_dict
 
-    proc set_dict_string from HIR with func_type_hir, "_type", "func_type"
+    proc set_dict_string with func_type_hir, "_type", "func_type"
 
-    Note: Get parameters and return type from children
+    Note: Children: [parameter list, return type?]
     Let children be proc memory_get_int64 from Layout with node, 24
     If children is not equal to 0:
-        Let params_hir be proc create_list from HIR
-        proc set_dict_value from HIR with func_type_hir, "parameters", params_hir
-
-        Let return_type_hir be proc create_dict from HIR
-        proc set_dict_value from HIR with func_type_hir, "return_type", return_type_hir
+        Let child_count be proc length from List with children
+        If child_count is greater than 0:
+            Let params_node be proc get from List with children, 0
+            Let params_hir be proc translate_parameter_list with context, params_node
+            proc set_dict_value with func_type_hir, "parameters", params_hir
+        End If
+        If child_count is greater than 1:
+            Let return_node be proc get from List with children, 1
+            Let return_type_hir be proc translate_return_type with context, return_node
+            proc set_dict_value with func_type_hir, "return_type", return_type_hir
+        End If
     End If
 
     Return func_type_hir
@@ -908,20 +1429,25 @@ Process called "translate_field" takes context as Integer, node as Integer retur
         Return 0
     End If
 
-    Let field_hir be proc create_dict from HIR
+    Let field_hir be proc create_dict
 
-    proc set_dict_string from HIR with field_hir, "_type", "field"
+    proc set_dict_string with field_hir, "_type", "field"
 
     Let field_name be proc memory_get_int64 from Layout with node, 8
     If field_name is not equal to 0:
-        proc set_dict_string from HIR with field_hir, "name", field_name
+        proc set_dict_string with field_hir, "name", field_name
     End If
 
-    Note: Get field type from children
+    Note: Children list: [field type]. Read the first element, not the
+    Note: list handle, then translate it.
     Let children be proc memory_get_int64 from Layout with node, 24
     If children is not equal to 0:
-        Let field_type_hir be proc translate_type with context, children
-        proc set_dict_value from HIR with field_hir, "type_info", field_type_hir
+        Let child_count be proc length from List with children
+        If child_count is greater than 0:
+            Let type_node be proc get from List with children, 0
+            Let field_type_hir be proc translate_type with context, type_node
+            proc set_dict_value with field_hir, "type_info", field_type_hir
+        End If
     End If
 
     Note: Get tag from attributes (for struct fields)
@@ -929,9 +1455,10 @@ Process called "translate_field" takes context as Integer, node as Integer retur
     If attributes is not equal to 0:
         Let tag_value be proc get from Dict with attributes, "tag"
         If tag_value is not equal to 0:
-            proc set_dict_string from HIR with field_hir, "tag", tag_value
+            proc set_dict_string with field_hir, "tag", tag_value
+        Otherwise:
+            proc set_dict_string with field_hir, "tag", ""
         End If
-        proc set_dict_string from HIR with field_hir, "tag", ""
     End If
 
     Return field_hir
@@ -955,20 +1482,25 @@ Process called "translate_parameter" takes context as Integer, node as Integer r
         Return 0
     End If
 
-    Let param_hir be proc create_dict from HIR
+    Let param_hir be proc create_dict
 
-    proc set_dict_string from HIR with param_hir, "_type", "parameter"
+    proc set_dict_string with param_hir, "_type", "parameter"
 
     Let param_name be proc memory_get_int64 from Layout with node, 8
     If param_name is not equal to 0:
-        proc set_dict_string from HIR with param_hir, "name", param_name
+        proc set_dict_string with param_hir, "name", param_name
     End If
 
-    Note: Get parameter type from children
+    Note: Children list: [parameter type]. Read the first element rather
+    Note: than the list handle itself, then translate it.
     Let children be proc memory_get_int64 from Layout with node, 24
     If children is not equal to 0:
-        Let param_type_hir be proc translate_type with context, children
-        proc set_dict_value from HIR with param_hir, "type_info", param_type_hir
+        Let child_count be proc length from List with children
+        If child_count is greater than 0:
+            Let type_node be proc get from List with children, 0
+            Let param_type_hir be proc translate_type with context, type_node
+            proc set_dict_value with param_hir, "type_info", param_type_hir
+        End If
     End If
 
     Return param_hir
@@ -1091,14 +1623,14 @@ Process called "translate_block" takes context as Integer, node as Integer retur
         Return 0
     End If
 
-    Let block_hir be proc create_dict from HIR
+    Let block_hir be proc create_dict
 
-    proc set_dict_string from HIR with block_hir, "_type", "block"
+    proc set_dict_string with block_hir, "_type", "block"
 
     Note: Get statements from children
     Let children be proc memory_get_int64 from Layout with node, 24
     If children is not equal to 0:
-        Let statements_hir be proc create_list from HIR
+        Let statements_hir be proc create_list
 
         Let stmt_count be proc size from List with children
         Let i be 0
@@ -1106,12 +1638,12 @@ Process called "translate_block" takes context as Integer, node as Integer retur
             Let stmt be proc get from List with children, i
             Let stmt_hir be proc translate_statement with context, stmt
             If stmt_hir is not equal to 0:
-                proc add_to_list from HIR with statements_hir, stmt_hir
+                proc add_to_list with statements_hir, stmt_hir
             End If
             Set i to i plus 1
         End While
 
-        proc set_dict_value from HIR with block_hir, "statements", statements_hir
+        proc set_dict_value with block_hir, "statements", statements_hir
     End If
 
     Return block_hir
@@ -1124,9 +1656,13 @@ init-statement preceding the condition (`if x := f(); cond { ... }`).
 @End Reasoning
 
 @Implementation:
-Reads children at offset 24. Walks children translating each as a
-statement and appending to a body list. Attaches placeholder init,
-condition, then_block, else_block dicts to capture all four slots.
+Reads children at offset 24. Locates the then-block as the first
+GO_BLOCK child; the child immediately before it is the condition
+(translated via translate_expression) and an earlier child, when
+present, is the init statement (translate_statement). A child after
+the then-block is the else clause (translate_statement, covering both
+`else { }` blocks and `else if` chains). Results attach under "init",
+"condition", "then_block", and "else_block".
 @End Implementation
 
 Process called "translate_if_statement" takes context as Integer, node as Integer returns Integer:
@@ -1136,34 +1672,69 @@ Process called "translate_if_statement" takes context as Integer, node as Intege
         Return 0
     End If
 
-    Let if_hir be proc create_dict from HIR
+    Let if_hir be proc create_dict
 
-    proc set_dict_string from HIR with if_hir, "_type", "if_stmt"
+    proc set_dict_string with if_hir, "_type", "if_stmt"
 
-    Note: Get children (init, condition, then, else)
+    Note: Children are a variable run: optional init (simple stmt), the
+    Note: condition expression, the then block, and an optional else clause.
+    Note: The then block is the first GO_BLOCK child; whatever precedes it is
+    Note: init+condition, and a child after it is the else clause.
     Let children be proc memory_get_int64 from Layout with node, 24
     If children is not equal to 0:
         Let child_count be proc size from List with children
-        Let i be 0
-        While i is less than child_count:
-            Let child be proc get from List with children, i
-            Let child_hir be proc translate_statement with context, child
-            If child_hir is not equal to 0:
-                proc add_to_list from HIR with body_hir, child_hir
+
+        Note: Locate the then-block (first GO_BLOCK child)
+        Let then_index be 0 minus 1
+        Let scan be 0
+        While scan is less than child_count:
+            Let candidate be proc get from List with children, scan
+            If candidate is not equal to 0:
+                Let candidate_kind be proc memory_get_int64 from Layout with candidate, 0
+                If candidate_kind is equal to GO_BLOCK from Parser:
+                    If then_index is less than 0:
+                        Set then_index to scan
+                    End If
+                End If
             End If
-            Set i to i plus 1
+            Set scan to scan plus 1
         End While
-        Let init_hir be proc create_dict from HIR
-        proc set_dict_value from HIR with if_hir, "init", init_hir
 
-        Let condition_hir be proc create_dict from HIR
-        proc set_dict_value from HIR with if_hir, "condition", condition_hir
+        If then_index is greater than 0:
+            Note: Pre-block children: condition is the last one before the
+            Note: then block; an earlier one (if present) is the init stmt.
+            Let cond_index be then_index minus 1
+            If cond_index is greater than 0:
+                Let init_node be proc get from List with children, 0
+                Let init_hir be proc translate_statement with context, init_node
+                If init_hir is not equal to 0:
+                    proc set_dict_value with if_hir, "init", init_hir
+                End If
+            End If
 
-        Let then_hir be proc create_dict from HIR
-        proc set_dict_value from HIR with if_hir, "then_block", then_hir
+            Let cond_node be proc get from List with children, cond_index
+            Let condition_hir be proc translate_expression with context, cond_node
+            If condition_hir is not equal to 0:
+                proc set_dict_value with if_hir, "condition", condition_hir
+            End If
+        End If
 
-        Let else_hir be proc create_dict from HIR
-        proc set_dict_value from HIR with if_hir, "else_block", else_hir
+        If then_index is greater than 0 minus 1:
+            Let then_node be proc get from List with children, then_index
+            Let then_hir be proc translate_block with context, then_node
+            If then_hir is not equal to 0:
+                proc set_dict_value with if_hir, "then_block", then_hir
+            End If
+
+            Let else_index be then_index plus 1
+            If else_index is less than child_count:
+                Let else_node be proc get from List with children, else_index
+                Let else_hir be proc translate_statement with context, else_node
+                If else_hir is not equal to 0:
+                    proc set_dict_value with if_hir, "else_block", else_hir
+                End If
+            End If
+        End If
     End If
 
     Return if_hir
@@ -1178,9 +1749,13 @@ downstream tooling doesn't need to inspect children.
 
 @Implementation:
 Reads attributes (offset 32) for loop type info; defaults to
-"three_part" if no explicit type. Reads children (offset 24) for
-the per-form slots (init/cond/post/body or range vars). Attaches
-placeholder dicts for each slot.
+"three_part" when no explicit type is present, "infinite" when the
+type attribute exists but is empty. The body is always the last child
+(a GO_BLOCK). For range loops children[0] is the range variable
+target (translate_statement -> "range_variables") and children[1] is
+the range expression (translate_expression -> "range_expr"). For
+three-part/condition loops the leading clauses before the body are
+translated in source order into "init", "condition", and "post".
 @End Implementation
 
 Process called "translate_for_statement" takes context as Integer, node as Integer returns Integer:
@@ -1190,42 +1765,86 @@ Process called "translate_for_statement" takes context as Integer, node as Integ
         Return 0
     End If
 
-    Let for_hir be proc create_dict from HIR
+    Let for_hir be proc create_dict
 
-    proc set_dict_string from HIR with for_hir, "_type", "for_stmt"
+    proc set_dict_string with for_hir, "_type", "for_stmt"
 
     Note: Check for range loop
     Let attributes be proc memory_get_int64 from Layout with node, 32
     If attributes is not equal to 0:
         Let loop_type be proc get from Dict with attributes, "type"
         If loop_type is not equal to 0:
-            Let is_range be proc equals from StringCore with loop_type, "range"
+            Let is_range be proc string_equals from StringCore with loop_type, "range"
             If is_range is equal to 1:
-                proc set_dict_string from HIR with for_hir, "loop_type", "range"
+                proc set_dict_string with for_hir, "loop_type", "range"
             Otherwise:
-                proc set_dict_string from HIR with for_hir, "loop_type", "condition"
+                proc set_dict_string with for_hir, "loop_type", "condition"
             End If
         Otherwise:
-            proc set_dict_string from HIR with for_hir, "loop_type", "infinite"
+            proc set_dict_string with for_hir, "loop_type", "infinite"
         End If
     Otherwise:
-        proc set_dict_string from HIR with for_hir, "loop_type", "three_part"
+        proc set_dict_string with for_hir, "loop_type", "three_part"
     End If
 
-    Note: Get children (init, condition, post, body OR range variables, range expr, body)
+    Note: The loop body is always the last child (a GO_BLOCK). Range loops
+    Note: carry [variables, range_expr, body]; three-part/condition loops
+    Note: carry the leading init/condition/post statements before the body.
     Let children be proc memory_get_int64 from Layout with node, 24
     If children is not equal to 0:
-        Let init_hir be proc create_dict from HIR
-        proc set_dict_value from HIR with for_hir, "init", init_hir
+        Let child_count be proc size from List with children
+        If child_count is greater than 0:
+            Let body_index be child_count minus 1
+            Let body_node be proc get from List with children, body_index
+            Let body_hir be proc translate_block with context, body_node
+            If body_hir is not equal to 0:
+                proc set_dict_value with for_hir, "body", body_hir
+            End If
 
-        Let condition_hir be proc create_dict from HIR
-        proc set_dict_value from HIR with for_hir, "condition", condition_hir
+            Let is_range_loop be proc get from Dict with attributes, "type"
+            Let range_match be 0
+            If attributes is not equal to 0:
+                If is_range_loop is not equal to 0:
+                    Set range_match to proc string_equals from StringCore with is_range_loop, "range"
+                End If
+            End If
 
-        Let post_hir be proc create_dict from HIR
-        proc set_dict_value from HIR with for_hir, "post", post_hir
-
-        Let body_hir be proc create_dict from HIR
-        proc set_dict_value from HIR with for_hir, "body", body_hir
+            If range_match is equal to 1:
+                Note: children[0] = range variables, children[1] = range expr
+                If child_count is greater than 1:
+                    Let range_vars_node be proc get from List with children, 0
+                    Let range_vars_hir be proc translate_statement with context, range_vars_node
+                    If range_vars_hir is not equal to 0:
+                        proc set_dict_value with for_hir, "range_variables", range_vars_hir
+                    End If
+                End If
+                If child_count is greater than 2:
+                    Let range_expr_node be proc get from List with children, 1
+                    Let range_expr_hir be proc translate_expression with context, range_expr_node
+                    If range_expr_hir is not equal to 0:
+                        proc set_dict_value with for_hir, "range_expr", range_expr_hir
+                    End If
+                End If
+            Otherwise:
+                Note: Three-part or condition-only: translate the leading
+                Note: clauses (everything before the body) in source order.
+                Let lead be 0
+                While lead is less than body_index:
+                    Let clause_node be proc get from List with children, lead
+                    Let clause_hir be proc translate_statement with context, clause_node
+                    If clause_hir is not equal to 0:
+                        If lead is equal to 0:
+                            proc set_dict_value with for_hir, "init", clause_hir
+                        Otherwise If lead is equal to 1:
+                            proc set_dict_value with for_hir, "condition", clause_hir
+                        Otherwise:
+                            proc set_dict_value with for_hir, "post", clause_hir
+                        End If
+                    End If
+                    Set lead to lead plus 1
+                End While
+            End If
+        End If
     End If
 
     Return for_hir
@@ -1238,8 +1857,10 @@ expressions and statements.
 @End Reasoning
 
 @Implementation:
-Reads children (offset 24). Attaches placeholder init, tag, and cases
-slots on the switch HIR dict.
+Reads children (offset 24). The children before the first
+GO_CASE_CLAUSE are the optional init statement and tag expression
+(init precedes tag when both are present); each GO_CASE_CLAUSE child
+is translated via translate_case_clause into the "cases" list.
 @End Implementation
 
 Process called "translate_switch_statement" takes context as Integer, node as Integer returns Integer:
@@ -1249,21 +1870,57 @@ Process called "translate_switch_statement" takes context as Integer, node as In
         Return 0
     End If
 
-    Let switch_hir be proc create_dict from HIR
+    Let switch_hir be proc create_dict
 
-    proc set_dict_string from HIR with switch_hir, "_type", "switch_stmt"
+    proc set_dict_string with switch_hir, "_type", "switch_stmt"
 
-    Note: Get children (init, tag, cases)
+    Note: Children: [init?, tag?, case_clause...]. Pre-case children are
+    Note: the optional init statement and tag expression; the parser emits
+    Note: at most two, with init (when present) preceding the tag.
     Let children be proc memory_get_int64 from Layout with node, 24
     If children is not equal to 0:
-        Let init_hir be proc create_dict from HIR
-        proc set_dict_value from HIR with switch_hir, "init", init_hir
+        Let child_count be proc length from List with children
 
-        Let tag_hir be proc create_dict from HIR
-        proc set_dict_value from HIR with switch_hir, "tag", tag_hir
+        Note: Find the index of the first case clause.
+        Let first_case be child_count
+        Let scan be 0
+        While scan is less than child_count:
+            Let candidate be proc get from List with children, scan
+            Let candidate_kind be proc memory_get_int64 from Layout with candidate, 0
+            If candidate_kind is equal to GO_CASE_CLAUSE from Parser:
+                If first_case is equal to child_count:
+                    Set first_case to scan
+                End If
+            End If
+            Set scan to scan plus 1
+        End While
 
-        Let cases_hir be proc create_list from HIR
-        proc set_dict_value from HIR with switch_hir, "cases", cases_hir
+        Note: Pre-case children: one => tag, two => init then tag.
+        If first_case is equal to 2:
+            Let init_node be proc get from List with children, 0
+            Let init_hir be proc translate_statement with context, init_node
+            proc set_dict_value with switch_hir, "init", init_hir
+            Let tag_node be proc get from List with children, 1
+            Let tag_hir be proc translate_expression with context, tag_node
+            proc set_dict_value with switch_hir, "tag", tag_hir
+        Otherwise If first_case is equal to 1:
+            Let tag_node2 be proc get from List with children, 0
+            Let tag_hir2 be proc translate_expression with context, tag_node2
+            proc set_dict_value with switch_hir, "tag", tag_hir2
+        End If
+
+        Note: Remaining children are the case clauses.
+        Let cases_hir be proc create_list
+        Let ci be first_case
+        While ci is less than child_count:
+            Let case_node be proc get from List with children, ci
+            Let case_hir be proc translate_case_clause with context, case_node
+            If case_hir is not equal to 0:
+                proc add_to_list with cases_hir, case_hir
+            End If
+            Set ci to ci plus 1
+        End While
+        proc set_dict_value with switch_hir, "cases", cases_hir
     End If
 
     Return switch_hir
@@ -1275,8 +1932,9 @@ a send or receive operation; default fires if no channel is ready.
 @End Reasoning
 
 @Implementation:
-Reads case clauses from children (offset 24), attaches as a placeholder
-"cases" list. Full case translation pending.
+Reads case clauses from children (offset 24); each GO_CASE_CLAUSE
+child is translated via translate_case_clause and accumulated into the
+"cases" list.
 @End Implementation
 
 Process called "translate_select_statement" takes context as Integer, node as Integer returns Integer:
@@ -1286,15 +1944,25 @@ Process called "translate_select_statement" takes context as Integer, node as In
         Return 0
     End If
 
-    Let select_hir be proc create_dict from HIR
+    Let select_hir be proc create_dict
 
-    proc set_dict_string from HIR with select_hir, "_type", "select_stmt"
+    proc set_dict_string with select_hir, "_type", "select_stmt"
 
-    Note: Get case clauses from children
+    Note: All children are case clauses.
     Let children be proc memory_get_int64 from Layout with node, 24
     If children is not equal to 0:
-        Let cases_hir be proc create_list from HIR
-        proc set_dict_value from HIR with select_hir, "cases", cases_hir
+        Let cases_hir be proc create_list
+        Let count be proc length from List with children
+        Let index be 0
+        While index is less than count:
+            Let case_node be proc get from List with children, index
+            Let case_hir be proc translate_case_clause with context, case_node
+            If case_hir is not equal to 0:
+                proc add_to_list with cases_hir, case_hir
+            End If
+            Set index to index plus 1
+        End While
+        proc set_dict_value with select_hir, "cases", cases_hir
     End If
 
     Return select_hir
@@ -1308,9 +1976,12 @@ match values) and a statement list to execute.
 @End Reasoning
 
 @Implementation:
-Reads attributes (offset 32) for is_default flag; defaults to "false".
-Reads children (offset 24); attaches placeholder expressions and
-statements lists.
+Reads the "default" attribute (offset 32); when present marks
+is_default="true", otherwise "false". Children interleave the case
+match expressions (raw expression nodes, emitted first by the parser)
+and the body statements (statement-kind nodes). Each child is
+classified via is_go_statement_node: statement-kind children go to the
+"statements" list, all others to the "expressions" list.
 @End Implementation
 
 Process called "translate_case_clause" takes context as Integer, node as Integer returns Integer:
@@ -1320,30 +1991,50 @@ Process called "translate_case_clause" takes context as Integer, node as Integer
         Return 0
     End If
 
-    Let case_hir be proc create_dict from HIR
+    Let case_hir be proc create_dict
 
-    proc set_dict_string from HIR with case_hir, "_type", "case_clause"
+    proc set_dict_string with case_hir, "_type", "case_clause"
 
-    Note: Check if default case
+    Note: Default-vs-case flag from the parser's "default" attribute.
     Let attributes be proc memory_get_int64 from Layout with node, 32
+    Let default_flag be 0
     If attributes is not equal to 0:
-        Let is_default be proc get from Dict with attributes, "default"
-        If is_default is not equal to 0:
-            proc set_dict_string from HIR with case_hir, "is_default", "true"
-        Otherwise:
-            proc set_dict_string from HIR with case_hir, "is_default", "false"
-        End If
-        proc set_dict_string from HIR with case_hir, "is_default", "false"
+        Set default_flag to proc get from Dict with attributes, "default"
+    End If
+    If default_flag is not equal to 0:
+        proc set_dict_string with case_hir, "is_default", "true"
+    Otherwise:
+        proc set_dict_string with case_hir, "is_default", "false"
     End If
 
-    Note: Get case expressions and statements from children
+    Note: Classify children into match expressions and body statements.
     Let children be proc memory_get_int64 from Layout with node, 24
     If children is not equal to 0:
-        Let expressions_hir be proc create_list from HIR
-        proc set_dict_value from HIR with case_hir, "expressions", expressions_hir
+        Let expressions_hir be proc create_list
+        Let statements_hir be proc create_list
 
-        Let statements_hir be proc create_list from HIR
-        proc set_dict_value from HIR with case_hir, "statements", statements_hir
+        Let count be proc length from List with children
+        Let index be 0
+        While index is less than count:
+            Let child be proc get from List with children, index
+            Let child_kind be proc memory_get_int64 from Layout with child, 0
+            Let is_stmt be proc is_go_statement_node with child_kind
+            If is_stmt is equal to 1:
+                Let stmt_hir be proc translate_statement with context, child
+                If stmt_hir is not equal to 0:
+                    proc add_to_list with statements_hir, stmt_hir
+                End If
+            Otherwise:
+                Let expr_hir be proc translate_expression with context, child
+                If expr_hir is not equal to 0:
+                    proc add_to_list with expressions_hir, expr_hir
+                End If
+            End If
+            Set index to index plus 1
+        End While
+
+        proc set_dict_value with case_hir, "expressions", expressions_hir
+        proc set_dict_value with case_hir, "statements", statements_hir
     End If
 
     Return case_hir
@@ -1368,14 +2059,14 @@ Process called "translate_return_statement" takes context as Integer, node as In
         Return 0
     End If
 
-    Let return_hir be proc create_dict from HIR
+    Let return_hir be proc create_dict
 
-    proc set_dict_string from HIR with return_hir, "_type", "return_stmt"
+    proc set_dict_string with return_hir, "_type", "return_stmt"
 
     Note: Get return values from children
     Let children be proc memory_get_int64 from Layout with node, 24
     If children is not equal to 0:
-        Let values_hir be proc create_list from HIR
+        Let values_hir be proc create_list
 
         Let return_count be proc size from List with children
         Let i be 0
@@ -1383,12 +2074,12 @@ Process called "translate_return_statement" takes context as Integer, node as In
             Let return_value be proc get from List with children, i
             Let value_hir be proc translate_expression with context, return_value
             If value_hir is not equal to 0:
-                proc add_to_list from HIR with return_values_hir, value_hir
+                proc add_to_list with values_hir, value_hir
             End If
             Set i to i plus 1
         End While
 
-        proc set_dict_value from HIR with return_hir, "values", values_hir
+        proc set_dict_value with return_hir, "values", values_hir
     End If
 
     Return return_hir
@@ -1411,9 +2102,9 @@ Process called "translate_break_statement" takes context as Integer, node as Int
         Return 0
     End If
 
-    Let break_hir be proc create_dict from HIR
+    Let break_hir be proc create_dict
 
-    proc set_dict_string from HIR with break_hir, "_type", "break_stmt"
+    proc set_dict_string with break_hir, "_type", "break_stmt"
 
     Return break_hir
 End Process
@@ -1435,9 +2126,9 @@ Process called "translate_continue_statement" takes context as Integer, node as 
         Return 0
     End If
 
-    Let continue_hir be proc create_dict from HIR
+    Let continue_hir be proc create_dict
 
-    proc set_dict_string from HIR with continue_hir, "_type", "continue_stmt"
+    proc set_dict_string with continue_hir, "_type", "continue_stmt"
 
     Return continue_hir
 End Process
@@ -1458,9 +2149,9 @@ Process called "translate_fallthrough_statement" takes context as Integer, node 
         Return 0
     End If
 
-    Let fallthrough_hir be proc create_dict from HIR
+    Let fallthrough_hir be proc create_dict
 
-    proc set_dict_string from HIR with fallthrough_hir, "_type", "fallthrough_stmt"
+    proc set_dict_string with fallthrough_hir, "_type", "fallthrough_stmt"
 
     Return fallthrough_hir
 End Process
@@ -1482,13 +2173,13 @@ Process called "translate_goto_statement" takes context as Integer, node as Inte
         Return 0
     End If
 
-    Let goto_hir be proc create_dict from HIR
+    Let goto_hir be proc create_dict
 
-    proc set_dict_string from HIR with goto_hir, "_type", "goto_stmt"
+    proc set_dict_string with goto_hir, "_type", "goto_stmt"
 
     Let label_name be proc memory_get_int64 from Layout with node, 8
     If label_name is not equal to 0:
-        proc set_dict_string from HIR with goto_hir, "label", label_name
+        proc set_dict_string with goto_hir, "label", label_name
     End If
 
     Return goto_hir
@@ -1511,15 +2202,15 @@ Process called "translate_defer_statement" takes context as Integer, node as Int
         Return 0
     End If
 
-    Let defer_hir be proc create_dict from HIR
+    Let defer_hir be proc create_dict
 
-    proc set_dict_string from HIR with defer_hir, "_type", "defer_stmt"
+    proc set_dict_string with defer_hir, "_type", "defer_stmt"
 
     Note: Get deferred call from children
     Let children be proc memory_get_int64 from Layout with node, 24
     If children is not equal to 0:
         Let call_hir be proc translate_expression with context, children
-        proc set_dict_value from HIR with defer_hir, "call", call_hir
+        proc set_dict_value with defer_hir, "call", call_hir
     End If
 
     Return defer_hir
@@ -1544,15 +2235,15 @@ Process called "translate_go_statement" takes context as Integer, node as Intege
         Return 0
     End If
 
-    Let go_hir be proc create_dict from HIR
+    Let go_hir be proc create_dict
 
-    proc set_dict_string from HIR with go_hir, "_type", "go_stmt"
+    proc set_dict_string with go_hir, "_type", "go_stmt"
 
     Note: Get goroutine call from children
     Let children be proc memory_get_int64 from Layout with node, 24
     If children is not equal to 0:
         Let call_hir be proc translate_expression with context, children
-        proc set_dict_value from HIR with go_hir, "call", call_hir
+        proc set_dict_value with go_hir, "call", call_hir
     End If
 
     Return go_hir
@@ -1578,30 +2269,41 @@ Process called "translate_assign_statement" takes context as Integer, node as In
         Return 0
     End If
 
-    Let assign_hir be proc create_dict from HIR
+    Let assign_hir be proc create_dict
 
-    proc set_dict_string from HIR with assign_hir, "_type", "assign_stmt"
+    proc set_dict_string with assign_hir, "_type", "assign_stmt"
 
     Note: Get operator from attributes
     Let attributes be proc memory_get_int64 from Layout with node, 32
     If attributes is not equal to 0:
         Let operator be proc get from Dict with attributes, "operator"
         If operator is not equal to 0:
-            proc set_dict_string from HIR with binary_hir, "operator", operator
+            proc set_dict_string with assign_hir, "operator", operator
         Otherwise:
-            proc set_dict_string from HIR with binary_hir, "operator", "unknown"
+            proc set_dict_string with assign_hir, "operator", "="
         End If
-        proc set_dict_string from HIR with assign_hir, "operator", "="
+    Otherwise:
+        proc set_dict_string with assign_hir, "operator", "="
     End If
 
-    Note: Get left and right from children
+    Note: Children are [LHS expression, RHS expression]
     Let children be proc memory_get_int64 from Layout with node, 24
     If children is not equal to 0:
-        Let left_hir be proc create_dict from HIR
-        proc set_dict_value from HIR with assign_hir, "left", left_hir
-
-        Let right_hir be proc create_dict from HIR
-        proc set_dict_value from HIR with assign_hir, "right", right_hir
+        Let child_count be proc size from List with children
+        If child_count is greater than 0:
+            Let left_node be proc get from List with children, 0
+            Let left_hir be proc translate_expression with context, left_node
+            If left_hir is not equal to 0:
+                proc set_dict_value with assign_hir, "left", left_hir
+            End If
+        End If
+        If child_count is greater than 1:
+            Let right_node be proc get from List with children, 1
+            Let right_hir be proc translate_expression with context, right_node
+            If right_hir is not equal to 0:
+                proc set_dict_value with assign_hir, "right", right_hir
+            End If
+        End If
     End If
 
     Return assign_hir
@@ -1613,8 +2315,10 @@ Translates Go's short declaration `x := value` (and multi-assignment
 @End Reasoning
 
 @Implementation:
-Reads children at offset 24. Attaches placeholder variables and values
-lists; full sub-translation pending.
+Children are [lhs_expression, rhs_expression]. The left-hand side
+(target variable expression) is translated via translate_expression
+into "variables"; the right-hand side (initialiser expression) into
+"values". The backend re-emits `variables := values`.
 @End Implementation
 
 Process called "translate_short_var_decl" takes context as Integer, node as Integer returns Integer:
@@ -1624,18 +2328,24 @@ Process called "translate_short_var_decl" takes context as Integer, node as Inte
         Return 0
     End If
 
-    Let short_var_hir be proc create_dict from HIR
+    Let short_var_hir be proc create_dict
 
-    proc set_dict_string from HIR with short_var_hir, "_type", "short_var_decl"
+    proc set_dict_string with short_var_hir, "_type", "short_var_decl"
 
-    Note: Get variables and values from children
+    Note: Children: [lhs target expression, rhs value expression]
     Let children be proc memory_get_int64 from Layout with node, 24
     If children is not equal to 0:
-        Let variables_hir be proc create_list from HIR
-        proc set_dict_value from HIR with short_var_hir, "variables", variables_hir
-
-        Let values_hir be proc create_list from HIR
-        proc set_dict_value from HIR with short_var_hir, "values", values_hir
+        Let child_count be proc length from List with children
+        If child_count is greater than 0:
+            Let lhs_node be proc get from List with children, 0
+            Let variables_hir be proc translate_expression with context, lhs_node
+            proc set_dict_value with short_var_hir, "variables", variables_hir
+        End If
+        If child_count is greater than 1:
+            Let rhs_node be proc get from List with children, 1
+            Let values_hir be proc translate_expression with context, rhs_node
+            proc set_dict_value with short_var_hir, "values", values_hir
+        End If
     End If
 
     Return short_var_hir
@@ -1659,15 +2369,15 @@ Process called "translate_expr_statement" takes context as Integer, node as Inte
         Return 0
     End If
 
-    Let expr_stmt_hir be proc create_dict from HIR
+    Let expr_stmt_hir be proc create_dict
 
-    proc set_dict_string from HIR with expr_stmt_hir, "_type", "expr_stmt"
+    proc set_dict_string with expr_stmt_hir, "_type", "expr_stmt"
 
     Note: Get expression from children
     Let children be proc memory_get_int64 from Layout with node, 24
     If children is not equal to 0:
         Let expr_hir be proc translate_expression with context, children
-        proc set_dict_value from HIR with expr_stmt_hir, "expression", expr_hir
+        proc set_dict_value with expr_stmt_hir, "expression", expr_hir
     End If
 
     Return expr_stmt_hir
@@ -1763,23 +2473,29 @@ Process called "translate_binary_expr" takes context as Integer, node as Integer
         Return 0
     End If
 
-    Let binary_hir be proc create_dict from HIR
+    Let binary_hir be proc create_dict
 
-    proc set_dict_string from HIR with binary_hir, "_type", "binary_expr"
+    proc set_dict_string with binary_hir, "_type", "binary_expr"
 
     Let operator be proc memory_get_int64 from Layout with node, 8
     If operator is not equal to 0:
-        proc set_dict_string from HIR with binary_hir, "operator", operator
+        proc set_dict_string with binary_hir, "operator", operator
     End If
 
-    Note: Get left and right operands from children
+    Note: Children list holds [left, right]; recursively translate each operand
     Let children be proc memory_get_int64 from Layout with node, 24
     If children is not equal to 0:
-        Let left_hir be proc create_dict from HIR
-        proc set_dict_value from HIR with binary_hir, "left", left_hir
-
-        Let right_hir be proc create_dict from HIR
-        proc set_dict_value from HIR with binary_hir, "right", right_hir
+        Let child_count be proc length from List with children
+        If child_count is greater than 0:
+            Let left_node be proc get from List with children, 0
+            Let left_hir be proc translate_expression with context, left_node
+            proc set_dict_value with binary_hir, "left", left_hir
+        End If
+        If child_count is greater than 1:
+            Let right_node be proc get from List with children, 1
+            Let right_hir be proc translate_expression with context, right_node
+            proc set_dict_value with binary_hir, "right", right_hir
+        End If
     End If
 
     Return binary_hir
@@ -1803,20 +2519,20 @@ Process called "translate_unary_expr" takes context as Integer, node as Integer 
         Return 0
     End If
 
-    Let unary_hir be proc create_dict from HIR
+    Let unary_hir be proc create_dict
 
-    proc set_dict_string from HIR with unary_hir, "_type", "unary_expr"
+    proc set_dict_string with unary_hir, "_type", "unary_expr"
 
     Let operator be proc memory_get_int64 from Layout with node, 8
     If operator is not equal to 0:
-        proc set_dict_string from HIR with unary_hir, "operator", operator
+        proc set_dict_string with unary_hir, "operator", operator
     End If
 
     Note: Get operand from children
     Let children be proc memory_get_int64 from Layout with node, 24
     If children is not equal to 0:
         Let operand_hir be proc translate_expression with context, children
-        proc set_dict_value from HIR with unary_hir, "operand", operand_hir
+        proc set_dict_value with unary_hir, "operand", operand_hir
     End If
 
     Return unary_hir
@@ -1829,9 +2545,10 @@ yielding a function value (identifier, member access, lambda).
 @End Reasoning
 
 @Implementation:
-Reads children at offset 24. First child is the callee (function
-expression); remaining children are arguments. Attaches placeholder
-"function" dict and "arguments" list.
+Reads children at offset 24. The first child is the callee (function
+expression), translated via translate_expression into "function"; the
+remaining children are arguments, each translated via
+translate_expression and accumulated into the "arguments" list.
 @End Implementation
 
 Process called "translate_call_expr" takes context as Integer, node as Integer returns Integer:
@@ -1841,20 +2558,29 @@ Process called "translate_call_expr" takes context as Integer, node as Integer r
         Return 0
     End If
 
-    Let call_hir be proc create_dict from HIR
+    Let call_hir be proc create_dict
 
-    proc set_dict_string from HIR with call_hir, "_type", "call_expr"
+    proc set_dict_string with call_hir, "_type", "call_expr"
 
-    Note: Get function and arguments from children
+    Note: Children list: [callee, arg0, arg1, ...]
     Let children be proc memory_get_int64 from Layout with node, 24
     If children is not equal to 0:
-        Note: First child is function being called
-        Let func_hir be proc create_dict from HIR
-        proc set_dict_value from HIR with call_hir, "function", func_hir
+        Let child_count be proc length from List with children
+        If child_count is greater than 0:
+            Let callee_node be proc get from List with children, 0
+            Let func_hir be proc translate_expression with context, callee_node
+            proc set_dict_value with call_hir, "function", func_hir
 
-        Note: Remaining children are arguments
-        Let args_hir be proc create_list from HIR
-        proc set_dict_value from HIR with call_hir, "arguments", args_hir
+            Let args_hir be proc create_list
+            Let arg_index be 1
+            While arg_index is less than child_count:
+                Let arg_node be proc get from List with children, arg_index
+                Let arg_hir be proc translate_expression with context, arg_node
+                proc list_append from List with args_hir, arg_hir
+                Set arg_index to arg_index plus 1
+            End While
+            proc set_dict_value with call_hir, "arguments", args_hir
+        End If
     End If
 
     Return call_hir
@@ -1866,7 +2592,8 @@ indexable value) and index (the key/offset).
 @End Reasoning
 
 @Implementation:
-Reads children; attaches placeholder "array" and "index" dicts.
+Children list holds [array, index]. Each is recursively translated via
+translate_expression and attached under "array" and "index".
 @End Implementation
 
 Process called "translate_index_expr" takes context as Integer, node as Integer returns Integer:
@@ -1876,18 +2603,24 @@ Process called "translate_index_expr" takes context as Integer, node as Integer 
         Return 0
     End If
 
-    Let index_hir be proc create_dict from HIR
+    Let index_hir be proc create_dict
 
-    proc set_dict_string from HIR with index_hir, "_type", "index_expr"
+    proc set_dict_string with index_hir, "_type", "index_expr"
 
-    Note: Get array and index from children
+    Note: Children list: [array, index]
     Let children be proc memory_get_int64 from Layout with node, 24
     If children is not equal to 0:
-        Let array_hir be proc create_dict from HIR
-        proc set_dict_value from HIR with index_hir, "array", array_hir
-
-        Let index_expr_hir be proc create_dict from HIR
-        proc set_dict_value from HIR with index_hir, "index", index_expr_hir
+        Let child_count be proc length from List with children
+        If child_count is greater than 0:
+            Let array_node be proc get from List with children, 0
+            Let array_hir be proc translate_expression with context, array_node
+            proc set_dict_value with index_hir, "array", array_hir
+        End If
+        If child_count is greater than 1:
+            Let idx_node be proc get from List with children, 1
+            Let index_expr_hir be proc translate_expression with context, idx_node
+            proc set_dict_value with index_hir, "index", index_expr_hir
+        End If
     End If
 
     Return index_hir
@@ -1899,8 +2632,9 @@ index form) -> "slice_expr" with array, low, and high fields.
 @End Reasoning
 
 @Implementation:
-Reads children; attaches placeholder "array", "low", "high" dicts.
-The three-index form's max slot is not yet captured — known gap.
+Children list holds [array, low] and, when the high bound is present,
+[array, low, high]. Each present slot is recursively translated via
+translate_expression.
 @End Implementation
 
 Process called "translate_slice_expr" takes context as Integer, node as Integer returns Integer:
@@ -1910,21 +2644,29 @@ Process called "translate_slice_expr" takes context as Integer, node as Integer 
         Return 0
     End If
 
-    Let slice_hir be proc create_dict from HIR
+    Let slice_hir be proc create_dict
 
-    proc set_dict_string from HIR with slice_hir, "_type", "slice_expr"
+    proc set_dict_string with slice_hir, "_type", "slice_expr"
 
-    Note: Get array, low, and high from children
+    Note: Children list: [array, low, high?]
     Let children be proc memory_get_int64 from Layout with node, 24
     If children is not equal to 0:
-        Let array_hir be proc create_dict from HIR
-        proc set_dict_value from HIR with slice_hir, "array", array_hir
-
-        Let low_hir be proc create_dict from HIR
-        proc set_dict_value from HIR with slice_hir, "low", low_hir
-
-        Let high_hir be proc create_dict from HIR
-        proc set_dict_value from HIR with slice_hir, "high", high_hir
+        Let child_count be proc length from List with children
+        If child_count is greater than 0:
+            Let array_node be proc get from List with children, 0
+            Let array_hir be proc translate_expression with context, array_node
+            proc set_dict_value with slice_hir, "array", array_hir
+        End If
+        If child_count is greater than 1:
+            Let low_node be proc get from List with children, 1
+            Let low_hir be proc translate_expression with context, low_node
+            proc set_dict_value with slice_hir, "low", low_hir
+        End If
+        If child_count is greater than 2:
+            Let high_node be proc get from List with children, 2
+            Let high_hir be proc translate_expression with context, high_node
+            proc set_dict_value with slice_hir, "high", high_hir
+        End If
     End If
 
     Return slice_hir
@@ -1937,7 +2679,10 @@ references (`fmt.Println`).
 @End Reasoning
 
 @Implementation:
-Reads children; attaches placeholder "object" and "field" dicts.
+Children list holds [object_expr, field_identifier]. The object is
+recursively translated via translate_expression; the field identifier
+is translated via translate_expression as well, yielding an identifier
+HIR sub-tree under "field" that the backend re-emits as `object.field`.
 @End Implementation
 
 Process called "translate_selector_expr" takes context as Integer, node as Integer returns Integer:
@@ -1947,18 +2692,24 @@ Process called "translate_selector_expr" takes context as Integer, node as Integ
         Return 0
     End If
 
-    Let selector_hir be proc create_dict from HIR
+    Let selector_hir be proc create_dict
 
-    proc set_dict_string from HIR with selector_hir, "_type", "selector_expr"
+    proc set_dict_string with selector_hir, "_type", "selector_expr"
 
-    Note: Get object and field from children
+    Note: Children list: [object, field_identifier]
     Let children be proc memory_get_int64 from Layout with node, 24
     If children is not equal to 0:
-        Let object_hir be proc create_dict from HIR
-        proc set_dict_value from HIR with selector_hir, "object", object_hir
-
-        Let field_hir be proc create_dict from HIR
-        proc set_dict_value from HIR with selector_hir, "field", field_hir
+        Let child_count be proc length from List with children
+        If child_count is greater than 0:
+            Let object_node be proc get from List with children, 0
+            Let object_hir be proc translate_expression with context, object_node
+            proc set_dict_value with selector_hir, "object", object_hir
+        End If
+        If child_count is greater than 1:
+            Let field_node be proc get from List with children, 1
+            Let field_hir be proc translate_expression with context, field_node
+            proc set_dict_value with selector_hir, "field", field_hir
+        End If
     End If
 
     Return selector_hir
@@ -1971,8 +2722,9 @@ interface unwrapping.
 @End Reasoning
 
 @Implementation:
-Reads children; attaches placeholder "expression" (x) and
-"asserted_type" (T) dicts.
+Children list holds [expression, asserted_type]. The expression is
+recursively translated via translate_expression and the asserted type
+via translate_type.
 @End Implementation
 
 Process called "translate_type_assert_expr" takes context as Integer, node as Integer returns Integer:
@@ -1982,18 +2734,24 @@ Process called "translate_type_assert_expr" takes context as Integer, node as In
         Return 0
     End If
 
-    Let assert_hir be proc create_dict from HIR
+    Let assert_hir be proc create_dict
 
-    proc set_dict_string from HIR with assert_hir, "_type", "type_assert_expr"
+    proc set_dict_string with assert_hir, "_type", "type_assert_expr"
 
-    Note: Get expression and type from children
+    Note: Children list: [expression, asserted_type]
     Let children be proc memory_get_int64 from Layout with node, 24
     If children is not equal to 0:
-        Let expr_hir be proc create_dict from HIR
-        proc set_dict_value from HIR with assert_hir, "expression", expr_hir
-
-        Let type_hir be proc create_dict from HIR
-        proc set_dict_value from HIR with assert_hir, "asserted_type", type_hir
+        Let child_count be proc length from List with children
+        If child_count is greater than 0:
+            Let expr_node be proc get from List with children, 0
+            Let expr_hir be proc translate_expression with context, expr_node
+            proc set_dict_value with assert_hir, "expression", expr_hir
+        End If
+        If child_count is greater than 1:
+            Let type_node be proc get from List with children, 1
+            Let type_hir be proc translate_type with context, type_node
+            proc set_dict_value with assert_hir, "asserted_type", type_hir
+        End If
     End If
 
     Return assert_hir
@@ -2006,7 +2764,13 @@ The type and elements are captured separately.
 @End Reasoning
 
 @Implementation:
-Reads children; attaches placeholder "type_info" and "elements" list.
+Children list holds [type, element...]. The first child is the
+composite type (translated via translate_type into "type_info"); each
+remaining child is an element expression translated via
+translate_expression and accumulated into the "elements" list. A
+keyed element (`key: value`) is parsed as a GO_BINARY_EXPR carrying
+the ':' operator, which the expression translator preserves so the
+backend recovers the key/value spelling.
 @End Implementation
 
 Process called "translate_composite_lit" takes context as Integer, node as Integer returns Integer:
@@ -2016,18 +2780,31 @@ Process called "translate_composite_lit" takes context as Integer, node as Integ
         Return 0
     End If
 
-    Let composite_hir be proc create_dict from HIR
+    Let composite_hir be proc create_dict
 
-    proc set_dict_string from HIR with composite_hir, "_type", "composite_lit"
+    proc set_dict_string with composite_hir, "_type", "composite_lit"
 
-    Note: Get type and elements from children
+    Note: Children: [type, element expression...]
     Let children be proc memory_get_int64 from Layout with node, 24
     If children is not equal to 0:
-        Let type_hir be proc create_dict from HIR
-        proc set_dict_value from HIR with composite_hir, "type_info", type_hir
+        Let child_count be proc length from List with children
+        If child_count is greater than 0:
+            Let type_node be proc get from List with children, 0
+            Let type_hir be proc translate_type with context, type_node
+            proc set_dict_value with composite_hir, "type_info", type_hir
+        End If
 
-        Let elements_hir be proc create_list from HIR
-        proc set_dict_value from HIR with composite_hir, "elements", elements_hir
+        Let elements_hir be proc create_list
+        Let index be 1
+        While index is less than child_count:
+            Let elem_node be proc get from List with children, index
+            Let elem_hir be proc translate_expression with context, elem_node
+            If elem_hir is not equal to 0:
+                proc add_to_list with elements_hir, elem_hir
+            End If
+            Set index to index plus 1
+        End While
+        proc set_dict_value with composite_hir, "elements", elements_hir
     End If
 
     Return composite_hir
@@ -2040,9 +2817,10 @@ higher-order arguments.
 @End Reasoning
 
 @Implementation:
-Reads children; attaches placeholder parameters list, return_type,
-and body dicts. Captures the lambda shape uniformly with named
-function declarations.
+Children mirror a function declaration: [parameters, return type?,
+body]. Parameters are translated via translate_parameter_list, the
+optional return type via translate_type, and the body via
+translate_block, disambiguating the body as the GO_BLOCK child.
 @End Implementation
 
 Process called "translate_func_lit" takes context as Integer, node as Integer returns Integer:
@@ -2052,21 +2830,38 @@ Process called "translate_func_lit" takes context as Integer, node as Integer re
         Return 0
     End If
 
-    Let func_lit_hir be proc create_dict from HIR
+    Let func_lit_hir be proc create_dict
 
-    proc set_dict_string from HIR with func_lit_hir, "_type", "func_lit"
+    proc set_dict_string with func_lit_hir, "_type", "func_lit"
 
-    Note: Get parameters, return type, and body from children
+    Note: Children: [parameters, return type?, body]
     Let children be proc memory_get_int64 from Layout with node, 24
     If children is not equal to 0:
-        Let params_hir be proc create_list from HIR
-        proc set_dict_value from HIR with func_lit_hir, "parameters", params_hir
+        Let child_count be proc length from List with children
+        If child_count is greater than 0:
+            Let params_node be proc get from List with children, 0
+            Let params_hir be proc translate_parameter_list with context, params_node
+            proc set_dict_value with func_lit_hir, "parameters", params_hir
+        End If
 
-        Let return_type_hir be proc create_dict from HIR
-        proc set_dict_value from HIR with func_lit_hir, "return_type", return_type_hir
-
-        Let body_hir be proc create_dict from HIR
-        proc set_dict_value from HIR with func_lit_hir, "body", body_hir
+        If child_count is greater than 1:
+            Let last_idx be child_count minus 1
+            Let last_node be proc get from List with children, last_idx
+            Let last_type be proc memory_get_int64 from Layout with last_node, 0
+            If last_type is equal to GO_BLOCK from Parser:
+                Let body_hir be proc translate_block with context, last_node
+                proc set_dict_value with func_lit_hir, "body", body_hir
+                If last_idx is greater than 1:
+                    Let return_node be proc get from List with children, 1
+                    Let return_hir be proc translate_return_type with context, return_node
+                    proc set_dict_value with func_lit_hir, "return_type", return_hir
+                End If
+            Otherwise:
+                Let return_node2 be proc get from List with children, 1
+                Let return_hir2 be proc translate_return_type with context, return_node2
+                proc set_dict_value with func_lit_hir, "return_type", return_hir2
+            End If
+        End If
     End If
 
     Return func_lit_hir
@@ -2089,13 +2884,13 @@ Process called "translate_identifier" takes context as Integer, node as Integer 
         Return 0
     End If
 
-    Let id_hir be proc create_dict from HIR
+    Let id_hir be proc create_dict
 
-    proc set_dict_string from HIR with id_hir, "_type", "identifier"
+    proc set_dict_string with id_hir, "_type", "identifier"
 
     Let name be proc memory_get_int64 from Layout with node, 8
     If name is not equal to 0:
-        proc set_dict_string from HIR with id_hir, "name", name
+        proc set_dict_string with id_hir, "name", name
     End If
 
     Return id_hir
@@ -2119,18 +2914,18 @@ Process called "translate_literal" takes context as Integer, node as Integer ret
         Return 0
     End If
 
-    Let literal_hir be proc create_dict from HIR
+    Let literal_hir be proc create_dict
 
-    proc set_dict_string from HIR with literal_hir, "_type", "literal"
+    proc set_dict_string with literal_hir, "_type", "literal"
 
     Let literal_type be proc memory_get_int64 from Layout with node, 8
     If literal_type is not equal to 0:
-        proc set_dict_string from HIR with literal_hir, "literal_type", literal_type
+        proc set_dict_string with literal_hir, "literal_type", literal_type
     End If
 
     Let value be proc memory_get_int64 from Layout with node, 16
     If value is not equal to 0:
-        proc set_dict_string from HIR with literal_hir, "value", value
+        proc set_dict_string with literal_hir, "value", value
     End If
 
     Return literal_hir
@@ -2187,7 +2982,7 @@ Process called "translate_go_to_hir" takes ast_node as Integer returns Integer:
         Note: Add other top-level node type translations as needed
     End If
 
-    proc destroy_go_to_hir_context from context
+    proc destroy_go_to_hir_context with context
 
     Return hir_result
 End Process

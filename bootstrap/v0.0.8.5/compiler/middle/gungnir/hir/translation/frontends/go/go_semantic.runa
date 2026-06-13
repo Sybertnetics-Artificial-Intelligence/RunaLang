@@ -1,11 +1,87 @@
 Note:
 Copyright 2025 Sybertnetics Artificial Intelligence Solutions
-Licensed under the Apache License, Version 2.0
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
 :End Note
 
 Note:
-Go Semantic Analyzer - Type checking, interface verification, and semantic analysis for Go AST
-Handles Go's type system, interface satisfaction, goroutine safety, and package resolution.
+GO SEMANTIC ANALYZER - name resolution, declaration registration, and Go-rule
+enforcement over the REAL Go AST.
+
+The Go parser (go_parser.runa) produces a tree of GoNode records. Every node is
+a 40-byte (5 x i64) record with this UNIFORM layout, confirmed against the
+parser and the go_to_hir lowering pass which consumes the same tree:
+
+  offset 0  node_type   one of the GO_* constants (1..46)
+  offset 8  name        StringCore handle (identifier / package name) or 0
+  offset 16 value       StringCore handle (literal lexeme / import path) or 0
+  offset 24 children    List handle of child GoNode handles (0 if leaf), OR a
+                        single GoNode handle stored directly for the kinds that
+                        carry exactly one sub-node (GO_PARAMETER element type,
+                        GO_FIELD type, GO_TYPE_DECL spec underlying type) - this
+                        analyzer dispatches on node_type so it always reads the
+                        slot the way the parser wrote it
+  offset 32 attributes  Dict handle of string-keyed metadata or 0
+                        (method "receiver" GoNode, assign "operator", for "type")
+
+This pass walks that real tree - it does NOT invent a parallel node schema - and
+enforces the SEMANTIC rules Go's grammar alone does not express:
+
+  1. Package / file / function / block scoping. A scope chain of name->level
+     symbol tables models Go's lexical nesting. Package scope is the bottom of
+     the chain; function bodies and blocks push fresh scopes. A name resolved in
+     an enclosing scope is visible; a name bound nowhere and not a predeclared
+     identifier is an undefined-reference error.
+
+  2. var / const / := binding. Top-level var/const land in package scope;
+     function-body var declarations and short variable declarations (:=) bind in
+     the innermost scope. The left side of a := introduces new locals.
+
+  3. Exported-vs-unexported visibility. Go ties export to the first rune's case:
+     an identifier whose first byte is an uppercase ASCII letter (A..Z) is
+     exported (visible to other packages); otherwise it is package-private. Every
+     registered top-level declaration records this classification so a later pass
+     (and the analyzer's own cross-package checks) can honour Go's visibility
+     rule without re-deriving it.
+
+  4. type / struct / interface declarations. Named types register in a dedicated
+     type registry; struct and interface bodies register their fields/methods so
+     method-set and field-access checks resolve. Type references in parameters,
+     fields, and var/const declarations are validated against the predeclared
+     type set plus the type registry.
+
+  5. function + method registration (receivers). Free functions register in
+     package scope. Methods (GO_METHOD, distinguished by a "receiver" attribute)
+     register against their receiver's base type so the receiver's method set is
+     complete; the receiver binding is introduced into the method-body scope.
+
+  6. import handling. Each import spec registers its imported package name (the
+     alias, or the last path segment) so qualified references pkg.Name resolve
+     to a known package rather than firing an undefined-identifier diagnostic.
+
+The symbol tables are STRING-KEYED dictionaries (dictionary.runa over the
+content-hashing hashtable): keys are the identifier strings the parser copied
+into the node, values are the 1-based declaration level (level+1, so 0
+unambiguously means "absent"). A string key keyed by content - not an
+integer-keyed table indexed by a string pointer - is mandatory; the latter
+hashes pointer identity and corrupts on the parser's distinct heap copies.
+
+Dependencies:
+- go_parser.runa             (GoNode shape, GO_* node constants)
+- compiler/frontend/primitives/memory/layout.runa
+- compiler/frontend/primitives/core/string_core.runa
+- compiler/frontend/primitives/collections/list.runa
+- compiler/frontend/primitives/collections/dictionary.runa
 :End Note
 
 Import "compiler/middle/gungnir/hir/translation/frontends/go/go_parser.runa" as Parser
@@ -13,58 +89,84 @@ Import "compiler/frontend/primitives/memory/layout.runa" as Layout
 Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
 Import "compiler/frontend/primitives/collections/list.runa" as List
 Import "compiler/frontend/primitives/collections/dictionary.runa" as Dict
+Import "compiler/internal/string_utils.runa" as StringUtils
+
+Note: ============================================================================
+Note: Analyzer State
+Note: ============================================================================
 
 @Reasoning:
-Go semantic analysis needs separate registries because Go distinguishes
-named types, interface types, and packages at the type-system level.
-Conflating them would force lookups to disambiguate after the fact.
-The scope stack handles block-scoped name resolution; the registries
-serve as the always-visible top-level namespace partitioned by kind.
+The analyzer threads its resolution state through the recursive walk in a single
+heap record. The lexical chain is modelled by current_scope (the innermost
+name->level table) and scope_stack (every enclosing scope, package scope at the
+bottom); a lookup walks current_scope then the stack top-down. current_level is
+the depth of the innermost scope (0 at package level). Three registries partition
+the always-visible top-level namespace by Go's type-system kind: type_registry
+(named types), interface_registry (interfaces, kept apart because interface
+satisfaction is a distinct algorithm), and package_registry (imported package
+names). method_sets maps a base-type name to a List of its method-name strings so
+interface-satisfaction can compare method sets. exported records every top-level
+name classified as exported (first rune uppercase). errors/warnings are
+append-only accumulators and has_error latches on the first error.
 @End Reasoning
 
 @Implementation:
-Eight 8-byte slots, total 64 bytes:
-- global_scope (0): package-level Dict of name -> declaration
-- current_scope (8): innermost block scope, top of scope_stack
-- scope_stack (16): List of block Dicts
-- type_registry (24): Dict of type_name -> type AST node
-- interface_registry (32): Dict of interface_name -> interface node
-- package_registry (40): Dict of package_path -> package descriptor
-- error_message (48): owned diagnostic StringCore or 0
-- has_error (56): sticky 0/1 flag
+Thirteen 8-byte slots at fixed offsets 0..96, total 104 bytes:
+- global_scope (0):       Dict string-key -> level+1 (package scope)
+- current_scope (8):      Dict string-key -> level+1 (innermost scope)
+- scope_stack (16):       List of enclosing scope Dicts (package scope at bottom)
+- current_level (24):     lexical depth of innermost scope (0 = package)
+- type_registry (32):     Dict type_name -> type-spec GoNode
+- interface_registry (40):Dict interface_name -> interface-type GoNode
+- package_registry (48):  Dict imported-package-name -> import GoNode
+- method_sets (56):       Dict base_type_name -> List of method-name strings
+- exported (64):          Dict name -> 1 for exported top-level names
+- errors (72):            List of error message strings
+- warnings (80):          List of warning message strings
+- has_error (88):         0/1 sticky flag
+- builtin_types (96):     Dict string-key -> 1 (predeclared type + ident surface)
 @End Implementation
+
 Type called "GoSemanticAnalyzer":
     global_scope as Integer
     current_scope as Integer
     scope_stack as Integer
+    current_level as Integer
     type_registry as Integer
     interface_registry as Integer
     package_registry as Integer
-    error_message as Integer
+    method_sets as Integer
+    exported as Integer
+    errors as Integer
+    warnings as Integer
     has_error as Integer
+    builtin_types as Integer
 End Type
 
+Note: ============================================================================
+Note: Analyzer Creation
+Note: ============================================================================
+
 @Reasoning:
-Allocates 64 bytes of raw memory for the eight-slot
-GoSemanticAnalyzer struct rather than a typed value because the
-caller-side ABI here treats the analyzer as an opaque pointer and
-all field access goes through fixed byte offsets. global_scope is
-aliased into current_scope (slot 8) so an empty function returns
-to package scope without an explicit pop.
+The constructor eagerly allocates every sub-collection so the recursive walk
+never has to null-check a table or list handle. global_scope doubles as the
+initial current_scope: top-level declarations resolve and bind against the
+package table without a special case, with current_level 0. The predeclared
+identifier surface (built-in types, true/false/nil/iota, the builtin functions)
+is seeded into builtin_types so an undefined-identifier diagnostic fires only on
+genuinely unknown names.
 @End Reasoning
 
 @Implementation:
-allocate(64); on failure returns 0. Creates five collection
-helpers (Dict for the four registries, List for scope_stack).
-Writes offsets 0=global_scope, 8=current_scope=global_scope,
-16=scope_stack, 24=type_registry, 32=interface_registry,
-40=package_registry, 48=error_message=null, 56=has_error=0.
+Allocate 104 bytes; return 0 on OOM. Create global_scope, scope_stack,
+type_registry, interface_registry, package_registry, method_sets, exported,
+errors, warnings, and builtin_types. Install global_scope at offsets 0 and 8,
+zero current_level and has_error, store the collection handles, then seed the
+predeclared surface.
 @End Implementation
-Process called "create_go_semantic_analyzer" returns Integer:
-    Note: Create Go semantic analyzer with type checking and interface verification
 
-    Let analyzer_size be 64
-    Let analyzer be proc allocate from Layout with analyzer_size
+Process called "create_go_semantic_analyzer" returns Integer:
+    Let analyzer be proc allocate from Layout with 104
 
     If analyzer is equal to 0:
         Return 0
@@ -75,56 +177,460 @@ Process called "create_go_semantic_analyzer" returns Integer:
     Let type_registry be proc create from Dict
     Let interface_registry be proc create from Dict
     Let package_registry be proc create from Dict
+    Let method_sets be proc create from Dict
+    Let exported be proc create from Dict
+    Let errors be proc create from List
+    Let warnings be proc create from List
+    Let builtin_types be proc create from Dict
 
     proc memory_set_int64 from Layout with analyzer, 0, global_scope
     proc memory_set_int64 from Layout with analyzer, 8, global_scope
     proc memory_set_int64 from Layout with analyzer, 16, scope_stack
-    proc memory_set_int64 from Layout with analyzer, 24, type_registry
-    proc memory_set_int64 from Layout with analyzer, 32, interface_registry
-    proc memory_set_int64 from Layout with analyzer, 40, package_registry
-    proc memory_set_int64 from Layout with analyzer, 48, 0
-    proc memory_set_int64 from Layout with analyzer, 56, 0
+    proc memory_set_int64 from Layout with analyzer, 24, 0
+    proc memory_set_int64 from Layout with analyzer, 32, type_registry
+    proc memory_set_int64 from Layout with analyzer, 40, interface_registry
+    proc memory_set_int64 from Layout with analyzer, 48, package_registry
+    proc memory_set_int64 from Layout with analyzer, 56, method_sets
+    proc memory_set_int64 from Layout with analyzer, 64, exported
+    proc memory_set_int64 from Layout with analyzer, 72, errors
+    proc memory_set_int64 from Layout with analyzer, 80, warnings
+    proc memory_set_int64 from Layout with analyzer, 88, 0
+    proc memory_set_int64 from Layout with analyzer, 96, builtin_types
+
+    proc setup_predeclared_surface with analyzer
 
     Return analyzer
 End Process
 
 @Reasoning:
-Three-phase pipeline: (1) collect declarations into registries
-so forward references resolve, (2) type resolution and interface
-satisfaction (requires complete type registry), (3) function-body
-analysis (requires fully resolved types). The phase split avoids
-needing speculative resolution or per-node forward-reference
-markers.
+Releases the analyzer record. The sub-collections are owned by the analyzer but
+their string keys/values are borrowed from the parser's AST (the analyzer never
+copies identifier strings into the tables, only their handles), so destroying the
+collections does not free AST-owned memory. The AST is owned by the caller.
 @End Reasoning
 
 @Implementation:
-Null-guards both inputs. Calls collect_go_declarations, then
-resolve_go_types, then analyze_go_functions in sequence. After
-the final phase, reads has_error (offset 56) and returns 0 if
-any phase reported an error, otherwise 1.
+Null short-circuits with success. Destroys each owned collection then deallocates
+the 104-byte record. Returns 1.
 @End Implementation
-Process called "analyze_go_program" takes analyzer as Integer, program_node as Integer returns Integer:
-    Note: Perform complete semantic analysis on Go program
 
+Process called "destroy_go_semantic_analyzer" takes analyzer as Integer returns Integer:
+    If analyzer is equal to 0:
+        Return 1
+    End If
+
+    Let global_scope be proc memory_get_int64 from Layout with analyzer, 0
+    Let scope_stack be proc memory_get_int64 from Layout with analyzer, 16
+    Let type_registry be proc memory_get_int64 from Layout with analyzer, 32
+    Let interface_registry be proc memory_get_int64 from Layout with analyzer, 40
+    Let package_registry be proc memory_get_int64 from Layout with analyzer, 48
+    Let method_sets be proc memory_get_int64 from Layout with analyzer, 56
+    Let exported be proc memory_get_int64 from Layout with analyzer, 64
+    Let errors be proc memory_get_int64 from Layout with analyzer, 72
+    Let warnings be proc memory_get_int64 from Layout with analyzer, 80
+    Let builtin_types be proc memory_get_int64 from Layout with analyzer, 96
+
+    proc destroy from Dict with global_scope
+    proc destroy from List with scope_stack
+    proc destroy from Dict with type_registry
+    proc destroy from Dict with interface_registry
+    proc destroy from Dict with package_registry
+    proc destroy from Dict with method_sets
+    proc destroy from Dict with exported
+    proc destroy from List with errors
+    proc destroy from List with warnings
+    proc destroy from Dict with builtin_types
+
+    proc deallocate from Layout with analyzer
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Diagnostics
+Note: ============================================================================
+
+@Reasoning:
+Errors and warnings accumulate in append-only lists so a single pass surfaces
+every problem rather than aborting on the first. record_error latches has_error
+to 1 so a caller can gate lowering on one boolean without scanning the list.
+@End Reasoning
+
+@Implementation:
+Append message to the errors list (offset 72) and set has_error (offset 88) to 1.
+@End Implementation
+
+Process called "record_error" takes analyzer as Integer, message as Integer:
+    Let errors be proc memory_get_int64 from Layout with analyzer, 72
+    proc list_append from List with errors, message
+    proc memory_set_int64 from Layout with analyzer, 88, 1
+End Process
+
+@Reasoning:
+Warnings track non-fatal observations (shadowing, unused import heuristics) that
+do not block lowering; kept separate from errors so a caller can report them
+without failing the analysis.
+@End Reasoning
+
+@Implementation:
+Append message to the warnings list (offset 80). has_error is left untouched.
+@End Implementation
+
+Process called "record_warning" takes analyzer as Integer, message as Integer:
+    Let warnings be proc memory_get_int64 from Layout with analyzer, 80
+    proc list_append from List with warnings, message
+End Process
+
+Note: ============================================================================
+Note: Scope Management
+Note: ============================================================================
+
+@Reasoning:
+Entering a scope pushes the current scope onto the stack, installs a fresh empty
+name table as the innermost scope, and raises the level. Both function bodies and
+nested blocks use the same mechanism; Go's scoping does not need a separate
+function-boundary marker for name resolution (unlike Lua's upvalue capture)
+because a Go closure can reference any enclosing binding directly - capture
+analysis happens during lowering, not here.
+@End Reasoning
+
+@Implementation:
+Push current_scope (offset 8) onto scope_stack (offset 16). Allocate a fresh Dict
+and store it at offset 8. Raise current_level (offset 24) by 1.
+@End Implementation
+
+Process called "enter_scope" takes analyzer as Integer:
+    Let current be proc memory_get_int64 from Layout with analyzer, 8
+    Let stack be proc memory_get_int64 from Layout with analyzer, 16
+    Let level be proc memory_get_int64 from Layout with analyzer, 24
+
+    proc list_append from List with stack, current
+
+    Let fresh be proc create from Dict
+    proc memory_set_int64 from Layout with analyzer, 8, fresh
+    proc memory_set_int64 from Layout with analyzer, 24, level plus 1
+End Process
+
+@Reasoning:
+Exiting restores the scope saved by the matching enter_scope and lowers the
+level. The package scope is never popped: it is the permanent bottom installed at
+construction. A well-formed walk never calls exit_scope more often than
+enter_scope; the depth guard makes the underflow path a no-op rather than a crash
+if a malformed AST drives it there.
+@End Reasoning
+
+@Implementation:
+If scope_stack (offset 16) is empty, return unchanged. Otherwise pop the saved
+scope into current_scope (offset 8) and lower current_level (offset 24) by 1.
+@End Implementation
+
+Process called "exit_scope" takes analyzer as Integer:
+    Let stack be proc memory_get_int64 from Layout with analyzer, 16
+    Let depth be proc size from List with stack
+
+    If depth is equal to 0:
+        Return
+    End If
+
+    Let level be proc memory_get_int64 from Layout with analyzer, 24
+    Let restored be proc list_pop from List with stack
+
+    proc memory_set_int64 from Layout with analyzer, 8, restored
+    proc memory_set_int64 from Layout with analyzer, 24, level minus 1
+End Process
+
+@Reasoning:
+Declares a name in the innermost scope at the current lexical level, encoding the
+level as level+1 so a lookup distinguishes "declared at level 0" from "absent"
+(both of which would otherwise read back as 0 from the value-0-means-missing
+dictionary). Re-declaration in the same scope overwrites - this is reported as a
+"redeclared in this block" error by the caller when it matters, but the binding
+itself simply takes the latest value.
+@End Reasoning
+
+@Implementation:
+Read current_scope (offset 8) and current_level (offset 24); set name -> level+1
+in that scope. Null name short-circuits.
+@End Implementation
+
+Process called "declare_in_scope" takes analyzer as Integer, name as Integer:
+    If name is equal to 0:
+        Return
+    End If
+
+    Let scope be proc memory_get_int64 from Layout with analyzer, 8
+    Let level be proc memory_get_int64 from Layout with analyzer, 24
+    proc set from Dict with scope, name, level plus 1
+End Process
+
+@Reasoning:
+Resolves a name to its declaration level by walking the scope chain innermost
+first: current_scope, then each stacked scope from the most recently pushed down
+to package scope at the bottom. Returns the stored level+1 encoding (non-zero
+means "found at level result-1") or 0 if the name is bound nowhere.
+@End Reasoning
+
+@Implementation:
+Check current_scope (offset 8) via Dict.get; if non-zero return it. Otherwise
+walk scope_stack (offset 16) from index size-1 down to 0, returning the first
+non-zero Dict.get. Return 0 if no scope binds the name.
+@End Implementation
+
+Process called "resolve_name" takes analyzer as Integer, name as Integer returns Integer:
+    If name is equal to 0:
+        Return 0
+    End If
+
+    Let current be proc memory_get_int64 from Layout with analyzer, 8
+    Let found be proc get from Dict with current, name
+    If found is not equal to 0:
+        Return found
+    End If
+
+    Let stack be proc memory_get_int64 from Layout with analyzer, 16
+    Let depth be proc size from List with stack
+    Let i be depth minus 1
+    While i is greater than or equal to 0:
+        Let scope be proc get from List with stack, i
+        Let hit be proc get from Dict with scope, name
+        If hit is not equal to 0:
+            Return hit
+        End If
+        Set i to i minus 1
+    End While
+
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: Predeclared Identifier Surface
+Note: ============================================================================
+
+@Reasoning:
+Go programs reference predeclared types (int, string, bool, ...), predeclared
+constants (true, false, iota, nil), and built-in functions (len, cap, make, new,
+append, ...) without declaring them. Seeding them into builtin_types lets the
+undefined-identifier and invalid-type heuristics fire only on genuinely unknown
+names. The set is the Go 1.x universe block exactly.
+@End Reasoning
+
+@Implementation:
+Read builtin_types (offset 96) once and register each predeclared name with value
+1. Grouped by category for readability; all land in the single flat table.
+@End Implementation
+
+Process called "setup_predeclared_surface" takes analyzer as Integer:
+    Let env be proc memory_get_int64 from Layout with analyzer, 96
+
+    Note: Predeclared numeric / boolean / string types
+    proc set from Dict with env, "bool", 1
+    proc set from Dict with env, "string", 1
+    proc set from Dict with env, "int", 1
+    proc set from Dict with env, "int8", 1
+    proc set from Dict with env, "int16", 1
+    proc set from Dict with env, "int32", 1
+    proc set from Dict with env, "int64", 1
+    proc set from Dict with env, "uint", 1
+    proc set from Dict with env, "uint8", 1
+    proc set from Dict with env, "uint16", 1
+    proc set from Dict with env, "uint32", 1
+    proc set from Dict with env, "uint64", 1
+    proc set from Dict with env, "uintptr", 1
+    proc set from Dict with env, "byte", 1
+    proc set from Dict with env, "rune", 1
+    proc set from Dict with env, "float32", 1
+    proc set from Dict with env, "float64", 1
+    proc set from Dict with env, "complex64", 1
+    proc set from Dict with env, "complex128", 1
+    proc set from Dict with env, "error", 1
+    proc set from Dict with env, "any", 1
+    proc set from Dict with env, "comparable", 1
+
+    Note: Predeclared constants and the blank identifier
+    proc set from Dict with env, "true", 1
+    proc set from Dict with env, "false", 1
+    proc set from Dict with env, "iota", 1
+    proc set from Dict with env, "nil", 1
+    proc set from Dict with env, "_", 1
+
+    Note: Built-in functions
+    proc set from Dict with env, "append", 1
+    proc set from Dict with env, "cap", 1
+    proc set from Dict with env, "clear", 1
+    proc set from Dict with env, "close", 1
+    proc set from Dict with env, "complex", 1
+    proc set from Dict with env, "copy", 1
+    proc set from Dict with env, "delete", 1
+    proc set from Dict with env, "imag", 1
+    proc set from Dict with env, "len", 1
+    proc set from Dict with env, "make", 1
+    proc set from Dict with env, "max", 1
+    proc set from Dict with env, "min", 1
+    proc set from Dict with env, "new", 1
+    proc set from Dict with env, "panic", 1
+    proc set from Dict with env, "print", 1
+    proc set from Dict with env, "println", 1
+    proc set from Dict with env, "real", 1
+    proc set from Dict with env, "recover", 1
+End Process
+
+@Reasoning:
+A name is predeclared if it is in the universe block. Used both for type-
+reference validation (built-in types) and identifier resolution (constants,
+builtins) so an undefined diagnostic never fires on the universe surface.
+@End Reasoning
+
+@Implementation:
+Null name returns 0 (not predeclared). Otherwise Dict.get against builtin_types
+(offset 96); returns 1 if present, 0 otherwise.
+@End Implementation
+
+Process called "is_predeclared" takes analyzer as Integer, name as Integer returns Integer:
+    If name is equal to 0:
+        Return 0
+    End If
+
+    Let env be proc memory_get_int64 from Layout with analyzer, 96
+    Let found be proc get from Dict with env, name
+    If found is not equal to 0:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: Go Export Rule (capitalization)
+Note: ============================================================================
+
+@Reasoning:
+Go ties export to the first rune's case: an identifier whose first character is
+an uppercase ASCII letter is exported (visible to importing packages); all other
+first characters (lowercase letters, '_', digits cannot start an identifier)
+yield a package-private name. ASCII A..Z is bytes 65..90, which covers the
+overwhelming majority of Go identifiers; the Unicode-uppercase tail of the rule
+is vanishingly rare in real Go and is treated as unexported here because the
+parser stores names as raw byte strings and a multi-byte leading rune is not an
+ASCII uppercase letter.
+@End Reasoning
+
+@Implementation:
+Null or empty name returns 0 (not exported). Read the first byte via
+string_char_at; return 1 if it is in the inclusive ASCII range 65 ('A') .. 90
+('Z'), otherwise 0.
+@End Implementation
+
+Process called "is_exported_name" takes name as Integer returns Integer:
+    If name is equal to 0:
+        Return 0
+    End If
+
+    Let len be proc string_length from StringCore with name
+    If len is equal to 0:
+        Return 0
+    End If
+
+    Let first be proc string_char_at from StringCore with name, 0
+    If first is greater than or equal to 65:
+        If first is less than or equal to 90:
+            Return 1
+        End If
+    End If
+    Return 0
+End Process
+
+@Reasoning:
+Records a top-level name's export classification in the exported table so a later
+pass can answer "is this symbol visible across packages?" in O(1) without
+re-deriving the capitalization rule. Only exported names are inserted (value 1);
+absence means unexported.
+@End Reasoning
+
+@Implementation:
+Null name short-circuits. If is_exported_name returns 1, set name -> 1 in the
+exported table (offset 64).
+@End Implementation
+
+Process called "record_export_class" takes analyzer as Integer, name as Integer:
+    If name is equal to 0:
+        Return
+    End If
+
+    Let exported_flag be proc is_exported_name with name
+    If exported_flag is equal to 1:
+        Let exported be proc memory_get_int64 from Layout with analyzer, 64
+        proc set from Dict with exported, name, 1
+    End If
+End Process
+
+Note: ============================================================================
+Note: Top-Level Analysis Entry
+Note: ============================================================================
+
+@Reasoning:
+Two-phase pipeline over the program's top-level children (offset 24 of the
+GO_PROGRAM node). Phase 1 registers every package-level declaration - imports,
+named types, interfaces, functions, methods, vars, consts - into the registries
+and package scope so forward references resolve regardless of source order (Go
+allows a function to reference a type declared later in the file). Phase 2 walks
+function and method bodies, where the now-complete registries let identifier and
+type references resolve. Splitting the phases avoids speculative resolution.
+@End Reasoning
+
+@Implementation:
+Null-guard analyzer and program_node. Verify the program node's type tag (offset
+0) is GO_PROGRAM; reject otherwise. Read children at offset 24. Phase 1: for each
+child dispatch on node_type to the matching collector. Phase 2: for each child
+that is GO_FUNCTION or GO_METHOD, analyze its body. Return 0 if has_error (offset
+88) latched, otherwise 1.
+@End Implementation
+
+Process called "analyze_go_program" takes analyzer as Integer, program_node as Integer returns Integer:
     If analyzer is equal to 0:
         Return 0
     End If
 
     If program_node is equal to 0:
-        proc set_go_semantic_error with analyzer, "Null program node"
+        proc record_error with analyzer, "Null program node"
         Return 0
     End If
 
-    Note: Phase 1: Collect all type and interface declarations
-    proc collect_go_declarations with analyzer, program_node
+    Let prog_type be proc memory_get_int64 from Layout with program_node, 0
+    If prog_type is not equal to GO_PROGRAM from Parser:
+        proc record_error with analyzer, "Root node is not a Go program"
+        Return 0
+    End If
 
-    Note: Phase 2: Resolve types and check interface satisfaction
-    proc resolve_go_types with analyzer, program_node
+    Let children be proc memory_get_int64 from Layout with program_node, 24
+    If children is equal to 0:
+        Note: Empty program (package clause only) is valid Go
+        Return 1
+    End If
 
-    Note: Phase 3: Analyze function bodies and expressions
-    proc analyze_go_functions with analyzer, program_node
+    Let child_count be proc size from List with children
 
-    Let has_error be proc memory_get_int64 from Layout with analyzer, 56
+    Note: Phase 1: collect all top-level declarations
+    Let i be 0
+    While i is less than child_count:
+        Let child be proc get from List with children, i
+        proc collect_top_level with analyzer, child
+        Set i to i plus 1
+    End While
+
+    Note: Phase 2: analyze function and method bodies
+    Let j be 0
+    While j is less than child_count:
+        Let decl be proc get from List with children, j
+        Let decl_type be proc memory_get_int64 from Layout with decl, 0
+
+        If decl_type is equal to GO_FUNCTION from Parser:
+            proc analyze_function_body with analyzer, decl
+        Otherwise If decl_type is equal to GO_METHOD from Parser:
+            proc analyze_method_body with analyzer, decl
+        End If
+
+        Set j to j plus 1
+    End While
+
+    Let has_error be proc memory_get_int64 from Layout with analyzer, 88
     If has_error is equal to 1:
         Return 0
     End If
@@ -133,630 +639,1749 @@ Process called "analyze_go_program" takes analyzer as Integer, program_node as I
 End Process
 
 @Reasoning:
-Single-pass walk of the program's top-level children, dispatching
-each to a registry-specific collector based on the GO_* node kind
-tag at child offset 0. Variables and constants both go into
-global_scope while types/interfaces/packages have their own
-dedicated registries. This split lets later phases query by
-declaration kind without walking the full AST.
+Dispatches a single top-level declaration to its registry-specific collector
+based on the GO_* node tag at offset 0. GO_PACKAGE carries no binding (the
+package name is metadata, not a scoped symbol). Imports, types, interfaces (a
+type whose underlying node is an interface), functions, methods, vars, and consts
+each register their introduced name(s).
 @End Reasoning
 
 @Implementation:
-Reads program_node's children list at offset 32. For each child,
-checks the node-type tag (offset 0) and calls the matching
-collector. Order of declarations is preserved in the registries
-(Dict insertion order) so diagnostics can replay source order
-during phase 2/3 reporting.
+Read node_type at offset 0. If-cascade routing GO_PACKAGE (no-op for binding),
+GO_IMPORT, GO_FUNCTION, GO_METHOD, GO_TYPE_DECL, GO_VAR_DECL, GO_CONST_DECL to
+the matching collector. Unknown kinds are ignored (the parser only emits these at
+top level).
 @End Implementation
-Process called "collect_go_declarations" takes analyzer as Integer, program_node as Integer:
-    Note: Collect all declarations for type resolution
 
-    If program_node is equal to 0:
+Process called "collect_top_level" takes analyzer as Integer, node as Integer:
+    If node is equal to 0:
         Return
     End If
 
-    Let global_scope be proc memory_get_int64 from Layout with analyzer, 0
-    Let type_registry be proc memory_get_int64 from Layout with analyzer, 24
-    Let interface_registry be proc memory_get_int64 from Layout with analyzer, 32
+    Let node_type be proc memory_get_int64 from Layout with node, 0
 
-    Let children be proc memory_get_int64 from Layout with program_node, 32
-    If children is not equal to 0:
-        Let child_count be proc size from List with children
-        Let i be 0
-        While i is less than child_count:
-            Let child be proc get from List with children, i
-            Let child_type be proc memory_get_int64 from Layout with child, 0
+    If node_type is equal to GO_PACKAGE from Parser:
+        Note: package clause carries no scoped binding
+        Return
+    End If
 
-            If child_type is equal to GO_TYPE from Parser:
-                proc collect_type_declaration with analyzer, child
-            Otherwise If child_type is equal to GO_INTERFACE from Parser:
-                proc collect_interface_declaration with analyzer, child
-            Otherwise If child_type is equal to GO_FUNCTION from Parser:
-                proc collect_function_declaration with analyzer, child
-            Otherwise If child_type is equal to GO_VARIABLE from Parser:
-                proc collect_variable_declaration with analyzer, child
-            Otherwise If child_type is equal to GO_CONSTANT from Parser:
-                proc collect_constant_declaration with analyzer, child
-            End If
+    If node_type is equal to GO_IMPORT from Parser:
+        proc collect_import with analyzer, node
+        Return
+    End If
 
-            Set i to i plus 1
-        End While
+    If node_type is equal to GO_FUNCTION from Parser:
+        proc collect_function with analyzer, node
+        Return
+    End If
+
+    If node_type is equal to GO_METHOD from Parser:
+        proc collect_method with analyzer, node
+        Return
+    End If
+
+    If node_type is equal to GO_TYPE_DECL from Parser:
+        proc collect_type_decl with analyzer, node
+        Return
+    End If
+
+    If node_type is equal to GO_VAR_DECL from Parser:
+        proc collect_var_decl with analyzer, node
+        Return
+    End If
+
+    If node_type is equal to GO_CONST_DECL from Parser:
+        proc collect_const_decl with analyzer, node
+        Return
     End If
 End Process
 
-@Reasoning:
-Registers a named type in type_registry keyed by its name (offset
-8). Skips nodes with null name (only generated by parser
-error-recovery). Does not validate the declaration body - that's
-phase 2's job.
-@End Reasoning
-Process called "collect_type_declaration" takes analyzer as Integer, type_node as Integer:
-    Note: Collect type declaration for later resolution
-
-    Let type_registry be proc memory_get_int64 from Layout with analyzer, 24
-    Let type_name be proc memory_get_int64 from Layout with type_node, 8
-
-    If type_name is not equal to 0:
-        proc set from Dict with type_registry, type_name, type_node
-    End If
-End Process
+Note: ============================================================================
+Note: Import Collection
+Note: ============================================================================
 
 @Reasoning:
-Interfaces go in their own registry (offset 32) because Go's
-"interface satisfaction" check is a separate algorithm from type
-identity. Keeping them apart lets phase 2's check_interface_*
-helpers iterate only interface declarations, not every named type.
+A GO_IMPORT node holds one or more import-spec children (the parser nests specs
+under the import node for both single and grouped imports). Each spec carries an
+optional alias in its name slot (offset 8) and the quoted path in its value slot
+(offset 16). The imported package name is the alias if present, otherwise the
+last '/'-separated segment of the path. Registering that name in package_registry
+lets qualified references pkg.Name resolve to a known package. A dot import
+(attribute "dot_import" = "true") brings the package's exported names into the
+file scope; since the analyzer cannot see the other package's symbols, a dot
+import suppresses undefined-identifier diagnostics by recording the package under
+the sentinel "." key, which the resolver treats as "names may come from a dot
+import".
 @End Reasoning
-Process called "collect_interface_declaration" takes analyzer as Integer, interface_node as Integer:
-    Note: Collect interface declaration for satisfaction checking
 
-    Let interface_registry be proc memory_get_int64 from Layout with analyzer, 32
-    Let interface_name be proc memory_get_int64 from Layout with interface_node, 8
+@Implementation:
+Read children at offset 24. For each spec child, derive the package name:
+attributes "dot_import" => register "." ; alias (offset 8) non-null => register
+alias; otherwise compute the last path segment of value (offset 16) via
+last_path_segment and register that. Each registration stores spec->node in
+package_registry. A bare GO_IMPORT with name/value directly (single-spec inlined)
+is handled by treating the node itself as its own spec when it has no children.
+@End Implementation
 
-    If interface_name is not equal to 0:
-        proc set from Dict with interface_registry, interface_name, interface_node
-    End If
-End Process
+Process called "collect_import" takes analyzer as Integer, node as Integer:
+    Let package_registry be proc memory_get_int64 from Layout with analyzer, 48
 
-@Reasoning:
-Functions land in global_scope (not a function-specific registry)
-because Go treats functions as first-class values; name resolution
-for "f()" uses the same lookup path as for variables. The function
-node itself carries the signature for type-check use later.
-@End Reasoning
-Process called "collect_function_declaration" takes analyzer as Integer, func_node as Integer:
-    Note: Collect function signature for type checking
-
-    Let global_scope be proc memory_get_int64 from Layout with analyzer, 0
-    Let func_name be proc memory_get_int64 from Layout with func_node, 8
-
-    If func_name is not equal to 0:
-        proc set from Dict with global_scope, func_name, func_node
-    End If
-End Process
-
-@Reasoning:
-Top-level "var x = ..." goes into the same global_scope dict as
-functions. Shadowing within nested scopes is handled by the scope
-stack, not by mutating this top-level dict.
-@End Reasoning
-Process called "collect_variable_declaration" takes analyzer as Integer, var_node as Integer:
-    Note: Collect variable declaration for scope analysis
-
-    Let global_scope be proc memory_get_int64 from Layout with analyzer, 0
-    Let var_name be proc memory_get_int64 from Layout with var_node, 8
-
-    If var_name is not equal to 0:
-        proc set from Dict with global_scope, var_name, var_node
-    End If
-End Process
-
-@Reasoning:
-"const X = ..." goes into global_scope alongside vars. Go's
-constants have compile-time-known values; type-checking handles
-implicit typing (untyped constants take on the type required by
-context) downstream in phase 3.
-@End Reasoning
-Process called "collect_constant_declaration" takes analyzer as Integer, const_node as Integer:
-    Note: Collect constant declaration for type analysis
-
-    Let global_scope be proc memory_get_int64 from Layout with analyzer, 0
-    Let const_name be proc memory_get_int64 from Layout with const_node, 8
-
-    If const_name is not equal to 0:
-        proc set from Dict with global_scope, const_name, const_node
-    End If
-End Process
-
-@Reasoning:
-Phase 2 orchestrator. Three sub-steps in order: (a) resolve every
-type-definition's structure into concrete representations,
-(b) compute which concrete types satisfy which interfaces (Go's
-structural typing requires every-type-vs-every-interface check),
-(c) validate method sets per receiver. Each sub-step is idempotent
-so re-running phase 2 after errors does not corrupt state.
-@End Reasoning
-Process called "resolve_go_types" takes analyzer as Integer, program_node as Integer:
-    Note: Resolve all types and check interface satisfaction
-
-    Let type_registry be proc memory_get_int64 from Layout with analyzer, 24
-    Let interface_registry be proc memory_get_int64 from Layout with analyzer, 32
-
-    Note: Resolve all type definitions
-    proc resolve_type_definitions with analyzer, type_registry
-
-    Note: Check interface satisfaction for all types
-    proc check_interface_satisfaction with analyzer, interface_registry
-
-    Note: Validate method sets
-    proc validate_method_sets with analyzer, program_node
-End Process
-
-@Reasoning:
-Iterates type_registry keys (insertion order) and dispatches each
-type to resolve_individual_type. Uses keys-list because Dict
-iteration uses a separate "keys" view rather than iterator state.
-Type-alias chains are resolved in declaration order; cyclic
-aliases are detected by the per-individual resolver via a visited
-set.
-@End Reasoning
-Process called "resolve_type_definitions" takes analyzer as Integer, type_registry as Integer:
-    Note: Resolve all type definitions and aliases
-
-    Let type_keys be proc keys from Dict with type_registry
-    If type_keys is not equal to 0:
-        Let key_count be proc size from List with type_keys
-        Let i be 0
-        While i is less than key_count:
-            Let type_name be proc get from List with type_keys, i
-            Let type_node be proc get from Dict with type_registry, type_name
-            proc resolve_individual_type with analyzer, type_node
-            Set i to i plus 1
-        End While
-    End If
-End Process
-
-@Reasoning:
-Reads the type definition node at offset 16 (the right-hand side of
-"type X = ...") and dispatches by its Go kind to a specialized
-resolver. Covers struct, interface, slice, map, channel, and
-function types. Anonymous/aliased types fall through to no
-resolver but the type_registry still keeps the AST node so
-downstream uses can still reference it by name.
-@End Reasoning
-Process called "resolve_individual_type" takes analyzer as Integer, type_node as Integer:
-    Note: Resolve individual type definition
-
-    Let type_definition be proc memory_get_int64 from Layout with type_node, 16
-    If type_definition is not equal to 0:
-        Let type_kind be proc memory_get_int64 from Layout with type_definition, 0
-
-        If type_kind is equal to GO_STRUCT from Parser:
-            proc resolve_struct_type with analyzer, type_definition
-        Otherwise If type_kind is equal to GO_INTERFACE from Parser:
-            proc resolve_interface_type with analyzer, type_definition
-        Otherwise If type_kind is equal to GO_SLICE from Parser:
-            proc resolve_slice_type with analyzer, type_definition
-        Otherwise If type_kind is equal to GO_MAP from Parser:
-            proc resolve_map_type with analyzer, type_definition
-        Otherwise If type_kind is equal to GO_CHANNEL from Parser:
-            proc resolve_channel_type with analyzer, type_definition
-        Otherwise If type_kind is equal to GO_FUNCTION_TYPE from Parser:
-            proc resolve_function_type with analyzer, type_definition
-        End If
-    End If
-End Process
-
-@Reasoning:
-Outer loop over every interface in the registry; the inner work
-(check_interface_implementations) does the per-interface scan.
-We do this O(I*T) check up front rather than lazily per use-site
-because Go's compiler emits "type T implements I" tables for the
-runtime; centralizing the computation here lets us emit those
-tables in one pass.
-@End Reasoning
-Process called "check_interface_satisfaction" takes analyzer as Integer, interface_registry as Integer:
-    Note: Check that all types properly implement interfaces
-
-    Let interface_keys be proc keys from Dict with interface_registry
-    If interface_keys is not equal to 0:
-        Let key_count be proc size from List with interface_keys
-        Let i be 0
-        While i is less than key_count:
-            Let interface_name be proc get from List with interface_keys, i
-            Let interface_node be proc get from Dict with interface_registry, interface_name
-            proc check_interface_implementations with analyzer, interface_node
-            Set i to i plus 1
-        End While
-    End If
-End Process
-
-@Reasoning:
-For a given interface, walks every type in type_registry and tests
-whether it has the required method set. type_implements_interface
-returns 1 on success, and we record the relationship via
-register_interface_implementation so the runtime has a fast O(1)
-lookup at the eventual type-assert site.
-@End Reasoning
-Process called "check_interface_implementations" takes analyzer as Integer, interface_node as Integer:
-    Note: Check which types implement this interface
-
-    Let interface_methods be proc get_interface_methods with analyzer, interface_node
-    Let type_registry be proc memory_get_int64 from Layout with analyzer, 24
-
-    Let type_keys be proc keys from Dict with type_registry
-    If type_keys is not equal to 0:
-        Let key_count be proc size from List with type_keys
-        Let i be 0
-        While i is less than key_count:
-            Let type_name be proc get from List with type_keys, i
-            Let type_node be proc get from Dict with type_registry, type_name
-            Let implements_interface be proc type_implements_interface with analyzer, type_node, interface_methods
-
-            If implements_interface is equal to 1:
-                proc register_interface_implementation with analyzer, type_name, interface_node
-            End If
-
-            Set i to i plus 1
-        End While
-    End If
-End Process
-
-@Reasoning:
-Phase 3 entry: walks top-level children and for each Function or
-Method node, descends into its body for type-checking. Other top-
-level decls (types, vars, consts) are skipped here because their
-analysis happened in phase 1/2.
-@End Reasoning
-Process called "analyze_go_functions" takes analyzer as Integer, program_node as Integer:
-    Note: Analyze function bodies and expressions
-
-    Let children be proc memory_get_int64 from Layout with program_node, 32
-    If children is not equal to 0:
-        Let child_count be proc size from List with children
-        Let i be 0
-        While i is less than child_count:
-            Let child be proc get from List with children, i
-            Let child_type be proc memory_get_int64 from Layout with child, 0
-
-            If child_type is equal to GO_FUNCTION from Parser:
-                proc analyze_function_body with analyzer, child
-            Otherwise If child_type is equal to GO_METHOD from Parser:
-                proc analyze_method_body with analyzer, child
-            End If
-
-            Set i to i plus 1
-        End While
-    End If
-End Process
-
-@Reasoning:
-Bracketed by enter_function_scope / exit_function_scope so any
-locals declared inside the body are popped on exit. Parameters are
-registered in scope first via analyze_function_parameters so they
-shadow any like-named globals. Statements are then analyzed in
-source order.
-@End Reasoning
-Process called "analyze_function_body" takes analyzer as Integer, func_node as Integer:
-    Note: Analyze function body for type correctness
-
-    proc enter_function_scope from analyzer
-
-    Note: Analyze function parameters
-    proc analyze_function_parameters with analyzer, func_node
-
-    Note: Analyze function body statements
-    Let children be proc memory_get_int64 from Layout with func_node, 32
-    If children is not equal to 0:
-        Let child_count be proc size from List with children
-        Let i be 0
-        While i is less than child_count:
-            Let child be proc get from List with children, i
-            proc analyze_statement with analyzer, child
-            Set i to i plus 1
-        End While
+    Let children be proc memory_get_int64 from Layout with node, 24
+    If children is equal to 0:
+        proc register_import_spec with analyzer, node
+        Return
     End If
 
-    proc exit_function_scope from analyzer
+    Let count be proc size from List with children
+    Let i be 0
+    While i is less than count:
+        Let spec be proc get from List with children, i
+        proc register_import_spec with analyzer, spec
+        Set i to i plus 1
+    End While
 End Process
 
 @Reasoning:
-Reads the params_node at offset 16 (the parenthesized list right
-of the function name). Walks each parameter child and validates
-its declaration via analyze_parameter_declaration. Null params
-node means a parameterless function; we simply return.
+Registers a single import spec's package name. Centralised so both the single and
+grouped import forms share the alias/dot-import/path-segment derivation.
 @End Reasoning
-Process called "analyze_function_parameters" takes analyzer as Integer, func_node as Integer:
-    Note: Analyze function parameters and register in scope
 
-    Let params_node be proc memory_get_int64 from Layout with func_node, 16
-    If params_node is not equal to 0:
-        Let children be proc memory_get_int64 from Layout with params_node, 32
-        If children is not equal to 0:
-            Let child_count be proc size from List with children
-            Let i be 0
-            While i is less than child_count:
-                Let param be proc get from List with children, i
-                proc analyze_parameter_declaration with analyzer, param
-                Set i to i plus 1
-            End While
-        End If
+@Implementation:
+Read attributes (offset 32); if it has "dot_import" register the "." sentinel.
+Otherwise read alias (offset 8): if non-null register it. Otherwise read path
+(offset 16) and register its last segment. The registry value is the spec node so
+later passes can recover the path.
+@End Implementation
+
+Process called "register_import_spec" takes analyzer as Integer, spec as Integer:
+    If spec is equal to 0:
+        Return
     End If
-End Process
 
-@Reasoning:
-Reads name (offset 8) and type (offset 16). Validates the type
-reference; on failure records an error and bails (the parameter
-is not registered in scope, which will likely cascade into
-"undefined identifier" diagnostics in the body - that's fine
-because the first error already identified the root cause).
-@End Reasoning
-Process called "analyze_parameter_declaration" takes analyzer as Integer, param_node as Integer:
-    Note: Analyze individual parameter declaration
+    Let package_registry be proc memory_get_int64 from Layout with analyzer, 48
 
-    Let param_name be proc memory_get_int64 from Layout with param_node, 8
-    Let param_type be proc memory_get_int64 from Layout with param_node, 16
-
-    If param_name is not equal to 0 and param_type is not equal to 0:
-        Let is_valid_type be proc validate_type_reference with analyzer, param_type
-        If is_valid_type is equal to 0:
-            proc set_go_semantic_error with analyzer, "Invalid parameter type"
+    Let attributes be proc memory_get_int64 from Layout with spec, 32
+    If attributes is not equal to 0:
+        Let is_dot be proc contains from Dict with attributes, "dot_import"
+        If is_dot is equal to 1:
+            Let dot_key be proc create_from_literal from StringCore with "."
+            proc set from Dict with package_registry, dot_key, spec
             Return
         End If
+    End If
 
-        proc register_variable_in_scope with analyzer, param_name, param_type
+    Let alias be proc memory_get_int64 from Layout with spec, 8
+    If alias is not equal to 0:
+        proc set from Dict with package_registry, alias, spec
+        Return
+    End If
+
+    Let path be proc memory_get_int64 from Layout with spec, 16
+    If path is not equal to 0:
+        Let pkg_name be proc last_path_segment with path
+        If pkg_name is not equal to 0:
+            proc set from Dict with package_registry, pkg_name, spec
+        End If
     End If
 End Process
 
 @Reasoning:
-Dispatches a single Go statement to its analyzer based on the
-node kind tag at offset 0. Covers all of Go's statement forms
-including the concurrency primitives (go, defer, select) which
-need their own validation rules around goroutine safety and
-deferred-call evaluation. Null stmt_node is a no-op (defensive).
+Derives the importable package name from an import path string: the substring
+after the final '/'. For an unquoted, unslashed path the whole string is the
+name. The parser stores the path with its surrounding quotes stripped (it copies
+the lexeme), so this operates on the bare path text.
 @End Reasoning
-Process called "analyze_statement" takes analyzer as Integer, stmt_node as Integer:
-    Note: Analyze Go statements for semantic correctness
 
+@Implementation:
+Scan the path for the last '/' (byte 47). If found, build a fresh StringCore of
+the bytes after it via slice_from. If no '/', return the path unchanged (the
+caller treats it as the package name directly).
+@End Implementation
+
+Process called "last_path_segment" takes path as Integer returns Integer:
+    If path is equal to 0:
+        Return 0
+    End If
+
+    Let len be proc string_length from StringCore with path
+    If len is equal to 0:
+        Return path
+    End If
+
+    Let last_slash be 0 minus 1
+    Let i be 0
+    While i is less than len:
+        Let ch be proc string_char_at from StringCore with path, i
+        If ch is equal to 47:
+            Set last_slash to i
+        End If
+        Set i to i plus 1
+    End While
+
+    If last_slash is less than 0:
+        Return path
+    End If
+
+    Let start be last_slash plus 1
+    Return proc slice_from with path, start, len
+End Process
+
+@Reasoning:
+Builds a fresh StringCore holding bytes [start, end) of source. Needed for path-
+segment extraction; constructs the result one character at a time through the
+StringCore character API so the result is an owned content string the
+package_registry can key on safely.
+@End Reasoning
+
+@Implementation:
+Create an empty StringCore via create_from_literal "". For each index in
+[start, end), read the byte via string_char_at, turn it into a one-char string
+via char_to_string, and concatenate via StringUtils.string_concat. Return the
+accumulated string.
+@End Implementation
+
+Process called "slice_from" takes source as Integer, start as Integer, end as Integer returns Integer:
+    Let result be proc create_from_literal from StringCore with ""
+    Let i be start
+    While i is less than end:
+        Let ch be proc string_char_at from StringCore with source, i
+        Let ch_str be proc char_to_string from StringCore with ch
+        Set result to proc string_concat from StringUtils with result, ch_str
+        Set i to i plus 1
+    End While
+    Return result
+End Process
+
+Note: ============================================================================
+Note: Function / Method Collection
+Note: ============================================================================
+
+@Reasoning:
+A free function (GO_FUNCTION) registers its name in package scope and records its
+export class. Functions are first-class in Go: a call f() resolves through the
+same name lookup as a variable reference, so package scope is the right home. The
+function node itself is not stored separately; its signature is recovered from
+the AST when a body is analysed.
+@End Reasoning
+
+@Implementation:
+Read name (offset 8). If non-null, declare it in package scope (which is
+current_scope during phase 1) and record its export class.
+@End Implementation
+
+Process called "collect_function" takes analyzer as Integer, node as Integer:
+    Let name be proc memory_get_int64 from Layout with node, 8
+    If name is not equal to 0:
+        proc declare_in_scope with analyzer, name
+        proc record_export_class with analyzer, name
+    End If
+End Process
+
+@Reasoning:
+A method (GO_METHOD) does NOT introduce a package-scope name - methods are
+selected through their receiver (recv.Method()), not referenced bare. Instead the
+method registers in the receiver base type's method set so interface-satisfaction
+and method-resolution can find it. The receiver is stored as a GO_PARAMETER node
+under the "receiver" attribute; its type child names the base type (after
+stripping a leading pointer). The method name's export class is still recorded
+because an exported method on an exported type is part of the package's public
+API.
+@End Reasoning
+
+@Implementation:
+Read name (offset 8) and attributes (offset 32). From attributes pull the
+"receiver" GO_PARAMETER node; derive its base type name via receiver_base_type.
+If both method name and base type resolve, append the method name to the base
+type's method-set list (creating the list on first method) and record the method
+name's export class.
+@End Implementation
+
+Process called "collect_method" takes analyzer as Integer, node as Integer:
+    Let name be proc memory_get_int64 from Layout with node, 8
+    If name is equal to 0:
+        Return
+    End If
+
+    proc record_export_class with analyzer, name
+
+    Let attributes be proc memory_get_int64 from Layout with node, 32
+    If attributes is equal to 0:
+        Return
+    End If
+
+    Let receiver be proc get from Dict with attributes, "receiver"
+    If receiver is equal to 0:
+        Return
+    End If
+
+    Let base_type be proc receiver_base_type with receiver
+    If base_type is equal to 0:
+        Return
+    End If
+
+    proc register_method with analyzer, base_type, name
+End Process
+
+@Reasoning:
+Extracts the base-type name a method receiver binds to. A receiver is
+'(r T)' or '(r *T)'; the base type is T in both. The parser stores the receiver
+as a GO_PARAMETER whose type child is the type node - a GO_BASIC_TYPE (name = T)
+for a value receiver or a GO_POINTER_TYPE (child = the pointee type node) for a
+pointer receiver. This unwraps one pointer level and returns the underlying type
+name.
+@End Reasoning
+
+@Implementation:
+Read the receiver's children (offset 24); the type node is element 0 (parameters
+store their type as the first/only child). If the type node is GO_POINTER_TYPE,
+descend to its child (offset 24 element 0, or the directly-stored node) before
+reading the name. Return the type node's name (offset 8), or 0 if unresolved.
+@End Implementation
+
+Process called "receiver_base_type" takes receiver as Integer returns Integer:
+    If receiver is equal to 0:
+        Return 0
+    End If
+
+    Let type_node be proc first_child with receiver
+    If type_node is equal to 0:
+        Return 0
+    End If
+
+    Let type_kind be proc memory_get_int64 from Layout with type_node, 0
+    If type_kind is equal to GO_POINTER_TYPE from Parser:
+        Let pointee be proc first_child with type_node
+        If pointee is equal to 0:
+            Return 0
+        End If
+        Return proc memory_get_int64 from Layout with pointee, 8
+    End If
+
+    Return proc memory_get_int64 from Layout with type_node, 8
+End Process
+
+@Reasoning:
+Appends a method name to a base type's method set, creating the set lazily on the
+first method registered for that type. The method set is the list of method-name
+strings; interface-satisfaction compares an interface's required method names
+against this set.
+@End Reasoning
+
+@Implementation:
+Read method_sets (offset 56). Look up the base type's list via Dict.get; if 0,
+create a fresh List and store it under base_type. Append method_name to the list.
+@End Implementation
+
+Process called "register_method" takes analyzer as Integer, base_type as Integer, method_name as Integer:
+    Let method_sets be proc memory_get_int64 from Layout with analyzer, 56
+
+    Let set be proc get from Dict with method_sets, base_type
+    If set is equal to 0:
+        Set set to proc create from List
+        proc set from Dict with method_sets, base_type, set
+    End If
+
+    proc list_append from List with set, method_name
+End Process
+
+Note: ============================================================================
+Note: Type / Var / Const Collection
+Note: ============================================================================
+
+@Reasoning:
+A GO_TYPE_DECL groups one or more type specs (the parser nests specs under it for
+both single and grouped 'type ( ... )' forms; each spec is itself a GO_TYPE_DECL
+with name and a single underlying-type child). Each named type registers in
+type_registry; if its underlying type is an interface, it ALSO registers in
+interface_registry so the satisfaction pass can iterate interfaces directly. The
+type name's export class is recorded.
+@End Reasoning
+
+@Implementation:
+Read children at offset 24. If the node has a name itself (a single inline spec),
+register it. Otherwise iterate the spec children, registering each. Registration:
+store spec->node under its name in type_registry; if the underlying type
+(first_child) is GO_INTERFACE_TYPE, also store in interface_registry; record
+export class.
+@End Implementation
+
+Process called "collect_type_decl" takes analyzer as Integer, node as Integer:
+    Let own_name be proc memory_get_int64 from Layout with node, 8
+    If own_name is not equal to 0:
+        proc register_type_spec with analyzer, node
+        Return
+    End If
+
+    Let children be proc memory_get_int64 from Layout with node, 24
+    If children is equal to 0:
+        Return
+    End If
+
+    Let count be proc size from List with children
+    Let i be 0
+    While i is less than count:
+        Let spec be proc get from List with children, i
+        proc register_type_spec with analyzer, spec
+        Set i to i plus 1
+    End While
+End Process
+
+@Reasoning:
+Registers a single type spec. Pulled out so the inline-single and grouped forms
+share identical logic. The underlying-type kind determines whether the type also
+belongs to the interface registry.
+@End Reasoning
+
+@Implementation:
+Read name (offset 8); null short-circuits. Store name->spec in type_registry
+(offset 32) and record export class. Read underlying type via first_child; if it
+is GO_INTERFACE_TYPE store name->spec in interface_registry (offset 40). If it is
+GO_STRUCT_TYPE, register the struct's field names through register_struct_fields
+so field-access checks resolve.
+@End Implementation
+
+Process called "register_type_spec" takes analyzer as Integer, spec as Integer:
+    If spec is equal to 0:
+        Return
+    End If
+
+    Let name be proc memory_get_int64 from Layout with spec, 8
+    If name is equal to 0:
+        Return
+    End If
+
+    Let type_registry be proc memory_get_int64 from Layout with analyzer, 32
+    proc set from Dict with type_registry, name, spec
+    proc record_export_class with analyzer, name
+
+    Let underlying be proc first_child with spec
+    If underlying is equal to 0:
+        Return
+    End If
+
+    Let underlying_kind be proc memory_get_int64 from Layout with underlying, 0
+    If underlying_kind is equal to GO_INTERFACE_TYPE from Parser:
+        Let interface_registry be proc memory_get_int64 from Layout with analyzer, 40
+        proc set from Dict with interface_registry, name, spec
+    End If
+End Process
+
+@Reasoning:
+A GO_VAR_DECL groups one or more var specs (single or grouped 'var ( ... )').
+Each spec carries a name and children [type?, init?]. Top-level vars bind in
+package scope and record export class. The spec's optional type child is
+validated against the type universe so 'var x BadType' is caught here.
+@End Reasoning
+
+@Implementation:
+If the node has its own name, treat it as a single inline spec. Otherwise iterate
+spec children. For each spec: declare its name in package scope, record export
+class, and if it has a type child (the first child when present and not the init
+expression) validate the type reference.
+@End Implementation
+
+Process called "collect_var_decl" takes analyzer as Integer, node as Integer:
+    Let own_name be proc memory_get_int64 from Layout with node, 8
+    If own_name is not equal to 0:
+        proc register_value_spec with analyzer, node
+        Return
+    End If
+
+    Let children be proc memory_get_int64 from Layout with node, 24
+    If children is equal to 0:
+        Return
+    End If
+
+    Let count be proc size from List with children
+    Let i be 0
+    While i is less than count:
+        Let spec be proc get from List with children, i
+        proc register_value_spec with analyzer, spec
+        Set i to i plus 1
+    End While
+End Process
+
+@Reasoning:
+A GO_CONST_DECL mirrors GO_VAR_DECL structurally: grouped or single specs, each
+with name and children [type?, value?]. Constants bind in package scope at top
+level. The same register_value_spec handles both because the binding/export/type-
+validation logic is identical; the const-specific iota and value-required rules
+are enforced during body-independent constant evaluation, which is out of scope
+for name resolution.
+@End Reasoning
+
+@Implementation:
+Identical shape to collect_var_decl, delegating each spec to register_value_spec.
+@End Implementation
+
+Process called "collect_const_decl" takes analyzer as Integer, node as Integer:
+    Let own_name be proc memory_get_int64 from Layout with node, 8
+    If own_name is not equal to 0:
+        proc register_value_spec with analyzer, node
+        Return
+    End If
+
+    Let children be proc memory_get_int64 from Layout with node, 24
+    If children is equal to 0:
+        Return
+    End If
+
+    Let count be proc size from List with children
+    Let i be 0
+    While i is less than count:
+        Let spec be proc get from List with children, i
+        proc register_value_spec with analyzer, spec
+        Set i to i plus 1
+    End While
+End Process
+
+@Reasoning:
+Registers a single var/const spec: binds its name in the current scope (package
+scope during phase 1), records export class, and validates any explicit type
+annotation. The parser stores a spec's children as [type, init] when a type is
+present, or [init] when the type is inferred; the first child is a type only when
+its node kind is one of the type-node kinds, which validate_type_reference
+checks, so passing the first child to type validation is safe (a non-type first
+child means the type was inferred and there is nothing to validate).
+@End Reasoning
+
+@Implementation:
+Read name (offset 8); null short-circuits. Declare in scope and record export
+class. Read first_child; if it is a type-kind node, validate the type reference.
+@End Implementation
+
+Process called "register_value_spec" takes analyzer as Integer, spec as Integer:
+    If spec is equal to 0:
+        Return
+    End If
+
+    Let name be proc memory_get_int64 from Layout with spec, 8
+    If name is equal to 0:
+        Return
+    End If
+
+    proc declare_in_scope with analyzer, name
+    proc record_export_class with analyzer, name
+
+    Let first be proc first_child with spec
+    If first is equal to 0:
+        Return
+    End If
+
+    Let first_kind be proc memory_get_int64 from Layout with first, 0
+    Let is_type be proc is_type_node with first_kind
+    If is_type is equal to 1:
+        proc validate_type_reference with analyzer, first
+    End If
+End Process
+
+Note: ============================================================================
+Note: Type Reference Validation
+Note: ============================================================================
+
+@Reasoning:
+Classifies a node kind as a type node so a spec's optional leading child can be
+told apart from an initializer expression. The Go type-node kinds the parser
+emits are the basic/named type, pointer, array, slice, map, channel, func, struct
+and interface type constructors.
+@End Reasoning
+
+@Implementation:
+Returns 1 if node_kind is any of GO_BASIC_TYPE, GO_POINTER_TYPE, GO_ARRAY_TYPE,
+GO_SLICE_TYPE, GO_MAP_TYPE, GO_CHAN_TYPE, GO_FUNC_TYPE, GO_STRUCT_TYPE,
+GO_INTERFACE_TYPE; 0 otherwise.
+@End Implementation
+
+Process called "is_type_node" takes node_kind as Integer returns Integer:
+    If node_kind is equal to GO_BASIC_TYPE from Parser:
+        Return 1
+    End If
+    If node_kind is equal to GO_POINTER_TYPE from Parser:
+        Return 1
+    End If
+    If node_kind is equal to GO_ARRAY_TYPE from Parser:
+        Return 1
+    End If
+    If node_kind is equal to GO_SLICE_TYPE from Parser:
+        Return 1
+    End If
+    If node_kind is equal to GO_MAP_TYPE from Parser:
+        Return 1
+    End If
+    If node_kind is equal to GO_CHAN_TYPE from Parser:
+        Return 1
+    End If
+    If node_kind is equal to GO_FUNC_TYPE from Parser:
+        Return 1
+    End If
+    If node_kind is equal to GO_STRUCT_TYPE from Parser:
+        Return 1
+    End If
+    If node_kind is equal to GO_INTERFACE_TYPE from Parser:
+        Return 1
+    End If
+    Return 0
+End Process
+
+@Reasoning:
+Validates that a type reference names a known type. Composite type constructors
+(pointer, slice, array, map, channel, func) are valid by construction and their
+element/key/value types are validated recursively. A basic/named type is valid
+if it is a predeclared type, a registered user type, or a qualified type from an
+imported package (selector form pkg.T, recognised by a name containing '.').
+@End Reasoning
+
+@Implementation:
+Null short-circuits to invalid (0). Dispatch on node kind. Composite constructors
+recurse into their child type(s) and return valid. GO_BASIC_TYPE: read name; if
+predeclared or in type_registry or a dot-import is active or the name is a
+qualified pkg.T (contains '.') return valid, otherwise record an
+undefined-type error and return invalid. Struct/interface type literals are valid
+(their fields are validated by register/resolve passes). Returns 1 valid, 0
+invalid.
+@End Implementation
+
+Process called "validate_type_reference" takes analyzer as Integer, type_node as Integer returns Integer:
+    If type_node is equal to 0:
+        Return 0
+    End If
+
+    Let kind be proc memory_get_int64 from Layout with type_node, 0
+
+    If kind is equal to GO_POINTER_TYPE from Parser:
+        Let pointee be proc first_child with type_node
+        proc validate_type_reference with analyzer, pointee
+        Return 1
+    End If
+
+    If kind is equal to GO_SLICE_TYPE from Parser:
+        Let elem be proc first_child with type_node
+        proc validate_type_reference with analyzer, elem
+        Return 1
+    End If
+
+    If kind is equal to GO_ARRAY_TYPE from Parser:
+        Let arr_elem be proc first_child with type_node
+        proc validate_type_reference with analyzer, arr_elem
+        Return 1
+    End If
+
+    If kind is equal to GO_MAP_TYPE from Parser:
+        proc validate_map_children with analyzer, type_node
+        Return 1
+    End If
+
+    If kind is equal to GO_CHAN_TYPE from Parser:
+        Let chan_elem be proc first_child with type_node
+        proc validate_type_reference with analyzer, chan_elem
+        Return 1
+    End If
+
+    If kind is equal to GO_FUNC_TYPE from Parser:
+        Return 1
+    End If
+
+    If kind is equal to GO_STRUCT_TYPE from Parser:
+        Return 1
+    End If
+
+    If kind is equal to GO_INTERFACE_TYPE from Parser:
+        Return 1
+    End If
+
+    If kind is equal to GO_BASIC_TYPE from Parser:
+        Let name be proc memory_get_int64 from Layout with type_node, 8
+        If name is equal to 0:
+            Return 0
+        End If
+
+        Let predeclared be proc is_predeclared with analyzer, name
+        If predeclared is equal to 1:
+            Return 1
+        End If
+
+        Let type_registry be proc memory_get_int64 from Layout with analyzer, 32
+        Let known be proc contains from Dict with type_registry, name
+        If known is equal to 1:
+            Return 1
+        End If
+
+        Let qualified be proc name_is_qualified with name
+        If qualified is equal to 1:
+            Return 1
+        End If
+
+        Let dot_active be proc has_dot_import with analyzer
+        If dot_active is equal to 1:
+            Return 1
+        End If
+
+        proc record_error with analyzer, "Undefined type reference"
+        Return 0
+    End If
+
+    Note: Identifier used in type position (parser may emit GO_IDENTIFIER)
+    If kind is equal to GO_IDENTIFIER from Parser:
+        Let id_name be proc memory_get_int64 from Layout with type_node, 8
+        If id_name is equal to 0:
+            Return 0
+        End If
+        Let id_predeclared be proc is_predeclared with analyzer, id_name
+        If id_predeclared is equal to 1:
+            Return 1
+        End If
+        Let id_registry be proc memory_get_int64 from Layout with analyzer, 32
+        Let id_known be proc contains from Dict with id_registry, id_name
+        If id_known is equal to 1:
+            Return 1
+        End If
+        Let id_qualified be proc name_is_qualified with id_name
+        If id_qualified is equal to 1:
+            Return 1
+        End If
+        Let id_dot be proc has_dot_import with analyzer
+        If id_dot is equal to 1:
+            Return 1
+        End If
+        proc record_error with analyzer, "Undefined type reference"
+        Return 0
+    End If
+
+    Return 1
+End Process
+
+@Reasoning:
+A map type carries two type sub-nodes - key and value. Both must be valid types.
+The parser stores them as the map node's two children, so both are validated.
+@End Reasoning
+
+@Implementation:
+Read children at offset 24. Validate element 0 (key) and, if present, element 1
+(value) via validate_type_reference.
+@End Implementation
+
+Process called "validate_map_children" takes analyzer as Integer, map_node as Integer:
+    Let children be proc memory_get_int64 from Layout with map_node, 24
+    If children is equal to 0:
+        Return
+    End If
+
+    Let count be proc size from List with children
+    If count is greater than 0:
+        Let key_type be proc get from List with children, 0
+        proc validate_type_reference with analyzer, key_type
+    End If
+    If count is greater than 1:
+        Let value_type be proc get from List with children, 1
+        proc validate_type_reference with analyzer, value_type
+    End If
+End Process
+
+@Reasoning:
+A qualified name pkg.T is recognised by a literal '.' in the identifier string;
+the parser produces such names for selector expressions used in type position and
+the analyzer cannot validate the foreign package's member, so a qualified name is
+accepted as long as the package qualifier is a known import. Here we only test
+the syntactic shape (presence of '.'); package-qualifier resolution is a separate
+concern handled where the selector is analysed.
+@End Reasoning
+
+@Implementation:
+Null or empty returns 0. Scan bytes for '.' (byte 46); return 1 on first hit, 0
+if none.
+@End Implementation
+
+Process called "name_is_qualified" takes name as Integer returns Integer:
+    If name is equal to 0:
+        Return 0
+    End If
+
+    Let len be proc string_length from StringCore with name
+    Let i be 0
+    While i is less than len:
+        Let ch be proc string_char_at from StringCore with name, i
+        If ch is equal to 46:
+            Return 1
+        End If
+        Set i to i plus 1
+    End While
+    Return 0
+End Process
+
+@Reasoning:
+A dot import (import . "pkg") injects the package's exported names into file
+scope, making any otherwise-undefined identifier potentially valid. When one is
+present the analyzer cannot prove a name undefined, so it suppresses
+undefined-type/identifier diagnostics. The presence flag is the "." sentinel key
+recorded in package_registry by register_import_spec.
+@End Reasoning
+
+@Implementation:
+Read package_registry (offset 48). Build the "." key and Dict.contains it;
+return 1 if present, 0 otherwise.
+@End Implementation
+
+Process called "has_dot_import" takes analyzer as Integer returns Integer:
+    Let package_registry be proc memory_get_int64 from Layout with analyzer, 48
+    Let dot_key be proc create_from_literal from StringCore with "."
+    Let present be proc contains from Dict with package_registry, dot_key
+    If present is equal to 1:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: Function / Method Body Analysis (phase 2)
+Note: ============================================================================
+
+@Reasoning:
+Analyses a function body in a fresh scope so locals do not leak into package
+scope. Parameters bind first (they shadow like-named package symbols), then the
+body block's statements are analysed in source order. The function's children are
+[param_list, return_type?, body_block?]; the body is the last child when present.
+@End Reasoning
+
+@Implementation:
+enter_scope. Read children at offset 24. Element 0 is the parameter list -
+declare its parameters via declare_parameters. The body block is the child whose
+kind is GO_BLOCK (scan the children for it) - analyse it via analyze_block.
+exit_scope.
+@End Implementation
+
+Process called "analyze_function_body" takes analyzer as Integer, func_node as Integer:
+    proc enter_scope with analyzer
+
+    Let children be proc memory_get_int64 from Layout with func_node, 24
+    If children is not equal to 0:
+        Let count be proc size from List with children
+        If count is greater than 0:
+            Let param_list be proc get from List with children, 0
+            proc declare_parameters with analyzer, param_list
+        End If
+
+        proc analyze_body_block_in with analyzer, children
+    End If
+
+    proc exit_scope with analyzer
+End Process
+
+@Reasoning:
+A method body analysis mirrors a function body but also binds the receiver as a
+local in the method scope (so the body can reference the receiver variable) and
+validates the receiver's type. The receiver is the "receiver" attribute
+GO_PARAMETER; its name binds and its type validates against the type universe.
+@End Reasoning
+
+@Implementation:
+enter_scope. Read attributes (offset 32); pull "receiver" GO_PARAMETER, declare
+its name (offset 8) and validate its type (first_child). Then declare parameters
+(children element 0) and analyse the body block, identical to
+analyze_function_body. exit_scope.
+@End Implementation
+
+Process called "analyze_method_body" takes analyzer as Integer, method_node as Integer:
+    proc enter_scope with analyzer
+
+    Let attributes be proc memory_get_int64 from Layout with method_node, 32
+    If attributes is not equal to 0:
+        Let receiver be proc get from Dict with attributes, "receiver"
+        If receiver is not equal to 0:
+            Let recv_name be proc memory_get_int64 from Layout with receiver, 8
+            If recv_name is not equal to 0:
+                proc declare_in_scope with analyzer, recv_name
+            End If
+            Let recv_type be proc first_child with receiver
+            If recv_type is not equal to 0:
+                proc validate_type_reference with analyzer, recv_type
+            End If
+        End If
+    End If
+
+    Let children be proc memory_get_int64 from Layout with method_node, 24
+    If children is not equal to 0:
+        Let count be proc size from List with children
+        If count is greater than 0:
+            Let param_list be proc get from List with children, 0
+            proc declare_parameters with analyzer, param_list
+        End If
+
+        proc analyze_body_block_in with analyzer, children
+    End If
+
+    proc exit_scope with analyzer
+End Process
+
+@Reasoning:
+Locates and analyses the body block among a function/method's children. The body
+is the GO_BLOCK child (the parser appends it last, after the parameter list and
+optional return type). Scanning by kind rather than fixed index is robust to the
+optional return-type child being present or absent.
+@End Reasoning
+
+@Implementation:
+Iterate the children list; for the first child whose kind (offset 0) is GO_BLOCK,
+call analyze_block and return. External (bodiless) declarations have no GO_BLOCK
+child and are a no-op.
+@End Implementation
+
+Process called "analyze_body_block_in" takes analyzer as Integer, children as Integer:
+    Let count be proc size from List with children
+    Let i be 0
+    While i is less than count:
+        Let child be proc get from List with children, i
+        Let child_kind be proc memory_get_int64 from Layout with child, 0
+        If child_kind is equal to GO_BLOCK from Parser:
+            proc analyze_block with analyzer, child
+            Return
+        End If
+        Set i to i plus 1
+    End While
+End Process
+
+@Reasoning:
+Declares each parameter of a parameter-list node in the current scope. The
+parser's parameter list is a GO_PARAMETER node whose children are the individual
+GO_PARAMETER entries; each entry has a name (offset 8) and a type child. The
+parameter name binds and its type validates. Anonymous parameters (type-only,
+name = 0) bind nothing but still validate their type.
+@End Reasoning
+
+@Implementation:
+Null param_list short-circuits. Read its children (offset 24). For each parameter
+entry: read name; if non-null declare_in_scope; read its type via first_child and
+validate_type_reference.
+@End Implementation
+
+Process called "declare_parameters" takes analyzer as Integer, param_list as Integer:
+    If param_list is equal to 0:
+        Return
+    End If
+
+    Let children be proc memory_get_int64 from Layout with param_list, 24
+    If children is equal to 0:
+        Return
+    End If
+
+    Let count be proc size from List with children
+    Let i be 0
+    While i is less than count:
+        Let param be proc get from List with children, i
+        Let param_name be proc memory_get_int64 from Layout with param, 8
+        If param_name is not equal to 0:
+            proc declare_in_scope with analyzer, param_name
+        End If
+
+        Let param_type be proc first_child with param
+        If param_type is not equal to 0:
+            proc validate_type_reference with analyzer, param_type
+        End If
+
+        Set i to i plus 1
+    End While
+End Process
+
+Note: ============================================================================
+Note: Statement Analysis
+Note: ============================================================================
+
+@Reasoning:
+A block introduces a nested lexical scope and analyses its statements in order.
+Go blocks scope their locals: a name declared inside a block is invisible after
+the block closes. enter/exit_scope bracket the statement walk.
+@End Reasoning
+
+@Implementation:
+Null short-circuits. enter_scope. Read children (offset 24); analyse each via
+analyze_statement. exit_scope.
+@End Implementation
+
+Process called "analyze_block" takes analyzer as Integer, block_node as Integer:
+    If block_node is equal to 0:
+        Return
+    End If
+
+    proc enter_scope with analyzer
+
+    Let children be proc memory_get_int64 from Layout with block_node, 24
+    If children is not equal to 0:
+        Let count be proc size from List with children
+        Let i be 0
+        While i is less than count:
+            Let stmt be proc get from List with children, i
+            proc analyze_statement with analyzer, stmt
+            Set i to i plus 1
+        End While
+    End If
+
+    proc exit_scope with analyzer
+End Process
+
+@Reasoning:
+Statement dispatcher. Routes each statement kind to a specialised analyser. The
+binding-introducing statements (short var decl :=, var decl) declare names in the
+current scope; the control-flow statements recurse into their sub-blocks and
+expressions. Other statements (break, continue, return, expr-stmt) analyse their
+contained expressions for name resolution. Null stmt short-circuits.
+@End Reasoning
+
+@Implementation:
+Read stmt_type (offset 0). If-cascade: GO_BLOCK -> analyze_block; GO_SHORT_VAR_DECL
+-> analyze_short_var_decl; GO_VAR_DECL/GO_CONST_DECL -> analyze_local_decl;
+GO_ASSIGN_STMT -> analyze_assign; GO_IF_STMT -> analyze_if; GO_FOR_STMT ->
+analyze_for; GO_SWITCH_STMT/GO_SELECT_STMT -> analyze_block-like via
+analyze_compound; GO_RETURN_STMT -> analyze_return; GO_EXPR_STMT/GO_DEFER_STMT/
+GO_GO_STMT -> analyze each child expression. break/continue/fallthrough/goto are
+control transfers with no name resolution needs and are accepted.
+@End Implementation
+
+Process called "analyze_statement" takes analyzer as Integer, stmt_node as Integer:
     If stmt_node is equal to 0:
         Return
     End If
 
     Let stmt_type be proc memory_get_int64 from Layout with stmt_node, 0
 
-    If stmt_type is equal to GO_ASSIGNMENT from Parser:
-        proc analyze_assignment_statement with analyzer, stmt_node
-    Otherwise If stmt_type is equal to GO_VARIABLE from Parser:
-        proc analyze_variable_declaration with analyzer, stmt_node
-    Otherwise If stmt_type is equal to GO_IF from Parser:
-        proc analyze_if_statement with analyzer, stmt_node
-    Otherwise If stmt_type is equal to GO_FOR from Parser:
-        proc analyze_for_statement with analyzer, stmt_node
-    Otherwise If stmt_type is equal to GO_SWITCH from Parser:
-        proc analyze_switch_statement with analyzer, stmt_node
-    Otherwise If stmt_type is equal to GO_SELECT from Parser:
-        proc analyze_select_statement with analyzer, stmt_node
-    Otherwise If stmt_type is equal to GO_DEFER from Parser:
-        proc analyze_defer_statement with analyzer, stmt_node
-    Otherwise If stmt_type is equal to GO_GO from Parser:
-        proc analyze_goroutine_statement with analyzer, stmt_node
-    Otherwise If stmt_type is equal to GO_RETURN from Parser:
-        proc analyze_return_statement with analyzer, stmt_node
-    Otherwise If stmt_type is equal to GO_EXPRESSION_STMT from Parser:
-        proc analyze_expression_statement with analyzer, stmt_node
+    If stmt_type is equal to GO_BLOCK from Parser:
+        proc analyze_block with analyzer, stmt_node
+        Return
+    End If
+
+    If stmt_type is equal to GO_SHORT_VAR_DECL from Parser:
+        proc analyze_short_var_decl with analyzer, stmt_node
+        Return
+    End If
+
+    If stmt_type is equal to GO_VAR_DECL from Parser:
+        proc analyze_local_decl with analyzer, stmt_node
+        Return
+    End If
+
+    If stmt_type is equal to GO_CONST_DECL from Parser:
+        proc analyze_local_decl with analyzer, stmt_node
+        Return
+    End If
+
+    If stmt_type is equal to GO_ASSIGN_STMT from Parser:
+        proc analyze_assign with analyzer, stmt_node
+        Return
+    End If
+
+    If stmt_type is equal to GO_IF_STMT from Parser:
+        proc analyze_if with analyzer, stmt_node
+        Return
+    End If
+
+    If stmt_type is equal to GO_FOR_STMT from Parser:
+        proc analyze_for with analyzer, stmt_node
+        Return
+    End If
+
+    If stmt_type is equal to GO_SWITCH_STMT from Parser:
+        proc analyze_compound with analyzer, stmt_node
+        Return
+    End If
+
+    If stmt_type is equal to GO_SELECT_STMT from Parser:
+        proc analyze_compound with analyzer, stmt_node
+        Return
+    End If
+
+    If stmt_type is equal to GO_CASE_CLAUSE from Parser:
+        proc analyze_compound with analyzer, stmt_node
+        Return
+    End If
+
+    If stmt_type is equal to GO_RETURN_STMT from Parser:
+        proc analyze_children_expressions with analyzer, stmt_node
+        Return
+    End If
+
+    If stmt_type is equal to GO_EXPR_STMT from Parser:
+        proc analyze_children_expressions with analyzer, stmt_node
+        Return
+    End If
+
+    If stmt_type is equal to GO_DEFER_STMT from Parser:
+        proc analyze_children_expressions with analyzer, stmt_node
+        Return
+    End If
+
+    If stmt_type is equal to GO_GO_STMT from Parser:
+        proc analyze_children_expressions with analyzer, stmt_node
+        Return
+    End If
+
+    Note: break / continue / fallthrough / goto carry no resolvable names
+End Process
+
+@Reasoning:
+A short variable declaration (lhs := rhs) introduces the left-hand identifiers as
+new locals in the current scope and analyses the right-hand expression for name
+resolution. Go allows multiple targets (a, b := f()); each identifier on the left
+binds. The parser stores children as [left_expr, right_expr]; the left expr is an
+identifier (or a comma-list the parser flattens into the left node's children).
+@End Reasoning
+
+@Implementation:
+Read children (offset 24). Element 0 is the left side: if it is a GO_IDENTIFIER,
+declare its name; if it has children (multi-target), declare each child
+identifier's name. Element 1 is the right side: analyse it via analyze_expression.
+@End Implementation
+
+Process called "analyze_short_var_decl" takes analyzer as Integer, node as Integer:
+    Let children be proc memory_get_int64 from Layout with node, 24
+    If children is equal to 0:
+        Return
+    End If
+
+    Let count be proc size from List with children
+    If count is greater than 0:
+        Let left be proc get from List with children, 0
+        proc declare_assignment_targets with analyzer, left
+    End If
+    If count is greater than 1:
+        Let right be proc get from List with children, 1
+        proc analyze_expression with analyzer, right
     End If
 End Process
 
 @Reasoning:
-A bare expression in statement position (e.g. function call with
-discarded result). Just delegates to analyze_expression on the
-inner expression at offset 8. The expression's resulting type is
-ignored - Go allows this only for calls with side effects.
+Declares the identifier target(s) of a := left-hand side. A single identifier
+binds directly; a multi-target left side is represented by the parser as a node
+whose children are the individual identifiers, so each child identifier binds.
 @End Reasoning
-Process called "analyze_expression_statement" takes analyzer as Integer, expr_stmt as Integer:
-    Note: Analyze expression statement
 
-    Let expr be proc memory_get_int64 from Layout with expr_stmt, 8
-    If expr is not equal to 0:
-        proc analyze_expression with analyzer, expr
+@Implementation:
+If the node is a GO_IDENTIFIER, declare its name (offset 8). Otherwise read its
+children (offset 24) and, for each GO_IDENTIFIER child, declare its name. The
+blank identifier "_" is predeclared and declaring it is harmless (it overwrites
+the universe entry in the local scope, which is fine since "_" is never read).
+@End Implementation
+
+Process called "declare_assignment_targets" takes analyzer as Integer, left as Integer:
+    If left is equal to 0:
+        Return
+    End If
+
+    Let kind be proc memory_get_int64 from Layout with left, 0
+    If kind is equal to GO_IDENTIFIER from Parser:
+        Let name be proc memory_get_int64 from Layout with left, 8
+        proc declare_in_scope with analyzer, name
+        Return
+    End If
+
+    Let children be proc memory_get_int64 from Layout with left, 24
+    If children is equal to 0:
+        Return
+    End If
+
+    Let count be proc size from List with children
+    Let i be 0
+    While i is less than count:
+        Let target be proc get from List with children, i
+        Let target_kind be proc memory_get_int64 from Layout with target, 0
+        If target_kind is equal to GO_IDENTIFIER from Parser:
+            Let target_name be proc memory_get_int64 from Layout with target, 8
+            proc declare_in_scope with analyzer, target_name
+        End If
+        Set i to i plus 1
+    End While
+End Process
+
+@Reasoning:
+A local var/const declaration inside a function body binds its spec names in the
+current (block/function) scope rather than package scope. Reuses
+register_value_spec semantics but against the live current_scope: since
+declare_in_scope always targets current_scope, calling the same registration here
+binds locally. Grouped local declarations are handled by iterating spec children.
+@End Reasoning
+
+@Implementation:
+If the node has its own name treat as inline single spec via register_value_spec.
+Otherwise iterate spec children, registering each via register_value_spec. (Local
+declarations do not record export class meaningfully - is_exported is only
+relevant at package level - but register_value_spec's export recording on a local
+name is harmless because nothing reads the exported set for locals.)
+@End Implementation
+
+Process called "analyze_local_decl" takes analyzer as Integer, node as Integer:
+    Let own_name be proc memory_get_int64 from Layout with node, 8
+    If own_name is not equal to 0:
+        proc register_value_spec with analyzer, node
+        Return
+    End If
+
+    Let children be proc memory_get_int64 from Layout with node, 24
+    If children is equal to 0:
+        Return
+    End If
+
+    Let count be proc size from List with children
+    Let i be 0
+    While i is less than count:
+        Let spec be proc get from List with children, i
+        proc register_value_spec with analyzer, spec
+        Set i to i plus 1
+    End While
+End Process
+
+@Reasoning:
+An assignment statement (lhs = rhs, lhs += rhs, ...) does NOT introduce new
+bindings (unlike :=); both sides are existing expressions whose identifiers must
+already resolve. Both sides are analysed for name resolution.
+@End Reasoning
+
+@Implementation:
+Read children (offset 24); analyse element 0 (lhs) and element 1 (rhs) via
+analyze_expression.
+@End Implementation
+
+Process called "analyze_assign" takes analyzer as Integer, node as Integer:
+    Let children be proc memory_get_int64 from Layout with node, 24
+    If children is equal to 0:
+        Return
+    End If
+
+    Let count be proc size from List with children
+    If count is greater than 0:
+        Let lhs be proc get from List with children, 0
+        proc analyze_expression with analyzer, lhs
+    End If
+    If count is greater than 1:
+        Let rhs be proc get from List with children, 1
+        proc analyze_expression with analyzer, rhs
     End If
 End Process
 
 @Reasoning:
-Expression-kind dispatcher returning the inferred type. Specialized
-analyzers exist for each Go expression kind because Go's type rules
-differ significantly per construct (channel ops, type asserts,
-slice expressions, etc.). Default-falls-through with no return
-when an unknown kind is seen; the caller treats absence of
-analysis as "unknown type" and propagates accordingly.
+An if statement scopes its optional init clause (if x := f(); cond { ... }) to the
+if and its branches. Entering a scope around the whole if lets the init binding be
+visible to the condition, then-block, and else-branch but not after the if. The
+children are [init?, condition, then_block, else?]; each is analysed in order,
+with statements analysed as statements and expressions as expressions.
 @End Reasoning
+
+@Implementation:
+enter_scope. Read children (offset 24). For each child dispatch by kind: a
+GO_BLOCK child is a branch (analyze_block); a GO_IF_STMT child is an else-if
+(analyze_if); a GO_SHORT_VAR_DECL/GO_ASSIGN_STMT/GO_VAR_DECL init clause is a
+statement (analyze_statement); anything else is the condition expression
+(analyze_expression). exit_scope.
+@End Implementation
+
+Process called "analyze_if" takes analyzer as Integer, node as Integer:
+    proc enter_scope with analyzer
+
+    Let children be proc memory_get_int64 from Layout with node, 24
+    If children is not equal to 0:
+        Let count be proc size from List with children
+        Let i be 0
+        While i is less than count:
+            Let child be proc get from List with children, i
+            Let child_kind be proc memory_get_int64 from Layout with child, 0
+
+            If child_kind is equal to GO_BLOCK from Parser:
+                proc analyze_block with analyzer, child
+            Otherwise If child_kind is equal to GO_IF_STMT from Parser:
+                proc analyze_if with analyzer, child
+            Otherwise If child_kind is equal to GO_SHORT_VAR_DECL from Parser:
+                proc analyze_statement with analyzer, child
+            Otherwise If child_kind is equal to GO_ASSIGN_STMT from Parser:
+                proc analyze_statement with analyzer, child
+            Otherwise If child_kind is equal to GO_VAR_DECL from Parser:
+                proc analyze_statement with analyzer, child
+            Otherwise If child_kind is equal to GO_EXPR_STMT from Parser:
+                proc analyze_statement with analyzer, child
+            Otherwise:
+                proc analyze_expression with analyzer, child
+            End If
+
+            Set i to i plus 1
+        End While
+    End If
+
+    proc exit_scope with analyzer
+End Process
+
+@Reasoning:
+A for statement scopes its loop variables (the init clause of a three-part loop,
+or the k, v of a range loop) to the loop body. The range form is flagged by the
+attribute "type" = "range": its first child is the variable target (which
+introduces the range variables), the second is the range expression, the third is
+the body. The three-part and condition-only forms carry init/condition/post
+statements and a body block. A fresh scope brackets the whole loop so the loop
+variables do not leak.
+@End Reasoning
+
+@Implementation:
+enter_scope. Read attributes (offset 32); if "type" == "range", treat the first
+child as the range-variable target (declare via declare_assignment_targets), the
+second as the range expression (analyze_expression), and the GO_BLOCK child as the
+body. Otherwise iterate children dispatching GO_BLOCK -> analyze_block, statement
+kinds -> analyze_statement, else -> analyze_expression (the condition). exit_scope.
+@End Implementation
+
+Process called "analyze_for" takes analyzer as Integer, node as Integer:
+    proc enter_scope with analyzer
+
+    Let children be proc memory_get_int64 from Layout with node, 24
+    If children is equal to 0:
+        proc exit_scope with analyzer
+        Return
+    End If
+
+    Let count be proc size from List with children
+
+    Let is_range be 0
+    Let attributes be proc memory_get_int64 from Layout with node, 32
+    If attributes is not equal to 0:
+        Let type_attr be proc get from Dict with attributes, "type"
+        If type_attr is not equal to 0:
+            Let range_lit be proc create_from_literal from StringCore with "range"
+            Let matches be proc string_equals from StringCore with type_attr, range_lit
+            If matches is equal to 1:
+                Set is_range to 1
+            End If
+        End If
+    End If
+
+    If is_range is equal to 1:
+        If count is greater than 0:
+            Let range_vars be proc get from List with children, 0
+            proc declare_assignment_targets with analyzer, range_vars
+        End If
+        If count is greater than 1:
+            Let range_expr be proc get from List with children, 1
+            proc analyze_expression with analyzer, range_expr
+        End If
+        If count is greater than 2:
+            Let range_body be proc get from List with children, 2
+            proc analyze_block with analyzer, range_body
+        End If
+        proc exit_scope with analyzer
+        Return
+    End If
+
+    Let i be 0
+    While i is less than count:
+        Let child be proc get from List with children, i
+        Let child_kind be proc memory_get_int64 from Layout with child, 0
+
+        If child_kind is equal to GO_BLOCK from Parser:
+            proc analyze_block with analyzer, child
+        Otherwise If child_kind is equal to GO_SHORT_VAR_DECL from Parser:
+            proc analyze_statement with analyzer, child
+        Otherwise If child_kind is equal to GO_ASSIGN_STMT from Parser:
+            proc analyze_statement with analyzer, child
+        Otherwise If child_kind is equal to GO_VAR_DECL from Parser:
+            proc analyze_statement with analyzer, child
+        Otherwise If child_kind is equal to GO_EXPR_STMT from Parser:
+            proc analyze_statement with analyzer, child
+        Otherwise:
+            proc analyze_expression with analyzer, child
+        End If
+
+        Set i to i plus 1
+    End While
+
+    proc exit_scope with analyzer
+End Process
+
+@Reasoning:
+Switch, select, and case clauses are compound statements: they hold an optional
+init/tag plus a sequence of case clauses (and the case clauses hold their
+statements). Analysing them in a fresh scope and recursing into every child -
+dispatching statement children to analyze_statement and expression children to
+analyze_expression - resolves all names without needing a separate analyser per
+compound kind, since the per-kind semantics (exhaustiveness, type-switch binding)
+do not affect name resolution.
+@End Reasoning
+
+@Implementation:
+enter_scope. Read children (offset 24). For each child: a recognised statement
+kind dispatches to analyze_statement; a GO_BLOCK to analyze_block; a case clause
+recurses to analyze_compound; everything else is treated as an expression
+(analyze_expression). exit_scope.
+@End Implementation
+
+Process called "analyze_compound" takes analyzer as Integer, node as Integer:
+    proc enter_scope with analyzer
+
+    Let children be proc memory_get_int64 from Layout with node, 24
+    If children is not equal to 0:
+        Let count be proc size from List with children
+        Let i be 0
+        While i is less than count:
+            Let child be proc get from List with children, i
+            Let child_kind be proc memory_get_int64 from Layout with child, 0
+
+            If child_kind is equal to GO_BLOCK from Parser:
+                proc analyze_block with analyzer, child
+            Otherwise If child_kind is equal to GO_CASE_CLAUSE from Parser:
+                proc analyze_compound with analyzer, child
+            Otherwise If child_kind is equal to GO_SHORT_VAR_DECL from Parser:
+                proc analyze_statement with analyzer, child
+            Otherwise If child_kind is equal to GO_ASSIGN_STMT from Parser:
+                proc analyze_statement with analyzer, child
+            Otherwise If child_kind is equal to GO_VAR_DECL from Parser:
+                proc analyze_statement with analyzer, child
+            Otherwise If child_kind is equal to GO_EXPR_STMT from Parser:
+                proc analyze_statement with analyzer, child
+            Otherwise If child_kind is equal to GO_RETURN_STMT from Parser:
+                proc analyze_statement with analyzer, child
+            Otherwise If child_kind is equal to GO_IF_STMT from Parser:
+                proc analyze_statement with analyzer, child
+            Otherwise If child_kind is equal to GO_FOR_STMT from Parser:
+                proc analyze_statement with analyzer, child
+            Otherwise:
+                proc analyze_expression with analyzer, child
+            End If
+
+            Set i to i plus 1
+        End While
+    End If
+
+    proc exit_scope with analyzer
+End Process
+
+@Reasoning:
+Analyses every child of a node as an expression. Used for statements that simply
+wrap expressions - return (its operands), expression statements (the discarded
+call), defer/go (the deferred/spawned call) - where each child is an expression
+whose identifiers must resolve.
+@End Reasoning
+
+@Implementation:
+Read children (offset 24); analyse each via analyze_expression. Null children is
+a no-op (e.g. bare 'return').
+@End Implementation
+
+Process called "analyze_children_expressions" takes analyzer as Integer, node as Integer:
+    Let children be proc memory_get_int64 from Layout with node, 24
+    If children is equal to 0:
+        Return
+    End If
+
+    Let count be proc size from List with children
+    Let i be 0
+    While i is less than count:
+        Let child be proc get from List with children, i
+        proc analyze_expression with analyzer, child
+        Set i to i plus 1
+    End While
+End Process
+
+Note: ============================================================================
+Note: Expression Analysis
+Note: ============================================================================
+
+@Reasoning:
+Expression dispatcher performing name resolution. A bare identifier must resolve
+to a scoped binding or a predeclared identifier, else it is an undefined-reference
+error. Selector expressions (a.b) resolve their base; a base that is a known
+imported package makes the selector a qualified reference (no member check, since
+the foreign package's symbols are not visible). Composite expressions (binary,
+unary, call, index, slice, composite literal) recurse into their operands.
+Literals need no resolution.
+@End Reasoning
+
+@Implementation:
+Null short-circuits. Read expr_type (offset 0). GO_IDENTIFIER -> resolve_identifier.
+GO_SELECTOR_EXPR -> analyze_selector. GO_LITERAL/GO_BASIC_TYPE -> no-op.
+GO_CALL_EXPR/GO_INDEX_EXPR/GO_SLICE_EXPR/GO_BINARY_EXPR/GO_UNARY_EXPR/
+GO_COMPOSITE_LIT/GO_TYPE_ASSERT_EXPR/GO_FUNC_LIT -> recurse into children via
+analyze_children_expressions (func lit bodies are analysed as a nested block when
+present). Unknown kinds recurse into children defensively.
+@End Implementation
+
 Process called "analyze_expression" takes analyzer as Integer, expr_node as Integer:
-    Note: Analyze expressions and return their types
-
     If expr_node is equal to 0:
-        Return 0
+        Return
     End If
 
     Let expr_type be proc memory_get_int64 from Layout with expr_node, 0
 
-    If expr_type is equal to GO_LITERAL from Parser:
-        Return proc analyze_literal_expression with analyzer, expr_node
-    Otherwise If expr_type is equal to GO_IDENTIFIER from Parser:
-        Return proc analyze_identifier_expression with analyzer, expr_node
-    Otherwise If expr_type is equal to GO_FUNCTION_CALL from Parser:
-        Return proc analyze_function_call_expression with analyzer, expr_node
-    Otherwise If expr_type is equal to GO_METHOD_CALL from Parser:
-        Return proc analyze_method_call_expression with analyzer, expr_node
-    Otherwise If expr_type is equal to GO_BINARY_OP from Parser:
-        Return proc analyze_binary_operation with analyzer, expr_node
-    Otherwise If expr_type is equal to GO_UNARY_OP from Parser:
-        Return proc analyze_unary_operation with analyzer, expr_node
-    Otherwise If expr_type is equal to GO_CHANNEL_RECEIVE from Parser:
-        Return proc analyze_channel_receive with analyzer, expr_node
-    Otherwise If expr_type is equal to GO_CHANNEL_SEND from Parser:
-        Return proc analyze_channel_send with analyzer, expr_node
-    Otherwise If expr_type is equal to GO_TYPE_ASSERTION from Parser:
-        Return proc analyze_type_assertion with analyzer, expr_node
-    Otherwise If expr_type is equal to GO_TYPE_CONVERSION from Parser:
-        Return proc analyze_type_conversion with analyzer, expr_node
+    If expr_type is equal to GO_IDENTIFIER from Parser:
+        proc resolve_identifier with analyzer, expr_node
+        Return
     End If
 
-    proc set_go_semantic_error with analyzer, "Unknown expression type"
-    Return 0
+    If expr_type is equal to GO_SELECTOR_EXPR from Parser:
+        proc analyze_selector with analyzer, expr_node
+        Return
+    End If
+
+    If expr_type is equal to GO_LITERAL from Parser:
+        Return
+    End If
+
+    If expr_type is equal to GO_BASIC_TYPE from Parser:
+        Return
+    End If
+
+    If expr_type is equal to GO_FUNC_LIT from Parser:
+        proc analyze_func_lit with analyzer, expr_node
+        Return
+    End If
+
+    If expr_type is equal to GO_COMPOSITE_LIT from Parser:
+        proc analyze_composite_lit with analyzer, expr_node
+        Return
+    End If
+
+    Note: binary / unary / call / index / slice / type-assert: operands are children
+    proc analyze_children_expressions with analyzer, expr_node
 End Process
 
 @Reasoning:
-Creates a fresh empty Dict, appends it to scope_stack, and updates
-current_scope (offset 8) to point at it. We do NOT preserve the
-previous current_scope pointer here - exit_function_scope
-reconstructs it from the stack on pop.
+Resolves a bare identifier reference. The name must be bound in some enclosing
+scope or be a predeclared identifier; otherwise it is undefined. A dot import
+suppresses the diagnostic since the name may come from the dot-imported package.
+The blank identifier "_" always resolves (it is predeclared).
 @End Reasoning
-Process called "enter_function_scope" takes analyzer as Integer:
-    Note: Enter new scope for function analysis
 
-    Let scope_stack be proc memory_get_int64 from Layout with analyzer, 16
-    Let new_scope be proc create from Dict
-    proc list_append with scope_stack, new_scope
+@Implementation:
+Read name (offset 8); null short-circuits. If resolve_name finds it in scope,
+done. Else if is_predeclared, done. Else if a dot import is active, done. Else
+record an undefined-identifier error.
+@End Implementation
 
-    proc memory_set_int64 from Layout with analyzer, 8, new_scope
+Process called "resolve_identifier" takes analyzer as Integer, ident as Integer:
+    Let name be proc memory_get_int64 from Layout with ident, 8
+    If name is equal to 0:
+        Return
+    End If
+
+    Let level be proc resolve_name with analyzer, name
+    If level is not equal to 0:
+        Return
+    End If
+
+    Let predeclared be proc is_predeclared with analyzer, name
+    If predeclared is equal to 1:
+        Return
+    End If
+
+    Let dot_active be proc has_dot_import with analyzer
+    If dot_active is equal to 1:
+        Return
+    End If
+
+    proc record_error with analyzer, "Undefined identifier"
 End Process
 
 @Reasoning:
-Pops the top scope. If the stack still has another nested scope
-under it, current_scope falls back to that one; if the stack is
-now empty, current_scope reverts to global_scope (the function
-just exited was at the package level). Stack underflow (empty on
-entry) is silently ignored to make this safe to over-call.
+A selector expression base.member resolves its base. When the base is a bare
+identifier that names an imported package, the selector is a qualified package
+reference (pkg.Func) and the member is a foreign symbol the analyzer cannot and
+should not validate - so it is accepted without resolving the member. Otherwise
+the base is an ordinary expression (e.g. a struct value) and is analysed normally;
+the member is a field/method access whose resolution belongs to a typed pass and
+is not a name-resolution concern here.
 @End Reasoning
-Process called "exit_function_scope" takes analyzer as Integer:
-    Note: Exit current function scope
 
-    Let scope_stack be proc memory_get_int64 from Layout with analyzer, 16
-    Let stack_size be proc size from List with scope_stack
+@Implementation:
+Read children (offset 24). Element 0 is the base. If the base is a GO_IDENTIFIER
+whose name is a registered imported package (package_registry contains it), accept
+(qualified reference). Otherwise analyse the base via analyze_expression. The
+member identifier (name on the selector node, or element 1) is not resolved as a
+scoped name.
+@End Implementation
 
-    If stack_size is greater than 0:
-        Let popped_scope be proc list_pop from List with scope_stack
-        Let new_size be stack_size minus 1
+Process called "analyze_selector" takes analyzer as Integer, node as Integer:
+    Let children be proc memory_get_int64 from Layout with node, 24
+    If children is equal to 0:
+        Return
+    End If
 
-        If new_size is greater than 0:
-            Let current_scope be proc get from List with scope_stack, new_size minus 1
-            proc memory_set_int64 from Layout with analyzer, 8, current_scope
-        Otherwise:
-            Let global_scope be proc memory_get_int64 from Layout with analyzer, 0
-            proc memory_set_int64 from Layout with analyzer, 8, global_scope
+    Let count be proc size from List with children
+    If count is equal to 0:
+        Return
+    End If
+
+    Let base be proc get from List with children, 0
+    Let base_kind be proc memory_get_int64 from Layout with base, 0
+
+    If base_kind is equal to GO_IDENTIFIER from Parser:
+        Let base_name be proc memory_get_int64 from Layout with base, 8
+        If base_name is not equal to 0:
+            Let package_registry be proc memory_get_int64 from Layout with analyzer, 48
+            Let is_package be proc contains from Dict with package_registry, base_name
+            If is_package is equal to 1:
+                Return
+            End If
+
+            Note: not a package - resolve as an ordinary value identifier
+            proc resolve_identifier with analyzer, base
+            Return
         End If
     End If
+
+    proc analyze_expression with analyzer, base
 End Process
 
 @Reasoning:
-Writes name -> type into current_scope. Caller is responsible for
-checking redeclaration (Go forbids "redeclared in this block")
-before calling because Dict.set silently overwrites.
+A function literal (closure) has its own parameter and body scope. Analysing it in
+a fresh scope binds its parameters and resolves its body's identifiers against the
+enclosing chain (Go closures capture enclosing bindings directly). Children mirror
+a function: [param_list, return_type?, body_block?].
 @End Reasoning
-Process called "register_variable_in_scope" takes analyzer as Integer, var_name as Integer, var_type as Integer:
-    Note: Register variable in current scope
 
-    Let current_scope be proc memory_get_int64 from Layout with analyzer, 8
-    If current_scope is not equal to 0:
-        proc set from Dict with current_scope, var_name, var_type
+@Implementation:
+enter_scope. Read children (offset 24); declare parameters from element 0 and
+analyse the GO_BLOCK body via analyze_body_block_in. exit_scope.
+@End Implementation
+
+Process called "analyze_func_lit" takes analyzer as Integer, node as Integer:
+    proc enter_scope with analyzer
+
+    Let children be proc memory_get_int64 from Layout with node, 24
+    If children is not equal to 0:
+        Let count be proc size from List with children
+        If count is greater than 0:
+            Let param_list be proc get from List with children, 0
+            proc declare_parameters with analyzer, param_list
+        End If
+        proc analyze_body_block_in with analyzer, children
     End If
+
+    proc exit_scope with analyzer
 End Process
 
 @Reasoning:
-Two-tier check: built-in types are checked via is_builtin_type
-(fast, name-only lookup against a fixed list), then user-defined
-types via type_registry has_key. We check builtins first because
-they're vastly more common in typical Go code and the registry
-lookup is more expensive. Returns 1 on valid, 0 on invalid.
-@End Reasoning
-Process called "validate_type_reference" takes analyzer as Integer, type_ref as Integer returns Integer:
-    Note: Validate that a type reference is valid
-
-    If type_ref is equal to 0:
-        Return 0
-    End If
-
-    Let type_name be proc memory_get_int64 from Layout with type_ref, 8
-    If type_name is equal to 0:
-        Return 0
-    End If
-
-    Note: Check built-in types first
-    Let is_builtin be proc is_builtin_type with analyzer, type_name
-    If is_builtin is equal to 1:
-        Return 1
-    End If
-
-    Note: Check user-defined types
-    Let type_registry be proc memory_get_int64 from Layout with analyzer, 24
-    Let has_type be proc has_key from Dict with type_registry, type_name
-    Return has_type
-End Process
-
-@Reasoning:
-Hard-coded list of Go's predeclared types. Allocates a List per
-call (slightly wasteful but acceptable on a non-hot path) and
-linearly searches via StringCore.equals. Includes the platform-
-sized aliases (int, uint, byte=uint8, rune=int32) which Go treats
-as distinct named types even when they're the same width.
+A composite literal T{...} (struct/slice/map/array literal) carries an optional
+type and a sequence of element expressions. The element expressions must resolve;
+the type, if a named type, is validated. Map/struct keyed elements appear as
+child expressions whose value parts are ordinary expressions; analysing every
+child as an expression resolves all referenced names. A bare value identifier used
+as a struct field key is not a scoped reference, but the parser represents keyed
+elements such that the key/value are distinct children, and an unresolved field-
+key would be a false positive - so composite-literal children are resolved
+leniently: a child that is a GO_IDENTIFIER is only an error if it is neither in
+scope, predeclared, a registered type, nor (potentially) a struct field key. To
+avoid false positives on field keys, identifier children of a composite literal
+are accepted without an undefined diagnostic; non-identifier children recurse.
 @End Reasoning
 
-@Performance_Hints:
-The builtin list is rebuilt per call rather than memoized in the
-analyzer state. For typical Go programs this is called a few
-hundred times during validation, so the overhead is bounded but
-noticeable. A cache could be added if profiling shows it matters.
-@End Performance_Hints
-Process called "is_builtin_type" takes analyzer as Integer, type_name as Integer returns Integer:
-    Note: Check if type is a Go built-in type
+@Implementation:
+Read children (offset 24). For each child: if it is a GO_IDENTIFIER, accept it
+(could be a field key); otherwise analyse it via analyze_expression. This resolves
+nested value expressions while not flagging struct field keys as undefined.
+@End Implementation
 
-    Let builtin_types be proc create from List
-    proc list_append with builtin_types, "int"
-    proc list_append with builtin_types, "int8"
-    proc list_append with builtin_types, "int16"
-    proc list_append with builtin_types, "int32"
-    proc list_append with builtin_types, "int64"
-    proc list_append with builtin_types, "uint"
-    proc list_append with builtin_types, "uint8"
-    proc list_append with builtin_types, "uint16"
-    proc list_append with builtin_types, "uint32"
-    proc list_append with builtin_types, "uint64"
-    proc list_append with builtin_types, "float32"
-    proc list_append with builtin_types, "float64"
-    proc list_append with builtin_types, "complex64"
-    proc list_append with builtin_types, "complex128"
-    proc list_append with builtin_types, "bool"
-    proc list_append with builtin_types, "string"
-    proc list_append with builtin_types, "byte"
-    proc list_append with builtin_types, "rune"
+Process called "analyze_composite_lit" takes analyzer as Integer, node as Integer:
+    Let children be proc memory_get_int64 from Layout with node, 24
+    If children is equal to 0:
+        Return
+    End If
 
-    Let builtin_count be proc size from List with builtin_types
+    Let count be proc size from List with children
     Let i be 0
-    While i is less than builtin_count:
-        Let builtin_name be proc get from List with builtin_types, i
-        Let matches be proc equals from StringCore with type_name, builtin_name
-        If matches is equal to 1:
-            Return 1
+    While i is less than count:
+        Let child be proc get from List with children, i
+        Let child_kind be proc memory_get_int64 from Layout with child, 0
+        If child_kind is equal to GO_IDENTIFIER from Parser:
+            Note: identifier element may be a struct field key - accept
+        Otherwise:
+            proc analyze_expression with analyzer, child
         End If
         Set i to i plus 1
     End While
+End Process
+
+Note: ============================================================================
+Note: Shared Child Accessor
+Note: ============================================================================
+
+@Reasoning:
+Several node kinds store exactly one significant sub-node in the children slot
+(a parameter's type, a field's type, a type spec's underlying type, a pointer's
+pointee). The parser uniformly appends children through add_node_child, which
+makes the slot a List even for a single child. first_child returns element 0 of
+that List, or 0 when the slot is empty - the single accessor every "one
+meaningful child" reader uses so the List-vs-direct ambiguity is resolved in one
+place against how the parser actually writes the slot (always a List).
+@End Reasoning
+
+@Implementation:
+Read children (offset 24). If 0, return 0. Otherwise if the list has at least one
+element return element 0, else return 0.
+@End Implementation
+
+Process called "first_child" takes node as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+
+    Let children be proc memory_get_int64 from Layout with node, 24
+    If children is equal to 0:
+        Return 0
+    End If
+
+    Let count be proc size from List with children
+    If count is greater than 0:
+        Return proc get from List with children, 0
+    End If
 
     Return 0
 End Process
 
+Note: ============================================================================
+Note: Result Accessors
+Note: ============================================================================
+
 @Reasoning:
-Sticky error sentinel: writes has_error=1 (offset 56) and stores
-a defensive copy of the message string at offset 48. The copy
-isolates the analyzer's error buffer from the caller's transient
-string lifetime. Subsequent set_go_semantic_error calls overwrite
-the message (last error wins) but the sticky flag stays set so
-the program-level check still reports failure.
+Caller-facing accessors so a driver can gate lowering and surface diagnostics
+without reaching into the analyzer's byte layout: did the analysis error, how many
+errors/warnings were recorded, and the lists themselves.
 @End Reasoning
-Process called "set_go_semantic_error" takes analyzer as Integer, message as Integer:
-    Note: Set semantic analyzer error state
 
-    proc memory_set_int64 from Layout with analyzer, 56, 1
+@Implementation:
+analyzer_has_error reads offset 88. analyzer_error_count / analyzer_warning_count
+read the list at offset 72 / 80 and return its size. analyzer_errors /
+analyzer_warnings return the raw list handles.
+@End Implementation
 
-    Let error_copy be proc copy_string from StringCore with message
-    proc memory_set_int64 from Layout with analyzer, 48, error_copy
+Process called "analyzer_has_error" takes analyzer as Integer returns Integer:
+    If analyzer is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Layout with analyzer, 88
+End Process
+
+Process called "analyzer_error_count" takes analyzer as Integer returns Integer:
+    If analyzer is equal to 0:
+        Return 0
+    End If
+    Let errors be proc memory_get_int64 from Layout with analyzer, 72
+    If errors is equal to 0:
+        Return 0
+    End If
+    Return proc size from List with errors
+End Process
+
+Process called "analyzer_warning_count" takes analyzer as Integer returns Integer:
+    If analyzer is equal to 0:
+        Return 0
+    End If
+    Let warnings be proc memory_get_int64 from Layout with analyzer, 80
+    If warnings is equal to 0:
+        Return 0
+    End If
+    Return proc size from List with warnings
+End Process
+
+Process called "analyzer_errors" takes analyzer as Integer returns Integer:
+    If analyzer is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Layout with analyzer, 72
+End Process
+
+Process called "analyzer_warnings" takes analyzer as Integer returns Integer:
+    If analyzer is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Layout with analyzer, 80
 End Process
