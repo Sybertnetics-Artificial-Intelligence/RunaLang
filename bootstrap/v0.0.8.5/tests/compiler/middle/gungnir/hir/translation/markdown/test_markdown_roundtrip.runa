@@ -1,0 +1,417 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+Licensed under Apache 2.0
+:End Note
+
+Note:
+Markdown Translation Round-Trip Probe
+
+End-to-end proof that the Markdown translation pipeline is REAL, not a skeleton:
+
+    Markdown source
+      -> markdown_lexer  (tokenize: ATX headings, fences, list markers, inline)
+      -> markdown_parser (build Markdown block/inline AST)
+      -> markdown_to_hir (lower AST to canonical HIR dictionary/array literal model)
+      -> hir_to_markdown (emit HIR back to CommonMark text)
+
+The probe feeds a representative document containing a level-2 ATX heading, a
+paragraph carrying emphasis and inline code, an unordered list with two items,
+a fenced code block with a language tag, and a link. It then:
+
+  1. Translates the source to HIR and asserts the HIR root is the document
+     dictionary literal, walks its block children, and checks each block's
+     structured attributes: heading level + text, paragraph inline children
+     (emphasis + inline code), list item markers, fenced code language + body,
+     and the link's visible text + URL target. Markdown -> HIR is the
+     lossless direction (every structural attribute is preserved as a typed
+     HIR entry), so these are exact structural asserts.
+
+  2. Emits the HIR back to Markdown text and asserts the text is non-empty and
+     begins with the heading sigil '#'.
+
+  3. Re-parses the emitted Markdown back into HIR and asserts the re-parsed
+     document is itself a document dictionary whose block-child sequence
+     preserves the heading (level + text) and the fenced code block (language
+     + body). Full byte/tree equality is NOT asserted because Markdown
+     emission is intentionally lossy at the inline boundary (the lexer
+     collapses an emphasis span into a single text slice on the second pass),
+     so structural equality is checked only on the attributes the format
+     round-trips faithfully.
+
+Exit code: number of failed assertions (0 == all passed). No exit_with_code.
+:End Note
+
+Import "compiler/middle/gungnir/hir/translation/frontends/markdown/markdown_to_hir.runa" as MarkdownFrontend
+Import "compiler/middle/gungnir/hir/translation/backends/markdown/hir_to_markdown.runa" as MarkdownBackend
+Import "compiler/middle/gungnir/hir/hir.runa" as HIR
+Import "compiler/frontend/primitives/collections/list.runa" as List
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "tests/test_utils.runa" as TestUtils
+
+Note: ============================================================================
+Note: HIR dictionary readers (entry blocks are [key(0), value(8)])
+Note: ============================================================================
+
+@Reasoning:
+The translation backends read attributes off HIR dictionary literals by
+scanning the entries List and matching keys with string_equals; the probe
+mirrors that exact access pattern so it validates the same memory layout the
+production backend depends on. Returning the raw value node lets callers
+decide whether to read it as a string literal, integer literal, or nested
+collection.
+@End Reasoning
+Process called "dict_value_for_key" takes hir_dict as Integer, key as Integer returns Integer:
+    Let entries be proc get_dictionary_entries from HIR with hir_dict
+
+    If entries is equal to 0:
+        Return 0
+    End If
+
+    Let count be proc size from List with entries
+    Let index be 0
+
+    While index is less than count:
+        Let entry be proc get_at from List with entries, index
+        Let current_key be proc memory_get_int64 from Layout with entry, 0
+        Let matches be proc string_equals from StringCore with key, current_key
+
+        If matches is equal to 1:
+            Return proc memory_get_int64 from Layout with entry, 8
+        End If
+
+        Set index to index plus 1
+    End While
+
+    Return 0
+End Process
+
+@Reasoning:
+String-typed attribute reader: locate the value node for a key and pull its
+string payload via the canonical typed accessor, which returns 0 unless the
+node really is a string-tagged HIR literal.
+@End Reasoning
+Process called "dict_string_for_key" takes hir_dict as Integer, key as Integer returns Integer:
+    Let value_node be proc dict_value_for_key with hir_dict, key
+
+    If value_node is equal to 0:
+        Return 0
+    End If
+
+    Return proc get_string_literal_value from HIR with value_node
+End Process
+
+@Reasoning:
+Integer-typed attribute reader for the heading level. Locates the value node
+and returns its int64 payload through the canonical typed accessor.
+@End Reasoning
+Process called "dict_integer_for_key" takes hir_dict as Integer, key as Integer returns Integer:
+    Let value_node be proc dict_value_for_key with hir_dict, key
+
+    If value_node is equal to 0:
+        Return 0
+    End If
+
+    Return proc get_integer_literal_value from HIR with value_node
+End Process
+
+@Reasoning:
+Locates the first block child of a document (or any container) dictionary
+whose "type" attribute equals the requested type string. Document children
+are a HIR array literal of block dictionaries; this linear scan mirrors how a
+renderer would dispatch on block kind.
+@End Reasoning
+Process called "find_child_by_type" takes container_dict as Integer, type_name as Integer returns Integer:
+    Let children_node be proc dict_value_for_key with container_dict, "children"
+
+    If children_node is equal to 0:
+        Return 0
+    End If
+
+    Let elements be proc get_list_elements from HIR with children_node
+
+    If elements is equal to 0:
+        Return 0
+    End If
+
+    Let count be proc size from List with elements
+    Let index be 0
+
+    While index is less than count:
+        Let child be proc get_at from List with elements, index
+        Let child_kind be proc get_hir_node_type from HIR with child
+
+        If child_kind is equal to HIR_DICTIONARY_LITERAL from HIR:
+            Let child_type be proc dict_string_for_key with child, "type"
+
+            If child_type is not equal to 0:
+                Let matches be proc string_equals from StringCore with type_name, child_type
+
+                If matches is equal to 1:
+                    Return child
+                End If
+            End If
+        End If
+
+        Set index to index plus 1
+    End While
+
+    Return 0
+End Process
+
+@Reasoning:
+Counts how many block children of a container carry the requested "type"
+string. Used to assert the list-item count without assuming the items are
+contiguous in the document child sequence.
+@End Reasoning
+Process called "count_children_by_type" takes container_dict as Integer, type_name as Integer returns Integer:
+    Let children_node be proc dict_value_for_key with container_dict, "children"
+
+    If children_node is equal to 0:
+        Return 0
+    End If
+
+    Let elements be proc get_list_elements from HIR with children_node
+
+    If elements is equal to 0:
+        Return 0
+    End If
+
+    Let count be proc size from List with elements
+    Let total be 0
+    Let index be 0
+
+    While index is less than count:
+        Let child be proc get_at from List with elements, index
+        Let child_kind be proc get_hir_node_type from HIR with child
+
+        If child_kind is equal to HIR_DICTIONARY_LITERAL from HIR:
+            Let child_type be proc dict_string_for_key with child, "type"
+
+            If child_type is not equal to 0:
+                Let matches be proc string_equals from StringCore with type_name, child_type
+
+                If matches is equal to 1:
+                    Set total to total plus 1
+                End If
+            End If
+        End If
+
+        Set index to index plus 1
+    End While
+
+    Return total
+End Process
+
+@Reasoning:
+Finds the first inline child of a paragraph (or other container) dictionary
+whose "type" attribute equals the requested inline kind ("emphasis", "code",
+"link", ...). Inline children mix bare HIR string literals (plain text runs)
+and inline-element dictionaries; only dictionaries are inspected for a "type".
+@End Reasoning
+Process called "find_inline_by_type" takes container_dict as Integer, type_name as Integer returns Integer:
+    Let children_node be proc dict_value_for_key with container_dict, "children"
+
+    If children_node is equal to 0:
+        Return 0
+    End If
+
+    Let elements be proc get_list_elements from HIR with children_node
+
+    If elements is equal to 0:
+        Return 0
+    End If
+
+    Let count be proc size from List with elements
+    Let index be 0
+
+    While index is less than count:
+        Let child be proc get_at from List with elements, index
+        Let child_kind be proc get_hir_node_type from HIR with child
+
+        If child_kind is equal to HIR_DICTIONARY_LITERAL from HIR:
+            Let child_type be proc dict_string_for_key with child, "type"
+
+            If child_type is not equal to 0:
+                Let matches be proc string_equals from StringCore with type_name, child_type
+
+                If matches is equal to 1:
+                    Return child
+                End If
+            End If
+        End If
+
+        Set index to index plus 1
+    End While
+
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: Probe entry point
+Note: ============================================================================
+
+Process called "main" returns Integer:
+    Let results be proc create_test_results from TestUtils
+    proc begin_suite from TestUtils with results, "Markdown translation round-trip"
+
+    Note:
+    Representative document: a level-2 ATX heading, a paragraph mixing
+    emphasis and inline code, an unordered list with two items, a fenced code
+    block with a language tag, and a link on its own paragraph. Block elements
+    are separated by blank lines so the parser closes each block cleanly.
+    :End Note
+    Let source be "## Title Here\n\nText with *stress* and `code` here.\n\n- first item\n- second item\n\n```runa\nLet x be 1\n```\n\n[Runa](https://runa.dev)\n"
+
+    Note: --- Stage 1: source -> HIR ---
+    Let hir1 be proc markdown_to_hir_from_source from MarkdownFrontend with source
+    proc assert_not_null from TestUtils with results, "frontend produced HIR root", hir1
+
+    Let root_kind be proc get_hir_node_type from HIR with hir1
+    proc assert_equal from TestUtils with results, "HIR root is dictionary literal", root_kind, HIR_DICTIONARY_LITERAL from HIR
+
+    Let root_type be proc dict_string_for_key with hir1, "type"
+    proc assert_string_equal from TestUtils with results, "root type is 'document'", root_type, "document"
+
+    Let doc_children be proc dict_value_for_key with hir1, "children"
+    proc assert_not_null from TestUtils with results, "document has children array", doc_children
+
+    Let doc_children_kind be proc get_hir_node_type from HIR with doc_children
+    proc assert_equal from TestUtils with results, "document children is array literal", doc_children_kind, HIR_ARRAY_LITERAL from HIR
+
+    Note: --- Heading: level 2 + exact text ---
+    Let heading be proc find_child_by_type with hir1, "heading"
+    proc assert_not_null from TestUtils with results, "document contains a heading block", heading
+
+    Let heading_level be proc dict_integer_for_key with heading, "level"
+    proc assert_equal from TestUtils with results, "heading level is 2", heading_level, 2
+
+    Let heading_text be proc dict_string_for_key with heading, "text"
+    proc assert_string_equal from TestUtils with results, "heading text is 'Title Here'", heading_text, "Title Here"
+
+    Note: --- Paragraph: emphasis + inline code inline children ---
+    Let paragraph be proc find_child_by_type with hir1, "paragraph"
+    proc assert_not_null from TestUtils with results, "document contains a paragraph block", paragraph
+
+    Let emphasis be proc find_inline_by_type with paragraph, "emphasis"
+    proc assert_not_null from TestUtils with results, "paragraph contains an emphasis inline", emphasis
+
+    Let emphasis_text be proc dict_string_for_key with emphasis, "text"
+    proc assert_string_equal from TestUtils with results, "emphasis text is 'stress'", emphasis_text, "stress"
+
+    Let inline_code be proc find_inline_by_type with paragraph, "code"
+    proc assert_not_null from TestUtils with results, "paragraph contains an inline code", inline_code
+
+    Let inline_code_text be proc dict_string_for_key with inline_code, "text"
+    proc assert_string_equal from TestUtils with results, "inline code text is 'code'", inline_code_text, "code"
+
+    Note: --- List: two unordered items ---
+    Let list_item_count be proc count_children_by_type with hir1, "list_item"
+    proc assert_equal from TestUtils with results, "document has 2 list items", list_item_count, 2
+
+    Let first_item be proc find_child_by_type with hir1, "list_item"
+    proc assert_not_null from TestUtils with results, "document contains a list item block", first_item
+
+    Let first_item_list_type be proc dict_string_for_key with first_item, "list_type"
+    proc assert_string_equal from TestUtils with results, "first list item is unordered", first_item_list_type, "unordered"
+
+    Let first_item_marker be proc dict_string_for_key with first_item, "marker"
+    proc assert_string_equal from TestUtils with results, "first list item marker is '-'", first_item_marker, "-"
+
+    Note: --- Fenced code block: language tag + body ---
+    Let code_block be proc find_child_by_type with hir1, "code_block"
+    proc assert_not_null from TestUtils with results, "document contains a code block", code_block
+
+    Let code_lang be proc dict_string_for_key with code_block, "language"
+    proc assert_string_equal from TestUtils with results, "code block language is 'runa'", code_lang, "runa"
+
+    Let code_body be proc dict_string_for_key with code_block, "code"
+    proc assert_not_null from TestUtils with results, "code block has a code body", code_body
+
+    Let code_body_len be proc string_length from StringCore with code_body
+    proc assert_greater_than from TestUtils with results, "code block body is non-empty", code_body_len, 0
+
+    Note: --- Link: visible text + URL target ---
+    Let link be proc find_inline_by_type with paragraph, "link"
+    Let link_para be paragraph
+
+    If link is equal to 0:
+        Note:
+        The link sits in its own paragraph (separated by a blank line); scan
+        every paragraph block for it.
+        :End Note
+        Let dchildren be proc dict_value_for_key with hir1, "children"
+        Let delems be proc get_list_elements from HIR with dchildren
+        Let dcount be proc size from List with delems
+        Let di be 0
+
+        While di is less than dcount:
+            Let dblock be proc get_at from List with delems, di
+            Let dblock_kind be proc get_hir_node_type from HIR with dblock
+
+            If dblock_kind is equal to HIR_DICTIONARY_LITERAL from HIR:
+                Let dblock_type be proc dict_string_for_key with dblock, "type"
+
+                If dblock_type is not equal to 0:
+                    Let is_para be proc string_equals from StringCore with dblock_type, "paragraph"
+
+                    If is_para is equal to 1:
+                        Let candidate be proc find_inline_by_type with dblock, "link"
+
+                        If candidate is not equal to 0:
+                            Set link to candidate
+                        End If
+                    End If
+                End If
+            End If
+
+            Set di to di plus 1
+        End While
+    End If
+
+    proc assert_not_null from TestUtils with results, "document contains a link inline", link
+
+    Let link_text be proc dict_string_for_key with link, "text"
+    proc assert_string_equal from TestUtils with results, "link text is 'Runa'", link_text, "Runa"
+
+    Let link_url be proc dict_string_for_key with link, "url"
+    proc assert_string_equal from TestUtils with results, "link url is 'https://runa.dev'", link_url, "https://runa.dev"
+
+    Note: --- Stage 2: HIR -> Markdown text ---
+    Let emitted be proc hir_to_markdown from MarkdownBackend with hir1
+    proc assert_not_null from TestUtils with results, "backend produced Markdown text", emitted
+
+    Let emitted_len be proc string_length from StringCore with emitted
+    proc assert_greater_than from TestUtils with results, "emitted Markdown is non-empty", emitted_len, 0
+
+    Let first_char be proc string_char_at from StringCore with emitted, 0
+    proc assert_equal from TestUtils with results, "emitted Markdown begins with '#' (35)", first_char, 35
+
+    Note: --- Stage 3: re-parse emitted Markdown -> HIR, assert stable structure ---
+    Let hir2 be proc markdown_to_hir_from_source from MarkdownFrontend with emitted
+    proc assert_not_null from TestUtils with results, "re-parse of emitted Markdown produced HIR", hir2
+
+    Let root2_type be proc dict_string_for_key with hir2, "type"
+    proc assert_string_equal from TestUtils with results, "re-parsed root type is 'document'", root2_type, "document"
+
+    Let heading2 be proc find_child_by_type with hir2, "heading"
+    proc assert_not_null from TestUtils with results, "re-parsed document keeps a heading", heading2
+
+    Let heading2_level be proc dict_integer_for_key with heading2, "level"
+    proc assert_equal from TestUtils with results, "re-parsed heading level is 2", heading2_level, 2
+
+    Let heading2_text be proc dict_string_for_key with heading2, "text"
+    proc assert_string_equal from TestUtils with results, "re-parsed heading text is 'Title Here'", heading2_text, "Title Here"
+
+    Let code_block2 be proc find_child_by_type with hir2, "code_block"
+    proc assert_not_null from TestUtils with results, "re-parsed document keeps a code block", code_block2
+
+    Let code_lang2 be proc dict_string_for_key with code_block2, "language"
+    proc assert_string_equal from TestUtils with results, "re-parsed code block language is 'runa'", code_lang2, "runa"
+
+    proc print_summary from TestUtils with results
+    Let failed be proc get_failed from TestUtils with results
+    proc destroy_test_results from TestUtils with results
+
+    Return failed
+End Process
