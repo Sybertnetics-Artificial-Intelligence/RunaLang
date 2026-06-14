@@ -4,8 +4,29 @@ Licensed under the Apache License, Version 2.0
 :End Note
 
 Note:
-Rust Semantic Analyzer - Ownership, borrowing, and type checking for Rust AST
-Handles lifetime analysis, borrow checking, trait resolution, and type inference.
+Rust Semantic Analyzer - real scope and name resolution over the Rust AST.
+
+This pass walks the RustASTNode tree produced by rust_parser and performs genuine
+name analysis: it builds a chain of lexical scopes (a module scope per crate / mod,
+a function scope per fn, a block scope per { }), registers every binding
+introduced (items, function parameters, generic and lifetime parameters, let
+bindings, match-arm pattern bindings, closure parameters, for-loop variables, and
+use-imported names), and resolves every identifier and type-path reference against
+the scope chain. Trait and impl bodies associate their methods with the trait/impl
+target so method references resolve. Unresolved references and duplicate bindings
+in the same scope are recorded as diagnostics.
+
+The analyzer does NOT mutate the AST; it is a validation pass. rust_to_hir runs it
+purely for its diagnostics; lowering walks the same AST regardless of outcome.
+
+Scope record (40 bytes): kind@0, parent@8, symbols@16 (dictionary name->kind),
+node@24 (the AST node that opened the scope), child_scopes@32 (list, for cleanup).
+Analyzer record (40 bytes): global_scope@0, current_scope@8, errors@16 (list),
+error_count@24, unresolved_count@32.
+
+Dependencies:
+- rust_parser.runa
+- primitives: layout, string_core, list, dictionary
 :End Note
 
 Import "compiler/middle/gungnir/hir/translation/frontends/rust/rust_parser.runa" as Parser
@@ -14,980 +35,1444 @@ Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
 Import "compiler/frontend/primitives/collections/list.runa" as List
 Import "compiler/frontend/primitives/collections/dictionary.runa" as Dict
 
-@Reasoning:
-Rust semantic analysis is a multi-pass operation: declarations must be
-collected before trait resolution can wire up impl blocks, which must
-complete before borrow checking can run with full type info. This
-analyzer struct carries the four substructures (lifetime context,
-borrow checker, trait resolver, type inference engine) that each pass
-needs, plus a scope stack for nested function/block visibility.
-@End Reasoning
+Note: Scope kinds
+Constant SCOPE_MODULE as Integer is 1
+Constant SCOPE_FUNCTION as Integer is 2
+Constant SCOPE_BLOCK as Integer is 3
+Constant SCOPE_IMPL as Integer is 4
+Constant SCOPE_TRAIT as Integer is 5
 
-@Implementation:
-72-byte record (9 x i64). Offsets: global_scope (0, Dict for top-level
-names), current_scope (8, alias of global at start), scope_stack (16,
-List for push/pop nested scopes), lifetime_context (24), borrow_checker
-(32), trait_resolver (40), type_inference (48), error_message (56,
-owned StringCore copy), has_error (64, sticky flag).
-@End Implementation
+Note: Symbol kinds (the dictionary value for a registered name)
+Constant SYM_ITEM as Integer is 1
+Constant SYM_VAR as Integer is 2
+Constant SYM_PARAM as Integer is 3
+Constant SYM_TYPE_PARAM as Integer is 4
+Constant SYM_LIFETIME as Integer is 5
+Constant SYM_IMPORT as Integer is 6
+Constant SYM_FIELD as Integer is 7
 
-Type called "RustSemanticAnalyzer":
-    global_scope as Integer
-    current_scope as Integer
-    scope_stack as Integer
-    lifetime_context as Integer
-    borrow_checker as Integer
-    trait_resolver as Integer
-    type_inference as Integer
-    error_message as Integer
-    has_error as Integer
-End Type
+Note: ============================================================================
+Note: Scope management
+Note: ============================================================================
 
 @Reasoning:
-Initializes the full analyzer with all four substructures eagerly. Eager
-construction (versus lazy per-pass) keeps the per-program overhead in
-one place and means downstream passes never have to check for null
-substructure pointers. global_scope is aliased into current_scope so
-the first scope_push/pop operates correctly without a separate init.
+A scope is a 40-byte record holding its kind, a pointer to the enclosing scope
+(forming the lexical chain), a symbols dictionary mapping a binding name to its
+symbol kind, the AST node that opened it (for diagnostics), and a list of nested
+child scopes so a future bulk teardown can reclaim them.
 @End Reasoning
-
 @Implementation:
-72-byte allocation, OOM short-circuit to 0. Builds global_scope (Dict),
-scope_stack (List), and the four substructure objects in independent
-calls. The duplicated set of global_scope into offsets 0 and 8 makes
-current_scope a moving cursor that starts identical to global; later
-scope_push will displace it without affecting the global reference.
-Has_error (offset 64) and error_message (offset 56) initialise to 0.
+allocate(40). Write kind@0, parent@8, a fresh Dict@16, node@24, a fresh List@32.
+Returns 0 on OOM. Chains itself into the parent's child list when a parent exists.
 @End Implementation
+Process called "create_scope" takes kind as Integer, parent as Integer, node as Integer returns Integer:
+    Let scope be proc allocate from Layout with 40
+    If scope is equal to 0:
+        Return 0
+    End If
+    Let symbols be proc create from Dict
+    Let children be proc create from List
+    proc memory_set_int64 from Layout with scope, 0, kind
+    proc memory_set_int64 from Layout with scope, 8, parent
+    proc memory_set_int64 from Layout with scope, 16, symbols
+    proc memory_set_int64 from Layout with scope, 24, node
+    proc memory_set_int64 from Layout with scope, 32, children
+    If parent is not equal to 0:
+        Let pchildren be proc memory_get_int64 from Layout with parent, 32
+        proc push from List with pchildren, scope
+    End If
+    Return scope
+End Process
 
+@Reasoning:
+Registers a binding in a scope's symbol table. Re-declaring an item or parameter
+name in the SAME scope is a duplicate-binding diagnostic (Rust permits shadowing
+across nested scopes but not duplicate items/params in one scope).
+@End Reasoning
+@Implementation:
+If the scope already contains the name, flag a duplicate for SYM_ITEM/SYM_PARAM.
+Then set(symbols, name, kind). A null name/scope is ignored.
+@End Implementation
+Process called "scope_declare" takes analyzer as Integer, scope as Integer, name as Integer, kind as Integer:
+    If scope is equal to 0:
+        Return
+    End If
+    If name is equal to 0:
+        Return
+    End If
+    Let symbols be proc memory_get_int64 from Layout with scope, 16
+    Let exists be proc contains from Dict with symbols, name
+    If exists is equal to 1:
+        If kind is equal to SYM_ITEM:
+            proc record_error with analyzer
+        End If
+        If kind is equal to SYM_PARAM:
+            proc record_error with analyzer
+        End If
+    End If
+    proc set from Dict with symbols, name, kind
+End Process
+
+@Reasoning:
+Resolves a name by walking the scope chain from the given scope outward to the
+global scope. Returns the symbol kind if found, or 0 if unresolved.
+@End Reasoning
+@Implementation:
+Walk parent pointers; at each scope, if the symbols dict contains the name return
+its stored kind. Returns 0 once the chain is exhausted.
+@End Implementation
+Process called "scope_lookup" takes scope as Integer, name as Integer returns Integer:
+    Let cur be scope
+    While cur is not equal to 0:
+        Let symbols be proc memory_get_int64 from Layout with cur, 16
+        Let has be proc contains from Dict with symbols, name
+        If has is equal to 1:
+            Return proc get from Dict with symbols, name
+        End If
+        Set cur to proc memory_get_int64 from Layout with cur, 8
+    End While
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: Analyzer lifecycle
+Note: ============================================================================
+
+@Reasoning:
+The analyzer holds the global (crate) scope, the current scope cursor used during
+the walk, an errors list, and two diagnostic counters (total errors, unresolved
+references). Keeping current_scope on the analyzer lets the recursive walkers push
+and pop scopes by updating one field.
+@End Reasoning
+@Implementation:
+allocate(40). Create the global module scope (no parent, no node). Write
+global_scope@0, current_scope@8 = global, errors list@16, 0 counts at 24 and 32.
+Returns 0 on OOM.
+@End Implementation
 Process called "create_rust_semantic_analyzer" returns Integer:
-    Note: Create Rust semantic analyzer with borrow checker
-
-    Let analyzer_size be 72
-    Let analyzer be proc allocate from Layout with analyzer_size
-
+    Let analyzer be proc allocate from Layout with 40
     If analyzer is equal to 0:
         Return 0
     End If
-
-    Let global_scope be proc create from Dict
-    Let scope_stack be proc create from List
-    Let lifetime_context be proc create_lifetime_context
-    Let borrow_checker be proc create_borrow_checker
-    Let trait_resolver be proc create_trait_resolver
-    Let type_inference be proc create_type_inference_engine
-
-    proc memory_set_int64 from Layout with analyzer, 0, global_scope
-    proc memory_set_int64 from Layout with analyzer, 8, global_scope
-    proc memory_set_int64 from Layout with analyzer, 16, scope_stack
-    proc memory_set_int64 from Layout with analyzer, 24, lifetime_context
-    proc memory_set_int64 from Layout with analyzer, 32, borrow_checker
-    proc memory_set_int64 from Layout with analyzer, 40, trait_resolver
-    proc memory_set_int64 from Layout with analyzer, 48, type_inference
-    proc memory_set_int64 from Layout with analyzer, 56, 0
-    proc memory_set_int64 from Layout with analyzer, 64, 0
-
+    Let global be proc create_scope with SCOPE_MODULE, 0, 0
+    Let errors be proc create from List
+    proc memory_set_int64 from Layout with analyzer, 0, global
+    proc memory_set_int64 from Layout with analyzer, 8, global
+    proc memory_set_int64 from Layout with analyzer, 16, errors
+    proc memory_set_int64 from Layout with analyzer, 24, 0
+    proc memory_set_int64 from Layout with analyzer, 32, 0
     Return analyzer
 End Process
 
 @Reasoning:
-Three-phase orchestrator: declarations first (for forward references),
-then trait resolution and type inference, then borrow/ownership
-checking. The order is dictated by Rust's semantic model — borrow rules
-need types resolved, types need traits resolved, traits need all impls
-known. Reversing any pair would produce false-negatives where forward
-references look unresolved.
+Increments the total-error counter. Errors are counted rather than message-strung
+because the caller (rust_to_hir) only consults presence; detailed messages would be
+surfaced by a diagnostics sink in the full driver.
 @End Reasoning
-
 @Implementation:
-Validates analyzer and program_node up-front (returns 0 with sticky
-error on null program). Invokes collect_rust_declarations,
-resolve_rust_traits, and check_rust_ownership in fixed order. After
-all three, checks has_error at offset 64; returns 0 on error or 1 on
-clean analysis. Each phase mutates analyzer substructures rather than
-returning new data — the analyzer itself is the result.
+Read error_count@24, increment, write back.
 @End Implementation
-
-Process called "analyze_rust_program" takes analyzer as Integer, program_node as Integer returns Integer:
-    Note: Perform complete semantic analysis on Rust program
-
+Process called "record_error" takes analyzer as Integer:
     If analyzer is equal to 0:
-        Return 0
+        Return
     End If
-
-    If program_node is equal to 0:
-        proc set_rust_semantic_error with analyzer, "Null program node"
-        Return 0
-    End If
-
-    Note: Phase 1: Collect all item declarations for trait resolution
-    proc collect_rust_declarations with analyzer, program_node
-
-    Note: Phase 2: Resolve traits and perform type inference
-    proc resolve_rust_traits with analyzer, program_node
-
-    Note: Phase 3: Perform borrow checking and lifetime analysis
-    proc check_rust_ownership with analyzer, program_node
-
-    Let has_error be proc memory_get_int64 from Layout with analyzer, 64
-    If has_error is equal to 1:
-        Return 0
-    End If
-
-    Return 1
+    Let c be proc memory_get_int64 from Layout with analyzer, 24
+    proc memory_set_int64 from Layout with analyzer, 24, c plus 1
 End Process
 
 @Reasoning:
-Tree walker that descends into the AST seeking function bodies, where
-the actual borrow-check rules apply. Non-function nodes are recursed
-through (modules, impls) without any per-node ownership state because
-ownership is body-local in Rust; only `fn` introduces a new scope where
-moves and borrows can be tracked.
+Increments the unresolved-reference counter for an identifier/type that did not
+resolve in any enclosing scope.
 @End Reasoning
-
 @Implementation:
-Null-guards the node, reads tag at offset 0. On RUST_FUNCTION delegates
-to check_function_ownership and returns (does not recurse into the
-function body — that's the function checker's job). Otherwise iterates
-children at offset 32 and recurses. The early-return on function nodes
-prevents nested function definitions from being checked in the outer
-function's borrow context.
+Read unresolved_count@32, increment, write back.
 @End Implementation
-
-Process called "check_rust_ownership" takes analyzer as Integer, node as Integer:
-    Note: Check ownership and borrowing rules
-
-    If node is equal to 0:
+Process called "record_unresolved" takes analyzer as Integer:
+    If analyzer is equal to 0:
         Return
     End If
-
-    Let node_type be proc memory_get_int64 from Layout with node, 0
-
-    Note: Check function bodies for borrow checker violations
-    If node_type is equal to RUST_FUNCTION from Parser:
-        proc check_function_ownership with analyzer, node
-        Return
-    End If
-
-    Note: Recursively check children
-    Let children be proc memory_get_int64 from Layout with node, 32
-    If children is not equal to 0:
-        Let child_count be proc size from List with children
-        Let i be 0
-        While i is less than child_count:
-            Let child be proc get from List with children, i
-            proc check_rust_ownership with analyzer, child
-            Set i to i plus 1
-        End While
-    End If
+    Let c be proc memory_get_int64 from Layout with analyzer, 32
+    proc memory_set_int64 from Layout with analyzer, 32, c plus 1
 End Process
 
 @Reasoning:
-Per-function ownership scope manager. Establishes a borrow-checker
-scope, processes parameters (which may move or borrow), walks the
-body once, then exits the scope to validate that no outstanding
-borrows escape. Symmetrical enter/exit is required for the borrow
-checker to maintain its invariant that scopes nest cleanly.
+Pushes a new scope of the given kind as the current scope, chained to the prior
+current scope, and returns it so the caller can restore on exit.
 @End Reasoning
-
 @Implementation:
-Reads borrow_checker pointer at analyzer offset 32. Calls
-enter_borrow_scope, then analyze_function_parameters_ownership to
-register parameter ownership patterns, then walks children at offset
-32 calling analyze_ownership_in_block on each. exit_borrow_scope is
-called unconditionally at the end — fail-fast semantics rely on
-set_rust_semantic_error rather than early return for error paths.
+Read current@8; create a child scope; set current@8 to it; return the new scope.
 @End Implementation
-
-Process called "check_function_ownership" takes analyzer as Integer, func_node as Integer:
-    Note: Check ownership rules within function body
-
-    Let borrow_checker be proc memory_get_int64 from Layout with analyzer, 32
-
-    Note: Create new borrow checking scope
-    proc enter_borrow_scope from borrow_checker
-
-    Note: Analyze function parameters for ownership transfer
-    proc analyze_function_parameters_ownership with analyzer, func_node
-
-    Note: Analyze function body for moves, borrows, and lifetimes
-    Let children be proc memory_get_int64 from Layout with func_node, 32
-    If children is not equal to 0:
-        Let child_count be proc size from List with children
-        Let i be 0
-        While i is less than child_count:
-            Let child be proc get from List with children, i
-            proc analyze_ownership_in_block with analyzer, child
-            Set i to i plus 1
-        End While
-    End If
-
-    Note: Exit borrow checking scope and validate all borrows resolved
-    proc exit_borrow_scope from borrow_checker
+Process called "push_scope" takes analyzer as Integer, kind as Integer, node as Integer returns Integer:
+    Let cur be proc memory_get_int64 from Layout with analyzer, 8
+    Let scope be proc create_scope with kind, cur, node
+    proc memory_set_int64 from Layout with analyzer, 8, scope
+    Return scope
 End Process
 
 @Reasoning:
-Rust function parameters can have different ownership patterns:
-by value (takes ownership), by immutable reference (&T), by mutable
-reference (&mut T), and the self variants (self/&self/&mut self).
-Each pattern has different implications for the borrow checker: a
-by-value parameter consumes the argument, a borrow tracks the
-argument as live but unconsumed, a mutable borrow excludes any other
-borrows of the same source until this scope exits.
+Restores the current scope to the given scope's parent on exit from a lexical
+region.
 @End Reasoning
-
 @Implementation:
-Reads func_node children at offset 32. Returns early if children is
-0 (zero-arg function). Iterates the list filtering on
-RUST_PARAMETER tag at child offset 0, dispatching each parameter
-through analyze_parameter_ownership which inspects the type-spec
-string for `&` and `mut` markers. Non-parameter children (return
-type annotation, where clauses) are skipped.
+current@8 = scope.parent (offset 8).
 @End Implementation
+Process called "pop_scope" takes analyzer as Integer, scope as Integer:
+    Let parent be proc memory_get_int64 from Layout with scope, 8
+    proc memory_set_int64 from Layout with analyzer, 8, parent
+End Process
 
-Process called "analyze_function_parameters_ownership" takes analyzer as Integer, func_node as Integer:
-    Note: Analyze function parameters for ownership transfer patterns
+@Reasoning:
+Returns the current scope cursor.
+@End Reasoning
+@Implementation:
+Read offset 8.
+@End Implementation
+Process called "cur_scope" takes analyzer as Integer returns Integer:
+    Return proc memory_get_int64 from Layout with analyzer, 8
+End Process
 
-    Let borrow_checker be proc memory_get_int64 from Layout with analyzer, 32
-    Let children be proc memory_get_int64 from Layout with func_node, 32
+Note: ============================================================================
+Note: Declaration collection
+Note: ============================================================================
 
-    If children is equal to 0:
+@Reasoning:
+Registers generic and lifetime parameters of an item into the current scope so the
+item's body and signature can resolve T, 'a, etc. Walks a RUST_GENERICS node's
+RUST_GENERIC_PARAM children; a name beginning with an apostrophe is a lifetime.
+@End Reasoning
+@Implementation:
+If generics is 0 return. For each RUST_GENERIC_PARAM child: read its name; if the
+first byte is 39 (') declare it SYM_LIFETIME, else SYM_TYPE_PARAM.
+@End Implementation
+Process called "declare_generics" takes analyzer as Integer, generics as Integer:
+    If generics is equal to 0:
         Return
     End If
-
-    Let child_count be proc size from List with children
+    Let scope be proc cur_scope with analyzer
+    Let count be proc node_child_count from Parser with generics
     Let i be 0
-    While i is less than child_count:
-        Let param be proc get from List with children, i
-        Let param_type be proc memory_get_int64 from Layout with param, 0
-
-        If param_type is equal to RUST_PARAMETER from Parser:
-            proc analyze_parameter_ownership with analyzer, param
+    While i is less than count:
+        Let param be proc node_child from Parser with generics, i
+        Let name be proc node_name from Parser with param
+        If name is not equal to 0:
+            Let first be proc memory_get_byte from Layout with name, 0
+            If first is equal to 39:
+                proc scope_declare with analyzer, scope, name, SYM_LIFETIME
+                Otherwise:
+                proc scope_declare with analyzer, scope, name, SYM_TYPE_PARAM
+            End If
         End If
-
         Set i to i plus 1
     End While
 End Process
 
 @Reasoning:
-Per-parameter dispatch based on the type string. The lexical
-distinction between move, immutable borrow, and mutable borrow lives
-entirely in the type-spec prefix — the borrow checker only cares
-about which of three states this parameter induces, not the underlying
-type. Missing type annotations are a hard error because parameter
-ownership cannot be inferred without type info.
+Pre-registers every top-level item name (functions, types, traits, modules,
+consts, statics, type aliases) in the current scope before analysing bodies, so
+forward references resolve. This is the standard two-pass module resolution. Use
+imports register their final path segment.
 @End Reasoning
-
 @Implementation:
-Pulls param_name from offset 8 and param_type from offset 16 (the
-type AST node, not the type string). If param_type is null, emits a
-"Parameter missing type annotation" error via set_rust_semantic_error
-and returns. Otherwise reads the type's string representation from
-type offset 8 and dispatches: leading `&` plus `mut` substring
-=> register_mutable_borrow; leading `&` alone => register_immutable_borrow;
-no `&` => register_move_semantics. The starts_with/contains pair is
-used because Rust types can be complex (`&mut [u8]`, `&'a Vec<T>`)
-and a simple prefix check would mis-classify them.
+For each item child of the container, read its name and declare it SYM_ITEM in the
+current scope. Use-imports register their leaf name as SYM_IMPORT.
 @End Implementation
+Process called "collect_items" takes analyzer as Integer, container as Integer:
+    Let scope be proc cur_scope with analyzer
+    Let count be proc node_child_count from Parser with container
+    Let i be 0
+    While i is less than count:
+        Let item be proc node_child from Parser with container, i
+        Let nt be proc node_type from Parser with item
 
-Process called "analyze_parameter_ownership" takes analyzer as Integer, param as Integer:
-    Note: Analyze ownership semantics of individual parameter
-
-    Let borrow_checker be proc memory_get_int64 from Layout with analyzer, 32
-    Let param_name be proc memory_get_int64 from Layout with param, 8
-    Let param_type be proc memory_get_int64 from Layout with param, 16
-
-    If param_type is equal to 0:
-        proc set_rust_semantic_error with analyzer, "Parameter missing type annotation"
-        Return
-    End If
-
-    Note: Check if parameter is a reference type
-    Let type_str be proc memory_get_int64 from Layout with param_type, 8
-    If type_str is not equal to 0:
-        Let is_ref be proc starts_with from StringCore with type_str, "&"
-        If is_ref is equal to 1:
-            Let is_mut be proc contains from StringCore with type_str, "mut"
-            If is_mut is equal to 1:
-                proc register_mutable_borrow with borrow_checker, param_name
+        If nt is equal to Parser.RUST_USE:
+            Let path be proc node_name from Parser with item
+            Let leaf be proc use_leaf_name with path
+            proc scope_declare with analyzer, scope, leaf, SYM_IMPORT
             Otherwise:
-                proc register_immutable_borrow with borrow_checker, param_name
+            Let name be proc node_name from Parser with item
+            If name is not equal to 0:
+                proc scope_declare with analyzer, scope, name, SYM_ITEM
             End If
-        Otherwise:
-            proc register_move_semantics with borrow_checker, param_name
         End If
-    End If
+        Set i to i plus 1
+    End While
 End Process
 
 @Reasoning:
-Dispatches each statement kind to its specialised ownership checker.
-Five statement forms have distinct ownership effects: let-binding
-(introduces a new variable, may move from initializer), assignment
-(may overwrite-then-drop), function call (may move arguments), method
-call (may consume self), and return (always moves out). Other
-statement kinds (block, if, while) need no ownership-specific work
-beyond recursing into children.
+Extracts the final identifier segment of a use path so the imported name can be
+registered for resolution. Handles `a::b::c` (-> "c"), `a::*` (no binding), and
+`a as b` (-> "b").
 @End Reasoning
-
 @Implementation:
-Tag at offset 0 selects the per-kind handler. After per-kind dispatch
-unconditionally recurses through children at offset 32 so nested
-blocks, conditionals, and loops inherit the same checking. Recursion
-is post-dispatch so a let-binding's initializer is checked through
-the let handler first, then its children pick up any nested expressions.
-Block-level scope push/pop is the borrow checker's job — this routine
-only walks structure.
+Scan the length. A trailing '*' means a glob with no single binding (return 0).
+Otherwise track the index just after the last "::" or space and copy the suffix
+into an owned buffer.
 @End Implementation
+Process called "use_leaf_name" takes path as Integer returns Integer:
+    If path is equal to 0:
+        Return 0
+    End If
+    Let len be 0
+    While 1 is equal to 1:
+        Let c be proc memory_get_byte from Layout with path, len
+        If c is equal to 0:
+            Break
+        End If
+        Set len to len plus 1
+    End While
+    If len is equal to 0:
+        Return 0
+    End If
 
-Process called "analyze_ownership_in_block" takes analyzer as Integer, block_node as Integer:
-    Note: Analyze ownership patterns within code blocks
+    Let last be proc memory_get_byte from Layout with path, len minus 1
+    If last is equal to 42:
+        Return 0
+    End If
 
-    If block_node is equal to 0:
+    Let start be 0
+    Let i be 0
+    While i is less than len:
+        Let a be proc memory_get_byte from Layout with path, i
+        If a is equal to 58:
+            Let b be proc memory_get_byte from Layout with path, i plus 1
+            If b is equal to 58:
+                Set start to i plus 2
+                Set i to i plus 1
+            End If
+        End If
+        If a is equal to 32:
+            Set start to i plus 1
+        End If
+        Set i to i plus 1
+    End While
+
+    Let outlen be len minus start
+    If outlen is less than 1:
+        Return 0
+    End If
+    Let buf be proc allocate from Layout with outlen plus 1
+    If buf is equal to 0:
+        Return 0
+    End If
+    Let j be 0
+    While j is less than outlen:
+        Let x be proc memory_get_byte from Layout with path, start plus j
+        proc memory_set_byte from Layout with buf, j, x
+        Set j to j plus 1
+    End While
+    proc memory_set_byte from Layout with buf, outlen, 0
+    Return buf
+End Process
+
+Note: ============================================================================
+Note: Pattern binding registration
+Note: ============================================================================
+
+@Reasoning:
+Registers the variable bindings introduced by a pattern (let bindings, match arms,
+closure params, for-loop variables) into the current scope so later references
+resolve. Walks identifier, tuple, enum-ctor, struct, reference, binding, and or
+patterns; wildcard/literal/rest/range patterns bind nothing.
+@End Reasoning
+@Implementation:
+Dispatch on pattern node_type. IDENT -> declare the name SYM_VAR. TUPLE / ENUM ->
+recurse each sub-pattern. STRUCT -> recurse each field's sub-pattern (or declare the
+shorthand field name). REF / BINDING -> recurse inner(s). OR -> recurse the first
+alternative. Other kinds bind nothing.
+@End Implementation
+Process called "declare_pattern" takes analyzer as Integer, pat as Integer:
+    If pat is equal to 0:
+        Return
+    End If
+    Let scope be proc cur_scope with analyzer
+    Let nt be proc node_type from Parser with pat
+
+    If nt is equal to Parser.RUST_PATTERN_IDENT:
+        Let name be proc node_name from Parser with pat
+        proc scope_declare with analyzer, scope, name, SYM_VAR
         Return
     End If
 
-    Let node_type be proc memory_get_int64 from Layout with block_node, 0
-
-    Note: Handle different statement types
-    If node_type is equal to RUST_LET_BINDING from Parser:
-        proc analyze_let_binding_ownership with analyzer, block_node
-    Otherwise If node_type is equal to RUST_ASSIGNMENT from Parser:
-        proc analyze_assignment_ownership with analyzer, block_node
-    Otherwise If node_type is equal to RUST_FUNCTION_CALL from Parser:
-        proc analyze_function_call_ownership with analyzer, block_node
-    Otherwise If node_type is equal to RUST_METHOD_CALL from Parser:
-        proc analyze_method_call_ownership with analyzer, block_node
-    Otherwise If node_type is equal to RUST_RETURN from Parser:
-        proc analyze_return_ownership with analyzer, block_node
-    End If
-
-    Note: Recursively analyze child nodes
-    Let children be proc memory_get_int64 from Layout with block_node, 32
-    If children is not equal to 0:
-        Let child_count be proc size from List with children
+    If nt is equal to Parser.RUST_PATTERN_TUPLE:
+        Let count be proc node_child_count from Parser with pat
         Let i be 0
-        While i is less than child_count:
-            Let child be proc get from List with children, i
-            proc analyze_ownership_in_block with analyzer, child
+        While i is less than count:
+            Let sub be proc node_child from Parser with pat, i
+            proc declare_pattern with analyzer, sub
             Set i to i plus 1
         End While
+        Return
     End If
-End Process
 
-@Reasoning:
-Let bindings are the primary ownership-introducing form in Rust. Three
-cases matter: `let y = x` moves x into y (or copies if x is Copy);
-`let y = &x` borrows x immutably; `let y = &mut x` borrows mutably.
-Each case must be reflected in the borrow checker so subsequent uses
-of x are checked correctly.
-@End Reasoning
+    If nt is equal to Parser.RUST_PATTERN_ENUM:
+        Let count2 be proc node_child_count from Parser with pat
+        Let j be 0
+        While j is less than count2:
+            Let sub2 be proc node_child from Parser with pat, j
+            proc declare_pattern with analyzer, sub2
+            Set j to j plus 1
+        End While
+        Return
+    End If
 
-@Implementation:
-Reads var_name (offset 8) and initializer (offset 16). When initializer
-exists, branches on its tag at offset 0: RUST_IDENTIFIER triggers a
-check_move_or_borrow which examines the source variable's type to
-decide move vs copy; RUST_BORROW (a `&expr`) reads the borrowed
-identifier from initializer offset 8 and the mutability flag from
-offset 16, then registers an immutable or mutable borrow. After the
-move/borrow analysis, unconditionally registers var_name as a new
-variable in the current scope.
-@End Implementation
-
-Process called "analyze_let_binding_ownership" takes analyzer as Integer, let_node as Integer:
-    Note: Analyze ownership transfer in let bindings
-
-    Let borrow_checker be proc memory_get_int64 from Layout with analyzer, 32
-    Let var_name be proc memory_get_int64 from Layout with let_node, 8
-    Let initializer be proc memory_get_int64 from Layout with let_node, 16
-
-    If initializer is not equal to 0:
-        Let init_type be proc memory_get_int64 from Layout with initializer, 0
-
-        Note: Check if initializer moves or borrows from existing variable
-        If init_type is equal to RUST_IDENTIFIER from Parser:
-            Let source_name be proc memory_get_int64 from Layout with initializer, 8
-            proc check_move_or_borrow with borrow_checker, source_name, var_name
-        Otherwise If init_type is equal to RUST_BORROW from Parser:
-            Let borrowed_expr be proc memory_get_int64 from Layout with initializer, 8
-            If borrowed_expr is not equal to 0:
-                Let borrowed_name be proc memory_get_int64 from Layout with borrowed_expr, 8
-                Let is_mutable be proc memory_get_int64 from Layout with initializer, 16
-                If is_mutable is equal to 1:
-                    proc register_mutable_borrow with borrow_checker, borrowed_name
-                Otherwise:
-                    proc register_immutable_borrow with borrow_checker, borrowed_name
+    If nt is equal to Parser.RUST_PATTERN_STRUCT:
+        Let count3 be proc node_child_count from Parser with pat
+        Let k be 0
+        While k is less than count3:
+            Let fld be proc node_child from Parser with pat, k
+            Let ft be proc node_type from Parser with fld
+            If ft is equal to Parser.RUST_PATTERN_FIELD:
+                Let fc be proc node_child_count from Parser with fld
+                If fc is greater than 0:
+                    Let inner be proc node_child from Parser with fld, 0
+                    proc declare_pattern with analyzer, inner
+                    Otherwise:
+                    Let fname be proc node_name from Parser with fld
+                    proc scope_declare with analyzer, scope, fname, SYM_VAR
                 End If
             End If
-        End If
-    End If
-
-    Note: Register new variable in current scope
-    proc register_variable with borrow_checker, var_name
-End Process
-
-@Reasoning:
-Assignment (x = y) is distinct from let-binding in two ways: the target
-already exists (so the borrow checker must verify its current state
-allows writing) and the previous value is dropped before the new one
-lands. The drop semantics matter because the previous value's lifetime
-ends here, freeing any borrows it held.
-@End Reasoning
-
-@Implementation:
-Reads target at offset 8 and value at offset 16. Both must be non-null
-to proceed. Only RUST_IDENTIFIER on the value side triggers a move
-check via check_assignment_move; literal-valued and computed assignments
-don't move anything. The target name is pulled from target offset 8.
-Complex targets (field access, indexing) are not currently treated as
-moves of the parent — that's a known gap for a later patch.
-@End Implementation
-
-Process called "analyze_assignment_ownership" takes analyzer as Integer, assign_node as Integer:
-    Note: Analyze ownership in assignment expressions
-
-    Let borrow_checker be proc memory_get_int64 from Layout with analyzer, 32
-    Let target be proc memory_get_int64 from Layout with assign_node, 8
-    Let value_expr be proc memory_get_int64 from Layout with assign_node, 16
-
-    If target is not equal to 0 and value_expr is not equal to 0:
-        Let target_name be proc memory_get_int64 from Layout with target, 8
-        Let value_type be proc memory_get_int64 from Layout with value_expr, 0
-
-        Note: Check if assignment moves value
-        If value_type is equal to RUST_IDENTIFIER from Parser:
-            Let source_name be proc memory_get_int64 from Layout with value_expr, 8
-            proc check_assignment_move with borrow_checker, source_name, target_name
-        End If
-    End If
-End Process
-
-@Reasoning:
-A function call may move each argument depending on the corresponding
-parameter's ownership pattern. Per-argument analysis is delegated to
-analyze_argument_ownership; this routine's job is just to iterate the
-argument list. Argument-to-parameter type matching for ownership
-inference relies on the trait_resolver having already resolved the
-called function's signature.
-@End Reasoning
-
-@Implementation:
-Reads args list pointer at call_node offset 16 (offset 8 holds the
-callee). Returns immediately if args is null (zero-arg call). Iterates
-the list calling analyze_argument_ownership on each element. The
-return value of the call is not handled here — that's expression
-context, attended to by the parent expression's analysis.
-@End Implementation
-
-Process called "analyze_function_call_ownership" takes analyzer as Integer, call_node as Integer:
-    Note: Analyze ownership transfer in function calls
-
-    Let borrow_checker be proc memory_get_int64 from Layout with analyzer, 32
-    Let args be proc memory_get_int64 from Layout with call_node, 16
-
-    If args is not equal to 0:
-        Let arg_count be proc size from List with args
-        Let i be 0
-        While i is less than arg_count:
-            Let arg be proc get from List with args, i
-            proc analyze_argument_ownership with analyzer, arg
-            Set i to i plus 1
+            Set k to k plus 1
         End While
-    End If
-End Process
-
-@Reasoning:
-Per-argument ownership classification: identifier arguments may be
-moved (check_variable_usage decides based on the variable's Copy-ness
-and current borrow state); borrow arguments (&x, &mut x) register
-a borrow for the duration of the call but do not move the source.
-Literal arguments and computed expressions need no borrow-checker
-interaction since they have no prior owner.
-@End Reasoning
-
-@Implementation:
-Reads tag at offset 0. On RUST_IDENTIFIER reads variable name from
-offset 8 and calls check_variable_usage on the borrow checker (which
-verifies the variable is currently usable and may flip it to a moved
-state). On RUST_BORROW reads the inner expression from offset 8 and
-its identifier name from inner offset 8, then calls check_borrow_validity.
-Other expression kinds (literals, calls, blocks) are no-ops here —
-their subexpressions will be visited via the recursive walker.
-@End Implementation
-
-Process called "analyze_argument_ownership" takes analyzer as Integer, arg as Integer:
-    Note: Analyze ownership of function call arguments
-
-    Let borrow_checker be proc memory_get_int64 from Layout with analyzer, 32
-    Let arg_type be proc memory_get_int64 from Layout with arg, 0
-
-    If arg_type is equal to RUST_IDENTIFIER from Parser:
-        Let var_name be proc memory_get_int64 from Layout with arg, 8
-        proc check_variable_usage with borrow_checker, var_name
-    Otherwise If arg_type is equal to RUST_BORROW from Parser:
-        Let borrowed_expr be proc memory_get_int64 from Layout with arg, 8
-        If borrowed_expr is not equal to 0:
-            Let borrowed_name be proc memory_get_int64 from Layout with borrowed_expr, 8
-            proc check_borrow_validity with borrow_checker, borrowed_name
-        End If
-    End If
-End Process
-
-@Reasoning:
-Method calls have an additional ownership consideration beyond regular
-function calls: the receiver (the value the method is called on) may
-be consumed (`self`), borrowed immutably (`&self`), or borrowed mutably
-(`&mut self`). Receiver handling must precede argument handling because
-some receiver patterns invalidate subsequent argument borrows of the
-same root.
-@End Reasoning
-
-@Implementation:
-Reads receiver from offset 8. When receiver is an RUST_IDENTIFIER,
-extracts the variable name from offset 8 and calls
-check_method_receiver_ownership which inspects the method signature
-(via trait_resolver) to decide self vs &self vs &mut self. Then
-delegates to analyze_function_call_ownership to handle the argument
-list, which lives at the same offset layout as regular calls.
-@End Implementation
-
-Process called "analyze_method_call_ownership" takes analyzer as Integer, call_node as Integer:
-    Note: Analyze ownership in method calls (including self consumption)
-
-    Let borrow_checker be proc memory_get_int64 from Layout with analyzer, 32
-    Let receiver be proc memory_get_int64 from Layout with call_node, 8
-
-    If receiver is not equal to 0:
-        Let receiver_type be proc memory_get_int64 from Layout with receiver, 0
-        If receiver_type is equal to RUST_IDENTIFIER from Parser:
-            Let var_name be proc memory_get_int64 from Layout with receiver, 8
-            proc check_method_receiver_ownership with borrow_checker, var_name
-        End If
-    End If
-
-    Note: Analyze method arguments
-    proc analyze_function_call_ownership with analyzer, call_node
-End Process
-
-@Reasoning:
-Return statements move their expression value out of the function
-scope. For identifier returns this means the returned variable is
-consumed and can't be used afterward (though in practice nothing
-follows a return in straight-line code). The check is still required
-because lifetime analysis needs to see that any borrows held by the
-returned value escape the function and must outlive the caller.
-@End Reasoning
-
-@Implementation:
-Reads return_expr at offset 8; null-guards. When the expression is
-RUST_IDENTIFIER, extracts var_name from expression offset 8 and calls
-check_return_ownership on the borrow checker, which records the move
-and flags any outstanding borrows that should now be invalidated.
-Other expression kinds (literals, calls) are not analysed here — the
-walker covers them recursively.
-@End Implementation
-
-Process called "analyze_return_ownership" takes analyzer as Integer, return_node as Integer:
-    Note: Analyze ownership transfer in return statements
-
-    Let borrow_checker be proc memory_get_int64 from Layout with analyzer, 32
-    Let return_expr be proc memory_get_int64 from Layout with return_node, 8
-
-    If return_expr is not equal to 0:
-        Let expr_type be proc memory_get_int64 from Layout with return_expr, 0
-        If expr_type is equal to RUST_IDENTIFIER from Parser:
-            Let var_name be proc memory_get_int64 from Layout with return_expr, 8
-            proc check_return_ownership with borrow_checker, var_name
-        End If
-    End If
-End Process
-
-@Reasoning:
-Phase 1 of semantic analysis must collect all type definitions, trait
-implementations, function signatures, and module declarations before
-performing detailed analysis. This enables forward references (a
-function calling another defined below it) and proper trait coherence
-checking (which requires knowing all impl blocks before deciding
-overlap).
-@End Reasoning
-
-@Implementation:
-Reads program children at offset 32. Iterates the list dispatching
-each top-level child to its kind-specific collector based on the tag
-at offset 0: RUST_STRUCT, RUST_ENUM, RUST_TRAIT, RUST_IMPL, RUST_FUNCTION.
-Unknown top-level kinds (modules, use statements) are skipped — this
-single-file analysis doesn't model the module graph. global_scope at
-offset 0 is the canonical name table populated by each collector.
-@End Implementation
-
-Process called "collect_rust_declarations" takes analyzer as Integer, program_node as Integer:
-    Note: Collect all declarations for trait resolution and type checking
-
-    If program_node is equal to 0:
         Return
     End If
 
-    Let global_scope be proc memory_get_int64 from Layout with analyzer, 0
-    Let children be proc memory_get_int64 from Layout with program_node, 32
+    If nt is equal to Parser.RUST_PATTERN_REF:
+        Let rinner be proc node_child from Parser with pat, 0
+        proc declare_pattern with analyzer, rinner
+        Return
+    End If
 
-    If children is not equal to 0:
-        Let child_count be proc size from List with children
-        Let i be 0
-        While i is less than child_count:
-            Let child be proc get from List with children, i
-            Let child_type be proc memory_get_int64 from Layout with child, 0
+    If nt is equal to Parser.RUST_PATTERN_BINDING:
+        Let count4 be proc node_child_count from Parser with pat
+        Let b be 0
+        While b is less than count4:
+            Let bsub be proc node_child from Parser with pat, b
+            proc declare_pattern with analyzer, bsub
+            Set b to b plus 1
+        End While
+        Return
+    End If
 
-            If child_type is equal to RUST_STRUCT from Parser:
-                proc collect_struct_declaration with analyzer, child
-            Otherwise If child_type is equal to RUST_ENUM from Parser:
-                proc collect_enum_declaration with analyzer, child
-            Otherwise If child_type is equal to RUST_TRAIT from Parser:
-                proc collect_trait_declaration with analyzer, child
-            Otherwise If child_type is equal to RUST_IMPL from Parser:
-                proc collect_impl_declaration with analyzer, child
-            Otherwise If child_type is equal to RUST_FUNCTION from Parser:
-                proc collect_function_declaration with analyzer, child
+    If nt is equal to Parser.RUST_PATTERN_OR:
+        Let first be proc node_child from Parser with pat, 0
+        proc declare_pattern with analyzer, first
+        Return
+    End If
+End Process
+
+Note: ============================================================================
+Note: Type-reference resolution
+Note: ============================================================================
+
+@Reasoning:
+Resolves the head identifier of a type path against the scope chain. Built-in Rust
+primitive/std type names always resolve. User type paths that resolve to an
+in-scope item/type-param are fine; otherwise the unresolved counter increments.
+Composite types recurse into their component types.
+@End Reasoning
+@Implementation:
+Dispatch on the type node_type. PATH: take the head segment; if it is a known
+primitive OR resolves in scope, ok, else count unresolved; recurse into generic-arg
+children. REFERENCE/POINTER/ARRAY/SLICE: recurse the inner type. TUPLE: recurse each
+element. dyn/impl: recurse the inner.
+@End Implementation
+Process called "resolve_type" takes analyzer as Integer, ty as Integer:
+    If ty is equal to 0:
+        Return
+    End If
+    Let nt be proc node_type from Parser with ty
+
+    If nt is equal to Parser.RUST_PATH_TYPE:
+        Let name be proc node_name from Parser with ty
+        Let head be proc path_head with name
+        Let is_prim be proc is_primitive_type with head
+        If is_prim is equal to 0:
+            Let scope be proc cur_scope with analyzer
+            Let found be proc scope_lookup with scope, head
+            If found is equal to 0:
+                proc record_unresolved with analyzer
             End If
-
+        End If
+        Let argc be proc node_child_count from Parser with ty
+        Let i be 0
+        While i is less than argc:
+            Let arg be proc node_child from Parser with ty, i
+            proc resolve_type with analyzer, arg
             Set i to i plus 1
         End While
+        Return
+    End If
+
+    If nt is equal to Parser.RUST_REFERENCE_TYPE:
+        Let inner be proc node_child from Parser with ty, 0
+        proc resolve_type with analyzer, inner
+        Return
+    End If
+    If nt is equal to Parser.RUST_POINTER_TYPE:
+        Let pinner be proc node_child from Parser with ty, 0
+        proc resolve_type with analyzer, pinner
+        Return
+    End If
+    If nt is equal to Parser.RUST_ARRAY_TYPE:
+        Let aelem be proc node_child from Parser with ty, 0
+        proc resolve_type with analyzer, aelem
+        Return
+    End If
+    If nt is equal to Parser.RUST_SLICE_TYPE:
+        Let selem be proc node_child from Parser with ty, 0
+        proc resolve_type with analyzer, selem
+        Return
+    End If
+    If nt is equal to Parser.RUST_TUPLE_TYPE:
+        Let tc be proc node_child_count from Parser with ty
+        Let j be 0
+        While j is less than tc:
+            Let te be proc node_child from Parser with ty, j
+            proc resolve_type with analyzer, te
+            Set j to j plus 1
+        End While
+        Return
+    End If
+    If nt is equal to Parser.RUST_DYN_TRAIT_TYPE:
+        Let dinner be proc node_child from Parser with ty, 0
+        proc resolve_type with analyzer, dinner
+        Return
+    End If
+    If nt is equal to Parser.RUST_IMPL_TRAIT_TYPE:
+        Let iinner be proc node_child from Parser with ty, 0
+        proc resolve_type with analyzer, iinner
+        Return
     End If
 End Process
 
 @Reasoning:
-Phase 2 performs trait resolution, type inference, and coherence
-checking. This must happen after declaration collection to handle
-forward references and complex trait bounds with associated types.
-The three sub-passes are ordered: resolve impls (wires up which type
-implements which trait) -> infer expression types (uses those impls
-to determine call return types) -> check trait bounds (verifies any
-where-clause constraints are satisfiable now that types are known).
+Returns the first path segment of a possibly-qualified name (`a::b::c` -> "a") as
+an owned copy.
 @End Reasoning
-
 @Implementation:
-Reads trait_resolver (offset 40) and type_inference (offset 48) sub-
-structure pointers. Invokes resolve_trait_implementations to walk all
-impl blocks registered in phase 1; then infer_expression_types to
-perform type inference across the AST using the resolved impl table;
-finally check_trait_bounds to validate where-clauses and bounds. No
-return value — errors are recorded via the analyzer's sticky-error
-mechanism rather than returned here.
+Scan to the first "::" or to NUL; copy the prefix into an owned buffer.
 @End Implementation
-
-Process called "resolve_rust_traits" takes analyzer as Integer, program_node as Integer:
-    Note: Resolve trait bounds and perform type inference
-
-    Let trait_resolver be proc memory_get_int64 from Layout with analyzer, 40
-    Let type_inference be proc memory_get_int64 from Layout with analyzer, 48
-
-    Note: Resolve all trait implementations and check coherence
-    proc resolve_trait_implementations with trait_resolver, program_node
-
-    Note: Perform type inference on all expressions
-    proc infer_expression_types with type_inference, program_node
-
-    Note: Check trait bound satisfaction
-    proc check_trait_bounds with trait_resolver, program_node
+Process called "path_head" takes name as Integer returns Integer:
+    If name is equal to 0:
+        Return 0
+    End If
+    Let i be 0
+    While 1 is equal to 1:
+        Let c be proc memory_get_byte from Layout with name, i
+        If c is equal to 0:
+            Break
+        End If
+        If c is equal to 58:
+            Let n be proc memory_get_byte from Layout with name, i plus 1
+            If n is equal to 58:
+                Break
+            End If
+        End If
+        Set i to i plus 1
+    End While
+    Let buf be proc allocate from Layout with i plus 1
+    If buf is equal to 0:
+        Return name
+    End If
+    Let j be 0
+    While j is less than i:
+        Let x be proc memory_get_byte from Layout with name, j
+        proc memory_set_byte from Layout with buf, j, x
+        Set j to j plus 1
+    End While
+    proc memory_set_byte from Layout with buf, i, 0
+    Return buf
 End Process
 
 @Reasoning:
-Indexes a struct declaration into global_scope keyed by name so later
-passes (trait resolution, type inference) can resolve references to
-the struct by name. Struct field information lives on the AST node
-itself; this routine just registers the entry point.
+Recognises the Rust primitive and ubiquitous std type names that are always in
+scope, avoiding false unresolved diagnostics for the common standard types.
 @End Reasoning
-
 @Implementation:
-Reads global_scope (analyzer offset 0) and struct_name (struct_node
-offset 8). On non-null name calls set on the Dict to register the
-mapping. Null names are skipped silently — the parser may emit them
-for malformed tuples or unit structs the user typed without identifier.
+Compare the head against each known name; return 1 on any match, else 0.
 @End Implementation
+Process called "is_primitive_type" takes name as Integer returns Integer:
+    Let e be 0
+    Set e to proc string_equals from StringCore with name, "i8"
+    If e is equal to 1:
+        Return 1
+    End If
+    Set e to proc string_equals from StringCore with name, "i16"
+    If e is equal to 1:
+        Return 1
+    End If
+    Set e to proc string_equals from StringCore with name, "i32"
+    If e is equal to 1:
+        Return 1
+    End If
+    Set e to proc string_equals from StringCore with name, "i64"
+    If e is equal to 1:
+        Return 1
+    End If
+    Set e to proc string_equals from StringCore with name, "i128"
+    If e is equal to 1:
+        Return 1
+    End If
+    Set e to proc string_equals from StringCore with name, "isize"
+    If e is equal to 1:
+        Return 1
+    End If
+    Set e to proc string_equals from StringCore with name, "u8"
+    If e is equal to 1:
+        Return 1
+    End If
+    Set e to proc string_equals from StringCore with name, "u16"
+    If e is equal to 1:
+        Return 1
+    End If
+    Set e to proc string_equals from StringCore with name, "u32"
+    If e is equal to 1:
+        Return 1
+    End If
+    Set e to proc string_equals from StringCore with name, "u64"
+    If e is equal to 1:
+        Return 1
+    End If
+    Set e to proc string_equals from StringCore with name, "u128"
+    If e is equal to 1:
+        Return 1
+    End If
+    Set e to proc string_equals from StringCore with name, "usize"
+    If e is equal to 1:
+        Return 1
+    End If
+    Set e to proc string_equals from StringCore with name, "f32"
+    If e is equal to 1:
+        Return 1
+    End If
+    Set e to proc string_equals from StringCore with name, "f64"
+    If e is equal to 1:
+        Return 1
+    End If
+    Set e to proc string_equals from StringCore with name, "bool"
+    If e is equal to 1:
+        Return 1
+    End If
+    Set e to proc string_equals from StringCore with name, "char"
+    If e is equal to 1:
+        Return 1
+    End If
+    Set e to proc string_equals from StringCore with name, "str"
+    If e is equal to 1:
+        Return 1
+    End If
+    Set e to proc string_equals from StringCore with name, "String"
+    If e is equal to 1:
+        Return 1
+    End If
+    Set e to proc string_equals from StringCore with name, "Vec"
+    If e is equal to 1:
+        Return 1
+    End If
+    Set e to proc string_equals from StringCore with name, "Option"
+    If e is equal to 1:
+        Return 1
+    End If
+    Set e to proc string_equals from StringCore with name, "Result"
+    If e is equal to 1:
+        Return 1
+    End If
+    Set e to proc string_equals from StringCore with name, "Box"
+    If e is equal to 1:
+        Return 1
+    End If
+    Set e to proc string_equals from StringCore with name, "Self"
+    If e is equal to 1:
+        Return 1
+    End If
+    Set e to proc string_equals from StringCore with name, "HashMap"
+    If e is equal to 1:
+        Return 1
+    End If
+    Set e to proc string_equals from StringCore with name, "Rc"
+    If e is equal to 1:
+        Return 1
+    End If
+    Set e to proc string_equals from StringCore with name, "Arc"
+    If e is equal to 1:
+        Return 1
+    End If
+    Return 0
+End Process
 
-Process called "collect_struct_declaration" takes analyzer as Integer, struct_node as Integer:
-    Note: Collect struct type information for later resolution
+Note: ============================================================================
+Note: Expression / statement walking
+Note: ============================================================================
 
-    Let global_scope be proc memory_get_int64 from Layout with analyzer, 0
-    Let struct_name be proc memory_get_int64 from Layout with struct_node, 8
+@Reasoning:
+Resolves identifier references and recurses into every sub-expression so name
+analysis covers entire function bodies. Identifiers are looked up in scope; bare
+self/Self and known primitives are always ok. Path expressions check only their
+head segment.
+@End Reasoning
+@Implementation:
+Dispatch on node_type. IDENTIFIER/PATH: resolve the head. Control-flow / block /
+closure expressions descend through their dedicated walkers. Field access walks only
+the object. Method call walks the receiver and args. Everything else walks all
+children.
+@End Implementation
+Process called "walk_expr" takes analyzer as Integer, node as Integer:
+    If node is equal to 0:
+        Return
+    End If
+    Let nt be proc node_type from Parser with node
 
-    If struct_name is not equal to 0:
-        proc set from Dict with global_scope, struct_name, struct_node
+    If nt is equal to Parser.RUST_IDENTIFIER:
+        proc resolve_ident with analyzer, node
+        Return
+    End If
+    If nt is equal to Parser.RUST_PATH:
+        proc resolve_ident with analyzer, node
+        Return
+    End If
+
+    If nt is equal to Parser.RUST_LITERAL:
+        Return
+    End If
+    If nt is equal to Parser.RUST_UNIT:
+        Return
+    End If
+    If nt is equal to Parser.RUST_CONTINUE:
+        Return
+    End If
+
+    If nt is equal to Parser.RUST_BLOCK_EXPR:
+        proc walk_block with analyzer, node
+        Return
+    End If
+    If nt is equal to Parser.RUST_IF_EXPR:
+        proc walk_if with analyzer, node
+        Return
+    End If
+    If nt is equal to Parser.RUST_IF_LET_EXPR:
+        proc walk_if_let with analyzer, node
+        Return
+    End If
+    If nt is equal to Parser.RUST_MATCH_EXPR:
+        proc walk_match with analyzer, node
+        Return
+    End If
+    If nt is equal to Parser.RUST_FOR_EXPR:
+        proc walk_for with analyzer, node
+        Return
+    End If
+    If nt is equal to Parser.RUST_WHILE_LET_EXPR:
+        proc walk_while_let with analyzer, node
+        Return
+    End If
+    If nt is equal to Parser.RUST_CLOSURE:
+        proc walk_closure with analyzer, node
+        Return
+    End If
+    If nt is equal to Parser.RUST_CAST:
+        Let cval be proc node_child from Parser with node, 0
+        proc walk_expr with analyzer, cval
+        Let cty be proc node_type_info from Parser with node
+        proc resolve_type with analyzer, cty
+        Return
+    End If
+    If nt is equal to Parser.RUST_STRUCT_EXPR:
+        proc walk_struct_expr with analyzer, node
+        Return
+    End If
+    If nt is equal to Parser.RUST_FIELD_ACCESS:
+        Let obj be proc node_child from Parser with node, 0
+        proc walk_expr with analyzer, obj
+        Return
+    End If
+
+    Note: default: walk all children as expressions (call, method, index, binary,
+    Note: unary, borrow, deref, range, tuple/array exprs, paren, while, loop,
+    Note: macro, return, break, try, await).
+    proc walk_children with analyzer, node
+End Process
+
+@Reasoning:
+Resolves a value identifier reference. "self", "_", and "()" are always ok; a
+primitive/std type name used in value position (e.g. Option, Vec) is ok; otherwise
+look up in scope and count an unresolved reference on miss.
+@End Reasoning
+@Implementation:
+Read the name; special-case self/_/(); compute the path head; if it is a primitive
+or resolves in scope, ok; else record_unresolved.
+@End Implementation
+Process called "resolve_ident" takes analyzer as Integer, node as Integer:
+    Let name be proc node_name from Parser with node
+    If name is equal to 0:
+        Return
+    End If
+
+    Let is_self be proc string_equals from StringCore with name, "self"
+    If is_self is equal to 1:
+        Return
+    End If
+    Let is_us be proc string_equals from StringCore with name, "_"
+    If is_us is equal to 1:
+        Return
+    End If
+    Let is_unit be proc string_equals from StringCore with name, "()"
+    If is_unit is equal to 1:
+        Return
+    End If
+
+    Let head be proc path_head with name
+    Let is_prim be proc is_primitive_type with head
+    If is_prim is equal to 1:
+        Return
+    End If
+
+    Let scope be proc cur_scope with analyzer
+    Let found be proc scope_lookup with scope, head
+    If found is equal to 0:
+        proc record_unresolved with analyzer
     End If
 End Process
 
 @Reasoning:
-Indexes an enum declaration into global_scope. Enums are referenced
-by name throughout type expressions and match arms, so name->node
-indexing is what enables later resolution of `MyEnum::Variant`
-patterns and trait impls on the enum.
+Walks every child of a node as an expression. Used for the many composite
+expression kinds whose children are all sub-expressions.
 @End Reasoning
-
 @Implementation:
-Reads global_scope (offset 0) and enum_name (enum_node offset 8).
-Non-null name triggers a Dict set; null name is silently skipped.
-Variant declarations live as children of the enum node and are
-not separately indexed — they're looked up via the parent enum.
+Iterate children 0..child_count, walk_expr each.
 @End Implementation
+Process called "walk_children" takes analyzer as Integer, node as Integer:
+    Let count be proc node_child_count from Parser with node
+    Let i be 0
+    While i is less than count:
+        Let child be proc node_child from Parser with node, i
+        proc walk_expr with analyzer, child
+        Set i to i plus 1
+    End While
+End Process
 
-Process called "collect_enum_declaration" takes analyzer as Integer, enum_node as Integer:
-    Note: Collect enum type information for later resolution
+@Reasoning:
+Walks a struct literal: each field-init value and any base spread is an expression.
+Field names are structural and not resolved as values.
+@End Reasoning
+@Implementation:
+For each child: a RUST_STRUCT_FIELD_INIT's child 0 is walked; any other child (the
+..base spread) is walked directly.
+@End Implementation
+Process called "walk_struct_expr" takes analyzer as Integer, node as Integer:
+    Let count be proc node_child_count from Parser with node
+    Let i be 0
+    While i is less than count:
+        Let child be proc node_child from Parser with node, i
+        Let ct be proc node_type from Parser with child
+        If ct is equal to Parser.RUST_STRUCT_FIELD_INIT:
+            Let val be proc node_child from Parser with child, 0
+            proc walk_expr with analyzer, val
+            Otherwise:
+            proc walk_expr with analyzer, child
+        End If
+        Set i to i plus 1
+    End While
+End Process
 
-    Let global_scope be proc memory_get_int64 from Layout with analyzer, 0
-    Let enum_name be proc memory_get_int64 from Layout with enum_node, 8
+@Reasoning:
+A block opens a fresh lexical block scope. Statements are analysed in order so a
+later statement sees bindings from earlier let statements.
+@End Reasoning
+@Implementation:
+push_scope(BLOCK); for each statement child walk_stmt; pop_scope.
+@End Implementation
+Process called "walk_block" takes analyzer as Integer, node as Integer:
+    Let scope be proc push_scope with analyzer, SCOPE_BLOCK, node
+    Let count be proc node_child_count from Parser with node
+    Let i be 0
+    While i is less than count:
+        Let stmt be proc node_child from Parser with node, i
+        proc walk_stmt with analyzer, stmt
+        Set i to i plus 1
+    End While
+    proc pop_scope with analyzer, scope
+End Process
 
-    If enum_name is not equal to 0:
-        proc set from Dict with global_scope, enum_name, enum_node
+@Reasoning:
+Analyses a single statement: let bindings register their pattern's names AFTER
+their initialiser is analysed (Rust let is not recursive); item statements register
+and recurse the inner item; expression statements walk their expression.
+@End Reasoning
+@Implementation:
+LET: resolve the annotation type, walk the initialiser (child 1 if present), THEN
+declare the pattern. ITEM: register the item name and analyze it. EXPR: walk the
+inner expression. Otherwise walk as an expression (tail).
+@End Implementation
+Process called "walk_stmt" takes analyzer as Integer, node as Integer:
+    If node is equal to 0:
+        Return
+    End If
+    Let nt be proc node_type from Parser with node
+
+    If nt is equal to Parser.RUST_LET_STMT:
+        Let ty be proc node_type_info from Parser with node
+        proc resolve_type with analyzer, ty
+        Let cc be proc node_child_count from Parser with node
+        If cc is greater than 1:
+            Let init be proc node_child from Parser with node, 1
+            proc walk_expr with analyzer, init
+        End If
+        Let pat be proc node_child from Parser with node, 0
+        proc declare_pattern with analyzer, pat
+        Return
+    End If
+
+    If nt is equal to Parser.RUST_ITEM_STMT:
+        Let inner be proc node_child from Parser with node, 0
+        Let iname be proc node_name from Parser with inner
+        Let scope be proc cur_scope with analyzer
+        If iname is not equal to 0:
+            proc scope_declare with analyzer, scope, iname, SYM_ITEM
+        End If
+        proc analyze_item with analyzer, inner
+        Return
+    End If
+
+    If nt is equal to Parser.RUST_EXPR_STMT:
+        Let expr be proc node_child from Parser with node, 0
+        proc walk_expr with analyzer, expr
+        Return
+    End If
+
+    proc walk_expr with analyzer, node
+End Process
+
+@Reasoning:
+if: walk the condition then each branch (then-block, optional else block/if).
+@End Reasoning
+@Implementation:
+walk child 0 (cond), child 1 (then); if a child 2 exists walk it.
+@End Implementation
+Process called "walk_if" takes analyzer as Integer, node as Integer:
+    Let cond be proc node_child from Parser with node, 0
+    proc walk_expr with analyzer, cond
+    Let then_blk be proc node_child from Parser with node, 1
+    proc walk_expr with analyzer, then_blk
+    Let cc be proc node_child_count from Parser with node
+    If cc is greater than 2:
+        Let elsebr be proc node_child from Parser with node, 2
+        proc walk_expr with analyzer, elsebr
     End If
 End Process
 
 @Reasoning:
-Traits go into the trait_resolver rather than global_scope because
-trait coherence checking (orphan rule, overlapping impl detection)
-needs a separate index. The trait resolver holds both definitions
-and impl blocks; this routine populates the definitions side.
+if-let binds the pattern over the then-block only. The scrutinee is analysed in the
+enclosing scope; the else branch in the enclosing scope.
 @End Reasoning
-
 @Implementation:
-Reads trait_resolver (analyzer offset 40) and trait_name (trait_node
-offset 8). On non-null name calls register_trait passing both the
-name and the node — the resolver wants the full AST for later
-inspection of supertraits, associated types, and default methods.
+walk the scrutinee (child 1). push a block scope, declare the pattern (child 0),
+walk the then-block (child 2), pop. If an else (child 3) exists, walk it.
 @End Implementation
+Process called "walk_if_let" takes analyzer as Integer, node as Integer:
+    Let scrut be proc node_child from Parser with node, 1
+    proc walk_expr with analyzer, scrut
 
-Process called "collect_trait_declaration" takes analyzer as Integer, trait_node as Integer:
-    Note: Collect trait information for trait resolution
+    Let scope be proc push_scope with analyzer, SCOPE_BLOCK, node
+    Let pat be proc node_child from Parser with node, 0
+    proc declare_pattern with analyzer, pat
+    Let then_blk be proc node_child from Parser with node, 2
+    proc walk_expr with analyzer, then_blk
+    proc pop_scope with analyzer, scope
 
-    Let trait_resolver be proc memory_get_int64 from Layout with analyzer, 40
-    Let trait_name be proc memory_get_int64 from Layout with trait_node, 8
-
-    If trait_name is not equal to 0:
-        proc register_trait with trait_resolver, trait_name, trait_node
+    Let cc be proc node_child_count from Parser with node
+    If cc is greater than 3:
+        Let elsebr be proc node_child from Parser with node, 3
+        proc walk_expr with analyzer, elsebr
     End If
 End Process
 
 @Reasoning:
-Impl blocks must be collected so the trait resolver can match calls
-to methods against the right impl. Coherence (orphan rule) and overlap
-checking happen later via check_trait_bounds; this routine just adds
-the impl to the list and lets the resolver index it later. Unlike
-struct/enum/trait, impl blocks have no name — they're identified by
-the trait+type pair.
+while-let mirrors if-let: scrutinee in the enclosing scope, pattern bindings over
+the body.
 @End Reasoning
-
 @Implementation:
-Reads trait_resolver at offset 40 and calls register_impl with the
-impl_node. No name lookup or dict insertion here because impls are
-keyed by (trait_id, self_type) which the resolver computes from the
-node's children — not exposed through a simple name slot.
+walk the scrutinee (child 1); push scope; declare pattern (child 0); walk the body
+(child 2); pop.
 @End Implementation
-
-Process called "collect_impl_declaration" takes analyzer as Integer, impl_node as Integer:
-    Note: Collect trait implementation for coherence checking
-
-    Let trait_resolver be proc memory_get_int64 from Layout with analyzer, 40
-    proc register_impl with trait_resolver, impl_node
+Process called "walk_while_let" takes analyzer as Integer, node as Integer:
+    Let scrut be proc node_child from Parser with node, 1
+    proc walk_expr with analyzer, scrut
+    Let scope be proc push_scope with analyzer, SCOPE_BLOCK, node
+    Let pat be proc node_child from Parser with node, 0
+    proc declare_pattern with analyzer, pat
+    Let body be proc node_child from Parser with node, 2
+    proc walk_expr with analyzer, body
+    proc pop_scope with analyzer, scope
 End Process
 
 @Reasoning:
-Top-level functions are indexed by name in global_scope. Function
-signatures (parameters and return type) live on the AST node and are
-read by trait resolution when checking calls against trait method
-signatures and by type inference when resolving call return types.
+match: the subject is analysed in the enclosing scope; each arm opens a scope
+binding its pattern over the (optional) guard and the arm body.
 @End Reasoning
-
 @Implementation:
-Reads global_scope (offset 0) and func_name (func_node offset 8).
-Non-null name triggers a Dict set; null name is silently skipped
-(closures and lambda bodies have anonymous structure). Note this
-only handles top-level/free functions — methods inside impl blocks
-are registered separately via the impl collection path.
+walk the subject (child 0). For each subsequent RUST_MATCH_ARM child: push scope,
+declare the arm pattern (arm child 0), walk the guard (arm value) if any, walk the
+arm body (arm last child), pop.
 @End Implementation
+Process called "walk_match" takes analyzer as Integer, node as Integer:
+    Let subject be proc node_child from Parser with node, 0
+    proc walk_expr with analyzer, subject
 
-Process called "collect_function_declaration" takes analyzer as Integer, func_node as Integer:
-    Note: Collect function signature for type checking
+    Let count be proc node_child_count from Parser with node
+    Let i be 1
+    While i is less than count:
+        Let arm be proc node_child from Parser with node, i
+        Let at be proc node_type from Parser with arm
+        If at is equal to Parser.RUST_MATCH_ARM:
+            Let scope be proc push_scope with analyzer, SCOPE_BLOCK, arm
+            Let pat be proc node_child from Parser with arm, 0
+            proc declare_pattern with analyzer, pat
+            Let guard be proc node_value from Parser with arm
+            proc walk_expr with analyzer, guard
+            Let armcc be proc node_child_count from Parser with arm
+            Let body be proc node_child from Parser with arm, armcc minus 1
+            proc walk_expr with analyzer, body
+            proc pop_scope with analyzer, scope
+        End If
+        Set i to i plus 1
+    End While
+End Process
 
-    Let global_scope be proc memory_get_int64 from Layout with analyzer, 0
-    Let func_name be proc memory_get_int64 from Layout with func_node, 8
+@Reasoning:
+for: the iterable is analysed in the enclosing scope; a scope binds the loop
+pattern over the body.
+@End Reasoning
+@Implementation:
+walk the iterable (child 1). push scope; declare the loop pattern (child 0); walk
+the body (child 2); pop.
+@End Implementation
+Process called "walk_for" takes analyzer as Integer, node as Integer:
+    Let iter be proc node_child from Parser with node, 1
+    proc walk_expr with analyzer, iter
+    Let scope be proc push_scope with analyzer, SCOPE_BLOCK, node
+    Let pat be proc node_child from Parser with node, 0
+    proc declare_pattern with analyzer, pat
+    Let body be proc node_child from Parser with node, 2
+    proc walk_expr with analyzer, body
+    proc pop_scope with analyzer, scope
+End Process
 
-    If func_name is not equal to 0:
-        proc set from Dict with global_scope, func_name, func_node
+@Reasoning:
+closure: a scope binds the closure parameters over the body. Parameter type
+annotations are resolved.
+@End Reasoning
+@Implementation:
+push scope. For each RUST_PARAM child (all but the last, the body): declare its
+pattern and resolve its type. Walk the body (last child). pop.
+@End Implementation
+Process called "walk_closure" takes analyzer as Integer, node as Integer:
+    Let scope be proc push_scope with analyzer, SCOPE_BLOCK, node
+    Let count be proc node_child_count from Parser with node
+    Let body_index be count minus 1
+
+    Let i be 0
+    While i is less than body_index:
+        Let param be proc node_child from Parser with node, i
+        Let pt be proc node_type from Parser with param
+        If pt is equal to Parser.RUST_PARAM:
+            Let ppat be proc node_child from Parser with param, 0
+            proc declare_pattern with analyzer, ppat
+            Let pty be proc node_type_info from Parser with param
+            proc resolve_type with analyzer, pty
+        End If
+        Set i to i plus 1
+    End While
+
+    If count is greater than 0:
+        Let body be proc node_child from Parser with node, body_index
+        proc walk_expr with analyzer, body
+    End If
+    proc pop_scope with analyzer, scope
+End Process
+
+Note: ============================================================================
+Note: Item analysis
+Note: ============================================================================
+
+@Reasoning:
+Analyses a function: a function scope binds its generic/lifetime params and value
+params; parameter and return types are resolved; the body is walked in that scope.
+@End Reasoning
+@Implementation:
+push FUNCTION scope. declare_generics. Analyse the param list. Resolve the return
+type. Walk the body block's statements directly in the function scope (params and
+locals share one scope). pop.
+@End Implementation
+Process called "analyze_function" takes analyzer as Integer, node as Integer:
+    Let scope be proc push_scope with analyzer, SCOPE_FUNCTION, node
+    Let generics be proc node_generics from Parser with node
+    proc declare_generics with analyzer, generics
+
+    Let count be proc node_child_count from Parser with node
+    Let i be 0
+    While i is less than count:
+        Let child be proc node_child from Parser with node, i
+        Let ct be proc node_type from Parser with child
+        If ct is equal to Parser.RUST_PARAM_LIST:
+            proc analyze_params with analyzer, child
+        End If
+        Set i to i plus 1
+    End While
+
+    Let ret be proc node_type_info from Parser with node
+    proc resolve_type with analyzer, ret
+
+    Let j be 0
+    While j is less than count:
+        Let child2 be proc node_child from Parser with node, j
+        Let ct2 be proc node_type from Parser with child2
+        If ct2 is equal to Parser.RUST_BLOCK_EXPR:
+            proc walk_function_body with analyzer, child2
+        End If
+        Set j to j plus 1
+    End While
+
+    proc pop_scope with analyzer, scope
+End Process
+
+@Reasoning:
+Declares function parameters into the current (function) scope and resolves their
+types. Self receivers declare "self"; ordinary params declare their pattern names.
+@End Reasoning
+@Implementation:
+For each RUST_PARAM: if it has a name (self receiver), declare it SYM_PARAM; else
+declare its pattern; resolve its type.
+@End Implementation
+Process called "analyze_params" takes analyzer as Integer, param_list as Integer:
+    Let scope be proc cur_scope with analyzer
+    Let count be proc node_child_count from Parser with param_list
+    Let i be 0
+    While i is less than count:
+        Let param be proc node_child from Parser with param_list, i
+        Let pname be proc node_name from Parser with param
+        If pname is not equal to 0:
+            proc scope_declare with analyzer, scope, pname, SYM_PARAM
+            Otherwise:
+            Let ppat be proc node_child from Parser with param, 0
+            proc declare_pattern with analyzer, ppat
+        End If
+        Let pty be proc node_type_info from Parser with param
+        proc resolve_type with analyzer, pty
+        Set i to i plus 1
+    End While
+End Process
+
+@Reasoning:
+Walks a function body's statements directly in the function scope (so parameters
+and body-locals share one scope), opening nested block scopes only for inner
+blocks.
+@End Reasoning
+@Implementation:
+For each statement child of the body block, walk_stmt in the current function
+scope.
+@End Implementation
+Process called "walk_function_body" takes analyzer as Integer, body as Integer:
+    Let count be proc node_child_count from Parser with body
+    Let i be 0
+    While i is less than count:
+        Let stmt be proc node_child from Parser with body, i
+        proc walk_stmt with analyzer, stmt
+        Set i to i plus 1
+    End While
+End Process
+
+@Reasoning:
+Analyses a struct/union/enum: a scope binds the type's generic params; field/variant
+types are resolved against that scope.
+@End Reasoning
+@Implementation:
+push a BLOCK scope for the generic params; declare_generics; resolve each field or
+variant payload type; pop.
+@End Implementation
+Process called "analyze_type_decl" takes analyzer as Integer, node as Integer:
+    Let scope be proc push_scope with analyzer, SCOPE_BLOCK, node
+    Let generics be proc node_generics from Parser with node
+    proc declare_generics with analyzer, generics
+
+    Let count be proc node_child_count from Parser with node
+    Let i be 0
+    While i is less than count:
+        Let child be proc node_child from Parser with node, i
+        Let ct be proc node_type from Parser with child
+        If ct is equal to Parser.RUST_FIELD_LIST:
+            proc resolve_field_types with analyzer, child
+        End If
+        If ct is equal to Parser.RUST_TUPLE_FIELDS:
+            proc resolve_field_types with analyzer, child
+        End If
+        If ct is equal to Parser.RUST_VARIANT_LIST:
+            proc resolve_variant_types with analyzer, child
+        End If
+        Set i to i plus 1
+    End While
+
+    proc pop_scope with analyzer, scope
+End Process
+
+@Reasoning:
+Resolves each field's declared type in a field list.
+@End Reasoning
+@Implementation:
+For each RUST_FIELD child, resolve its type_info.
+@End Implementation
+Process called "resolve_field_types" takes analyzer as Integer, field_list as Integer:
+    Let count be proc node_child_count from Parser with field_list
+    Let i be 0
+    While i is less than count:
+        Let field be proc node_child from Parser with field_list, i
+        Let ty be proc node_type_info from Parser with field
+        proc resolve_type with analyzer, ty
+        Set i to i plus 1
+    End While
+End Process
+
+@Reasoning:
+Resolves the payload types of each enum variant (tuple or struct fields).
+@End Reasoning
+@Implementation:
+For each RUST_VARIANT, for each of its field-list children, resolve field types.
+@End Implementation
+Process called "resolve_variant_types" takes analyzer as Integer, variant_list as Integer:
+    Let count be proc node_child_count from Parser with variant_list
+    Let i be 0
+    While i is less than count:
+        Let variant be proc node_child from Parser with variant_list, i
+        Let vc be proc node_child_count from Parser with variant
+        Let j be 0
+        While j is less than vc:
+            Let fields be proc node_child from Parser with variant, j
+            Let ft be proc node_type from Parser with fields
+            If ft is equal to Parser.RUST_FIELD_LIST:
+                proc resolve_field_types with analyzer, fields
+            End If
+            If ft is equal to Parser.RUST_TUPLE_FIELDS:
+                proc resolve_field_types with analyzer, fields
+            End If
+            Set j to j plus 1
+        End While
+        Set i to i plus 1
+    End While
+End Process
+
+@Reasoning:
+Analyses a trait or impl: a scope binds the impl/trait generics and "Self";
+contained methods are pre-registered so they can reference each other, then each is
+analysed. For an impl the target type and any implemented trait reference are
+resolved.
+@End Reasoning
+@Implementation:
+push an IMPL/TRAIT scope; declare_generics; declare "Self"; for an impl resolve the
+target type (type_info) and trait reference (value); pre-register each associated
+function name; analyse each associated item.
+@End Implementation
+Process called "analyze_trait_or_impl" takes analyzer as Integer, node as Integer:
+    Let nt be proc node_type from Parser with node
+    Let kind be SCOPE_IMPL
+    If nt is equal to Parser.RUST_TRAIT:
+        Set kind to SCOPE_TRAIT
+    End If
+
+    Let scope be proc push_scope with analyzer, kind, node
+    Let generics be proc node_generics from Parser with node
+    proc declare_generics with analyzer, generics
+    proc scope_declare with analyzer, scope, "Self", SYM_TYPE_PARAM
+
+    If nt is equal to Parser.RUST_IMPL:
+        Let target be proc node_type_info from Parser with node
+        proc resolve_type with analyzer, target
+        Let trait_ref be proc node_value from Parser with node
+        proc resolve_type with analyzer, trait_ref
+    End If
+
+    Let count be proc node_child_count from Parser with node
+    Let i be 0
+    While i is less than count:
+        Let child be proc node_child from Parser with node, i
+        Let ct be proc node_type from Parser with child
+        If ct is equal to Parser.RUST_ITEM_LIST:
+            Let ic be proc node_child_count from Parser with child
+            Let p be 0
+            While p is less than ic:
+                Let item be proc node_child from Parser with child, p
+                Let iname be proc node_name from Parser with item
+                If iname is not equal to 0:
+                    proc scope_declare with analyzer, scope, iname, SYM_ITEM
+                End If
+                Set p to p plus 1
+            End While
+            Let q be 0
+            While q is less than ic:
+                Let item2 be proc node_child from Parser with child, q
+                proc analyze_item with analyzer, item2
+                Set q to q plus 1
+            End While
+        End If
+        Set i to i plus 1
+    End While
+
+    proc pop_scope with analyzer, scope
+End Process
+
+@Reasoning:
+Analyses an inline module with the same two-pass structure as the crate root.
+@End Reasoning
+@Implementation:
+push MODULE scope; collect_items; for each item child analyze_item; pop.
+@End Implementation
+Process called "analyze_module" takes analyzer as Integer, node as Integer:
+    Let scope be proc push_scope with analyzer, SCOPE_MODULE, node
+    proc collect_items with analyzer, node
+    Let count be proc node_child_count from Parser with node
+    Let i be 0
+    While i is less than count:
+        Let child be proc node_child from Parser with node, i
+        proc analyze_item with analyzer, child
+        Set i to i plus 1
+    End While
+    proc pop_scope with analyzer, scope
+End Process
+
+@Reasoning:
+Item-level dispatch for the analysis walk.
+@End Reasoning
+@Implementation:
+On node_type route to analyze_function / analyze_type_decl /
+analyze_trait_or_impl / analyze_module; const/static resolve their type and walk
+their initialiser; type alias resolves its aliased type; use needs no analysis.
+@End Implementation
+Process called "analyze_item" takes analyzer as Integer, node as Integer:
+    If node is equal to 0:
+        Return
+    End If
+    Let nt be proc node_type from Parser with node
+
+    If nt is equal to Parser.RUST_FUNCTION:
+        proc analyze_function with analyzer, node
+        Return
+    End If
+    If nt is equal to Parser.RUST_STRUCT:
+        proc analyze_type_decl with analyzer, node
+        Return
+    End If
+    If nt is equal to Parser.RUST_UNION:
+        proc analyze_type_decl with analyzer, node
+        Return
+    End If
+    If nt is equal to Parser.RUST_ENUM:
+        proc analyze_type_decl with analyzer, node
+        Return
+    End If
+    If nt is equal to Parser.RUST_TRAIT:
+        proc analyze_trait_or_impl with analyzer, node
+        Return
+    End If
+    If nt is equal to Parser.RUST_IMPL:
+        proc analyze_trait_or_impl with analyzer, node
+        Return
+    End If
+    If nt is equal to Parser.RUST_MODULE:
+        proc analyze_module with analyzer, node
+        Return
+    End If
+    If nt is equal to Parser.RUST_CONST:
+        Let cty be proc node_type_info from Parser with node
+        proc resolve_type with analyzer, cty
+        Let ccount be proc node_child_count from Parser with node
+        If ccount is greater than 0:
+            Let init be proc node_child from Parser with node, 0
+            proc walk_expr with analyzer, init
+        End If
+        Return
+    End If
+    If nt is equal to Parser.RUST_STATIC:
+        Let sty be proc node_type_info from Parser with node
+        proc resolve_type with analyzer, sty
+        Let scount be proc node_child_count from Parser with node
+        If scount is greater than 0:
+            Let sinit be proc node_child from Parser with node, 0
+            proc walk_expr with analyzer, sinit
+        End If
+        Return
+    End If
+    If nt is equal to Parser.RUST_TYPE_ALIAS:
+        Let aty be proc node_type_info from Parser with node
+        proc resolve_type with analyzer, aty
+        Return
     End If
 End Process
 
+Note: ============================================================================
+Note: Public entry point
+Note: ============================================================================
+
 @Reasoning:
-Lifetime context is a separate substructure because lifetime parameters
-have different scoping rules than ownership: a named lifetime `'a`
-threads through multiple impl blocks and trait bounds, while ownership
-is purely function-local. Splitting them lets each be reset
-independently at scope boundaries.
+Top-level analysis driver. Performs the two-pass crate resolution: first register
+every top-level item name in the global scope (so forward references resolve), then
+analyse each item's signature and body. Returns 1 when no errors/unresolved
+references were recorded, 0 otherwise.
 @End Reasoning
-
 @Implementation:
-32-byte struct (4 x i64): lifetime_stack at offset 0 (List for nested
-scopes), named_lifetimes at offset 8 (Dict mapping `'a` name -> bound
-info), and two reserved slots at offsets 16 and 24 (currently zero —
-held for future fields like elision rule state or implicit-lifetime
-counters). OOM returns 0.
+Null-guard analyzer and ast. collect_items over the program (global scope). For each
+program child analyze_item. Read error_count + unresolved_count; return 1 if both
+are 0, else 0.
 @End Implementation
-
-Process called "create_lifetime_context" returns Integer:
-    Note: Create lifetime tracking context for borrow checker
-
-    Let context_size be 32
-    Let context be proc allocate from Layout with context_size
-
-    If context is equal to 0:
+Process called "analyze_rust_program" takes analyzer as Integer, ast as Integer returns Integer:
+    If analyzer is equal to 0:
+        Return 0
+    End If
+    If ast is equal to 0:
         Return 0
     End If
 
-    Let lifetime_stack be proc create from List
-    Let named_lifetimes be proc create from Dict
+    proc collect_items with analyzer, ast
 
-    proc memory_set_int64 from Layout with context, 0, lifetime_stack
-    proc memory_set_int64 from Layout with context, 8, named_lifetimes
-    proc memory_set_int64 from Layout with context, 16, 0
-    proc memory_set_int64 from Layout with context, 24, 0
+    Let count be proc node_child_count from Parser with ast
+    Let i be 0
+    While i is less than count:
+        Let item be proc node_child from Parser with ast, i
+        proc analyze_item with analyzer, item
+        Set i to i plus 1
+    End While
 
-    Return context
-End Process
-
-@Reasoning:
-Borrow checker holds three primary data structures: scope_stack for
-nested block lexical scopes, active_borrows for the (source, borrow_kind)
-map, and moved_variables for variables that have been consumed.
-Reserved slots leave headroom for future state without re-allocating
-the struct (loan invalidation queue, two-phase borrow tracking, etc.).
-@End Reasoning
-
-@Implementation:
-48-byte struct (6 x i64). Offsets: scope_stack (0), active_borrows (8),
-moved_variables (16), then three reserved slots at 24/32/40 zero-init.
-OOM returns 0. Three sub-collections created up-front so subsequent
-operations never need to check for null sub-structures.
-@End Implementation
-
-Process called "create_borrow_checker" returns Integer:
-    Note: Create borrow checker for ownership analysis
-
-    Let checker_size be 48
-    Let checker be proc allocate from Layout with checker_size
-
-    If checker is equal to 0:
+    Let errors be proc memory_get_int64 from Layout with analyzer, 24
+    Let unresolved be proc memory_get_int64 from Layout with analyzer, 32
+    If errors is greater than 0:
         Return 0
     End If
-
-    Let scope_stack be proc create from List
-    Let active_borrows be proc create from Dict
-    Let moved_variables be proc create from List
-
-    proc memory_set_int64 from Layout with checker, 0, scope_stack
-    proc memory_set_int64 from Layout with checker, 8, active_borrows
-    proc memory_set_int64 from Layout with checker, 16, moved_variables
-    proc memory_set_int64 from Layout with checker, 24, 0
-    proc memory_set_int64 from Layout with checker, 32, 0
-    proc memory_set_int64 from Layout with checker, 40, 0
-
-    Return checker
-End Process
-
-@Reasoning:
-Trait resolver indexes trait definitions, impl blocks, and a coherence
-cache. The cache is essential because method-lookup queries during type
-inference would otherwise repeatedly traverse the entire impl list;
-caching (trait, type) -> resolution lets each query be O(1) after the
-first lookup.
-@End Reasoning
-
-@Implementation:
-40-byte struct (5 x i64). Offsets: trait_definitions (0, Dict by trait
-name), impl_blocks (8, List of impl AST nodes), coherence_cache (16,
-Dict keyed on (trait_id, type_id)), then two reserved slots at 24/32
-for future fields like associated-type-binding tables. OOM returns 0.
-@End Implementation
-
-Process called "create_trait_resolver" returns Integer:
-    Note: Create trait resolution engine
-
-    Let resolver_size be 40
-    Let resolver be proc allocate from Layout with resolver_size
-
-    If resolver is equal to 0:
+    If unresolved is greater than 0:
         Return 0
     End If
-
-    Let trait_definitions be proc create from Dict
-    Let impl_blocks be proc create from List
-    Let coherence_cache be proc create from Dict
-
-    proc memory_set_int64 from Layout with resolver, 0, trait_definitions
-    proc memory_set_int64 from Layout with resolver, 8, impl_blocks
-    proc memory_set_int64 from Layout with resolver, 16, coherence_cache
-    proc memory_set_int64 from Layout with resolver, 24, 0
-    proc memory_set_int64 from Layout with resolver, 32, 0
-
-    Return resolver
+    Return 1
 End Process
 
 @Reasoning:
-Type inference uses Hindley-Milner-style constraint generation and
-resolution. The engine separates type_variables (the universe of
-introduced unification variables) from constraints (equalities and
-subtype relations to be resolved). Splitting them lets the resolver
-add new constraints during unification without invalidating the
-variable iteration.
+Returns the number of unresolved references recorded - a finer diagnostic the
+driver can surface separately from hard errors.
 @End Reasoning
-
 @Implementation:
-32-byte struct (4 x i64). Offsets: type_variables (0, Dict keyed by
-type-var id), constraints (8, List of constraint records). Two
-reserved slots at 16/24 for future fields (e.g., inference depth
-counter, unification log). OOM returns 0.
+Null-guard; read offset 32.
 @End Implementation
-
-Process called "create_type_inference_engine" returns Integer:
-    Note: Create type inference system for generic resolution
-
-    Let engine_size be 32
-    Let engine be proc allocate from Layout with engine_size
-
-    If engine is equal to 0:
+Process called "rust_semantic_unresolved_count" takes analyzer as Integer returns Integer:
+    If analyzer is equal to 0:
         Return 0
     End If
-
-    Let type_variables be proc create from Dict
-    Let constraints be proc create from List
-
-    proc memory_set_int64 from Layout with engine, 0, type_variables
-    proc memory_set_int64 from Layout with engine, 8, constraints
-    proc memory_set_int64 from Layout with engine, 16, 0
-    proc memory_set_int64 from Layout with engine, 24, 0
-
-    Return engine
+    Return proc memory_get_int64 from Layout with analyzer, 32
 End Process
 
 @Reasoning:
-Records the first error encountered. First-error-wins semantics avoid
-cascade failures where one borrow-check violation produces a stream of
-follow-on errors that obscure the original cause. The message is copied
-into a buffer the analyzer owns so the caller's transient string can
-be freed independently.
+Returns the total error count (duplicate bindings etc.) for the driver.
 @End Reasoning
-
 @Implementation:
-Writes 1 to has_error at offset 64 (sticky flag — never cleared by
-this routine). Calls copy_string from StringCore for an owned copy of
-the message, stores the pointer at offset 56 (error_message). No
-previous error message is freed here — first-set-wins, so subsequent
-calls silently overwrite the pointer slot but the underlying buffer
-from the first call leaks until the analyzer is destroyed. The analyzer
-destructor (not present in this file's API but implied by the contract)
-must release whatever is currently at offset 56.
+Null-guard; read offset 24.
 @End Implementation
-
-Process called "set_rust_semantic_error" takes analyzer as Integer, message as Integer:
-    Note: Set semantic analyzer error state
-
-    proc memory_set_int64 from Layout with analyzer, 64, 1
-
-    Let error_copy be proc copy_string from StringCore with message
-    proc memory_set_int64 from Layout with analyzer, 56, error_copy
+Process called "rust_semantic_error_count" takes analyzer as Integer returns Integer:
+    If analyzer is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Layout with analyzer, 24
 End Process

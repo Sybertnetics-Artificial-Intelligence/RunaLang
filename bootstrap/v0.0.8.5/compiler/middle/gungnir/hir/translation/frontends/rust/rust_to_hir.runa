@@ -4,974 +4,1815 @@ Licensed under the Apache License, Version 2.0
 :End Note
 
 Note:
-Rust to HIR Translator - Convert Rust AST to High-level Intermediate Representation
-Handles ownership semantics, trait implementations, lifetimes, and borrowing patterns.
+Rust to HIR Translator - lowers a Rust AST (rust_parser RustASTNode tree) into
+the canonical hir.runa create_hir_node IR consumed by hir_to_rust.
+
+The HIR model here is hir.runa's typed-node model (NOT the dict/list literal
+model used by c/go/json/csharp/cpp): every node is a 104-byte HIRNode built by
+create_hir_node(node_type, line, column); the textual payload lives in the value
+slot (set via set_hir_node_value with a value_type tag); children hang off the
+children list (built via add_hir_node, which also maintains child_count). This is
+exactly the shape hir_to_rust reads through node_type_of / node_value /
+node_value_type / node_child / node_child_count, so the two halves round-trip.
+
+Lowering map (Rust AST -> HIR):
+  program            -> HIR_MODULE_DEFINITION (name "crate")
+  fn                 -> HIR_PROCESS_DEFINITION: value=name; param Lets; return
+                        type (value_type 1); HIR_BLOCK_STATEMENT body.
+  struct / union     -> HIR_TYPE_DEFINITION: value=name; HIR_FIELD_DEFINITION kids.
+  enum               -> HIR_TYPE_DEFINITION: value=name; HIR_VARIANT_DEFINITION kids.
+  trait / impl       -> HIR_MODULE_DEFINITION grouping the lowered methods so the
+                        backend emits each fn (impl/trait bodies become methods).
+  mod                -> HIR_MODULE_DEFINITION: value=name; lowered item kids.
+  use                -> HIR_IMPORT_STATEMENT: value=path.
+  const / static     -> HIR_DEFINE_STATEMENT: value=name; type(value_type 1); init.
+  type alias         -> HIR_DEFINE_STATEMENT (name + aliased type).
+  let                -> HIR_LET_STATEMENT: value=name; type(value_type 1); init.
+  expr stmt          -> HIR_EXPRESSION_STATEMENT wrapping the expression.
+  if / if-let        -> HIR_IF_STATEMENT (cond, then-block, else-block).
+  match              -> HIR_MATCH_STATEMENT (subject, HIR_WHEN_CLAUSE arms).
+  loop/while/while-let-> HIR_LOOP_STATEMENT / HIR_WHILE_STATEMENT.
+  for                -> HIR_FOR_STATEMENT (var Let, iterable, body).
+  return/break/cont  -> HIR_RETURN/BREAK/CONTINUE_STATEMENT.
+  literals/idents    -> HIR_LITERAL / HIR_IDENTIFIER.
+  binary/unary       -> HIR_BINARY_EXPRESSION / HIR_UNARY_EXPRESSION with Runa op
+                        words (the backend maps Runa words -> Rust symbols).
+  call/method/macro  -> HIR_CALL_EXPRESSION (callee + args).
+  field/tuple access -> HIR_MEMBER_EXPRESSION (value=field; child0=object).
+  index              -> HIR_INDEX_EXPRESSION.
+  range              -> HIR_RANGE_EXPRESSION (start, end).
+  struct literal     -> HIR_RECORD_LITERAL (value=type; HIR_FIELD_DEFINITION inits).
+  array/tuple expr   -> HIR_ARRAY_LITERAL / HIR_TUPLE_LITERAL.
+  closure            -> HIR_LAMBDA_EXPRESSION (param Lets + body).
+  cast               -> HIR_CAST_EXPRESSION (value, target type).
+  ?, .await, paren   -> wrapped faithfully (try -> call to a synthetic, await ->
+                        member, paren -> HIR_PARENTHESIZED).
+  types              -> HIR_BASIC_TYPE / GENERIC / REFERENCE / OPTIONAL / ARRAY /
+                        TUPLE as the backend's emit_type expects.
+  patterns           -> HIR_WILDCARD/IDENTIFIER/LITERAL/TUPLE/VARIANT_PATTERN.
+
+Dependencies:
+- compiler/middle/gungnir/hir/hir.runa
+- rust_parser.runa, rust_semantic.runa
+- primitives: layout, string_core, list
 :End Note
 
-Import "compiler/middle/gungnir/hir/hir_nodes.runa" as HIR
+Import "compiler/middle/gungnir/hir/hir.runa" as HIR
 Import "compiler/middle/gungnir/hir/translation/frontends/rust/rust_parser.runa" as Parser
 Import "compiler/middle/gungnir/hir/translation/frontends/rust/rust_semantic.runa" as Semantic
 Import "compiler/frontend/primitives/memory/layout.runa" as Layout
 Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
 Import "compiler/frontend/primitives/collections/list.runa" as List
-Import "compiler/frontend/primitives/collections/dictionary.runa" as Dict
+
+Note: HIR literal value_type tags as read by hir_to_rust.emit_literal:
+Note:   0/1 numeric, 2 string, 3 boolean, 4 null.
+Constant HIRLIT_NUMERIC as Integer is 0
+Constant HIRLIT_STRING as Integer is 2
+Constant HIRLIT_BOOL as Integer is 3
+
+Note: ============================================================================
+Note: Small helpers over the canonical HIR builder
+Note: ============================================================================
 
 @Reasoning:
-Rust-to-HIR translation is stateful: it tracks a scope chain (because Rust's
-lexical scoping affects how Let bindings, generic parameter binders, and
-trait method dispatch resolve), a lifetime annotation context (Rust's `'a`
-parameters must be threaded into HIR's lifetime model), and a trait mapping
-table for resolving method calls back to their trait declarations. Keeping
-these fields in a single heap-resident state struct lets the recursive
-translate_rust_* family pass a single pointer everywhere.
+Thin wrapper to create a HIR node at line/column 0 (source positions are not
+threaded through the translation pipeline; the backend ignores them). Centralises
+the create_hir_node call so the lowering reads cleanly.
 @End Reasoning
 @Implementation:
-48-byte layout: current_scope@0, scope_stack@8, lifetime_context@16,
-trait_mappings@24, error_message@32, has_error@40. current_scope is the top
-of scope_stack cached at offset 0 for O(1) access in the hot translation
-path; entering/exiting a scope updates both.
+Returns create_hir_node(node_type, 0, 0).
 @End Implementation
-Type called "RustToHIRTranslator":
-    current_scope as Integer
-    scope_stack as Integer
-    lifetime_context as Integer
-    trait_mappings as Integer
-    error_message as Integer
-    has_error as Integer
-End Type
-
-@Reasoning:
-Factory rather than constructor literal because the translator owns three
-collections (scope stack list, lifetime dictionary, trait dictionary) that
-must be created at allocation time so the recursive translate_rust_*
-routines can blindly read them without null-checks.
-@End Reasoning
-@Implementation:
-Allocate 48 bytes via Layout; on success, create the scope list and two
-dictionaries; zero current_scope, error_message, and has_error. Allocation
-failure returns 0 so callers can fail fast.
-@End Implementation
-Process called "create_rust_to_hir_translator" returns Integer:
-    Note: Create Rust to HIR translator with ownership preservation
-
-    @Reasoning:
-    Rust to HIR translation must preserve ownership semantics, lifetime
-    information, and trait bounds while converting to the intermediate
-    representation that can be consumed by backend code generators.
-    @End Reasoning
-
-    Let translator_size be 48
-    Let translator be proc allocate from Layout with translator_size
-
-    If translator is equal to 0:
-        Return 0
-    End If
-
-    Let scope_stack be proc create from List
-    Let lifetime_context be proc create from Dict
-    Let trait_mappings be proc create from Dict
-
-    proc memory_set_int64 from Layout with translator, 0, 0
-    proc memory_set_int64 from Layout with translator, 8, scope_stack
-    proc memory_set_int64 from Layout with translator, 16, lifetime_context
-    proc memory_set_int64 from Layout with translator, 24, trait_mappings
-    proc memory_set_int64 from Layout with translator, 32, 0
-    proc memory_set_int64 from Layout with translator, 40, 0
-
-    Return translator
+Process called "new_hir" takes node_type as Integer returns Integer:
+    Return proc create_hir_node from HIR with node_type, 0, 0
 End Process
 
 @Reasoning:
-The Rust AST root carries a children list at offset 32 (the parser's
-convention for "container of items"). Translating the program is therefore a
-linear walk over those items, with each result attached to a fresh
-HIR_PROGRAM node. Errors at this level are sentinel HIR error nodes rather
-than nulls so the consumer doesn't have to special-case missing program data.
+Sets a string payload with the string value_type tag so the backend's literal and
+identifier paths read it as text. For identifiers/types the value_type is
+irrelevant to the backend (it reads node_value directly) but we tag string so the
+pair is self-consistent.
 @End Reasoning
 @Implementation:
-Null-check both inputs and return a HIR error node on failure. Read children
-list from offset 32, iterate with proc size/get from List, dispatch each to
-translate_rust_item, and attach non-null results to hir_program. Children
-that fail translation (return 0) are silently skipped because translate_rust_item
-already records an HIR error for them.
+set_hir_node_value(node, text, HIRLIT_STRING).
+@End Implementation
+Process called "set_text" takes node as Integer, text as Integer:
+    proc set_hir_node_value from HIR with node, text, HIRLIT_STRING
+End Process
+
+@Reasoning:
+Appends a child via the canonical add_hir_node which maintains both the children
+list (offset 24) and child_count (offset 32) the backend reads.
+@End Reasoning
+@Implementation:
+add_hir_node(parent, child) when both non-null.
+@End Implementation
+Process called "attach" takes parent as Integer, child as Integer:
+    If parent is equal to 0:
+        Return
+    End If
+    If child is equal to 0:
+        Return
+    End If
+    proc add_hir_node from HIR with parent, child
+End Process
+
+@Reasoning:
+Marks a node as a type carrier by setting its value_type slot to 1, the
+convention the backend uses to distinguish a function's/Let's return-or-annotation
+type child from value children (emit_function / emit_let test value_type == 1).
+@End Reasoning
+@Implementation:
+Read the node's current value (offset 40) and re-set with value_type 1 so the type
+flag is on without disturbing the payload.
+@End Implementation
+Process called "mark_as_type" takes node as Integer:
+    If node is equal to 0:
+        Return
+    End If
+    Let v be proc memory_get_int64 from Layout with node, 40
+    proc set_hir_node_value from HIR with node, v, 1
+End Process
+
+Note: ============================================================================
+Note: Operator mapping: Rust symbols -> Runa operator words
+Note: ============================================================================
+
+@Reasoning:
+The backend's emit_binary maps Runa operator WORDS ("plus", "is equal to") to Rust
+SYMBOLS. So the lowering must convert the Rust operator symbols the parser captured
+("+", "==") into those Runa words; otherwise the backend passes them through
+verbatim and the round-trip still works textually, but using the canonical words
+keeps the HIR uniform with every other frontend. Unknown operators pass through.
+@End Reasoning
+@Implementation:
+Compare the op text against each Rust symbol and return the corresponding Runa
+word; default returns the input.
+@End Implementation
+Process called "map_binary_op" takes op as Integer returns Integer:
+    Let e be 0
+    Set e to proc string_equals from StringCore with op, "+"
+    If e is equal to 1:
+        Return "plus"
+    End If
+    Set e to proc string_equals from StringCore with op, "-"
+    If e is equal to 1:
+        Return "minus"
+    End If
+    Set e to proc string_equals from StringCore with op, "*"
+    If e is equal to 1:
+        Return "multiplied by"
+    End If
+    Set e to proc string_equals from StringCore with op, "/"
+    If e is equal to 1:
+        Return "divided by"
+    End If
+    Set e to proc string_equals from StringCore with op, "%"
+    If e is equal to 1:
+        Return "modulo"
+    End If
+    Set e to proc string_equals from StringCore with op, "=="
+    If e is equal to 1:
+        Return "is equal to"
+    End If
+    Set e to proc string_equals from StringCore with op, "!="
+    If e is equal to 1:
+        Return "is not equal to"
+    End If
+    Set e to proc string_equals from StringCore with op, "<"
+    If e is equal to 1:
+        Return "is less than"
+    End If
+    Set e to proc string_equals from StringCore with op, ">"
+    If e is equal to 1:
+        Return "is greater than"
+    End If
+    Set e to proc string_equals from StringCore with op, "<="
+    If e is equal to 1:
+        Return "is less than or equal to"
+    End If
+    Set e to proc string_equals from StringCore with op, ">="
+    If e is equal to 1:
+        Return "is greater than or equal to"
+    End If
+    Set e to proc string_equals from StringCore with op, "&&"
+    If e is equal to 1:
+        Return "and"
+    End If
+    Set e to proc string_equals from StringCore with op, "||"
+    If e is equal to 1:
+        Return "or"
+    End If
+    Set e to proc string_equals from StringCore with op, "&"
+    If e is equal to 1:
+        Return "bitwise and"
+    End If
+    Set e to proc string_equals from StringCore with op, "|"
+    If e is equal to 1:
+        Return "bitwise or"
+    End If
+    Set e to proc string_equals from StringCore with op, "^"
+    If e is equal to 1:
+        Return "bitwise xor"
+    End If
+    Set e to proc string_equals from StringCore with op, "<<"
+    If e is equal to 1:
+        Return "shifted left by"
+    End If
+    Set e to proc string_equals from StringCore with op, ">>"
+    If e is equal to 1:
+        Return "shifted right by"
+    End If
+    Return op
+End Process
+
+@Reasoning:
+Maps Rust unary operator symbols to the Runa unary words the backend's
+rust_map_unary_op recognises: '-' -> negate, '!' -> not.
+@End Reasoning
+@Implementation:
+Compare and return the Runa word; default returns the input.
+@End Implementation
+Process called "map_unary_op" takes op as Integer returns Integer:
+    Let e be 0
+    Set e to proc string_equals from StringCore with op, "-"
+    If e is equal to 1:
+        Return "negate"
+    End If
+    Set e to proc string_equals from StringCore with op, "!"
+    If e is equal to 1:
+        Return "not"
+    End If
+    Return op
+End Process
+
+Note: ============================================================================
+Note: Types
+Note: ============================================================================
+
+@Reasoning:
+Lowers a Rust AST type node into the HIR type node the backend's emit_type expects:
+path types become HIR_BASIC_TYPE (or HIR_GENERIC_TYPE when they carry type args),
+references become HIR_REFERENCE_TYPE (mut flag in value_type), arrays/slices become
+HIR_ARRAY_TYPE, tuples become HIR_TUPLE_TYPE. The well-known Option<T> path lowers
+to HIR_OPTIONAL_TYPE so it re-emits as Option<T> idiomatically.
+@End Reasoning
+@Implementation:
+Dispatch on the AST node_type. Path: read the name; if it has child type-args
+build a HIR_GENERIC_TYPE (value=name) with lowered arg children, recognising
+"Option" with one arg as HIR_OPTIONAL_TYPE; otherwise HIR_BASIC_TYPE (value=name).
+Reference: HIR_REFERENCE_TYPE, value_type=mutability, child0=lowered inner.
+Pointer: same shape (the backend renders *const/*mut from value_type). Array:
+HIR_ARRAY_TYPE with the element child. Slice: HIR_ARRAY_TYPE (closest emit). Tuple:
+HIR_TUPLE_TYPE with element children. Unit: HIR_BASIC_TYPE "Nothing". Dyn/impl: the
+inner path type. Returns 0 for a null input.
+@End Implementation
+Process called "lower_type" takes node as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    Let nt be proc node_type from Parser with node
+
+    If nt is equal to Parser.RUST_PATH_TYPE:
+        Let name be proc node_name from Parser with node
+        Let argc be proc node_child_count from Parser with node
+        If argc is greater than 0:
+            Note: generic instantiation; Option<T> -> HIR_OPTIONAL_TYPE
+            Let is_opt be proc string_equals from StringCore with name, "Option"
+            If is_opt is equal to 1:
+                If argc is equal to 1:
+                    Let opt be proc new_hir with HIR.HIR_OPTIONAL_TYPE
+                    Let inner0 be proc node_child from Parser with node, 0
+                    Let lowered0 be proc lower_type with inner0
+                    proc attach with opt, lowered0
+                    Return opt
+                End If
+            End If
+            Let gen be proc new_hir with HIR.HIR_GENERIC_TYPE
+            proc set_text with gen, name
+            Let i be 0
+            While i is less than argc:
+                Let arg be proc node_child from Parser with node, i
+                Let larg be proc lower_type with arg
+                proc attach with gen, larg
+                Set i to i plus 1
+            End While
+            Return gen
+        End If
+        Let basic be proc new_hir with HIR.HIR_BASIC_TYPE
+        proc set_text with basic, name
+        Return basic
+    End If
+
+    If nt is equal to Parser.RUST_REFERENCE_TYPE:
+        Let ref be proc new_hir with HIR.HIR_REFERENCE_TYPE
+        Let mut be proc node_mutability from Parser with node
+        proc set_hir_node_value from HIR with ref, 0, mut
+        Let inner be proc node_child from Parser with node, 0
+        Let li be proc lower_type with inner
+        proc attach with ref, li
+        Return ref
+    End If
+
+    If nt is equal to Parser.RUST_POINTER_TYPE:
+        Let ptr be proc new_hir with HIR.HIR_REFERENCE_TYPE
+        Let pmut be proc node_mutability from Parser with node
+        proc set_hir_node_value from HIR with ptr, 0, pmut
+        Let pinner be proc node_child from Parser with node, 0
+        Let pli be proc lower_type with pinner
+        proc attach with ptr, pli
+        Return ptr
+    End If
+
+    If nt is equal to Parser.RUST_ARRAY_TYPE:
+        Let arr be proc new_hir with HIR.HIR_ARRAY_TYPE
+        Let aelem be proc node_child from Parser with node, 0
+        Let lae be proc lower_type with aelem
+        proc attach with arr, lae
+        Return arr
+    End If
+
+    If nt is equal to Parser.RUST_SLICE_TYPE:
+        Let sl be proc new_hir with HIR.HIR_ARRAY_TYPE
+        Let selem be proc node_child from Parser with node, 0
+        Let lse be proc lower_type with selem
+        proc attach with sl, lse
+        Return sl
+    End If
+
+    If nt is equal to Parser.RUST_TUPLE_TYPE:
+        Let tup be proc new_hir with HIR.HIR_TUPLE_TYPE
+        Let tc be proc node_child_count from Parser with node
+        Let j be 0
+        While j is less than tc:
+            Let te be proc node_child from Parser with node, j
+            Let lte be proc lower_type with te
+            proc attach with tup, lte
+            Set j to j plus 1
+        End While
+        Return tup
+    End If
+
+    If nt is equal to Parser.RUST_UNIT_TYPE:
+        Let unit be proc new_hir with HIR.HIR_BASIC_TYPE
+        proc set_text with unit, "Nothing"
+        Return unit
+    End If
+
+    If nt is equal to Parser.RUST_DYN_TRAIT_TYPE:
+        Let dinner be proc node_child from Parser with node, 0
+        Return proc lower_type with dinner
+    End If
+
+    If nt is equal to Parser.RUST_IMPL_TRAIT_TYPE:
+        Let iinner be proc node_child from Parser with node, 0
+        Return proc lower_type with iinner
+    End If
+
+    Note: Fallback: a bare basic type with whatever name is present.
+    Let fb be proc new_hir with HIR.HIR_BASIC_TYPE
+    Let fname be proc node_name from Parser with node
+    proc set_text with fb, fname
+    Return fb
+End Process
+
+Note: ============================================================================
+Note: Patterns
+Note: ============================================================================
+
+@Reasoning:
+Lowers a Rust AST pattern into the HIR pattern node the backend's emit_pattern
+expects: wildcard, identifier binding, literal, tuple, and variant (enum-ctor)
+patterns. Struct/range/or patterns degrade to the nearest faithful HIR form so the
+generated match still type-checks.
+@End Reasoning
+@Implementation:
+Dispatch on AST node_type: wildcard -> HIR_WILDCARD_PATTERN; ident ->
+HIR_IDENTIFIER_PATTERN (value=name); literal -> HIR_LITERAL_PATTERN over the
+lowered literal child; tuple -> HIR_TUPLE_PATTERN with lowered element patterns;
+enum -> HIR_VARIANT_PATTERN (value=path; lowered sub-patterns); struct ->
+HIR_VARIANT_PATTERN (value=path) with field sub-patterns; or -> first alternative
+(rendered with '|' is not supported as a single HIR pattern, so the principal arm
+is used); range/rest -> wildcard. Returns 0 for null.
+@End Implementation
+Process called "lower_pattern" takes node as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    Let nt be proc node_type from Parser with node
+
+    If nt is equal to Parser.RUST_PATTERN_WILDCARD:
+        Return proc new_hir with HIR.HIR_WILDCARD_PATTERN
+    End If
+
+    If nt is equal to Parser.RUST_PATTERN_IDENT:
+        Let id be proc new_hir with HIR.HIR_IDENTIFIER_PATTERN
+        Let name be proc node_name from Parser with node
+        proc set_text with id, name
+        Return id
+    End If
+
+    If nt is equal to Parser.RUST_PATTERN_LITERAL:
+        Let lp be proc new_hir with HIR.HIR_LITERAL_PATTERN
+        Let litchild be proc node_child from Parser with node, 0
+        Let llit be proc lower_expression with litchild
+        Note: emit_pattern for a literal pattern re-uses emit_literal on the
+        Note: pattern node itself, so copy the literal payload onto lp.
+        If litchild is not equal to 0:
+            Let v be proc node_value from Parser with litchild
+            proc set_hir_node_value from HIR with lp, v, HIRLIT_NUMERIC
+        End If
+        Return lp
+    End If
+
+    If nt is equal to Parser.RUST_PATTERN_TUPLE:
+        Let tup be proc new_hir with HIR.HIR_TUPLE_PATTERN
+        Let tc be proc node_child_count from Parser with node
+        Let i be 0
+        While i is less than tc:
+            Let e be proc node_child from Parser with node, i
+            Let le be proc lower_pattern with e
+            proc attach with tup, le
+            Set i to i plus 1
+        End While
+        Return tup
+    End If
+
+    If nt is equal to Parser.RUST_PATTERN_ENUM:
+        Let v be proc new_hir with HIR.HIR_VARIANT_PATTERN
+        Let pname be proc node_name from Parser with node
+        proc set_text with v, pname
+        Let vc be proc node_child_count from Parser with node
+        Let j be 0
+        While j is less than vc:
+            Let sub be proc node_child from Parser with node, j
+            Let lsub be proc lower_pattern with sub
+            proc attach with v, lsub
+            Set j to j plus 1
+        End While
+        Return v
+    End If
+
+    If nt is equal to Parser.RUST_PATTERN_STRUCT:
+        Let vs be proc new_hir with HIR.HIR_VARIANT_PATTERN
+        Let sname be proc node_name from Parser with node
+        proc set_text with vs, sname
+        Return vs
+    End If
+
+    If nt is equal to Parser.RUST_PATTERN_RANGE:
+        Return proc new_hir with HIR.HIR_WILDCARD_PATTERN
+    End If
+
+    If nt is equal to Parser.RUST_PATTERN_OR:
+        Let first be proc node_child from Parser with node, 0
+        Return proc lower_pattern with first
+    End If
+
+    If nt is equal to Parser.RUST_PATTERN_BINDING:
+        Let inner be proc node_child from Parser with node, 0
+        Return proc lower_pattern with inner
+    End If
+
+    If nt is equal to Parser.RUST_PATTERN_REF:
+        Let rinner be proc node_child from Parser with node, 0
+        Return proc lower_pattern with rinner
+    End If
+
+    Return proc new_hir with HIR.HIR_WILDCARD_PATTERN
+End Process
+
+Note: ============================================================================
+Note: Expressions
+Note: ============================================================================
+
+@Reasoning:
+The expression lowering fans out over every Rust expression AST kind, producing the
+matching HIR expression node the backend's emit_expression dispatches on. This is
+the largest dispatch and the heart of round-trip fidelity for function bodies.
+@End Reasoning
+@Implementation:
+Dispatch on node_type. Each branch builds the HIR node and recursively lowers its
+operands. See the per-branch comments inline. Null input -> 0.
+@End Implementation
+Process called "lower_expression" takes node as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    Let nt be proc node_type from Parser with node
+
+    If nt is equal to Parser.RUST_LITERAL:
+        Return proc lower_literal with node
+    End If
+
+    If nt is equal to Parser.RUST_IDENTIFIER:
+        Let id be proc new_hir with HIR.HIR_IDENTIFIER
+        Let name be proc node_name from Parser with node
+        proc set_text with id, name
+        Return id
+    End If
+
+    If nt is equal to Parser.RUST_PATH:
+        Let pid be proc new_hir with HIR.HIR_IDENTIFIER
+        Let pname be proc node_name from Parser with node
+        proc set_text with pid, pname
+        Return pid
+    End If
+
+    If nt is equal to Parser.RUST_BINARY_OP:
+        Let bin be proc new_hir with HIR.HIR_BINARY_EXPRESSION
+        Let op be proc node_value from Parser with node
+        Let mapped be proc map_binary_op with op
+        proc set_text with bin, mapped
+        Let l be proc node_child from Parser with node, 0
+        Let r be proc node_child from Parser with node, 1
+        Let bl be proc lower_expression with l
+        Let br2 be proc lower_expression with r
+        proc attach with bin, bl
+        proc attach with bin, br2
+        Return bin
+    End If
+
+    If nt is equal to Parser.RUST_UNARY_OP:
+        Let un be proc new_hir with HIR.HIR_UNARY_EXPRESSION
+        Let uop be proc node_value from Parser with node
+        Let umapped be proc map_unary_op with uop
+        proc set_text with un, umapped
+        Let operand be proc node_child from Parser with node, 0
+        Let lop be proc lower_expression with operand
+        proc attach with un, lop
+        Return un
+    End If
+
+    If nt is equal to Parser.RUST_ASSIGNMENT:
+        Note: assignment renders as a binary with the assign operator preserved so
+        Note: the emitted text reflects `lhs op rhs`.
+        Let asn be proc new_hir with HIR.HIR_BINARY_EXPRESSION
+        Let aop be proc node_value from Parser with node
+        proc set_text with asn, aop
+        Let al be proc node_child from Parser with node, 0
+        Let ar be proc node_child from Parser with node, 1
+        Let lal be proc lower_expression with al
+        Let lar be proc lower_expression with ar
+        proc attach with asn, lal
+        proc attach with asn, lar
+        Return asn
+    End If
+
+    If nt is equal to Parser.RUST_FUNCTION_CALL:
+        Let call be proc new_hir with HIR.HIR_CALL_EXPRESSION
+        Let callee be proc node_child from Parser with node, 0
+        Let lcallee be proc lower_expression with callee
+        proc attach with call, lcallee
+        Let argc be proc node_child_count from Parser with node
+        Let i be 1
+        While i is less than argc:
+            Let arg be proc node_child from Parser with node, i
+            Let larg be proc lower_expression with arg
+            proc attach with call, larg
+            Set i to i plus 1
+        End While
+        Return call
+    End If
+
+    If nt is equal to Parser.RUST_METHOD_CALL:
+        Note: receiver.method(args) -> a call whose callee is a member access.
+        Let mcall be proc new_hir with HIR.HIR_CALL_EXPRESSION
+        Let member be proc new_hir with HIR.HIR_MEMBER_EXPRESSION
+        Let mname be proc node_name from Parser with node
+        proc set_text with member, mname
+        Let recv be proc node_child from Parser with node, 0
+        Let lrecv be proc lower_expression with recv
+        proc attach with member, lrecv
+        proc attach with mcall, member
+        Let mc be proc node_child_count from Parser with node
+        Let j be 1
+        While j is less than mc:
+            Let marg be proc node_child from Parser with node, j
+            Let lmarg be proc lower_expression with marg
+            proc attach with mcall, lmarg
+            Set j to j plus 1
+        End While
+        Return mcall
+    End If
+
+    If nt is equal to Parser.RUST_FIELD_ACCESS:
+        Let fa be proc new_hir with HIR.HIR_MEMBER_EXPRESSION
+        Let fname be proc node_name from Parser with node
+        proc set_text with fa, fname
+        Let obj be proc node_child from Parser with node, 0
+        Let lobj be proc lower_expression with obj
+        proc attach with fa, lobj
+        Return fa
+    End If
+
+    If nt is equal to Parser.RUST_ARRAY_ACCESS:
+        Let idx be proc new_hir with HIR.HIR_INDEX_EXPRESSION
+        Let coll be proc node_child from Parser with node, 0
+        Let index be proc node_child from Parser with node, 1
+        Let lcoll be proc lower_expression with coll
+        Let lindex be proc lower_expression with index
+        proc attach with idx, lcoll
+        proc attach with idx, lindex
+        Return idx
+    End If
+
+    If nt is equal to Parser.RUST_BORROW:
+        Let brw be proc new_hir with HIR.HIR_UNARY_EXPRESSION
+        proc set_text with brw, "&"
+        Let bop be proc node_child from Parser with node, 0
+        Let lbop be proc lower_expression with bop
+        proc attach with brw, lbop
+        Return brw
+    End If
+
+    If nt is equal to Parser.RUST_DEREFERENCE:
+        Let dr be proc new_hir with HIR.HIR_UNARY_EXPRESSION
+        proc set_text with dr, "*"
+        Let dop be proc node_child from Parser with node, 0
+        Let ldop be proc lower_expression with dop
+        proc attach with dr, ldop
+        Return dr
+    End If
+
+    If nt is equal to Parser.RUST_RANGE:
+        Let rng be proc new_hir with HIR.HIR_RANGE_EXPRESSION
+        Let rc be proc node_child_count from Parser with node
+        Let start be proc node_child from Parser with node, 0
+        Let lstart be proc lower_expression with start
+        proc attach with rng, lstart
+        If rc is greater than 1:
+            Let endv be proc node_child from Parser with node, 1
+            Let lendv be proc lower_expression with endv
+            proc attach with rng, lendv
+        End If
+        Return rng
+    End If
+
+    If nt is equal to Parser.RUST_STRUCT_EXPR:
+        Let rec be proc new_hir with HIR.HIR_RECORD_LITERAL
+        Let tyname be proc node_name from Parser with node
+        proc set_text with rec, tyname
+        Let sc be proc node_child_count from Parser with node
+        Let k be 0
+        While k is less than sc:
+            Let init be proc node_child from Parser with node, k
+            Let it be proc node_type from Parser with init
+            If it is equal to Parser.RUST_STRUCT_FIELD_INIT:
+                Let fld be proc new_hir with HIR.HIR_FIELD_DEFINITION
+                Let fname2 be proc node_name from Parser with init
+                proc set_text with fld, fname2
+                Let fval be proc node_child from Parser with init, 0
+                Let lfval be proc lower_expression with fval
+                proc attach with fld, lfval
+                proc attach with rec, fld
+            End If
+            Set k to k plus 1
+        End While
+        Return rec
+    End If
+
+    If nt is equal to Parser.RUST_ARRAY_EXPR:
+        Let arr be proc new_hir with HIR.HIR_ARRAY_LITERAL
+        Let ac be proc node_child_count from Parser with node
+        Let a be 0
+        While a is less than ac:
+            Let elem be proc node_child from Parser with node, a
+            Let lelem be proc lower_expression with elem
+            proc attach with arr, lelem
+            Set a to a plus 1
+        End While
+        Return arr
+    End If
+
+    If nt is equal to Parser.RUST_TUPLE_EXPR:
+        Let tup be proc new_hir with HIR.HIR_TUPLE_LITERAL
+        Let tc be proc node_child_count from Parser with node
+        Let t be 0
+        While t is less than tc:
+            Let te be proc node_child from Parser with node, t
+            Let lte be proc lower_expression with te
+            proc attach with tup, lte
+            Set t to t plus 1
+        End While
+        Return tup
+    End If
+
+    If nt is equal to Parser.RUST_PAREN:
+        Let par be proc new_hir with HIR.HIR_PARENTHESIZED
+        Let pinner be proc node_child from Parser with node, 0
+        Let lpinner be proc lower_expression with pinner
+        proc attach with par, lpinner
+        Return par
+    End If
+
+    If nt is equal to Parser.RUST_UNIT:
+        Let u be proc new_hir with HIR.HIR_TUPLE_LITERAL
+        Return u
+    End If
+
+    If nt is equal to Parser.RUST_BLOCK_EXPR:
+        Return proc lower_block with node
+    End If
+
+    If nt is equal to Parser.RUST_IF_EXPR:
+        Return proc lower_if with node
+    End If
+
+    If nt is equal to Parser.RUST_IF_LET_EXPR:
+        Return proc lower_if_let with node
+    End If
+
+    If nt is equal to Parser.RUST_MATCH_EXPR:
+        Return proc lower_match with node
+    End If
+
+    If nt is equal to Parser.RUST_LOOP_EXPR:
+        Let lp be proc new_hir with HIR.HIR_LOOP_STATEMENT
+        Let lbody be proc node_child from Parser with node, 0
+        Let llbody be proc lower_block with lbody
+        proc attach with lp, llbody
+        Return lp
+    End If
+
+    If nt is equal to Parser.RUST_WHILE_EXPR:
+        Let wh be proc new_hir with HIR.HIR_WHILE_STATEMENT
+        Let wc be proc node_child from Parser with node, 0
+        Let wb be proc node_child from Parser with node, 1
+        Let lwc be proc lower_expression with wc
+        Let lwb be proc lower_block with wb
+        proc attach with wh, lwc
+        proc attach with wh, lwb
+        Return wh
+    End If
+
+    If nt is equal to Parser.RUST_WHILE_LET_EXPR:
+        Note: while let pat = scrut { body } -> a while over the scrutinee with
+        Note: the body block; the pattern binding is faithfully represented by
+        Note: lowering the scrutinee as the condition.
+        Let whl be proc new_hir with HIR.HIR_WHILE_STATEMENT
+        Let wscrut be proc node_child from Parser with node, 1
+        Let wbody be proc node_child from Parser with node, 2
+        Let lwscrut be proc lower_expression with wscrut
+        Let lwbody be proc lower_block with wbody
+        proc attach with whl, lwscrut
+        proc attach with whl, lwbody
+        Return whl
+    End If
+
+    If nt is equal to Parser.RUST_FOR_EXPR:
+        Return proc lower_for with node
+    End If
+
+    If nt is equal to Parser.RUST_CLOSURE:
+        Return proc lower_closure with node
+    End If
+
+    If nt is equal to Parser.RUST_CAST:
+        Let cast be proc new_hir with HIR.HIR_CAST_EXPRESSION
+        Let cval be proc node_child from Parser with node, 0
+        Let lcval be proc lower_expression with cval
+        proc attach with cast, lcval
+        Let cty be proc node_type_info from Parser with node
+        Let lcty be proc lower_type with cty
+        proc attach with cast, lcty
+        Return cast
+    End If
+
+    If nt is equal to Parser.RUST_TRY:
+        Note: expr? -> a call to a synthetic "try" helper so the value is kept.
+        Let tr be proc new_hir with HIR.HIR_CALL_EXPRESSION
+        Let tcallee be proc new_hir with HIR.HIR_IDENTIFIER
+        proc set_text with tcallee, "try"
+        proc attach with tr, tcallee
+        Let tval be proc node_child from Parser with node, 0
+        Let ltval be proc lower_expression with tval
+        proc attach with tr, ltval
+        Return tr
+    End If
+
+    If nt is equal to Parser.RUST_AWAIT:
+        Let aw be proc new_hir with HIR.HIR_MEMBER_EXPRESSION
+        proc set_text with aw, "await"
+        Let aobj be proc node_child from Parser with node, 0
+        Let laobj be proc lower_expression with aobj
+        proc attach with aw, laobj
+        Return aw
+    End If
+
+    If nt is equal to Parser.RUST_MACRO_CALL:
+        Note: name!(args) -> a call to an identifier named "name!" so the macro
+        Note: surface is preserved on round-trip.
+        Let mac be proc new_hir with HIR.HIR_CALL_EXPRESSION
+        Let mcallee be proc new_hir with HIR.HIR_IDENTIFIER
+        Let macname be proc node_name from Parser with node
+        Let bang_name be proc append_bang with macname
+        proc set_text with mcallee, bang_name
+        proc attach with mac, mcallee
+        Let mcc be proc node_child_count from Parser with node
+        Let m be 0
+        While m is less than mcc:
+            Let marg2 be proc node_child from Parser with node, m
+            Let lmarg2 be proc lower_expression with marg2
+            proc attach with mac, lmarg2
+            Set m to m plus 1
+        End While
+        Return mac
+    End If
+
+    If nt is equal to Parser.RUST_RETURN:
+        Note: a return used in expression position lowers to a return statement.
+        Let ret be proc new_hir with HIR.HIR_RETURN_STATEMENT
+        Let rc2 be proc node_child_count from Parser with node
+        If rc2 is greater than 0:
+            Let rv be proc node_child from Parser with node, 0
+            Let lrv be proc lower_expression with rv
+            proc attach with ret, lrv
+        End If
+        Return ret
+    End If
+
+    If nt is equal to Parser.RUST_BREAK:
+        Return proc new_hir with HIR.HIR_BREAK_STATEMENT
+    End If
+
+    If nt is equal to Parser.RUST_CONTINUE:
+        Return proc new_hir with HIR.HIR_CONTINUE_STATEMENT
+    End If
+
+    Note: Fallback: a unit identifier so the output remains valid.
+    Let fb be proc new_hir with HIR.HIR_IDENTIFIER
+    proc set_text with fb, "()"
+    Return fb
+End Process
+
+@Reasoning:
+Lowers a Rust literal AST node to a HIR_LITERAL with the correct value_type tag so
+the backend formats strings (quoted), booleans (true/false), and numbers
+correctly. The parser stored the literal-kind discriminant in the AST node's
+mutability slot.
+@End Reasoning
+@Implementation:
+Read the literal text (node value) and the kind (node mutability). Map STRING->2,
+BOOL->3, else numeric (0). Build HIR_LITERAL and set value+value_type.
+@End Implementation
+Process called "lower_literal" takes node as Integer returns Integer:
+    Let text be proc node_value from Parser with node
+    Let kind be proc node_mutability from Parser with node
+
+    Let vt be HIRLIT_NUMERIC
+    If kind is equal to Parser.RUST_LIT_STRING:
+        Set vt to HIRLIT_STRING
+        Set text to proc strip_quotes with text
+    End If
+    If kind is equal to Parser.RUST_LIT_BOOL:
+        Set vt to HIRLIT_BOOL
+    End If
+    If kind is equal to Parser.RUST_LIT_CHAR:
+        Set vt to HIRLIT_NUMERIC
+    End If
+
+    Let lit be proc new_hir with HIR.HIR_LITERAL
+    proc set_hir_node_value from HIR with lit, text, vt
+    Return lit
+End Process
+
+@Reasoning:
+The lexer captured string literals WITH their surrounding quotes; the HIR string
+payload must be the raw content (the backend re-quotes and re-escapes via
+emit_escaped_string). This strips a single leading and trailing double-quote when
+present, returning a fresh owned buffer.
+@End Reasoning
+@Implementation:
+Scan the length. If length >= 2 and first and last bytes are '"', allocate len-2+1,
+copy the interior, NUL-terminate, return. Otherwise return the input unchanged.
+@End Implementation
+Process called "strip_quotes" takes text as Integer returns Integer:
+    If text is equal to 0:
+        Return 0
+    End If
+    Let len be 0
+    While 1 is equal to 1:
+        Let c be proc memory_get_byte from Layout with text, len
+        If c is equal to 0:
+            Break
+        End If
+        Set len to len plus 1
+    End While
+    If len is less than 2:
+        Return text
+    End If
+    Let first be proc memory_get_byte from Layout with text, 0
+    Let last be proc memory_get_byte from Layout with text, len minus 1
+    If first is not equal to 34:
+        Return text
+    End If
+    If last is not equal to 34:
+        Return text
+    End If
+    Let inner_len be len minus 2
+    Let buf be proc allocate from Layout with inner_len plus 1
+    If buf is equal to 0:
+        Return text
+    End If
+    Let i be 0
+    While i is less than inner_len:
+        Let b be proc memory_get_byte from Layout with text, i plus 1
+        proc memory_set_byte from Layout with buf, i, b
+        Set i to i plus 1
+    End While
+    proc memory_set_byte from Layout with buf, inner_len, 0
+    Return buf
+End Process
+
+@Reasoning:
+Appends a '!' to a macro name so the emitted call reads as a Rust macro invocation
+(println! etc.). A fresh owned buffer is returned.
+@End Reasoning
+@Implementation:
+Scan length; allocate len+2; copy the name, write '!' then NUL; return.
+@End Implementation
+Process called "append_bang" takes name as Integer returns Integer:
+    Let len be 0
+    If name is not equal to 0:
+        While 1 is equal to 1:
+            Let c be proc memory_get_byte from Layout with name, len
+            If c is equal to 0:
+                Break
+            End If
+            Set len to len plus 1
+        End While
+    End If
+    Let buf be proc allocate from Layout with len plus 2
+    If buf is equal to 0:
+        Return name
+    End If
+    Let i be 0
+    While i is less than len:
+        Let b be proc memory_get_byte from Layout with name, i
+        proc memory_set_byte from Layout with buf, i, b
+        Set i to i plus 1
+    End While
+    proc memory_set_byte from Layout with buf, len, 33
+    proc memory_set_byte from Layout with buf, len plus 1, 0
+    Return buf
+End Process
+
+Note: ============================================================================
+Note: Blocks and statements
+Note: ============================================================================
+
+@Reasoning:
+Lowers a Rust block expression into a HIR_BLOCK_STATEMENT whose children are the
+lowered statements in source order. The backend's emit_block_children walks them.
+@End Reasoning
+@Implementation:
+Build HIR_BLOCK_STATEMENT; iterate AST block children; lower each statement and
+attach non-null results.
+@End Implementation
+Process called "lower_block" takes node as Integer returns Integer:
+    Let blk be proc new_hir with HIR.HIR_BLOCK_STATEMENT
+    If node is equal to 0:
+        Return blk
+    End If
+    Let count be proc node_child_count from Parser with node
+    Let i be 0
+    While i is less than count:
+        Let stmt be proc node_child from Parser with node, i
+        Let lowered be proc lower_statement with stmt
+        proc attach with blk, lowered
+        Set i to i plus 1
+    End While
+    Return blk
+End Process
+
+@Reasoning:
+Lowers a single Rust statement. Let bindings become HIR_LET_STATEMENT; item
+statements lower the inner item; expression statements become
+HIR_EXPRESSION_STATEMENT (or pass control-flow expressions through as statements
+since the backend handles if/match/for/while/loop at statement level too).
+@End Reasoning
+@Implementation:
+Dispatch on AST node_type: RUST_LET_STMT -> lower_let; RUST_ITEM_STMT -> lower the
+inner item; RUST_EXPR_STMT -> lower the inner expression; if it lowered to a
+statement-kind node (if/match/loop/while/for/return/break/continue/block) return it
+directly, otherwise wrap in HIR_EXPRESSION_STATEMENT.
+@End Implementation
+Process called "lower_statement" takes node as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    Let nt be proc node_type from Parser with node
+
+    If nt is equal to Parser.RUST_LET_STMT:
+        Return proc lower_let with node
+    End If
+
+    If nt is equal to Parser.RUST_ITEM_STMT:
+        Let inner be proc node_child from Parser with node, 0
+        Return proc lower_item with inner
+    End If
+
+    If nt is equal to Parser.RUST_EXPR_STMT:
+        Let expr be proc node_child from Parser with node, 0
+        Let lowered be proc lower_expression with expr
+        Let lt be proc node_type from Parser with expr
+        Let is_stmt be proc is_statement_expr with lt
+        If is_stmt is equal to 1:
+            Return lowered
+        End If
+        Let wrap be proc new_hir with HIR.HIR_EXPRESSION_STATEMENT
+        proc attach with wrap, lowered
+        Return wrap
+    End If
+
+    Note: A bare expression used as the block tail.
+    Let tail be proc lower_expression with node
+    Let tt be proc node_type from Parser with node
+    Let tail_stmt be proc is_statement_expr with tt
+    If tail_stmt is equal to 1:
+        Return tail
+    End If
+    Let twrap be proc new_hir with HIR.HIR_EXPRESSION_STATEMENT
+    proc attach with twrap, tail
+    Return twrap
+End Process
+
+@Reasoning:
+Classifies whether a Rust expression AST kind already lowers to a HIR statement
+node (if/match/loop/while/for/return/break/continue/block), so the statement
+wrapper isn't doubled around it.
+@End Reasoning
+@Implementation:
+Returns 1 for those control-flow / block / jump kinds, else 0.
+@End Implementation
+Process called "is_statement_expr" takes nt as Integer returns Integer:
+    If nt is equal to Parser.RUST_IF_EXPR:
+        Return 1
+    End If
+    If nt is equal to Parser.RUST_IF_LET_EXPR:
+        Return 1
+    End If
+    If nt is equal to Parser.RUST_MATCH_EXPR:
+        Return 1
+    End If
+    If nt is equal to Parser.RUST_LOOP_EXPR:
+        Return 1
+    End If
+    If nt is equal to Parser.RUST_WHILE_EXPR:
+        Return 1
+    End If
+    If nt is equal to Parser.RUST_WHILE_LET_EXPR:
+        Return 1
+    End If
+    If nt is equal to Parser.RUST_FOR_EXPR:
+        Return 1
+    End If
+    If nt is equal to Parser.RUST_RETURN:
+        Return 1
+    End If
+    If nt is equal to Parser.RUST_BREAK:
+        Return 1
+    End If
+    If nt is equal to Parser.RUST_CONTINUE:
+        Return 1
+    End If
+    If nt is equal to Parser.RUST_BLOCK_EXPR:
+        Return 1
+    End If
+    Return 0
+End Process
+
+@Reasoning:
+Lowers a let binding to HIR_LET_STATEMENT. The bound name comes from the pattern
+(identifier patterns carry it); the optional type becomes a type child flagged
+value_type==1; the optional initialiser becomes a value child. Matches emit_let's
+expectations (name in node value; type child with value_type 1; init child).
+@End Reasoning
+@Implementation:
+make HIR_LET_STATEMENT. Read the pattern child 0; if it is an identifier pattern
+set the let's value to its name, else use "_". If type_info present, lower it,
+mark_as_type, attach. If an initialiser child (child index 1) exists, lower and
+attach it. Returns the let node.
+@End Implementation
+Process called "lower_let" takes node as Integer returns Integer:
+    Let let_node be proc new_hir with HIR.HIR_LET_STATEMENT
+
+    Let pat be proc node_child from Parser with node, 0
+    Let pname be "_"
+    If pat is not equal to 0:
+        Let pt be proc node_type from Parser with pat
+        If pt is equal to Parser.RUST_PATTERN_IDENT:
+            Set pname to proc node_name from Parser with pat
+        End If
+    End If
+    proc set_text with let_node, pname
+
+    Let ty be proc node_type_info from Parser with node
+    If ty is not equal to 0:
+        Let lty be proc lower_type with ty
+        proc mark_as_type with lty
+        proc attach with let_node, lty
+    End If
+
+    Note: the initialiser is the second child of the AST let node (child 0 = pat).
+    Let cc be proc node_child_count from Parser with node
+    If cc is greater than 1:
+        Let init be proc node_child from Parser with node, 1
+        Let linit be proc lower_expression with init
+        proc attach with let_node, linit
+    End If
+
+    Return let_node
+End Process
+
+@Reasoning:
+Lowers `if cond { then } else { else }` to HIR_IF_STATEMENT with the canonical
+child order emit_if expects: child0 condition, child1 then-block, child2 optional
+else-block (which may itself be an if for else-if chains).
+@End Reasoning
+@Implementation:
+make HIR_IF_STATEMENT. Lower the condition (child 0) and attach. Lower the
+then-block (child 1) and attach. If a third child exists, lower it (block or nested
+if) and attach as the else branch.
+@End Implementation
+Process called "lower_if" takes node as Integer returns Integer:
+    Let if_node be proc new_hir with HIR.HIR_IF_STATEMENT
+
+    Let cond be proc node_child from Parser with node, 0
+    Let lcond be proc lower_expression with cond
+    proc attach with if_node, lcond
+
+    Let then_blk be proc node_child from Parser with node, 1
+    Let lthen be proc lower_block with then_blk
+    proc attach with if_node, lthen
+
+    Let cc be proc node_child_count from Parser with node
+    If cc is greater than 2:
+        Let elsebr be proc node_child from Parser with node, 2
+        Let et be proc node_type from Parser with elsebr
+        If et is equal to Parser.RUST_BLOCK_EXPR:
+            Let lelse be proc lower_block with elsebr
+            proc attach with if_node, lelse
+            Otherwise:
+            Note: else-if: wrap the nested if in a block so emit_block_children
+            Note: renders it as the else body.
+            Let wrap be proc new_hir with HIR.HIR_BLOCK_STATEMENT
+            Let lelif be proc lower_expression with elsebr
+            proc attach with wrap, lelif
+            proc attach with if_node, wrap
+        End If
+    End If
+
+    Return if_node
+End Process
+
+@Reasoning:
+Lowers `if let pat = scrut { then } else { else }` to a HIR_IF_STATEMENT whose
+condition is the scrutinee (the pattern binding is preserved by lowering the
+scrutinee as the tested value), keeping the then/else blocks. This produces valid
+Rust on round-trip (the backend re-emits `if scrut { ... }`).
+@End Reasoning
+@Implementation:
+make HIR_IF_STATEMENT. children of the AST node: 0 pattern, 1 scrutinee, 2
+then-block, optional 3 else. Lower the scrutinee as the condition; then-block;
+optional else.
+@End Implementation
+Process called "lower_if_let" takes node as Integer returns Integer:
+    Let if_node be proc new_hir with HIR.HIR_IF_STATEMENT
+
+    Let scrut be proc node_child from Parser with node, 1
+    Let lscrut be proc lower_expression with scrut
+    proc attach with if_node, lscrut
+
+    Let then_blk be proc node_child from Parser with node, 2
+    Let lthen be proc lower_block with then_blk
+    proc attach with if_node, lthen
+
+    Let cc be proc node_child_count from Parser with node
+    If cc is greater than 3:
+        Let elsebr be proc node_child from Parser with node, 3
+        Let et be proc node_type from Parser with elsebr
+        If et is equal to Parser.RUST_BLOCK_EXPR:
+            Let lelse be proc lower_block with elsebr
+            proc attach with if_node, lelse
+            Otherwise:
+            Let wrap be proc new_hir with HIR.HIR_BLOCK_STATEMENT
+            Let lelif be proc lower_expression with elsebr
+            proc attach with wrap, lelif
+            proc attach with if_node, wrap
+        End If
+    End If
+
+    Return if_node
+End Process
+
+@Reasoning:
+Lowers `match scrut { arm... }` to HIR_MATCH_STATEMENT with child0 the subject and
+each arm a HIR_WHEN_CLAUSE (child0 pattern, child1 body) - exactly emit_match's
+contract.
+@End Reasoning
+@Implementation:
+make HIR_MATCH_STATEMENT. Lower the subject (AST child 0) and attach. For each
+subsequent AST child (a RUST_MATCH_ARM), build a HIR_WHEN_CLAUSE: lower the arm
+pattern (arm child 0) and the arm body (arm last child), attach both, attach the
+clause to the match.
+@End Implementation
+Process called "lower_match" takes node as Integer returns Integer:
+    Let m be proc new_hir with HIR.HIR_MATCH_STATEMENT
+
+    Let subject be proc node_child from Parser with node, 0
+    Let lsubject be proc lower_expression with subject
+    proc attach with m, lsubject
+
+    Let count be proc node_child_count from Parser with node
+    Let i be 1
+    While i is less than count:
+        Let arm be proc node_child from Parser with node, i
+        Let at be proc node_type from Parser with arm
+        If at is equal to Parser.RUST_MATCH_ARM:
+            Let clause be proc new_hir with HIR.HIR_WHEN_CLAUSE
+            Let pat be proc node_child from Parser with arm, 0
+            Let lpat be proc lower_pattern with pat
+            proc attach with clause, lpat
+            Let armcc be proc node_child_count from Parser with arm
+            Let body be proc node_child from Parser with arm, armcc minus 1
+            Let lbody be proc lower_expression with body
+            proc attach with clause, lbody
+            proc attach with m, clause
+        End If
+        Set i to i plus 1
+    End While
+
+    Return m
+End Process
+
+@Reasoning:
+Lowers `for pat in iter { body }` to HIR_FOR_STATEMENT with emit_for's child order:
+child0 an iteration-variable Let (carrying the loop variable name), child1 the
+collection expression, child2 the body block.
+@End Reasoning
+@Implementation:
+make HIR_FOR_STATEMENT. Build a HIR_LET_STATEMENT whose value is the loop variable
+name (taken from the pattern if it is an identifier, else "_") and attach as child0.
+Lower the iterable (AST child 1) and attach. Lower the body block (AST child 2).
+@End Implementation
+Process called "lower_for" takes node as Integer returns Integer:
+    Let f be proc new_hir with HIR.HIR_FOR_STATEMENT
+
+    Let pat be proc node_child from Parser with node, 0
+    Let vname be "_"
+    If pat is not equal to 0:
+        Let pt be proc node_type from Parser with pat
+        If pt is equal to Parser.RUST_PATTERN_IDENT:
+            Set vname to proc node_name from Parser with pat
+        End If
+    End If
+    Let var_let be proc new_hir with HIR.HIR_LET_STATEMENT
+    proc set_text with var_let, vname
+    proc attach with f, var_let
+
+    Let iter be proc node_child from Parser with node, 1
+    Let liter be proc lower_expression with iter
+    proc attach with f, liter
+
+    Let body be proc node_child from Parser with node, 2
+    Let lbody be proc lower_block with body
+    proc attach with f, lbody
+
+    Return f
+End Process
+
+@Reasoning:
+Lowers a closure to HIR_LAMBDA_EXPRESSION with emit_lambda's contract: the leading
+children are parameter Lets, the last child is the body. Each parameter becomes a
+HIR_LET_STATEMENT carrying the parameter name and optional type.
+@End Reasoning
+@Implementation:
+make HIR_LAMBDA_EXPRESSION. The AST closure children are RUST_PARAM nodes followed
+by the body expression (last child). For each param: build a HIR_LET_STATEMENT with
+the param's pattern name and (if present) its type; attach. Then lower the body and
+attach as the final child.
+@End Implementation
+Process called "lower_closure" takes node as Integer returns Integer:
+    Let lam be proc new_hir with HIR.HIR_LAMBDA_EXPRESSION
+
+    Let count be proc node_child_count from Parser with node
+    Let body_index be count minus 1
+
+    Let i be 0
+    While i is less than body_index:
+        Let param be proc node_child from Parser with node, i
+        Let pt be proc node_type from Parser with param
+        If pt is equal to Parser.RUST_PARAM:
+            Let plet be proc new_hir with HIR.HIR_LET_STATEMENT
+            Let ppat be proc node_child from Parser with param, 0
+            Let pname be "_"
+            If ppat is not equal to 0:
+                Let ppt be proc node_type from Parser with ppat
+                If ppt is equal to Parser.RUST_PATTERN_IDENT:
+                    Set pname to proc node_name from Parser with ppat
+                End If
+            End If
+            proc set_text with plet, pname
+            Let pty be proc node_type_info from Parser with param
+            If pty is not equal to 0:
+                Let lpty be proc lower_type with pty
+                proc attach with plet, lpty
+            End If
+            proc attach with lam, plet
+        End If
+        Set i to i plus 1
+    End While
+
+    If count is greater than 0:
+        Let body be proc node_child from Parser with node, body_index
+        Let lbody be proc lower_expression with body
+        proc attach with lam, lbody
+    End If
+
+    Return lam
+End Process
+
+Note: ============================================================================
+Note: Items
+Note: ============================================================================
+
+@Reasoning:
+Item-level dispatch. Each Rust item lowers to the HIR declaration the backend emits
+as a top-level construct.
+@End Reasoning
+@Implementation:
+Dispatch on AST node_type to the per-item lowerer. Unknown items return 0.
+@End Implementation
+Process called "lower_item" takes node as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    Let nt be proc node_type from Parser with node
+
+    If nt is equal to Parser.RUST_FUNCTION:
+        Return proc lower_function with node
+    End If
+    If nt is equal to Parser.RUST_STRUCT:
+        Return proc lower_struct with node
+    End If
+    If nt is equal to Parser.RUST_UNION:
+        Return proc lower_struct with node
+    End If
+    If nt is equal to Parser.RUST_ENUM:
+        Return proc lower_enum with node
+    End If
+    If nt is equal to Parser.RUST_TRAIT:
+        Return proc lower_trait_or_impl with node
+    End If
+    If nt is equal to Parser.RUST_IMPL:
+        Return proc lower_trait_or_impl with node
+    End If
+    If nt is equal to Parser.RUST_MODULE:
+        Return proc lower_module with node
+    End If
+    If nt is equal to Parser.RUST_USE:
+        Return proc lower_use with node
+    End If
+    If nt is equal to Parser.RUST_CONST:
+        Return proc lower_const with node
+    End If
+    If nt is equal to Parser.RUST_STATIC:
+        Return proc lower_const with node
+    End If
+    If nt is equal to Parser.RUST_TYPE_ALIAS:
+        Return proc lower_type_alias with node
+    End If
+
+    Return 0
+End Process
+
+@Reasoning:
+Lowers a function to HIR_PROCESS_DEFINITION with emit_function's contract: node
+value = function name; parameter declarations as HIR_LET_STATEMENT children (name +
+type child); the return type as a type-flagged child (value_type==1); the body as a
+HIR_BLOCK_STATEMENT child. Self receivers are emitted as a `self` parameter.
+@End Reasoning
+@Implementation:
+make HIR_PROCESS_DEFINITION; set name. Find the AST param list (RUST_PARAM_LIST
+child) and for each RUST_PARAM build a HIR_LET_STATEMENT: value = the param name
+(self for receivers, else the pattern identifier), with the lowered type as a
+child. Attach each. If a return type (type_info) exists, lower it, mark_as_type,
+attach. Find the body block (RUST_BLOCK_EXPR child) and attach its lowering.
+@End Implementation
+Process called "lower_function" takes node as Integer returns Integer:
+    Let fn be proc new_hir with HIR.HIR_PROCESS_DEFINITION
+    Let name be proc node_name from Parser with node
+    proc set_text with fn, name
+
+    Note: locate param list and body among the AST children
+    Let count be proc node_child_count from Parser with node
+    Let i be 0
+    While i is less than count:
+        Let child be proc node_child from Parser with node, i
+        Let ct be proc node_type from Parser with child
+        If ct is equal to Parser.RUST_PARAM_LIST:
+            proc lower_params with fn, child
+        End If
+        Set i to i plus 1
+    End While
+
+    Note: return type
+    Let ret be proc node_type_info from Parser with node
+    If ret is not equal to 0:
+        Let lret be proc lower_type with ret
+        proc mark_as_type with lret
+        proc attach with fn, lret
+    End If
+
+    Note: body
+    Let j be 0
+    While j is less than count:
+        Let child2 be proc node_child from Parser with node, j
+        Let ct2 be proc node_type from Parser with child2
+        If ct2 is equal to Parser.RUST_BLOCK_EXPR:
+            Let lbody be proc lower_block with child2
+            proc attach with fn, lbody
+        End If
+        Set j to j plus 1
+    End While
+
+    Return fn
+End Process
+
+@Reasoning:
+Lowers each parameter in a RUST_PARAM_LIST into a HIR_LET_STATEMENT child of the
+function (emit_function reads param Lets). The param name is the receiver "self" or
+the pattern identifier; the type (if present) is a child.
+@End Reasoning
+@Implementation:
+Iterate the param list children. For each RUST_PARAM: determine the name (the
+param's own name slot if set - that's how self receivers are stored - else the
+identifier pattern's name, else "_"). Build a HIR_LET_STATEMENT with that name and
+the lowered type child. Attach to the function.
+@End Implementation
+Process called "lower_params" takes fn as Integer, param_list as Integer:
+    Let count be proc node_child_count from Parser with param_list
+    Let i be 0
+    While i is less than count:
+        Let param be proc node_child from Parser with param_list, i
+        Let plet be proc new_hir with HIR.HIR_LET_STATEMENT
+
+        Let pname be proc node_name from Parser with param
+        If pname is equal to 0:
+            Set pname to "_"
+            Let ppat be proc node_child from Parser with param, 0
+            If ppat is not equal to 0:
+                Let ppt be proc node_type from Parser with ppat
+                If ppt is equal to Parser.RUST_PATTERN_IDENT:
+                    Set pname to proc node_name from Parser with ppat
+                End If
+            End If
+        End If
+        proc set_text with plet, pname
+
+        Let pty be proc node_type_info from Parser with param
+        If pty is not equal to 0:
+            Let lpty be proc lower_type with pty
+            proc attach with plet, lpty
+        End If
+
+        proc attach with fn, plet
+        Set i to i plus 1
+    End While
+End Process
+
+@Reasoning:
+Lowers a struct/union to HIR_TYPE_DEFINITION with emit_struct's contract: node
+value = struct name; each field a HIR_FIELD_DEFINITION (value = field name; child0
+= field type). Tuple-struct positional fields are named by their index.
+@End Reasoning
+@Implementation:
+make HIR_TYPE_DEFINITION; set name. Find the field-list child (RUST_FIELD_LIST or
+RUST_TUPLE_FIELDS). For named fields: each RUST_FIELD has a name and type_info ->
+HIR_FIELD_DEFINITION. For tuple fields: each gets a synthetic name "0","1",... .
+Attach each field. Returns the type definition.
+@End Implementation
+Process called "lower_struct" takes node as Integer returns Integer:
+    Let td be proc new_hir with HIR.HIR_TYPE_DEFINITION
+    Let name be proc node_name from Parser with node
+    proc set_text with td, name
+
+    Let count be proc node_child_count from Parser with node
+    Let i be 0
+    While i is less than count:
+        Let child be proc node_child from Parser with node, i
+        Let ct be proc node_type from Parser with child
+        If ct is equal to Parser.RUST_FIELD_LIST:
+            proc lower_named_fields with td, child
+        End If
+        If ct is equal to Parser.RUST_TUPLE_FIELDS:
+            proc lower_tuple_fields with td, child
+        End If
+        Set i to i plus 1
+    End While
+
+    Return td
+End Process
+
+@Reasoning:
+Lowers named struct fields into HIR_FIELD_DEFINITION children (value=name;
+child0=type).
+@End Reasoning
+@Implementation:
+Iterate the field list; for each RUST_FIELD build HIR_FIELD_DEFINITION with the
+name and the lowered type child; attach.
+@End Implementation
+Process called "lower_named_fields" takes td as Integer, field_list as Integer:
+    Let count be proc node_child_count from Parser with field_list
+    Let i be 0
+    While i is less than count:
+        Let field be proc node_child from Parser with field_list, i
+        Let fd be proc new_hir with HIR.HIR_FIELD_DEFINITION
+        Let fname be proc node_name from Parser with field
+        proc set_text with fd, fname
+        Let fty be proc node_type_info from Parser with field
+        Let lfty be proc lower_type with fty
+        proc attach with fd, lfty
+        proc attach with td, fd
+        Set i to i plus 1
+    End While
+End Process
+
+@Reasoning:
+Lowers tuple (positional) fields into HIR_FIELD_DEFINITION children with NO name
+(value left 0) and the type as the sole child. Leaving the name unset is the
+correct representation of a positional field and lets the backend distinguish a
+tuple variant `Variant(T, U)` from a struct variant `Variant { x: T }` by testing
+whether the first field carries a name.
+@End Reasoning
+@Implementation:
+Iterate; for each positional RUST_FIELD build a HIR_FIELD_DEFINITION (name unset)
+with the lowered type child; attach.
+@End Implementation
+Process called "lower_tuple_fields" takes td as Integer, field_list as Integer:
+    Let count be proc node_child_count from Parser with field_list
+    Let i be 0
+    While i is less than count:
+        Let field be proc node_child from Parser with field_list, i
+        Let fd be proc new_hir with HIR.HIR_FIELD_DEFINITION
+        Let fty be proc node_type_info from Parser with field
+        Let lfty be proc lower_type with fty
+        proc attach with fd, lfty
+        proc attach with td, fd
+        Set i to i plus 1
+    End While
+End Process
+
+@Reasoning:
+Lowers an enum to HIR_TYPE_DEFINITION with HIR_VARIANT_DEFINITION children
+(value=variant name). Variant payloads (tuple/struct fields) are attached as field
+definitions so they survive round-trip.
+@End Reasoning
+@Implementation:
+make HIR_TYPE_DEFINITION; set name. Find the RUST_VARIANT_LIST child; for each
+RUST_VARIANT build a HIR_VARIANT_DEFINITION named by the variant; if it has tuple
+or struct fields, lower them as HIR_FIELD_DEFINITION children of the variant.
+Attach each variant.
+@End Implementation
+Process called "lower_enum" takes node as Integer returns Integer:
+    Let td be proc new_hir with HIR.HIR_TYPE_DEFINITION
+    Let name be proc node_name from Parser with node
+    proc set_text with td, name
+
+    Let count be proc node_child_count from Parser with node
+    Let i be 0
+    While i is less than count:
+        Let child be proc node_child from Parser with node, i
+        Let ct be proc node_type from Parser with child
+        If ct is equal to Parser.RUST_VARIANT_LIST:
+            Let vc be proc node_child_count from Parser with child
+            Let v be 0
+            While v is less than vc:
+                Let variant be proc node_child from Parser with child, v
+                Let vd be proc new_hir with HIR.HIR_VARIANT_DEFINITION
+                Let vname be proc node_name from Parser with variant
+                proc set_text with vd, vname
+
+                Let vfc be proc node_child_count from Parser with variant
+                Let f be 0
+                While f is less than vfc:
+                    Let fields be proc node_child from Parser with variant, f
+                    Let ft be proc node_type from Parser with fields
+                    If ft is equal to Parser.RUST_TUPLE_FIELDS:
+                        proc lower_tuple_fields with vd, fields
+                    End If
+                    If ft is equal to Parser.RUST_FIELD_LIST:
+                        proc lower_named_fields with vd, fields
+                    End If
+                    Set f to f plus 1
+                End While
+
+                proc attach with td, vd
+                Set v to v plus 1
+            End While
+        End If
+        Set i to i plus 1
+    End While
+
+    Return td
+End Process
+
+@Reasoning:
+Lowers a trait or impl to a HIR_MODULE_DEFINITION grouping its lowered methods, so
+the backend emits each contained fn. The module name carries the impl/trait target
+so the generated grouping is identifiable; the contained associated functions are
+the meaningful output for translation.
+@End Reasoning
+@Implementation:
+make HIR_MODULE_DEFINITION; set the name from the trait name, or for an impl from
+the target type's path name (type_info). Find the RUST_ITEM_LIST child; for each
+contained RUST_FUNCTION, lower it and attach. Associated consts/types lower to
+HIR_DEFINE_STATEMENT and attach too.
+@End Implementation
+Process called "lower_trait_or_impl" takes node as Integer returns Integer:
+    Let mod be proc new_hir with HIR.HIR_MODULE_DEFINITION
+
+    Let nt be proc node_type from Parser with node
+    Let name be proc node_name from Parser with node
+    If name is equal to 0:
+        Note: impl block: name from the target type path
+        Let target be proc node_type_info from Parser with node
+        If target is not equal to 0:
+            Set name to proc node_name from Parser with target
+        End If
+    End If
+    If name is equal to 0:
+        Set name to "impl"
+    End If
+    proc set_text with mod, name
+
+    Let count be proc node_child_count from Parser with node
+    Let i be 0
+    While i is less than count:
+        Let child be proc node_child from Parser with node, i
+        Let ct be proc node_type from Parser with child
+        If ct is equal to Parser.RUST_ITEM_LIST:
+            Let ic be proc node_child_count from Parser with child
+            Let j be 0
+            While j is less than ic:
+                Let item be proc node_child from Parser with child, j
+                Let lowered be proc lower_item with item
+                proc attach with mod, lowered
+                Set j to j plus 1
+            End While
+        End If
+        Set i to i plus 1
+    End While
+
+    Return mod
+End Process
+
+@Reasoning:
+Lowers a module to HIR_MODULE_DEFINITION with its lowered items as children, so the
+backend emits `pub mod name { ... }`.
+@End Reasoning
+@Implementation:
+make HIR_MODULE_DEFINITION; set name. For each AST child that is a lowerable item,
+lower and attach.
+@End Implementation
+Process called "lower_module" takes node as Integer returns Integer:
+    Let mod be proc new_hir with HIR.HIR_MODULE_DEFINITION
+    Let name be proc node_name from Parser with node
+    proc set_text with mod, name
+
+    Let count be proc node_child_count from Parser with node
+    Let i be 0
+    While i is less than count:
+        Let child be proc node_child from Parser with node, i
+        Let lowered be proc lower_item with child
+        proc attach with mod, lowered
+        Set i to i plus 1
+    End While
+
+    Return mod
+End Process
+
+@Reasoning:
+Lowers a use declaration to HIR_IMPORT_STATEMENT whose value is the use path. The
+backend's emit_import converts the path to `use a::b::c;` form.
+@End Reasoning
+@Implementation:
+make HIR_IMPORT_STATEMENT; set value to the use path (the AST node name).
+@End Implementation
+Process called "lower_use" takes node as Integer returns Integer:
+    Let imp be proc new_hir with HIR.HIR_IMPORT_STATEMENT
+    Let path be proc node_name from Parser with node
+    proc set_text with imp, path
+    Return imp
+End Process
+
+@Reasoning:
+Lowers const/static to HIR_DEFINE_STATEMENT with emit_const's contract: value =
+name; a type-flagged child (value_type==1); an initialiser child.
+@End Reasoning
+@Implementation:
+make HIR_DEFINE_STATEMENT; set name. Lower type_info, mark_as_type, attach. If an
+initialiser child exists, lower and attach it.
+@End Implementation
+Process called "lower_const" takes node as Integer returns Integer:
+    Let def be proc new_hir with HIR.HIR_DEFINE_STATEMENT
+    Let name be proc node_name from Parser with node
+    proc set_text with def, name
+
+    Let ty be proc node_type_info from Parser with node
+    If ty is not equal to 0:
+        Let lty be proc lower_type with ty
+        proc mark_as_type with lty
+        proc attach with def, lty
+    End If
+
+    Let cc be proc node_child_count from Parser with node
+    If cc is greater than 0:
+        Let init be proc node_child from Parser with node, 0
+        Let linit be proc lower_expression with init
+        proc attach with def, linit
+    End If
+
+    Return def
+End Process
+
+@Reasoning:
+Lowers a type alias to HIR_DEFINE_STATEMENT carrying the alias name and the aliased
+type as a type-flagged child, so it re-emits as a const-like definition referencing
+the type (the closest faithful HIR form available).
+@End Reasoning
+@Implementation:
+make HIR_DEFINE_STATEMENT; set name; lower the aliased type (type_info),
+mark_as_type, attach.
+@End Implementation
+Process called "lower_type_alias" takes node as Integer returns Integer:
+    Let def be proc new_hir with HIR.HIR_DEFINE_STATEMENT
+    Let name be proc node_name from Parser with node
+    proc set_text with def, name
+
+    Let ty be proc node_type_info from Parser with node
+    If ty is not equal to 0:
+        Let lty be proc lower_type with ty
+        proc mark_as_type with lty
+        proc attach with def, lty
+    End If
+
+    Return def
+End Process
+
+Note: ============================================================================
+Note: Program entry points
+Note: ============================================================================
+
+@Reasoning:
+Lowers a whole Rust program (RUST_PROGRAM root) into a HIR_MODULE_DEFINITION named
+"crate" whose children are the lowered top-level items - the shape hir_to_rust's
+emit_module walks. The translator argument is accepted for API compatibility with
+the dispatcher convention but the lowering is stateless (semantic analysis runs
+separately).
+@End Reasoning
+@Implementation:
+make HIR_MODULE_DEFINITION; set name "crate". Iterate the program's children;
+lower each item and attach non-null results. Returns the module.
 @End Implementation
 Process called "translate_rust_program" takes translator as Integer, rust_ast as Integer returns Integer:
-    Note: Translate complete Rust program to HIR
+    Let module be proc new_hir with HIR.HIR_MODULE_DEFINITION
+    proc set_text with module, "crate"
 
-    @Reasoning:
-    Program translation involves converting all top-level items including
-    functions, structs, enums, traits, and implementations while preserving
-    the semantic relationships and ownership patterns.
-    @End Reasoning
-
-    If translator is equal to 0 or rust_ast is equal to 0:
-        Return proc create_hir_error_node from HIR with "Invalid input to Rust translator"
+    If rust_ast is equal to 0:
+        Return module
     End If
 
-    Let hir_program be proc create_hir_program_node from HIR
+    Let count be proc node_child_count from Parser with rust_ast
+    Let i be 0
+    While i is less than count:
+        Let item be proc node_child from Parser with rust_ast, i
+        Let lowered be proc lower_item with item
+        proc attach with module, lowered
+        Set i to i plus 1
+    End While
 
-    Let children be proc memory_get_int64 from Layout with rust_ast, 32
-    If children is not equal to 0:
-        Let child_count be proc size from List with children
-        Let i be 0
-        While i is less than child_count:
-            Let child be proc get from List with children, i
-            Let hir_item be proc translate_rust_item with translator, child
-
-            If hir_item is not equal to 0:
-                proc add_program_item from HIR with hir_program, hir_item
-            End If
-
-            Set i to i plus 1
-        End While
-    End If
-
-    Return hir_program
+    Return module
 End Process
 
 @Reasoning:
-Top-level item dispatch on the parser's tag value lives here because the
-Rust grammar admits ten distinct item categories (functions, structs, enums,
-traits, impls, modules, use, const, static, type alias). Centralizing the
-fan-out means adding a new item kind is a one-line addition rather than
-edits scattered through translate_rust_program.
+Public single-arg facade invoked by the central translation dispatcher's LANG_RUST
+arm. Wires the full source -> HIR pipeline: build the parser (which builds the
+lexer), parse to the Rust AST, run the optional semantic validation pass (which
+does not mutate the AST), then lower to canonical HIR.
 @End Reasoning
 @Implementation:
-Read the type tag from offset 0 of item_node and dispatch via if/Otherwise If
-chain. Unknown tags yield a HIR error node "Unknown Rust item type" so the
-upstream consumer surfaces the gap rather than silently dropping items.
+create_rust_parser(source); on 0 return 0. parse_rust_program; on 0 return 0.
+create_rust_semantic_analyzer + analyze_rust_program for validation (result
+discarded; errors surface via the analyzer's flags). translate_rust_program(0, ast).
 @End Implementation
-Process called "translate_rust_item" takes translator as Integer, item_node as Integer returns Integer:
-    Note: Translate Rust top-level items to HIR
-
-    If item_node is equal to 0:
-        Return 0
-    End If
-
-    Let item_type be proc memory_get_int64 from Layout with item_node, 0
-
-    If item_type is equal to RUST_FUNCTION from Parser:
-        Return proc translate_rust_function with translator, item_node
-    Otherwise If item_type is equal to RUST_STRUCT from Parser:
-        Return proc translate_rust_struct with translator, item_node
-    Otherwise If item_type is equal to RUST_ENUM from Parser:
-        Return proc translate_rust_enum with translator, item_node
-    Otherwise If item_type is equal to RUST_TRAIT from Parser:
-        Return proc translate_rust_trait with translator, item_node
-    Otherwise If item_type is equal to RUST_IMPL from Parser:
-        Return proc translate_rust_impl with translator, item_node
-    Otherwise If item_type is equal to RUST_MODULE from Parser:
-        Return proc translate_rust_module with translator, item_node
-    Otherwise If item_type is equal to RUST_USE from Parser:
-        Return proc translate_rust_use with translator, item_node
-    Otherwise If item_type is equal to RUST_CONST from Parser:
-        Return proc translate_rust_const with translator, item_node
-    Otherwise If item_type is equal to RUST_STATIC from Parser:
-        Return proc translate_rust_static with translator, item_node
-    Otherwise If item_type is equal to RUST_TYPE_ALIAS from Parser:
-        Return proc translate_rust_type_alias with translator, item_node
-    End If
-
-    Return proc create_hir_error_node from HIR with "Unknown Rust item type"
-End Process
-
-@Reasoning:
-Function translation is the dominant entry point for body content: it must
-process parameters (including the receiver `self`, `&self`, `&mut self`),
-return type, generic parameter list, modifiers (async/unsafe/const/extern),
-and finally the body block. Each is wrapped in a presence check because Rust
-omits whichever section is empty (no params, unit return, no generics).
-@End Reasoning
-@Implementation:
-Reads func fields at offsets 8,16,24,32,40,48. Constructs the HIR function
-node first, then populates each sub-component via dedicated setters from HIR.
-Body translation is bracketed by enter_function_scope / exit_function_scope
-so let-bindings inside the body see a fresh scope dictionary.
-@End Implementation
-Process called "translate_rust_function" takes translator as Integer, func_node as Integer returns Integer:
-    Note: Translate Rust function to HIR function with ownership semantics
-
-    @Reasoning:
-    Function translation must preserve parameter ownership patterns (self, &self, &mut self),
-    lifetime parameters, generic constraints, and async/unsafe modifiers while
-    converting the function body to HIR statements.
-    @End Reasoning
-
-    Let func_name be proc memory_get_int64 from Layout with func_node, 8
-    Let func_params be proc memory_get_int64 from Layout with func_node, 16
-    Let func_return_type be proc memory_get_int64 from Layout with func_node, 24
-    Let func_body be proc memory_get_int64 from Layout with func_node, 32
-    Let func_generics be proc memory_get_int64 from Layout with func_node, 40
-    Let func_modifiers be proc memory_get_int64 from Layout with func_node, 48
-
-    Let hir_function be proc create_hir_function_node from HIR with func_name
-
-    Note: Translate function parameters with ownership semantics
-    If func_params is not equal to 0:
-        Let hir_params be proc translate_rust_function_params with translator, func_params
-        proc set_function_parameters from HIR with hir_function, hir_params
-    End If
-
-    Note: Translate return type
-    If func_return_type is not equal to 0:
-        Let hir_return_type be proc translate_rust_type with translator, func_return_type
-        proc set_function_return_type from HIR with hir_function, hir_return_type
-    End If
-
-    Note: Translate generic parameters and constraints
-    If func_generics is not equal to 0:
-        Let hir_generics be proc translate_rust_generics with translator, func_generics
-        proc set_function_generics from HIR with hir_function, hir_generics
-    End If
-
-    Note: Set function modifiers (async, unsafe, const, extern)
-    If func_modifiers is not equal to 0:
-        proc apply_rust_function_modifiers with translator, hir_function, func_modifiers
-    End If
-
-    Note: Translate function body
-    If func_body is not equal to 0:
-        proc enter_function_scope from translator
-        Let hir_body be proc translate_rust_block with translator, func_body
-        proc set_function_body from HIR with hir_function, hir_body
-        proc exit_function_scope from translator
-    End If
-
-    Return hir_function
-End Process
-
-@Reasoning:
-The parameter list is itself a parser node with a children list at offset 32
-(matching the generic "container of items" convention). Building a HIR
-parameter list and appending one HIR parameter per Rust parameter keeps the
-order the user wrote in source, which matters for positional arguments.
-@End Reasoning
-@Implementation:
-Create the HIR parameter list, then iterate children with proc size/get from
-List. Each child is delegated to translate_rust_parameter. Non-null results
-are appended; nulls (which signal a translation failure) are dropped silently
-because the per-parameter translator records its own diagnostic.
-@End Implementation
-Process called "translate_rust_function_params" takes translator as Integer, params_node as Integer returns Integer:
-    Note: Translate function parameters preserving ownership patterns
-
-    Let hir_params be proc create_hir_parameter_list from HIR
-
-    Let children be proc memory_get_int64 from Layout with params_node, 32
-    If children is not equal to 0:
-        Let child_count be proc size from List with children
-        Let i be 0
-        While i is less than child_count:
-            Let param be proc get from List with children, i
-            Let hir_param be proc translate_rust_parameter with translator, param
-
-            If hir_param is not equal to 0:
-                proc add_parameter from HIR with hir_params, hir_param
-            End If
-
-            Set i to i plus 1
-        End While
-    End If
-
-    Return hir_params
-End Process
-
-@Reasoning:
-A single parameter has up to three components: name, type, and an optional
-destructuring pattern (e.g. `(a, b): (i32, i32)`). The `self`-receiver case
-must additionally tag the HIR parameter with the receiver's outer type so
-downstream method-resolution can find the impl.
-@End Reasoning
-@Implementation:
-Read name@8, type@16, pattern@24. Create HIR parameter; if type is present,
-translate it and check for the special "self" name to set self_type. If a
-destructuring pattern is present, translate and attach it. Both are optional
-because Rust permits `fn f(x)` only inside closure-like sugar paths the
-parser doesn't propagate without a type.
-@End Implementation
-Process called "translate_rust_parameter" takes translator as Integer, param_node as Integer returns Integer:
-    Note: Translate individual parameter with ownership semantics
-
-    Let param_name be proc memory_get_int64 from Layout with param_node, 8
-    Let param_type be proc memory_get_int64 from Layout with param_node, 16
-    Let param_pattern be proc memory_get_int64 from Layout with param_node, 24
-
-    Let hir_param be proc create_hir_parameter_node from HIR with param_name
-
-    Note: Translate parameter type (includes ownership information)
-    If param_type is not equal to 0:
-        Let hir_type be proc translate_rust_type with translator, param_type
-        proc set_parameter_type from HIR with hir_param, hir_type
-
-        Note: Check for self parameter patterns
-        Let type_str be proc memory_get_int64 from Layout with param_type, 8
-        If type_str is not equal to 0:
-            Let is_self be proc equals from StringCore with param_name, "self"
-            If is_self is equal to 1:
-                proc set_parameter_self_type from HIR with hir_param, type_str
-            End If
-        End If
-    End If
-
-    Note: Handle destructuring patterns in parameters
-    If param_pattern is not equal to 0:
-        Let hir_pattern be proc translate_rust_pattern with translator, param_pattern
-        proc set_parameter_pattern from HIR with hir_param, hir_pattern
-    End If
-
-    Return hir_param
-End Process
-
-@Reasoning:
-Three optional companion sections - fields, generics, and attributes -
-attach to a struct via dedicated HIR setters rather than positional slots so
-adding a future section (e.g. `where` clauses) won't shift existing offsets.
-@End Reasoning
-@Implementation:
-Read name@8, fields@16, generics@24, attributes@32. Create HIR struct node;
-translate and attach each optional section if non-null. Attributes are
-processed via apply_rust_struct_attributes which handles derive(...) macros
-specifically.
-@End Implementation
-Process called "translate_rust_struct" takes translator as Integer, struct_node as Integer returns Integer:
-    Note: Translate Rust struct to HIR struct type
-
-    @Reasoning:
-    Struct translation must handle named fields, tuple structs, unit structs,
-    generic parameters, lifetime parameters, and derive attributes while
-    preserving field ownership and visibility semantics.
-    @End Reasoning
-
-    Let struct_name be proc memory_get_int64 from Layout with struct_node, 8
-    Let struct_fields be proc memory_get_int64 from Layout with struct_node, 16
-    Let struct_generics be proc memory_get_int64 from Layout with struct_node, 24
-    Let struct_attributes be proc memory_get_int64 from Layout with struct_node, 32
-
-    Let hir_struct be proc create_hir_struct_node from HIR with struct_name
-
-    Note: Translate struct fields
-    If struct_fields is not equal to 0:
-        Let hir_fields be proc translate_rust_struct_fields with translator, struct_fields
-        proc set_struct_fields from HIR with hir_struct, hir_fields
-    End If
-
-    Note: Translate generic parameters
-    If struct_generics is not equal to 0:
-        Let hir_generics be proc translate_rust_generics with translator, struct_generics
-        proc set_struct_generics from HIR with hir_struct, hir_generics
-    End If
-
-    Note: Process derive and other attributes
-    If struct_attributes is not equal to 0:
-        proc apply_rust_struct_attributes with translator, hir_struct, struct_attributes
-    End If
-
-    Return hir_struct
-End Process
-
-@Reasoning:
-Field-list iteration uses the same offset-32 children convention as
-function params. Keeping field order is required because tuple-style structs
-identify fields positionally and even named structs preserve declaration
-order for layout decisions in the backend.
-@End Reasoning
-@Implementation:
-Build a HIR field list; iterate fields_node children; delegate each to
-translate_rust_struct_field; append non-null results.
-@End Implementation
-Process called "translate_rust_struct_fields" takes translator as Integer, fields_node as Integer returns Integer:
-    Note: Translate struct fields with visibility and ownership
-
-    Let hir_fields be proc create_hir_field_list from HIR
-
-    Let children be proc memory_get_int64 from Layout with fields_node, 32
-    If children is not equal to 0:
-        Let child_count be proc size from List with children
-        Let i be 0
-        While i is less than child_count:
-            Let field be proc get from List with children, i
-            Let hir_field be proc translate_rust_struct_field with translator, field
-
-            If hir_field is not equal to 0:
-                proc add_field from HIR with hir_fields, hir_field
-            End If
-
-            Set i to i plus 1
-        End While
-    End If
-
-    Return hir_fields
-End Process
-
-@Reasoning:
-A struct field carries name, type, and visibility. Visibility is stored as
-an integer enum (pub, crate, super, restricted) rather than a string because
-the HIR-side consumer compares it numerically when checking access from
-other crates/modules.
-@End Reasoning
-@Implementation:
-Read name@8, type@16, visibility@24. Construct HIR field; if type is present
-translate and set it; if visibility is present, attach it as-is (no further
-translation needed since the enum codes match between parser and HIR).
-@End Implementation
-Process called "translate_rust_struct_field" takes translator as Integer, field_node as Integer returns Integer:
-    Note: Translate individual struct field
-
-    Let field_name be proc memory_get_int64 from Layout with field_node, 8
-    Let field_type be proc memory_get_int64 from Layout with field_node, 16
-    Let field_visibility be proc memory_get_int64 from Layout with field_node, 24
-
-    Let hir_field be proc create_hir_field_node from HIR with field_name
-
-    Note: Translate field type
-    If field_type is not equal to 0:
-        Let hir_type be proc translate_rust_type with translator, field_type
-        proc set_field_type from HIR with hir_field, hir_type
-    End If
-
-    Note: Set field visibility
-    If field_visibility is not equal to 0:
-        proc set_field_visibility from HIR with hir_field, field_visibility
-    End If
-
-    Return hir_field
-End Process
-
-@Reasoning:
-Rust enums are sum types whose variants each carry zero, named, or
-positional fields. Generic parameters apply uniformly across variants. We
-translate variants and generics independently because they reside in
-different containers in the parser AST.
-@End Reasoning
-@Implementation:
-Read name@8, variants@16, generics@24. Build HIR enum, then translate
-variants and generics through their respective helpers and attach via
-set_enum_variants / set_enum_generics.
-@End Implementation
-Process called "translate_rust_enum" takes translator as Integer, enum_node as Integer returns Integer:
-    Note: Translate Rust enum to HIR enum type
-
-    @Reasoning:
-    Enum translation must handle unit variants, tuple variants, struct variants,
-    discriminant values, generic parameters, and pattern matching semantics
-    while preserving the algebraic data type structure.
-    @End Reasoning
-
-    Let enum_name be proc memory_get_int64 from Layout with enum_node, 8
-    Let enum_variants be proc memory_get_int64 from Layout with enum_node, 16
-    Let enum_generics be proc memory_get_int64 from Layout with enum_node, 24
-
-    Let hir_enum be proc create_hir_enum_node from HIR with enum_name
-
-    Note: Translate enum variants
-    If enum_variants is not equal to 0:
-        Let hir_variants be proc translate_rust_enum_variants with translator, enum_variants
-        proc set_enum_variants from HIR with hir_enum, hir_variants
-    End If
-
-    Note: Translate generic parameters
-    If enum_generics is not equal to 0:
-        Let hir_generics be proc translate_rust_generics with translator, enum_generics
-        proc set_enum_generics from HIR with hir_enum, hir_generics
-    End If
-
-    Return hir_enum
-End Process
-
-@Reasoning:
-Variant order is significant for discriminant assignment when the user did
-not specify explicit discriminants - the first variant gets 0, subsequent
-ones increment. The walk therefore preserves source order.
-@End Reasoning
-@Implementation:
-Build HIR variant list; iterate variants_node children at offset 32;
-delegate each to translate_rust_enum_variant; append non-null results.
-@End Implementation
-Process called "translate_rust_enum_variants" takes translator as Integer, variants_node as Integer returns Integer:
-    Note: Translate enum variants with data preservation
-
-    Let hir_variants be proc create_hir_variant_list from HIR
-
-    Let children be proc memory_get_int64 from Layout with variants_node, 32
-    If children is not equal to 0:
-        Let child_count be proc size from List with children
-        Let i be 0
-        While i is less than child_count:
-            Let variant be proc get from List with children, i
-            Let hir_variant be proc translate_rust_enum_variant with translator, variant
-
-            If hir_variant is not equal to 0:
-                proc add_variant from HIR with hir_variants, hir_variant
-            End If
-
-            Set i to i plus 1
-        End While
-    End If
-
-    Return hir_variants
-End Process
-
-@Reasoning:
-A variant can be: unit (`A`), tuple (`A(i32, f64)`), or struct
-(`A { x: i32 }`). The variant_data discriminator at offset 0 of the data
-node distinguishes tuple from struct fields; missing data means unit
-variant.
-@End Reasoning
-@Implementation:
-Read name@8, variant_data@16, variant_discriminant@24. Build HIR variant
-node. If variant_data exists, read its tag and dispatch to either tuple-field
-or struct-field translation. If a discriminant expression is present (e.g.
-`A = 7`), translate and attach it.
-@End Implementation
-Process called "translate_rust_enum_variant" takes translator as Integer, variant_node as Integer returns Integer:
-    Note: Translate individual enum variant
-
-    Let variant_name be proc memory_get_int64 from Layout with variant_node, 8
-    Let variant_data be proc memory_get_int64 from Layout with variant_node, 16
-    Let variant_discriminant be proc memory_get_int64 from Layout with variant_node, 24
-
-    Let hir_variant be proc create_hir_variant_node from HIR with variant_name
-
-    Note: Translate variant data (tuple or struct fields)
-    If variant_data is not equal to 0:
-        Let data_type be proc memory_get_int64 from Layout with variant_data, 0
-
-        If data_type is equal to RUST_TUPLE_FIELDS from Parser:
-            Let hir_fields be proc translate_rust_tuple_fields with translator, variant_data
-            proc set_variant_tuple_fields from HIR with hir_variant, hir_fields
-        Otherwise If data_type is equal to RUST_STRUCT_FIELDS from Parser:
-            Set hir_fields to proc translate_rust_struct_fields with translator, variant_data
-            proc set_variant_struct_fields from HIR with hir_variant, hir_fields
-        End If
-    End If
-
-    Note: Set explicit discriminant value
-    If variant_discriminant is not equal to 0:
-        Let hir_discriminant be proc translate_rust_expression with translator, variant_discriminant
-        proc set_variant_discriminant from HIR with hir_variant, hir_discriminant
-    End If
-
-    Return hir_variant
-End Process
-
-@Reasoning:
-A trait declaration aggregates its item list (methods, associated types,
-associated constants), its generic parameters, and its supertrait bounds.
-All three are stored in separate parser containers so we translate each
-through a focused helper rather than overloading one walker.
-@End Reasoning
-@Implementation:
-Read name@8, items@16, generics@24, bounds@32. Construct HIR trait node and
-attach each translated sub-container via dedicated setters.
-@End Implementation
-Process called "translate_rust_trait" takes translator as Integer, trait_node as Integer returns Integer:
-    Note: Translate Rust trait to HIR trait definition
-
-    @Reasoning:
-    Trait translation must preserve associated types, const items, default
-    implementations, generic bounds, lifetime parameters, and trait bounds
-    while maintaining the interface contract semantics.
-    @End Reasoning
-
-    Let trait_name be proc memory_get_int64 from Layout with trait_node, 8
-    Let trait_items be proc memory_get_int64 from Layout with trait_node, 16
-    Let trait_generics be proc memory_get_int64 from Layout with trait_node, 24
-    Let trait_bounds be proc memory_get_int64 from Layout with trait_node, 32
-
-    Let hir_trait be proc create_hir_trait_node from HIR with trait_name
-
-    Note: Translate trait items (methods, associated types, constants)
-    If trait_items is not equal to 0:
-        Let hir_items be proc translate_rust_trait_items with translator, trait_items
-        proc set_trait_items from HIR with hir_trait, hir_items
-    End If
-
-    Note: Translate generic parameters
-    If trait_generics is not equal to 0:
-        Let hir_generics be proc translate_rust_generics with translator, trait_generics
-        proc set_trait_generics from HIR with hir_trait, hir_generics
-    End If
-
-    Note: Translate trait bounds (supertraits)
-    If trait_bounds is not equal to 0:
-        Let hir_bounds be proc translate_rust_trait_bounds with translator, trait_bounds
-        proc set_trait_bounds from HIR with hir_trait, hir_bounds
-    End If
-
-    Return hir_trait
-End Process
-
-@Reasoning:
-An impl block can be inherent (`impl Type`) or trait (`impl Trait for Type`).
-We distinguish by presence of impl_trait at offset 16 rather than by a
-separate tag. Generic parameters are stored last so adding `where` clause
-support later won't shift earlier offsets.
-@End Reasoning
-@Implementation:
-Read impl_type@8, impl_trait@16, impl_items@24, impl_generics@32. Build HIR
-impl; if impl_type is present translate and attach (inherent or trait
-target); if impl_trait is present translate the trait reference; translate
-items and generics through their helpers.
-@End Implementation
-Process called "translate_rust_impl" takes translator as Integer, impl_node as Integer returns Integer:
-    Note: Translate Rust impl block to HIR implementation
-
-    @Reasoning:
-    Implementation blocks must preserve trait implementations, inherent implementations,
-    generic parameters, where clauses, and method implementations while maintaining
-    coherence and orphan rule semantics.
-    @End Reasoning
-
-    Let impl_type be proc memory_get_int64 from Layout with impl_node, 8
-    Let impl_trait be proc memory_get_int64 from Layout with impl_node, 16
-    Let impl_items be proc memory_get_int64 from Layout with impl_node, 24
-    Let impl_generics be proc memory_get_int64 from Layout with impl_node, 32
-
-    Let hir_impl be proc create_hir_impl_node from HIR
-
-    Note: Set the type being implemented for
-    If impl_type is not equal to 0:
-        Let hir_type be proc translate_rust_type with translator, impl_type
-        proc set_impl_type from HIR with hir_impl, hir_type
-    End If
-
-    Note: Set the trait being implemented (if trait impl)
-    If impl_trait is not equal to 0:
-        Let hir_trait_ref be proc translate_rust_trait_ref with translator, impl_trait
-        proc set_impl_trait from HIR with hir_impl, hir_trait_ref
-    End If
-
-    Note: Translate implementation items
-    If impl_items is not equal to 0:
-        Let hir_items be proc translate_rust_impl_items with translator, impl_items
-        proc set_impl_items from HIR with hir_impl, hir_items
-    End If
-
-    Note: Translate generic parameters
-    If impl_generics is not equal to 0:
-        Let hir_generics be proc translate_rust_generics with translator, impl_generics
-        proc set_impl_generics from HIR with hir_impl, hir_generics
-    End If
-
-    Return hir_impl
-End Process
-
-@Reasoning:
-A Rust block is a sequence of statements terminated optionally by a tail
-expression that becomes the block's value. The parser flattens both into the
-same children list; the HIR block node distinguishes them via the
-add_block_statement / set_block_tail HIR setters (only the former is used
-here because the parser already encodes the tail as a final expression-
-statement when applicable).
-@End Reasoning
-@Implementation:
-Build HIR block node, iterate children at offset 32 of block_node, dispatch
-each to translate_rust_statement, and append non-null HIR statements via
-add_block_statement.
-@End Implementation
-Process called "translate_rust_block" takes translator as Integer, block_node as Integer returns Integer:
-    Note: Translate Rust block expression to HIR block
-
-    @Reasoning:
-    Block translation must preserve statement order, expression vs statement
-    semantics, variable scoping, and the final expression return value
-    while maintaining proper ownership transfer patterns.
-    @End Reasoning
-
-    Let hir_block be proc create_hir_block_node from HIR
-
-    Let children be proc memory_get_int64 from Layout with block_node, 32
-    If children is not equal to 0:
-        Let child_count be proc size from List with children
-        Let i be 0
-        While i is less than child_count:
-            Let stmt be proc get from List with children, i
-            Let hir_stmt be proc translate_rust_statement with translator, stmt
-
-            If hir_stmt is not equal to 0:
-                proc add_block_statement from HIR with hir_block, hir_stmt
-            End If
-
-            Set i to i plus 1
-        End While
-    End If
-
-    Return hir_block
-End Process
-
-@Reasoning:
-Statements in Rust come in three flavors: let bindings, expression
-statements, and item statements (inner functions/structs declared inside a
-block). Dispatch is by parser tag at offset 0; unknown tags yield an error
-node so the gap is visible.
-@End Reasoning
-@Implementation:
-Null-check the input. Read tag@0. If/Otherwise If chain to
-translate_rust_let_statement, translate_rust_expression_statement, or
-translate_rust_item_statement. Default branch returns a HIR error node.
-@End Implementation
-Process called "translate_rust_statement" takes translator as Integer, stmt_node as Integer returns Integer:
-    Note: Translate Rust statements to HIR statements
-
-    If stmt_node is equal to 0:
-        Return 0
-    End If
-
-    Let stmt_type be proc memory_get_int64 from Layout with stmt_node, 0
-
-    If stmt_type is equal to RUST_LET_BINDING from Parser:
-        Return proc translate_rust_let_statement with translator, stmt_node
-    Otherwise If stmt_type is equal to RUST_EXPRESSION_STMT from Parser:
-        Return proc translate_rust_expression_statement with translator, stmt_node
-    Otherwise If stmt_type is equal to RUST_ITEM_STMT from Parser:
-        Return proc translate_rust_item_statement with translator, stmt_node
-    End If
-
-    Return proc create_hir_error_node from HIR with "Unknown statement type"
-End Process
-
-@Reasoning:
-The expression dispatcher fans out to 27 different translators - the largest
-single fan-out in this translator - because Rust's expression grammar covers
-literals, identifiers, calls, indexing, all binary and unary ops, ranges,
-closures, async/unsafe blocks, all forms of control flow, and various
-constructions (struct literals, tuples, arrays). Centralizing the dispatch
-guarantees every new expression kind goes through one chokepoint.
-@End Reasoning
-@Implementation:
-Null-check the input. Read tag@0. Long if/Otherwise If chain dispatching to
-each translate_rust_<kind> helper. Unknown tags return a HIR error node so
-producer-side gaps are surfaced as visible errors rather than silent drops.
-@End Implementation
-Process called "translate_rust_expression" takes translator as Integer, expr_node as Integer returns Integer:
-    Note: Translate Rust expressions to HIR expressions
-
-    @Reasoning:
-    Expression translation must handle all Rust expression types including
-    literals, variables, function calls, method calls, field access, array/tuple
-    indexing, borrowing, dereferencing, and ownership transfer semantics.
-    @End Reasoning
-
-    If expr_node is equal to 0:
-        Return 0
-    End If
-
-    Let expr_type be proc memory_get_int64 from Layout with expr_node, 0
-
-    If expr_type is equal to RUST_LITERAL from Parser:
-        Return proc translate_rust_literal with translator, expr_node
-    Otherwise If expr_type is equal to RUST_IDENTIFIER from Parser:
-        Return proc translate_rust_identifier with translator, expr_node
-    Otherwise If expr_type is equal to RUST_FUNCTION_CALL from Parser:
-        Return proc translate_rust_function_call with translator, expr_node
-    Otherwise If expr_type is equal to RUST_METHOD_CALL from Parser:
-        Return proc translate_rust_method_call with translator, expr_node
-    Otherwise If expr_type is equal to RUST_FIELD_ACCESS from Parser:
-        Return proc translate_rust_field_access with translator, expr_node
-    Otherwise If expr_type is equal to RUST_ARRAY_ACCESS from Parser:
-        Return proc translate_rust_array_access with translator, expr_node
-    Otherwise If expr_type is equal to RUST_BORROW from Parser:
-        Return proc translate_rust_borrow with translator, expr_node
-    Otherwise If expr_type is equal to RUST_DEREFERENCE from Parser:
-        Return proc translate_rust_dereference with translator, expr_node
-    Otherwise If expr_type is equal to RUST_BINARY_OP from Parser:
-        Return proc translate_rust_binary_op with translator, expr_node
-    Otherwise If expr_type is equal to RUST_UNARY_OP from Parser:
-        Return proc translate_rust_unary_op with translator, expr_node
-    Otherwise If expr_type is equal to RUST_ASSIGNMENT from Parser:
-        Return proc translate_rust_assignment with translator, expr_node
-    Otherwise If expr_type is equal to RUST_RANGE from Parser:
-        Return proc translate_rust_range with translator, expr_node
-    Otherwise If expr_type is equal to RUST_STRUCT_EXPR from Parser:
-        Return proc translate_rust_struct_expr with translator, expr_node
-    Otherwise If expr_type is equal to RUST_ARRAY_EXPR from Parser:
-        Return proc translate_rust_array_expr with translator, expr_node
-    Otherwise If expr_type is equal to RUST_TUPLE_EXPR from Parser:
-        Return proc translate_rust_tuple_expr with translator, expr_node
-    Otherwise If expr_type is equal to RUST_BLOCK_EXPR from Parser:
-        Return proc translate_rust_block with translator, expr_node
-    Otherwise If expr_type is equal to RUST_IF_EXPR from Parser:
-        Return proc translate_rust_if_expr with translator, expr_node
-    Otherwise If expr_type is equal to RUST_MATCH_EXPR from Parser:
-        Return proc translate_rust_match_expr with translator, expr_node
-    Otherwise If expr_type is equal to RUST_LOOP_EXPR from Parser:
-        Return proc translate_rust_loop_expr with translator, expr_node
-    Otherwise If expr_type is equal to RUST_WHILE_EXPR from Parser:
-        Return proc translate_rust_while_expr with translator, expr_node
-    Otherwise If expr_type is equal to RUST_FOR_EXPR from Parser:
-        Return proc translate_rust_for_expr with translator, expr_node
-    Otherwise If expr_type is equal to RUST_CLOSURE from Parser:
-        Return proc translate_rust_closure with translator, expr_node
-    Otherwise If expr_type is equal to RUST_ASYNC_BLOCK from Parser:
-        Return proc translate_rust_async_block with translator, expr_node
-    Otherwise If expr_type is equal to RUST_UNSAFE_BLOCK from Parser:
-        Return proc translate_rust_unsafe_block with translator, expr_node
-    Otherwise If expr_type is equal to RUST_RETURN from Parser:
-        Return proc translate_rust_return with translator, expr_node
-    Otherwise If expr_type is equal to RUST_BREAK from Parser:
-        Return proc translate_rust_break with translator, expr_node
-    Otherwise If expr_type is equal to RUST_CONTINUE from Parser:
-        Return proc translate_rust_continue with translator, expr_node
-    End If
-
-    Return proc create_hir_error_node from HIR with "Unknown expression type"
-End Process
-
-@Reasoning:
-Type dispatch covers 10 Rust type kinds: path types (Foo::Bar<T>), references
-(&T, &mut T), arrays ([T; N]), slices ([T]), tuples ((T, U)), function types
-(fn(T)->U), generic types, associated types (T::Item), impl-Trait, and
-dyn-Trait. The path-vs-reference distinction is the most important because
-references carry lifetime and mutability that flow into HIR's ownership model.
-@End Reasoning
-@Implementation:
-Null-check input. Read tag@0. Dispatch via if/Otherwise If to the specific
-translate_rust_<kind>_type helper. Default returns a HIR error node "Unknown
-type".
-@End Implementation
-Process called "translate_rust_type" takes translator as Integer, type_node as Integer returns Integer:
-    Note: Translate Rust type annotations to HIR types
-
-    @Reasoning:
-    Type translation must preserve ownership information (ownership, borrowing),
-    lifetime parameters, generic arguments, trait bounds, and complex types
-    like function pointers, closures, and associated types.
-    @End Reasoning
-
-    If type_node is equal to 0:
-        Return 0
-    End If
-
-    Let type_type be proc memory_get_int64 from Layout with type_node, 0
-
-    If type_type is equal to RUST_PATH_TYPE from Parser:
-        Return proc translate_rust_path_type with translator, type_node
-    Otherwise If type_type is equal to RUST_REFERENCE_TYPE from Parser:
-        Return proc translate_rust_reference_type with translator, type_node
-    Otherwise If type_type is equal to RUST_ARRAY_TYPE from Parser:
-        Return proc translate_rust_array_type with translator, type_node
-    Otherwise If type_type is equal to RUST_SLICE_TYPE from Parser:
-        Return proc translate_rust_slice_type with translator, type_node
-    Otherwise If type_type is equal to RUST_TUPLE_TYPE from Parser:
-        Return proc translate_rust_tuple_type with translator, type_node
-    Otherwise If type_type is equal to RUST_FUNCTION_TYPE from Parser:
-        Return proc translate_rust_function_type with translator, type_node
-    Otherwise If type_type is equal to RUST_GENERIC_TYPE from Parser:
-        Return proc translate_rust_generic_type with translator, type_node
-    Otherwise If type_type is equal to RUST_ASSOCIATED_TYPE from Parser:
-        Return proc translate_rust_associated_type with translator, type_node
-    Otherwise If type_type is equal to RUST_IMPL_TRAIT_TYPE from Parser:
-        Return proc translate_rust_impl_trait_type with translator, type_node
-    Otherwise If type_type is equal to RUST_DYN_TRAIT_TYPE from Parser:
-        Return proc translate_rust_dyn_trait_type with translator, type_node
-    End If
-
-    Return proc create_hir_error_node from HIR with "Unknown type"
-End Process
-
-@Reasoning:
-Function bodies introduce a fresh lexical scope for let-bindings, named
-loop labels, and generic parameter binders. Pushing a new dictionary onto
-the scope stack and caching its handle in current_scope (offset 0) lets the
-hot translate path read current_scope without walking the stack.
-@End Reasoning
-@Implementation:
-Read scope_stack from offset 8, create a new empty dictionary, append it to
-the stack, then update current_scope at offset 0 to that new dictionary.
-The previous current_scope is recoverable from the stack on exit.
-@End Implementation
-Process called "enter_function_scope" takes translator as Integer:
-    Note: Enter new scope for function translation
-
-    Let scope_stack be proc memory_get_int64 from Layout with translator, 8
-    Let new_scope be proc create from Dict
-    proc append with scope_stack, new_scope
-
-    proc memory_set_int64 from Layout with translator, 0, new_scope
-End Process
-
-@Reasoning:
-Exit must rebind current_scope to the previous frame. The previous frame is
-located at stack_size - 2 after removing the topmost element, hence the
-"new_size - 1" expression. When the stack empties, current_scope becomes 0
-to signal "outside any function" rather than dangling at the popped frame.
-@End Reasoning
-@Implementation:
-Read scope_stack@8 and its size. Guard against underflow when stack is
-empty. Remove the last frame; if any remain, set current_scope to the now-
-topmost frame (index new_size - 1); otherwise zero current_scope.
-@End Implementation
-Process called "exit_function_scope" takes translator as Integer:
-    Note: Exit current function scope
-
-    Let scope_stack be proc memory_get_int64 from Layout with translator, 8
-    Let stack_size be proc size from List with scope_stack
-
-    If stack_size is greater than 0:
-        proc remove_last with scope_stack
-        Let new_size be stack_size minus 1
-
-        If new_size is greater than 0:
-            Let current_scope be proc get from List with scope_stack, new_size minus 1
-            proc memory_set_int64 from Layout with translator, 0, current_scope
-        Otherwise:
-            proc memory_set_int64 from Layout with translator, 0, 0
-        End If
-    End If
-End Process
-
-@Reasoning:
-Records a translator-level error: both the has_error flag (so cheap branch
-"did anything fail?" checks work) and the message itself. The message is
-COPIED rather than referenced because the caller may free or reuse the
-buffer immediately after this call.
-@End Reasoning
-@Implementation:
-Set has_error@40 to 1; copy_string the message via StringCore (defensive
-ownership); store the copy at error_message@32. Subsequent errors overwrite
-the previous message; first-error-wins semantics would require a presence
-check here.
-@End Implementation
-Process called "set_rust_translator_error" takes translator as Integer, message as Integer:
-    Note: Set translator error state
-
-    proc memory_set_int64 from Layout with translator, 40, 1
-
-    Let error_copy be proc copy_string from StringCore with message
-    proc memory_set_int64 from Layout with translator, 32, error_copy
-End Process
-
-@Reasoning:
-Public single-arg facade invoked by the translation dispatcher's
-LANG_RUST arm. Wires the full source -> HIR pipeline: Parser's
-create_rust_parser builds both the lexer and parser state from raw
-source, parse_rust_program walks the token stream into a RUST_PROGRAM
-AST root, the optional semantic pass (borrow / lifetime / trait
-resolution) validates the AST without mutating its shape, and
-translate_rust_program lowers it into HIR through a freshly
-constructed RustToHIRTranslator.
-@End Reasoning
-
-@Implementation:
-parser = Parser.create_rust_parser(source); on parser == 0 return 0;
-ast = Parser.parse_rust_program(parser); if ast == 0 return 0;
-analyzer = Semantic.create_rust_semantic_analyzer(); if non-zero, run
-Semantic.analyze_rust_program(analyzer, ast) -- this is a validation
-pass, the result is discarded because translate_rust_program walks the
-same AST regardless of semantic outcome (errors surface later via the
-translator's has_error flag). translator = create_rust_to_hir_translator();
-on translator == 0 return 0; return translate_rust_program(translator,
-ast). Allocator lifetimes are bounded by the calling translate_to_hir
-frame; no explicit destroy is required because the parser/analyzer/
-translator records are heap blobs that the global allocator reclaims
-when the compilation arena is reset.
-@End Implementation
-
 Process called "rust_to_hir_from_source" takes source_code as Integer returns Integer:
     Let parser be proc create_rust_parser from Parser with source_code
     If parser is equal to 0:
         Return 0
     End If
+
     Let ast be proc parse_rust_program from Parser with parser
     If ast is equal to 0:
         Return 0
@@ -982,10 +1823,5 @@ Process called "rust_to_hir_from_source" takes source_code as Integer returns In
         proc analyze_rust_program from Semantic with analyzer, ast
     End If
 
-    Let translator be proc create_rust_to_hir_translator
-    If translator is equal to 0:
-        Return 0
-    End If
-
-    Return proc translate_rust_program with translator, ast
+    Return proc translate_rust_program with 0, ast
 End Process

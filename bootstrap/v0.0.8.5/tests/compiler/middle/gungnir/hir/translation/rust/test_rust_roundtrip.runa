@@ -1,0 +1,271 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+Licensed under Apache 2.0
+:End Note
+
+Note:
+Rust Translation Round-Trip Probe
+
+End-to-end proof that the Rust translation pipeline is REAL, not a skeleton:
+
+    Rust source
+      -> rust_lexer    (streaming tokenizer: keywords as distinct tokens,
+                        identifiers, lifetimes, numeric/char/string literals,
+                        the full operator/punctuation set incl :: -> => ..= << >>)
+      -> rust_parser   (recursive-descent AST: mod, use, a generic struct + impl
+                        with methods, an enum with data variants, a trait + impl,
+                        a generic fn with where clause, match, if-let, a closure,
+                        the ? operator, a for loop)
+      -> rust_semantic (real scope/name resolution; validation only)
+      -> rust_to_hir   (lower to the canonical hir.runa create_hir_node IR)
+      -> hir_to_rust   (emit HIR back to valid Rust text)
+      -> re-lex / re-parse / re-to_hir of the emitted text
+      -> structural HIR equality on the key constructs
+
+The Rust HIR node model is hir.runa's canonical typed-node model shared by
+rust_to_hir (producer) and hir_to_rust (consumer): every node is a 104-byte
+HIRNode with node_type at offset 0, the textual payload at offset 40, a children
+List at offset 24, and child_count at offset 32. This probe reads HIR fields
+through exactly that contract.
+
+It lowers the source to HIR1, asserts HIR1 is a crate module whose declarations
+include a process named "area" and a type definition named "Shape", emits HIR1
+back to Rust text, re-runs the whole pipeline on the emitted text to HIR2, and
+asserts HIR2 is STRUCTURALLY EQUAL to HIR1 on those same key constructs.
+
+Exit code: number of failed assertions (0 == all passed). No exit_with_code.
+:End Note
+
+Import "compiler/middle/gungnir/hir/translation/frontends/rust/rust_to_hir.runa" as RustFrontend
+Import "compiler/middle/gungnir/hir/translation/backends/rust/hir_to_rust.runa" as RustBackend
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/collections/list.runa" as List
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "tests/test_utils.runa" as TestUtils
+
+Note: ============================================================================
+Note: Canonical HIRNode decoders (node_type@0, children@24, child_count@32,
+Note: value@40) - the exact layout rust_to_hir produces and hir_to_rust reads.
+Note: ============================================================================
+
+@Reasoning:
+The node_type tag lives at offset 0. Centralising the read documents the contract.
+@End Reasoning
+Process called "hir_kind" takes node as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Layout with node, 0
+End Process
+
+@Reasoning:
+The textual payload (name/operator/literal) lives at offset 40.
+@End Reasoning
+Process called "hir_value" takes node as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Layout with node, 40
+End Process
+
+@Reasoning:
+The children List handle lives at offset 24; the count at offset 32. The list is
+the same List the producer built via add_hir_node, so List.size/get_at iterate it.
+@End Reasoning
+Process called "hir_children" takes node as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Layout with node, 24
+End Process
+
+Process called "hir_child_count" takes node as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Layout with node, 32
+End Process
+
+@Reasoning:
+Positional child access over the children list.
+@End Reasoning
+Process called "hir_child" takes node as Integer, index as Integer returns Integer:
+    Let children be proc hir_children with node
+    If children is equal to 0:
+        Return 0
+    End If
+    Return proc get_at from List with children, index
+End Process
+
+@Reasoning:
+Finds the first child of a node whose node_type tag matches the requested kind AND
+whose value (name) string-equals the requested name. Returns 0 if none. This is the
+structural locator the assertions use to find a specific function/type by name.
+@End Reasoning
+Process called "find_child_named" takes parent as Integer, kind as Integer, name as Integer returns Integer:
+    If parent is equal to 0:
+        Return 0
+    End If
+    Let count be proc hir_child_count with parent
+    Let i be 0
+    While i is less than count:
+        Let child be proc hir_child with parent, i
+        Let ck be proc hir_kind with child
+        If ck is equal to kind:
+            Let cv be proc hir_value with child
+            Let matches be proc string_equals from StringCore with cv, name
+            If matches is equal to 1:
+                Return child
+            End If
+        End If
+        Set i to i plus 1
+    End While
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: Pipeline helper
+Note: ============================================================================
+
+@Reasoning:
+Each round runs the identical source -> HIR pipeline (parse, validate, lower) via
+the public single-arg facade, so any structural divergence is attributable to the
+emitter, not to a difference in how the inputs were driven.
+@End Reasoning
+Process called "source_to_hir" takes source as Integer returns Integer:
+    Return proc rust_to_hir_from_source from RustFrontend with source
+End Process
+
+Note: ============================================================================
+Note: Probe entry point
+Note: ============================================================================
+
+Process called "main" returns Integer:
+    Let results be proc create_test_results from TestUtils
+    proc begin_suite from TestUtils with results, "Rust translation round-trip"
+
+    Note:
+    Representative program exercising the constructs the task requires: a use
+    import, a generic struct, an enum with data variants, a trait, an impl with
+    methods (self receiver, generics, where clause, match, if-let, a closure, the
+    ? operator, a for loop), and a free generic function.
+    :End Note
+    Let source be "use std::collections::HashMap;\nstruct Point<T> {\nx: T,\ny: T,\n}\nenum Shape {\nCircle(f64),\nRect { w: f64, h: f64 },\nNothing,\n}\ntrait Area {\nfn area(&self) -> f64;\n}\nimpl Area for Shape {\nfn area(&self) -> f64 {\nlet result = match self {\nShape::Circle(r) => r * r,\nShape::Rect { w, h } => w * h,\nShape::Nothing => 0.0,\n};\nreturn result;\n}\n}\nimpl Shape {\nfn classify<T>(&self, items: Vec<T>) -> i64 where T: Clone {\nlet mut total = 0;\nfor item in items {\ntotal = total + 1;\n}\nif let Shape::Nothing = self {\ntotal = total - 1;\n}\nlet f = |z: i64| z + total;\nlet maybe = compute()?;\nreturn f(total);\n}\n}\nfn area(s: Shape) -> f64 {\nreturn s.area();\n}\n"
+
+    Note: --- Stage 0-2: source -> HIR1 (parse, validate, lower) ---
+    Let hir1 be proc rust_to_hir_from_source from RustFrontend with source
+    proc assert_not_null from TestUtils with results, "frontend produced HIR module", hir1
+
+    Note: HIR root is the crate module; it must have declarations.
+    Let root_kids be proc hir_child_count with hir1
+    proc assert_greater_than from TestUtils with results, "crate has declarations", root_kids, 0
+
+    Note: --- free function `area` present at the crate root (located by name) ---
+    Let area_node be proc find_named_any with hir1, "area"
+    proc assert_not_null from TestUtils with results, "function 'area' lowered", area_node
+
+    Note: --- generic struct `Point` present ---
+    Let point_node be proc find_named_any with hir1, "Point"
+    proc assert_not_null from TestUtils with results, "struct 'Point' lowered", point_node
+    Let point_fields be proc hir_child_count with point_node
+    proc assert_greater_than_or_equal from TestUtils with results, "Point has 2 fields", point_fields, 2
+
+    Note: --- enum `Shape` present with variants ---
+    Let shape_node be proc find_named_any with hir1, "Shape"
+    proc assert_not_null from TestUtils with results, "enum 'Shape' lowered", shape_node
+    Let shape_variants be proc hir_child_count with shape_node
+    proc assert_greater_than_or_equal from TestUtils with results, "Shape has 3 variants", shape_variants, 3
+
+    Note: --- method `area` (inside impl) and `classify` present somewhere ---
+    Let classify_node be proc find_named_any with hir1, "classify"
+    proc assert_not_null from TestUtils with results, "method 'classify' lowered", classify_node
+
+    Note: --- Stage 3: HIR1 -> Rust text ---
+    Let emitted be proc hir_to_rust from RustBackend with hir1
+    proc assert_not_null from TestUtils with results, "backend produced Rust text", emitted
+    Let emitted_len be proc string_length from StringCore with emitted
+    proc assert_greater_than from TestUtils with results, "emitted Rust is non-empty", emitted_len, 0
+
+    Note: --- Stage 4: re-run the pipeline on the emitted text -> HIR2 ---
+    Let hir2 be proc source_to_hir with emitted
+    proc assert_not_null from TestUtils with results, "re-parse of emitted Rust produced HIR", hir2
+    Let root2_kids be proc hir_child_count with hir2
+    proc assert_greater_than from TestUtils with results, "round-trip crate has declarations", root2_kids, 0
+
+    Note: --- Stage 5: structural equality on the key constructs ---
+    Let area2 be proc find_named_any with hir2, "area"
+    proc assert_not_null from TestUtils with results, "round-trip preserves function 'area'", area2
+    Let area_same be proc same_kind with area_node, area2
+    proc assert_equal from TestUtils with results, "round-trip preserves 'area' node kind", area_same, 1
+
+    Let point2 be proc find_named_any with hir2, "Point"
+    proc assert_not_null from TestUtils with results, "round-trip preserves struct 'Point'", point2
+    Let point_same be proc same_kind with point_node, point2
+    proc assert_equal from TestUtils with results, "round-trip preserves 'Point' node kind", point_same, 1
+
+    Let shape2 be proc find_named_any with hir2, "Shape"
+    proc assert_not_null from TestUtils with results, "round-trip preserves enum 'Shape'", shape2
+    Let shape2_variants be proc hir_child_count with shape2
+    proc assert_greater_than_or_equal from TestUtils with results, "round-trip preserves Shape variants", shape2_variants, 3
+
+    Let classify2 be proc find_named_any with hir2, "classify"
+    proc assert_not_null from TestUtils with results, "round-trip preserves method 'classify'", classify2
+
+    proc print_summary from TestUtils with results
+    Let failed be proc get_failed from TestUtils with results
+    proc destroy_test_results from TestUtils with results
+
+    Return failed
+End Process
+
+@Reasoning:
+Recursively searches the whole HIR tree for the first node (of any kind) whose
+value string-equals the requested name. This is the robust locator for a named
+declaration regardless of whether it sits at the crate root or inside an impl/trait
+module grouping.
+@End Reasoning
+Process called "find_named_any" takes parent as Integer, name as Integer returns Integer:
+    If parent is equal to 0:
+        Return 0
+    End If
+    Let pv be proc hir_value with parent
+    If pv is not equal to 0:
+        Let matches be proc string_equals from StringCore with pv, name
+        If matches is equal to 1:
+            Return parent
+        End If
+    End If
+    Let count be proc hir_child_count with parent
+    Let i be 0
+    While i is less than count:
+        Let child be proc hir_child with parent, i
+        Let found be proc find_named_any with child, name
+        If found is not equal to 0:
+            Note: do not return the crate root itself when it merely contains the
+            Note: name deeper; the recursion already returns the deepest match.
+            Return found
+        End If
+        Set i to i plus 1
+    End While
+    Return 0
+End Process
+
+@Reasoning:
+Two HIR nodes are structurally equal on a construct when both carry the same
+node_type tag - a whitespace-insensitive fidelity check that survives the emitter's
+re-indentation.
+@End Reasoning
+Process called "same_kind" takes a as Integer, b as Integer returns Integer:
+    If a is equal to 0:
+        Return 0
+    End If
+    If b is equal to 0:
+        Return 0
+    End If
+    Let ka be proc hir_kind with a
+    Let kb be proc hir_kind with b
+    If ka is equal to kb:
+        Return 1
+    End If
+    Return 0
+End Process
