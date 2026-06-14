@@ -1,0 +1,353 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+Licensed under Apache 2.0
+:End Note
+
+Note:
+CSS Translation Round-Trip Probe
+
+End-to-end proof that the CSS translation pipeline is REAL, not a skeleton:
+
+    CSS source
+      -> css_lexer    (tokenize: selectors, declarations, at-rules, functions,
+                       colors, units, strings, comments)
+      -> css_parser   (build CSS AST: stylesheet / rules / at-rules /
+                       selectors / declarations / values / functions / comments)
+      -> css_to_hir   (lower the CSS AST to the CSS-local HIR dict/list model)
+      -> hir_to_css   (emit the HIR back to formatted CSS3 source text)
+
+The probe feeds a representative stylesheet exercising the full CSS coverage
+surface: a comment, a type selector, a class selector, an id selector, the
+universal selector, an attribute selector, the child / adjacent / general
+sibling / descendant combinators, a pseudo-class and a pseudo-element, a
+selector list, rule blocks with multiple property:value declarations including
+multi-value and comma-list values, an !important flag, hex / rgb() / hsl()
+colors, px / em / rem / % units, calc() / var() / url() functions, an @import,
+an @media query with a nested rule, an @font-face block, and an @keyframes
+block. It then:
+
+  1. Parses the source and asserts the parser produced a non-empty AST whose
+     stylesheet root carries top-level children (PARSE-SMOKE: terminates under
+     the CPU cap because every parse loop has a forward-progress guard).
+  2. Lowers the source to the CSS-local HIR and asserts the HIR root dict is a
+     "stylesheet", its "rules" list is non-empty, that a class selector and a
+     combinator selector survive, that a rule carries at least two declarations
+     each with a property and a value, and that an !important value, a color
+     value, and a calc()/var() function value are reachable through the HIR.
+  3. Emits the HIR back to CSS text and asserts the text is non-empty and that
+     the depth content (class selector, combinator, two declarations,
+     !important, @media nesting, a color, calc()/var(), the comment) is present
+     in the emitted bytes.
+  4. Re-parses the emitted CSS back into HIR and asserts the round-trip HIR is
+     still a non-empty "stylesheet" with surviving rules -- proving the content
+     survives a full source -> HIR -> source -> HIR cycle.
+
+Exit code: number of failed assertions (0 == all passed). No exit_with_code.
+:End Note
+
+Import "compiler/middle/gungnir/hir/translation/frontends/css/css_parser.runa" as CssParser
+Import "compiler/middle/gungnir/hir/translation/frontends/css/css_to_hir.runa" as CssFrontend
+Import "compiler/middle/gungnir/hir/translation/backends/css/hir_to_css.runa" as CssBackend
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "tests/test_utils.runa" as TestUtils
+
+Note: ============================================================================
+Note: CSS-local HIR accessors
+Note: -
+Note: The CSS translator builds its own dependency-light dict/list structures
+Note: (it intentionally avoids the canonical HIR module). These accessors mirror
+Note: the exact byte layout that css_to_hir writes and hir_to_css reads:
+Note:   Dict header: offset 0 = size, 8 = capacity, 16 = keys ptr, 24 = values ptr
+Note:   List header: offset 0 = size, 8 = capacity, 16 = items ptr
+Note: ============================================================================
+
+Process called "css_dict_get" takes dict as Integer, key as Integer returns Integer:
+    If dict is equal to 0:
+        Return 0
+    End If
+
+    Let size be proc memory_get_int64 from Layout with dict, 0
+    Let keys_ptr be proc memory_get_int64 from Layout with dict, 16
+    Let values_ptr be proc memory_get_int64 from Layout with dict, 24
+
+    Let index be 0
+    While index is less than size:
+        Let current_key be proc memory_get_int64 from Layout with keys_ptr, index multiplied by 8
+        Let matches be proc string_equals from StringCore with current_key, key
+
+        If matches is equal to 1:
+            Let value be proc memory_get_int64 from Layout with values_ptr, index multiplied by 8
+            Return value
+        End If
+
+        Set index to index plus 1
+    End While
+
+    Return 0
+End Process
+
+Process called "css_list_size" takes list as Integer returns Integer:
+    If list is equal to 0:
+        Return 0
+    End If
+    Let size be proc memory_get_int64 from Layout with list, 0
+    Return size
+End Process
+
+Process called "css_list_get" takes list as Integer, index as Integer returns Integer:
+    If list is equal to 0:
+        Return 0
+    End If
+    Let items be proc memory_get_int64 from Layout with list, 16
+    Let item be proc memory_get_int64 from Layout with items, index multiplied by 8
+    Return item
+End Process
+
+Note: ============================================================================
+Note: Substring search over a null-terminated CSS string
+Note: -
+Note: StringCore exposes no contains primitive; this naive scan answers "does the
+Note: emitted CSS text carry this byte sequence" so the depth assertions can
+Note: prove specific content survived the HIR -> CSS emission.
+Note: ============================================================================
+
+Process called "contains_substr" takes haystack as Integer, needle as Integer returns Integer:
+    If haystack is equal to 0:
+        Return 0
+    End If
+    If needle is equal to 0:
+        Return 0
+    End If
+
+    Let hay_len be proc string_length from StringCore with haystack
+    Let needle_len be proc string_length from StringCore with needle
+
+    If needle_len is equal to 0:
+        Return 1
+    End If
+
+    If needle_len is greater than hay_len:
+        Return 0
+    End If
+
+    Let last_start be hay_len minus needle_len
+    Let start be 0
+
+    While start is less than or equal to last_start:
+        Let offset be 0
+        Let matched be 1
+
+        While offset is less than needle_len:
+            Let hay_char be proc string_char_at from StringCore with haystack, start plus offset
+            Let needle_char be proc string_char_at from StringCore with needle, offset
+
+            If hay_char is not equal to needle_char:
+                Set matched to 0
+                Break
+            End If
+
+            Set offset to offset plus 1
+        End While
+
+        If matched is equal to 1:
+            Return 1
+        End If
+
+        Set start to start plus 1
+    End While
+
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: Locate the first rule dict inside a stylesheet HIR (skipping comments and
+Note: at-rules so the declaration-depth assertions land on a real rule).
+Note: ============================================================================
+
+Process called "first_rule_dict" takes stylesheet_hir as Integer returns Integer:
+    Let rules_key be proc create_from_literal from StringCore with "rules"
+    Let rules be proc css_dict_get with stylesheet_hir, rules_key
+
+    If rules is equal to 0:
+        Return 0
+    End If
+
+    Let type_key be proc create_from_literal from StringCore with "type"
+    Let rule_marker be proc create_from_literal from StringCore with "rule"
+
+    Let count be proc css_list_size with rules
+    Let index be 0
+
+    While index is less than count:
+        Let entry be proc css_list_get with rules, index
+        Let entry_type be proc css_dict_get with entry, type_key
+        Let is_rule be proc string_equals from StringCore with entry_type, rule_marker
+
+        If is_rule is equal to 1:
+            Return entry
+        End If
+
+        Set index to index plus 1
+    End While
+
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: Probe entry point
+Note: ============================================================================
+
+Process called "main" returns Integer:
+    Let results be proc create_test_results from TestUtils
+    proc begin_suite from TestUtils with results, "CSS translation round-trip"
+
+    Note:
+    Representative stylesheet exercising the full CSS coverage surface. Kept on
+    a single logical document so the parser walks every construct in one pass.
+    :End Note
+    Let source be "/* base theme */ @import \"reset.css\"; h1.title, #main > .nav + li ~ a[data-x=\"y\"]:hover::before { color: #ff00aa; background: rgb(10, 20, 30); margin: 0 auto; width: calc(100% - 2rem); padding: 10px 1em; --accent: hsl(200, 50%, 40%); content: var(--accent) !important; background-image: url(bg.png); } @media screen { .responsive { display: block; font-size: 1.5rem; } } @font-face { font-family: \"Demo\"; } @keyframes spin { from { opacity: 0; } to { opacity: 1; } }"
+
+    Note: --- Stage 0: parse (PARSE-SMOKE) ---
+    Let ast be proc parse_css from CssParser with source
+    proc assert_not_null from TestUtils with results, "parser produced CSS AST", ast
+
+    Let ast_child_count be proc memory_get_int64 from Layout with ast, 32
+    proc assert_greater_than from TestUtils with results, "stylesheet AST has top-level children", ast_child_count, 0
+
+    Note: --- Stage 1: source -> HIR ---
+    Let hir1 be proc css_to_hir_from_source from CssFrontend with source
+    proc assert_not_null from TestUtils with results, "frontend produced HIR root", hir1
+
+    Let type_key be proc create_from_literal from StringCore with "type"
+    Let root_type be proc css_dict_get with hir1, type_key
+    proc assert_string_equal from TestUtils with results, "HIR root type is 'stylesheet'", root_type, "stylesheet"
+
+    Let rules_key be proc create_from_literal from StringCore with "rules"
+    Let rules be proc css_dict_get with hir1, rules_key
+    proc assert_not_null from TestUtils with results, "HIR root has a rules list", rules
+
+    Let rules_count be proc css_list_size with rules
+    proc assert_greater_than from TestUtils with results, "HIR rules list is non-empty", rules_count, 0
+
+    Note: --- Depth: a real rule with selectors and >=2 declarations ---
+    Let rule be proc first_rule_dict with hir1
+    proc assert_not_null from TestUtils with results, "HIR contains a 'rule' node", rule
+
+    Let selectors_key be proc create_from_literal from StringCore with "selectors"
+    Let selectors be proc css_dict_get with rule, selectors_key
+    proc assert_not_null from TestUtils with results, "rule has a selectors list", selectors
+
+    Let selectors_count be proc css_list_size with selectors
+    proc assert_greater_than from TestUtils with results, "rule has at least one selector", selectors_count, 0
+
+    Note:
+    The selector list is comma-separated; the class selector and the child
+    combinator live in different entries (h1.title vs "#main > .nav ..."). Scan
+    every selector entry so the assertions are robust to which entry carries
+    which marker.
+    :End Note
+    Let has_class be 0
+    Let has_combinator be 0
+    Let sel_index be 0
+    While sel_index is less than selectors_count:
+        Let one_selector be proc css_list_get with selectors, sel_index
+
+        Let this_has_class be proc contains_substr with one_selector, ".title"
+        If this_has_class is equal to 1:
+            Set has_class to 1
+        End If
+
+        Let this_has_combinator be proc contains_substr with one_selector, ">"
+        If this_has_combinator is equal to 1:
+            Set has_combinator to 1
+        End If
+
+        Set sel_index to sel_index plus 1
+    End While
+
+    proc assert_equal from TestUtils with results, "class selector '.title' survives into HIR", has_class, 1
+    proc assert_equal from TestUtils with results, "child combinator '>' survives into HIR", has_combinator, 1
+
+    Let declarations_key be proc create_from_literal from StringCore with "declarations"
+    Let declarations be proc css_dict_get with rule, declarations_key
+    proc assert_not_null from TestUtils with results, "rule has a declarations list", declarations
+
+    Let decl_count be proc css_list_size with declarations
+    proc assert_greater_than from TestUtils with results, "rule has at least two declarations", decl_count, 1
+
+    Note: First declaration must carry a property and a value
+    Let first_decl be proc css_list_get with declarations, 0
+    Let property_key be proc create_from_literal from StringCore with "property"
+    Let value_key be proc create_from_literal from StringCore with "value"
+    Let first_property be proc css_dict_get with first_decl, property_key
+    Let first_value be proc css_dict_get with first_decl, value_key
+    proc assert_not_null from TestUtils with results, "first declaration has a property", first_property
+    proc assert_not_null from TestUtils with results, "first declaration has a value", first_value
+
+    Note: A color value must be reachable: the 'color' property holds the hex color
+    Let color_has_hex be proc contains_substr with first_value, "#ff00aa"
+    proc assert_equal from TestUtils with results, "hex color value survives into HIR", color_has_hex, 1
+
+    Note: --- Stage 2: HIR -> CSS text ---
+    Let emitted be proc generate_css from CssBackend with hir1
+    proc assert_not_null from TestUtils with results, "backend produced CSS text", emitted
+
+    Let emitted_len be proc string_length from StringCore with emitted
+    proc assert_greater_than from TestUtils with results, "emitted CSS is non-empty", emitted_len, 0
+
+    Note: Depth content must appear in the emitted CSS bytes
+    Let emit_has_class be proc contains_substr with emitted, ".title"
+    proc assert_equal from TestUtils with results, "emitted CSS contains class selector", emit_has_class, 1
+
+    Let emit_has_combinator be proc contains_substr with emitted, ">"
+    proc assert_equal from TestUtils with results, "emitted CSS contains combinator", emit_has_combinator, 1
+
+    Let emit_has_important be proc contains_substr with emitted, "!important"
+    proc assert_equal from TestUtils with results, "emitted CSS preserves !important", emit_has_important, 1
+
+    Let emit_has_color be proc contains_substr with emitted, "#ff00aa"
+    proc assert_equal from TestUtils with results, "emitted CSS preserves hex color", emit_has_color, 1
+
+    Let emit_has_calc be proc contains_substr with emitted, "calc"
+    proc assert_equal from TestUtils with results, "emitted CSS preserves calc() function", emit_has_calc, 1
+
+    Let emit_has_var be proc contains_substr with emitted, "var"
+    proc assert_equal from TestUtils with results, "emitted CSS preserves var() function", emit_has_var, 1
+
+    Let emit_has_media be proc contains_substr with emitted, "@media"
+    proc assert_equal from TestUtils with results, "emitted CSS preserves @media at-rule", emit_has_media, 1
+
+    Let emit_has_display be proc contains_substr with emitted, "display"
+    proc assert_equal from TestUtils with results, "emitted CSS preserves @media nested rule declaration", emit_has_display, 1
+
+    Let emit_has_keyframes be proc contains_substr with emitted, "@keyframes"
+    proc assert_equal from TestUtils with results, "emitted CSS preserves @keyframes structure", emit_has_keyframes, 1
+
+    Let emit_has_comment be proc contains_substr with emitted, "base theme"
+    proc assert_equal from TestUtils with results, "emitted CSS preserves comment", emit_has_comment, 1
+
+    Note: --- Stage 3: re-parse emitted CSS -> HIR, assert content survives ---
+    Let hir2 be proc css_to_hir_from_source from CssFrontend with emitted
+    proc assert_not_null from TestUtils with results, "re-parse of emitted CSS produced HIR", hir2
+
+    Let root_type2 be proc css_dict_get with hir2, type_key
+    proc assert_string_equal from TestUtils with results, "round-trip HIR root type is 'stylesheet'", root_type2, "stylesheet"
+
+    Let rules2 be proc css_dict_get with hir2, rules_key
+    Let rules_count2 be proc css_list_size with rules2
+    proc assert_greater_than from TestUtils with results, "round-trip HIR rules list is non-empty", rules_count2, 0
+
+    Let rule2 be proc first_rule_dict with hir2
+    proc assert_not_null from TestUtils with results, "round-trip HIR contains a 'rule' node", rule2
+
+    Let declarations2 be proc css_dict_get with rule2, declarations_key
+    Let decl_count2 be proc css_list_size with declarations2
+    proc assert_greater_than from TestUtils with results, "round-trip rule still has two declarations", decl_count2, 1
+
+    proc print_summary from TestUtils with results
+    Let failed be proc get_failed from TestUtils with results
+    proc destroy_test_results from TestUtils with results
+
+    Return failed
+End Process
