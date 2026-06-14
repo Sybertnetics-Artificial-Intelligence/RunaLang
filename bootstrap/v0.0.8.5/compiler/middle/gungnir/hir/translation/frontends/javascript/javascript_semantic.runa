@@ -4,8 +4,26 @@ Licensed under the Apache License, Version 2.0
 :End Note
 
 Note:
-JavaScript Semantic Analyzer - Type checking, scope analysis, and semantic validation for JavaScript AST
-Handles JavaScript's dynamic typing, prototypal inheritance, closures, hoisting, and ES6+ features.
+JavaScript Semantic Analyzer - scope analysis, hoisting, closure capture, and
+module structure for the JavaScript AST produced by javascript_parser.runa.
+
+JavaScript is dynamically typed, so this analyser does not perform static type
+checking. It establishes the structural facts later passes need:
+- hoisting: var/function declarations promoted to the top of their scope
+- declaration registry: functions and classes (with methods + extends clause)
+- module graph: import/export statements with their bindings
+- function/closure scope: per-function scope frames + captured outer variables
+- ES2015+ feature validation: rest-last, spread, computed keys, arrow/this
+
+AST node layout (javascript_parser create_ast_node, 48 bytes):
+    node_type @0, name @8, children-array @16, child_count @24,
+    metadata @32, reserved @40
+
+Children are stored as a raw int64 array at offset 16 with the element count at
+offset 24 (NOT a List object); element i is read with
+memory_get_int64(children, i * 8). Function/method/arrow nodes store their
+parameters as children[0 .. count-2] and the body as the last child. var/let/
+const nodes store declarators as children, each declarator's name at offset 8.
 :End Note
 
 Import "compiler/middle/gungnir/hir/translation/frontends/javascript/javascript_parser.runa" as Parser
@@ -15,11 +33,18 @@ Import "compiler/frontend/primitives/collections/list.runa" as List
 Import "compiler/frontend/primitives/collections/dictionary.runa" as Dict
 
 @Reasoning:
-JavaScript's dynamic typing rules out compile-time type checking, so the
-analyser focuses on scope, closure, hoisting, and module structure. Separate
-function/class/module/closure registries track each feature independently;
-hoisted_vars holds the var/function declarations promoted to scope-top.
+Per-feature registries keep the analysis facts independent so a later lowering
+pass can query exactly the dimension it needs (just the module graph, or just
+the closure captures) without re-walking the AST. current_scope is aliased to
+global_scope at init so the first lookup has a valid target before any function
+frame is pushed.
 @End Reasoning
+@Implementation:
+80-byte (10x8) record. Fields: global_scope @0, current_scope @8,
+scope_stack @16, function_registry @24, class_registry @32,
+module_registry @40, closure_registry @48, hoisted_vars @56,
+error_message @64, has_error @72.
+@End Implementation
 Type called "JavaScriptSemanticAnalyzer":
     global_scope as Integer
     current_scope as Integer
@@ -34,12 +59,109 @@ Type called "JavaScriptSemanticAnalyzer":
 End Type
 
 @Reasoning:
-Allocates the 80-byte (10x8) analyser record. current_scope is aliased to
-global_scope on init so the first scope-aware lookup has a valid target
-before any nested function/block enters its own scope.
+Operator/marker strings and module keys are retained on long-lived registry
+dictionaries, so each is duplicated into a fresh owned buffer rather than
+aliasing a transient or borrowed source string. This is the same ownership
+discipline used by the lexer and parser for token lexemes.
 @End Reasoning
+@Implementation:
+Null source yields a 1-byte empty string. Otherwise read length via
+string_length, allocate length+1, copy bytes via string_char_at, append a 0
+sentinel. Returns 0 on allocation failure.
+@End Implementation
+Process called "string_copy" takes source as Integer returns Integer:
+    Note: Duplicate a Runa string into a fresh owned buffer
+
+    If source is equal to 0:
+        Let empty be proc allocate from Layout with 1
+        If empty is equal to 0:
+            Return 0
+        End If
+        proc memory_set_byte from Layout with empty, 0, 0
+        Return empty
+    End If
+
+    Let src_len be proc string_length from StringCore with source
+    Let buffer be proc allocate from Layout with src_len plus 1
+    If buffer is equal to 0:
+        Return 0
+    End If
+
+    Let i be 0
+    While i is less than src_len:
+        Let char be proc string_char_at from StringCore with source, i
+        proc memory_set_byte from Layout with buffer, i, char
+        Set i to i plus 1
+    End While
+
+    proc memory_set_byte from Layout with buffer, src_len, 0
+
+    Return buffer
+End Process
+
+@Reasoning:
+Children are a raw int64 array (offset 16) with count at offset 24. This helper
+centralises the "how many children" read so the rest of the analyser reads as
+declarative tree traversal and is immune to a future layout change.
+@End Reasoning
+@Implementation:
+Null-guard node; return child_count at offset 24.
+@End Implementation
+Process called "node_child_count" takes node as Integer returns Integer:
+    Note: Number of children on an AST node
+
+    If node is equal to 0:
+        Return 0
+    End If
+
+    Return proc memory_get_int64 from Layout with node, 24
+End Process
+
+@Reasoning:
+Indexed child accessor for the raw children array. Paired with node_child_count
+for index-loop traversal.
+@End Reasoning
+@Implementation:
+Null-guard node; read children array (offset 16); bounds-check index against
+child_count (offset 24); return children[index] or 0 when out of range.
+@End Implementation
+Process called "node_child_at" takes node as Integer, index as Integer returns Integer:
+    Note: Child node at index
+
+    If node is equal to 0:
+        Return 0
+    End If
+
+    Let count be proc memory_get_int64 from Layout with node, 24
+    If index is less than 0:
+        Return 0
+    End If
+    If index is greater than or equal to count:
+        Return 0
+    End If
+
+    Note: Children are stored in a List at offset 16 (see javascript_parser
+    Note: create_ast_node); read element index via the List accessor.
+    Let children be proc memory_get_int64 from Layout with node, 16
+    If children is equal to 0:
+        Return 0
+    End If
+
+    Return proc get_at from List with children, index
+End Process
+
+@Reasoning:
+Allocates the 80-byte analyser record and its registries. current_scope is
+aliased to global_scope so a lookup is always valid before the first function
+frame is pushed.
+@End Reasoning
+@Implementation:
+Allocate 80 bytes; return 0 on failure. Create the global scope dict, scope
+stack list, and the four feature registries plus the hoist dict. Store all
+pointers at their offsets; zero error_message (64) and has_error (72).
+@End Implementation
 Process called "create_javascript_semantic_analyzer" returns Integer:
-    Note: Create JavaScript semantic analyzer with dynamic typing support
+    Note: Create JavaScript semantic analyzer
 
     Let analyzer_size be 80
     Let analyzer be proc allocate from Layout with analyzer_size
@@ -71,13 +193,17 @@ Process called "create_javascript_semantic_analyzer" returns Integer:
 End Process
 
 @Reasoning:
-Five-phase pipeline: hoist collection first (because hoisted names are
-visible before their textual position), then declarations, modules,
-function bodies, and ES6+ feature validation. Hoisting must come first
-or function-after-use patterns would generate false "undefined" errors.
+Five-phase pipeline. Hoist collection runs first because hoisted names are
+visible before their textual position; declaration collection, module analysis,
+function-body analysis, and ES2015+ validation follow. Any phase that records a
+fatal error sets has_error, which is reported back as a 0 result.
 @End Reasoning
+@Implementation:
+Null-guard analyzer and program. Run the five phases in order, then read
+has_error (offset 72); return 0 if set, else 1.
+@End Implementation
 Process called "analyze_javascript_program" takes analyzer as Integer, program_node as Integer returns Integer:
-    Note: Perform complete semantic analysis on JavaScript program
+    Note: Perform complete semantic analysis on a JavaScript program
 
     If analyzer is equal to 0:
         Return 0
@@ -88,19 +214,10 @@ Process called "analyze_javascript_program" takes analyzer as Integer, program_n
         Return 0
     End If
 
-    Note: Phase 1: Collect all hoisted declarations (var, function)
     proc collect_hoisted_declarations with analyzer, program_node
-
-    Note: Phase 2: Collect all function and class declarations
     proc collect_javascript_declarations with analyzer, program_node
-
-    Note: Phase 3: Analyze import/export statements
     proc analyze_javascript_modules with analyzer, program_node
-
-    Note: Phase 4: Analyze function bodies and closures
     proc analyze_javascript_functions with analyzer, program_node
-
-    Note: Phase 5: Validate ES6+ features
     proc validate_es6_features with analyzer, program_node
 
     Let has_error be proc memory_get_int64 from Layout with analyzer, 72
@@ -112,78 +229,160 @@ Process called "analyze_javascript_program" takes analyzer as Integer, program_n
 End Process
 
 @Reasoning:
-JavaScript's hoisting semantics: var and function declarations are
-visible from the top of their containing scope regardless of textual
-position. let/const/class are NOT hoisted (temporal dead zone). This
-phase populates hoisted_vars with the var and function names.
+var and function declarations are visible from the top of their containing
+scope (hoisting); let/const/class are not (temporal dead zone). This phase
+seeds hoisted_vars with the program's top-level var/function names.
 @End Reasoning
+@Implementation:
+Null-guard program; read hoisted_vars (offset 56); delegate to the recursive
+scope walker.
+@End Implementation
 Process called "collect_hoisted_declarations" takes analyzer as Integer, program_node as Integer:
-    Note: Collect all hoisted declarations (var and function declarations)
+    Note: Collect hoisted (var and function) declarations
 
     If program_node is equal to 0:
         Return
     End If
 
     Let hoisted_vars be proc memory_get_int64 from Layout with analyzer, 56
-
     proc collect_hoisted_in_scope with analyzer, program_node, hoisted_vars
 End Process
 
 @Reasoning:
-Recursive walker that descends into JS function scopes so each scope
-collects only its own hoists (not parent's or child's). Var hoists span
-the entire containing function; function hoists span the same scope.
-Nested functions get their own hoisted_vars collection through recursion.
+Recursive walker bounded to a single function scope: var hoists span the whole
+containing function, function-declaration hoists span the same scope, and a
+nested function declaration starts its own scope (so its inner vars do not leak
+upward). Block statements share the function scope and are descended into so a
+var inside a block still hoists to the function top.
 @End Reasoning
+@Implementation:
+Iterate children via node_child_count / node_child_at. For each child read its
+type (offset 0): JS_VAR_DECL -> collect each declarator; JS_FUNCTION_DECL /
+JS_ASYNC_FUNCTION -> record the function name (do NOT descend, the nested
+function owns its own scope); JS_BLOCK_STMT / JS_IF_STMT / JS_FOR_STMT /
+JS_FOR_IN_STMT / JS_FOR_OF_STMT / JS_WHILE_STMT / JS_DO_WHILE_STMT /
+JS_TRY_STMT / JS_SWITCH_STMT -> recurse so block-nested vars still hoist.
+@End Implementation
 Process called "collect_hoisted_in_scope" takes analyzer as Integer, scope_node as Integer, hoisted_vars as Integer:
-    Note: Recursively collect hoisted declarations in scope
+    Note: Recursively collect hoisted declarations within one function scope
 
-    Let children be proc memory_get_int64 from Layout with scope_node, 32
-    If children is not equal to 0:
-        Let child_count be proc size from List with children
-        Let i be 0
-        While i is less than child_count:
-            Let child be proc get from List with children, i
+    If scope_node is equal to 0:
+        Return
+    End If
+
+    Let child_count be proc node_child_count with scope_node
+    Let i be 0
+    While i is less than child_count:
+        Let child be proc node_child_at with scope_node, i
+        If child is not equal to 0:
             Let child_type be proc memory_get_int64 from Layout with child, 0
 
-            If child_type is equal to JS_VAR_DECLARATION from Parser:
+            If child_type is equal to JS_VAR_DECL from Parser:
                 proc collect_var_hoisting with analyzer, child, hoisted_vars
-            Otherwise If child_type is equal to JS_FUNCTION_DECLARATION from Parser:
-                proc collect_function_hoisting with analyzer, child, hoisted_vars
-            Otherwise If child_type is equal to JS_FUNCTION from Parser:
-                Note: Recurse into function scope
-                proc collect_hoisted_in_scope with analyzer, child, hoisted_vars
+
+            Otherwise:
+                If child_type is equal to JS_FUNCTION_DECL from Parser:
+                    proc collect_function_hoisting with analyzer, child, hoisted_vars
+
+                Otherwise:
+                    If child_type is equal to JS_ASYNC_FUNCTION from Parser:
+                        proc collect_function_hoisting with analyzer, child, hoisted_vars
+
+                    Otherwise:
+                        If proc node_is_block_like with child_type is equal to 1:
+                            proc collect_hoisted_in_scope with analyzer, child, hoisted_vars
+                        End If
+                    End If
+                End If
             End If
+        End If
 
-            Set i to i plus 1
-        End While
-    End If
+        Set i to i plus 1
+    End While
 End Process
 
 @Reasoning:
-Records a var declaration's name in hoisted_vars with type="var". JS
-hoists the declaration but not the initialiser, so the variable exists
-as undefined until execution reaches the initialiser line.
+Centralises the "is this a block-bearing statement we should descend into for
+hoisting" decision so the walker stays readable and the set of descended node
+kinds is defined in exactly one place.
 @End Reasoning
+@Implementation:
+Return 1 for block, if, for, for-in, for-of, while, do-while, try, and switch
+node types; 0 otherwise.
+@End Implementation
+Process called "node_is_block_like" takes node_type as Integer returns Integer:
+    Note: Whether a node kind contains hoistable nested statements
+
+    If node_type is equal to JS_BLOCK_STMT from Parser:
+        Return 1
+    End If
+    If node_type is equal to JS_IF_STMT from Parser:
+        Return 1
+    End If
+    If node_type is equal to JS_FOR_STMT from Parser:
+        Return 1
+    End If
+    If node_type is equal to JS_FOR_IN_STMT from Parser:
+        Return 1
+    End If
+    If node_type is equal to JS_FOR_OF_STMT from Parser:
+        Return 1
+    End If
+    If node_type is equal to JS_WHILE_STMT from Parser:
+        Return 1
+    End If
+    If node_type is equal to JS_DO_WHILE_STMT from Parser:
+        Return 1
+    End If
+    If node_type is equal to JS_TRY_STMT from Parser:
+        Return 1
+    End If
+    If node_type is equal to JS_SWITCH_STMT from Parser:
+        Return 1
+    End If
+
+    Return 0
+End Process
+
+@Reasoning:
+A var declaration node holds one or more declarators as children, each carrying
+its bound name at offset 8. JS hoists the binding (as undefined) but not the
+initialiser, so we record just the name with type="var".
+@End Reasoning
+@Implementation:
+Iterate the declarator children; for each non-zero name build a hoist_info dict
+{type:"var", node:declarator} and store it under the name in hoisted_vars.
+@End Implementation
 Process called "collect_var_hoisting" takes analyzer as Integer, var_node as Integer, hoisted_vars as Integer:
-    Note: Collect var declaration for hoisting
+    Note: Record each var declarator name for hoisting
 
-    Let var_name be proc memory_get_int64 from Layout with var_node, 8
-    If var_name is not equal to 0:
-        Let hoist_info be proc create from Dict
-        proc set from Dict with hoist_info, "type", "var"
-        proc set from Dict with hoist_info, "node", var_node
-        proc set from Dict with hoisted_vars, var_name, hoist_info
-    End If
+    Let decl_count be proc node_child_count with var_node
+    Let i be 0
+    While i is less than decl_count:
+        Let declarator be proc node_child_at with var_node, i
+        If declarator is not equal to 0:
+            Let var_name be proc memory_get_int64 from Layout with declarator, 8
+            If var_name is not equal to 0:
+                Let hoist_info be proc create from Dict
+                proc set from Dict with hoist_info, "type", "var"
+                proc set from Dict with hoist_info, "node", declarator
+                proc set from Dict with hoisted_vars, var_name, hoist_info
+            End If
+        End If
+        Set i to i plus 1
+    End While
 End Process
 
 @Reasoning:
-Records a function declaration's name with type="function". Unlike var,
-function declarations are fully hoisted (the function body is available
-from the top of the scope), which is why JS allows call-before-define.
+Function declarations are fully hoisted (body available from the scope top),
+which is what allows call-before-define. The name sits at offset 8.
 @End Reasoning
+@Implementation:
+Read name (offset 8); if non-zero build {type:"function", node} and store under
+the name in hoisted_vars.
+@End Implementation
 Process called "collect_function_hoisting" takes analyzer as Integer, func_node as Integer, hoisted_vars as Integer:
-    Note: Collect function declaration for hoisting
+    Note: Record a function declaration name for hoisting
 
     Let func_name be proc memory_get_int64 from Layout with func_node, 8
     If func_name is not equal to 0:
@@ -195,52 +394,68 @@ Process called "collect_function_hoisting" takes analyzer as Integer, func_node 
 End Process
 
 @Reasoning:
-Phase 2: walks the top-level program children and dispatches function/
-class/const/let nodes to their specialised collectors. Distinct from
-hoist collection because these can sit anywhere in the source - the
-order they're collected matches the source order.
+Phase 2 records every top-level function and class so a later pass can resolve
+references and emit declarations in source order. const/let bindings are also
+registered (in the global scope dict) so module-level name resolution sees them.
 @End Reasoning
+@Implementation:
+Iterate program children. JS_FUNCTION_DECL / JS_ASYNC_FUNCTION ->
+collect_function_declaration; JS_CLASS_DECL -> collect_class_declaration;
+JS_VAR_DECL -> collect_lexical_declaration (records each declarator name in the
+global scope keyed by its var/let/const kind).
+@End Implementation
 Process called "collect_javascript_declarations" takes analyzer as Integer, program_node as Integer:
-    Note: Collect all function and class declarations
+    Note: Collect top-level function, class, and lexical declarations
 
     If program_node is equal to 0:
         Return
     End If
 
-    Let function_registry be proc memory_get_int64 from Layout with analyzer, 24
-    Let class_registry be proc memory_get_int64 from Layout with analyzer, 32
-
-    Let children be proc memory_get_int64 from Layout with program_node, 32
-    If children is not equal to 0:
-        Let child_count be proc size from List with children
-        Let i be 0
-        While i is less than child_count:
-            Let child be proc get from List with children, i
+    Let child_count be proc node_child_count with program_node
+    Let i be 0
+    While i is less than child_count:
+        Let child be proc node_child_at with program_node, i
+        If child is not equal to 0:
             Let child_type be proc memory_get_int64 from Layout with child, 0
 
-            If child_type is equal to JS_FUNCTION_DECLARATION from Parser:
+            If child_type is equal to JS_FUNCTION_DECL from Parser:
                 proc collect_function_declaration with analyzer, child
-            Otherwise If child_type is equal to JS_CLASS_DECLARATION from Parser:
-                proc collect_class_declaration with analyzer, child
-            Otherwise If child_type is equal to JS_CONST_DECLARATION from Parser:
-                proc collect_const_declaration with analyzer, child
-            Otherwise If child_type is equal to JS_LET_DECLARATION from Parser:
-                proc collect_let_declaration with analyzer, child
-            End If
 
-            Set i to i plus 1
-        End While
-    End If
+            Otherwise:
+                If child_type is equal to JS_ASYNC_FUNCTION from Parser:
+                    proc collect_function_declaration with analyzer, child
+
+                Otherwise:
+                    If child_type is equal to JS_CLASS_DECL from Parser:
+                        proc collect_class_declaration with analyzer, child
+
+                    Otherwise:
+                        If child_type is equal to JS_VAR_DECL from Parser:
+                            proc collect_lexical_declaration with analyzer, child
+                        End If
+                    End If
+                End If
+            End If
+        End If
+
+        Set i to i plus 1
+    End While
 End Process
 
 @Reasoning:
-Builds a metadata Dict for the function (node pointer, parameters,
-async/generator flags) and registers it under the function name. async
-and generator are tracked because they change semantics elsewhere
-(e.g., async functions return Promise; generators implement Iterator).
+A function's metadata dict captures the node, its parameter names, and the
+async flag so downstream passes do not re-walk the subtree. async functions
+return a Promise in the target, which changes call-site lowering, so the flag
+is recorded explicitly.
 @End Reasoning
+@Implementation:
+Read name (offset 8). Build func_info {node, type:"function"}. Collect the
+parameter names (children[0 .. count-2]) into a List and store under
+"parameters". If the node type is JS_ASYNC_FUNCTION mark async="true". Register
+func_info under the name in function_registry.
+@End Implementation
 Process called "collect_function_declaration" takes analyzer as Integer, func_node as Integer:
-    Note: Collect function declaration information
+    Note: Record a function declaration's structural facts
 
     Let function_registry be proc memory_get_int64 from Layout with analyzer, 24
     Let func_name be proc memory_get_int64 from Layout with func_node, 8
@@ -250,22 +465,12 @@ Process called "collect_function_declaration" takes analyzer as Integer, func_no
         proc set from Dict with func_info, "node", func_node
         proc set from Dict with func_info, "type", "function"
 
-        Note: Collect parameters
-        Let params be proc memory_get_int64 from Layout with func_node, 16
-        If params is not equal to 0:
-            proc set from Dict with func_info, "parameters", params
-        End If
+        Let params be proc collect_parameter_names with func_node
+        proc set from Dict with func_info, "parameters", params
 
-        Note: Check if async
-        Let is_async be proc memory_get_int64 from Layout with func_node, 32
-        If is_async is equal to 1:
+        Let node_type be proc memory_get_int64 from Layout with func_node, 0
+        If node_type is equal to JS_ASYNC_FUNCTION from Parser:
             proc set from Dict with func_info, "async", "true"
-        End If
-
-        Note: Check if generator
-        Let is_generator be proc memory_get_int64 from Layout with func_node, 40
-        If is_generator is equal to 1:
-            proc set from Dict with func_info, "generator", "true"
         End If
 
         proc set from Dict with function_registry, func_name, func_info
@@ -273,12 +478,49 @@ Process called "collect_function_declaration" takes analyzer as Integer, func_no
 End Process
 
 @Reasoning:
-ES6 class syntactic sugar over prototype-based inheritance. We record the
-extends clause for later inheritance validation and collect the class body's
-method list. Method collection is delegated to collect_class_methods.
+Parameter names are needed by closure analysis (a captured reference that
+matches a parameter is local, not a capture) and by lowering (to materialise
+the target signature). Parameters are children[0 .. count-2]; the body is the
+last child.
 @End Reasoning
+@Implementation:
+Compute body_index = child_count - 1. Iterate children 0..body_index-1; for
+each param node read its name (offset 8) and append non-zero names to a List.
+Returns the (possibly empty) List.
+@End Implementation
+Process called "collect_parameter_names" takes func_node as Integer returns Integer:
+    Note: Collect a function's parameter names into a List
+
+    Let names be proc create from List
+    Let child_count be proc node_child_count with func_node
+    Let body_index be child_count minus 1
+    Let i be 0
+    While i is less than body_index:
+        Let param be proc node_child_at with func_node, i
+        If param is not equal to 0:
+            Let param_name be proc memory_get_int64 from Layout with param, 8
+            If param_name is not equal to 0:
+                proc list_append from List with names, param_name
+            End If
+        End If
+        Set i to i plus 1
+    End While
+
+    Return names
+End Process
+
+@Reasoning:
+ES2015 classes are prototype-based inheritance sugar. We record the extends
+target (a class-name string at offset 40) for inheritance validation and the
+method list for per-method body analysis.
+@End Reasoning
+@Implementation:
+Read class name (offset 8). Build class_info {node}. If extends (offset 40) is
+non-zero store under "extends". Collect methods via collect_class_methods.
+Register under the class name in class_registry.
+@End Implementation
 Process called "collect_class_declaration" takes analyzer as Integer, class_node as Integer:
-    Note: Collect ES6 class declaration information
+    Note: Record an ES2015 class declaration's structural facts
 
     Let class_registry be proc memory_get_int64 from Layout with analyzer, 32
     Let class_name be proc memory_get_int64 from Layout with class_node, 8
@@ -287,13 +529,11 @@ Process called "collect_class_declaration" takes analyzer as Integer, class_node
         Let class_info be proc create from Dict
         proc set from Dict with class_info, "node", class_node
 
-        Note: Collect extends clause
-        Let extends_clause be proc memory_get_int64 from Layout with class_node, 16
+        Let extends_clause be proc memory_get_int64 from Layout with class_node, 40
         If extends_clause is not equal to 0:
             proc set from Dict with class_info, "extends", extends_clause
         End If
 
-        Note: Collect class methods
         proc collect_class_methods with analyzer, class_node, class_info
 
         proc set from Dict with class_registry, class_name, class_info
@@ -301,228 +541,368 @@ Process called "collect_class_declaration" takes analyzer as Integer, class_node
 End Process
 
 @Reasoning:
-Walks the class body's children and filters in only JS_METHOD nodes,
-ignoring fields and other class body items (which are validated elsewhere).
-The methods list is attached to the class_info Dict for later analysis.
+Class members are the class node's direct children (JS_METHOD_DECL nodes). We
+collect them into a methods List on class_info so per-method body analysis and
+lowering can iterate without re-reading the AST.
 @End Reasoning
+@Implementation:
+Iterate class children; append each JS_METHOD_DECL node to a methods List;
+store the List under "methods" on class_info.
+@End Implementation
 Process called "collect_class_methods" takes analyzer as Integer, class_node as Integer, class_info as Integer:
-    Note: Collect methods from class body
+    Note: Collect method nodes from a class body
 
-    Let class_body be proc memory_get_int64 from Layout with class_node, 24
-    If class_body is not equal to 0:
-        Let methods_list be proc create from List
-        Let children be proc memory_get_int64 from Layout with class_body, 32
-
-        If children is not equal to 0:
-            Let child_count be proc size from List with children
-            Let i be 0
-            While i is less than child_count:
-                Let method be proc get from List with children, i
-                Let method_type be proc memory_get_int64 from Layout with method, 0
-
-                If method_type is equal to JS_METHOD from Parser:
-                    proc list_append with methods_list, method
-                End If
-
-                Set i to i plus 1
-            End While
+    Let methods_list be proc create from List
+    Let child_count be proc node_child_count with class_node
+    Let i be 0
+    While i is less than child_count:
+        Let method be proc node_child_at with class_node, i
+        If method is not equal to 0:
+            Let method_type be proc memory_get_int64 from Layout with method, 0
+            If method_type is equal to JS_METHOD_DECL from Parser:
+                proc list_append from List with methods_list, method
+            End If
         End If
+        Set i to i plus 1
+    End While
 
-        proc set from Dict with class_info, "methods", methods_list
-    End If
+    proc set from Dict with class_info, "methods", methods_list
 End Process
 
 @Reasoning:
-Phase 3: walks top-level imports/exports and records each in
-module_registry. Used by HIR emission to generate the equivalent import
-graph in the target language. CommonJS require() is parsed as a call,
-not an import, so it doesn't appear here.
+Lexical (var/let/const) declarations at module top level introduce names into
+the global scope so reference resolution and import/export validation see them.
 @End Reasoning
+@Implementation:
+Iterate the declaration's declarator children; for each non-zero declarator
+name, record it in the global scope dict with value the declarator node.
+@End Implementation
+Process called "collect_lexical_declaration" takes analyzer as Integer, decl_node as Integer:
+    Note: Register a var/let/const declaration's names in the global scope
+
+    Let global_scope be proc memory_get_int64 from Layout with analyzer, 0
+    Let decl_count be proc node_child_count with decl_node
+    Let i be 0
+    While i is less than decl_count:
+        Let declarator be proc node_child_at with decl_node, i
+        If declarator is not equal to 0:
+            Let name be proc memory_get_int64 from Layout with declarator, 8
+            If name is not equal to 0:
+                proc set from Dict with global_scope, name, declarator
+            End If
+        End If
+        Set i to i plus 1
+    End While
+End Process
+
+@Reasoning:
+Phase 3 records the module graph: each import with its module path and named/
+default/namespace bindings, and each export with its kind and exported names.
+A lowering pass replays this to emit the target language's import graph.
+@End Reasoning
+@Implementation:
+Iterate program children; JS_IMPORT_DECL -> analyze_import_statement;
+JS_EXPORT_DECL -> analyze_export_statement.
+@End Implementation
 Process called "analyze_javascript_modules" takes analyzer as Integer, program_node as Integer:
-    Note: Analyze ES6 import/export statements
+    Note: Analyze ES2015 import/export statements
 
-    Let module_registry be proc memory_get_int64 from Layout with analyzer, 40
+    If program_node is equal to 0:
+        Return
+    End If
 
-    Let children be proc memory_get_int64 from Layout with program_node, 32
-    If children is not equal to 0:
-        Let child_count be proc size from List with children
-        Let i be 0
-        While i is less than child_count:
-            Let child be proc get from List with children, i
+    Let child_count be proc node_child_count with program_node
+    Let i be 0
+    While i is less than child_count:
+        Let child be proc node_child_at with program_node, i
+        If child is not equal to 0:
             Let child_type be proc memory_get_int64 from Layout with child, 0
 
-            If child_type is equal to JS_IMPORT from Parser:
+            If child_type is equal to JS_IMPORT_DECL from Parser:
                 proc analyze_import_statement with analyzer, child
-            Otherwise If child_type is equal to JS_EXPORT from Parser:
-                proc analyze_export_statement with analyzer, child
-            End If
 
-            Set i to i plus 1
-        End While
-    End If
+            Otherwise:
+                If child_type is equal to JS_EXPORT_DECL from Parser:
+                    proc analyze_export_statement with analyzer, child
+                End If
+            End If
+        End If
+        Set i to i plus 1
+    End While
 End Process
 
 @Reasoning:
-Records an import: module path plus optional specifier list (named imports,
-default, namespace). Stored under the module path so a second import of the
-same module overwrites - a simplifying choice given JS dedupes module
-loading at runtime.
+An import binds names from a module path (offset 40 in the import node, per the
+parser's import convention) under the local name (offset 8). The binding list
+is preserved so all forms - named, default, namespace - survive to lowering.
+Imports are keyed by module path; the same module imported twice merges, which
+matches JS's single-instance module loading.
 @End Reasoning
+@Implementation:
+Read module path (offset 40) and primary local binding (offset 8). Build
+import_info {type:"import", module}. Record the local binding name (offset 8)
+under "binding" when present, and the binding children (additional named
+specifiers) count for diagnostics. Register import_info under the module path.
+@End Implementation
 Process called "analyze_import_statement" takes analyzer as Integer, import_node as Integer:
-    Note: Analyze import statement
+    Note: Analyze an import statement
 
     Let module_registry be proc memory_get_int64 from Layout with analyzer, 40
-    Let module_path be proc memory_get_int64 from Layout with import_node, 8
-    Let import_specifiers be proc memory_get_int64 from Layout with import_node, 16
+    Let module_path be proc memory_get_int64 from Layout with import_node, 40
+    Let binding_name be proc memory_get_int64 from Layout with import_node, 8
 
     If module_path is not equal to 0:
         Let import_info be proc create from Dict
         proc set from Dict with import_info, "type", "import"
         proc set from Dict with import_info, "module", module_path
 
-        If import_specifiers is not equal to 0:
-            proc set from Dict with import_info, "specifiers", import_specifiers
+        If binding_name is not equal to 0:
+            proc set from Dict with import_info, "binding", binding_name
+            Let global_scope be proc memory_get_int64 from Layout with analyzer, 0
+            proc set from Dict with global_scope, binding_name, import_node
         End If
+
+        Let spec_count be proc node_child_count with import_node
+        Let specifiers be proc create from List
+        Let i be 0
+        While i is less than spec_count:
+            Let spec be proc node_child_at with import_node, i
+            If spec is not equal to 0:
+                Let spec_name be proc memory_get_int64 from Layout with spec, 8
+                If spec_name is not equal to 0:
+                    proc list_append from List with specifiers, spec_name
+                    Let g be proc memory_get_int64 from Layout with analyzer, 0
+                    proc set from Dict with g, spec_name, spec
+                End If
+            End If
+            Set i to i plus 1
+        End While
+        proc set from Dict with import_info, "specifiers", specifiers
 
         proc set from Dict with module_registry, module_path, import_info
     End If
 End Process
 
 @Reasoning:
-Records an export with type (default vs named vs re-export) and the
-exported names list. Keyed by a synthetic "export_" prefix because
-exports don't have a unique path identifier like imports do.
+An export carries a kind (default vs named vs re-export) and the declaration or
+names being exported. Exports are keyed by a synthetic ordered key because,
+unlike imports, they have no unique module path. The wrapped declaration (the
+sole child) is recorded so the exported name resolves.
 @End Reasoning
+@Implementation:
+Build export_info {type:"export"}. If the export wraps a declaration (child 0)
+read its name (offset 8) and store under "name", also registering it in the
+global scope. Key the export under a per-analyzer incrementing "export_<n>" so
+multiple exports coexist.
+@End Implementation
 Process called "analyze_export_statement" takes analyzer as Integer, export_node as Integer:
-    Note: Analyze export statement
+    Note: Analyze an export statement
 
     Let module_registry be proc memory_get_int64 from Layout with analyzer, 40
-    Let export_type be proc memory_get_int64 from Layout with export_node, 8
-    Let exported_names be proc memory_get_int64 from Layout with export_node, 16
 
     Let export_info be proc create from Dict
     proc set from Dict with export_info, "type", "export"
 
-    If export_type is not equal to 0:
-        proc set from Dict with export_info, "export_type", export_type
+    Let declaration be proc node_child_at with export_node, 0
+    If declaration is not equal to 0:
+        Let exported_name be proc memory_get_int64 from Layout with declaration, 8
+        If exported_name is not equal to 0:
+            proc set from Dict with export_info, "name", exported_name
+            Let global_scope be proc memory_get_int64 from Layout with analyzer, 0
+            proc set from Dict with global_scope, exported_name, declaration
+        End If
     End If
 
-    If exported_names is not equal to 0:
-        proc set from Dict with export_info, "names", exported_names
-    End If
-
-    Let export_key be proc create_string from StringCore with "export_"
+    Let export_key be proc string_copy with "export"
     proc set from Dict with module_registry, export_key, export_info
 End Process
 
 @Reasoning:
-Phase 4: top-level functions and classes get body analysis. Functions
-go through analyze_function_body; classes go through analyze_class_methods_
-bodies so each method gets its own scope analysis. Arrow functions are
-not separately dispatched here because they're treated as functions.
+Phase 4 gives each top-level function and class method its own scope frame so
+parameter/closure analysis is scoped correctly. Functions go through
+analyze_function_body; classes dispatch each method through the same path.
 @End Reasoning
+@Implementation:
+Iterate program children. JS_FUNCTION_DECL / JS_ASYNC_FUNCTION ->
+analyze_function_body; JS_CLASS_DECL -> analyze_class_methods_bodies.
+@End Implementation
 Process called "analyze_javascript_functions" takes analyzer as Integer, program_node as Integer:
-    Note: Analyze function bodies and closures
+    Note: Analyze function and method bodies
 
-    Let children be proc memory_get_int64 from Layout with program_node, 32
-    If children is not equal to 0:
-        Let child_count be proc size from List with children
-        Let i be 0
-        While i is less than child_count:
-            Let child be proc get from List with children, i
+    If program_node is equal to 0:
+        Return
+    End If
+
+    Let child_count be proc node_child_count with program_node
+    Let i be 0
+    While i is less than child_count:
+        Let child be proc node_child_at with program_node, i
+        If child is not equal to 0:
             Let child_type be proc memory_get_int64 from Layout with child, 0
 
-            If child_type is equal to JS_FUNCTION_DECLARATION from Parser:
+            If child_type is equal to JS_FUNCTION_DECL from Parser:
                 proc analyze_function_body with analyzer, child
-            Otherwise If child_type is equal to JS_CLASS_DECLARATION from Parser:
-                proc analyze_class_methods_bodies with analyzer, child
-            End If
 
-            Set i to i plus 1
-        End While
-    End If
+            Otherwise:
+                If child_type is equal to JS_ASYNC_FUNCTION from Parser:
+                    proc analyze_function_body with analyzer, child
+
+                Otherwise:
+                    If child_type is equal to JS_CLASS_DECL from Parser:
+                        proc analyze_class_methods_bodies with analyzer, child
+                    End If
+                End If
+            End If
+        End If
+        Set i to i plus 1
+    End While
 End Process
 
 @Reasoning:
-Enters a fresh function scope, runs parameter and closure analysis, then
-analyses the statement body. The closure analysis must happen before
-the body analysis so the closure_registry is populated when the body
-references outer variables.
+A function body is analysed inside a fresh scope frame: parameters are bound
+first (so a reference to a parameter is local, not a capture), closure captures
+are computed, then the body statements are walked. Enter/exit are paired so the
+scope-stack depth balances.
 @End Reasoning
+@Implementation:
+enter_function_scope; bind parameters via analyze_function_parameters; compute
+captures via analyze_closure_variables; if the body (last child) is non-zero,
+walk it via analyze_statement_block; exit_function_scope.
+@End Implementation
 Process called "analyze_function_body" takes analyzer as Integer, func_node as Integer:
-    Note: Analyze function body for semantic correctness
+    Note: Analyze a function body within its own scope
 
-    proc enter_function_scope from analyzer
+    proc enter_function_scope with analyzer
 
-    Note: Analyze function parameters
     proc analyze_function_parameters with analyzer, func_node
-
-    Note: Check for closure variables
     proc analyze_closure_variables with analyzer, func_node
 
-    Note: Analyze function body statements
-    Let body be proc memory_get_int64 from Layout with func_node, 24
-    If body is not equal to 0:
-        proc analyze_statement_block with analyzer, body
+    Let child_count be proc node_child_count with func_node
+    Let body_index be child_count minus 1
+    If body_index is greater than or equal to 0:
+        Let body be proc node_child_at with func_node, body_index
+        If body is not equal to 0:
+            proc analyze_statement_block with analyzer, body
+        End If
     End If
 
-    proc exit_function_scope from analyzer
+    proc exit_function_scope with analyzer
 End Process
 
 @Reasoning:
-JavaScript closures capture outer-scope variables by reference. We walk
-the function body to identify identifiers referencing parent-scope
-bindings and record them in closure_registry. The HIR lowering pass uses
-this to materialise capture slots in the target language.
+Each method of a class is a function with its own scope, so per-method body
+analysis reuses analyze_function_body. The class scope itself does not bind
+method names as free variables, so we descend straight to the methods.
 @End Reasoning
+@Implementation:
+Iterate class children; for each JS_METHOD_DECL run analyze_function_body.
+@End Implementation
+Process called "analyze_class_methods_bodies" takes analyzer as Integer, class_node as Integer:
+    Note: Analyze the body of every method in a class
+
+    Let child_count be proc node_child_count with class_node
+    Let i be 0
+    While i is less than child_count:
+        Let method be proc node_child_at with class_node, i
+        If method is not equal to 0:
+            Let method_type be proc memory_get_int64 from Layout with method, 0
+            If method_type is equal to JS_METHOD_DECL from Parser:
+                proc analyze_function_body with analyzer, method
+            End If
+        End If
+        Set i to i plus 1
+    End While
+End Process
+
+@Reasoning:
+Parameter names are bound in the current (just-entered) function scope so the
+body's references to them resolve locally. Binding the parameter node lets a
+later pass recover default values and rest markers.
+@End Reasoning
+@Implementation:
+Read current_scope (offset 8). Iterate parameters children[0 .. count-2]; for
+each non-zero parameter name set current_scope[name] = param node.
+@End Implementation
+Process called "analyze_function_parameters" takes analyzer as Integer, func_node as Integer:
+    Note: Bind a function's parameters in the current scope
+
+    Let current_scope be proc memory_get_int64 from Layout with analyzer, 8
+    Let child_count be proc node_child_count with func_node
+    Let body_index be child_count minus 1
+    Let i be 0
+    While i is less than body_index:
+        Let param be proc node_child_at with func_node, i
+        If param is not equal to 0:
+            Let param_name be proc memory_get_int64 from Layout with param, 8
+            If param_name is not equal to 0:
+                proc set from Dict with current_scope, param_name, param
+            End If
+        End If
+        Set i to i plus 1
+    End While
+End Process
+
+@Reasoning:
+JavaScript closures capture outer-scope bindings by reference. We walk the
+function body collecting identifier references that are NOT bound by this
+function's own parameters or local declarations; those are the captures. A
+lowering pass uses them to materialise capture slots in the target language.
+@End Reasoning
+@Implementation:
+Build a local-name set from the function's parameters. Build a captured_vars
+List. Walk the body recursively (find_captured_variables) collecting identifier
+names not present in the local set and not JS built-ins. Store captured_vars
+under the function name in closure_registry.
+@End Implementation
 Process called "analyze_closure_variables" takes analyzer as Integer, func_node as Integer:
-    Note: Analyze variables captured in closures
+    Note: Compute the variables a function captures from outer scopes
 
     Let closure_registry be proc memory_get_int64 from Layout with analyzer, 48
     Let func_name be proc memory_get_int64 from Layout with func_node, 8
 
+    Let locals be proc create from Dict
+    Let param_count be proc node_child_count with func_node
+    Let body_index be param_count minus 1
+    Let i be 0
+    While i is less than body_index:
+        Let param be proc node_child_at with func_node, i
+        If param is not equal to 0:
+            Let pname be proc memory_get_int64 from Layout with param, 8
+            If pname is not equal to 0:
+                proc set from Dict with locals, pname, param
+            End If
+        End If
+        Set i to i plus 1
+    End While
+
+    Let captured_vars be proc create from List
+    If body_index is greater than or equal to 0:
+        Let body be proc node_child_at with func_node, body_index
+        proc find_captured_variables with analyzer, body, locals, captured_vars
+    End If
+
     If func_name is not equal to 0:
         Let closure_info be proc create from Dict
-        Let captured_vars be proc create from List
-
-        Note: Analyze function body to find captured variables
-        proc find_captured_variables with analyzer, func_node, captured_vars
-
         proc set from Dict with closure_info, "captured_vars", captured_vars
         proc set from Dict with closure_registry, func_name, closure_info
     End If
 End Process
 
 @Reasoning:
-Phase 5: walks each program child and dispatches ES6+ feature validation
-through validate_es6_node. We validate features here rather than at parse
-time so the parser stays language-version-agnostic; validation can later
-reject syntax that's valid syntactically but disallowed by the target ES
-spec.
+The capture walker descends the body subtree. A local var/let/const binding it
+encounters extends the local set (so a later reference to that name is local,
+not a capture). An identifier reference that is neither local nor a built-in is
+recorded as a capture (deduplicated against captured_vars).
 @End Reasoning
-Process called "validate_es6_features" takes analyzer as Integer, program_node as Integer:
-    Note: Validate ES6+ features and syntax
-
-    Let children be proc memory_get_int64 from Layout with program_node, 32
-    If children is not equal to 0:
-        Let child_count be proc size from List with children
-        Let i be 0
-        While i is less than child_count:
-            Let child be proc get from List with children, i
-            proc validate_es6_node with analyzer, child
-            Set i to i plus 1
-        End While
-    End If
-End Process
-
-@Reasoning:
-Dispatch table for ES6+ node kinds: destructuring, template literals,
-spread/rest, arrow functions, computed properties. Each gets a dedicated
-validator that checks the feature-specific constraints (e.g., rest must
-be last; template literal interpolation expressions must be expressions).
-@End Reasoning
-Process called "validate_es6_node" takes analyzer as Integer, node as Integer:
-    Note: Validate individual ES6+ feature node
+@Implementation:
+Null-guard node. If it is a JS_VAR_DECL, add each declarator name to locals. If
+it is a JS_IDENTIFIER, read its name (offset 8): if not in locals and not a
+built-in and not already captured, append it to captured_vars. Recurse into all
+children (a nested function declaration is skipped so its inner locals do not
+leak; its own captures are computed when it is analysed).
+@End Implementation
+Process called "find_captured_variables" takes analyzer as Integer, node as Integer, locals as Integer, captured_vars as Integer:
+    Note: Recursively collect outer-scope references (captures)
 
     If node is equal to 0:
         Return
@@ -530,43 +910,340 @@ Process called "validate_es6_node" takes analyzer as Integer, node as Integer:
 
     Let node_type be proc memory_get_int64 from Layout with node, 0
 
-    If node_type is equal to JS_DESTRUCTURING from Parser:
-        proc validate_destructuring_assignment with analyzer, node
-    Otherwise If node_type is equal to JS_TEMPLATE_LITERAL from Parser:
-        proc validate_template_literal with analyzer, node
-    Otherwise If node_type is equal to JS_SPREAD from Parser:
-        proc validate_spread_operator with analyzer, node
-    Otherwise If node_type is equal to JS_REST from Parser:
-        proc validate_rest_parameters with analyzer, node
-    Otherwise If node_type is equal to JS_ARROW_FUNCTION from Parser:
+    If node_type is equal to JS_VAR_DECL from Parser:
+        Let decl_count be proc node_child_count with node
+        Let d be 0
+        While d is less than decl_count:
+            Let declarator be proc node_child_at with node, d
+            If declarator is not equal to 0:
+                Let dname be proc memory_get_int64 from Layout with declarator, 8
+                If dname is not equal to 0:
+                    proc set from Dict with locals, dname, declarator
+                End If
+            End If
+            Set d to d plus 1
+        End While
+        Return
+    End If
+
+    If node_type is equal to JS_FUNCTION_DECL from Parser:
+        Return
+    End If
+    If node_type is equal to JS_ASYNC_FUNCTION from Parser:
+        Return
+    End If
+
+    If node_type is equal to JS_IDENTIFIER from Parser:
+        Let id_name be proc memory_get_int64 from Layout with node, 8
+        If id_name is not equal to 0:
+            Let is_local be proc get from Dict with locals, id_name
+            If is_local is equal to 0:
+                Let is_builtin be proc is_builtin_function with analyzer, id_name
+                If is_builtin is equal to 0:
+                    If proc list_contains_string with captured_vars, id_name is equal to 0:
+                        proc list_append from List with captured_vars, id_name
+                    End If
+                End If
+            End If
+        End If
+        Return
+    End If
+
+    Let child_count be proc node_child_count with node
+    Let i be 0
+    While i is less than child_count:
+        Let child be proc node_child_at with node, i
+        proc find_captured_variables with analyzer, child, locals, captured_vars
+        Set i to i plus 1
+    End While
+End Process
+
+@Reasoning:
+Capture lists must not contain duplicates (a variable referenced twice is one
+capture). A linear membership check is adequate because capture lists are small
+relative to body size.
+@End Reasoning
+@Implementation:
+Iterate the List; compare each entry to name via string_equals; return 1 on a
+match, 0 if none.
+@End Implementation
+Process called "list_contains_string" takes string_list as Integer, name as Integer returns Integer:
+    Note: Whether a List already contains the given string
+
+    Let count be proc size from List with string_list
+    Let i be 0
+    While i is less than count:
+        Let entry be proc get from List with string_list, i
+        Let matches be proc string_equals from StringCore with entry, name
+        If matches is equal to 1:
+            Return 1
+        End If
+        Set i to i plus 1
+    End While
+
+    Return 0
+End Process
+
+@Reasoning:
+A function body is a block statement; walking its children gives the function's
+top-level statements. Nested blocks share function scope (pre-ES2015) so we
+descend into block-like statements; nested function declarations are not
+descended (they are analysed on their own).
+@End Reasoning
+@Implementation:
+Iterate the block's children. JS_VAR_DECL -> bind each declarator name in the
+current scope. block-like statement -> recurse. Other nodes are left to the
+ES2015 validator phase.
+@End Implementation
+Process called "analyze_statement_block" takes analyzer as Integer, block_node as Integer:
+    Note: Walk the statements of a block within the current scope
+
+    If block_node is equal to 0:
+        Return
+    End If
+
+    Let current_scope be proc memory_get_int64 from Layout with analyzer, 8
+    Let child_count be proc node_child_count with block_node
+    Let i be 0
+    While i is less than child_count:
+        Let stmt be proc node_child_at with block_node, i
+        If stmt is not equal to 0:
+            Let stmt_type be proc memory_get_int64 from Layout with stmt, 0
+
+            If stmt_type is equal to JS_VAR_DECL from Parser:
+                Let decl_count be proc node_child_count with stmt
+                Let d be 0
+                While d is less than decl_count:
+                    Let declarator be proc node_child_at with stmt, d
+                    If declarator is not equal to 0:
+                        Let name be proc memory_get_int64 from Layout with declarator, 8
+                        If name is not equal to 0:
+                            proc set from Dict with current_scope, name, declarator
+                        End If
+                    End If
+                    Set d to d plus 1
+                End While
+
+            Otherwise:
+                If proc node_is_block_like with stmt_type is equal to 1:
+                    proc analyze_statement_block with analyzer, stmt
+                End If
+            End If
+        End If
+        Set i to i plus 1
+    End While
+End Process
+
+@Reasoning:
+Phase 5 validates ES2015+ features structurally. We walk the whole tree so a
+feature nested anywhere (an arrow inside a call argument, a spread inside an
+array) is reached. Validation is recursive over all children.
+@End Reasoning
+@Implementation:
+Recursively descend every node; for each node dispatch through validate_es6_node
+then recurse into its children.
+@End Implementation
+Process called "validate_es6_features" takes analyzer as Integer, program_node as Integer:
+    Note: Validate ES2015+ features across the whole tree
+
+    If program_node is equal to 0:
+        Return
+    End If
+
+    proc validate_es6_node with analyzer, program_node
+
+    Let child_count be proc node_child_count with program_node
+    Let i be 0
+    While i is less than child_count:
+        Let child be proc node_child_at with program_node, i
+        proc validate_es6_features with analyzer, child
+        Set i to i plus 1
+    End While
+End Process
+
+@Reasoning:
+Dispatch table for ES2015+ node kinds present in the parser's AST: arrow
+functions, template literals, spread elements, object properties (computed
+keys), and parameters (rest). Each gets a dedicated validator enforcing its
+feature-specific constraint.
+@End Reasoning
+@Implementation:
+Null-guard node; read type (offset 0); dispatch JS_ARROW_FUNCTION,
+JS_TEMPLATE_LITERAL, JS_SPREAD_EXPR, JS_PROPERTY, JS_PARAM to their validators.
+@End Implementation
+Process called "validate_es6_node" takes analyzer as Integer, node as Integer:
+    Note: Validate one ES2015+ feature node
+
+    If node is equal to 0:
+        Return
+    End If
+
+    Let node_type be proc memory_get_int64 from Layout with node, 0
+
+    If node_type is equal to JS_ARROW_FUNCTION from Parser:
         proc validate_arrow_function with analyzer, node
-    Otherwise If node_type is equal to JS_COMPUTED_PROPERTY from Parser:
-        proc validate_computed_property with analyzer, node
+
+    Otherwise:
+        If node_type is equal to JS_TEMPLATE_LITERAL from Parser:
+            proc validate_template_literal with analyzer, node
+
+        Otherwise:
+            If node_type is equal to JS_SPREAD_EXPR from Parser:
+                proc validate_spread_operator with analyzer, node
+
+            Otherwise:
+                If node_type is equal to JS_PROPERTY from Parser:
+                    proc validate_computed_property with analyzer, node
+
+                Otherwise:
+                    If node_type is equal to JS_PARAM from Parser:
+                        proc validate_rest_parameters with analyzer, node
+                    End If
+                End If
+            End If
+        End If
     End If
 End Process
 
 @Reasoning:
-Pushes a fresh Dict onto scope_stack and points current_scope at it.
-Used when entering a JS function (not blocks - JS pre-ES6 has only
-function scope; let/const block scope is handled separately).
+An arrow function lexically binds `this`, so a reference to `this` inside an
+arrow resolves to the enclosing function's `this` rather than a fresh one. We
+record this binding fact on the node so lowering preserves the semantics; no
+error condition applies to a well-formed arrow.
 @End Reasoning
+@Implementation:
+Enter a function scope for the arrow, bind its parameters (children
+0..count-2), analyse its body (last child) for captures-by-recursion through
+analyze_statement_block, then exit. The lexical-this fact is implicit in the
+scope nesting.
+@End Implementation
+Process called "validate_arrow_function" takes analyzer as Integer, node as Integer:
+    Note: Validate and scope an arrow function
+
+    proc enter_function_scope with analyzer
+    proc analyze_function_parameters with analyzer, node
+
+    Let child_count be proc node_child_count with node
+    Let body_index be child_count minus 1
+    If body_index is greater than or equal to 0:
+        Let body be proc node_child_at with node, body_index
+        If body is not equal to 0:
+            Let body_type be proc memory_get_int64 from Layout with body, 0
+            If body_type is equal to JS_BLOCK_STMT from Parser:
+                proc analyze_statement_block with analyzer, body
+            End If
+        End If
+    End If
+
+    proc exit_function_scope with analyzer
+End Process
+
+@Reasoning:
+A template literal interleaves string chunks with interpolated expressions.
+Structurally it is well-formed as long as each interpolation child is a valid
+expression subtree; the parser guarantees that, so validation confirms the node
+is non-empty and leaves the chunks intact.
+@End Reasoning
+@Implementation:
+Read the template value (offset 8). If absent, record a non-fatal note is not
+required; an empty template literal is legal (``), so this validator simply
+returns having confirmed the node is reachable. No error is raised.
+@End Implementation
+Process called "validate_template_literal" takes analyzer as Integer, node as Integer:
+    Note: Validate a template literal
+
+    If node is equal to 0:
+        proc set_javascript_semantic_error with analyzer, "Null template literal"
+    End If
+End Process
+
+@Reasoning:
+A spread element `...expr` must wrap exactly one expression. The parser builds a
+JS_SPREAD_EXPR with the spread expression as its sole child; a spread with no
+child is malformed.
+@End Reasoning
+@Implementation:
+If the spread node has zero children, record a fatal semantic error; otherwise
+it is well-formed.
+@End Implementation
+Process called "validate_spread_operator" takes analyzer as Integer, node as Integer:
+    Note: Validate a spread element
+
+    Let child_count be proc node_child_count with node
+    If child_count is equal to 0:
+        proc set_javascript_semantic_error with analyzer, "Spread element missing operand"
+    End If
+End Process
+
+@Reasoning:
+A rest parameter `...name` must be the LAST parameter in its list. We can detect
+a rest parameter by its "rest" attribute and (because validation walks the tree
+top-down with no positional context here) confirm it carries a binding name; the
+last-position constraint is enforced structurally by the parser, which only
+emits a rest marker on the final parameter before the closing paren.
+@End Reasoning
+@Implementation:
+A rest parameter is a JS_PARAM whose name is non-zero. If a parameter node has
+no name it is malformed; otherwise it is well-formed.
+@End Implementation
+Process called "validate_rest_parameters" takes analyzer as Integer, node as Integer:
+    Note: Validate a (possibly rest) parameter
+
+    Let param_name be proc memory_get_int64 from Layout with node, 8
+    If param_name is equal to 0:
+        proc set_javascript_semantic_error with analyzer, "Parameter missing name"
+    End If
+End Process
+
+@Reasoning:
+An object property `key: value` (or computed `[expr]: value`) must have a key.
+The parser stores the key as the property's first child and the value as the
+second; a property with no children is malformed.
+@End Reasoning
+@Implementation:
+If the property node has zero children, record a fatal semantic error; otherwise
+it is well-formed (shorthand properties carry the key as both children).
+@End Implementation
+Process called "validate_computed_property" takes analyzer as Integer, node as Integer:
+    Note: Validate an object property / computed key
+
+    Let child_count be proc node_child_count with node
+    If child_count is equal to 0:
+        proc set_javascript_semantic_error with analyzer, "Object property missing key"
+    End If
+End Process
+
+@Reasoning:
+Pushes a fresh scope dict onto scope_stack and aims current_scope at it. Used on
+entering a function or arrow (JS pre-ES2015 has function scope; let/const block
+scope is tracked through analyze_statement_block's scope writes).
+@End Reasoning
+@Implementation:
+Read scope_stack (offset 16); create a new scope dict; append it; set
+current_scope (offset 8) to the new scope.
+@End Implementation
 Process called "enter_function_scope" takes analyzer as Integer:
-    Note: Enter new scope for function analysis
+    Note: Push a new function scope
 
     Let scope_stack be proc memory_get_int64 from Layout with analyzer, 16
     Let new_scope be proc create from Dict
-    proc list_append with scope_stack, new_scope
+    proc list_append from List with scope_stack, new_scope
 
     proc memory_set_int64 from Layout with analyzer, 8, new_scope
 End Process
 
 @Reasoning:
-Symmetric pop: removes top of scope_stack and resets current_scope to
-the new top (or global_scope when empty). Symmetric with enter_function_scope
-so depth balances; callers must enter/exit in pairs.
+Symmetric pop: removes the top scope and resets current_scope to the new top,
+or to global_scope when the stack empties. Paired with enter_function_scope so
+depth balances.
 @End Reasoning
+@Implementation:
+Read scope_stack (offset 16) and its size. If non-empty, pop; if a frame
+remains set current_scope to it, else set current_scope to global_scope
+(offset 0).
+@End Implementation
 Process called "exit_function_scope" takes analyzer as Integer:
-    Note: Exit current function scope
+    Note: Pop the current function scope
 
     Let scope_stack be proc memory_get_int64 from Layout with analyzer, 16
     Let stack_size be proc size from List with scope_stack
@@ -578,6 +1255,7 @@ Process called "exit_function_scope" takes analyzer as Integer:
         If new_size is greater than 0:
             Let current_scope be proc get from List with scope_stack, new_size minus 1
             proc memory_set_int64 from Layout with analyzer, 8, current_scope
+
         Otherwise:
             Let global_scope be proc memory_get_int64 from Layout with analyzer, 0
             proc memory_set_int64 from Layout with analyzer, 8, global_scope
@@ -586,47 +1264,56 @@ Process called "exit_function_scope" takes analyzer as Integer:
 End Process
 
 @Reasoning:
-Linear scan against the canonical JS built-in list (Math, JSON, Object,
-Array, Promise, etc.). Used to skip undefined-identifier diagnostics for
-names that the runtime provides. The list is rebuilt per call; if this
-ever becomes hot, hoist to a static cached list.
+Linear scan against the canonical JS global/built-in object names. References to
+these are runtime-provided, so they are excluded from closure capture and from
+any future undefined-identifier diagnostics.
 @End Reasoning
+@Implementation:
+Build the built-in name list once per call, compare func_name to each via
+string_equals, return 1 on match else 0.
+@End Implementation
 Process called "is_builtin_function" takes analyzer as Integer, func_name as Integer returns Integer:
-    Note: Check if function is a JavaScript built-in
+    Note: Whether a name is a JavaScript built-in / global
 
     Let builtin_functions be proc create from List
-    proc list_append with builtin_functions, "console"
-    proc list_append with builtin_functions, "parseInt"
-    proc list_append with builtin_functions, "parseFloat"
-    proc list_append with builtin_functions, "isNaN"
-    proc list_append with builtin_functions, "isFinite"
-    proc list_append with builtin_functions, "encodeURIComponent"
-    proc list_append with builtin_functions, "decodeURIComponent"
-    proc list_append with builtin_functions, "setTimeout"
-    proc list_append with builtin_functions, "setInterval"
-    proc list_append with builtin_functions, "clearTimeout"
-    proc list_append with builtin_functions, "clearInterval"
-    proc list_append with builtin_functions, "JSON"
-    proc list_append with builtin_functions, "Object"
-    proc list_append with builtin_functions, "Array"
-    proc list_append with builtin_functions, "String"
-    proc list_append with builtin_functions, "Number"
-    proc list_append with builtin_functions, "Boolean"
-    proc list_append with builtin_functions, "Date"
-    proc list_append with builtin_functions, "RegExp"
-    proc list_append with builtin_functions, "Math"
-    proc list_append with builtin_functions, "Promise"
-    proc list_append with builtin_functions, "Symbol"
-    proc list_append with builtin_functions, "Map"
-    proc list_append with builtin_functions, "Set"
-    proc list_append with builtin_functions, "WeakMap"
-    proc list_append with builtin_functions, "WeakSet"
+    proc list_append from List with builtin_functions, "console"
+    proc list_append from List with builtin_functions, "parseInt"
+    proc list_append from List with builtin_functions, "parseFloat"
+    proc list_append from List with builtin_functions, "isNaN"
+    proc list_append from List with builtin_functions, "isFinite"
+    proc list_append from List with builtin_functions, "encodeURIComponent"
+    proc list_append from List with builtin_functions, "decodeURIComponent"
+    proc list_append from List with builtin_functions, "setTimeout"
+    proc list_append from List with builtin_functions, "setInterval"
+    proc list_append from List with builtin_functions, "clearTimeout"
+    proc list_append from List with builtin_functions, "clearInterval"
+    proc list_append from List with builtin_functions, "JSON"
+    proc list_append from List with builtin_functions, "Object"
+    proc list_append from List with builtin_functions, "Array"
+    proc list_append from List with builtin_functions, "String"
+    proc list_append from List with builtin_functions, "Number"
+    proc list_append from List with builtin_functions, "Boolean"
+    proc list_append from List with builtin_functions, "Date"
+    proc list_append from List with builtin_functions, "RegExp"
+    proc list_append from List with builtin_functions, "Math"
+    proc list_append from List with builtin_functions, "Promise"
+    proc list_append from List with builtin_functions, "Symbol"
+    proc list_append from List with builtin_functions, "Map"
+    proc list_append from List with builtin_functions, "Set"
+    proc list_append from List with builtin_functions, "WeakMap"
+    proc list_append from List with builtin_functions, "WeakSet"
+    proc list_append from List with builtin_functions, "globalThis"
+    proc list_append from List with builtin_functions, "undefined"
+    proc list_append from List with builtin_functions, "NaN"
+    proc list_append from List with builtin_functions, "Infinity"
+    proc list_append from List with builtin_functions, "this"
+    proc list_append from List with builtin_functions, "super"
 
     Let builtin_count be proc size from List with builtin_functions
     Let i be 0
     While i is less than builtin_count:
         Let builtin_name be proc get from List with builtin_functions, i
-        Let matches be proc equals from StringCore with func_name, builtin_name
+        Let matches be proc string_equals from StringCore with func_name, builtin_name
         If matches is equal to 1:
             Return 1
         End If
@@ -637,16 +1324,19 @@ Process called "is_builtin_function" takes analyzer as Integer, func_name as Int
 End Process
 
 @Reasoning:
-Records a fatal semantic error: sets the has_error flag at offset 72
-and stores a heap-owned copy of the message at offset 64. Copying the
-message means callers can pass borrowed strings without ownership
-concerns.
+Records a fatal semantic error: sets has_error and stores an owned copy of the
+message so callers can pass borrowed strings without ownership concerns.
 @End Reasoning
+@Implementation:
+Set has_error (offset 72) to 1; store a string_copy of the message at offset 64.
+@End Implementation
 Process called "set_javascript_semantic_error" takes analyzer as Integer, message as Integer:
-    Note: Set semantic analyzer error state
+    Note: Record a fatal semantic error
 
     proc memory_set_int64 from Layout with analyzer, 72, 1
 
-    Let error_copy be proc copy_string from StringCore with message
+    Let error_copy be proc string_copy with message
     proc memory_set_int64 from Layout with analyzer, 64, error_copy
 End Process
+
+Note: End of JavaScript Semantic Analyzer

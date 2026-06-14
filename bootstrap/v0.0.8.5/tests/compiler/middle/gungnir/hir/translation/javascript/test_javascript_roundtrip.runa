@@ -1,0 +1,584 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+Licensed under Apache 2.0
+:End Note
+
+Note:
+JavaScript Translation Round-Trip Probe (depth-hardened)
+
+End-to-end proof that the JavaScript translation pipeline is REAL, not a
+skeleton, and that construct MEMBERS survive the round-trip:
+
+    JavaScript source
+      -> javascript_lexer    (ASI-safe, regex/divide aware tokenizer)
+      -> javascript_parser   (recursive-descent AST; every block/list loop
+                              force-advances on zero lexer-cursor progress)
+      -> javascript_to_hir   (lower to the HIR dictionary/list-literal model)
+      -> hir_to_javascript   (emit HIR back to valid JavaScript text)
+      -> re-lex / re-parse / re-to_hir of the emitted text  (HIR2)
+      -> structural + MEMBER-SURVIVAL assertions on HIR2
+
+The JavaScript HIR is the hir.runa dictionary-literal / list-literal model:
+a dictionary-literal node's entries are read via get_dictionary_entries (a List
+of 16-byte [key, value] blocks); a list-literal node's elements via
+get_list_elements (a List of node handles); a string-literal value via
+get_string_literal_value. This probe reads HIR fields through exactly those
+accessors - the same contract the producer (javascript_to_hir) and consumer
+(hir_to_javascript) share.
+
+Member-survival assertions (the load-bearing part of this probe):
+  - a class's METHOD names + count survive (constructor + 2 methods + static
+    + getter)
+  - an object literal's PROPERTY keys survive (3 keys + a method)
+  - an arrow function's PARAMETER names + count survive (2 params)
+  - an import's named BINDINGS survive (named + default + namespace)
+  - an array literal's ELEMENT count survives (incl. a spread)
+
+Exit code: number of failed assertions (0 == all passed). No exit_with_code.
+:End Note
+
+Import "compiler/middle/gungnir/hir/translation/frontends/javascript/javascript_to_hir.runa" as JsFrontend
+Import "compiler/middle/gungnir/hir/translation/backends/javascript/hir_to_javascript.runa" as JsBackend
+Import "compiler/middle/gungnir/hir/hir.runa" as HIR
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/frontend/primitives/collections/list.runa" as List
+Import "compiler/internal/string_utils.runa" as StringUtils
+Import "tests/test_utils.runa" as TestUtils
+
+Note: ============================================================================
+Note: HIR dictionary-literal / list-literal decoders (mirror producer/consumer)
+Note: ============================================================================
+
+@Reasoning:
+Resolve a string-valued dictionary field: find the entry whose key matches, then
+unwrap the string-literal value to its raw payload. Mirrors the backend's
+get_dict_string_value.
+@End Reasoning
+Process called "dict_string" takes node as Integer, key as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    Let entries be proc get_dictionary_entries from HIR with node
+    If entries is equal to 0:
+        Return 0
+    End If
+    Let count be proc size from List with entries
+    Let i be 0
+    While i is less than count:
+        Let entry be proc get_at from List with entries, i
+        If entry is not equal to 0:
+            Let entry_key be proc memory_get_int64 from Layout with entry, 0
+            Let matches be proc string_equals from StringCore with entry_key, key
+            If matches is equal to 1:
+                Let value_node be proc memory_get_int64 from Layout with entry, 8
+                Return proc get_string_literal_value from HIR with value_node
+            End If
+        End If
+        Set i to i plus 1
+    End While
+    Return 0
+End Process
+
+@Reasoning:
+Resolve a node-valued dictionary field (a nested dict or list literal). Returns
+the raw value node so the caller can recurse.
+@End Reasoning
+Process called "dict_node" takes node as Integer, key as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    Let entries be proc get_dictionary_entries from HIR with node
+    If entries is equal to 0:
+        Return 0
+    End If
+    Let count be proc size from List with entries
+    Let i be 0
+    While i is less than count:
+        Let entry be proc get_at from List with entries, i
+        If entry is not equal to 0:
+            Let entry_key be proc memory_get_int64 from Layout with entry, 0
+            Let matches be proc string_equals from StringCore with entry_key, key
+            If matches is equal to 1:
+                Return proc memory_get_int64 from Layout with entry, 8
+            End If
+        End If
+        Set i to i plus 1
+    End While
+    Return 0
+End Process
+
+Process called "list_count" takes node as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    Let elements be proc get_list_elements from HIR with node
+    If elements is equal to 0:
+        Return 0
+    End If
+    Return proc size from List with elements
+End Process
+
+Process called "list_item" takes node as Integer, index as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    Let elements be proc get_list_elements from HIR with node
+    If elements is equal to 0:
+        Return 0
+    End If
+    Let count be proc size from List with elements
+    If index is less than 0:
+        Return 0
+    End If
+    If index is greater than or equal to count:
+        Return 0
+    End If
+    Return proc get_at from List with elements, index
+End Process
+
+@Reasoning:
+Find the program's top-level statement whose "_type" tag matches the requested
+kind. A linear scan over the program "statements" list is robust to ordering.
+@End Reasoning
+Process called "find_stmt" takes program as Integer, kind as Integer returns Integer:
+    If program is equal to 0:
+        Return 0
+    End If
+    Let statements be proc dict_node with program, "statements"
+    Let count be proc list_count with statements
+    Let i be 0
+    While i is less than count:
+        Let stmt be proc list_item with statements, i
+        Let stmt_kind be proc dict_string with stmt, "_type"
+        If stmt_kind is not equal to 0:
+            Let matches be proc string_equals from StringCore with stmt_kind, kind
+            If matches is equal to 1:
+                Return stmt
+            End If
+        End If
+        Set i to i plus 1
+    End While
+    Return 0
+End Process
+
+@Reasoning:
+Whether a class's "methods" list contains a method with the given name. Used to
+assert that each class member name survives the round-trip.
+@End Reasoning
+Process called "class_has_method" takes class_node as Integer, name as Integer returns Integer:
+    Let methods be proc dict_node with class_node, "methods"
+    Let count be proc list_count with methods
+    Let i be 0
+    While i is less than count:
+        Let method be proc list_item with methods, i
+        Let method_name be proc dict_string with method, "name"
+        If method_name is not equal to 0:
+            Let matches be proc string_equals from StringCore with method_name, name
+            If matches is equal to 1:
+                Return 1
+            End If
+        End If
+        Set i to i plus 1
+    End While
+    Return 0
+End Process
+
+@Reasoning:
+Whether the class has a method with the given name AND the given "kind"
+attribute (e.g. a getter has kind="get", the static method has static="true").
+@End Reasoning
+Process called "class_has_method_kind" takes class_node as Integer, name as Integer, kind_key as Integer, kind_val as Integer returns Integer:
+    Let methods be proc dict_node with class_node, "methods"
+    Let count be proc list_count with methods
+    Let i be 0
+    While i is less than count:
+        Let method be proc list_item with methods, i
+        Let method_name be proc dict_string with method, "name"
+        If method_name is not equal to 0:
+            Let matches be proc string_equals from StringCore with method_name, name
+            If matches is equal to 1:
+                Let attr be proc dict_string with method, kind_key
+                If attr is not equal to 0:
+                    Let attr_ok be proc string_equals from StringCore with attr, kind_val
+                    If attr_ok is equal to 1:
+                        Return 1
+                    End If
+                End If
+            End If
+        End If
+        Set i to i plus 1
+    End While
+    Return 0
+End Process
+
+@Reasoning:
+Whether an object literal's "properties" list contains a property with the given
+key. Used to assert object-literal property keys survive.
+@End Reasoning
+Process called "object_has_key" takes object_node as Integer, key_name as Integer returns Integer:
+    Let properties be proc dict_node with object_node, "properties"
+    Let count be proc list_count with properties
+    Let i be 0
+    While i is less than count:
+        Let prop be proc list_item with properties, i
+        Let prop_key be proc dict_string with prop, "key"
+        If prop_key is not equal to 0:
+            Let matches be proc string_equals from StringCore with prop_key, key_name
+            If matches is equal to 1:
+                Return 1
+            End If
+        End If
+        Set i to i plus 1
+    End While
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: Locate the var-declarator initializer matching a given _type tag
+Note: ============================================================================
+
+@Reasoning:
+Several constructs in the test source are bound to variables (the object literal,
+the arrow function, the array literal). This helper walks every top-level
+var-declaration's declarator initializers and returns the first initializer
+whose "_type" matches the requested kind.
+@End Reasoning
+Process called "find_init_of_kind" takes program as Integer, kind as Integer returns Integer:
+    Let statements be proc dict_node with program, "statements"
+    Let count be proc list_count with statements
+    Let i be 0
+    While i is less than count:
+        Let stmt be proc list_item with statements, i
+        Let stmt_kind be proc dict_string with stmt, "_type"
+        Let is_var be 0
+        If stmt_kind is not equal to 0:
+            Set is_var to proc string_equals from StringCore with stmt_kind, "js_var_decl"
+        End If
+        If is_var is equal to 1:
+            Let declarators be proc dict_node with stmt, "declarators"
+            Let dcount be proc list_count with declarators
+            Let d be 0
+            While d is less than dcount:
+                Let declarator be proc list_item with declarators, d
+                Let init be proc dict_node with declarator, "init"
+                Let init_kind be proc dict_string with init, "_type"
+                If init_kind is not equal to 0:
+                    Let imatch be proc string_equals from StringCore with init_kind, kind
+                    If imatch is equal to 1:
+                        Return init
+                    End If
+                End If
+                Set d to d plus 1
+            End While
+        End If
+        Set i to i plus 1
+    End While
+    Return 0
+End Process
+
+@Reasoning:
+Locate the top-level var-declarator initializer bound to a specific variable
+name. The depth-gap probes bind a bare arrow, an async bare arrow, and an
+interpolated template literal to distinct names; find_init_of_kind returns the
+FIRST match of a kind, so for these targeted assertions we disambiguate by the
+declarator name instead.
+@End Reasoning
+Process called "find_init_by_name" takes program as Integer, var_name as Integer returns Integer:
+    Let statements be proc dict_node with program, "statements"
+    Let count be proc list_count with statements
+    Let i be 0
+    While i is less than count:
+        Let stmt be proc list_item with statements, i
+        Let stmt_kind be proc dict_string with stmt, "_type"
+        Let is_var be 0
+        If stmt_kind is not equal to 0:
+            Set is_var to proc string_equals from StringCore with stmt_kind, "js_var_decl"
+        End If
+        If is_var is equal to 1:
+            Let declarators be proc dict_node with stmt, "declarators"
+            Let dcount be proc list_count with declarators
+            Let d be 0
+            While d is less than dcount:
+                Let declarator be proc list_item with declarators, d
+                Let decl_name be proc dict_string with declarator, "name"
+                If decl_name is not equal to 0:
+                    Let nmatch be proc string_equals from StringCore with decl_name, var_name
+                    If nmatch is equal to 1:
+                        Return proc dict_node with declarator, "init"
+                    End If
+                End If
+                Set d to d plus 1
+            End While
+        End If
+        Set i to i plus 1
+    End While
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: Probe entry point
+Note: ============================================================================
+
+Process called "main" returns Integer:
+    Let results be proc create_test_results from TestUtils
+    proc begin_suite from TestUtils with results, "JavaScript translation round-trip"
+
+    Note:
+    Representative ES2020+ program exercising: named + default + namespace
+    imports; a class extends with a constructor + 2 methods + a static + a
+    getter; an object literal with 3 properties + a method; an arrow function
+    with 2 params + destructuring usage; a for-of; a template literal; optional
+    chaining; and an array literal with a spread.
+    :End Note
+    Let source be "import defaultExport, { namedA, namedB } from \"mod\";\nimport * as ns from \"other\";\nclass Animal extends Base {\nconstructor(name) {\nthis.name = name;\n}\nspeak(volume) {\nreturn volume;\n}\nmove(distance) {\nreturn distance;\n}\nstatic create(name) {\nreturn name;\n}\nget label() {\nreturn this.name;\n}\n}\nlet config = {\nalpha: 1,\nbeta: 2,\ngamma: 3,\ncompute(x) {\nreturn x;\n}\n};\nlet add = (left, right) => {\nreturn left;\n};\nlet items = [1, 2, ...rest, 4];\nfor (const it of items) {\nlet greeting = `hello ${it}`;\nlet safe = obj?.prop;\n}\nlet doubler = x => x * 2;\nlet asy = async y => y;\nlet msg = `Hi ${name}, ${count + 1} items`;\n"
+
+    Note: --- Stage 0-2: source -> HIR1 (lex, parse, lower) ---
+    Let hir1 be proc javascript_to_hir_from_source from JsFrontend with source
+    proc assert_not_null from TestUtils with results, "frontend produced HIR program", hir1
+
+    Let root_kind be proc dict_string with hir1, "_type"
+    Let root_ok be proc string_equals from StringCore with root_kind, "js_program"
+    proc assert_equal from TestUtils with results, "HIR root is a js_program", root_ok, 1
+
+    Note: ---- Member survival on HIR1 ----
+
+    Note: Class: extends + constructor + 2 methods + static + getter.
+    Let class_node be proc find_stmt with hir1, "js_class"
+    proc assert_not_null from TestUtils with results, "class declaration present", class_node
+    Let class_name be proc dict_string with class_node, "name"
+    Let class_name_ok be proc string_equals from StringCore with class_name, "Animal"
+    proc assert_equal from TestUtils with results, "class name is 'Animal'", class_name_ok, 1
+    Let class_extends be proc dict_string with class_node, "extends"
+    proc assert_not_null from TestUtils with results, "class records extends clause", class_extends
+
+    Let methods be proc dict_node with class_node, "methods"
+    Let method_count be proc list_count with methods
+    proc assert_greater_than_or_equal from TestUtils with results, "class has 5 members (ctor+2+static+getter)", method_count, 5
+
+    Let has_speak be proc class_has_method with class_node, "speak"
+    proc assert_equal from TestUtils with results, "class method 'speak' survives", has_speak, 1
+    Let has_move be proc class_has_method with class_node, "move"
+    proc assert_equal from TestUtils with results, "class method 'move' survives", has_move, 1
+    Let has_ctor be proc class_has_method with class_node, "constructor"
+    proc assert_equal from TestUtils with results, "class constructor survives", has_ctor, 1
+    Let has_static be proc class_has_method_kind with class_node, "create", "static", "true"
+    proc assert_equal from TestUtils with results, "static method 'create' survives as static", has_static, 1
+    Let has_getter be proc class_has_method_kind with class_node, "label", "kind", "get"
+    proc assert_equal from TestUtils with results, "getter 'label' survives as kind=get", has_getter, 1
+
+    Note: Object literal: 3 property keys + a method, all bound to `config`.
+    Let object_node be proc find_init_of_kind with hir1, "js_object"
+    proc assert_not_null from TestUtils with results, "object literal present", object_node
+    Let props be proc dict_node with object_node, "properties"
+    Let prop_count be proc list_count with props
+    proc assert_greater_than_or_equal from TestUtils with results, "object literal has 4 properties (3 keys + method)", prop_count, 4
+    Let has_alpha be proc object_has_key with object_node, "alpha"
+    proc assert_equal from TestUtils with results, "object key 'alpha' survives", has_alpha, 1
+    Let has_beta be proc object_has_key with object_node, "beta"
+    proc assert_equal from TestUtils with results, "object key 'beta' survives", has_beta, 1
+    Let has_gamma be proc object_has_key with object_node, "gamma"
+    proc assert_equal from TestUtils with results, "object key 'gamma' survives", has_gamma, 1
+    Let has_compute be proc object_has_key with object_node, "compute"
+    proc assert_equal from TestUtils with results, "object method 'compute' key survives", has_compute, 1
+
+    Note: Arrow function: 2 parameter names survive.
+    Let arrow_node be proc find_init_of_kind with hir1, "js_arrow"
+    proc assert_not_null from TestUtils with results, "arrow function present", arrow_node
+    Let arrow_params be proc dict_node with arrow_node, "params"
+    Let arrow_param_count be proc list_count with arrow_params
+    proc assert_equal from TestUtils with results, "arrow function has 2 params", arrow_param_count, 2
+    Let arrow_p0 be proc list_item with arrow_params, 0
+    Let arrow_p0_name be proc dict_string with arrow_p0, "name"
+    Let arrow_p0_ok be proc string_equals from StringCore with arrow_p0_name, "left"
+    proc assert_equal from TestUtils with results, "arrow param 0 name is 'left'", arrow_p0_ok, 1
+    Let arrow_p1 be proc list_item with arrow_params, 1
+    Let arrow_p1_name be proc dict_string with arrow_p1, "name"
+    Let arrow_p1_ok be proc string_equals from StringCore with arrow_p1_name, "right"
+    proc assert_equal from TestUtils with results, "arrow param 1 name is 'right'", arrow_p1_ok, 1
+
+    Note: Array literal: element count survives (1, 2, ...rest, 4 -> 4 elements).
+    Let array_node be proc find_init_of_kind with hir1, "js_array"
+    proc assert_not_null from TestUtils with results, "array literal present", array_node
+    Let array_elems be proc dict_node with array_node, "elements"
+    Let array_elem_count be proc list_count with array_elems
+    proc assert_greater_than_or_equal from TestUtils with results, "array literal has 4 elements (incl spread)", array_elem_count, 4
+
+    Note: Import: named + default + namespace bindings survive.
+    Let import_node be proc find_stmt with hir1, "js_import"
+    proc assert_not_null from TestUtils with results, "import statement present", import_node
+    Let import_bindings be proc dict_node with import_node, "bindings"
+    Let binding_count be proc list_count with import_bindings
+    proc assert_greater_than_or_equal from TestUtils with results, "import has named bindings", binding_count, 1
+
+    Note: ---- GAP 1: bare single-identifier arrow `x => x * 2` ----
+    Note: `doubler` is bound to a bare (unparenthesized) arrow; its single param
+    Note: name `x` must survive lowering.
+    Let bare_arrow be proc find_init_by_name with hir1, "doubler"
+    proc assert_not_null from TestUtils with results, "bare arrow `x => x*2` parsed and bound", bare_arrow
+    Let bare_arrow_kind be proc dict_string with bare_arrow, "_type"
+    Let bare_arrow_ok be proc string_equals from StringCore with bare_arrow_kind, "js_arrow"
+    proc assert_equal from TestUtils with results, "bare arrow lowers to js_arrow", bare_arrow_ok, 1
+    Let bare_params be proc dict_node with bare_arrow, "params"
+    Let bare_param_count be proc list_count with bare_params
+    proc assert_equal from TestUtils with results, "bare arrow has exactly 1 param", bare_param_count, 1
+    Let bare_p0 be proc list_item with bare_params, 0
+    Let bare_p0_name be proc dict_string with bare_p0, "name"
+    Let bare_p0_ok be proc string_equals from StringCore with bare_p0_name, "x"
+    proc assert_equal from TestUtils with results, "bare arrow param name 'x' survives", bare_p0_ok, 1
+
+    Note: ---- GAP 1: bare async arrow `async y => y` ----
+    Let async_arrow be proc find_init_by_name with hir1, "asy"
+    proc assert_not_null from TestUtils with results, "bare async arrow `async y => y` parsed", async_arrow
+    Let async_arrow_kind be proc dict_string with async_arrow, "_type"
+    Let async_arrow_ok be proc string_equals from StringCore with async_arrow_kind, "js_arrow"
+    proc assert_equal from TestUtils with results, "bare async arrow lowers to js_arrow", async_arrow_ok, 1
+    Let async_flag be proc dict_string with async_arrow, "async"
+    proc assert_not_null from TestUtils with results, "bare async arrow records async flag", async_flag
+    Let async_params be proc dict_node with async_arrow, "params"
+    Let async_param_count be proc list_count with async_params
+    proc assert_equal from TestUtils with results, "bare async arrow has exactly 1 param", async_param_count, 1
+    Let async_p0 be proc list_item with async_params, 0
+    Let async_p0_name be proc dict_string with async_p0, "name"
+    Let async_p0_ok be proc string_equals from StringCore with async_p0_name, "y"
+    proc assert_equal from TestUtils with results, "bare async arrow param name 'y' survives", async_p0_ok, 1
+
+    Note: ---- GAP 2: template literal `Hi ${name}, ${count + 1} items` ----
+    Note: 3 quasi chunks ("Hi ", ", ", " items") + 2 interpolation expressions
+    Note: (`name`, `count + 1`). The SECOND interpolation must be a STRUCTURED
+    Note: binary expression whose operands survive - not an opaque string.
+    Let templ be proc find_init_by_name with hir1, "msg"
+    proc assert_not_null from TestUtils with results, "interpolated template parsed and bound", templ
+    Let templ_kind be proc dict_string with templ, "_type"
+    Let templ_ok be proc string_equals from StringCore with templ_kind, "js_template"
+    proc assert_equal from TestUtils with results, "template lowers to js_template", templ_ok, 1
+    Let templ_quasis be proc dict_node with templ, "quasis"
+    Let templ_quasi_count be proc list_count with templ_quasis
+    proc assert_equal from TestUtils with results, "template has 3 quasi chunks", templ_quasi_count, 3
+    Let templ_exprs be proc dict_node with templ, "expressions"
+    Let templ_expr_count be proc list_count with templ_exprs
+    proc assert_equal from TestUtils with results, "template has 2 interpolation expressions", templ_expr_count, 2
+    Let templ_expr1 be proc list_item with templ_exprs, 1
+    proc assert_not_null from TestUtils with results, "second interpolation expression present", templ_expr1
+    Let templ_expr1_kind be proc dict_string with templ_expr1, "_type"
+    Let templ_expr1_ok be proc string_equals from StringCore with templ_expr1_kind, "js_binary"
+    proc assert_equal from TestUtils with results, "second interpolation is a STRUCTURED binary expr (count + 1)", templ_expr1_ok, 1
+    Let templ_expr1_op be proc dict_string with templ_expr1, "operator"
+    Let templ_expr1_op_ok be proc string_equals from StringCore with templ_expr1_op, "+"
+    proc assert_equal from TestUtils with results, "second interpolation operator is '+'", templ_expr1_op_ok, 1
+    Let templ_expr1_left be proc dict_node with templ_expr1, "left"
+    proc assert_not_null from TestUtils with results, "binary interpolation left operand survives", templ_expr1_left
+    Let templ_expr1_right be proc dict_node with templ_expr1, "right"
+    proc assert_not_null from TestUtils with results, "binary interpolation right operand survives", templ_expr1_right
+
+    Note: --- Stage 3: HIR1 -> JavaScript text ---
+    Let arena be proc allocate from Layout with 65536
+    Let emitted be proc generate_javascript_from_hir from JsBackend with hir1, arena
+    proc assert_not_null from TestUtils with results, "backend produced JavaScript text", emitted
+    Let emitted_len be proc string_length from StringCore with emitted
+    proc assert_greater_than from TestUtils with results, "emitted JavaScript is non-empty", emitted_len, 0
+
+    Let has_class_text be proc string_contains from StringUtils with emitted, "class Animal"
+    proc assert_equal from TestUtils with results, "emitted contains class Animal", has_class_text, 1
+    Let has_extends_text be proc string_contains from StringUtils with emitted, "extends Base"
+    proc assert_equal from TestUtils with results, "emitted contains extends Base", has_extends_text, 1
+    Let has_static_text be proc string_contains from StringUtils with emitted, "static "
+    proc assert_equal from TestUtils with results, "emitted contains static member", has_static_text, 1
+
+    Note: --- Stage 4: re-run the pipeline on the emitted text -> HIR2 ---
+    Let hir2 be proc javascript_to_hir_from_source from JsFrontend with emitted
+    proc assert_not_null from TestUtils with results, "re-parse of emitted JavaScript produced HIR", hir2
+    Let root2_kind be proc dict_string with hir2, "_type"
+    Let root2_ok be proc string_equals from StringCore with root2_kind, "js_program"
+    proc assert_equal from TestUtils with results, "round-trip root is a js_program", root2_ok, 1
+
+    Note: --- Stage 5: MEMBER SURVIVAL on HIR2 (the depth guarantee) ---
+    Let class2 be proc find_stmt with hir2, "js_class"
+    proc assert_not_null from TestUtils with results, "round-trip preserves class", class2
+    Let class2_name be proc dict_string with class2, "name"
+    Let class2_name_ok be proc string_equals from StringCore with class2_name, "Animal"
+    proc assert_equal from TestUtils with results, "round-trip preserves class name 'Animal'", class2_name_ok, 1
+    Let methods2 be proc dict_node with class2, "methods"
+    Let method2_count be proc list_count with methods2
+    proc assert_greater_than_or_equal from TestUtils with results, "round-trip preserves 5 class members", method2_count, 5
+    Let has_speak2 be proc class_has_method with class2, "speak"
+    proc assert_equal from TestUtils with results, "round-trip preserves method 'speak'", has_speak2, 1
+    Let has_move2 be proc class_has_method with class2, "move"
+    proc assert_equal from TestUtils with results, "round-trip preserves method 'move'", has_move2, 1
+    Let has_static2 be proc class_has_method_kind with class2, "create", "static", "true"
+    proc assert_equal from TestUtils with results, "round-trip preserves static 'create'", has_static2, 1
+    Let has_getter2 be proc class_has_method_kind with class2, "label", "kind", "get"
+    proc assert_equal from TestUtils with results, "round-trip preserves getter 'label'", has_getter2, 1
+
+    Let object2 be proc find_init_of_kind with hir2, "js_object"
+    proc assert_not_null from TestUtils with results, "round-trip preserves object literal", object2
+    Let has_alpha2 be proc object_has_key with object2, "alpha"
+    proc assert_equal from TestUtils with results, "round-trip preserves object key 'alpha'", has_alpha2, 1
+    Let has_beta2 be proc object_has_key with object2, "beta"
+    proc assert_equal from TestUtils with results, "round-trip preserves object key 'beta'", has_beta2, 1
+    Let has_gamma2 be proc object_has_key with object2, "gamma"
+    proc assert_equal from TestUtils with results, "round-trip preserves object key 'gamma'", has_gamma2, 1
+
+    Let arrow2 be proc find_init_of_kind with hir2, "js_arrow"
+    proc assert_not_null from TestUtils with results, "round-trip preserves arrow function", arrow2
+    Let arrow2_params be proc dict_node with arrow2, "params"
+    Let arrow2_param_count be proc list_count with arrow2_params
+    proc assert_equal from TestUtils with results, "round-trip preserves 2 arrow params", arrow2_param_count, 2
+
+    Let array2 be proc find_init_of_kind with hir2, "js_array"
+    proc assert_not_null from TestUtils with results, "round-trip preserves array literal", array2
+    Let array2_elems be proc dict_node with array2, "elements"
+    Let array2_elem_count be proc list_count with array2_elems
+    proc assert_greater_than_or_equal from TestUtils with results, "round-trip preserves array element count", array2_elem_count, 4
+
+    Let import2 be proc find_stmt with hir2, "js_import"
+    proc assert_not_null from TestUtils with results, "round-trip preserves import", import2
+    Let import2_bindings be proc dict_node with import2, "bindings"
+    Let binding2_count be proc list_count with import2_bindings
+    proc assert_greater_than_or_equal from TestUtils with results, "round-trip preserves import bindings", binding2_count, 1
+
+    Note: ---- GAP 1 round-trip: bare arrow survives re-emit + re-parse ----
+    Let bare_arrow2 be proc find_init_by_name with hir2, "doubler"
+    proc assert_not_null from TestUtils with results, "round-trip preserves bare arrow", bare_arrow2
+    Let bare2_params be proc dict_node with bare_arrow2, "params"
+    Let bare2_param_count be proc list_count with bare2_params
+    proc assert_equal from TestUtils with results, "round-trip preserves bare arrow 1 param", bare2_param_count, 1
+    Let bare2_p0 be proc list_item with bare2_params, 0
+    Let bare2_p0_name be proc dict_string with bare2_p0, "name"
+    Let bare2_p0_ok be proc string_equals from StringCore with bare2_p0_name, "x"
+    proc assert_equal from TestUtils with results, "round-trip preserves bare arrow param 'x'", bare2_p0_ok, 1
+
+    Let async_arrow2 be proc find_init_by_name with hir2, "asy"
+    proc assert_not_null from TestUtils with results, "round-trip preserves bare async arrow", async_arrow2
+    Let async2_flag be proc dict_string with async_arrow2, "async"
+    proc assert_not_null from TestUtils with results, "round-trip preserves async flag on bare arrow", async2_flag
+    Let async2_params be proc dict_node with async_arrow2, "params"
+    Let async2_p0 be proc list_item with async2_params, 0
+    Let async2_p0_name be proc dict_string with async2_p0, "name"
+    Let async2_p0_ok be proc string_equals from StringCore with async2_p0_name, "y"
+    proc assert_equal from TestUtils with results, "round-trip preserves async arrow param 'y'", async2_p0_ok, 1
+
+    Note: ---- GAP 2 round-trip: template structure survives re-emit + re-parse ----
+    Let templ2 be proc find_init_by_name with hir2, "msg"
+    proc assert_not_null from TestUtils with results, "round-trip preserves interpolated template", templ2
+    Let templ2_quasis be proc dict_node with templ2, "quasis"
+    Let templ2_quasi_count be proc list_count with templ2_quasis
+    proc assert_equal from TestUtils with results, "round-trip preserves 3 template quasi chunks", templ2_quasi_count, 3
+    Let templ2_exprs be proc dict_node with templ2, "expressions"
+    Let templ2_expr_count be proc list_count with templ2_exprs
+    proc assert_equal from TestUtils with results, "round-trip preserves 2 template interpolations", templ2_expr_count, 2
+    Let templ2_expr1 be proc list_item with templ2_exprs, 1
+    Let templ2_expr1_kind be proc dict_string with templ2_expr1, "_type"
+    Let templ2_expr1_ok be proc string_equals from StringCore with templ2_expr1_kind, "js_binary"
+    proc assert_equal from TestUtils with results, "round-trip preserves STRUCTURED binary interpolation (count + 1)", templ2_expr1_ok, 1
+    Let templ2_expr1_left be proc dict_node with templ2_expr1, "left"
+    proc assert_not_null from TestUtils with results, "round-trip preserves binary interpolation left operand", templ2_expr1_left
+    Let templ2_expr1_right be proc dict_node with templ2_expr1, "right"
+    proc assert_not_null from TestUtils with results, "round-trip preserves binary interpolation right operand", templ2_expr1_right
+
+    proc print_summary from TestUtils with results
+    Let failed be proc get_failed from TestUtils with results
+    proc destroy_test_results from TestUtils with results
+
+    Return failed
+End Process
