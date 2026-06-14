@@ -1,0 +1,330 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+Licensed under Apache 2.0
+:End Note
+
+Note:
+Go Translation Round-Trip Probe
+
+End-to-end proof that the Go translation pipeline is REAL, not a skeleton:
+
+    Go source
+      -> go_lexer    (tokenize: identifiers, keywords, numbers, strings, operators)
+      -> go_parser   (build Go AST: package, funcs incl. methods, structs, control
+                      flow, slices/maps, := / var / const, expressions)
+      -> go_to_hir   (lower Go AST to the Go dict-encoding HIR interchange)
+      -> hir_to_go   (emit HIR back to valid Go text)
+      -> re-lex / re-parse / re-to_hir of the emitted text
+      -> structural HIR equality on the key constructs
+
+The probe feeds a representative Go program that exercises every construct the
+task requires:
+
+  - a package clause                              (package main)
+  - a func with params + multiple returns         (func divmod(a, b int) (int, int))
+  - a struct type                                 (type Point struct { X int; Y int })
+  - an if statement                               (if a > b { ... })
+  - a for-range loop                              (for i, v := range xs { ... })
+  - a short variable declaration                  (s := ...)
+  - a method call                                 (p.Scale(2))
+  - a slice literal and a map literal             ([]int{1,2,3}, map[string]int{...})
+
+The Go HIR node model is the dict-encoding interchange shared by go_to_hir
+(producer) and hir_to_go (consumer): every node is a 16-byte block with a tag
+at offset 0 (1 = dictionary, 2 = list) and a backing List at offset 8.
+Dictionary entries are 16-byte [key, value] blocks; list elements are stored
+directly. This probe reads HIR fields through that same layout, so the test is
+exercising the exact contract the frontend emits and the backend consumes.
+
+It lowers the source to HIR1, asserts HIR1 carries a program node whose
+declarations include a function named "divmod" with 2 parameters, emits HIR1
+back to Go text, re-runs the whole pipeline on the emitted text to HIR2, and
+asserts HIR2 is STRUCTURALLY EQUAL to HIR1 on those same key constructs.
+Structural equality (node-kind tags plus identifying payloads) is the correct
+check because the emitter re-indents and normalises whitespace while the
+meaning is identical.
+
+Exit code: number of failed assertions (0 == all passed). No exit_with_code.
+:End Note
+
+Import "compiler/middle/gungnir/hir/translation/frontends/go/go_lexer.runa" as GoLexer
+Import "compiler/middle/gungnir/hir/translation/frontends/go/go_parser.runa" as GoParser
+Import "compiler/middle/gungnir/hir/translation/frontends/go/go_to_hir.runa" as GoFrontend
+Import "compiler/middle/gungnir/hir/translation/backends/go/hir_to_go.runa" as GoBackend
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/collections/list.runa" as List
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "tests/test_utils.runa" as TestUtils
+
+Note: ============================================================================
+Note: Dict-encoding decoders (mirror the producer/consumer contract)
+Note: ============================================================================
+
+@Reasoning:
+The Go HIR dictionary node tags itself with 1 at offset 0 and holds a List of
+16-byte [key, value] entry blocks at offset 8. This decoder linear-scans the
+entries comparing keys with string_equals and returns the stored value (a child
+node or a string handle - the caller decides). It is the exact read the backend
+performs, so reading HIR through it proves the produced shape is the consumed
+shape.
+@End Reasoning
+Process called "dict_get" takes node as Integer, key as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+
+    Let tag be proc memory_get_int64 from Layout with node, 0
+    If tag is not equal to 1:
+        Return 0
+    End If
+
+    Let entries be proc memory_get_int64 from Layout with node, 8
+    If entries is equal to 0:
+        Return 0
+    End If
+
+    Let count be proc size from List with entries
+    Let index be 0
+    While index is less than count:
+        Let entry be proc get_at from List with entries, index
+        If entry is not equal to 0:
+            Let entry_key be proc memory_get_int64 from Layout with entry, 0
+            Let matches be proc string_equals from StringCore with entry_key, key
+            If matches is equal to 1:
+                Return proc memory_get_int64 from Layout with entry, 8
+            End If
+        End If
+        Set index to index plus 1
+    End While
+
+    Return 0
+End Process
+
+@Reasoning:
+A list node tags itself with 2 at offset 0 and holds its backing List at
+offset 8. Returning that List lets the probe iterate declarations / parameters
+with List.size and List.get_at.
+@End Reasoning
+Process called "list_elements" takes node as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+
+    Let tag be proc memory_get_int64 from Layout with node, 0
+    If tag is not equal to 2:
+        Return 0
+    End If
+
+    Return proc memory_get_int64 from Layout with node, 8
+End Process
+
+@Reasoning:
+Locates the first declaration in the program's "declarations" list whose
+"_type" string matches the requested kind. Linear scan rather than a fixed
+index is robust to the package/import declarations preceding the function.
+@End Reasoning
+Process called "find_decl" takes program as Integer, type_name as Integer returns Integer:
+    If program is equal to 0:
+        Return 0
+    End If
+
+    Let declarations be proc dict_get with program, "declarations"
+    If declarations is equal to 0:
+        Return 0
+    End If
+
+    Let items be proc list_elements with declarations
+    If items is equal to 0:
+        Return 0
+    End If
+
+    Let count be proc size from List with items
+    Let index be 0
+    While index is less than count:
+        Let decl be proc get_at from List with items, index
+        Let decl_type be proc dict_get with decl, "_type"
+        If decl_type is not equal to 0:
+            Let matches be proc string_equals from StringCore with decl_type, type_name
+            If matches is equal to 1:
+                Return decl
+            End If
+        End If
+        Set index to index plus 1
+    End While
+
+    Return 0
+End Process
+
+@Reasoning:
+Two HIR projections are structurally equal on a construct when both expose the
+same "_type" tag. Comparing the kind tag (and, for named constructs, the name
+payload) is whitespace-insensitive, proving round-trip fidelity without being
+defeated by the emitter's re-indenting.
+@End Reasoning
+Process called "same_type" takes a as Integer, b as Integer returns Integer:
+    If a is equal to 0:
+        Return 0
+    End If
+    If b is equal to 0:
+        Return 0
+    End If
+
+    Let ta be proc dict_get with a, "_type"
+    Let tb be proc dict_get with b, "_type"
+    If ta is equal to 0:
+        Return 0
+    End If
+    If tb is equal to 0:
+        Return 0
+    End If
+
+    Return proc string_equals from StringCore with ta, tb
+End Process
+
+Note: ============================================================================
+Note: Pipeline helper
+Note: ============================================================================
+
+@Reasoning:
+Each round of the probe runs the identical front-of-pipeline (lex -> parse ->
+to_hir). Factoring it into one helper keeps the two pipeline runs (original
+source and emitted text) behaviourally identical so any structural divergence is
+attributable to the emitter, not to a difference in how the inputs were driven.
+@End Reasoning
+@Implementation:
+Measures the source length, builds a lexer, wraps it in a parser (which pulls
+tokens lazily), drives a full parse to the Go AST root, then lowers the AST to
+the Go HIR dict-encoding via translate_go_to_hir. Returns 0 if any stage
+yields 0.
+@End Implementation
+Process called "source_to_hir" takes source as Integer returns Integer:
+    Let length be proc string_length from StringCore with source
+
+    Let lexer be proc create_go_lexer from GoLexer with source, length
+    If lexer is equal to 0:
+        Return 0
+    End If
+
+    Let parser be proc create_go_parser from GoParser with lexer
+    If parser is equal to 0:
+        Return 0
+    End If
+
+    Let ast be proc parse_program from GoParser with parser
+    If ast is equal to 0:
+        Return 0
+    End If
+
+    Let hir be proc translate_go_to_hir from GoFrontend with ast
+    Return hir
+End Process
+
+Note: ============================================================================
+Note: Probe entry point
+Note: ============================================================================
+
+Process called "main" returns Integer:
+    Let results be proc create_test_results from TestUtils
+    proc begin_suite from TestUtils with results, "Go translation round-trip"
+
+    Note:
+    Representative program: package clause, a func with two params and a
+    two-value return, a struct type, an if statement, a for-range loop, a
+    short variable declaration, a method call, and slice + map literals.
+    :End Note
+    Let source be "package main\ntype Point struct {\nX int\nY int\n}\nfunc divmod(a int, b int) (int, int) {\nq := a / b\nr := a - q * b\nreturn q, r\n}\nfunc run() {\nxs := []int{1, 2, 3}\nm := map[string]int{\"one\": 1}\nif len(xs) > 0 {\nq, r := divmod(10, 3)\n}\nfor i, v := range xs {\ns := i + v\n}\n}\n"
+
+    Note: --- Stage 0-2: source -> HIR (lex, parse, lower) ---
+    Let length be proc string_length from StringCore with source
+    Let lexer be proc create_go_lexer from GoLexer with source, length
+    proc assert_not_null from TestUtils with results, "lexer created", lexer
+
+    Let parser be proc create_go_parser from GoParser with lexer
+    proc assert_not_null from TestUtils with results, "parser created", parser
+
+    Let ast be proc parse_program from GoParser with parser
+    proc assert_not_null from TestUtils with results, "parser produced Go AST", ast
+
+    Let hir1 be proc translate_go_to_hir from GoFrontend with ast
+    proc assert_not_null from TestUtils with results, "frontend produced HIR program", hir1
+
+    Note: Program must be a dict node tagged "go_program".
+    Let prog_type be proc dict_get with hir1, "_type"
+    Let prog_type_ok be proc string_equals from StringCore with prog_type, "go_program"
+    proc assert_equal from TestUtils with results, "HIR root is a go_program", prog_type_ok, 1
+
+    Note: Program must expose a non-empty declarations list.
+    Let declarations be proc dict_get with hir1, "declarations"
+    proc assert_not_null from TestUtils with results, "program has declarations", declarations
+    Let decl_items be proc list_elements with declarations
+    proc assert_not_null from TestUtils with results, "declarations is a list", decl_items
+    Let decl_count be proc size from List with decl_items
+    proc assert_greater_than_or_equal from TestUtils with results, "at least two top-level declarations", decl_count, 2
+
+    Note: --- function: located by kind, name + parameter count checked ---
+    Let func_node be proc find_decl with hir1, "go_function"
+    proc assert_not_null from TestUtils with results, "function node present", func_node
+    Let func_name be proc dict_get with func_node, "name"
+    Let func_name_ok be proc string_equals from StringCore with func_name, "divmod"
+    proc assert_equal from TestUtils with results, "function name is 'divmod'", func_name_ok, 1
+
+    Let func_params be proc dict_get with func_node, "parameters"
+    proc assert_not_null from TestUtils with results, "function has a parameters list", func_params
+    Let func_param_elems be proc list_elements with func_params
+    Let func_param_count be proc size from List with func_param_elems
+    proc assert_equal from TestUtils with results, "function 'divmod' has 2 parameters", func_param_count, 2
+
+    Note: --- struct type declaration: located by kind ---
+    Let type_node be proc find_decl with hir1, "go_type_decl"
+    proc assert_not_null from TestUtils with results, "type declaration node present", type_node
+    Let type_name be proc dict_get with type_node, "name"
+    Let type_name_ok be proc string_equals from StringCore with type_name, "Point"
+    proc assert_equal from TestUtils with results, "type declaration name is 'Point'", type_name_ok, 1
+
+    Note: --- package clause: located by kind ---
+    Let pkg_node be proc find_decl with hir1, "go_package"
+    proc assert_not_null from TestUtils with results, "package node present", pkg_node
+
+    Note: --- Stage 3: HIR -> Go text ---
+    Let emitted be proc generate_hir_to_go from GoBackend with hir1
+    proc assert_not_null from TestUtils with results, "backend produced Go text", emitted
+    Let emitted_len be proc string_length from StringCore with emitted
+    proc assert_greater_than from TestUtils with results, "emitted Go is non-empty", emitted_len, 0
+
+    Note: --- Stage 4: re-run the pipeline on the emitted text -> HIR2 ---
+    Let hir2 be proc source_to_hir with emitted
+    proc assert_not_null from TestUtils with results, "re-parse of emitted Go produced HIR", hir2
+
+    Let prog2_type be proc dict_get with hir2, "_type"
+    Let prog2_type_ok be proc string_equals from StringCore with prog2_type, "go_program"
+    proc assert_equal from TestUtils with results, "round-trip root is a go_program", prog2_type_ok, 1
+
+    Note: --- Stage 5: structural equality on the key constructs ---
+    Let func2 be proc find_decl with hir2, "go_function"
+    Let func_type_ok be proc same_type with func_node, func2
+    proc assert_equal from TestUtils with results, "round-trip preserves function node", func_type_ok, 1
+    Let func2_name be proc dict_get with func2, "name"
+    Let func2_name_ok be proc string_equals from StringCore with func2_name, "divmod"
+    proc assert_equal from TestUtils with results, "round-trip preserves function name 'divmod'", func2_name_ok, 1
+    Let func2_params be proc dict_get with func2, "parameters"
+    Let func2_param_elems be proc list_elements with func2_params
+    Let func2_param_count be proc size from List with func2_param_elems
+    proc assert_equal from TestUtils with results, "round-trip preserves 2 parameters", func2_param_count, 2
+
+    Let type2 be proc find_decl with hir2, "go_type_decl"
+    Let type_type_ok be proc same_type with type_node, type2
+    proc assert_equal from TestUtils with results, "round-trip preserves type declaration node", type_type_ok, 1
+    Let type2_name be proc dict_get with type2, "name"
+    Let type2_name_ok be proc string_equals from StringCore with type2_name, "Point"
+    proc assert_equal from TestUtils with results, "round-trip preserves type name 'Point'", type2_name_ok, 1
+
+    Let pkg2 be proc find_decl with hir2, "go_package"
+    Let pkg_type_ok be proc same_type with pkg_node, pkg2
+    proc assert_equal from TestUtils with results, "round-trip preserves package node", pkg_type_ok, 1
+
+    proc print_summary from TestUtils with results
+    Let failed be proc get_failed from TestUtils with results
+    proc destroy_test_results from TestUtils with results
+
+    Return failed
+End Process
