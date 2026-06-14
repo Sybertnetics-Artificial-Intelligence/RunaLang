@@ -45,8 +45,10 @@ Dependencies:
 :End Note
 
 Import "compiler/middle/gungnir/hir/translation/backends/typescript/typescript_emitter.runa" as Emitter
+Import "compiler/middle/gungnir/hir/hir.runa" as HIR
 Import "compiler/frontend/primitives/memory/layout.runa" as Layout
 Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/frontend/primitives/collections/list.runa" as List
 
 Note: ============================================================================
 Note: Generation Context Structure
@@ -136,57 +138,133 @@ Note: Helper Functions
 Note: ============================================================================
 
 @Reasoning:
-The TypeScript backend reads HIR attributes through a simple two-slot
-dictionary representation (single entry held at offset 8). Inlining the
-lookup avoids pulling in a heavier Dict module.
+The TypeScript backend consumes the canonical HIR dictionary-literal /
+list-literal interchange model produced by typescript_to_hir (the same
+shape the JavaScript backend reads). A dictionary literal holds a List
+of 16-byte [key, value] entry blocks reachable via
+get_dictionary_entries; a list literal holds a List of node pointers
+reachable via get_list_elements. These decode helpers linear-scan the
+entries List and unwrap string-literal values, mirroring the frontend's
+encode facade exactly so every field written round-trips intact.
 @End Reasoning
 
 @Implementation:
-Returns 0 for null dict. Otherwise reads the entry slot at offset 8;
-compares the entry's key (offset 0) against the supplied key via
-strings_equal; on match returns the value at offset 8 of the entry.
+get_dictionary_value linear-scans the entries List comparing each entry
+key (offset 0) against the supplied key via string_equals and returns
+the entry value (offset 8). get_dict_string_value unwraps that value
+node with get_string_literal_value. get_dict_hir_value returns the raw
+value node. All null-guard their inputs.
 @End Implementation
 
-Process called "get_dict_string_value" takes dict as Integer, key as Integer returns Integer:
-    Note: Get string value from HIR dictionary structure
+Process called "get_dictionary_value" takes dict as Integer, key as Integer returns Integer:
+    Note: Look up a value node by key in a HIR dictionary literal
 
     If dict is equal to 0:
         Return 0
     End If
-
-    Let entry be proc memory_get_int64 from Layout with dict, 8
-
-    If entry is equal to 0:
+    If key is equal to 0:
         Return 0
     End If
 
-    Let entry_key be proc memory_get_int64 from Layout with entry, 0
-    Let matches be proc strings_equal from StringCore with entry_key, key
-
-    If matches is equal to 1:
-        Let value be proc memory_get_int64 from Layout with entry, 8
-        Return value
+    Let entries be proc get_dictionary_entries from HIR with dict
+    If entries is equal to 0:
+        Return 0
     End If
+
+    Let count be proc size from List with entries
+    Let index be 0
+    While index is less than count:
+        Let entry be proc get_at from List with entries, index
+        If entry is not equal to 0:
+            Let entry_key be proc memory_get_int64 from Layout with entry, 0
+            Let matches be proc string_equals from StringCore with entry_key, key
+            If matches is equal to 1:
+                Return proc memory_get_int64 from Layout with entry, 8
+            End If
+        End If
+        Set index to index plus 1
+    End While
 
     Return 0
 End Process
 
+Process called "get_dict_string_value" takes dict as Integer, key as Integer returns Integer:
+    Note: Get a string-valued dictionary field (unwraps a HIR string literal)
+
+    Let value_node be proc get_dictionary_value with dict, key
+    If value_node is equal to 0:
+        Return 0
+    End If
+
+    Return proc get_string_literal_value from HIR with value_node
+End Process
+
 @Reasoning:
-Companion accessor when the caller wants to interpret the slot as an HIR
-node pointer rather than a string. The backend's flat layout makes the
-two indistinguishable at the byte level.
+Companion accessor that returns the stored HIR node verbatim, used when
+the field value is itself a translated node (members list, body block,
+sub-expression) rather than a string literal.
 @End Reasoning
 
 @Implementation:
-Delegates to get_dict_string_value because the underlying memory access
-pattern is identical; the distinction is only at the call-site type
-intent.
+Direct delegation to get_dictionary_value; no string-literal unwrap.
 @End Implementation
 
 Process called "get_dict_hir_value" takes dict as Integer, key as Integer returns Integer:
-    Note: Get HIR value from dictionary structure
+    Note: Get a HIR-node-valued dictionary field
 
-    Return proc get_dict_string_value with dict, key
+    Return proc get_dictionary_value with dict, key
+End Process
+
+@Reasoning:
+List-literal length and element accessors over the canonical HIR list
+model. get_list_length reads the elements List and returns its size;
+get_list_item bounds-checks then returns the element node at the index.
+Together they replace the former inline (count@8, item@index*8+16)
+record walk that the single-slot representation used.
+@End Reasoning
+
+@Implementation:
+get_list_length: null-guard, get_list_elements, List.size. get_list_item:
+null-guard, get_list_elements, bounds-check index against List.size,
+List.get_at. Both return 0 on null/out-of-range.
+@End Implementation
+
+Process called "get_list_length" takes list_node as Integer returns Integer:
+    Note: Number of elements in a HIR list literal
+
+    If list_node is equal to 0:
+        Return 0
+    End If
+
+    Let elements be proc get_list_elements from HIR with list_node
+    If elements is equal to 0:
+        Return 0
+    End If
+
+    Return proc size from List with elements
+End Process
+
+Process called "get_list_item" takes list_node as Integer, index as Integer returns Integer:
+    Note: Element at index in a HIR list literal
+
+    If list_node is equal to 0:
+        Return 0
+    End If
+
+    Let elements be proc get_list_elements from HIR with list_node
+    If elements is equal to 0:
+        Return 0
+    End If
+
+    Let count be proc size from List with elements
+    If index is less than 0:
+        Return 0
+    End If
+    If index is greater than or equal to count:
+        Return 0
+    End If
+
+    Return proc get_at from List with elements, index
 End Process
 
 Note: ============================================================================
@@ -219,7 +297,7 @@ Process called "generate_type_annotation" takes context as Integer, type_hir as 
     Let kind be proc get_dict_string_value with type_hir, "kind"
 
     If kind is equal to 0:
-        Note: Simple type reference
+        Note: Simple type reference (no kind tag)
         Let type_name be proc get_dict_string_value with type_hir, "type_name"
         If type_name is not equal to 0:
             proc emit_string from Emitter with emitter, type_name
@@ -227,8 +305,21 @@ Process called "generate_type_annotation" takes context as Integer, type_hir as 
         Return 1
     End If
 
+    Note: Simple named type reference (kind="type_reference"). The frontend
+    Note: tags every primitive / named type this way, so this branch must emit
+    Note: the type name; without it a parameter/return/alias type would emit as
+    Note: empty text and the re-parse would lose the annotation.
+    Let is_type_ref be proc string_equals from StringCore with kind, "type_reference"
+    If is_type_ref is equal to 1:
+        Let ref_name be proc get_dict_string_value with type_hir, "type_name"
+        If ref_name is not equal to 0:
+            proc emit_string from Emitter with emitter, ref_name
+        End If
+        Return 1
+    End If
+
     Note: Generic type
-    Let is_generic be proc strings_equal from StringCore with kind, "generic_type"
+    Let is_generic be proc string_equals from StringCore with kind, "generic_type"
     If is_generic is equal to 1:
         Set type_name to proc get_dict_string_value with type_hir, "type_name"
         proc emit_string from Emitter with emitter, type_name
@@ -237,7 +328,7 @@ Process called "generate_type_annotation" takes context as Integer, type_hir as 
         If type_args is not equal to 0:
             proc emit_char from Emitter with emitter, 60  Note: <
 
-            Let count be proc memory_get_int64 from Layout with type_args, 8
+            Let count be proc get_list_length with type_args
             Let index be 0
 
             While index is less than count:
@@ -246,7 +337,7 @@ Process called "generate_type_annotation" takes context as Integer, type_hir as 
                     proc emit_space from Emitter with emitter
                 End If
 
-                Let arg be proc memory_get_int64 from Layout with type_args, index multiplied by 8 plus 16
+                Let arg be proc get_list_item with type_args, index
                 proc generate_type_annotation with context, arg
 
                 Set index to index plus 1
@@ -259,12 +350,12 @@ Process called "generate_type_annotation" takes context as Integer, type_hir as 
     End If
 
     Note: Union type
-    Let is_union be proc strings_equal from StringCore with kind, "union_type"
+    Let is_union be proc string_equals from StringCore with kind, "union_type"
     If is_union is equal to 1:
         Let types_list be proc get_dict_hir_value with type_hir, "types"
 
         If types_list is not equal to 0:
-            Set count to proc memory_get_int64 from Layout with types_list, 8
+            Set count to proc get_list_length with types_list
             Set index to 0
 
             While index is less than count:
@@ -274,7 +365,7 @@ Process called "generate_type_annotation" takes context as Integer, type_hir as 
                     proc emit_space from Emitter with emitter
                 End If
 
-                Let type_item be proc memory_get_int64 from Layout with types_list, index multiplied by 8 plus 16
+                Let type_item be proc get_list_item with types_list, index
                 proc generate_type_annotation with context, type_item
 
                 Set index to index plus 1
@@ -285,12 +376,12 @@ Process called "generate_type_annotation" takes context as Integer, type_hir as 
     End If
 
     Note: Intersection type
-    Let is_intersection be proc strings_equal from StringCore with kind, "intersection_type"
+    Let is_intersection be proc string_equals from StringCore with kind, "intersection_type"
     If is_intersection is equal to 1:
         Set types_list to proc get_dict_hir_value with type_hir, "types"
 
         If types_list is not equal to 0:
-            Set count to proc memory_get_int64 from Layout with types_list, 8
+            Set count to proc get_list_length with types_list
             Set index to 0
 
             While index is less than count:
@@ -300,7 +391,7 @@ Process called "generate_type_annotation" takes context as Integer, type_hir as 
                     proc emit_space from Emitter with emitter
                 End If
 
-                Set type_item to proc memory_get_int64 from Layout with types_list, index multiplied by 8 plus 16
+                Set type_item to proc get_list_item with types_list, index
                 proc generate_type_annotation with context, type_item
 
                 Set index to index plus 1
@@ -333,7 +424,7 @@ Process called "generate_type_parameters" takes context as Integer, params_hir a
     End If
 
     Let emitter be proc memory_get_int64 from Layout with context, 0
-    Let count be proc memory_get_int64 from Layout with params_hir, 8
+    Let count be proc get_list_length with params_hir
 
     If count is equal to 0:
         Return 1
@@ -349,7 +440,7 @@ Process called "generate_type_parameters" takes context as Integer, params_hir a
             proc emit_space from Emitter with emitter
         End If
 
-        Let param be proc memory_get_int64 from Layout with params_hir, index multiplied by 8 plus 16
+        Let param be proc get_list_item with params_hir, index
         Let param_name be proc get_dict_string_value with param, "name"
 
         proc emit_string from Emitter with emitter, param_name
@@ -409,21 +500,21 @@ Process called "generate_interface_declaration" takes context as Integer, hir as
     Let members be proc get_dict_hir_value with hir, "members"
 
     If members is not equal to 0:
-        Let count be proc memory_get_int64 from Layout with members, 8
+        Let count be proc get_list_length with members
         Let index be 0
 
         proc memory_set_int64 from Layout with context, 8, indent_level plus 1
 
         While index is less than count:
-            Let member be proc memory_get_int64 from Layout with members, index multiplied by 8 plus 16
+            Let member be proc get_list_item with members, index
             Let member_type be proc get_dict_string_value with member, "node_type"
 
-            Let is_property be proc strings_equal from StringCore with member_type, "property_definition"
+            Let is_property be proc string_equals from StringCore with member_type, "property_definition"
             If is_property is equal to 1:
                 proc generate_interface_property with context, member
             End If
 
-            Let is_method be proc strings_equal from StringCore with member_type, "method_definition"
+            Let is_method be proc string_equals from StringCore with member_type, "method_definition"
             If is_method is equal to 1:
                 proc generate_interface_method with context, member
             End If
@@ -598,11 +689,11 @@ Process called "generate_enum_declaration" takes context as Integer, hir as Inte
     Let members be proc get_dict_hir_value with hir, "members"
 
     If members is not equal to 0:
-        Let count be proc memory_get_int64 from Layout with members, 8
+        Let count be proc get_list_length with members
         Let index be 0
 
         While index is less than count:
-            Let member be proc memory_get_int64 from Layout with members, index multiplied by 8 plus 16
+            Let member be proc get_list_item with members, index
 
             proc emit_indent from Emitter with emitter, indent_level plus 1
 
@@ -677,21 +768,21 @@ Process called "generate_class_declaration" takes context as Integer, hir as Int
     Let members be proc get_dict_hir_value with hir, "members"
 
     If members is not equal to 0:
-        Let count be proc memory_get_int64 from Layout with members, 8
+        Let count be proc get_list_length with members
         Let index be 0
 
         proc memory_set_int64 from Layout with context, 8, indent_level plus 1
 
         While index is less than count:
-            Let member be proc memory_get_int64 from Layout with members, index multiplied by 8 plus 16
+            Let member be proc get_list_item with members, index
             Let member_type be proc get_dict_string_value with member, "node_type"
 
-            Let is_property be proc strings_equal from StringCore with member_type, "property_definition"
+            Let is_property be proc string_equals from StringCore with member_type, "property_definition"
             If is_property is equal to 1:
                 proc generate_class_property with context, member
             End If
 
-            Let is_method be proc strings_equal from StringCore with member_type, "method_definition"
+            Let is_method be proc string_equals from StringCore with member_type, "method_definition"
             If is_method is equal to 1:
                 proc generate_class_method with context, member
             End If
@@ -907,7 +998,7 @@ Process called "generate_parameter_list" takes context as Integer, params_hir as
     End If
 
     Let emitter be proc memory_get_int64 from Layout with context, 0
-    Let count be proc memory_get_int64 from Layout with params_hir, 8
+    Let count be proc get_list_length with params_hir
     Let index be 0
 
     While index is less than count:
@@ -916,7 +1007,7 @@ Process called "generate_parameter_list" takes context as Integer, params_hir as
             proc emit_space from Emitter with emitter
         End If
 
-        Let param be proc memory_get_int64 from Layout with params_hir, index multiplied by 8 plus 16
+        Let param be proc get_list_item with params_hir, index
 
         Note: Rest parameter
         Let is_rest be proc get_dict_string_value with param, "rest"
@@ -988,7 +1079,7 @@ Process called "generate_variable_declaration" takes context as Integer, hir as 
     Let declarators be proc get_dict_hir_value with hir, "declarators"
 
     If declarators is not equal to 0:
-        Let count be proc memory_get_int64 from Layout with declarators, 8
+        Let count be proc get_list_length with declarators
         Let index be 0
 
         While index is less than count:
@@ -997,7 +1088,7 @@ Process called "generate_variable_declaration" takes context as Integer, hir as 
                 proc emit_space from Emitter with emitter
             End If
 
-            Let declarator be proc memory_get_int64 from Layout with declarators, index multiplied by 8 plus 16
+            Let declarator be proc get_list_item with declarators, index
 
             Let var_name be proc get_dict_string_value with declarator, "name"
             proc emit_string from Emitter with emitter, var_name
@@ -1019,6 +1110,133 @@ Process called "generate_variable_declaration" takes context as Integer, hir as 
 
             Set index to index plus 1
         End While
+    End If
+
+    proc emit_semicolon from Emitter with emitter
+    proc emit_newline from Emitter with emitter
+
+    Return 1
+End Process
+
+@Reasoning:
+Re-emits an import declaration so it survives the round trip:
+`import [type] { a, b } from "module";`. The type-only marker is restored
+from the "type_only" flag; the binding names come from the "bindings"
+list; the module path from "module". Emitting the brace-delimited named
+form for all bindings is a faithful, parseable rendering - the re-parse
+recovers the same binding names and module path, which is what the depth
+probe asserts.
+@End Reasoning
+
+@Implementation:
+Emits "import "; if type_only flag present emits "type "; emits "{ " then
+each binding name comma-separated, then " } from "; emits the quoted
+module path; then ";" and a newline. With no module path (a side-effect
+import) the from-clause is omitted.
+@End Implementation
+Process called "generate_import_declaration" takes context as Integer, hir as Integer returns Integer:
+    Note: Generate a TypeScript import declaration
+
+    Let emitter be proc memory_get_int64 from Layout with context, 0
+
+    proc emit_string from Emitter with emitter, "import "
+
+    Let is_type_only be proc get_dict_string_value with hir, "type_only"
+    If is_type_only is not equal to 0:
+        proc emit_string from Emitter with emitter, "type "
+    End If
+
+    Let bindings be proc get_dict_hir_value with hir, "bindings"
+    Let binding_count be proc get_list_length with bindings
+
+    If binding_count is greater than 0:
+        proc emit_string from Emitter with emitter, "{ "
+        Let index be 0
+        While index is less than binding_count:
+            If index is greater than 0:
+                proc emit_comma from Emitter with emitter
+                proc emit_space from Emitter with emitter
+            End If
+            Let binding be proc get_list_item with bindings, index
+            Let binding_name be proc get_dict_string_value with binding, "name"
+            If binding_name is not equal to 0:
+                proc emit_string from Emitter with emitter, binding_name
+            End If
+            Set index to index plus 1
+        End While
+        proc emit_string from Emitter with emitter, " }"
+    End If
+
+    Let module_path be proc get_dict_string_value with hir, "module"
+    If module_path is not equal to 0:
+        If binding_count is greater than 0:
+            proc emit_string from Emitter with emitter, " from "
+        End If
+        proc emit_char from Emitter with emitter, 34  Note: "
+        proc emit_string from Emitter with emitter, module_path
+        proc emit_char from Emitter with emitter, 34  Note: "
+    End If
+
+    proc emit_semicolon from Emitter with emitter
+    proc emit_newline from Emitter with emitter
+
+    Return 1
+End Process
+
+@Reasoning:
+Re-emits an export declaration. A wrapped declaration (`export <decl>`)
+re-emits "export " followed by the declaration; a named export group
+re-emits "export [type] { a, b } [from \"module\"];". This keeps export
+names and re-export sources parseable on the round trip.
+@End Reasoning
+
+@Implementation:
+If a "declaration" node is present, emits "export " then generates that
+declaration. Otherwise emits "export "; optional "type "; "{ " bindings
+" }"; optional " from \"module\""; then ";" and a newline.
+@End Implementation
+Process called "generate_export_declaration" takes context as Integer, hir as Integer returns Integer:
+    Note: Generate a TypeScript export declaration
+
+    Let emitter be proc memory_get_int64 from Layout with context, 0
+
+    Let declaration be proc get_dict_hir_value with hir, "declaration"
+    If declaration is not equal to 0:
+        proc emit_string from Emitter with emitter, "export "
+        Return proc generate_statement with context, declaration
+    End If
+
+    proc emit_string from Emitter with emitter, "export "
+
+    Let is_type_only be proc get_dict_string_value with hir, "type_only"
+    If is_type_only is not equal to 0:
+        proc emit_string from Emitter with emitter, "type "
+    End If
+
+    proc emit_string from Emitter with emitter, "{ "
+    Let bindings be proc get_dict_hir_value with hir, "bindings"
+    Let binding_count be proc get_list_length with bindings
+    Let index be 0
+    While index is less than binding_count:
+        If index is greater than 0:
+            proc emit_comma from Emitter with emitter
+            proc emit_space from Emitter with emitter
+        End If
+        Let binding be proc get_list_item with bindings, index
+        Let binding_name be proc get_dict_string_value with binding, "name"
+        If binding_name is not equal to 0:
+            proc emit_string from Emitter with emitter, binding_name
+        End If
+        Set index to index plus 1
+    End While
+    proc emit_string from Emitter with emitter, " }"
+
+    Let module_path be proc get_dict_string_value with hir, "module"
+    If module_path is not equal to 0:
+        proc emit_string from Emitter with emitter, " from "
+        proc emit_char from Emitter with emitter, 34  Note: "
+        proc emit_string from Emitter with emitter, module_path
+        proc emit_char from Emitter with emitter, 34  Note: "
     End If
 
     proc emit_semicolon from Emitter with emitter
@@ -1060,37 +1278,47 @@ Process called "generate_statement" takes context as Integer, hir as Integer ret
         Return 1
     End If
 
-    Let is_interface be proc strings_equal from StringCore with node_type, "interface_declaration"
+    Let is_import be proc string_equals from StringCore with node_type, "import_declaration"
+    If is_import is equal to 1:
+        Return proc generate_import_declaration with context, hir
+    End If
+
+    Let is_export be proc string_equals from StringCore with node_type, "export_declaration"
+    If is_export is equal to 1:
+        Return proc generate_export_declaration with context, hir
+    End If
+
+    Let is_interface be proc string_equals from StringCore with node_type, "interface_declaration"
     If is_interface is equal to 1:
         Return proc generate_interface_declaration with context, hir
     End If
 
-    Let is_type_alias be proc strings_equal from StringCore with node_type, "type_alias_declaration"
+    Let is_type_alias be proc string_equals from StringCore with node_type, "type_alias_declaration"
     If is_type_alias is equal to 1:
         Return proc generate_type_alias_declaration with context, hir
     End If
 
-    Let is_enum be proc strings_equal from StringCore with node_type, "enum_declaration"
+    Let is_enum be proc string_equals from StringCore with node_type, "enum_declaration"
     If is_enum is equal to 1:
         Return proc generate_enum_declaration with context, hir
     End If
 
-    Let is_class be proc strings_equal from StringCore with node_type, "class_declaration"
+    Let is_class be proc string_equals from StringCore with node_type, "class_declaration"
     If is_class is equal to 1:
         Return proc generate_class_declaration with context, hir
     End If
 
-    Let is_function be proc strings_equal from StringCore with node_type, "function_declaration"
+    Let is_function be proc string_equals from StringCore with node_type, "function_declaration"
     If is_function is equal to 1:
         Return proc generate_function_declaration with context, hir
     End If
 
-    Let is_variable be proc strings_equal from StringCore with node_type, "variable_declaration"
+    Let is_variable be proc string_equals from StringCore with node_type, "variable_declaration"
     If is_variable is equal to 1:
         Return proc generate_variable_declaration with context, hir
     End If
 
-    Let is_block be proc strings_equal from StringCore with node_type, "block_statement"
+    Let is_block be proc string_equals from StringCore with node_type, "block_statement"
     If is_block is equal to 1:
         Let emitter be proc memory_get_int64 from Layout with context, 0
         Let indent_level be proc memory_get_int64 from Layout with context, 8
@@ -1101,13 +1329,13 @@ Process called "generate_statement" takes context as Integer, hir as Integer ret
         Let statements be proc get_dict_hir_value with hir, "statements"
 
         If statements is not equal to 0:
-            Let count be proc memory_get_int64 from Layout with statements, 8
+            Let count be proc get_list_length with statements
             Let index be 0
 
             proc memory_set_int64 from Layout with context, 8, indent_level plus 1
 
             While index is less than count:
-                Let stmt be proc memory_get_int64 from Layout with statements, index multiplied by 8 plus 16
+                Let stmt be proc get_list_item with statements, index
                 proc generate_statement with context, stmt
                 Set index to index plus 1
             End While
@@ -1122,7 +1350,7 @@ Process called "generate_statement" takes context as Integer, hir as Integer ret
         Return 1
     End If
 
-    Let is_return be proc strings_equal from StringCore with node_type, "return_statement"
+    Let is_return be proc string_equals from StringCore with node_type, "return_statement"
     If is_return is equal to 1:
         Set emitter to proc memory_get_int64 from Layout with context, 0
         Set indent_level to proc memory_get_int64 from Layout with context, 8
@@ -1142,7 +1370,7 @@ Process called "generate_statement" takes context as Integer, hir as Integer ret
         Return 1
     End If
 
-    Let is_if be proc strings_equal from StringCore with node_type, "if_statement"
+    Let is_if be proc string_equals from StringCore with node_type, "if_statement"
     If is_if is equal to 1:
         Set emitter to proc memory_get_int64 from Layout with context, 0
         Set indent_level to proc memory_get_int64 from Layout with context, 8
@@ -1168,7 +1396,7 @@ Process called "generate_statement" takes context as Integer, hir as Integer ret
         Return 1
     End If
 
-    Let is_for be proc strings_equal from StringCore with node_type, "for_statement"
+    Let is_for be proc string_equals from StringCore with node_type, "for_statement"
     If is_for is equal to 1:
         Set emitter to proc memory_get_int64 from Layout with context, 0
         Set indent_level to proc memory_get_int64 from Layout with context, 8
@@ -1206,7 +1434,7 @@ Process called "generate_statement" takes context as Integer, hir as Integer ret
         Return 1
     End If
 
-    Let is_while be proc strings_equal from StringCore with node_type, "while_statement"
+    Let is_while be proc string_equals from StringCore with node_type, "while_statement"
     If is_while is equal to 1:
         Set emitter to proc memory_get_int64 from Layout with context, 0
         Set indent_level to proc memory_get_int64 from Layout with context, 8
@@ -1225,7 +1453,7 @@ Process called "generate_statement" takes context as Integer, hir as Integer ret
         Return 1
     End If
 
-    Let is_switch be proc strings_equal from StringCore with node_type, "switch_statement"
+    Let is_switch be proc string_equals from StringCore with node_type, "switch_statement"
     If is_switch is equal to 1:
         Set emitter to proc memory_get_int64 from Layout with context, 0
         Set indent_level to proc memory_get_int64 from Layout with context, 8
@@ -1242,13 +1470,13 @@ Process called "generate_statement" takes context as Integer, hir as Integer ret
         Let cases be proc get_dict_hir_value with hir, "cases"
 
         If cases is not equal to 0:
-            Set count to proc memory_get_int64 from Layout with cases, 8
+            Set count to proc get_list_length with cases
             Set index to 0
 
             proc memory_set_int64 from Layout with context, 8, indent_level plus 1
 
             While index is less than count:
-                Let case_stmt be proc memory_get_int64 from Layout with cases, index multiplied by 8 plus 16
+                Let case_stmt be proc get_list_item with cases, index
                 proc generate_statement with context, case_stmt
                 Set index to index plus 1
             End While
@@ -1263,7 +1491,7 @@ Process called "generate_statement" takes context as Integer, hir as Integer ret
         Return 1
     End If
 
-    Let is_try be proc strings_equal from StringCore with node_type, "try_statement"
+    Let is_try be proc string_equals from StringCore with node_type, "try_statement"
     If is_try is equal to 1:
         Set emitter to proc memory_get_int64 from Layout with context, 0
         Set indent_level to proc memory_get_int64 from Layout with context, 8
@@ -1300,7 +1528,7 @@ Process called "generate_statement" takes context as Integer, hir as Integer ret
         Return 1
     End If
 
-    Let is_expr_stmt be proc strings_equal from StringCore with node_type, "expression_statement"
+    Let is_expr_stmt be proc string_equals from StringCore with node_type, "expression_statement"
     If is_expr_stmt is equal to 1:
         Set emitter to proc memory_get_int64 from Layout with context, 0
         Set indent_level to proc memory_get_int64 from Layout with context, 8
@@ -1316,7 +1544,7 @@ Process called "generate_statement" takes context as Integer, hir as Integer ret
         Return 1
     End If
 
-    Let is_break be proc strings_equal from StringCore with node_type, "break_statement"
+    Let is_break be proc string_equals from StringCore with node_type, "break_statement"
     If is_break is equal to 1:
         Set emitter to proc memory_get_int64 from Layout with context, 0
         Set indent_level to proc memory_get_int64 from Layout with context, 8
@@ -1329,7 +1557,7 @@ Process called "generate_statement" takes context as Integer, hir as Integer ret
         Return 1
     End If
 
-    Let is_continue be proc strings_equal from StringCore with node_type, "continue_statement"
+    Let is_continue be proc string_equals from StringCore with node_type, "continue_statement"
     If is_continue is equal to 1:
         Set emitter to proc memory_get_int64 from Layout with context, 0
         Set indent_level to proc memory_get_int64 from Layout with context, 8
@@ -1379,7 +1607,7 @@ Process called "generate_expression" takes context as Integer, hir as Integer re
         Return 1
     End If
 
-    Let is_binary be proc strings_equal from StringCore with node_type, "binary_expression"
+    Let is_binary be proc string_equals from StringCore with node_type, "binary_expression"
     If is_binary is equal to 1:
         Let left be proc get_dict_hir_value with hir, "left"
         proc generate_expression with context, left
@@ -1397,7 +1625,7 @@ Process called "generate_expression" takes context as Integer, hir as Integer re
         Return 1
     End If
 
-    Let is_unary be proc strings_equal from StringCore with node_type, "unary_expression"
+    Let is_unary be proc string_equals from StringCore with node_type, "unary_expression"
     If is_unary is equal to 1:
         Set operator to proc get_dict_string_value with hir, "operator"
         proc emit_string from Emitter with emitter, operator
@@ -1408,7 +1636,7 @@ Process called "generate_expression" takes context as Integer, hir as Integer re
         Return 1
     End If
 
-    Let is_assignment be proc strings_equal from StringCore with node_type, "assignment_expression"
+    Let is_assignment be proc string_equals from StringCore with node_type, "assignment_expression"
     If is_assignment is equal to 1:
         Set left to proc get_dict_hir_value with hir, "left"
         proc generate_expression with context, left
@@ -1426,7 +1654,7 @@ Process called "generate_expression" takes context as Integer, hir as Integer re
         Return 1
     End If
 
-    Let is_call be proc strings_equal from StringCore with node_type, "call_expression"
+    Let is_call be proc string_equals from StringCore with node_type, "call_expression"
     If is_call is equal to 1:
         Let callee be proc get_dict_hir_value with hir, "callee"
         proc generate_expression with context, callee
@@ -1436,7 +1664,7 @@ Process called "generate_expression" takes context as Integer, hir as Integer re
         Let arguments be proc get_dict_hir_value with hir, "arguments"
 
         If arguments is not equal to 0:
-            Let count be proc memory_get_int64 from Layout with arguments, 8
+            Let count be proc get_list_length with arguments
             Let index be 0
 
             While index is less than count:
@@ -1445,7 +1673,7 @@ Process called "generate_expression" takes context as Integer, hir as Integer re
                     proc emit_space from Emitter with emitter
                 End If
 
-                Let arg be proc memory_get_int64 from Layout with arguments, index multiplied by 8 plus 16
+                Let arg be proc get_list_item with arguments, index
                 proc generate_expression with context, arg
 
                 Set index to index plus 1
@@ -1457,7 +1685,7 @@ Process called "generate_expression" takes context as Integer, hir as Integer re
         Return 1
     End If
 
-    Let is_member be proc strings_equal from StringCore with node_type, "member_expression"
+    Let is_member be proc string_equals from StringCore with node_type, "member_expression"
     If is_member is equal to 1:
         Let object_expr be proc get_dict_hir_value with hir, "object"
         proc generate_expression with context, object_expr
@@ -1470,7 +1698,7 @@ Process called "generate_expression" takes context as Integer, hir as Integer re
         Return 1
     End If
 
-    Let is_arrow be proc strings_equal from StringCore with node_type, "arrow_function_expression"
+    Let is_arrow be proc string_equals from StringCore with node_type, "arrow_function_expression"
     If is_arrow is equal to 1:
         proc emit_char from Emitter with emitter, 40  Note: (
 
@@ -1492,7 +1720,7 @@ Process called "generate_expression" takes context as Integer, hir as Integer re
         Let body be proc get_dict_hir_value with hir, "body"
         Let body_type be proc get_dict_string_value with body, "node_type"
 
-        Let is_block_body be proc strings_equal from StringCore with body_type, "block_statement"
+        Let is_block_body be proc string_equals from StringCore with body_type, "block_statement"
         If is_block_body is equal to 1:
             proc generate_statement with context, body
         Otherwise:
@@ -1502,14 +1730,14 @@ Process called "generate_expression" takes context as Integer, hir as Integer re
         Return 1
     End If
 
-    Let is_array be proc strings_equal from StringCore with node_type, "array_expression"
+    Let is_array be proc string_equals from StringCore with node_type, "array_expression"
     If is_array is equal to 1:
         proc emit_char from Emitter with emitter, 91  Note: [
 
         Let elements be proc get_dict_hir_value with hir, "elements"
 
         If elements is not equal to 0:
-            Set count to proc memory_get_int64 from Layout with elements, 8
+            Set count to proc get_list_length with elements
             Set index to 0
 
             While index is less than count:
@@ -1518,7 +1746,7 @@ Process called "generate_expression" takes context as Integer, hir as Integer re
                     proc emit_space from Emitter with emitter
                 End If
 
-                Let elem be proc memory_get_int64 from Layout with elements, index multiplied by 8 plus 16
+                Let elem be proc get_list_item with elements, index
                 proc generate_expression with context, elem
 
                 Set index to index plus 1
@@ -1530,14 +1758,14 @@ Process called "generate_expression" takes context as Integer, hir as Integer re
         Return 1
     End If
 
-    Let is_object be proc strings_equal from StringCore with node_type, "object_expression"
+    Let is_object be proc string_equals from StringCore with node_type, "object_expression"
     If is_object is equal to 1:
         proc emit_char from Emitter with emitter, 123  Note: {
 
         Let properties be proc get_dict_hir_value with hir, "properties"
 
         If properties is not equal to 0:
-            Set count to proc memory_get_int64 from Layout with properties, 8
+            Set count to proc get_list_length with properties
             Set index to 0
 
             While index is less than count:
@@ -1546,7 +1774,7 @@ Process called "generate_expression" takes context as Integer, hir as Integer re
                     proc emit_space from Emitter with emitter
                 End If
 
-                Let prop be proc memory_get_int64 from Layout with properties, index multiplied by 8 plus 16
+                Let prop be proc get_list_item with properties, index
 
                 Let key be proc get_dict_string_value with prop, "key"
                 proc emit_string from Emitter with emitter, key
@@ -1566,7 +1794,7 @@ Process called "generate_expression" takes context as Integer, hir as Integer re
         Return 1
     End If
 
-    Let is_type_assertion be proc strings_equal from StringCore with node_type, "type_assertion"
+    Let is_type_assertion be proc string_equals from StringCore with node_type, "type_assertion"
     If is_type_assertion is equal to 1:
         Let expression be proc get_dict_hir_value with hir, "expression"
         proc generate_expression with context, expression
@@ -1579,7 +1807,7 @@ Process called "generate_expression" takes context as Integer, hir as Integer re
         Return 1
     End If
 
-    Let is_identifier be proc strings_equal from StringCore with node_type, "identifier"
+    Let is_identifier be proc string_equals from StringCore with node_type, "identifier"
     If is_identifier is equal to 1:
         Let name be proc get_dict_string_value with hir, "name"
         proc emit_string from Emitter with emitter, name
@@ -1587,7 +1815,7 @@ Process called "generate_expression" takes context as Integer, hir as Integer re
         Return 1
     End If
 
-    Let is_literal be proc strings_equal from StringCore with node_type, "literal"
+    Let is_literal be proc string_equals from StringCore with node_type, "literal"
     If is_literal is equal to 1:
         Set value to proc get_dict_string_value with hir, "value"
 
@@ -1596,7 +1824,7 @@ Process called "generate_expression" takes context as Integer, hir as Integer re
         Otherwise:
             Let literal_type be proc get_dict_string_value with hir, "literal_type"
 
-            Let is_null be proc strings_equal from StringCore with literal_type, "null"
+            Let is_null be proc string_equals from StringCore with literal_type, "null"
             If is_null is equal to 1:
                 proc emit_string from Emitter with emitter, "null"
                 Return 1
@@ -1606,7 +1834,7 @@ Process called "generate_expression" takes context as Integer, hir as Integer re
         Return 1
     End If
 
-    Let is_template be proc strings_equal from StringCore with node_type, "template_literal"
+    Let is_template be proc string_equals from StringCore with node_type, "template_literal"
     If is_template is equal to 1:
         proc emit_char from Emitter with emitter, 96  Note: backtick
 
@@ -1651,11 +1879,11 @@ Process called "generate_typescript" takes context as Integer, hir_root as Integ
     Let statements be proc get_dict_hir_value with hir_root, "statements"
 
     If statements is not equal to 0:
-        Let count be proc memory_get_int64 from Layout with statements, 8
+        Let count be proc get_list_length with statements
         Let index be 0
 
         While index is less than count:
-            Let stmt be proc memory_get_int64 from Layout with statements, index multiplied by 8 plus 16
+            Let stmt be proc get_list_item with statements, index
             proc generate_statement with context, stmt
             Set index to index plus 1
         End While

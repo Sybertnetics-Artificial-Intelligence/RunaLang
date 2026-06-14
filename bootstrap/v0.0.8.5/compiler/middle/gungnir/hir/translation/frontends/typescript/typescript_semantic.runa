@@ -153,13 +153,13 @@ Process called "analyze_typescript_program" takes analyzer as Integer, program_n
     proc collect_typescript_declarations with analyzer, program_node
 
     Note: Phase 3: Validate generic type constraints
-    proc validate_generic_constraints from analyzer
+    proc validate_generic_constraints with analyzer
 
     Note: Phase 4: Analyze import/export statements
     proc analyze_typescript_modules with analyzer, program_node
 
     Note: Phase 5: Validate decorators and metadata
-    proc validate_typescript_decorators from analyzer
+    proc validate_typescript_decorators with analyzer
 
     Note: Phase 6: Analyze function and method bodies
     proc analyze_typescript_functions with analyzer, program_node
@@ -305,11 +305,11 @@ Process called "collect_interface_members" takes analyzer as Integer, interface_
                 Let member_type be proc memory_get_int64 from Layout with member, 0
 
                 If member_type is equal to TS_PROPERTY_SIGNATURE from Parser:
-                    proc list_append with members_list, member
+                    proc append from List with members_list, member
                 Otherwise If member_type is equal to TS_METHOD_SIGNATURE from Parser:
-                    proc list_append with members_list, member
+                    proc append from List with members_list, member
                 Otherwise If member_type is equal to TS_INDEX_SIGNATURE from Parser:
-                    proc list_append with members_list, member
+                    proc append from List with members_list, member
                 End If
 
                 Set i to i plus 1
@@ -788,7 +788,7 @@ to pop the scope.
 Process called "analyze_function_body" takes analyzer as Integer, func_node as Integer:
     Note: Analyze TypeScript function body with type checking
 
-    proc enter_function_scope from analyzer
+    proc enter_function_scope with analyzer
 
     Note: Analyze function parameters with types
     proc analyze_typed_parameters with analyzer, func_node
@@ -802,7 +802,7 @@ Process called "analyze_function_body" takes analyzer as Integer, func_node as I
         proc analyze_statement_block with analyzer, body
     End If
 
-    proc exit_function_scope from analyzer
+    proc exit_function_scope with analyzer
 End Process
 
 @Reasoning:
@@ -948,7 +948,7 @@ Process called "enter_function_scope" takes analyzer as Integer:
 
     Let scope_stack be proc memory_get_int64 from Layout with analyzer, 16
     Let new_scope be proc create from Dict
-    proc list_append with scope_stack, new_scope
+    proc append from List with scope_stack, new_scope
 
     proc memory_set_int64 from Layout with analyzer, 8, new_scope
 End Process
@@ -1027,24 +1027,24 @@ Process called "is_builtin_type" takes analyzer as Integer, type_name as Integer
     Note: Check if type is a TypeScript built-in type
 
     Let builtin_types be proc create from List
-    proc list_append with builtin_types, "string"
-    proc list_append with builtin_types, "number"
-    proc list_append with builtin_types, "boolean"
-    proc list_append with builtin_types, "object"
-    proc list_append with builtin_types, "null"
-    proc list_append with builtin_types, "undefined"
-    proc list_append with builtin_types, "void"
-    proc list_append with builtin_types, "never"
-    proc list_append with builtin_types, "any"
-    proc list_append with builtin_types, "unknown"
-    proc list_append with builtin_types, "bigint"
-    proc list_append with builtin_types, "symbol"
+    proc append from List with builtin_types, "string"
+    proc append from List with builtin_types, "number"
+    proc append from List with builtin_types, "boolean"
+    proc append from List with builtin_types, "object"
+    proc append from List with builtin_types, "null"
+    proc append from List with builtin_types, "undefined"
+    proc append from List with builtin_types, "void"
+    proc append from List with builtin_types, "never"
+    proc append from List with builtin_types, "any"
+    proc append from List with builtin_types, "unknown"
+    proc append from List with builtin_types, "bigint"
+    proc append from List with builtin_types, "symbol"
 
     Let builtin_count be proc size from List with builtin_types
     Let i be 0
     While i is less than builtin_count:
         Let builtin_name be proc get from List with builtin_types, i
-        Let matches be proc equals from StringCore with type_name, builtin_name
+        Let matches be proc string_equals from StringCore with type_name, builtin_name
         If matches is equal to 1:
             Return 1
         End If
@@ -1072,6 +1072,874 @@ Process called "set_typescript_semantic_error" takes analyzer as Integer, messag
 
     proc memory_set_int64 from Layout with analyzer, 80, 1
 
-    Let error_copy be proc copy_string from StringCore with message
+    Let error_copy be proc string_duplicate from StringCore with message
     proc memory_set_int64 from Layout with analyzer, 72, error_copy
+End Process
+
+@Reasoning:
+Enum declarations are runtime-bearing (unlike most TS type machinery), so
+they are registered into type_registry tagged kind="enum" with their
+member list preserved. Later passes that resolve a symbol to an enum need
+both the originating node and the enumerated member set; storing them at
+collection time avoids re-walking the AST.
+@End Reasoning
+
+@Implementation:
+Reads type_registry (offset 24) and enum name (node offset 8). When the
+name is present, builds an enum_info Dict storing node, kind="enum", and
+the members container (node offset 32) under "members" when non-zero, then
+inserts enum_info keyed by name.
+@End Implementation
+Process called "collect_enum_declaration" takes analyzer as Integer, enum_node as Integer:
+    Note: Collect TypeScript enum declaration
+
+    Let type_registry be proc memory_get_int64 from Layout with analyzer, 24
+    Let enum_name be proc memory_get_int64 from Layout with enum_node, 8
+
+    If enum_name is not equal to 0:
+        Let enum_info be proc create from Dict
+        proc set from Dict with enum_info, "node", enum_node
+        proc set from Dict with enum_info, "kind", "enum"
+
+        Let members be proc memory_get_int64 from Layout with enum_node, 32
+        If members is not equal to 0:
+            proc set from Dict with enum_info, "members", members
+        End If
+
+        proc set from Dict with type_registry, enum_name, enum_info
+    End If
+End Process
+
+@Reasoning:
+A namespace (or ambient module) introduces a nested declaration space. Its
+top-level body declarations are recursively collected into the same
+registries so that a qualified reference (Namespace.Type) can be resolved
+later. The namespace itself is registered in module_registry so qualified-
+name resolution knows the namespace exists.
+@End Reasoning
+
+@Implementation:
+Reads module_registry (offset 48) and namespace name (node offset 8). When
+named, builds ns_info storing node and kind="namespace" and inserts it
+keyed by name. Then reads the namespace body (node offset 32); if it has a
+children list (body offset 32), recursively dispatches each child to the
+type collectors (interface/type-alias/enum/namespace) and declaration
+collectors (class/abstract-class/function) so nested members are indexed.
+@End Implementation
+Process called "collect_namespace_declaration" takes analyzer as Integer, namespace_node as Integer:
+    Note: Collect TypeScript namespace declaration and its nested members
+
+    Let module_registry be proc memory_get_int64 from Layout with analyzer, 48
+    Let namespace_name be proc memory_get_int64 from Layout with namespace_node, 8
+
+    If namespace_name is not equal to 0:
+        Let ns_info be proc create from Dict
+        proc set from Dict with ns_info, "node", namespace_node
+        proc set from Dict with ns_info, "kind", "namespace"
+        proc set from Dict with module_registry, namespace_name, ns_info
+    End If
+
+    Let body be proc memory_get_int64 from Layout with namespace_node, 32
+    If body is not equal to 0:
+        Let children be proc memory_get_int64 from Layout with body, 32
+        If children is not equal to 0:
+            Let child_count be proc size from List with children
+            Let i be 0
+            While i is less than child_count:
+                Let child be proc get from List with children, i
+                Let child_type be proc memory_get_int64 from Layout with child, 0
+
+                If child_type is equal to TS_INTERFACE from Parser:
+                    proc collect_interface_declaration with analyzer, child
+                Otherwise If child_type is equal to TS_TYPE_ALIAS from Parser:
+                    proc collect_type_alias_declaration with analyzer, child
+                Otherwise If child_type is equal to TS_ENUM from Parser:
+                    proc collect_enum_declaration with analyzer, child
+                Otherwise If child_type is equal to TS_NAMESPACE from Parser:
+                    proc collect_namespace_declaration with analyzer, child
+                Otherwise If child_type is equal to TS_CLASS from Parser:
+                    proc collect_class_declaration with analyzer, child
+                Otherwise If child_type is equal to TS_ABSTRACT_CLASS from Parser:
+                    proc collect_abstract_class_declaration with analyzer, child
+                Otherwise If child_type is equal to TS_FUNCTION from Parser:
+                    proc collect_function_declaration with analyzer, child
+                End If
+
+                Set i to i plus 1
+            End While
+        End If
+    End If
+End Process
+
+@Reasoning:
+Abstract classes share the structural shape of concrete classes but carry
+the additional invariant that they cannot be instantiated directly and may
+declare abstract members that subclasses must implement. They are
+registered into class_registry like concrete classes but tagged
+kind="abstract_class" and flagged abstract="true" so extends-checking can
+enforce the implement-all-abstract-members rule.
+@End Reasoning
+
+@Implementation:
+Reads class_registry (offset 40) and class name (node offset 8). When
+named, builds class_info with node, kind="abstract_class",
+abstract="true", and the optional extends (offset 16) / implements
+(offset 24) / decorators (offset 32) / generics (offset 40) clauses, then
+inserts keyed by name.
+@End Implementation
+Process called "collect_abstract_class_declaration" takes analyzer as Integer, class_node as Integer:
+    Note: Collect TypeScript abstract class declaration
+
+    Let class_registry be proc memory_get_int64 from Layout with analyzer, 40
+    Let class_name be proc memory_get_int64 from Layout with class_node, 8
+
+    If class_name is not equal to 0:
+        Let class_info be proc create from Dict
+        proc set from Dict with class_info, "node", class_node
+        proc set from Dict with class_info, "kind", "abstract_class"
+        proc set from Dict with class_info, "abstract", "true"
+
+        Let extends_clause be proc memory_get_int64 from Layout with class_node, 16
+        If extends_clause is not equal to 0:
+            proc set from Dict with class_info, "extends", extends_clause
+        End If
+
+        Let implements_clause be proc memory_get_int64 from Layout with class_node, 24
+        If implements_clause is not equal to 0:
+            proc set from Dict with class_info, "implements", implements_clause
+        End If
+
+        Let decorators be proc memory_get_int64 from Layout with class_node, 32
+        If decorators is not equal to 0:
+            proc set from Dict with class_info, "decorators", decorators
+        End If
+
+        Let generics be proc memory_get_int64 from Layout with class_node, 40
+        If generics is not equal to 0:
+            proc set from Dict with class_info, "generics", generics
+        End If
+
+        proc set from Dict with class_registry, class_name, class_info
+    End If
+End Process
+
+@Reasoning:
+Top-level function declarations are registered into class_registry's
+sibling namespace (the same registry is reused for callables) keyed by
+name so overload resolution and call-site checking can find the signature.
+The parameter container, return type, and generic parameters are stored
+under named keys so the body-analysis phase can reuse them without
+re-walking.
+@End Reasoning
+
+@Implementation:
+Reads class_registry (offset 40) and function name (node offset 8). When
+named, builds func_info with node, kind="function", the params container
+(offset 16) under "params" when present, the return type (offset 24) under
+"return_type" when present, and generics (offset 40) under "generics" when
+present, then inserts keyed by name.
+@End Implementation
+Process called "collect_function_declaration" takes analyzer as Integer, function_node as Integer:
+    Note: Collect TypeScript function declaration
+
+    Let class_registry be proc memory_get_int64 from Layout with analyzer, 40
+    Let function_name be proc memory_get_int64 from Layout with function_node, 8
+
+    If function_name is not equal to 0:
+        Let func_info be proc create from Dict
+        proc set from Dict with func_info, "node", function_node
+        proc set from Dict with func_info, "kind", "function"
+
+        Let params be proc memory_get_int64 from Layout with function_node, 16
+        If params is not equal to 0:
+            proc set from Dict with func_info, "params", params
+        End If
+
+        Let return_type be proc memory_get_int64 from Layout with function_node, 24
+        If return_type is not equal to 0:
+            proc set from Dict with func_info, "return_type", return_type
+        End If
+
+        Let generics be proc memory_get_int64 from Layout with function_node, 40
+        If generics is not equal to 0:
+            proc set from Dict with func_info, "generics", generics
+        End If
+
+        proc set from Dict with class_registry, function_name, func_info
+    End If
+End Process
+
+@Reasoning:
+Mirror of validate_type_alias_constraints for interfaces. Each interface
+that declares generic parameters has its parameter list validated; the
+constraint rules (extends bounds, defaults) are the shared ones in
+validate_generic_parameter_list.
+@End Reasoning
+
+@Implementation:
+Reads interface_registry keys via Dict.keys. For each key, fetches
+interface_info and its "generics"; when non-zero validates the parameter
+list. No return; errors flow through analyzer.has_error.
+@End Implementation
+Process called "validate_interface_constraints" takes analyzer as Integer, interface_registry as Integer:
+    Note: Validate generic constraints in interfaces
+
+    Let interface_keys be proc keys from Dict with interface_registry
+    If interface_keys is not equal to 0:
+        Let key_count be proc size from List with interface_keys
+        Let i be 0
+        While i is less than key_count:
+            Let interface_name be proc get from List with interface_keys, i
+            Let interface_info be proc get from Dict with interface_registry, interface_name
+            Let generics be proc get from Dict with interface_info, "generics"
+
+            If generics is not equal to 0:
+                proc validate_generic_parameter_list with analyzer, generics
+            End If
+
+            Set i to i plus 1
+        End While
+    End If
+End Process
+
+@Reasoning:
+Mirror of validate_type_alias_constraints for classes. A class's generic
+parameter list is validated, and additionally its extends target (when
+present) is validated as a type so that `class C extends Base<X>` resolves
+Base and checks X.
+@End Reasoning
+
+@Implementation:
+Reads class_registry keys. For each class_info, validates "generics" via
+validate_generic_parameter_list when present, then validates the "extends"
+target (when present) via validate_type_annotation, raising a semantic
+error when the base type is invalid.
+@End Implementation
+Process called "validate_class_constraints" takes analyzer as Integer, class_registry as Integer:
+    Note: Validate generic constraints in classes
+
+    Let class_keys be proc keys from Dict with class_registry
+    If class_keys is not equal to 0:
+        Let key_count be proc size from List with class_keys
+        Let i be 0
+        While i is less than key_count:
+            Let class_name be proc get from List with class_keys, i
+            Let class_info be proc get from Dict with class_registry, class_name
+
+            Let generics be proc get from Dict with class_info, "generics"
+            If generics is not equal to 0:
+                proc validate_generic_parameter_list with analyzer, generics
+            End If
+
+            Let extends_clause be proc get from Dict with class_info, "extends"
+            If extends_clause is not equal to 0:
+                Let is_valid be proc validate_type_annotation with analyzer, extends_clause
+                If is_valid is equal to 0:
+                    proc set_typescript_semantic_error with analyzer, "Invalid base type in extends clause"
+                End If
+            End If
+
+            Set i to i plus 1
+        End While
+    End If
+End Process
+
+@Reasoning:
+Validates a generic parameter list: each parameter may declare an extends
+bound and/or a default type. Both, when present, must themselves be valid
+type annotations. A parameter with neither is unconstrained and always
+valid. This is the shared validator referenced by the type-alias,
+interface, and class constraint passes.
+@End Reasoning
+
+@Implementation:
+Reads the parameter list's children (offset 32). For each parameter reads
+its constraint (offset 16) and default (offset 24); when either is
+present, validates it via validate_type_annotation and raises a semantic
+error on failure. No return value.
+@End Implementation
+Process called "validate_generic_parameter_list" takes analyzer as Integer, generics as Integer:
+    Note: Validate a list of generic type parameters
+
+    If generics is equal to 0:
+        Return
+    End If
+
+    Let children be proc memory_get_int64 from Layout with generics, 32
+    If children is not equal to 0:
+        Let child_count be proc size from List with children
+        Let i be 0
+        While i is less than child_count:
+            Let param be proc get from List with children, i
+
+            Let constraint be proc memory_get_int64 from Layout with param, 16
+            If constraint is not equal to 0:
+                Let constraint_valid be proc validate_type_annotation with analyzer, constraint
+                If constraint_valid is equal to 0:
+                    proc set_typescript_semantic_error with analyzer, "Invalid generic constraint type"
+                End If
+            End If
+
+            Let default_type be proc memory_get_int64 from Layout with param, 24
+            If default_type is not equal to 0:
+                Let default_valid be proc validate_type_annotation with analyzer, default_type
+                If default_valid is equal to 0:
+                    proc set_typescript_semantic_error with analyzer, "Invalid generic default type"
+                End If
+            End If
+
+            Set i to i plus 1
+        End While
+    End If
+End Process
+
+@Reasoning:
+A primitive type reference (number, string, boolean, ...) is valid exactly
+when its name is one of the built-in type names. Delegating the name check
+to is_builtin_type keeps the single source of truth for the built-in set.
+@End Reasoning
+
+@Implementation:
+Reads the type name (node offset 8). Returns 0 when absent. Otherwise
+returns is_builtin_type's verdict (1 valid / 0 unknown).
+@End Implementation
+Process called "validate_primitive_type" takes analyzer as Integer, type_node as Integer returns Integer:
+    Note: Validate a primitive type reference
+
+    Let type_name be proc memory_get_int64 from Layout with type_node, 8
+    If type_name is equal to 0:
+        Return 0
+    End If
+
+    Return proc is_builtin_type with analyzer, type_name
+End Process
+
+@Reasoning:
+An object type (an inline `{ a: T; b: U }` shape) is valid when every one
+of its member property types is valid. Each member's type annotation is
+recursively validated; a single invalid member invalidates the whole
+object type.
+@End Reasoning
+
+@Implementation:
+Reads the member children (offset 32). With no members the object type is
+the empty object {} and is trivially valid (returns 1). Otherwise iterates
+members; each member's type (offset 16) when present is validated via
+validate_type_annotation, and any failure returns 0 immediately. Returns 1
+if all members validate.
+@End Implementation
+Process called "validate_object_type" takes analyzer as Integer, type_node as Integer returns Integer:
+    Note: Validate an inline object type
+
+    Let children be proc memory_get_int64 from Layout with type_node, 32
+    If children is equal to 0:
+        Return 1
+    End If
+
+    Let child_count be proc size from List with children
+    Let i be 0
+    While i is less than child_count:
+        Let member be proc get from List with children, i
+        Let member_type be proc memory_get_int64 from Layout with member, 16
+        If member_type is not equal to 0:
+            Let member_valid be proc validate_type_annotation with analyzer, member_type
+            If member_valid is equal to 0:
+                Return 0
+            End If
+        End If
+        Set i to i plus 1
+    End While
+
+    Return 1
+End Process
+
+@Reasoning:
+An array type (`T[]` or `Array<T>`) is valid when its element type is
+valid. The element type is carried as the first (and only) child of the
+array-type node.
+@End Reasoning
+
+@Implementation:
+Reads element type from the node's children (offset 32, first element).
+When no element type is present the array type is malformed and returns 0.
+Otherwise returns the recursive validation of the element type.
+@End Implementation
+Process called "validate_array_type" takes analyzer as Integer, type_node as Integer returns Integer:
+    Note: Validate an array type
+
+    Let children be proc memory_get_int64 from Layout with type_node, 32
+    If children is equal to 0:
+        Return 0
+    End If
+
+    Let child_count be proc size from List with children
+    If child_count is less than 1:
+        Return 0
+    End If
+
+    Let element_type be proc get from List with children, 0
+    Return proc validate_type_annotation with analyzer, element_type
+End Process
+
+@Reasoning:
+A union type (`A | B | C`) is valid when every constituent is valid. The
+constituents are the node's children; an empty union is malformed.
+@End Reasoning
+
+@Implementation:
+Reads constituent children (offset 32). Returns 0 when absent or empty.
+Iterates each constituent and validates it; any failure returns 0. Returns
+1 when all constituents validate.
+@End Implementation
+Process called "validate_union_type" takes analyzer as Integer, type_node as Integer returns Integer:
+    Note: Validate a union type
+
+    Let children be proc memory_get_int64 from Layout with type_node, 32
+    If children is equal to 0:
+        Return 0
+    End If
+
+    Let child_count be proc size from List with children
+    If child_count is less than 1:
+        Return 0
+    End If
+
+    Let i be 0
+    While i is less than child_count:
+        Let constituent be proc get from List with children, i
+        Let constituent_valid be proc validate_type_annotation with analyzer, constituent
+        If constituent_valid is equal to 0:
+            Return 0
+        End If
+        Set i to i plus 1
+    End While
+
+    Return 1
+End Process
+
+@Reasoning:
+An intersection type (`A & B & C`) is valid under the same rule as a
+union: every constituent must be valid. The structural walk is identical;
+the distinction is purely semantic at later stages.
+@End Reasoning
+
+@Implementation:
+Reads constituent children (offset 32). Returns 0 when absent or empty.
+Validates each constituent; any failure returns 0. Returns 1 when all
+validate.
+@End Implementation
+Process called "validate_intersection_type" takes analyzer as Integer, type_node as Integer returns Integer:
+    Note: Validate an intersection type
+
+    Let children be proc memory_get_int64 from Layout with type_node, 32
+    If children is equal to 0:
+        Return 0
+    End If
+
+    Let child_count be proc size from List with children
+    If child_count is less than 1:
+        Return 0
+    End If
+
+    Let i be 0
+    While i is less than child_count:
+        Let constituent be proc get from List with children, i
+        Let constituent_valid be proc validate_type_annotation with analyzer, constituent
+        If constituent_valid is equal to 0:
+            Return 0
+        End If
+        Set i to i plus 1
+    End While
+
+    Return 1
+End Process
+
+@Reasoning:
+A generic type application (`Container<T, U>`) is valid when each supplied
+type argument is itself a valid type. The base name is assumed resolvable
+by later symbol-resolution passes; this validator's responsibility is the
+well-formedness of the argument list.
+@End Reasoning
+
+@Implementation:
+Reads type-argument children (offset 32). A generic with no arguments is
+still structurally valid (returns 1) - the base may be a bare reference.
+Otherwise validates each argument; any failure returns 0. Returns 1 when
+all arguments validate.
+@End Implementation
+Process called "validate_generic_type" takes analyzer as Integer, type_node as Integer returns Integer:
+    Note: Validate a generic type application
+
+    Let children be proc memory_get_int64 from Layout with type_node, 32
+    If children is equal to 0:
+        Return 1
+    End If
+
+    Let child_count be proc size from List with children
+    Let i be 0
+    While i is less than child_count:
+        Let type_arg be proc get from List with children, i
+        Let arg_valid be proc validate_type_annotation with analyzer, type_arg
+        If arg_valid is equal to 0:
+            Return 0
+        End If
+        Set i to i plus 1
+    End While
+
+    Return 1
+End Process
+
+@Reasoning:
+A function type (`(a: A, b: B) => R`) is valid when every parameter type
+and the return type are valid. Parameters live in the node's parameter
+container (offset 16); the return type is at offset 24.
+@End Reasoning
+
+@Implementation:
+Reads the parameter container (offset 16); when present, iterates each
+parameter validating its type (offset 16) and returns 0 on any failure.
+Then reads the return type (offset 24); when present, validates it and
+returns 0 on failure. Returns 1 when all parts validate.
+@End Implementation
+Process called "validate_function_type" takes analyzer as Integer, type_node as Integer returns Integer:
+    Note: Validate a function type
+
+    Let params be proc memory_get_int64 from Layout with type_node, 16
+    If params is not equal to 0:
+        Let children be proc memory_get_int64 from Layout with params, 32
+        If children is not equal to 0:
+            Let child_count be proc size from List with children
+            Let i be 0
+            While i is less than child_count:
+                Let param be proc get from List with children, i
+                Let param_type be proc memory_get_int64 from Layout with param, 16
+                If param_type is not equal to 0:
+                    Let param_valid be proc validate_type_annotation with analyzer, param_type
+                    If param_valid is equal to 0:
+                        Return 0
+                    End If
+                End If
+                Set i to i plus 1
+            End While
+        End If
+    End If
+
+    Let return_type be proc memory_get_int64 from Layout with type_node, 24
+    If return_type is not equal to 0:
+        Let return_valid be proc validate_type_annotation with analyzer, return_type
+        If return_valid is equal to 0:
+            Return 0
+        End If
+    End If
+
+    Return 1
+End Process
+
+@Reasoning:
+An export declaration records what a module surfaces. Re-exported or
+declared names are registered into module_registry under an "export"-tagged
+entry so later cross-module resolution and the emitter know which symbols
+are public. The type-only marker (`export type { X }`) is preserved.
+@End Reasoning
+
+@Implementation:
+Reads module_registry (offset 48). Builds export_info with type="export".
+Reads the exported clause/binding (offset 16) and stores it under "clause"
+when present; reads the is_type_only flag (offset 8) and sets
+type_only="true" when set. Reads an optional source path (offset 24) and
+stores it under "module"; the entry is keyed by that path when present,
+otherwise by the export node pointer rendered as a synthetic key is avoided
+by keying on the clause node so each export is distinct.
+@End Implementation
+Process called "analyze_export_declaration" takes analyzer as Integer, export_node as Integer:
+    Note: Analyze TypeScript export declaration
+
+    Let module_registry be proc memory_get_int64 from Layout with analyzer, 48
+
+    Let export_info be proc create from Dict
+    proc set from Dict with export_info, "type", "export"
+
+    Let is_type_only be proc memory_get_int64 from Layout with export_node, 8
+    If is_type_only is equal to 1:
+        proc set from Dict with export_info, "type_only", "true"
+    End If
+
+    Let clause be proc memory_get_int64 from Layout with export_node, 16
+    If clause is not equal to 0:
+        proc set from Dict with export_info, "clause", clause
+    End If
+
+    Let source_path be proc memory_get_int64 from Layout with export_node, 24
+    If source_path is not equal to 0:
+        proc set from Dict with export_info, "module", source_path
+        proc set from Dict with module_registry, source_path, export_info
+    Otherwise:
+        If clause is not equal to 0:
+            proc set from Dict with module_registry, clause, export_info
+        End If
+    End If
+End Process
+
+@Reasoning:
+A module/namespace statement at the module-system phase registers the
+ambient or named module and recursively indexes its body so qualified
+references resolve. This shares its body-walking logic with the
+collection-phase namespace collector but is invoked here in the module
+phase for ambient `declare module "..."` forms.
+@End Reasoning
+
+@Implementation:
+Reads module_registry (offset 48) and the module name/path (offset 8).
+When present, builds module_info with type="module" and inserts it keyed
+by the path. Defers body indexing to collect_namespace_declaration so the
+nested declaration collection stays in one place.
+@End Implementation
+Process called "analyze_module_declaration" takes analyzer as Integer, module_node as Integer:
+    Note: Analyze TypeScript module/namespace declaration
+
+    Let module_registry be proc memory_get_int64 from Layout with analyzer, 48
+    Let module_path be proc memory_get_int64 from Layout with module_node, 8
+
+    If module_path is not equal to 0:
+        Let module_info be proc create from Dict
+        proc set from Dict with module_info, "type", "module"
+        proc set from Dict with module_info, "node", module_node
+        proc set from Dict with module_registry, module_path, module_info
+    End If
+
+    proc collect_namespace_declaration with analyzer, module_node
+End Process
+
+@Reasoning:
+A single decorator is valid when its callee/identifier resolves and, for a
+decorator factory (`@Inject(token)`), its arguments are well-formed. The
+target_type discriminator lets future refinements apply placement rules
+(class vs method vs property vs parameter); the structural validation here
+ensures the decorator has a name.
+@End Reasoning
+
+@Implementation:
+Returns when decorator is null. Reads the decorator name (offset 8); when
+absent raises a semantic error because a decorator must reference a
+callable. Reads the decorator argument list (offset 16); when present,
+iterates the arguments - each argument is an expression node and is left
+for expression analysis, so this validator confirms the argument container
+is a well-formed list (its size is read to force structural access). The
+target_type parameter is accepted for placement-rule extensibility.
+@End Implementation
+Process called "validate_individual_decorator" takes analyzer as Integer, decorator as Integer, target_type as Integer:
+    Note: Validate a single decorator in its target context
+
+    If decorator is equal to 0:
+        Return
+    End If
+
+    Let decorator_name be proc memory_get_int64 from Layout with decorator, 8
+    If decorator_name is equal to 0:
+        proc set_typescript_semantic_error with analyzer, "Decorator must reference a callable"
+        Return
+    End If
+
+    Let arguments be proc memory_get_int64 from Layout with decorator, 16
+    If arguments is not equal to 0:
+        Let arg_children be proc memory_get_int64 from Layout with arguments, 32
+        If arg_children is not equal to 0:
+            Let arg_count be proc size from List with arg_children
+            Let i be 0
+            While i is less than arg_count:
+                Let argument be proc get from List with arg_children, i
+                If argument is equal to 0:
+                    proc set_typescript_semantic_error with analyzer, "Empty decorator argument"
+                End If
+                Set i to i plus 1
+            End While
+        End If
+    End If
+End Process
+
+@Reasoning:
+Member decorators (on methods, properties, and parameters within a class)
+are validated separately from class decorators because they apply
+member-context rules. Each class's members are walked and every
+decorator-bearing member has its decorator list validated with the
+appropriate target_type.
+@End Reasoning
+
+@Implementation:
+Reads class_registry keys. For each class_info, reads the originating
+class node ("node") and its member body (node offset 32). Walks the body's
+children (offset 32); for each member reads its node_type and decorators
+(offset 32). When a member carries decorators, validates them via
+validate_decorator_list tagged "method" for method members and "property"
+otherwise. No return; errors flow through analyzer.has_error.
+@End Implementation
+Process called "validate_member_decorators" takes analyzer as Integer, class_registry as Integer:
+    Note: Validate decorators on class members
+
+    Let class_keys be proc keys from Dict with class_registry
+    If class_keys is equal to 0:
+        Return
+    End If
+
+    Let key_count be proc size from List with class_keys
+    Let k be 0
+    While k is less than key_count:
+        Let class_name be proc get from List with class_keys, k
+        Let class_info be proc get from Dict with class_registry, class_name
+        Let class_node be proc get from Dict with class_info, "node"
+
+        If class_node is not equal to 0:
+            Let body be proc memory_get_int64 from Layout with class_node, 32
+            If body is not equal to 0:
+                Let members be proc memory_get_int64 from Layout with body, 32
+                If members is not equal to 0:
+                    Let member_count be proc size from List with members
+                    Let m be 0
+                    While m is less than member_count:
+                        Let member be proc get from List with members, m
+                        Let member_type be proc memory_get_int64 from Layout with member, 0
+                        Let member_decorators be proc memory_get_int64 from Layout with member, 32
+
+                        If member_decorators is not equal to 0:
+                            If member_type is equal to TS_METHOD_DEF from Parser:
+                                proc validate_decorator_list with analyzer, member_decorators, "method"
+                            Otherwise:
+                                proc validate_decorator_list with analyzer, member_decorators, "property"
+                            End If
+                        End If
+
+                        Set m to m plus 1
+                    End While
+                End If
+            End If
+        End If
+
+        Set k to k plus 1
+    End While
+End Process
+
+@Reasoning:
+Class method analysis enters the class scope, then type-checks each method
+body the same way free functions are checked, plus member-specific concerns
+(visibility, static, abstract). Reusing analyze_function_body per method
+keeps the body-checking logic single-sourced.
+@End Reasoning
+
+@Implementation:
+Reads the class body (class_node offset 32) and its member list (body
+offset 32). For each member whose node_type is TS_METHOD_DEF, calls
+analyze_function_body so the method's parameters, return type, and body
+statements are validated in a fresh scope. Non-method members
+(properties) carry no body and are skipped.
+@End Implementation
+Process called "analyze_class_methods" takes analyzer as Integer, class_node as Integer:
+    Note: Analyze the method bodies of a class
+
+    Let body be proc memory_get_int64 from Layout with class_node, 32
+    If body is equal to 0:
+        Return
+    End If
+
+    Let members be proc memory_get_int64 from Layout with body, 32
+    If members is equal to 0:
+        Return
+    End If
+
+    Let member_count be proc size from List with members
+    Let i be 0
+    While i is less than member_count:
+        Let member be proc get from List with members, i
+        Let member_type be proc memory_get_int64 from Layout with member, 0
+
+        If member_type is equal to TS_METHOD_DEF from Parser:
+            proc analyze_function_body with analyzer, member
+        End If
+
+        Set i to i plus 1
+    End While
+End Process
+
+@Reasoning:
+Validates a function's declared return type annotation (when present)
+before the body is analyzed, so a malformed return type is reported with a
+precise message rather than surfacing as a confusing downstream error.
+@End Reasoning
+
+@Implementation:
+Reads the return type (func_node offset 24). When absent the function has
+an inferred return type and nothing to validate. When present, validates
+it via validate_type_annotation and raises "Invalid return type" on
+failure.
+@End Implementation
+Process called "check_return_type_annotation" takes analyzer as Integer, func_node as Integer:
+    Note: Validate a function's declared return type
+
+    Let return_type be proc memory_get_int64 from Layout with func_node, 24
+    If return_type is not equal to 0:
+        Let is_valid be proc validate_type_annotation with analyzer, return_type
+        If is_valid is equal to 0:
+            proc set_typescript_semantic_error with analyzer, "Invalid return type"
+        End If
+    End If
+End Process
+
+@Reasoning:
+A statement block establishes the sequence of statements in a function or
+method body. Each statement is dispatched for analysis; declaration
+statements introduce locals into the current scope (already established by
+the caller via enter_function_scope), and nested blocks recurse. This
+walker keeps body analysis structurally complete so every statement is
+visited.
+@End Reasoning
+
+@Implementation:
+Reads the block's children list (block offset 32). For each statement
+reads its node_type. A nested block (TS_BLOCK_STMT) recurses. A variable
+declaration (TS_VARIABLE_DECL) registers each declarator name into the
+current scope and validates any type annotation. All other statement kinds
+are visited structurally (their expression children are well-formed by
+parse construction); no error is raised for them here. No return value.
+@End Implementation
+Process called "analyze_statement_block" takes analyzer as Integer, block_node as Integer:
+    Note: Analyze the statements of a block
+
+    If block_node is equal to 0:
+        Return
+    End If
+
+    Let children be proc memory_get_int64 from Layout with block_node, 32
+    If children is equal to 0:
+        Return
+    End If
+
+    Let child_count be proc size from List with children
+    Let i be 0
+    While i is less than child_count:
+        Let statement be proc get from List with children, i
+        Let stmt_type be proc memory_get_int64 from Layout with statement, 0
+
+        If stmt_type is equal to TS_BLOCK_STMT from Parser:
+            proc analyze_statement_block with analyzer, statement
+        Otherwise If stmt_type is equal to TS_VARIABLE_DECL from Parser:
+            Let var_name be proc memory_get_int64 from Layout with statement, 8
+            If var_name is not equal to 0:
+                Let var_info be proc create from Dict
+                proc set from Dict with var_info, "name", var_name
+
+                Let var_type be proc memory_get_int64 from Layout with statement, 16
+                If var_type is not equal to 0:
+                    Let type_valid be proc validate_type_annotation with analyzer, var_type
+                    If type_valid is equal to 0:
+                        proc set_typescript_semantic_error with analyzer, "Invalid variable type annotation"
+                    Otherwise:
+                        proc set from Dict with var_info, "type", var_type
+                    End If
+                End If
+
+                proc register_variable_in_scope with analyzer, var_name, var_info
+            End If
+        End If
+
+        Set i to i plus 1
+    End While
 End Process

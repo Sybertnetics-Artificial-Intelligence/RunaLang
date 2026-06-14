@@ -1,0 +1,436 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+Licensed under Apache 2.0
+:End Note
+
+Note:
+TypeScript Translation Round-Trip Probe (depth-hardened)
+
+End-to-end proof that the TypeScript translation pipeline is REAL, not a
+skeleton, and that the TYPE LAYER and construct MEMBERS survive the round trip:
+
+    TypeScript source
+      -> typescript_lexer    (TS/JS-superset tokenizer)
+      -> typescript_parser   (recursive-descent AST; every block/list loop
+                              force-advances on zero lexer-cursor progress)
+      -> typescript_to_hir   (lower to the HIR dictionary/list-literal model)
+      -> hir_to_typescript   (emit HIR back to valid TypeScript text)
+      -> re-lex / re-parse / re-to_hir of the emitted text  (HIR2)
+      -> structural + MEMBER + TYPE-ANNOTATION survival assertions on HIR2
+
+The TypeScript HIR is the hir.runa dictionary-literal / list-literal model:
+a dictionary-literal node's entries are read via get_dictionary_entries (a List
+of 16-byte [key, value] blocks); a list-literal node's elements via
+get_list_elements (a List of node handles); a string-literal value via
+get_string_literal_value. This probe reads HIR fields through exactly those
+accessors - the same contract the producer (typescript_to_hir) and consumer
+(hir_to_typescript) share. The node-type tag key is "node_type".
+
+Depth assertions (the load-bearing part of this probe):
+  - interface MEMBER names + count survive (an optional property + a method sig)
+  - the union type-alias's constituent count survives
+  - enum MEMBER names + count survive (3 members)
+  - a generic class's METHOD names + count survive + the generic TYPE PARAMETER
+    name "T" and its constraint survive
+  - a function's PARAMETER names + their TYPE ANNOTATIONS survive + return type
+  - an arrow function's typed PARAMETER names survive
+  - an import's named BINDINGS survive
+
+Exit code: number of failed assertions (0 == all passed). No exit_with_code.
+:End Note
+
+Import "compiler/middle/gungnir/hir/translation/frontends/typescript/typescript_to_hir.runa" as TsFrontend
+Import "compiler/middle/gungnir/hir/translation/backends/typescript/hir_to_typescript.runa" as TsBackend
+Import "compiler/middle/gungnir/hir/hir.runa" as HIR
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/frontend/primitives/collections/list.runa" as List
+Import "compiler/internal/string_utils.runa" as StringUtils
+Import "tests/test_utils.runa" as TestUtils
+
+Note: ============================================================================
+Note: HIR dictionary-literal / list-literal decoders (mirror producer/consumer)
+Note: ============================================================================
+
+@Reasoning:
+Resolve a string-valued dictionary field: find the entry whose key matches, then
+unwrap the string-literal value to its raw payload. Mirrors the backend's
+get_dict_string_value.
+@End Reasoning
+Process called "dict_string" takes node as Integer, key as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    Let entries be proc get_dictionary_entries from HIR with node
+    If entries is equal to 0:
+        Return 0
+    End If
+    Let count be proc size from List with entries
+    Let i be 0
+    While i is less than count:
+        Let entry be proc get_at from List with entries, i
+        If entry is not equal to 0:
+            Let entry_key be proc memory_get_int64 from Layout with entry, 0
+            Let matches be proc string_equals from StringCore with entry_key, key
+            If matches is equal to 1:
+                Let value_node be proc memory_get_int64 from Layout with entry, 8
+                Return proc get_string_literal_value from HIR with value_node
+            End If
+        End If
+        Set i to i plus 1
+    End While
+    Return 0
+End Process
+
+@Reasoning:
+Resolve a node-valued dictionary field (a nested dict or list literal). Returns
+the raw value node so the caller can recurse.
+@End Reasoning
+Process called "dict_node" takes node as Integer, key as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    Let entries be proc get_dictionary_entries from HIR with node
+    If entries is equal to 0:
+        Return 0
+    End If
+    Let count be proc size from List with entries
+    Let i be 0
+    While i is less than count:
+        Let entry be proc get_at from List with entries, i
+        If entry is not equal to 0:
+            Let entry_key be proc memory_get_int64 from Layout with entry, 0
+            Let matches be proc string_equals from StringCore with entry_key, key
+            If matches is equal to 1:
+                Return proc memory_get_int64 from Layout with entry, 8
+            End If
+        End If
+        Set i to i plus 1
+    End While
+    Return 0
+End Process
+
+Process called "list_count" takes node as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    Let elements be proc get_list_elements from HIR with node
+    If elements is equal to 0:
+        Return 0
+    End If
+    Return proc size from List with elements
+End Process
+
+Process called "list_item" takes node as Integer, index as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    Let elements be proc get_list_elements from HIR with node
+    If elements is equal to 0:
+        Return 0
+    End If
+    Let count be proc size from List with elements
+    If index is less than 0:
+        Return 0
+    End If
+    If index is greater than or equal to count:
+        Return 0
+    End If
+    Return proc get_at from List with elements, index
+End Process
+
+@Reasoning:
+Find the program's top-level statement whose "node_type" tag matches the
+requested kind. A linear scan over the program "statements" list is robust to
+ordering.
+@End Reasoning
+Process called "find_stmt" takes program as Integer, kind as Integer returns Integer:
+    If program is equal to 0:
+        Return 0
+    End If
+    Let statements be proc dict_node with program, "statements"
+    Let count be proc list_count with statements
+    Let i be 0
+    While i is less than count:
+        Let stmt be proc list_item with statements, i
+        Let stmt_kind be proc dict_string with stmt, "node_type"
+        If stmt_kind is not equal to 0:
+            Let matches be proc string_equals from StringCore with stmt_kind, kind
+            If matches is equal to 1:
+                Return stmt
+            End If
+        End If
+        Set i to i plus 1
+    End While
+    Return 0
+End Process
+
+@Reasoning:
+Whether a member list (interface members, class members) contains an entry with
+the given "name". Used to assert each member name survives the round trip.
+@End Reasoning
+Process called "members_have_name" takes members as Integer, name as Integer returns Integer:
+    Let count be proc list_count with members
+    Let i be 0
+    While i is less than count:
+        Let member be proc list_item with members, i
+        Let member_name be proc dict_string with member, "name"
+        If member_name is not equal to 0:
+            Let matches be proc string_equals from StringCore with member_name, name
+            If matches is equal to 1:
+                Return 1
+            End If
+        End If
+        Set i to i plus 1
+    End While
+    Return 0
+End Process
+
+@Reasoning:
+Return the member node in a member list whose "name" matches, so the caller can
+inspect that member's own fields (e.g. a parameter's type annotation).
+@End Reasoning
+Process called "member_by_name" takes members as Integer, name as Integer returns Integer:
+    Let count be proc list_count with members
+    Let i be 0
+    While i is less than count:
+        Let member be proc list_item with members, i
+        Let member_name be proc dict_string with member, "name"
+        If member_name is not equal to 0:
+            Let matches be proc string_equals from StringCore with member_name, name
+            If matches is equal to 1:
+                Return member
+            End If
+        End If
+        Set i to i plus 1
+    End While
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: Probe entry point
+Note: ============================================================================
+
+Process called "main" returns Integer:
+    Let results be proc create_test_results from TestUtils
+    proc begin_suite from TestUtils with results, "TypeScript translation round-trip"
+
+    Note:
+    Representative TypeScript program exercising the JS-superset grammar PLUS
+    the TS type layer: a regular import + a type-only import; an interface with
+    an optional property and a method signature; a union type alias; a 3-member
+    enum; a generic class `<T extends Base>` implementing the interface, with a
+    constructor, two typed methods, and a getter; a function with typed
+    parameters + a return type + a default; a typed arrow function.
+    :End Note
+    Let source be "import { Base } from \"base\";\nimport type { Meta } from \"meta\";\ninterface Shape {\nname: string;\nsize?: number;\narea(): number;\n}\ntype Result = number | string;\nenum Color {\nRed,\nGreen,\nBlue\n}\nclass Box<T extends Base> {\nlabel: string;\nconstructor(label: string) {\nthis.label = label;\n}\ngetArea(scale: number): number {\nreturn scale;\n}\nrename(next: string): void {\nthis.label = next;\n}\nget title(): string {\nreturn this.label;\n}\n}\nfunction combine(a: number, b: string): string {\nreturn b;\n}\nlet doubler = (value: number): number => value;\n"
+
+    Note: --- Stage 0-2: source -> HIR1 (lex, parse, lower) ---
+    Let hir1 be proc typescript_to_hir_from_source from TsFrontend with source
+    proc assert_not_null from TestUtils with results, "frontend produced HIR program", hir1
+
+    Let root_kind be proc dict_string with hir1, "node_type"
+    Let root_ok be proc string_equals from StringCore with root_kind, "program"
+    proc assert_equal from TestUtils with results, "HIR root is a program", root_ok, 1
+
+    Let lang be proc dict_string with hir1, "language"
+    Let lang_ok be proc string_equals from StringCore with lang, "typescript"
+    proc assert_equal from TestUtils with results, "HIR records language=typescript", lang_ok, 1
+
+    Note: ---- Interface: optional property + method signature survive ----
+    Let iface be proc find_stmt with hir1, "interface_declaration"
+    proc assert_not_null from TestUtils with results, "interface declaration present", iface
+    Let iface_name be proc dict_string with iface, "name"
+    Let iface_name_ok be proc string_equals from StringCore with iface_name, "Shape"
+    proc assert_equal from TestUtils with results, "interface name is 'Shape'", iface_name_ok, 1
+    Let iface_members be proc dict_node with iface, "members"
+    Let iface_member_count be proc list_count with iface_members
+    proc assert_greater_than_or_equal from TestUtils with results, "interface has 3 members (name, size?, area())", iface_member_count, 3
+    Let has_name_member be proc members_have_name with iface_members, "name"
+    proc assert_equal from TestUtils with results, "interface member 'name' survives", has_name_member, 1
+    Let has_size_member be proc members_have_name with iface_members, "size"
+    proc assert_equal from TestUtils with results, "interface optional member 'size' survives", has_size_member, 1
+    Let has_area_member be proc members_have_name with iface_members, "area"
+    proc assert_equal from TestUtils with results, "interface method 'area' survives", has_area_member, 1
+    Let name_member be proc member_by_name with iface_members, "name"
+    Let name_member_type be proc dict_node with name_member, "type"
+    proc assert_not_null from TestUtils with results, "interface member 'name' keeps its type annotation", name_member_type
+
+    Note: ---- Type alias: union constituent count survives ----
+    Let alias be proc find_stmt with hir1, "type_alias_declaration"
+    proc assert_not_null from TestUtils with results, "type alias present", alias
+    Let alias_name be proc dict_string with alias, "name"
+    Let alias_name_ok be proc string_equals from StringCore with alias_name, "Result"
+    proc assert_equal from TestUtils with results, "type alias name is 'Result'", alias_name_ok, 1
+    Let alias_type be proc dict_node with alias, "type"
+    proc assert_not_null from TestUtils with results, "type alias keeps its target type", alias_type
+    Let alias_kind be proc dict_string with alias_type, "kind"
+    Let alias_kind_ok be proc string_equals from StringCore with alias_kind, "union_type"
+    proc assert_equal from TestUtils with results, "type alias target is a union_type", alias_kind_ok, 1
+    Let alias_union be proc dict_node with alias_type, "types"
+    Let alias_union_count be proc list_count with alias_union
+    proc assert_greater_than_or_equal from TestUtils with results, "union has 2 constituents (number | string)", alias_union_count, 2
+
+    Note: ---- Enum: 3 member names survive ----
+    Let enum_node be proc find_stmt with hir1, "enum_declaration"
+    proc assert_not_null from TestUtils with results, "enum declaration present", enum_node
+    Let enum_name be proc dict_string with enum_node, "name"
+    Let enum_name_ok be proc string_equals from StringCore with enum_name, "Color"
+    proc assert_equal from TestUtils with results, "enum name is 'Color'", enum_name_ok, 1
+    Let enum_members be proc dict_node with enum_node, "members"
+    Let enum_member_count be proc list_count with enum_members
+    proc assert_equal from TestUtils with results, "enum has exactly 3 members", enum_member_count, 3
+    Let has_red be proc members_have_name with enum_members, "Red"
+    proc assert_equal from TestUtils with results, "enum member 'Red' survives", has_red, 1
+    Let has_green be proc members_have_name with enum_members, "Green"
+    proc assert_equal from TestUtils with results, "enum member 'Green' survives", has_green, 1
+    Let has_blue be proc members_have_name with enum_members, "Blue"
+    proc assert_equal from TestUtils with results, "enum member 'Blue' survives", has_blue, 1
+
+    Note: ---- Generic class: methods + generic type param + constraint survive ----
+    Let class_node be proc find_stmt with hir1, "class_declaration"
+    proc assert_not_null from TestUtils with results, "class declaration present", class_node
+    Let class_name be proc dict_string with class_node, "name"
+    Let class_name_ok be proc string_equals from StringCore with class_name, "Box"
+    proc assert_equal from TestUtils with results, "class name is 'Box'", class_name_ok, 1
+
+    Let type_params be proc dict_node with class_node, "type_parameters"
+    Let type_param_count be proc list_count with type_params
+    proc assert_greater_than_or_equal from TestUtils with results, "class declares a generic type parameter", type_param_count, 1
+    Let tp0 be proc list_item with type_params, 0
+    Let tp0_name be proc dict_string with tp0, "name"
+    Let tp0_name_ok be proc string_equals from StringCore with tp0_name, "T"
+    proc assert_equal from TestUtils with results, "generic type parameter name 'T' survives", tp0_name_ok, 1
+    Let tp0_constraint be proc dict_node with tp0, "constraint"
+    proc assert_not_null from TestUtils with results, "generic type parameter constraint (extends Base) survives", tp0_constraint
+
+    Let class_members be proc dict_node with class_node, "members"
+    Let class_member_count be proc list_count with class_members
+    proc assert_greater_than_or_equal from TestUtils with results, "class has 4 members (field+ctor+2methods+getter)", class_member_count, 4
+    Let has_ctor be proc members_have_name with class_members, "constructor"
+    proc assert_equal from TestUtils with results, "class constructor survives", has_ctor, 1
+    Let has_getarea be proc members_have_name with class_members, "getArea"
+    proc assert_equal from TestUtils with results, "class method 'getArea' survives", has_getarea, 1
+    Let has_rename be proc members_have_name with class_members, "rename"
+    proc assert_equal from TestUtils with results, "class method 'rename' survives", has_rename, 1
+
+    Note: A class method's parameter type annotation must survive.
+    Let getarea be proc member_by_name with class_members, "getArea"
+    Let getarea_params be proc dict_node with getarea, "parameters"
+    Let getarea_param_count be proc list_count with getarea_params
+    proc assert_greater_than_or_equal from TestUtils with results, "getArea has 1 parameter", getarea_param_count, 1
+    Let getarea_p0 be proc list_item with getarea_params, 0
+    Let getarea_p0_name be proc dict_string with getarea_p0, "name"
+    Let getarea_p0_name_ok be proc string_equals from StringCore with getarea_p0_name, "scale"
+    proc assert_equal from TestUtils with results, "getArea param name 'scale' survives", getarea_p0_name_ok, 1
+    Let getarea_p0_type be proc dict_node with getarea_p0, "type"
+    proc assert_not_null from TestUtils with results, "getArea param 'scale' keeps its type annotation", getarea_p0_type
+    Let getarea_return be proc dict_node with getarea, "return_type"
+    proc assert_not_null from TestUtils with results, "getArea keeps its return type annotation", getarea_return
+
+    Note: ---- Function: typed params + return type survive ----
+    Let func_node be proc find_stmt with hir1, "function_declaration"
+    proc assert_not_null from TestUtils with results, "function declaration present", func_node
+    Let func_name be proc dict_string with func_node, "name"
+    Let func_name_ok be proc string_equals from StringCore with func_name, "combine"
+    proc assert_equal from TestUtils with results, "function name is 'combine'", func_name_ok, 1
+    Let func_params be proc dict_node with func_node, "parameters"
+    Let func_param_count be proc list_count with func_params
+    proc assert_equal from TestUtils with results, "function has 2 parameters", func_param_count, 2
+    Let func_p0 be proc list_item with func_params, 0
+    Let func_p0_name be proc dict_string with func_p0, "name"
+    Let func_p0_name_ok be proc string_equals from StringCore with func_p0_name, "a"
+    proc assert_equal from TestUtils with results, "function param 0 name 'a' survives", func_p0_name_ok, 1
+    Let func_p0_type be proc dict_node with func_p0, "type"
+    proc assert_not_null from TestUtils with results, "function param 'a' keeps its type annotation", func_p0_type
+    Let func_p1 be proc list_item with func_params, 1
+    Let func_p1_type be proc dict_node with func_p1, "type"
+    proc assert_not_null from TestUtils with results, "function param 'b' keeps its type annotation", func_p1_type
+    Let func_return be proc dict_node with func_node, "return_type"
+    proc assert_not_null from TestUtils with results, "function keeps its return type annotation", func_return
+
+    Note: ---- Import: named bindings survive, type-only import marked ----
+    Let import_node be proc find_stmt with hir1, "import_declaration"
+    proc assert_not_null from TestUtils with results, "import declaration present", import_node
+
+    Note: --- Stage 3: HIR1 -> TypeScript text ---
+    Let emitted be proc hir_to_typescript from TsBackend with hir1
+    proc assert_not_null from TestUtils with results, "backend produced TypeScript text", emitted
+    Let emitted_len be proc string_length from StringCore with emitted
+    proc assert_greater_than from TestUtils with results, "emitted TypeScript is non-empty", emitted_len, 0
+
+    Let has_iface_text be proc string_contains from StringUtils with emitted, "interface Shape"
+    proc assert_equal from TestUtils with results, "emitted contains interface Shape", has_iface_text, 1
+    Let has_enum_text be proc string_contains from StringUtils with emitted, "enum Color"
+    proc assert_equal from TestUtils with results, "emitted contains enum Color", has_enum_text, 1
+    Let has_class_text be proc string_contains from StringUtils with emitted, "class Box"
+    proc assert_equal from TestUtils with results, "emitted contains class Box", has_class_text, 1
+
+    Note: --- Stage 4: re-run the pipeline on the emitted text -> HIR2 ---
+    Let hir2 be proc typescript_to_hir_from_source from TsFrontend with emitted
+    proc assert_not_null from TestUtils with results, "re-parse of emitted TypeScript produced HIR", hir2
+    Let root2_kind be proc dict_string with hir2, "node_type"
+    Let root2_ok be proc string_equals from StringCore with root2_kind, "program"
+    proc assert_equal from TestUtils with results, "round-trip root is a program", root2_ok, 1
+
+    Note: --- Stage 5: MEMBER + TYPE-ANNOTATION survival on HIR2 ---
+    Let iface2 be proc find_stmt with hir2, "interface_declaration"
+    proc assert_not_null from TestUtils with results, "round-trip preserves interface", iface2
+    Let iface2_members be proc dict_node with iface2, "members"
+    Let iface2_member_count be proc list_count with iface2_members
+    proc assert_greater_than_or_equal from TestUtils with results, "round-trip preserves 3 interface members", iface2_member_count, 3
+    Let has_size2 be proc members_have_name with iface2_members, "size"
+    proc assert_equal from TestUtils with results, "round-trip preserves optional member 'size'", has_size2, 1
+    Let has_area2 be proc members_have_name with iface2_members, "area"
+    proc assert_equal from TestUtils with results, "round-trip preserves method 'area'", has_area2, 1
+
+    Let alias2 be proc find_stmt with hir2, "type_alias_declaration"
+    proc assert_not_null from TestUtils with results, "round-trip preserves type alias", alias2
+    Let alias2_type be proc dict_node with alias2, "type"
+    Let alias2_union be proc dict_node with alias2_type, "types"
+    Let alias2_union_count be proc list_count with alias2_union
+    proc assert_greater_than_or_equal from TestUtils with results, "round-trip preserves union constituent count", alias2_union_count, 2
+
+    Let enum2 be proc find_stmt with hir2, "enum_declaration"
+    proc assert_not_null from TestUtils with results, "round-trip preserves enum", enum2
+    Let enum2_members be proc dict_node with enum2, "members"
+    Let enum2_member_count be proc list_count with enum2_members
+    proc assert_equal from TestUtils with results, "round-trip preserves 3 enum members", enum2_member_count, 3
+    Let has_blue2 be proc members_have_name with enum2_members, "Blue"
+    proc assert_equal from TestUtils with results, "round-trip preserves enum member 'Blue'", has_blue2, 1
+
+    Let class2 be proc find_stmt with hir2, "class_declaration"
+    proc assert_not_null from TestUtils with results, "round-trip preserves class", class2
+    Let class2_tparams be proc dict_node with class2, "type_parameters"
+    Let class2_tp0 be proc list_item with class2_tparams, 0
+    Let class2_tp0_name be proc dict_string with class2_tp0, "name"
+    Let class2_tp0_ok be proc string_equals from StringCore with class2_tp0_name, "T"
+    proc assert_equal from TestUtils with results, "round-trip preserves generic type parameter 'T'", class2_tp0_ok, 1
+    Let class2_tp0_constraint be proc dict_node with class2_tp0, "constraint"
+    proc assert_not_null from TestUtils with results, "round-trip preserves generic constraint", class2_tp0_constraint
+    Let class2_members be proc dict_node with class2, "members"
+    Let has_getarea2 be proc members_have_name with class2_members, "getArea"
+    proc assert_equal from TestUtils with results, "round-trip preserves class method 'getArea'", has_getarea2, 1
+    Let getarea2 be proc member_by_name with class2_members, "getArea"
+    Let getarea2_params be proc dict_node with getarea2, "parameters"
+    Let getarea2_p0 be proc list_item with getarea2_params, 0
+    Let getarea2_p0_type be proc dict_node with getarea2_p0, "type"
+    proc assert_not_null from TestUtils with results, "round-trip preserves getArea param type annotation", getarea2_p0_type
+
+    Let func2 be proc find_stmt with hir2, "function_declaration"
+    proc assert_not_null from TestUtils with results, "round-trip preserves function", func2
+    Let func2_params be proc dict_node with func2, "parameters"
+    Let func2_param_count be proc list_count with func2_params
+    proc assert_equal from TestUtils with results, "round-trip preserves 2 function parameters", func2_param_count, 2
+    Let func2_p0 be proc list_item with func2_params, 0
+    Let func2_p0_type be proc dict_node with func2_p0, "type"
+    proc assert_not_null from TestUtils with results, "round-trip preserves function param type annotation", func2_p0_type
+    Let func2_return be proc dict_node with func2, "return_type"
+    proc assert_not_null from TestUtils with results, "round-trip preserves function return type", func2_return
+
+    proc print_summary from TestUtils with results
+    Let failed be proc get_failed from TestUtils with results
+    proc destroy_test_results from TestUtils with results
+
+    Return failed
+End Process

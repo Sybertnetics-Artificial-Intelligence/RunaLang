@@ -43,7 +43,9 @@ Dependencies:
 - compiler/frontend/primitives/core/string_core.runa
 :End Note
 
+Import "compiler/middle/gungnir/hir/translation/frontends/typescript/typescript_lexer.runa" as Lexer
 Import "compiler/middle/gungnir/hir/translation/frontends/typescript/typescript_parser.runa" as Parser
+Import "compiler/middle/gungnir/hir/hir.runa" as HIR
 Import "compiler/frontend/primitives/memory/layout.runa" as Layout
 Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
 
@@ -52,110 +54,124 @@ Note: HIR Dictionary Management
 Note: ============================================================================
 
 @Reasoning:
-Factory for HIR dictionary nodes. Two-field record: tag (offset 0,
-value 1 to mark it a dict) and data pointer (offset 8, initially
-null). Used as the universal payload carrier for translated TypeScript
-AST nodes because the rest of this file treats HIR nodes as bag-of-
-fields.
+The TypeScript translator emits the canonical HIR dictionary-literal /
+list-literal interchange model defined in hir.runa — the same shape the
+JavaScript, C, Go, Kotlin, Haskell and other frontends produce and that
+the hir_to_typescript backend consumes via get_dictionary_entries /
+get_list_elements. create_hir_dict therefore delegates to
+create_hir_dictionary_literal, which builds a real multi-entry
+dictionary backed by a List of [key, value] blocks. This eliminates the
+former single-slot record that silently dropped every field but the
+last one written, which made any multi-field node (interface members +
+name + type parameters, etc.) impossible to round-trip.
 @End Reasoning
 
 Process called "create_hir_dict" returns Integer:
-    Note: Create HIR dictionary for TypeScript translation
+    Note: Create HIR dictionary-literal node for TypeScript translation
 
-    Let dict_size be 16  Note: type plus data pointer
-    Let dict be proc allocate from Layout with dict_size
-
-    If dict is equal to 0:
-        Return 0
-    End If
-
-    proc memory_set_int64 from Layout with dict, 0, 1  Note: type = dict
-    proc memory_set_int64 from Layout with dict, 8, 0  Note: data = null
-
-    Return dict
+    Return proc create_hir_dictionary_literal from HIR
 End Process
 
 @Reasoning:
-Stores a key/value pair in the dictionary's data slot. Currently
-overwrites prior entries — a fuller hash-table implementation will
-extend this in a future iteration. The two-field entry record is
-sufficient for the current single-entry usage pattern in this file.
+String-valued dictionary fields (node_type, name, kind, access,
+operator, type_name, literal payloads, and the boolean modifier flags
+encoded as the string "1") are wrapped in a HIR string literal so the
+backend's get_dict_string_value can unwrap them with
+get_string_literal_value. The wrap-then-add sequence mirrors the
+JavaScript frontend's set_dict_string_value exactly, keeping the two
+TypeScript-family frontends representation-compatible.
 @End Reasoning
 
 Process called "set_dict_value" takes dict as Integer, key as Integer, value as Integer returns Integer:
-    Note: Set dictionary key-value pair in HIR structure
+    Note: Add a string-valued entry to a HIR dictionary literal
 
     If dict is equal to 0:
         Return 0
     End If
+    If key is equal to 0:
+        Return 0
+    End If
+    If value is equal to 0:
+        Return 0
+    End If
 
-    Let entry_size be 16
-    Let entry be proc allocate from Layout with entry_size
-
-    proc memory_set_int64 from Layout with entry, 0, key
-    proc memory_set_int64 from Layout with entry, 8, value
-
-    proc memory_set_int64 from Layout with dict, 8, entry
-
-    Return 1
+    Let value_literal be proc create_hir_string_literal from HIR with value
+    Return proc add_dictionary_entry from HIR with dict, key, value_literal
 End Process
 
 @Reasoning:
-Factory for HIR list nodes: two-field record (tag=2 for list, count=0
-initially). The list grows by reallocation on add_to_list — this trades
-allocation churn for code simplicity in a context where most lists are
-small (a few dozen items).
+Modifier flags (abstract, async, readonly, optional, rest) are written
+with the integer 1 by the translation logic. They share the
+string-valued read path in the backend (get_dict_string_value tested
+against zero), so they are stored as the string literal "1": a non-zero
+string pointer the backend reads back as truthy. A dedicated helper
+keeps the integer-to-string-flag conversion in one place.
+@End Reasoning
+
+Process called "set_dict_flag" takes dict as Integer, key as Integer returns Integer:
+    Note: Set a boolean modifier flag (stored as the string "1")
+
+    If dict is equal to 0:
+        Return 0
+    End If
+    If key is equal to 0:
+        Return 0
+    End If
+
+    Let flag_literal be proc create_hir_string_literal from HIR with "1"
+    Return proc add_dictionary_entry from HIR with dict, key, flag_literal
+End Process
+
+@Reasoning:
+Node-valued dictionary fields (members, parameters, body, type,
+sub-expressions, nested lists) carry an already-translated HIR node
+verbatim. The backend reads them back with get_dict_hir_value, which
+returns the stored node unchanged. No string-literal wrapping occurs
+because the value is itself an HIR node, not a raw string.
+@End Reasoning
+
+Process called "set_dict_node" takes dict as Integer, key as Integer, value as Integer returns Integer:
+    Note: Add an HIR-node-valued entry to a HIR dictionary literal
+
+    If dict is equal to 0:
+        Return 0
+    End If
+    If key is equal to 0:
+        Return 0
+    End If
+
+    Return proc add_dictionary_entry from HIR with dict, key, value
+End Process
+
+@Reasoning:
+List construction delegates to the canonical HIR list literal. Unlike
+the former reallocating record, add_list_element appends in place and
+the caller's handle stays valid, so the historical reassignment idiom
+(Set list to add_to_list ...) remains correct because add_to_list
+returns the same list pointer it was given.
 @End Reasoning
 
 Process called "create_hir_list" returns Integer:
-    Note: Create HIR list
+    Note: Create HIR list-literal node
 
-    Let list_size be 16  Note: type plus count
-    Let list be proc allocate from Layout with list_size
-
-    If list is equal to 0:
-        Return 0
-    End If
-
-    proc memory_set_int64 from Layout with list, 0, 2  Note: type = list
-    proc memory_set_int64 from Layout with list, 8, 0  Note: count = 0
-
-    Return list
+    Return proc create_hir_list_literal from HIR
 End Process
 
 @Reasoning:
-Reallocates a new list with count + 1 capacity, copies the existing
-items, appends the new item. Returns the new list pointer; the caller
-must update its handle. The old list buffer is intentionally NOT freed
-here because the items live in the same arena and a per-add free
-would be unsound.
+Appends an element to a HIR list literal and returns the (unchanged)
+list pointer so existing "Set list to add_to_list with list, item"
+call sites continue to function without modification.
 @End Reasoning
 
 Process called "add_to_list" takes list as Integer, item as Integer returns Integer:
-    Note: Add item to HIR list
+    Note: Append an element to a HIR list literal
 
     If list is equal to 0:
         Return 0
     End If
 
-    Let count be proc memory_get_int64 from Layout with list, 8
-    Let new_count be count plus 1
-
-    Let new_list be proc allocate from Layout with new_count multiplied by 8 plus 16
-
-    proc memory_set_int64 from Layout with new_list, 0, 2  Note: type = list
-    proc memory_set_int64 from Layout with new_list, 8, new_count
-
-    Let index be 0
-    While index is less than count:
-        Let old_item be proc memory_get_int64 from Layout with list, index multiplied by 8 plus 16
-        proc memory_set_int64 from Layout with new_list, index multiplied by 8 plus 16, old_item
-        Set index to index plus 1
-    End While
-
-    proc memory_set_int64 from Layout with new_list, count multiplied by 8 plus 16, item
-
-    Return new_list
+    proc add_list_element from HIR with list, item
+    Return list
 End Process
 
 Note: ============================================================================
@@ -208,12 +224,12 @@ Process called "translate_type_annotation" takes type_node as Integer returns In
 
             While index is less than count:
                 Let child be proc memory_get_int64 from Layout with children, index multiplied by 8 plus 8
-                Let arg_hir be proc translate_type_annotation from child
+                Let arg_hir be proc translate_type_annotation with child
                 Set type_args to proc add_to_list with type_args, arg_hir
                 Set index to index plus 1
             End While
 
-            proc set_dict_value with hir_type, "type_arguments", type_args
+            proc set_dict_node with hir_type, "type_arguments", type_args
         End If
 
         Return hir_type
@@ -233,13 +249,13 @@ Process called "translate_type_annotation" takes type_node as Integer returns In
 
             While index is less than count:
                 Set child to proc memory_get_int64 from Layout with children, index multiplied by 8 plus 8
-                Let type_hir be proc translate_type_annotation from child
+                Let type_hir be proc translate_type_annotation with child
                 Set types_list to proc add_to_list with types_list, type_hir
                 Set index to index plus 1
             End While
         End If
 
-        proc set_dict_value with hir_type, "types", types_list
+        proc set_dict_node with hir_type, "types", types_list
 
         Return hir_type
     End If
@@ -258,13 +274,13 @@ Process called "translate_type_annotation" takes type_node as Integer returns In
 
             While index is less than count:
                 Set child to proc memory_get_int64 from Layout with children, index multiplied by 8 plus 8
-                Set type_hir to proc translate_type_annotation from child
+                Set type_hir to proc translate_type_annotation with child
                 Set types_list to proc add_to_list with types_list, type_hir
                 Set index to index plus 1
             End While
         End If
 
-        proc set_dict_value with hir_type, "types", types_list
+        proc set_dict_node with hir_type, "types", types_list
 
         Return hir_type
     End If
@@ -309,8 +325,8 @@ Process called "translate_type_parameters" takes params_node as Integer returns 
             Let constraint_count be proc memory_get_int64 from Layout with param_children, 0
             If constraint_count is greater than 0:
                 Let constraint_node be proc memory_get_int64 from Layout with param_children, 8
-                Let constraint_hir be proc translate_type_annotation from constraint_node
-                proc set_dict_value with param_hir, "constraint", constraint_hir
+                Let constraint_hir be proc translate_type_annotation with constraint_node
+                proc set_dict_node with param_hir, "constraint", constraint_hir
             End If
         End If
 
@@ -354,8 +370,8 @@ Process called "translate_interface_declaration" takes node as Integer returns I
             Let first_type be proc get_node_type from Parser with first_child
 
             If first_type is equal to TS_TYPE_PARAMETER from Parser:
-                Let type_params be proc translate_type_parameters from first_child
-                proc set_dict_value with hir_node, "type_parameters", type_params
+                Let type_params be proc translate_type_parameters with first_child
+                proc set_dict_node with hir_node, "type_parameters", type_params
                 Set child_index to 1
             End If
         End If
@@ -368,11 +384,11 @@ Process called "translate_interface_declaration" takes node as Integer returns I
             Let child_type be proc get_node_type from Parser with child
 
             If child_type is equal to TS_PROPERTY_DEF from Parser:
-                Let member_hir be proc translate_property_definition from child
+                Let member_hir be proc translate_property_definition with child
                 Set members_list to proc add_to_list with members_list, member_hir
             Otherwise:
                 If child_type is equal to TS_METHOD_DEF from Parser:
-                    Set member_hir to proc translate_method_definition from child
+                    Set member_hir to proc translate_method_definition with child
                     Set members_list to proc add_to_list with members_list, member_hir
                 End If
             End If
@@ -380,7 +396,7 @@ Process called "translate_interface_declaration" takes node as Integer returns I
             Set child_index to child_index plus 1
         End While
 
-        proc set_dict_value with hir_node, "members", members_list
+        proc set_dict_node with hir_node, "members", members_list
     End If
 
     Return hir_node
@@ -415,8 +431,8 @@ Process called "translate_type_alias_declaration" takes node as Integer returns 
             Let first_type be proc get_node_type from Parser with first_child
 
             If first_type is equal to TS_TYPE_PARAMETER from Parser:
-                Let type_params be proc translate_type_parameters from first_child
-                proc set_dict_value with hir_node, "type_parameters", type_params
+                Let type_params be proc translate_type_parameters with first_child
+                proc set_dict_node with hir_node, "type_parameters", type_params
                 Set child_index to 1
             End If
         End If
@@ -424,8 +440,8 @@ Process called "translate_type_alias_declaration" takes node as Integer returns 
         Note: Type expression
         If child_index is less than count:
             Let type_expr be proc memory_get_int64 from Layout with children, child_index multiplied by 8 plus 8
-            Let type_hir be proc translate_type_annotation from type_expr
-            proc set_dict_value with hir_node, "type", type_hir
+            Let type_hir be proc translate_type_annotation with type_expr
+            proc set_dict_node with hir_node, "type", type_hir
         End If
     End If
 
@@ -469,8 +485,8 @@ Process called "translate_enum_declaration" takes node as Integer returns Intege
                 Let init_count be proc memory_get_int64 from Layout with member_children, 0
                 If init_count is greater than 0:
                     Let init_node be proc memory_get_int64 from Layout with member_children, 8
-                    Let init_hir be proc translate_expression from init_node
-                    proc set_dict_value with member_hir, "initializer", init_hir
+                    Let init_hir be proc translate_expression with init_node
+                    proc set_dict_node with member_hir, "initializer", init_hir
                 End If
             End If
 
@@ -479,7 +495,7 @@ Process called "translate_enum_declaration" takes node as Integer returns Intege
         End While
     End If
 
-    proc set_dict_value with hir_node, "members", members_list
+    proc set_dict_node with hir_node, "members", members_list
 
     Return hir_node
 End Process
@@ -507,7 +523,7 @@ Process called "translate_class_declaration" takes node as Integer returns Integ
     If attributes is not equal to 0:
         Let is_abstract be proc memory_get_int64 from Layout with attributes, 8
         If is_abstract is equal to 1:
-            proc set_dict_value with hir_node, "abstract", 1
+            proc set_dict_flag with hir_node, "abstract"
         End If
     End If
 
@@ -523,8 +539,8 @@ Process called "translate_class_declaration" takes node as Integer returns Integ
             Let first_type be proc get_node_type from Parser with first_child
 
             If first_type is equal to TS_TYPE_PARAMETER from Parser:
-                Let type_params be proc translate_type_parameters from first_child
-                proc set_dict_value with hir_node, "type_parameters", type_params
+                Let type_params be proc translate_type_parameters with first_child
+                proc set_dict_node with hir_node, "type_parameters", type_params
                 Set child_index to 1
             End If
         End If
@@ -537,11 +553,11 @@ Process called "translate_class_declaration" takes node as Integer returns Integ
             Let child_type be proc get_node_type from Parser with child
 
             If child_type is equal to TS_PROPERTY_DEF from Parser:
-                Let member_hir be proc translate_property_definition from child
+                Let member_hir be proc translate_property_definition with child
                 Set members_list to proc add_to_list with members_list, member_hir
             Otherwise:
                 If child_type is equal to TS_METHOD_DEF from Parser:
-                    Set member_hir to proc translate_method_definition from child
+                    Set member_hir to proc translate_method_definition with child
                     Set members_list to proc add_to_list with members_list, member_hir
                 End If
             End If
@@ -549,7 +565,7 @@ Process called "translate_class_declaration" takes node as Integer returns Integ
             Set child_index to child_index plus 1
         End While
 
-        proc set_dict_value with hir_node, "members", members_list
+        proc set_dict_node with hir_node, "members", members_list
     End If
 
     Return hir_node
@@ -588,7 +604,7 @@ Process called "translate_property_definition" takes node as Integer returns Int
 
         Let is_readonly be proc memory_get_int64 from Layout with attributes, 8
         If is_readonly is equal to 1:
-            proc set_dict_value with hir_node, "readonly", 1
+            proc set_dict_flag with hir_node, "readonly"
         End If
     End If
 
@@ -603,15 +619,15 @@ Process called "translate_property_definition" takes node as Integer returns Int
 
             Note: First child is type annotation
             If first_type is equal to TS_TYPE_ANNOTATION from Parser:
-                Let type_hir be proc translate_type_annotation from first_child
-                proc set_dict_value with hir_node, "type", type_hir
+                Let type_hir be proc translate_type_annotation with first_child
+                proc set_dict_node with hir_node, "type", type_hir
             End If
 
             Note: Second child might be initializer
             If count is greater than 1:
                 Let init_node be proc memory_get_int64 from Layout with children, 16
-                Let init_hir be proc translate_expression from init_node
-                proc set_dict_value with hir_node, "initializer", init_hir
+                Let init_hir be proc translate_expression with init_node
+                proc set_dict_node with hir_node, "initializer", init_hir
             End If
         End If
     End If
@@ -660,8 +676,8 @@ Process called "translate_method_definition" takes node as Integer returns Integ
         Note: Parameters
         If count is greater than 0:
             Let params_node be proc memory_get_int64 from Layout with children, 8
-            Let params_hir be proc translate_parameter_list from params_node
-            proc set_dict_value with hir_node, "parameters", params_hir
+            Let params_hir be proc translate_parameter_list with params_node
+            proc set_dict_node with hir_node, "parameters", params_hir
             Set child_index to 1
         End If
 
@@ -671,8 +687,8 @@ Process called "translate_method_definition" takes node as Integer returns Integ
             Let next_type be proc get_node_type from Parser with next_child
 
             If next_type is equal to TS_TYPE_ANNOTATION from Parser:
-                Let return_type_hir be proc translate_type_annotation from next_child
-                proc set_dict_value with hir_node, "return_type", return_type_hir
+                Let return_type_hir be proc translate_type_annotation with next_child
+                proc set_dict_node with hir_node, "return_type", return_type_hir
                 Set child_index to child_index plus 1
             End If
         End If
@@ -680,8 +696,8 @@ Process called "translate_method_definition" takes node as Integer returns Integ
         Note: Body
         If child_index is less than count:
             Let body_node be proc memory_get_int64 from Layout with children, child_index multiplied by 8 plus 8
-            Let body_hir be proc translate_statement from body_node
-            proc set_dict_value with hir_node, "body", body_hir
+            Let body_hir be proc translate_statement with body_node
+            proc set_dict_node with hir_node, "body", body_hir
         End If
     End If
 
@@ -710,7 +726,7 @@ Process called "translate_function_declaration" takes node as Integer returns In
     If attributes is not equal to 0:
         Let is_async be proc memory_get_int64 from Layout with attributes, 8
         If is_async is equal to 1:
-            proc set_dict_value with hir_node, "async", 1
+            proc set_dict_flag with hir_node, "async"
         End If
     End If
 
@@ -726,8 +742,8 @@ Process called "translate_function_declaration" takes node as Integer returns In
             Let first_type be proc get_node_type from Parser with first_child
 
             If first_type is equal to TS_TYPE_PARAMETER from Parser:
-                Let type_params be proc translate_type_parameters from first_child
-                proc set_dict_value with hir_node, "type_parameters", type_params
+                Let type_params be proc translate_type_parameters with first_child
+                proc set_dict_node with hir_node, "type_parameters", type_params
                 Set child_index to 1
             End If
         End If
@@ -735,8 +751,8 @@ Process called "translate_function_declaration" takes node as Integer returns In
         Note: Parameters
         If child_index is less than count:
             Let params_node be proc memory_get_int64 from Layout with children, child_index multiplied by 8 plus 8
-            Let params_hir be proc translate_parameter_list from params_node
-            proc set_dict_value with hir_node, "parameters", params_hir
+            Let params_hir be proc translate_parameter_list with params_node
+            proc set_dict_node with hir_node, "parameters", params_hir
             Set child_index to child_index plus 1
         End If
 
@@ -746,8 +762,8 @@ Process called "translate_function_declaration" takes node as Integer returns In
             Let next_type be proc get_node_type from Parser with next_child
 
             If next_type is equal to TS_TYPE_ANNOTATION from Parser:
-                Let return_type_hir be proc translate_type_annotation from next_child
-                proc set_dict_value with hir_node, "return_type", return_type_hir
+                Let return_type_hir be proc translate_type_annotation with next_child
+                proc set_dict_node with hir_node, "return_type", return_type_hir
                 Set child_index to child_index plus 1
             End If
         End If
@@ -755,8 +771,8 @@ Process called "translate_function_declaration" takes node as Integer returns In
         Note: Body
         If child_index is less than count:
             Let body_node be proc memory_get_int64 from Layout with children, child_index multiplied by 8 plus 8
-            Let body_hir be proc translate_statement from body_node
-            proc set_dict_value with hir_node, "body", body_hir
+            Let body_hir be proc translate_statement with body_node
+            proc set_dict_node with hir_node, "body", body_hir
         End If
     End If
 
@@ -801,12 +817,12 @@ Process called "translate_parameter_list" takes params_node as Integer returns I
         If attributes is not equal to 0:
             Let is_rest be proc memory_get_int64 from Layout with attributes, 0
             If is_rest is equal to 1:
-                proc set_dict_value with param_hir, "rest", 1
+                proc set_dict_flag with param_hir, "rest"
             End If
 
             Let is_optional be proc memory_get_int64 from Layout with attributes, 8
             If is_optional is equal to 1:
-                proc set_dict_value with param_hir, "optional", 1
+                proc set_dict_flag with param_hir, "optional"
             End If
         End If
 
@@ -820,15 +836,15 @@ Process called "translate_parameter_list" takes params_node as Integer returns I
                 Let first_type be proc get_node_type from Parser with first_child
 
                 If first_type is equal to TS_TYPE_ANNOTATION from Parser:
-                    Let type_hir be proc translate_type_annotation from first_child
-                    proc set_dict_value with param_hir, "type", type_hir
+                    Let type_hir be proc translate_type_annotation with first_child
+                    proc set_dict_node with param_hir, "type", type_hir
                 End If
 
                 Note: Default value
                 If param_count is greater than 1:
                     Let default_node be proc memory_get_int64 from Layout with param_children, 16
-                    Let default_hir be proc translate_expression from default_node
-                    proc set_dict_value with param_hir, "default", default_hir
+                    Let default_hir be proc translate_expression with default_node
+                    proc set_dict_node with param_hir, "default", default_hir
                 End If
             End If
         End If
@@ -893,15 +909,15 @@ Process called "translate_variable_declaration" takes node as Integer returns In
                     Let first_type be proc get_node_type from Parser with first_child
 
                     If first_type is equal to TS_TYPE_ANNOTATION from Parser:
-                        Let type_hir be proc translate_type_annotation from first_child
-                        proc set_dict_value with declarator_hir, "type", type_hir
+                        Let type_hir be proc translate_type_annotation with first_child
+                        proc set_dict_node with declarator_hir, "type", type_hir
                     End If
 
                     Note: Initializer
                     If decl_count is greater than 1:
                         Let init_node be proc memory_get_int64 from Layout with decl_children, 16
-                        Let init_hir be proc translate_expression from init_node
-                        proc set_dict_value with declarator_hir, "initializer", init_hir
+                        Let init_hir be proc translate_expression with init_node
+                        proc set_dict_node with declarator_hir, "initializer", init_hir
                     End If
                 End If
             End If
@@ -911,7 +927,116 @@ Process called "translate_variable_declaration" takes node as Integer returns In
         End While
     End If
 
-    proc set_dict_value with hir_node, "declarators", declarators_list
+    proc set_dict_node with hir_node, "declarators", declarators_list
+
+    Return hir_node
+End Process
+
+@Reasoning:
+import [type] <bindings> from "module" lowers to an import_declaration HIR
+record carrying the module path, a bindings list (one entry per imported
+name, each a dict with its "name"), and the type-only marker preserved so
+the backend can re-emit `import type`. Binding names are read from the
+parser's TS_IDENTIFIER children; the module path is the node name; the
+type-only flag is the attribute value at offset 8.
+@End Reasoning
+
+Process called "translate_import_declaration" takes node as Integer returns Integer:
+    Note: Translate an import declaration to HIR
+
+    Let hir_node be proc create_hir_dict
+    proc set_dict_value with hir_node, "node_type", "import_declaration"
+
+    Let module_path be proc memory_get_int64 from Layout with node, 8
+    If module_path is not equal to 0:
+        proc set_dict_value with hir_node, "module", module_path
+    End If
+
+    Note: Type-only marker (`import type`): attribute value at offset 8.
+    Let attributes be proc memory_get_int64 from Layout with node, 32
+    If attributes is not equal to 0:
+        Let is_type_only be proc memory_get_int64 from Layout with attributes, 8
+        If is_type_only is equal to 1:
+            proc set_dict_flag with hir_node, "type_only"
+        End If
+    End If
+
+    Let bindings_list be proc create_hir_list
+    Let children be proc memory_get_int64 from Layout with node, 24
+    If children is not equal to 0:
+        Let count be proc memory_get_int64 from Layout with children, 0
+        Let index be 0
+        While index is less than count:
+            Let binding_node be proc memory_get_int64 from Layout with children, index multiplied by 8 plus 8
+            Let binding_hir be proc create_hir_dict
+            Let binding_name be proc memory_get_int64 from Layout with binding_node, 8
+            If binding_name is not equal to 0:
+                proc set_dict_value with binding_hir, "name", binding_name
+            End If
+            Set bindings_list to proc add_to_list with bindings_list, binding_hir
+            Set index to index plus 1
+        End While
+    End If
+
+    proc set_dict_node with hir_node, "bindings", bindings_list
+
+    Return hir_node
+End Process
+
+@Reasoning:
+export forms lower to an export_declaration HIR record. A re-export keeps
+the optional source module path; a named export group keeps a bindings
+list; an `export <decl>` / `export default <decl>` keeps the wrapped
+declaration HIR under "declaration". The type-only marker is preserved.
+@End Reasoning
+
+Process called "translate_export_declaration" takes node as Integer returns Integer:
+    Note: Translate an export declaration to HIR
+
+    Let hir_node be proc create_hir_dict
+    proc set_dict_value with hir_node, "node_type", "export_declaration"
+
+    Let module_path be proc memory_get_int64 from Layout with node, 8
+    If module_path is not equal to 0:
+        proc set_dict_value with hir_node, "module", module_path
+    End If
+
+    Let attributes be proc memory_get_int64 from Layout with node, 32
+    If attributes is not equal to 0:
+        Let is_type_only be proc memory_get_int64 from Layout with attributes, 8
+        If is_type_only is equal to 1:
+            proc set_dict_flag with hir_node, "type_only"
+        End If
+    End If
+
+    Note: Children are either binding identifiers (named export group) or a
+    Note: single wrapped declaration (`export <decl>` / `export default`).
+    Let bindings_list be proc create_hir_list
+    Let children be proc memory_get_int64 from Layout with node, 24
+    If children is not equal to 0:
+        Let count be proc memory_get_int64 from Layout with children, 0
+        Let index be 0
+        While index is less than count:
+            Let child be proc memory_get_int64 from Layout with children, index multiplied by 8 plus 8
+            Let child_type be proc get_node_type from Parser with child
+
+            If child_type is equal to TS_IDENTIFIER from Parser:
+                Let binding_hir be proc create_hir_dict
+                Let binding_name be proc memory_get_int64 from Layout with child, 8
+                If binding_name is not equal to 0:
+                    proc set_dict_value with binding_hir, "name", binding_name
+                End If
+                Set bindings_list to proc add_to_list with bindings_list, binding_hir
+            Otherwise:
+                Let decl_hir be proc translate_statement with child
+                proc set_dict_node with hir_node, "declaration", decl_hir
+            End If
+
+            Set index to index plus 1
+        End While
+    End If
+
+    proc set_dict_node with hir_node, "bindings", bindings_list
 
     Return hir_node
 End Process
@@ -938,28 +1063,36 @@ Process called "translate_statement" takes node as Integer returns Integer:
 
     Let node_type be proc get_node_type from Parser with node
 
+    If node_type is equal to TS_IMPORT_DECL from Parser:
+        Return proc translate_import_declaration with node
+    End If
+
+    If node_type is equal to TS_EXPORT_DECL from Parser:
+        Return proc translate_export_declaration with node
+    End If
+
     If node_type is equal to TS_INTERFACE_DECL from Parser:
-        Return proc translate_interface_declaration from node
+        Return proc translate_interface_declaration with node
     End If
 
     If node_type is equal to TS_TYPE_ALIAS_DECL from Parser:
-        Return proc translate_type_alias_declaration from node
+        Return proc translate_type_alias_declaration with node
     End If
 
     If node_type is equal to TS_ENUM_DECL from Parser:
-        Return proc translate_enum_declaration from node
+        Return proc translate_enum_declaration with node
     End If
 
     If node_type is equal to TS_CLASS_DECL from Parser:
-        Return proc translate_class_declaration from node
+        Return proc translate_class_declaration with node
     End If
 
     If node_type is equal to TS_FUNCTION_DECL from Parser:
-        Return proc translate_function_declaration from node
+        Return proc translate_function_declaration with node
     End If
 
     If node_type is equal to TS_VARIABLE_DECL from Parser:
-        Return proc translate_variable_declaration from node
+        Return proc translate_variable_declaration with node
     End If
 
     If node_type is equal to TS_BLOCK_STMT from Parser:
@@ -975,13 +1108,13 @@ Process called "translate_statement" takes node as Integer returns Integer:
 
             While index is less than count:
                 Let child be proc memory_get_int64 from Layout with children, index multiplied by 8 plus 8
-                Let stmt_hir be proc translate_statement from child
+                Let stmt_hir be proc translate_statement with child
                 Set statements_list to proc add_to_list with statements_list, stmt_hir
                 Set index to index plus 1
             End While
         End If
 
-        proc set_dict_value with hir_node, "statements", statements_list
+        proc set_dict_node with hir_node, "statements", statements_list
 
         Return hir_node
     End If
@@ -995,8 +1128,8 @@ Process called "translate_statement" takes node as Integer returns Integer:
             Set count to proc memory_get_int64 from Layout with children, 0
             If count is greater than 0:
                 Let value_node be proc memory_get_int64 from Layout with children, 8
-                Let value_hir be proc translate_expression from value_node
-                proc set_dict_value with hir_node, "value", value_hir
+                Let value_hir be proc translate_expression with value_node
+                proc set_dict_node with hir_node, "value", value_hir
             End If
         End If
 
@@ -1013,20 +1146,20 @@ Process called "translate_statement" takes node as Integer returns Integer:
 
             If count is greater than 0:
                 Let condition_node be proc memory_get_int64 from Layout with children, 8
-                Let condition_hir be proc translate_expression from condition_node
-                proc set_dict_value with hir_node, "condition", condition_hir
+                Let condition_hir be proc translate_expression with condition_node
+                proc set_dict_node with hir_node, "condition", condition_hir
             End If
 
             If count is greater than 1:
                 Let consequent_node be proc memory_get_int64 from Layout with children, 16
-                Let consequent_hir be proc translate_statement from consequent_node
-                proc set_dict_value with hir_node, "consequent", consequent_hir
+                Let consequent_hir be proc translate_statement with consequent_node
+                proc set_dict_node with hir_node, "consequent", consequent_hir
             End If
 
             If count is greater than 2:
                 Let alternate_node be proc memory_get_int64 from Layout with children, 24
-                Let alternate_hir be proc translate_statement from alternate_node
-                proc set_dict_value with hir_node, "alternate", alternate_hir
+                Let alternate_hir be proc translate_statement with alternate_node
+                proc set_dict_node with hir_node, "alternate", alternate_hir
             End If
         End If
 
@@ -1043,26 +1176,26 @@ Process called "translate_statement" takes node as Integer returns Integer:
 
             If count is greater than 0:
                 Let init_node be proc memory_get_int64 from Layout with children, 8
-                Let init_hir be proc translate_statement from init_node
-                proc set_dict_value with hir_node, "init", init_hir
+                Let init_hir be proc translate_statement with init_node
+                proc set_dict_node with hir_node, "init", init_hir
             End If
 
             If count is greater than 1:
                 Set condition_node to proc memory_get_int64 from Layout with children, 16
-                Set condition_hir to proc translate_expression from condition_node
-                proc set_dict_value with hir_node, "condition", condition_hir
+                Set condition_hir to proc translate_expression with condition_node
+                proc set_dict_node with hir_node, "condition", condition_hir
             End If
 
             If count is greater than 2:
                 Let update_node be proc memory_get_int64 from Layout with children, 24
-                Let update_hir be proc translate_expression from update_node
-                proc set_dict_value with hir_node, "update", update_hir
+                Let update_hir be proc translate_expression with update_node
+                proc set_dict_node with hir_node, "update", update_hir
             End If
 
             If count is greater than 3:
                 Let body_node be proc memory_get_int64 from Layout with children, 32
-                Let body_hir be proc translate_statement from body_node
-                proc set_dict_value with hir_node, "body", body_hir
+                Let body_hir be proc translate_statement with body_node
+                proc set_dict_node with hir_node, "body", body_hir
             End If
         End If
 
@@ -1079,14 +1212,14 @@ Process called "translate_statement" takes node as Integer returns Integer:
 
             If count is greater than 0:
                 Set condition_node to proc memory_get_int64 from Layout with children, 8
-                Set condition_hir to proc translate_expression from condition_node
-                proc set_dict_value with hir_node, "condition", condition_hir
+                Set condition_hir to proc translate_expression with condition_node
+                proc set_dict_node with hir_node, "condition", condition_hir
             End If
 
             If count is greater than 1:
                 Set body_node to proc memory_get_int64 from Layout with children, 16
-                Set body_hir to proc translate_statement from body_node
-                proc set_dict_value with hir_node, "body", body_hir
+                Set body_hir to proc translate_statement with body_node
+                proc set_dict_node with hir_node, "body", body_hir
             End If
         End If
 
@@ -1103,8 +1236,8 @@ Process called "translate_statement" takes node as Integer returns Integer:
 
             If count is greater than 0:
                 Let discriminant_node be proc memory_get_int64 from Layout with children, 8
-                Let discriminant_hir be proc translate_expression from discriminant_node
-                proc set_dict_value with hir_node, "discriminant", discriminant_hir
+                Let discriminant_hir be proc translate_expression with discriminant_node
+                proc set_dict_node with hir_node, "discriminant", discriminant_hir
             End If
 
             Let cases_list be proc create_hir_list
@@ -1112,12 +1245,12 @@ Process called "translate_statement" takes node as Integer returns Integer:
 
             While index is less than count:
                 Let case_node be proc memory_get_int64 from Layout with children, index multiplied by 8 plus 8
-                Let case_hir be proc translate_statement from case_node
+                Let case_hir be proc translate_statement with case_node
                 Set cases_list to proc add_to_list with cases_list, case_hir
                 Set index to index plus 1
             End While
 
-            proc set_dict_value with hir_node, "cases", cases_list
+            proc set_dict_node with hir_node, "cases", cases_list
         End If
 
         Return hir_node
@@ -1133,8 +1266,8 @@ Process called "translate_statement" takes node as Integer returns Integer:
 
             If count is greater than 0:
                 Let try_block be proc memory_get_int64 from Layout with children, 8
-                Let try_hir be proc translate_statement from try_block
-                proc set_dict_value with hir_node, "try_block", try_hir
+                Let try_hir be proc translate_statement with try_block
+                proc set_dict_node with hir_node, "try_block", try_hir
             End If
 
             If count is greater than 1:
@@ -1156,12 +1289,12 @@ Process called "translate_statement" takes node as Integer returns Integer:
 
                         If catch_count is greater than 1:
                             Let catch_body be proc memory_get_int64 from Layout with catch_children, 16
-                            Set body_hir to proc translate_statement from catch_body
-                            proc set_dict_value with catch_hir, "body", body_hir
+                            Set body_hir to proc translate_statement with catch_body
+                            proc set_dict_node with catch_hir, "body", body_hir
                         End If
                     End If
 
-                    proc set_dict_value with hir_node, "catch_clause", catch_hir
+                    proc set_dict_node with hir_node, "catch_clause", catch_hir
                 End If
             End If
 
@@ -1175,8 +1308,8 @@ Process called "translate_statement" takes node as Integer returns Integer:
                         Let finally_count be proc memory_get_int64 from Layout with finally_children, 0
                         If finally_count is greater than 0:
                             Let finally_block be proc memory_get_int64 from Layout with finally_children, 8
-                            Let finally_hir be proc translate_statement from finally_block
-                            proc set_dict_value with hir_node, "finally_block", finally_hir
+                            Let finally_hir be proc translate_statement with finally_block
+                            proc set_dict_node with hir_node, "finally_block", finally_hir
                         End If
                     End If
                 End If
@@ -1195,8 +1328,8 @@ Process called "translate_statement" takes node as Integer returns Integer:
             Set count to proc memory_get_int64 from Layout with children, 0
             If count is greater than 0:
                 Let expr_node be proc memory_get_int64 from Layout with children, 8
-                Let expr_hir be proc translate_expression from expr_node
-                proc set_dict_value with hir_node, "expression", expr_hir
+                Let expr_hir be proc translate_expression with expr_node
+                proc set_dict_node with hir_node, "expression", expr_hir
             End If
         End If
 
@@ -1255,14 +1388,14 @@ Process called "translate_expression" takes node as Integer returns Integer:
 
             If count is greater than 0:
                 Let left_node be proc memory_get_int64 from Layout with children, 8
-                Let left_hir be proc translate_expression from left_node
-                proc set_dict_value with hir_node, "left", left_hir
+                Let left_hir be proc translate_expression with left_node
+                proc set_dict_node with hir_node, "left", left_hir
             End If
 
             If count is greater than 1:
                 Let right_node be proc memory_get_int64 from Layout with children, 16
-                Let right_hir be proc translate_expression from right_node
-                proc set_dict_value with hir_node, "right", right_hir
+                Let right_hir be proc translate_expression with right_node
+                proc set_dict_node with hir_node, "right", right_hir
             End If
         End If
 
@@ -1281,8 +1414,8 @@ Process called "translate_expression" takes node as Integer returns Integer:
             Set count to proc memory_get_int64 from Layout with children, 0
             If count is greater than 0:
                 Let operand_node be proc memory_get_int64 from Layout with children, 8
-                Let operand_hir be proc translate_expression from operand_node
-                proc set_dict_value with hir_node, "operand", operand_hir
+                Let operand_hir be proc translate_expression with operand_node
+                proc set_dict_node with hir_node, "operand", operand_hir
             End If
         End If
 
@@ -1302,14 +1435,14 @@ Process called "translate_expression" takes node as Integer returns Integer:
 
             If count is greater than 0:
                 Set left_node to proc memory_get_int64 from Layout with children, 8
-                Set left_hir to proc translate_expression from left_node
-                proc set_dict_value with hir_node, "left", left_hir
+                Set left_hir to proc translate_expression with left_node
+                proc set_dict_node with hir_node, "left", left_hir
             End If
 
             If count is greater than 1:
                 Set right_node to proc memory_get_int64 from Layout with children, 16
-                Set right_hir to proc translate_expression from right_node
-                proc set_dict_value with hir_node, "right", right_hir
+                Set right_hir to proc translate_expression with right_node
+                proc set_dict_node with hir_node, "right", right_hir
             End If
         End If
 
@@ -1326,8 +1459,8 @@ Process called "translate_expression" takes node as Integer returns Integer:
 
             If count is greater than 0:
                 Let callee_node be proc memory_get_int64 from Layout with children, 8
-                Let callee_hir be proc translate_expression from callee_node
-                proc set_dict_value with hir_node, "callee", callee_hir
+                Let callee_hir be proc translate_expression with callee_node
+                proc set_dict_node with hir_node, "callee", callee_hir
             End If
 
             Let args_list be proc create_hir_list
@@ -1335,12 +1468,12 @@ Process called "translate_expression" takes node as Integer returns Integer:
 
             While index is less than count:
                 Let arg_node be proc memory_get_int64 from Layout with children, index multiplied by 8 plus 8
-                Let arg_hir be proc translate_expression from arg_node
+                Let arg_hir be proc translate_expression with arg_node
                 Set args_list to proc add_to_list with args_list, arg_hir
                 Set index to index plus 1
             End While
 
-            proc set_dict_value with hir_node, "arguments", args_list
+            proc set_dict_node with hir_node, "arguments", args_list
         End If
 
         Return hir_node
@@ -1356,14 +1489,14 @@ Process called "translate_expression" takes node as Integer returns Integer:
 
             If count is greater than 0:
                 Let object_node be proc memory_get_int64 from Layout with children, 8
-                Let object_hir be proc translate_expression from object_node
-                proc set_dict_value with hir_node, "object", object_hir
+                Let object_hir be proc translate_expression with object_node
+                proc set_dict_node with hir_node, "object", object_hir
             End If
 
             If count is greater than 1:
                 Let property_node be proc memory_get_int64 from Layout with children, 16
-                Let property_hir be proc translate_expression from property_node
-                proc set_dict_value with hir_node, "property", property_hir
+                Let property_hir be proc translate_expression with property_node
+                proc set_dict_node with hir_node, "property", property_hir
             End If
         End If
 
@@ -1381,8 +1514,8 @@ Process called "translate_expression" takes node as Integer returns Integer:
 
             If count is greater than 0:
                 Let params_node be proc memory_get_int64 from Layout with children, 8
-                Let params_hir be proc translate_parameter_list from params_node
-                proc set_dict_value with hir_node, "parameters", params_hir
+                Let params_hir be proc translate_parameter_list with params_node
+                proc set_dict_node with hir_node, "parameters", params_hir
                 Set child_index to 1
             End If
 
@@ -1392,8 +1525,8 @@ Process called "translate_expression" takes node as Integer returns Integer:
                 Let next_type be proc get_node_type from Parser with next_child
 
                 If next_type is equal to TS_TYPE_ANNOTATION from Parser:
-                    Let return_type_hir be proc translate_type_annotation from next_child
-                    proc set_dict_value with hir_node, "return_type", return_type_hir
+                    Let return_type_hir be proc translate_type_annotation with next_child
+                    proc set_dict_node with hir_node, "return_type", return_type_hir
                     Set child_index to child_index plus 1
                 End If
             End If
@@ -1404,11 +1537,11 @@ Process called "translate_expression" takes node as Integer returns Integer:
                 Let body_type be proc get_node_type from Parser with body_node
 
                 If body_type is equal to TS_BLOCK_STMT from Parser:
-                    Let body_hir be proc translate_statement from body_node
-                    proc set_dict_value with hir_node, "body", body_hir
+                    Let body_hir be proc translate_statement with body_node
+                    proc set_dict_node with hir_node, "body", body_hir
                 Otherwise:
-                    Set body_hir to proc translate_expression from body_node
-                    proc set_dict_value with hir_node, "body", body_hir
+                    Set body_hir to proc translate_expression with body_node
+                    proc set_dict_node with hir_node, "body", body_hir
                 End If
             End If
         End If
@@ -1429,13 +1562,13 @@ Process called "translate_expression" takes node as Integer returns Integer:
 
             While index is less than count:
                 Let elem_node be proc memory_get_int64 from Layout with children, index multiplied by 8 plus 8
-                Let elem_hir be proc translate_expression from elem_node
+                Let elem_hir be proc translate_expression with elem_node
                 Set elements_list to proc add_to_list with elements_list, elem_hir
                 Set index to index plus 1
             End While
         End If
 
-        proc set_dict_value with hir_node, "elements", elements_list
+        proc set_dict_node with hir_node, "elements", elements_list
 
         Return hir_node
     End If
@@ -1463,8 +1596,8 @@ Process called "translate_expression" takes node as Integer returns Integer:
                     Let prop_count be proc memory_get_int64 from Layout with prop_children, 0
                     If prop_count is greater than 0:
                         Let value_node be proc memory_get_int64 from Layout with prop_children, 8
-                        Let value_hir be proc translate_expression from value_node
-                        proc set_dict_value with prop_hir, "value", value_hir
+                        Let value_hir be proc translate_expression with value_node
+                        proc set_dict_node with prop_hir, "value", value_hir
                     End If
                 End If
 
@@ -1473,7 +1606,7 @@ Process called "translate_expression" takes node as Integer returns Integer:
             End While
         End If
 
-        proc set_dict_value with hir_node, "properties", properties_list
+        proc set_dict_node with hir_node, "properties", properties_list
 
         Return hir_node
     End If
@@ -1493,14 +1626,14 @@ Process called "translate_expression" takes node as Integer returns Integer:
 
             If count is greater than 0:
                 Let expr_node be proc memory_get_int64 from Layout with children, 8
-                Let expr_hir be proc translate_expression from expr_node
-                proc set_dict_value with hir_node, "expression", expr_hir
+                Let expr_hir be proc translate_expression with expr_node
+                proc set_dict_node with hir_node, "expression", expr_hir
             End If
 
             If count is greater than 1:
                 Let type_node be proc memory_get_int64 from Layout with children, 16
-                Let type_hir be proc translate_type_annotation from type_node
-                proc set_dict_value with hir_node, "type", type_hir
+                Let type_hir be proc translate_type_annotation with type_node
+                proc set_dict_node with hir_node, "type", type_hir
             End If
         End If
 
@@ -1522,10 +1655,34 @@ Process called "translate_expression" takes node as Integer returns Integer:
         proc set_dict_value with hir_node, "node_type", "literal"
 
         Let literal_type be proc memory_get_int64 from Layout with node, 8
-        proc set_dict_value with hir_node, "literal_type", literal_type
+        If literal_type is not equal to 0:
+            proc set_dict_value with hir_node, "literal_type", literal_type
+        End If
 
+        Note: For integer/float/string literals the value slot holds the
+        Note: source lexeme (a string pointer) and is stored verbatim as a
+        Note: string field. For boolean literals the parser stores the raw
+        Note: integer 1/0 in the value slot, so it is rendered to the
+        Note: keyword string "true"/"false" here to keep the value field a
+        Note: genuine round-trippable string. null literals carry no value.
         Let value be proc memory_get_int64 from Layout with node, 16
-        proc set_dict_value with hir_node, "value", value
+
+        Let is_boolean be 0
+        If literal_type is not equal to 0:
+            Set is_boolean to proc string_equals from StringCore with literal_type, "boolean"
+        End If
+
+        If is_boolean is equal to 1:
+            If value is equal to 0:
+                proc set_dict_value with hir_node, "value", "false"
+            Otherwise:
+                proc set_dict_value with hir_node, "value", "true"
+            End If
+        Otherwise:
+            If value is not equal to 0:
+                proc set_dict_value with hir_node, "value", value
+            End If
+        End If
 
         Return hir_node
     End If
@@ -1581,13 +1738,54 @@ Process called "translate_to_hir" takes ast_root as Integer returns Integer:
 
         While index is less than count:
             Let child be proc memory_get_int64 from Layout with children, index multiplied by 8 plus 8
-            Let stmt_hir be proc translate_statement from child
+            Let stmt_hir be proc translate_statement with child
             Set statements_list to proc add_to_list with statements_list, stmt_hir
             Set index to index plus 1
         End While
     End If
 
-    proc set_dict_value with hir_root, "statements", statements_list
+    proc set_dict_node with hir_root, "statements", statements_list
 
     Return hir_root
+End Process
+
+@Reasoning:
+End-to-end convenience entry matching the JavaScript frontend's
+javascript_to_hir_from_source: it threads raw TypeScript source through
+the three frontend stages (lex -> parse -> lower) and returns the HIR
+program root. The universal-translation pipeline and the round-trip probe
+both want a single source-to-HIR call rather than wiring the lexer,
+parser, and translator together at every call site.
+@End Reasoning
+
+@Implementation:
+Returns 0 on null source. Creates a lexer over the source, a parser over
+that lexer, runs parse to obtain the AST root, and returns 0 if any stage
+yields 0. Otherwise returns translate_to_hir of the AST root. The lexer
+and parser records are owned by this call; the produced HIR is owned by
+the caller.
+@End Implementation
+Process called "typescript_to_hir_from_source" takes source as Integer returns Integer:
+    Note: Lex, parse, and lower TypeScript source to a HIR program
+
+    If source is equal to 0:
+        Return 0
+    End If
+
+    Let lexer be proc create_lexer from Lexer with source
+    If lexer is equal to 0:
+        Return 0
+    End If
+
+    Let parser be proc create_parser from Parser with lexer
+    If parser is equal to 0:
+        Return 0
+    End If
+
+    Let ast_root be proc parse from Parser with parser
+    If ast_root is equal to 0:
+        Return 0
+    End If
+
+    Return proc translate_to_hir with ast_root
 End Process
