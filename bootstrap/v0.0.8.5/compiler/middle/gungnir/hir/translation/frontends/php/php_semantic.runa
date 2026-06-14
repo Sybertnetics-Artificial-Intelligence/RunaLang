@@ -1,1313 +1,1207 @@
-Note: ===================================================================
-Note: PHP SEMANTIC ANALYZER
-Note: ===================================================================
-Note: Semantic analysis for PHP source code. Handles PHP's type system,
-Note: variable scoping, class hierarchies, namespace resolution, and
-Note: modern PHP 7+ features including type hints and strict typing.
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
 
-Note: Part of the Translation Translation System
-Note: Location: compiler/middle/gungnir/hir/translation/frontends/php/php_semantic.runa
-Note: ===================================================================
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+PHP Semantic Analyzer - scope and name analysis over the Stage-A dict-AST.
+
+This pass walks the dictionary/list AST produced by php_parser.runa and performs
+real two-phase semantic analysis:
+
+Phase 1 (collection) records every top-level declaration name: namespaces,
+classes / interfaces / traits / enums, and functions, plus the constant set, so
+forward references resolve regardless of definition order.
+
+Phase 2 (resolution) walks every member resolving name references and per-scope
+variable bindings: function/method/closure/arrow_fn parameters introduce bindings
+that are restored on scope exit; $this / self / static / parent are recognised
+inside class members; foreach key/value vars, catch vars, global/static vars, and
+list() destructuring targets all bind; assignment targets bind their variable.
+Unbound bare variables are recorded as warnings (PHP creates variables on first
+assignment, so an unbound read is suspicious but not provably wrong); unresolved
+class-name references that are not built-ins are recorded as warnings; genuine
+structural problems (a class with an empty name, a function with no name) are
+recorded as errors.
+
+The AST is read entirely through the Stage-A contract documented at the top of
+php_parser.runa: get_ast_attribute(node, key) for named attributes,
+get_ast_children(node) for positional children, and the "node_type" string
+attribute on every node.
+
+Dependencies:
+- compiler/middle/gungnir/hir/translation/frontends/php/php_parser.runa
+- compiler/frontend/primitives/memory/layout.runa
+- compiler/frontend/primitives/collections/list.runa
+- compiler/frontend/primitives/core/string_core.runa
+:End Note
 
 Import "compiler/middle/gungnir/hir/translation/frontends/php/php_parser.runa" as Parser
 Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/collections/list.runa" as ListOps
 Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
-Import "compiler/frontend/primitives/collections/list.runa" as List
-Import "compiler/frontend/primitives/collections/dictionary.runa" as Dict
 
-Note: ===================================================================
-Note: SEMANTIC ANALYZER STRUCTURE
-Note: ===================================================================
+Note: ============================================================================
+Note: ANALYZER STATE
+Note: ============================================================================
 
 @Reasoning:
-Eighteen-slot analyzer state covering PHP's full semantic surface:
-- global_scope/current_scope/scope_stack implement nested function/method
-  scoping;
-- class/interface/trait/function/namespace registries enable O(1)
-  cross-reference resolution;
-- variable_types is the optional inferred-type table;
-- constant_registry holds class- and namespace-level const declarations;
-- use_statements records imported names with their aliases for
-  namespace-rewriting at reference sites;
-- current_namespace and current_class track lexical context for
-  unqualified-name resolution;
-- validation_errors/validation_warnings collect diagnostics;
-- error_message/has_error signal fatal internal errors;
-- strict_types reflects the "declare(strict_types=1)" pragma which
-  changes type-coercion behavior across the file.
+The analyzer threads four lists through the recursive walk: defined_names (the
+names of classes/interfaces/traits/enums/functions/constants declared across the
+program), bound_variables (the variable names currently in scope), errors, and
+warnings. Flat name lists keep binding scope cheap to save/restore around function
+and closure boundaries: a callable records the bound-list length on entry and
+truncates back to it on exit so parameters never leak between sibling callables.
 @End Reasoning
-Type called "PHPSemanticAnalyzer":
-    global_scope as Integer
-    current_scope as Integer
-    scope_stack as Integer
-    class_registry as Integer
-    interface_registry as Integer
-    trait_registry as Integer
-    function_registry as Integer
-    namespace_registry as Integer
-    variable_types as Integer
-    constant_registry as Integer
-    use_statements as Integer
-    current_namespace as Integer
-    current_class as Integer
-    validation_errors as Integer
-    validation_warnings as Integer
-    error_message as Integer
-    has_error as Integer
-    strict_types as Integer
+Type called "PhpSemanticAnalyzer":
+    defined_names as Integer       Note: List of declaration-name strings
+    bound_variables as Integer     Note: List of in-scope variable-name strings
+    errors as Integer              Note: List of error message strings
+    warnings as Integer            Note: List of warning message strings
 End Type
 
-Note: ===================================================================
-Note: ANALYZER CREATION
-Note: ===================================================================
-
 @Reasoning:
-Builds an analyzer with twelve eagerly-allocated registries plus the
-two name-cursor slots (current_namespace, current_class). Eager
-construction avoids per-pass null checks at the cost of upfront
-allocation of empty containers — acceptable because the analyzer is
-constructed once per file.
+Allocates a 32-byte analyzer with four freshly-created lists so each analysis run
+starts with empty scope and diagnostic state. Returns 0 on allocation failure so
+callers can guard.
 @End Reasoning
-
-@Implementation:
-Allocates 136-byte struct, OOM short-circuit. Builds twelve sub-
-containers (Dicts for the registries and use_statements, Lists for
-the scope stack and validation channels). Stores them at offsets
-0/8/16/24/32/40/48/56/64/72/80/104/112. global_scope is aliased into
-both offset 0 and offset 8 so current_scope can move independently
-via push_function_scope without affecting the global anchor. The
-remaining slots (current_namespace 88, current_class 96, error_message
-120, has_error 128, strict_types 136) zero-init.
-@End Implementation
-
 Process called "create_php_semantic_analyzer" returns Integer:
-    Note: Create PHP semantic analyzer for type checking and validation
+    Note: Create a fresh PHP semantic analyzer
 
-    Let analyzer_size be 136
-    Let analyzer be proc allocate from Layout with analyzer_size
-
+    Let analyzer be proc allocate from Layout with 32
     If analyzer is equal to 0:
         Return 0
     End If
 
-    Let global_scope be proc create from Dict
-    Let scope_stack be proc create from List
-    Let class_registry be proc create from Dict
-    Let interface_registry be proc create from Dict
-    Let trait_registry be proc create from Dict
-    Let function_registry be proc create from Dict
-    Let namespace_registry be proc create from Dict
-    Let variable_types be proc create from Dict
-    Let constant_registry be proc create from Dict
-    Let use_statements be proc create from Dict
-    Let validation_errors be proc create from List
-    Let validation_warnings be proc create from List
+    Let defined_names be proc create from ListOps
+    proc memory_set_int64 from Layout with analyzer, 0, defined_names
 
-    proc memory_set_int64 from Layout with analyzer, 0, global_scope
-    proc memory_set_int64 from Layout with analyzer, 8, global_scope
-    proc memory_set_int64 from Layout with analyzer, 16, scope_stack
-    proc memory_set_int64 from Layout with analyzer, 24, class_registry
-    proc memory_set_int64 from Layout with analyzer, 32, interface_registry
-    proc memory_set_int64 from Layout with analyzer, 40, trait_registry
-    proc memory_set_int64 from Layout with analyzer, 48, function_registry
-    proc memory_set_int64 from Layout with analyzer, 56, namespace_registry
-    proc memory_set_int64 from Layout with analyzer, 64, variable_types
-    proc memory_set_int64 from Layout with analyzer, 72, constant_registry
-    proc memory_set_int64 from Layout with analyzer, 80, use_statements
-    proc memory_set_int64 from Layout with analyzer, 88, 0  Note: current_namespace
-    proc memory_set_int64 from Layout with analyzer, 96, 0  Note: current_class
-    proc memory_set_int64 from Layout with analyzer, 104, validation_errors
-    proc memory_set_int64 from Layout with analyzer, 112, validation_warnings
-    proc memory_set_int64 from Layout with analyzer, 120, 0  Note: error_message
-    proc memory_set_int64 from Layout with analyzer, 128, 0  Note: has_error
-    proc memory_set_int64 from Layout with analyzer, 136, 0  Note: strict_types
+    Let bound_variables be proc create from ListOps
+    proc memory_set_int64 from Layout with analyzer, 8, bound_variables
+
+    Let errors be proc create from ListOps
+    proc memory_set_int64 from Layout with analyzer, 16, errors
+
+    Let warnings be proc create from ListOps
+    proc memory_set_int64 from Layout with analyzer, 24, warnings
 
     Return analyzer
 End Process
 
-Note: ===================================================================
-Note: MAIN ANALYSIS ENTRY POINT
-Note: ===================================================================
+@Reasoning:
+Releases the analyzer struct. The four lists are borrowed by callers that may read
+diagnostics afterward, so only the 32-byte struct is freed here; callers own the
+analysis lifetime.
+@End Reasoning
+Process called "destroy_php_semantic_analyzer" takes analyzer as Integer returns Integer:
+    If analyzer is equal to 0:
+        Return 1
+    End If
+    proc deallocate from Layout with analyzer
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: SMALL ACCESSORS
+Note: ============================================================================
 
 @Reasoning:
-Five-phase orchestrator: declarations -> namespace resolution -> class
-hierarchy validation -> function body analysis -> variable usage
-validation. The phase order is dictated by PHP's name-resolution rules:
-namespaces must be resolved before class hierarchies, and class
-hierarchies must be intact before method/function bodies are typed,
-because method calls and inheritance require name resolution to
-succeed first.
+Reads a node's string node_type attribute through the Stage-A accessor.
 @End Reasoning
+Process called "node_type_of" takes node as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    Return proc get_ast_attribute from Parser with node, "node_type"
+End Process
 
-@Implementation:
-Null analyzer returns 0; null program triggers "Null program node"
-error and returns 0. Calls collect_php_declarations,
-resolve_php_namespaces, validate_php_class_hierarchies,
-analyze_php_functions, validate_php_variable_usage in order. After
-all five, reads has_error at offset 128; non-zero short-circuits to
-0. Returns 1 on clean analysis.
-@End Implementation
+@Reasoning:
+Reads a named AST attribute; null-guards the node.
+@End Reasoning
+Process called "attr" takes node as Integer, key as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    Return proc get_ast_attribute from Parser with node, key
+End Process
 
-Process called "analyze_php_program" takes analyzer as Integer, program_node as Integer returns Integer:
-    Note: Perform complete semantic analysis on PHP program
+@Reasoning:
+True (1) when a node's node_type string equals tag.
+@End Reasoning
+Process called "node_is" takes node as Integer, tag as Integer returns Integer:
+    Let nt be proc node_type_of with node
+    If nt is equal to 0:
+        Return 0
+    End If
+    Return proc string_equals from StringCore with nt, tag
+End Process
 
+@Reasoning:
+Records a semantic error message on the analyzer's error list.
+@End Reasoning
+Process called "add_semantic_error" takes analyzer as Integer, message as Integer returns Integer:
+    If analyzer is equal to 0:
+        Return 0
+    End If
+    Let errors be proc memory_get_int64 from Layout with analyzer, 16
+    proc list_append from ListOps with errors, message
+    Return 1
+End Process
+
+@Reasoning:
+Records a semantic warning message on the analyzer's warning list.
+@End Reasoning
+Process called "add_semantic_warning" takes analyzer as Integer, message as Integer returns Integer:
+    If analyzer is equal to 0:
+        Return 0
+    End If
+    Let warnings be proc memory_get_int64 from Layout with analyzer, 24
+    proc list_append from ListOps with warnings, message
+    Return 1
+End Process
+
+@Reasoning:
+Returns the accumulated error list for the driver.
+@End Reasoning
+Process called "get_semantic_errors" takes analyzer as Integer returns Integer:
+    If analyzer is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Layout with analyzer, 16
+End Process
+
+@Reasoning:
+Returns the accumulated warning list for the driver.
+@End Reasoning
+Process called "get_semantic_warnings" takes analyzer as Integer returns Integer:
+    If analyzer is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Layout with analyzer, 24
+End Process
+
+Note: ============================================================================
+Note: SCOPE MANAGEMENT
+Note: ============================================================================
+
+@Reasoning:
+Records a declared name (class/interface/trait/enum/function/constant) so later
+reference resolution can recognise it. Duplicate names are permitted; the table is
+a definition set, not a uniqueness check.
+@End Reasoning
+Process called "define_name" takes analyzer as Integer, name as Integer returns Integer:
+    If analyzer is equal to 0:
+        Return 0
+    End If
+    If name is equal to 0:
+        Return 0
+    End If
+    Let defs be proc memory_get_int64 from Layout with analyzer, 0
+    proc list_append from ListOps with defs, name
+    Return 1
+End Process
+
+@Reasoning:
+Binds a variable name into the current scope (a parameter, a foreach var, a catch
+var, a global/static var, an assignment target, or a list() target). Records the
+name on the bound list.
+@End Reasoning
+Process called "bind_variable" takes analyzer as Integer, name as Integer returns Integer:
+    If analyzer is equal to 0:
+        Return 0
+    End If
+    If name is equal to 0:
+        Return 0
+    End If
+    Let bound be proc memory_get_int64 from Layout with analyzer, 8
+    proc list_append from ListOps with bound, name
+    Return 1
+End Process
+
+@Reasoning:
+Returns the current depth of the binding scope (the bound-variable list length). A
+callable saves this on entry and truncates back to it on exit so parameters do not
+leak across sibling callables.
+@End Reasoning
+Process called "scope_mark" takes analyzer as Integer returns Integer:
+    If analyzer is equal to 0:
+        Return 0
+    End If
+    Let bound be proc memory_get_int64 from Layout with analyzer, 8
+    Return proc list_length from ListOps with bound
+End Process
+
+@Reasoning:
+Truncates the binding scope back to a previously-recorded mark by rebuilding the
+bound-variable list with only the entries below the mark. Because list.runa has no
+in-place truncate primitive, we build a fresh list of the surviving prefix and
+install it as the analyzer's bound list. This restores the enclosing scope when a
+callable exits.
+@End Reasoning
+Process called "scope_restore" takes analyzer as Integer, mark as Integer returns Integer:
     If analyzer is equal to 0:
         Return 0
     End If
 
-    If program_node is equal to 0:
-        proc set_php_semantic_error with analyzer, "Null program node"
+    Let bound be proc memory_get_int64 from Layout with analyzer, 8
+    Let count be proc list_length from ListOps with bound
+
+    If count is less than or equal to mark:
+        Return 1
+    End If
+
+    Let rebuilt be proc create from ListOps
+    Let i be 0
+    While i is less than mark:
+        Let name be proc list_get from ListOps with bound, i
+        proc list_append from ListOps with rebuilt, name
+        Set i to i plus 1
+    End While
+
+    proc memory_set_int64 from Layout with analyzer, 8, rebuilt
+    Return 1
+End Process
+
+@Reasoning:
+True (1) when a variable name is currently in scope. Linear scan over the bound
+list comparing with string_equals. PHP's superglobals ($GLOBALS, $_GET, $_POST,
+$_SERVER, $_SESSION, $_COOKIE, $_REQUEST, $_FILES, $_ENV) and the implicit $this
+are always considered bound.
+@End Reasoning
+Process called "is_variable_bound" takes analyzer as Integer, name as Integer returns Integer:
+    If analyzer is equal to 0:
+        Return 0
+    End If
+    If name is equal to 0:
         Return 0
     End If
 
-    Note: Phase 1: Collect all declarations
-    proc collect_php_declarations with analyzer, program_node
+    If proc is_superglobal with name:
+        Return 1
+    End If
 
-    Note: Phase 2: Resolve namespaces and use statements
-    proc resolve_php_namespaces with analyzer, program_node
+    Let bound be proc memory_get_int64 from Layout with analyzer, 8
+    Let count be proc list_length from ListOps with bound
+    Let i be 0
+    While i is less than count:
+        Let bn be proc list_get from ListOps with bound, i
+        Let matches be proc string_equals from StringCore with bn, name
+        If matches is equal to 1:
+            Return 1
+        End If
+        Set i to i plus 1
+    End While
 
-    Note: Phase 3: Validate class hierarchies and interfaces
-    proc validate_php_class_hierarchies from analyzer
+    Return 0
+End Process
 
-    Note: Phase 4: Analyze function bodies and type checking
-    proc analyze_php_functions with analyzer, program_node
-
-    Note: Phase 5: Validate variable scoping and usage
-    proc validate_php_variable_usage with analyzer, program_node
-
-    Let has_error be proc memory_get_int64 from Layout with analyzer, 128
-    If has_error is equal to 1:
+@Reasoning:
+True (1) when a variable name is one of PHP's automatically-available variables:
+the superglobals and $this. These are bound implicitly in every scope.
+@End Reasoning
+Process called "is_superglobal" takes name as Integer returns Integer:
+    If name is equal to 0:
         Return 0
+    End If
+    If proc string_equals from StringCore with name, "$this":
+        Return 1
+    End If
+    If proc string_equals from StringCore with name, "$GLOBALS":
+        Return 1
+    End If
+    If proc string_equals from StringCore with name, "$_GET":
+        Return 1
+    End If
+    If proc string_equals from StringCore with name, "$_POST":
+        Return 1
+    End If
+    If proc string_equals from StringCore with name, "$_SERVER":
+        Return 1
+    End If
+    If proc string_equals from StringCore with name, "$_SESSION":
+        Return 1
+    End If
+    If proc string_equals from StringCore with name, "$_COOKIE":
+        Return 1
+    End If
+    If proc string_equals from StringCore with name, "$_REQUEST":
+        Return 1
+    End If
+    If proc string_equals from StringCore with name, "$_FILES":
+        Return 1
+    End If
+    If proc string_equals from StringCore with name, "$_ENV":
+        Return 1
+    End If
+    Return 0
+End Process
+
+@Reasoning:
+True (1) when a class-name reference resolves to a recognised PHP built-in or
+reserved class/keyword: self / static / parent and the common SPL / engine
+exception and core classes. References to these are not flagged as unresolved.
+@End Reasoning
+Process called "is_builtin_class" takes name as Integer returns Integer:
+    If name is equal to 0:
+        Return 0
+    End If
+    If proc string_equals from StringCore with name, "self":
+        Return 1
+    End If
+    If proc string_equals from StringCore with name, "static":
+        Return 1
+    End If
+    If proc string_equals from StringCore with name, "parent":
+        Return 1
+    End If
+    If proc string_equals from StringCore with name, "Exception":
+        Return 1
+    End If
+    If proc string_equals from StringCore with name, "Throwable":
+        Return 1
+    End If
+    If proc string_equals from StringCore with name, "Error":
+        Return 1
+    End If
+    If proc string_equals from StringCore with name, "RuntimeException":
+        Return 1
+    End If
+    If proc string_equals from StringCore with name, "InvalidArgumentException":
+        Return 1
+    End If
+    If proc string_equals from StringCore with name, "LogicException":
+        Return 1
+    End If
+    If proc string_equals from StringCore with name, "TypeError":
+        Return 1
+    End If
+    If proc string_equals from StringCore with name, "ValueError":
+        Return 1
+    End If
+    If proc string_equals from StringCore with name, "stdClass":
+        Return 1
+    End If
+    If proc string_equals from StringCore with name, "Closure":
+        Return 1
+    End If
+    If proc string_equals from StringCore with name, "ArrayObject":
+        Return 1
+    End If
+    If proc string_equals from StringCore with name, "Iterator":
+        Return 1
+    End If
+    If proc string_equals from StringCore with name, "IteratorAggregate":
+        Return 1
+    End If
+    If proc string_equals from StringCore with name, "Countable":
+        Return 1
+    End If
+    If proc string_equals from StringCore with name, "Generator":
+        Return 1
+    End If
+    Return 0
+End Process
+
+@Reasoning:
+True (1) when a name is one of those declared across the program. Linear scan over
+the definition set.
+@End Reasoning
+Process called "is_name_defined" takes analyzer as Integer, name as Integer returns Integer:
+    If analyzer is equal to 0:
+        Return 0
+    End If
+    If name is equal to 0:
+        Return 0
+    End If
+
+    Let defs be proc memory_get_int64 from Layout with analyzer, 0
+    Let count be proc list_length from ListOps with defs
+    Let i be 0
+    While i is less than count:
+        Let dn be proc list_get from ListOps with defs, i
+        Let matches be proc string_equals from StringCore with dn, name
+        If matches is equal to 1:
+            Return 1
+        End If
+        Set i to i plus 1
+    End While
+
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: TOP-LEVEL ANALYSIS
+Note: ============================================================================
+
+@Reasoning:
+Entry point. Performs a two-phase analysis over the "program" root's body. Phase 1
+collects every top-level declaration name (recursing into namespace bodies) so
+forward references resolve. Phase 2 walks every member resolving references against
+the collected definitions and per-callable binding scopes. A null AST is a no-op
+success.
+@End Reasoning
+Process called "analyze_php_ast" takes analyzer as Integer, ast as Integer returns Integer:
+    Note: Analyze the PHP AST for scope/name correctness
+
+    If analyzer is equal to 0:
+        Return 0
+    End If
+    If ast is equal to 0:
+        Return 1
+    End If
+
+    Let body be proc attr with ast, "body"
+    If body is equal to 0:
+        Return 1
+    End If
+
+    Note: Phase 1 - collect declaration names for forward references
+    proc collect_definitions_in_list with analyzer, body
+
+    Note: Phase 2 - resolve references node by node
+    proc analyze_node_list with analyzer, body
+    Return 1
+End Process
+
+@Reasoning:
+Phase-1 collector: records class/interface/trait/enum/function names so the resolve
+phase recognises references regardless of order. Recurses into namespace bodies
+(declarations inside a namespace block are still visible by their unqualified name
+within the analysis). Other nodes contribute no top-level definitions.
+@End Reasoning
+Process called "collect_definitions" takes analyzer as Integer, node as Integer returns Integer:
+    If node is equal to 0:
+        Return 1
+    End If
+
+    Let nt be proc node_type_of with node
+    If nt is equal to 0:
+        Return 1
+    End If
+
+    If proc string_equals from StringCore with nt, "namespace":
+        Let nbody be proc attr with node, "body"
+        proc collect_definitions_in_list with analyzer, nbody
+        Return 1
+    End If
+
+    Let is_class be proc string_equals from StringCore with nt, "class"
+    If is_class is equal to 1:
+        proc collect_named with analyzer, node
+        Return 1
+    End If
+    Let is_iface be proc string_equals from StringCore with nt, "interface"
+    If is_iface is equal to 1:
+        proc collect_named with analyzer, node
+        Return 1
+    End If
+    Let is_trait be proc string_equals from StringCore with nt, "trait"
+    If is_trait is equal to 1:
+        proc collect_named with analyzer, node
+        Return 1
+    End If
+    Let is_enum be proc string_equals from StringCore with nt, "enum"
+    If is_enum is equal to 1:
+        proc collect_named with analyzer, node
+        Return 1
+    End If
+    Let is_fn be proc string_equals from StringCore with nt, "function"
+    If is_fn is equal to 1:
+        proc collect_named with analyzer, node
+        Return 1
     End If
 
     Return 1
 End Process
 
-Note: ===================================================================
-Note: DECLARATION COLLECTION
-Note: ===================================================================
-
 @Reasoning:
-First phase: build the registries (class, interface, trait, function,
-constant, namespace, use_statement) by scanning every top-level
-statement. Without this pre-pass, forward references (a class
-extending another class declared later in the file) would fail in
-phase 2.
+Records a node's "name" attribute into the definition set when present.
 @End Reasoning
-
-@Implementation:
-Reads statements list via get_php_statements. Iterates each, querying
-get_php_statement_type and dispatching through Match on the string
-kind: "namespace" -> collect_php_namespace, "use" -> collect_php_use_statement,
-"class"/"interface"/"trait"/"function"/"const"/"declare" -> their
-respective collectors. Other statement kinds are skipped (they are
-analyzed in later phases). No early termination — all collection runs
-even if individual collectors set errors; resolution decides whether
-to bail out.
-@End Implementation
-
-Process called "collect_php_declarations" takes analyzer as Integer, program_node as Integer:
-    Note: Collect all PHP declarations for reference resolution
-
-    Let statements be proc get_php_statements from program_node
-    Let stmt_count be proc size from List with statements
-    Let i be 0
-
-    While i is less than stmt_count:
-        Let statement be proc get from List with statements, i
-        Let stmt_type be proc get_php_statement_type from statement
-
-        Match stmt_type:
-            When "namespace":
-                proc collect_php_namespace with analyzer, statement
-            When "use":
-                proc collect_php_use_statement with analyzer, statement
-            When "class":
-                proc collect_php_class with analyzer, statement
-            When "interface":
-                proc collect_php_interface with analyzer, statement
-            When "trait":
-                proc collect_php_trait with analyzer, statement
-            When "function":
-                proc collect_php_function with analyzer, statement
-            When "const":
-                proc collect_php_constant with analyzer, statement
-            When "declare":
-                proc collect_php_declare with analyzer, statement
-            Otherwise:
-                Note: Other statements will be analyzed in later phases
-        End Match
-
-        Set i to i plus 1
-    End While
+Process called "collect_named" takes analyzer as Integer, node as Integer returns Integer:
+    Let name be proc attr with node, "name"
+    If name is not equal to 0:
+        proc define_name with analyzer, name
+    End If
+    Return 1
 End Process
 
 @Reasoning:
-Registers a namespace declaration and updates the current_namespace
-cursor. Subsequent class/function/constant collectors use the cursor
-to build qualified names. PHP allows multiple namespace declarations
-per file (especially with bracketed namespaces); the cursor reflects
-the most recent declaration only.
+Collects definitions from every node in a list. Null-safe.
 @End Reasoning
-
-@Implementation:
-Reads namespace_name via get_php_namespace_name. Inserts into
-namespace_registry (analyzer offset 56) keyed by name. Updates
-current_namespace (offset 88) to the new name string. The new
-qualified-name cursor takes effect immediately for any subsequent
-collectors invoked in this collect_php_declarations pass.
-@End Implementation
-
-Process called "collect_php_namespace" takes analyzer as Integer, namespace_stmt as Integer:
-    Note: Collect namespace declaration
-
-    Let namespace_name be proc get_php_namespace_name from namespace_stmt
-    Let registry be proc memory_get_int64 from Layout with analyzer, 56
-
-    proc set from Dict with registry, namespace_name, namespace_stmt
-    proc memory_set_int64 from Layout with analyzer, 88, namespace_name
-End Process
-
-@Reasoning:
-Use statements bind a fully-qualified name to a shorter alias in the
-current file. PHP supports three flavours of use (class/function/
-const), each with potentially many items in one use declaration
-(group syntax). The registry key combines type and alias so the
-three namespaces (class/function/const) don't collide.
-@End Reasoning
-
-@Implementation:
-Reads use_type ("class", "function", or "const") and items list.
-Iterates items, extracting original (fully-qualified) name and alias.
-When no explicit alias is provided (use_alias_name returns 0), the
-alias defaults to the simple-name suffix of the original via
-get_simple_name_from_fqn (e.g., `use Foo\Bar` aliases to `Bar`).
-The registry key is built as `"<type>:<alias>"` (e.g., "class:Bar")
-to give each use namespace its own keyspace inside the single
-use_statements Dict.
-@End Implementation
-
-Process called "collect_php_use_statement" takes analyzer as Integer, use_stmt as Integer:
-    Note: Collect use statement for alias resolution
-
-    Let use_type be proc get_php_use_type from use_stmt
-    Let use_items be proc get_php_use_items from use_stmt
-    Let registry be proc memory_get_int64 from Layout with analyzer, 80
-    Let item_count be proc size from List with use_items
+Process called "collect_definitions_in_list" takes analyzer as Integer, lst as Integer returns Integer:
+    If lst is equal to 0:
+        Return 1
+    End If
+    Let count be proc list_length from ListOps with lst
     Let i be 0
-
-    While i is less than item_count:
-        Let use_item be proc get from List with use_items, i
-        Let original_name be proc get_php_use_original_name from use_item
-        Let alias_name be proc get_php_use_alias_name from use_item
-
-        If alias_name is equal to 0:
-            Set alias_name to proc get_simple_name_from_fqn from original_name
+    While i is less than count:
+        Let member be proc list_get from ListOps with lst, i
+        If member is not equal to 0:
+            proc collect_definitions with analyzer, member
         End If
-
-        Let use_key be proc string_concat from StringCore with use_type, ":"
-        Set use_key to proc string_concat from StringCore with use_key, alias_name
-
-        proc set from Dict with registry, use_key, original_name
         Set i to i plus 1
     End While
+    Return 1
 End Process
 
+Note: ============================================================================
+Note: NODE RESOLUTION WALK
+Note: ============================================================================
+
 @Reasoning:
-Indexes a class declaration in class_registry under its qualified
-name. Duplicate definitions in the same namespace are a hard error
-(PHP allows redeclaration only via class_alias which is a runtime
-function, not a declaration). The qualified name is built from the
-current namespace plus the unqualified class name.
+Central resolution dispatcher. Declarations open the structures whose members need
+their own scope handling; callables open binding scopes; control-flow nodes that
+introduce bindings (foreach, catch, global, static) handle them specially; leaf
+variables and names go through reference resolution; every other node recurses into
+its sub-expressions generically. Returns 1 for every node; diagnostics accumulate
+on the analyzer rather than aborting the walk.
 @End Reasoning
-
-@Implementation:
-Reads class_name and current_namespace (offset 88). build_qualified_name
-combines them. Reads class_registry at offset 24, checks for duplicate
-via Dict.contains; on collision sets a "Duplicate class: <name>"
-error and returns. Otherwise inserts the class_stmt AST node into the
-registry keyed by qualified_name.
-@End Implementation
-
-Process called "collect_php_class" takes analyzer as Integer, class_stmt as Integer:
-    Note: Collect class declaration for registry
-
-    Let class_name be proc get_php_class_name from class_stmt
-    Let current_ns be proc memory_get_int64 from Layout with analyzer, 88
-    Let qualified_name be proc build_qualified_name with current_ns, class_name
-
-    Let registry be proc memory_get_int64 from Layout with analyzer, 24
-    Let exists be proc contains from Dict with registry, qualified_name
-
-    If exists is equal to 1:
-        Let error be proc string_concat from StringCore with "Duplicate class: ", qualified_name
-        proc set_php_semantic_error with analyzer, error
-        Return
+Process called "analyze_node" takes analyzer as Integer, node as Integer returns Integer:
+    If node is equal to 0:
+        Return 1
     End If
 
-    proc set from Dict with registry, qualified_name, class_stmt
-End Process
-
-@Reasoning:
-Indexes an interface declaration in interface_registry. Like classes,
-duplicate interface definitions in the same namespace are a hard
-error. Interfaces have their own registry (offset 32) separate from
-classes because PHP allows a class and interface to share a name
-even within the same namespace.
-@End Reasoning
-
-@Implementation:
-Identical pattern to collect_php_class: reads interface_name and
-current_namespace, builds qualified_name, checks for duplicate in
-interface_registry (offset 32), emits "Duplicate interface:" error
-on collision, otherwise inserts the AST node.
-@End Implementation
-
-Process called "collect_php_interface" takes analyzer as Integer, interface_stmt as Integer:
-    Note: Collect interface declaration for registry
-
-    Let interface_name be proc get_php_interface_name from interface_stmt
-    Let current_ns be proc memory_get_int64 from Layout with analyzer, 88
-    Let qualified_name be proc build_qualified_name with current_ns, interface_name
-
-    Let registry be proc memory_get_int64 from Layout with analyzer, 32
-    Let exists be proc contains from Dict with registry, qualified_name
-
-    If exists is equal to 1:
-        Let error be proc string_concat from StringCore with "Duplicate interface: ", qualified_name
-        proc set_php_semantic_error with analyzer, error
-        Return
+    Let nt be proc node_type_of with node
+    If nt is equal to 0:
+        Return 1
     End If
 
-    proc set from Dict with registry, qualified_name, interface_stmt
-End Process
-
-@Reasoning:
-Indexes a trait declaration in trait_registry (offset 40). Traits
-provide horizontal code reuse — methods that can be mixed into multiple
-classes — and must be uniquely named within their namespace. Trait
-conflict resolution during composition is a class-level concern
-handled later, not here.
-@End Reasoning
-
-@Implementation:
-Same duplicate-detection pattern as class/interface collectors. Reads
-trait_name, builds qualified_name with current_namespace, checks for
-existing entry in trait_registry, emits "Duplicate trait:" error on
-collision, otherwise inserts the AST node.
-@End Implementation
-
-Process called "collect_php_trait" takes analyzer as Integer, trait_stmt as Integer:
-    Note: Collect trait declaration for registry
-
-    Let trait_name be proc get_php_trait_name from trait_stmt
-    Let current_ns be proc memory_get_int64 from Layout with analyzer, 88
-    Let qualified_name be proc build_qualified_name with current_ns, trait_name
-
-    Let registry be proc memory_get_int64 from Layout with analyzer, 40
-    Let exists be proc contains from Dict with registry, qualified_name
-
-    If exists is equal to 1:
-        Let error be proc string_concat from StringCore with "Duplicate trait: ", qualified_name
-        proc set_php_semantic_error with analyzer, error
-        Return
+    If proc string_equals from StringCore with nt, "namespace":
+        Let nbody be proc attr with node, "body"
+        Return proc analyze_node_list with analyzer, nbody
+    End If
+    If proc string_equals from StringCore with nt, "class":
+        Return proc analyze_type_decl with analyzer, node
+    End If
+    If proc string_equals from StringCore with nt, "interface":
+        Return proc analyze_type_decl with analyzer, node
+    End If
+    If proc string_equals from StringCore with nt, "trait":
+        Return proc analyze_type_decl with analyzer, node
+    End If
+    If proc string_equals from StringCore with nt, "enum":
+        Return proc analyze_type_decl with analyzer, node
+    End If
+    If proc string_equals from StringCore with nt, "function":
+        Return proc analyze_callable with analyzer, node
+    End If
+    If proc string_equals from StringCore with nt, "method":
+        Return proc analyze_callable with analyzer, node
+    End If
+    If proc string_equals from StringCore with nt, "closure":
+        Return proc analyze_closure with analyzer, node
+    End If
+    If proc string_equals from StringCore with nt, "arrow_fn":
+        Return proc analyze_callable with analyzer, node
+    End If
+    If proc string_equals from StringCore with nt, "foreach":
+        Return proc analyze_foreach with analyzer, node
+    End If
+    If proc string_equals from StringCore with nt, "catch_clause":
+        Return proc analyze_catch with analyzer, node
+    End If
+    If proc string_equals from StringCore with nt, "global":
+        Return proc analyze_var_binding_list with analyzer, node
+    End If
+    If proc string_equals from StringCore with nt, "static_var":
+        Return proc analyze_static_var with analyzer, node
+    End If
+    If proc string_equals from StringCore with nt, "assign":
+        Return proc analyze_assign with analyzer, node
+    End If
+    If proc string_equals from StringCore with nt, "variable":
+        Return proc resolve_variable with analyzer, node
+    End If
+    If proc string_equals from StringCore with nt, "name":
+        Return proc resolve_name with analyzer, node
+    End If
+    If proc string_equals from StringCore with nt, "member":
+        Return proc analyze_member with analyzer, node
+    End If
+    If proc string_equals from StringCore with nt, "static_member":
+        Return proc analyze_static_member with analyzer, node
+    End If
+    If proc string_equals from StringCore with nt, "pair":
+        Note: a pair's key is a STRING; only its value is a sub-expression.
+        Let pval be proc attr with node, "value"
+        If pval is not equal to 0:
+            proc analyze_node with analyzer, pval
+        End If
+        Return 1
     End If
 
-    proc set from Dict with registry, qualified_name, trait_stmt
-End Process
-
-@Reasoning:
-Indexes a top-level (namespace-scoped) function in function_registry.
-Class methods are NOT collected here — they live on their parent class
-node and are reached via the class_registry. PHP namespaces can host
-free functions distinct from class methods of the same name.
-@End Reasoning
-
-@Implementation:
-Same pattern as the other collectors: reads function_name, builds
-qualified_name with current_namespace, checks for duplicate in
-function_registry (offset 48), emits "Duplicate function:" on
-collision, otherwise inserts the AST node.
-@End Implementation
-
-Process called "collect_php_function" takes analyzer as Integer, function_stmt as Integer:
-    Note: Collect function declaration for registry
-
-    Let function_name be proc get_php_function_name from function_stmt
-    Let current_ns be proc memory_get_int64 from Layout with analyzer, 88
-    Let qualified_name be proc build_qualified_name with current_ns, function_name
-
-    Let registry be proc memory_get_int64 from Layout with analyzer, 48
-    Let exists be proc contains from Dict with registry, qualified_name
-
-    If exists is equal to 1:
-        Let error be proc string_concat from StringCore with "Duplicate function: ", qualified_name
-        proc set_php_semantic_error with analyzer, error
-        Return
+    Note: Leaf literal nodes carry their payload as a STRING ("value"), not as a
+    Note: sub-node. They must terminate here so the generic walk never reads a raw
+    Note: string attribute as if it were an AST node pointer (which dereferences
+    Note: garbage). int/float/string/bool/null carry no sub-expressions.
+    If proc string_equals from StringCore with nt, "int":
+        Return 1
+    End If
+    If proc string_equals from StringCore with nt, "float":
+        Return 1
+    End If
+    If proc string_equals from StringCore with nt, "string":
+        Return 1
+    End If
+    If proc string_equals from StringCore with nt, "bool":
+        Return 1
+    End If
+    If proc string_equals from StringCore with nt, "null":
+        Return 1
+    End If
+    If proc string_equals from StringCore with nt, "inline_html":
+        Return 1
     End If
 
-    proc set from Dict with registry, qualified_name, function_stmt
+    Return proc analyze_generic with analyzer, node
 End Process
 
 @Reasoning:
-Indexes a top-level constant in constant_registry. Class constants
-are tracked on their parent class node, not here — this registry
-holds only namespace-level/global `const NAME = value;` declarations
-(not class constants).
+Analyzes every node in a list. Null-safe.
 @End Reasoning
-
-@Implementation:
-Identical pattern to other collectors: reads name, qualifies via
-current_namespace, checks duplicate in constant_registry (offset 72),
-emits "Duplicate constant:" on collision, otherwise inserts.
-@End Implementation
-
-Process called "collect_php_constant" takes analyzer as Integer, const_stmt as Integer:
-    Note: Collect constant declaration for registry
-
-    Let const_name be proc get_php_constant_name from const_stmt
-    Let current_ns be proc memory_get_int64 from Layout with analyzer, 88
-    Let qualified_name be proc build_qualified_name with current_ns, const_name
-
-    Let registry be proc memory_get_int64 from Layout with analyzer, 72
-    Let exists be proc contains from Dict with registry, qualified_name
-
-    If exists is equal to 1:
-        Let error be proc string_concat from StringCore with "Duplicate constant: ", qualified_name
-        proc set_php_semantic_error with analyzer, error
-        Return
+Process called "analyze_node_list" takes analyzer as Integer, lst as Integer returns Integer:
+    If lst is equal to 0:
+        Return 1
     End If
-
-    proc set from Dict with registry, qualified_name, const_stmt
-End Process
-
-@Reasoning:
-The `declare(...)` directive primarily affects strict_types and
-ticks. Of these, strict_types=1 is the most significant because it
-changes type-coercion behavior throughout the file (no implicit
-int->string, no implicit string->int, etc.). We track strict_types
-on the analyzer so check_php_type_compatibility can branch on it.
-@End Reasoning
-
-@Implementation:
-Reads the directives list. Iterates each directive comparing its
-name against "strict_types". On match, if the value is 1, sets
-strict_types at analyzer offset 136 to 1. Other directives are
-currently ignored (ticks, encoding are runtime concerns not semantic
-ones).
-@End Implementation
-
-Process called "collect_php_declare" takes analyzer as Integer, declare_stmt as Integer:
-    Note: Collect declare statement for strict typing
-
-    Let directives be proc get_php_declare_directives from declare_stmt
-    Let directive_count be proc size from List with directives
+    Let count be proc list_length from ListOps with lst
     Let i be 0
+    While i is less than count:
+        Let item be proc list_get from ListOps with lst, i
+        If item is not equal to 0:
+            proc analyze_node with analyzer, item
+        End If
+        Set i to i plus 1
+    End While
+    Return 1
+End Process
 
-    While i is less than directive_count:
-        Let directive be proc get from List with directives, i
-        Let name be proc get_php_directive_name from directive
-        Let value be proc get_php_directive_value from directive
+@Reasoning:
+A class/interface/trait/enum with an empty name is a structural error. Otherwise
+its members are analyzed: methods open their own scopes, while properties and
+constants resolve their default/value expressions at the class scope.
+@End Reasoning
+Process called "analyze_type_decl" takes analyzer as Integer, node as Integer returns Integer:
+    Let name be proc attr with node, "name"
+    If name is equal to 0:
+        proc add_semantic_error with analyzer, "type declaration has no name"
+        Return 1
+    End If
+    Let name_len be proc string_length from StringCore with name
+    If name_len is equal to 0:
+        proc add_semantic_error with analyzer, "type declaration has an empty name"
+        Return 1
+    End If
 
-        Let is_strict_types be proc string_equals from StringCore with name, "strict_types"
-        If is_strict_types is equal to 1:
-            If value is equal to 1:
-                proc memory_set_int64 from Layout with analyzer, 136, 1
+    Let members be proc attr with node, "members"
+    proc analyze_node_list with analyzer, members
+    Return 1
+End Process
+
+@Reasoning:
+A function/method/arrow_fn opens a fresh binding scope. A function/method with no
+name is a structural error. Parameters bind their variable names (and a promoted
+property param binds $this->name implicitly via the param itself); param defaults
+are resolved at the enclosing scope before binding. The body is then resolved with
+the parameters in scope. On exit the scope is restored so the next callable starts
+clean.
+@End Reasoning
+Process called "analyze_callable" takes analyzer as Integer, node as Integer returns Integer:
+    Let nt be proc node_type_of with node
+    Let is_arrow be proc string_equals from StringCore with nt, "arrow_fn"
+    Let is_closure be proc string_equals from StringCore with nt, "closure"
+
+    If is_arrow is equal to 0:
+        If is_closure is equal to 0:
+            Let name be proc attr with node, "name"
+            If name is equal to 0:
+                proc add_semantic_error with analyzer, "callable has no name"
+                Return 1
             End If
         End If
-
-        Set i to i plus 1
-    End While
-End Process
-
-Note: ===================================================================
-Note: NAMESPACE RESOLUTION
-Note: ===================================================================
-
-@Reasoning:
-Phase 2 of the analyzer pipeline. Drives the four reference-resolution
-sub-passes covering classes, interfaces, traits, and functions. After
-this phase, every name used in the program either points to a known
-declaration in one of the registries or is recorded as an undefined-
-name error.
-@End Reasoning
-
-@Implementation:
-Four sequential calls: resolve_class_references, resolve_interface_references,
-resolve_trait_references, resolve_function_references. Each scans the
-corresponding registry and resolves cross-references (extends, implements,
-use traits, function call targets). Errors from each sub-pass
-accumulate via add_php_validation_error.
-@End Implementation
-
-Process called "resolve_php_namespaces" takes analyzer as Integer, program_node as Integer:
-    Note: Resolve namespace and use statement references
-
-    proc resolve_class_references from analyzer
-    proc resolve_interface_references from analyzer
-    proc resolve_trait_references from analyzer
-    proc resolve_function_references from analyzer
-End Process
-
-@Reasoning:
-Iterates every class in class_registry and runs the three reference-
-resolution sub-passes on each: inheritance ("extends"), interfaces
-("implements"), and traits ("use"). The order matters because trait
-resolution depends on the inherited methods being known first.
-@End Reasoning
-Process called "resolve_class_references" takes analyzer as Integer:
-    Note: Resolve class name references and inheritance
-
-    Let class_registry be proc memory_get_int64 from Layout with analyzer, 24
-    Let classes be proc values from Dict with class_registry
-    Let class_count be proc size from List with classes
-    Let i be 0
-
-    While i is less than class_count:
-        Let class_stmt be proc get from List with classes, i
-        proc resolve_class_inheritance with analyzer, class_stmt
-        proc resolve_class_interfaces with analyzer, class_stmt
-        proc resolve_class_traits with analyzer, class_stmt
-        Set i to i plus 1
-    End While
-End Process
-
-@Reasoning:
-Validates the `extends` clause: resolves the parent class name
-through namespace/use-statement rules and reports an error if the
-parent doesn't exist. Circular inheritance detection runs separately
-in detect_circular_inheritance after all parent references are
-resolved.
-@End Reasoning
-
-@Implementation:
-Reads parent_class via get_php_class_extends. If null (no extends),
-returns early. Calls resolve_class_name which applies PHP's
-namespace-resolution rules; on null result (unresolvable), constructs
-a contextual error string "Undefined parent class for <child>: <parent>"
-and adds to validation_errors via add_php_validation_error.
-@End Implementation
-
-Process called "resolve_class_inheritance" takes analyzer as Integer, class_stmt as Integer:
-    Note: Resolve parent class reference
-
-    Let parent_class be proc get_php_class_extends from class_stmt
-    If parent_class is equal to 0:
-        Return
     End If
 
-    Let resolved_parent be proc resolve_class_name with analyzer, parent_class
-    If resolved_parent is equal to 0:
-        Let class_name be proc get_php_class_name from class_stmt
-        Let error be proc string_concat from StringCore with "Undefined parent class for ", class_name
-        Set error to proc string_concat from StringCore with error, ": "
-        Set error to proc string_concat from StringCore with error, parent_class
-        proc add_php_validation_error with analyzer, error
-    End If
-End Process
+    Let mark be proc scope_mark with analyzer
 
-@Reasoning:
-Validates the `implements` clause. PHP allows multiple-interface
-implementation so this scans the full list and reports each
-unresolvable interface separately. Method-implementation completeness
-is checked later by validate_interface_implementations.
-@End Reasoning
+    Let params be proc attr with node, "params"
+    proc bind_params with analyzer, params
 
-@Implementation:
-Reads interfaces list via get_php_class_implements; null returns early
-(no implements clause). Iterates each interface name, calls
-resolve_interface_name. On null result, constructs an "Undefined
-interface for <class>: <interface>" error message and adds via
-add_php_validation_error. Continues iterating after errors so all
-undefined interfaces are reported in one pass.
-@End Implementation
-
-Process called "resolve_class_interfaces" takes analyzer as Integer, class_stmt as Integer:
-    Note: Resolve implemented interface references
-
-    Let interfaces be proc get_php_class_implements from class_stmt
-    If interfaces is equal to 0:
-        Return
-    End If
-
-    Let interface_count be proc size from List with interfaces
-    Let i be 0
-
-    While i is less than interface_count:
-        Let interface_name be proc get from List with interfaces, i
-        Let resolved_interface be proc resolve_interface_name with analyzer, interface_name
-
-        If resolved_interface is equal to 0:
-            Let class_name be proc get_php_class_name from class_stmt
-            Let error be proc string_concat from StringCore with "Undefined interface for ", class_name
-            Set error to proc string_concat from StringCore with error, ": "
-            Set error to proc string_concat from StringCore with error, interface_name
-            proc add_php_validation_error with analyzer, error
-        End If
-
-        Set i to i plus 1
-    End While
-End Process
-
-@Reasoning:
-Validates the `use TraitName` declarations inside a class body. PHP
-allows trait composition with method-conflict resolution syntax
-(precedence and alias); the conflict-resolution checks are deferred
-to a later pass — this routine just verifies that every named trait
-actually exists.
-@End Reasoning
-
-@Implementation:
-Reads the use_traits list via get_php_class_use_traits; null returns
-early. Iterates each trait reference, extracts the trait_name via
-get_php_trait_use_name (the reference structure may include
-precedence/alias info we don't validate here), calls resolve_trait_name.
-On unresolvable, emits "Undefined trait for <class>: <trait>" error.
-@End Implementation
-
-Process called "resolve_class_traits" takes analyzer as Integer, class_stmt as Integer:
-    Note: Resolve used trait references
-
-    Let use_traits be proc get_php_class_use_traits from class_stmt
-    If use_traits is equal to 0:
-        Return
-    End If
-
-    Let trait_count be proc size from List with use_traits
-    Let i be 0
-
-    While i is less than trait_count:
-        Let trait_ref be proc get from List with use_traits, i
-        Let trait_name be proc get_php_trait_use_name from trait_ref
-        Let resolved_trait be proc resolve_trait_name with analyzer, trait_name
-
-        If resolved_trait is equal to 0:
-            Let class_name be proc get_php_class_name from class_stmt
-            Let error be proc string_concat from StringCore with "Undefined trait for ", class_name
-            Set error to proc string_concat from StringCore with error, ": "
-            Set error to proc string_concat from StringCore with error, trait_name
-            proc add_php_validation_error with analyzer, error
-        End If
-
-        Set i to i plus 1
-    End While
-End Process
-
-Note: ===================================================================
-Note: CLASS HIERARCHY VALIDATION
-Note: ===================================================================
-
-@Reasoning:
-Phase 3 driver: runs four validators against the registered class
-graph: cycle detection, interface implementation completeness, trait
-composition rules, and method signature compatibility (LSP, etc.).
-Each is a separate sub-pass to keep the per-validator logic focused.
-@End Reasoning
-
-@Implementation:
-Four sequential calls: detect_circular_inheritance,
-validate_interface_implementations, validate_trait_compositions,
-validate_method_signatures. Each reports errors through
-add_php_validation_error; no early termination so the developer gets
-all hierarchy errors in one pass.
-@End Implementation
-
-Process called "validate_php_class_hierarchies" takes analyzer as Integer:
-    Note: Validate class inheritance hierarchies
-
-    proc detect_circular_inheritance from analyzer
-    proc validate_interface_implementations from analyzer
-    proc validate_trait_compositions from analyzer
-    proc validate_method_signatures from analyzer
-End Process
-
-@Reasoning:
-Detects inheritance cycles using classic three-color DFS: a class
-being visited is gray, a fully-explored class is black, an unvisited
-class is white. A gray->gray transition (a back-edge) is a cycle.
-Cycles are fatal at the language level because PHP cannot resolve
-method dispatch through them.
-@End Reasoning
-
-@Implementation:
-Reads class_registry, builds two Dicts: visited (black) and visiting
-(gray). Iterates each class name; if not yet visited, calls
-detect_inheritance_cycle_from_class which performs the recursive DFS
-and emits errors for any cycles found. Classes already explored
-through a previous DFS root are skipped via the visited check.
-@End Implementation
-
-Process called "detect_circular_inheritance" takes analyzer as Integer:
-    Note: Detect circular inheritance in class hierarchy
-
-    Let class_registry be proc memory_get_int64 from Layout with analyzer, 24
-    Let visited be proc create from Dict
-    Let visiting be proc create from Dict
-
-    Let class_names be proc keys from Dict with class_registry
-    Let class_count be proc size from List with class_names
-    Let i be 0
-
-    While i is less than class_count:
-        Let class_name be proc get from List with class_names, i
-        Let is_visited be proc contains from Dict with visited, class_name
-
-        If is_visited is equal to 0:
-            proc detect_inheritance_cycle_from_class with analyzer, class_name, visited, visiting
-        End If
-
-        Set i to i plus 1
-    End While
-End Process
-
-@Reasoning:
-DFS visit for circular-inheritance detection. Three-color tracking
-(white=not visited; gray=in visiting set; black=in visited set) catches
-back-edges through the "visiting" check. A cycle through the class
-hierarchy is fatal in PHP — emits an error and marks the chain.
-@End Reasoning
-Process called "detect_inheritance_cycle_from_class" takes analyzer as Integer, class_name as Integer, visited as Integer, visiting as Integer:
-    Note: Detect cycles starting from a specific class
-
-    proc set from Dict with visiting, class_name, 1
-
-    Let class_registry be proc memory_get_int64 from Layout with analyzer, 24
-    Let class_stmt be proc get from Dict with class_registry, class_name
-    Let parent_class be proc get_php_class_extends from class_stmt
-
-    If parent_class is not equal to 0:
-        Let is_visiting be proc contains from Dict with visiting, parent_class
-
-        If is_visiting is equal to 1:
-            Note: Cycle detected
-            Let error be proc string_concat from StringCore with "Circular inheritance detected: ", class_name
-            Set error to proc string_concat from StringCore with error, " extends "
-            Set error to proc string_concat from StringCore with error, parent_class
-            proc add_php_validation_error with analyzer, error
+    Let body be proc attr with node, "body"
+    If body is not equal to 0:
+        Let body_nt be proc node_type_of with body
+        Let body_is_block be proc string_equals from StringCore with body_nt, "block"
+        If body_is_block is equal to 1:
+            Let inner be proc attr with body, "body"
+            proc analyze_node_list with analyzer, inner
         Otherwise:
-            Let is_visited be proc contains from Dict with visited, parent_class
-            If is_visited is equal to 0:
-                proc detect_inheritance_cycle_from_class with analyzer, parent_class, visited, visiting
+            Note: arrow_fn body is a single expression.
+            proc analyze_node with analyzer, body
+        End If
+    End If
+
+    proc scope_restore with analyzer, mark
+    Return 1
+End Process
+
+@Reasoning:
+A closure opens a fresh binding scope. Its parameters bind, and its use(...)
+captures bind (a captured variable is in scope inside the closure body), then the
+body is resolved. The captured variables' references in the enclosing scope are
+resolved before binding them inside. On exit the scope is restored.
+@End Reasoning
+Process called "analyze_closure" takes analyzer as Integer, node as Integer returns Integer:
+    Note: Resolve the use(...) capture sources in the enclosing scope first.
+    Let uses be proc attr with node, "uses"
+    If uses is not equal to 0:
+        Let ucount be proc list_length from ListOps with uses
+        Let u be 0
+        While u is less than ucount:
+            Let use_node be proc list_get from ListOps with uses, u
+            If use_node is not equal to 0:
+                Let cap_name be proc attr with use_node, "name"
+                If cap_name is not equal to 0:
+                    Let bound be proc is_variable_bound with analyzer, cap_name
+                    If bound is equal to 0:
+                        proc add_semantic_warning with analyzer, "closure captures unbound variable"
+                    End If
+                End If
+            End If
+            Set u to u plus 1
+        End While
+    End If
+
+    Let mark be proc scope_mark with analyzer
+
+    Let params be proc attr with node, "params"
+    proc bind_params with analyzer, params
+
+    Note: Bind the captured names inside the closure scope.
+    If uses is not equal to 0:
+        Let ucount2 be proc list_length from ListOps with uses
+        Let u2 be 0
+        While u2 is less than ucount2:
+            Let use_node2 be proc list_get from ListOps with uses, u2
+            If use_node2 is not equal to 0:
+                Let cap_name2 be proc attr with use_node2, "name"
+                If cap_name2 is not equal to 0:
+                    proc bind_variable with analyzer, cap_name2
+                End If
+            End If
+            Set u2 to u2 plus 1
+        End While
+    End If
+
+    Let body be proc attr with node, "body"
+    If body is not equal to 0:
+        Let inner be proc attr with body, "body"
+        proc analyze_node_list with analyzer, inner
+    End If
+
+    proc scope_restore with analyzer, mark
+    Return 1
+End Process
+
+@Reasoning:
+Binds every parameter's variable name into scope and resolves each parameter's
+default expression at the enclosing scope (defaults cannot reference other
+parameters). A promoted-property param (non-empty visibility) still binds its
+$name like any other parameter.
+@End Reasoning
+Process called "bind_params" takes analyzer as Integer, params as Integer returns Integer:
+    If params is equal to 0:
+        Return 1
+    End If
+    Let count be proc list_length from ListOps with params
+    Let i be 0
+    While i is less than count:
+        Let param be proc list_get from ListOps with params, i
+        If param is not equal to 0:
+            Let default be proc attr with param, "default"
+            If default is not equal to 0:
+                proc analyze_node with analyzer, default
+            End If
+            Let name be proc attr with param, "name"
+            If name is not equal to 0:
+                proc bind_variable with analyzer, name
             End If
         End If
-    End If
-
-    proc remove from Dict with visiting, class_name
-    proc set from Dict with visited, class_name, 1
-End Process
-
-@Reasoning:
-Iterates every class to check that each implements its declared
-interfaces' required methods. PHP requires that an implementing class
-declare a method with compatible signature for every interface method
-(or be declared abstract to defer it).
-@End Reasoning
-
-@Implementation:
-Reads class_registry, gets all class statements as a list. Iterates
-calling validate_class_interface_implementation on each. That helper
-walks the class's `implements` list and checks each interface against
-the class's method set.
-@End Implementation
-
-Process called "validate_interface_implementations" takes analyzer as Integer:
-    Note: Validate that classes implement all interface methods
-
-    Let class_registry be proc memory_get_int64 from Layout with analyzer, 24
-    Let classes be proc values from Dict with class_registry
-    Let class_count be proc size from List with classes
-    Let i be 0
-
-    While i is less than class_count:
-        Let class_stmt be proc get from List with classes, i
-        proc validate_class_interface_implementation with analyzer, class_stmt
         Set i to i plus 1
     End While
+    Return 1
 End Process
 
 @Reasoning:
-For each interface declared in a class's "implements" list, verifies the
-class declares (or inherits) all the methods required by that interface.
-A missing method emits an error pinpointing both the interface name and
-the absent method.
+A foreach resolves its collection, then binds its key var (when present) and its
+value var (the value var may be a list() destructuring target whose inner targets
+all bind), then resolves the body. The loop variables persist into the body, which
+is foreach's semantics.
 @End Reasoning
-Process called "validate_class_interface_implementation" takes analyzer as Integer, class_stmt as Integer:
-    Note: Validate interface implementation for specific class
-
-    Let interfaces be proc get_php_class_implements from class_stmt
-    If interfaces is equal to 0:
-        Return
+Process called "analyze_foreach" takes analyzer as Integer, node as Integer returns Integer:
+    Let collection be proc attr with node, "collection"
+    If collection is not equal to 0:
+        proc analyze_node with analyzer, collection
     End If
 
-    Let class_methods be proc get_php_class_methods from class_stmt
-    Let interface_count be proc size from List with interfaces
-    Let i be 0
-
-    While i is less than interface_count:
-        Let interface_name be proc get from List with interfaces, i
-        proc validate_interface_method_implementation with analyzer, class_stmt, interface_name, class_methods
-        Set i to i plus 1
-    End While
-End Process
-
-Note: ===================================================================
-Note: FUNCTION ANALYSIS
-Note: ===================================================================
-
-@Reasoning:
-Phase 4 driver: type-checks and validates function bodies. Three
-sub-passes: global functions (free functions registered in
-function_registry), class methods (accessed via class_registry), and
-function calls (validating that callees exist and arguments match
-parameters).
-@End Reasoning
-
-@Implementation:
-Three sequential calls: analyze_global_functions (no program arg —
-uses function_registry), analyze_class_methods (uses class_registry),
-analyze_function_calls (walks the entire program AST to validate
-call sites). Errors accumulate via add_php_validation_error.
-@End Implementation
-
-Process called "analyze_php_functions" takes analyzer as Integer, program_node as Integer:
-    Note: Analyze function bodies and method implementations
-
-    proc analyze_global_functions from analyzer
-    proc analyze_class_methods from analyzer
-    proc analyze_function_calls with analyzer, program_node
-End Process
-
-@Reasoning:
-Walks every entry in the function_registry (the global, namespace-
-qualified functions; not class methods) and analyzes each body via
-analyze_function_body. Class methods are analyzed during class
-analysis, not here.
-@End Reasoning
-Process called "analyze_global_functions" takes analyzer as Integer:
-    Note: Analyze global function implementations
-
-    Let function_registry be proc memory_get_int64 from Layout with analyzer, 48
-    Let functions be proc values from Dict with function_registry
-    Let function_count be proc size from List with functions
-    Let i be 0
-
-    While i is less than function_count:
-        Let function_stmt be proc get from List with functions, i
-        proc analyze_function_body with analyzer, function_stmt
-        Set i to i plus 1
-    End While
-End Process
-
-@Reasoning:
-Per-function analyzer: opens a fresh function-local scope, validates
-parameters (registers them as local variables with their types),
-walks the body statement-by-statement, then validates that return
-statements match the declared return type. The scope push/pop pair
-ensures parameter bindings don't leak into the enclosing scope.
-@End Reasoning
-
-@Implementation:
-Four sequential steps: push_function_scope (creates a new
-function-local scope on the scope_stack and stores function metadata
-for later access by validate_function_returns),
-validate_function_parameters (typechecks param defaults, registers
-param symbols), analyze_statement_block on the body (type-checks
-expressions and statement-level constructs), validate_function_returns
-(verifies each return statement against the declared return type),
-pop_function_scope (tears down the scope).
-@End Implementation
-
-Process called "analyze_function_body" takes analyzer as Integer, function_stmt as Integer:
-    Note: Analyze individual function body
-
-    Note: Enter function scope
-    proc push_function_scope with analyzer, function_stmt
-
-    Note: Validate parameters
-    proc validate_function_parameters with analyzer, function_stmt
-
-    Note: Analyze function body statements
-    Let body be proc get_php_function_body from function_stmt
-    proc analyze_statement_block with analyzer, body
-
-    Note: Validate return statements
-    proc validate_function_returns with analyzer, function_stmt
-
-    Note: Exit function scope
-    proc pop_function_scope from analyzer
-End Process
-
-Note: ===================================================================
-Note: VARIABLE VALIDATION
-Note: ===================================================================
-
-@Reasoning:
-Phase 5 driver: catches three classes of variable-usage error.
-Declaration validation ensures `$var` is bound before being read.
-Reference validation catches type mismatches at use sites against
-the inferred type. Undefined-variable detection emits warnings (not
-errors) since PHP allows undefined variables (they evaluate to null
-with a notice).
-@End Reasoning
-
-@Implementation:
-Three sequential validators on the same program_node:
-validate_variable_declarations, validate_variable_references, and
-check_undefined_variables. Each walks the program AST recursively
-and emits findings via add_php_validation_error or
-add_php_validation_warning.
-@End Implementation
-
-Process called "validate_php_variable_usage" takes analyzer as Integer, program_node as Integer:
-    Note: Validate variable scoping and usage patterns
-
-    proc validate_variable_declarations with analyzer, program_node
-    proc validate_variable_references with analyzer, program_node
-    proc check_undefined_variables with analyzer, program_node
-End Process
-
-Note: ===================================================================
-Note: TYPE CHECKING
-Note: ===================================================================
-
-@Reasoning:
-PHP type compatibility decisions hinge on the strict_types flag.
-Strict mode forbids type juggling: int->string is rejected. Loose
-mode allows the juggling matrix defined by PHP's type-coercion
-rules. Nullable types (?int) are handled specially: they accept the
-base type OR null. Both modes accept exact-name matches.
-@End Reasoning
-
-@Implementation:
-Null on either side returns 1 (no constraint). Reads strict_mode at
-offset 136. Tests exact-name match via strings_equal; on match returns
-1. Tests nullable prefix `?`: if expected starts with `?`, strips
-prefix and re-tests against actual; also returns 1 if actual is
-"null". Falls through to type-juggling check (check_php_type_juggling)
-in loose mode, returns 0 in strict mode.
-@End Implementation
-
-Process called "check_php_type_compatibility" takes analyzer as Integer, expected_type as Integer, actual_type as Integer returns Integer:
-    Note: Check if actual type is compatible with expected type
-
-    If expected_type is equal to 0 or actual_type is equal to 0:
-        Return 1  Note: No type constraint
+    Let key_var be proc attr with node, "key_var"
+    If key_var is not equal to 0:
+        proc bind_assign_target with analyzer, key_var
     End If
 
-    Let strict_mode be proc memory_get_int64 from Layout with analyzer, 136
-
-    Note: Exact type match
-    Let types_equal be proc string_equals from StringCore with expected_type, actual_type
-    If types_equal is equal to 1:
-        Return 1
+    Let value_var be proc attr with node, "value_var"
+    If value_var is not equal to 0:
+        proc bind_assign_target with analyzer, value_var
     End If
 
-    Note: Handle nullable types
-    Let expected_nullable be proc string_starts_with from StringCore with expected_type, "?"
-    If expected_nullable is equal to 1:
-        Let base_expected be proc string_substring from StringCore with expected_type, 1, proc string_length from StringCore with expected_type minus 1
-        Let base_match be proc string_equals from StringCore with base_expected, actual_type
-        If base_match is equal to 1:
-            Return 1
-        End If
+    Let body be proc attr with node, "body"
+    If body is not equal to 0:
+        proc analyze_node with analyzer, body
+    End If
+    Return 1
+End Process
 
-        Note: null is compatible with nullable types
-        Let is_null be proc string_equals from StringCore with actual_type, "null"
-        If is_null is equal to 1:
-            Return 1
+@Reasoning:
+A catch clause binds its exception variable (when named) and resolves its caught
+type names and body. The bound variable persists into the body.
+@End Reasoning
+Process called "analyze_catch" takes analyzer as Integer, node as Integer returns Integer:
+    Let var be proc attr with node, "var"
+    If var is not equal to 0:
+        Let var_len be proc string_length from StringCore with var
+        If var_len is greater than 0:
+            proc bind_variable with analyzer, var
         End If
     End If
 
-    Note: Type juggling in non-strict mode
-    If strict_mode is equal to 0:
-        Return proc check_php_type_juggling with expected_type, actual_type
+    Let body be proc attr with node, "body"
+    If body is not equal to 0:
+        proc analyze_node with analyzer, body
     End If
-
-    Return 0  Note: Not compatible
-End Process
-
-Note: ===================================================================
-Note: ERROR HANDLING
-Note: ===================================================================
-
-@Reasoning:
-Records an internal fatal-error condition on the analyzer (e.g. an
-unexpected AST shape that the analyzer cannot handle). Separate from
-the validation_errors list, which is for user-visible PHP code errors.
-@End Reasoning
-Process called "set_php_semantic_error" takes analyzer as Integer, error_message as Integer:
-    Note: Set semantic analysis error
-
-    proc memory_set_int64 from Layout with analyzer, 120, error_message
-    proc memory_set_int64 from Layout with analyzer, 128, 1
+    Return 1
 End Process
 
 @Reasoning:
-Appends a user-visible validation error (e.g. undefined class, missing
-interface method, type mismatch) to validation_errors. Multiple errors
-accumulate; callers query them via php_semantic_get_errors after the
-analysis pass.
+A member access ($obj->prop or $obj->{$expr}) resolves its object expression. The
+property slot is a STRING when not computed and a sub-node when computed, so it is
+only descended into when the computed flag is set; reading the string slot as a
+node dereferences garbage.
 @End Reasoning
-Process called "add_php_validation_error" takes analyzer as Integer, error_message as Integer:
-    Note: Add validation error to error list
-
-    Let errors be proc memory_get_int64 from Layout with analyzer, 104
-    proc add from List with errors, error_message
+Process called "analyze_member" takes analyzer as Integer, node as Integer returns Integer:
+    Let object be proc attr with node, "object"
+    If object is not equal to 0:
+        proc analyze_node with analyzer, object
+    End If
+    Let computed be proc attr with node, "computed"
+    If computed is equal to 1:
+        Let prop be proc attr with node, "property"
+        If prop is not equal to 0:
+            proc analyze_node with analyzer, prop
+        End If
+    End If
+    Return 1
 End Process
 
 @Reasoning:
-Appends a non-fatal warning (e.g. unused variable, deprecated function
-call) to validation_warnings. Warnings do not block analysis success;
-they are advisory and surface through php_semantic_get_warnings.
+A static member access (Class::member or Class::{$expr}) resolves its class_name
+expression. The member slot is a STRING when not computed and a sub-node when
+computed, so it is only descended into under the computed flag, exactly like
+analyze_member.
 @End Reasoning
-Process called "add_php_validation_warning" takes analyzer as Integer, warning_message as Integer:
-    Note: Add validation warning to warning list
-
-    Let warnings be proc memory_get_int64 from Layout with analyzer, 112
-    proc add from List with warnings, warning_message
-End Process
-
-Note: ===================================================================
-Note: UTILITY FUNCTIONS
-Note: ===================================================================
-
-@Reasoning:
-PHP qualified-name construction: `Namespace\SimpleName`. When the
-namespace is null or empty (global scope), returns the simple name
-unchanged. The backslash is the PHP namespace separator (escaped as
-\\ in source code).
-@End Reasoning
-
-@Implementation:
-Null namespace -> return simple_name. Length-0 namespace -> also
-return simple_name (global scope shortcut). Otherwise concatenates
-namespace + "\" + simple_name using string_concat. Two concatenations
-because Runa lacks a 3-arg concat at this layer.
-@End Implementation
-
-Process called "build_qualified_name" takes namespace as Integer, simple_name as Integer returns Integer:
-    Note: Build fully qualified name from namespace and simple name
-
-    If namespace is equal to 0:
-        Return simple_name
+Process called "analyze_static_member" takes analyzer as Integer, node as Integer returns Integer:
+    Let class_name be proc attr with node, "class_name"
+    If class_name is not equal to 0:
+        proc analyze_node with analyzer, class_name
     End If
-
-    Let ns_length be proc string_length from StringCore with namespace
-    If ns_length is equal to 0:
-        Return simple_name
+    Let computed be proc attr with node, "computed"
+    If computed is equal to 1:
+        Let member be proc attr with node, "member"
+        If member is not equal to 0:
+            proc analyze_node with analyzer, member
+        End If
     End If
-
-    Let qualified be proc string_concat from StringCore with namespace, "\\"
-    Return proc string_concat from StringCore with qualified, simple_name
+    Return 1
 End Process
 
 @Reasoning:
-PHP's class-name resolution algorithm. Checks (in order): use-statement
-aliases (e.g., `use Foo\Bar as Baz` resolves Baz to Foo\Bar);
-fully-qualified names (leading `\`); current-namespace qualification;
-global namespace. Returns the resolved qualified name or 0 (not found).
-Matches the standard PHP resolution rules.
+A global statement binds each of its vars (variable nodes) into the current scope.
 @End Reasoning
-
-@Implementation:
-Step 1: Construct use_key as "class:<name>" and probe use_statements
-(offset 80); on hit return the aliased target. Step 2: Check the
-first character for ASCII 92 ('\\') indicating a fully-qualified
-name; if so return as-is. Step 3: Build current-namespace qualified
-form via build_qualified_name and probe class_registry (offset 24);
-on hit return qualified_name. Step 4: Probe class_registry for the
-bare class_name (global namespace); on hit return class_name itself.
-Step 5: Return 0 (unresolvable).
-@End Implementation
-
-Process called "resolve_class_name" takes analyzer as Integer, class_name as Integer returns Integer:
-    Note: Resolve class name using use statements and namespaces
-
-    Note: Check if it's a use statement alias
-    Let use_registry be proc memory_get_int64 from Layout with analyzer, 80
-    Let use_key be proc string_concat from StringCore with "class:", class_name
-    Let use_exists be proc contains from Dict with use_registry, use_key
-
-    If use_exists is equal to 1:
-        Return proc get from Dict with use_registry, use_key
+Process called "analyze_var_binding_list" takes analyzer as Integer, node as Integer returns Integer:
+    Let vars be proc attr with node, "vars"
+    If vars is equal to 0:
+        Return 1
     End If
-
-    Note: Check if it's fully qualified (starts with \)
-    Let first_char be proc string_char_at from StringCore with class_name, 0
-    If first_char is equal to 92:  Note: Backslash
-        Return class_name
-    End If
-
-    Note: Try current namespace
-    Let current_ns be proc memory_get_int64 from Layout with analyzer, 88
-    Let qualified_name be proc build_qualified_name with current_ns, class_name
-
-    Let class_registry be proc memory_get_int64 from Layout with analyzer, 24
-    Let exists be proc contains from Dict with class_registry, qualified_name
-
-    If exists is equal to 1:
-        Return qualified_name
-    End If
-
-    Note: Try global namespace
-    Let global_exists be proc contains from Dict with class_registry, class_name
-    If global_exists is equal to 1:
-        Return class_name
-    End If
-
-    Return 0  Note: Not found
+    Let count be proc list_length from ListOps with vars
+    Let i be 0
+    While i is less than count:
+        Let v be proc list_get from ListOps with vars, i
+        If v is not equal to 0:
+            proc bind_assign_target with analyzer, v
+        End If
+        Set i to i plus 1
+    End While
+    Return 1
 End Process
 
 @Reasoning:
-Resolves an interface name through PHP's name-resolution rules:
-namespace-qualified names (\Foo\Bar) bypass the use-statement table and
-look up directly; unqualified names check the use-aliases first, then
-the current namespace, then the global namespace. Returns the qualified
-name on success or 0 if unresolvable.
+A static statement binds each static_var_item's name and resolves its default
+expression.
 @End Reasoning
-Process called "resolve_interface_name" takes analyzer as Integer, interface_name as Integer returns Integer:
-    Note: Resolve interface name using use statements and namespaces
-
-    Let use_registry be proc memory_get_int64 from Layout with analyzer, 80
-    Let use_key be proc string_concat from StringCore with "class:", interface_name
-    Let use_exists be proc contains from Dict with use_registry, use_key
-
-    If use_exists is equal to 1:
-        Return proc get from Dict with use_registry, use_key
+Process called "analyze_static_var" takes analyzer as Integer, node as Integer returns Integer:
+    Let vars be proc attr with node, "vars"
+    If vars is equal to 0:
+        Return 1
     End If
-
-    Let current_ns be proc memory_get_int64 from Layout with analyzer, 88
-    Let qualified_name be proc build_qualified_name with current_ns, interface_name
-
-    Let interface_registry be proc memory_get_int64 from Layout with analyzer, 32
-    Let exists be proc contains from Dict with interface_registry, qualified_name
-
-    If exists is equal to 1:
-        Return qualified_name
-    End If
-
-    Let global_exists be proc contains from Dict with interface_registry, interface_name
-    If global_exists is equal to 1:
-        Return interface_name
-    End If
-
-    Return 0
+    Let count be proc list_length from ListOps with vars
+    Let i be 0
+    While i is less than count:
+        Let item be proc list_get from ListOps with vars, i
+        If item is not equal to 0:
+            Let default be proc attr with item, "default"
+            If default is not equal to 0:
+                proc analyze_node with analyzer, default
+            End If
+            Let name be proc attr with item, "name"
+            If name is not equal to 0:
+                proc bind_variable with analyzer, name
+            End If
+        End If
+        Set i to i plus 1
+    End While
+    Return 1
 End Process
 
 @Reasoning:
-Symmetric to resolve_interface_name but resolves against trait_registry.
-Trait resolution follows the same fully-qualified vs use-statement vs
-current-namespace fallback rules as classes and interfaces.
+An assignment resolves its value expression, then binds its target (a plain
+variable, an index/member lvalue whose base resolves, or a list() destructuring
+whose inner targets all bind). This is what makes a subsequently-read variable
+resolve, modelling PHP's create-on-first-assignment semantics.
 @End Reasoning
-Process called "resolve_trait_name" takes analyzer as Integer, trait_name as Integer returns Integer:
-    Note: Resolve trait name using use statements and namespaces
-
-    Let use_registry be proc memory_get_int64 from Layout with analyzer, 80
-    Let use_key be proc string_concat from StringCore with "class:", trait_name
-    Let use_exists be proc contains from Dict with use_registry, use_key
-
-    If use_exists is equal to 1:
-        Return proc get from Dict with use_registry, use_key
+Process called "analyze_assign" takes analyzer as Integer, node as Integer returns Integer:
+    Let value be proc attr with node, "value"
+    If value is not equal to 0:
+        proc analyze_node with analyzer, value
     End If
 
-    Let current_ns be proc memory_get_int64 from Layout with analyzer, 88
-    Let qualified_name be proc build_qualified_name with current_ns, trait_name
-
-    Let trait_registry be proc memory_get_int64 from Layout with analyzer, 40
-    Let exists be proc contains from Dict with trait_registry, qualified_name
-
-    If exists is equal to 1:
-        Return qualified_name
+    Let target be proc attr with node, "target"
+    If target is not equal to 0:
+        proc bind_assign_target with analyzer, target
     End If
-
-    Let global_exists be proc contains from Dict with trait_registry, trait_name
-    If global_exists is equal to 1:
-        Return trait_name
-    End If
-
-    Return 0
-End Process
-
-Note: ===================================================================
-Note: PUBLIC API
-Note: ===================================================================
-
-@Reasoning:
-Public one-shot entry point. Constructs an analyzer, runs the full
-pipeline (collection -> namespace resolution -> class hierarchy
-validation -> function analysis -> variable usage check) against the
-supplied AST, and returns the populated analyzer for the caller to
-query via the accessor procs.
-@End Reasoning
-Process called "php_semantic_analyze" takes program_node as Integer returns Integer:
-    Note: Perform semantic analysis on PHP program
-
-    Let analyzer be proc create_php_semantic_analyzer
-    If analyzer is equal to 0:
-        Return 0
-    End If
-
-    Let result be proc analyze_php_program with analyzer, program_node
-    Return analyzer
+    Return 1
 End Process
 
 @Reasoning:
-Accessor for validation_errors. Null-safe (returns 0 on null analyzer)
-so callers can chain after a possibly-failed analyze call without an
-explicit null check.
+Binds the variables introduced by an assignment/foreach/global target. A plain
+variable binds its name. A list() or array destructuring binds each of its element
+values recursively. An index or member lvalue (e.g. $a[0] = ..., $o->p = ...)
+binds nothing new but resolves its base expression so the base variable is checked.
 @End Reasoning
-Process called "php_semantic_get_errors" takes analyzer as Integer returns Integer:
-    Note: Get validation errors from semantic analysis
-
-    If analyzer is equal to 0:
-        Return 0
-    End If
-
-    Return proc memory_get_int64 from Layout with analyzer, 104
-End Process
-
-@Reasoning:
-Accessor for validation_warnings. Same null-safe semantics as the errors
-accessor.
-@End Reasoning
-Process called "php_semantic_get_warnings" takes analyzer as Integer returns Integer:
-    Note: Get validation warnings from semantic analysis
-
-    If analyzer is equal to 0:
-        Return 0
-    End If
-
-    Return proc memory_get_int64 from Layout with analyzer, 112
-End Process
-
-@Reasoning:
-Returns the error count from validation_errors (or 1 for null analyzer,
-which is itself a failure state). Callers typically treat any non-zero
-result as a build-blocking failure.
-@End Reasoning
-Process called "php_semantic_has_errors" takes analyzer as Integer returns Integer:
-    Note: Check if semantic analysis found any errors
-
-    If analyzer is equal to 0:
+Process called "bind_assign_target" takes analyzer as Integer, target as Integer returns Integer:
+    If target is equal to 0:
         Return 1
     End If
 
-    Let errors be proc memory_get_int64 from Layout with analyzer, 104
-    Let error_count be proc size from List with errors
-    Return error_count
+    Let nt be proc node_type_of with target
+    If nt is equal to 0:
+        Return 1
+    End If
+
+    If proc string_equals from StringCore with nt, "variable":
+        Let name be proc attr with target, "name"
+        If name is not equal to 0:
+            proc bind_variable with analyzer, name
+        End If
+        Return 1
+    End If
+
+    If proc string_equals from StringCore with nt, "list_pattern":
+        proc bind_destructure_elements with analyzer, target
+        Return 1
+    End If
+
+    If proc string_equals from StringCore with nt, "array":
+        proc bind_destructure_elements with analyzer, target
+        Return 1
+    End If
+
+    Note: index / member / static_member lvalue: resolve the base expression.
+    proc analyze_node with analyzer, target
+    Return 1
 End Process
 
 @Reasoning:
-Accessor for the internal fatal error_message string (set via
-set_php_semantic_error). Distinct from the validation_errors list which
-collects user-visible PHP code defects.
+Binds each element value of a list()/[] destructuring target. Each element is an
+array_item whose value is itself a target (a variable or a nested destructuring),
+and whose key (when present) is an ordinary expression that is resolved.
 @End Reasoning
-Process called "php_semantic_get_error_message" takes analyzer as Integer returns Integer:
-    Note: Get primary error message from semantic analysis
+Process called "bind_destructure_elements" takes analyzer as Integer, node as Integer returns Integer:
+    Let elements be proc attr with node, "elements"
+    If elements is equal to 0:
+        Return 1
+    End If
+    Let count be proc list_length from ListOps with elements
+    Let i be 0
+    While i is less than count:
+        Let item be proc list_get from ListOps with elements, i
+        If item is not equal to 0:
+            Let key be proc attr with item, "key"
+            If key is not equal to 0:
+                proc analyze_node with analyzer, key
+            End If
+            Let value be proc attr with item, "value"
+            If value is not equal to 0:
+                proc bind_assign_target with analyzer, value
+            End If
+        End If
+        Set i to i plus 1
+    End While
+    Return 1
+End Process
 
-    If analyzer is equal to 0:
-        Return "Null analyzer"
+Note: ============================================================================
+Note: REFERENCE RESOLUTION
+Note: ============================================================================
+
+@Reasoning:
+Resolves a variable reference. A bound variable (parameter, prior assignment,
+loop/catch/global/static binding) or a superglobal/$this resolves cleanly. Anything
+else is recorded as a warning rather than an error: PHP creates variables lazily so
+an unbound read is suspicious but not provably wrong.
+@End Reasoning
+Process called "resolve_variable" takes analyzer as Integer, node as Integer returns Integer:
+    Let name be proc attr with node, "name"
+    If name is equal to 0:
+        Return 1
     End If
 
-    Return proc memory_get_int64 from Layout with analyzer, 120
+    Let bound be proc is_variable_bound with analyzer, name
+    If bound is equal to 1:
+        Return 1
+    End If
+
+    proc add_semantic_warning with analyzer, "unbound variable reference"
+    Return 1
+End Process
+
+@Reasoning:
+Resolves a class/function/constant name reference. A name that is a declared name
+or a recognised built-in/reserved class resolves cleanly. Anything else is recorded
+as a warning: the referenced symbol may be imported via use or autoloaded, so an
+unknown bare name is suspicious but not provably wrong.
+@End Reasoning
+Process called "resolve_name" takes analyzer as Integer, node as Integer returns Integer:
+    Let value be proc attr with node, "value"
+    If value is equal to 0:
+        Return 1
+    End If
+
+    Let defined be proc is_name_defined with analyzer, value
+    If defined is equal to 1:
+        Return 1
+    End If
+
+    Let builtin be proc is_builtin_class with value
+    If builtin is equal to 1:
+        Return 1
+    End If
+
+    proc add_semantic_warning with analyzer, "unresolved name reference"
+    Return 1
+End Process
+
+@Reasoning:
+Generic recursion for nodes that are not scope-introducing. Resolves the standard
+named single-expression slots and expression-list slots, plus positional children,
+so every reachable variable and name reaches its resolver. The slot set is the
+union of every attribute key the dict-AST contract defines that can hold an
+expression or expression list, so no sub-expression is skipped.
+@End Reasoning
+Process called "analyze_generic" takes analyzer as Integer, node as Integer returns Integer:
+    Note: single-expression slots
+    proc analyze_attr_node with analyzer, node, "expr"
+    proc analyze_attr_node with analyzer, node, "value"
+    proc analyze_attr_node with analyzer, node, "condition"
+    proc analyze_attr_node with analyzer, node, "then"
+    proc analyze_attr_node with analyzer, node, "else"
+    proc analyze_attr_node with analyzer, node, "left"
+    proc analyze_attr_node with analyzer, node, "right"
+    proc analyze_attr_node with analyzer, node, "operand"
+    proc analyze_attr_node with analyzer, node, "object"
+    proc analyze_attr_node with analyzer, node, "callee"
+    proc analyze_attr_node with analyzer, node, "class_name"
+    proc analyze_attr_node with analyzer, node, "anon_class"
+    proc analyze_attr_node with analyzer, node, "index"
+    proc analyze_attr_node with analyzer, node, "collection"
+    proc analyze_attr_node with analyzer, node, "discriminant"
+    proc analyze_attr_node with analyzer, node, "key"
+    proc analyze_attr_node with analyzer, node, "test"
+    proc analyze_attr_node with analyzer, node, "level"
+    proc analyze_attr_node with analyzer, node, "arg"
+    proc analyze_attr_node with analyzer, node, "body"
+    proc analyze_attr_node with analyzer, node, "then_branch"
+    proc analyze_attr_node with analyzer, node, "else_branch"
+    proc analyze_attr_node with analyzer, node, "finally"
+    proc analyze_attr_node with analyzer, node, "default"
+
+    Note: expression-list slots
+    proc analyze_attr_list with analyzer, node, "args"
+    proc analyze_attr_list with analyzer, node, "elements"
+    proc analyze_attr_list with analyzer, node, "conditions"
+    proc analyze_attr_list with analyzer, node, "arms"
+    proc analyze_attr_list with analyzer, node, "cases"
+    proc analyze_attr_list with analyzer, node, "elseifs"
+    proc analyze_attr_list with analyzer, node, "catches"
+    proc analyze_attr_list with analyzer, node, "init"
+    proc analyze_attr_list with analyzer, node, "update"
+    proc analyze_attr_list with analyzer, node, "body"
+    proc analyze_attr_list with analyzer, node, "members"
+    proc analyze_attr_list with analyzer, node, "params"
+
+    Note: positional children, if any
+    Let children be proc get_ast_children from Parser with node
+    If children is not equal to 0:
+        proc analyze_node_list with analyzer, children
+    End If
+
+    Return 1
+End Process
+
+@Reasoning:
+Resolves a single named-attribute sub-node when present and when it is an AST node
+(not a plain string). A node carries a "node_type" attribute; a plain string
+attribute (e.g. an operator) does not, so node_type_of returns 0 and it is skipped.
+Null-safe.
+@End Reasoning
+Process called "analyze_attr_node" takes analyzer as Integer, node as Integer, key as Integer returns Integer:
+    Let child be proc attr with node, key
+    If child is equal to 0:
+        Return 1
+    End If
+    Let child_nt be proc node_type_of with child
+    If child_nt is equal to 0:
+        Return 1
+    End If
+    proc analyze_node with analyzer, child
+    Return 1
+End Process
+
+@Reasoning:
+Resolves a single named-attribute list of sub-nodes when present. The list holds
+AST nodes; condition lists may also hold plain expressions which analyze_node
+handles. Null-safe.
+@End Reasoning
+Process called "analyze_attr_list" takes analyzer as Integer, node as Integer, key as Integer returns Integer:
+    Let lst be proc attr with node, key
+    If lst is not equal to 0:
+        proc analyze_node_list with analyzer, lst
+    End If
+    Return 1
 End Process

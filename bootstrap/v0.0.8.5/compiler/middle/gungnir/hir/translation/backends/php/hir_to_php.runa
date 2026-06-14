@@ -1,1392 +1,2570 @@
-Note: ===================================================================
-Note: HIR TO PHP CODE GENERATOR
-Note: ===================================================================
-Note: Generates PHP code from High-level Intermediate Representation (HIR).
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
 
-Note: Part of the Translation Translation System
-Note: Location: compiler/middle/gungnir/hir/translation/backends/php/hir_to_php.runa
-Note: ===================================================================
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
 
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+HIR to PHP Code Generator - Emit PHP source text from the dict/list-literal HIR
+produced by php_to_hir.runa.
+
+This backend consumes the model-3 interchange shape (hir.runa dictionary-literal
+and list-literal nodes) that the PHP frontend produced, and re-emits valid PHP
+source. Producer and consumer share one representation: a dictionary is a
+HIR_DICTIONARY_LITERAL whose entries List (16-byte [key, value] blocks) hangs at
+the children slot; a list is a HIR_ARRAY_LITERAL whose elements List hangs at the
+children slot; string payloads are HIR string literals read with
+get_string_literal_value. Every node carries a "_type" string entry.
+
+The emitted text re-parses (via php_lexer -> php_parser -> php_to_hir) to a HIR
+that preserves the contents the round-trip probe asserts: namespace + class names,
+method names + count, typed params + defaults, foreach `as $k => $v`, match arm
+counts, array `=>` keys, closure `use(...)` captures, string interpolation.
+
+Dependencies:
+- compiler/middle/gungnir/hir/translation/backends/php/php_emitter.runa
+- compiler/middle/gungnir/hir/hir.runa
+- compiler/frontend/primitives/memory/layout.runa
+- compiler/frontend/primitives/core/string_core.runa
+- compiler/frontend/primitives/collections/list.runa
+:End Note
+
+Import "compiler/middle/gungnir/hir/translation/backends/php/php_emitter.runa" as Emitter
+Import "compiler/middle/gungnir/hir/hir.runa" as HIR
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
 Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
-Import "compiler/frontend/primitives/collections/list.runa" as ListCore
-Import "compiler/middle/gungnir/hir/hir_nodes.runa" as HIR
+Import "compiler/frontend/primitives/collections/list.runa" as ListOps
 
-Note: ===================================================================
-Note: GENERATION CONTEXT
-Note: ===================================================================
+Note: ============================================================================
+Note: Generation Context
+Note: ============================================================================
 
 @Reasoning:
-The per-translation working context for the PHP code generator. The
-output string accumulates all emitted PHP source; indent_level tracks
-the current nesting depth so emit_indent can prefix lines with the
-right number of spaces. current_namespace is reserved for future
-namespace-aware emission (PHP 'namespace' / 'use' directives).
+The generator carries the emitter (backing byte buffer) and the current
+indentation level. PHP blocks are introduced by { ... } with 4-space indentation;
+the level feeds emit_indent so every statement line begins at the correct column.
 @End Reasoning
-
-@Implementation:
-Runa struct of three fields: output (running String of generated PHP),
-indent_level (Integer, 0-based), current_namespace (String, currently
-unused but kept for forward compatibility). Constructed via
-create_generation_context with empty strings and zero indent.
-@End Implementation
-Type called "GenerationContext":
-    output as Integer
-    indent_level as Integer
-    current_namespace as Integer
+Type called "HirToPhpContext":
+    emitter as Integer          Note: PHP emitter instance
+    indent_level as Integer     Note: Current indentation level
 End Type
 
-Note: ===================================================================
-Note: MAIN GENERATION ENTRY POINT
-Note: ===================================================================
-
 @Reasoning:
-Top-level driver: creates a fresh GenerationContext, prefixes the
-output with the PHP open tag '<?php', and dispatches to
-generate_module. Returns the accumulated output string so the caller
-can write it to a file or pass it on.
+Initialises the context at indent level 0 with the supplied emitter. Returns 0 on
+allocation failure.
 @End Reasoning
-
-@Implementation:
-Calls create_generation_context to obtain a fresh ctx. Emits the
-"<?php\n\n" header. Calls generate_module(ctx, hir_module). Returns
-ctx.output (the String built up by every emit call).
-@End Implementation
-Process called "generate_php_from_hir" takes hir_module as Integer returns Integer:
-    Let ctx be proc create_generation_context
-    
-    Note: Add PHP opening tag
-    proc emit with ctx, "<?php\n\n"
-    
-    proc generate_module with ctx, hir_module
-    
-    Return ctx.output
+Process called "create_hir_to_php_context" takes emitter as Integer returns Integer:
+    Let context be proc allocate from Layout with 16
+    If context is equal to 0:
+        Return 0
+    End If
+    proc memory_set_int64 from Layout with context, 0, emitter
+    proc memory_set_int64 from Layout with context, 8, 0
+    Return context
 End Process
 
 @Reasoning:
-Factory for GenerationContext. Initialises every field to a safe
-empty value so the caller can immediately begin emitting without
-checking for null slots. The initial indent_level of 0 is correct
-for module-level emission.
+Releases the context struct; the emitter is owned by the caller so the output
+buffer survives.
 @End Reasoning
-
-@Implementation:
-Constructs a GenerationContext with empty-string output, 0
-indent_level, and empty-string current_namespace. Returns the new
-value.
-@End Implementation
-Process called "create_generation_context" returns Integer:
-    Let ctx be a value of type GenerationContext with
-        output as "",
-        indent_level as 0,
-        current_namespace as ""
-    
-    Return ctx
+Process called "destroy_hir_to_php_context" takes context as Integer returns Integer:
+    If context is equal to 0:
+        Return 1
+    End If
+    proc deallocate from Layout with context
+    Return 1
 End Process
 
-Note: ===================================================================
-Note: MODULE GENERATION
-Note: ===================================================================
+@Reasoning:
+Increases indentation by one level.
+@End Reasoning
+Process called "increase_indent" takes context as Integer returns Integer:
+    If context is equal to 0:
+        Return 0
+    End If
+    Let current be proc memory_get_int64 from Layout with context, 8
+    proc memory_set_int64 from Layout with context, 8, current plus 1
+    Return 1
+End Process
 
 @Reasoning:
-Walks the three top-level lists of an HIR module - imports, classes,
-and functions - and emits each as a PHP top-level construct. The
-order matters: 'use' directives must precede class/function bodies in
-valid PHP. A blank line is inserted between sections only when the
-preceding section was non-empty so the output is tidy regardless of
-which sections are populated.
+Decreases indentation by one level, guarded against underflow so a malformed HIR
+cannot drive indent_level negative.
 @End Reasoning
+Process called "decrease_indent" takes context as Integer returns Integer:
+    If context is equal to 0:
+        Return 0
+    End If
+    Let current be proc memory_get_int64 from Layout with context, 8
+    If current is greater than 0:
+        proc memory_set_int64 from Layout with context, 8, current minus 1
+    End If
+    Return 1
+End Process
 
-@Implementation:
-Queries HIR module accessors hir_module_get_imports/_classes/_functions.
-Each section's list is iterated by index; per item the corresponding
-generate_import / generate_class / generate_function is invoked. After
-each non-empty section the routine emits a "\n" so the next section
-starts on a fresh blank line.
-@End Implementation
-Process called "generate_module" takes ctx as Integer, hir_module as Integer:
-    Note: Generate imports
-    Let imports be proc hir_module_get_imports from HIR with hir_module
-    Let import_count be proc list_length from ListCore with imports
+@Reasoning:
+Emits the current indentation as spaces via the emitter.
+@End Reasoning
+Process called "emit_indent" takes context as Integer returns Integer:
+    If context is equal to 0:
+        Return 0
+    End If
+    Let emitter be proc memory_get_int64 from Layout with context, 0
+    Let level be proc memory_get_int64 from Layout with context, 8
+    proc emit_indent from Emitter with emitter, level
+    Return 1
+End Process
+
+@Reasoning:
+Thin emitter wrappers so the generators read cleanly. Each forwards to the emitter
+held in the context.
+@End Reasoning
+Process called "out_str" takes context as Integer, text as Integer returns Integer:
+    If context is equal to 0:
+        Return 0
+    End If
+    If text is equal to 0:
+        Return 0
+    End If
+    Let emitter be proc memory_get_int64 from Layout with context, 0
+    proc emit_string from Emitter with emitter, text
+    Return 1
+End Process
+
+Process called "out_char" takes context as Integer, ch as Integer returns Integer:
+    If context is equal to 0:
+        Return 0
+    End If
+    Let emitter be proc memory_get_int64 from Layout with context, 0
+    proc emit_char from Emitter with emitter, ch
+    Return 1
+End Process
+
+Process called "out_newline" takes context as Integer returns Integer:
+    If context is equal to 0:
+        Return 0
+    End If
+    Let emitter be proc memory_get_int64 from Layout with context, 0
+    proc emit_newline from Emitter with emitter
+    Return 1
+End Process
+
+Process called "out_space" takes context as Integer returns Integer:
+    If context is equal to 0:
+        Return 0
+    End If
+    Let emitter be proc memory_get_int64 from Layout with context, 0
+    proc emit_space from Emitter with emitter
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: HIR Decode Helpers
+Note: ============================================================================
+
+@Reasoning:
+hir.runa exposes dictionary contents only as an entries List of 16-byte
+[key(0), value(8)] blocks via get_dictionary_entries; it has no keyed lookup.
+This accessor performs the linear key scan the frontend's producer surface pairs
+with, returning the matching entry's value node or 0.
+@End Reasoning
+Process called "get_dictionary_value" takes dict_hir as Integer, key as Integer returns Integer:
+    If dict_hir is equal to 0:
+        Return 0
+    End If
+    If key is equal to 0:
+        Return 0
+    End If
+
+    Let entries be proc get_dictionary_entries from HIR with dict_hir
+    If entries is equal to 0:
+        Return 0
+    End If
+
+    Let count be proc size from ListOps with entries
+    Let index be 0
+    While index is less than count:
+        Let entry be proc get_at from ListOps with entries, index
+        If entry is not equal to 0:
+            Let entry_key be proc memory_get_int64 from Layout with entry, 0
+            Let matches be proc string_equals from StringCore with entry_key, key
+            If matches is equal to 1:
+                Return proc memory_get_int64 from Layout with entry, 8
+            End If
+        End If
+        Set index to index plus 1
+    End While
+
+    Return 0
+End Process
+
+@Reasoning:
+Resolves a keyed value that is stored as a HIR string literal and unwraps it to
+its char* payload. Returns 0 when absent.
+@End Reasoning
+Process called "get_dict_string_value" takes dict_hir as Integer, key as Integer returns Integer:
+    If dict_hir is equal to 0:
+        Return 0
+    End If
+    Let value be proc get_dictionary_value with dict_hir, key
+    If value is equal to 0:
+        Return 0
+    End If
+    Return proc get_string_literal_value from HIR with value
+End Process
+
+@Reasoning:
+Returns a keyed subtree (dict or list HIR node) unmodified.
+@End Reasoning
+Process called "get_dict_hir_value" takes dict_hir as Integer, key as Integer returns Integer:
+    If dict_hir is equal to 0:
+        Return 0
+    End If
+    Return proc get_dictionary_value with dict_hir, key
+End Process
+
+@Reasoning:
+True (1) when a keyed flag entry resolves to the string "1". Flags are stored by
+the frontend as "1"/"0" strings. Absent keys are false.
+@End Reasoning
+Process called "get_dict_flag" takes dict_hir as Integer, key as Integer returns Integer:
+    Let s be proc get_dict_string_value with dict_hir, key
+    If s is equal to 0:
+        Return 0
+    End If
+    Return proc string_equals from StringCore with s, "1"
+End Process
+
+@Reasoning:
+Returns the backing element List of a HIR list-literal node so generators iterate
+with size / get_at.
+@End Reasoning
+Process called "list_elements" takes node as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    Return proc get_list_elements from HIR with node
+End Process
+
+@Reasoning:
+Returns the element count of a keyed list (0 when absent).
+@End Reasoning
+Process called "keyed_list_count" takes node as Integer, key as Integer returns Integer:
+    Let lst be proc get_dict_hir_value with node, key
+    If lst is equal to 0:
+        Return 0
+    End If
+    Let items be proc list_elements with lst
+    If items is equal to 0:
+        Return 0
+    End If
+    Return proc size from ListOps with items
+End Process
+
+@Reasoning:
+True (1) when a node's "_type" string equals tag. Central type test.
+@End Reasoning
+Process called "type_is" takes node as Integer, tag as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    Let nt be proc get_dict_string_value with node, "_type"
+    If nt is equal to 0:
+        Return 0
+    End If
+    Return proc string_equals from StringCore with nt, tag
+End Process
+
+@Reasoning:
+True (1) when a string is non-null and has length > 0. Used to decide whether
+optional name/type/visibility fields are present.
+@End Reasoning
+Process called "str_present" takes s as Integer returns Integer:
+    If s is equal to 0:
+        Return 0
+    End If
+    Let len be proc string_length from StringCore with s
+    If len is greater than 0:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: Main Entry Point
+Note: ============================================================================
+
+@Reasoning:
+Public entry: pairs an emitter with a fresh context, emits the leading <?php tag,
+drives the recursive walker from the HIR root, and lifts the output string before
+destroying the context (the emitter buffer outlives both). Returns 0 on null root.
+@End Reasoning
+Process called "generate_php_from_hir" takes hir_root as Integer returns Integer:
+    Note: Generate PHP source text from HIR
+
+    If hir_root is equal to 0:
+        Return 0
+    End If
+
+    Let emitter be proc create_php_emitter from Emitter
+    If emitter is equal to 0:
+        Return 0
+    End If
+
+    Let context be proc create_hir_to_php_context with emitter
+    If context is equal to 0:
+        proc destroy_php_emitter from Emitter with emitter
+        Return 0
+    End If
+
+    proc out_str with context, "<?php"
+    proc out_newline with context
+
+    proc generate_node with context, hir_root
+
+    Let output be proc get_output from Emitter with emitter
+
+    proc destroy_hir_to_php_context with context
+    proc destroy_php_emitter from Emitter with emitter
+
+    Return output
+End Process
+
+@Reasoning:
+Central dispatcher. Reads the "_type" tag and routes to the matching generator.
+Program + declarations first, then statements, then control-flow + expressions,
+then leaves; unknown tags emit nothing rather than crash.
+@End Reasoning
+Process called "generate_node" takes context as Integer, node as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+
+    Let nt be proc get_dict_string_value with node, "_type"
+    If nt is equal to 0:
+        Return 0
+    End If
+
+    Note: --- program / top level ---
+    If proc string_equals from StringCore with nt, "php_program":
+        Return proc generate_program with context, node
+    End If
+    If proc string_equals from StringCore with nt, "inline_html":
+        Return proc generate_inline_html with context, node
+    End If
+    If proc string_equals from StringCore with nt, "namespace":
+        Return proc generate_namespace with context, node
+    End If
+    If proc string_equals from StringCore with nt, "use":
+        Return proc generate_use with context, node
+    End If
+    If proc string_equals from StringCore with nt, "declare":
+        Return proc generate_declare with context, node
+    End If
+
+    Note: --- declarations ---
+    If proc string_equals from StringCore with nt, "class":
+        Return proc generate_class with context, node, "class"
+    End If
+    If proc string_equals from StringCore with nt, "interface":
+        Return proc generate_interface with context, node
+    End If
+    If proc string_equals from StringCore with nt, "trait":
+        Return proc generate_trait with context, node
+    End If
+    If proc string_equals from StringCore with nt, "enum":
+        Return proc generate_enum with context, node
+    End If
+    If proc string_equals from StringCore with nt, "function":
+        Return proc generate_function with context, node
+    End If
+    If proc string_equals from StringCore with nt, "method":
+        Return proc generate_method with context, node
+    End If
+    If proc string_equals from StringCore with nt, "property":
+        Return proc generate_property with context, node
+    End If
+    If proc string_equals from StringCore with nt, "class_const":
+        Return proc generate_class_const with context, node
+    End If
+    If proc string_equals from StringCore with nt, "enum_case":
+        Return proc generate_enum_case with context, node
+    End If
+    If proc string_equals from StringCore with nt, "use_trait":
+        Return proc generate_use_trait with context, node
+    End If
+
+    Note: --- statements ---
+    If proc string_equals from StringCore with nt, "block":
+        Return proc generate_block with context, node
+    End If
+    If proc string_equals from StringCore with nt, "expr_stmt":
+        Return proc generate_expr_stmt with context, node
+    End If
+    If proc string_equals from StringCore with nt, "echo":
+        Return proc generate_echo with context, node
+    End If
+    If proc string_equals from StringCore with nt, "print":
+        Return proc generate_print_stmt with context, node
+    End If
+    If proc string_equals from StringCore with nt, "if":
+        Return proc generate_if with context, node
+    End If
+    If proc string_equals from StringCore with nt, "while":
+        Return proc generate_while with context, node
+    End If
+    If proc string_equals from StringCore with nt, "do_while":
+        Return proc generate_do_while with context, node
+    End If
+    If proc string_equals from StringCore with nt, "for":
+        Return proc generate_for with context, node
+    End If
+    If proc string_equals from StringCore with nt, "foreach":
+        Return proc generate_foreach with context, node
+    End If
+    If proc string_equals from StringCore with nt, "switch":
+        Return proc generate_switch with context, node
+    End If
+    If proc string_equals from StringCore with nt, "return":
+        Return proc generate_return with context, node
+    End If
+    If proc string_equals from StringCore with nt, "break":
+        Return proc generate_break with context, node
+    End If
+    If proc string_equals from StringCore with nt, "continue":
+        Return proc generate_continue with context, node
+    End If
+    If proc string_equals from StringCore with nt, "throw":
+        Return proc generate_throw with context, node
+    End If
+    If proc string_equals from StringCore with nt, "try":
+        Return proc generate_try with context, node
+    End If
+    If proc string_equals from StringCore with nt, "global":
+        Return proc generate_global with context, node
+    End If
+    If proc string_equals from StringCore with nt, "static_var":
+        Return proc generate_static_var with context, node
+    End If
+    If proc string_equals from StringCore with nt, "unset":
+        Return proc generate_unset with context, node
+    End If
+    If proc string_equals from StringCore with nt, "goto":
+        Return proc generate_goto with context, node
+    End If
+    If proc string_equals from StringCore with nt, "label":
+        Return proc generate_label with context, node
+    End If
+
+    Note: --- expressions (fall through to inline expression generation) ---
+    Return proc generate_expr with context, node
+End Process
+
+Note: ============================================================================
+Note: Program + top level
+Note: ============================================================================
+
+@Reasoning:
+A php_program emits each top-level body node in order. Declarations and statements
+emit their own indentation and trailing newline via generate_stmt_node.
+@End Reasoning
+Process called "generate_program" takes context as Integer, node as Integer returns Integer:
+    Let body be proc get_dict_hir_value with node, "body"
+    proc generate_stmt_list with context, body
+    Return 1
+End Process
+
+@Reasoning:
+Emits every node in a HIR statement list as its own statement line.
+@End Reasoning
+Process called "generate_stmt_list" takes context as Integer, list_node as Integer returns Integer:
+    If list_node is equal to 0:
+        Return 1
+    End If
+    Let items be proc list_elements with list_node
+    If items is equal to 0:
+        Return 1
+    End If
+    Let count be proc size from ListOps with items
     Let i be 0
-    
-    While i is less than import_count:
-        Let import_node be proc list_get from ListCore with imports, i
-        proc generate_import with ctx, import_node
+    While i is less than count:
+        Let item be proc get_at from ListOps with items, i
+        If item is not equal to 0:
+            proc generate_node with context, item
+        End If
         Set i to i plus 1
     End While
-    
-    If import_count is greater than 0:
-        proc emit with ctx, "\n"
-    End If
-    
-    Note: Generate classes
-    Let classes be proc hir_module_get_classes from HIR with hir_module
-    Let class_count be proc list_length from ListCore with classes
-    Set i to 0
-    
-    While i is less than class_count:
-        Let class_node be proc list_get from ListCore with classes, i
-        proc generate_class with ctx, class_node
-        proc emit with ctx, "\n"
-        Set i to i plus 1
-    End While
-    
-    Note: Generate functions
-    Let functions be proc hir_module_get_functions from HIR with hir_module
-    Let func_count be proc list_length from ListCore with functions
-    Set i to 0
-    
-    While i is less than func_count:
-        Let func_node be proc list_get from ListCore with functions, i
-        proc generate_function with ctx, func_node
-        proc emit with ctx, "\n"
-        Set i to i plus 1
-    End While
+    Return 1
 End Process
 
-Note: ===================================================================
-Note: IMPORT GENERATION
-Note: ===================================================================
-
 @Reasoning:
-Emits a PHP 'use Name;' directive for each HIR import. PHP's 'use'
-imports a namespace/class into the current file scope, the closest
-analogue to a generic source-language import. Indentation is applied
-even at module scope (0 indent) so the directive shape is uniform.
+Inline HTML emitted between PHP tags: close PHP, emit verbatim text, reopen PHP.
 @End Reasoning
-
-@Implementation:
-Calls hir_import_get_name to retrieve the import target string. Emits
-"use ", then the name, then ";\n" - the trailing newline ensures each
-'use' directive sits on its own line.
-@End Implementation
-Process called "generate_import" takes ctx as Integer, import_node as Integer:
-    Let import_name be proc hir_import_get_name from HIR with import_node
-    
-    proc emit_indent from ctx
-    proc emit with ctx, "use "
-    proc emit with ctx, import_name
-    proc emit with ctx, ";\n"
+Process called "generate_inline_html" takes context as Integer, node as Integer returns Integer:
+    Let text be proc get_dict_string_value with node, "text"
+    proc out_str with context, "?>"
+    If text is not equal to 0:
+        proc out_str with context, text
+    End If
+    proc out_str with context, "<?php"
+    proc out_newline with context
+    Return 1
 End Process
 
-Note: ===================================================================
-Note: CLASS GENERATION
-Note: ===================================================================
-
 @Reasoning:
-Emits a PHP class, interface, or trait declaration with all its
-members. The discrimination among class/interface/trait is carried as
-the metadata key 'php_type' on the HIR node so the same HIR shape
-covers all three; this avoids three nearly-identical generators.
-Modifiers (abstract/final), 'extends' parent, and 'implements' list
-are also read from metadata. Inside the body, the four member kinds
-are emitted in the conventional PHP order: constants, fields, then
-methods - matching common PSR style guides.
+A namespace emits 'namespace Name;' for the ';' form (no body lines) or
+'namespace Name {\n ... \n}' for the block form. A blank name emits the global
+namespace block 'namespace {' ... '}'.
 @End Reasoning
+Process called "generate_namespace" takes context as Integer, node as Integer returns Integer:
+    Let name be proc get_dict_string_value with node, "name"
+    Let is_block be proc get_dict_flag with node, "is_block"
+    Let body be proc get_dict_hir_value with node, "body"
 
-@Implementation:
-Reads php_type, php_modifier, php_extends, php_implements via
-hir_get_metadata. Emits modifier prefix (abstract/final), then
-class/interface/trait keyword, then the class name, then optional
-'extends X', then optional 'implements I1, I2'. Opens body brace.
-Iterates hir_class_get_constants, _fields, _methods; each iteration
-delegates to generate_class_constant / generate_field /
-generate_method. A blank line separates non-empty member groups;
-within methods a blank line separates adjacent methods. Closes body
-brace.
-@End Implementation
-Process called "generate_class" takes ctx as Integer, class_node as Integer:
-    Let class_name be proc hir_class_get_name from HIR with class_node
-    
-    Note: Check if this is an interface or trait
-    Let php_type be proc hir_get_metadata from HIR with class_node, "php_type"
-    
-    Let is_interface be proc string_equals from StringCore with php_type, "interface"
-    Let is_trait be proc string_equals from StringCore with php_type, "trait"
-    
-    Note: Extract modifiers
-    Let modifiers be proc hir_get_metadata from HIR with class_node, "php_modifier"
-    
-    proc emit_indent from ctx
-    
-    Note: Emit modifiers
-    If modifiers is not equal to 0:
-        Let is_abstract be proc string_equals from StringCore with modifiers, "abstract"
-        Let is_final be proc string_equals from StringCore with modifiers, "final"
-        
-        If is_abstract is equal to 1:
-            proc emit with ctx, "abstract "
-        End If
-        
-        If is_final is equal to 1:
-            proc emit with ctx, "final "
-        End If
+    proc emit_indent with context
+    proc out_str with context, "namespace"
+
+    If proc str_present with name:
+        proc out_space with context
+        proc out_str with context, name
     End If
-    
-    Note: Emit class/interface/trait keyword
-    If is_interface is equal to 1:
-        proc emit with ctx, "interface "
+
+    If is_block is equal to 1:
+        proc out_space with context
+        proc out_str with context, "{"
+        proc out_newline with context
+        proc increase_indent with context
+        proc generate_stmt_list with context, body
+        proc decrease_indent with context
+        proc emit_indent with context
+        proc out_str with context, "}"
+        proc out_newline with context
     Otherwise:
-        If is_trait is equal to 1:
-            proc emit with ctx, "trait "
-        Otherwise:
-            proc emit with ctx, "class "
+        proc out_str with context, ";"
+        proc out_newline with context
+        proc generate_stmt_list with context, body
+    End If
+    Return 1
+End Process
+
+@Reasoning:
+A use statement emits 'use [function|const] Name [as Alias], ...;' across its
+items. The kind prefixes "function "/"const " for those import flavors.
+@End Reasoning
+Process called "generate_use" takes context as Integer, node as Integer returns Integer:
+    proc emit_indent with context
+    proc out_str with context, "use"
+    proc out_space with context
+
+    Let kind be proc get_dict_string_value with node, "kind"
+    If kind is not equal to 0:
+        Let is_fn be proc string_equals from StringCore with kind, "function"
+        If is_fn is equal to 1:
+            proc out_str with context, "function"
+            proc out_space with context
+        End If
+        Let is_const be proc string_equals from StringCore with kind, "const"
+        If is_const is equal to 1:
+            proc out_str with context, "const"
+            proc out_space with context
         End If
     End If
-    
-    proc emit with ctx, class_name
-    
-    Note: Emit extends
-    Let extends_class be proc hir_get_metadata from HIR with class_node, "php_extends"
-    If extends_class is not equal to 0:
-        Let extends_len be proc string_length from StringCore with extends_class
-        If extends_len is greater than 0:
-            proc emit with ctx, " extends "
-            proc emit with ctx, extends_class
+
+    Let items be proc get_dict_hir_value with node, "items"
+    Let elems be proc list_elements with items
+    If elems is not equal to 0:
+        Let count be proc size from ListOps with elems
+        Let i be 0
+        While i is less than count:
+            If i is greater than 0:
+                proc out_str with context, ", "
+            End If
+            Let item be proc get_at from ListOps with elems, i
+            Let iname be proc get_dict_string_value with item, "name"
+            If iname is not equal to 0:
+                proc out_str with context, iname
+            End If
+            Let alias be proc get_dict_string_value with item, "alias"
+            If proc str_present with alias:
+                proc out_str with context, " as "
+                proc out_str with context, alias
+            End If
+            Set i to i plus 1
+        End While
+    End If
+
+    proc out_str with context, ";"
+    proc out_newline with context
+    Return 1
+End Process
+
+@Reasoning:
+A declare emits 'declare(directive=value, ...)' followed by ';' (no body) or a
+'{ ... }' block. Each directive is a pair node carrying a "key" string and a
+"value" expression.
+@End Reasoning
+Process called "generate_declare" takes context as Integer, node as Integer returns Integer:
+    proc emit_indent with context
+    proc out_str with context, "declare("
+
+    Let directives be proc get_dict_hir_value with node, "directives"
+    Let delems be proc list_elements with directives
+    If delems is not equal to 0:
+        Let count be proc size from ListOps with delems
+        Let i be 0
+        While i is less than count:
+            If i is greater than 0:
+                proc out_str with context, ", "
+            End If
+            Let pair be proc get_at from ListOps with delems, i
+            Let key be proc get_dict_string_value with pair, "key"
+            If key is not equal to 0:
+                proc out_str with context, key
+            End If
+            proc out_str with context, "="
+            Let value be proc get_dict_hir_value with pair, "value"
+            proc generate_expr with context, value
+            Set i to i plus 1
+        End While
+    End If
+    proc out_str with context, ")"
+
+    Let body be proc get_dict_hir_value with node, "body"
+    Let belems be proc list_elements with body
+    Let has_body be 0
+    If belems is not equal to 0:
+        Let bcount be proc size from ListOps with belems
+        If bcount is greater than 0:
+            Set has_body to 1
         End If
     End If
-    
-    Note: Emit implements
-    Let implements_list be proc hir_get_metadata from HIR with class_node, "php_implements"
-    If implements_list is not equal to 0:
-        Let implements_count be proc list_length from ListCore with implements_list
-        If implements_count is greater than 0:
-            proc emit with ctx, " implements "
-            
+
+    If has_body is equal to 1:
+        proc out_str with context, " {"
+        proc out_newline with context
+        proc increase_indent with context
+        proc generate_stmt_list with context, body
+        proc decrease_indent with context
+        proc emit_indent with context
+        proc out_str with context, "}"
+        proc out_newline with context
+    Otherwise:
+        proc out_str with context, ";"
+        proc out_newline with context
+    End If
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Declarations
+Note: ============================================================================
+
+@Reasoning:
+A class emits its attribute groups, modifiers (abstract/final/readonly), the
+'class Name', an optional 'extends Base', an optional 'implements I1, I2', then a
+brace-delimited member list. Each member emits its own line.
+@End Reasoning
+Process called "generate_class" takes context as Integer, node as Integer, keyword as Integer returns Integer:
+    proc generate_attribute_groups with context, node
+
+    proc emit_indent with context
+    proc generate_string_list_spaced with context, node, "modifiers"
+
+    proc out_str with context, keyword
+    proc out_space with context
+    Let name be proc get_dict_string_value with node, "name"
+    If name is not equal to 0:
+        proc out_str with context, name
+    End If
+
+    Let extends be proc get_dict_string_value with node, "extends"
+    If proc str_present with extends:
+        proc out_str with context, " extends "
+        proc out_str with context, extends
+    End If
+
+    proc generate_implements with context, node
+
+    proc generate_member_block with context, node
+    Return 1
+End Process
+
+@Reasoning:
+An interface emits 'interface Name', an optional 'extends I1, I2' list, then the
+member block.
+@End Reasoning
+Process called "generate_interface" takes context as Integer, node as Integer returns Integer:
+    proc generate_attribute_groups with context, node
+
+    proc emit_indent with context
+    proc out_str with context, "interface"
+    proc out_space with context
+    Let name be proc get_dict_string_value with node, "name"
+    If name is not equal to 0:
+        proc out_str with context, name
+    End If
+
+    Let extends_count be proc keyed_list_count with node, "extends"
+    If extends_count is greater than 0:
+        proc out_str with context, " extends "
+        proc generate_string_list_commas with context, node, "extends"
+    End If
+
+    proc generate_member_block with context, node
+    Return 1
+End Process
+
+@Reasoning:
+A trait emits 'trait Name' then the member block.
+@End Reasoning
+Process called "generate_trait" takes context as Integer, node as Integer returns Integer:
+    proc generate_attribute_groups with context, node
+
+    proc emit_indent with context
+    proc out_str with context, "trait"
+    proc out_space with context
+    Let name be proc get_dict_string_value with node, "name"
+    If name is not equal to 0:
+        proc out_str with context, name
+    End If
+
+    proc generate_member_block with context, node
+    Return 1
+End Process
+
+@Reasoning:
+An enum emits 'enum Name', an optional ': BackingType', an optional
+'implements I1, I2', then the member block (cases + methods + consts).
+@End Reasoning
+Process called "generate_enum" takes context as Integer, node as Integer returns Integer:
+    proc generate_attribute_groups with context, node
+
+    proc emit_indent with context
+    proc out_str with context, "enum"
+    proc out_space with context
+    Let name be proc get_dict_string_value with node, "name"
+    If name is not equal to 0:
+        proc out_str with context, name
+    End If
+
+    Let backing be proc get_dict_string_value with node, "backing_type"
+    If proc str_present with backing:
+        proc out_str with context, ": "
+        proc out_str with context, backing
+    End If
+
+    proc generate_implements with context, node
+
+    proc generate_member_block with context, node
+    Return 1
+End Process
+
+@Reasoning:
+Emits the 'implements I1, I2' clause when the implements list is non-empty.
+@End Reasoning
+Process called "generate_implements" takes context as Integer, node as Integer returns Integer:
+    Let impl_count be proc keyed_list_count with node, "implements"
+    If impl_count is greater than 0:
+        proc out_str with context, " implements "
+        proc generate_string_list_commas with context, node, "implements"
+    End If
+    Return 1
+End Process
+
+@Reasoning:
+Emits a brace-delimited member block: ' {\n', then each member on its own line at
+one deeper indent, then '}\n'.
+@End Reasoning
+Process called "generate_member_block" takes context as Integer, node as Integer returns Integer:
+    proc out_space with context
+    proc out_str with context, "{"
+    proc out_newline with context
+    proc increase_indent with context
+
+    Let members be proc get_dict_hir_value with node, "members"
+    Let elems be proc list_elements with members
+    If elems is not equal to 0:
+        Let count be proc size from ListOps with elems
+        Let i be 0
+        While i is less than count:
+            Let member be proc get_at from ListOps with elems, i
+            If member is not equal to 0:
+                proc generate_node with context, member
+            End If
+            Set i to i plus 1
+        End While
+    End If
+
+    proc decrease_indent with context
+    proc emit_indent with context
+    proc out_str with context, "}"
+    proc out_newline with context
+    Return 1
+End Process
+
+@Reasoning:
+A top-level function emits its attribute groups, 'function ', an optional '&' for
+by-ref returns, the name, the parameter list, an optional ': ReturnType', then the
+body block. A 0 body (declared/abstract) emits ';'.
+@End Reasoning
+Process called "generate_function" takes context as Integer, node as Integer returns Integer:
+    proc generate_attribute_groups with context, node
+
+    proc emit_indent with context
+    proc out_str with context, "function"
+    proc out_space with context
+
+    Let by_ref be proc get_dict_flag with node, "by_ref"
+    If by_ref is equal to 1:
+        proc out_str with context, "&"
+    End If
+
+    Let name be proc get_dict_string_value with node, "name"
+    If name is not equal to 0:
+        proc out_str with context, name
+    End If
+
+    proc generate_param_list with context, node
+
+    Let rtype be proc get_dict_string_value with node, "return_type"
+    If proc str_present with rtype:
+        proc out_str with context, ": "
+        proc out_str with context, rtype
+    End If
+
+    proc generate_callable_body with context, node
+    Return 1
+End Process
+
+@Reasoning:
+A method emits attribute groups, its modifiers (visibility + static/abstract/
+final), 'function ', an optional '&', the name, the param list, an optional return
+type, then the body (or ';' for an abstract method with no body).
+@End Reasoning
+Process called "generate_method" takes context as Integer, node as Integer returns Integer:
+    proc generate_attribute_groups with context, node
+
+    proc emit_indent with context
+
+    Let visibility be proc get_dict_string_value with node, "visibility"
+    If proc str_present with visibility:
+        proc out_str with context, visibility
+        proc out_space with context
+    End If
+
+    proc generate_string_list_spaced with context, node, "modifiers"
+
+    proc out_str with context, "function"
+    proc out_space with context
+
+    Let by_ref be proc get_dict_flag with node, "by_ref"
+    If by_ref is equal to 1:
+        proc out_str with context, "&"
+    End If
+
+    Let name be proc get_dict_string_value with node, "name"
+    If name is not equal to 0:
+        proc out_str with context, name
+    End If
+
+    proc generate_param_list with context, node
+
+    Let rtype be proc get_dict_string_value with node, "return_type"
+    If proc str_present with rtype:
+        proc out_str with context, ": "
+        proc out_str with context, rtype
+    End If
+
+    proc generate_callable_body with context, node
+    Return 1
+End Process
+
+@Reasoning:
+Emits a callable's body: ' {\n ... \n}\n' when a body block is present, or ';\n'
+when absent (abstract / interface method / declared function). The body value is a
+"block" node whose body list is emitted at one deeper indent.
+@End Reasoning
+Process called "generate_callable_body" takes context as Integer, node as Integer returns Integer:
+    Let body be proc get_dict_hir_value with node, "body"
+    If body is equal to 0:
+        proc out_str with context, ";"
+        proc out_newline with context
+        Return 1
+    End If
+
+    proc out_space with context
+    proc out_str with context, "{"
+    proc out_newline with context
+    proc increase_indent with context
+
+    Let inner be proc get_dict_hir_value with body, "body"
+    proc generate_stmt_list with context, inner
+
+    proc decrease_indent with context
+    proc emit_indent with context
+    proc out_str with context, "}"
+    proc out_newline with context
+    Return 1
+End Process
+
+@Reasoning:
+A property emits attribute groups, its visibility, its modifiers, an optional type,
+the '$name', an optional '= default', then ';'.
+@End Reasoning
+Process called "generate_property" takes context as Integer, node as Integer returns Integer:
+    proc generate_attribute_groups with context, node
+
+    proc emit_indent with context
+
+    Let visibility be proc get_dict_string_value with node, "visibility"
+    If proc str_present with visibility:
+        proc out_str with context, visibility
+        proc out_space with context
+    End If
+
+    proc generate_string_list_spaced with context, node, "modifiers"
+
+    Let ptype be proc get_dict_string_value with node, "type"
+    If proc str_present with ptype:
+        proc out_str with context, ptype
+        proc out_space with context
+    End If
+
+    Let name be proc get_dict_string_value with node, "name"
+    If name is not equal to 0:
+        proc out_str with context, name
+    End If
+
+    Let default be proc get_dict_hir_value with node, "default"
+    If default is not equal to 0:
+        proc out_str with context, " = "
+        proc generate_expr with context, default
+    End If
+
+    proc out_str with context, ";"
+    proc out_newline with context
+    Return 1
+End Process
+
+@Reasoning:
+A class_const emits its visibility, modifiers, 'const ', the name, ' = value', ';'.
+@End Reasoning
+Process called "generate_class_const" takes context as Integer, node as Integer returns Integer:
+    proc emit_indent with context
+
+    Let visibility be proc get_dict_string_value with node, "visibility"
+    If proc str_present with visibility:
+        proc out_str with context, visibility
+        proc out_space with context
+    End If
+
+    proc generate_string_list_spaced with context, node, "modifiers"
+
+    proc out_str with context, "const"
+    proc out_space with context
+
+    Let name be proc get_dict_string_value with node, "name"
+    If name is not equal to 0:
+        proc out_str with context, name
+    End If
+
+    proc out_str with context, " = "
+    Let value be proc get_dict_hir_value with node, "value"
+    proc generate_expr with context, value
+
+    proc out_str with context, ";"
+    proc out_newline with context
+    Return 1
+End Process
+
+@Reasoning:
+An enum_case emits 'case Name', an optional ' = value' for backed enums, then ';'.
+@End Reasoning
+Process called "generate_enum_case" takes context as Integer, node as Integer returns Integer:
+    proc generate_attribute_groups with context, node
+
+    proc emit_indent with context
+    proc out_str with context, "case"
+    proc out_space with context
+
+    Let name be proc get_dict_string_value with node, "name"
+    If name is not equal to 0:
+        proc out_str with context, name
+    End If
+
+    Let value be proc get_dict_hir_value with node, "value"
+    If value is not equal to 0:
+        proc out_str with context, " = "
+        proc generate_expr with context, value
+    End If
+
+    proc out_str with context, ";"
+    proc out_newline with context
+    Return 1
+End Process
+
+@Reasoning:
+A use_trait member emits 'use T1, T2', then either ';' (no adaptations) or a
+'{ ... }' block of adaptation lines.
+@End Reasoning
+Process called "generate_use_trait" takes context as Integer, node as Integer returns Integer:
+    proc emit_indent with context
+    proc out_str with context, "use"
+    proc out_space with context
+    proc generate_string_list_commas with context, node, "traits"
+
+    Let adaptations be proc get_dict_hir_value with node, "adaptations"
+    Let aelems be proc list_elements with adaptations
+    Let has_adapt be 0
+    If aelems is not equal to 0:
+        Let acount be proc size from ListOps with aelems
+        If acount is greater than 0:
+            Set has_adapt to 1
+        End If
+    End If
+
+    If has_adapt is equal to 1:
+        proc out_str with context, " {"
+        proc out_newline with context
+        proc increase_indent with context
+        Let count be proc size from ListOps with aelems
+        Let i be 0
+        While i is less than count:
+            Let adapt be proc get_at from ListOps with aelems, i
+            proc generate_trait_adaptation with context, adapt
+            Set i to i plus 1
+        End While
+        proc decrease_indent with context
+        proc emit_indent with context
+        proc out_str with context, "}"
+        proc out_newline with context
+    Otherwise:
+        proc out_str with context, ";"
+        proc out_newline with context
+    End If
+    Return 1
+End Process
+
+@Reasoning:
+A trait_adaptation emits 'lhs insteadof rhs;' or 'lhs as rhs;' per its text_kind.
+@End Reasoning
+Process called "generate_trait_adaptation" takes context as Integer, node as Integer returns Integer:
+    proc emit_indent with context
+    Let lhs be proc get_dict_string_value with node, "lhs"
+    If lhs is not equal to 0:
+        proc out_str with context, lhs
+    End If
+    proc out_space with context
+    Let text_kind be proc get_dict_string_value with node, "text_kind"
+    If text_kind is not equal to 0:
+        proc out_str with context, text_kind
+    End If
+    proc out_space with context
+    Let rhs be proc get_dict_string_value with node, "rhs"
+    If rhs is not equal to 0:
+        proc out_str with context, rhs
+    End If
+    proc out_str with context, ";"
+    proc out_newline with context
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Parameters + attribute groups + string lists
+Note: ============================================================================
+
+@Reasoning:
+Emits the '(' params ')' of a function/method/closure/arrow_fn. Each param is
+rendered comma-separated by generate_param.
+@End Reasoning
+Process called "generate_param_list" takes context as Integer, node as Integer returns Integer:
+    proc out_str with context, "("
+    Let params be proc get_dict_hir_value with node, "params"
+    Let elems be proc list_elements with params
+    If elems is not equal to 0:
+        Let count be proc size from ListOps with elems
+        Let i be 0
+        While i is less than count:
+            If i is greater than 0:
+                proc out_str with context, ", "
+            End If
+            Let param be proc get_at from ListOps with elems, i
+            proc generate_param with context, param
+            Set i to i plus 1
+        End While
+    End If
+    proc out_str with context, ")"
+    Return 1
+End Process
+
+@Reasoning:
+A param emits its promoted visibility (when present), an optional type, an optional
+'&' (by-ref), an optional '...' (variadic), the '$name', then an optional
+'= default'. The promoted visibility reproduces constructor property promotion.
+@End Reasoning
+Process called "generate_param" takes context as Integer, param as Integer returns Integer:
+    Let visibility be proc get_dict_string_value with param, "visibility"
+    If proc str_present with visibility:
+        proc out_str with context, visibility
+        proc out_space with context
+    End If
+
+    Let ptype be proc get_dict_string_value with param, "type"
+    If proc str_present with ptype:
+        proc out_str with context, ptype
+        proc out_space with context
+    End If
+
+    Let by_ref be proc get_dict_flag with param, "by_ref"
+    If by_ref is equal to 1:
+        proc out_str with context, "&"
+    End If
+
+    Let variadic be proc get_dict_flag with param, "variadic"
+    If variadic is equal to 1:
+        proc out_str with context, "..."
+    End If
+
+    Let name be proc get_dict_string_value with param, "name"
+    If name is not equal to 0:
+        proc out_str with context, name
+    End If
+
+    Let default be proc get_dict_hir_value with param, "default"
+    If default is not equal to 0:
+        proc out_str with context, " = "
+        proc generate_expr with context, default
+    End If
+    Return 1
+End Process
+
+@Reasoning:
+Emits every attribute_group ('#[Attr(args), Attr2]') on its own line before the
+declaration it annotates. Null-safe; emits nothing when there are no groups.
+@End Reasoning
+Process called "generate_attribute_groups" takes context as Integer, node as Integer returns Integer:
+    Let groups be proc get_dict_hir_value with node, "attributes"
+    Let elems be proc list_elements with groups
+    If elems is equal to 0:
+        Return 1
+    End If
+    Let count be proc size from ListOps with elems
+    Let i be 0
+    While i is less than count:
+        Let group be proc get_at from ListOps with elems, i
+        proc emit_indent with context
+        proc out_str with context, "#["
+        Let attrs be proc get_dict_hir_value with group, "attributes"
+        Let aelems be proc list_elements with attrs
+        If aelems is not equal to 0:
+            Let acount be proc size from ListOps with aelems
             Let j be 0
-            While j is less than implements_count:
-                Let interface_name be proc list_get from ListCore with implements_list, j
-                proc emit with ctx, interface_name
-                
-                If j is less than implements_count minus 1:
-                    proc emit with ctx, ", "
+            While j is less than acount:
+                If j is greater than 0:
+                    proc out_str with context, ", "
                 End If
-                
+                Let attr be proc get_at from ListOps with aelems, j
+                proc generate_attribute with context, attr
                 Set j to j plus 1
             End While
         End If
+        proc out_str with context, "]"
+        proc out_newline with context
+        Set i to i plus 1
+    End While
+    Return 1
+End Process
+
+@Reasoning:
+A single attribute emits 'Name' and, when it has args, '(arg, arg)' via the shared
+argument-list generator.
+@End Reasoning
+Process called "generate_attribute" takes context as Integer, attr as Integer returns Integer:
+    Let name be proc get_dict_string_value with attr, "name"
+    If name is not equal to 0:
+        proc out_str with context, name
     End If
-    
-    proc emit with ctx, "\n"
-    proc emit_indent from ctx
-    proc emit with ctx, "{\n"
-    
-    proc increase_indent from ctx
-    
-    Note: Generate constants
-    Let constants be proc hir_class_get_constants from HIR with class_node
-    Let const_count be proc list_length from ListCore with constants
+    Let args be proc get_dict_hir_value with attr, "args"
+    Let aelems be proc list_elements with args
+    If aelems is not equal to 0:
+        Let acount be proc size from ListOps with aelems
+        If acount is greater than 0:
+            proc generate_arg_list with context, attr
+        End If
+    End If
+    Return 1
+End Process
+
+@Reasoning:
+Emits a HIR string list (of string-literal nodes) space-separated, each followed by
+a trailing space, used for modifier lists (abstract final / public static) so they
+prefix the keyword they modify. Null-safe.
+@End Reasoning
+Process called "generate_string_list_spaced" takes context as Integer, node as Integer, key as Integer returns Integer:
+    Let lst be proc get_dict_hir_value with node, key
+    Let elems be proc list_elements with lst
+    If elems is equal to 0:
+        Return 1
+    End If
+    Let count be proc size from ListOps with elems
     Let i be 0
-    
-    While i is less than const_count:
-        Let const_node be proc list_get from ListCore with constants, i
-        proc generate_class_constant with ctx, const_node
+    While i is less than count:
+        Let lit be proc get_at from ListOps with elems, i
+        Let s be proc get_string_literal_value from HIR with lit
+        If s is not equal to 0:
+            proc out_str with context, s
+            proc out_space with context
+        End If
         Set i to i plus 1
     End While
-    
-    If const_count is greater than 0:
-        proc emit with ctx, "\n"
-    End If
-    
-    Note: Generate fields
-    Let fields be proc hir_class_get_fields from HIR with class_node
-    Let field_count be proc list_length from ListCore with fields
-    Set i to 0
-    
-    While i is less than field_count:
-        Let field_node be proc list_get from ListCore with fields, i
-        proc generate_field with ctx, field_node
-        Set i to i plus 1
-    End While
-    
-    If field_count is greater than 0:
-        proc emit with ctx, "\n"
-    End If
-    
-    Note: Generate methods
-    Let methods be proc hir_class_get_methods from HIR with class_node
-    Let method_count be proc list_length from ListCore with methods
-    Set i to 0
-    
-    While i is less than method_count:
-        Let method_node be proc list_get from ListCore with methods, i
-        proc generate_method with ctx, method_node
-        
-        If i is less than method_count minus 1:
-            proc emit with ctx, "\n"
-        End If
-        
-        Set i to i plus 1
-    End While
-    
-    proc decrease_indent from ctx
-    proc emit_indent from ctx
-    proc emit with ctx, "}\n"
-End Process
-
-Note: ===================================================================
-Note: CLASS MEMBER GENERATION
-Note: ===================================================================
-
-@Reasoning:
-Emits a PHP class-level constant declaration ('public const X = ...').
-Class constants in PHP carry visibility (public/protected/private)
-from PHP 7.1 onward; this generator emits the visibility from
-metadata or defaults to 'public' for compatibility with older PHP
-targets and PSR style.
-@End Reasoning
-
-@Implementation:
-Reads visibility from metadata; emits it (with a trailing space) or
-"public " as fallback. Emits 'const NAME = '. Recurses into
-generate_expression for the value initialiser. Terminates with ";\n".
-@End Implementation
-Process called "generate_class_constant" takes ctx as Integer, const_node as Integer:
-    Let const_name be proc hir_constant_get_name from HIR with const_node
-    
-    proc emit_indent from ctx
-    
-    Note: Visibility
-    Let visibility be proc hir_get_metadata from HIR with const_node, "visibility"
-    If visibility is not equal to 0:
-        proc emit with ctx, visibility
-        proc emit with ctx, " "
-    Otherwise:
-        proc emit with ctx, "public "
-    End If
-    
-    proc emit with ctx, "const "
-    proc emit with ctx, const_name
-    proc emit with ctx, " = "
-    
-    Let value be proc hir_constant_get_value from HIR with const_node
-    proc generate_expression with ctx, value
-    
-    proc emit with ctx, ";\n"
+    Return 1
 End Process
 
 @Reasoning:
-Emits a PHP class property declaration. PHP property declarations
-carry visibility, optional 'static', and optional default initialiser.
-The field name in HIR omits the conventional '$' prefix used by PHP;
-it is the caller's responsibility to ensure the name field already
-includes the '$' if the target style requires it.
+Emits a HIR string list comma-separated (implements / extends / traits / catch
+types). Null-safe.
 @End Reasoning
-
-@Implementation:
-Reads visibility, is_static, default_value from metadata. Emits
-visibility (with fallback "public "). Emits "static " if applicable.
-Emits the field_name. If default_value is non-null, emits " = " and
-recurses into generate_expression. Terminates with ";\n".
-@End Implementation
-Process called "generate_field" takes ctx as Integer, field_node as Integer:
-    Let field_name be proc hir_field_get_name from HIR with field_node
-    
-    proc emit_indent from ctx
-    
-    Note: Visibility
-    Let visibility be proc hir_get_metadata from HIR with field_node, "visibility"
-    If visibility is not equal to 0:
-        proc emit with ctx, visibility
-        proc emit with ctx, " "
-    Otherwise:
-        proc emit with ctx, "public "
+Process called "generate_string_list_commas" takes context as Integer, node as Integer, key as Integer returns Integer:
+    Let lst be proc get_dict_hir_value with node, key
+    Let elems be proc list_elements with lst
+    If elems is equal to 0:
+        Return 1
     End If
-    
-    Note: Static
-    Let is_static be proc hir_get_metadata from HIR with field_node, "is_static"
-    If is_static is equal to 1:
-        proc emit with ctx, "static "
-    End If
-    
-    proc emit with ctx, field_name
-    
-    Note: Default value
-    Let default_value be proc hir_get_metadata from HIR with field_node, "default_value"
-    If default_value is not equal to 0:
-        proc emit with ctx, " = "
-        proc generate_expression with ctx, default_value
-    End If
-    
-    proc emit with ctx, ";\n"
-End Process
-
-@Reasoning:
-Emits a PHP method declaration. Covers the full PHP method modifier
-set: visibility, static, abstract, final, plus an optional ':
-return-type' tail. Abstract methods omit the body and terminate with
-';' per PHP semantics; concrete methods follow the header with a
-block body.
-@End Reasoning
-
-@Implementation:
-Reads name. Emits modifiers in PHP-canonical order: visibility,
-static, abstract, final. Emits "function NAME(", then delegates to
-generate_parameters for the comma-separated argument list, then ")".
-If return_type metadata is non-empty, appends ": Type". For abstract
-methods emits ";\n" only; for concrete methods emits "\n" and
-recurses into generate_statement on the body.
-@End Implementation
-Process called "generate_method" takes ctx as Integer, method_node as Integer:
-    Let method_name be proc hir_function_get_name from HIR with method_node
-    
-    proc emit_indent from ctx
-    
-    Note: Visibility
-    Let visibility be proc hir_get_metadata from HIR with method_node, "visibility"
-    If visibility is not equal to 0:
-        proc emit with ctx, visibility
-        proc emit with ctx, " "
-    Otherwise:
-        proc emit with ctx, "public "
-    End If
-    
-    Note: Static
-    Let is_static be proc hir_get_metadata from HIR with method_node, "is_static"
-    If is_static is equal to 1:
-        proc emit with ctx, "static "
-    End If
-    
-    Note: Abstract
-    Let is_abstract be proc hir_get_metadata from HIR with method_node, "is_abstract"
-    If is_abstract is equal to 1:
-        proc emit with ctx, "abstract "
-    End If
-    
-    Note: Final
-    Let is_final be proc hir_get_metadata from HIR with method_node, "is_final"
-    If is_final is equal to 1:
-        proc emit with ctx, "final "
-    End If
-    
-    proc emit with ctx, "function "
-    proc emit with ctx, method_name
-    proc emit with ctx, "("
-    
-    Note: Parameters
-    proc generate_parameters with ctx, method_node
-    
-    proc emit with ctx, ")"
-    
-    Note: Return type
-    Let return_type be proc hir_get_metadata from HIR with method_node, "return_type"
-    If return_type is not equal to 0:
-        Let type_len be proc string_length from StringCore with return_type
-        If type_len is greater than 0:
-            proc emit with ctx, ": "
-            proc emit with ctx, return_type
-        End If
-    End If
-    
-    Note: Abstract methods have no body
-    If is_abstract is equal to 1:
-        proc emit with ctx, ";\n"
-    Otherwise:
-        proc emit with ctx, "\n"
-        
-        Let body be proc hir_function_get_body from HIR with method_node
-        proc generate_statement with ctx, body
-    End If
-End Process
-
-Note: ===================================================================
-Note: FUNCTION GENERATION
-Note: ===================================================================
-
-@Reasoning:
-Emits a top-level PHP function declaration. Unlike methods, free
-functions have no visibility modifier. Return-type metadata is honoured
-identically to generate_method's tail. The body is always present
-(PHP has no 'abstract function' at file scope).
-@End Reasoning
-
-@Implementation:
-Reads name. Emits "function NAME(", delegates to generate_parameters,
-emits ")". If return_type metadata is non-empty, appends ": Type".
-Emits "\n" then recurses into generate_statement on the body.
-@End Implementation
-Process called "generate_function" takes ctx as Integer, func_node as Integer:
-    Let func_name be proc hir_function_get_name from HIR with func_node
-    
-    proc emit_indent from ctx
-    proc emit with ctx, "function "
-    proc emit with ctx, func_name
-    proc emit with ctx, "("
-    
-    Note: Parameters
-    proc generate_parameters with ctx, func_node
-    
-    proc emit with ctx, ")"
-    
-    Note: Return type
-    Let return_type be proc hir_get_metadata from HIR with func_node, "return_type"
-    If return_type is not equal to 0:
-        Let type_len be proc string_length from StringCore with return_type
-        If type_len is greater than 0:
-            proc emit with ctx, ": "
-            proc emit with ctx, return_type
-        End If
-    End If
-    
-    proc emit with ctx, "\n"
-    
-    Let body be proc hir_function_get_body from HIR with func_node
-    proc generate_statement with ctx, body
-End Process
-
-@Reasoning:
-Emits the comma-separated parameter list for a function or method.
-PHP supports optional type hints on parameters since PHP 5; this
-generator emits the type hint (when non-empty) followed by the
-parameter name. No default-value or by-reference handling is provided
-here; if needed those would extend this routine without changing its
-caller.
-@End Reasoning
-
-@Implementation:
-Loops over hir_function_get_parameters. For each: queries the type
-via hir_parameter_get_type; if the type string is non-empty emits
-"TYPE " (with trailing space). Emits the parameter name. Adds ", "
-between consecutive parameters (not after the last).
-@End Implementation
-Process called "generate_parameters" takes ctx as Integer, func_node as Integer:
-    Let parameters be proc hir_function_get_parameters from HIR with func_node
-    Let param_count be proc list_length from ListCore with parameters
+    Let count be proc size from ListOps with elems
     Let i be 0
-    
-    While i is less than param_count:
-        Let param be proc list_get from ListCore with parameters, i
-        
-        Note: Type hint
-        Let param_type be proc hir_parameter_get_type from HIR with param
-        If param_type is not equal to 0:
-            Let type_len be proc string_length from StringCore with param_type
-            If type_len is greater than 0:
-                proc emit with ctx, param_type
-                proc emit with ctx, " "
-            End If
+    While i is less than count:
+        If i is greater than 0:
+            proc out_str with context, ", "
         End If
-        
-        Note: Parameter name
-        Let param_name be proc hir_parameter_get_name from HIR with param
-        proc emit with ctx, param_name
-        
-        If i is less than param_count minus 1:
-            proc emit with ctx, ", "
+        Let lit be proc get_at from ListOps with elems, i
+        Let s be proc get_string_literal_value from HIR with lit
+        If s is not equal to 0:
+            proc out_str with context, s
         End If
-        
         Set i to i plus 1
     End While
+    Return 1
 End Process
 
-Note: ===================================================================
-Note: STATEMENT GENERATION
-Note: ===================================================================
+Note: ============================================================================
+Note: Statements
+Note: ============================================================================
 
 @Reasoning:
-Statement-level dispatch. Reads the HIR node's type tag and routes to
-the specialist generator (block, if, while, for, return, break,
-continue). Anything not matched is treated as an expression statement
-- the routine emits indentation, the expression, and the trailing
-';\n'. Null nodes return immediately so callers can pass optional
-clauses without null-checking.
+A bare block statement emits '{\n ... \n}\n' at the current indent.
 @End Reasoning
-
-@Implementation:
-Null stmt_node short-circuits via Return. Reads hir_node_get_type;
-cascade of equality tests against HIR.HIR_BLOCK / _IF / _WHILE / _FOR
-/ _RETURN dispatches to the corresponding generate_* and returns.
-HIR.HIR_BREAK and HIR.HIR_CONTINUE emit single-line "break;" /
-"continue;" with proper indentation. Default path: emit_indent,
-generate_expression, ";\n".
-@End Implementation
-Process called "generate_statement" takes ctx as Integer, stmt_node as Integer:
-    If stmt_node is equal to 0:
-        Return
-    End If
-    
-    Let stmt_type be proc hir_node_get_type from HIR with stmt_node
-    
-    Note: Block
-    If stmt_type is equal to HIR.HIR_BLOCK:
-        proc generate_block with ctx, stmt_node
-        Return
-    End If
-    
-    Note: If statement
-    If stmt_type is equal to HIR.HIR_IF:
-        proc generate_if_statement with ctx, stmt_node
-        Return
-    End If
-    
-    Note: While loop
-    If stmt_type is equal to HIR.HIR_WHILE:
-        proc generate_while_statement with ctx, stmt_node
-        Return
-    End If
-    
-    Note: For loop
-    If stmt_type is equal to HIR.HIR_FOR:
-        proc generate_for_statement with ctx, stmt_node
-        Return
-    End If
-    
-    Note: Return statement
-    If stmt_type is equal to HIR.HIR_RETURN:
-        proc generate_return_statement with ctx, stmt_node
-        Return
-    End If
-    
-    Note: Break
-    If stmt_type is equal to HIR.HIR_BREAK:
-        proc emit_indent from ctx
-        proc emit with ctx, "break;\n"
-        Return
-    End If
-    
-    Note: Continue
-    If stmt_type is equal to HIR.HIR_CONTINUE:
-        proc emit_indent from ctx
-        proc emit with ctx, "continue;\n"
-        Return
-    End If
-    
-    Note: Expression statement
-    proc emit_indent from ctx
-    proc generate_expression with ctx, stmt_node
-    proc emit with ctx, ";\n"
+Process called "generate_block" takes context as Integer, node as Integer returns Integer:
+    proc emit_indent with context
+    proc out_str with context, "{"
+    proc out_newline with context
+    proc increase_indent with context
+    Let body be proc get_dict_hir_value with node, "body"
+    proc generate_stmt_list with context, body
+    proc decrease_indent with context
+    proc emit_indent with context
+    proc out_str with context, "}"
+    proc out_newline with context
+    Return 1
 End Process
 
 @Reasoning:
-Emits a PHP brace-delimited block. The open brace appears on its own
-indented line per Allman style; the indent is increased while emitting
-the body so nested statements line up correctly; the close brace
-returns to the outer indent.
+Emits a statement that may itself be a block (used for if/while/for bodies). A
+block node is emitted inline starting with ' {'; any other statement is emitted on
+its own indented line. This keeps PHP brace style idiomatic while reusing the
+recursive statement generators.
 @End Reasoning
+Process called "generate_branch_block" takes context as Integer, node as Integer returns Integer:
+    If node is equal to 0:
+        proc out_str with context, " {"
+        proc out_newline with context
+        proc emit_indent with context
+        proc out_str with context, "}"
+        proc out_newline with context
+        Return 1
+    End If
 
-@Implementation:
-emit_indent + "{\n". increase_indent. Iterates hir_block_get_statements,
-recursing into generate_statement for each. decrease_indent.
-emit_indent + "}\n".
-@End Implementation
-Process called "generate_block" takes ctx as Integer, block_node as Integer:
-    proc emit_indent from ctx
-    proc emit with ctx, "{\n"
-    
-    proc increase_indent from ctx
-    
-    Let statements be proc hir_block_get_statements from HIR with block_node
-    Let stmt_count be proc list_length from ListCore with statements
-    Let i be 0
-    
-    While i is less than stmt_count:
-        Let stmt be proc list_get from ListCore with statements, i
-        proc generate_statement with ctx, stmt
-        Set i to i plus 1
-    End While
-    
-    proc decrease_indent from ctx
-    proc emit_indent from ctx
-    proc emit with ctx, "}\n"
+    Let is_block be proc type_is with node, "block"
+    If is_block is equal to 1:
+        proc out_str with context, " {"
+        proc out_newline with context
+        proc increase_indent with context
+        Let body be proc get_dict_hir_value with node, "body"
+        proc generate_stmt_list with context, body
+        proc decrease_indent with context
+        proc emit_indent with context
+        proc out_str with context, "}"
+        proc out_newline with context
+        Return 1
+    End If
+
+    Note: single non-block statement: wrap in braces for unambiguous re-parse.
+    proc out_str with context, " {"
+    proc out_newline with context
+    proc increase_indent with context
+    proc generate_node with context, node
+    proc decrease_indent with context
+    proc emit_indent with context
+    proc out_str with context, "}"
+    proc out_newline with context
+    Return 1
 End Process
 
 @Reasoning:
-Emits a PHP if/else construct. Branches that are already
-HIR_BLOCK pass through generate_statement which adds its own braces;
-branches that are bare statements are wrapped in synthesised braces
-to satisfy PHP's grammar uniformly. The 'else if' chain is realised
-by recursing into generate_if_statement at one fewer indent level so
-the conditional sits on the same line as 'else'.
+An expression statement emits 'expr;\n' at the current indent.
 @End Reasoning
-
-@Implementation:
-Emits 'if (CONDITION) '. Reads then_branch and inspects its HIR
-type: HIR_BLOCK -> emit "\n" then generate_statement (which produces
-the brace block); otherwise emit "{\n", increase_indent,
-generate_statement, decrease_indent, emit_indent + "}\n". Reads
-else_branch; if non-null emits 'else '; if else_branch is HIR_IF
-chain-recurses (temporarily decrementing indent_level to keep the
-'else if' on one line); HIR_BLOCK delegates; otherwise synthesised
-braces as above.
-@End Implementation
-Process called "generate_if_statement" takes ctx as Integer, if_node as Integer:
-    proc emit_indent from ctx
-    proc emit with ctx, "if ("
-    
-    Let condition be proc hir_if_get_condition from HIR with if_node
-    proc generate_expression with ctx, condition
-    
-    proc emit with ctx, ") "
-    
-    Let then_branch be proc hir_if_get_then from HIR with if_node
-    Let then_type be proc hir_node_get_type from HIR with then_branch
-    
-    If then_type is equal to HIR.HIR_BLOCK:
-        proc emit with ctx, "\n"
-        proc generate_statement with ctx, then_branch
-    Otherwise:
-        proc emit with ctx, "{\n"
-        proc increase_indent from ctx
-        proc generate_statement with ctx, then_branch
-        proc decrease_indent from ctx
-        proc emit_indent from ctx
-        proc emit with ctx, "}\n"
-    End If
-    
-    Let else_branch be proc hir_if_get_else from HIR with if_node
-    If else_branch is not equal to 0:
-        proc emit_indent from ctx
-        proc emit with ctx, "else "
-        
-        Let else_type be proc hir_node_get_type from HIR with else_branch
-        
-        If else_type is equal to HIR.HIR_BLOCK:
-            proc emit with ctx, "\n"
-            proc generate_statement with ctx, else_branch
-        Otherwise:
-            If else_type is equal to HIR.HIR_IF:
-                Note: else if
-                proc emit with ctx, ""
-                Set ctx.indent_level to ctx.indent_level minus 1
-                proc generate_if_statement with ctx, else_branch
-                Set ctx.indent_level to ctx.indent_level plus 1
-            Otherwise:
-                proc emit with ctx, "{\n"
-                proc increase_indent from ctx
-                proc generate_statement with ctx, else_branch
-                proc decrease_indent from ctx
-                proc emit_indent from ctx
-                proc emit with ctx, "}\n"
-            End If
-        End If
-    End If
+Process called "generate_expr_stmt" takes context as Integer, node as Integer returns Integer:
+    proc emit_indent with context
+    Let expr be proc get_dict_hir_value with node, "expr"
+    proc generate_expr with context, expr
+    proc out_str with context, ";"
+    proc out_newline with context
+    Return 1
 End Process
 
 @Reasoning:
-Emits a PHP while loop. The body brace handling mirrors
-generate_if_statement: HIR_BLOCK bodies pass through directly; bare-
-statement bodies get synthesised braces. PHP's do-while form is not
-covered here because the bootstrap HIR does not surface it.
+An echo emits 'echo a, b, c;\n' across its comma-separated args.
 @End Reasoning
-
-@Implementation:
-Emits 'while (CONDITION) '. Inspects body's HIR type: HIR_BLOCK ->
-emit "\n" + generate_statement; otherwise synthesised brace form
-with proper increase_indent/decrease_indent bracketing.
-@End Implementation
-Process called "generate_while_statement" takes ctx as Integer, while_node as Integer:
-    proc emit_indent from ctx
-    proc emit with ctx, "while ("
-    
-    Let condition be proc hir_while_get_condition from HIR with while_node
-    proc generate_expression with ctx, condition
-    
-    proc emit with ctx, ") "
-    
-    Let body be proc hir_while_get_body from HIR with while_node
-    Let body_type be proc hir_node_get_type from HIR with body
-    
-    If body_type is equal to HIR.HIR_BLOCK:
-        proc emit with ctx, "\n"
-        proc generate_statement with ctx, body
-    Otherwise:
-        proc emit with ctx, "{\n"
-        proc increase_indent from ctx
-        proc generate_statement with ctx, body
-        proc decrease_indent from ctx
-        proc emit_indent from ctx
-        proc emit with ctx, "}\n"
-    End If
-End Process
-
-@Reasoning:
-Emits a C-style PHP 'for (init; cond; update) body' loop. Each of
-init, cond, and update is optional; missing clauses simply emit the
-';' separator with nothing before. PHP's foreach form is not
-generated here - the HIR pipeline lowers iteration to either while
-or for prior to PHP emission.
-@End Reasoning
-
-@Implementation:
-Emits 'for ('. Reads init/condition/update via the corresponding HIR
-accessors; each non-null clause is generated as an expression. The
-two ';' separators are unconditionally emitted between clauses. Body
-is emitted with the same HIR_BLOCK-or-synthesised-brace pattern used
-for if/while.
-@End Implementation
-Process called "generate_for_statement" takes ctx as Integer, for_node as Integer:
-    proc emit_indent from ctx
-    proc emit with ctx, "for ("
-    
-    Let init be proc hir_for_get_init from HIR with for_node
-    If init is not equal to 0:
-        proc generate_expression with ctx, init
-    End If
-    
-    proc emit with ctx, "; "
-    
-    Let condition be proc hir_for_get_condition from HIR with for_node
-    If condition is not equal to 0:
-        proc generate_expression with ctx, condition
-    End If
-    
-    proc emit with ctx, "; "
-    
-    Let update be proc hir_for_get_update from HIR with for_node
-    If update is not equal to 0:
-        proc generate_expression with ctx, update
-    End If
-    
-    proc emit with ctx, ") "
-    
-    Let body be proc hir_for_get_body from HIR with for_node
-    Let body_type be proc hir_node_get_type from HIR with body
-    
-    If body_type is equal to HIR.HIR_BLOCK:
-        proc emit with ctx, "\n"
-        proc generate_statement with ctx, body
-    Otherwise:
-        proc emit with ctx, "{\n"
-        proc increase_indent from ctx
-        proc generate_statement with ctx, body
-        proc decrease_indent from ctx
-        proc emit_indent from ctx
-        proc emit with ctx, "}\n"
-    End If
-End Process
-
-@Reasoning:
-Emits 'return [expr];'. The value expression is optional - bare
-'return;' produces only the keyword. PHP accepts both forms; the
-choice depends on the function's return semantics.
-@End Reasoning
-
-@Implementation:
-emit_indent + 'return'. Reads hir_return_get_value; if non-null emits
-" " + generate_expression. Terminates with ";\n".
-@End Implementation
-Process called "generate_return_statement" takes ctx as Integer, return_node as Integer:
-    proc emit_indent from ctx
-    proc emit with ctx, "return"
-    
-    Let value be proc hir_return_get_value from HIR with return_node
-    If value is not equal to 0:
-        proc emit with ctx, " "
-        proc generate_expression with ctx, value
-    End If
-    
-    proc emit with ctx, ";\n"
-End Process
-
-Note: ===================================================================
-Note: EXPRESSION GENERATION
-Note: ===================================================================
-
-@Reasoning:
-Expression-level dispatch. Reads the HIR expression's type tag and
-routes to the dedicated generator. Leaf kinds (variables, identifiers)
-are inlined here for brevity because they reduce to a single emit
-call; complex kinds delegate. Unknown kinds fall through silently
-(no emit) which is the right behaviour for forward-compatible HIR
-extensions.
-@End Reasoning
-
-@Implementation:
-Null expr_node short-circuits. Reads hir_node_get_type. Cascade:
-HIR_LITERAL -> generate_literal. HIR_VARIABLE / HIR_IDENTIFIER ->
-read name accessor and emit directly. HIR_BINARY_OP / _UNARY_OP /
-_TERNARY / _ASSIGN / _CALL / _NEW / _MEMBER_ACCESS / _INDEX_ACCESS /
-_ARRAY -> delegate to corresponding generate_* and return.
-@End Implementation
-Process called "generate_expression" takes ctx as Integer, expr_node as Integer:
-    If expr_node is equal to 0:
-        Return
-    End If
-    
-    Let expr_type be proc hir_node_get_type from HIR with expr_node
-    
-    Note: Literal
-    If expr_type is equal to HIR.HIR_LITERAL:
-        proc generate_literal with ctx, expr_node
-        Return
-    End If
-    
-    Note: Variable
-    If expr_type is equal to HIR.HIR_VARIABLE:
-        Let var_name be proc hir_variable_get_name from HIR with expr_node
-        proc emit with ctx, var_name
-        Return
-    End If
-    
-    Note: Identifier
-    If expr_type is equal to HIR.HIR_IDENTIFIER:
-        Let id_name be proc hir_identifier_get_name from HIR with expr_node
-        proc emit with ctx, id_name
-        Return
-    End If
-    
-    Note: Binary operation
-    If expr_type is equal to HIR.HIR_BINARY_OP:
-        proc generate_binary_op with ctx, expr_node
-        Return
-    End If
-    
-    Note: Unary operation
-    If expr_type is equal to HIR.HIR_UNARY_OP:
-        proc generate_unary_op with ctx, expr_node
-        Return
-    End If
-    
-    Note: Ternary
-    If expr_type is equal to HIR.HIR_TERNARY:
-        proc generate_ternary with ctx, expr_node
-        Return
-    End If
-    
-    Note: Assignment
-    If expr_type is equal to HIR.HIR_ASSIGN:
-        proc generate_assign with ctx, expr_node
-        Return
-    End If
-    
-    Note: Call
-    If expr_type is equal to HIR.HIR_CALL:
-        proc generate_call with ctx, expr_node
-        Return
-    End If
-    
-    Note: New
-    If expr_type is equal to HIR.HIR_NEW:
-        proc generate_new with ctx, expr_node
-        Return
-    End If
-    
-    Note: Member access
-    If expr_type is equal to HIR.HIR_MEMBER_ACCESS:
-        proc generate_member_access with ctx, expr_node
-        Return
-    End If
-    
-    Note: Index access
-    If expr_type is equal to HIR.HIR_INDEX_ACCESS:
-        proc generate_index_access with ctx, expr_node
-        Return
-    End If
-    
-    Note: Array
-    If expr_type is equal to HIR.HIR_ARRAY:
-        proc generate_array with ctx, expr_node
-        Return
-    End If
-End Process
-
-@Reasoning:
-Emits a literal value as PHP source. Strings are wrapped in double
-quotes (PHP interprets escapes in double-quoted strings, so callers
-relying on literal-string semantics must ensure the lexeme is
-already escape-safe). null becomes the PHP 'null' keyword. All other
-literal types (numbers, booleans) emit their raw lexeme verbatim.
-@End Reasoning
-
-@Implementation:
-Reads literal_type and literal_value via the HIR accessors. If
-literal_type equals "string": emit '"', value, '"'. If "null": emit
-'null'. Otherwise emit value as-is (which covers number, bool, etc).
-@End Implementation
-Process called "generate_literal" takes ctx as Integer, literal_node as Integer:
-    Let literal_type be proc hir_literal_get_type from HIR with literal_node
-    Let literal_value be proc hir_literal_get_value from HIR with literal_node
-    
-    Let is_string be proc string_equals from StringCore with literal_type, "string"
-    If is_string is equal to 1:
-        proc emit with ctx, "\""
-        proc emit with ctx, literal_value
-        proc emit with ctx, "\""
-        Return
-    End If
-    
-    Let is_null be proc string_equals from StringCore with literal_type, "null"
-    If is_null is equal to 1:
-        proc emit with ctx, "null"
-        Return
-    End If
-    
-    Note: Number or boolean
-    proc emit with ctx, literal_value
-End Process
-
-@Reasoning:
-Emits a binary operation '(LEFT OP RIGHT)'. Parentheses are emitted
-unconditionally so the result is correct without consulting PHP
-operator precedence; this trades terseness for unambiguous semantics.
-The operator string is HIR-supplied (no PHP-specific translation
-needed for the common arithmetic/logical/comparison operators).
-@End Reasoning
-
-@Implementation:
-Emits "(". Reads left via hir_binary_op_get_left, recurses
-generate_expression. Emits " OP " (operator from
-hir_binary_op_get_operator). Reads right, recurses. Emits ")".
-@End Implementation
-Process called "generate_binary_op" takes ctx as Integer, binary_node as Integer:
-    proc emit with ctx, "("
-    
-    Let left be proc hir_binary_op_get_left from HIR with binary_node
-    proc generate_expression with ctx, left
-    
-    proc emit with ctx, " "
-    
-    Let operator be proc hir_binary_op_get_operator from HIR with binary_node
-    proc emit with ctx, operator
-    
-    proc emit with ctx, " "
-    
-    Let right be proc hir_binary_op_get_right from HIR with binary_node
-    proc generate_expression with ctx, right
-    
-    proc emit with ctx, ")"
-End Process
-
-@Reasoning:
-Emits a unary operator either in prefix form (OP OPERAND) or postfix
-form (OPERAND OP) based on the 'prefix' metadata flag. This covers
-both PHP prefix ops (!, -, ++X) and postfix ops (X++, X--).
-@End Reasoning
-
-@Implementation:
-Reads operator and 'prefix' metadata. If prefix=1 emits operator
-before operand. Recurses into generate_expression on the operand. If
-prefix!=1 emits operator after operand.
-@End Implementation
-Process called "generate_unary_op" takes ctx as Integer, unary_node as Integer:
-    Let operator be proc hir_unary_op_get_operator from HIR with unary_node
-    
-    Note: Check if prefix or postfix
-    Let is_prefix be proc hir_get_metadata from HIR with unary_node, "prefix"
-    
-    If is_prefix is equal to 1:
-        proc emit with ctx, operator
-    End If
-    
-    Let operand be proc hir_unary_op_get_operand from HIR with unary_node
-    proc generate_expression with ctx, operand
-    
-    If is_prefix is not equal to 1:
-        proc emit with ctx, operator
-    End If
-End Process
-
-@Reasoning:
-Emits a parenthesised ternary '(C ? T : E)'. As in generate_binary_op,
-parentheses are unconditional so the emitted PHP is correct without
-operator-precedence awareness in the caller.
-@End Reasoning
-
-@Implementation:
-Emits "(". Generates condition. Emits " ? ". Generates then-branch.
-Emits " : ". Generates else-branch. Emits ")".
-@End Implementation
-Process called "generate_ternary" takes ctx as Integer, ternary_node as Integer:
-    proc emit with ctx, "("
-    
-    Let condition be proc hir_ternary_get_condition from HIR with ternary_node
-    proc generate_expression with ctx, condition
-    
-    proc emit with ctx, " ? "
-    
-    Let then_expr be proc hir_ternary_get_then from HIR with ternary_node
-    proc generate_expression with ctx, then_expr
-    
-    proc emit with ctx, " : "
-    
-    Let else_expr be proc hir_ternary_get_else from HIR with ternary_node
-    proc generate_expression with ctx, else_expr
-    
-    proc emit with ctx, ")"
-End Process
-
-@Reasoning:
-Emits 'TARGET OP VALUE' where OP is the assignment-class operator
-('=', '+=', '-=', '*=', etc.). This is reused for compound assignments
-which lets the caller carry the operator on the HIR node without
-generating distinct HIR kinds for each variant.
-@End Reasoning
-
-@Implementation:
-Generates target expression. Emits " OP " (operator string from
-hir_assign_get_operator). Generates value expression. No surrounding
-parentheses (assignment binds tighter than statement boundaries; the
-caller is responsible for any wrapping needed in expression context).
-@End Implementation
-Process called "generate_assign" takes ctx as Integer, assign_node as Integer:
-    Let target be proc hir_assign_get_target from HIR with assign_node
-    proc generate_expression with ctx, target
-    
-    proc emit with ctx, " "
-    
-    Let operator be proc hir_assign_get_operator from HIR with assign_node
-    proc emit with ctx, operator
-    
-    proc emit with ctx, " "
-    
-    Let value be proc hir_assign_get_value from HIR with assign_node
-    proc generate_expression with ctx, value
-End Process
-
-@Reasoning:
-Emits a PHP function call. The 'php_echo' metadata flag opts the
-call into PHP's special 'echo' construct (which is a language form,
-not a function, and takes a comma-separated argument list without
-parentheses). All other calls use the conventional NAME(arg, ...)
-syntax.
-@End Reasoning
-
-@Implementation:
-Reads function_name. Reads php_echo metadata; if equal to "true",
-emits 'echo ' and the comma-separated arguments WITHOUT surrounding
-parentheses. Otherwise emits NAME, '(', the comma-separated
-arguments, ')'. In both branches arguments are iterated via
-hir_call_get_arguments and recursively generated.
-@End Implementation
-Process called "generate_call" takes ctx as Integer, call_node as Integer:
-    Let function_name be proc hir_call_get_name from HIR with call_node
-    
-    Note: Check if this is a PHP echo
-    Let is_echo be proc hir_get_metadata from HIR with call_node, "php_echo"
-    Let is_echo_true be proc string_equals from StringCore with is_echo, "true"
-    
-    If is_echo_true is equal to 1:
-        proc emit with ctx, "echo "
-        
-        Let arguments be proc hir_call_get_arguments from HIR with call_node
-        Let arg_count be proc list_length from ListCore with arguments
+Process called "generate_echo" takes context as Integer, node as Integer returns Integer:
+    proc emit_indent with context
+    proc out_str with context, "echo"
+    proc out_space with context
+    Let args be proc get_dict_hir_value with node, "args"
+    Let elems be proc list_elements with args
+    If elems is not equal to 0:
+        Let count be proc size from ListOps with elems
         Let i be 0
-        
-        While i is less than arg_count:
-            Let arg be proc list_get from ListCore with arguments, i
-            proc generate_expression with ctx, arg
-            
-            If i is less than arg_count minus 1:
-                proc emit with ctx, ", "
+        While i is less than count:
+            If i is greater than 0:
+                proc out_str with context, ", "
             End If
-            
+            Let arg be proc get_at from ListOps with elems, i
+            proc generate_expr with context, arg
             Set i to i plus 1
         End While
-    Otherwise:
-        proc emit with ctx, function_name
-        proc emit with ctx, "("
-        
-        Set arguments to proc hir_call_get_arguments from HIR with call_node
-        Set arg_count to proc list_length from ListCore with arguments
-        Set i to 0
-        
-        While i is less than arg_count:
-            Set arg to proc list_get from ListCore with arguments, i
-            proc generate_expression with ctx, arg
-            
-            If i is less than arg_count minus 1:
-                proc emit with ctx, ", "
-            End If
-            
-            Set i to i plus 1
-        End While
-        
-        proc emit with ctx, ")"
     End If
+    proc out_str with context, ";"
+    proc out_newline with context
+    Return 1
 End Process
 
 @Reasoning:
-Emits a PHP object construction 'new ClassName(args...)'. The class
-name is captured at HIR construction time and emitted verbatim;
-qualified class names (with namespace separators) are passed through
-without further transformation.
+A print statement emits 'print expr;\n'.
 @End Reasoning
+Process called "generate_print_stmt" takes context as Integer, node as Integer returns Integer:
+    proc emit_indent with context
+    proc out_str with context, "print"
+    proc out_space with context
+    Let expr be proc get_dict_hir_value with node, "expr"
+    proc generate_expr with context, expr
+    proc out_str with context, ";"
+    proc out_newline with context
+    Return 1
+End Process
 
-@Implementation:
-Emits 'new '. Reads class name and emits it. Emits '('. Iterates
-hir_new_get_arguments, recursively generating each and separating
-with ", ". Emits ')'.
-@End Implementation
-Process called "generate_new" takes ctx as Integer, new_node as Integer:
-    proc emit with ctx, "new "
-    
-    Let class_name be proc hir_new_get_class from HIR with new_node
-    proc emit with ctx, class_name
-    proc emit with ctx, "("
-    
-    Let arguments be proc hir_new_get_arguments from HIR with new_node
-    Let arg_count be proc list_length from ListCore with arguments
-    Let i be 0
-    
-    While i is less than arg_count:
-        Let arg be proc list_get from ListCore with arguments, i
-        proc generate_expression with ctx, arg
-        
-        If i is less than arg_count minus 1:
-            proc emit with ctx, ", "
+@Reasoning:
+An if emits 'if (condition)' then the then-branch block, each elseif clause as
+'elseif (cond) { ... }', and an optional 'else { ... }'.
+@End Reasoning
+Process called "generate_if" takes context as Integer, node as Integer returns Integer:
+    proc emit_indent with context
+    proc out_str with context, "if ("
+    Let condition be proc get_dict_hir_value with node, "condition"
+    proc generate_expr with context, condition
+    proc out_str with context, ")"
+    Let then_branch be proc get_dict_hir_value with node, "then_branch"
+    proc generate_branch_block with context, then_branch
+
+    Let elseifs be proc get_dict_hir_value with node, "elseifs"
+    Let elems be proc list_elements with elseifs
+    If elems is not equal to 0:
+        Let count be proc size from ListOps with elems
+        Let i be 0
+        While i is less than count:
+            Let clause be proc get_at from ListOps with elems, i
+            proc emit_indent with context
+            proc out_str with context, "elseif ("
+            Let cc be proc get_dict_hir_value with clause, "condition"
+            proc generate_expr with context, cc
+            proc out_str with context, ")"
+            Let cb be proc get_dict_hir_value with clause, "body"
+            proc generate_branch_block with context, cb
+            Set i to i plus 1
+        End While
+    End If
+
+    Let else_branch be proc get_dict_hir_value with node, "else_branch"
+    If else_branch is not equal to 0:
+        proc emit_indent with context
+        proc out_str with context, "else"
+        proc generate_branch_block with context, else_branch
+    End If
+    Return 1
+End Process
+
+@Reasoning:
+A while emits 'while (condition)' then the body block.
+@End Reasoning
+Process called "generate_while" takes context as Integer, node as Integer returns Integer:
+    proc emit_indent with context
+    proc out_str with context, "while ("
+    Let condition be proc get_dict_hir_value with node, "condition"
+    proc generate_expr with context, condition
+    proc out_str with context, ")"
+    Let body be proc get_dict_hir_value with node, "body"
+    proc generate_branch_block with context, body
+    Return 1
+End Process
+
+@Reasoning:
+A do_while emits 'do { ... } while (condition);'.
+@End Reasoning
+Process called "generate_do_while" takes context as Integer, node as Integer returns Integer:
+    proc emit_indent with context
+    proc out_str with context, "do"
+    Let body be proc get_dict_hir_value with node, "body"
+    proc generate_inline_block with context, body
+    proc out_str with context, " while ("
+    Let condition be proc get_dict_hir_value with node, "condition"
+    proc generate_expr with context, condition
+    proc out_str with context, ");"
+    proc out_newline with context
+    Return 1
+End Process
+
+@Reasoning:
+Emits a block body inline without a trailing newline after the closing brace, so a
+trailing 'while (...)' can follow on the same line (do-while). Falls back to a
+single-statement wrap for a non-block body.
+@End Reasoning
+Process called "generate_inline_block" takes context as Integer, node as Integer returns Integer:
+    proc out_str with context, " {"
+    proc out_newline with context
+    proc increase_indent with context
+    If node is not equal to 0:
+        Let is_block be proc type_is with node, "block"
+        If is_block is equal to 1:
+            Let body be proc get_dict_hir_value with node, "body"
+            proc generate_stmt_list with context, body
+        Otherwise:
+            proc generate_node with context, node
         End If
-        
-        Set i to i plus 1
-    End While
-    
-    proc emit with ctx, ")"
+    End If
+    proc decrease_indent with context
+    proc emit_indent with context
+    proc out_str with context, "}"
+    Return 1
 End Process
 
 @Reasoning:
-Emits an object-property access OBJECT->MEMBER. PHP uses the '->'
-arrow for both property reads and method calls; this generator
-unconditionally emits '->' for member access. Static class access
-(Class::member) is not handled here - it would need a separate HIR
-kind because the syntactic form differs.
+A for emits 'for (init; condition; update)' then the body block. Each of the three
+clause lists is emitted comma-separated.
 @End Reasoning
-
-@Implementation:
-Generates the object expression. Emits '->'. Emits the member_name
-verbatim (no escaping or quoting).
-@End Implementation
-Process called "generate_member_access" takes ctx as Integer, member_node as Integer:
-    Let object be proc hir_member_access_get_object from HIR with member_node
-    proc generate_expression with ctx, object
-    
-    proc emit with ctx, "->"
-    
-    Let member_name be proc hir_member_access_get_member from HIR with member_node
-    proc emit with ctx, member_name
+Process called "generate_for" takes context as Integer, node as Integer returns Integer:
+    proc emit_indent with context
+    proc out_str with context, "for ("
+    proc generate_expr_list_commas with context, node, "init"
+    proc out_str with context, "; "
+    proc generate_expr_list_commas with context, node, "condition"
+    proc out_str with context, "; "
+    proc generate_expr_list_commas with context, node, "update"
+    proc out_str with context, ")"
+    Let body be proc get_dict_hir_value with node, "body"
+    proc generate_branch_block with context, body
+    Return 1
 End Process
 
 @Reasoning:
-Emits an array/index subscript ARRAY[INDEX]. Works for both
-positional (numeric) and associative (string-keyed) PHP arrays
-because the syntax is identical.
+Emits a keyed HIR list of expressions comma-separated (for-clause lists, etc.).
+Null-safe.
 @End Reasoning
-
-@Implementation:
-Generates the array expression. Emits '['. Generates the index
-expression. Emits ']'.
-@End Implementation
-Process called "generate_index_access" takes ctx as Integer, index_node as Integer:
-    Let array be proc hir_index_access_get_array from HIR with index_node
-    proc generate_expression with ctx, array
-    
-    proc emit with ctx, "["
-    
-    Let index be proc hir_index_access_get_index from HIR with index_node
-    proc generate_expression with ctx, index
-    
-    proc emit with ctx, "]"
-End Process
-
-@Reasoning:
-Emits a PHP array literal '[a, b, c]'. The PHP 5.4+ short array
-syntax is used unconditionally; the older 'array(...)' form is not
-generated. Associative array elements (key => value) would require
-extending this routine with HIR support for keyed entries; the
-current bootstrap pipeline only produces positional arrays.
-@End Reasoning
-
-@Implementation:
-Emits '['. Iterates hir_array_get_elements; each element is
-recursively generated and separated by ", ". Emits ']'.
-@End Implementation
-Process called "generate_array" takes ctx as Integer, array_node as Integer:
-    proc emit with ctx, "["
-    
-    Let elements be proc hir_array_get_elements from HIR with array_node
-    Let elem_count be proc list_length from ListCore with elements
+Process called "generate_expr_list_commas" takes context as Integer, node as Integer, key as Integer returns Integer:
+    Let lst be proc get_dict_hir_value with node, key
+    Let elems be proc list_elements with lst
+    If elems is equal to 0:
+        Return 1
+    End If
+    Let count be proc size from ListOps with elems
     Let i be 0
-    
-    While i is less than elem_count:
-        Let elem be proc list_get from ListCore with elements, i
-        proc generate_expression with ctx, elem
-        
-        If i is less than elem_count minus 1:
-            proc emit with ctx, ", "
+    While i is less than count:
+        If i is greater than 0:
+            proc out_str with context, ", "
         End If
-        
+        Let e be proc get_at from ListOps with elems, i
+        proc generate_expr with context, e
         Set i to i plus 1
     End While
-    
-    proc emit with ctx, "]"
-End Process
-
-Note: ===================================================================
-Note: OUTPUT UTILITIES
-Note: ===================================================================
-
-@Reasoning:
-The fundamental output primitive: appends a chunk of text to the
-context's running output string. Every other generate_* routine
-flows its output through here.
-@End Reasoning
-
-@Implementation:
-Sets ctx.output to the StringCore concatenation of ctx.output and
-text. The concat allocates a fresh string each call; this is O(N)
-per emission but acceptable for the bootstrap's small input sizes.
-@End Implementation
-Process called "emit" takes ctx as Integer, text as Integer:
-    Set ctx.output to proc string_concat from StringCore with ctx.output, text
+    Return 1
 End Process
 
 @Reasoning:
-Writes four spaces times the current indent_level so the next emit
-lands at the correct column. Uses four-space indents (PSR-12 PHP
-style); changing this width is a single literal-change in this proc.
+A foreach emits 'foreach (collection as [$k =>] [&]$v)' then the body block. When a
+key_var is present the keyed form 'as $k => $v' is emitted; the by_ref flag adds
+'&' before the value var. This preserves the `as $k => $v` form the probe asserts.
 @End Reasoning
+Process called "generate_foreach" takes context as Integer, node as Integer returns Integer:
+    proc emit_indent with context
+    proc out_str with context, "foreach ("
+    Let collection be proc get_dict_hir_value with node, "collection"
+    proc generate_expr with context, collection
+    proc out_str with context, " as "
 
-@Implementation:
-Loop 0..ctx.indent_level: each iteration emits a four-space string.
-No-op at indent_level 0 (module scope).
-@End Implementation
-Process called "emit_indent" takes ctx as Integer:
+    Let key_var be proc get_dict_hir_value with node, "key_var"
+    If key_var is not equal to 0:
+        proc generate_expr with context, key_var
+        proc out_str with context, " => "
+    End If
+
+    Let by_ref be proc get_dict_flag with node, "by_ref"
+    If by_ref is equal to 1:
+        proc out_str with context, "&"
+    End If
+
+    Let value_var be proc get_dict_hir_value with node, "value_var"
+    proc generate_expr with context, value_var
+    proc out_str with context, ")"
+
+    Let body be proc get_dict_hir_value with node, "body"
+    proc generate_branch_block with context, body
+    Return 1
+End Process
+
+@Reasoning:
+A switch emits 'switch (discriminant) {' then each case ('case test:' or
+'default:') with its body statements at a deeper indent, then '}'.
+@End Reasoning
+Process called "generate_switch" takes context as Integer, node as Integer returns Integer:
+    proc emit_indent with context
+    proc out_str with context, "switch ("
+    Let discriminant be proc get_dict_hir_value with node, "discriminant"
+    proc generate_expr with context, discriminant
+    proc out_str with context, ") {"
+    proc out_newline with context
+    proc increase_indent with context
+
+    Let cases be proc get_dict_hir_value with node, "cases"
+    Let elems be proc list_elements with cases
+    If elems is not equal to 0:
+        Let count be proc size from ListOps with elems
+        Let i be 0
+        While i is less than count:
+            Let case_node be proc get_at from ListOps with elems, i
+            proc emit_indent with context
+            Let test be proc get_dict_hir_value with case_node, "test"
+            If test is not equal to 0:
+                proc out_str with context, "case "
+                proc generate_expr with context, test
+                proc out_str with context, ":"
+            Otherwise:
+                proc out_str with context, "default:"
+            End If
+            proc out_newline with context
+            proc increase_indent with context
+            Let cbody be proc get_dict_hir_value with case_node, "body"
+            proc generate_stmt_list with context, cbody
+            proc decrease_indent with context
+            Set i to i plus 1
+        End While
+    End If
+
+    proc decrease_indent with context
+    proc emit_indent with context
+    proc out_str with context, "}"
+    proc out_newline with context
+    Return 1
+End Process
+
+@Reasoning:
+A return emits 'return;' or 'return expr;'.
+@End Reasoning
+Process called "generate_return" takes context as Integer, node as Integer returns Integer:
+    proc emit_indent with context
+    proc out_str with context, "return"
+    Let value be proc get_dict_hir_value with node, "value"
+    If value is not equal to 0:
+        proc out_space with context
+        proc generate_expr with context, value
+    End If
+    proc out_str with context, ";"
+    proc out_newline with context
+    Return 1
+End Process
+
+@Reasoning:
+A break emits 'break;' or 'break N;'.
+@End Reasoning
+Process called "generate_break" takes context as Integer, node as Integer returns Integer:
+    proc emit_indent with context
+    proc out_str with context, "break"
+    Let level be proc get_dict_hir_value with node, "level"
+    If level is not equal to 0:
+        proc out_space with context
+        proc generate_expr with context, level
+    End If
+    proc out_str with context, ";"
+    proc out_newline with context
+    Return 1
+End Process
+
+@Reasoning:
+A continue emits 'continue;' or 'continue N;'.
+@End Reasoning
+Process called "generate_continue" takes context as Integer, node as Integer returns Integer:
+    proc emit_indent with context
+    proc out_str with context, "continue"
+    Let level be proc get_dict_hir_value with node, "level"
+    If level is not equal to 0:
+        proc out_space with context
+        proc generate_expr with context, level
+    End If
+    proc out_str with context, ";"
+    proc out_newline with context
+    Return 1
+End Process
+
+@Reasoning:
+A throw statement emits 'throw expr;'.
+@End Reasoning
+Process called "generate_throw" takes context as Integer, node as Integer returns Integer:
+    proc emit_indent with context
+    proc out_str with context, "throw"
+    proc out_space with context
+    Let expr be proc get_dict_hir_value with node, "expr"
+    proc generate_expr with context, expr
+    proc out_str with context, ";"
+    proc out_newline with context
+    Return 1
+End Process
+
+@Reasoning:
+A try emits 'try { ... }', each catch as 'catch (T1|T2 [$e]) { ... }', and an
+optional 'finally { ... }'.
+@End Reasoning
+Process called "generate_try" takes context as Integer, node as Integer returns Integer:
+    proc emit_indent with context
+    proc out_str with context, "try"
+    Let body be proc get_dict_hir_value with node, "body"
+    proc generate_branch_block with context, body
+
+    Let catches be proc get_dict_hir_value with node, "catches"
+    Let elems be proc list_elements with catches
+    If elems is not equal to 0:
+        Let count be proc size from ListOps with elems
+        Let i be 0
+        While i is less than count:
+            Let clause be proc get_at from ListOps with elems, i
+            proc emit_indent with context
+            proc out_str with context, "catch ("
+            proc generate_catch_types with context, clause
+            Let var be proc get_dict_string_value with clause, "var"
+            If proc str_present with var:
+                proc out_space with context
+                proc out_str with context, var
+            End If
+            proc out_str with context, ")"
+            Let cbody be proc get_dict_hir_value with clause, "body"
+            proc generate_branch_block with context, cbody
+            Set i to i plus 1
+        End While
+    End If
+
+    Let finally be proc get_dict_hir_value with node, "finally"
+    If finally is not equal to 0:
+        proc emit_indent with context
+        proc out_str with context, "finally"
+        proc generate_branch_block with context, finally
+    End If
+    Return 1
+End Process
+
+@Reasoning:
+Emits a catch clause's exception types pipe-separated ('T1|T2'). The types are a
+HIR string list.
+@End Reasoning
+Process called "generate_catch_types" takes context as Integer, clause as Integer returns Integer:
+    Let lst be proc get_dict_hir_value with clause, "types"
+    Let elems be proc list_elements with lst
+    If elems is equal to 0:
+        Return 1
+    End If
+    Let count be proc size from ListOps with elems
     Let i be 0
-    While i is less than ctx.indent_level:
-        proc emit with ctx, "    "
+    While i is less than count:
+        If i is greater than 0:
+            proc out_str with context, "|"
+        End If
+        Let lit be proc get_at from ListOps with elems, i
+        Let s be proc get_string_literal_value from HIR with lit
+        If s is not equal to 0:
+            proc out_str with context, s
+        End If
         Set i to i plus 1
     End While
+    Return 1
 End Process
 
 @Reasoning:
-Bumps the context's indent counter so subsequent emit_indent calls
-produce one more level of indentation. Paired with decrease_indent
-around any nested block.
+A global statement emits 'global $a, $b;'.
 @End Reasoning
-
-@Implementation:
-ctx.indent_level += 1.
-@End Implementation
-Process called "increase_indent" takes ctx as Integer:
-    Set ctx.indent_level to ctx.indent_level plus 1
+Process called "generate_global" takes context as Integer, node as Integer returns Integer:
+    proc emit_indent with context
+    proc out_str with context, "global"
+    proc out_space with context
+    proc generate_expr_list_commas with context, node, "vars"
+    proc out_str with context, ";"
+    proc out_newline with context
+    Return 1
 End Process
 
 @Reasoning:
-Companion to increase_indent: drops one level of nesting. The caller
-is responsible for never calling this below 0 (which would produce
-negative indentation); the convention is that every generator that
-calls increase_indent immediately pairs it with decrease_indent on
-every exit path.
+A static_var statement emits 'static $a = 1, $b;'. Each var is a static_var_item
+carrying a name and an optional default.
 @End Reasoning
-
-@Implementation:
-ctx.indent_level -= 1.
-@End Implementation
-Process called "decrease_indent" takes ctx as Integer:
-    Set ctx.indent_level to ctx.indent_level minus 1
+Process called "generate_static_var" takes context as Integer, node as Integer returns Integer:
+    proc emit_indent with context
+    proc out_str with context, "static"
+    proc out_space with context
+    Let vars be proc get_dict_hir_value with node, "vars"
+    Let elems be proc list_elements with vars
+    If elems is not equal to 0:
+        Let count be proc size from ListOps with elems
+        Let i be 0
+        While i is less than count:
+            If i is greater than 0:
+                proc out_str with context, ", "
+            End If
+            Let item be proc get_at from ListOps with elems, i
+            Let name be proc get_dict_string_value with item, "name"
+            If name is not equal to 0:
+                proc out_str with context, name
+            End If
+            Let default be proc get_dict_hir_value with item, "default"
+            If default is not equal to 0:
+                proc out_str with context, " = "
+                proc generate_expr with context, default
+            End If
+            Set i to i plus 1
+        End While
+    End If
+    proc out_str with context, ";"
+    proc out_newline with context
+    Return 1
 End Process
 
-Note: ===================================================================
-Note: PUBLIC API
-Note: ===================================================================
+@Reasoning:
+An unset statement emits 'unset($a, $b);'.
+@End Reasoning
+Process called "generate_unset" takes context as Integer, node as Integer returns Integer:
+    proc emit_indent with context
+    proc out_str with context, "unset("
+    proc generate_expr_list_commas with context, node, "args"
+    proc out_str with context, ");"
+    proc out_newline with context
+    Return 1
+End Process
 
 @Reasoning:
-Public entry-point alias for generate_php_from_hir. Provides the
-naming convention 'hir_to_<lang>' that the translation pipeline
-drivers expect when locating backends by symbol name.
+A goto statement emits 'goto label;'.
 @End Reasoning
+Process called "generate_goto" takes context as Integer, node as Integer returns Integer:
+    proc emit_indent with context
+    proc out_str with context, "goto"
+    proc out_space with context
+    Let label be proc get_dict_string_value with node, "label"
+    If label is not equal to 0:
+        proc out_str with context, label
+    End If
+    proc out_str with context, ";"
+    proc out_newline with context
+    Return 1
+End Process
 
-@Implementation:
-Tail-calls generate_php_from_hir with the same hir_module argument.
-@End Implementation
-Process called "hir_to_php" takes hir_module as Integer returns Integer:
-    Return proc generate_php_from_hir from hir_module
+@Reasoning:
+A label statement emits 'name:'.
+@End Reasoning
+Process called "generate_label" takes context as Integer, node as Integer returns Integer:
+    proc emit_indent with context
+    Let name be proc get_dict_string_value with node, "name"
+    If name is not equal to 0:
+        proc out_str with context, name
+    End If
+    proc out_str with context, ":"
+    proc out_newline with context
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Expressions
+Note: ============================================================================
+
+@Reasoning:
+Central expression dispatcher. Reads the "_type" tag and emits the inline source
+for the expression. Statement-shaped expressions (closures, match, etc.) are
+handled here so they can appear anywhere an expression is expected. Anonymous
+classes are emitted via generate_class as the operand of 'new'. Unknown tags emit
+nothing.
+@End Reasoning
+Process called "generate_expr" takes context as Integer, node as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+
+    Let nt be proc get_dict_string_value with node, "_type"
+    If nt is equal to 0:
+        Return 0
+    End If
+
+    If proc string_equals from StringCore with nt, "variable":
+        Let name be proc get_dict_string_value with node, "name"
+        If name is not equal to 0:
+            proc out_str with context, name
+        End If
+        Return 1
+    End If
+    If proc string_equals from StringCore with nt, "name":
+        Return proc generate_name with context, node
+    End If
+    If proc string_equals from StringCore with nt, "int":
+        Return proc generate_raw_value with context, node
+    End If
+    If proc string_equals from StringCore with nt, "float":
+        Return proc generate_raw_value with context, node
+    End If
+    If proc string_equals from StringCore with nt, "string":
+        Return proc generate_string_literal with context, node
+    End If
+    If proc string_equals from StringCore with nt, "bool":
+        Return proc generate_raw_value with context, node
+    End If
+    If proc string_equals from StringCore with nt, "null":
+        proc out_str with context, "null"
+        Return 1
+    End If
+    If proc string_equals from StringCore with nt, "assign":
+        Return proc generate_assign with context, node
+    End If
+    If proc string_equals from StringCore with nt, "ternary":
+        Return proc generate_ternary with context, node
+    End If
+    If proc string_equals from StringCore with nt, "binary_op":
+        Return proc generate_binary_op with context, node
+    End If
+    If proc string_equals from StringCore with nt, "unary_op":
+        Return proc generate_unary_op with context, node
+    End If
+    If proc string_equals from StringCore with nt, "cast":
+        Return proc generate_cast with context, node
+    End If
+    If proc string_equals from StringCore with nt, "instanceof":
+        Return proc generate_instanceof with context, node
+    End If
+    If proc string_equals from StringCore with nt, "call":
+        Return proc generate_call with context, node
+    End If
+    If proc string_equals from StringCore with nt, "new":
+        Return proc generate_new with context, node
+    End If
+    If proc string_equals from StringCore with nt, "clone":
+        proc out_str with context, "clone "
+        Let operand be proc get_dict_hir_value with node, "operand"
+        proc generate_expr with context, operand
+        Return 1
+    End If
+    If proc string_equals from StringCore with nt, "member":
+        Return proc generate_member with context, node
+    End If
+    If proc string_equals from StringCore with nt, "static_member":
+        Return proc generate_static_member with context, node
+    End If
+    If proc string_equals from StringCore with nt, "index":
+        Return proc generate_index with context, node
+    End If
+    If proc string_equals from StringCore with nt, "array":
+        Return proc generate_array with context, node
+    End If
+    If proc string_equals from StringCore with nt, "list_pattern":
+        Return proc generate_list_pattern with context, node
+    End If
+    If proc string_equals from StringCore with nt, "closure":
+        Return proc generate_closure with context, node
+    End If
+    If proc string_equals from StringCore with nt, "arrow_fn":
+        Return proc generate_arrow_fn with context, node
+    End If
+    If proc string_equals from StringCore with nt, "match":
+        Return proc generate_match with context, node
+    End If
+    If proc string_equals from StringCore with nt, "yield":
+        Return proc generate_yield with context, node
+    End If
+    If proc string_equals from StringCore with nt, "isset":
+        proc out_str with context, "isset("
+        proc generate_expr_list_commas with context, node, "args"
+        proc out_str with context, ")"
+        Return 1
+    End If
+    If proc string_equals from StringCore with nt, "empty":
+        proc out_str with context, "empty("
+        Let arg be proc get_dict_hir_value with node, "arg"
+        proc generate_expr with context, arg
+        proc out_str with context, ")"
+        Return 1
+    End If
+    If proc string_equals from StringCore with nt, "print":
+        proc out_str with context, "print "
+        Let pexpr be proc get_dict_hir_value with node, "expr"
+        proc generate_expr with context, pexpr
+        Return 1
+    End If
+    If proc string_equals from StringCore with nt, "exit":
+        Return proc generate_exit with context, node
+    End If
+    If proc string_equals from StringCore with nt, "include":
+        Return proc generate_include with context, node
+    End If
+    If proc string_equals from StringCore with nt, "class":
+        Return proc generate_class with context, node, "class"
+    End If
+
+    Return 0
+End Process
+
+@Reasoning:
+A name emits its qualified value, prefixed with '\' when fully_qualified.
+@End Reasoning
+Process called "generate_name" takes context as Integer, node as Integer returns Integer:
+    Let fq be proc get_dict_flag with node, "fully_qualified"
+    If fq is equal to 1:
+        proc out_char with context, 92
+    End If
+    Let value be proc get_dict_string_value with node, "value"
+    If value is not equal to 0:
+        proc out_str with context, value
+    End If
+    Return 1
+End Process
+
+@Reasoning:
+Emits a leaf node's raw "value" lexeme verbatim (int / float / bool), preserving
+the original radix, grouping, and casing.
+@End Reasoning
+Process called "generate_raw_value" takes context as Integer, node as Integer returns Integer:
+    Let value be proc get_dict_string_value with node, "value"
+    If value is not equal to 0:
+        proc out_str with context, value
+    End If
+    Return 1
+End Process
+
+@Reasoning:
+A string literal emits its raw lexeme verbatim. The raw "value" already carries the
+original delimiters (single/double/heredoc/nowdoc) and any interpolation markers,
+so re-emitting it byte-for-byte guarantees the kind, interpolation flag, and inner
+contents all round-trip. Falls back to a quoted decoded payload if the raw lexeme
+is missing.
+@End Reasoning
+Process called "generate_string_literal" takes context as Integer, node as Integer returns Integer:
+    Let raw be proc get_dict_string_value with node, "value"
+    If raw is not equal to 0:
+        proc out_str with context, raw
+        Return 1
+    End If
+
+    Let decoded be proc get_dict_string_value with node, "decoded"
+    proc out_char with context, 34
+    If decoded is not equal to 0:
+        proc out_str with context, decoded
+    End If
+    proc out_char with context, 34
+    Return 1
+End Process
+
+@Reasoning:
+An assign emits 'target op [&]value'. The operator covers '=' and the compound
+forms; the by_ref flag inserts '&' before a reference assignment value.
+@End Reasoning
+Process called "generate_assign" takes context as Integer, node as Integer returns Integer:
+    Let target be proc get_dict_hir_value with node, "target"
+    proc generate_expr with context, target
+    proc out_space with context
+    Let operator be proc get_dict_string_value with node, "operator"
+    If operator is not equal to 0:
+        proc out_str with context, operator
+    Otherwise:
+        proc out_str with context, "="
+    End If
+    proc out_space with context
+    Let by_ref be proc get_dict_flag with node, "by_ref"
+    If by_ref is equal to 1:
+        proc out_str with context, "&"
+    End If
+    Let value be proc get_dict_hir_value with node, "value"
+    proc generate_expr with context, value
+    Return 1
+End Process
+
+@Reasoning:
+A ternary emits '(condition ? then : else)' or the short '(condition ?: else)' when
+no then-branch is present. Parentheses keep precedence unambiguous on re-parse.
+@End Reasoning
+Process called "generate_ternary" takes context as Integer, node as Integer returns Integer:
+    proc out_str with context, "("
+    Let condition be proc get_dict_hir_value with node, "condition"
+    proc generate_expr with context, condition
+    Let then be proc get_dict_hir_value with node, "then"
+    If then is not equal to 0:
+        proc out_str with context, " ? "
+        proc generate_expr with context, then
+        proc out_str with context, " : "
+    Otherwise:
+        proc out_str with context, " ?: "
+    End If
+    Let else_node be proc get_dict_hir_value with node, "else"
+    proc generate_expr with context, else_node
+    proc out_str with context, ")"
+    Return 1
+End Process
+
+@Reasoning:
+A binary_op emits '(left op right)'. Parentheses preserve grouping across the
+round-trip without re-deriving PHP's precedence table.
+@End Reasoning
+Process called "generate_binary_op" takes context as Integer, node as Integer returns Integer:
+    proc out_str with context, "("
+    Let left be proc get_dict_hir_value with node, "left"
+    proc generate_expr with context, left
+    proc out_space with context
+    Let operator be proc get_dict_string_value with node, "operator"
+    If operator is not equal to 0:
+        proc out_str with context, operator
+    End If
+    proc out_space with context
+    Let right be proc get_dict_hir_value with node, "right"
+    proc generate_expr with context, right
+    proc out_str with context, ")"
+    Return 1
+End Process
+
+@Reasoning:
+A unary_op emits '(op operand)' for the prefix form (incl. !, -, ~, ++, --) or
+'(operand op)' for the postfix form (++/--). The prefix flag selects which.
+@End Reasoning
+Process called "generate_unary_op" takes context as Integer, node as Integer returns Integer:
+    Let operator be proc get_dict_string_value with node, "operator"
+    Let operand be proc get_dict_hir_value with node, "operand"
+    Let prefix be proc get_dict_flag with node, "prefix"
+
+    proc out_str with context, "("
+    If prefix is equal to 1:
+        If operator is not equal to 0:
+            proc out_str with context, operator
+        End If
+        proc generate_expr with context, operand
+    Otherwise:
+        proc generate_expr with context, operand
+        If operator is not equal to 0:
+            proc out_str with context, operator
+        End If
+    End If
+    proc out_str with context, ")"
+    Return 1
+End Process
+
+@Reasoning:
+A cast emits '(type) operand'.
+@End Reasoning
+Process called "generate_cast" takes context as Integer, node as Integer returns Integer:
+    proc out_str with context, "("
+    Let cast_type be proc get_dict_string_value with node, "cast_type"
+    If cast_type is not equal to 0:
+        proc out_str with context, cast_type
+    End If
+    proc out_str with context, ") "
+    Let operand be proc get_dict_hir_value with node, "operand"
+    proc generate_expr with context, operand
+    Return 1
+End Process
+
+@Reasoning:
+An instanceof emits '(operand instanceof class_name)'.
+@End Reasoning
+Process called "generate_instanceof" takes context as Integer, node as Integer returns Integer:
+    proc out_str with context, "("
+    Let operand be proc get_dict_hir_value with node, "operand"
+    proc generate_expr with context, operand
+    proc out_str with context, " instanceof "
+    Let class_name be proc get_dict_hir_value with node, "class_name"
+    proc generate_expr with context, class_name
+    proc out_str with context, ")"
+    Return 1
+End Process
+
+@Reasoning:
+A call emits 'callee(args)'. The first-class-callable form is preserved by an arg
+with spread=1 and no value, rendered as '...'.
+@End Reasoning
+Process called "generate_call" takes context as Integer, node as Integer returns Integer:
+    Let callee be proc get_dict_hir_value with node, "callee"
+    proc generate_expr with context, callee
+    proc generate_arg_list with context, node
+    Return 1
+End Process
+
+@Reasoning:
+Emits a parenthesised argument list. Each arg may be named ('name: value'), spread
+('...value'), or a first-class-callable marker ('...' with no value). Shared by
+call, new, and attribute generators.
+@End Reasoning
+Process called "generate_arg_list" takes context as Integer, node as Integer returns Integer:
+    proc out_str with context, "("
+    Let args be proc get_dict_hir_value with node, "args"
+    Let elems be proc list_elements with args
+    If elems is not equal to 0:
+        Let count be proc size from ListOps with elems
+        Let i be 0
+        While i is less than count:
+            If i is greater than 0:
+                proc out_str with context, ", "
+            End If
+            Let arg be proc get_at from ListOps with elems, i
+            proc generate_arg with context, arg
+            Set i to i plus 1
+        End While
+    End If
+    proc out_str with context, ")"
+    Return 1
+End Process
+
+@Reasoning:
+A single argument: an optional 'name:' prefix for named args, an optional '...' for
+spread / first-class-callable, then the value expression (absent for the
+first-class-callable foo(...) form).
+@End Reasoning
+Process called "generate_arg" takes context as Integer, arg as Integer returns Integer:
+    Let name be proc get_dict_string_value with arg, "name"
+    If proc str_present with name:
+        proc out_str with context, name
+        proc out_str with context, ": "
+    End If
+    Let spread be proc get_dict_flag with arg, "spread"
+    If spread is equal to 1:
+        proc out_str with context, "..."
+    End If
+    Let value be proc get_dict_hir_value with arg, "value"
+    If value is not equal to 0:
+        proc generate_expr with context, value
+    End If
+    Return 1
+End Process
+
+@Reasoning:
+A new emits 'new class_name(args)'. For an anonymous class the anon_class member is
+emitted as 'new class(args) { ... }' via the class generator.
+@End Reasoning
+Process called "generate_new" takes context as Integer, node as Integer returns Integer:
+    proc out_str with context, "new "
+
+    Let anon be proc get_dict_hir_value with node, "anon_class"
+    If anon is not equal to 0:
+        proc out_str with context, "class"
+        proc generate_arg_list with context, node
+        proc generate_member_block with context, anon
+        Return 1
+    End If
+
+    Let class_name be proc get_dict_hir_value with node, "class_name"
+    proc generate_expr with context, class_name
+    proc generate_arg_list with context, node
+    Return 1
+End Process
+
+@Reasoning:
+A member access emits 'object->prop' or 'object?->prop' (nullsafe). When computed
+the property is an expression wrapped in '{...}'; otherwise it is a plain name.
+@End Reasoning
+Process called "generate_member" takes context as Integer, node as Integer returns Integer:
+    Let object be proc get_dict_hir_value with node, "object"
+    proc generate_expr with context, object
+
+    Let nullsafe be proc get_dict_flag with node, "nullsafe"
+    If nullsafe is equal to 1:
+        proc out_str with context, "?->"
+    Otherwise:
+        proc out_str with context, "->"
+    End If
+
+    Let computed be proc get_dict_flag with node, "computed"
+    If computed is equal to 1:
+        proc out_str with context, "{"
+        Let prop_node be proc get_dict_hir_value with node, "property"
+        proc generate_expr with context, prop_node
+        proc out_str with context, "}"
+    Otherwise:
+        Let prop be proc get_dict_string_value with node, "property"
+        If prop is not equal to 0:
+            proc out_str with context, prop
+        End If
+    End If
+    Return 1
+End Process
+
+@Reasoning:
+A static member access emits 'class_name::member'. When computed the member is an
+expression wrapped in '{...}'; otherwise a plain name (constant / method /
+$property).
+@End Reasoning
+Process called "generate_static_member" takes context as Integer, node as Integer returns Integer:
+    Let class_name be proc get_dict_hir_value with node, "class_name"
+    proc generate_expr with context, class_name
+    proc out_str with context, "::"
+
+    Let computed be proc get_dict_flag with node, "computed"
+    If computed is equal to 1:
+        proc out_str with context, "{"
+        Let member_node be proc get_dict_hir_value with node, "member"
+        proc generate_expr with context, member_node
+        proc out_str with context, "}"
+    Otherwise:
+        Let member be proc get_dict_string_value with node, "member"
+        If member is not equal to 0:
+            proc out_str with context, member
+        End If
+    End If
+    Return 1
+End Process
+
+@Reasoning:
+An index access emits 'object[index]' or 'object[]' for the append form (no index).
+@End Reasoning
+Process called "generate_index" takes context as Integer, node as Integer returns Integer:
+    Let object be proc get_dict_hir_value with node, "object"
+    proc generate_expr with context, object
+    proc out_str with context, "["
+    Let index be proc get_dict_hir_value with node, "index"
+    If index is not equal to 0:
+        proc generate_expr with context, index
+    End If
+    proc out_str with context, "]"
+    Return 1
+End Process
+
+@Reasoning:
+An array emits '[...]' for the short syntax or 'array(...)' otherwise. Each element
+is rendered by generate_array_item.
+@End Reasoning
+Process called "generate_array" takes context as Integer, node as Integer returns Integer:
+    Let short_syntax be proc get_dict_flag with node, "short_syntax"
+    If short_syntax is equal to 1:
+        proc out_str with context, "["
+    Otherwise:
+        proc out_str with context, "array("
+    End If
+
+    Let elements be proc get_dict_hir_value with node, "elements"
+    Let elems be proc list_elements with elements
+    If elems is not equal to 0:
+        Let count be proc size from ListOps with elems
+        Let i be 0
+        While i is less than count:
+            If i is greater than 0:
+                proc out_str with context, ", "
+            End If
+            Let item be proc get_at from ListOps with elems, i
+            proc generate_array_item with context, item
+            Set i to i plus 1
+        End While
+    End If
+
+    If short_syntax is equal to 1:
+        proc out_str with context, "]"
+    Otherwise:
+        proc out_str with context, ")"
+    End If
+    Return 1
+End Process
+
+@Reasoning:
+An array_item emits 'value', 'key => value' (when a key is present), '...value'
+(spread), or '&value' (by-ref). This preserves the array's '=>' keys the probe
+asserts.
+@End Reasoning
+Process called "generate_array_item" takes context as Integer, item as Integer returns Integer:
+    Let spread be proc get_dict_flag with item, "spread"
+    If spread is equal to 1:
+        proc out_str with context, "..."
+    End If
+
+    Let key be proc get_dict_hir_value with item, "key"
+    If key is not equal to 0:
+        proc generate_expr with context, key
+        proc out_str with context, " => "
+    End If
+
+    Let by_ref be proc get_dict_flag with item, "by_ref"
+    If by_ref is equal to 1:
+        proc out_str with context, "&"
+    End If
+
+    Let value be proc get_dict_hir_value with item, "value"
+    If value is not equal to 0:
+        proc generate_expr with context, value
+    End If
+    Return 1
+End Process
+
+@Reasoning:
+A list_pattern emits 'list(...)' destructuring with its elements (each an
+array_item, possibly keyed or empty for a skipped slot).
+@End Reasoning
+Process called "generate_list_pattern" takes context as Integer, node as Integer returns Integer:
+    proc out_str with context, "list("
+    Let elements be proc get_dict_hir_value with node, "elements"
+    Let elems be proc list_elements with elements
+    If elems is not equal to 0:
+        Let count be proc size from ListOps with elems
+        Let i be 0
+        While i is less than count:
+            If i is greater than 0:
+                proc out_str with context, ", "
+            End If
+            Let item be proc get_at from ListOps with elems, i
+            proc generate_array_item with context, item
+            Set i to i plus 1
+        End While
+    End If
+    proc out_str with context, ")"
+    Return 1
+End Process
+
+@Reasoning:
+A closure emits '[static] function [&](params) [use (...)] [: ReturnType] { ... }'.
+The use list reproduces the captured variables (with '&' for by-ref captures) the
+probe asserts.
+@End Reasoning
+Process called "generate_closure" takes context as Integer, node as Integer returns Integer:
+    Let is_static be proc get_dict_flag with node, "is_static"
+    If is_static is equal to 1:
+        proc out_str with context, "static "
+    End If
+
+    proc out_str with context, "function"
+
+    Let by_ref be proc get_dict_flag with node, "by_ref"
+    If by_ref is equal to 1:
+        proc out_str with context, " &"
+    End If
+
+    proc generate_param_list with context, node
+
+    proc generate_closure_uses with context, node
+
+    Let rtype be proc get_dict_string_value with node, "return_type"
+    If proc str_present with rtype:
+        proc out_str with context, ": "
+        proc out_str with context, rtype
+    End If
+
+    Let body be proc get_dict_hir_value with node, "body"
+    proc out_str with context, " {"
+    proc out_newline with context
+    proc increase_indent with context
+    Let inner be proc get_dict_hir_value with body, "body"
+    proc generate_stmt_list with context, inner
+    proc decrease_indent with context
+    proc emit_indent with context
+    proc out_str with context, "}"
+    Return 1
+End Process
+
+@Reasoning:
+Emits a closure's ' use ($a, &$b)' capture list when non-empty. Each closure_use
+carries a name and a by_ref flag.
+@End Reasoning
+Process called "generate_closure_uses" takes context as Integer, node as Integer returns Integer:
+    Let uses be proc get_dict_hir_value with node, "uses"
+    Let elems be proc list_elements with uses
+    If elems is equal to 0:
+        Return 1
+    End If
+    Let count be proc size from ListOps with elems
+    If count is equal to 0:
+        Return 1
+    End If
+
+    proc out_str with context, " use ("
+    Let i be 0
+    While i is less than count:
+        If i is greater than 0:
+            proc out_str with context, ", "
+        End If
+        Let use_node be proc get_at from ListOps with elems, i
+        Let by_ref be proc get_dict_flag with use_node, "by_ref"
+        If by_ref is equal to 1:
+            proc out_str with context, "&"
+        End If
+        Let name be proc get_dict_string_value with use_node, "name"
+        If name is not equal to 0:
+            proc out_str with context, name
+        End If
+        Set i to i plus 1
+    End While
+    proc out_str with context, ")"
+    Return 1
+End Process
+
+@Reasoning:
+An arrow_fn emits '[static] fn [&](params) [: ReturnType] => body'.
+@End Reasoning
+Process called "generate_arrow_fn" takes context as Integer, node as Integer returns Integer:
+    Let is_static be proc get_dict_flag with node, "is_static"
+    If is_static is equal to 1:
+        proc out_str with context, "static "
+    End If
+
+    proc out_str with context, "fn"
+
+    Let by_ref be proc get_dict_flag with node, "by_ref"
+    If by_ref is equal to 1:
+        proc out_str with context, " &"
+    End If
+
+    proc generate_param_list with context, node
+
+    Let rtype be proc get_dict_string_value with node, "return_type"
+    If proc str_present with rtype:
+        proc out_str with context, ": "
+        proc out_str with context, rtype
+    End If
+
+    proc out_str with context, " => "
+    Let body be proc get_dict_hir_value with node, "body"
+    proc generate_expr with context, body
+    Return 1
+End Process
+
+@Reasoning:
+A match emits 'match (discriminant) {\n arm,\n ... \n}'. Each arm is
+'cond1, cond2 => body' or 'default => body' for the default (empty conditions). The
+arms are comma-separated and indented, preserving the arm count the probe asserts.
+@End Reasoning
+Process called "generate_match" takes context as Integer, node as Integer returns Integer:
+    proc out_str with context, "match ("
+    Let discriminant be proc get_dict_hir_value with node, "discriminant"
+    proc generate_expr with context, discriminant
+    proc out_str with context, ") {"
+    proc out_newline with context
+    proc increase_indent with context
+
+    Let arms be proc get_dict_hir_value with node, "arms"
+    Let elems be proc list_elements with arms
+    If elems is not equal to 0:
+        Let count be proc size from ListOps with elems
+        Let i be 0
+        While i is less than count:
+            Let arm be proc get_at from ListOps with elems, i
+            proc emit_indent with context
+
+            Let conditions be proc get_dict_hir_value with arm, "conditions"
+            Let celems be proc list_elements with conditions
+            Let ccount be 0
+            If celems is not equal to 0:
+                Set ccount to proc size from ListOps with celems
+            End If
+
+            If ccount is equal to 0:
+                proc out_str with context, "default"
+            Otherwise:
+                Let j be 0
+                While j is less than ccount:
+                    If j is greater than 0:
+                        proc out_str with context, ", "
+                    End If
+                    Let cond be proc get_at from ListOps with celems, j
+                    proc generate_expr with context, cond
+                    Set j to j plus 1
+                End While
+            End If
+
+            proc out_str with context, " => "
+            Let body be proc get_dict_hir_value with arm, "body"
+            proc generate_expr with context, body
+            proc out_str with context, ","
+            proc out_newline with context
+            Set i to i plus 1
+        End While
+    End If
+
+    proc decrease_indent with context
+    proc emit_indent with context
+    proc out_str with context, "}"
+    Return 1
+End Process
+
+@Reasoning:
+A yield emits 'yield', 'yield value', 'yield key => value', or 'yield from value'
+per the is_from flag and which of key/value are present.
+@End Reasoning
+Process called "generate_yield" takes context as Integer, node as Integer returns Integer:
+    Let is_from be proc get_dict_flag with node, "is_from"
+    If is_from is equal to 1:
+        proc out_str with context, "yield from "
+        Let value be proc get_dict_hir_value with node, "value"
+        proc generate_expr with context, value
+        Return 1
+    End If
+
+    proc out_str with context, "yield"
+    Let key be proc get_dict_hir_value with node, "key"
+    Let value be proc get_dict_hir_value with node, "value"
+    If key is not equal to 0:
+        proc out_space with context
+        proc generate_expr with context, key
+        proc out_str with context, " => "
+        proc generate_expr with context, value
+        Return 1
+    End If
+    If value is not equal to 0:
+        proc out_space with context
+        proc generate_expr with context, value
+    End If
+    Return 1
+End Process
+
+@Reasoning:
+An exit emits 'exit' or 'exit(arg)'.
+@End Reasoning
+Process called "generate_exit" takes context as Integer, node as Integer returns Integer:
+    proc out_str with context, "exit"
+    Let arg be proc get_dict_hir_value with node, "arg"
+    If arg is not equal to 0:
+        proc out_str with context, "("
+        proc generate_expr with context, arg
+        proc out_str with context, ")"
+    End If
+    Return 1
+End Process
+
+@Reasoning:
+An include emits 'kind expr' (include/include_once/require/require_once).
+@End Reasoning
+Process called "generate_include" takes context as Integer, node as Integer returns Integer:
+    Let kind be proc get_dict_string_value with node, "kind"
+    If kind is not equal to 0:
+        proc out_str with context, kind
+    Otherwise:
+        proc out_str with context, "include"
+    End If
+    proc out_space with context
+    Let expr be proc get_dict_hir_value with node, "expr"
+    proc generate_expr with context, expr
+    Return 1
 End Process

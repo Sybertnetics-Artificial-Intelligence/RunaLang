@@ -1,0 +1,652 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+Licensed under Apache 2.0
+:End Note
+
+Note:
+PHP Translation Round-Trip Probe
+
+End-to-end proof that the PHP translation pipeline is REAL, not a skeleton:
+
+    PHP source
+      -> php_lexer       (tokenize: namespace/class/function/foreach/match/fn,
+                          $variables, "interpolated" strings, => arrays)
+      -> php_parser      (build the dict-AST documented at the top of php_parser)
+      -> php_semantic    (real two-phase scope/name analysis)
+      -> php_to_hir      (lower the dict-AST to the hir.runa dictionary/list HIR)
+      -> hir_to_php      (emit HIR back to valid PHP text)
+      -> re-lex / re-parse / re-semantic / re-to_hir of the emitted text
+      -> structural + CONTENT equality on the key constructs
+
+The PHP HIR node model is hir.runa's dictionary/list literal interchange shared by
+php_to_hir (producer) and hir_to_php (consumer): a dictionary is a
+HIR_DICTIONARY_LITERAL whose entries List (16-byte [key, value] blocks) hangs at
+the children slot; a list is a HIR_ARRAY_LITERAL whose elements List hangs at the
+children slot; string payloads are HIR string-literal nodes read with
+get_string_literal_value. This probe reads HIR fields through exactly that contract
+(the decoders below mirror the producer/consumer).
+
+DEPTH: the probe does NOT merely check that nodes exist. It asserts on the
+re-parsed HIR2 that the CONTENTS survive: namespace name; class name; >= 6 method
+names; a typed parameter with a default; a foreach `as $k => $v` (key var + value
+var both present); a match expression's arm count (4); an array's `=>` keys; a
+closure's use(...) captures; a double-quoted interpolated string. A translator that
+returned an empty members list (members vanish) makes this probe FAIL.
+
+Exit code: number of failed assertions (0 == all passed). No exit_with_code.
+:End Note
+
+Import "compiler/middle/gungnir/hir/translation/frontends/php/php_lexer.runa" as PhpLexer
+Import "compiler/middle/gungnir/hir/translation/frontends/php/php_parser.runa" as PhpParser
+Import "compiler/middle/gungnir/hir/translation/frontends/php/php_to_hir.runa" as PhpFrontend
+Import "compiler/middle/gungnir/hir/translation/backends/php/hir_to_php.runa" as PhpBackend
+Import "compiler/middle/gungnir/hir/hir.runa" as HIR
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/collections/list.runa" as List
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/frontend/primitives/core/string_primitive.runa" as StringPrim
+Import "tests/test_utils.runa" as TestUtils
+
+Note: ============================================================================
+Note: hir.runa dict/list literal decoders (mirror the producer/consumer contract)
+Note: ============================================================================
+
+@Reasoning:
+A PHP HIR dictionary is a HIR_DICTIONARY_LITERAL whose entries List hangs at the
+children slot. Each entry is a 16-byte block: key (raw string handle) at offset 0,
+value (a child HIR node or HIR string literal) at offset 8. This decoder
+linear-scans those entries comparing the raw key with string_equals, returning the
+stored value. It is the exact lookup hir_to_php's get_dictionary_value performs, so
+reading HIR through it proves the produced shape is the consumed shape.
+@End Reasoning
+Process called "dict_get" takes node as Integer, key as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+
+    Let entries be proc get_dictionary_entries from HIR with node
+    If entries is equal to 0:
+        Return 0
+    End If
+
+    Let count be proc size from List with entries
+    Let index be 0
+    While index is less than count:
+        Let entry be proc get_at from List with entries, index
+        If entry is not equal to 0:
+            Let entry_key be proc memory_get_int64 from Layout with entry, 0
+            Let matches be proc string_equals from StringCore with entry_key, key
+            If matches is equal to 1:
+                Return proc memory_get_int64 from Layout with entry, 8
+            End If
+        End If
+        Set index to index plus 1
+    End While
+
+    Return 0
+End Process
+
+@Reasoning:
+String fields ("_type", "name", "operator", ...) are stored as HIR string literal
+nodes. This helper resolves the key then unwraps the literal to its char* payload
+via get_string_literal_value, so the probe can compare tags, names, operators.
+@End Reasoning
+Process called "dict_get_string" takes node as Integer, key as Integer returns Integer:
+    Let value_node be proc dict_get with node, key
+    If value_node is equal to 0:
+        Return 0
+    End If
+    Return proc get_string_literal_value from HIR with value_node
+End Process
+
+@Reasoning:
+A PHP HIR list is a HIR_ARRAY_LITERAL whose backing element List hangs at the
+children slot. Returning that List lets the probe iterate members / params / arms /
+elements / uses with List.size and List.get_at.
+@End Reasoning
+Process called "list_elements" takes node as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    Return proc get_list_elements from HIR with node
+End Process
+
+@Reasoning:
+Returns the element count of a HIR list node (0 when absent). Used to assert match
+arm count, member count, array element count, etc.
+@End Reasoning
+Process called "list_count" takes node as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    Let items be proc list_elements with node
+    If items is equal to 0:
+        Return 0
+    End If
+    Return proc size from List with items
+End Process
+
+@Reasoning:
+Locates the program's first top-level node whose "_type" matches the requested
+kind. Used to find the namespace and, within it, the class.
+@End Reasoning
+Process called "find_in_list" takes list_node as Integer, type_name as Integer returns Integer:
+    If list_node is equal to 0:
+        Return 0
+    End If
+    Let items be proc list_elements with list_node
+    If items is equal to 0:
+        Return 0
+    End If
+    Let count be proc size from List with items
+    Let index be 0
+    While index is less than count:
+        Let item be proc get_at from List with items, index
+        Let item_type be proc dict_get_string with item, "_type"
+        If item_type is not equal to 0:
+            Let matches be proc string_equals from StringCore with item_type, type_name
+            If matches is equal to 1:
+                Return item
+            End If
+        End If
+        Set index to index plus 1
+    End While
+    Return 0
+End Process
+
+@Reasoning:
+Counts the number of method members in a class's members list, so the probe can
+assert the method count survives round-trip.
+@End Reasoning
+Process called "count_methods" takes members as Integer returns Integer:
+    If members is equal to 0:
+        Return 0
+    End If
+    Let items be proc list_elements with members
+    If items is equal to 0:
+        Return 0
+    End If
+    Let count be proc size from List with items
+    Let found be 0
+    Let index be 0
+    While index is less than count:
+        Let item be proc get_at from List with items, index
+        Let item_type be proc dict_get_string with item, "_type"
+        If item_type is not equal to 0:
+            Let type_ok be proc string_equals from StringCore with item_type, "method"
+            If type_ok is equal to 1:
+                Set found to found plus 1
+            End If
+        End If
+        Set index to index plus 1
+    End While
+    Return found
+End Process
+
+@Reasoning:
+Locates a method member by name within a class's members list.
+@End Reasoning
+Process called "find_method" takes members as Integer, want_name as Integer returns Integer:
+    If members is equal to 0:
+        Return 0
+    End If
+    Let items be proc list_elements with members
+    If items is equal to 0:
+        Return 0
+    End If
+    Let count be proc size from List with items
+    Let index be 0
+    While index is less than count:
+        Let item be proc get_at from List with items, index
+        Let item_type be proc dict_get_string with item, "_type"
+        If item_type is not equal to 0:
+            Let type_ok be proc string_equals from StringCore with item_type, "method"
+            If type_ok is equal to 1:
+                Let item_name be proc dict_get_string with item, "name"
+                If item_name is not equal to 0:
+                    Let name_ok be proc string_equals from StringCore with item_name, want_name
+                    If name_ok is equal to 1:
+                        Return item
+                    End If
+                End If
+            End If
+        End If
+        Set index to index plus 1
+    End While
+    Return 0
+End Process
+
+@Reasoning:
+Scans a method's body block for the first statement (or return value) whose nested
+expression tree contains a node of the requested tag. Bodies are statement lists;
+the relevant constructs (match, closure, foreach, array) each appear as the value
+of a return / expr_stmt / assignment, so this descends one expression level into
+each statement. Bounded by body length, so it always terminates.
+@End Reasoning
+Process called "find_tag_in_method" takes method as Integer, tag as Integer returns Integer:
+    If method is equal to 0:
+        Return 0
+    End If
+    Let body be proc dict_get with method, "body"
+    If body is equal to 0:
+        Return 0
+    End If
+    Let inner be proc dict_get with body, "body"
+    If inner is equal to 0:
+        Return 0
+    End If
+    Let items be proc list_elements with inner
+    If items is equal to 0:
+        Return 0
+    End If
+    Let count be proc size from List with items
+    Let i be 0
+    While i is less than count:
+        Let stmt be proc get_at from List with items, i
+        Let found be proc match_stmt_tag with stmt, tag
+        If found is not equal to 0:
+            Return found
+        End If
+        Set i to i plus 1
+    End While
+    Return 0
+End Process
+
+@Reasoning:
+Inspects one statement for a tagged expression. A statement of the tag itself
+matches; a return/expr_stmt/throw whose value/expr is the tag matches; an
+expr_stmt holding an assignment whose value is the tag matches. Returns the tagged
+node or 0.
+@End Reasoning
+Process called "match_stmt_tag" takes stmt as Integer, tag as Integer returns Integer:
+    If stmt is equal to 0:
+        Return 0
+    End If
+
+    Let stmt_type be proc dict_get_string with stmt, "_type"
+    If stmt_type is equal to 0:
+        Return 0
+    End If
+
+    Let direct be proc string_equals from StringCore with stmt_type, tag
+    If direct is equal to 1:
+        Return stmt
+    End If
+
+    Note: return value / print-expr / throw-expr
+    Let value be proc dict_get with stmt, "value"
+    If value is not equal to 0:
+        Let v_ok be proc node_has_tag with value, tag
+        If v_ok is not equal to 0:
+            Return v_ok
+        End If
+    End If
+
+    Note: expr_stmt -> expr (which may be an assignment)
+    Let expr be proc dict_get with stmt, "expr"
+    If expr is not equal to 0:
+        Let e_ok be proc node_has_tag with expr, tag
+        If e_ok is not equal to 0:
+            Return e_ok
+        End If
+        Let assign_value be proc dict_get with expr, "value"
+        If assign_value is not equal to 0:
+            Let av_ok be proc node_has_tag with assign_value, tag
+            If av_ok is not equal to 0:
+                Return av_ok
+            End If
+        End If
+    End If
+
+    Return 0
+End Process
+
+@Reasoning:
+Returns the node when its "_type" equals tag, else 0. Single-level tag check.
+@End Reasoning
+Process called "node_has_tag" takes node as Integer, tag as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    Let nt be proc dict_get_string with node, "_type"
+    If nt is equal to 0:
+        Return 0
+    End If
+    Let ok be proc string_equals from StringCore with nt, tag
+    If ok is equal to 1:
+        Return node
+    End If
+    Return 0
+End Process
+
+@Reasoning:
+True (1) when an array's elements list contains an array_item whose key is a string
+literal whose decoded/raw value equals the target. Used to assert the array's `=>`
+keys survive. The key node is a "string" node carrying value/decoded.
+@End Reasoning
+Process called "array_has_string_key" takes array_node as Integer, want_key as Integer returns Integer:
+    If array_node is equal to 0:
+        Return 0
+    End If
+    Let elements be proc dict_get with array_node, "elements"
+    Let items be proc list_elements with elements
+    If items is equal to 0:
+        Return 0
+    End If
+    Let count be proc size from List with items
+    Let index be 0
+    While index is less than count:
+        Let item be proc get_at from List with items, index
+        If item is not equal to 0:
+            Let key be proc dict_get with item, "key"
+            If key is not equal to 0:
+                Let decoded be proc dict_get_string with key, "decoded"
+                If decoded is not equal to 0:
+                    Let matches be proc string_equals from StringCore with decoded, want_key
+                    If matches is equal to 1:
+                        Return 1
+                    End If
+                End If
+            End If
+        End If
+        Set index to index plus 1
+    End While
+    Return 0
+End Process
+
+@Reasoning:
+True (1) when a closure's uses list contains a capture whose name equals the
+target. Used to assert the closure's use(...) captures survive.
+@End Reasoning
+Process called "closure_has_use" takes closure_node as Integer, want_name as Integer returns Integer:
+    If closure_node is equal to 0:
+        Return 0
+    End If
+    Let uses be proc dict_get with closure_node, "uses"
+    Let items be proc list_elements with uses
+    If items is equal to 0:
+        Return 0
+    End If
+    Let count be proc size from List with items
+    Let index be 0
+    While index is less than count:
+        Let use_node be proc get_at from List with items, index
+        Let uname be proc dict_get_string with use_node, "name"
+        If uname is not equal to 0:
+            Let matches be proc string_equals from StringCore with uname, want_name
+            If matches is equal to 1:
+                Return 1
+            End If
+        End If
+        Set index to index plus 1
+    End While
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: Pipeline helper
+Note: ============================================================================
+
+@Reasoning:
+Each round of the probe runs the identical front-of-pipeline (lex -> parse ->
+semantic -> to_hir). php_to_hir_from_source already runs all of these as a unit;
+this wrapper just guards the source so the two runs (original and emitted) are
+behaviourally identical and any divergence is attributable to the emitter.
+@End Reasoning
+Process called "source_to_hir" takes source as Integer returns Integer:
+    If source is equal to 0:
+        Return 0
+    End If
+    Return proc php_to_hir_from_source from PhpFrontend with source
+End Process
+
+@Reasoning:
+Locates the program's class node: the program body holds a namespace whose body
+holds the class. Returns the class HIR dict or 0.
+@End Reasoning
+Process called "find_class" takes hir_root as Integer returns Integer:
+    Let body be proc dict_get with hir_root, "body"
+    Let namespace be proc find_in_list with body, "namespace"
+    If namespace is equal to 0:
+        Return 0
+    End If
+    Let nbody be proc dict_get with namespace, "body"
+    Return proc find_in_list with nbody, "class"
+End Process
+
+Note: ============================================================================
+Note: Probe entry point
+Note: ============================================================================
+
+Process called "main" returns Integer:
+    Let results be proc create_test_results from TestUtils
+    proc begin_suite from TestUtils with results, "PHP translation round-trip"
+
+    Note:
+    Representative program exercising a broad declaration surface:
+    - namespace App\Service
+    - class Calculator with 6 methods (__construct + 5 named)
+    - a typed parameter with a default (int $base = 10)
+    - a foreach with `as $k => $v`
+    - a match expression of 4 arms
+    - an array literal with => keys ("alpha", "beta")
+    - a closure capturing via use($factor)
+    - a double-quoted interpolated string "Result: $sum"
+    :End Note
+    Let source be "<?php\nnamespace App {\nclass Calculator {\nprivate int $total = 0;\npublic function __construct(int $base = 10) {\n$this->total = $base;\n}\npublic function add(int $x): int {\n$sum = $this->total + $x;\nreturn $sum;\n}\npublic function describe(int $sum): string {\nreturn \"Result: $sum\";\n}\npublic function tally(array $items): int {\nforeach ($items as $k => $v) {\n$this->total = $this->total + $v;\n}\nreturn $this->total;\n}\npublic function grade(int $score): string {\nreturn match ($score) {\n1, 2 => \"low\",\n3, 4 => \"mid\",\n5 => \"high\",\ndefault => \"none\",\n};\n}\npublic function scaler(int $factor): callable {\nreturn function (int $n) use ($factor): int {\nreturn $n * $factor;\n};\n}\npublic function labels(): array {\nreturn [\"alpha\" => 1, \"beta\" => 2];\n}\n}\n}\n"
+
+    Note: --- Stage 0-2: source -> HIR1 (lex, parse, semantic, lower) ---
+    Let tokens be proc php_lex from PhpLexer with source
+    proc assert_not_null from TestUtils with results, "lexer produced tokens", tokens
+
+    Let parser be proc create_php_parser from PhpParser with tokens
+    proc assert_not_null from TestUtils with results, "parser created", parser
+
+    Let ast be proc parse_program from PhpParser with parser
+    proc assert_not_null from TestUtils with results, "parser produced PHP AST", ast
+
+    Let hir1 be proc php_to_hir_from_source from PhpFrontend with source
+    proc assert_not_null from TestUtils with results, "frontend produced HIR program", hir1
+
+    Note: Root must be a dict node tagged "php_program" with a body.
+    Let prog_type be proc dict_get_string with hir1, "_type"
+    Let prog_type_ok be proc string_equals from StringCore with prog_type, "php_program"
+    proc assert_equal from TestUtils with results, "HIR root is a php_program", prog_type_ok, 1
+
+    Let body be proc dict_get with hir1, "body"
+    proc assert_not_null from TestUtils with results, "program has a body", body
+
+    Note: --- namespace name survives ---
+    Let namespace be proc find_in_list with body, "namespace"
+    proc assert_not_null from TestUtils with results, "namespace node present", namespace
+    Let ns_name be proc dict_get_string with namespace, "name"
+    Let ns_name_ok be proc string_equals from StringCore with ns_name, "App"
+    proc assert_equal from TestUtils with results, "namespace name is 'App'", ns_name_ok, 1
+
+    Note: --- class name + method count survive ---
+    Let cls be proc find_class with hir1
+    proc assert_not_null from TestUtils with results, "class node present", cls
+    Let cls_name be proc dict_get_string with cls, "name"
+    Let cls_name_ok be proc string_equals from StringCore with cls_name, "Calculator"
+    proc assert_equal from TestUtils with results, "class name is 'Calculator'", cls_name_ok, 1
+
+    Let members be proc dict_get with cls, "members"
+    proc assert_not_null from TestUtils with results, "class has members", members
+    Let method_count be proc count_methods with members
+    proc assert_greater_than_or_equal from TestUtils with results, "class has >= 6 methods", method_count, 6
+
+    Let m_construct be proc find_method with members, "__construct"
+    proc assert_not_null from TestUtils with results, "method '__construct' present", m_construct
+    Let m_add be proc find_method with members, "add"
+    proc assert_not_null from TestUtils with results, "method 'add' present", m_add
+    Let m_tally be proc find_method with members, "tally"
+    proc assert_not_null from TestUtils with results, "method 'tally' present", m_tally
+    Let m_grade be proc find_method with members, "grade"
+    proc assert_not_null from TestUtils with results, "method 'grade' present", m_grade
+    Let m_scaler be proc find_method with members, "scaler"
+    proc assert_not_null from TestUtils with results, "method 'scaler' present", m_scaler
+    Let m_labels be proc find_method with members, "labels"
+    proc assert_not_null from TestUtils with results, "method 'labels' present", m_labels
+    Let m_describe be proc find_method with members, "describe"
+    proc assert_not_null from TestUtils with results, "method 'describe' present", m_describe
+
+    Note: --- typed param + default survive (__construct: int $base = 10) ---
+    Let ctor_params be proc dict_get with m_construct, "params"
+    Let ctor_param_count be proc list_count with ctor_params
+    proc assert_greater_than_or_equal from TestUtils with results, "ctor has >= 1 param", ctor_param_count, 1
+    Let ctor_param_items be proc list_elements with ctor_params
+    Let ctor_param0 be proc get_at from List with ctor_param_items, 0
+    proc assert_not_null from TestUtils with results, "ctor param 0 present", ctor_param0
+    Let ctor_param_type be proc dict_get_string with ctor_param0, "type"
+    Let ctor_param_type_ok be proc string_equals from StringCore with ctor_param_type, "int"
+    proc assert_equal from TestUtils with results, "ctor param 0 type is 'int'", ctor_param_type_ok, 1
+    Let ctor_param_default be proc dict_get with ctor_param0, "default"
+    proc assert_not_null from TestUtils with results, "ctor param 0 has a default", ctor_param_default
+
+    Note: --- foreach `as $k => $v` survives (tally) ---
+    Let foreach_node be proc find_tag_in_method with m_tally, "foreach"
+    proc assert_not_null from TestUtils with results, "foreach node present in tally()", foreach_node
+    Let foreach_key be proc dict_get with foreach_node, "key_var"
+    proc assert_not_null from TestUtils with results, "foreach has a key var ($k)", foreach_key
+    Let foreach_value be proc dict_get with foreach_node, "value_var"
+    proc assert_not_null from TestUtils with results, "foreach has a value var ($v)", foreach_value
+
+    Note: --- match arm count = 4 survives (grade) ---
+    Let match_node be proc find_tag_in_method with m_grade, "match"
+    proc assert_not_null from TestUtils with results, "match node present in grade()", match_node
+    Let match_arms be proc dict_get with match_node, "arms"
+    Let match_arm_count be proc list_count with match_arms
+    proc assert_equal from TestUtils with results, "match has 4 arms", match_arm_count, 4
+
+    Note: --- array `=>` keys survive (labels) ---
+    Let array_node be proc find_tag_in_method with m_labels, "array"
+    proc assert_not_null from TestUtils with results, "array node present in labels()", array_node
+    Let array_count be proc list_count with array_node
+    Let array_elems be proc dict_get with array_node, "elements"
+    Let array_elem_count be proc list_count with array_elems
+    proc assert_equal from TestUtils with results, "array has 2 elements", array_elem_count, 2
+    Let has_alpha be proc array_has_string_key with array_node, "alpha"
+    proc assert_equal from TestUtils with results, "array has key 'alpha'", has_alpha, 1
+    Let has_beta be proc array_has_string_key with array_node, "beta"
+    proc assert_equal from TestUtils with results, "array has key 'beta'", has_beta, 1
+
+    Note: --- closure use(...) captures survive (scaler) ---
+    Let closure_node be proc find_tag_in_method with m_scaler, "closure"
+    proc assert_not_null from TestUtils with results, "closure node present in scaler()", closure_node
+    Let has_factor be proc closure_has_use with closure_node, "$factor"
+    proc assert_equal from TestUtils with results, "closure captures use($factor)", has_factor, 1
+
+    Note: --- double-quoted interpolated string survives (describe) ---
+    Let str_node be proc find_tag_in_method with m_describe, "string"
+    proc assert_not_null from TestUtils with results, "interpolated string node present in describe()", str_node
+    Let str_interp be proc dict_get_string with str_node, "interpolated"
+    Let str_interp_ok be proc string_equals from StringCore with str_interp, "1"
+    proc assert_equal from TestUtils with results, "describe string is interpolated", str_interp_ok, 1
+    Let str_kind be proc dict_get_string with str_node, "kind"
+    Let str_kind_ok be proc string_equals from StringCore with str_kind, "double"
+    proc assert_equal from TestUtils with results, "describe string kind is 'double'", str_kind_ok, 1
+
+    Note: --- Stage 3: HIR1 -> PHP text ---
+    Let emitted be proc generate_php_from_hir from PhpBackend with hir1
+    proc assert_not_null from TestUtils with results, "backend produced PHP text", emitted
+    Let emitted_len be proc string_length from StringCore with emitted
+    proc assert_greater_than from TestUtils with results, "emitted PHP is non-empty", emitted_len, 0
+
+    Note: --- Stage 4: re-run the pipeline on the emitted text -> HIR2 ---
+    Let hir2 be proc source_to_hir with emitted
+    proc assert_not_null from TestUtils with results, "re-parse of emitted PHP produced HIR2", hir2
+
+    Let prog2_type be proc dict_get_string with hir2, "_type"
+    Let prog2_type_ok be proc string_equals from StringCore with prog2_type, "php_program"
+    proc assert_equal from TestUtils with results, "round-trip root is a php_program", prog2_type_ok, 1
+
+    Note: --- Stage 5: CONTENT equality on the key constructs (HIR2) ---
+
+    Note: namespace name survives round-trip
+    Let body2 be proc dict_get with hir2, "body"
+    Let namespace2 be proc find_in_list with body2, "namespace"
+    proc assert_not_null from TestUtils with results, "round-trip preserves namespace node", namespace2
+    Let ns2_name be proc dict_get_string with namespace2, "name"
+    Let ns2_name_ok be proc string_equals from StringCore with ns2_name, "App"
+    proc assert_equal from TestUtils with results, "round-trip preserves namespace 'App'", ns2_name_ok, 1
+
+    Note: class name + method count survive round-trip
+    Let cls2 be proc find_class with hir2
+    proc assert_not_null from TestUtils with results, "round-trip preserves class node", cls2
+    Let cls2_name be proc dict_get_string with cls2, "name"
+    Let cls2_name_ok be proc string_equals from StringCore with cls2_name, "Calculator"
+    proc assert_equal from TestUtils with results, "round-trip preserves class 'Calculator'", cls2_name_ok, 1
+
+    Let members2 be proc dict_get with cls2, "members"
+    Let method2_count be proc count_methods with members2
+    proc assert_greater_than_or_equal from TestUtils with results, "round-trip preserves >= 6 methods", method2_count, 6
+
+    Let m2_construct be proc find_method with members2, "__construct"
+    proc assert_not_null from TestUtils with results, "round-trip preserves '__construct'", m2_construct
+    Let m2_grade be proc find_method with members2, "grade"
+    proc assert_not_null from TestUtils with results, "round-trip preserves 'grade'", m2_grade
+    Let m2_tally be proc find_method with members2, "tally"
+    proc assert_not_null from TestUtils with results, "round-trip preserves 'tally'", m2_tally
+    Let m2_scaler be proc find_method with members2, "scaler"
+    proc assert_not_null from TestUtils with results, "round-trip preserves 'scaler'", m2_scaler
+    Let m2_labels be proc find_method with members2, "labels"
+    proc assert_not_null from TestUtils with results, "round-trip preserves 'labels'", m2_labels
+    Let m2_describe be proc find_method with members2, "describe"
+    proc assert_not_null from TestUtils with results, "round-trip preserves 'describe'", m2_describe
+
+    Note: typed param + default survive round-trip
+    Let ctor2_params be proc dict_get with m2_construct, "params"
+    Let ctor2_param_items be proc list_elements with ctor2_params
+    Let ctor2_param0 be proc get_at from List with ctor2_param_items, 0
+    proc assert_not_null from TestUtils with results, "round-trip ctor param 0 present", ctor2_param0
+    Let ctor2_param_type be proc dict_get_string with ctor2_param0, "type"
+    Let ctor2_param_type_ok be proc string_equals from StringCore with ctor2_param_type, "int"
+    proc assert_equal from TestUtils with results, "round-trip preserves ctor param type 'int'", ctor2_param_type_ok, 1
+    Let ctor2_param_default be proc dict_get with ctor2_param0, "default"
+    proc assert_not_null from TestUtils with results, "round-trip preserves ctor param default", ctor2_param_default
+
+    Note: foreach `as $k => $v` survives round-trip
+    Let foreach2 be proc find_tag_in_method with m2_tally, "foreach"
+    proc assert_not_null from TestUtils with results, "round-trip preserves foreach node", foreach2
+    Let foreach2_key be proc dict_get with foreach2, "key_var"
+    proc assert_not_null from TestUtils with results, "round-trip preserves foreach key var", foreach2_key
+    Let foreach2_value be proc dict_get with foreach2, "value_var"
+    proc assert_not_null from TestUtils with results, "round-trip preserves foreach value var", foreach2_value
+
+    Note: match arm count survives round-trip
+    Let match2 be proc find_tag_in_method with m2_grade, "match"
+    proc assert_not_null from TestUtils with results, "round-trip preserves match node", match2
+    Let match2_arms be proc dict_get with match2, "arms"
+    Let match2_arm_count be proc list_count with match2_arms
+    proc assert_equal from TestUtils with results, "round-trip preserves 4 match arms", match2_arm_count, 4
+
+    Note: array `=>` keys survive round-trip
+    Let array2 be proc find_tag_in_method with m2_labels, "array"
+    proc assert_not_null from TestUtils with results, "round-trip preserves array node", array2
+    Let has_alpha2 be proc array_has_string_key with array2, "alpha"
+    proc assert_equal from TestUtils with results, "round-trip preserves array key 'alpha'", has_alpha2, 1
+    Let has_beta2 be proc array_has_string_key with array2, "beta"
+    proc assert_equal from TestUtils with results, "round-trip preserves array key 'beta'", has_beta2, 1
+
+    Note: closure use(...) captures survive round-trip
+    Let closure2 be proc find_tag_in_method with m2_scaler, "closure"
+    proc assert_not_null from TestUtils with results, "round-trip preserves closure node", closure2
+    Let has_factor2 be proc closure_has_use with closure2, "$factor"
+    proc assert_equal from TestUtils with results, "round-trip preserves closure use($factor)", has_factor2, 1
+
+    Note: interpolated string survives round-trip
+    Let str2 be proc find_tag_in_method with m2_describe, "string"
+    proc assert_not_null from TestUtils with results, "round-trip preserves interpolated string", str2
+    Let str2_interp be proc dict_get_string with str2, "interpolated"
+    Let str2_interp_ok be proc string_equals from StringCore with str2_interp, "1"
+    proc assert_equal from TestUtils with results, "round-trip preserves interpolation flag", str2_interp_ok, 1
+    Let str2_kind be proc dict_get_string with str2, "kind"
+    Let str2_kind_ok be proc string_equals from StringCore with str2_kind, "double"
+    proc assert_equal from TestUtils with results, "round-trip preserves double-quote kind", str2_kind_ok, 1
+
+    proc print_summary from TestUtils with results
+    Let failed be proc get_failed from TestUtils with results
+    proc destroy_test_results from TestUtils with results
+
+    Return failed
+End Process

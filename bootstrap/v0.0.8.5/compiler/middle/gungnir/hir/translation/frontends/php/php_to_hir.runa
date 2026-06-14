@@ -1,1438 +1,1822 @@
-Note: ===================================================================
-Note: PHP TO HIR TRANSLATOR
-Note: ===================================================================
-Note: Translates PHP AST to High-level Intermediate Representation (HIR).
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
 
-Note: Part of the Translation Translation System
-Note: Location: compiler/middle/gungnir/hir/translation/frontends/php/php_to_hir.runa
-Note: ===================================================================
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
 
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+PHP to HIR Translator - Translate the PHP dict-AST to High-level Intermediate
+Representation.
+
+This file lowers the Stage-A PHP Abstract Syntax Tree (a dictionary/list AST
+produced by php_parser.runa) into HIR (High-level Intermediate Representation)
+expressed as hir.runa dictionary-literal and list-literal nodes, the model-3
+interchange shared by every translation frontend (c/go/csharp/cpp/kotlin/elixir).
+
+The AST is read entirely through the Stage-A contract documented at the top of
+php_parser.runa: get_ast_attribute(node, key) for named attributes and
+get_ast_children(node) for positional children; every node carries a string
+"node_type" attribute. The HIR is produced through the canonical hir.runa
+primitives wrapped by the thin builders below, exactly as elixir_to_hir.runa
+does, so producer and consumer share one representation.
+
+Stage-B responsibilities handled here (the Stage-A handoff facts): string nodes
+carry RAW lexemes including quotes/markers, so this lowering records both the raw
+lexeme ("value") and a decoded payload ("decoded") plus the interpolation flag
+and string kind, leaving emission decisions to the backend; numeric literals
+carry raw lexemes (0x/0b/0o, '_' separators) preserved verbatim; types are
+strings; multi-declaration members are already split into one node each by the
+parser; constructor-promoted params carry a non-empty visibility.
+
+HIR _type tags emitted (and consumed by hir_to_php.runa + the round-trip probe):
+php_program, inline_html, namespace, use, use_item, declare, pair, class,
+interface, trait, enum, enum_case, use_trait, trait_adaptation, function, method,
+property, class_const, param, attribute_group, attribute, block, expr_stmt, echo,
+print, if, elseif_clause, while, do_while, for, foreach, switch, switch_case,
+return, break, continue, throw, try, catch_clause, global, static_var,
+static_var_item, unset, goto, label, assign, ternary, binary_op, unary_op, cast,
+instanceof, call, arg, new, clone, member, static_member, index, array,
+array_item, list_pattern, closure, closure_use, arrow_fn, match, match_arm,
+yield, isset, empty, exit, include, variable, name, int, float, string, bool,
+null.
+
+Dependencies:
+- compiler/middle/gungnir/hir/translation/frontends/php/php_parser.runa
+- compiler/middle/gungnir/hir/translation/frontends/php/php_lexer.runa
+- compiler/middle/gungnir/hir/translation/frontends/php/php_semantic.runa
+- compiler/middle/gungnir/hir/hir.runa
+- compiler/frontend/primitives/memory/layout.runa
+- compiler/frontend/primitives/collections/list.runa
+- compiler/frontend/primitives/core/string_core.runa
+- compiler/frontend/primitives/core/string_primitive.runa
+:End Note
+
+Import "compiler/middle/gungnir/hir/translation/frontends/php/php_parser.runa" as Parser
+Import "compiler/middle/gungnir/hir/translation/frontends/php/php_lexer.runa" as Lexer
+Import "compiler/middle/gungnir/hir/translation/frontends/php/php_semantic.runa" as Semantic
+Import "compiler/middle/gungnir/hir/hir.runa" as HIR
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/collections/list.runa" as ListOps
 Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
-Import "compiler/frontend/primitives/collections/list.runa" as ListCore
-Import "compiler/middle/gungnir/hir/hir_nodes.runa" as HIR
-Import "compiler/middle/gungnir/hir/translation/frontends/php/php_parser.runa" as PHPParser
+Import "compiler/frontend/primitives/core/string_primitive.runa" as StringPrim
 
-Note: ===================================================================
-Note: TRANSLATION CONTEXT
-Note: ===================================================================
+Note: ============================================================================
+Note: HIR OUTPUT BUILDERS
+Note: ============================================================================
 
 @Reasoning:
-PHP-to-HIR state tracks the active HIR module being built, plus
-"current" class and function for nested-context tracking (method
-translation needs to know which class it's in for visibility checks),
-plus the active namespace string for qualified-name resolution.
+The PHP lowering emits its HIR as dictionary-literal and list-literal nodes from
+hir.runa, the same producer surface every other model-3 frontend uses. The
+backend reads these nodes through get_dictionary_entries / get_list_elements, so
+producer and consumer share one representation. These thin wrappers name the
+operations in PHP-domain terms while delegating to the canonical hir.runa
+primitives; nothing here re-implements dictionary or list storage.
 @End Reasoning
-@Implementation:
-4 fields: hir_module (HIR construction target), current_class (0 when
-not inside a class), current_function (0 when not inside a function),
-namespace_name ("" at file scope).
-@End Implementation
-Type called "TranslationContext":
-    hir_module as Integer
-    current_class as Integer
-    current_function as Integer
-    namespace_name as Integer
-End Type
+Process called "create_dict" returns Integer:
+    Return proc create_hir_dictionary_literal from HIR
+End Process
 
-Note: ===================================================================
-Note: MAIN TRANSLATION ENTRY POINT
-Note: ===================================================================
-
-@Reasoning:
-Primary entry point. Creates a fresh context, walks the program, returns
-the built HIR module. The context is discarded after extracting the
-hir_module pointer.
-@End Reasoning
-@Implementation:
-create_context; translate_program; return ctx.hir_module.
-@End Implementation
-Process called "translate_php_to_hir" takes php_ast as Integer returns Integer:
-    Let ctx be proc create_context
-    proc translate_program with ctx, php_ast
-    Return ctx.hir_module
+Process called "create_list" returns Integer:
+    Return proc create_hir_list_literal from HIR
 End Process
 
 @Reasoning:
-Allocate a fresh TranslationContext with an empty HIR module named
-"php_module" and reset class/function/namespace.
+String-valued attributes are stored wrapped in a HIR string literal so the
+backend's get_string_literal_value resolves them. A null key or dict short-
+circuits to 0.
 @End Reasoning
-@Implementation:
-Call hir_create_module; build TranslationContext value with hir_module
-set, others 0/empty.
-@End Implementation
-Process called "create_context" returns Integer:
-    Let hir_module be proc hir_create_module from HIR with "php_module"
-    
-    Let ctx be a value of type TranslationContext with
-        hir_module as hir_module,
-        current_class as 0,
-        current_function as 0,
-        namespace_name as ""
-    
-    Return ctx
+Process called "set_dict_string" takes dict_hir as Integer, key as Integer, value as Integer returns Integer:
+    If dict_hir is equal to 0:
+        Return 0
+    End If
+    If key is equal to 0:
+        Return 0
+    End If
+
+    Let value_literal be proc create_hir_string_literal from HIR with value
+    Return proc add_dictionary_entry from HIR with dict_hir, key, value_literal
 End Process
 
-Note: ===================================================================
-Note: PROGRAM TRANSLATION
-Note: ===================================================================
+@Reasoning:
+Subtree-valued attributes (child HIR nodes and HIR lists) are stored verbatim so
+the backend reads them back as nodes/lists rather than strings.
+@End Reasoning
+Process called "set_dict_value" takes dict_hir as Integer, key as Integer, value as Integer returns Integer:
+    If dict_hir is equal to 0:
+        Return 0
+    End If
+    If key is equal to 0:
+        Return 0
+    End If
+
+    Return proc add_dictionary_entry from HIR with dict_hir, key, value
+End Process
 
 @Reasoning:
-Walks the top-level children of the PHP program node and dispatches
-each to translate_declaration. PHP files can contain a mix of
-declarations and statements at top level; this routine treats them
-uniformly via translate_declaration's dispatch.
+Appends a translated node to a HIR list literal; null-guards both operands.
 @End Reasoning
-@Implementation:
-Get children list; loop by index calling translate_declaration on each.
-@End Implementation
-Process called "translate_program" takes ctx as Integer, program_node as Integer:
-    Let children be proc php_ast_node_children from PHPParser with program_node
-    Let count be proc list_length from ListCore with children
+Process called "add_to_hir_list" takes list_hir as Integer, element as Integer returns Integer:
+    If list_hir is equal to 0:
+        Return 0
+    End If
+    If element is equal to 0:
+        Return 0
+    End If
+
+    Return proc add_list_element from HIR with list_hir, element
+End Process
+
+@Reasoning:
+Records an integer-flag attribute (by_ref / variadic / nullsafe / computed /
+spread / prefix / is_block / is_static / is_from / short_syntax / fully_qualified
+/ interpolated) as a "1"/"0" string so the backend reconstructs the flag without a
+numeric HIR literal type.
+@End Reasoning
+Process called "set_dict_flag" takes dict_hir as Integer, key as Integer, flag as Integer returns Integer:
+    If flag is equal to 1:
+        Return proc set_dict_string with dict_hir, key, "1"
+    End If
+    Return proc set_dict_string with dict_hir, key, "0"
+End Process
+
+Note: ============================================================================
+Note: AST READ HELPERS
+Note: ============================================================================
+
+@Reasoning:
+Reads a node's string "node_type" attribute through the Stage-A accessor so the
+dispatcher can branch on it. Returns 0 when the node is null.
+@End Reasoning
+Process called "node_type_of" takes node as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    Return proc get_ast_attribute from Parser with node, "node_type"
+End Process
+
+@Reasoning:
+Reads a named AST attribute through the Stage-A accessor; null-guards the node.
+@End Reasoning
+Process called "attr" takes node as Integer, key as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    Return proc get_ast_attribute from Parser with node, key
+End Process
+
+@Reasoning:
+Compares the node_type string against a tag; thin wrapper over StringCore so the
+dispatcher reads cleanly.
+@End Reasoning
+Process called "type_is" takes nt as Integer, tag as Integer returns Integer:
+    Return proc string_equals from StringCore with nt, tag
+End Process
+
+@Reasoning:
+Copies a string attribute from the AST node onto the HIR dict under the same key,
+but only when the AST carries it; absent attributes are skipped so the dict stays
+minimal.
+@End Reasoning
+Process called "carry_string" takes hir as Integer, node as Integer, key as Integer returns Integer:
+    Let value be proc attr with node, key
+    If value is not equal to 0:
+        proc set_dict_string with hir, key, value
+    End If
+    Return 1
+End Process
+
+@Reasoning:
+Lowers a single AST child attribute (a sub-expression node) onto the HIR dict
+under the same key when present, recursing through translate_node.
+@End Reasoning
+Process called "carry_node" takes hir as Integer, node as Integer, key as Integer returns Integer:
+    Let child be proc attr with node, key
+    If child is not equal to 0:
+        Let child_hir be proc translate_node with child
+        If child_hir is not equal to 0:
+            proc set_dict_value with hir, key, child_hir
+        End If
+    End If
+    Return 1
+End Process
+
+@Reasoning:
+Lowers an AST list attribute into a HIR list literal under the same key. The list
+is always set (possibly empty) so the backend can iterate a real list; emptiness
+reflects an empty source construct, never a dropped one.
+@End Reasoning
+Process called "carry_list" takes hir as Integer, node as Integer, key as Integer returns Integer:
+    Let ast_list be proc attr with node, key
+    Let list_hir be proc translate_node_list with ast_list
+    proc set_dict_value with hir, key, list_hir
+    Return 1
+End Process
+
+@Reasoning:
+Lowers an AST list of expression/member nodes into a HIR list literal by
+dispatching each element through translate_node. Skips null elements. Returns a
+(possibly empty) HIR list literal so every member, clause, param, arm, pair and
+case list is fully populated from its AST source.
+@End Reasoning
+Process called "translate_node_list" takes ast_list as Integer returns Integer:
+    Let list_hir be proc create_list
+    If ast_list is equal to 0:
+        Return list_hir
+    End If
+
+    Let count be proc list_length from ListOps with ast_list
     Let i be 0
-    
     While i is less than count:
-        Let child be proc list_get from ListCore with children, i
-        proc translate_declaration with ctx, child
-        Set i to i plus 1
-    End While
-End Process
-
-Note: ===================================================================
-Note: DECLARATION TRANSLATION
-Note: ===================================================================
-
-@Reasoning:
-Top-level declaration dispatch: namespace, use, class, interface,
-trait, function. Top-level statements (not declarations) are also
-allowed in PHP and route through translate_statement.
-@End Reasoning
-@Implementation:
-Read node_type; switch on PHP_NS / PHP_USE / PHP_CLASS / PHP_INTERFACE /
-PHP_TRAIT / PHP_FUNCTION / PHP_STMT; dispatch to the corresponding
-translator.
-@End Implementation
-Process called "translate_declaration" takes ctx as Integer, node as Integer:
-    Let node_type be proc php_ast_node_type from PHPParser with node
-    
-    If node_type is equal to PHPParser.PHP_NAMESPACE:
-        proc translate_namespace with ctx, node
-    Otherwise:
-        If node_type is equal to PHPParser.PHP_USE_DECLARATION:
-            proc translate_use_declaration with ctx, node
-        Otherwise:
-            If node_type is equal to PHPParser.PHP_CLASS:
-                proc translate_class with ctx, node
-            Otherwise:
-                If node_type is equal to PHPParser.PHP_INTERFACE:
-                    proc translate_interface with ctx, node
-                Otherwise:
-                    If node_type is equal to PHPParser.PHP_TRAIT:
-                        proc translate_trait with ctx, node
-                    Otherwise:
-                        If node_type is equal to PHPParser.PHP_FUNCTION:
-                            proc translate_function with ctx, node
-                        Otherwise:
-                            Note: Statement at top level
-                            proc translate_statement with ctx, node
-                        End If
-                    End If
-                End If
+        Let item be proc list_get from ListOps with ast_list, i
+        If item is not equal to 0:
+            Let item_hir be proc translate_node with item
+            If item_hir is not equal to 0:
+                proc add_to_hir_list with list_hir, item_hir
             End If
         End If
+        Set i to i plus 1
+    End While
+
+    Return list_hir
+End Process
+
+@Reasoning:
+Lowers an AST node's positional children read from get_ast_children into a HIR
+list literal. Identical to translate_node_list but sourced from the children list.
+@End Reasoning
+Process called "translate_children" takes node as Integer returns Integer:
+    Let list_hir be proc create_list
+    If node is equal to 0:
+        Return list_hir
     End If
-End Process
 
-Note: ===================================================================
-Note: NAMESPACE TRANSLATION
-Note: ===================================================================
-
-@Reasoning:
-`namespace Foo\Bar;` or `namespace Foo\Bar { body }`. Sets the
-active namespace_name on the context so subsequent declarations are
-namespaced.
-@End Reasoning
-@Implementation:
-Read namespace name from node; set ctx.namespace_name; recurse over the
-namespace body if it has block form.
-@End Implementation
-Process called "translate_namespace" takes ctx as Integer, namespace_node as Integer:
-    Let namespace_name be proc php_ast_node_value from PHPParser with namespace_node
-    Set ctx.namespace_name to namespace_name
-    
-    Note: Translate namespace contents
-    Let children be proc php_ast_node_children from PHPParser with namespace_node
-    Let count be proc list_length from ListCore with children
-    Let i be 0
-    
-    While i is less than count:
-        Let child be proc list_get from ListCore with children, i
-        proc translate_declaration with ctx, child
-        Set i to i plus 1
-    End While
-End Process
-
-Note: ===================================================================
-Note: USE DECLARATION TRANSLATION
-Note: ===================================================================
-
-@Reasoning:
-`use Foo\Bar [as Baz];`. Translates to a HIR import directive so the
-HIR module records the symbol it brought into local scope.
-@End Reasoning
-@Implementation:
-Read qualified name and optional alias from use_node; build HIR import
-with both fields.
-@End Implementation
-Process called "translate_use_declaration" takes ctx as Integer, use_node as Integer:
-    Let import_name be proc php_ast_node_value from PHPParser with use_node
-    
-    Note: Create HIR import
-    Let hir_import be proc hir_create_import from HIR with import_name
-    proc hir_module_add_import from HIR with ctx.hir_module, hir_import
-End Process
-
-Note: ===================================================================
-Note: CLASS TRANSLATION
-Note: ===================================================================
-
-@Reasoning:
-`class Name extends Base implements I1, I2 { members }`. Builds a HIR
-class and pushes it onto ctx.current_class so nested method/property
-translation knows it's inside this class.
-@End Reasoning
-@Implementation:
-Read name/extends/implements/metadata; build HIR class; save previous
-current_class on the stack; set ctx.current_class = new class; iterate
-members translating each; restore current_class on exit.
-@End Implementation
-Process called "translate_class" takes ctx as Integer, class_node as Integer:
-    Let class_name be proc php_ast_node_value from PHPParser with class_node
-    
-    Note: Add namespace prefix if in namespace
-    Let full_name be class_name
-    Let ns_len be proc string_length from StringCore with ctx.namespace_name
-    If ns_len is greater than 0:
-        Set full_name to proc string_concat from StringCore with ctx.namespace_name, "\\"
-        Set full_name to proc string_concat from StringCore with full_name, class_name
+    Let children be proc get_ast_children from Parser with node
+    If children is equal to 0:
+        Return list_hir
     End If
-    
-    Let hir_class be proc hir_create_class from HIR with full_name
-    Set ctx.current_class to hir_class
-    
-    Note: Store PHP metadata
-    proc hir_set_metadata from HIR with hir_class, "source_language", "php"
-    proc hir_set_metadata from HIR with hir_class, "php_class_name", class_name
-    
-    Note: Handle modifiers
-    Let metadata be proc php_ast_node_metadata from PHPParser with class_node
-    proc translate_class_metadata with ctx, hir_class, metadata
-    
-    Note: Translate class members
-    Let children be proc php_ast_node_children from PHPParser with class_node
-    Let count be proc list_length from ListCore with children
+
+    Let count be proc list_length from ListOps with children
     Let i be 0
-    
     While i is less than count:
-        Let child be proc list_get from ListCore with children, i
-        proc translate_class_member with ctx, child
-        Set i to i plus 1
-    End While
-    
-    proc hir_module_add_class from HIR with ctx.hir_module, hir_class
-    Set ctx.current_class to 0
-End Process
-
-@Reasoning:
-PHP class modifiers (abstract, final, readonly) and attribute lists
-(`#[Attribute]`) come through a separate metadata sub-node. Decoded
-here onto HIR class flag fields.
-@End Reasoning
-@Implementation:
-Read flags from metadata; set is_abstract / is_final / is_readonly on
-hir_class; copy attribute list.
-@End Implementation
-Process called "translate_class_metadata" takes ctx as Integer, hir_class as Integer, metadata as Integer:
-    Note: Extract metadata pairs
-    Let count be proc list_length from ListCore with metadata
-    Let i be 0
-    
-    While i is less than count:
-        Let pair be proc list_get from ListCore with metadata, i
-        Let key be proc list_get from ListCore with pair, 0
-        Let value be proc list_get from ListCore with pair, 1
-        
-        Note: Check for modifiers
-        Let is_modifiers be proc string_equals from StringCore with key, "modifiers"
-        If is_modifiers is equal to 1:
-            Let mod_count be proc list_length from ListCore with value
-            Let j be 0
-            While j is less than mod_count:
-                Let modifier be proc list_get from ListCore with value, j
-                proc hir_set_metadata from HIR with hir_class, "php_modifier", modifier
-                Set j to j plus 1
-            End While
-        End If
-        
-        Note: Check for extends
-        Let is_extends be proc string_equals from StringCore with key, "extends"
-        If is_extends is equal to 1:
-            proc hir_set_metadata from HIR with hir_class, "php_extends", value
-        End If
-        
-        Note: Check for implements
-        Let is_implements be proc string_equals from StringCore with key, "implements"
-        If is_implements is equal to 1:
-            proc hir_set_metadata from HIR with hir_class, "php_implements", value
-        End If
-        
-        Set i to i plus 1
-    End While
-End Process
-
-Note: ===================================================================
-Note: INTERFACE TRANSLATION
-Note: ===================================================================
-
-@Reasoning:
-`interface Name extends Other { abstract methods, const X }`. Like
-class but interfaces only contain method signatures (no bodies) and
-constants.
-@End Reasoning
-@Implementation:
-Build HIR interface; iterate members translating each (only methods
-and constants are valid); attach.
-@End Implementation
-Process called "translate_interface" takes ctx as Integer, interface_node as Integer:
-    Let interface_name be proc php_ast_node_value from PHPParser with interface_node
-    
-    Let full_name be interface_name
-    Let ns_len be proc string_length from StringCore with ctx.namespace_name
-    If ns_len is greater than 0:
-        Set full_name to proc string_concat from StringCore with ctx.namespace_name, "\\"
-        Set full_name to proc string_concat from StringCore with full_name, interface_name
-    End If
-    
-    Let hir_interface be proc hir_create_class from HIR with full_name
-    Set ctx.current_class to hir_interface
-    
-    proc hir_set_metadata from HIR with hir_interface, "source_language", "php"
-    proc hir_set_metadata from HIR with hir_interface, "php_type", "interface"
-    
-    Note: Translate interface members
-    Let children be proc php_ast_node_children from PHPParser with interface_node
-    Let count be proc list_length from ListCore with children
-    Let i be 0
-    
-    While i is less than count:
-        Let child be proc list_get from ListCore with children, i
-        proc translate_class_member with ctx, child
-        Set i to i plus 1
-    End While
-    
-    proc hir_module_add_class from HIR with ctx.hir_module, hir_interface
-    Set ctx.current_class to 0
-End Process
-
-Note: ===================================================================
-Note: TRAIT TRANSLATION
-Note: ===================================================================
-
-@Reasoning:
-`trait Name { members }`. Traits are PHP's mixin mechanism. Same
-structure as class but the HIR tag distinguishes it so the consumer
-applies trait-specific semantics (e.g. no instantiation).
-@End Reasoning
-@Implementation:
-Build HIR trait; iterate members; attach.
-@End Implementation
-Process called "translate_trait" takes ctx as Integer, trait_node as Integer:
-    Let trait_name be proc php_ast_node_value from PHPParser with trait_node
-    
-    Let full_name be trait_name
-    Let ns_len be proc string_length from StringCore with ctx.namespace_name
-    If ns_len is greater than 0:
-        Set full_name to proc string_concat from StringCore with ctx.namespace_name, "\\"
-        Set full_name to proc string_concat from StringCore with full_name, trait_name
-    End If
-    
-    Let hir_trait be proc hir_create_class from HIR with full_name
-    Set ctx.current_class to hir_trait
-    
-    proc hir_set_metadata from HIR with hir_trait, "source_language", "php"
-    proc hir_set_metadata from HIR with hir_trait, "php_type", "trait"
-    
-    Note: Translate trait members
-    Let children be proc php_ast_node_children from PHPParser with trait_node
-    Let count be proc list_length from ListCore with children
-    Let i be 0
-    
-    While i is less than count:
-        Let child be proc list_get from ListCore with children, i
-        proc translate_class_member with ctx, child
-        Set i to i plus 1
-    End While
-    
-    proc hir_module_add_class from HIR with ctx.hir_module, hir_trait
-    Set ctx.current_class to 0
-End Process
-
-Note: ===================================================================
-Note: CLASS MEMBER TRANSLATION
-Note: ===================================================================
-
-@Reasoning:
-Class members are methods, properties, or constants. Dispatches by
-node type to the appropriate translator.
-@End Reasoning
-@Implementation:
-Read member_node type; switch on PHP_METHOD / PHP_PROPERTY /
-PHP_CLASS_CONST; dispatch.
-@End Implementation
-Process called "translate_class_member" takes ctx as Integer, member_node as Integer:
-    Let node_type be proc php_ast_node_type from PHPParser with member_node
-    
-    If node_type is equal to PHPParser.PHP_METHOD:
-        proc translate_method with ctx, member_node
-    Otherwise:
-        If node_type is equal to PHPParser.PHP_PROPERTY:
-            proc translate_property with ctx, member_node
-        Otherwise:
-            If node_type is equal to PHPParser.PHP_CONSTANT:
-                proc translate_class_constant with ctx, member_node
+        Let child be proc list_get from ListOps with children, i
+        If child is not equal to 0:
+            Let child_hir be proc translate_node with child
+            If child_hir is not equal to 0:
+                proc add_to_hir_list with list_hir, child_hir
             End If
         End If
-    End If
-End Process
-
-@Reasoning:
-A class method has the same shape as a free-standing function plus
-visibility (public/private/protected) and modifiers (static, abstract,
-final). Records the HIR method as a child of ctx.current_class.
-@End Reasoning
-@Implementation:
-Build HIR method with name; translate metadata (visibility/modifiers);
-translate parameters; translate body. Attach to ctx.current_class.
-@End Implementation
-Process called "translate_method" takes ctx as Integer, method_node as Integer:
-    Let method_name be proc php_ast_node_value from PHPParser with method_node
-    
-    Let hir_method be proc hir_create_function from HIR with method_name
-    Set ctx.current_function to hir_method
-    
-    proc hir_set_metadata from HIR with hir_method, "source_language", "php"
-    
-    Note: Extract metadata (visibility, static, etc.)
-    Let metadata be proc php_ast_node_metadata from PHPParser with method_node
-    proc translate_method_metadata with ctx, hir_method, metadata
-    
-    Note: Translate method body
-    Let children be proc php_ast_node_children from PHPParser with method_node
-    Let count be proc list_length from ListCore with children
-    If count is greater than 0:
-        Let body be proc list_get from ListCore with children, 0
-        Let hir_body be proc translate_statement with ctx, body
-        proc hir_function_set_body from HIR with hir_method, hir_body
-    End If
-    
-    proc hir_class_add_method from HIR with ctx.current_class, hir_method
-    Set ctx.current_function to 0
-End Process
-
-@Reasoning:
-Sets the method-level flags (visibility, static, abstract, final) on
-the HIR method. Default visibility is public per PHP rules.
-@End Reasoning
-@Implementation:
-Read flag bits from metadata; set is_public/is_private/is_protected/
-is_static/is_abstract/is_final.
-@End Implementation
-Process called "translate_method_metadata" takes ctx as Integer, hir_method as Integer, metadata as Integer:
-    Let count be proc list_length from ListCore with metadata
-    Let i be 0
-    
-    While i is less than count:
-        Let pair be proc list_get from ListCore with metadata, i
-        Let key be proc list_get from ListCore with pair, 0
-        Let value be proc list_get from ListCore with pair, 1
-        
-        proc hir_set_metadata from HIR with hir_method, key, value
         Set i to i plus 1
     End While
+
+    Return list_hir
 End Process
 
 @Reasoning:
-PHP property declaration: `[visibility] [type] $name [= default];`.
-Type hints are PHP 7.4+. Default value is constant-expressible per PHP
-spec.
+Several AST attributes are ListOps lists of plain strings, not nodes: class/enum
+modifiers, implements/extends name lists, use_trait traits, and catch types. These
+must survive as a HIR list of string-literal nodes (not lowered through
+translate_node, which expects dict nodes). This builds a HIR list literal whose
+elements are HIR string literals, one per source string, then sets it under the
+key. The list is always set (possibly empty) so the backend iterates a real list.
 @End Reasoning
-@Implementation:
-Read name, type hint, default value, visibility flags; build HIR
-property; attach to ctx.current_class.
-@End Implementation
-Process called "translate_property" takes ctx as Integer, property_node as Integer:
-    Let property_name be proc php_ast_node_value from PHPParser with property_node
-    
-    Let hir_field be proc hir_create_field from HIR with property_name
-    proc hir_set_metadata from HIR with hir_field, "source_language", "php"
-    
-    Note: Extract metadata
-    Let metadata be proc php_ast_node_metadata from PHPParser with property_node
-    Let count be proc list_length from ListCore with metadata
-    Let i be 0
-    
-    While i is less than count:
-        Let pair be proc list_get from ListCore with metadata, i
-        Let key be proc list_get from ListCore with pair, 0
-        Let value be proc list_get from ListCore with pair, 1
-        proc hir_set_metadata from HIR with hir_field, key, value
-        Set i to i plus 1
-    End While
-    
-    Note: Translate default value if present
-    Let children be proc php_ast_node_children from PHPParser with property_node
-    Let child_count be proc list_length from ListCore with children
-    If child_count is greater than 0:
-        Let default_value be proc list_get from ListCore with children, 0
-        Let hir_value be proc translate_expression with ctx, default_value
-        proc hir_set_metadata from HIR with hir_field, "default_value", hir_value
+Process called "set_string_list" takes hir as Integer, node as Integer, key as Integer returns Integer:
+    Let ast_list be proc attr with node, key
+    Let list_hir be proc create_list
+
+    If ast_list is not equal to 0:
+        Let count be proc list_length from ListOps with ast_list
+        Let i be 0
+        While i is less than count:
+            Let s be proc list_get from ListOps with ast_list, i
+            If s is not equal to 0:
+                Let s_lit be proc create_hir_string_literal from HIR with s
+                proc add_to_hir_list with list_hir, s_lit
+            End If
+            Set i to i plus 1
+        End While
     End If
-    
-    proc hir_class_add_field from HIR with ctx.current_class, hir_field
+
+    proc set_dict_value with hir, key, list_hir
+    Return 1
 End Process
 
-@Reasoning:
-`const NAME = value;` inside a class body. Distinct from `define()`
-constants (which are global). Constants in interfaces are implicitly
-public.
-@End Reasoning
-@Implementation:
-Read name, value, visibility; build HIR class constant; attach.
-@End Implementation
-Process called "translate_class_constant" takes ctx as Integer, const_node as Integer:
-    Let const_name be proc php_ast_node_value from PHPParser with const_node
-    
-    Let hir_const be proc hir_create_constant from HIR with const_name
-    proc hir_set_metadata from HIR with hir_const, "source_language", "php"
-    
-    Note: Translate value
-    Let children be proc php_ast_node_children from PHPParser with const_node
-    Let count be proc list_length from ListCore with children
-    If count is greater than 0:
-        Let value be proc list_get from ListCore with children, 0
-        Let hir_value be proc translate_expression with ctx, value
-        proc hir_constant_set_value from HIR with hir_const, hir_value
-    End If
-    
-    proc hir_class_add_constant from HIR with ctx.current_class, hir_const
-End Process
-
-Note: ===================================================================
-Note: FUNCTION TRANSLATION
-Note: ===================================================================
+Note: ============================================================================
+Note: STRING DECODING (Stage-B responsibility)
+Note: ============================================================================
 
 @Reasoning:
-Top-level (or namespaced) function: `function name(params): return_type
-{ body }`. Updates ctx.current_function while translating the body so
-nested constructs know they're inside a function.
+PHP string nodes carry the RAW lexeme including the surrounding quote/marker
+characters. The backend needs both the verbatim lexeme (to emit byte-identical
+single-quoted / nowdoc strings) and a decoded payload usable when re-quoting. This
+strips the outer single- or double-quote delimiters from the raw lexeme, leaving
+the inner contents for the "decoded" field. Heredoc/nowdoc lexemes keep their
+marker block verbatim (decoding their multi-line body is the backend's concern),
+so for those kinds the decoded payload equals the raw lexeme. Returns the decoded
+string; never null when raw is non-null.
 @End Reasoning
-@Implementation:
-Build HIR function; translate metadata; translate parameters; save
-previous current_function; set ctx.current_function; translate body;
-restore.
-@End Implementation
-Process called "translate_function" takes ctx as Integer, function_node as Integer:
-    Let function_name be proc php_ast_node_value from PHPParser with function_node
-    
-    Let full_name be function_name
-    Let ns_len be proc string_length from StringCore with ctx.namespace_name
-    If ns_len is greater than 0:
-        Set full_name to proc string_concat from StringCore with ctx.namespace_name, "\\"
-        Set full_name to proc string_concat from StringCore with full_name, function_name
+Process called "decode_string_lexeme" takes raw as Integer, kind as Integer returns Integer:
+    If raw is equal to 0:
+        Return 0
     End If
-    
-    Let hir_function be proc hir_create_function from HIR with full_name
-    Set ctx.current_function to hir_function
-    
-    proc hir_set_metadata from HIR with hir_function, "source_language", "php"
-    
-    Note: Extract metadata (parameters, return type)
-    Let metadata be proc php_ast_node_metadata from PHPParser with function_node
-    proc translate_function_metadata with ctx, hir_function, metadata
-    
-    Note: Translate function body
-    Let children be proc php_ast_node_children from PHPParser with function_node
-    Let count be proc list_length from ListCore with children
-    If count is greater than 0:
-        Let body be proc list_get from ListCore with children, 0
-        Let hir_body be proc translate_statement with ctx, body
-        proc hir_function_set_body from HIR with hir_function, hir_body
-    End If
-    
-    proc hir_module_add_function from HIR with ctx.hir_module, hir_function
-    Set ctx.current_function to 0
-End Process
 
-@Reasoning:
-For free-standing functions: return type, references, attributes. PHP
-attributes (`#[...]`) on functions are carried through to the HIR.
-@End Reasoning
-@Implementation:
-Set return_type on hir_function; copy attribute list; record byref
-return if applicable.
-@End Implementation
-Process called "translate_function_metadata" takes ctx as Integer, hir_function as Integer, metadata as Integer:
-    Let count be proc list_length from ListCore with metadata
-    Let i be 0
-    
-    While i is less than count:
-        Let pair be proc list_get from ListCore with metadata, i
-        Let key be proc list_get from ListCore with pair, 0
-        Let value be proc list_get from ListCore with pair, 1
-        
-        Let is_parameters be proc string_equals from StringCore with key, "parameters"
-        If is_parameters is equal to 1:
-            proc translate_parameters with ctx, hir_function, value
-        Otherwise:
-            proc hir_set_metadata from HIR with hir_function, key, value
+    Let len be proc string_length from StringCore with raw
+    If len is less than 2:
+        Return raw
+    End If
+
+    Let is_single be proc string_equals from StringCore with kind, "single"
+    Let is_double be proc string_equals from StringCore with kind, "double"
+
+    If is_single is equal to 1:
+        Let first be proc string_char_at from StringCore with raw, 0
+        Let last be proc string_char_at from StringCore with raw, len minus 1
+        If first is equal to 39:
+            If last is equal to 39:
+                Return proc string_substring from StringPrim with raw, 1, len minus 2
+            End If
         End If
-        
-        Set i to i plus 1
-    End While
+        Return raw
+    End If
+
+    If is_double is equal to 1:
+        Let firstd be proc string_char_at from StringCore with raw, 0
+        Let lastd be proc string_char_at from StringCore with raw, len minus 1
+        If firstd is equal to 34:
+            If lastd is equal to 34:
+                Return proc string_substring from StringPrim with raw, 1, len minus 2
+            End If
+        End If
+        Return raw
+    End If
+
+    Note: heredoc / nowdoc keep their body verbatim for the backend to re-emit.
+    Return raw
+End Process
+
+Note: ============================================================================
+Note: MAIN TRANSLATION ENTRY POINTS
+Note: ============================================================================
+
+@Reasoning:
+Top-level AST entry point. The parser's parse_program returns a "program" root
+carrying a "body" list of every top-level node (namespaces, uses, declarations,
+statements). This builds a "php_program" HIR dict whose "body" list is lowered
+from that body, so the backend walks a uniform program -> body shape. Returns 0
+on a null AST.
+@End Reasoning
+Process called "translate_php_ast_to_hir" takes ast_root as Integer returns Integer:
+    Note: Translate PHP AST to HIR
+
+    If ast_root is equal to 0:
+        Return 0
+    End If
+
+    Let program_hir be proc create_dict
+    proc set_dict_string with program_hir, "_type", "php_program"
+
+    Let body be proc attr with ast_root, "body"
+    Let body_hir be proc translate_node_list with body
+    proc set_dict_value with program_hir, "body", body_hir
+
+    Return program_hir
 End Process
 
 @Reasoning:
-Iterate parameter list and attach each translated parameter HIR to the
-function. Order is preserved (positional matters).
+Convenience entry point that drives the whole front of the pipeline from raw
+source: lex, parse, run semantic analysis (real scope/name checking), then lower
+the AST to HIR. Returns 0 if any stage yields 0. Semantic analysis is run for its
+name/scope diagnostics; the produced AST is lowered regardless so the caller can
+inspect diagnostics via the semantic analyzer when needed.
 @End Reasoning
-@Implementation:
-Loop over params list; translate_parameter on each; append to
-hir_function's parameter list.
-@End Implementation
-Process called "translate_parameters" takes ctx as Integer, hir_function as Integer, params as Integer:
-    Let count be proc list_length from ListCore with params
-    Let i be 0
-    
-    While i is less than count:
-        Let param be proc list_get from ListCore with params, i
-        Let hir_param be proc translate_parameter with ctx, param
-        proc hir_function_add_parameter from HIR with hir_function, hir_param
-        Set i to i plus 1
-    End While
+Process called "php_to_hir_from_source" takes source as Integer returns Integer:
+    Note: Lex -> parse -> semantic -> lower a PHP source string to HIR
+
+    If source is equal to 0:
+        Return 0
+    End If
+
+    Let tokens be proc php_lex from Lexer with source
+    If tokens is equal to 0:
+        Return 0
+    End If
+
+    Let parser be proc create_php_parser from Parser with tokens
+    If parser is equal to 0:
+        Return 0
+    End If
+
+    Let ast be proc parse_program from Parser with parser
+    If ast is equal to 0:
+        Return 0
+    End If
+
+    Note: Real semantic analysis (scope + name resolution). Diagnostics are
+    Note: collected on the analyzer; lowering proceeds on the validated AST.
+    Let analyzer be proc create_php_semantic_analyzer from Semantic
+    If analyzer is not equal to 0:
+        proc analyze_php_ast from Semantic with analyzer, ast
+    End If
+
+    Return proc translate_php_ast_to_hir with ast
 End Process
 
 @Reasoning:
-A single PHP parameter: `[type] [&]$name [= default]`. Supports
-by-reference parameters (the `&` prefix) and default values.
-Constructor promotion (PHP 8.0+) is detected via visibility flags.
+Single dispatcher for the entire PHP AST. Reads the node's string node_type and
+routes to the matching translator. Declarations, statements, control flow,
+collections, and leaf expressions are all funnelled through here so recursive
+sub-translators bottom out without per-kind plumbing. Returns 0 on an
+unrecognised node_type rather than crashing.
 @End Reasoning
-@Implementation:
-Read name, type hint, default value, is_byref, is_variadic, visibility
-flags; build HIR parameter; return it.
-@End Implementation
-Process called "translate_parameter" takes ctx as Integer, param_node as Integer returns Integer:
-    Note: Extract parameter metadata
-    Let metadata be proc php_ast_node_metadata from PHPParser with param_node
-    
-    Let param_name be ""
-    Let param_type be ""
-    
-    Let count be proc list_length from ListCore with metadata
-    Let i be 0
-    
-    While i is less than count:
-        Let pair be proc list_get from ListCore with metadata, i
-        Let key be proc list_get from ListCore with pair, 0
-        Let value be proc list_get from ListCore with pair, 1
-        
-        Let is_name be proc string_equals from StringCore with key, "name"
-        If is_name is equal to 1:
-            Set param_name to value
-        End If
-        
-        Let is_type be proc string_equals from StringCore with key, "type"
-        If is_type is equal to 1:
-            Set param_type to value
-        End If
-        
-        Set i to i plus 1
-    End While
-    
-    Let hir_param be proc hir_create_parameter from HIR with param_name, param_type
-    proc hir_set_metadata from HIR with hir_param, "source_language", "php"
-    
-    Return hir_param
-End Process
+Process called "translate_node" takes node as Integer returns Integer:
+    Note: Translate one PHP AST node to HIR based on its node_type
 
-Note: ===================================================================
-Note: STATEMENT TRANSLATION
-Note: ===================================================================
+    If node is equal to 0:
+        Return 0
+    End If
 
-@Reasoning:
-Central statement dispatcher: blocks, if/while/do/for/foreach/switch,
-return, try, throw, echo, expression statements. Routes each to its
-dedicated translator.
-@End Reasoning
-@Implementation:
-Read stmt_node type; switch through every PHP_STMT_* tag dispatching
-to translate_<kind>_statement; default treats as expression statement.
-@End Implementation
-Process called "translate_statement" takes ctx as Integer, stmt_node as Integer returns Integer:
-    Let node_type be proc php_ast_node_type from PHPParser with stmt_node
-    
-    If node_type is equal to PHPParser.PHP_BLOCK_STMT:
-        Return proc translate_block with ctx, stmt_node
+    Let nt be proc node_type_of with node
+    If nt is equal to 0:
+        Return 0
     End If
-    
-    If node_type is equal to PHPParser.PHP_IF_STMT:
-        Return proc translate_if_statement with ctx, stmt_node
+
+    Note: --- program / top level ---
+    If proc type_is with nt, "program":
+        Return proc translate_php_ast_to_hir with node
     End If
-    
-    If node_type is equal to PHPParser.PHP_WHILE_STMT:
-        Return proc translate_while_statement with ctx, stmt_node
+    If proc type_is with nt, "inline_html":
+        Return proc translate_inline_html with node
     End If
-    
-    If node_type is equal to PHPParser.PHP_DO_WHILE_STMT:
-        Return proc translate_do_while_statement with ctx, stmt_node
+    If proc type_is with nt, "namespace":
+        Return proc translate_namespace with node
     End If
-    
-    If node_type is equal to PHPParser.PHP_FOR_STMT:
-        Return proc translate_for_statement with ctx, stmt_node
+    If proc type_is with nt, "use":
+        Return proc translate_use with node
     End If
-    
-    If node_type is equal to PHPParser.PHP_FOREACH_STMT:
-        Return proc translate_foreach_statement with ctx, stmt_node
+    If proc type_is with nt, "use_item":
+        Return proc translate_use_item with node
     End If
-    
-    If node_type is equal to PHPParser.PHP_SWITCH_STMT:
-        Return proc translate_switch_statement with ctx, stmt_node
+    If proc type_is with nt, "declare":
+        Return proc translate_declare with node
     End If
-    
-    If node_type is equal to PHPParser.PHP_RETURN_STMT:
-        Return proc translate_return_statement with ctx, stmt_node
+    If proc type_is with nt, "pair":
+        Return proc translate_pair with node
     End If
-    
-    If node_type is equal to PHPParser.PHP_BREAK_STMT:
-        Return proc hir_create_break from HIR
+
+    Note: --- declarations ---
+    If proc type_is with nt, "class":
+        Return proc translate_class with node
     End If
-    
-    If node_type is equal to PHPParser.PHP_CONTINUE_STMT:
-        Return proc hir_create_continue from HIR
+    If proc type_is with nt, "interface":
+        Return proc translate_interface with node
     End If
-    
-    If node_type is equal to PHPParser.PHP_TRY_STMT:
-        Return proc translate_try_statement with ctx, stmt_node
+    If proc type_is with nt, "trait":
+        Return proc translate_trait with node
     End If
-    
-    If node_type is equal to PHPParser.PHP_THROW_STMT:
-        Return proc translate_throw_statement with ctx, stmt_node
+    If proc type_is with nt, "enum":
+        Return proc translate_enum with node
     End If
-    
-    If node_type is equal to PHPParser.PHP_ECHO_STMT:
-        Return proc translate_echo_statement with ctx, stmt_node
+    If proc type_is with nt, "enum_case":
+        Return proc translate_enum_case with node
     End If
-    
-    If node_type is equal to PHPParser.PHP_EXPRESSION_STMT:
-        Let children be proc php_ast_node_children from PHPParser with stmt_node
-        Let count be proc list_length from ListCore with children
-        If count is greater than 0:
-            Let expr be proc list_get from ListCore with children, 0
-            Return proc translate_expression with ctx, expr
-        End If
+    If proc type_is with nt, "use_trait":
+        Return proc translate_use_trait with node
     End If
-    
+    If proc type_is with nt, "trait_adaptation":
+        Return proc translate_trait_adaptation with node
+    End If
+    If proc type_is with nt, "function":
+        Return proc translate_function with node
+    End If
+    If proc type_is with nt, "method":
+        Return proc translate_method with node
+    End If
+    If proc type_is with nt, "property":
+        Return proc translate_property with node
+    End If
+    If proc type_is with nt, "class_const":
+        Return proc translate_class_const with node
+    End If
+    If proc type_is with nt, "param":
+        Return proc translate_param with node
+    End If
+    If proc type_is with nt, "attribute_group":
+        Return proc translate_attribute_group with node
+    End If
+    If proc type_is with nt, "attribute":
+        Return proc translate_attribute with node
+    End If
+
+    Note: --- statements ---
+    If proc type_is with nt, "block":
+        Return proc translate_block with node
+    End If
+    If proc type_is with nt, "expr_stmt":
+        Return proc translate_expr_stmt with node
+    End If
+    If proc type_is with nt, "echo":
+        Return proc translate_echo with node
+    End If
+    If proc type_is with nt, "print":
+        Return proc translate_print with node
+    End If
+    If proc type_is with nt, "if":
+        Return proc translate_if with node
+    End If
+    If proc type_is with nt, "elseif_clause":
+        Return proc translate_elseif_clause with node
+    End If
+    If proc type_is with nt, "while":
+        Return proc translate_while with node
+    End If
+    If proc type_is with nt, "do_while":
+        Return proc translate_do_while with node
+    End If
+    If proc type_is with nt, "for":
+        Return proc translate_for with node
+    End If
+    If proc type_is with nt, "foreach":
+        Return proc translate_foreach with node
+    End If
+    If proc type_is with nt, "switch":
+        Return proc translate_switch with node
+    End If
+    If proc type_is with nt, "switch_case":
+        Return proc translate_switch_case with node
+    End If
+    If proc type_is with nt, "return":
+        Return proc translate_return with node
+    End If
+    If proc type_is with nt, "break":
+        Return proc translate_break with node
+    End If
+    If proc type_is with nt, "continue":
+        Return proc translate_continue with node
+    End If
+    If proc type_is with nt, "throw":
+        Return proc translate_throw with node
+    End If
+    If proc type_is with nt, "try":
+        Return proc translate_try with node
+    End If
+    If proc type_is with nt, "catch_clause":
+        Return proc translate_catch_clause with node
+    End If
+    If proc type_is with nt, "global":
+        Return proc translate_global with node
+    End If
+    If proc type_is with nt, "static_var":
+        Return proc translate_static_var with node
+    End If
+    If proc type_is with nt, "static_var_item":
+        Return proc translate_static_var_item with node
+    End If
+    If proc type_is with nt, "unset":
+        Return proc translate_unset with node
+    End If
+    If proc type_is with nt, "goto":
+        Return proc translate_goto with node
+    End If
+    If proc type_is with nt, "label":
+        Return proc translate_label with node
+    End If
+
+    Note: --- expressions ---
+    If proc type_is with nt, "assign":
+        Return proc translate_assign with node
+    End If
+    If proc type_is with nt, "ternary":
+        Return proc translate_ternary with node
+    End If
+    If proc type_is with nt, "binary_op":
+        Return proc translate_binary_op with node
+    End If
+    If proc type_is with nt, "unary_op":
+        Return proc translate_unary_op with node
+    End If
+    If proc type_is with nt, "cast":
+        Return proc translate_cast with node
+    End If
+    If proc type_is with nt, "instanceof":
+        Return proc translate_instanceof with node
+    End If
+    If proc type_is with nt, "call":
+        Return proc translate_call with node
+    End If
+    If proc type_is with nt, "arg":
+        Return proc translate_arg with node
+    End If
+    If proc type_is with nt, "new":
+        Return proc translate_new with node
+    End If
+    If proc type_is with nt, "clone":
+        Return proc translate_clone with node
+    End If
+    If proc type_is with nt, "member":
+        Return proc translate_member with node
+    End If
+    If proc type_is with nt, "static_member":
+        Return proc translate_static_member with node
+    End If
+    If proc type_is with nt, "index":
+        Return proc translate_index with node
+    End If
+    If proc type_is with nt, "array":
+        Return proc translate_array with node
+    End If
+    If proc type_is with nt, "array_item":
+        Return proc translate_array_item with node
+    End If
+    If proc type_is with nt, "list_pattern":
+        Return proc translate_list_pattern with node
+    End If
+    If proc type_is with nt, "closure":
+        Return proc translate_closure with node
+    End If
+    If proc type_is with nt, "closure_use":
+        Return proc translate_closure_use with node
+    End If
+    If proc type_is with nt, "arrow_fn":
+        Return proc translate_arrow_fn with node
+    End If
+    If proc type_is with nt, "match":
+        Return proc translate_match with node
+    End If
+    If proc type_is with nt, "match_arm":
+        Return proc translate_match_arm with node
+    End If
+    If proc type_is with nt, "yield":
+        Return proc translate_yield with node
+    End If
+    If proc type_is with nt, "isset":
+        Return proc translate_isset with node
+    End If
+    If proc type_is with nt, "empty":
+        Return proc translate_empty with node
+    End If
+    If proc type_is with nt, "exit":
+        Return proc translate_exit with node
+    End If
+    If proc type_is with nt, "include":
+        Return proc translate_include with node
+    End If
+
+    Note: --- primary / leaves ---
+    If proc type_is with nt, "variable":
+        Return proc translate_variable with node
+    End If
+    If proc type_is with nt, "name":
+        Return proc translate_name with node
+    End If
+    If proc type_is with nt, "int":
+        Return proc translate_int with node
+    End If
+    If proc type_is with nt, "float":
+        Return proc translate_float with node
+    End If
+    If proc type_is with nt, "string":
+        Return proc translate_string with node
+    End If
+    If proc type_is with nt, "bool":
+        Return proc translate_bool with node
+    End If
+    If proc type_is with nt, "null":
+        Return proc translate_null with node
+    End If
+
+    Note: unknown node type
     Return 0
 End Process
 
+Note: ============================================================================
+Note: TOP-LEVEL TRANSLATORS
+Note: ============================================================================
+
 @Reasoning:
-`{ stmt; stmt; ... }`. Builds a HIR block and recurses each child as
-a statement. Preserves source order.
+Inline HTML between PHP tags carries only its text lexeme; preserved verbatim.
 @End Reasoning
-@Implementation:
-Build HIR block; iterate block_node children; translate_statement
-each; append to block.
-@End Implementation
-Process called "translate_block" takes ctx as Integer, block_node as Integer returns Integer:
-    Let hir_block be proc hir_create_block from HIR
-    
-    Let children be proc php_ast_node_children from PHPParser with block_node
-    Let count be proc list_length from ListCore with children
-    Let i be 0
-    
-    While i is less than count:
-        Let child be proc list_get from ListCore with children, i
-        Let hir_stmt be proc translate_statement with ctx, child
-        If hir_stmt is not equal to 0:
-            proc hir_block_add_statement from HIR with hir_block, hir_stmt
+Process called "translate_inline_html" takes node as Integer returns Integer:
+    Let hir be proc create_dict
+    proc set_dict_string with hir, "_type", "inline_html"
+    proc carry_string with hir, node, "text"
+    Return hir
+End Process
+
+@Reasoning:
+A namespace carries a name string (empty for the global block), an is_block flag,
+and a body of declaration nodes. Name and flag survive as strings; the body as a
+real lowered list.
+@End Reasoning
+Process called "translate_namespace" takes node as Integer returns Integer:
+    Let hir be proc create_dict
+    proc set_dict_string with hir, "_type", "namespace"
+    proc carry_string with hir, node, "name"
+
+    Let is_block be proc attr with node, "is_block"
+    proc set_dict_flag with hir, "is_block", is_block
+
+    proc carry_list with hir, node, "body"
+    Return hir
+End Process
+
+@Reasoning:
+A use statement carries a kind ("normal"/"function"/"const") and an items list of
+use_item nodes. Kind survives as a string; items as a real lowered list.
+@End Reasoning
+Process called "translate_use" takes node as Integer returns Integer:
+    Let hir be proc create_dict
+    proc set_dict_string with hir, "_type", "use"
+    proc carry_string with hir, node, "kind"
+    proc carry_list with hir, node, "items"
+    Return hir
+End Process
+
+@Reasoning:
+A use_item carries a qualified name string and an alias string (empty when none).
+Both preserved as strings.
+@End Reasoning
+Process called "translate_use_item" takes node as Integer returns Integer:
+    Let hir be proc create_dict
+    proc set_dict_string with hir, "_type", "use_item"
+    proc carry_string with hir, node, "name"
+    proc carry_string with hir, node, "alias"
+    Return hir
+End Process
+
+@Reasoning:
+A declare carries a directives list of pair nodes and an optional body list (empty
+for the ';' form). Both are real lowered lists.
+@End Reasoning
+Process called "translate_declare" takes node as Integer returns Integer:
+    Let hir be proc create_dict
+    proc set_dict_string with hir, "_type", "declare"
+    proc carry_list with hir, node, "directives"
+    proc carry_list with hir, node, "body"
+    Return hir
+End Process
+
+@Reasoning:
+A pair carries a key string and a value expression (declare directives, etc.). The
+key is preserved as a string; the value lowered as a subtree.
+@End Reasoning
+Process called "translate_pair" takes node as Integer returns Integer:
+    Let hir be proc create_dict
+    proc set_dict_string with hir, "_type", "pair"
+    proc carry_string with hir, node, "key"
+    proc carry_node with hir, node, "value"
+    Return hir
+End Process
+
+Note: ============================================================================
+Note: DECLARATION TRANSLATORS
+Note: ============================================================================
+
+@Reasoning:
+A class carries a name, a modifiers list (abstract/final/readonly), an extends
+string, an implements list of name strings, an attributes list of attribute_group
+nodes, and a members list (methods, properties, class_consts, use_traits). Name
+and extends survive as strings; modifiers and implements are kept as string lists;
+attributes and members are real lowered lists so no member is dropped.
+@End Reasoning
+Process called "translate_class" takes node as Integer returns Integer:
+    Let hir be proc create_dict
+    proc set_dict_string with hir, "_type", "class"
+    proc carry_string with hir, node, "name"
+    proc carry_string with hir, node, "extends"
+    proc set_string_list with hir, node, "modifiers"
+    proc set_string_list with hir, node, "implements"
+    proc carry_list with hir, node, "attributes"
+    proc carry_list with hir, node, "members"
+    Return hir
+End Process
+
+@Reasoning:
+An interface carries a name, an extends list of name strings, an attributes list,
+and a members list. Name survives as a string; extends as a string list; the rest
+as real lowered lists.
+@End Reasoning
+Process called "translate_interface" takes node as Integer returns Integer:
+    Let hir be proc create_dict
+    proc set_dict_string with hir, "_type", "interface"
+    proc carry_string with hir, node, "name"
+    proc set_string_list with hir, node, "extends"
+    proc carry_list with hir, node, "attributes"
+    proc carry_list with hir, node, "members"
+    Return hir
+End Process
+
+@Reasoning:
+A trait carries a name, attributes, and members. Name as a string; the lists as
+real lowered lists.
+@End Reasoning
+Process called "translate_trait" takes node as Integer returns Integer:
+    Let hir be proc create_dict
+    proc set_dict_string with hir, "_type", "trait"
+    proc carry_string with hir, node, "name"
+    proc carry_list with hir, node, "attributes"
+    proc carry_list with hir, node, "members"
+    Return hir
+End Process
+
+@Reasoning:
+An enum carries a name, a backing_type string (empty for pure enums), an
+implements list of name strings, attributes, and members (enum_cases + methods +
+class_consts). Name and backing_type survive as strings; implements as a string
+list; attributes and members as real lowered lists.
+@End Reasoning
+Process called "translate_enum" takes node as Integer returns Integer:
+    Let hir be proc create_dict
+    proc set_dict_string with hir, "_type", "enum"
+    proc carry_string with hir, node, "name"
+    proc carry_string with hir, node, "backing_type"
+    proc set_string_list with hir, node, "implements"
+    proc carry_list with hir, node, "attributes"
+    proc carry_list with hir, node, "members"
+    Return hir
+End Process
+
+@Reasoning:
+An enum_case carries a name string, an optional value expression (0 for pure-enum
+cases), and an attributes list. Name survives as a string; value as a subtree when
+present; attributes as a real lowered list.
+@End Reasoning
+Process called "translate_enum_case" takes node as Integer returns Integer:
+    Let hir be proc create_dict
+    proc set_dict_string with hir, "_type", "enum_case"
+    proc carry_string with hir, node, "name"
+    proc carry_node with hir, node, "value"
+    proc carry_list with hir, node, "attributes"
+    Return hir
+End Process
+
+@Reasoning:
+A use_trait member carries a traits list of name strings and an adaptations list
+of trait_adaptation nodes. Traits as a string list; adaptations as a real lowered
+list.
+@End Reasoning
+Process called "translate_use_trait" takes node as Integer returns Integer:
+    Let hir be proc create_dict
+    proc set_dict_string with hir, "_type", "use_trait"
+    proc set_string_list with hir, node, "traits"
+    proc carry_list with hir, node, "adaptations"
+    Return hir
+End Process
+
+@Reasoning:
+A trait_adaptation carries a text_kind ("insteadof"/"as"), an lhs string, and an
+rhs string. All three preserved as strings.
+@End Reasoning
+Process called "translate_trait_adaptation" takes node as Integer returns Integer:
+    Let hir be proc create_dict
+    proc set_dict_string with hir, "_type", "trait_adaptation"
+    proc carry_string with hir, node, "text_kind"
+    proc carry_string with hir, node, "lhs"
+    proc carry_string with hir, node, "rhs"
+    Return hir
+End Process
+
+@Reasoning:
+A function carries a name, a by_ref flag, a params list, a return_type string, an
+attributes list, and a body block node (0 if abstract/declared). Name and
+return_type survive as strings; by_ref as a flag; params and attributes as real
+lowered lists; the body as a subtree when present.
+@End Reasoning
+Process called "translate_function" takes node as Integer returns Integer:
+    Let hir be proc create_dict
+    proc set_dict_string with hir, "_type", "function"
+    proc carry_string with hir, node, "name"
+    proc carry_string with hir, node, "return_type"
+
+    Let by_ref be proc attr with node, "by_ref"
+    proc set_dict_flag with hir, "by_ref", by_ref
+
+    proc carry_list with hir, node, "params"
+    proc carry_list with hir, node, "attributes"
+    proc carry_node with hir, node, "body"
+    Return hir
+End Process
+
+@Reasoning:
+A method carries a name, a by_ref flag, a visibility string, a modifiers list
+(static/abstract/final), a params list, a return_type string, attributes, and a
+body block (0 if abstract). All scalar fields survive as strings/flags; params,
+modifiers, and attributes as real lowered lists; the body as a subtree when
+present.
+@End Reasoning
+Process called "translate_method" takes node as Integer returns Integer:
+    Let hir be proc create_dict
+    proc set_dict_string with hir, "_type", "method"
+    proc carry_string with hir, node, "name"
+    proc carry_string with hir, node, "visibility"
+    proc carry_string with hir, node, "return_type"
+
+    Let by_ref be proc attr with node, "by_ref"
+    proc set_dict_flag with hir, "by_ref", by_ref
+
+    proc set_string_list with hir, node, "modifiers"
+    proc carry_list with hir, node, "params"
+    proc carry_list with hir, node, "attributes"
+    proc carry_node with hir, node, "body"
+    Return hir
+End Process
+
+@Reasoning:
+A property carries a name (with leading '$'), a visibility string, a modifiers
+list, a type string, an attributes list, and an optional default expression. All
+scalar fields survive as strings; modifiers and attributes as real lowered lists;
+the default as a subtree when present.
+@End Reasoning
+Process called "translate_property" takes node as Integer returns Integer:
+    Let hir be proc create_dict
+    proc set_dict_string with hir, "_type", "property"
+    proc carry_string with hir, node, "name"
+    proc carry_string with hir, node, "visibility"
+    proc carry_string with hir, node, "type"
+    proc set_string_list with hir, node, "modifiers"
+    proc carry_list with hir, node, "attributes"
+    proc carry_node with hir, node, "default"
+    Return hir
+End Process
+
+@Reasoning:
+A class_const carries a name, a visibility string, a modifiers list, and a value
+expression. Scalars survive as strings; modifiers as a string list; the value as a
+subtree.
+@End Reasoning
+Process called "translate_class_const" takes node as Integer returns Integer:
+    Let hir be proc create_dict
+    proc set_dict_string with hir, "_type", "class_const"
+    proc carry_string with hir, node, "name"
+    proc carry_string with hir, node, "visibility"
+    proc set_string_list with hir, node, "modifiers"
+    proc carry_node with hir, node, "value"
+    Return hir
+End Process
+
+@Reasoning:
+A param carries a name (with leading '$'), a type string, by_ref + variadic flags,
+an optional default expression, a visibility string (non-empty only for
+constructor-promoted params), a modifiers list, and an attributes list. All scalar
+fields survive as strings/flags; the default as a subtree; modifiers and
+attributes as real lowered lists. The promoted-property visibility is preserved so
+the backend can re-emit constructor promotion.
+@End Reasoning
+Process called "translate_param" takes node as Integer returns Integer:
+    Let hir be proc create_dict
+    proc set_dict_string with hir, "_type", "param"
+    proc carry_string with hir, node, "name"
+    proc carry_string with hir, node, "type"
+    proc carry_string with hir, node, "visibility"
+
+    Let by_ref be proc attr with node, "by_ref"
+    proc set_dict_flag with hir, "by_ref", by_ref
+    Let variadic be proc attr with node, "variadic"
+    proc set_dict_flag with hir, "variadic", variadic
+
+    proc carry_node with hir, node, "default"
+    proc set_string_list with hir, node, "modifiers"
+    proc carry_list with hir, node, "attributes"
+    Return hir
+End Process
+
+@Reasoning:
+An attribute_group carries an attributes list of attribute nodes (the #[...]
+block). Lowered into a real "attributes" list.
+@End Reasoning
+Process called "translate_attribute_group" takes node as Integer returns Integer:
+    Let hir be proc create_dict
+    proc set_dict_string with hir, "_type", "attribute_group"
+    proc carry_list with hir, node, "attributes"
+    Return hir
+End Process
+
+@Reasoning:
+An attribute carries a qualified name string and an args list of arg nodes. Name
+survives as a string; args as a real lowered list.
+@End Reasoning
+Process called "translate_attribute" takes node as Integer returns Integer:
+    Let hir be proc create_dict
+    proc set_dict_string with hir, "_type", "attribute"
+    proc carry_string with hir, node, "name"
+    proc carry_list with hir, node, "args"
+    Return hir
+End Process
+
+Note: ============================================================================
+Note: STATEMENT TRANSLATORS
+Note: ============================================================================
+
+@Reasoning:
+A block carries a body statement list. Lowered into a real "body" list.
+@End Reasoning
+Process called "translate_block" takes node as Integer returns Integer:
+    Let hir be proc create_dict
+    proc set_dict_string with hir, "_type", "block"
+    proc carry_list with hir, node, "body"
+    Return hir
+End Process
+
+@Reasoning:
+An expression statement wraps a single expression. The expr is lowered as a
+subtree.
+@End Reasoning
+Process called "translate_expr_stmt" takes node as Integer returns Integer:
+    Let hir be proc create_dict
+    proc set_dict_string with hir, "_type", "expr_stmt"
+    proc carry_node with hir, node, "expr"
+    Return hir
+End Process
+
+@Reasoning:
+An echo carries an args list of expressions. Lowered into a real "args" list.
+@End Reasoning
+Process called "translate_echo" takes node as Integer returns Integer:
+    Let hir be proc create_dict
+    proc set_dict_string with hir, "_type", "echo"
+    proc carry_list with hir, node, "args"
+    Return hir
+End Process
+
+@Reasoning:
+A print carries a single expression. Lowered as a subtree.
+@End Reasoning
+Process called "translate_print" takes node as Integer returns Integer:
+    Let hir be proc create_dict
+    proc set_dict_string with hir, "_type", "print"
+    proc carry_node with hir, node, "expr"
+    Return hir
+End Process
+
+@Reasoning:
+An if carries a condition, a then_branch statement, an elseifs list of
+elseif_clause nodes, and an optional else_branch statement. Condition and branches
+are subtrees; elseifs is a real lowered list.
+@End Reasoning
+Process called "translate_if" takes node as Integer returns Integer:
+    Let hir be proc create_dict
+    proc set_dict_string with hir, "_type", "if"
+    proc carry_node with hir, node, "condition"
+    proc carry_node with hir, node, "then_branch"
+    proc carry_list with hir, node, "elseifs"
+    proc carry_node with hir, node, "else_branch"
+    Return hir
+End Process
+
+@Reasoning:
+An elseif_clause carries a condition and a body statement. Both lowered as
+subtrees.
+@End Reasoning
+Process called "translate_elseif_clause" takes node as Integer returns Integer:
+    Let hir be proc create_dict
+    proc set_dict_string with hir, "_type", "elseif_clause"
+    proc carry_node with hir, node, "condition"
+    proc carry_node with hir, node, "body"
+    Return hir
+End Process
+
+@Reasoning:
+A while carries a condition and a body statement. Both lowered as subtrees.
+@End Reasoning
+Process called "translate_while" takes node as Integer returns Integer:
+    Let hir be proc create_dict
+    proc set_dict_string with hir, "_type", "while"
+    proc carry_node with hir, node, "condition"
+    proc carry_node with hir, node, "body"
+    Return hir
+End Process
+
+@Reasoning:
+A do_while carries a body statement and a condition. Both lowered as subtrees.
+@End Reasoning
+Process called "translate_do_while" takes node as Integer returns Integer:
+    Let hir be proc create_dict
+    proc set_dict_string with hir, "_type", "do_while"
+    proc carry_node with hir, node, "body"
+    proc carry_node with hir, node, "condition"
+    Return hir
+End Process
+
+@Reasoning:
+A for carries init, condition, and update expression lists plus a body statement.
+The three expression lists are real lowered lists; the body is a subtree.
+@End Reasoning
+Process called "translate_for" takes node as Integer returns Integer:
+    Let hir be proc create_dict
+    proc set_dict_string with hir, "_type", "for"
+    proc carry_list with hir, node, "init"
+    proc carry_list with hir, node, "condition"
+    proc carry_list with hir, node, "update"
+    proc carry_node with hir, node, "body"
+    Return hir
+End Process
+
+@Reasoning:
+A foreach carries a collection expression, an optional key_var, a value_var, a
+by_ref flag, and a body statement. Collection / key_var / value_var / body are
+subtrees; by_ref is a flag. This preserves the `as $k => $v` form: key_var present
+means a keyed iteration.
+@End Reasoning
+Process called "translate_foreach" takes node as Integer returns Integer:
+    Let hir be proc create_dict
+    proc set_dict_string with hir, "_type", "foreach"
+    proc carry_node with hir, node, "collection"
+    proc carry_node with hir, node, "key_var"
+    proc carry_node with hir, node, "value_var"
+
+    Let by_ref be proc attr with node, "by_ref"
+    proc set_dict_flag with hir, "by_ref", by_ref
+
+    proc carry_node with hir, node, "body"
+    Return hir
+End Process
+
+@Reasoning:
+A switch carries a discriminant expression and a cases list of switch_case nodes.
+Discriminant is a subtree; cases is a real lowered list.
+@End Reasoning
+Process called "translate_switch" takes node as Integer returns Integer:
+    Let hir be proc create_dict
+    proc set_dict_string with hir, "_type", "switch"
+    proc carry_node with hir, node, "discriminant"
+    proc carry_list with hir, node, "cases"
+    Return hir
+End Process
+
+@Reasoning:
+A switch_case carries a test expression (0 for default) and a body statement list.
+Test as a subtree when present; body as a real lowered list.
+@End Reasoning
+Process called "translate_switch_case" takes node as Integer returns Integer:
+    Let hir be proc create_dict
+    proc set_dict_string with hir, "_type", "switch_case"
+    proc carry_node with hir, node, "test"
+    proc carry_list with hir, node, "body"
+    Return hir
+End Process
+
+@Reasoning:
+A return carries an optional value expression. Lowered as a subtree when present.
+@End Reasoning
+Process called "translate_return" takes node as Integer returns Integer:
+    Let hir be proc create_dict
+    proc set_dict_string with hir, "_type", "return"
+    proc carry_node with hir, node, "value"
+    Return hir
+End Process
+
+@Reasoning:
+A break carries an optional level expression. Lowered as a subtree when present.
+@End Reasoning
+Process called "translate_break" takes node as Integer returns Integer:
+    Let hir be proc create_dict
+    proc set_dict_string with hir, "_type", "break"
+    proc carry_node with hir, node, "level"
+    Return hir
+End Process
+
+@Reasoning:
+A continue carries an optional level expression. Lowered as a subtree when present.
+@End Reasoning
+Process called "translate_continue" takes node as Integer returns Integer:
+    Let hir be proc create_dict
+    proc set_dict_string with hir, "_type", "continue"
+    proc carry_node with hir, node, "level"
+    Return hir
+End Process
+
+@Reasoning:
+A throw carries an expression. Lowered as a subtree.
+@End Reasoning
+Process called "translate_throw" takes node as Integer returns Integer:
+    Let hir be proc create_dict
+    proc set_dict_string with hir, "_type", "throw"
+    proc carry_node with hir, node, "expr"
+    Return hir
+End Process
+
+@Reasoning:
+A try carries a body block, a catches list of catch_clause nodes, and an optional
+finally block. Body and finally are subtrees; catches is a real lowered list.
+@End Reasoning
+Process called "translate_try" takes node as Integer returns Integer:
+    Let hir be proc create_dict
+    proc set_dict_string with hir, "_type", "try"
+    proc carry_node with hir, node, "body"
+    proc carry_list with hir, node, "catches"
+    proc carry_node with hir, node, "finally"
+    Return hir
+End Process
+
+@Reasoning:
+A catch_clause carries a types list of name strings, a var string (empty for a
+variableless catch), and a body block. Types as a string list; var as a string;
+body as a subtree.
+@End Reasoning
+Process called "translate_catch_clause" takes node as Integer returns Integer:
+    Let hir be proc create_dict
+    proc set_dict_string with hir, "_type", "catch_clause"
+    proc set_string_list with hir, node, "types"
+    proc carry_string with hir, node, "var"
+    proc carry_node with hir, node, "body"
+    Return hir
+End Process
+
+@Reasoning:
+A global carries a vars list of variable nodes. Lowered into a real "vars" list.
+@End Reasoning
+Process called "translate_global" takes node as Integer returns Integer:
+    Let hir be proc create_dict
+    proc set_dict_string with hir, "_type", "global"
+    proc carry_list with hir, node, "vars"
+    Return hir
+End Process
+
+@Reasoning:
+A static_var carries a vars list of static_var_item nodes. Lowered into a real
+"vars" list.
+@End Reasoning
+Process called "translate_static_var" takes node as Integer returns Integer:
+    Let hir be proc create_dict
+    proc set_dict_string with hir, "_type", "static_var"
+    proc carry_list with hir, node, "vars"
+    Return hir
+End Process
+
+@Reasoning:
+A static_var_item carries a name string and an optional default expression. Name
+survives as a string; default as a subtree when present.
+@End Reasoning
+Process called "translate_static_var_item" takes node as Integer returns Integer:
+    Let hir be proc create_dict
+    proc set_dict_string with hir, "_type", "static_var_item"
+    proc carry_string with hir, node, "name"
+    proc carry_node with hir, node, "default"
+    Return hir
+End Process
+
+@Reasoning:
+An unset carries an args list of expressions. Lowered into a real "args" list.
+@End Reasoning
+Process called "translate_unset" takes node as Integer returns Integer:
+    Let hir be proc create_dict
+    proc set_dict_string with hir, "_type", "unset"
+    proc carry_list with hir, node, "args"
+    Return hir
+End Process
+
+@Reasoning:
+A goto carries a label string. Preserved as a string.
+@End Reasoning
+Process called "translate_goto" takes node as Integer returns Integer:
+    Let hir be proc create_dict
+    proc set_dict_string with hir, "_type", "goto"
+    proc carry_string with hir, node, "label"
+    Return hir
+End Process
+
+@Reasoning:
+A label carries a name string. Preserved as a string.
+@End Reasoning
+Process called "translate_label" takes node as Integer returns Integer:
+    Let hir be proc create_dict
+    proc set_dict_string with hir, "_type", "label"
+    proc carry_string with hir, node, "name"
+    Return hir
+End Process
+
+Note: ============================================================================
+Note: EXPRESSION TRANSLATORS
+Note: ============================================================================
+
+@Reasoning:
+An assign carries an operator string, a target, a value, and a by_ref flag. The
+operator survives as a string; target and value as subtrees; by_ref as a flag. The
+operator covers compound forms ("+=", ".=", "??=", etc.) verbatim.
+@End Reasoning
+Process called "translate_assign" takes node as Integer returns Integer:
+    Let hir be proc create_dict
+    proc set_dict_string with hir, "_type", "assign"
+    proc carry_string with hir, node, "operator"
+    proc carry_node with hir, node, "target"
+    proc carry_node with hir, node, "value"
+
+    Let by_ref be proc attr with node, "by_ref"
+    proc set_dict_flag with hir, "by_ref", by_ref
+    Return hir
+End Process
+
+@Reasoning:
+A ternary carries a condition, an optional then (0 for the short ?: form), and an
+else. All lowered as subtrees; absence of "then" preserves the elvis operator.
+@End Reasoning
+Process called "translate_ternary" takes node as Integer returns Integer:
+    Let hir be proc create_dict
+    proc set_dict_string with hir, "_type", "ternary"
+    proc carry_node with hir, node, "condition"
+    proc carry_node with hir, node, "then"
+    proc carry_node with hir, node, "else"
+    Return hir
+End Process
+
+@Reasoning:
+A binary_op carries an operator string and left/right operands. The operator is
+preserved verbatim as "operator" and recorded under "php_operator" metadata so a
+HIR_OP-consuming backend can map it; both operands lowered as subtrees.
+@End Reasoning
+Process called "translate_binary_op" takes node as Integer returns Integer:
+    Let hir be proc create_dict
+    proc set_dict_string with hir, "_type", "binary_op"
+
+    Let operator be proc attr with node, "operator"
+    If operator is not equal to 0:
+        proc set_dict_string with hir, "operator", operator
+        proc set_dict_string with hir, "php_operator", operator
+    End If
+
+    proc carry_node with hir, node, "left"
+    proc carry_node with hir, node, "right"
+    Return hir
+End Process
+
+@Reasoning:
+A unary_op carries an operator string, an operand, and a prefix flag (postfix vs
+prefix ++/--). Operator preserved verbatim (and as "php_operator" metadata);
+operand lowered as a subtree; prefix recorded as a flag.
+@End Reasoning
+Process called "translate_unary_op" takes node as Integer returns Integer:
+    Let hir be proc create_dict
+    proc set_dict_string with hir, "_type", "unary_op"
+
+    Let operator be proc attr with node, "operator"
+    If operator is not equal to 0:
+        proc set_dict_string with hir, "operator", operator
+        proc set_dict_string with hir, "php_operator", operator
+    End If
+
+    proc carry_node with hir, node, "operand"
+
+    Let prefix be proc attr with node, "prefix"
+    proc set_dict_flag with hir, "prefix", prefix
+    Return hir
+End Process
+
+@Reasoning:
+A cast carries a cast_type string and an operand expression. Type survives as a
+string; operand as a subtree.
+@End Reasoning
+Process called "translate_cast" takes node as Integer returns Integer:
+    Let hir be proc create_dict
+    proc set_dict_string with hir, "_type", "cast"
+    proc carry_string with hir, node, "cast_type"
+    proc carry_node with hir, node, "operand"
+    Return hir
+End Process
+
+@Reasoning:
+An instanceof carries an operand and a class_name (an expr or name node). Both
+lowered as subtrees.
+@End Reasoning
+Process called "translate_instanceof" takes node as Integer returns Integer:
+    Let hir be proc create_dict
+    proc set_dict_string with hir, "_type", "instanceof"
+    proc carry_node with hir, node, "operand"
+    proc carry_node with hir, node, "class_name"
+    Return hir
+End Process
+
+@Reasoning:
+A call carries a callee expression and an args list of arg nodes. Callee as a
+subtree; args as a real lowered list.
+@End Reasoning
+Process called "translate_call" takes node as Integer returns Integer:
+    Let hir be proc create_dict
+    proc set_dict_string with hir, "_type", "call"
+    proc carry_node with hir, node, "callee"
+    proc carry_list with hir, node, "args"
+    Return hir
+End Process
+
+@Reasoning:
+An arg carries a value expression, a spread flag, and a name string (non-empty for
+named args). value lowered as a subtree (0 only for the first-class-callable
+foo(...) form, where spread=1 value=0); spread as a flag; name as a string. The
+first-class-callable form is preserved by the spread flag with no value.
+@End Reasoning
+Process called "translate_arg" takes node as Integer returns Integer:
+    Let hir be proc create_dict
+    proc set_dict_string with hir, "_type", "arg"
+    proc carry_node with hir, node, "value"
+
+    Let spread be proc attr with node, "spread"
+    proc set_dict_flag with hir, "spread", spread
+
+    proc carry_string with hir, node, "name"
+    Return hir
+End Process
+
+@Reasoning:
+A new carries a class_name (expr or name node), an args list of arg nodes, and an
+optional anon_class (a class node). class_name and anon_class are subtrees; args is
+a real lowered list.
+@End Reasoning
+Process called "translate_new" takes node as Integer returns Integer:
+    Let hir be proc create_dict
+    proc set_dict_string with hir, "_type", "new"
+    proc carry_node with hir, node, "class_name"
+    proc carry_list with hir, node, "args"
+    proc carry_node with hir, node, "anon_class"
+    Return hir
+End Process
+
+@Reasoning:
+A clone carries an operand expression. Lowered as a subtree.
+@End Reasoning
+Process called "translate_clone" takes node as Integer returns Integer:
+    Let hir be proc create_dict
+    proc set_dict_string with hir, "_type", "clone"
+    proc carry_node with hir, node, "operand"
+    Return hir
+End Process
+
+@Reasoning:
+A member carries an object expression, a property (a string for ->name or an expr
+node for ->{$x}), a nullsafe flag, and a computed flag. Object lowered as a
+subtree. The property is preserved exactly: when computed, it is a subtree;
+otherwise a string. The two flags survive so ?-> and ->{...} round-trip.
+@End Reasoning
+Process called "translate_member" takes node as Integer returns Integer:
+    Let hir be proc create_dict
+    proc set_dict_string with hir, "_type", "member"
+    proc carry_node with hir, node, "object"
+
+    Let computed be proc attr with node, "computed"
+    proc set_dict_flag with hir, "computed", computed
+    Let nullsafe be proc attr with node, "nullsafe"
+    proc set_dict_flag with hir, "nullsafe", nullsafe
+
+    proc carry_property with hir, node, computed
+    Return hir
+End Process
+
+@Reasoning:
+A static_member carries a class_name (expr or name node), a member (a string for
+::CONST/::method or an expr node for ::$$x), and a computed flag. class_name
+lowered as a subtree. The member is preserved as a subtree when computed, else a
+string. The flag survives.
+@End Reasoning
+Process called "translate_static_member" takes node as Integer returns Integer:
+    Let hir be proc create_dict
+    proc set_dict_string with hir, "_type", "static_member"
+    proc carry_node with hir, node, "class_name"
+
+    Let computed be proc attr with node, "computed"
+    proc set_dict_flag with hir, "computed", computed
+
+    proc carry_member_field with hir, node, computed
+    Return hir
+End Process
+
+@Reasoning:
+Lowers a member/static-member "property" slot. When the access is computed the
+property is an expression node lowered as a subtree; otherwise it is a string name
+preserved verbatim. This keeps ->name distinct from ->{$expr} on the way back.
+@End Reasoning
+Process called "carry_property" takes hir as Integer, node as Integer, computed as Integer returns Integer:
+    Let prop be proc attr with node, "property"
+    If prop is equal to 0:
+        Return 1
+    End If
+    If computed is equal to 1:
+        Let prop_hir be proc translate_node with prop
+        If prop_hir is not equal to 0:
+            proc set_dict_value with hir, "property", prop_hir
         End If
-        Set i to i plus 1
-    End While
-    
-    Return hir_block
-End Process
-
-@Reasoning:
-`if (cond) then [elseif ...] [else alt]`. PHP's elseif chains are
-expanded to nested HIR if-else nodes.
-@End Reasoning
-@Implementation:
-Translate cond and then; if elseif clauses exist, recursively build
-nested if-elses; finally translate optional else.
-@End Implementation
-Process called "translate_if_statement" takes ctx as Integer, if_node as Integer returns Integer:
-    Let children be proc php_ast_node_children from PHPParser with if_node
-    Let count be proc list_length from ListCore with children
-    
-    If count is less than 2:
-        Return 0
-    End If
-    
-    Let condition be proc list_get from ListCore with children, 0
-    Let then_branch be proc list_get from ListCore with children, 1
-    
-    Let hir_condition be proc translate_expression with ctx, condition
-    Let hir_then be proc translate_statement with ctx, then_branch
-    
-    Let hir_else be 0
-    If count is greater than 2:
-        Let else_branch be proc list_get from ListCore with children, 2
-        Set hir_else to proc translate_statement with ctx, else_branch
-    End If
-    
-    Return proc hir_create_if from HIR with hir_condition, hir_then, hir_else
-End Process
-
-@Reasoning:
-`while (cond) body`. Cond is tested before each iteration.
-@End Reasoning
-@Implementation:
-Translate cond and body; build HIR while node.
-@End Implementation
-Process called "translate_while_statement" takes ctx as Integer, while_node as Integer returns Integer:
-    Let children be proc php_ast_node_children from PHPParser with while_node
-    
-    Let condition be proc list_get from ListCore with children, 0
-    Let body be proc list_get from ListCore with children, 1
-    
-    Let hir_condition be proc translate_expression with ctx, condition
-    Let hir_body be proc translate_statement with ctx, body
-    
-    Return proc hir_create_while from HIR with hir_condition, hir_body
-End Process
-
-@Reasoning:
-`do body while (cond);`. Cond tested AFTER each iteration, so body runs
-at least once.
-@End Reasoning
-@Implementation:
-Translate body and cond; build HIR do-while node.
-@End Implementation
-Process called "translate_do_while_statement" takes ctx as Integer, do_while_node as Integer returns Integer:
-    Let children be proc php_ast_node_children from PHPParser with do_while_node
-    
-    Let body be proc list_get from ListCore with children, 0
-    Let condition be proc list_get from ListCore with children, 1
-    
-    Let hir_body be proc translate_statement with ctx, body
-    Let hir_condition be proc translate_expression with ctx, condition
-    
-    Return proc hir_create_do_while from HIR with hir_body, hir_condition
-End Process
-
-@Reasoning:
-`for (init; cond; update) body`. Each of init/cond/update is a list
-of expressions in PHP (comma-separated); the HIR uses sequences for
-those to preserve PHP semantics.
-@End Reasoning
-@Implementation:
-Translate init/cond/update lists into HIR sequence expressions;
-translate body; build HIR for-loop node.
-@End Implementation
-Process called "translate_for_statement" takes ctx as Integer, for_node as Integer returns Integer:
-    Let children be proc php_ast_node_children from PHPParser with for_node
-    Let count be proc list_length from ListCore with children
-    
-    Let hir_init be 0
-    Let hir_condition be 0
-    Let hir_update be 0
-    Let hir_body be 0
-    
-    Let idx be 0
-    
-    Note: Init (optional)
-    If idx is less than count:
-        Let child be proc list_get from ListCore with children, idx
-        Let child_type be proc php_ast_node_type from PHPParser with child
-        If child_type is not equal to PHPParser.PHP_BLOCK_STMT:
-            Set hir_init to proc translate_expression with ctx, child
-            Set idx to idx plus 1
-        End If
-    End If
-    
-    Note: Condition (optional)
-    If idx is less than count:
-        Set child to proc list_get from ListCore with children, idx
-        Set child_type to proc php_ast_node_type from PHPParser with child
-        If child_type is not equal to PHPParser.PHP_BLOCK_STMT:
-            Set hir_condition to proc translate_expression with ctx, child
-            Set idx to idx plus 1
-        End If
-    End If
-    
-    Note: Update (optional)
-    If idx is less than count:
-        Set child to proc list_get from ListCore with children, idx
-        Set child_type to proc php_ast_node_type from PHPParser with child
-        If child_type is not equal to PHPParser.PHP_BLOCK_STMT:
-            Set hir_update to proc translate_expression with ctx, child
-            Set idx to idx plus 1
-        End If
-    End If
-    
-    Note: Body
-    If idx is less than count:
-        Let body be proc list_get from ListCore with children, idx
-        Set hir_body to proc translate_statement with ctx, body
-    End If
-    
-    Return proc hir_create_for from HIR with hir_init, hir_condition, hir_update, hir_body
-End Process
-
-@Reasoning:
-`foreach (expr as [$key =>] $value) body`. Translates to a HIR
-for-each with optional key binding.
-@End Reasoning
-@Implementation:
-Translate iterable expression; read key and value variables;
-translate body; build HIR foreach node.
-@End Implementation
-Process called "translate_foreach_statement" takes ctx as Integer, foreach_node as Integer returns Integer:
-    Let children be proc php_ast_node_children from PHPParser with foreach_node
-    
-    Note: Children: iterable, [key], value, body
-    Let iterable be proc list_get from ListCore with children, 0
-    Let hir_iterable be proc translate_expression with ctx, iterable
-    
-    Note: Store foreach metadata for later reconstruction
-    Let hir_foreach be proc hir_create_foreach from HIR with hir_iterable
-    proc hir_set_metadata from HIR with hir_foreach, "source_language", "php"
-    
-    Return hir_foreach
-End Process
-
-@Reasoning:
-`switch (subject) { case_clauses default }`. PHP switch uses loose
-comparison (==) which matters for the executor; the HIR preserves that
-distinction.
-@End Reasoning
-@Implementation:
-Translate subject expression; iterate case clauses translating each;
-build HIR switch node.
-@End Implementation
-Process called "translate_switch_statement" takes ctx as Integer, switch_node as Integer returns Integer:
-    Let children be proc php_ast_node_children from PHPParser with switch_node
-    
-    Let expr be proc list_get from ListCore with children, 0
-    Let hir_expr be proc translate_expression with ctx, expr
-    
-    Let hir_switch be proc hir_create_switch from HIR with hir_expr
-    
-    Note: Translate cases
-    Let count be proc list_length from ListCore with children
-    Let i be 1
-    
-    While i is less than count:
-        Let case_clause be proc list_get from ListCore with children, i
-        Let hir_case be proc translate_case_clause with ctx, case_clause
-        proc hir_switch_add_case from HIR with hir_switch, hir_case
-        Set i to i plus 1
-    End While
-    
-    Return hir_switch
-End Process
-
-@Reasoning:
-A single case/default clause inside switch. PHP cases fall through
-implicitly unless break/return ends them - the HIR preserves the
-original statement list so the executor handles fall-through.
-@End Reasoning
-@Implementation:
-Read value expression (or is_default flag); translate each statement
-in the clause body; build HIR case node.
-@End Implementation
-Process called "translate_case_clause" takes ctx as Integer, case_node as Integer returns Integer:
-    Let children be proc php_ast_node_children from PHPParser with case_node
-    Let count be proc list_length from ListCore with children
-    
-    If count is equal to 0:
-        Return 0
-    End If
-    
-    Let first be proc list_get from ListCore with children, 0
-    Let hir_value be proc translate_expression with ctx, first
-    
-    Let hir_case be proc hir_create_case from HIR with hir_value
-    
-    Note: Translate case body
-    Let i be 1
-    While i is less than count:
-        Let stmt be proc list_get from ListCore with children, i
-        Let hir_stmt be proc translate_statement with ctx, stmt
-        proc hir_case_add_statement from HIR with hir_case, hir_stmt
-        Set i to i plus 1
-    End While
-    
-    Return hir_case
-End Process
-
-@Reasoning:
-`return [expr];`. Bare return is allowed in PHP (returns null).
-@End Reasoning
-@Implementation:
-Read optional value; if present translate; build HIR return node.
-@End Implementation
-Process called "translate_return_statement" takes ctx as Integer, return_node as Integer returns Integer:
-    Let children be proc php_ast_node_children from PHPParser with return_node
-    Let count be proc list_length from ListCore with children
-    
-    If count is equal to 0:
-        Return proc hir_create_return from HIR with 0
-    End If
-    
-    Let expr be proc list_get from ListCore with children, 0
-    Let hir_expr be proc translate_expression with ctx, expr
-    
-    Return proc hir_create_return from HIR with hir_expr
-End Process
-
-@Reasoning:
-`try block catch (Type1|Type2 $e) { handler } ... finally { cleanup }`.
-Multi-type catch (PHP 8.0+) is supported via the union-type syntax. The
-finally block is optional.
-@End Reasoning
-@Implementation:
-Translate try body; iterate catch clauses translating each (catch type
-union plus handler body); translate finally if present.
-@End Implementation
-Process called "translate_try_statement" takes ctx as Integer, try_node as Integer returns Integer:
-    Let children be proc php_ast_node_children from PHPParser with try_node
-    
-    Let try_body be proc list_get from ListCore with children, 0
-    Let hir_try_body be proc translate_statement with ctx, try_body
-    
-    Let hir_try be proc hir_create_try from HIR with hir_try_body
-    proc hir_set_metadata from HIR with hir_try, "source_language", "php"
-    
-    Note: Store catch/finally clauses in metadata
-    Let count be proc list_length from ListCore with children
-    Let i be 1
-    While i is less than count:
-        Let clause be proc list_get from ListCore with children, i
-        Let clause_type be proc php_ast_node_type from PHPParser with clause
-        
-        If clause_type is equal to PHPParser.PHP_CATCH_CLAUSE:
-            Let hir_catch be proc translate_statement with ctx, clause
-            proc hir_try_add_catch from HIR with hir_try, hir_catch
-        End If
-        
-        Set i to i plus 1
-    End While
-    
-    Return hir_try
-End Process
-
-@Reasoning:
-`throw expr;`. PHP 8 made throw an expression too, but we translate it
-as a statement here; expression-form throws come through
-translate_expression.
-@End Reasoning
-@Implementation:
-Translate the exception expression; build HIR throw node.
-@End Implementation
-Process called "translate_throw_statement" takes ctx as Integer, throw_node as Integer returns Integer:
-    Let children be proc php_ast_node_children from PHPParser with throw_node
-    Let expr be proc list_get from ListCore with children, 0
-    Let hir_expr be proc translate_expression with ctx, expr
-    
-    Return proc hir_create_throw from HIR with hir_expr
-End Process
-
-@Reasoning:
-`echo expr, expr, expr;` outputs all expressions concatenated. Lowered
-to a call to a built-in echo helper in HIR with each expression as a
-separate argument.
-@End Reasoning
-@Implementation:
-Iterate echo arguments translating each; build HIR call to "echo"
-builtin with the argument list.
-@End Implementation
-Process called "translate_echo_statement" takes ctx as Integer, echo_node as Integer returns Integer:
-    Note: Translate echo as print function call
-    Let children be proc php_ast_node_children from PHPParser with echo_node
-    Let count be proc list_length from ListCore with children
-    
-    Let hir_call be proc hir_create_call from HIR with "print"
-    proc hir_set_metadata from HIR with hir_call, "source_language", "php"
-    proc hir_set_metadata from HIR with hir_call, "php_echo", "true"
-    
-    Let i be 0
-    While i is less than count:
-        Let expr be proc list_get from ListCore with children, i
-        Let hir_expr be proc translate_expression with ctx, expr
-        proc hir_call_add_argument from HIR with hir_call, hir_expr
-        Set i to i plus 1
-    End While
-    
-    Return hir_call
-End Process
-
-Note: ===================================================================
-Note: EXPRESSION TRANSLATION
-Note: ===================================================================
-
-@Reasoning:
-The central expression dispatcher: literals, variables, binary/unary/
-ternary ops, assignment, function/method calls, new, member access,
-indexing, array literals. Each routes through a dedicated helper.
-@End Reasoning
-@Implementation:
-Read expr_node type; switch through all PHP_EXPR_* tags dispatching
-to translate_<kind>_expr. Default: error/skip.
-@End Implementation
-Process called "translate_expression" takes ctx as Integer, expr_node as Integer returns Integer:
-    Let node_type be proc php_ast_node_type from PHPParser with expr_node
-    
-    Note: Literals
-    If node_type is equal to PHPParser.PHP_NUMBER_LITERAL:
-        Let value be proc php_ast_node_value from PHPParser with expr_node
-        Return proc hir_create_literal from HIR with "number", value
-    End If
-    
-    If node_type is equal to PHPParser.PHP_STRING_LITERAL:
-        Set value to proc php_ast_node_value from PHPParser with expr_node
-        Return proc hir_create_literal from HIR with "string", value
-    End If
-    
-    If node_type is equal to PHPParser.PHP_BOOLEAN_LITERAL:
-        Set value to proc php_ast_node_value from PHPParser with expr_node
-        Return proc hir_create_literal from HIR with "boolean", value
-    End If
-    
-    If node_type is equal to PHPParser.PHP_NULL_LITERAL:
-        Return proc hir_create_literal from HIR with "null", "null"
-    End If
-    
-    Note: Variable
-    If node_type is equal to PHPParser.PHP_VARIABLE:
-        Set value to proc php_ast_node_value from PHPParser with expr_node
-        Return proc hir_create_variable from HIR with value
-    End If
-    
-    Note: Identifier
-    If node_type is equal to PHPParser.PHP_IDENTIFIER:
-        Set value to proc php_ast_node_value from PHPParser with expr_node
-        Return proc hir_create_identifier from HIR with value
-    End If
-    
-    Note: Binary expression
-    If node_type is equal to PHPParser.PHP_BINARY_EXPR:
-        Return proc translate_binary_expr with ctx, expr_node
-    End If
-    
-    Note: Unary expression
-    If node_type is equal to PHPParser.PHP_UNARY_EXPR:
-        Return proc translate_unary_expr with ctx, expr_node
-    End If
-    
-    Note: Ternary expression
-    If node_type is equal to PHPParser.PHP_TERNARY_EXPR:
-        Return proc translate_ternary_expr with ctx, expr_node
-    End If
-    
-    Note: Assignment
-    If node_type is equal to PHPParser.PHP_ASSIGN_EXPR:
-        Return proc translate_assign_expr with ctx, expr_node
-    End If
-    
-    Note: Function call
-    If node_type is equal to PHPParser.PHP_CALL_EXPR:
-        Return proc translate_call_expr with ctx, expr_node
-    End If
-    
-    Note: New expression
-    If node_type is equal to PHPParser.PHP_NEW_EXPR:
-        Return proc translate_new_expr with ctx, expr_node
-    End If
-    
-    Note: Member access
-    If node_type is equal to PHPParser.PHP_MEMBER_EXPR:
-        Return proc translate_member_expr with ctx, expr_node
-    End If
-    
-    Note: Array access
-    If node_type is equal to PHPParser.PHP_INDEX_EXPR:
-        Return proc translate_index_expr with ctx, expr_node
-    End If
-    
-    Note: Array literal
-    If node_type is equal to PHPParser.PHP_ARRAY_EXPR:
-        Return proc translate_array_expr with ctx, expr_node
-    End If
-    
-    Return 0
-End Process
-
-@Reasoning:
-`left OP right`. PHP operator semantics differ from C in subtle ways
-(== is loose equality, === is strict). The operator string is passed
-through verbatim so the executor applies the correct rules.
-@End Reasoning
-@Implementation:
-Translate left and right; read operator; build HIR binary expression.
-@End Implementation
-Process called "translate_binary_expr" takes ctx as Integer, binary_node as Integer returns Integer:
-    Let operator be proc php_ast_node_value from PHPParser with binary_node
-    
-    Let children be proc php_ast_node_children from PHPParser with binary_node
-    Let left be proc list_get from ListCore with children, 0
-    Let right be proc list_get from ListCore with children, 1
-    
-    Let hir_left be proc translate_expression with ctx, left
-    Let hir_right be proc translate_expression with ctx, right
-    
-    Return proc hir_create_binary_op from HIR with operator, hir_left, hir_right
-End Process
-
-@Reasoning:
-Unary operators: !, -, ~, ++, --. Prefix vs postfix tracked separately
-for ++/--.
-@End Reasoning
-@Implementation:
-Translate operand; read operator and prefix flag; build HIR unary
-expression.
-@End Implementation
-Process called "translate_unary_expr" takes ctx as Integer, unary_node as Integer returns Integer:
-    Let operator be proc php_ast_node_value from PHPParser with unary_node
-    
-    Let children be proc php_ast_node_children from PHPParser with unary_node
-    Let operand be proc list_get from ListCore with children, 0
-    Let hir_operand be proc translate_expression with ctx, operand
-    
-    Return proc hir_create_unary_op from HIR with operator, hir_operand
-End Process
-
-@Reasoning:
-`cond ? then : else`. PHP also supports the short form `cond ?: else`
-(returns cond if truthy else 'else') which arrives with the then
-branch null.
-@End Reasoning
-@Implementation:
-Translate cond, then (or null for short form), else; build HIR
-conditional expression.
-@End Implementation
-Process called "translate_ternary_expr" takes ctx as Integer, ternary_node as Integer returns Integer:
-    Let children be proc php_ast_node_children from PHPParser with ternary_node
-    
-    Let condition be proc list_get from ListCore with children, 0
-    Let then_expr be proc list_get from ListCore with children, 1
-    Let else_expr be proc list_get from ListCore with children, 2
-    
-    Let hir_condition be proc translate_expression with ctx, condition
-    Let hir_then be proc translate_expression with ctx, then_expr
-    Let hir_else be proc translate_expression with ctx, else_expr
-    
-    Return proc hir_create_ternary from HIR with hir_condition, hir_then, hir_else
-End Process
-
-@Reasoning:
-`lhs = rhs` or compound forms `+=`, `.=`, etc. Distinct from a binary
-expression because assignment is its own HIR construct (lvalue
-requirements differ).
-@End Reasoning
-@Implementation:
-Translate target and value; read operator; build HIR assignment node.
-@End Implementation
-Process called "translate_assign_expr" takes ctx as Integer, assign_node as Integer returns Integer:
-    Let operator be proc php_ast_node_value from PHPParser with assign_node
-    
-    Let children be proc php_ast_node_children from PHPParser with assign_node
-    Let target be proc list_get from ListCore with children, 0
-    Let value be proc list_get from ListCore with children, 1
-    
-    Let hir_target be proc translate_expression with ctx, target
-    Let hir_value be proc translate_expression with ctx, value
-    
-    Return proc hir_create_assign from HIR with operator, hir_target, hir_value
-End Process
-
-@Reasoning:
-`callee(args...)`. Supports both function calls and method calls
-(callee may be a member-access expression). Named arguments (PHP 8.0+)
-are emitted as named args in the HIR.
-@End Reasoning
-@Implementation:
-Translate callee; iterate args translating each (positional or named);
-build HIR call expression.
-@End Implementation
-Process called "translate_call_expr" takes ctx as Integer, call_node as Integer returns Integer:
-    Let children be proc php_ast_node_children from PHPParser with call_node
-    
-    Let callee be proc list_get from ListCore with children, 0
-    Let hir_callee be proc translate_expression with ctx, callee
-    
-    Note: Extract function name for HIR
-    Let callee_type be proc php_ast_node_type from PHPParser with callee
-    Let function_name be ""
-    
-    If callee_type is equal to PHPParser.PHP_IDENTIFIER:
-        Set function_name to proc php_ast_node_value from PHPParser with callee
     Otherwise:
-        Set function_name to "anonymous"
+        proc set_dict_string with hir, "property", prop
     End If
-    
-    Let hir_call be proc hir_create_call from HIR with function_name
-    
-    Note: Translate arguments
-    Let count be proc list_length from ListCore with children
-    Let i be 1
-    While i is less than count:
-        Let arg be proc list_get from ListCore with children, i
-        Let hir_arg be proc translate_expression with ctx, arg
-        proc hir_call_add_argument from HIR with hir_call, hir_arg
-        Set i to i plus 1
-    End While
-    
-    Return hir_call
+    Return 1
 End Process
 
 @Reasoning:
-`new ClassName(args)`. Constructor invocation. The class name may be a
-qualified name; the HIR carries it as a fully-qualified reference.
+Lowers a static_member "member" slot, mirroring carry_property: a computed member
+is a subtree, a plain member is a string name preserved verbatim.
 @End Reasoning
-@Implementation:
-Read class name; iterate constructor args; build HIR new expression.
-@End Implementation
-Process called "translate_new_expr" takes ctx as Integer, new_node as Integer returns Integer:
-    Let class_name be proc php_ast_node_value from PHPParser with new_node
-    
-    Let hir_new be proc hir_create_new from HIR with class_name
-    
-    Note: Translate constructor arguments
-    Let children be proc php_ast_node_children from PHPParser with new_node
-    Let count be proc list_length from ListCore with children
-    Let i be 0
-    
-    While i is less than count:
-        Let arg be proc list_get from ListCore with children, i
-        Let hir_arg be proc translate_expression with ctx, arg
-        proc hir_new_add_argument from HIR with hir_new, hir_arg
-        Set i to i plus 1
-    End While
-    
-    Return hir_new
-End Process
-
-@Reasoning:
-`obj->member` (instance access) or `Class::member` (static access).
-The HIR distinguishes via a flag because static access is
-semantically different.
-@End Reasoning
-@Implementation:
-Translate base; read member name and is_static flag; build HIR member
-access node.
-@End Implementation
-Process called "translate_member_expr" takes ctx as Integer, member_node as Integer returns Integer:
-    Let member_name be proc php_ast_node_value from PHPParser with member_node
-    
-    Let children be proc php_ast_node_children from PHPParser with member_node
-    Let object be proc list_get from ListCore with children, 0
-    Let hir_object be proc translate_expression with ctx, object
-    
-    Return proc hir_create_member_access from HIR with hir_object, member_name
-End Process
-
-@Reasoning:
-`array[index]` or `array{index}` (deprecated form). PHP arrays are
-associative, so the index may be any expression yielding a value usable
-as a key.
-@End Reasoning
-@Implementation:
-Translate base and index; build HIR index expression.
-@End Implementation
-Process called "translate_index_expr" takes ctx as Integer, index_node as Integer returns Integer:
-    Let children be proc php_ast_node_children from PHPParser with index_node
-    
-    Let array be proc list_get from ListCore with children, 0
-    Let index be proc list_get from ListCore with children, 1
-    
-    Let hir_array be proc translate_expression with ctx, array
-    Let hir_index be proc translate_expression with ctx, index
-    
-    Return proc hir_create_index_access from HIR with hir_array, hir_index
-End Process
-
-@Reasoning:
-`[key => value, value, ...]` or `array(...)`. PHP arrays mix sequential
-and associative entries; the HIR builds an array literal preserving
-both kinds of entries with their explicit-or-implicit keys.
-@End Reasoning
-@Implementation:
-Iterate elements; for each, translate optional key (or null for
-sequential) and required value; build HIR array literal.
-@End Implementation
-Process called "translate_array_expr" takes ctx as Integer, array_node as Integer returns Integer:
-    Let hir_array be proc hir_create_array from HIR
-    proc hir_set_metadata from HIR with hir_array, "source_language", "php"
-    
-    Let children be proc php_ast_node_children from PHPParser with array_node
-    Let count be proc list_length from ListCore with children
-    Let i be 0
-    
-    While i is less than count:
-        Let element be proc list_get from ListCore with children, i
-        Let hir_element be proc translate_expression with ctx, element
-        proc hir_array_add_element from HIR with hir_array, hir_element
-        Set i to i plus 1
-    End While
-    
-    Return hir_array
-End Process
-
-Note: ===================================================================
-Note: PUBLIC API
-Note: ===================================================================
-
-@Reasoning:
-Public entry point alias for translate_php_to_hir. Kept for backward
-compatibility with callers using the shorter name.
-@End Reasoning
-@Implementation:
-Delegates to translate_php_to_hir.
-@End Implementation
-Process called "php_to_hir" takes php_ast as Integer returns Integer:
-    Return proc translate_php_to_hir from php_ast
-End Process
-
-@Reasoning:
-Public single-arg facade invoked by the translation dispatcher's
-LANG_PHP arm. Wires the full source -> HIR pipeline: PHPParser
-parse_php_source lexes + parses to a PHP_PROGRAM AST root, then
-translate_php_to_hir walks the AST into HIR. On parse failure (0
-return from parse_php_source) the wrapper short-circuits to 0 so
-the caller observes a parse-only failure without a translator NPE.
-@End Reasoning
-
-@Implementation:
-ast = PHPParser.parse_php_source(source); if ast == 0 return 0;
-return translate_php_to_hir(ast). The intermediate AST is consumed
-by translate_php_to_hir and the caller does not need to free it
-explicitly (lifetime is tied to the global arena used by the
-PHP frontend).
-@End Implementation
-
-Process called "php_to_hir_from_source" takes source_code as Integer returns Integer:
-    Let php_ast be proc parse_php_source from PHPParser with source_code
-    If php_ast is equal to 0:
-        Return 0
+Process called "carry_member_field" takes hir as Integer, node as Integer, computed as Integer returns Integer:
+    Let member be proc attr with node, "member"
+    If member is equal to 0:
+        Return 1
     End If
-    Return proc translate_php_to_hir with php_ast
+    If computed is equal to 1:
+        Let member_hir be proc translate_node with member
+        If member_hir is not equal to 0:
+            proc set_dict_value with hir, "member", member_hir
+        End If
+    Otherwise:
+        proc set_dict_string with hir, "member", member
+    End If
+    Return 1
+End Process
+
+@Reasoning:
+An index carries an object expression and an index expression (0 for the [] append
+form). Object lowered as a subtree; index as a subtree when present. Absence of
+index preserves the $a[] = ... append form.
+@End Reasoning
+Process called "translate_index" takes node as Integer returns Integer:
+    Let hir be proc create_dict
+    proc set_dict_string with hir, "_type", "index"
+    proc carry_node with hir, node, "object"
+    proc carry_node with hir, node, "index"
+    Return hir
+End Process
+
+@Reasoning:
+An array carries an elements list of array_item nodes and a short_syntax flag
+([...] vs array(...)). Elements lowered as a real list; the flag preserved so the
+backend re-emits the original syntax.
+@End Reasoning
+Process called "translate_array" takes node as Integer returns Integer:
+    Let hir be proc create_dict
+    proc set_dict_string with hir, "_type", "array"
+    proc carry_list with hir, node, "elements"
+
+    Let short_syntax be proc attr with node, "short_syntax"
+    proc set_dict_flag with hir, "short_syntax", short_syntax
+    Return hir
+End Process
+
+@Reasoning:
+An array_item carries an optional key (0 for positional), a value, a spread flag,
+and a by_ref flag. key and value lowered as subtrees; the flags preserved. A
+present key preserves the => association; spread preserves ...$x; by_ref preserves
+[&$x].
+@End Reasoning
+Process called "translate_array_item" takes node as Integer returns Integer:
+    Let hir be proc create_dict
+    proc set_dict_string with hir, "_type", "array_item"
+    proc carry_node with hir, node, "key"
+    proc carry_node with hir, node, "value"
+
+    Let spread be proc attr with node, "spread"
+    proc set_dict_flag with hir, "spread", spread
+    Let by_ref be proc attr with node, "by_ref"
+    proc set_dict_flag with hir, "by_ref", by_ref
+    Return hir
+End Process
+
+@Reasoning:
+A list_pattern (list(...) destructuring target) carries an elements list of
+array_item nodes. Lowered into a real "elements" list.
+@End Reasoning
+Process called "translate_list_pattern" takes node as Integer returns Integer:
+    Let hir be proc create_dict
+    proc set_dict_string with hir, "_type", "list_pattern"
+    proc carry_list with hir, node, "elements"
+    Return hir
+End Process
+
+@Reasoning:
+A closure carries a params list, a uses list of closure_use nodes, a return_type
+string, by_ref + is_static flags, and a body block. params and uses are real
+lowered lists; return_type is a string; the flags survive; the body is a subtree.
+The uses list preserves the `use(...)` captures.
+@End Reasoning
+Process called "translate_closure" takes node as Integer returns Integer:
+    Let hir be proc create_dict
+    proc set_dict_string with hir, "_type", "closure"
+    proc carry_list with hir, node, "params"
+    proc carry_list with hir, node, "uses"
+    proc carry_string with hir, node, "return_type"
+
+    Let by_ref be proc attr with node, "by_ref"
+    proc set_dict_flag with hir, "by_ref", by_ref
+    Let is_static be proc attr with node, "is_static"
+    proc set_dict_flag with hir, "is_static", is_static
+
+    proc carry_node with hir, node, "body"
+    Return hir
+End Process
+
+@Reasoning:
+A closure_use carries a name string and a by_ref flag. Name preserved as a string;
+by_ref as a flag so `use(&$x)` round-trips.
+@End Reasoning
+Process called "translate_closure_use" takes node as Integer returns Integer:
+    Let hir be proc create_dict
+    proc set_dict_string with hir, "_type", "closure_use"
+    proc carry_string with hir, node, "name"
+
+    Let by_ref be proc attr with node, "by_ref"
+    proc set_dict_flag with hir, "by_ref", by_ref
+    Return hir
+End Process
+
+@Reasoning:
+An arrow_fn carries a params list, a return_type string, by_ref + is_static flags,
+and a body expression. params is a real lowered list; return_type a string; the
+flags survive; the body a subtree.
+@End Reasoning
+Process called "translate_arrow_fn" takes node as Integer returns Integer:
+    Let hir be proc create_dict
+    proc set_dict_string with hir, "_type", "arrow_fn"
+    proc carry_list with hir, node, "params"
+    proc carry_string with hir, node, "return_type"
+
+    Let by_ref be proc attr with node, "by_ref"
+    proc set_dict_flag with hir, "by_ref", by_ref
+    Let is_static be proc attr with node, "is_static"
+    proc set_dict_flag with hir, "is_static", is_static
+
+    proc carry_node with hir, node, "body"
+    Return hir
+End Process
+
+@Reasoning:
+A match carries a discriminant expression and an arms list of match_arm nodes.
+Discriminant lowered as a subtree; arms as a real lowered list so the arm count
+survives round-trip.
+@End Reasoning
+Process called "translate_match" takes node as Integer returns Integer:
+    Let hir be proc create_dict
+    proc set_dict_string with hir, "_type", "match"
+    proc carry_node with hir, node, "discriminant"
+    proc carry_list with hir, node, "arms"
+    Return hir
+End Process
+
+@Reasoning:
+A match_arm carries a conditions list of expressions (empty for the default arm)
+and a body expression. Conditions lowered as a real list; body as a subtree. An
+empty conditions list distinguishes the default arm.
+@End Reasoning
+Process called "translate_match_arm" takes node as Integer returns Integer:
+    Let hir be proc create_dict
+    proc set_dict_string with hir, "_type", "match_arm"
+    proc carry_list with hir, node, "conditions"
+    proc carry_node with hir, node, "body"
+    Return hir
+End Process
+
+@Reasoning:
+A yield carries an optional key, an optional value, and an is_from flag (yield
+from). key and value lowered as subtrees when present; is_from as a flag.
+@End Reasoning
+Process called "translate_yield" takes node as Integer returns Integer:
+    Let hir be proc create_dict
+    proc set_dict_string with hir, "_type", "yield"
+    proc carry_node with hir, node, "key"
+    proc carry_node with hir, node, "value"
+
+    Let is_from be proc attr with node, "is_from"
+    proc set_dict_flag with hir, "is_from", is_from
+    Return hir
+End Process
+
+@Reasoning:
+An isset carries an args list of expressions. Lowered into a real "args" list.
+@End Reasoning
+Process called "translate_isset" takes node as Integer returns Integer:
+    Let hir be proc create_dict
+    proc set_dict_string with hir, "_type", "isset"
+    proc carry_list with hir, node, "args"
+    Return hir
+End Process
+
+@Reasoning:
+An empty carries a single argument expression. Lowered as a subtree.
+@End Reasoning
+Process called "translate_empty" takes node as Integer returns Integer:
+    Let hir be proc create_dict
+    proc set_dict_string with hir, "_type", "empty"
+    proc carry_node with hir, node, "arg"
+    Return hir
+End Process
+
+@Reasoning:
+An exit carries an optional argument expression. Lowered as a subtree when present.
+@End Reasoning
+Process called "translate_exit" takes node as Integer returns Integer:
+    Let hir be proc create_dict
+    proc set_dict_string with hir, "_type", "exit"
+    proc carry_node with hir, node, "arg"
+    Return hir
+End Process
+
+@Reasoning:
+An include carries a kind ("include"/"include_once"/"require"/"require_once") and
+an expr. Kind preserved as a string; expr lowered as a subtree.
+@End Reasoning
+Process called "translate_include" takes node as Integer returns Integer:
+    Let hir be proc create_dict
+    proc set_dict_string with hir, "_type", "include"
+    proc carry_string with hir, node, "kind"
+    proc carry_node with hir, node, "expr"
+    Return hir
+End Process
+
+Note: ============================================================================
+Note: PRIMARY / LEAF TRANSLATORS
+Note: ============================================================================
+
+@Reasoning:
+A variable carries a name string including the leading '$'. Preserved verbatim.
+@End Reasoning
+Process called "translate_variable" takes node as Integer returns Integer:
+    Let hir be proc create_dict
+    proc set_dict_string with hir, "_type", "variable"
+    proc carry_string with hir, node, "name"
+    Return hir
+End Process
+
+@Reasoning:
+A name carries a qualified identifier string and a fully_qualified flag (leading
+'\'). Name preserved verbatim; flag preserved so rooted names round-trip.
+@End Reasoning
+Process called "translate_name" takes node as Integer returns Integer:
+    Let hir be proc create_dict
+    proc set_dict_string with hir, "_type", "name"
+    proc carry_string with hir, node, "value"
+
+    Let fq be proc attr with node, "fully_qualified"
+    proc set_dict_flag with hir, "fully_qualified", fq
+    Return hir
+End Process
+
+@Reasoning:
+An int literal carries its raw lexeme (decimal, 0x, 0b, 0o, with '_' separators).
+Preserved verbatim so the backend re-emits the original radix and grouping.
+@End Reasoning
+Process called "translate_int" takes node as Integer returns Integer:
+    Let hir be proc create_dict
+    proc set_dict_string with hir, "_type", "int"
+    proc carry_string with hir, node, "value"
+    Return hir
+End Process
+
+@Reasoning:
+A float literal carries its raw lexeme. Preserved verbatim.
+@End Reasoning
+Process called "translate_float" takes node as Integer returns Integer:
+    Let hir be proc create_dict
+    proc set_dict_string with hir, "_type", "float"
+    proc carry_string with hir, node, "value"
+    Return hir
+End Process
+
+@Reasoning:
+A string literal carries its raw lexeme (including quotes/markers), an interpolated
+flag, and a kind ("single"/"double"/"heredoc"/"nowdoc"). Stage B decodes the
+delimiters into a "decoded" payload while preserving the raw "value" and the kind
++ interpolation flag, so the backend can emit either the verbatim lexeme or a
+re-quoted form and interpolation survives the round-trip.
+@End Reasoning
+Process called "translate_string" takes node as Integer returns Integer:
+    Let hir be proc create_dict
+    proc set_dict_string with hir, "_type", "string"
+
+    Let raw be proc attr with node, "value"
+    Let kind be proc attr with node, "kind"
+    If raw is not equal to 0:
+        proc set_dict_string with hir, "value", raw
+        Let decoded be proc decode_string_lexeme with raw, kind
+        If decoded is not equal to 0:
+            proc set_dict_string with hir, "decoded", decoded
+        End If
+    End If
+
+    If kind is not equal to 0:
+        proc set_dict_string with hir, "kind", kind
+    End If
+
+    Let interpolated be proc attr with node, "interpolated"
+    proc set_dict_flag with hir, "interpolated", interpolated
+    Return hir
+End Process
+
+@Reasoning:
+A bool literal carries a value string ("true"/"false"). Preserved verbatim.
+@End Reasoning
+Process called "translate_bool" takes node as Integer returns Integer:
+    Let hir be proc create_dict
+    proc set_dict_string with hir, "_type", "bool"
+    proc carry_string with hir, node, "value"
+    Return hir
+End Process
+
+@Reasoning:
+A null literal carries no payload; only its tag.
+@End Reasoning
+Process called "translate_null" takes node as Integer returns Integer:
+    Let hir be proc create_dict
+    proc set_dict_string with hir, "_type", "null"
+    Return hir
 End Process
