@@ -8,7 +8,41 @@ Note: Part of the Translation Translation System
 Note: Location: compiler/middle/gungnir/hir/translation/backends/solidity/hir_to_solidity.runa
 Note: ===================================================================
 
+Note:
+HIR CONSUMER MODEL (model 1, typed hir_nodes.runa surface)
+==========================================================
+This backend consumes the exact HIR shape the solidity_to_hir frontend produces.
+All dispatch goes through hir_node_type(node) returning an HIR_* kind constant,
+compared in an If-ladder (there is no hir_is_* predicate family). Accessors use
+the real word order (hir_get_binary_left, not hir_binary_get_left). The module
+exposes ONE declarations list (hir_get_declarations) holding classes (contracts/
+interfaces/libraries/structs/errors) and enums intermixed, plus an imports list
+(hir_get_imports); a class exposes ONE member list (hir_get_class_members) holding
+fields, functions, and nested classes/enums intermixed. Each member is dispatched
+by its node kind and, for classes/functions, its "solidity_type" metadata tag.
+
+Operator precedence (Solidity, low -> high), used to decide parenthesisation in
+generate_binary_expression so re-emitted source re-parses to the same tree:
+  1 ternary  ?:
+  2 ||
+  3 &&
+  4 == !=
+  5 < <= > >=
+  6 |          (bitwise or)
+  7 ^          (bitwise xor)
+  8 &          (bitwise and)
+  9 << >>      (shifts)
+ 10 + -
+ 11 * / %
+ 12 **         (exponent)
+A binary operand is wrapped in parentheses when its own operator binds LESS
+tightly than the parent operator, preserving evaluation order across the round
+trip. The exact Solidity operator spelling comes from "solidity_operator"
+metadata (the HIR opcode alone cannot distinguish ** from *, or & from &&).
+:End Note
+
 Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/internal/string_utils.runa" as StringUtils
 Import "compiler/frontend/primitives/collections/list.runa" as ListCore
 Import "compiler/middle/gungnir/hir/hir_nodes.runa" as HIR
 
@@ -20,13 +54,12 @@ Note: ===================================================================
 Per-translation context for Solidity emission. output accumulates the
 generated source; indent_level controls per-line spacing;
 current_contract is a back-pointer to the enclosing HIR class node so
-state-variable and function generation can consult contract-level
-metadata (e.g. base list, abstract flag) without re-locating the
-contract.
+member generation can consult contract-level metadata without
+re-locating the contract.
 @End Reasoning
 
 @Implementation:
-Runa struct of three fields: output (String, running source), indent_level
+Runa struct of three fields: output (running source string), indent_level
 (Integer), current_contract (Integer handle to enclosing contract HIR node
 or 0 at file scope). Constructed via create_generation_context with
 empty/zero values; current_contract is set/cleared on entry/exit of
@@ -44,8 +77,8 @@ Note: ===================================================================
 
 @Reasoning:
 Top-level driver. Creates a fresh GenerationContext and dispatches to
-generate_module which emits the SPDX comment, pragma, imports, types,
-and contracts in that order. Returns the accumulated output string.
+generate_module which emits the SPDX comment, pragma, imports,
+file-scope declarations, and contracts. Returns the accumulated output.
 @End Reasoning
 
 @Implementation:
@@ -83,81 +116,111 @@ Note: MODULE GENERATION
 Note: ===================================================================
 
 @Reasoning:
-Emits the full module preamble (SPDX license, pragma directive) and
-then walks the top-level lists - imports, types (structs/enums/errors),
-and contracts (contract/interface/library). Solidity files must lead
-with an SPDX comment and pragma; this driver enforces that
-unconditionally. If the HIR module supplies pragma metadata it is
-used verbatim, otherwise a default 'pragma solidity ^0.8.0;' is
-emitted.
+Emits the full module preamble (SPDX license, pragma directive) then
+walks the imports list and the single declarations list. Solidity files
+must lead with an SPDX comment and pragma; if the HIR module supplies
+pragma metadata it is used verbatim, otherwise a default
+'pragma solidity ^0.8.0;' is emitted. The declarations list intermixes
+contracts/interfaces/libraries (HIR_CLASS) with file-scope structs/
+errors (also HIR_CLASS, distinguished by "solidity_type") and enums
+(HIR_ENUM); each is dispatched by node kind and metadata tag.
 @End Reasoning
 
 @Implementation:
-Emits the SPDX comment. Reads solidity_pragma_type and _pragma_value
-metadata; if pragma_type is non-empty emits 'pragma TYPE VALUE;'
-otherwise the default. Iterates hir_module_get_imports, then
-_get_types, then _get_classes (which holds contracts/interfaces/
-libraries). Each call delegates to the corresponding generate_*.
-Blank lines separate non-empty sections.
+Emits the SPDX comment and pragma. Iterates hir_get_imports calling
+generate_import. Iterates hir_get_declarations: HIR_ENUM ->
+generate_enum; HIR_CLASS routes on "solidity_type" ("struct" ->
+generate_struct, "error" -> generate_error, otherwise generate_contract).
+Blank lines separate declarations.
 @End Implementation
 Process called "generate_module" takes ctx as Integer, hir_module as Integer:
-    Note: Generate SPDX license identifier
     proc emit with ctx, "// SPDX-License-Identifier: MIT\n"
 
-    Note: Generate pragma directive
     Let pragma_type be proc hir_get_metadata from HIR with hir_module, "solidity_pragma_type"
     Let pragma_value be proc hir_get_metadata from HIR with hir_module, "solidity_pragma_value"
 
-    Let pragma_type_len be proc string_length from StringCore with pragma_type
+    Let pragma_type_len be proc safe_string_length with pragma_type
     If pragma_type_len is greater than 0:
         proc emit with ctx, "pragma "
         proc emit with ctx, pragma_type
-        proc emit with ctx, " "
-        proc emit with ctx, pragma_value
+        Let pragma_value_len be proc safe_string_length with pragma_value
+        If pragma_value_len is greater than 0:
+            proc emit with ctx, " "
+            proc emit with ctx, pragma_value
+        End If
         proc emit with ctx, ";\n\n"
     Otherwise:
-        Note: Default pragma
         proc emit with ctx, "pragma solidity ^0.8.0;\n\n"
     End If
 
-    Note: Generate imports
-    Let imports be proc hir_module_get_imports from HIR with hir_module
-    Let import_count be proc list_length from ListCore with imports
+    Note: Imports
+    Let imports be proc hir_get_imports from HIR with hir_module
+    Let import_count be 0
+    If imports is not equal to 0:
+        Set import_count to proc list_length from ListCore with imports
+    End If
     Let i be 0
-
     While i is less than import_count:
         Let import_node be proc list_get from ListCore with imports, i
         proc generate_import with ctx, import_node
         Set i to i plus 1
     End While
-
     If import_count is greater than 0:
         proc emit with ctx, "\n"
     End If
 
-    Note: Generate types (structs, enums, errors)
-    Let types be proc hir_module_get_types from HIR with hir_module
-    Let type_count be proc list_length from ListCore with types
+    Note: Top-level declarations (contracts, interfaces, libraries, file-scope structs/enums/errors)
+    Let declarations be proc hir_get_declarations from HIR with hir_module
+    Let decl_count be 0
+    If declarations is not equal to 0:
+        Set decl_count to proc list_length from ListCore with declarations
+    End If
     Set i to 0
-
-    While i is less than type_count:
-        Let type_node be proc list_get from ListCore with types, i
-        proc generate_type with ctx, type_node
+    While i is less than decl_count:
+        Let decl be proc list_get from ListCore with declarations, i
+        proc generate_declaration with ctx, decl
         proc emit with ctx, "\n"
         Set i to i plus 1
     End While
+End Process
 
-    Note: Generate contracts, interfaces, and libraries
-    Let classes be proc hir_module_get_classes from HIR with hir_module
-    Let class_count be proc list_length from ListCore with classes
-    Set i to 0
+@Reasoning:
+A top-level declaration is either a HIR_ENUM (file-scope enum) or a
+HIR_CLASS whose "solidity_type" tag selects struct / error / contract
+(contract covers contract/interface/library, further refined inside
+generate_contract).
+@End Reasoning
 
-    While i is less than class_count:
-        Let class_node be proc list_get from ListCore with classes, i
-        proc generate_contract with ctx, class_node
-        proc emit with ctx, "\n"
-        Set i to i plus 1
-    End While
+@Implementation:
+Reads hir_node_type. HIR_ENUM -> generate_enum. HIR_CLASS -> read
+"solidity_type": "struct" -> generate_struct; "error" -> generate_error;
+anything else -> generate_contract.
+@End Implementation
+Process called "generate_declaration" takes ctx as Integer, decl as Integer:
+    Let kind be proc hir_node_type from HIR with decl
+
+    If kind is equal to HIR.HIR_ENUM:
+        proc generate_enum with ctx, decl
+        Return
+    End If
+
+    If kind is equal to HIR.HIR_CLASS:
+        Let solidity_type be proc hir_get_metadata from HIR with decl, "solidity_type"
+        Let is_struct be proc safe_string_equals with solidity_type, "struct"
+        Let is_error be proc safe_string_equals with solidity_type, "error"
+
+        If is_struct is equal to 1:
+            proc generate_struct with ctx, decl
+            Return
+        End If
+        If is_error is equal to 1:
+            proc generate_error with ctx, decl
+            Return
+        End If
+
+        proc generate_contract with ctx, decl
+        Return
+    End If
 End Process
 
 Note: ===================================================================
@@ -166,27 +229,24 @@ Note: ===================================================================
 
 @Reasoning:
 Emits 'import "path";' or 'import "path" as Alias;'. Solidity's import
-target is always quoted (a path or URI) unlike most languages'
-identifier-based imports; the alias clause is optional and recorded
-in metadata.
+target is always quoted (a path or URI); the alias clause is optional
+and recorded in "solidity_alias" metadata.
 @End Reasoning
 
 @Implementation:
-Reads import name. Emits 'import "', name, '"'. Reads
-'solidity_alias' metadata; if non-empty emits ' as ALIAS'. Terminates
-with ';\n'.
+Reads the import path via hir_get_import_path. Emits 'import "PATH"'.
+Reads 'solidity_alias' metadata; if non-empty emits ' as ALIAS'.
+Terminates with ';\n'.
 @End Implementation
 Process called "generate_import" takes ctx as Integer, import_node as Integer:
-    Let import_name be proc hir_import_get_name from HIR with import_node
+    Let import_path be proc hir_get_import_path from HIR with import_node
 
-    proc emit with ctx, "import "
-    proc emit with ctx, "\""
-    proc emit with ctx, import_name
+    proc emit with ctx, "import \""
+    proc emit with ctx, import_path
     proc emit with ctx, "\""
 
-    Note: Check for alias
     Let alias be proc hir_get_metadata from HIR with import_node, "solidity_alias"
-    Let alias_len be proc string_length from StringCore with alias
+    Let alias_len be proc safe_string_length with alias
     If alias_len is greater than 0:
         proc emit with ctx, " as "
         proc emit with ctx, alias
@@ -200,118 +260,82 @@ Note: TYPE GENERATION (STRUCTS, ENUMS, ERRORS)
 Note: ===================================================================
 
 @Reasoning:
-Top-level type-declaration dispatcher. Solidity's type-level
-declarations split into three distinct keywords (struct, enum, error
-- each introduced in different language versions). The
-'solidity_type' metadata key selects which generator to invoke; an
-unrecognised value silently produces no output, which is the right
-behaviour for forward-compatible HIR extensions.
+Emits 'struct Name { type1 field1; type2 field2; ... }' for a Solidity
+value-type aggregate. Each field is emitted with its Solidity type
+(from 'solidity_field_type' metadata) followed by the field name.
 @End Reasoning
 
 @Implementation:
-Reads 'solidity_type' metadata. Branches on string_equals match:
-"struct" -> generate_struct; "enum" -> generate_enum; "error" ->
-generate_error. Other values fall through with no emission.
-@End Implementation
-Process called "generate_type" takes ctx as Integer, type_node as Integer:
-    Let solidity_type be proc hir_get_metadata from HIR with type_node, "solidity_type"
-
-    Let is_struct be proc string_equals from StringCore with solidity_type, "struct"
-    Let is_enum be proc string_equals from StringCore with solidity_type, "enum"
-    Let is_error be proc string_equals from StringCore with solidity_type, "error"
-
-    If is_struct is equal to 1:
-        proc generate_struct with ctx, type_node
-    Otherwise:
-        If is_enum is equal to 1:
-            proc generate_enum with ctx, type_node
-        Otherwise:
-            If is_error is equal to 1:
-                proc generate_error with ctx, type_node
-            End If
-        End If
-    End If
-End Process
-
-@Reasoning:
-Emits 'struct Name { type1 field1; type2 field2; ... }' for a
-Solidity value-type aggregate. Each field is emitted with its
-Solidity type (from 'solidity_field_type' metadata) followed by the
-field name.
-@End Reasoning
-
-@Implementation:
-Reads struct name. Emits 'struct NAME {\n'. increase_indent. Loops
-hir_type_get_fields: each field becomes
-'<indent>TYPE NAME;\n'. The TYPE comes from 'solidity_field_type'
-metadata via generate_type_expression. decrease_indent. Emits '}\n'.
+Reads struct name via hir_get_class_name. Emits 'struct NAME {\n'.
+increase_indent. Iterates hir_get_class_members filtering HIR_FIELD:
+each field becomes '<indent>TYPE NAME;\n'. decrease_indent. Emits '}\n'.
 @End Implementation
 Process called "generate_struct" takes ctx as Integer, struct_node as Integer:
-    Let struct_name be proc hir_type_get_name from HIR with struct_node
+    Let struct_name be proc hir_get_class_name from HIR with struct_node
 
     proc emit with ctx, "struct "
     proc emit with ctx, struct_name
     proc emit with ctx, " {\n"
 
-    proc increase_indent from ctx
+    proc increase_indent with ctx
 
-    Note: Generate fields
-    Let fields be proc hir_type_get_fields from HIR with struct_node
-    Let field_count be proc list_length from ListCore with fields
+    Let members be proc hir_get_class_members from HIR with struct_node
+    Let member_count be 0
+    If members is not equal to 0:
+        Set member_count to proc list_length from ListCore with members
+    End If
     Let i be 0
+    While i is less than member_count:
+        Let member be proc list_get from ListCore with members, i
+        Let member_kind be proc hir_node_type from HIR with member
+        If member_kind is equal to HIR.HIR_FIELD:
+            Let field_name be proc hir_get_field_name from HIR with member
+            Let field_type be proc hir_get_metadata from HIR with member, "solidity_field_type"
 
-    While i is less than field_count:
-        Let field be proc list_get from ListCore with fields, i
-        Let field_name be proc hir_field_get_name from HIR with field
-        Let field_type be proc hir_get_metadata from HIR with field, "solidity_field_type"
-
-        proc emit_indent from ctx
-        proc generate_type_expression with ctx, field_type
-        proc emit with ctx, " "
-        proc emit with ctx, field_name
-        proc emit with ctx, ";\n"
-
+            proc emit_indent with ctx
+            proc emit_type with ctx, field_type
+            proc emit with ctx, " "
+            proc emit with ctx, field_name
+            proc emit with ctx, ";\n"
+        End If
         Set i to i plus 1
     End While
 
-    proc decrease_indent from ctx
+    proc decrease_indent with ctx
+    proc emit_indent with ctx
     proc emit with ctx, "}\n"
 End Process
 
 @Reasoning:
-Emits 'enum Name { V1, V2, ... }' for a Solidity enum. Variant names
-are stored in the enum node's metadata under the 'solidity_enum_value'
-key (potentially multiple occurrences); get_all_metadata_values
-collects them in declared order.
+Emits 'enum Name { V1, V2, ... }'. Variant names are stored in the
+enum node's value list, read via hir_get_enum_values in declared order.
 @End Reasoning
 
 @Implementation:
-Reads enum name. Emits 'enum NAME {\n'. increase_indent. Pulls the
-metadata map via hir_type_get_metadata, collects values under
-"solidity_enum_value" via get_all_metadata_values. Iterates the
-returned list: each variant is emitted on its own indented line with
-a trailing comma except the last. decrease_indent + '}\n'.
+Reads enum name via hir_get_enum_name. Emits 'enum NAME {\n'.
+increase_indent. Iterates hir_get_enum_values: each variant is emitted
+on its own indented line with a trailing comma except the last.
+decrease_indent + '}\n'.
 @End Implementation
 Process called "generate_enum" takes ctx as Integer, enum_node as Integer:
-    Let enum_name be proc hir_type_get_name from HIR with enum_node
+    Let enum_name be proc hir_get_enum_name from HIR with enum_node
 
     proc emit with ctx, "enum "
     proc emit with ctx, enum_name
     proc emit with ctx, " {\n"
 
-    proc increase_indent from ctx
+    proc increase_indent with ctx
 
-    Note: Get enum values from metadata
-    Let metadata be proc hir_type_get_metadata from HIR with enum_node
-    Let values be proc get_all_metadata_values with metadata, "solidity_enum_value"
-
-    Let value_count be proc list_length from ListCore with values
+    Let values be proc hir_get_enum_values from HIR with enum_node
+    Let value_count be 0
+    If values is not equal to 0:
+        Set value_count to proc list_length from ListCore with values
+    End If
     Let i be 0
-
     While i is less than value_count:
         Let value be proc list_get from ListCore with values, i
 
-        proc emit_indent from ctx
+        proc emit_indent with ctx
         proc emit with ctx, value
 
         If i is less than value_count minus 1:
@@ -322,49 +346,49 @@ Process called "generate_enum" takes ctx as Integer, enum_node as Integer:
         Set i to i plus 1
     End While
 
-    proc decrease_indent from ctx
+    proc decrease_indent with ctx
+    proc emit_indent with ctx
     proc emit with ctx, "}\n"
 End Process
 
 @Reasoning:
 Emits a Solidity 0.8.4+ custom error declaration:
-'error Name(type1 field1, type2 field2);'. Errors are file-scope
-constructs (unlike struct/enum which can also live inside contracts)
-and form the typed counterpart to require/revert messages, enabling
-gas-efficient diagnostics.
+'error Name(type1 field1, type2 field2);'. Error parameters are stored
+as HIR fields whose Solidity type lives in 'solidity_field_type'.
 @End Reasoning
 
 @Implementation:
-Reads error name. Emits 'error NAME('. Iterates hir_type_get_fields:
-each field becomes 'TYPE NAME' separated by ', '. The TYPE comes
-from the field's 'type' metadata via generate_type_expression.
-Terminates with ');\n'.
+Reads error name. Emits 'error NAME('. Iterates HIR_FIELD members:
+each becomes 'TYPE NAME' separated by ', '. Terminates with ');\n'.
 @End Implementation
 Process called "generate_error" takes ctx as Integer, error_node as Integer:
-    Let error_name be proc hir_type_get_name from HIR with error_node
+    Let error_name be proc hir_get_class_name from HIR with error_node
 
     proc emit with ctx, "error "
     proc emit with ctx, error_name
     proc emit with ctx, "("
 
-    Note: Generate error parameters
-    Let fields be proc hir_type_get_fields from HIR with error_node
-    Let field_count be proc list_length from ListCore with fields
+    Let members be proc hir_get_class_members from HIR with error_node
+    Let member_count be 0
+    If members is not equal to 0:
+        Set member_count to proc list_length from ListCore with members
+    End If
+    Let emitted be 0
     Let i be 0
-
-    While i is less than field_count:
-        Let field be proc list_get from ListCore with fields, i
-        Let field_name be proc hir_field_get_name from HIR with field
-        Let field_type be proc hir_get_metadata from HIR with field, "type"
-
-        proc generate_type_expression with ctx, field_type
-        proc emit with ctx, " "
-        proc emit with ctx, field_name
-
-        If i is less than field_count minus 1:
-            proc emit with ctx, ", "
+    While i is less than member_count:
+        Let member be proc list_get from ListCore with members, i
+        Let member_kind be proc hir_node_type from HIR with member
+        If member_kind is equal to HIR.HIR_FIELD:
+            If emitted is greater than 0:
+                proc emit with ctx, ", "
+            End If
+            Let field_name be proc hir_get_field_name from HIR with member
+            Let field_type be proc hir_get_metadata from HIR with member, "solidity_field_type"
+            proc emit_type with ctx, field_type
+            proc emit with ctx, " "
+            proc emit with ctx, field_name
+            Set emitted to emitted plus 1
         End If
-
         Set i to i plus 1
     End While
 
@@ -376,47 +400,37 @@ Note: CONTRACT GENERATION
 Note: ===================================================================
 
 @Reasoning:
-Emits a Solidity contract, interface, or library declaration with
-all members. Solidity distinguishes three top-level container forms:
-'contract' (default), 'interface' (no state, no implementations),
-and 'library' (no state, no inheritance, stateless utilities). The
-'solidity_type' metadata key selects the keyword; the 'solidity_abstract'
-metadata flag adds the 'abstract' prefix (Solidity 0.6+). Inheritance
-is expressed via 'is Base1, Base2'. The proc saves and restores
-ctx.current_contract so member generators (state vars, modifiers,
-functions) can consult enclosing-contract metadata.
+Emits a Solidity contract, interface, or library with all members.
+The 'solidity_type' metadata key selects the keyword ('contract' /
+'interface' / 'library'); 'solidity_abstract' adds the 'abstract'
+prefix. Inheritance is expressed via 'is Base1, Base2' from the
+multi-valued 'solidity_inherits' metadata. The proc saves and restores
+ctx.current_contract so member generators can consult enclosing-contract
+metadata.
 @End Reasoning
 
 @Implementation:
 Reads contract name and 'solidity_type'/'solidity_abstract' metadata.
-Emits 'abstract ' if applicable, then the keyword ('contract' /
-'interface' / 'library'), then the name. Reads
-'solidity_inherits' metadata via get_all_metadata_values; if non-
-empty emits ' is B1, B2, ...'. Emits ' {\n'. Increases indent, sets
-ctx.current_contract = contract_node. Calls generate_using_directives
-then walks fields (-> generate_state_variable) and methods (each
-method's 'solidity_type' metadata routes to generate_event /
-_modifier / _function). Blank lines separate non-empty groups and
-adjacent methods. Decreases indent, clears current_contract, emits
-'}\n'.
+Emits 'abstract '? + keyword + name. Reads 'solidity_inherits' via
+get_all_metadata_values; if non-empty emits ' is B1, B2, ...'. Emits
+' {\n', increases indent, sets ctx.current_contract. Emits any
+contract-scope using directive. Walks hir_get_class_members in source
+order, dispatching each by node kind / "solidity_type" to the matching
+member generator. Decreases indent, clears current_contract, '}\n'.
 @End Implementation
 Process called "generate_contract" takes ctx as GenerationContext, contract_node as Integer:
-    Let contract_name be proc hir_class_get_name from HIR with contract_node
+    Let contract_name be proc hir_get_class_name from HIR with contract_node
 
-    Note: Check contract type (contract, interface, library)
     Let solidity_type be proc hir_get_metadata from HIR with contract_node, "solidity_type"
+    Let is_interface be proc safe_string_equals with solidity_type, "interface"
+    Let is_library be proc safe_string_equals with solidity_type, "library"
 
-    Let is_interface be proc string_equals from StringCore with solidity_type, "interface"
-    Let is_library be proc string_equals from StringCore with solidity_type, "library"
-
-    Note: Check for abstract modifier
     Let is_abstract be proc hir_get_metadata from HIR with contract_node, "solidity_abstract"
-    Let abstract_len be proc string_length from StringCore with is_abstract
+    Let abstract_len be proc safe_string_length with is_abstract
     If abstract_len is greater than 0:
         proc emit with ctx, "abstract "
     End If
 
-    Note: Emit contract keyword
     If is_interface is equal to 1:
         proc emit with ctx, "interface "
     Otherwise:
@@ -429,149 +443,140 @@ Process called "generate_contract" takes ctx as GenerationContext, contract_node
 
     proc emit with ctx, contract_name
 
-    Note: Emit inheritance
     Let inherits_meta be proc hir_get_metadata from HIR with contract_node, "solidity_inherits"
     Let bases be proc get_all_metadata_values with inherits_meta
     Let base_count be proc list_length from ListCore with bases
     If base_count is greater than 0:
         proc emit with ctx, " is "
-
-        Let i be 0
-        While i is less than base_count:
-            Let base_name be proc list_get from ListCore with bases, i
+        Let b be 0
+        While b is less than base_count:
+            Let base_name be proc list_get from ListCore with bases, b
             proc emit with ctx, base_name
-
-            If i is less than base_count minus 1:
+            If b is less than base_count minus 1:
                 proc emit with ctx, ", "
             End If
-
-            Set i to i plus 1
+            Set b to b plus 1
         End While
     End If
 
     proc emit with ctx, " {\n"
 
-    proc increase_indent from ctx
+    proc increase_indent with ctx
     Set ctx.current_contract to contract_node
 
-    Note: Generate using directives (if any in contract scope)
-    proc generate_using_directives with ctx, contract_node
+    proc generate_using_directive with ctx, contract_node
 
-    Note: Generate state variables
-    Let fields be proc hir_class_get_fields from HIR with contract_node
-    Let field_count be proc list_length from ListCore with fields
-    Set i to 0
-
-    While i is less than field_count:
-        Let field be proc list_get from ListCore with fields, i
-        proc generate_state_variable with ctx, field
-        Set i to i plus 1
-    End While
-
-    If field_count is greater than 0:
-        proc emit with ctx, "\n"
+    Let members be proc hir_get_class_members from HIR with contract_node
+    Let member_count be 0
+    If members is not equal to 0:
+        Set member_count to proc list_length from ListCore with members
     End If
+    Let i be 0
+    While i is less than member_count:
+        Let member be proc list_get from ListCore with members, i
+        proc generate_member with ctx, member
 
-    Note: Generate events, modifiers, and functions
-    Let methods be proc hir_class_get_methods from HIR with contract_node
-    Let method_count be proc list_length from ListCore with methods
-    Set i to 0
-
-    While i is less than method_count:
-        Let method be proc list_get from ListCore with methods, i
-        Let method_solidity_type be proc hir_get_metadata from HIR with method, "solidity_type"
-
-        Let is_event be proc string_equals from StringCore with method_solidity_type, "event"
-        Let is_modifier be proc string_equals from StringCore with method_solidity_type, "modifier"
-
-        If is_event is equal to 1:
-            proc generate_event with ctx, method
-        Otherwise:
-            If is_modifier is equal to 1:
-                proc generate_modifier with ctx, method
-            Otherwise:
-                proc generate_function with ctx, method
-            End If
-        End If
-
-        If i is less than method_count minus 1:
+        If i is less than member_count minus 1:
             proc emit with ctx, "\n"
         End If
 
         Set i to i plus 1
     End While
 
-    proc decrease_indent from ctx
+    proc decrease_indent with ctx
     Set ctx.current_contract to 0
 
     proc emit with ctx, "}\n"
 End Process
 
 @Reasoning:
-Emits 'using LIB for TYPE;' directives inside a contract. The
-directive attaches a library's free functions as methods on instances
-of the target type (e.g. 'using SafeMath for uint256' makes
-'a.add(b)' resolve to 'SafeMath.add(a, b)'). A missing target_type
-metadata is interpreted as the global form 'using LIB for *' (file
-scope only in Solidity 0.8.13+, but emitted here unconditionally for
-backward-compat HIR shapes).
+Dispatches a single contract member. Fields are state variables;
+HIR_ENUM / nested HIR_CLASS members are nested enums/structs/errors;
+HIR_FUNCTION members route on "solidity_type" to the event, modifier,
+or function generator.
 @End Reasoning
 
 @Implementation:
-Reads 'solidity_using' metadata. Returns early if absent. Pulls the
-list of directives via get_metadata_list; returns early if empty.
-Iterates: each directive carries 'library' and 'for_type' fields.
-If library is non-null: emit_indent, 'using LIB for '; emit either
-target_type or '*'; ';\n'. Returns 1 to signal completion.
+Reads hir_node_type. HIR_FIELD -> generate_state_variable. HIR_ENUM ->
+generate_enum (indented). HIR_CLASS -> generate_struct / generate_error
+(by "solidity_type"). HIR_FUNCTION -> event / modifier / function (by
+"solidity_type").
 @End Implementation
-Process called "generate_using_directives" takes ctx as Integer, contract_node as Integer:
-    Note: Generate Solidity using directives (e.g., using SafeMath for uint256)
-    Note: Using directives attach library functions to types
+Process called "generate_member" takes ctx as Integer, member as Integer:
+    Let kind be proc hir_node_type from HIR with member
 
-    Note: Get using directives from contract metadata
-    Let metadata be proc hir_get_metadata from HIR with contract_node, "solidity_using"
-
-    If metadata is equal to 0:
-        Return 0
+    If kind is equal to HIR.HIR_FIELD:
+        proc generate_state_variable with ctx, member
+        Return
     End If
 
-    Note: Metadata should be a list of using directive objects
-    Let using_list be proc get_metadata_list from HIR with metadata
-
-    If using_list is equal to 0:
-        Return 0
+    If kind is equal to HIR.HIR_ENUM:
+        proc emit_indent with ctx
+        proc generate_enum with ctx, member
+        Return
     End If
 
-    Let using_count be proc list_length from ListCore with using_list
-    Let i be 0
-
-    While i is less than using_count:
-        Let using_directive be proc list_get from ListCore with using_list, i
-
-        Note: Each directive has: library_name and target_type
-        Let library_name be proc get_field from HIR with using_directive, "library"
-        Let target_type be proc get_field from HIR with using_directive, "for_type"
-
-        If library_name is not equal to 0:
-            proc emit_indent from ctx
-            proc emit with ctx, "using "
-            proc emit with ctx, library_name
-            proc emit with ctx, " for "
-
-            If target_type is not equal to 0:
-                proc emit with ctx, target_type
-            Otherwise:
-                Note: Global using (for all types)
-                proc emit with ctx, "*"
-            End If
-
-            proc emit with ctx, ";\n"
+    If kind is equal to HIR.HIR_CLASS:
+        Let nested_type be proc hir_get_metadata from HIR with member, "solidity_type"
+        Let is_error be proc safe_string_equals with nested_type, "error"
+        proc emit_indent with ctx
+        If is_error is equal to 1:
+            proc generate_error with ctx, member
+        Otherwise:
+            proc generate_struct with ctx, member
         End If
+        Return
+    End If
 
-        Set i to i plus 1
-    End While
+    If kind is equal to HIR.HIR_FUNCTION:
+        Let func_type be proc hir_get_metadata from HIR with member, "solidity_type"
+        Let is_event be proc safe_string_equals with func_type, "event"
+        Let is_modifier be proc safe_string_equals with func_type, "modifier"
 
-    Return 1
+        If is_event is equal to 1:
+            proc generate_event with ctx, member
+            Return
+        End If
+        If is_modifier is equal to 1:
+            proc generate_modifier with ctx, member
+            Return
+        End If
+        proc generate_function with ctx, member
+        Return
+    End If
+End Process
+
+@Reasoning:
+Emits 'using LIB for TYPE;' inside a contract when the contract carries
+'solidity_using_library' metadata. A missing target type is emitted as
+the global form 'using LIB for *'.
+@End Reasoning
+
+@Implementation:
+Reads 'solidity_using_library'; returns if absent. emit_indent + 'using
+LIB for '; emits 'solidity_using_target' if present, else '*'; ';\n\n'.
+@End Implementation
+Process called "generate_using_directive" takes ctx as Integer, contract_node as Integer:
+    Let library_name be proc hir_get_metadata from HIR with contract_node, "solidity_using_library"
+    Let lib_len be proc safe_string_length with library_name
+    If lib_len is equal to 0:
+        Return
+    End If
+
+    proc emit_indent with ctx
+    proc emit with ctx, "using "
+    proc emit with ctx, library_name
+    proc emit with ctx, " for "
+
+    Let target_type be proc hir_get_metadata from HIR with contract_node, "solidity_using_target"
+    Let target_len be proc safe_string_length with target_type
+    If target_len is greater than 0:
+        proc emit with ctx, target_type
+    Otherwise:
+        proc emit with ctx, "*"
+    End If
+
+    proc emit with ctx, ";\n\n"
 End Process
 
 Note: ===================================================================
@@ -582,35 +587,28 @@ Note: ===================================================================
 Emits a contract state-variable declaration:
 'TYPE [modifier...] NAME [= INIT];'. Solidity modifiers for state
 variables include visibility (public/internal/private) and storage
-classifiers (constant/immutable). They can appear in either order
-between the type and the name. The modifier list is collected from
-'solidity_modifier' metadata which may have multiple values.
+classifiers (constant/immutable), collected from the multi-valued
+'solidity_modifier' metadata in declared order.
 @End Reasoning
 
 @Implementation:
-emit_indent. Reads modifier list via get_all_metadata_values keyed by
-'solidity_modifier'. Emits 'TYPE ' from 'solidity_type' metadata via
-generate_type_expression. Then emits each modifier followed by a
-space. Emits the field_name. If 'solidity_initializer' metadata is
-non-null emits ' = INIT' via generate_expression. Terminates with
+emit_indent. Emits 'TYPE ' from 'solidity_type' metadata. Emits each
+'solidity_modifier' value followed by a space. Emits the field name.
+If 'solidity_initializer' is non-null emits ' = INIT'. Terminates
 ';\n'.
 @End Implementation
 Process called "generate_state_variable" takes ctx as Integer, field_node as Integer:
-    Let field_name be proc hir_field_get_name from HIR with field_node
+    Let field_name be proc hir_get_field_name from HIR with field_node
 
-    proc emit_indent from ctx
+    proc emit_indent with ctx
 
-    Note: Get visibility and modifiers
-    Let modifiers_meta_field be proc hir_get_metadata from HIR with field_node, "solidity_modifier"
-    Let modifiers be proc get_all_metadata_values with modifiers_meta_field
-    Let modifier_count be proc list_length from ListCore with modifiers
-
-    Note: Emit type
     Let field_type be proc hir_get_metadata from HIR with field_node, "solidity_type"
-    proc generate_type_expression with ctx, field_type
+    proc emit_type with ctx, field_type
     proc emit with ctx, " "
 
-    Note: Emit modifiers (public, private, internal, constant, immutable)
+    Let modifiers_meta be proc hir_get_metadata from HIR with field_node, "solidity_modifier"
+    Let modifiers be proc get_all_metadata_values with modifiers_meta
+    Let modifier_count be proc list_length from ListCore with modifiers
     Let i be 0
     While i is less than modifier_count:
         Let modifier be proc list_get from ListCore with modifiers, i
@@ -621,11 +619,10 @@ Process called "generate_state_variable" takes ctx as Integer, field_node as Int
 
     proc emit with ctx, field_name
 
-    Note: Emit initializer if present
     Let initializer be proc hir_get_metadata from HIR with field_node, "solidity_initializer"
     If initializer is not equal to 0:
         proc emit with ctx, " = "
-        proc generate_expression with ctx, initializer
+        proc generate_expression with ctx, initializer, 0
     End If
 
     proc emit with ctx, ";\n"
@@ -636,49 +633,44 @@ Note: EVENT GENERATION
 Note: ===================================================================
 
 @Reasoning:
-Emits 'event Name(type1 indexed? name1, ...);'. Each event parameter
-may carry the 'indexed' modifier (up to 3 per event in Solidity)
-which causes the parameter to be stored in a log topic for efficient
-indexed access. The 'anonymous' event-level modifier removes the
-event's identifier topic - emitted via the 'solidity_anonymous'
-metadata flag.
+Emits 'event Name(type1 indexed? name1, ...);'. Each parameter may
+carry the 'indexed' modifier ('solidity_indexed'); the 'anonymous'
+event-level modifier ('solidity_anonymous') is appended after ')'.
 @End Reasoning
 
 @Implementation:
-emit_indent + 'event NAME('. Loops parameters; each yields
-'TYPE [indexed] [NAME]'. The 'indexed' keyword is emitted when
-'solidity_indexed' metadata is non-empty. Parameters separated by
-', '. After ')', emits ' anonymous' when 'solidity_anonymous'
-metadata is non-empty. Terminates with ';\n'.
+emit_indent + 'event NAME('. Loops parameters; each yields 'TYPE
+[indexed] [NAME]'. Parameters separated by ', '. After ')', emits '
+anonymous' when 'solidity_anonymous' is non-empty. Terminates ';\n'.
 @End Implementation
 Process called "generate_event" takes ctx as Integer, event_node as Integer:
-    Let event_name be proc hir_function_get_name from HIR with event_node
+    Let event_name be proc hir_get_function_name from HIR with event_node
 
-    proc emit_indent from ctx
+    proc emit_indent with ctx
     proc emit with ctx, "event "
     proc emit with ctx, event_name
     proc emit with ctx, "("
 
-    Note: Generate event parameters
-    Let params be proc hir_function_get_parameters from HIR with event_node
-    Let param_count be proc list_length from ListCore with params
+    Let params be proc get_parameter_list with event_node
+    Let param_count be 0
+    If params is not equal to 0:
+        Set param_count to proc list_length from ListCore with params
+    End If
     Let i be 0
-
     While i is less than param_count:
         Let param be proc list_get from ListCore with params, i
-        Let param_name be proc hir_parameter_get_name from HIR with param
-        Let param_type be proc hir_parameter_get_type from HIR with param
+        Let param_name be proc hir_get_parameter_name from HIR with param
+        Let param_type be proc hir_get_metadata from HIR with param, "solidity_type"
 
-        proc generate_type_expression with ctx, param_type
+        proc emit_type with ctx, param_type
 
-        Note: Check for indexed modifier
         Let is_indexed be proc hir_get_metadata from HIR with param, "solidity_indexed"
-        Let indexed_len be proc string_length from StringCore with is_indexed
+        Let indexed_len be proc safe_string_length with is_indexed
         If indexed_len is greater than 0:
             proc emit with ctx, " indexed"
         End If
 
-        Let param_name_len be proc string_length from StringCore with param_name
+        Let param_name_len be proc safe_string_length with param_name
         If param_name_len is greater than 0:
             proc emit with ctx, " "
             proc emit with ctx, param_name
@@ -693,9 +685,8 @@ Process called "generate_event" takes ctx as Integer, event_node as Integer:
 
     proc emit with ctx, ")"
 
-    Note: Check for anonymous modifier
     Let is_anonymous be proc hir_get_metadata from HIR with event_node, "solidity_anonymous"
-    Let anon_len be proc string_length from StringCore with is_anonymous
+    Let anon_len be proc safe_string_length with is_anonymous
     If anon_len is greater than 0:
         proc emit with ctx, " anonymous"
     End If
@@ -709,67 +700,53 @@ Note: ===================================================================
 
 @Reasoning:
 Emits a Solidity modifier definition:
-'modifier NAME(params) [virtual/override] { body... }'. Modifiers are
-re-usable pre/post-condition fragments composed onto functions. The
-'_;' placeholder represents the wrapped function's body and must be
-present somewhere in the modifier; when no body is provided this
+'modifier NAME(params) { body... }'. Modifiers are re-usable pre/post-
+condition fragments composed onto functions. The '_;' placeholder
+represents the wrapped function's body; when no body is provided this
 generator emits a minimal '{ _; }' so the output is syntactically
 valid.
 @End Reasoning
 
 @Implementation:
-emit_indent + 'modifier NAME(' + comma-separated 'TYPE NAME'
-parameters + ')'. Calls generate_function_modifiers to append
-virtual/override and other tag modifiers. Emits ' '. If body is
-non-null, delegates to generate_statement. Otherwise emits a default
-empty body '{\n    _;\n}\n'.
+emit_indent + 'modifier NAME(' + comma-separated 'TYPE NAME' parameters
++ ')'. Calls generate_modifier_tail for any extra modifiers. If body is
+non-null, delegates to generate_statement. Otherwise emits '{ _; }'.
 @End Implementation
 Process called "generate_modifier" takes ctx as Integer, modifier_node as Integer:
-    Let modifier_name be proc hir_function_get_name from HIR with modifier_node
+    Let modifier_name be proc hir_get_function_name from HIR with modifier_node
 
-    proc emit_indent from ctx
+    proc emit_indent with ctx
     proc emit with ctx, "modifier "
     proc emit with ctx, modifier_name
-
-    Note: Generate parameters
     proc emit with ctx, "("
 
-    Let params be proc hir_function_get_parameters from HIR with modifier_node
-    Let param_count be proc list_length from ListCore with params
+    Let params be proc get_parameter_list with modifier_node
+    Let param_count be 0
+    If params is not equal to 0:
+        Set param_count to proc list_length from ListCore with params
+    End If
     Let i be 0
-
     While i is less than param_count:
         Let param be proc list_get from ListCore with params, i
-        Let param_name be proc hir_parameter_get_name from HIR with param
-        Let param_type be proc hir_parameter_get_type from HIR with param
-
-        proc generate_type_expression with ctx, param_type
-        proc emit with ctx, " "
-        proc emit with ctx, param_name
-
+        proc generate_parameter with ctx, param
         If i is less than param_count minus 1:
             proc emit with ctx, ", "
         End If
-
         Set i to i plus 1
     End While
 
-    proc emit with ctx, ")"
+    proc emit with ctx, ") "
 
-    Note: Generate virtual/override if present
-    proc generate_function_modifiers with ctx, modifier_node
-
-    proc emit with ctx, " "
-
-    Note: Generate body
-    Let body be proc hir_function_get_body from HIR with modifier_node
+    Let body be proc hir_get_function_body from HIR with modifier_node
     If body is not equal to 0:
         proc generate_statement with ctx, body
     Otherwise:
         proc emit with ctx, "{\n"
-        proc emit_indent from ctx
-        proc emit with ctx, "    _;\n"
-        proc emit_indent from ctx
+        proc increase_indent with ctx
+        proc emit_indent with ctx
+        proc emit with ctx, "_;\n"
+        proc decrease_indent with ctx
+        proc emit_indent with ctx
         proc emit with ctx, "}\n"
     End If
 End Process
@@ -779,38 +756,33 @@ Note: FUNCTION GENERATION
 Note: ===================================================================
 
 @Reasoning:
-Emits a Solidity function declaration. Covers the four function
-forms: regular 'function NAME', the unnamed 'constructor', the
-unnamed 'fallback', and the unnamed 'receive'. Parameters carry an
-optional storage location (memory/calldata/storage) emitted between
-type and name. Returns clause uses the 'solidity_returns' metadata
-which holds a parameter list (each entry can name its return slot).
+Emits a Solidity function declaration covering the four forms: regular
+'function NAME', the unnamed 'constructor', 'fallback', and 'receive'.
+Parameters carry an optional storage location (memory/calldata/storage)
+between type and name. The returns clause uses the multi-valued
+'solidity_return' metadata (each entry a "type[ name]" string).
 @End Reasoning
 
 @Implementation:
-emit_indent. Reads 'solidity_type' metadata. Branches:
+emit_indent. Reads 'solidity_type'. Branches:
   "constructor" -> 'constructor'
   "fallback"    -> 'fallback'
   "receive"     -> 'receive'
   else          -> 'function NAME'
-Emits '('. Loops params: emits TYPE via generate_type_expression;
-emits ' STORAGE' if 'solidity_storage' metadata is non-empty; emits
-' NAME' if name is non-empty. Parameters separated by ', '. Emits
-')'. Calls generate_function_modifiers (visibility/mutability/etc).
-If 'solidity_returns' metadata is non-null emits ' returns (' +
-comma-separated parameter list via generate_parameter + ')'. If
-body is non-null emits ' ' + generate_statement; otherwise ';\n'.
+Emits '('. Loops parameters via generate_parameter. Emits ')'. Calls
+generate_modifier_tail (visibility/mutability/user modifiers). If any
+'solidity_return' values exist, emits ' returns (V1, V2, ...)'. If body
+is non-null emits ' ' + generate_statement; otherwise ';\n'.
 @End Implementation
 Process called "generate_function" takes ctx as Integer, function_node as Integer:
-    Let function_name be proc hir_function_get_name from HIR with function_node
+    Let function_name be proc hir_get_function_name from HIR with function_node
     Let solidity_type be proc hir_get_metadata from HIR with function_node, "solidity_type"
 
-    proc emit_indent from ctx
+    proc emit_indent with ctx
 
-    Note: Check for special function types
-    Let is_constructor be proc string_equals from StringCore with solidity_type, "constructor"
-    Let is_fallback be proc string_equals from StringCore with solidity_type, "fallback"
-    Let is_receive be proc string_equals from StringCore with solidity_type, "receive"
+    Let is_constructor be proc safe_string_equals with solidity_type, "constructor"
+    Let is_fallback be proc safe_string_equals with solidity_type, "fallback"
+    Let is_receive be proc safe_string_equals with solidity_type, "receive"
 
     If is_constructor is equal to 1:
         proc emit with ctx, "constructor"
@@ -827,70 +799,45 @@ Process called "generate_function" takes ctx as Integer, function_node as Intege
         End If
     End If
 
-    Note: Generate parameters
     proc emit with ctx, "("
 
-    Let params be proc hir_function_get_parameters from HIR with function_node
-    Let param_count be proc list_length from ListCore with params
+    Let params be proc get_parameter_list with function_node
+    Let param_count be 0
+    If params is not equal to 0:
+        Set param_count to proc list_length from ListCore with params
+    End If
     Let i be 0
-
     While i is less than param_count:
         Let param be proc list_get from ListCore with params, i
-        Let param_name be proc hir_parameter_get_name from HIR with param
-        Let param_type be proc hir_parameter_get_type from HIR with param
-
-        proc generate_type_expression with ctx, param_type
-
-        Note: Check for storage location
-        Let storage_loc be proc hir_get_metadata from HIR with param, "solidity_storage"
-        Let storage_len be proc string_length from StringCore with storage_loc
-        If storage_len is greater than 0:
-            proc emit with ctx, " "
-            proc emit with ctx, storage_loc
-        End If
-
-        Let param_name_len be proc string_length from StringCore with param_name
-        If param_name_len is greater than 0:
-            proc emit with ctx, " "
-            proc emit with ctx, param_name
-        End If
-
+        proc generate_parameter with ctx, param
         If i is less than param_count minus 1:
             proc emit with ctx, ", "
         End If
-
         Set i to i plus 1
     End While
 
     proc emit with ctx, ")"
 
-    Note: Generate function modifiers (visibility, mutability, virtual, override)
-    proc generate_function_modifiers with ctx, function_node
+    proc generate_modifier_tail with ctx, function_node
 
-    Note: Generate returns if present
-    Let return_types be proc hir_get_metadata from HIR with function_node, "solidity_returns"
-    If return_types is not equal to 0:
+    Let returns_meta be proc hir_get_metadata from HIR with function_node, "solidity_return"
+    Let return_list be proc get_all_metadata_values with returns_meta
+    Let return_count be proc list_length from ListCore with return_list
+    If return_count is greater than 0:
         proc emit with ctx, " returns ("
-
-        Let return_count be proc list_length from ListCore with return_types
         Let j be 0
-
         While j is less than return_count:
-            Let return_param be proc list_get from ListCore with return_types, j
-            proc generate_parameter with ctx, return_param
-
+            Let return_slot be proc list_get from ListCore with return_list, j
+            proc emit with ctx, return_slot
             If j is less than return_count minus 1:
                 proc emit with ctx, ", "
             End If
-
             Set j to j plus 1
         End While
-
         proc emit with ctx, ")"
     End If
 
-    Note: Generate body
-    Let body be proc hir_function_get_body from HIR with function_node
+    Let body be proc hir_get_function_body from HIR with function_node
     If body is not equal to 0:
         proc emit with ctx, " "
         proc generate_statement with ctx, body
@@ -900,24 +847,22 @@ Process called "generate_function" takes ctx as Integer, function_node as Intege
 End Process
 
 @Reasoning:
-Emits the modifier-list tail of a function or modifier declaration:
-the space-separated tags visibility (public/private/internal/external),
-mutability (view/pure/payable), virtual, override, and any custom
-modifiers like 'onlyOwner'. The order follows the HIR-supplied
-sequence verbatim because Solidity is lenient about modifier ordering.
+Emits the modifier-list tail of a function or modifier declaration: the
+space-separated visibility (public/private/internal/external),
+mutability (view/pure/payable), virtual, override, and user modifiers
+(e.g. 'onlyOwner') in the HIR-supplied order. Solidity is lenient about
+modifier ordering, so verbatim order is correct.
 @End Reasoning
 
 @Implementation:
-Collects modifier list from 'solidity_modifier' metadata via
-get_all_metadata_values. Iterates; each entry is emitted as ' TAG'
-(leading space). No trailing semicolon or newline - the caller
-controls termination.
+Collects the multi-valued 'solidity_modifier' metadata via
+get_all_metadata_values. Emits each as ' TAG' (leading space). No
+trailing punctuation - the caller controls termination.
 @End Implementation
-Process called "generate_function_modifiers" takes ctx as Integer, function_node as Integer:
-    Let modifiers_meta_func be proc hir_get_metadata from HIR with function_node, "solidity_modifier"
-    Let modifiers be proc get_all_metadata_values with modifiers_meta_func
+Process called "generate_modifier_tail" takes ctx as Integer, function_node as Integer:
+    Let modifiers_meta be proc hir_get_metadata from HIR with function_node, "solidity_modifier"
+    Let modifiers be proc get_all_metadata_values with modifiers_meta
     Let modifier_count be proc list_length from ListCore with modifiers
-
     Let i be 0
     While i is less than modifier_count:
         Let modifier be proc list_get from ListCore with modifiers, i
@@ -928,32 +873,28 @@ Process called "generate_function_modifiers" takes ctx as Integer, function_node
 End Process
 
 @Reasoning:
-Single-parameter emitter used for return-list parameters (the
-function-argument list inlines parameter emission for tighter
-control over the comma-separator logic). Emits 'TYPE [STORAGE] [NAME]'.
+Single-parameter emitter shared by function/modifier parameter lists.
+Emits 'TYPE [STORAGE] [NAME]'.
 @End Reasoning
 
 @Implementation:
-Reads param_name and param_type. Emits TYPE via
-generate_type_expression. Reads 'solidity_storage' metadata; if non-
-empty appends ' STORAGE'. Emits ' NAME' if name is non-empty (named
-returns are an optional Solidity feature).
+Reads param name and Solidity type. Emits TYPE. Reads 'solidity_storage';
+if non-empty appends ' STORAGE'. Emits ' NAME' if name is non-empty.
 @End Implementation
 Process called "generate_parameter" takes ctx as Integer, param_node as Integer:
-    Let param_name be proc hir_parameter_get_name from HIR with param_node
-    Let param_type be proc hir_parameter_get_type from HIR with param_node
+    Let param_name be proc hir_get_parameter_name from HIR with param_node
+    Let param_type be proc hir_get_metadata from HIR with param_node, "solidity_type"
 
-    proc generate_type_expression with ctx, param_type
+    proc emit_type with ctx, param_type
 
-    Note: Check for storage location
     Let storage_loc be proc hir_get_metadata from HIR with param_node, "solidity_storage"
-    Let storage_len be proc string_length from StringCore with storage_loc
+    Let storage_len be proc safe_string_length with storage_loc
     If storage_len is greater than 0:
         proc emit with ctx, " "
         proc emit with ctx, storage_loc
     End If
 
-    Let param_name_len be proc string_length from StringCore with param_name
+    Let param_name_len be proc safe_string_length with param_name
     If param_name_len is greater than 0:
         proc emit with ctx, " "
         proc emit with ctx, param_name
@@ -965,143 +906,144 @@ Note: STATEMENT GENERATION
 Note: ===================================================================
 
 @Reasoning:
-Statement-level dispatcher. Unlike PHP's backend which uses a single
-type-tag read, the Solidity backend uses per-kind predicate helpers
-(hir_is_block / hir_is_if_statement / etc.) - this keeps the
-predicate logic centralised in HIR but costs an extra call per
-candidate kind. Each predicate match short-circuits via Return.
+Statement-level dispatcher driven entirely by hir_node_type. Each kind
+short-circuits via Return after emitting. Block, if, while, for,
+do-while, return, break, continue, try, and expression statements are
+all handled; emit/revert/unchecked are recovered from metadata tags.
 @End Reasoning
 
 @Implementation:
-Reads the node's type via hir_node_get_type (used only for the
-default-case fallthrough; predicates do their own type-tag inspection
-internally). Cascade: hir_is_block -> generate_block; _is_if -> _if;
-_is_while -> _while; _is_return -> _return; _is_break -> 'break;\n';
-_is_continue -> 'continue;\n'; _is_expression_statement ->
-_expression_statement. Unrecognised statement kinds produce no output.
+Reads hir_node_type and routes: HIR_BLOCK -> generate_block;
+HIR_IF -> generate_if_statement; HIR_WHILE -> generate_while_statement;
+HIR_FOR -> generate_for_statement; HIR_DO_WHILE ->
+generate_do_while_statement; HIR_RETURN -> generate_return_statement;
+HIR_BREAK -> 'break;'; HIR_CONTINUE -> 'continue;'; HIR_TRY ->
+generate_try_statement; HIR_THROW -> generate_throw_statement;
+HIR_EXPR_STMT -> generate_expression_statement.
 @End Implementation
 Process called "generate_statement" takes ctx as Integer, stmt_node as Integer:
-    Let stmt_type be proc hir_node_get_type from HIR with stmt_node
+    Let kind be proc hir_node_type from HIR with stmt_node
 
-    Note: Block statement
-    Let is_block be proc hir_is_block from HIR with stmt_node
-    If is_block is equal to 1:
+    If kind is equal to HIR.HIR_BLOCK:
         proc generate_block with ctx, stmt_node
         Return
     End If
-
-    Note: If statement
-    Let is_if be proc hir_is_if_statement from HIR with stmt_node
-    If is_if is equal to 1:
+    If kind is equal to HIR.HIR_IF:
         proc generate_if_statement with ctx, stmt_node
         Return
     End If
-
-    Note: While statement
-    Let is_while be proc hir_is_while_statement from HIR with stmt_node
-    If is_while is equal to 1:
+    If kind is equal to HIR.HIR_WHILE:
         proc generate_while_statement with ctx, stmt_node
         Return
     End If
-
-    Note: Return statement
-    Let is_return be proc hir_is_return_statement from HIR with stmt_node
-    If is_return is equal to 1:
+    If kind is equal to HIR.HIR_FOR:
+        proc generate_for_statement with ctx, stmt_node
+        Return
+    End If
+    If kind is equal to HIR.HIR_DO_WHILE:
+        proc generate_do_while_statement with ctx, stmt_node
+        Return
+    End If
+    If kind is equal to HIR.HIR_RETURN:
         proc generate_return_statement with ctx, stmt_node
         Return
     End If
-
-    Note: Break statement
-    Let is_break be proc hir_is_break_statement from HIR with stmt_node
-    If is_break is equal to 1:
-        proc emit_indent from ctx
+    If kind is equal to HIR.HIR_BREAK:
+        proc emit_indent with ctx
         proc emit with ctx, "break;\n"
         Return
     End If
-
-    Note: Continue statement
-    Let is_continue be proc hir_is_continue_statement from HIR with stmt_node
-    If is_continue is equal to 1:
-        proc emit_indent from ctx
+    If kind is equal to HIR.HIR_CONTINUE:
+        proc emit_indent with ctx
         proc emit with ctx, "continue;\n"
         Return
     End If
-
-    Note: Expression statement
-    Let is_expr_stmt be proc hir_is_expression_statement from HIR with stmt_node
-    If is_expr_stmt is equal to 1:
+    If kind is equal to HIR.HIR_TRY:
+        proc generate_try_statement with ctx, stmt_node
+        Return
+    End If
+    If kind is equal to HIR.HIR_THROW:
+        proc generate_throw_statement with ctx, stmt_node
+        Return
+    End If
+    If kind is equal to HIR.HIR_EXPR_STMT:
         proc generate_expression_statement with ctx, stmt_node
         Return
     End If
 End Process
 
 @Reasoning:
-Emits a Solidity brace-delimited block. The opening brace lands on
-the current cursor position (no fresh emit_indent) so 'if (...) {'
-and similar can attach the brace to the previous line.
+Emits a Solidity brace-delimited block. The opening brace lands on the
+current cursor position (no fresh emit_indent) so 'if (...) {' attaches
+the brace to the previous line. An 'unchecked' block (tagged
+"solidity_unchecked") emits the 'unchecked' keyword before the brace.
 @End Reasoning
 
 @Implementation:
-Emits '{\n'. increase_indent. Loops hir_block_get_statements,
-recursing generate_statement for each. decrease_indent. emit_indent
-+ '}\n'.
+If the block is tagged solidity_unchecked emits 'unchecked '. Emits
+'{\n'. increase_indent. Loops hir_get_block_statements recursing
+generate_statement. decrease_indent. emit_indent + '}\n'.
 @End Implementation
 Process called "generate_block" takes ctx as Integer, block_node as Integer:
+    Let is_unchecked be proc hir_get_metadata from HIR with block_node, "solidity_unchecked"
+    Let unchecked_len be proc safe_string_length with is_unchecked
+    If unchecked_len is greater than 0:
+        proc emit with ctx, "unchecked "
+    End If
+
     proc emit with ctx, "{\n"
 
-    proc increase_indent from ctx
+    proc increase_indent with ctx
 
-    Let statements be proc hir_block_get_statements from HIR with block_node
-    Let stmt_count be proc list_length from ListCore with statements
+    Let statements be proc hir_get_block_statements from HIR with block_node
+    Let stmt_count be 0
+    If statements is not equal to 0:
+        Set stmt_count to proc list_length from ListCore with statements
+    End If
     Let i be 0
-
     While i is less than stmt_count:
         Let stmt be proc list_get from ListCore with statements, i
         proc generate_statement with ctx, stmt
         Set i to i plus 1
     End While
 
-    proc decrease_indent from ctx
-    proc emit_indent from ctx
+    proc decrease_indent with ctx
+    proc emit_indent with ctx
     proc emit with ctx, "}\n"
 End Process
 
 @Reasoning:
-Emits 'if (cond) thenStmt' with optional 'else elseStmt'. Unlike the
-PHP backend, this generator passes the branch through
-generate_statement without wrapping bare statements in synthesised
-braces - the HIR is expected to wrap such cases in a block node
-already.
+Emits 'if (cond) thenStmt' with optional 'else elseStmt'. The branches
+pass through generate_statement; the HIR is expected to wrap bodies in
+block nodes.
 @End Reasoning
 
 @Implementation:
-emit_indent + 'if (' + generate_expression(condition) + ') '. Then
-generate_statement(then_branch). If else_branch is non-null:
-emit_indent + 'else ' + generate_statement(else_branch).
+emit_indent + 'if (' + generate_expression(condition) + ') ' +
+generate_statement(then). If else is non-null: emit_indent + 'else ' +
+generate_statement(else).
 @End Implementation
 Process called "generate_if_statement" takes ctx as Integer, if_node as Integer:
-    Let condition be proc hir_if_get_condition from HIR with if_node
-    Let then_stmt be proc hir_if_get_then_branch from HIR with if_node
-    Let else_stmt be proc hir_if_get_else_branch from HIR with if_node
+    Let condition be proc hir_get_if_condition from HIR with if_node
+    Let then_stmt be proc hir_get_if_then from HIR with if_node
+    Let else_stmt be proc hir_get_if_else from HIR with if_node
 
-    proc emit_indent from ctx
+    proc emit_indent with ctx
     proc emit with ctx, "if ("
-    proc generate_expression with ctx, condition
+    proc generate_expression with ctx, condition, 0
     proc emit with ctx, ") "
 
     proc generate_statement with ctx, then_stmt
 
     If else_stmt is not equal to 0:
-        proc emit_indent from ctx
+        proc emit_indent with ctx
         proc emit with ctx, "else "
         proc generate_statement with ctx, else_stmt
     End If
 End Process
 
 @Reasoning:
-Emits 'while (cond) body'. As in generate_if_statement, the body is
-passed straight to generate_statement on the assumption that the HIR
-already wraps multi-statement bodies in a block.
+Emits 'while (cond) body'.
 @End Reasoning
 
 @Implementation:
@@ -1109,56 +1051,256 @@ emit_indent + 'while (' + generate_expression(condition) + ') ' +
 generate_statement(body).
 @End Implementation
 Process called "generate_while_statement" takes ctx as Integer, while_node as Integer:
-    Let condition be proc hir_while_get_condition from HIR with while_node
-    Let body be proc hir_while_get_body from HIR with while_node
+    Let condition be proc hir_get_while_condition from HIR with while_node
+    Let body be proc hir_get_while_body from HIR with while_node
 
-    proc emit_indent from ctx
+    proc emit_indent with ctx
     proc emit with ctx, "while ("
-    proc generate_expression with ctx, condition
+    proc generate_expression with ctx, condition, 0
     proc emit with ctx, ") "
 
     proc generate_statement with ctx, body
 End Process
 
 @Reasoning:
-Emits 'return [expr];'. The value is optional - bare 'return;' is
-the typeless or void-returning form.
+Emits the C-style 'for (init; cond; update) body'. The init slot is a
+statement (declaration or expression statement); its own trailing
+semicolon/newline is suppressed by emitting the init inline. Condition
+and update are expressions. Empty header slots emit nothing between the
+separating semicolons.
 @End Reasoning
 
 @Implementation:
-emit_indent + 'return'. If hir_return_get_value is non-null appends
-' ' + generate_expression(value). Terminates with ';\n'.
+emit_indent + 'for ('. Emits the init via generate_for_init (inline, no
+newline), then '; '. Emits the condition expression if present, then
+'; '. Emits the update expression if present. Emits ') ' +
+generate_statement(body).
+@End Implementation
+Process called "generate_for_statement" takes ctx as Integer, for_node as Integer:
+    Let init be proc hir_get_for_init from HIR with for_node
+    Let condition be proc hir_get_for_condition from HIR with for_node
+    Let update be proc hir_get_for_update from HIR with for_node
+    Let body be proc hir_get_for_body from HIR with for_node
+
+    proc emit_indent with ctx
+    proc emit with ctx, "for ("
+
+    If init is not equal to 0:
+        proc generate_for_init with ctx, init
+    End If
+    proc emit with ctx, "; "
+
+    If condition is not equal to 0:
+        proc generate_expression with ctx, condition, 0
+    End If
+    proc emit with ctx, "; "
+
+    If update is not equal to 0:
+        proc generate_expression with ctx, update, 0
+    End If
+
+    proc emit with ctx, ") "
+
+    proc generate_statement with ctx, body
+End Process
+
+@Reasoning:
+The for-loop init is a statement in HIR but must be emitted inline (no
+indentation, no trailing ';\n') inside the for header. This helper
+emits the bare expression of an expression-statement init, or for any
+other statement kind, the underlying expression, without punctuation.
+@End Reasoning
+
+@Implementation:
+If the init is a HIR_EXPR_STMT, emits its inner expression. Otherwise
+treats the init as an expression and emits it directly. No semicolon or
+newline is appended; the for header supplies the separators.
+@End Implementation
+Process called "generate_for_init" takes ctx as Integer, init_node as Integer:
+    Let kind be proc hir_node_type from HIR with init_node
+    If kind is equal to HIR.HIR_EXPR_STMT:
+        Let inner be proc hir_get_expression_statement_expr from HIR with init_node
+        proc generate_expression with ctx, inner, 0
+        Return
+    End If
+
+    proc generate_expression with ctx, init_node, 0
+End Process
+
+@Reasoning:
+Emits 'do body while (cond);'. The do-while keeps body-first semantics.
+@End Reasoning
+
+@Implementation:
+emit_indent + 'do ' + generate_statement(body) + emit_indent + 'while ('
++ generate_expression(condition) + ');\n'.
+@End Implementation
+Process called "generate_do_while_statement" takes ctx as Integer, do_while_node as Integer:
+    Let body be proc hir_get_do_while_body from HIR with do_while_node
+    Let condition be proc hir_get_do_while_condition from HIR with do_while_node
+
+    proc emit_indent with ctx
+    proc emit with ctx, "do "
+    proc generate_statement with ctx, body
+    proc emit_indent with ctx
+    proc emit with ctx, "while ("
+    proc generate_expression with ctx, condition, 0
+    proc emit with ctx, ");\n"
+End Process
+
+@Reasoning:
+Emits 'return [expr];'. The value is optional.
+@End Reasoning
+
+@Implementation:
+emit_indent + 'return'. If hir_get_return_value is non-null appends ' '
++ generate_expression(value). Terminates ';\n'.
 @End Implementation
 Process called "generate_return_statement" takes ctx as Integer, return_node as Integer:
-    proc emit_indent from ctx
+    proc emit_indent with ctx
     proc emit with ctx, "return"
 
-    Let value be proc hir_return_get_value from HIR with return_node
+    Let value be proc hir_get_return_value from HIR with return_node
     If value is not equal to 0:
         proc emit with ctx, " "
-        proc generate_expression with ctx, value
+        proc generate_expression with ctx, value, 0
     End If
 
     proc emit with ctx, ";\n"
 End Process
 
 @Reasoning:
-Emits an expression evaluated for its side effect: 'expr;'. The
-emit_indent / trailing ';\n' separation here (rather than inside
-generate_expression) keeps expression generation reusable both as a
-statement and as a sub-expression of another expression without
-emitting stray semicolons.
+Emits a Solidity `try EXPR { ... } catch ... { ... }` statement. The
+try expression is preserved as "solidity_try_expr" metadata; the
+success body is the try block; the catch clauses are the catch list.
 @End Reasoning
 
 @Implementation:
-emit_indent + generate_expression(hir_expression_statement_get_expression)
-+ ';\n'.
+emit_indent + 'try ' + generate_expression(solidity_try_expr) + ' '.
+generate_statement(try_block). Iterates hir_get_catch_clauses emitting
+each via generate_catch_clause.
+@End Implementation
+Process called "generate_try_statement" takes ctx as Integer, try_node as Integer:
+    proc emit_indent with ctx
+    proc emit with ctx, "try "
+
+    Let try_expr be proc hir_get_metadata from HIR with try_node, "solidity_try_expr"
+    If try_expr is not equal to 0:
+        proc generate_expression with ctx, try_expr, 0
+        proc emit with ctx, " "
+    End If
+
+    Let try_block be proc hir_get_try_block from HIR with try_node
+    proc generate_statement with ctx, try_block
+
+    Let catches be proc hir_get_catch_clauses from HIR with try_node
+    Let catch_count be 0
+    If catches is not equal to 0:
+        Set catch_count to proc list_length from ListCore with catches
+    End If
+    Let i be 0
+    While i is less than catch_count:
+        Let catch_clause be proc list_get from ListCore with catches, i
+        proc generate_catch_clause with ctx, catch_clause
+        Set i to i plus 1
+    End While
+End Process
+
+@Reasoning:
+Emits 'catch (VAR) { body }' for one catch clause. The catch variable
+defaults to a low-level catch when not named.
+@End Reasoning
+
+@Implementation:
+emit_indent + 'catch '. If the catch variable is non-empty emits
+'(VAR) '. Emits generate_statement(catch_body).
+@End Implementation
+Process called "generate_catch_clause" takes ctx as Integer, catch_node as Integer:
+    proc emit_indent with ctx
+    proc emit with ctx, "catch "
+
+    Let catch_var be proc hir_get_catch_variable from HIR with catch_node
+    Let var_len be proc safe_string_length with catch_var
+    If var_len is greater than 0:
+        proc emit with ctx, "("
+        proc emit with ctx, catch_var
+        proc emit with ctx, ") "
+    End If
+
+    Let body be proc hir_get_catch_body from HIR with catch_node
+    proc generate_statement with ctx, body
+End Process
+
+@Reasoning:
+Emits a Solidity `revert ...;` statement from a HIR throw tagged
+"solidity_revert". The thrown expression is the error call/message; a
+bare 'revert' identifier round-trips to plain 'revert();'.
+@End Reasoning
+
+@Implementation:
+emit_indent + 'revert'. Reads the throw expression. If it is the bare
+'revert' identifier, emits '()'. Otherwise emits ' ' + the expression.
+Terminates ';\n'.
+@End Implementation
+Process called "generate_throw_statement" takes ctx as Integer, throw_node as Integer:
+    proc emit_indent with ctx
+    proc emit with ctx, "revert"
+
+    Let expr be proc hir_get_throw_expression from HIR with throw_node
+    Let expr_kind be proc hir_node_type from HIR with expr
+    Let is_bare be 0
+    If expr_kind is equal to HIR.HIR_IDENTIFIER:
+        Let name be proc hir_get_identifier_name from HIR with expr
+        Let is_revert be proc safe_string_equals with name, "revert"
+        If is_revert is equal to 1:
+            Set is_bare to 1
+        End If
+    End If
+
+    If is_bare is equal to 1:
+        proc emit with ctx, "()"
+    Otherwise:
+        proc emit with ctx, " "
+        proc generate_expression with ctx, expr, 0
+    End If
+
+    proc emit with ctx, ";\n"
+End Process
+
+@Reasoning:
+Emits an expression evaluated for its side effect: 'expr;'. An emit
+statement (tagged "solidity_emit") prefixes the 'emit' keyword; an
+assembly carrier (tagged "solidity_assembly") emits the raw assembly
+block verbatim.
+@End Reasoning
+
+@Implementation:
+emit_indent. If "solidity_assembly" is present, emits 'assembly ' +
+the raw body and ';\n' is omitted (assembly blocks self-terminate with
+their braces). If "solidity_emit" is present emits 'emit '. Then
+generate_expression(inner) + ';\n'.
 @End Implementation
 Process called "generate_expression_statement" takes ctx as Integer, expr_stmt as Integer:
-    Let expr be proc hir_expression_statement_get_expression from HIR with expr_stmt
+    Let assembly be proc hir_get_metadata from HIR with expr_stmt, "solidity_assembly"
+    Let assembly_len be proc safe_string_length with assembly
+    If assembly_len is greater than 0:
+        proc emit_indent with ctx
+        proc emit with ctx, "assembly "
+        proc emit with ctx, assembly
+        proc emit with ctx, "\n"
+        Return
+    End If
 
-    proc emit_indent from ctx
-    proc generate_expression with ctx, expr
+    proc emit_indent with ctx
+
+    Let is_emit be proc hir_get_metadata from HIR with expr_stmt, "solidity_emit"
+    Let emit_len be proc safe_string_length with is_emit
+    If emit_len is greater than 0:
+        proc emit with ctx, "emit "
+    End If
+
+    Let expr be proc hir_get_expression_statement_expr from HIR with expr_stmt
+    proc generate_expression with ctx, expr, 0
     proc emit with ctx, ";\n"
 End Process
 
@@ -1167,168 +1309,269 @@ Note: EXPRESSION GENERATION
 Note: ===================================================================
 
 @Reasoning:
-Expression-level dispatcher. Tests each expression kind via the
-corresponding hir_is_* predicate and routes to the dedicated
-generator. Literal kinds (integer/string/boolean/identifier) are
-inlined here because they reduce to a single emit pair.
+Expression-level dispatcher driven by hir_node_type. The parent_prec
+argument is the binding strength of the enclosing operator; binary
+sub-expressions use it to decide parenthesisation. Literal kinds are
+inlined here since each reduces to one emit pair. Number literals
+(tagged "solidity_number") emit their exact lexeme unquoted; plain
+string literals emit with quotes; booleans emit true/false.
 @End Reasoning
 
 @Implementation:
-Cascade of predicate calls: _is_binary -> generate_binary_expression;
-_is_unary -> generate_unary_expression; _is_call -> generate_call;
-_is_member -> generate_member; _is_index -> generate_index;
-_is_integer_literal -> emit raw integer text; _is_string_literal ->
-emit '"VALUE"' with quotes; _is_boolean_literal -> emit 'true' or
-'false' based on the 0/1 value; _is_identifier -> emit the
-identifier name. Unknown kinds fall through with no emission.
+hir_node_type cascade: HIR_BINARY_EXPR -> generate_binary_expression;
+HIR_UNARY_EXPR -> generate_unary_expression; HIR_ASSIGN_EXPR ->
+generate_assign_expression; HIR_TERNARY_EXPR -> generate_ternary_expression;
+HIR_CALL_EXPR -> generate_call_expression; HIR_NEW -> generate_new_expression;
+HIR_MEMBER_EXPR -> generate_member_expression; HIR_INDEX_EXPR ->
+generate_index_expression; HIR_LIST_LITERAL -> generate_array_literal;
+HIR_STRING_LITERAL -> bare-or-quoted by "solidity_number"; HIR_INT_LITERAL
+-> integer text; HIR_BOOL_LITERAL -> true/false; HIR_IDENTIFIER -> name.
 @End Implementation
-Process called "generate_expression" takes ctx as Integer, expr_node as Integer:
-    Note: Binary expression
-    Let is_binary be proc hir_is_binary_expression from HIR with expr_node
-    If is_binary is equal to 1:
-        proc generate_binary_expression with ctx, expr_node
+Process called "generate_expression" takes ctx as Integer, expr_node as Integer, parent_prec as Integer:
+    If expr_node is equal to 0:
         Return
     End If
 
-    Note: Unary expression
-    Let is_unary be proc hir_is_unary_expression from HIR with expr_node
-    If is_unary is equal to 1:
+    Let kind be proc hir_node_type from HIR with expr_node
+
+    If kind is equal to HIR.HIR_BINARY_EXPR:
+        proc generate_binary_expression with ctx, expr_node, parent_prec
+        Return
+    End If
+    If kind is equal to HIR.HIR_UNARY_EXPR:
         proc generate_unary_expression with ctx, expr_node
         Return
     End If
-
-    Note: Call expression
-    Let is_call be proc hir_is_call_expression from HIR with expr_node
-    If is_call is equal to 1:
+    If kind is equal to HIR.HIR_ASSIGN_EXPR:
+        proc generate_assign_expression with ctx, expr_node
+        Return
+    End If
+    If kind is equal to HIR.HIR_TERNARY_EXPR:
+        proc generate_ternary_expression with ctx, expr_node
+        Return
+    End If
+    If kind is equal to HIR.HIR_CALL_EXPR:
         proc generate_call_expression with ctx, expr_node
         Return
     End If
-
-    Note: Member expression
-    Let is_member be proc hir_is_member_expression from HIR with expr_node
-    If is_member is equal to 1:
+    If kind is equal to HIR.HIR_NEW:
+        proc generate_new_expression with ctx, expr_node
+        Return
+    End If
+    If kind is equal to HIR.HIR_MEMBER_EXPR:
         proc generate_member_expression with ctx, expr_node
         Return
     End If
-
-    Note: Index expression
-    Let is_index be proc hir_is_index_expression from HIR with expr_node
-    If is_index is equal to 1:
+    If kind is equal to HIR.HIR_INDEX_EXPR:
         proc generate_index_expression with ctx, expr_node
         Return
     End If
-
-    Note: Literals
-    Let is_integer be proc hir_is_integer_literal from HIR with expr_node
-    If is_integer is equal to 1:
-        Let value be proc hir_integer_literal_get_value from HIR with expr_node
-        proc emit with ctx, value
+    If kind is equal to HIR.HIR_LIST_LITERAL:
+        proc generate_array_literal with ctx, expr_node
         Return
     End If
-
-    Let is_string be proc hir_is_string_literal from HIR with expr_node
-    If is_string is equal to 1:
-        Set value to proc hir_string_literal_get_value from HIR with expr_node
-        proc emit with ctx, "\""
-        proc emit with ctx, value
-        proc emit with ctx, "\""
+    If kind is equal to HIR.HIR_STRING_LITERAL:
+        Let is_number be proc hir_get_metadata from HIR with expr_node, "solidity_number"
+        Let number_len be proc safe_string_length with is_number
+        Let str_value be proc hir_get_string_literal_value from HIR with expr_node
+        If number_len is greater than 0:
+            proc emit with ctx, str_value
+        Otherwise:
+            proc emit with ctx, "\""
+            proc emit with ctx, str_value
+            proc emit with ctx, "\""
+        End If
         Return
     End If
-
-    Let is_boolean be proc hir_is_boolean_literal from HIR with expr_node
-    If is_boolean is equal to 1:
-        Set value to proc hir_boolean_literal_get_value from HIR with expr_node
-        If value is equal to 1:
+    If kind is equal to HIR.HIR_INT_LITERAL:
+        Let int_value be proc hir_get_int_literal_value from HIR with expr_node
+        proc emit_int with ctx, int_value
+        Return
+    End If
+    If kind is equal to HIR.HIR_BOOL_LITERAL:
+        Let bool_value be proc hir_get_bool_literal_value from HIR with expr_node
+        If bool_value is equal to 1:
             proc emit with ctx, "true"
         Otherwise:
             proc emit with ctx, "false"
         End If
         Return
     End If
-
-    Note: Identifier
-    Let is_identifier be proc hir_is_identifier from HIR with expr_node
-    If is_identifier is equal to 1:
-        Let name be proc hir_identifier_get_name from HIR with expr_node
+    If kind is equal to HIR.HIR_IDENTIFIER:
+        Let name be proc hir_get_identifier_name from HIR with expr_node
         proc emit with ctx, name
         Return
     End If
 End Process
 
 @Reasoning:
-Emits 'LEFT OP RIGHT'. Unlike the PHP backend, the Solidity backend
-does NOT wrap binary expressions in parentheses; the caller is
-expected to ensure that the surrounding context respects Solidity
-operator precedence, or to insert explicit parenthesisation in HIR
-when needed.
+Emits 'LEFT OP RIGHT' using the exact Solidity operator spelling from
+"solidity_operator" metadata. The whole expression is wrapped in
+parentheses when its precedence is strictly less than the enclosing
+operator's precedence, and each operand is generated with this
+operator's precedence as the parent so nested lower-precedence
+sub-expressions parenthesise themselves. This guarantees the re-emitted
+source re-parses to a structurally identical tree.
 @End Reasoning
 
 @Implementation:
-Reads operator, left, right via HIR accessors. Generates left,
-emits ' OP ', generates right.
+Reads the operator string (or maps the HIR opcode when metadata is
+absent) and its precedence. Computes self_prec. If self_prec <
+parent_prec, emits '(' ... ')'. Generates left with self_prec, ' OP ',
+right with self_prec.
 @End Implementation
-Process called "generate_binary_expression" takes ctx as Integer, binary_node as Integer:
-    Let operator be proc hir_binary_get_operator from HIR with binary_node
-    Let left be proc hir_binary_get_left from HIR with binary_node
-    Let right be proc hir_binary_get_right from HIR with binary_node
+Process called "generate_binary_expression" takes ctx as Integer, binary_node as Integer, parent_prec as Integer:
+    Let operator be proc hir_get_metadata from HIR with binary_node, "solidity_operator"
+    Let op_len be proc safe_string_length with operator
+    If op_len is equal to 0:
+        Let opcode be proc hir_get_binary_op from HIR with binary_node
+        Set operator to proc opcode_to_solidity with opcode
+    End If
 
-    proc generate_expression with ctx, left
+    Let left be proc hir_get_binary_left from HIR with binary_node
+    Let right be proc hir_get_binary_right from HIR with binary_node
+
+    Let self_prec be proc solidity_operator_precedence with operator
+
+    Let needs_paren be 0
+    If self_prec is less than parent_prec:
+        Set needs_paren to 1
+    End If
+
+    If needs_paren is equal to 1:
+        proc emit with ctx, "("
+    End If
+
+    proc generate_expression with ctx, left, self_prec
     proc emit with ctx, " "
     proc emit with ctx, operator
     proc emit with ctx, " "
-    proc generate_expression with ctx, right
+    proc generate_expression with ctx, right, self_prec
+
+    If needs_paren is equal to 1:
+        proc emit with ctx, ")"
+    End If
 End Process
 
 @Reasoning:
-Emits an unconditional prefix unary form 'OP OPERAND' (no postfix
-support). Solidity admits prefix '!', '-', '~', '++', '--' on
-expressions; the postfix '++' and '--' forms are not generated here -
-HIR-side lowering must convert any postfix forms to compound
-assignments before reaching this backend.
+Emits a Solidity unary form. Prefix operators ('!', '-', '~', '++',
+'--', 'delete') are emitted before the operand; postfix '++'/'--'
+after. The exact operator comes from "solidity_unary_operator"; the
+"solidity_prefix" flag selects position. `delete` requires a trailing
+space before its operand.
 @End Reasoning
 
 @Implementation:
-Reads operator and operand. Emits operator, then recurses into
-generate_expression for the operand.
+Reads operator and prefix flag. For prefix: emit operator (+ a space
+for the 'delete' keyword) then the operand at unary precedence. For
+postfix: emit the operand then the operator.
 @End Implementation
 Process called "generate_unary_expression" takes ctx as Integer, unary_node as Integer:
-    Let operator be proc hir_unary_get_operator from HIR with unary_node
-    Let operand be proc hir_unary_get_operand from HIR with unary_node
+    Let operator be proc hir_get_metadata from HIR with unary_node, "solidity_unary_operator"
+    Let op_len be proc safe_string_length with operator
+    If op_len is equal to 0:
+        Let opcode be proc hir_get_unary_op from HIR with unary_node
+        Set operator to proc unary_opcode_to_solidity with opcode
+    End If
 
-    proc emit with ctx, operator
-    proc generate_expression with ctx, operand
+    Let operand be proc hir_get_unary_operand from HIR with unary_node
+    Let prefix_flag be proc hir_get_metadata from HIR with unary_node, "solidity_prefix"
+    Let is_postfix be proc safe_string_equals with prefix_flag, "false"
+
+    Let unary_prec be 13
+
+    If is_postfix is equal to 1:
+        proc generate_expression with ctx, operand, unary_prec
+        proc emit with ctx, operator
+    Otherwise:
+        proc emit with ctx, operator
+        Let is_delete be proc safe_string_equals with operator, "delete"
+        If is_delete is equal to 1:
+            proc emit with ctx, " "
+        End If
+        proc generate_expression with ctx, operand, unary_prec
+    End If
 End Process
 
 @Reasoning:
-Emits 'CALLEE(arg1, arg2, ...)'. The callee is itself a general
-expression so member calls (a.b()), index expressions, and chained
-calls all emit correctly through the recursive generate_expression
-path.
+Emits a Solidity assignment 'LHS OP RHS' (OP is '=' or a compound
+operator like '+='). The whole assignment is the lowest-precedence
+expression form, so it parenthesises itself when embedded in a tighter
+context.
 @End Reasoning
 
 @Implementation:
-Generates the callee expression. Emits '('. Iterates
-hir_call_get_arguments, generating each and inserting ', ' between
-adjacent arguments (not after the last). Emits ')'.
+Reads lhs, the operator string, and rhs. Generates lhs, ' OP ', rhs.
+Assignment uses precedence 1 (same as the lowest level) for its
+operands so nested assignments and ternaries do not over-parenthesise.
+@End Implementation
+Process called "generate_assign_expression" takes ctx as Integer, assign_node as Integer:
+    Let lhs be proc hir_get_assign_lhs from HIR with assign_node
+    Let rhs be proc hir_get_assign_rhs from HIR with assign_node
+    Let operator be proc hir_get_metadata from HIR with assign_node, "solidity_operator"
+    Let op_len be proc safe_string_length with operator
+    If op_len is equal to 0:
+        Set operator to proc hir_get_assign_op from HIR with assign_node
+    End If
+
+    proc generate_expression with ctx, lhs, 1
+    proc emit with ctx, " "
+    proc emit with ctx, operator
+    proc emit with ctx, " "
+    proc generate_expression with ctx, rhs, 1
+End Process
+
+@Reasoning:
+Emits 'cond ? then : else'. The ternary is the second-lowest precedence
+form; its operands are generated at ternary precedence.
+@End Reasoning
+
+@Implementation:
+Reads condition/then/else and emits 'C ? T : E' with each operand at
+ternary precedence (1).
+@End Implementation
+Process called "generate_ternary_expression" takes ctx as Integer, ternary_node as Integer:
+    Let condition be proc hir_get_ternary_condition from HIR with ternary_node
+    Let then_expr be proc hir_get_ternary_then from HIR with ternary_node
+    Let else_expr be proc hir_get_ternary_else from HIR with ternary_node
+
+    proc generate_expression with ctx, condition, 1
+    proc emit with ctx, " ? "
+    proc generate_expression with ctx, then_expr, 1
+    proc emit with ctx, " : "
+    proc generate_expression with ctx, else_expr, 1
+End Process
+
+@Reasoning:
+Emits 'CALLEE(arg1, arg2, ...)'. The callee is a general expression, so
+member calls and chained calls emit correctly through the recursive
+path. A 'payable'/cast call (tagged solidity_payable/solidity_cast) is
+just a regular call on the payable/type identifier.
+@End Reasoning
+
+@Implementation:
+Generates the callee at primary precedence. Emits '('. Iterates
+hir_get_call_arguments generating each (at lowest precedence so commas
+separate them) with ', ' between. Emits ')'.
 @End Implementation
 Process called "generate_call_expression" takes ctx as Integer, call_node as Integer:
-    Let callee be proc hir_call_get_callee from HIR with call_node
-    Let arguments be proc hir_call_get_arguments from HIR with call_node
+    Let callee be proc hir_get_call_callee from HIR with call_node
 
-    proc generate_expression with ctx, callee
+    proc generate_expression with ctx, callee, 13
     proc emit with ctx, "("
 
-    Let arg_count be proc list_length from ListCore with arguments
+    Let arguments be proc hir_get_call_arguments from HIR with call_node
+    Let arg_count be 0
+    If arguments is not equal to 0:
+        Set arg_count to proc list_length from ListCore with arguments
+    End If
     Let i be 0
-
     While i is less than arg_count:
         Let arg be proc list_get from ListCore with arguments, i
-        proc generate_expression with ctx, arg
-
+        proc generate_expression with ctx, arg, 1
         If i is less than arg_count minus 1:
             proc emit with ctx, ", "
         End If
-
         Set i to i plus 1
     End While
 
@@ -1336,43 +1579,279 @@ Process called "generate_call_expression" takes ctx as Integer, call_node as Int
 End Process
 
 @Reasoning:
-Emits 'OBJECT.MEMBER'. Solidity uses '.' for both contract-member
-access and struct-field access; the syntactic form is identical so
-this one routine covers both.
+Emits 'new TYPE(args)'. The new operator allocates a new instance
+(contract deployment) or array.
 @End Reasoning
 
 @Implementation:
-Generates the object expression. Emits '.'. Emits the member name
-verbatim.
+Reads the type name. Emits 'new TYPE('. Iterates hir_get_new_arguments
+generating each with ', ' between. Emits ')'.
+@End Implementation
+Process called "generate_new_expression" takes ctx as Integer, new_node as Integer:
+    Let type_name be proc hir_get_new_type_name from HIR with new_node
+
+    proc emit with ctx, "new "
+    proc emit with ctx, type_name
+    proc emit with ctx, "("
+
+    Let arguments be proc hir_get_new_arguments from HIR with new_node
+    Let arg_count be 0
+    If arguments is not equal to 0:
+        Set arg_count to proc list_length from ListCore with arguments
+    End If
+    Let i be 0
+    While i is less than arg_count:
+        Let arg be proc list_get from ListCore with arguments, i
+        proc generate_expression with ctx, arg, 1
+        If i is less than arg_count minus 1:
+            proc emit with ctx, ", "
+        End If
+        Set i to i plus 1
+    End While
+
+    proc emit with ctx, ")"
+End Process
+
+@Reasoning:
+Emits 'OBJECT.MEMBER'. Solidity uses '.' for both contract-member and
+struct-field access; the syntactic form is identical.
+@End Reasoning
+
+@Implementation:
+Generates the object at primary precedence. Emits '.'. Emits the member
+name.
 @End Implementation
 Process called "generate_member_expression" takes ctx as Integer, member_node as Integer:
-    Let object be proc hir_member_get_object from HIR with member_node
-    Let member_name be proc hir_member_get_name from HIR with member_node
+    Let object be proc hir_get_member_object from HIR with member_node
+    Let member_name be proc hir_get_member_name from HIR with member_node
 
-    proc generate_expression with ctx, object
+    proc generate_expression with ctx, object, 13
     proc emit with ctx, "."
     proc emit with ctx, member_name
 End Process
 
 @Reasoning:
-Emits 'OBJECT[INDEX]'. Solidity uses [] subscript for arrays
-(fixed-size and dynamic) and mappings. The index expression's type
-is determined by the object's type at the HIR layer; this generator
-treats them uniformly.
+Emits 'OBJECT[INDEX]'. Solidity uses [] for arrays and mappings.
 @End Reasoning
 
 @Implementation:
-Generates the object expression. Emits '['. Generates the index
-expression. Emits ']'.
+Generates the object at primary precedence. Emits '['. Generates the
+index at lowest precedence. Emits ']'.
 @End Implementation
 Process called "generate_index_expression" takes ctx as Integer, index_node as Integer:
-    Let object be proc hir_index_get_object from HIR with index_node
-    Let index be proc hir_index_get_index from HIR with index_node
+    Let object be proc hir_get_index_object from HIR with index_node
+    Let index be proc hir_get_index_value from HIR with index_node
 
-    proc generate_expression with ctx, object
+    proc generate_expression with ctx, object, 13
     proc emit with ctx, "["
-    proc generate_expression with ctx, index
+    proc generate_expression with ctx, index, 1
     proc emit with ctx, "]"
+End Process
+
+@Reasoning:
+Emits an inline array literal '[e1, e2, ...]'.
+@End Reasoning
+
+@Implementation:
+Emits '['. Iterates hir_get_list_elements generating each at lowest
+precedence with ', ' between. Emits ']'.
+@End Implementation
+Process called "generate_array_literal" takes ctx as Integer, array_node as Integer:
+    proc emit with ctx, "["
+
+    Let elements be proc hir_get_list_elements from HIR with array_node
+    Let element_count be 0
+    If elements is not equal to 0:
+        Set element_count to proc list_length from ListCore with elements
+    End If
+    Let i be 0
+    While i is less than element_count:
+        Let element be proc list_get from ListCore with elements, i
+        proc generate_expression with ctx, element, 1
+        If i is less than element_count minus 1:
+            proc emit with ctx, ", "
+        End If
+        Set i to i plus 1
+    End While
+
+    proc emit with ctx, "]"
+End Process
+
+Note: ===================================================================
+Note: OPERATOR PRECEDENCE AND OPCODE MAPPING
+Note: ===================================================================
+
+@Reasoning:
+Maps a Solidity binary-operator lexeme to its precedence level (low ->
+high, 1..12 per the table in the file header). Used to decide
+parenthesisation so the re-emitted expression re-parses to the same
+tree. Comparison ladder over the operator strings.
+@End Reasoning
+
+@Implementation:
+string_equals comparisons returning the integer precedence; unknown
+operators get 2 (just above ternary) as a conservative default that
+never strips required parentheses.
+@End Implementation
+Process called "solidity_operator_precedence" takes operator as Integer returns Integer:
+    If proc safe_string_equals with operator, "||" is equal to 1:
+        Return 2
+    End If
+    If proc safe_string_equals with operator, "&&" is equal to 1:
+        Return 3
+    End If
+    If proc safe_string_equals with operator, "==" is equal to 1:
+        Return 4
+    End If
+    If proc safe_string_equals with operator, "!=" is equal to 1:
+        Return 4
+    End If
+    If proc safe_string_equals with operator, "<" is equal to 1:
+        Return 5
+    End If
+    If proc safe_string_equals with operator, "<=" is equal to 1:
+        Return 5
+    End If
+    If proc safe_string_equals with operator, ">" is equal to 1:
+        Return 5
+    End If
+    If proc safe_string_equals with operator, ">=" is equal to 1:
+        Return 5
+    End If
+    If proc safe_string_equals with operator, "|" is equal to 1:
+        Return 6
+    End If
+    If proc safe_string_equals with operator, "^" is equal to 1:
+        Return 7
+    End If
+    If proc safe_string_equals with operator, "&" is equal to 1:
+        Return 8
+    End If
+    If proc safe_string_equals with operator, "<<" is equal to 1:
+        Return 9
+    End If
+    If proc safe_string_equals with operator, ">>" is equal to 1:
+        Return 9
+    End If
+    If proc safe_string_equals with operator, "+" is equal to 1:
+        Return 10
+    End If
+    If proc safe_string_equals with operator, "-" is equal to 1:
+        Return 10
+    End If
+    If proc safe_string_equals with operator, "*" is equal to 1:
+        Return 11
+    End If
+    If proc safe_string_equals with operator, "/" is equal to 1:
+        Return 11
+    End If
+    If proc safe_string_equals with operator, "%" is equal to 1:
+        Return 11
+    End If
+    If proc safe_string_equals with operator, "**" is equal to 1:
+        Return 12
+    End If
+
+    Return 2
+End Process
+
+@Reasoning:
+Fallback operator-string recovery from an HIR opcode when the
+"solidity_operator" metadata is absent (e.g. HIR built by a non-Solidity
+producer feeding this backend). Returns the canonical Solidity spelling
+for each HIR_OP_* binary code.
+@End Reasoning
+
+@Implementation:
+If-ladder over the HIR_OP_* binary opcode constants returning the
+matching Solidity operator string; defaults to '+'.
+@End Implementation
+Process called "opcode_to_solidity" takes opcode as Integer returns Integer:
+    If opcode is equal to HIR.HIR_OP_ADD:
+        Return "+"
+    End If
+    If opcode is equal to HIR.HIR_OP_SUBTRACT:
+        Return "-"
+    End If
+    If opcode is equal to HIR.HIR_OP_MULTIPLY:
+        Return "*"
+    End If
+    If opcode is equal to HIR.HIR_OP_DIVIDE:
+        Return "/"
+    End If
+    If opcode is equal to HIR.HIR_OP_MODULO:
+        Return "%"
+    End If
+    If opcode is equal to HIR.HIR_OP_EQUAL:
+        Return "=="
+    End If
+    If opcode is equal to HIR.HIR_OP_NOT_EQUAL:
+        Return "!="
+    End If
+    If opcode is equal to HIR.HIR_OP_LESS_THAN:
+        Return "<"
+    End If
+    If opcode is equal to HIR.HIR_OP_LESS_EQUAL:
+        Return "<="
+    End If
+    If opcode is equal to HIR.HIR_OP_GREATER_THAN:
+        Return ">"
+    End If
+    If opcode is equal to HIR.HIR_OP_GREATER_EQUAL:
+        Return ">="
+    End If
+    If opcode is equal to HIR.HIR_OP_LOGICAL_AND:
+        Return "&&"
+    End If
+    If opcode is equal to HIR.HIR_OP_LOGICAL_OR:
+        Return "||"
+    End If
+    If opcode is equal to HIR.HIR_OP_BITWISE_AND:
+        Return "&"
+    End If
+    If opcode is equal to HIR.HIR_OP_BITWISE_OR:
+        Return "|"
+    End If
+    If opcode is equal to HIR.HIR_OP_BITWISE_XOR:
+        Return "^"
+    End If
+    If opcode is equal to HIR.HIR_OP_SHIFT_LEFT:
+        Return "<<"
+    End If
+    If opcode is equal to HIR.HIR_OP_SHIFT_RIGHT:
+        Return ">>"
+    End If
+
+    Return "+"
+End Process
+
+@Reasoning:
+Fallback unary-operator recovery from an HIR opcode when the
+"solidity_unary_operator" metadata is absent.
+@End Reasoning
+
+@Implementation:
+If-ladder over the HIR_OP_* unary opcode constants returning the
+matching Solidity unary spelling; defaults to '!'.
+@End Implementation
+Process called "unary_opcode_to_solidity" takes opcode as Integer returns Integer:
+    If opcode is equal to HIR.HIR_OP_LOGICAL_NOT:
+        Return "!"
+    End If
+    If opcode is equal to HIR.HIR_OP_NEGATE:
+        Return "-"
+    End If
+    If opcode is equal to HIR.HIR_OP_BITWISE_NOT:
+        Return "~"
+    End If
+    If opcode is equal to HIR.HIR_OP_INCREMENT:
+        Return "++"
+    End If
+    If opcode is equal to HIR.HIR_OP_DECREMENT:
+        Return "--"
+    End If
+
+    Return "!"
 End Process
 
 Note: ===================================================================
@@ -1380,29 +1859,23 @@ Note: TYPE EXPRESSION GENERATION
 Note: ===================================================================
 
 @Reasoning:
-Emits a Solidity type reference. The input may be either a raw string
-('uint256', 'address payable', 'mapping(...)', etc.) or an HIR type
-node. The is_string_value probe lets either form work without the
-caller knowing which kind it has on hand - useful because metadata
-slots often carry strings while AST slots carry HIR nodes.
+Emits a Solidity type reference held as a raw string ('uint256',
+'address', 'mapping(address => uint256)', etc.). When the type is
+absent (0 or empty) emits 'var' as a defensive placeholder so the
+output stays syntactically shaped, though well-formed Solidity HIR
+always supplies the type.
 @End Reasoning
 
 @Implementation:
-Calls is_string_value on the input. If 1, emits the input directly
-(string-literal form). Otherwise treats it as an HIR type node and
-emits hir_type_get_name.
+If the type string is non-empty emits it; otherwise emits 'var'.
 @End Implementation
-Process called "generate_type_expression" takes ctx as Integer, type_expr as Integer:
-    Note: Handle type node or string
-    Let is_string be proc is_string_value from type_expr
-    If is_string is equal to 1:
+Process called "emit_type" takes ctx as Integer, type_expr as Integer:
+    Let type_len be proc safe_string_length with type_expr
+    If type_len is greater than 0:
         proc emit with ctx, type_expr
-        Return
+    Otherwise:
+        proc emit with ctx, "var"
     End If
-
-    Note: Handle HIR type nodes
-    Let type_name be proc hir_type_get_name from HIR with type_expr
-    proc emit with ctx, type_name
 End Process
 
 Note: ===================================================================
@@ -1410,100 +1883,71 @@ Note: METADATA UTILITIES
 Note: ===================================================================
 
 @Reasoning:
-HIR metadata is encoded as an interleaved flat List of
-[key1, val1, key2, val2, ...]. This routine collects all values
-whose preceding key matches the supplied key string. Some metadata
-keys are inherently multi-valued (modifiers, inheritance bases) so
-duplicates are preserved in declared order. A null metadata pointer
-or missing key yields an empty list rather than null so the caller
-can iterate without a null-check.
+The multi-valued metadata keys this backend reads (solidity_modifier,
+solidity_inherits, solidity_return) are written by the solidity_to_hir
+frontend as a SINGLE ListCore handle per key (the HIR property
+dictionary overwrites repeated keys, so the frontend accumulates all
+values into one list and stores it once). This helper therefore just
+normalises the stored value into a List the caller can iterate: the
+list handle itself when present, or a fresh empty list when the key is
+absent (0), so callers never null-check.
 @End Reasoning
 
 @Implementation:
-Allocates a fresh empty List via list_create. Null metadata returns
-the empty list. Iterates 0..count in steps of 2: reads
-metadata[i] as a key, compares against the requested key via
-string_equals; on match reads metadata[i+1] (if in bounds) and
-appends to the values list. Returns the populated list.
+Returns a fresh empty list when meta is 0; otherwise returns meta
+directly (it is the ListCore handle the frontend stored).
 @End Implementation
-Process called "get_all_metadata_values" takes metadata as Integer, key as Integer returns Integer:
-    Let values be proc list_create from ListCore
-
-    If metadata is equal to 0:
-        Return values
+Process called "get_all_metadata_values" takes meta as Integer returns Integer:
+    If meta is equal to 0:
+        Return proc list_create from ListCore
     End If
-
-    Let count be proc list_length from ListCore with metadata
-    Let i be 0
-
-    While i is less than count:
-        Let metadata_key be proc list_get from ListCore with metadata, i
-        Let matches be proc string_equals from StringCore with metadata_key, key
-
-        If matches is equal to 1:
-            Let value_index be i plus 1
-            If value_index is less than count:
-                Let value be proc list_get from ListCore with metadata, value_index
-                proc list_append from ListCore with values, value
-            End If
-        End If
-
-        Set i to i plus 2
-    End While
-
-    Return values
+    Return meta
 End Process
 
 @Reasoning:
-Tag-discriminator for the metadata/AST polymorphic input accepted by
-generate_type_expression. Tries the HIR-side string predicate first;
-if that fails, applies a heuristic memory probe: real
-StringCore handles store a length integer in their first 8 bytes
-that lies in a plausible range [0, 1MB), whereas AST node handles
-store a type tag that does not. The probe is safe on Layout-allocated
-memory and avoids false positives in practice for typical Solidity
-HIR shapes.
+Resolves a callable node's parameter List in one step. hir_get_parameters
+returns the callable as its own collection handle; hir_get_parameter_list
+resolves that to the ordered List. Centralised so every member generator
+reads parameters identically.
 @End Reasoning
 
 @Implementation:
-Null short-circuits to 0. Calls is_string_hir from HIR; on match
-returns 1. Otherwise reads the first i64 at the input pointer and
-checks 0 <= length < 1048576; if so returns 1 (likely string).
-Otherwise returns 0 (likely HIR node).
+hir_get_parameter_list(hir_get_parameters(node)).
 @End Implementation
+Process called "get_parameter_list" takes callable as Integer returns Integer:
+    Let params be proc hir_get_parameters from HIR with callable
+    Return proc hir_get_parameter_list from HIR with params
+End Process
 
-@Security_Scope:
-The memory probe assumes the input pointer is at least 8 bytes of
-allocated memory; this is always true for Layout.allocate results
-and StringCore handles. Callers must not pass arbitrary integers.
-@End Security_Scope
-Process called "is_string_value" takes value as Integer returns Integer:
-    Note: Check if value is a string by examining its type tag or structure
+@Reasoning:
+Null-safe string length. Metadata reads can legitimately return 0 for an
+absent key; string_length on 0 is undefined, so this wrapper returns 0
+length for a null handle.
+@End Reasoning
 
-    If value is equal to 0:
+@Implementation:
+Returns 0 when str is 0; otherwise string_length(str).
+@End Implementation
+Process called "safe_string_length" takes str as Integer returns Integer:
+    If str is equal to 0:
         Return 0
     End If
+    Return proc string_length from StringCore with str
+End Process
 
-    Note: Try to use HIR type checking if available
-    Let is_hir_string be proc is_string_hir from HIR with value
+@Reasoning:
+Null-safe string equality. A metadata read of an absent key returns 0;
+comparing 0 against a literal must yield "not equal" without faulting.
+@End Reasoning
 
-    If is_hir_string is equal to 1:
-        Return 1
+@Implementation:
+Returns 0 when a is 0; otherwise string_equals(a, b).
+@End Implementation
+Process called "safe_string_equals" takes a as Integer, b as Integer returns Integer:
+    If a is equal to 0:
+        Return 0
     End If
-
-    Note: Check if this is a raw string pointer by attempting memory access
-    Note: Strings in memory typically have a length field followed by data
-    Note: We can check if the first 8 bytes contain a reasonable length value
-    Let possible_length be proc memory_get_int64 from Layout with value, 0
-
-    Note: Reasonable string length check (between 0 and 1MB)
-    If possible_length is greater than or equal to 0 and possible_length is less than 1048576:
-        Note: Likely a string - check if next bytes are readable text
-        Return 1
-    End If
-
-    Note: If HIR type check returns false and memory check fails, not a string
-    Return 0
+    Return proc string_equals from StringCore with a, b
 End Process
 
 Note: ===================================================================
@@ -1511,29 +1955,39 @@ Note: OUTPUT UTILITIES
 Note: ===================================================================
 
 @Reasoning:
-The output primitive: appends a chunk of text to the context's
-running output string. Every other generate_* routine flows its
-output through here.
+The output primitive: appends a chunk of text to the context's running
+output string. Every other generate_* routine flows through here.
 @End Reasoning
 
 @Implementation:
-ctx.output := StringCore.string_concat(ctx.output, text). The concat
-allocates a fresh string each call; this is O(N) per emission but
-acceptable for the bootstrap's small input sizes.
+ctx.output := string_concat(ctx.output, text).
 @End Implementation
 Process called "emit" takes ctx as Integer, text as Integer:
-    Set ctx.output to proc string_concat from StringCore with ctx.output, text
+    Set ctx.output to proc string_concat from StringUtils with ctx.output, text
 End Process
 
 @Reasoning:
-Writes four spaces times the current indent_level. Solidity's
-de-facto style guide (per the official documentation) prescribes
-four-space indentation; this routine encodes that style.
+Emits an integer value as its decimal text. Used for HIR_INT_LITERAL
+nodes that carry a raw int64 payload (Solidity number literals usually
+arrive as exact-lexeme string literals, but a core-built integer
+literal feeding this backend is rendered here).
 @End Reasoning
 
 @Implementation:
-Loop 0..ctx.indent_level: each iteration emits a four-space string.
-No-op at indent_level 0.
+Converts the integer to a string via int_to_string and emits it.
+@End Implementation
+Process called "emit_int" takes ctx as Integer, value as Integer:
+    Let text be proc integer_to_string from StringUtils with value
+    proc emit with ctx, text
+End Process
+
+@Reasoning:
+Writes four spaces per current indent level. Solidity's de-facto style
+guide prescribes four-space indentation.
+@End Reasoning
+
+@Implementation:
+Loop 0..ctx.indent_level emitting a four-space string each iteration.
 @End Implementation
 Process called "emit_indent" takes ctx as Integer:
     Let i be 0
@@ -1544,9 +1998,8 @@ Process called "emit_indent" takes ctx as Integer:
 End Process
 
 @Reasoning:
-Bumps the context's indent counter so subsequent emit_indent calls
-produce one more level of indentation. Paired with decrease_indent
-around any nested block.
+Bumps the indent counter so subsequent emit_indent calls produce one
+more level. Paired with decrease_indent around any nested block.
 @End Reasoning
 
 @Implementation:
@@ -1557,9 +2010,8 @@ Process called "increase_indent" takes ctx as Integer:
 End Process
 
 @Reasoning:
-Companion to increase_indent. The caller must never let indent_level
-go negative; the convention is that every increase has a paired
-decrease on every exit path.
+Companion to increase_indent. Every increase has a paired decrease on
+every exit path.
 @End Reasoning
 
 @Implementation:
@@ -1574,15 +2026,14 @@ Note: PUBLIC API
 Note: ===================================================================
 
 @Reasoning:
-Public entry-point alias for generate_solidity_from_hir. Provides
-the 'hir_to_<lang>' naming convention that the translation pipeline
-drivers expect when locating backends by symbol name.
+Public entry-point alias for generate_solidity_from_hir, providing the
+'hir_to_<lang>' naming convention the translation pipeline drivers
+expect when locating backends by symbol name.
 @End Reasoning
 
 @Implementation:
-Tail-calls generate_solidity_from_hir with the same hir_module
-argument.
+Tail-calls generate_solidity_from_hir with the same hir_module argument.
 @End Implementation
 Process called "hir_to_solidity" takes hir_module as Integer returns Integer:
-    Return proc generate_solidity_from_hir from hir_module
+    Return proc generate_solidity_from_hir with hir_module
 End Process

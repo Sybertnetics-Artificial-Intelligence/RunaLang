@@ -8,7 +8,45 @@ Note: Part of the Translation Translation System
 Note: Location: compiler/middle/gungnir/hir/translation/frontends/solidity/solidity_to_hir.runa
 Note: ===================================================================
 
+Note:
+HIR PRODUCER MODEL (model 1, typed hir_nodes.runa surface)
+==========================================================
+Solidity lowers onto the canonical hir_nodes.runa producer surface, the same
+family ruby/dart/java use. The real hir_nodes API uses short creators
+(hir_create_binary_expr), zero-arg declaration creators paired with setters
+(hir_create_class then hir_set_class_name), a single module declarations list
+(hir_add_declaration) and a single class member list (hir_add_class_member) -
+there is NO per-kind module collection (no hir_module_add_class) and NO separate
+field/method lists on a class. Every Solidity-specific construct that HIR has no
+native slot for is carried as a string-keyed metadata property via
+hir_set_metadata, and the hir_to_solidity backend reconstructs the exact Solidity
+spelling from those keys.
+
+Declaration storage decisions:
+  contract / interface / library -> HIR_CLASS, distinguished by "solidity_type"
+      metadata; members (state vars, functions, events, modifiers, nested
+      struct/enum) are appended with hir_add_class_member.
+  struct  -> HIR_CLASS  ("solidity_type"="struct"), fields are HIR_FIELD members.
+  error   -> HIR_CLASS  ("solidity_type"="error"), parameters are HIR_FIELD members.
+  enum    -> HIR_ENUM, value names appended with hir_add_enum_value.
+  state variable -> HIR_FIELD class member, type/visibility/mutability/initializer
+      preserved as metadata.
+  function / constructor / fallback / receive / event / modifier -> HIR_FUNCTION
+      class members, distinguished by "solidity_type"; events carry "solidity_indexed"
+      on indexed parameters, modifiers carry their `_;` placeholder body.
+  pragma / using -> module-level metadata (compiler directives, not runtime nodes).
+  import -> HIR_IMPORT attached with hir_add_import.
+
+Number literals keep their EXACT Solidity lexeme (0x..., 1 ether, 1_000) as a HIR
+string literal tagged "solidity_number"="true" so the backend re-emits them bare
+(unquoted); string literals are plain HIR string literals; booleans are HIR bool
+literals. Binary/unary operators map to the nearest HIR_OP_* code AND record the
+exact Solidity operator string ("solidity_operator"/"solidity_unary_operator") so
+operators with no HIR opcode (** << >> & | ^) round-trip losslessly.
+:End Note
+
 Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/internal/string_utils.runa" as StringUtils
 Import "compiler/frontend/primitives/collections/list.runa" as ListCore
 Import "compiler/middle/gungnir/hir/hir_nodes.runa" as HIR
 Import "compiler/middle/gungnir/hir/translation/frontends/solidity/solidity_parser.runa" as SolidityParser
@@ -53,8 +91,8 @@ holds the result accumulated through the walk.
 @Implementation:
 create_context returns a fresh context with an empty HIR module.
 translate_program walks the AST top-down, registering each top-level
-declaration into the module via add_class/add_import/etc. Returns
-ctx.hir_module.
+declaration into the module via hir_add_declaration/hir_add_import.
+Returns ctx.hir_module.
 @End Implementation
 
 Process called "translate_solidity_to_hir" takes solidity_ast as Integer returns Integer:
@@ -70,14 +108,15 @@ distinguish Solidity-derived HIR from other source languages.
 @End Reasoning
 
 @Implementation:
-Calls hir_create_module to allocate the underlying HIR module.
-Constructs a TranslationContext value-type with hir_module set and
-the three current_* cursors nulled out (we're at top-level on
-entry).
+Calls hir_create_module (no-arg) to allocate the underlying HIR
+module, then hir_set_module_name to label it. Constructs a
+TranslationContext value-type with hir_module set and the three
+current_* cursors nulled out (we're at top-level on entry).
 @End Implementation
 
 Process called "create_context" returns Integer:
-    Let hir_module be proc hir_create_module from HIR with "solidity_module"
+    Let hir_module be proc hir_create_module from HIR
+    proc hir_set_module_name from HIR with hir_module, "solidity_module"
 
     Let ctx be a value of type TranslationContext with
         hir_module as hir_module,
@@ -86,6 +125,163 @@ Process called "create_context" returns Integer:
         current_scope as 0
 
     Return ctx
+End Process
+
+Note: ===================================================================
+Note: METADATA UTILITIES
+Note: ===================================================================
+
+@Reasoning:
+Generic accessor for Solidity AST metadata lists. The parser stores
+metadata as a flat interleaved [key0, value0, key1, value1, ...]
+ListCore, so a value lookup is a linear scan stepping two entries at a
+time. Centralised here so translation routines don't repeat the
+boilerplate.
+@End Reasoning
+
+@Implementation:
+If metadata is null returns 0. Otherwise iterates in steps of 2,
+comparing each even-index entry against the requested key via
+string_equals; on match returns the following odd-index value entry.
+Returns 0 when the key is absent.
+@End Implementation
+
+Process called "get_metadata_value" takes metadata as Integer, key as Integer returns Integer:
+    If metadata is equal to 0:
+        Return 0
+    End If
+
+    Let count be proc list_length from ListCore with metadata
+    Let i be 0
+
+    While i is less than count:
+        Let metadata_key be proc list_get from ListCore with metadata, i
+        Let matches be proc string_equals from StringCore with metadata_key, key
+
+        If matches is equal to 1:
+            Let value_index be i plus 1
+            If value_index is less than count:
+                Let value be proc list_get from ListCore with metadata, value_index
+                Return value
+            End If
+        End If
+
+        Set i to i plus 2
+    End While
+
+    Return 0
+End Process
+
+@Reasoning:
+Maps a Solidity binary-operator lexeme to the nearest HIR_OP_* opcode.
+HIR carries a fixed opcode set; operators Solidity has that HIR does
+not name directly (** exponent, & | ^ bitwise, << >> shifts) lower to
+the closest structural opcode and are disambiguated by the
+"solidity_operator" metadata the caller attaches, so the backend
+re-emits the exact token. The cascade is an unrolled string_equals
+ladder ordered roughly by frequency; an unknown operator falls back to
+HIR_OP_ADD as a structural carrier (still recovered verbatim from
+metadata).
+@End Reasoning
+
+@Implementation:
+string_equals comparisons against each known Solidity operator,
+returning the matching HIR.HIR_OP_* constant.
+@End Implementation
+
+Process called "map_solidity_binop_to_hir" takes operator as Integer returns Integer:
+    If proc string_equals from StringCore with operator, "+" is equal to 1:
+        Return HIR.HIR_OP_ADD
+    End If
+    If proc string_equals from StringCore with operator, "-" is equal to 1:
+        Return HIR.HIR_OP_SUBTRACT
+    End If
+    If proc string_equals from StringCore with operator, "*" is equal to 1:
+        Return HIR.HIR_OP_MULTIPLY
+    End If
+    If proc string_equals from StringCore with operator, "/" is equal to 1:
+        Return HIR.HIR_OP_DIVIDE
+    End If
+    If proc string_equals from StringCore with operator, "%" is equal to 1:
+        Return HIR.HIR_OP_MODULO
+    End If
+    If proc string_equals from StringCore with operator, "**" is equal to 1:
+        Return HIR.HIR_OP_MULTIPLY
+    End If
+    If proc string_equals from StringCore with operator, "==" is equal to 1:
+        Return HIR.HIR_OP_EQUAL
+    End If
+    If proc string_equals from StringCore with operator, "!=" is equal to 1:
+        Return HIR.HIR_OP_NOT_EQUAL
+    End If
+    If proc string_equals from StringCore with operator, "<" is equal to 1:
+        Return HIR.HIR_OP_LESS_THAN
+    End If
+    If proc string_equals from StringCore with operator, "<=" is equal to 1:
+        Return HIR.HIR_OP_LESS_EQUAL
+    End If
+    If proc string_equals from StringCore with operator, ">" is equal to 1:
+        Return HIR.HIR_OP_GREATER_THAN
+    End If
+    If proc string_equals from StringCore with operator, ">=" is equal to 1:
+        Return HIR.HIR_OP_GREATER_EQUAL
+    End If
+    If proc string_equals from StringCore with operator, "&&" is equal to 1:
+        Return HIR.HIR_OP_LOGICAL_AND
+    End If
+    If proc string_equals from StringCore with operator, "||" is equal to 1:
+        Return HIR.HIR_OP_LOGICAL_OR
+    End If
+    If proc string_equals from StringCore with operator, "&" is equal to 1:
+        Return HIR.HIR_OP_BITWISE_AND
+    End If
+    If proc string_equals from StringCore with operator, "|" is equal to 1:
+        Return HIR.HIR_OP_BITWISE_OR
+    End If
+    If proc string_equals from StringCore with operator, "^" is equal to 1:
+        Return HIR.HIR_OP_BITWISE_XOR
+    End If
+    If proc string_equals from StringCore with operator, "<<" is equal to 1:
+        Return HIR.HIR_OP_SHIFT_LEFT
+    End If
+    If proc string_equals from StringCore with operator, ">>" is equal to 1:
+        Return HIR.HIR_OP_SHIFT_RIGHT
+    End If
+
+    Return HIR.HIR_OP_ADD
+End Process
+
+@Reasoning:
+Maps a Solidity prefix/postfix unary operator lexeme to the nearest
+HIR_OP_* opcode. Solidity unary forms are ! (logical not), - (negate),
+~ (bitwise not), ++ (increment), -- (decrement), and the `delete`
+keyword. `delete` has no HIR opcode; it lowers to HIR_OP_LOGICAL_NOT
+as a structural carrier and is disambiguated by the
+"solidity_unary_operator" metadata, so the backend re-emits "delete".
+@End Reasoning
+
+@Implementation:
+string_equals ladder over the five unary lexemes plus `delete`.
+@End Implementation
+
+Process called "map_solidity_unop_to_hir" takes operator as Integer returns Integer:
+    If proc string_equals from StringCore with operator, "!" is equal to 1:
+        Return HIR.HIR_OP_LOGICAL_NOT
+    End If
+    If proc string_equals from StringCore with operator, "-" is equal to 1:
+        Return HIR.HIR_OP_NEGATE
+    End If
+    If proc string_equals from StringCore with operator, "~" is equal to 1:
+        Return HIR.HIR_OP_BITWISE_NOT
+    End If
+    If proc string_equals from StringCore with operator, "++" is equal to 1:
+        Return HIR.HIR_OP_INCREMENT
+    End If
+    If proc string_equals from StringCore with operator, "--" is equal to 1:
+        Return HIR.HIR_OP_DECREMENT
+    End If
+
+    Return HIR.HIR_OP_LOGICAL_NOT
 End Process
 
 Note: ===================================================================
@@ -100,12 +296,15 @@ to its kind-specific handler.
 
 @Implementation:
 Reads children list via solidity_ast_children. Iterates list calling
-translate_top_level_declaration on each. No early termination —
+translate_top_level_declaration on each. No early termination -
 errors handled at child-handler level via metadata.
 @End Implementation
 
 Process called "translate_program" takes ctx as Integer, program_node as Integer:
     Let children be proc solidity_ast_children from SolidityParser with program_node
+    If children is equal to 0:
+        Return
+    End If
     Let count be proc list_length from ListCore with children
     Let i be 0
 
@@ -137,30 +336,39 @@ Process called "translate_top_level_declaration" takes ctx as Integer, node as I
 
     If node_type is equal to SolidityParser.SOL_PRAGMA:
         proc translate_pragma with ctx, node
-    Otherwise:
-        If node_type is equal to SolidityParser.SOL_IMPORT:
-            proc translate_import with ctx, node
-        Otherwise:
-            If node_type is equal to SolidityParser.SOL_CONTRACT:
-                proc translate_contract with ctx, node
-            Otherwise:
-                If node_type is equal to SolidityParser.SOL_INTERFACE:
-                    proc translate_interface with ctx, node
-                Otherwise:
-                    If node_type is equal to SolidityParser.SOL_LIBRARY:
-                        proc translate_library with ctx, node
-                    Otherwise:
-                        If node_type is equal to SolidityParser.SOL_USING:
-                            proc translate_using with ctx, node
-                        Otherwise:
-                            If node_type is equal to SolidityParser.SOL_ERROR:
-                                proc translate_error_definition with ctx, node
-                            End If
-                        End If
-                    End If
-                End If
-            End If
-        End If
+        Return
+    End If
+    If node_type is equal to SolidityParser.SOL_IMPORT:
+        proc translate_import with ctx, node
+        Return
+    End If
+    If node_type is equal to SolidityParser.SOL_CONTRACT:
+        proc translate_contract with ctx, node
+        Return
+    End If
+    If node_type is equal to SolidityParser.SOL_INTERFACE:
+        proc translate_interface with ctx, node
+        Return
+    End If
+    If node_type is equal to SolidityParser.SOL_LIBRARY:
+        proc translate_library with ctx, node
+        Return
+    End If
+    If node_type is equal to SolidityParser.SOL_USING:
+        proc translate_using with ctx, node
+        Return
+    End If
+    If node_type is equal to SolidityParser.SOL_ERROR:
+        proc translate_error_definition with ctx, node
+        Return
+    End If
+    If node_type is equal to SolidityParser.SOL_STRUCT:
+        proc translate_struct with ctx, node
+        Return
+    End If
+    If node_type is equal to SolidityParser.SOL_ENUM:
+        proc translate_enum with ctx, node
+        Return
     End If
 End Process
 
@@ -176,7 +384,7 @@ behaviour, not the runtime semantics of the contract.
 
 @Implementation:
 Reads pragma_type (the directive name like "solidity") and metadata
-dict containing the value. Sets two metadata fields on the HIR
+list containing the value. Sets two metadata fields on the HIR
 module: "solidity_pragma_type" and "solidity_pragma_value" (only if
 value is non-empty).
 @End Implementation
@@ -185,13 +393,14 @@ Process called "translate_pragma" takes ctx as Integer, pragma_node as Integer:
     Let pragma_type be proc solidity_ast_value from SolidityParser with pragma_node
     Let metadata be proc solidity_ast_metadata from SolidityParser with pragma_node
 
-    Note: Store pragma as module metadata
     proc hir_set_metadata from HIR with ctx.hir_module, "solidity_pragma_type", pragma_type
 
     Let value be proc get_metadata_value with metadata, "value"
-    Let value_len be proc string_length from StringCore with value
-    If value_len is greater than 0:
-        proc hir_set_metadata from HIR with ctx.hir_module, "solidity_pragma_value", value
+    If value is not equal to 0:
+        Let value_len be proc string_length from StringCore with value
+        If value_len is greater than 0:
+            proc hir_set_metadata from HIR with ctx.hir_module, "solidity_pragma_value", value
+        End If
     End If
 End Process
 
@@ -207,24 +416,27 @@ metadata on the import.
 
 @Implementation:
 Reads metadata, extracts "path" and "alias" via get_metadata_value.
-Creates HIR import via hir_create_import, adds to module via
-hir_module_add_import. If alias non-empty, attaches as
-"solidity_alias" metadata on the import.
+Creates HIR import via hir_create_import, sets the path with
+hir_set_import_path, attaches it to the module with hir_add_import. If
+alias is non-empty, attaches as "solidity_alias" metadata on the
+import.
 @End Implementation
 
 Process called "translate_import" takes ctx as Integer, import_node as Integer:
     Let metadata be proc solidity_ast_metadata from SolidityParser with import_node
     Let path be proc get_metadata_value with metadata, "path"
 
-    Note: Create HIR import
-    Let hir_import be proc hir_create_import from HIR with path
-    proc hir_module_add_import from HIR with ctx.hir_module, hir_import
+    Let hir_import be proc hir_create_import from HIR
+    proc hir_set_import_path from HIR with hir_import, path
+    proc hir_add_import from HIR with ctx.hir_module, hir_import
 
-    Note: Store alias if present
     Let alias be proc get_metadata_value with metadata, "alias"
-    Let alias_len be proc string_length from StringCore with alias
-    If alias_len is greater than 0:
-        proc hir_set_metadata from HIR with hir_import, "solidity_alias", alias
+    If alias is not equal to 0:
+        Let alias_len be proc string_length from StringCore with alias
+        If alias_len is greater than 0:
+            proc hir_set_import_alias from HIR with hir_import, alias
+            proc hir_set_metadata from HIR with hir_import, "solidity_alias", alias
+        End If
     End If
 End Process
 
@@ -241,74 +453,85 @@ Solidity's multiple-inheritance specifics.
 @End Reasoning
 
 @Implementation:
-Reads contract_name. Creates HIR class. Pushes ctx.current_contract.
-Sets source_language and solidity_type metadata. Reads metadata dict
-for "abstract" flag and "bases" inheritance list; attaches as
-metadata. Iterates contract children invoking translate_contract_member
-on each. Adds the class to the module. Restores ctx.current_contract
-to 0 (we're leaving contract scope).
+Reads contract_name (value slot). Creates HIR class via hir_create_class
+and names it via hir_set_class_name. Pushes ctx.current_contract. Sets
+source_language and solidity_type metadata. Reads metadata for the
+"abstract" flag and "bases" inheritance list; attaches as metadata.
+Iterates contract children invoking translate_contract_member on each.
+Adds the class to the module via hir_add_declaration. Restores
+ctx.current_contract to 0 (we're leaving contract scope).
 @End Implementation
 
 Process called "translate_contract" takes ctx as TranslationContext, contract_node as Integer:
     Let contract_name be proc solidity_ast_value from SolidityParser with contract_node
 
-    Let hir_class be proc hir_create_class from HIR with contract_name
+    Let hir_class be proc hir_create_class from HIR
+    proc hir_set_class_name from HIR with hir_class, contract_name
     Set ctx.current_contract to hir_class
 
-    Note: Store Solidity metadata
     proc hir_set_metadata from HIR with hir_class, "source_language", "solidity"
     proc hir_set_metadata from HIR with hir_class, "solidity_type", "contract"
 
-    Note: Handle abstract modifier
     Let metadata be proc solidity_ast_metadata from SolidityParser with contract_node
     Let is_abstract be proc get_metadata_value with metadata, "abstract"
-    Let abstract_len be proc string_length from StringCore with is_abstract
-    If abstract_len is greater than 0:
-        proc hir_set_metadata from HIR with hir_class, "solidity_abstract", "true"
+    If is_abstract is not equal to 0:
+        Let abstract_len be proc string_length from StringCore with is_abstract
+        If abstract_len is greater than 0:
+            proc hir_set_metadata from HIR with hir_class, "solidity_abstract", "true"
+        End If
     End If
 
-    Note: Handle inheritance
     Let bases be proc get_metadata_value with metadata, "bases"
     If bases is not equal to 0:
         proc translate_inheritance with ctx, hir_class, bases
     End If
 
-    Note: Translate contract members
     Let children be proc solidity_ast_children from SolidityParser with contract_node
-    Let count be proc list_length from ListCore with children
-    Let i be 0
+    If children is not equal to 0:
+        Let count be proc list_length from ListCore with children
+        Let i be 0
+        While i is less than count:
+            Let child be proc list_get from ListCore with children, i
+            proc translate_contract_member with ctx, child
+            Set i to i plus 1
+        End While
+    End If
 
-    While i is less than count:
-        Let child be proc list_get from ListCore with children, i
-        proc translate_contract_member with ctx, child
-        Set i to i plus 1
-    End While
-
-    proc hir_module_add_class from HIR with ctx.hir_module, hir_class
+    proc hir_add_declaration from HIR with ctx.hir_module, hir_class
     Set ctx.current_contract to 0
 End Process
 
 @Reasoning:
 Records inheritance via metadata since HIR's basic class model doesn't
 directly express Solidity's C3-linearized multiple-inheritance. Each
-base class is added as a separate "solidity_inherits" metadata entry.
+base class is added as a separate "solidity_inherits" metadata entry;
+multiple sets with the same key accumulate into the node's property
+list, which the backend re-reads with get_all_metadata_values.
 @End Reasoning
 
 @Implementation:
-Iterates bases list. For each base name, calls hir_set_metadata to
-attach as "solidity_inherits" — multiple sets with the same key
-accumulate into a list at the HIR level.
+Copies the bases into a fresh ListCore and stores that single list
+handle under "solidity_inherits" in one hir_set_metadata call. Storing a
+list (rather than one set per base) is required because the HIR property
+dictionary overwrites repeated keys - a per-base loop would keep only
+the last base. The backend reads the list back via get_all_metadata_values.
 @End Implementation
 
 Process called "translate_inheritance" takes ctx as Integer, hir_class as Integer, bases as Integer:
     Let count be proc list_length from ListCore with bases
-    Let i be 0
+    If count is equal to 0:
+        Return
+    End If
 
+    Let inherits be proc list_create from ListCore
+    Let i be 0
     While i is less than count:
         Let base_name be proc list_get from ListCore with bases, i
-        proc hir_set_metadata from HIR with hir_class, "solidity_inherits", base_name
+        proc list_append from ListCore with inherits, base_name
         Set i to i plus 1
     End While
+
+    proc hir_set_metadata from HIR with hir_class, "solidity_inherits", inherits
 End Process
 
 Note: ===================================================================
@@ -324,38 +547,38 @@ solidity_type="interface" metadata.
 @Implementation:
 Same shape as translate_contract: reads name, creates HIR class,
 pushes current_contract, sets metadata (source_language, solidity_type
-= "interface"), iterates members, adds to module, restores
-current_contract.
+= "interface"), iterates members, adds to module via
+hir_add_declaration, restores current_contract.
 @End Implementation
 
 Process called "translate_interface" takes ctx as TranslationContext, interface_node as Integer:
     Let interface_name be proc solidity_ast_value from SolidityParser with interface_node
 
-    Let hir_class be proc hir_create_class from HIR with interface_name
+    Let hir_class be proc hir_create_class from HIR
+    proc hir_set_class_name from HIR with hir_class, interface_name
     Set ctx.current_contract to hir_class
 
     proc hir_set_metadata from HIR with hir_class, "source_language", "solidity"
     proc hir_set_metadata from HIR with hir_class, "solidity_type", "interface"
 
-    Note: Handle inheritance
     Let metadata be proc solidity_ast_metadata from SolidityParser with interface_node
     Let bases be proc get_metadata_value with metadata, "bases"
     If bases is not equal to 0:
         proc translate_inheritance with ctx, hir_class, bases
     End If
 
-    Note: Translate interface members
     Let children be proc solidity_ast_children from SolidityParser with interface_node
-    Let count be proc list_length from ListCore with children
-    Let i be 0
+    If children is not equal to 0:
+        Let count be proc list_length from ListCore with children
+        Let i be 0
+        While i is less than count:
+            Let child be proc list_get from ListCore with children, i
+            proc translate_contract_member with ctx, child
+            Set i to i plus 1
+        End While
+    End If
 
-    While i is less than count:
-        Let child be proc list_get from ListCore with children, i
-        proc translate_contract_member with ctx, child
-        Set i to i plus 1
-    End While
-
-    proc hir_module_add_class from HIR with ctx.hir_module, hir_class
+    proc hir_add_declaration from HIR with ctx.hir_module, hir_class
     Set ctx.current_contract to 0
 End Process
 
@@ -372,30 +595,32 @@ treats them as classes with solidity_type="library" metadata.
 @Implementation:
 Same pattern as contract/interface: reads name, creates HIR class
 with solidity_type="library" metadata, pushes current_contract,
-translates members, restores cursor.
+translates members, adds to module via hir_add_declaration, restores
+cursor.
 @End Implementation
 
 Process called "translate_library" takes ctx as TranslationContext, library_node as Integer:
     Let library_name be proc solidity_ast_value from SolidityParser with library_node
 
-    Let hir_class be proc hir_create_class from HIR with library_name
+    Let hir_class be proc hir_create_class from HIR
+    proc hir_set_class_name from HIR with hir_class, library_name
     Set ctx.current_contract to hir_class
 
     proc hir_set_metadata from HIR with hir_class, "source_language", "solidity"
     proc hir_set_metadata from HIR with hir_class, "solidity_type", "library"
 
-    Note: Translate library members
     Let children be proc solidity_ast_children from SolidityParser with library_node
-    Let count be proc list_length from ListCore with children
-    Let i be 0
+    If children is not equal to 0:
+        Let count be proc list_length from ListCore with children
+        Let i be 0
+        While i is less than count:
+            Let child be proc list_get from ListCore with children, i
+            proc translate_contract_member with ctx, child
+            Set i to i plus 1
+        End While
+    End If
 
-    While i is less than count:
-        Let child be proc list_get from ListCore with children, i
-        proc translate_contract_member with ctx, child
-        Set i to i plus 1
-    End While
-
-    proc hir_module_add_class from HIR with ctx.hir_module, hir_class
+    proc hir_add_declaration from HIR with ctx.hir_module, hir_class
     Set ctx.current_contract to 0
 End Process
 
@@ -406,23 +631,30 @@ Note: ===================================================================
 @Reasoning:
 Solidity's `using LibName for Type;` directive attaches library
 methods to a type so they can be called via dot notation. Recorded
-as module metadata since there's no direct HIR analog.
+as module (or contract) metadata since there's no direct HIR analog.
 @End Reasoning
 
 @Implementation:
-Reads library_name (the library name) and target_type from metadata.
-Attaches as module metadata "solidity_using_library" and
-"solidity_using_for_type" respectively.
+Reads library_name (the value slot) and target_type from metadata.
+Attaches as metadata "solidity_using_library" and
+"solidity_using_target" on the enclosing contract when inside one,
+otherwise on the module.
 @End Implementation
 
-Process called "translate_using" takes ctx as Integer, using_node as Integer:
+Process called "translate_using" takes ctx as TranslationContext, using_node as Integer:
     Let library_name be proc solidity_ast_value from SolidityParser with using_node
     Let metadata be proc solidity_ast_metadata from SolidityParser with using_node
     Let target_type be proc get_metadata_value with metadata, "target"
 
-    Note: Store using directive as module metadata
-    proc hir_set_metadata from HIR with ctx.hir_module, "solidity_using_library", library_name
-    proc hir_set_metadata from HIR with ctx.hir_module, "solidity_using_target", target_type
+    Let host be ctx.current_contract
+    If host is equal to 0:
+        Set host to ctx.hir_module
+    End If
+
+    proc hir_set_metadata from HIR with host, "solidity_using_library", library_name
+    If target_type is not equal to 0:
+        proc hir_set_metadata from HIR with host, "solidity_using_target", target_type
+    End If
 End Process
 
 Note: ===================================================================
@@ -432,36 +664,52 @@ Note: ===================================================================
 @Reasoning:
 Solidity 0.8.4+ custom errors `error MyError(uint256 code);` are
 exception-like types used with `revert` for cheaper error reporting.
-HIR records them as classes with solidity_type="error".
+HIR records them as classes with solidity_type="error" whose fields
+hold the error parameters.
 @End Reasoning
 
 @Implementation:
-Reads error name, creates a HIR class with the
-solidity_type="error" metadata tag. Iterates parameters and adds
-them as fields on the class.
+Reads error name, creates a HIR class with solidity_type="error"
+metadata. Iterates parameter children, building a HIR field per
+parameter (name + "solidity_field_type" metadata) appended via
+hir_add_class_member. Errors declared inside a contract attach as a
+member of the enclosing contract; file-scope errors attach to the
+module.
 @End Implementation
 
-Process called "translate_error_definition" takes ctx as Integer, error_node as Integer:
+Process called "translate_error_definition" takes ctx as TranslationContext, error_node as Integer:
     Let error_name be proc solidity_ast_value from SolidityParser with error_node
 
-    Note: Create HIR type for error
-    Let hir_type be proc hir_create_type from HIR with error_name
-    proc hir_set_metadata from HIR with hir_type, "source_language", "solidity"
-    proc hir_set_metadata from HIR with hir_type, "solidity_type", "error"
+    Let hir_class be proc hir_create_class from HIR
+    proc hir_set_class_name from HIR with hir_class, error_name
+    proc hir_set_metadata from HIR with hir_class, "source_language", "solidity"
+    proc hir_set_metadata from HIR with hir_class, "solidity_type", "error"
 
-    Note: Translate error parameters
     Let children be proc solidity_ast_children from SolidityParser with error_node
-    Let count be proc list_length from ListCore with children
-    Let i be 0
+    If children is not equal to 0:
+        Let count be proc list_length from ListCore with children
+        Let i be 0
+        While i is less than count:
+            Let child be proc list_get from ListCore with children, i
+            Let param_name be proc solidity_ast_value from SolidityParser with child
+            Let param_metadata be proc solidity_ast_metadata from SolidityParser with child
+            Let param_type be proc get_metadata_value with param_metadata, "type"
 
-    While i is less than count:
-        Let child be proc list_get from ListCore with children, i
-        Let param_name be proc solidity_ast_value from SolidityParser with child
-        proc hir_add_field from HIR with hir_type, param_name
-        Set i to i plus 1
-    End While
+            Let hir_field be proc hir_create_field from HIR
+            proc hir_set_field_name from HIR with hir_field, param_name
+            If param_type is not equal to 0:
+                proc hir_set_metadata from HIR with hir_field, "solidity_field_type", param_type
+            End If
+            proc hir_add_class_member from HIR with hir_class, hir_field
+            Set i to i plus 1
+        End While
+    End If
 
-    proc hir_module_add_type from HIR with ctx.hir_module, hir_type
+    If ctx.current_contract is not equal to 0:
+        proc hir_add_class_member from HIR with ctx.current_contract, hir_class
+    Otherwise:
+        proc hir_add_declaration from HIR with ctx.hir_module, hir_class
+    End If
 End Process
 
 Note: ===================================================================
@@ -471,12 +719,12 @@ Note: ===================================================================
 @Reasoning:
 Contract member dispatcher. Within a contract, members can be:
 struct, enum, event, modifier, function, constructor, fallback,
-receive, state variable, error (Solidity 0.8.4+), or nested type.
-Each routes to its specialised translator.
+receive, state variable, error (Solidity 0.8.4+), using, or nested
+type. Each routes to its specialised translator.
 @End Reasoning
 
 @Implementation:
-Reads node_type and dispatches via nested If-chain against the
+Reads node_type and dispatches via If-chain against the
 SolidityParser.SOL_* constants for each member kind, calling the
 corresponding translate_* handler.
 @End Implementation
@@ -486,46 +734,47 @@ Process called "translate_contract_member" takes ctx as Integer, member_node as 
 
     If node_type is equal to SolidityParser.SOL_USING:
         proc translate_using with ctx, member_node
-    Otherwise:
-        If node_type is equal to SolidityParser.SOL_STRUCT:
-            proc translate_struct with ctx, member_node
-        Otherwise:
-            If node_type is equal to SolidityParser.SOL_ENUM:
-                proc translate_enum with ctx, member_node
-            Otherwise:
-                If node_type is equal to SolidityParser.SOL_EVENT:
-                    proc translate_event with ctx, member_node
-                Otherwise:
-                    If node_type is equal to SolidityParser.SOL_ERROR:
-                        proc translate_error_definition with ctx, member_node
-                    Otherwise:
-                        If node_type is equal to SolidityParser.SOL_MODIFIER:
-                            proc translate_modifier with ctx, member_node
-                        Otherwise:
-                            If node_type is equal to SolidityParser.SOL_CONSTRUCTOR:
-                                proc translate_constructor with ctx, member_node
-                            Otherwise:
-                                If node_type is equal to SolidityParser.SOL_FALLBACK:
-                                    proc translate_fallback with ctx, member_node
-                                Otherwise:
-                                    If node_type is equal to SolidityParser.SOL_RECEIVE:
-                                        proc translate_receive with ctx, member_node
-                                    Otherwise:
-                                        If node_type is equal to SolidityParser.SOL_FUNCTION:
-                                            proc translate_function with ctx, member_node
-                                        Otherwise:
-                                            If node_type is equal to SolidityParser.SOL_STATE_VARIABLE:
-                                                proc translate_state_variable with ctx, member_node
-                                            End If
-                                        End If
-                                    End If
-                                End If
-                            End If
-                        End If
-                    End If
-                End If
-            End If
-        End If
+        Return
+    End If
+    If node_type is equal to SolidityParser.SOL_STRUCT:
+        proc translate_struct with ctx, member_node
+        Return
+    End If
+    If node_type is equal to SolidityParser.SOL_ENUM:
+        proc translate_enum with ctx, member_node
+        Return
+    End If
+    If node_type is equal to SolidityParser.SOL_EVENT:
+        proc translate_event with ctx, member_node
+        Return
+    End If
+    If node_type is equal to SolidityParser.SOL_ERROR:
+        proc translate_error_definition with ctx, member_node
+        Return
+    End If
+    If node_type is equal to SolidityParser.SOL_MODIFIER:
+        proc translate_modifier with ctx, member_node
+        Return
+    End If
+    If node_type is equal to SolidityParser.SOL_CONSTRUCTOR:
+        proc translate_constructor with ctx, member_node
+        Return
+    End If
+    If node_type is equal to SolidityParser.SOL_FALLBACK:
+        proc translate_fallback with ctx, member_node
+        Return
+    End If
+    If node_type is equal to SolidityParser.SOL_RECEIVE:
+        proc translate_receive with ctx, member_node
+        Return
+    End If
+    If node_type is equal to SolidityParser.SOL_FUNCTION:
+        proc translate_function with ctx, member_node
+        Return
+    End If
+    If node_type is equal to SolidityParser.SOL_STATE_VARIABLE:
+        proc translate_state_variable with ctx, member_node
+        Return
     End If
 End Process
 
@@ -535,38 +784,51 @@ Note: ===================================================================
 
 @Reasoning:
 Translates `struct Name { field; field; }` to a HIR class with
-solidity_type="struct". Struct fields map to HIR class fields.
+solidity_type="struct". Struct fields map to HIR class fields whose
+Solidity type is preserved in "solidity_field_type" metadata.
 @End Reasoning
 
 @Implementation:
 Reads struct name, creates HIR class, attaches solidity_type metadata.
-Iterates fields and adds each as a field on the class.
+Iterates field children, building a HIR field per entry (name +
+solidity_field_type) appended via hir_add_class_member. Nested structs
+inside a contract attach as a member of the enclosing contract;
+file-scope structs attach to the module.
 @End Implementation
 
-Process called "translate_struct" takes ctx as Integer, struct_node as Integer:
+Process called "translate_struct" takes ctx as TranslationContext, struct_node as Integer:
     Let struct_name be proc solidity_ast_value from SolidityParser with struct_node
 
-    Let hir_type be proc hir_create_type from HIR with struct_name
-    proc hir_set_metadata from HIR with hir_type, "source_language", "solidity"
-    proc hir_set_metadata from HIR with hir_type, "solidity_type", "struct"
+    Let hir_class be proc hir_create_class from HIR
+    proc hir_set_class_name from HIR with hir_class, struct_name
+    proc hir_set_metadata from HIR with hir_class, "source_language", "solidity"
+    proc hir_set_metadata from HIR with hir_class, "solidity_type", "struct"
 
-    Note: Translate struct fields
     Let children be proc solidity_ast_children from SolidityParser with struct_node
-    Let count be proc list_length from ListCore with children
-    Let i be 0
+    If children is not equal to 0:
+        Let count be proc list_length from ListCore with children
+        Let i be 0
+        While i is less than count:
+            Let child be proc list_get from ListCore with children, i
+            Let field_name be proc solidity_ast_value from SolidityParser with child
+            Let field_metadata be proc solidity_ast_metadata from SolidityParser with child
+            Let field_type be proc get_metadata_value with field_metadata, "type"
 
-    While i is less than count:
-        Let child be proc list_get from ListCore with children, i
-        Let field_name be proc solidity_ast_value from SolidityParser with child
-        Let field_metadata be proc solidity_ast_metadata from SolidityParser with child
-        Let field_type be proc get_metadata_value with field_metadata, "type"
+            Let hir_field be proc hir_create_field from HIR
+            proc hir_set_field_name from HIR with hir_field, field_name
+            If field_type is not equal to 0:
+                proc hir_set_metadata from HIR with hir_field, "solidity_field_type", field_type
+            End If
+            proc hir_add_class_member from HIR with hir_class, hir_field
+            Set i to i plus 1
+        End While
+    End If
 
-        Let hir_field be proc hir_add_field from HIR with hir_type, field_name
-        proc hir_set_metadata from HIR with hir_field, "solidity_field_type", field_type
-        Set i to i plus 1
-    End While
-
-    proc hir_module_add_type from HIR with ctx.hir_module, hir_type
+    If ctx.current_contract is not equal to 0:
+        proc hir_add_class_member from HIR with ctx.current_contract, hir_class
+    Otherwise:
+        proc hir_add_declaration from HIR with ctx.hir_module, hir_class
+    End If
 End Process
 
 Note: ===================================================================
@@ -574,38 +836,45 @@ Note: ENUM TRANSLATION
 Note: ===================================================================
 
 @Reasoning:
-Translates `enum Name { A, B, C }` to a HIR class with members for
-each enum constant. Solidity enums are sequentially-numbered
-constants represented as uint values.
+Translates `enum Name { A, B, C }` to a HIR enum whose value-name list
+holds each constant in declared order. Solidity enums are
+sequentially-numbered constants represented as uint values.
 @End Reasoning
 
 @Implementation:
-Reads enum name, creates HIR class with solidity_type="enum" metadata.
-Iterates enum value children adding each as a static field on the
-class.
+Reads enum name, creates HIR enum via hir_create_enum + hir_set_enum_name
+with solidity_type="enum" metadata. Reads the "values" metadata list and
+appends each value name via hir_add_enum_value. Nested enums inside a
+contract attach as a member of the enclosing contract; file-scope enums
+attach to the module via hir_add_declaration.
 @End Implementation
 
-Process called "translate_enum" takes ctx as Integer, enum_node as Integer:
+Process called "translate_enum" takes ctx as TranslationContext, enum_node as Integer:
     Let enum_name be proc solidity_ast_value from SolidityParser with enum_node
 
-    Let hir_type be proc hir_create_type from HIR with enum_name
-    proc hir_set_metadata from HIR with hir_type, "source_language", "solidity"
-    proc hir_set_metadata from HIR with hir_type, "solidity_type", "enum"
+    Let hir_enum be proc hir_create_enum from HIR
+    proc hir_set_enum_name from HIR with hir_enum, enum_name
+    proc hir_set_metadata from HIR with hir_enum, "source_language", "solidity"
+    proc hir_set_metadata from HIR with hir_enum, "solidity_type", "enum"
 
-    Note: Store enum values
     Let metadata be proc solidity_ast_metadata from SolidityParser with enum_node
     Let values be proc get_metadata_value with metadata, "values"
 
-    Let count be proc list_length from ListCore with values
-    Let i be 0
+    If values is not equal to 0:
+        Let count be proc list_length from ListCore with values
+        Let i be 0
+        While i is less than count:
+            Let value_name be proc list_get from ListCore with values, i
+            proc hir_add_enum_value from HIR with hir_enum, value_name
+            Set i to i plus 1
+        End While
+    End If
 
-    While i is less than count:
-        Let value_name be proc list_get from ListCore with values, i
-        proc hir_set_metadata from HIR with hir_type, "solidity_enum_value", value_name
-        Set i to i plus 1
-    End While
-
-    proc hir_module_add_type from HIR with ctx.hir_module, hir_type
+    If ctx.current_contract is not equal to 0:
+        proc hir_add_class_member from HIR with ctx.current_contract, hir_enum
+    Otherwise:
+        proc hir_add_declaration from HIR with ctx.hir_module, hir_enum
+    End If
 End Process
 
 Note: ===================================================================
@@ -620,50 +889,54 @@ distinguish them.
 @End Reasoning
 
 @Implementation:
-Reads event name, creates HIR function with solidity_type="event"
-metadata. Iterates parameters adding each. Optionally handles
-"anonymous" flag on the event.
+Reads event name, creates HIR function via hir_create_function +
+hir_set_function_name with solidity_type="event" metadata. Iterates
+parameter children adding each via build_parameter, tagging indexed
+parameters with "solidity_indexed". Handles the "anonymous" flag.
+Appended to the enclosing contract via hir_add_class_member.
 @End Implementation
 
 Process called "translate_event" takes ctx as TranslationContext, event_node as Integer:
     Let event_name be proc solidity_ast_value from SolidityParser with event_node
 
-    Note: Create HIR function to represent event
-    Let hir_event be proc hir_create_function from HIR with event_name
+    Let hir_event be proc hir_create_function from HIR
+    proc hir_set_function_name from HIR with hir_event, event_name
     proc hir_set_metadata from HIR with hir_event, "source_language", "solidity"
     proc hir_set_metadata from HIR with hir_event, "solidity_type", "event"
 
-    Note: Check for anonymous modifier
     Let metadata be proc solidity_ast_metadata from SolidityParser with event_node
     Let is_anonymous be proc get_metadata_value with metadata, "anonymous"
-    Let anon_len be proc string_length from StringCore with is_anonymous
-    If anon_len is greater than 0:
-        proc hir_set_metadata from HIR with hir_event, "solidity_anonymous", "true"
+    If is_anonymous is not equal to 0:
+        Let anon_len be proc string_length from StringCore with is_anonymous
+        If anon_len is greater than 0:
+            proc hir_set_metadata from HIR with hir_event, "solidity_anonymous", "true"
+        End If
     End If
 
-    Note: Translate event parameters
     Let children be proc solidity_ast_children from SolidityParser with event_node
-    Let count be proc list_length from ListCore with children
-    Let i be 0
+    If children is not equal to 0:
+        Let count be proc list_length from ListCore with children
+        Let i be 0
+        While i is less than count:
+            Let child be proc list_get from ListCore with children, i
+            Let child_type be proc solidity_ast_type from SolidityParser with child
+            If child_type is equal to SolidityParser.SOL_PARAMETER:
+                Let hir_param be proc build_parameter with child
+                Let param_metadata be proc solidity_ast_metadata from SolidityParser with child
+                Let is_indexed be proc get_metadata_value with param_metadata, "indexed"
+                If is_indexed is not equal to 0:
+                    Let indexed_len be proc string_length from StringCore with is_indexed
+                    If indexed_len is greater than 0:
+                        proc hir_set_metadata from HIR with hir_param, "solidity_indexed", "true"
+                    End If
+                End If
+                proc hir_add_parameter from HIR with hir_event, hir_param
+            End If
+            Set i to i plus 1
+        End While
+    End If
 
-    While i is less than count:
-        Let child be proc list_get from ListCore with children, i
-        Let param_name be proc solidity_ast_value from SolidityParser with child
-        Let param_metadata be proc solidity_ast_metadata from SolidityParser with child
-
-        Let hir_param be proc hir_add_parameter from HIR with hir_event, param_name
-
-        Note: Check for indexed modifier
-        Let is_indexed be proc get_metadata_value with param_metadata, "indexed"
-        Let indexed_len be proc string_length from StringCore with is_indexed
-        If indexed_len is greater than 0:
-            proc hir_set_metadata from HIR with hir_param, "solidity_indexed", "true"
-        End If
-
-        Set i to i plus 1
-    End While
-
-    proc hir_class_add_method from HIR with ctx.current_contract, hir_event
+    proc hir_add_class_member from HIR with ctx.current_contract, hir_event
 End Process
 
 Note: ===================================================================
@@ -674,49 +947,50 @@ Note: ===================================================================
 Solidity modifiers `modifier onlyOwner() { ...; _; }` are aspect-style
 preconditions that wrap function bodies. HIR represents them as
 functions with solidity_type="modifier" so consumers can decide whether
-to inline them or keep them as named blocks.
+to inline them or keep them as named blocks. The `_;` placeholder lives
+inside the modifier body block as an expression statement on an
+identifier named "_".
 @End Reasoning
 
 @Implementation:
 Reads modifier name, creates HIR function. Sets solidity_type="modifier"
-metadata. Iterates parameters and adds the body block (containing the
-`_` placeholder where the wrapped function inserts).
+metadata. Iterates children: parameters become HIR parameters, the body
+block lowers via translate_statement and is set with hir_set_function_body.
+Appended to the enclosing contract via hir_add_class_member.
 @End Implementation
 
 Process called "translate_modifier" takes ctx as TranslationContext, modifier_node as Integer:
     Let modifier_name be proc solidity_ast_value from SolidityParser with modifier_node
 
-    Note: Create HIR function to represent modifier
-    Let hir_modifier be proc hir_create_function from HIR with modifier_name
+    Let hir_modifier be proc hir_create_function from HIR
+    proc hir_set_function_name from HIR with hir_modifier, modifier_name
     proc hir_set_metadata from HIR with hir_modifier, "source_language", "solidity"
     proc hir_set_metadata from HIR with hir_modifier, "solidity_type", "modifier"
 
-    Note: Translate modifier parameters and body
     Let children be proc solidity_ast_children from SolidityParser with modifier_node
-    Let count be proc list_length from ListCore with children
-    Let i be 0
+    If children is not equal to 0:
+        Let count be proc list_length from ListCore with children
+        Let i be 0
+        While i is less than count:
+            Let child be proc list_get from ListCore with children, i
+            Let child_type be proc solidity_ast_type from SolidityParser with child
 
-    While i is less than count:
-        Let child be proc list_get from ListCore with children, i
-        Let child_type be proc solidity_ast_type from SolidityParser with child
-
-        If child_type is equal to SolidityParser.SOL_PARAMETER:
-            Let param_name be proc solidity_ast_value from SolidityParser with child
-            proc hir_add_parameter from HIR with hir_modifier, param_name
-        Otherwise:
-            If child_type is equal to SolidityParser.SOL_BLOCK_STMT:
-                Note: Translate modifier body
-                Set ctx.current_function to hir_modifier
-                Let hir_body be proc translate_statement with ctx, child
-                proc hir_set_function_body from HIR with hir_modifier, hir_body
-                Set ctx.current_function to 0
+            If child_type is equal to SolidityParser.SOL_PARAMETER:
+                Let hir_param be proc build_parameter with child
+                proc hir_add_parameter from HIR with hir_modifier, hir_param
+            Otherwise:
+                If child_type is equal to SolidityParser.SOL_BLOCK_STMT:
+                    Set ctx.current_function to hir_modifier
+                    Let hir_body be proc translate_statement with ctx, child
+                    proc hir_set_function_body from HIR with hir_modifier, hir_body
+                    Set ctx.current_function to 0
+                End If
             End If
-        End If
+            Set i to i plus 1
+        End While
+    End If
 
-        Set i to i plus 1
-    End While
-
-    proc hir_class_add_method from HIR with ctx.current_contract, hir_modifier
+    proc hir_add_class_member from HIR with ctx.current_contract, hir_modifier
 End Process
 
 Note: ===================================================================
@@ -726,77 +1000,127 @@ Note: ===================================================================
 @Reasoning:
 Solidity function with full metadata: visibility (public/private/
 external/internal), state mutability (pure/view/payable), modifiers
-list, return type. Each piece is captured on the HIR function.
+list, return type. Each piece is captured on the HIR function so the
+backend reconstructs the exact declaration.
 @End Reasoning
 
 @Implementation:
-Reads function name, creates HIR function, pushes ctx.current_function.
-Reads metadata for visibility, mutability; attaches each as metadata.
-Iterates parameters, return values, modifiers. Translates body if
-present. Pops current_function on exit.
+Reads function name, creates HIR function, sets name. Reads metadata
+for visibility/mutability/modifiers via translate_function_modifiers
+and the "returns" return-type list. Iterates parameter children
+(build_parameter + hir_add_parameter) and the body block (lowered via
+translate_statement, set with hir_set_function_body). Appended to the
+enclosing contract via hir_add_class_member.
 @End Implementation
 
 Process called "translate_function" takes ctx as TranslationContext, function_node as Integer:
     Let function_name be proc solidity_ast_value from SolidityParser with function_node
 
-    Note: Create HIR function
-    Let hir_function be proc hir_create_function from HIR with function_name
+    Let hir_function be proc hir_create_function from HIR
+    proc hir_set_function_name from HIR with hir_function, function_name
     proc hir_set_metadata from HIR with hir_function, "source_language", "solidity"
     proc hir_set_metadata from HIR with hir_function, "solidity_type", "function"
 
-    Note: Translate function modifiers
     Let metadata be proc solidity_ast_metadata from SolidityParser with function_node
     proc translate_function_modifiers with ctx, hir_function, metadata
 
-    Note: Translate parameters and body
     Let children be proc solidity_ast_children from SolidityParser with function_node
-    Let count be proc list_length from ListCore with children
-    Let i be 0
+    If children is not equal to 0:
+        Let count be proc list_length from ListCore with children
+        Let i be 0
+        While i is less than count:
+            Let child be proc list_get from ListCore with children, i
+            Let child_type be proc solidity_ast_type from SolidityParser with child
 
-    While i is less than count:
-        Let child be proc list_get from ListCore with children, i
-        Let child_type be proc solidity_ast_type from SolidityParser with child
-
-        If child_type is equal to SolidityParser.SOL_PARAMETER:
-            Let param_name be proc solidity_ast_value from SolidityParser with child
-            Let param_metadata be proc solidity_ast_metadata from SolidityParser with child
-            Let hir_param be proc hir_add_parameter from HIR with hir_function, param_name
-
-            Note: Store storage location
-            Let storage_loc be proc get_metadata_value with param_metadata, "storage"
-            Let storage_len be proc string_length from StringCore with storage_loc
-            If storage_len is greater than 0:
-                proc hir_set_metadata from HIR with hir_param, "solidity_storage", storage_loc
+            If child_type is equal to SolidityParser.SOL_PARAMETER:
+                Let hir_param be proc build_parameter with child
+                proc hir_add_parameter from HIR with hir_function, hir_param
+            Otherwise:
+                If child_type is equal to SolidityParser.SOL_BLOCK_STMT:
+                    Set ctx.current_function to hir_function
+                    Let hir_body be proc translate_statement with ctx, child
+                    proc hir_set_function_body from HIR with hir_function, hir_body
+                    Set ctx.current_function to 0
+                End If
             End If
-        Otherwise If child_type is equal to SolidityParser.SOL_BLOCK_STMT:
-            Note: Translate function body
-            Set ctx.current_function to hir_function
-            Let hir_body be proc translate_statement with ctx, child
-            proc hir_set_function_body from HIR with hir_function, hir_body
-            Set ctx.current_function to 0
-        End If
-
-        Set i to i plus 1
-    End While
-
-    Note: Store return types if present
-    Let return_types be proc get_metadata_value with metadata, "returns"
-    If return_types is not equal to 0:
-        proc hir_set_metadata from HIR with hir_function, "solidity_returns", return_types
+            Set i to i plus 1
+        End While
     End If
 
-    proc hir_class_add_method from HIR with ctx.current_contract, hir_function
+    Let return_types be proc get_metadata_value with metadata, "returns"
+    If return_types is not equal to 0:
+        proc translate_return_parameters with hir_function, return_types
+    End If
+
+    proc hir_add_class_member from HIR with ctx.current_contract, hir_function
 End Process
 
 @Reasoning:
-Attaches Solidity function modifiers (e.g., `onlyOwner`) as metadata
-on the HIR function. Each modifier name is added separately so they
-can be applied in order.
+Solidity named return parameters `returns (uint256 total, bool ok)`
+carry per-slot types and optional names. They are preserved on the HIR
+function under the "solidity_return" multi-valued metadata key (one
+"type name" string per slot) so the backend reconstructs the precise
+`returns (...)` clause, including named return slots.
 @End Reasoning
 
 @Implementation:
-Reads modifiers list from metadata. Iterates calling hir_set_metadata
-on each with key "solidity_function_modifier".
+Iterates the return-type list. Each entry is either a SOL_PARAMETER
+AST node (read its value=name and "type" metadata) or a bare type
+string. Builds a "type[ name]" string and attaches it as a
+"solidity_return" metadata value on the function.
+@End Implementation
+
+Process called "translate_return_parameters" takes hir_function as Integer, return_types as Integer:
+    Let count be proc list_length from ListCore with return_types
+    If count is equal to 0:
+        Return
+    End If
+
+    Let return_list be proc list_create from ListCore
+    Let i be 0
+    While i is less than count:
+        Let entry be proc list_get from ListCore with return_types, i
+        Let entry_type be proc solidity_ast_type from SolidityParser with entry
+
+        Let slot_text be ""
+        If entry_type is equal to SolidityParser.SOL_PARAMETER:
+            Let entry_metadata be proc solidity_ast_metadata from SolidityParser with entry
+            Let ret_type be proc get_metadata_value with entry_metadata, "type"
+            If ret_type is not equal to 0:
+                Set slot_text to ret_type
+            End If
+            Let ret_name be proc solidity_ast_value from SolidityParser with entry
+            If ret_name is not equal to 0:
+                Let name_len be proc string_length from StringCore with ret_name
+                If name_len is greater than 0:
+                    Set slot_text to proc string_concat from StringUtils with slot_text, " "
+                    Set slot_text to proc string_concat from StringUtils with slot_text, ret_name
+                End If
+            End If
+        Otherwise:
+            Set slot_text to entry
+        End If
+
+        proc list_append from ListCore with return_list, slot_text
+        Set i to i plus 1
+    End While
+
+    proc hir_set_metadata from HIR with hir_function, "solidity_return", return_list
+End Process
+
+@Reasoning:
+Attaches Solidity function modifiers, visibility, and mutability as
+metadata on the HIR function. Each modifier name (including the
+visibility keyword public/private/internal/external and the mutability
+keyword view/pure/payable, plus user modifiers like `onlyOwner` and
+`virtual`/`override`) is recorded under the multi-valued
+"solidity_modifier" key in declared order so the backend reproduces
+the exact modifier tail.
+@End Reasoning
+
+@Implementation:
+Reads the modifiers list from metadata. Iterates calling hir_set_metadata
+on each with key "solidity_modifier".
 @End Implementation
 
 Process called "translate_function_modifiers" takes ctx as Integer, hir_function as Integer, metadata as Integer:
@@ -807,13 +1131,56 @@ Process called "translate_function_modifiers" takes ctx as Integer, hir_function
     End If
 
     Let count be proc list_length from ListCore with modifiers
-    Let i be 0
+    If count is equal to 0:
+        Return
+    End If
 
+    Let mod_list be proc list_create from ListCore
+    Let i be 0
     While i is less than count:
         Let modifier be proc list_get from ListCore with modifiers, i
-        proc hir_set_metadata from HIR with hir_function, "solidity_modifier", modifier
+        proc list_append from ListCore with mod_list, modifier
         Set i to i plus 1
     End While
+
+    proc hir_set_metadata from HIR with hir_function, "solidity_modifier", mod_list
+End Process
+
+@Reasoning:
+Builds a single HIR parameter node from a SOL_PARAMETER AST node,
+preserving its Solidity type and storage location (memory/calldata/
+storage) as metadata so the backend reconstructs the exact parameter
+spelling. Shared by function/event/modifier/constructor parameter
+lists so the per-parameter metadata wiring lives in one place.
+@End Reasoning
+
+@Implementation:
+Creates a HIR parameter via hir_create_parameter, sets its name from
+the AST value slot, and attaches "solidity_storage"/"solidity_type"
+metadata from the parameter's metadata list when present. Returns the
+parameter node (the caller appends it with hir_add_parameter).
+@End Implementation
+
+Process called "build_parameter" takes param_node as Integer returns Integer:
+    Let param_name be proc solidity_ast_value from SolidityParser with param_node
+    Let hir_param be proc hir_create_parameter from HIR
+    proc hir_set_parameter_name from HIR with hir_param, param_name
+
+    Let param_metadata be proc solidity_ast_metadata from SolidityParser with param_node
+    Let param_type be proc get_metadata_value with param_metadata, "type"
+    If param_type is not equal to 0:
+        proc hir_set_metadata from HIR with hir_param, "solidity_type", param_type
+    End If
+
+    Let storage_loc be proc get_metadata_value with param_metadata, "storage"
+    If storage_loc is not equal to 0:
+        Let storage_len be proc string_length from StringCore with storage_loc
+        If storage_len is greater than 0:
+            proc hir_set_metadata from HIR with hir_param, "solidity_storage", storage_loc
+        End If
+    End If
+
+    Return hir_param
 End Process
 
 Note: ===================================================================
@@ -822,51 +1189,49 @@ Note: ===================================================================
 
 @Reasoning:
 Solidity constructors run once at contract deployment. Represented as
-HIR functions with a special "<init>" name and
-solidity_type="constructor" metadata.
+HIR functions named "constructor" with solidity_type="constructor"
+metadata so the backend emits the unnamed `constructor` keyword form.
 @End Reasoning
 
 @Implementation:
-Creates a HIR function with name "<init>". Reads metadata for
-visibility and mutability and attaches as metadata. Translates
-parameters and body identically to a regular function.
+Creates a HIR function named "constructor". Reads metadata for
+modifiers via translate_function_modifiers. Iterates parameters and
+body identically to a regular function. Appended via hir_add_class_member.
 @End Implementation
 
 Process called "translate_constructor" takes ctx as TranslationContext, constructor_node as Integer:
-    Note: Create HIR function for constructor
-    Let hir_constructor be proc hir_create_function from HIR with "constructor"
+    Let hir_constructor be proc hir_create_function from HIR
+    proc hir_set_function_name from HIR with hir_constructor, "constructor"
     proc hir_set_metadata from HIR with hir_constructor, "source_language", "solidity"
     proc hir_set_metadata from HIR with hir_constructor, "solidity_type", "constructor"
 
-    Note: Translate modifiers
     Let metadata be proc solidity_ast_metadata from SolidityParser with constructor_node
     proc translate_function_modifiers with ctx, hir_constructor, metadata
 
-    Note: Translate parameters and body
     Let children be proc solidity_ast_children from SolidityParser with constructor_node
-    Let count be proc list_length from ListCore with children
-    Let i be 0
+    If children is not equal to 0:
+        Let count be proc list_length from ListCore with children
+        Let i be 0
+        While i is less than count:
+            Let child be proc list_get from ListCore with children, i
+            Let child_type be proc solidity_ast_type from SolidityParser with child
 
-    While i is less than count:
-        Let child be proc list_get from ListCore with children, i
-        Let child_type be proc solidity_ast_type from SolidityParser with child
-
-        If child_type is equal to SolidityParser.SOL_PARAMETER:
-            Let param_name be proc solidity_ast_value from SolidityParser with child
-            proc hir_add_parameter from HIR with hir_constructor, param_name
-        Otherwise:
-            If child_type is equal to SolidityParser.SOL_BLOCK_STMT:
-                Set ctx.current_function to hir_constructor
-                Let hir_body be proc translate_statement with ctx, child
-                proc hir_set_function_body from HIR with hir_constructor, hir_body
-                Set ctx.current_function to 0
+            If child_type is equal to SolidityParser.SOL_PARAMETER:
+                Let hir_param be proc build_parameter with child
+                proc hir_add_parameter from HIR with hir_constructor, hir_param
+            Otherwise:
+                If child_type is equal to SolidityParser.SOL_BLOCK_STMT:
+                    Set ctx.current_function to hir_constructor
+                    Let hir_body be proc translate_statement with ctx, child
+                    proc hir_set_function_body from HIR with hir_constructor, hir_body
+                    Set ctx.current_function to 0
+                End If
             End If
-        End If
+            Set i to i plus 1
+        End While
+    End If
 
-        Set i to i plus 1
-    End While
-
-    proc hir_class_add_method from HIR with ctx.current_contract, hir_constructor
+    proc hir_add_class_member from HIR with ctx.current_contract, hir_constructor
 End Process
 
 Note: ===================================================================
@@ -881,37 +1246,43 @@ as a named function with solidity_type="fallback".
 
 @Implementation:
 Creates HIR function named "fallback" with solidity_type="fallback"
-metadata. Iterates parameters (usually empty), translates body.
+metadata. Reads modifiers, iterates parameters and body, appends via
+hir_add_class_member.
 @End Implementation
 
 Process called "translate_fallback" takes ctx as TranslationContext, fallback_node as Integer:
-    Let hir_fallback be proc hir_create_function from HIR with "fallback"
+    Let hir_fallback be proc hir_create_function from HIR
+    proc hir_set_function_name from HIR with hir_fallback, "fallback"
     proc hir_set_metadata from HIR with hir_fallback, "source_language", "solidity"
     proc hir_set_metadata from HIR with hir_fallback, "solidity_type", "fallback"
 
     Let metadata be proc solidity_ast_metadata from SolidityParser with fallback_node
     proc translate_function_modifiers with ctx, hir_fallback, metadata
 
-    Note: Translate body
     Let children be proc solidity_ast_children from SolidityParser with fallback_node
-    Let count be proc list_length from ListCore with children
-    Let i be 0
+    If children is not equal to 0:
+        Let count be proc list_length from ListCore with children
+        Let i be 0
+        While i is less than count:
+            Let child be proc list_get from ListCore with children, i
+            Let child_type be proc solidity_ast_type from SolidityParser with child
 
-    While i is less than count:
-        Let child be proc list_get from ListCore with children, i
-        Let child_type be proc solidity_ast_type from SolidityParser with child
+            If child_type is equal to SolidityParser.SOL_PARAMETER:
+                Let hir_param be proc build_parameter with child
+                proc hir_add_parameter from HIR with hir_fallback, hir_param
+            Otherwise:
+                If child_type is equal to SolidityParser.SOL_BLOCK_STMT:
+                    Set ctx.current_function to hir_fallback
+                    Let hir_body be proc translate_statement with ctx, child
+                    proc hir_set_function_body from HIR with hir_fallback, hir_body
+                    Set ctx.current_function to 0
+                End If
+            End If
+            Set i to i plus 1
+        End While
+    End If
 
-        If child_type is equal to SolidityParser.SOL_BLOCK_STMT:
-            Set ctx.current_function to hir_fallback
-            Let hir_body be proc translate_statement with ctx, child
-            proc hir_set_function_body from HIR with hir_fallback, hir_body
-            Set ctx.current_function to 0
-        End If
-
-        Set i to i plus 1
-    End While
-
-    proc hir_class_add_method from HIR with ctx.current_contract, hir_fallback
+    proc hir_add_class_member from HIR with ctx.current_contract, hir_fallback
 End Process
 
 @Reasoning:
@@ -922,38 +1293,43 @@ with solidity_type="receive".
 
 @Implementation:
 Creates HIR function named "receive" with solidity_type="receive"
-metadata. Receive must be payable per Solidity rules; the payable
-metadata is also attached.
+metadata. Reads modifiers, iterates parameters (usually empty) and
+body, appends via hir_add_class_member.
 @End Implementation
 
 Process called "translate_receive" takes ctx as TranslationContext, receive_node as Integer:
-    Let hir_receive be proc hir_create_function from HIR with "receive"
+    Let hir_receive be proc hir_create_function from HIR
+    proc hir_set_function_name from HIR with hir_receive, "receive"
     proc hir_set_metadata from HIR with hir_receive, "source_language", "solidity"
     proc hir_set_metadata from HIR with hir_receive, "solidity_type", "receive"
 
     Let metadata be proc solidity_ast_metadata from SolidityParser with receive_node
     proc translate_function_modifiers with ctx, hir_receive, metadata
 
-    Note: Translate body
     Let children be proc solidity_ast_children from SolidityParser with receive_node
-    Let count be proc list_length from ListCore with children
-    Let i be 0
+    If children is not equal to 0:
+        Let count be proc list_length from ListCore with children
+        Let i be 0
+        While i is less than count:
+            Let child be proc list_get from ListCore with children, i
+            Let child_type be proc solidity_ast_type from SolidityParser with child
 
-    While i is less than count:
-        Let child be proc list_get from ListCore with children, i
-        Let child_type be proc solidity_ast_type from SolidityParser with child
+            If child_type is equal to SolidityParser.SOL_PARAMETER:
+                Let hir_param be proc build_parameter with child
+                proc hir_add_parameter from HIR with hir_receive, hir_param
+            Otherwise:
+                If child_type is equal to SolidityParser.SOL_BLOCK_STMT:
+                    Set ctx.current_function to hir_receive
+                    Let hir_body be proc translate_statement with ctx, child
+                    proc hir_set_function_body from HIR with hir_receive, hir_body
+                    Set ctx.current_function to 0
+                End If
+            End If
+            Set i to i plus 1
+        End While
+    End If
 
-        If child_type is equal to SolidityParser.SOL_BLOCK_STMT:
-            Set ctx.current_function to hir_receive
-            Let hir_body be proc translate_statement with ctx, child
-            proc hir_set_function_body from HIR with hir_receive, hir_body
-            Set ctx.current_function to 0
-        End If
-
-        Set i to i plus 1
-    End While
-
-    proc hir_class_add_method from HIR with ctx.current_contract, hir_receive
+    proc hir_add_class_member from HIR with ctx.current_contract, hir_receive
 End Process
 
 Note: ===================================================================
@@ -968,19 +1344,20 @@ as class fields with attached metadata.
 @End Reasoning
 
 @Implementation:
-Reads variable name, type, visibility, mutability, and initializer
-from the AST node. Creates HIR field on the current_contract,
-attaches visibility/mutability as metadata. Translates initializer
-expression if present.
+Reads variable name (value slot). Creates a HIR field via
+hir_create_field + hir_set_field_name, appended to the current
+contract via hir_add_class_member. Attaches type ("solidity_type"),
+each modifier ("solidity_modifier"), and initializer
+("solidity_initializer") from the AST metadata.
 @End Implementation
 
 Process called "translate_state_variable" takes ctx as TranslationContext, var_node as Integer:
     Let var_name be proc solidity_ast_value from SolidityParser with var_node
 
-    Let hir_field be proc hir_add_field from HIR with ctx.current_contract, var_name
+    Let hir_field be proc hir_create_field from HIR
+    proc hir_set_field_name from HIR with hir_field, var_name
     proc hir_set_metadata from HIR with hir_field, "source_language", "solidity"
 
-    Note: Store type and modifiers
     Let metadata be proc solidity_ast_metadata from SolidityParser with var_node
     Let var_type be proc get_metadata_value with metadata, "type"
     If var_type is not equal to 0:
@@ -990,20 +1367,24 @@ Process called "translate_state_variable" takes ctx as TranslationContext, var_n
     Let modifiers be proc get_metadata_value with metadata, "modifiers"
     If modifiers is not equal to 0:
         Let count be proc list_length from ListCore with modifiers
-        Let i be 0
-
-        While i is less than count:
-            Let modifier be proc list_get from ListCore with modifiers, i
-            proc hir_set_metadata from HIR with hir_field, "solidity_modifier", modifier
-            Set i to i plus 1
-        End While
+        If count is greater than 0:
+            Let mod_list be proc list_create from ListCore
+            Let i be 0
+            While i is less than count:
+                Let modifier be proc list_get from ListCore with modifiers, i
+                proc list_append from ListCore with mod_list, modifier
+                Set i to i plus 1
+            End While
+            proc hir_set_metadata from HIR with hir_field, "solidity_modifier", mod_list
+        End If
     End If
 
-    Note: Store initializer if present
     Let initializer be proc get_metadata_value with metadata, "initializer"
     If initializer is not equal to 0:
         proc hir_set_metadata from HIR with hir_field, "solidity_initializer", initializer
     End If
+
+    proc hir_add_class_member from HIR with ctx.current_contract, hir_field
 End Process
 
 Note: ===================================================================
@@ -1013,13 +1394,13 @@ Note: ===================================================================
 @Reasoning:
 Statement-kind dispatcher. Solidity has block, if, while, for,
 do-while, return, emit, revert, try, expression-statement, plus
-break/continue (handled separately). Routes each to its translator.
+break/continue. Routes each to its translator.
 @End Reasoning
 
 @Implementation:
-Reads node_type via solidity_ast_type and uses nested If-chain to
+Reads node_type via solidity_ast_type and uses an If-chain to
 dispatch against SolidityParser.SOL_*_STMT constants. Each match
-returns the corresponding translate_*_statement result.
+returns the corresponding translate_* result.
 @End Implementation
 
 Process called "translate_statement" takes ctx as Integer, stmt_node as Integer returns Integer:
@@ -1028,127 +1409,133 @@ Process called "translate_statement" takes ctx as Integer, stmt_node as Integer 
     If node_type is equal to SolidityParser.SOL_BLOCK_STMT:
         Return proc translate_block with ctx, stmt_node
     End If
-
+    If node_type is equal to SolidityParser.SOL_UNCHECKED_BLOCK:
+        Return proc translate_block with ctx, stmt_node
+    End If
     If node_type is equal to SolidityParser.SOL_IF_STMT:
         Return proc translate_if_statement with ctx, stmt_node
     End If
-
     If node_type is equal to SolidityParser.SOL_WHILE_STMT:
         Return proc translate_while_statement with ctx, stmt_node
     End If
-
     If node_type is equal to SolidityParser.SOL_FOR_STMT:
         Return proc translate_for_statement with ctx, stmt_node
     End If
-
     If node_type is equal to SolidityParser.SOL_DO_WHILE_STMT:
         Return proc translate_do_while_statement with ctx, stmt_node
     End If
-
     If node_type is equal to SolidityParser.SOL_RETURN_STMT:
         Return proc translate_return_statement with ctx, stmt_node
     End If
-
     If node_type is equal to SolidityParser.SOL_BREAK_STMT:
-        Return proc hir_create_break_statement from HIR
+        Return proc hir_create_break from HIR
     End If
-
     If node_type is equal to SolidityParser.SOL_CONTINUE_STMT:
-        Return proc hir_create_continue_statement from HIR
+        Return proc hir_create_continue from HIR
     End If
-
     If node_type is equal to SolidityParser.SOL_EMIT_STMT:
         Return proc translate_emit_statement with ctx, stmt_node
     End If
-
     If node_type is equal to SolidityParser.SOL_REVERT_STMT:
         Return proc translate_revert_statement with ctx, stmt_node
     End If
-
     If node_type is equal to SolidityParser.SOL_TRY_STMT:
         Return proc translate_try_statement with ctx, stmt_node
     End If
-
+    If node_type is equal to SolidityParser.SOL_ASSEMBLY_BLOCK:
+        Return proc translate_assembly_block with ctx, stmt_node
+    End If
     If node_type is equal to SolidityParser.SOL_EXPRESSION_STMT:
         Return proc translate_expression_statement with ctx, stmt_node
     End If
 
-    Note: Unknown statement type
     Return 0
 End Process
 
 @Reasoning:
 Block statement `{ s1; s2; }`. Wraps a sequence of statements in a
-HIR block node.
+HIR block node. The unchecked block `unchecked { ... }` reuses this
+translator and is tagged so the backend re-emits the `unchecked`
+keyword.
 @End Reasoning
 
 @Implementation:
 Creates HIR block, iterates children statements translating each
-via translate_statement, appending to the block's body.
+via translate_statement, appending to the block via hir_add_statement.
+Tags SOL_UNCHECKED_BLOCK nodes with "solidity_unchecked"="true".
 @End Implementation
 
 Process called "translate_block" takes ctx as Integer, block_node as Integer returns Integer:
     Let hir_block be proc hir_create_block from HIR
 
+    Let block_type be proc solidity_ast_type from SolidityParser with block_node
+    If block_type is equal to SolidityParser.SOL_UNCHECKED_BLOCK:
+        proc hir_set_metadata from HIR with hir_block, "solidity_unchecked", "true"
+    End If
+
     Let children be proc solidity_ast_children from SolidityParser with block_node
-    Let count be proc list_length from ListCore with children
-    Let i be 0
-
-    While i is less than count:
-        Let child be proc list_get from ListCore with children, i
-        Let hir_stmt be proc translate_statement with ctx, child
-
-        If hir_stmt is not equal to 0:
-            proc hir_block_add_statement from HIR with hir_block, hir_stmt
-        End If
-
-        Set i to i plus 1
-    End While
+    If children is not equal to 0:
+        Let count be proc list_length from ListCore with children
+        Let i be 0
+        While i is less than count:
+            Let child be proc list_get from ListCore with children, i
+            Let hir_stmt be proc translate_statement with ctx, child
+            If hir_stmt is not equal to 0:
+                proc hir_add_statement from HIR with hir_block, hir_stmt
+            End If
+            Set i to i plus 1
+        End While
+    End If
 
     Return hir_block
 End Process
 
 @Reasoning:
-`if (cond) { then } else { else }`. Creates HIR if with condition,
-then-block, and optional else-block.
+`if (cond) { then } else { else }`. Creates a zero-arg HIR if node and
+wires its condition, then-branch, and optional else-branch with the
+hir_set_if_* setters.
 @End Reasoning
 
 @Implementation:
-Reads condition, then-block, optional else-block from children.
-Recursively translates each via translate_expression /
-translate_statement. Constructs HIR if-statement.
+Reads condition from metadata; then/else branches from children.
+Recursively translates each. Sets condition/then/else on the HIR if.
 @End Implementation
 
 Process called "translate_if_statement" takes ctx as Integer, if_node as Integer returns Integer:
     Let metadata be proc solidity_ast_metadata from SolidityParser with if_node
     Let condition be proc get_metadata_value with metadata, "condition"
 
-    Note: Translate condition
     Let hir_condition be proc translate_expression with ctx, condition
 
-    Note: Translate then and else branches
-    Let children be proc solidity_ast_children from SolidityParser with if_node
-    Let then_stmt be proc list_get from ListCore with children, 0
-    Let hir_then be proc translate_statement with ctx, then_stmt
+    Let hir_if be proc hir_create_if from HIR
+    proc hir_set_if_condition from HIR with hir_if, hir_condition
 
-    Let hir_else be 0
-    Let count be proc list_length from ListCore with children
-    If count is greater than 1:
-        Let else_stmt be proc list_get from ListCore with children, 1
-        Set hir_else to proc translate_statement with ctx, else_stmt
+    Let children be proc solidity_ast_children from SolidityParser with if_node
+    If children is not equal to 0:
+        Let count be proc list_length from ListCore with children
+        If count is greater than 0:
+            Let then_stmt be proc list_get from ListCore with children, 0
+            Let hir_then be proc translate_statement with ctx, then_stmt
+            proc hir_set_if_then from HIR with hir_if, hir_then
+        End If
+        If count is greater than 1:
+            Let else_stmt be proc list_get from ListCore with children, 1
+            Let hir_else be proc translate_statement with ctx, else_stmt
+            proc hir_set_if_else from HIR with hir_if, hir_else
+        End If
     End If
 
-    Let hir_if be proc hir_create_if_statement from HIR with hir_condition, hir_then, hir_else
     Return hir_if
 End Process
 
 @Reasoning:
-`while (cond) body`. Creates HIR while-loop with condition and body.
+`while (cond) body`. Creates a zero-arg HIR while node and wires its
+condition and body with hir_set_while_condition / hir_set_while_body.
 @End Reasoning
 
 @Implementation:
-Reads condition and body from children; recursively translates both.
-Constructs HIR while-loop.
+Reads condition from metadata and body from children; recursively
+translates both and sets them on the HIR while.
 @End Implementation
 
 Process called "translate_while_statement" takes ctx as Integer, while_node as Integer returns Integer:
@@ -1157,82 +1544,85 @@ Process called "translate_while_statement" takes ctx as Integer, while_node as I
 
     Let hir_condition be proc translate_expression with ctx, condition
 
-    Let children be proc solidity_ast_children from SolidityParser with while_node
-    Let body be proc list_get from ListCore with children, 0
-    Let hir_body be proc translate_statement with ctx, body
+    Let hir_while be proc hir_create_while from HIR
+    proc hir_set_while_condition from HIR with hir_while, hir_condition
 
-    Let hir_while be proc hir_create_while_statement from HIR with hir_condition, hir_body
+    Let children be proc solidity_ast_children from SolidityParser with while_node
+    If children is not equal to 0:
+        Let count be proc list_length from ListCore with children
+        If count is greater than 0:
+            Let body be proc list_get from ListCore with children, 0
+            Let hir_body be proc translate_statement with ctx, body
+            proc hir_set_while_body from HIR with hir_while, hir_body
+        End If
+    End If
+
     Return hir_while
 End Process
 
 @Reasoning:
-C-style `for (init; cond; update) body`. All three header slots are
-optional. HIR captures them in a structured for-loop node.
+C-style `for (init; cond; update) body`. HIR has a native for node
+(hir_create_for) with separate init/condition/update/body slots, so
+the Solidity for maps directly onto it without lowering to a while -
+preserving the loop's structure for the backend to re-emit the exact
+`for (...)` form. Each of the three header slots is optional.
 @End Reasoning
 
 @Implementation:
-Reads init, condition, update, body from children. Each optional;
-nulls preserved on absent slots. Recursively translates each
-present part.
+Creates a zero-arg HIR for node. The init is a statement (declaration
+or expression statement) lowered via translate_statement; condition
+and update are expressions. Body is the single statement child. Each
+present part is set with the matching hir_set_for_* setter.
 @End Implementation
 
 Process called "translate_for_statement" takes ctx as Integer, for_node as Integer returns Integer:
     Let metadata be proc solidity_ast_metadata from SolidityParser with for_node
+    Let hir_for be proc hir_create_for from HIR
 
-    Note: For loops translate to HIR while loops with initialization
-    Let hir_block be proc hir_create_block from HIR
-
-    Note: Translate init
     Let init be proc get_metadata_value with metadata, "init"
     If init is not equal to 0:
         Let hir_init be proc translate_statement with ctx, init
         If hir_init is not equal to 0:
-            proc hir_block_add_statement from HIR with hir_block, hir_init
+            proc hir_set_for_init from HIR with hir_for, hir_init
         End If
     End If
 
-    Note: Translate condition
     Let condition be proc get_metadata_value with metadata, "condition"
-    Let hir_condition be 0
     If condition is not equal to 0:
-        Set hir_condition to proc translate_expression with ctx, condition
-    Otherwise:
-        Note: No condition means infinite loop
-        Set hir_condition to proc hir_create_boolean_literal from HIR with 1
+        Let hir_condition be proc translate_expression with ctx, condition
+        proc hir_set_for_condition from HIR with hir_for, hir_condition
     End If
 
-    Note: Translate body and update
-    Let children be proc solidity_ast_children from SolidityParser with for_node
-    Let body be proc list_get from ListCore with children, 0
-    Let hir_body_block be proc hir_create_block from HIR
-    Let hir_body_stmt be proc translate_statement with ctx, body
-    proc hir_block_add_statement from HIR with hir_body_block, hir_body_stmt
-
-    Note: Add update at end of body
     Let update be proc get_metadata_value with metadata, "update"
     If update is not equal to 0:
         Let hir_update be proc translate_expression with ctx, update
-        If hir_update is not equal to 0:
-            Let hir_update_stmt be proc hir_create_expression_statement from HIR with hir_update
-            proc hir_block_add_statement from HIR with hir_body_block, hir_update_stmt
+        proc hir_set_for_update from HIR with hir_for, hir_update
+    End If
+
+    Let children be proc solidity_ast_children from SolidityParser with for_node
+    If children is not equal to 0:
+        Let count be proc list_length from ListCore with children
+        If count is greater than 0:
+            Let body be proc list_get from ListCore with children, 0
+            Let hir_body be proc translate_statement with ctx, body
+            proc hir_set_for_body from HIR with hir_for, hir_body
         End If
     End If
 
-    Let hir_while be proc hir_create_while_statement from HIR with hir_condition, hir_body_block
-    proc hir_block_add_statement from HIR with hir_block, hir_while
-
-    Return hir_block
+    Return hir_for
 End Process
 
 @Reasoning:
-`do body while (cond);` — body executes once before condition is
-tested. Creates HIR do-while statement.
+`do body while (cond);` - body executes once before condition is
+tested. HIR has a native do-while node (hir_create_do_while) with
+body and condition slots, so the body-first semantics survive
+directly.
 @End Reasoning
 
 @Implementation:
-Reads body and condition from children. Recursively translates both
-and constructs the HIR do-while node with the body-first semantics
-preserved.
+Creates a zero-arg HIR do-while node. Reads body from children and
+condition from metadata; recursively translates both and sets them
+with hir_set_do_while_body / hir_set_do_while_condition.
 @End Implementation
 
 Process called "translate_do_while_statement" takes ctx as Integer, do_while_node as Integer returns Integer:
@@ -1241,18 +1631,20 @@ Process called "translate_do_while_statement" takes ctx as Integer, do_while_nod
 
     Let hir_condition be proc translate_expression with ctx, condition
 
+    Let hir_do_while be proc hir_create_do_while from HIR
+    proc hir_set_do_while_condition from HIR with hir_do_while, hir_condition
+
     Let children be proc solidity_ast_children from SolidityParser with do_while_node
-    Let body be proc list_get from ListCore with children, 0
-    Let hir_body be proc translate_statement with ctx, body
+    If children is not equal to 0:
+        Let count be proc list_length from ListCore with children
+        If count is greater than 0:
+            Let body be proc list_get from ListCore with children, 0
+            Let hir_body be proc translate_statement with ctx, body
+            proc hir_set_do_while_body from HIR with hir_do_while, hir_body
+        End If
+    End If
 
-    Note: Do-while translates to while with body executed first
-    Let hir_block be proc hir_create_block from HIR
-    proc hir_block_add_statement from HIR with hir_block, hir_body
-
-    Let hir_while be proc hir_create_while_statement from HIR with hir_condition, hir_body
-    proc hir_block_add_statement from HIR with hir_block, hir_while
-
-    Return hir_block
+    Return hir_do_while
 End Process
 
 @Reasoning:
@@ -1261,159 +1653,200 @@ optional value expression.
 @End Reasoning
 
 @Implementation:
-Reads optional return expression child; if present, translates via
-translate_expression and attaches as the return value. Otherwise
-emits a value-less return.
+Reads optional return expression from "value" metadata; if present,
+translates via translate_expression and attaches with
+hir_set_return_value. Otherwise emits a value-less return.
 @End Implementation
 
 Process called "translate_return_statement" takes ctx as Integer, return_node as Integer returns Integer:
     Let metadata be proc solidity_ast_metadata from SolidityParser with return_node
     Let value be proc get_metadata_value with metadata, "value"
 
-    Let hir_value be 0
+    Let hir_return be proc hir_create_return from HIR
     If value is not equal to 0:
-        Set hir_value to proc translate_expression with ctx, value
+        Let hir_value be proc translate_expression with ctx, value
+        proc hir_set_return_value from HIR with hir_return, hir_value
     End If
 
-    Let hir_return be proc hir_create_return_statement from HIR with hir_value
     Return hir_return
 End Process
 
 @Reasoning:
 Solidity `emit EventName(args);` fires an event log. HIR translates
-to a call expression with solidity_type="emit" metadata so consumers
-recognise it as an event emission rather than a regular call.
+the inner call to a HIR call expression wrapped in an expression
+statement tagged "solidity_emit"="true" so the backend re-emits the
+`emit` keyword.
 @End Reasoning
 
 @Implementation:
 Reads the event call expression child, recursively translates it,
-attaches solidity_type="emit" metadata.
+wraps in an expression statement, and tags it solidity_emit.
 @End Implementation
 
 Process called "translate_emit_statement" takes ctx as Integer, emit_node as Integer returns Integer:
-    Note: Emit statement translates to function call
     Let children be proc solidity_ast_children from SolidityParser with emit_node
-    Let call_expr be proc list_get from ListCore with children, 0
+    Let hir_call be 0
+    If children is not equal to 0:
+        Let count be proc list_length from ListCore with children
+        If count is greater than 0:
+            Let call_expr be proc list_get from ListCore with children, 0
+            Set hir_call to proc translate_expression with ctx, call_expr
+        End If
+    End If
 
-    Let hir_call be proc translate_expression with ctx, call_expr
     Let hir_stmt be proc hir_create_expression_statement from HIR with hir_call
-
+    proc hir_set_metadata from HIR with hir_stmt, "solidity_emit", "true"
     Return hir_stmt
 End Process
 
 @Reasoning:
-`revert();` or `revert MyError(args);` aborts execution and refunds
-remaining gas. The optional error argument uses the custom-error
-syntax (Solidity 0.8.4+) or a string-message form.
+`revert();`, `revert("msg");` or `revert MyError(args);` aborts
+execution. HIR models it as a throw statement tagged "solidity_revert"
+so the backend re-emits `revert`; the thrown expression is the error
+call / message, or a bare identifier when revert has no argument.
 @End Reasoning
 
 @Implementation:
-Reads optional argument child. Wraps in HIR revert statement with
-metadata "solidity_revert_kind" set to "error" or "message" based
-on the argument shape.
+Reads the optional argument child. If present, translates it as the
+thrown expression. Otherwise creates a bare `revert` identifier as the
+throw payload. Tags the throw "solidity_revert"="true".
 @End Implementation
 
 Process called "translate_revert_statement" takes ctx as Integer, revert_node as Integer returns Integer:
-    Note: Revert translates to exception throw
     Let children be proc solidity_ast_children from SolidityParser with revert_node
-    Let count be proc list_length from ListCore with children
+    Let count be 0
+    If children is not equal to 0:
+        Set count to proc list_length from ListCore with children
+    End If
 
     Let hir_exception be 0
     If count is greater than 0:
         Let call_expr be proc list_get from ListCore with children, 0
         Set hir_exception to proc translate_expression with ctx, call_expr
     Otherwise:
-        Note: Simple revert without error
-        Set hir_exception to proc hir_create_string_literal from HIR with "revert"
+        Set hir_exception to proc hir_create_identifier from HIR with "revert"
     End If
 
-    Let hir_throw be proc hir_create_throw_statement from HIR with hir_exception
+    Let hir_throw be proc hir_create_throw from HIR
+    proc hir_set_throw_expression from HIR with hir_throw, hir_exception
+    proc hir_set_metadata from HIR with hir_throw, "solidity_revert", "true"
     Return hir_throw
 End Process
 
 @Reasoning:
-`try expression { success } catch ErrorName(args) { handler }` is
-Solidity 0.6+ external-call error recovery. HIR represents as a
-try-catch with a list of catch clauses (Error, Panic, low-level).
+`try expression returns (...) { success } catch ... { handler }` is
+Solidity 0.6+ external-call error recovery. HIR represents it as a
+try node whose try block holds the success body and whose catch
+clauses hold the handlers; the try expression is preserved on the try
+node as "solidity_try_expr" metadata.
 @End Reasoning
 
 @Implementation:
-Reads try-call expression and the catch clauses list. Translates the
-expression and each catch clause via translate_catch_clause.
+Reads the try-call expression from "expression" metadata and translates
+it. Iterates children: the first SOL_BLOCK_STMT is the success body
+(set with hir_set_try_block), each SOL_CATCH_CLAUSE lowers via
+translate_catch_clause and is added with hir_add_catch_clause.
 @End Implementation
 
 Process called "translate_try_statement" takes ctx as Integer, try_node as Integer returns Integer:
     Let metadata be proc solidity_ast_metadata from SolidityParser with try_node
     Let expression be proc get_metadata_value with metadata, "expression"
 
-    Note: Translate try expression
-    Let hir_try_expr be proc translate_expression with ctx, expression
+    Let hir_try be proc hir_create_try from HIR
 
-    Note: Translate try body
+    If expression is not equal to 0:
+        Let hir_try_expr be proc translate_expression with ctx, expression
+        proc hir_set_metadata from HIR with hir_try, "solidity_try_expr", hir_try_expr
+    End If
+
     Let children be proc solidity_ast_children from SolidityParser with try_node
-    Let count be proc list_length from ListCore with children
-    Let i be 0
+    If children is not equal to 0:
+        Let count be proc list_length from ListCore with children
+        Let i be 0
+        Let body_set be 0
+        While i is less than count:
+            Let child be proc list_get from ListCore with children, i
+            Let child_type be proc solidity_ast_type from SolidityParser with child
 
-    Let hir_try_body be 0
-    Let catch_clauses be proc list_create from ListCore
-
-    While i is less than count:
-        Let child be proc list_get from ListCore with children, i
-        Let child_type be proc solidity_ast_type from SolidityParser with child
-
-        If child_type is equal to SolidityParser.SOL_BLOCK_STMT:
-            If hir_try_body is equal to 0:
-                Set hir_try_body to proc translate_statement with ctx, child
+            If child_type is equal to SolidityParser.SOL_BLOCK_STMT:
+                If body_set is equal to 0:
+                    Let hir_try_body be proc translate_statement with ctx, child
+                    proc hir_set_try_block from HIR with hir_try, hir_try_body
+                    Set body_set to 1
+                End If
+            Otherwise:
+                If child_type is equal to SolidityParser.SOL_CATCH_CLAUSE:
+                    Let hir_catch be proc translate_catch_clause with ctx, child
+                    proc hir_add_catch_clause from HIR with hir_try, hir_catch
+                End If
             End If
-        Otherwise If child_type is equal to SolidityParser.SOL_CATCH_CLAUSE:
-            Let hir_catch be proc translate_catch_clause with ctx, child
-            proc list_append from ListCore with catch_clauses, hir_catch
-        End If
+            Set i to i plus 1
+        End While
+    End If
 
-        Set i to i plus 1
-    End While
-
-    Let hir_try be proc hir_create_try_statement from HIR with hir_try_body, catch_clauses
     Return hir_try
 End Process
 
 @Reasoning:
-Each catch clause has a catch-kind (Error, Panic, low-level/no-name)
-plus optional parameter binding and a body block.
+Each catch clause has an optional catch-identifier (Error / Panic /
+low-level) plus optional parameter binding and a body block. HIR's
+catch node carries a catch variable and a body block.
 @End Reasoning
 
 @Implementation:
-Reads catch_kind from the AST node and parameters/body from
-children. Constructs a HIR catch clause with kind metadata, parameter
-list, and translated body.
+Scans children: the first SOL_PARAMETER supplies the catch variable
+name (defaulting to "error"), the SOL_BLOCK_STMT supplies the body.
+Builds a HIR catch via hir_create_catch and wires the variable and
+body with hir_set_catch_variable / hir_set_catch_body.
 @End Implementation
 
 Process called "translate_catch_clause" takes ctx as Integer, catch_node as Integer returns Integer:
-    Note: Translate catch clause
-    Let children be proc solidity_ast_children from SolidityParser with catch_node
-    Let count be proc list_length from ListCore with children
-    Let i be 0
-
+    Let hir_catch be proc hir_create_catch from HIR
     Let exception_var be "error"
-    Let hir_catch_body be 0
 
-    While i is less than count:
-        Let child be proc list_get from ListCore with children, i
-        Let child_type be proc solidity_ast_type from SolidityParser with child
+    Let children be proc solidity_ast_children from SolidityParser with catch_node
+    If children is not equal to 0:
+        Let count be proc list_length from ListCore with children
+        Let i be 0
+        While i is less than count:
+            Let child be proc list_get from ListCore with children, i
+            Let child_type be proc solidity_ast_type from SolidityParser with child
 
-        If child_type is equal to SolidityParser.SOL_PARAMETER:
-            Set exception_var to proc solidity_ast_value from SolidityParser with child
-        Otherwise:
-            If child_type is equal to SolidityParser.SOL_BLOCK_STMT:
-                Set hir_catch_body to proc translate_statement with ctx, child
+            If child_type is equal to SolidityParser.SOL_PARAMETER:
+                Set exception_var to proc solidity_ast_value from SolidityParser with child
+            Otherwise:
+                If child_type is equal to SolidityParser.SOL_BLOCK_STMT:
+                    Let hir_catch_body be proc translate_statement with ctx, child
+                    proc hir_set_catch_body from HIR with hir_catch, hir_catch_body
+                End If
             End If
-        End If
+            Set i to i plus 1
+        End While
+    End If
 
-        Set i to i plus 1
-    End While
-
-    Let hir_catch be proc hir_create_catch_clause from HIR with exception_var, hir_catch_body
+    proc hir_set_catch_variable from HIR with hir_catch, exception_var
     Return hir_catch
+End Process
+
+@Reasoning:
+Solidity inline `assembly { ... }` blocks contain Yul code that has no
+HIR structural representation. The block is preserved verbatim as an
+expression statement carrying the raw assembly body text in
+"solidity_assembly" metadata so the backend re-emits it unchanged.
+@End Reasoning
+
+@Implementation:
+Reads the raw body text from the node value slot, creates a HIR nop
+expression-statement carrier, and stores the body under
+"solidity_assembly".
+@End Implementation
+
+Process called "translate_assembly_block" takes ctx as Integer, assembly_node as Integer returns Integer:
+    Let body_text be proc solidity_ast_value from SolidityParser with assembly_node
+    Let hir_nop be proc hir_create_nop from HIR
+    Let hir_stmt be proc hir_create_expression_statement from HIR with hir_nop
+    proc hir_set_metadata from HIR with hir_stmt, "solidity_assembly", body_text
+    Return hir_stmt
 End Process
 
 @Reasoning:
@@ -1428,11 +1861,16 @@ translate_expression, wrapping in a HIR expression-statement node.
 
 Process called "translate_expression_statement" takes ctx as Integer, expr_stmt as Integer returns Integer:
     Let children be proc solidity_ast_children from SolidityParser with expr_stmt
-    Let expr_node be proc list_get from ListCore with children, 0
+    Let hir_expr be 0
+    If children is not equal to 0:
+        Let count be proc list_length from ListCore with children
+        If count is greater than 0:
+            Let expr_node be proc list_get from ListCore with children, 0
+            Set hir_expr to proc translate_expression with ctx, expr_node
+        End If
+    End If
 
-    Let hir_expr be proc translate_expression with ctx, expr_node
     Let hir_stmt be proc hir_create_expression_statement from HIR with hir_expr
-
     Return hir_stmt
 End Process
 
@@ -1447,85 +1885,103 @@ identifier, literal. Each routes to its translator.
 @End Reasoning
 
 @Implementation:
-Reads node_type via solidity_ast_type and dispatches via nested
-If-chain against SolidityParser.SOL_*_EXPR / SOL_LITERAL /
-SOL_IDENTIFIER constants. Each match returns the corresponding
-translate_*_expression result.
+Reads node_type via solidity_ast_type and dispatches via an If-chain
+against SolidityParser.SOL_*_EXPR / SOL_*_LITERAL / SOL_IDENTIFIER
+constants. Each match returns the corresponding translation result.
+Number literals keep their exact lexeme as a string literal tagged
+"solidity_number"; booleans become HIR bool literals; identifiers
+become HIR identifiers.
 @End Implementation
 
 Process called "translate_expression" takes ctx as Integer, expr_node as Integer returns Integer:
+    If expr_node is equal to 0:
+        Return 0
+    End If
+
     Let node_type be proc solidity_ast_type from SolidityParser with expr_node
 
     If node_type is equal to SolidityParser.SOL_BINARY_EXPR:
         Return proc translate_binary_expression with ctx, expr_node
     End If
-
     If node_type is equal to SolidityParser.SOL_UNARY_EXPR:
         Return proc translate_unary_expression with ctx, expr_node
     End If
-
     If node_type is equal to SolidityParser.SOL_TERNARY_EXPR:
         Return proc translate_ternary_expression with ctx, expr_node
     End If
-
     If node_type is equal to SolidityParser.SOL_ASSIGN_EXPR:
         Return proc translate_assign_expression with ctx, expr_node
     End If
-
     If node_type is equal to SolidityParser.SOL_CALL_EXPR:
         Return proc translate_call_expression with ctx, expr_node
     End If
-
     If node_type is equal to SolidityParser.SOL_NEW_EXPR:
         Return proc translate_new_expression with ctx, expr_node
     End If
-
     If node_type is equal to SolidityParser.SOL_MEMBER_EXPR:
         Return proc translate_member_expression with ctx, expr_node
     End If
-
     If node_type is equal to SolidityParser.SOL_INDEX_EXPR:
         Return proc translate_index_expression with ctx, expr_node
     End If
-
     If node_type is equal to SolidityParser.SOL_ARRAY_LITERAL:
         Return proc translate_array_literal with ctx, expr_node
     End If
+    If node_type is equal to SolidityParser.SOL_PAYABLE_EXPR:
+        Return proc translate_payable_expression with ctx, expr_node
+    End If
+    If node_type is equal to SolidityParser.SOL_TYPE_CAST:
+        Return proc translate_type_cast with ctx, expr_node
+    End If
 
     If node_type is equal to SolidityParser.SOL_NUMBER_LITERAL:
-        Let value be proc solidity_ast_value from SolidityParser with expr_node
-        Return proc hir_create_integer_literal from HIR with value
+        Let num_value be proc solidity_ast_value from SolidityParser with expr_node
+        Let hir_num be proc hir_create_string_literal from HIR with num_value
+        proc hir_set_metadata from HIR with hir_num, "solidity_number", "true"
+        Return hir_num
     End If
-
+    If node_type is equal to SolidityParser.SOL_HEX_LITERAL:
+        Let hex_value be proc solidity_ast_value from SolidityParser with expr_node
+        Let hir_hex be proc hir_create_string_literal from HIR with hex_value
+        proc hir_set_metadata from HIR with hir_hex, "solidity_number", "true"
+        Return hir_hex
+    End If
+    If node_type is equal to SolidityParser.SOL_ADDRESS_LITERAL:
+        Let addr_value be proc solidity_ast_value from SolidityParser with expr_node
+        Let hir_addr be proc hir_create_string_literal from HIR with addr_value
+        proc hir_set_metadata from HIR with hir_addr, "solidity_number", "true"
+        Return hir_addr
+    End If
     If node_type is equal to SolidityParser.SOL_STRING_LITERAL:
-        Set value to proc solidity_ast_value from SolidityParser with expr_node
-        Return proc hir_create_string_literal from HIR with value
+        Let str_value be proc solidity_ast_value from SolidityParser with expr_node
+        Return proc hir_create_string_literal from HIR with str_value
     End If
-
     If node_type is equal to SolidityParser.SOL_BOOLEAN_LITERAL:
-        Set value to proc solidity_ast_value from SolidityParser with expr_node
-        Let is_true be proc string_equals from StringCore with value, "true"
-        Return proc hir_create_boolean_literal from HIR with is_true
+        Let bool_value be proc solidity_ast_value from SolidityParser with expr_node
+        Let is_true be proc string_equals from StringCore with bool_value, "true"
+        Return proc hir_create_bool_literal from HIR with is_true
     End If
-
     If node_type is equal to SolidityParser.SOL_IDENTIFIER:
         Let name be proc solidity_ast_value from SolidityParser with expr_node
         Return proc hir_create_identifier from HIR with name
     End If
 
-    Note: Unknown expression type
     Return 0
 End Process
 
 @Reasoning:
 Emits HIR binary expression. Solidity binary operators include
 arithmetic (+ - * / % **), comparison (== != < > <= >=), logical
-(&& ||), bitwise (& | ^ << >>).
+(&& ||), bitwise (& | ^ << >>). The operator string lives in the node
+value slot; left/right operands in metadata. The exact Solidity
+operator spelling is preserved as "solidity_operator" so operators
+that share an HIR opcode (or have none) round-trip losslessly.
 @End Reasoning
 
 @Implementation:
-Reads operator from metadata, left and right from children.
-Recursively translates each operand and constructs HIR binary node.
+Reads operator (value slot) and left/right (metadata). Recursively
+translates each operand, maps the operator to a HIR opcode, builds the
+HIR binary node, and tags it with the source operator.
 @End Implementation
 
 Process called "translate_binary_expression" takes ctx as Integer, binary_node as Integer returns Integer:
@@ -1538,20 +1994,23 @@ Process called "translate_binary_expression" takes ctx as Integer, binary_node a
     Let hir_left be proc translate_expression with ctx, left
     Let hir_right be proc translate_expression with ctx, right
 
-    Let hir_binary be proc hir_create_binary_expression from HIR with operator, hir_left, hir_right
+    Let hir_op be proc map_solidity_binop_to_hir with operator
+    Let hir_binary be proc hir_create_binary_expr from HIR with hir_op, hir_left, hir_right
+    proc hir_set_metadata from HIR with hir_binary, "solidity_operator", operator
     Return hir_binary
 End Process
 
 @Reasoning:
-Unary expression: prefix (++, --, !, ~, +, -, delete) and postfix
-(++, --). Solidity distinguishes prefix/postfix; the AST stores the
-position flag.
+Unary expression: prefix (++, --, !, ~, -, delete) and postfix
+(++, --). The "prefix" metadata flag distinguishes the two positions
+so the backend re-emits `++x` versus `x++`. The exact operator is
+preserved under "solidity_unary_operator".
 @End Reasoning
 
 @Implementation:
-Reads operator and is_prefix flag from metadata, operand from
-children. Recursively translates operand and constructs HIR unary
-node with prefix/postfix indication.
+Reads operator (value slot), operand and prefix flag from metadata.
+Recursively translates operand, maps the operator, builds the HIR
+unary node, and tags it with the operator and prefix/postfix flag.
 @End Implementation
 
 Process called "translate_unary_expression" takes ctx as Integer, unary_node as Integer returns Integer:
@@ -1561,18 +2020,28 @@ Process called "translate_unary_expression" takes ctx as Integer, unary_node as 
     Let operand be proc get_metadata_value with metadata, "operand"
     Let hir_operand be proc translate_expression with ctx, operand
 
-    Let hir_unary be proc hir_create_unary_expression from HIR with operator, hir_operand
+    Let hir_op be proc map_solidity_unop_to_hir with operator
+    Let hir_unary be proc hir_create_unary_expr from HIR with hir_op, hir_operand
+    proc hir_set_metadata from HIR with hir_unary, "solidity_unary_operator", operator
+
+    Let prefix be proc get_metadata_value with metadata, "prefix"
+    If prefix is not equal to 0:
+        proc hir_set_metadata from HIR with hir_unary, "solidity_prefix", "true"
+    Otherwise:
+        proc hir_set_metadata from HIR with hir_unary, "solidity_prefix", "false"
+    End If
+
     Return hir_unary
 End Process
 
 @Reasoning:
-Conditional expression `cond ? then : else`. Three children
-representing condition, then-value, else-value.
+Conditional expression `cond ? then : else`. Three operands stored in
+metadata under "condition"/"then"/"else".
 @End Reasoning
 
 @Implementation:
-Reads three children, recursively translates each via
-translate_expression. Constructs HIR ternary node.
+Reads the three metadata operands, recursively translates each, and
+constructs a HIR ternary node.
 @End Implementation
 
 Process called "translate_ternary_expression" takes ctx as Integer, ternary_node as Integer returns Integer:
@@ -1586,23 +2055,27 @@ Process called "translate_ternary_expression" takes ctx as Integer, ternary_node
     Let hir_then be proc translate_expression with ctx, then_expr
     Let hir_else be proc translate_expression with ctx, else_expr
 
-    Let hir_ternary be proc hir_create_ternary_expression from HIR with hir_condition, hir_then, hir_else
-    Return hir_ternary
+    Return proc hir_create_ternary_expr from HIR with hir_condition, hir_then, hir_else
 End Process
 
 @Reasoning:
 Assignment `lhs = rhs` or compound `lhs += rhs`. Solidity assignments
-are expressions (return the assigned value) but commonly appear in
-statement position.
+are expressions; the operator string is preserved on the HIR assign
+node so compound forms round-trip. Although the current parser folds
+assignment through the binary-expression layer, this handler keeps the
+SOL_ASSIGN_EXPR contract honoured for any assign node reaching the
+translator.
 @End Reasoning
 
 @Implementation:
-Reads operator from metadata, left and right children. Recursively
-translates both operands and constructs HIR assignment node with
-the operator string preserved.
+Reads operator (value slot) and target/value (metadata). Recursively
+translates both operands and constructs a HIR assign node with the
+operator preserved as both the HIR assign op-string and
+"solidity_operator" metadata.
 @End Implementation
 
 Process called "translate_assign_expression" takes ctx as Integer, assign_node as Integer returns Integer:
+    Let operator be proc solidity_ast_value from SolidityParser with assign_node
     Let metadata be proc solidity_ast_metadata from SolidityParser with assign_node
 
     Let target be proc get_metadata_value with metadata, "target"
@@ -1611,91 +2084,95 @@ Process called "translate_assign_expression" takes ctx as Integer, assign_node a
     Let hir_target be proc translate_expression with ctx, target
     Let hir_value be proc translate_expression with ctx, value
 
-    Let hir_assign be proc hir_create_assign_expression from HIR with hir_target, hir_value
+    Let hir_assign be proc hir_create_assign_expr from HIR with hir_target, operator, hir_value
+    proc hir_set_metadata from HIR with hir_assign, "solidity_operator", operator
     Return hir_assign
 End Process
 
 @Reasoning:
-Function call `f(args)`. The callee can be any expression yielding
-a callable (identifier, member access, address.call). Solidity also
-has named-argument calls `f({a: 1, b: 2})` which the metadata flag
-distinguishes.
+Function call `f(args)`. The callee can be any expression yielding a
+callable (identifier, member access, address.call). Stored as the
+"function" metadata expression with arguments as children.
 @End Reasoning
 
 @Implementation:
-Reads callee (first child) and arguments (remaining children).
-Recursively translates each. Reads named_args flag from metadata
-to record call style. Constructs HIR call expression.
+Reads callee from "function" metadata (recursively translated) or, if
+absent, the node value as an identifier. Builds a HIR call expression
+and appends each argument child via hir_add_argument.
 @End Implementation
 
 Process called "translate_call_expression" takes ctx as Integer, call_node as Integer returns Integer:
     Let metadata be proc solidity_ast_metadata from SolidityParser with call_node
     Let function be proc get_metadata_value with metadata, "function"
 
-    Note: If no function in metadata, use value
+    Let callee be 0
     If function is equal to 0:
         Let call_name be proc solidity_ast_value from SolidityParser with call_node
-        Set function to proc hir_create_identifier from HIR with call_name
+        Set callee to proc hir_create_identifier from HIR with call_name
     Otherwise:
-        Set function to proc translate_expression with ctx, function
+        Set callee to proc translate_expression with ctx, function
     End If
 
-    Let hir_call be proc hir_create_call_expression from HIR with function
+    Let hir_call be proc hir_create_call_expr from HIR with callee
 
-    Note: Translate arguments
     Let children be proc solidity_ast_children from SolidityParser with call_node
-    Let count be proc list_length from ListCore with children
-    Let i be 0
-
-    While i is less than count:
-        Let arg be proc list_get from ListCore with children, i
-        Let hir_arg be proc translate_expression with ctx, arg
-        proc hir_call_add_argument from HIR with hir_call, hir_arg
-        Set i to i plus 1
-    End While
+    If children is not equal to 0:
+        Let count be proc list_length from ListCore with children
+        Let i be 0
+        While i is less than count:
+            Let arg be proc list_get from ListCore with children, i
+            Let hir_arg be proc translate_expression with ctx, arg
+            If hir_arg is not equal to 0:
+                proc hir_add_argument from HIR with hir_call, hir_arg
+            End If
+            Set i to i plus 1
+        End While
+    End If
 
     Return hir_call
 End Process
 
 @Reasoning:
-`new Contract(args)` or `new Type[](size)` for array creation. The
-new operator allocates a new instance on the blockchain (contract
-deployment) or in memory (arrays).
+`new Contract(args)` or `new Type[](size)` for array creation. HIR has
+a native new node (hir_create_new) carrying the type name; the
+constructor arguments are appended via hir_add_argument.
 @End Reasoning
 
 @Implementation:
-Reads target type from child and optional arguments. Recursively
-translates both. Constructs HIR new-expression with the type and
-argument list.
+Reads the target type from the node value slot, creates a HIR new node,
+and appends each argument child translated via translate_expression.
 @End Implementation
 
 Process called "translate_new_expression" takes ctx as Integer, new_node as Integer returns Integer:
     Let type_name be proc solidity_ast_value from SolidityParser with new_node
 
-    Let hir_new be proc hir_create_new_expression from HIR with type_name
+    Let hir_new be proc hir_create_new from HIR with type_name
 
-    Note: Translate constructor arguments
     Let children be proc solidity_ast_children from SolidityParser with new_node
-    Let count be proc list_length from ListCore with children
-    Let i be 0
-
-    While i is less than count:
-        Let arg be proc list_get from ListCore with children, i
-        Let hir_arg be proc translate_expression with ctx, arg
-        proc hir_new_add_argument from HIR with hir_new, hir_arg
-        Set i to i plus 1
-    End While
+    If children is not equal to 0:
+        Let count be proc list_length from ListCore with children
+        Let i be 0
+        While i is less than count:
+            Let arg be proc list_get from ListCore with children, i
+            Let hir_arg be proc translate_expression with ctx, arg
+            If hir_arg is not equal to 0:
+                proc hir_add_argument from HIR with hir_new, hir_arg
+            End If
+            Set i to i plus 1
+        End While
+    End If
 
     Return hir_new
 End Process
 
 @Reasoning:
-Member access `x.y` for field/method/contract-member references.
+Member access `x.y` for field/method/contract-member references. The
+object lives in "object" metadata; the member name in the value slot.
 @End Reasoning
 
 @Implementation:
-Reads object (first child) and member name from metadata. Recursively
-translates object and constructs HIR member-access node.
+Reads object metadata (recursively translated) and member name, then
+constructs a HIR member-access node.
 @End Implementation
 
 Process called "translate_member_expression" takes ctx as Integer, member_node as Integer returns Integer:
@@ -1705,18 +2182,17 @@ Process called "translate_member_expression" takes ctx as Integer, member_node a
     Let object be proc get_metadata_value with metadata, "object"
     Let hir_object be proc translate_expression with ctx, object
 
-    Let hir_member be proc hir_create_member_expression from HIR with hir_object, member_name
-    Return hir_member
+    Return proc hir_create_member_expr from HIR with hir_object, member_name
 End Process
 
 @Reasoning:
-Index access `a[i]` for arrays and mappings. Solidity index works on
-arrays (numeric index) and mappings (any-type key).
+Index access `a[i]` for arrays and mappings. Object and index live in
+"object" / "index" metadata.
 @End Reasoning
 
 @Implementation:
-Reads array (first child) and index (second child). Recursively
-translates both and constructs HIR index-access node.
+Reads object and index metadata, recursively translates both, and
+constructs a HIR index-access node.
 @End Implementation
 
 Process called "translate_index_expression" takes ctx as Integer, index_node as Integer returns Integer:
@@ -1728,81 +2204,113 @@ Process called "translate_index_expression" takes ctx as Integer, index_node as 
     Let hir_object be proc translate_expression with ctx, object
     Let hir_index be proc translate_expression with ctx, index
 
-    Let hir_index_expr be proc hir_create_index_expression from HIR with hir_object, hir_index
-    Return hir_index_expr
+    Return proc hir_create_index_expr from HIR with hir_object, hir_index
 End Process
 
 @Reasoning:
-Array literal `[1, 2, 3]` creates an inline array. Element types
-must be uniform (or coercible to a common type).
+Array literal `[1, 2, 3]` creates an inline array. HIR's list literal
+node holds the element expressions in order.
 @End Reasoning
 
 @Implementation:
-Iterates child element expressions, recursively translates each via
-translate_expression, accumulates into the HIR array literal's
-elements list.
+Creates a HIR list literal and appends each child element translated
+via translate_expression with hir_add_list_element.
 @End Implementation
 
 Process called "translate_array_literal" takes ctx as Integer, array_node as Integer returns Integer:
-    Let hir_array be proc hir_create_array_literal from HIR
+    Let hir_array be proc hir_create_list_literal from HIR
 
     Let children be proc solidity_ast_children from SolidityParser with array_node
-    Let count be proc list_length from ListCore with children
-    Let i be 0
-
-    While i is less than count:
-        Let element be proc list_get from ListCore with children, i
-        Let hir_element be proc translate_expression with ctx, element
-        proc hir_array_add_element from HIR with hir_array, hir_element
-        Set i to i plus 1
-    End While
+    If children is not equal to 0:
+        Let count be proc list_length from ListCore with children
+        Let i be 0
+        While i is less than count:
+            Let element be proc list_get from ListCore with children, i
+            Let hir_element be proc translate_expression with ctx, element
+            If hir_element is not equal to 0:
+                proc hir_add_list_element from HIR with hir_array, hir_element
+            End If
+            Set i to i plus 1
+        End While
+    End If
 
     Return hir_array
 End Process
 
-Note: ===================================================================
-Note: METADATA UTILITIES
-Note: ===================================================================
-
 @Reasoning:
-Generic accessor for Solidity AST metadata dictionaries. Centralised
-helper so translation routines don't repeat the same Dict-lookup
-boilerplate.
+`payable(addr)` casts an address to the payable address type. HIR
+models the cast as a call on a "payable" identifier tagged
+"solidity_payable" so the backend re-emits the `payable(...)` form.
 @End Reasoning
 
 @Implementation:
-If metadata is null returns 0 (empty string). Otherwise queries the
-underlying Dict via dict_get_value for the given key, returning the
-stored value or 0 if absent.
+Reads the operand from "object" metadata (or the first child),
+translates it, and wraps it in a call on a "payable" identifier with
+the solidity_payable tag.
 @End Implementation
 
-Process called "get_metadata_value" takes metadata as Integer, key as Integer returns Integer:
-    If metadata is equal to 0:
-        Return 0
-    End If
+Process called "translate_payable_expression" takes ctx as Integer, payable_node as Integer returns Integer:
+    Let metadata be proc solidity_ast_metadata from SolidityParser with payable_node
+    Let operand be proc get_metadata_value with metadata, "object"
 
-    Note: Metadata is stored as list of key-value pairs
-    Let count be proc list_length from ListCore with metadata
-    Let i be 0
-
-    While i is less than count:
-        Let metadata_key be proc list_get from ListCore with metadata, i
-        Let matches be proc string_equals from StringCore with metadata_key, key
-
-        If matches is equal to 1:
-            Note: Return the value (next item)
-            Let value_index be i plus 1
-            If value_index is less than count:
-                Let value be proc list_get from ListCore with metadata, value_index
-                Return value
+    If operand is equal to 0:
+        Let children be proc solidity_ast_children from SolidityParser with payable_node
+        If children is not equal to 0:
+            Let count be proc list_length from ListCore with children
+            If count is greater than 0:
+                Set operand to proc list_get from ListCore with children, 0
             End If
         End If
+    End If
 
-        Note: Skip to next key-value pair
-        Set i to i plus 2
-    End While
+    Let callee be proc hir_create_identifier from HIR with "payable"
+    Let hir_call be proc hir_create_call_expr from HIR with callee
+    proc hir_set_metadata from HIR with hir_call, "solidity_payable", "true"
 
-    Return 0
+    Let hir_operand be proc translate_expression with ctx, operand
+    If hir_operand is not equal to 0:
+        proc hir_add_argument from HIR with hir_call, hir_operand
+    End If
+
+    Return hir_call
+End Process
+
+@Reasoning:
+A Solidity type cast `uint256(x)` converts a value to another type.
+HIR's cast node carries the target-type name and the cast expression.
+@End Reasoning
+
+@Implementation:
+Reads the target type from the value slot and the operand from "object"
+metadata (or the first child); builds a HIR cast carrying the
+expression and re-emits the type via the "solidity_cast_type" tag.
+@End Implementation
+
+Process called "translate_type_cast" takes ctx as Integer, cast_node as Integer returns Integer:
+    Let cast_type be proc solidity_ast_value from SolidityParser with cast_node
+    Let metadata be proc solidity_ast_metadata from SolidityParser with cast_node
+    Let operand be proc get_metadata_value with metadata, "object"
+
+    If operand is equal to 0:
+        Let children be proc solidity_ast_children from SolidityParser with cast_node
+        If children is not equal to 0:
+            Let count be proc list_length from ListCore with children
+            If count is greater than 0:
+                Set operand to proc list_get from ListCore with children, 0
+            End If
+        End If
+    End If
+
+    Let callee be proc hir_create_identifier from HIR with cast_type
+    Let hir_call be proc hir_create_call_expr from HIR with callee
+    proc hir_set_metadata from HIR with hir_call, "solidity_cast", "true"
+
+    Let hir_operand be proc translate_expression with ctx, operand
+    If hir_operand is not equal to 0:
+        proc hir_add_argument from HIR with hir_call, hir_operand
+    End If
+
+    Return hir_call
 End Process
 
 Note: ===================================================================
@@ -1820,7 +2328,7 @@ Single-line wrapper delegating to translate_solidity_to_hir.
 @End Implementation
 
 Process called "solidity_to_hir" takes solidity_ast as Integer returns Integer:
-    Return proc translate_solidity_to_hir from solidity_ast
+    Return proc translate_solidity_to_hir with solidity_ast
 End Process
 
 @Reasoning:

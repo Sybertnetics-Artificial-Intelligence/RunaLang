@@ -1,0 +1,595 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+Licensed under Apache 2.0
+:End Note
+
+Note:
+Solidity Translation Round-Trip Probe
+
+End-to-end proof that the Solidity translation pipeline is REAL, not a skeleton:
+
+    Solidity source
+      -> solidity_lexer / solidity_parser  (build the SOL_* AST)
+      -> solidity_to_hir                   (lower AST to the canonical hir_nodes model)
+      -> hir_to_solidity                   (emit HIR back to valid Solidity text)
+      -> re-lex / re-parse / re-to_hir of the emitted text
+      -> structural HIR equality on the key constructs (CONTENT, not mere presence)
+
+The probe feeds a representative Solidity contract exercising every construct the
+task requires: SPDX + pragma; a struct with fields; an enum; a custom error; an
+event with an indexed parameter; a mapping state variable with visibility; a
+public constant; a modifier whose body contains the `_;` placeholder; a
+constructor; six functions with assorted visibility / mutability / named returns;
+an if/else, a for-loop, a while-loop, a require/revert, an emit, and member /
+index access in their bodies.
+
+It lowers the source to HIR1 and asserts on HIR1 (CONTENT survival):
+  - the contract is present with the expected name,
+  - at least six function members carry their names,
+  - one function's visibility AND mutability survive (public + view),
+  - a modifier member exists whose body holds the `_;` placeholder,
+  - a state variable carries a mapping(...) Solidity type,
+  - an event member has an indexed parameter,
+  - the struct's fields survive,
+  - a for-loop node is present inside a function body.
+Then it emits HIR1 back to Solidity text, re-runs the full pipeline to HIR2, and
+asserts HIR2 is STRUCTURALLY EQUAL to HIR1 on those same constructs. Structural
+equality (node kinds plus identifying payloads - names, visibility/mutability
+tags, mapping type text, indexed flag, field set, control-flow kinds) is the
+correct semantic-equivalence check because the emitter re-indents and normalises
+whitespace while the meaning is identical.
+
+Exit code: number of failed assertions (0 == all passed). No exit_with_code.
+:End Note
+
+Import "compiler/middle/gungnir/hir/translation/frontends/solidity/solidity_parser.runa" as SolidityParser
+Import "compiler/middle/gungnir/hir/translation/frontends/solidity/solidity_to_hir.runa" as SolidityFrontend
+Import "compiler/middle/gungnir/hir/translation/backends/solidity/hir_to_solidity.runa" as SolidityBackend
+Import "compiler/middle/gungnir/hir/hir_nodes.runa" as HIR
+Import "compiler/frontend/primitives/collections/list.runa" as List
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "tests/test_utils.runa" as TestUtils
+
+Note: ============================================================================
+Note: Pipeline helpers
+Note: ============================================================================
+
+@Reasoning:
+Each round runs the identical front-of-pipeline (parse -> to_hir). Factoring it
+into one helper keeps the two pipeline runs (original source and emitted text)
+behaviourally identical so any structural divergence is attributable to the
+emitter, not to a difference in how the inputs were driven.
+@End Reasoning
+Process called "source_to_hir" takes source as Integer returns Integer:
+    Let ast be proc parse_solidity_source from SolidityParser with source
+    If ast is equal to 0:
+        Return 0
+    End If
+    Return proc translate_solidity_to_hir from SolidityFrontend with ast
+End Process
+
+@Reasoning:
+The Solidity frontend adds each top-level declaration directly to the module
+declarations list. To locate the contract we scan that list for the first
+HIR_CLASS whose "solidity_type" is "contract".
+@End Reasoning
+Process called "find_contract" takes module as Integer returns Integer:
+    If module is equal to 0:
+        Return 0
+    End If
+    Let declarations be proc hir_get_declarations from HIR with module
+    If declarations is equal to 0:
+        Return 0
+    End If
+    Let count be proc list_length from List with declarations
+    Let i be 0
+    While i is less than count:
+        Let decl be proc list_get from List with declarations, i
+        Let kind be proc hir_node_type from HIR with decl
+        If kind is equal to HIR.HIR_CLASS:
+            Let stype be proc hir_get_metadata from HIR with decl, "solidity_type"
+            Let is_contract be proc safe_equals with stype, "contract"
+            If is_contract is equal to 1:
+                Return decl
+            End If
+        End If
+        Set i to i plus 1
+    End While
+    Return 0
+End Process
+
+@Reasoning:
+Counts HIR_FUNCTION members of a contract whose "solidity_type" is "function"
+(plain functions, excluding events/modifiers/constructors). Used to prove the
+function set survives the round trip without silent drops.
+@End Reasoning
+Process called "count_functions" takes contract as Integer returns Integer:
+    If contract is equal to 0:
+        Return 0
+    End If
+    Let members be proc hir_get_class_members from HIR with contract
+    If members is equal to 0:
+        Return 0
+    End If
+    Let count be proc list_length from List with members
+    Let found be 0
+    Let i be 0
+    While i is less than count:
+        Let member be proc list_get from List with members, i
+        Let kind be proc hir_node_type from HIR with member
+        If kind is equal to HIR.HIR_FUNCTION:
+            Let stype be proc hir_get_metadata from HIR with member, "solidity_type"
+            Let is_function be proc safe_equals with stype, "function"
+            If is_function is equal to 1:
+                Set found to found plus 1
+            End If
+        End If
+        Set i to i plus 1
+    End While
+    Return found
+End Process
+
+@Reasoning:
+Locates a contract function member by its exact name so per-function attributes
+(visibility, mutability) can be asserted on a known target.
+@End Reasoning
+Process called "find_function" takes contract as Integer, name as Integer returns Integer:
+    If contract is equal to 0:
+        Return 0
+    End If
+    Let members be proc hir_get_class_members from HIR with contract
+    If members is equal to 0:
+        Return 0
+    End If
+    Let count be proc list_length from List with members
+    Let i be 0
+    While i is less than count:
+        Let member be proc list_get from List with members, i
+        Let kind be proc hir_node_type from HIR with member
+        If kind is equal to HIR.HIR_FUNCTION:
+            Let fname be proc hir_get_function_name from HIR with member
+            Let matches be proc safe_equals with fname, name
+            If matches is equal to 1:
+                Return member
+            End If
+        End If
+        Set i to i plus 1
+    End While
+    Return 0
+End Process
+
+@Reasoning:
+A function's visibility and mutability live in the multi-valued
+"solidity_modifier" metadata list (the keywords public/external/internal/private
+and view/pure/payable plus user modifiers). This helper returns 1 when the given
+keyword is present in that list, so the probe can assert specific attributes
+survive.
+@End Reasoning
+Process called "function_has_modifier" takes function as Integer, keyword as Integer returns Integer:
+    If function is equal to 0:
+        Return 0
+    End If
+    Let modifiers be proc hir_get_metadata from HIR with function, "solidity_modifier"
+    If modifiers is equal to 0:
+        Return 0
+    End If
+    Let count be proc list_length from List with modifiers
+    Let i be 0
+    While i is less than count:
+        Let mod be proc list_get from List with modifiers, i
+        Let matches be proc safe_equals with mod, keyword
+        If matches is equal to 1:
+            Return 1
+        End If
+        Set i to i plus 1
+    End While
+    Return 0
+End Process
+
+@Reasoning:
+Locates a contract modifier member (HIR_FUNCTION tagged "modifier") by name so
+its `_;` placeholder body can be inspected.
+@End Reasoning
+Process called "find_modifier" takes contract as Integer, name as Integer returns Integer:
+    If contract is equal to 0:
+        Return 0
+    End If
+    Let members be proc hir_get_class_members from HIR with contract
+    If members is equal to 0:
+        Return 0
+    End If
+    Let count be proc list_length from List with members
+    Let i be 0
+    While i is less than count:
+        Let member be proc list_get from List with members, i
+        Let kind be proc hir_node_type from HIR with member
+        If kind is equal to HIR.HIR_FUNCTION:
+            Let stype be proc hir_get_metadata from HIR with member, "solidity_type"
+            Let is_modifier be proc safe_equals with stype, "modifier"
+            If is_modifier is equal to 1:
+                Let mname be proc hir_get_function_name from HIR with member
+                Let matches be proc safe_equals with mname, name
+                If matches is equal to 1:
+                    Return member
+                End If
+            End If
+        End If
+        Set i to i plus 1
+    End While
+    Return 0
+End Process
+
+@Reasoning:
+The `_;` placeholder lowers to an expression statement on an identifier named "_"
+inside the modifier body block. This helper walks the modifier body's statements
+and returns 1 when it finds that placeholder, proving the modifier body survives.
+@End Reasoning
+Process called "modifier_has_placeholder" takes modifier as Integer returns Integer:
+    If modifier is equal to 0:
+        Return 0
+    End If
+    Let body be proc hir_get_function_body from HIR with modifier
+    If body is equal to 0:
+        Return 0
+    End If
+    Let statements be proc hir_get_block_statements from HIR with body
+    If statements is equal to 0:
+        Return 0
+    End If
+    Let count be proc list_length from List with statements
+    Let i be 0
+    While i is less than count:
+        Let stmt be proc list_get from List with statements, i
+        Let kind be proc hir_node_type from HIR with stmt
+        If kind is equal to HIR.HIR_EXPR_STMT:
+            Let inner be proc hir_get_expression_statement_expr from HIR with stmt
+            Let inner_kind be proc hir_node_type from HIR with inner
+            If inner_kind is equal to HIR.HIR_IDENTIFIER:
+                Let name be proc hir_get_identifier_name from HIR with inner
+                Let is_placeholder be proc safe_equals with name, "_"
+                If is_placeholder is equal to 1:
+                    Return 1
+                End If
+            End If
+        End If
+        Set i to i plus 1
+    End While
+    Return 0
+End Process
+
+@Reasoning:
+Locates a state-variable field by name so its Solidity type (e.g. a mapping)
+can be asserted to survive.
+@End Reasoning
+Process called "find_field" takes contract as Integer, name as Integer returns Integer:
+    If contract is equal to 0:
+        Return 0
+    End If
+    Let members be proc hir_get_class_members from HIR with contract
+    If members is equal to 0:
+        Return 0
+    End If
+    Let count be proc list_length from List with members
+    Let i be 0
+    While i is less than count:
+        Let member be proc list_get from List with members, i
+        Let kind be proc hir_node_type from HIR with member
+        If kind is equal to HIR.HIR_FIELD:
+            Let fname be proc hir_get_field_name from HIR with member
+            Let matches be proc safe_equals with fname, name
+            If matches is equal to 1:
+                Return member
+            End If
+        End If
+        Set i to i plus 1
+    End While
+    Return 0
+End Process
+
+@Reasoning:
+Locates the event member (HIR_FUNCTION tagged "event") and returns 1 when it has
+at least one parameter carrying the "solidity_indexed" flag, proving the indexed
+event parameter round-trips.
+@End Reasoning
+Process called "find_event_with_indexed" takes contract as Integer returns Integer:
+    If contract is equal to 0:
+        Return 0
+    End If
+    Let members be proc hir_get_class_members from HIR with contract
+    If members is equal to 0:
+        Return 0
+    End If
+    Let count be proc list_length from List with members
+    Let i be 0
+    While i is less than count:
+        Let member be proc list_get from List with members, i
+        Let kind be proc hir_node_type from HIR with member
+        If kind is equal to HIR.HIR_FUNCTION:
+            Let stype be proc hir_get_metadata from HIR with member, "solidity_type"
+            Let is_event be proc safe_equals with stype, "event"
+            If is_event is equal to 1:
+                Let params be proc hir_get_parameters from HIR with member
+                Let plist be proc hir_get_parameter_list from HIR with params
+                If plist is not equal to 0:
+                    Let pcount be proc list_length from List with plist
+                    Let j be 0
+                    While j is less than pcount:
+                        Let param be proc list_get from List with plist, j
+                        Let indexed be proc hir_get_metadata from HIR with param, "solidity_indexed"
+                        Let indexed_len be proc safe_length with indexed
+                        If indexed_len is greater than 0:
+                            Return member
+                        End If
+                        Set j to j plus 1
+                    End While
+                End If
+            End If
+        End If
+        Set i to i plus 1
+    End While
+    Return 0
+End Process
+
+@Reasoning:
+Locates the struct member (HIR_CLASS tagged "struct") so its field set can be
+counted and asserted to survive.
+@End Reasoning
+Process called "find_struct" takes contract as Integer returns Integer:
+    If contract is equal to 0:
+        Return 0
+    End If
+    Let members be proc hir_get_class_members from HIR with contract
+    If members is equal to 0:
+        Return 0
+    End If
+    Let count be proc list_length from List with members
+    Let i be 0
+    While i is less than count:
+        Let member be proc list_get from List with members, i
+        Let kind be proc hir_node_type from HIR with member
+        If kind is equal to HIR.HIR_CLASS:
+            Let stype be proc hir_get_metadata from HIR with member, "solidity_type"
+            Let is_struct be proc safe_equals with stype, "struct"
+            If is_struct is equal to 1:
+                Return member
+            End If
+        End If
+        Set i to i plus 1
+    End While
+    Return 0
+End Process
+
+@Reasoning:
+Counts HIR_FIELD members of a struct so the struct's field set is asserted by
+exact count (content survival), not mere presence.
+@End Reasoning
+Process called "count_fields" takes struct as Integer returns Integer:
+    If struct is equal to 0:
+        Return 0
+    End If
+    Let members be proc hir_get_class_members from HIR with struct
+    If members is equal to 0:
+        Return 0
+    End If
+    Let count be proc list_length from List with members
+    Let found be 0
+    Let i be 0
+    While i is less than count:
+        Let member be proc list_get from List with members, i
+        Let kind be proc hir_node_type from HIR with member
+        If kind is equal to HIR.HIR_FIELD:
+            Set found to found plus 1
+        End If
+        Set i to i plus 1
+    End While
+    Return found
+End Process
+
+@Reasoning:
+Returns 1 when a function's body (a HIR block) contains a HIR_FOR loop in its
+top-level statement sequence, proving the for-loop round-trips.
+@End Reasoning
+Process called "function_has_for_loop" takes function as Integer returns Integer:
+    If function is equal to 0:
+        Return 0
+    End If
+    Let body be proc hir_get_function_body from HIR with function
+    If body is equal to 0:
+        Return 0
+    End If
+    Let statements be proc hir_get_block_statements from HIR with body
+    If statements is equal to 0:
+        Return 0
+    End If
+    Let count be proc list_length from List with statements
+    Let i be 0
+    While i is less than count:
+        Let stmt be proc list_get from List with statements, i
+        Let kind be proc hir_node_type from HIR with stmt
+        If kind is equal to HIR.HIR_FOR:
+            Return 1
+        End If
+        Set i to i plus 1
+    End While
+    Return 0
+End Process
+
+@Reasoning:
+Null-safe string equality so a metadata read of an absent key (0) compares as
+"not equal" rather than faulting.
+@End Reasoning
+Process called "safe_equals" takes a as Integer, b as Integer returns Integer:
+    If a is equal to 0:
+        Return 0
+    End If
+    Return proc string_equals from StringCore with a, b
+End Process
+
+@Reasoning:
+Null-safe string length for metadata reads that may return 0 for an absent key.
+@End Reasoning
+Process called "safe_length" takes s as Integer returns Integer:
+    If s is equal to 0:
+        Return 0
+    End If
+    Return proc string_length from StringCore with s
+End Process
+
+Note: ============================================================================
+Note: Probe entry point
+Note: ============================================================================
+
+Process called "main" returns Integer:
+    Let results be proc create_test_results from TestUtils
+    proc begin_suite from TestUtils with results, "Solidity translation round-trip"
+
+    Note:
+    Representative contract. Newlines separate the source lines. It exercises a
+    struct, an enum, a custom error, an indexed event, a mapping state variable,
+    a public constant, a modifier with `_;`, a constructor, and six functions
+    whose bodies hold if/else, for, while, emit, revert, member/index access, and
+    a named return.
+    :End Note
+    Let source be "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.0;\n\ncontract Ledger {\nstruct Account {\nuint256 balance;\naddress owner;\nbool active;\n}\nenum State {\nIdle,\nActive,\nClosed\n}\nerror Unauthorized(address who);\nevent Transfer(address indexed from, address indexed to, uint256 amount);\nmapping(address => uint256) private balances;\nuint256 public constant MAX = 1000000;\naddress public owner;\nmodifier onlyOwner() {\nrequire(msg.sender == owner);\n_;\n}\nconstructor() {\nowner = msg.sender;\n}\nfunction deposit(uint256 amount) public {\nbalances[msg.sender] = balances[msg.sender] + amount;\nemit Transfer(owner, msg.sender, amount);\n}\nfunction balanceOf(address who) public view returns (uint256 total) {\ntotal = balances[who];\nreturn total;\n}\nfunction withdraw(uint256 amount) public onlyOwner {\nif (balances[msg.sender] >= amount) {\nbalances[msg.sender] = balances[msg.sender] - amount;\n} else {\nrevert Unauthorized(msg.sender);\n}\n}\nfunction sum(uint256 n) public pure returns (uint256) {\nuint256 acc = 0;\nfor (uint256 i = 0; i < n; i = i + 1) {\nacc = acc + i;\n}\nreturn acc;\n}\nfunction countdown(uint256 n) public pure {\nwhile (n > 0) {\nn = n - 1;\n}\n}\nfunction transferOwner(address next) public onlyOwner {\nowner = next;\n}\n}\n"
+
+    Note: --- Stage 0-2: source -> HIR1 (parse + lower) ---
+    Let ast be proc parse_solidity_source from SolidityParser with source
+    proc assert_not_null from TestUtils with results, "parser produced Solidity AST", ast
+
+    Let hir1 be proc translate_solidity_to_hir from SolidityFrontend with ast
+    proc assert_not_null from TestUtils with results, "frontend produced HIR module", hir1
+
+    Let declarations be proc hir_get_declarations from HIR with hir1
+    proc assert_not_null from TestUtils with results, "HIR module has declarations", declarations
+
+    Note: --- contract present with the expected name ---
+    Let contract be proc find_contract with hir1
+    proc assert_not_null from TestUtils with results, "contract node present", contract
+    Let contract_name be proc hir_get_class_name from HIR with contract
+    Let name_ok be proc safe_equals with contract_name, "Ledger"
+    proc assert_equal from TestUtils with results, "contract name is 'Ledger'", name_ok, 1
+
+    Note: --- at least six plain functions survive (no silent drop) ---
+    Let func_total be proc count_functions with contract
+    proc assert_greater_than_or_equal from TestUtils with results, "contract has >= 6 functions", func_total, 6
+
+    Note: --- a function's visibility AND mutability survive ---
+    Let balance_of be proc find_function with contract, "balanceOf"
+    proc assert_not_null from TestUtils with results, "function 'balanceOf' present", balance_of
+    Let bo_public be proc function_has_modifier with balance_of, "public"
+    proc assert_equal from TestUtils with results, "balanceOf is public", bo_public, 1
+    Let bo_view be proc function_has_modifier with balance_of, "view"
+    proc assert_equal from TestUtils with results, "balanceOf is view", bo_view, 1
+
+    Note: --- a modifier whose body holds the `_;` placeholder ---
+    Let only_owner be proc find_modifier with contract, "onlyOwner"
+    proc assert_not_null from TestUtils with results, "modifier 'onlyOwner' present", only_owner
+    Let has_placeholder be proc modifier_has_placeholder with only_owner
+    proc assert_equal from TestUtils with results, "onlyOwner body has '_;' placeholder", has_placeholder, 1
+
+    Note: --- a mapping-typed state variable ---
+    Let balances_field be proc find_field with contract, "balances"
+    proc assert_not_null from TestUtils with results, "state variable 'balances' present", balances_field
+    Let balances_type be proc hir_get_metadata from HIR with balances_field, "solidity_type"
+    Let is_mapping be proc contains_mapping with balances_type
+    proc assert_equal from TestUtils with results, "balances type is a mapping(...)", is_mapping, 1
+
+    Note: --- an event with an indexed parameter ---
+    Let event_node be proc find_event_with_indexed with contract
+    proc assert_not_null from TestUtils with results, "event with indexed parameter present", event_node
+
+    Note: --- the struct's fields survive (exact count) ---
+    Let struct_node be proc find_struct with contract
+    proc assert_not_null from TestUtils with results, "struct 'Account' present", struct_node
+    Let struct_fields be proc count_fields with struct_node
+    proc assert_equal from TestUtils with results, "struct Account has 3 fields", struct_fields, 3
+
+    Note: --- a for-loop inside a function body ---
+    Let sum_fn be proc find_function with contract, "sum"
+    proc assert_not_null from TestUtils with results, "function 'sum' present", sum_fn
+    Let has_for be proc function_has_for_loop with sum_fn
+    proc assert_equal from TestUtils with results, "sum body has a for-loop", has_for, 1
+
+    Note: --- Stage 3: HIR1 -> Solidity text ---
+    Let emitted be proc generate_solidity_from_hir from SolidityBackend with hir1
+    proc assert_not_null from TestUtils with results, "backend produced Solidity text", emitted
+    Let emitted_len be proc string_length from StringCore with emitted
+    proc assert_greater_than from TestUtils with results, "emitted Solidity is non-empty", emitted_len, 0
+
+    Note: --- Stage 4: re-run the pipeline on the emitted text -> HIR2 ---
+    Let hir2 be proc source_to_hir with emitted
+    proc assert_not_null from TestUtils with results, "re-parse of emitted Solidity produced HIR", hir2
+
+    Note: --- Stage 5: structural / content equality on the key constructs ---
+    Let contract2 be proc find_contract with hir2
+    proc assert_not_null from TestUtils with results, "round-trip preserves contract node", contract2
+    Let contract2_name be proc hir_get_class_name from HIR with contract2
+    Let name2_ok be proc safe_equals with contract2_name, "Ledger"
+    proc assert_equal from TestUtils with results, "round-trip preserves contract name 'Ledger'", name2_ok, 1
+
+    Let func2_total be proc count_functions with contract2
+    proc assert_greater_than_or_equal from TestUtils with results, "round-trip preserves >= 6 functions", func2_total, 6
+
+    Let balance_of2 be proc find_function with contract2, "balanceOf"
+    proc assert_not_null from TestUtils with results, "round-trip preserves 'balanceOf'", balance_of2
+    Let bo2_public be proc function_has_modifier with balance_of2, "public"
+    proc assert_equal from TestUtils with results, "round-trip preserves balanceOf public", bo2_public, 1
+    Let bo2_view be proc function_has_modifier with balance_of2, "view"
+    proc assert_equal from TestUtils with results, "round-trip preserves balanceOf view", bo2_view, 1
+
+    Let only_owner2 be proc find_modifier with contract2, "onlyOwner"
+    proc assert_not_null from TestUtils with results, "round-trip preserves modifier 'onlyOwner'", only_owner2
+    Let has_placeholder2 be proc modifier_has_placeholder with only_owner2
+    proc assert_equal from TestUtils with results, "round-trip preserves '_;' placeholder", has_placeholder2, 1
+
+    Let balances_field2 be proc find_field with contract2, "balances"
+    proc assert_not_null from TestUtils with results, "round-trip preserves 'balances' field", balances_field2
+    Let balances_type2 be proc hir_get_metadata from HIR with balances_field2, "solidity_type"
+    Let is_mapping2 be proc contains_mapping with balances_type2
+    proc assert_equal from TestUtils with results, "round-trip preserves mapping type", is_mapping2, 1
+
+    Let event_node2 be proc find_event_with_indexed with contract2
+    proc assert_not_null from TestUtils with results, "round-trip preserves indexed event", event_node2
+
+    Let struct_node2 be proc find_struct with contract2
+    proc assert_not_null from TestUtils with results, "round-trip preserves struct 'Account'", struct_node2
+    Let struct_fields2 be proc count_fields with struct_node2
+    proc assert_equal from TestUtils with results, "round-trip preserves 3 struct fields", struct_fields2, 3
+
+    Let sum_fn2 be proc find_function with contract2, "sum"
+    proc assert_not_null from TestUtils with results, "round-trip preserves 'sum'", sum_fn2
+    Let has_for2 be proc function_has_for_loop with sum_fn2
+    proc assert_equal from TestUtils with results, "round-trip preserves for-loop", has_for2, 1
+
+    proc print_summary from TestUtils with results
+    Let failed be proc get_failed from TestUtils with results
+    proc destroy_test_results from TestUtils with results
+
+    Return failed
+End Process
+
+@Reasoning:
+A mapping type prints as "mapping(K => V)". This helper returns 1 when the type
+string starts with the seven characters "mapping", proving a mapping-typed state
+variable survives the round trip with its type intact. The prefix is checked
+byte-by-byte via string_char_at so the test depends only on StringCore.
+@End Reasoning
+Process called "contains_mapping" takes type_str as Integer returns Integer:
+    Let len be proc safe_length with type_str
+    If len is less than 7:
+        Return 0
+    End If
+
+    Let expected be "mapping"
+    Let i be 0
+    While i is less than 7:
+        Let actual_char be proc string_char_at from StringCore with type_str, i
+        Let want_char be proc string_char_at from StringCore with expected, i
+        If actual_char is not equal to want_char:
+            Return 0
+        End If
+        Set i to i plus 1
+    End While
+
+    Return 1
+End Process
