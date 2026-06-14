@@ -1,0 +1,409 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+Licensed under Apache 2.0
+:End Note
+
+Note:
+Haskell Translation Round-Trip Probe
+
+End-to-end proof that the Haskell translation pipeline is REAL, not a skeleton:
+
+    Haskell source
+      -> haskell_lexer    (layout-aware tokenizer)
+      -> haskell_parser   (recursive-descent AST: module header + exports,
+                          imports (qualified / as), data type w/ deriving,
+                          type class, instance, function w/ type sig +
+                          equations + guards, let/where, case..of, do-notation,
+                          list comprehension, lambda)
+      -> haskell_semantic (scope/name analysis; validation only)
+      -> haskell_to_hir   (lower to the producer's dict/list HIR interchange)
+      -> hir_to_haskell   (emit HIR back to valid Haskell text)
+      -> re-lex / re-parse / re-to_hir of the emitted text
+      -> structural HIR equality on the key constructs
+
+The Haskell HIR node model is haskell_to_hir.runa's dict/list interchange: each
+node is a HashTable carrying an integer node-type discriminant under the
+"node_type" key plus per-node fields ("name", "declarations", "body", ...).
+This probe reads HIR fields through exactly that contract.
+
+It lowers the source to HIR1, asserts HIR1 is a module whose "declarations"
+list contains the named declarations (function "area", data type "Shape",
+type class "Eq", instance, function "classify"), emits HIR1 back to Haskell
+text, re-runs the whole pipeline on the emitted text to HIR2, and asserts HIR2
+preserves those same key constructs.
+
+Exit code: number of failed assertions (0 == all passed). No exit_with_code.
+:End Note
+
+Import "compiler/middle/gungnir/hir/translation/frontends/haskell/haskell_to_hir.runa" as HaskellFrontend
+Import "compiler/middle/gungnir/hir/translation/backends/haskell/hir_to_haskell.runa" as HaskellBackend
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/collections/hashtable.runa" as Dict
+Import "compiler/frontend/primitives/collections/list.runa" as List
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "tests/test_utils.runa" as TestUtils
+
+Note: ============================================================================
+Note: HIR dict decoders - matching haskell_to_hir.runa's interchange model:
+Note: each node is a HashTable; the integer node-type discriminant lives under
+Note: the "node_type" key; the module's declarations live under "declarations";
+Note: each declaration's name lives under "name".
+Note: ============================================================================
+
+@Reasoning:
+Reads the integer node-type discriminant a node carries under the "node_type"
+key. Centralising the read documents the contract this probe shares with both
+producer (create_hir_node) and consumer (the backend dispatchers).
+@End Reasoning
+Process called "hir_node_type" takes node as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    Let key be proc create_from_literal from StringCore with "node_type"
+    Return proc hashtable_get from Dict with node, key
+End Process
+
+@Reasoning:
+Reads a node's "declarations" list (present on the module node). Returns 0
+when the node is null or has no declarations field.
+@End Reasoning
+Process called "hir_declarations" takes node as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    Let key be proc create_from_literal from StringCore with "declarations"
+    Return proc hashtable_get from Dict with node, key
+End Process
+
+@Reasoning:
+Reads a node's "name" string field, used to identify declarations by name.
+@End Reasoning
+Process called "hir_name" takes node as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    Let key be proc create_from_literal from StringCore with "name"
+    Return proc hashtable_get from Dict with node, key
+End Process
+
+@Reasoning:
+Counts the declarations in a module's "declarations" list, the basic
+"did the frontend lower anything" sanity check.
+@End Reasoning
+Process called "hir_declaration_count" takes module_node as Integer returns Integer:
+    Let decls be proc hir_declarations with module_node
+    If decls is equal to 0:
+        Return 0
+    End If
+    Return proc list_length from List with decls
+End Process
+
+@Reasoning:
+Linear scan of the module's declaration list returning the first declaration
+whose "name" equals the requested name, or 0 if none. This is how the probe
+proves a specific named construct survived lowering and round-tripping.
+@End Reasoning
+Process called "find_decl_named" takes module_node as Integer, name as Integer returns Integer:
+    Let decls be proc hir_declarations with module_node
+    If decls is equal to 0:
+        Return 0
+    End If
+
+    Let count be proc list_length from List with decls
+    Let index be 0
+    While index is less than count:
+        Let decl be proc list_get from List with decls, index
+        Let decl_name be proc hir_name with decl
+        If decl_name is not equal to 0:
+            Let matches be proc string_equals from StringCore with decl_name, name
+            If matches is equal to 1:
+                Return decl
+            End If
+        End If
+        Set index to index plus 1
+    End While
+
+    Return 0
+End Process
+
+@Reasoning:
+Two HIR nodes are "the same kind" when their integer node-type discriminants
+are equal. Used to prove the round-trip preserves a construct's node kind.
+@End Reasoning
+Process called "same_kind" takes a as Integer, b as Integer returns Integer:
+    If a is equal to 0:
+        Return 0
+    End If
+    If b is equal to 0:
+        Return 0
+    End If
+    Let ka be proc hir_node_type with a
+    Let kb be proc hir_node_type with b
+    If ka is equal to kb:
+        Return 1
+    End If
+    Return 0
+End Process
+
+@Reasoning:
+Reads an arbitrary list-valued field of a HIR dict node by key name (e.g.
+"constructors", "methods", "implementations", "imports"). Returns the list
+pointer or 0. Centralises the "field-then-decode" pattern the gap assertions
+share.
+@End Reasoning
+Process called "hir_list_field" takes node as Integer, key_name as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    Return proc hashtable_get from Dict with node, key_name
+End Process
+
+@Reasoning:
+Length of a list field of a HIR dict node, or 0 when the field is absent. Used
+to assert that a constructor/method/implementation list survived with the
+expected member count.
+@End Reasoning
+Process called "hir_field_count" takes node as Integer, key_name as Integer returns Integer:
+    Let lst be proc hir_list_field with node, key_name
+    If lst is equal to 0:
+        Return 0
+    End If
+    Return proc list_length from List with lst
+End Process
+
+@Reasoning:
+Linear scan of a constructor/method list returning the member whose "name"
+equals the requested name, or 0. Proves a specific named constructor/method
+survived lowering and round-tripping.
+@End Reasoning
+Process called "find_member_named" takes member_list as Integer, name as Integer returns Integer:
+    If member_list is equal to 0:
+        Return 0
+    End If
+    Let count be proc list_length from List with member_list
+    Let index be 0
+    While index is less than count:
+        Let member be proc list_get from List with member_list, index
+        Let member_name be proc hir_name with member
+        If member_name is not equal to 0:
+            Let matches be proc string_equals from StringCore with member_name, name
+            If matches is equal to 1:
+                Return member
+            End If
+        End If
+        Set index to index plus 1
+    End While
+    Return 0
+End Process
+
+@Reasoning:
+Scans the module's "imports" list for an import whose "module" field equals the
+requested full module name. Proves the dotted module path "Data.Map" survived
+intact rather than being truncated to "Data".
+@End Reasoning
+Process called "find_import_module" takes module_node as Integer, module_name as Integer returns Integer:
+    Let imports_key be proc create_from_literal from StringCore with "imports"
+    Let imports be proc hir_list_field with module_node, imports_key
+    If imports is equal to 0:
+        Return 0
+    End If
+    Let module_key be proc create_from_literal from StringCore with "module"
+    Let count be proc list_length from List with imports
+    Let index be 0
+    While index is less than count:
+        Let imp be proc list_get from List with imports, index
+        Let imp_module be proc hashtable_get from Dict with imp, module_key
+        If imp_module is not equal to 0:
+            Let matches be proc string_equals from StringCore with imp_module, module_name
+            If matches is equal to 1:
+                Return imp
+            End If
+        End If
+        Set index to index plus 1
+    End While
+    Return 0
+End Process
+
+@Reasoning:
+Reads the "alias" field of an import HIR dict (the "as L" alias), or 0. Used to
+assert the aliased import round-trips with its alias intact.
+@End Reasoning
+Process called "import_alias" takes import_node as Integer returns Integer:
+    If import_node is equal to 0:
+        Return 0
+    End If
+    Let alias_key be proc create_from_literal from StringCore with "alias"
+    Return proc hashtable_get from Dict with import_node, alias_key
+End Process
+
+Note: ============================================================================
+Note: Probe entry point
+Note: ============================================================================
+
+Process called "main" returns Integer:
+    Let results be proc create_test_results from TestUtils
+    proc begin_suite from TestUtils with results, "Haskell translation round-trip"
+
+    Note:
+    Representative program exercising the constructs the task requires: a module
+    header with an export list, a qualified import and an aliased import, a data
+    type with a deriving clause, a type class, an instance, a function with a
+    type signature plus a body using if/let/lambda/application, and a second
+    function.
+    :End Note
+    Let source be "module Geometry (area, classify) where\nimport qualified Data.Map\nimport Data.List as L\ndata Shape = Circle Double | Square Double deriving (Show)\ndata Person = Person { name :: String, age :: Int }\nclass Eq a where\n  same :: Shape -> Double\ninstance Eq Shape where\n  same x = x\narea :: Double -> Double\narea r = r\nclassify x = if x then let y = x in y else x\npositives xs = [x | x <- xs, x]\n"
+
+    Note: --- Stage 0-2: source -> HIR1 (parse, validate, lower) ---
+    Let hir1 be proc haskell_to_hir_from_source from HaskellFrontend with source
+    proc assert_not_null from TestUtils with results, "frontend produced HIR module", hir1
+
+    Note: HIR module is the HIR_MODULE node kind (20001).
+    Let hir1_kind be proc hir_node_type with hir1
+    proc assert_equal from TestUtils with results, "HIR1 root is a module node", hir1_kind, 20001
+
+    Note: HIR root has declarations.
+    Let root_decls be proc hir_declaration_count with hir1
+    proc assert_greater_than from TestUtils with results, "module has declarations", root_decls, 0
+
+    Note: --- key named constructs present in HIR1 ---
+    Let area_name be proc create_from_literal from StringCore with "area"
+    Let classify_name be proc create_from_literal from StringCore with "classify"
+    Let shape_name be proc create_from_literal from StringCore with "Shape"
+
+    Let area_node be proc find_decl_named with hir1, area_name
+    proc assert_not_null from TestUtils with results, "function 'area' lowered", area_node
+
+    Let classify_node be proc find_decl_named with hir1, classify_name
+    proc assert_not_null from TestUtils with results, "function 'classify' lowered", classify_node
+
+    Let shape_node be proc find_decl_named with hir1, shape_name
+    proc assert_not_null from TestUtils with results, "data type 'Shape' lowered", shape_node
+
+    Note: --- Stage 3: HIR1 -> Haskell text ---
+    Let emitted be proc hir_to_haskell from HaskellBackend with hir1
+    proc assert_not_null from TestUtils with results, "backend produced Haskell text", emitted
+    Let emitted_len be proc string_length from StringCore with emitted
+    proc assert_greater_than from TestUtils with results, "emitted Haskell is non-empty", emitted_len, 0
+
+    Note: --- Stage 4: re-run the pipeline on the emitted text -> HIR2 ---
+    Let hir2 be proc haskell_to_hir_from_source from HaskellFrontend with emitted
+    proc assert_not_null from TestUtils with results, "re-parse of emitted Haskell produced HIR", hir2
+    Let hir2_kind be proc hir_node_type with hir2
+    proc assert_equal from TestUtils with results, "HIR2 root is a module node", hir2_kind, 20001
+    Let root2_decls be proc hir_declaration_count with hir2
+    proc assert_greater_than from TestUtils with results, "round-trip module has declarations", root2_decls, 0
+
+    Note: --- Stage 5: structural equality on the key constructs ---
+    Let classify2 be proc find_decl_named with hir2, classify_name
+    proc assert_not_null from TestUtils with results, "round-trip preserves function 'classify'", classify2
+    Let classify_same be proc same_kind with classify_node, classify2
+    proc assert_equal from TestUtils with results, "round-trip preserves 'classify' node kind", classify_same, 1
+
+    Let shape2 be proc find_decl_named with hir2, shape_name
+    proc assert_not_null from TestUtils with results, "round-trip preserves data type 'Shape'", shape2
+
+    Note:
+    ========================================================================
+    DEPTH ASSERTIONS - these walk HIR2 (the re-parse of emitted Haskell) to
+    prove the constructs that the round-trip used to silently lose now
+    survive: data constructors + their fields, record field names, class
+    methods, instance methods, dotted imports + alias, and list
+    comprehensions. Each of these would have passed the shallow node-kind
+    checks above while the body was empty; these assertions read the actual
+    member lists so a regression to the empty-list stubs fails loudly.
+    ========================================================================
+    :End Note
+
+    Note: --- GAP 1a: data constructors + fields survive ---
+    Let constructors_key be proc create_from_literal from StringCore with "constructors"
+    Let arguments_key be proc create_from_literal from StringCore with "arguments"
+    Let circle_name be proc create_from_literal from StringCore with "Circle"
+    Let square_name be proc create_from_literal from StringCore with "Square"
+
+    Let shape_ctor_count be proc hir_field_count with shape2, constructors_key
+    proc assert_equal from TestUtils with results, "Shape has 2 constructors after round-trip", shape_ctor_count, 2
+
+    Let shape_ctors be proc hir_list_field with shape2, constructors_key
+    Let circle_ctor be proc find_member_named with shape_ctors, circle_name
+    proc assert_not_null from TestUtils with results, "constructor 'Circle' survives", circle_ctor
+    Let square_ctor be proc find_member_named with shape_ctors, square_name
+    proc assert_not_null from TestUtils with results, "constructor 'Square' survives", square_ctor
+
+    Let circle_fields be proc hir_field_count with circle_ctor, arguments_key
+    proc assert_equal from TestUtils with results, "'Circle' has 1 field after round-trip", circle_fields, 1
+    Let square_fields be proc hir_field_count with square_ctor, arguments_key
+    proc assert_equal from TestUtils with results, "'Square' has 1 field after round-trip", square_fields, 1
+
+    Note: --- GAP 1b: record-syntax constructor field names survive ---
+    Let person_name be proc create_from_literal from StringCore with "Person"
+    Let field_names_key be proc create_from_literal from StringCore with "field_names"
+    Let person2 be proc find_decl_named with hir2, person_name
+    proc assert_not_null from TestUtils with results, "record data type 'Person' lowered", person2
+    Let person_ctors be proc hir_list_field with person2, constructors_key
+    Let person_ctor be proc find_member_named with person_ctors, person_name
+    proc assert_not_null from TestUtils with results, "record constructor 'Person' survives", person_ctor
+    Let person_field_names be proc hir_field_count with person_ctor, field_names_key
+    proc assert_equal from TestUtils with results, "'Person' record has 2 field names after round-trip", person_field_names, 2
+
+    Note: --- GAP 1c: type class methods survive ---
+    Let eq_name be proc create_from_literal from StringCore with "Eq"
+    Let methods_key be proc create_from_literal from StringCore with "methods"
+    Let same_name be proc create_from_literal from StringCore with "same"
+    Let eq_class2 be proc find_decl_named with hir2, eq_name
+    proc assert_not_null from TestUtils with results, "type class 'Eq' lowered", eq_class2
+    Let eq_method_count be proc hir_field_count with eq_class2, methods_key
+    proc assert_greater_than from TestUtils with results, "class 'Eq' has methods after round-trip", eq_method_count, 0
+    Let eq_methods be proc hir_list_field with eq_class2, methods_key
+    Let same_method be proc find_member_named with eq_methods, same_name
+    proc assert_not_null from TestUtils with results, "class method 'same' survives", same_method
+
+    Note: --- GAP 1d: instance method count survives ---
+    Let implementations_key be proc create_from_literal from StringCore with "implementations"
+    Let decls2 be proc hir_declarations with hir2
+    Let inst_impl_count be 0
+    Let dcount be proc list_length from List with decls2
+    Let dindex be 0
+    While dindex is less than dcount:
+        Let decl be proc list_get from List with decls2, dindex
+        Let dkind be proc hir_node_type with decl
+        If dkind is equal to 20105:
+            Let this_impls be proc hir_field_count with decl, implementations_key
+            If this_impls is greater than inst_impl_count:
+                Set inst_impl_count to this_impls
+            End If
+        End If
+        Set dindex to dindex plus 1
+    End While
+    proc assert_greater_than from TestUtils with results, "instance has method implementations after round-trip", inst_impl_count, 0
+
+    Note: --- GAP 2: dotted import + alias survive ---
+    Let datamap_name be proc create_from_literal from StringCore with "Data.Map"
+    Let datalist_name be proc create_from_literal from StringCore with "Data.List"
+    Let datamap_import be proc find_import_module with hir2, datamap_name
+    proc assert_not_null from TestUtils with results, "dotted import 'Data.Map' survives (not truncated to 'Data')", datamap_import
+    Let datalist_import be proc find_import_module with hir2, datalist_name
+    proc assert_not_null from TestUtils with results, "dotted import 'Data.List' survives", datalist_import
+    Let l_alias be proc import_alias with datalist_import
+    proc assert_not_null from TestUtils with results, "import alias 'L' survives", l_alias
+
+    Note: --- GAP 3: list comprehension round-trips (generator + guard) ---
+    Let positives_name be proc create_from_literal from StringCore with "positives"
+    Let body_key be proc create_from_literal from StringCore with "body"
+    Let generators_key be proc create_from_literal from StringCore with "generators"
+    Let guards_key be proc create_from_literal from StringCore with "guards"
+    Let positives2 be proc find_decl_named with hir2, positives_name
+    proc assert_not_null from TestUtils with results, "function 'positives' lowered", positives2
+    Let positives_body be proc hashtable_get from Dict with positives2, body_key
+    Let body_kind be proc hir_node_type with positives_body
+    proc assert_equal from TestUtils with results, "'positives' body is a comprehension after round-trip", body_kind, 20211
+    Let comp_gen_count be proc hir_field_count with positives_body, generators_key
+    proc assert_greater_than from TestUtils with results, "comprehension has a generator after round-trip", comp_gen_count, 0
+    Let comp_guard_count be proc hir_field_count with positives_body, guards_key
+    proc assert_greater_than from TestUtils with results, "comprehension has a guard after round-trip", comp_guard_count, 0
+
+    proc print_summary from TestUtils with results
+    Let failed be proc get_failed from TestUtils with results
+    proc destroy_test_results from TestUtils with results
+
+    Return failed
+End Process

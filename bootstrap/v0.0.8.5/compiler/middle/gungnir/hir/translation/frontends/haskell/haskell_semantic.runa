@@ -44,6 +44,7 @@ Dependencies:
 
 Import "compiler/middle/gungnir/hir/translation/frontends/haskell/haskell_parser.runa" as Parser
 Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/frontend/primitives/core/string_primitive.runa" as StringPrim
 Import "compiler/frontend/primitives/memory/layout.runa" as Layout
 Import "compiler/frontend/primitives/collections/hashtable.runa" as HashTable
 Import "compiler/frontend/primitives/collections/list.runa" as List
@@ -116,7 +117,7 @@ fresh type variables for the Hindley-Milner pass.
 - class_env @16 - type class name -> class id (HashTable)
 - instance_env @24 - instance map (HashTable)
 - module_env @32 - module name -> declarations (HashTable)
-- constraint_solver @40 - constraint queue (placeholder)
+- scope_stack @40 - List of per-scope name frames (lexical scope tracking)
 - error_list @48 - List of error strings
 - warning_list @56 - List of warning strings
 - current_scope @64 - integer depth (entered/exited per scope)
@@ -274,8 +275,11 @@ Process called "create_haskell_semantic_analyzer" returns Integer:
     Let module_env be proc hashtable_create from HashTable
     proc memory_set_int64 from Layout with analyzer, 32, module_env
 
-    Note: Initialize constraint solver
-    proc memory_set_int64 from Layout with analyzer, 40, 0
+    Note: Initialize lexical-scope frame stack (offset 40). Each frame is a
+    Note: List of the variable names bound at that scope level, so exiting a
+    Note: scope can delete exactly those bindings from the symbol table.
+    Let scope_stack be proc list_create from List
+    proc memory_set_int64 from Layout with analyzer, 40, scope_stack
 
     Note: Initialize error and warning lists
     Let error_list be proc list_create from List
@@ -289,7 +293,7 @@ Process called "create_haskell_semantic_analyzer" returns Integer:
     proc memory_set_int64 from Layout with analyzer, 72, 0  Note: type_var_counter
 
     Note: Populate with built-in types and classes
-    proc populate_builtin_environment from analyzer
+    proc populate_builtin_environment with analyzer
 
     Return analyzer
 End Process
@@ -343,6 +347,21 @@ Process called "destroy_haskell_semantic_analyzer" takes analyzer as Integer ret
     Let module_env be proc memory_get_int64 from Layout with analyzer, 32
     If module_env is not equal to 0:
         proc hashtable_destroy from HashTable with module_env
+    End If
+
+    Note: Destroy the lexical-scope frame stack and each remaining frame list
+    Let scope_stack be proc memory_get_int64 from Layout with analyzer, 40
+    If scope_stack is not equal to 0:
+        Let frame_count be proc list_length from List with scope_stack
+        Let frame_idx be 0
+        While frame_idx is less than frame_count:
+            Let frame be proc list_get from List with scope_stack, frame_idx
+            If frame is not equal to 0:
+                proc list_destroy from List with frame
+            End If
+            Set frame_idx to frame_idx plus 1
+        End While
+        proc list_destroy from List with scope_stack
     End If
 
     Note: Destroy error list
@@ -444,10 +463,10 @@ Process called "add_builtin_type" takes analyzer as Integer, name as Integer, ty
     Note: Add built-in type to type environment
 
     Let type_env be proc memory_get_int64 from Layout with analyzer, 8
-    Let type_name_str be proc create_string from StringCore with name
+    Let type_name_str be proc string_duplicate from StringCore with name
 
     Note: Create type representation
-    Let type_obj be proc create_haskell_type from type_id
+    Let type_obj be proc create_haskell_type with type_id
     proc hashtable_set from HashTable with type_env, type_name_str, type_obj
 
     Return 1
@@ -469,7 +488,7 @@ Process called "add_builtin_class" takes analyzer as Integer, name as Integer, c
     Note: Add built-in type class to class environment
 
     Let class_env be proc memory_get_int64 from Layout with analyzer, 16
-    Let class_name_str be proc create_string from StringCore with name
+    Let class_name_str be proc string_duplicate from StringCore with name
 
     Note: Create class representation
     proc hashtable_set from HashTable with class_env, class_name_str, class_id
@@ -495,10 +514,10 @@ Process called "add_builtin_function" takes analyzer as Integer, name as Integer
     Note: Add built-in function to symbol table
 
     Let symbol_table be proc memory_get_int64 from Layout with analyzer, 0
-    Let func_name_str be proc create_string from StringCore with name
+    Let func_name_str be proc string_duplicate from StringCore with name
 
     Note: Parse type string and create type scheme
-    Let type_scheme be proc parse_type_signature from type_str
+    Let type_scheme be proc parse_type_signature with type_str
     proc hashtable_set from HashTable with symbol_table, func_name_str, type_scheme
 
     Return 1
@@ -564,8 +583,8 @@ Process called "create_fresh_type_variable" takes analyzer as Integer returns In
     proc memory_set_int64 from Layout with analyzer, 72, counter
 
     Note: Create type variable name like "t1", "t2", etc.
-    Let var_name be proc create_type_var_name from counter
-    Let type_var be proc create_haskell_type from TYPE_VARIABLE
+    Let var_name be proc create_type_var_name with counter
+    Let type_var be proc create_haskell_type with TYPE_VARIABLE
 
     proc memory_set_int64 from Layout with type_var, 8, var_name
 
@@ -587,14 +606,101 @@ StringCore.string_concat to form the variable name. Deallocates
 the two intermediate strings (the concatenated result is the
 return value).
 @End Implementation
+@Reasoning:
+StringCore offers no whitespace-trim primitive, so the type-signature
+parser carries its own. Trimming leading/trailing ASCII spaces and tabs
+is all the Haskell type-string scanner needs (newlines never appear in a
+single type token at this stage).
+@End Reasoning
+@Implementation:
+Scans from both ends past bytes 32 (space) and 9 (tab) to compute the
+trimmed [first, last] inclusive range, then copies that range into a
+freshly owned-heap NUL-terminated buffer via StringPrim.string_substring
+(start = first, length = last - first + 1). An all-whitespace or empty
+input yields a freshly allocated empty string so callers can always
+deallocate the result uniformly.
+@End Implementation
+Process called "haskell_trim" takes str as Integer returns Integer:
+    Note: Return a new string with leading/trailing spaces and tabs removed
+
+    If str is equal to 0:
+        Return 0
+    End If
+
+    Let str_len be proc string_length from StringCore with str
+    Let first be 0
+    While first is less than str_len:
+        Let ch be proc string_char_at from StringCore with str, first
+        If ch is equal to 32:
+            Set first to first plus 1
+        Otherwise:
+            If ch is equal to 9:
+                Set first to first plus 1
+            Otherwise:
+                Break
+            End If
+        End If
+    End While
+
+    Let last be str_len minus 1
+    While last is greater than or equal to first:
+        Let tail_ch be proc string_char_at from StringCore with str, last
+        If tail_ch is equal to 32:
+            Set last to last minus 1
+        Otherwise:
+            If tail_ch is equal to 9:
+                Set last to last minus 1
+            Otherwise:
+                Break
+            End If
+        End If
+    End While
+
+    If last is less than first:
+        Return proc create_from_literal from StringCore with ""
+    End If
+
+    Let trimmed_length be last minus first plus 1
+    Return proc string_substring from StringPrim with str, first, trimmed_length
+End Process
+
+@Reasoning:
+Numeric-literal classification needs a contains-character test that
+StringCore does not provide; this self-contained scan mirrors the lexer's
+equivalent helper so the semantic pass can decide int vs float from a
+literal string.
+@End Reasoning
+@Implementation:
+Walks indices 0..length-1, returning 1 on the first byte equal to
+target_char and 0 otherwise (including null/empty input).
+@End Implementation
+Process called "haskell_contains_char" takes str as Integer, target_char as Integer returns Integer:
+    Note: Return 1 if str contains target_char, else 0
+
+    If str is equal to 0:
+        Return 0
+    End If
+
+    Let scan_len be proc string_length from StringCore with str
+    Let idx be 0
+    While idx is less than scan_len:
+        Let scan_ch be proc string_char_at from StringCore with str, idx
+        If scan_ch is equal to target_char:
+            Return 1
+        End If
+        Set idx to idx plus 1
+    End While
+
+    Return 0
+End Process
+
 Process called "create_type_var_name" takes counter as Integer returns Integer:
     Note: Create type variable name from counter
 
-    Let prefix be proc create_string from StringCore with "t"
-    Let counter_str be proc int_to_string from StringCore with counter
-    Let var_name be proc string_concat from StringCore with prefix, counter_str
+    Let prefix be proc create_from_literal from StringCore with "t"
+    Let counter_str be proc integer_to_string from StringPrim with counter
+    Let var_name be proc string_concat from StringPrim with prefix, counter_str
 
-    proc deallocate from Layout with prefix
     proc deallocate from Layout with counter_str
 
     Return var_name
@@ -879,7 +985,7 @@ numeric_type with TYPE_FLOAT, absent -> with TYPE_INT.
 @End Implementation
 Process called "infer_literal_type" takes analyzer as Integer, literal_value as Integer returns Integer:
     If literal_value is equal to 0:
-        Return proc create_haskell_type from TYPE_UNIT
+        Return proc create_haskell_type with TYPE_UNIT
     End If
 
     Note: Determine literal type based on value format
@@ -887,28 +993,28 @@ Process called "infer_literal_type" takes analyzer as Integer, literal_value as 
 
     Note: Character literal (starts with ')
     If first_char is equal to 39:  Note: '
-        Return proc create_haskell_type from TYPE_CHAR
+        Return proc create_haskell_type with TYPE_CHAR
     End If
 
     Note: String literal (starts with ")
     If first_char is equal to 34:  Note: "
-        Return proc create_haskell_type from TYPE_STRING
+        Return proc create_haskell_type with TYPE_STRING
     End If
 
     Note: Boolean literals
-    Let true_str be proc create_string from StringCore with "True"
-    Let false_str be proc create_string from StringCore with "False"
+    Let true_str be proc create_from_literal from StringCore with "True"
+    Let false_str be proc create_from_literal from StringCore with "False"
     Let is_true be proc string_equals from StringCore with literal_value, true_str
     Let is_false be proc string_equals from StringCore with literal_value, false_str
     proc deallocate from Layout with true_str
     proc deallocate from Layout with false_str
 
     If is_true is equal to 1 or is_false is equal to 1:
-        Return proc create_haskell_type from TYPE_BOOL
+        Return proc create_haskell_type with TYPE_BOOL
     End If
 
     Note: Numeric literals
-    Let has_dot be proc string_contains_char from StringCore with literal_value, 46  Note: .
+    Let has_dot be proc haskell_contains_char with literal_value, 46  Note: .
     If has_dot is equal to 1:
         Note: Floating point literal
         Return proc create_polymorphic_numeric_type with analyzer, TYPE_FLOAT
@@ -934,7 +1040,7 @@ via add_type_constraint. Returns the variable - the constraint
 travels separately via the analyzer's constraint slot.
 @End Implementation
 Process called "create_polymorphic_numeric_type" takes analyzer as Integer, base_type as Integer returns Integer:
-    Let type_var be proc create_fresh_type_variable from analyzer
+    Let type_var be proc create_fresh_type_variable with analyzer
     Let num_constraint be proc create_type_constraint with TYPECLASS_NUM, type_var
 
     Note: Add constraint to constraint solver
@@ -999,18 +1105,30 @@ Process called "instantiate_type_scheme" takes analyzer as Integer, type_scheme 
     Let bound_vars be proc memory_get_int64 from Layout with type_scheme, 8
     Let bound_count be proc memory_get_int64 from Layout with type_scheme, 16
 
-    Note: Create substitution map for instantiation
-    Let substitution be proc create from Dictionary
+    Note: Create substitution map for instantiation. The substitution is a
+    Note: HashTable keyed by the bound variable's NAME (string) so the shared
+    Note: substitute_into_type walker can match a TYPE_VARIABLE by its name.
+    Let substitution be proc hashtable_create from HashTable
 
     Let i be 0
     While i is less than bound_count:
-        Let bound_var be proc get from List with bound_vars, i
+        Let bound_var be proc list_get from List with bound_vars, i
 
         Note: Create fresh type variable for this bound variable
-        Let fresh_var be proc create_fresh_type_variable from analyzer
+        Let fresh_var be proc create_fresh_type_variable with analyzer
+
+        Note: A bound var may be stored either as a bare name string or as a
+        Note: TYPE_VARIABLE type object; normalise to the name string for the key.
+        Let bound_var_name be bound_var
+        If bound_var is not equal to 0:
+            Let bv_constructor be proc memory_get_int64 from Layout with bound_var, 0
+            If bv_constructor is equal to KIND_STAR:
+                Set bound_var_name to proc memory_get_int64 from Layout with bound_var, 8
+            End If
+        End If
 
         Note: Add to substitution map
-        proc set from Dictionary with substitution, bound_var, fresh_var
+        proc hashtable_set from HashTable with substitution, bound_var_name, fresh_var
 
         Set i to i plus 1
     End While
@@ -1058,7 +1176,7 @@ Process called "infer_application_type" takes analyzer as Integer, app_expr as I
     End If
 
     Note: Create fresh type variable for result
-    Let result_type be proc create_fresh_type_variable from analyzer
+    Let result_type be proc create_fresh_type_variable with analyzer
 
     Note: Create function type (arg_type -> result_type)
     Let expected_func_type be proc create_function_type with arg_type, result_type
@@ -1091,7 +1209,7 @@ parameters offset (16). Returns the function type.
 Process called "create_function_type" takes arg_type as Integer, result_type as Integer returns Integer:
     Note: Create function type (arg -> result)
 
-    Let func_type be proc create_haskell_type from TYPE_FUNCTION
+    Let func_type be proc create_haskell_type with TYPE_FUNCTION
 
     Note: Create parameter list with arg and result types
     Let params be proc list_create from List
@@ -1120,7 +1238,7 @@ create_function_type. Exits scope. Returns the assembled function
 type.
 @End Implementation
 Process called "infer_lambda_type" takes analyzer as Integer, lambda_expr as Integer returns Integer:
-    proc enter_scope from analyzer
+    proc enter_scope with analyzer
 
     Let lambda_children be proc get_haskell_ast_children from Parser with lambda_expr
 
@@ -1140,7 +1258,7 @@ Process called "infer_lambda_type" takes analyzer as Integer, lambda_expr as Int
         Let param_name be proc get_haskell_ast_value from Parser with param_node
 
         Note: Create fresh type variable for this parameter
-        Let param_type be proc create_fresh_type_variable from analyzer
+        Let param_type be proc create_fresh_type_variable with analyzer
 
         Note: Add parameter to symbol table with its type
         proc add_variable_to_scope with analyzer, param_name, param_type
@@ -1155,7 +1273,7 @@ Process called "infer_lambda_type" takes analyzer as Integer, lambda_expr as Int
     Let body_type be proc infer_expression_type with analyzer, body_expr
 
     Note: Exit lambda scope
-    proc exit_scope from analyzer
+    proc exit_scope with analyzer
 
     Note: Create function type from parameters to body
     Note: For multiple parameters, create nested function type: a -> b -> c -> result
@@ -1195,7 +1313,7 @@ Process called "infer_case_type" takes analyzer as Integer, case_expr as Integer
     Let scrutinee_type be proc infer_expression_type with analyzer, scrutinee_expr
 
     Note: Infer types of all alternatives and unify
-    Let result_type be proc create_fresh_type_variable from analyzer
+    Let result_type be proc create_fresh_type_variable with analyzer
 
     Note: Get alternatives list
     Let alternatives_node be proc get from List with case_children, 1
@@ -1213,14 +1331,14 @@ Process called "infer_case_type" takes analyzer as Integer, case_expr as Integer
         Let alt_expr be proc get from List with alt_children, 1
 
         Note: Enter new scope for pattern bindings
-        proc enter_scope from analyzer
+        proc enter_scope with analyzer
 
         Note: Check pattern matches scrutinee type and bind pattern variables
         Let pattern_check be proc check_pattern_type with analyzer, pattern, scrutinee_type
 
         If pattern_check is equal to 0:
             proc add_type_error with analyzer, "Pattern does not match scrutinee type"
-            proc exit_scope from analyzer
+            proc exit_scope with analyzer
             Set i to i plus 1
             Continue
         End If
@@ -1229,7 +1347,7 @@ Process called "infer_case_type" takes analyzer as Integer, case_expr as Integer
         Let alt_type be proc infer_expression_type with analyzer, alt_expr
 
         Note: Exit pattern scope
-        proc exit_scope from analyzer
+        proc exit_scope with analyzer
 
         Note: Unify alternative type with result type
         Let unification be proc unify_types with analyzer, alt_type, result_type
@@ -1365,7 +1483,7 @@ Process called "check_constructor_pattern" takes analyzer as Integer, pattern as
     End If
 
     Note: Check that constructor belongs to scrutinee type
-    Let constructor_type be proc get_constructor_type from constructor_info
+    Let constructor_type be proc get_constructor_type with constructor_info
     Let unification be proc unify_types with analyzer, constructor_type, scrutinee_type
 
     If unification is equal to 0:
@@ -1495,7 +1613,61 @@ Process called "enter_scope" takes analyzer as Integer returns Integer:
     Set current_scope to current_scope plus 1
     proc memory_set_int64 from Layout with analyzer, 64, current_scope
 
+    Note: Push a fresh frame onto the scope stack to record the names bound
+    Note: in this scope, so exit_scope can remove exactly those bindings.
+    Let scope_stack be proc memory_get_int64 from Layout with analyzer, 40
+    If scope_stack is not equal to 0:
+        Let frame be proc list_create from List
+        proc list_append from List with scope_stack, frame
+    End If
+
     Return current_scope
+End Process
+
+@Reasoning:
+Binds a variable name to its inferred type in the symbol table and
+records the name in the current scope frame so the binding is removed
+when the scope is exited. The name is duplicated into analyzer-owned
+storage so it survives independently of the caller's AST buffers, and
+the symbol-table value is the type pointer directly - matching the
+representation produced by add_builtin_function and consumed by
+infer_identifier_type.
+@End Reasoning
+@Implementation:
+Reads symbol_table @0; null-guards the name. Duplicates the name via
+string_duplicate. Sets symbol_table[name_copy] = var_type. Reads the
+scope stack @40; if it has at least one frame, appends the name copy
+to the top frame so remove_scope_symbols can delete it on exit.
+Returns 1.
+@End Implementation
+Process called "add_variable_to_scope" takes analyzer as Integer, name as Integer, var_type as Integer returns Integer:
+    Note: Bind a variable name to a type in the current lexical scope
+
+    If name is equal to 0:
+        Return 0
+    End If
+
+    Let symbol_table be proc memory_get_int64 from Layout with analyzer, 0
+    If symbol_table is equal to 0:
+        Return 0
+    End If
+
+    Let name_copy be proc string_duplicate from StringCore with name
+    proc hashtable_set from HashTable with symbol_table, name_copy, var_type
+
+    Note: Record the name in the current (top) scope frame for later removal
+    Let scope_stack be proc memory_get_int64 from Layout with analyzer, 40
+    If scope_stack is not equal to 0:
+        Let frame_count be proc list_length from List with scope_stack
+        If frame_count is greater than 0:
+            Let top_frame be proc list_get from List with scope_stack, frame_count minus 1
+            If top_frame is not equal to 0:
+                proc list_append from List with top_frame, name_copy
+            End If
+        End If
+    End If
+
+    Return 1
 End Process
 
 @Reasoning:
@@ -1528,29 +1700,56 @@ Process called "exit_scope" takes analyzer as Integer returns Integer:
 End Process
 
 @Reasoning:
-Scaffold for the scope-bulk-removal pass. Reads the symbol table
-but the iterative removal step is intentionally minimal here -
-the analyzer's typical pattern is to add new bindings during a
-scope and discard them implicitly on exit by re-adding (no
-shadowing recovery is needed in this prototype-grade analyzer
-beyond what hashtable_set's overwrite semantics provide).
+Removes every binding introduced in the scope being exited. The scope
+frame stack (analyzer offset 40) records, per scope, exactly which
+names were bound, so removal is a precise pop-and-delete rather than a
+full symbol-table scan. After deletion an outer-scope binding of the
+same name (still present in the table from when it was added) is once
+again the visible binding, giving correct lexical shadowing recovery.
 @End Reasoning
-
 @Implementation:
-Reads symbol_table (analyzer offset 0) into a local. The full
-implementation would iterate every symbol entry and remove
-those whose stored scope_level equals the passed argument;
-currently the function returns 1 as a no-op so callers that
-expect a non-zero success indicator still work.
+Reads symbol_table @0 and the scope stack @40. If the stack has at
+least one frame, pops the top frame (list_pop), iterates its recorded
+names, and for each non-null name calls hashtable_delete on the symbol
+table then deallocates the analyzer-owned name copy. Finally destroys
+the popped frame list. Returns 1. The scope_level argument is retained
+for signature stability with the caller; the frame stack already
+identifies the precise bindings to remove.
 @End Implementation
 Process called "remove_scope_symbols" takes analyzer as Integer, scope_level as Integer returns Integer:
-    Note: Remove all symbols from specified scope level
+    Note: Remove all symbols bound in the scope being exited
 
     Let symbol_table be proc memory_get_int64 from Layout with analyzer, 0
+    Let scope_stack be proc memory_get_int64 from Layout with analyzer, 40
 
-    Note: implementation  iterate through symbol table
-    Note: and remove all symbols with matching scope level
+    If scope_stack is equal to 0:
+        Return 1
+    End If
 
+    Let frame_count be proc list_length from List with scope_stack
+    If frame_count is equal to 0:
+        Return 1
+    End If
+
+    Let frame be proc list_pop from List with scope_stack
+    If frame is equal to 0:
+        Return 1
+    End If
+
+    Let name_count be proc list_length from List with frame
+    Let idx be 0
+    While idx is less than name_count:
+        Let bound_name be proc list_get from List with frame, idx
+        If bound_name is not equal to 0:
+            If symbol_table is not equal to 0:
+                proc hashtable_delete from HashTable with symbol_table, bound_name
+            End If
+            proc deallocate from Layout with bound_name
+        End If
+        Set idx to idx plus 1
+    End While
+
+    proc list_destroy from List with frame
     Return 1
 End Process
 
@@ -1573,7 +1772,7 @@ list_push. Returns 1.
 @End Implementation
 Process called "add_type_error" takes analyzer as Integer, message as Integer returns Integer:
     Let error_list be proc memory_get_int64 from Layout with analyzer, 48
-    Let error_msg be proc create_string from StringCore with message
+    Let error_msg be proc string_duplicate from StringCore with message
 
     proc list_push from List with error_list, error_msg
 
@@ -1595,7 +1794,7 @@ Process called "add_type_warning" takes analyzer as Integer, message as Integer 
     Note: Add type warning to warning list
 
     Let warning_list be proc memory_get_int64 from Layout with analyzer, 56
-    Let warning_msg be proc create_string from StringCore with message
+    Let warning_msg be proc string_duplicate from StringCore with message
 
     proc list_push from List with warning_list, warning_msg
 
@@ -1689,7 +1888,9 @@ solver queue without needing a separate parameter for each piece.
 
 @Implementation:
 Allocates 24 bytes (3 i64 slots). Returns 0 on allocation failure.
-Stores class_id @0, type_arg @8, 0 @16 (source location placeholder).
+Stores class_id @0, type_arg @8, 0 @16 (the source-location slot is 0 when
+the constraint originates from inference rather than an explicit signature;
+0 is the documented "no source location" sentinel read back by the solver).
 @End Implementation
 Process called "create_type_constraint" takes class_id as Integer, type_arg as Integer returns Integer:
     Let constraint_size be 24  Note: 3 fields × 8 bytes each
@@ -1732,7 +1933,102 @@ Returns a substitution handle pairing var_name with type_expr. The
 caller composes multiple substitutions via the constraint solver.
 @End Implementation
 Process called "create_substitution" takes var_name as Integer, type_expr as Integer returns Integer:
-    Return 1
+    Note: A substitution is a HashTable mapping a type-variable name (string)
+    Note: to the type it is bound to. A single-binding substitution is the
+    Note: atom produced by unifying one variable against another type.
+
+    If var_name is equal to 0:
+        Return 0
+    End If
+
+    Let substitution be proc hashtable_create from HashTable
+    If substitution is equal to 0:
+        Return 0
+    End If
+
+    proc hashtable_set from HashTable with substitution, var_name, type_expr
+    Return substitution
+End Process
+
+@Reasoning:
+Shared structure-preserving substitution walk used by both
+apply_substitution and apply_type_substitution (which differ only in
+argument order). A type variable whose name is a key in the
+substitution is replaced by its bound type; every other node is
+rebuilt with its children substituted so the original type tree is
+never mutated in place.
+@End Reasoning
+@Implementation:
+Null substitution or null type returns the type unchanged. Reads the
+type constructor at offset 8. For TYPE_VARIABLE, looks the variable
+name up in the substitution HashTable; on a hit returns the bound
+type, on a miss returns the variable unchanged. For any composite
+type, walks its parameter list (offset 16) - when present - applying
+the substitution to each element and storing the result back into a
+fresh parameter list on a new shallow copy of the type so the source
+type is preserved. Types with no parameter list are returned as-is.
+@End Implementation
+Process called "substitute_into_type" takes substitution as Integer, type_expr as Integer returns Integer:
+    If substitution is equal to 0:
+        Return type_expr
+    End If
+    If type_expr is equal to 0:
+        Return type_expr
+    End If
+
+    Let constructor be proc memory_get_int64 from Layout with type_expr, 8
+
+    Note: Type variable - replace if bound in the substitution
+    If constructor is equal to TYPE_VARIABLE:
+        Let bound be proc hashtable_get from HashTable with substitution, constructor
+        If bound is not equal to 0:
+            Return bound
+        End If
+        Return type_expr
+    End If
+
+    Note: Composite type - substitute into each parameter
+    Let params be proc memory_get_int64 from Layout with type_expr, 16
+    If params is equal to 0:
+        Return type_expr
+    End If
+
+    Let param_count be proc list_length from List with params
+    If param_count is equal to 0:
+        Return type_expr
+    End If
+
+    Note: Build a shallow copy of the type with substituted parameters so the
+    Note: original type tree is left intact for other inference branches.
+    Let new_type be proc create_haskell_type with constructor
+    If new_type is equal to 0:
+        Return type_expr
+    End If
+    Let original_kind be proc memory_get_int64 from Layout with type_expr, 0
+    proc memory_set_int64 from Layout with new_type, 0, original_kind
+
+    Let new_params be proc list_create from List
+    Let idx be 0
+    While idx is less than param_count:
+        Let param_type be proc list_get from List with params, idx
+        Let new_param be proc substitute_into_type with substitution, param_type
+        proc list_append from List with new_params, new_param
+        Set idx to idx plus 1
+    End While
+
+    proc memory_set_int64 from Layout with new_type, 16, new_params
+    Let original_constraints be proc memory_get_int64 from Layout with type_expr, 24
+    proc memory_set_int64 from Layout with new_type, 24, original_constraints
+    Return new_type
+End Process
+
+@Reasoning:
+Instantiation-side entry point: applies a forall substitution
+(bound-variable -> fresh-variable) to a type scheme's underlying type.
+Delegates to the shared substitute_into_type walker.
+@End Reasoning
+Process called "apply_type_substitution" takes substitution as Integer, type_expr as Integer returns Integer:
+    Return proc substitute_into_type with substitution, type_expr
 End Process
 
 @Reasoning:
@@ -1747,7 +2043,9 @@ with their substitution targets. The walk is structure-preserving:
 non-variable nodes are unchanged.
 @End Implementation
 Process called "apply_substitution" takes type_expr as Integer, substitution as Integer returns Integer:
-    Return type_expr
+    Note: Unification-side entry point (type, substitution) - the argument
+    Note: order mirrors the unify result flow. Delegates to the shared walker.
+    Return proc substitute_into_type with substitution, type_expr
 End Process
 
 @Reasoning:
@@ -1769,7 +2067,7 @@ Process called "parse_type_signature" takes type_str as Integer returns Integer:
     End If
 
     Note: Trim whitespace from type string
-    Let trimmed be proc string_trim from StringCore with type_str
+    Let trimmed be proc haskell_trim with type_str
 
     Note: Check for empty string
     Let length be proc string_length from StringCore with trimmed
@@ -1921,7 +2219,7 @@ Process called "parse_primary_type" takes type_str as Integer, start as Integer,
             End If
 
             Note: Create list type
-            Let list_type be proc create_haskell_type from TYPE_LIST
+            Let list_type be proc create_haskell_type with TYPE_LIST
             Let params be proc create from List
             proc append from List with params, element_type
             proc memory_set_int64 from Layout with list_type, 16, params
@@ -1939,7 +2237,7 @@ Process called "parse_primary_type" takes type_str as Integer, start as Integer,
 
             If has_comma is equal to 1:
                 Note: Tuple type
-                Let tuple_type be proc create_haskell_type from TYPE_TUPLE
+                Let tuple_type be proc create_haskell_type with TYPE_TUPLE
                 Let elements be proc parse_tuple_elements with type_str, pos plus 1, close_paren
                 proc memory_set_int64 from Layout with tuple_type, 16, elements
                 Return tuple_type
@@ -2128,19 +2426,21 @@ TYPE_VARIABLE type and stashes the identifier name at offset 8.
 @End Implementation
 Process called "parse_type_identifier" takes type_str as Integer, start as Integer, end_pos as Integer returns Integer:
 
-    Note: Extract identifier substring
-    Let ident be proc string_substring from StringCore with type_str, start, end_pos
+    Note: Extract identifier substring [start, end_pos); string_substring
+    Note: takes a length, so convert the half-open range to a length.
+    Let ident_length be end_pos minus start
+    Let ident be proc string_substring from StringPrim with type_str, start, ident_length
 
     If ident is equal to 0:
         Return 0
     End If
 
     Note: Trim whitespace
-    Let trimmed be proc string_trim from StringCore with ident
+    Let trimmed be proc haskell_trim with ident
     proc deallocate from Layout with ident
 
     Note: Check basic types
-    Let result_type be proc lookup_basic_type from trimmed
+    Let result_type be proc lookup_basic_type with trimmed
 
     If result_type is not equal to 0:
         proc deallocate from Layout with trimmed
@@ -2148,7 +2448,7 @@ Process called "parse_type_identifier" takes type_str as Integer, start as Integ
     End If
 
     Note: Must be type variable (lowercase identifier)
-    Let type_var be proc create_haskell_type from TYPE_VARIABLE
+    Let type_var be proc create_haskell_type with TYPE_VARIABLE
     proc memory_set_int64 from Layout with type_var, 8, trimmed
 
     Return type_var
@@ -2169,46 +2469,46 @@ variable or user type".
 @End Implementation
 Process called "lookup_basic_type" takes type_name as Integer returns Integer:
 
-    Let int_str be proc create_string from StringCore with "Int"
+    Let int_str be proc create_from_literal from StringCore with "Int"
     Let is_int be proc string_equals from StringCore with type_name, int_str
     proc deallocate from Layout with int_str
     If is_int is equal to 1:
-        Return proc create_haskell_type from TYPE_INT
+        Return proc create_haskell_type with TYPE_INT
     End If
 
-    Let bool_str be proc create_string from StringCore with "Bool"
+    Let bool_str be proc create_from_literal from StringCore with "Bool"
     Let is_bool be proc string_equals from StringCore with type_name, bool_str
     proc deallocate from Layout with bool_str
     If is_bool is equal to 1:
-        Return proc create_haskell_type from TYPE_BOOL
+        Return proc create_haskell_type with TYPE_BOOL
     End If
 
-    Let string_str be proc create_string from StringCore with "String"
+    Let string_str be proc create_from_literal from StringCore with "String"
     Let is_string be proc string_equals from StringCore with type_name, string_str
     proc deallocate from Layout with string_str
     If is_string is equal to 1:
-        Return proc create_haskell_type from TYPE_STRING
+        Return proc create_haskell_type with TYPE_STRING
     End If
 
-    Let char_str be proc create_string from StringCore with "Char"
+    Let char_str be proc create_from_literal from StringCore with "Char"
     Let is_char be proc string_equals from StringCore with type_name, char_str
     proc deallocate from Layout with char_str
     If is_char is equal to 1:
-        Return proc create_haskell_type from TYPE_CHAR
+        Return proc create_haskell_type with TYPE_CHAR
     End If
 
-    Let float_str be proc create_string from StringCore with "Float"
+    Let float_str be proc create_from_literal from StringCore with "Float"
     Let is_float be proc string_equals from StringCore with type_name, float_str
     proc deallocate from Layout with float_str
     If is_float is equal to 1:
-        Return proc create_haskell_type from TYPE_FLOAT
+        Return proc create_haskell_type with TYPE_FLOAT
     End If
 
-    Let unit_str be proc create_string from StringCore with "()"
+    Let unit_str be proc create_from_literal from StringCore with "()"
     Let is_unit be proc string_equals from StringCore with type_name, unit_str
     proc deallocate from Layout with unit_str
     If is_unit is equal to 1:
-        Return proc create_haskell_type from TYPE_UNIT
+        Return proc create_haskell_type with TYPE_UNIT
     End If
 
     Note: Not a basic type
@@ -2233,8 +2533,8 @@ its parameters list with [element_type], stores the params at offset
 caller's responsibility (typically done by visiting each element).
 @End Implementation
 Process called "infer_list_type" takes analyzer as Integer, list_expr as Integer returns Integer:
-    Let element_type be proc create_fresh_type_variable from analyzer
-    Let list_type be proc create_haskell_type from TYPE_LIST
+    Let element_type be proc create_fresh_type_variable with analyzer
+    Let list_type be proc create_haskell_type with TYPE_LIST
 
     Let params be proc list_create from List
     proc list_push from List with params, element_type
@@ -2254,7 +2554,7 @@ Creates a TYPE_TUPLE haskell type with empty parameters; caller is
 expected to attach the element types.
 @End Implementation
 Process called "infer_tuple_type" takes analyzer as Integer, tuple_expr as Integer returns Integer:
-    Let tuple_type be proc create_haskell_type from TYPE_TUPLE
+    Let tuple_type be proc create_haskell_type with TYPE_TUPLE
     Return tuple_type
 End Process
 
@@ -2271,7 +2571,7 @@ result type. Returns it. Full constraint generation lives in the
 caller.
 @End Implementation
 Process called "infer_if_type" takes analyzer as Integer, if_expr as Integer returns Integer:
-    Let result_type be proc create_fresh_type_variable from analyzer
+    Let result_type be proc create_fresh_type_variable with analyzer
     Return result_type
 End Process
 
@@ -2288,7 +2588,7 @@ body inference machinery is fleshed out by the caller via
 enter_scope / add_pattern_binding / infer_expression_type / unify.
 @End Implementation
 Process called "infer_let_type" takes analyzer as Integer, let_expr as Integer returns Integer:
-    Let body_type be proc create_fresh_type_variable from analyzer
+    Let body_type be proc create_fresh_type_variable with analyzer
     Return body_type
 End Process
 
@@ -2307,8 +2607,8 @@ Returns result_var (the monad parameter is bound by the caller
 through constraint propagation).
 @End Implementation
 Process called "infer_do_type" takes analyzer as Integer, do_expr as Integer returns Integer:
-    Let monad_var be proc create_fresh_type_variable from analyzer
-    Let result_var be proc create_fresh_type_variable from analyzer
+    Let monad_var be proc create_fresh_type_variable with analyzer
+    Let result_var be proc create_fresh_type_variable with analyzer
 
     Return result_var
 End Process
@@ -2400,14 +2700,14 @@ Process called "analyze_haskell_semantics" takes ast as Integer returns Integer:
     proc analyze_module with analyzer, ast
 
     Note: Check for errors
-    Let error_count be proc get_error_count from analyzer
+    Let error_count be proc get_error_count with analyzer
 
     If error_count is greater than 0:
-        proc destroy_haskell_semantic_analyzer from analyzer
+        proc destroy_haskell_semantic_analyzer with analyzer
         Return 0
     End If
 
-    proc destroy_haskell_semantic_analyzer from analyzer
+    proc destroy_haskell_semantic_analyzer with analyzer
     Return 1
 End Process
 

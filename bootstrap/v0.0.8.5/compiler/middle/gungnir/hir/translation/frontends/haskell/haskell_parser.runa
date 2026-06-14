@@ -41,6 +41,7 @@ Dependencies:
 
 Import "compiler/middle/gungnir/hir/translation/frontends/haskell/haskell_lexer.runa" as Lexer
 Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/frontend/primitives/core/string_primitive.runa" as StringPrim
 Import "compiler/frontend/primitives/memory/layout.runa" as Layout
 
 Note: ============================================================================
@@ -52,6 +53,7 @@ Constant AST_MODULE as Integer is 1001              Note: Module declaration
 Constant AST_IMPORT as Integer is 1002              Note: Import declaration
 Constant AST_EXPORT_LIST as Integer is 1003         Note: Export list
 Constant AST_IMPORT_LIST as Integer is 1004         Note: Import list
+Constant AST_EXPORT as Integer is 1005              Note: Single exported name
 
 Note: Declarations
 Constant AST_TYPE_DECLARATION as Integer is 2001    Note: Type declaration
@@ -62,6 +64,14 @@ Constant AST_INSTANCE_DECLARATION as Integer is 2005 Note: Instance declaration
 Constant AST_FUNCTION_DECLARATION as Integer is 2006 Note: Function declaration
 Constant AST_VALUE_DECLARATION as Integer is 2007   Note: Value binding
 Constant AST_SIGNATURE_DECLARATION as Integer is 2008 Note: Type signature
+Note: Semantic aliases consumed by the HIR translator's module dispatcher.
+Note: They share values with the corresponding *_DECLARATION nodes the parser
+Note: actually emits, so the translator's type checks match without the parser
+Note: producing a second, divergent node kind.
+Constant AST_DATA_TYPE as Integer is 2002           Note: alias of AST_DATA_DECLARATION
+Constant AST_TYPE_CLASS as Integer is 2004          Note: alias of AST_CLASS_DECLARATION
+Constant AST_INSTANCE as Integer is 2005            Note: alias of AST_INSTANCE_DECLARATION
+Constant AST_FUNCTION as Integer is 2006            Note: alias of AST_FUNCTION_DECLARATION
 Constant AST_FIXITY_DECLARATION as Integer is 2009  Note: Infix declaration
 
 Note: Expressions
@@ -77,6 +87,9 @@ Constant AST_LIST as Integer is 3009                Note: List literal
 Constant AST_TUPLE as Integer is 3010               Note: Tuple literal
 Constant AST_SECTION as Integer is 3011             Note: Operator section
 Constant AST_COMPREHENSION as Integer is 3012       Note: List comprehension
+Constant AST_DO_EXPR as Integer is 3013             Note: do-statement: bare expression
+Constant AST_DO_BIND as Integer is 3014             Note: do-statement: pattern <- expr
+Constant AST_DO_LET as Integer is 3015             Note: do-statement: let bindings
 
 Note: Patterns
 Constant AST_PATTERN_VARIABLE as Integer is 4001    Note: Variable pattern
@@ -182,6 +195,12 @@ Process called "destroy_haskell_parser" takes parser as Integer returns Integer:
             proc destroy_haskell_token from Lexer with current_token
         End If
 
+        Note: Free any one-token lookahead buffered at offset 32
+        Let buffered_token be proc memory_get_int64 from Layout with parser, 32
+        If buffered_token is not equal to 0:
+            proc destroy_haskell_token from Lexer with buffered_token
+        End If
+
         Let layout_stack be proc memory_get_int64 from Layout with parser, 40
         If layout_stack is not equal to 0:
             proc deallocate from Layout with layout_stack
@@ -238,7 +257,7 @@ Process called "destroy_haskell_ast_node" takes node as Integer returns Integer:
         While i is less than child_count:
             Let child be proc get from List with children, i
             If child is not equal to 0:
-                proc destroy_haskell_ast_node from child
+                proc destroy_haskell_ast_node with child
             End If
             Set i to i plus 1
         End While
@@ -277,6 +296,19 @@ Process called "advance_haskell_parser" takes parser as Integer returns Integer:
         proc destroy_haskell_token from Lexer with current_token
     End If
 
+    Note: If a token was buffered by peek_next_token (offset 32), consume it
+    Note: as the new current token instead of pulling a fresh one from the
+    Note: lexer. This gives the parser a true one-token lookahead without
+    Note: losing the current token (the lexer has no rewind).
+    Let buffered_token be proc memory_get_int64 from Layout with parser, 32
+    If buffered_token is not equal to 0:
+        proc memory_set_int64 from Layout with parser, 8, buffered_token
+        proc memory_set_int64 from Layout with parser, 32, 0
+        Set position to position plus 1
+        proc memory_set_int64 from Layout with parser, 16, position
+        Return buffered_token
+    End If
+
     Note: Get next token
     Let next_token be proc next_haskell_token from Lexer with lexer
     proc memory_set_int64 from Layout with parser, 8, next_token
@@ -285,6 +317,75 @@ Process called "advance_haskell_parser" takes parser as Integer returns Integer:
     proc memory_set_int64 from Layout with parser, 16, position
 
     Return next_token
+End Process
+
+@Reasoning:
+Returns the parser's monotonic token-advance counter (offset 16), bumped
+once per advance_haskell_parser call. Loops that delegate to sub-parsers
+read this before and after the sub-parse to detect zero progress and
+force a one-token advance, guaranteeing every list/block loop terminates
+even on malformed input (the non-advancing-loop guard).
+@End Reasoning
+Process called "parser_source_position" takes parser as Integer returns Integer:
+    Note: Return the monotonic token-advance counter for progress checks
+
+    If parser is equal to 0:
+        Return 0
+    End If
+
+    Return proc memory_get_int64 from Layout with parser, 16
+End Process
+
+@Reasoning:
+Returns the source column of the current token, used by layout-sensitive
+body parsing (class/instance where-blocks): a method line is indented
+(column > 1) while the next top-level declaration returns to column 1, so
+the body loop terminates when it sees a column-1 token.
+@End Reasoning
+Process called "current_haskell_token_column" takes parser as Integer returns Integer:
+    If parser is equal to 0:
+        Return 0
+    End If
+    Let current_token be proc memory_get_int64 from Layout with parser, 8
+    If current_token is equal to 0:
+        Return 0
+    End If
+    Return proc get_haskell_token_column from Lexer with current_token
+End Process
+
+@Reasoning:
+True one-token lookahead. The bare lexer has no rewind, so distinguishing a
+function definition ("name args = ...") from a type signature
+("name :: ...") needs to inspect the token AFTER the current identifier
+without consuming it. This pulls one token from the lexer and buffers it in
+the parser's pushback slot (offset 32) so the subsequent advance consumes it
+rather than skipping it. Returns the buffered token's kind.
+@End Reasoning
+@Implementation:
+If a token is already buffered at offset 32, returns its kind directly.
+Otherwise pulls the next token from the lexer, stores it at offset 32, and
+returns its type tag (offset 0). A null buffered token (EOF allocation
+failure) yields TOKEN_EOF.
+@End Implementation
+Process called "peek_next_token_type" takes parser as Integer returns Integer:
+    Note: Look at the token after the current one without consuming it
+
+    If parser is equal to 0:
+        Return TOKEN_EOF from Lexer
+    End If
+
+    Let buffered_token be proc memory_get_int64 from Layout with parser, 32
+    If buffered_token is equal to 0:
+        Let lexer be proc memory_get_int64 from Layout with parser, 0
+        Set buffered_token to proc next_haskell_token from Lexer with lexer
+        proc memory_set_int64 from Layout with parser, 32, buffered_token
+    End If
+
+    If buffered_token is equal to 0:
+        Return TOKEN_EOF from Lexer
+    End If
+
+    Return proc get_haskell_token_type from Lexer with buffered_token
 End Process
 
 @Reasoning:
@@ -331,7 +432,7 @@ Process called "expect_haskell_token" takes parser as Integer, expected_type as 
     If not, records parse error. Essential for grammar enforcement.
     @End Reasoning
 
-    Let current_type be proc current_haskell_token_type from parser
+    Let current_type be proc current_haskell_token_type with parser
 
     If current_type is not equal to expected_type:
         Note: Parse error - increment error count
@@ -341,7 +442,7 @@ Process called "expect_haskell_token" takes parser as Integer, expected_type as 
         Return 0
     End If
 
-    Return proc advance_haskell_parser from parser
+    Return proc advance_haskell_parser with parser
 End Process
 
 @Reasoning:
@@ -352,7 +453,7 @@ token kind.
 Process called "peek_haskell_token_type" takes parser as Integer returns Integer:
     Note: Peek at current token type without advancing
 
-    Return proc current_haskell_token_type from parser
+    Return proc current_haskell_token_type with parser
 End Process
 
 Note: ============================================================================
@@ -373,97 +474,97 @@ Process called "parse_haskell_primary_expression" takes parser as Integer return
     These form the building blocks for more complex expressions.
     @End Reasoning
 
-    Let token_type be proc current_haskell_token_type from parser
-    Let token_value be proc current_haskell_token_value from parser
+    Let token_type be proc current_haskell_token_type with parser
+    Let token_value be proc current_haskell_token_value with parser
     Let current_token be proc memory_get_int64 from Layout with parser, 8
 
     Note: Literals
     If token_type is equal to TOKEN_INTEGER from Lexer:
-        Let node be proc create_haskell_ast_node from AST_LITERAL
+        Let node be proc create_haskell_ast_node with AST_LITERAL
         proc memory_set_int64 from Layout with node, 8, token_value
-        proc advance_haskell_parser from parser
+        proc advance_haskell_parser with parser
         Return node
     End If
 
     If token_type is equal to TOKEN_FLOAT from Lexer:
-        Set node to proc create_haskell_ast_node from AST_LITERAL
+        Set node to proc create_haskell_ast_node with AST_LITERAL
         proc memory_set_int64 from Layout with node, 8, token_value
-        proc advance_haskell_parser from parser
+        proc advance_haskell_parser with parser
         Return node
     End If
 
     If token_type is equal to TOKEN_CHAR from Lexer:
-        Set node to proc create_haskell_ast_node from AST_LITERAL
+        Set node to proc create_haskell_ast_node with AST_LITERAL
         proc memory_set_int64 from Layout with node, 8, token_value
-        proc advance_haskell_parser from parser
+        proc advance_haskell_parser with parser
         Return node
     End If
 
     If token_type is equal to TOKEN_STRING from Lexer:
-        Set node to proc create_haskell_ast_node from AST_LITERAL
+        Set node to proc create_haskell_ast_node with AST_LITERAL
         proc memory_set_int64 from Layout with node, 8, token_value
-        proc advance_haskell_parser from parser
+        proc advance_haskell_parser with parser
         Return node
     End If
 
     Note: Identifiers and constructors
     If token_type is equal to TOKEN_IDENTIFIER from Lexer:
-        Set node to proc create_haskell_ast_node from AST_IDENTIFIER
+        Set node to proc create_haskell_ast_node with AST_IDENTIFIER
         proc memory_set_int64 from Layout with node, 8, token_value
-        proc advance_haskell_parser from parser
+        proc advance_haskell_parser with parser
         Return node
     End If
 
     If token_type is equal to TOKEN_CONSTRUCTOR from Lexer:
-        Set node to proc create_haskell_ast_node from AST_IDENTIFIER
+        Set node to proc create_haskell_ast_node with AST_IDENTIFIER
         proc memory_set_int64 from Layout with node, 8, token_value
-        proc advance_haskell_parser from parser
+        proc advance_haskell_parser with parser
         Return node
     End If
 
     Note: Parenthesized expressions
     If token_type is equal to TOKEN_LEFT_PAREN from Lexer:
-        proc advance_haskell_parser from parser
-        Let expr be proc parse_haskell_expression from parser
+        proc advance_haskell_parser with parser
+        Let expr be proc parse_haskell_expression with parser
         proc expect_haskell_token with parser, TOKEN_RIGHT_PAREN from Lexer
         Return expr
     End If
 
     Note: List literals
     If token_type is equal to TOKEN_LEFT_BRACKET from Lexer:
-        Return proc parse_haskell_list from parser
+        Return proc parse_haskell_list with parser
     End If
 
     Note: Tuple literals (handled by parentheses with commas)
     Note: Lambda expressions
     If token_type is equal to TOKEN_LAMBDA from Lexer:
-        Return proc parse_haskell_lambda from parser
+        Return proc parse_haskell_lambda with parser
     End If
 
     Note: Case expressions
     If token_type is equal to TOKEN_CASE from Lexer:
-        Return proc parse_haskell_case from parser
+        Return proc parse_haskell_case with parser
     End If
 
     Note: If expressions
     If token_type is equal to TOKEN_IF from Lexer:
-        Return proc parse_haskell_if from parser
+        Return proc parse_haskell_if with parser
     End If
 
     Note: Let expressions
     If token_type is equal to TOKEN_LET from Lexer:
-        Return proc parse_haskell_let from parser
+        Return proc parse_haskell_let with parser
     End If
 
     Note: Do notation
     If token_type is equal to TOKEN_DO from Lexer:
-        Return proc parse_haskell_do from parser
+        Return proc parse_haskell_do with parser
     End If
 
     Note: Wildcard pattern
     If token_type is equal to TOKEN_UNDERSCORE from Lexer:
-        Set node to proc create_haskell_ast_node from AST_PATTERN_WILDCARD
-        proc advance_haskell_parser from parser
+        Set node to proc create_haskell_ast_node with AST_PATTERN_WILDCARD
+        proc advance_haskell_parser with parser
         Return node
     End If
 
@@ -501,14 +602,14 @@ Process called "parse_haskell_expression_precedence" takes parser as Integer, mi
     and infix operators efficiently.
     @End Reasoning
 
-    Let left be proc parse_haskell_primary_expression from parser
+    Let left be proc parse_haskell_primary_expression with parser
 
     If left is equal to 0:
         Return 0
     End If
 
     While 1 is equal to 1:
-        Let token_type be proc current_haskell_token_type from parser
+        Let token_type be proc current_haskell_token_type with parser
 
         Note: Check if current token is an operator
         If token_type is not equal to TOKEN_OPERATOR from Lexer:
@@ -529,13 +630,13 @@ Process called "parse_haskell_expression_precedence" takes parser as Integer, mi
             End If
         End If
 
-        Let operator_precedence be proc get_haskell_operator_precedence from token_type
+        Let operator_precedence be proc get_haskell_operator_precedence with token_type
         If operator_precedence is less than min_precedence:
             Break
         End If
 
-        Let operator_token be proc current_haskell_token_value from parser
-        proc advance_haskell_parser from parser
+        Let operator_token be proc current_haskell_token_value with parser
+        proc advance_haskell_parser with parser
 
         Let right_precedence be operator_precedence plus 1  Note: Left associative
         Let right be proc parse_haskell_expression_precedence with parser, right_precedence
@@ -545,7 +646,7 @@ Process called "parse_haskell_expression_precedence" takes parser as Integer, mi
         End If
 
         Note: Create application node
-        Let app_node be proc create_haskell_ast_node from AST_APPLICATION
+        Let app_node be proc create_haskell_ast_node with AST_APPLICATION
         proc memory_set_int64 from Layout with app_node, 8, operator_token
 
         Note: Create children list and add left and right operands
@@ -640,19 +741,19 @@ Process called "parse_haskell_lambda" takes parser as Integer returns Integer:
 
     proc expect_haskell_token with parser, TOKEN_LAMBDA from Lexer
 
-    Let lambda_node be proc create_haskell_ast_node from AST_LAMBDA
+    Let lambda_node be proc create_haskell_ast_node with AST_LAMBDA
 
     Note: Parse parameters into list
     Let parameters be proc create from List
 
     While 1 is equal to 1:
-        Let token_type be proc current_haskell_token_type from parser
+        Let token_type be proc current_haskell_token_type with parser
 
         If token_type is equal to TOKEN_ARROW from Lexer:
             Break
         End If
 
-        Let param be proc parse_haskell_pattern from parser
+        Let param be proc parse_haskell_pattern with parser
         If param is equal to 0:
             Return 0
         End If
@@ -663,11 +764,15 @@ Process called "parse_haskell_lambda" takes parser as Integer returns Integer:
 
     proc expect_haskell_token with parser, TOKEN_ARROW from Lexer
 
-    Let body be proc parse_haskell_expression from parser
+    Let body be proc parse_haskell_expression with parser
     If body is equal to 0:
         Return 0
     End If
 
+    Note: value slot @8 holds the parameter-pattern list; children slot @16
+    Note: holds the body expression. extract_lambda_parameters / get_lambda_body
+    Note: read these slots respectively.
+    proc memory_set_int64 from Layout with lambda_node, 8, parameters
     proc memory_set_int64 from Layout with lambda_node, 16, body
 
     Return lambda_node
@@ -689,20 +794,20 @@ Process called "parse_haskell_case" takes parser as Integer returns Integer:
 
     proc expect_haskell_token with parser, TOKEN_CASE from Lexer
 
-    Let case_node be proc create_haskell_ast_node from AST_CASE
+    Let case_node be proc create_haskell_ast_node with AST_CASE
 
-    Let expr be proc parse_haskell_expression from parser
+    Let expr be proc parse_haskell_expression with parser
     If expr is equal to 0:
         Return 0
     End If
 
     proc expect_haskell_token with parser, TOKEN_OF from Lexer
 
-    Note: Parse alternatives
-    Let alternatives be 0  Note: List of alternatives
+    Note: Parse alternatives into a list
+    Let alternatives be proc create from List
 
     While 1 is equal to 1:
-        Let token_type be proc current_haskell_token_type from parser
+        Let token_type be proc current_haskell_token_type with parser
 
         Note: Check for end of case block
         If token_type is equal to TOKEN_EOF from Lexer:
@@ -717,17 +822,26 @@ Process called "parse_haskell_case" takes parser as Integer returns Integer:
             Break
         End If
 
-        Let alternative be proc parse_haskell_case_alternative from parser
+        Let alternative be proc parse_haskell_case_alternative with parser
         If alternative is equal to 0:
             Break
         End If
 
         Note: Add to alternatives list
-        Set alternatives to alternative
+        proc append from List with alternatives, alternative
     End While
 
-    proc memory_set_int64 from Layout with case_node, 8, expr
-    proc memory_set_int64 from Layout with case_node, 16, alternatives
+    Note: Children layout: [0] = scrutinee, [1] = alternatives-list-node.
+    Note: to_hir's translate_case reads child 0 as scrutinee and child 1 as the
+    Note: alternatives collection, so wrap the alternatives list in a carrier
+    Note: node whose own children are the alternatives.
+    Let alternatives_carrier be proc create_haskell_ast_node with AST_ALTERNATIVE
+    proc memory_set_int64 from Layout with alternatives_carrier, 16, alternatives
+
+    Let case_children be proc create from List
+    proc append from List with case_children, expr
+    proc append from List with case_children, alternatives_carrier
+    proc memory_set_int64 from Layout with case_node, 16, case_children
 
     Return case_node
 End Process
@@ -746,30 +860,32 @@ Process called "parse_haskell_case_alternative" takes parser as Integer returns 
     Handles complex patterns and guard expressions for complete pattern matching.
     @End Reasoning
 
-    Let alt_node be proc create_haskell_ast_node from AST_ALTERNATIVE
+    Let alt_node be proc create_haskell_ast_node with AST_ALTERNATIVE
 
-    Let pattern be proc parse_haskell_pattern from parser
+    Let pattern be proc parse_haskell_pattern with parser
     If pattern is equal to 0:
         Return 0
     End If
 
     Note: Check for guards
     Let guards be 0
-    Let token_type be proc current_haskell_token_type from parser
+    Let token_type be proc current_haskell_token_type with parser
 
     If token_type is equal to TOKEN_PIPE from Lexer:
-        Set guards to proc parse_haskell_guards from parser
+        Set guards to proc parse_haskell_guards with parser
     End If
 
     proc expect_haskell_token with parser, TOKEN_ARROW from Lexer
 
-    Let expr be proc parse_haskell_expression from parser
+    Let expr be proc parse_haskell_expression with parser
     If expr is equal to 0:
         Return 0
     End If
 
+    Note: Alternative layout: pattern @8, body expr @16, optional guard @24.
     proc memory_set_int64 from Layout with alt_node, 8, pattern
     proc memory_set_int64 from Layout with alt_node, 16, expr
+    proc memory_set_int64 from Layout with alt_node, 24, guards
 
     Return alt_node
 End Process
@@ -784,29 +900,34 @@ Process called "parse_haskell_if" takes parser as Integer returns Integer:
 
     proc expect_haskell_token with parser, TOKEN_IF from Lexer
 
-    Let if_node be proc create_haskell_ast_node from AST_IF
+    Let if_node be proc create_haskell_ast_node with AST_IF
 
-    Let condition be proc parse_haskell_expression from parser
+    Let condition be proc parse_haskell_expression with parser
     If condition is equal to 0:
         Return 0
     End If
 
     proc expect_haskell_token with parser, TOKEN_THEN from Lexer
 
-    Let then_expr be proc parse_haskell_expression from parser
+    Let then_expr be proc parse_haskell_expression with parser
     If then_expr is equal to 0:
         Return 0
     End If
 
     proc expect_haskell_token with parser, TOKEN_ELSE from Lexer
 
-    Let else_expr be proc parse_haskell_expression from parser
+    Let else_expr be proc parse_haskell_expression with parser
     If else_expr is equal to 0:
         Return 0
     End If
 
-    proc memory_set_int64 from Layout with if_node, 8, condition
-    proc memory_set_int64 from Layout with if_node, 16, then_expr
+    Note: Children layout: [0] condition, [1] then-branch, [2] else-branch -
+    Note: matching to_hir.translate_if which reads child 0/1/2 from the list.
+    Let if_children be proc create from List
+    proc append from List with if_children, condition
+    proc append from List with if_children, then_expr
+    proc append from List with if_children, else_expr
+    proc memory_set_int64 from Layout with if_node, 16, if_children
 
     Return if_node
 End Process
@@ -826,20 +947,24 @@ Process called "parse_haskell_let" takes parser as Integer returns Integer:
 
     proc expect_haskell_token with parser, TOKEN_LET from Lexer
 
-    Let let_node be proc create_haskell_ast_node from AST_LET
+    Let let_node be proc create_haskell_ast_node with AST_LET
 
-    Note: Parse bindings
-    Let bindings be proc parse_haskell_bindings from parser
+    Note: Parse bindings (a carrier node whose children are the bindings)
+    Let bindings be proc parse_haskell_bindings with parser
 
     proc expect_haskell_token with parser, TOKEN_IN from Lexer
 
-    Let expr be proc parse_haskell_expression from parser
+    Let expr be proc parse_haskell_expression with parser
     If expr is equal to 0:
         Return 0
     End If
 
-    proc memory_set_int64 from Layout with let_node, 8, bindings
-    proc memory_set_int64 from Layout with let_node, 16, expr
+    Note: Children layout: [0] = bindings carrier, [1] = body expression -
+    Note: matching to_hir.translate_let (child 0 = bindings, child 1 = body).
+    Let let_children be proc create from List
+    proc append from List with let_children, bindings
+    proc append from List with let_children, expr
+    proc memory_set_int64 from Layout with let_node, 16, let_children
 
     Return let_node
 End Process
@@ -859,26 +984,42 @@ Process called "parse_haskell_do" takes parser as Integer returns Integer:
 
     proc expect_haskell_token with parser, TOKEN_DO from Lexer
 
-    Let do_node be proc create_haskell_ast_node from AST_DO
+    Let do_node be proc create_haskell_ast_node with AST_DO
 
-    Note: Parse statements
-    Let statements be 0  Note: List of statements
+    Note: Parse statements into a real list
+    Let statements be proc create from List
 
     While 1 is equal to 1:
-        Let token_type be proc current_haskell_token_type from parser
+        Let token_type be proc current_haskell_token_type with parser
 
         Note: Check for end of do block
         If token_type is equal to TOKEN_EOF from Lexer:
             Break
         End If
+        If token_type is equal to TOKEN_IN from Lexer:
+            Break
+        End If
+        If token_type is equal to TOKEN_RIGHT_BRACE from Lexer:
+            Break
+        End If
 
-        Let statement be proc parse_haskell_do_statement from parser
+        Note: Skip statement separators (newlines / explicit semicolons)
+        If token_type is equal to TOKEN_NEWLINE from Lexer:
+            proc advance_haskell_parser with parser
+            Continue
+        End If
+        If token_type is equal to TOKEN_SEMICOLON from Lexer:
+            proc advance_haskell_parser with parser
+            Continue
+        End If
+
+        Let statement be proc parse_haskell_do_statement with parser
         If statement is equal to 0:
             Break
         End If
 
         Note: Add to statements list
-        Set statements to statement
+        proc append from List with statements, statement
     End While
 
     proc memory_set_int64 from Layout with do_node, 16, statements
@@ -897,30 +1038,45 @@ Process called "parse_haskell_list" takes parser as Integer returns Integer:
 
     proc expect_haskell_token with parser, TOKEN_LEFT_BRACKET from Lexer
 
-    Let list_node be proc create_haskell_ast_node from AST_LIST
+    Let list_node be proc create_haskell_ast_node with AST_LIST
 
     Note: Check for empty list
-    Let token_type be proc current_haskell_token_type from parser
+    Let token_type be proc current_haskell_token_type with parser
     If token_type is equal to TOKEN_RIGHT_BRACKET from Lexer:
-        proc advance_haskell_parser from parser
+        proc advance_haskell_parser with parser
+        proc memory_set_int64 from Layout with list_node, 16, proc create from List
         Return list_node
     End If
 
-    Note: Parse elements
-    Let elements be 0  Note: List of elements
+    Note: Parse the first element. The token following it decides the bracket
+    Note: form: '|' -> list comprehension "[e | quals]", ',' / ']' -> ordinary
+    Note: list literal "[e1, e2, ...]". Comprehension is a distinct AST kind.
+    Let first_element be proc parse_haskell_expression with parser
+    If first_element is equal to 0:
+        Return 0
+    End If
+
+    Set token_type to proc current_haskell_token_type with parser
+    If token_type is equal to TOKEN_PIPE from Lexer:
+        proc destroy_haskell_ast_node with list_node
+        Return proc parse_haskell_comprehension with parser, first_element
+    End If
+
+    Note: Ordinary list literal: collect every element into a real children
+    Note: list (overwriting one slot would keep only the last element).
+    Let elements be proc create from List
+    proc append from List with elements, first_element
 
     While 1 is equal to 1:
-        Let element be proc parse_haskell_expression from parser
-        If element is equal to 0:
-            Return 0
-        End If
-
-        Note: Add to elements list
-        Set elements to element
-
-        Set token_type to proc current_haskell_token_type from parser
+        Set token_type to proc current_haskell_token_type with parser
         If token_type is equal to TOKEN_COMMA from Lexer:
-            proc advance_haskell_parser from parser
+            proc advance_haskell_parser with parser
+
+            Let element be proc parse_haskell_expression with parser
+            If element is equal to 0:
+                Return 0
+            End If
+            proc append from List with elements, element
             Continue
         End If
 
@@ -937,6 +1093,122 @@ Process called "parse_haskell_list" takes parser as Integer returns Integer:
     proc memory_set_int64 from Layout with list_node, 16, elements
 
     Return list_node
+End Process
+
+@Reasoning:
+"[ e | q1, q2, ... ]" list comprehension. The result expression e has already
+been parsed by parse_haskell_list (which detected the '|'); this builds the
+AST_COMPREHENSION node whose three children - in the exact order the HIR
+lowering (translate_comprehension_generator) reads them - are:
+  child 0: the result expression e
+  child 1: a generators carrier whose children are the AST_QUALIFIER nodes
+           (each "pat <- expr"), readable via get_generator_pattern /
+           get_generator_expression
+  child 2: a guards carrier whose children are the boolean guard expressions
+A qualifier "pat <- expr" is a generator; "let ..." introduces local bindings;
+anything else is a boolean guard. let-qualifiers desugar into the generators
+carrier as a binding so their scope is preserved. Forward progress is forced
+on every iteration (the comma-separated qualifier list cannot spin).
+@End Reasoning
+Process called "parse_haskell_comprehension" takes parser as Integer, result_expr as Integer returns Integer:
+    Note: Parse list comprehension "[ result | qualifiers ]" (result already parsed)
+
+    Note: Consume the '|' that separates the result expression from qualifiers.
+    proc expect_haskell_token with parser, TOKEN_PIPE from Lexer
+
+    Let comp_node be proc create_haskell_ast_node with AST_COMPREHENSION
+    Let generators_carrier be proc create_haskell_ast_node with AST_LIST
+    Let guards_carrier be proc create_haskell_ast_node with AST_LIST
+    Let generators be proc create from List
+    Let guards be proc create from List
+
+    While 1 is equal to 1:
+        Let qual_type be proc current_haskell_token_type with parser
+
+        If qual_type is equal to TOKEN_RIGHT_BRACKET from Lexer:
+            Break
+        End If
+        If qual_type is equal to TOKEN_EOF from Lexer:
+            Break
+        End If
+        If qual_type is equal to TOKEN_COMMA from Lexer:
+            proc advance_haskell_parser with parser
+            Continue
+        End If
+
+        Note: A "let" qualifier introduces local bindings scoped to the rest of
+        Note: the comprehension; capture them in the generators carrier as a
+        Note: binding qualifier so their definitions survive the round-trip.
+        If qual_type is equal to TOKEN_LET from Lexer:
+            proc advance_haskell_parser with parser
+            Let let_bindings be proc parse_haskell_bindings with parser
+            Let let_qual be proc create_haskell_ast_node with AST_QUALIFIER
+            proc memory_set_int64 from Layout with let_qual, 16, let_bindings
+            proc append from List with generators, let_qual
+            Continue
+        End If
+
+        Note: Distinguish a generator "pat <- expr" from a boolean guard by
+        Note: scanning for "<-". The parser has only one-token lookahead, so we
+        Note: parse a leading expression first; if the next token is the arrow
+        Note: the parsed expression was actually the pattern (re-read as a
+        Note: pattern would lose binding info, so we record the source expression
+        Note: as the generator pattern via its identifier value).
+        Let before_pos be proc parser_source_position with parser
+        Let lead_expr be proc parse_haskell_expression with parser
+
+        Let after_lead be proc current_haskell_token_type with parser
+        If after_lead is equal to TOKEN_LEFT_ARROW from Lexer:
+            proc advance_haskell_parser with parser
+            Let source_expr be proc parse_haskell_expression with parser
+
+            Note: The left of "<-" is a binding pattern, not an expression. The
+            Note: common form "x <- xs" parses as an identifier expression, which
+            Note: we promote to an AST_PATTERN_VARIABLE carrying the same name so
+            Note: the HIR pattern lowering binds it correctly. Non-identifier
+            Note: lead forms are kept as-is (their structure is preserved).
+            Let gen_pattern be lead_expr
+            Let lead_type be proc get_haskell_ast_type with lead_expr
+            If lead_type is equal to AST_IDENTIFIER:
+                Let lead_name be proc memory_get_int64 from Layout with lead_expr, 8
+                Set gen_pattern to proc create_haskell_ast_node with AST_PATTERN_VARIABLE
+                proc memory_set_int64 from Layout with gen_pattern, 8, lead_name
+                proc destroy_haskell_ast_node with lead_expr
+            End If
+
+            Let gen_qual be proc create_haskell_ast_node with AST_QUALIFIER
+            proc memory_set_int64 from Layout with gen_qual, 8, gen_pattern
+            proc memory_set_int64 from Layout with gen_qual, 16, source_expr
+            proc append from List with generators, gen_qual
+        Otherwise:
+            Note: A boolean guard expression filters the iteration.
+            proc append from List with guards, lead_expr
+        End If
+
+        Note: Forward-progress guard: if nothing was consumed (malformed
+        Note: qualifier), force a one-token advance so the loop terminates.
+        Let after_pos be proc parser_source_position with parser
+        If after_pos is equal to before_pos:
+            Let stuck be proc current_haskell_token_type with parser
+            If stuck is equal to TOKEN_EOF from Lexer:
+                Break
+            End If
+            proc advance_haskell_parser with parser
+        End If
+    End While
+
+    proc expect_haskell_token with parser, TOKEN_RIGHT_BRACKET from Lexer
+
+    proc memory_set_int64 from Layout with generators_carrier, 16, generators
+    proc memory_set_int64 from Layout with guards_carrier, 16, guards
+
+    Let comp_children be proc create from List
+    proc append from List with comp_children, result_expr
+    proc append from List with comp_children, generators_carrier
+    proc append from List with comp_children, guards_carrier
+    proc memory_set_int64 from Layout with comp_node, 16, comp_children
+
+    Return comp_node
 End Process
 
 Note: ============================================================================
@@ -957,29 +1229,29 @@ Process called "parse_haskell_pattern" takes parser as Integer returns Integer:
     complex nested patterns.
     @End Reasoning
 
-    Let token_type be proc current_haskell_token_type from parser
-    Let token_value be proc current_haskell_token_value from parser
+    Let token_type be proc current_haskell_token_type with parser
+    Let token_value be proc current_haskell_token_value with parser
 
     Note: Wildcard pattern
     If token_type is equal to TOKEN_UNDERSCORE from Lexer:
-        Let node be proc create_haskell_ast_node from AST_PATTERN_WILDCARD
-        proc advance_haskell_parser from parser
+        Let node be proc create_haskell_ast_node with AST_PATTERN_WILDCARD
+        proc advance_haskell_parser with parser
         Return node
     End If
 
     Note: Variable pattern
     If token_type is equal to TOKEN_IDENTIFIER from Lexer:
-        Set node to proc create_haskell_ast_node from AST_PATTERN_VARIABLE
+        Set node to proc create_haskell_ast_node with AST_PATTERN_VARIABLE
         proc memory_set_int64 from Layout with node, 8, token_value
-        proc advance_haskell_parser from parser
+        proc advance_haskell_parser with parser
 
         Note: Check for @ pattern (as pattern)
-        Let next_type be proc current_haskell_token_type from parser
+        Let next_type be proc current_haskell_token_type with parser
         If next_type is equal to TOKEN_AT from Lexer:
-            proc advance_haskell_parser from parser
-            Let inner_pattern be proc parse_haskell_pattern from parser
+            proc advance_haskell_parser with parser
+            Let inner_pattern be proc parse_haskell_pattern with parser
 
-            Let as_node be proc create_haskell_ast_node from AST_PATTERN_AS
+            Let as_node be proc create_haskell_ast_node with AST_PATTERN_AS
             proc memory_set_int64 from Layout with as_node, 8, token_value
             proc memory_set_int64 from Layout with as_node, 16, inner_pattern
             Return as_node
@@ -990,31 +1262,31 @@ Process called "parse_haskell_pattern" takes parser as Integer returns Integer:
 
     Note: Constructor pattern
     If token_type is equal to TOKEN_CONSTRUCTOR from Lexer:
-        Set node to proc create_haskell_ast_node from AST_PATTERN_CONSTRUCTOR
+        Set node to proc create_haskell_ast_node with AST_PATTERN_CONSTRUCTOR
         proc memory_set_int64 from Layout with node, 8, token_value
-        proc advance_haskell_parser from parser
+        proc advance_haskell_parser with parser
 
         Note: Parse constructor arguments
         Let args be 0  Note: List of pattern arguments
 
         While 1 is equal to 1:
-            Set next_type to proc current_haskell_token_type from parser
+            Set next_type to proc current_haskell_token_type with parser
 
             Note: Check if next token can start a pattern
             If next_type is equal to TOKEN_IDENTIFIER from Lexer:
-                Let arg be proc parse_haskell_pattern from parser
+                Let arg be proc parse_haskell_pattern with parser
                 Set args to arg  Note: minus add to list
                 Continue
             End If
 
             If next_type is equal to TOKEN_CONSTRUCTOR from Lexer:
-                Set arg to proc parse_haskell_pattern from parser
+                Set arg to proc parse_haskell_pattern with parser
                 Set args to arg  Note: minus add to list
                 Continue
             End If
 
             If next_type is equal to TOKEN_LEFT_PAREN from Lexer:
-                Set arg to proc parse_haskell_pattern from parser
+                Set arg to proc parse_haskell_pattern with parser
                 Set args to arg  Note: minus add to list
                 Continue
             End If
@@ -1028,37 +1300,37 @@ Process called "parse_haskell_pattern" takes parser as Integer returns Integer:
 
     Note: Literal patterns
     If token_type is equal to TOKEN_INTEGER from Lexer:
-        Set node to proc create_haskell_ast_node from AST_PATTERN_LITERAL
+        Set node to proc create_haskell_ast_node with AST_PATTERN_LITERAL
         proc memory_set_int64 from Layout with node, 8, token_value
-        proc advance_haskell_parser from parser
+        proc advance_haskell_parser with parser
         Return node
     End If
 
     If token_type is equal to TOKEN_CHAR from Lexer:
-        Set node to proc create_haskell_ast_node from AST_PATTERN_LITERAL
+        Set node to proc create_haskell_ast_node with AST_PATTERN_LITERAL
         proc memory_set_int64 from Layout with node, 8, token_value
-        proc advance_haskell_parser from parser
+        proc advance_haskell_parser with parser
         Return node
     End If
 
     If token_type is equal to TOKEN_STRING from Lexer:
-        Set node to proc create_haskell_ast_node from AST_PATTERN_LITERAL
+        Set node to proc create_haskell_ast_node with AST_PATTERN_LITERAL
         proc memory_set_int64 from Layout with node, 8, token_value
-        proc advance_haskell_parser from parser
+        proc advance_haskell_parser with parser
         Return node
     End If
 
     Note: Parenthesized patterns
     If token_type is equal to TOKEN_LEFT_PAREN from Lexer:
-        proc advance_haskell_parser from parser
-        Let pattern be proc parse_haskell_pattern from parser
+        proc advance_haskell_parser with parser
+        Let pattern be proc parse_haskell_pattern with parser
         proc expect_haskell_token with parser, TOKEN_RIGHT_PAREN from Lexer
         Return pattern
     End If
 
     Note: List patterns
     If token_type is equal to TOKEN_LEFT_BRACKET from Lexer:
-        Return proc parse_haskell_list_pattern from parser
+        Return proc parse_haskell_list_pattern with parser
     End If
 
     Return 0
@@ -1074,12 +1346,12 @@ Process called "parse_haskell_list_pattern" takes parser as Integer returns Inte
 
     proc expect_haskell_token with parser, TOKEN_LEFT_BRACKET from Lexer
 
-    Let list_pattern_node be proc create_haskell_ast_node from AST_PATTERN_LIST
+    Let list_pattern_node be proc create_haskell_ast_node with AST_PATTERN_LIST
 
     Note: Check for empty list pattern
-    Let token_type be proc current_haskell_token_type from parser
+    Let token_type be proc current_haskell_token_type with parser
     If token_type is equal to TOKEN_RIGHT_BRACKET from Lexer:
-        proc advance_haskell_parser from parser
+        proc advance_haskell_parser with parser
         Return list_pattern_node
     End If
 
@@ -1087,22 +1359,22 @@ Process called "parse_haskell_list_pattern" takes parser as Integer returns Inte
     Let patterns be 0  Note: List of patterns
 
     While 1 is equal to 1:
-        Let pattern be proc parse_haskell_pattern from parser
+        Let pattern be proc parse_haskell_pattern with parser
         If pattern is equal to 0:
             Return 0
         End If
 
         Set patterns to pattern
 
-        Set token_type to proc current_haskell_token_type from parser
+        Set token_type to proc current_haskell_token_type with parser
         If token_type is equal to TOKEN_COMMA from Lexer:
-            proc advance_haskell_parser from parser
+            proc advance_haskell_parser with parser
             Continue
         End If
 
         If token_type is equal to TOKEN_CONS from Lexer:
-            proc advance_haskell_parser from parser
-            Let tail_pattern be proc parse_haskell_pattern from parser
+            proc advance_haskell_parser with parser
+            Let tail_pattern be proc parse_haskell_pattern with parser
             Note: Create cons pattern
             Return list_pattern_node
         End If
@@ -1137,7 +1409,7 @@ Process called "parse_haskell_type" takes parser as Integer returns Integer:
     and complex type applications. Handles type signatures and constraints.
     @End Reasoning
 
-    Return proc parse_haskell_type_application from parser
+    Return proc parse_haskell_type_application with parser
 End Process
 
 @Reasoning:
@@ -1148,23 +1420,23 @@ application, matching Haskell's standard type grammar.
 Process called "parse_haskell_type_application" takes parser as Integer returns Integer:
     Note: Parse type application (Type1 Type2 Type3)
 
-    Let left be proc parse_haskell_primary_type from parser
+    Let left be proc parse_haskell_primary_type with parser
 
     If left is equal to 0:
         Return 0
     End If
 
     While 1 is equal to 1:
-        Let token_type be proc current_haskell_token_type from parser
+        Let token_type be proc current_haskell_token_type with parser
 
         Note: Check if next token can start a type
         If token_type is equal to TOKEN_IDENTIFIER from Lexer:
-            Let right be proc parse_haskell_primary_type from parser
+            Let right be proc parse_haskell_primary_type with parser
             If right is equal to 0:
                 Break
             End If
 
-            Let app_node be proc create_haskell_ast_node from AST_TYPE_APPLICATION
+            Let app_node be proc create_haskell_ast_node with AST_TYPE_APPLICATION
             proc memory_set_int64 from Layout with app_node, 8, left
             proc memory_set_int64 from Layout with app_node, 16, right
             Set left to app_node
@@ -1172,12 +1444,12 @@ Process called "parse_haskell_type_application" takes parser as Integer returns 
         End If
 
         If token_type is equal to TOKEN_CONSTRUCTOR from Lexer:
-            Set right to proc parse_haskell_primary_type from parser
+            Set right to proc parse_haskell_primary_type with parser
             If right is equal to 0:
                 Break
             End If
 
-            Set app_node to proc create_haskell_ast_node from AST_TYPE_APPLICATION
+            Set app_node to proc create_haskell_ast_node with AST_TYPE_APPLICATION
             proc memory_set_int64 from Layout with app_node, 8, left
             proc memory_set_int64 from Layout with app_node, 16, right
             Set left to app_node
@@ -1185,12 +1457,12 @@ Process called "parse_haskell_type_application" takes parser as Integer returns 
         End If
 
         If token_type is equal to TOKEN_LEFT_PAREN from Lexer:
-            Set right to proc parse_haskell_primary_type from parser
+            Set right to proc parse_haskell_primary_type with parser
             If right is equal to 0:
                 Break
             End If
 
-            Set app_node to proc create_haskell_ast_node from AST_TYPE_APPLICATION
+            Set app_node to proc create_haskell_ast_node with AST_TYPE_APPLICATION
             proc memory_set_int64 from Layout with app_node, 8, left
             proc memory_set_int64 from Layout with app_node, 16, right
             Set left to app_node
@@ -1201,12 +1473,12 @@ Process called "parse_haskell_type_application" takes parser as Integer returns 
     End While
 
     Note: Check for function type
-    Set token_type to proc current_haskell_token_type from parser
+    Set token_type to proc current_haskell_token_type with parser
     If token_type is equal to TOKEN_ARROW from Lexer:
-        proc advance_haskell_parser from parser
-        Set right to proc parse_haskell_type from parser
+        proc advance_haskell_parser with parser
+        Set right to proc parse_haskell_type with parser
 
-        Let func_node be proc create_haskell_ast_node from AST_TYPE_FUNCTION
+        Let func_node be proc create_haskell_ast_node with AST_TYPE_FUNCTION
         proc memory_set_int64 from Layout with func_node, 8, left
         proc memory_set_int64 from Layout with func_node, 16, right
         Return func_node
@@ -1220,43 +1492,87 @@ Atomic type expressions: type constructor names (Int, String), type
 variables (a, b), parenthesised types, tuple types (a, b, c), and list
 types [a]. The atomic building blocks for type_application.
 @End Reasoning
+@Reasoning:
+Parses a bare type-constructor / class name (an uppercase-led identifier
+lexed as TOKEN_CONSTRUCTOR). Used by the deriving-clause parser to read
+each derived class name (Eq, Show, ...). The defining grammar position is
+"a single capitalized name"; full type application is handled elsewhere by
+parse_haskell_type_application.
+@End Reasoning
+@Implementation:
+Reads the current token; when it is a TOKEN_CONSTRUCTOR, captures the
+lexeme, builds an AST_TYPE_CONSTRUCTOR node carrying the name, advances
+past it, and returns the node. When the current token is NOT a
+constructor (malformed deriving list), it records a parse error via the
+parser's error counter AND force-advances one token before returning 0.
+The forced advance is essential: the enclosing deriving loop is a
+`While 1` that only breaks on `)` / consumes `,`; without guaranteed
+forward progress here a stray token would spin that loop forever
+(unbounded-allocation hang). EOF is never advanced past, so the loop's
+EOF guard still terminates the parse.
+@End Implementation
+Process called "parse_haskell_type_constructor" takes parser as Integer returns Integer:
+    Note: Parse a single uppercase type-constructor / class name
+
+    Let token_type be proc current_haskell_token_type with parser
+
+    If token_type is equal to TOKEN_CONSTRUCTOR from Lexer:
+        Let token_value be proc current_haskell_token_value with parser
+        Let node be proc create_haskell_ast_node with AST_TYPE_CONSTRUCTOR
+        proc memory_set_int64 from Layout with node, 8, token_value
+        proc advance_haskell_parser with parser
+        Return node
+    End If
+
+    Note: Not a constructor - record the error and guarantee forward progress
+    Let error_count be proc memory_get_int64 from Layout with parser, 24
+    Set error_count to error_count plus 1
+    proc memory_set_int64 from Layout with parser, 24, error_count
+
+    If token_type is not equal to TOKEN_EOF from Lexer:
+        proc advance_haskell_parser with parser
+    End If
+
+    Return 0
+End Process
+
 Process called "parse_haskell_primary_type" takes parser as Integer returns Integer:
     Note: Parse primary type (variable, constructor, parenthesized)
 
-    Let token_type be proc current_haskell_token_type from parser
-    Let token_value be proc current_haskell_token_value from parser
+    Let token_type be proc current_haskell_token_type with parser
+    Let token_value be proc current_haskell_token_value with parser
 
     Note: Type variable (lowercase)
     If token_type is equal to TOKEN_IDENTIFIER from Lexer:
-        Let node be proc create_haskell_ast_node from AST_TYPE_VARIABLE
+        Let node be proc create_haskell_ast_node with AST_TYPE_VARIABLE
         proc memory_set_int64 from Layout with node, 8, token_value
-        proc advance_haskell_parser from parser
+        proc advance_haskell_parser with parser
         Return node
     End If
 
     Note: Type constructor (uppercase)
     If token_type is equal to TOKEN_CONSTRUCTOR from Lexer:
-        Set node to proc create_haskell_ast_node from AST_TYPE_CONSTRUCTOR
+        Set node to proc create_haskell_ast_node with AST_TYPE_CONSTRUCTOR
         proc memory_set_int64 from Layout with node, 8, token_value
-        proc advance_haskell_parser from parser
+        proc advance_haskell_parser with parser
         Return node
     End If
 
     Note: Parenthesized type
     If token_type is equal to TOKEN_LEFT_PAREN from Lexer:
-        proc advance_haskell_parser from parser
-        Let type_expr be proc parse_haskell_type from parser
+        proc advance_haskell_parser with parser
+        Let type_expr be proc parse_haskell_type with parser
         proc expect_haskell_token with parser, TOKEN_RIGHT_PAREN from Lexer
         Return type_expr
     End If
 
     Note: List type [Type]
     If token_type is equal to TOKEN_LEFT_BRACKET from Lexer:
-        proc advance_haskell_parser from parser
-        Let element_type be proc parse_haskell_type from parser
+        proc advance_haskell_parser with parser
+        Let element_type be proc parse_haskell_type with parser
         proc expect_haskell_token with parser, TOKEN_RIGHT_BRACKET from Lexer
 
-        Let list_node be proc create_haskell_ast_node from AST_TYPE_LIST
+        Let list_node be proc create_haskell_ast_node with AST_TYPE_LIST
         proc memory_set_int64 from Layout with list_node, 16, element_type
         Return list_node
     End If
@@ -1281,60 +1597,56 @@ Process called "parse_haskell_declaration" takes parser as Integer returns Integ
     and type signatures. Each has specific syntax and semantic requirements.
     @End Reasoning
 
-    Let token_type be proc current_haskell_token_type from parser
+    Let token_type be proc current_haskell_token_type with parser
 
     Note: Data declaration
     If token_type is equal to TOKEN_DATA from Lexer:
-        Return proc parse_haskell_data_declaration from parser
+        Return proc parse_haskell_data_declaration with parser
     End If
 
     Note: Type declaration
     If token_type is equal to TOKEN_TYPE from Lexer:
-        Return proc parse_haskell_type_declaration from parser
+        Return proc parse_haskell_type_declaration with parser
     End If
 
     Note: Newtype declaration
     If token_type is equal to TOKEN_NEWTYPE from Lexer:
-        Return proc parse_haskell_newtype_declaration from parser
+        Return proc parse_haskell_newtype_declaration with parser
     End If
 
     Note: Class declaration
     If token_type is equal to TOKEN_CLASS from Lexer:
-        Return proc parse_haskell_class_declaration from parser
+        Return proc parse_haskell_class_declaration with parser
     End If
 
     Note: Instance declaration
     If token_type is equal to TOKEN_INSTANCE from Lexer:
-        Return proc parse_haskell_instance_declaration from parser
+        Return proc parse_haskell_instance_declaration with parser
     End If
 
     Note: Fixity declaration
     If token_type is equal to TOKEN_INFIX from Lexer:
-        Return proc parse_haskell_fixity_declaration from parser
+        Return proc parse_haskell_fixity_declaration with parser
     End If
     If token_type is equal to TOKEN_INFIXL from Lexer:
-        Return proc parse_haskell_fixity_declaration from parser
+        Return proc parse_haskell_fixity_declaration with parser
     End If
     If token_type is equal to TOKEN_INFIXR from Lexer:
-        Return proc parse_haskell_fixity_declaration from parser
+        Return proc parse_haskell_fixity_declaration with parser
     End If
 
-    Note: Function declaration or type signature
+    Note: Function declaration or type signature. Both begin with an
+    Note: identifier; the token AFTER it decides: "::" -> signature, anything
+    Note: else -> function equation. Use a non-consuming one-token lookahead so
+    Note: the current identifier is preserved for the chosen sub-parser (the
+    Note: lexer has no rewind, so consuming-then-resetting would lose it).
     If token_type is equal to TOKEN_IDENTIFIER from Lexer:
-        Note: Look ahead to distinguish function from type signature
-        Let saved_pos be proc memory_get_int64 from Layout with parser, 16
-
-        proc advance_haskell_parser from parser
-        Let next_type be proc current_haskell_token_type from parser
+        Let next_type be proc peek_next_token_type with parser
 
         If next_type is equal to TOKEN_DOUBLE_COLON from Lexer:
-            Note: Type signature - reset to start of identifier
-            proc memory_set_int64 from Layout with parser, 16, saved_pos
-            Return proc parse_haskell_signature_declaration from parser
+            Return proc parse_haskell_signature_declaration with parser
         Otherwise:
-            Note: Function declaration - reset to start of identifier
-            proc memory_set_int64 from Layout with parser, 16, saved_pos
-            Return proc parse_haskell_function_declaration from parser
+            Return proc parse_haskell_function_declaration with parser
         End If
     End If
 
@@ -1357,44 +1669,48 @@ Process called "parse_haskell_data_declaration" takes parser as Integer returns 
 
     proc expect_haskell_token with parser, TOKEN_DATA from Lexer
 
-    Let data_node be proc create_haskell_ast_node from AST_DATA_DECLARATION
+    Let data_node be proc create_haskell_ast_node with AST_DATA_DECLARATION
 
     Note: Parse type name
-    Let type_name be proc current_haskell_token_value from parser
+    Let type_name be proc current_haskell_token_value with parser
     proc expect_haskell_token with parser, TOKEN_CONSTRUCTOR from Lexer
 
-    Note: Parse type parameters
-    Let parameters be 0  Note: List of type parameters
+    Note: Parse type parameters. Each lowercase type variable becomes one entry
+    Note: in the parameters list so the data-type lowering can emit "data T a b".
+    Let parameters be proc create from List
 
     While 1 is equal to 1:
-        Let token_type be proc current_haskell_token_type from parser
+        Let token_type be proc current_haskell_token_type with parser
 
         If token_type is equal to TOKEN_IDENTIFIER from Lexer:
-            Let param be proc current_haskell_token_value from parser
-            proc advance_haskell_parser from parser
-            Set parameters to param
+            Let param be proc current_haskell_token_value with parser
+            proc advance_haskell_parser with parser
+            proc append from List with parameters, param
             Continue
         End If
 
         Break
     End While
 
-    proc expect_haskell_token with parser, TOKEN_EQUAL from Lexer
+    proc expect_haskell_token with parser, TOKEN_ASSIGN from Lexer
 
-    Note: Parse constructors
-    Let constructors be 0  Note: List of constructors
+    Note: Parse the pipe-separated constructor list. Every constructor is a
+    Note: distinct child node, so they are collected into a real list rather
+    Note: than overwriting a single slot - otherwise only the final constructor
+    Note: would survive ("data Shape = Circle | Square" must keep both).
+    Let constructors be proc create from List
 
     While 1 is equal to 1:
-        Let constructor be proc parse_haskell_constructor from parser
+        Let constructor be proc parse_haskell_constructor with parser
         If constructor is equal to 0:
             Return 0
         End If
 
-        Set constructors to constructor
+        proc append from List with constructors, constructor
 
-        Set token_type to proc current_haskell_token_type from parser
+        Set token_type to proc current_haskell_token_type with parser
         If token_type is equal to TOKEN_PIPE from Lexer:
-            proc advance_haskell_parser from parser
+            proc advance_haskell_parser with parser
             Continue
         End If
 
@@ -1403,41 +1719,48 @@ Process called "parse_haskell_data_declaration" takes parser as Integer returns 
 
     Note: Optional deriving clause
     Let derived_classes be 0
-    Set token_type to proc current_haskell_token_type from parser
+    Set token_type to proc current_haskell_token_type with parser
     If token_type is equal to TOKEN_DERIVING from Lexer:
-        proc advance_haskell_parser from parser
+        proc advance_haskell_parser with parser
 
         Note: Parse deriving classes: deriving (Eq, Show, Read)
         Set derived_classes to proc create from List
 
         Note: Expect opening paren or single class
-        Set token_type to proc current_haskell_token_type from parser
-        If token_type is equal to TOKEN_LPAREN from Lexer:
-            proc advance_haskell_parser from parser
+        Set token_type to proc current_haskell_token_type with parser
+        If token_type is equal to TOKEN_LEFT_PAREN from Lexer:
+            proc advance_haskell_parser with parser
 
             Note: Parse comma-separated class list
             While 1 is equal to 1:
-                Set token_type to proc current_haskell_token_type from parser
+                Set token_type to proc current_haskell_token_type with parser
 
-                If token_type is equal to TOKEN_RPAREN from Lexer:
-                    proc advance_haskell_parser from parser
+                Note: Terminate on EOF so an unterminated deriving list cannot
+                Note: spin this loop forever (parse_haskell_type_constructor does
+                Note: not advance past EOF).
+                If token_type is equal to TOKEN_EOF from Lexer:
+                    Break
+                End If
+
+                If token_type is equal to TOKEN_RIGHT_PAREN from Lexer:
+                    proc advance_haskell_parser with parser
                     Break
                 End If
 
                 If token_type is equal to TOKEN_COMMA from Lexer:
-                    proc advance_haskell_parser from parser
+                    proc advance_haskell_parser with parser
                     Continue
                 End If
 
                 Note: Parse class name
-                Let class_name be proc parse_haskell_type_constructor from parser
+                Let class_name be proc parse_haskell_type_constructor with parser
                 If class_name is not equal to 0:
                     proc append from List with derived_classes, class_name
                 End If
             End While
         Otherwise:
             Note: Single derived class without parens
-            Set class_name to proc parse_haskell_type_constructor from parser
+            Set class_name to proc parse_haskell_type_constructor with parser
             If class_name is not equal to 0:
                 proc append from List with derived_classes, class_name
             End If
@@ -1447,6 +1770,7 @@ Process called "parse_haskell_data_declaration" takes parser as Integer returns 
     proc memory_set_int64 from Layout with data_node, 8, type_name
     proc memory_set_int64 from Layout with data_node, 16, constructors
     proc memory_set_int64 from Layout with data_node, 24, derived_classes
+    proc memory_set_int64 from Layout with data_node, 32, parameters
 
     Return data_node
 End Process
@@ -1460,34 +1784,87 @@ functions.
 Process called "parse_haskell_constructor" takes parser as Integer returns Integer:
     Note: Parse data constructor with fields
 
-    Let constructor_name be proc current_haskell_token_value from parser
+    Let constructor_name be proc current_haskell_token_value with parser
     proc expect_haskell_token with parser, TOKEN_CONSTRUCTOR from Lexer
 
-    Let constructor_node be proc create_haskell_ast_node from AST_IDENTIFIER
+    Let constructor_node be proc create_haskell_ast_node with AST_IDENTIFIER
     proc memory_set_int64 from Layout with constructor_node, 8, constructor_name
 
-    Note: Parse constructor fields
-    Let fields be 0  Note: List of field types
+    Note: Constructor fields are collected into a real list (slot @16). Record
+    Note: field names, when present, are collected into a parallel list (slot
+    Note: @24) positionally aligned with the field types. Using overwrite-a-slot
+    Note: would discard every field but the last, so both are proper lists.
+    Let fields be proc create from List
+    Let field_names be 0
 
+    Note: Record syntax: "Name { f1 :: T1, f2 :: T2, ... }". Each entry binds a
+    Note: field name (identifier) to its type; the names round-trip so the
+    Note: emitted Haskell reproduces the record declaration.
+    Let token_type be proc current_haskell_token_type with parser
+    If token_type is equal to TOKEN_LEFT_BRACE from Lexer:
+        proc advance_haskell_parser with parser
+        Set field_names to proc create from List
+
+        While 1 is equal to 1:
+            Let rec_type be proc current_haskell_token_type with parser
+
+            If rec_type is equal to TOKEN_RIGHT_BRACE from Lexer:
+                proc advance_haskell_parser with parser
+                Break
+            End If
+            If rec_type is equal to TOKEN_EOF from Lexer:
+                Break
+            End If
+            If rec_type is equal to TOKEN_COMMA from Lexer:
+                proc advance_haskell_parser with parser
+                Continue
+            End If
+
+            If rec_type is equal to TOKEN_IDENTIFIER from Lexer:
+                Let rec_field_name be proc current_haskell_token_value with parser
+                proc advance_haskell_parser with parser
+
+                Note: Consume "::" separating the field name from its type.
+                Let sep_type be proc current_haskell_token_type with parser
+                If sep_type is equal to TOKEN_DOUBLE_COLON from Lexer:
+                    proc advance_haskell_parser with parser
+                End If
+
+                Let rec_field_type be proc parse_haskell_type with parser
+                proc append from List with field_names, rec_field_name
+                proc append from List with fields, rec_field_type
+                Continue
+            End If
+
+            Note: Unrecognised token inside the record body - force progress so
+            Note: the loop cannot spin on malformed input.
+            proc advance_haskell_parser with parser
+        End While
+
+        proc memory_set_int64 from Layout with constructor_node, 16, fields
+        proc memory_set_int64 from Layout with constructor_node, 24, field_names
+        Return constructor_node
+    End If
+
+    Note: Positional constructor: "Name T1 T2 ...". Each field is one type.
     While 1 is equal to 1:
-        Let token_type be proc current_haskell_token_type from parser
+        Set token_type to proc current_haskell_token_type with parser
 
-        Note: Check if next token can start a type
         If token_type is equal to TOKEN_IDENTIFIER from Lexer:
-            Let field_type be proc parse_haskell_type from parser
-            Set fields to field_type
+            Let field_type be proc parse_haskell_type with parser
+            proc append from List with fields, field_type
             Continue
         End If
 
         If token_type is equal to TOKEN_CONSTRUCTOR from Lexer:
-            Set field_type to proc parse_haskell_type from parser
-            Set fields to field_type
+            Set field_type to proc parse_haskell_type with parser
+            proc append from List with fields, field_type
             Continue
         End If
 
         If token_type is equal to TOKEN_LEFT_PAREN from Lexer:
-            Set field_type to proc parse_haskell_type from parser
-            Set fields to field_type
+            Set field_type to proc parse_haskell_type with parser
+            proc append from List with fields, field_type
             Continue
         End If
 
@@ -1512,18 +1889,18 @@ Process called "parse_haskell_function_declaration" takes parser as Integer retu
     Supports multiple equations for pattern matching functions.
     @End Reasoning
 
-    Let func_node be proc create_haskell_ast_node from AST_FUNCTION_DECLARATION
+    Let func_node be proc create_haskell_ast_node with AST_FUNCTION_DECLARATION
 
-    Let func_name be proc current_haskell_token_value from parser
+    Let func_name be proc current_haskell_token_value with parser
     proc expect_haskell_token with parser, TOKEN_IDENTIFIER from Lexer
 
     Note: Parse patterns
     Let patterns be 0  Note: List of patterns
 
     While 1 is equal to 1:
-        Let token_type be proc current_haskell_token_type from parser
+        Let token_type be proc current_haskell_token_type with parser
 
-        If token_type is equal to TOKEN_EQUAL from Lexer:
+        If token_type is equal to TOKEN_ASSIGN from Lexer:
             Break
         End If
 
@@ -1531,7 +1908,7 @@ Process called "parse_haskell_function_declaration" takes parser as Integer retu
             Break
         End If
 
-        Let pattern be proc parse_haskell_pattern from parser
+        Let pattern be proc parse_haskell_pattern with parser
         If pattern is equal to 0:
             Break
         End If
@@ -1541,24 +1918,24 @@ Process called "parse_haskell_function_declaration" takes parser as Integer retu
 
     Note: Parse guards or direct expression
     Let guards be 0
-    Set token_type to proc current_haskell_token_type from parser
+    Set token_type to proc current_haskell_token_type with parser
 
     If token_type is equal to TOKEN_PIPE from Lexer:
-        Set guards to proc parse_haskell_guards from parser
+        Set guards to proc parse_haskell_guards with parser
     End If
 
-    proc expect_haskell_token with parser, TOKEN_EQUAL from Lexer
+    proc expect_haskell_token with parser, TOKEN_ASSIGN from Lexer
 
-    Let body be proc parse_haskell_expression from parser
+    Let body be proc parse_haskell_expression with parser
     If body is equal to 0:
         Return 0
     End If
 
     Note: Optional where clause
-    Set token_type to proc current_haskell_token_type from parser
+    Set token_type to proc current_haskell_token_type with parser
     If token_type is equal to TOKEN_WHERE from Lexer:
-        proc advance_haskell_parser from parser
-        Let where_bindings be proc parse_haskell_bindings from parser
+        proc advance_haskell_parser with parser
+        Let where_bindings be proc parse_haskell_bindings with parser
         Note: Attach where bindings to function
     End If
 
@@ -1584,27 +1961,27 @@ Process called "parse_haskell_guards" takes parser as Integer returns Integer:
     Let guards be 0  Note: List of guards
 
     While 1 is equal to 1:
-        Let token_type be proc current_haskell_token_type from parser
+        Let token_type be proc current_haskell_token_type with parser
 
         If token_type is not equal to TOKEN_PIPE from Lexer:
             Break
         End If
 
-        proc advance_haskell_parser from parser
+        proc advance_haskell_parser with parser
 
-        Let guard_expr be proc parse_haskell_expression from parser
+        Let guard_expr be proc parse_haskell_expression with parser
         If guard_expr is equal to 0:
             Return 0
         End If
 
-        proc expect_haskell_token with parser, TOKEN_EQUAL from Lexer
+        proc expect_haskell_token with parser, TOKEN_ASSIGN from Lexer
 
-        Let result_expr be proc parse_haskell_expression from parser
+        Let result_expr be proc parse_haskell_expression with parser
         If result_expr is equal to 0:
             Return 0
         End If
 
-        Let guard_node be proc create_haskell_ast_node from AST_GUARD
+        Let guard_node be proc create_haskell_ast_node with AST_GUARD
         proc memory_set_int64 from Layout with guard_node, 8, guard_expr
         proc memory_set_int64 from Layout with guard_node, 16, result_expr
 
@@ -1620,12 +1997,14 @@ let/where clauses. Each binding is parsed as a function declaration since
 the syntax is identical.
 @End Reasoning
 Process called "parse_haskell_bindings" takes parser as Integer returns Integer:
-    Note: Parse local bindings (function definitions and value bindings)
+    Note: Parse local bindings (function definitions and value bindings) into a
+    Note: carrier node whose children list holds every binding declaration.
 
-    Let bindings be 0  Note: List of bindings
+    Let bindings_node be proc create_haskell_ast_node with AST_VALUE_DECLARATION
+    Let bindings be proc create from List
 
     While 1 is equal to 1:
-        Let token_type be proc current_haskell_token_type from parser
+        Let token_type be proc current_haskell_token_type with parser
 
         Note: Check for end of bindings
         If token_type is equal to TOKEN_IN from Lexer:
@@ -1636,15 +2015,26 @@ Process called "parse_haskell_bindings" takes parser as Integer returns Integer:
             Break
         End If
 
-        Let binding be proc parse_haskell_declaration from parser
+        Note: Skip separators between bindings
+        If token_type is equal to TOKEN_NEWLINE from Lexer:
+            proc advance_haskell_parser with parser
+            Continue
+        End If
+        If token_type is equal to TOKEN_SEMICOLON from Lexer:
+            proc advance_haskell_parser with parser
+            Continue
+        End If
+
+        Let binding be proc parse_haskell_declaration with parser
         If binding is equal to 0:
             Break
         End If
 
-        Set bindings to binding
+        proc append from List with bindings, binding
     End While
 
-    Return bindings
+    proc memory_set_int64 from Layout with bindings_node, 16, bindings
+    Return bindings_node
 End Process
 
 @Reasoning:
@@ -1655,28 +2045,49 @@ peek determines the form.
 Process called "parse_haskell_do_statement" takes parser as Integer returns Integer:
     Note: Parse do statement (binding or expression)
 
-    Let token_type be proc current_haskell_token_type from parser
+    Let token_type be proc current_haskell_token_type with parser
 
-    Note: Check for let statement
+    Note: let statement: "let <bindings>" - wrap in an AST_DO_LET node whose
+    Note: children hold the let-expression so get_let_bindings can recover it.
     If token_type is equal to TOKEN_LET from Lexer:
-        Return proc parse_haskell_let from parser
+        Let let_stmt be proc parse_haskell_let with parser
+        If let_stmt is equal to 0:
+            Return 0
+        End If
+        Let do_let_node be proc create_haskell_ast_node with AST_DO_LET
+        proc memory_set_int64 from Layout with do_let_node, 16, let_stmt
+        Return do_let_node
     End If
 
-    Note: Try to parse as binding (pattern <- expr)
-    Let expr be proc parse_haskell_expression from parser
+    Note: Parse the leading expression; it is either a bare expression
+    Note: statement or the pattern of a "pattern <- expr" bind.
+    Let expr be proc parse_haskell_expression with parser
     If expr is equal to 0:
         Return 0
     End If
 
-    Set token_type to proc current_haskell_token_type from parser
+    Set token_type to proc current_haskell_token_type with parser
     If token_type is equal to TOKEN_LEFT_ARROW from Lexer:
-        Note: Left arrow (<-) indicates generator in list comprehension or do-notation
-        proc advance_haskell_parser from parser
-        Let rhs_expr be proc parse_haskell_expression from parser
-        Return rhs_expr
+        Note: Bind statement: "pattern <- expr". The leading expression is the
+        Note: bind pattern; the RHS is the monadic action.
+        proc advance_haskell_parser with parser
+        Let rhs_expr be proc parse_haskell_expression with parser
+        If rhs_expr is equal to 0:
+            Return 0
+        End If
+
+        Let bind_node be proc create_haskell_ast_node with AST_DO_BIND
+        Let bind_children be proc create from List
+        proc append from List with bind_children, expr
+        proc append from List with bind_children, rhs_expr
+        proc memory_set_int64 from Layout with bind_node, 16, bind_children
+        Return bind_node
     End If
 
-    Return expr
+    Note: Bare expression statement
+    Let expr_node be proc create_haskell_ast_node with AST_DO_EXPR
+    proc memory_set_int64 from Layout with expr_node, 16, expr
+    Return expr_node
 End Process
 
 Note: ============================================================================
@@ -1696,52 +2107,111 @@ Process called "parse_haskell_module" takes parser as Integer returns Integer:
     imports, and declarations. Handles module exports and qualified imports.
     @End Reasoning
 
-    Let module_node be proc create_haskell_ast_node from AST_MODULE
+    Let module_node be proc create_haskell_ast_node with AST_MODULE
 
-    Note: Optional module declaration
-    Let token_type be proc current_haskell_token_type from parser
+    Note: Children is a single flat list of: an optional AST_EXPORT node, every
+    Note: AST_IMPORT node, then every top-level declaration. to_hir's
+    Note: translate_haskell_module iterates this list dispatching on each child's
+    Note: AST type. The module NAME (string) is stored in the value slot @8.
+    Let module_children be proc create from List
+
+    Note: Optional module header "module Name (exports) where"
+    Let token_type be proc current_haskell_token_type with parser
     If token_type is equal to TOKEN_MODULE from Lexer:
-        Let module_decl be proc parse_haskell_module_declaration from parser
-        proc memory_set_int64 from Layout with module_node, 8, module_decl
+        Let module_decl be proc parse_haskell_module_declaration with parser
+        If module_decl is not equal to 0:
+            Note: module_decl value @8 = name, children @16 = export carrier (or 0)
+            Let module_name be proc memory_get_int64 from Layout with module_decl, 8
+            proc memory_set_int64 from Layout with module_node, 8, module_name
+
+            Let export_carrier be proc memory_get_int64 from Layout with module_decl, 16
+            If export_carrier is not equal to 0:
+                Note: Flatten each per-name AST_EXPORT node into module children
+                Let export_nodes be proc memory_get_int64 from Layout with export_carrier, 16
+                If export_nodes is not equal to 0:
+                    Let export_count be proc list_length from List with export_nodes
+                    Let export_idx be 0
+                    While export_idx is less than export_count:
+                        Let one_export be proc list_get from List with export_nodes, export_idx
+                        proc append from List with module_children, one_export
+                        Set export_idx to export_idx plus 1
+                    End While
+                End If
+            End If
+        End If
     End If
 
-    Note: Parse imports
-    Let imports be 0  Note: List of imports
-
+    Note: Skip any blank lines before imports
     While 1 is equal to 1:
-        Set token_type to proc current_haskell_token_type from parser
+        Set token_type to proc current_haskell_token_type with parser
+        If token_type is equal to TOKEN_NEWLINE from Lexer:
+            proc advance_haskell_parser with parser
+            Continue
+        End If
+        Break
+    End While
+
+    Note: Parse imports
+    While 1 is equal to 1:
+        Set token_type to proc current_haskell_token_type with parser
+
+        If token_type is equal to TOKEN_NEWLINE from Lexer:
+            proc advance_haskell_parser with parser
+            Continue
+        End If
 
         If token_type is not equal to TOKEN_IMPORT from Lexer:
             Break
         End If
 
-        Let import_decl be proc parse_haskell_import_declaration from parser
+        Let import_decl be proc parse_haskell_import_declaration with parser
         If import_decl is equal to 0:
             Break
         End If
 
-        Set imports to import_decl
+        proc append from List with module_children, import_decl
     End While
 
-    Note: Parse declarations
-    Let declarations be 0  Note: List of declarations
-
+    Note: Parse top-level declarations
     While 1 is equal to 1:
-        Set token_type to proc current_haskell_token_type from parser
+        Set token_type to proc current_haskell_token_type with parser
 
         If token_type is equal to TOKEN_EOF from Lexer:
             Break
         End If
 
-        Let decl be proc parse_haskell_declaration from parser
-        If decl is equal to 0:
-            Break
+        Note: Skip separators (blank lines / explicit semicolons) so the
+        Note: declaration loop always makes forward progress.
+        If token_type is equal to TOKEN_NEWLINE from Lexer:
+            proc advance_haskell_parser with parser
+            Continue
+        End If
+        If token_type is equal to TOKEN_SEMICOLON from Lexer:
+            proc advance_haskell_parser with parser
+            Continue
         End If
 
-        Set declarations to decl
+        Note: Record the byte cursor before parsing; if a declaration parse
+        Note: consumes nothing we force-advance one token to guarantee the
+        Note: top-level loop cannot spin forever on an unrecognised token.
+        Let before_pos be proc parser_source_position with parser
+
+        Let decl be proc parse_haskell_declaration with parser
+        If decl is not equal to 0:
+            proc append from List with module_children, decl
+        End If
+
+        Let after_pos be proc parser_source_position with parser
+        If after_pos is equal to before_pos:
+            Set token_type to proc current_haskell_token_type with parser
+            If token_type is equal to TOKEN_EOF from Lexer:
+                Break
+            End If
+            proc advance_haskell_parser with parser
+        End If
     End While
 
-    proc memory_set_int64 from Layout with module_node, 16, declarations
+    proc memory_set_int64 from Layout with module_node, 16, module_children
 
     Return module_node
 End Process
@@ -1756,19 +2226,19 @@ Process called "parse_haskell_module_declaration" takes parser as Integer return
 
     proc expect_haskell_token with parser, TOKEN_MODULE from Lexer
 
-    Let module_name be proc current_haskell_token_value from parser
+    Let module_name be proc current_haskell_token_value with parser
     proc expect_haskell_token with parser, TOKEN_CONSTRUCTOR from Lexer
 
-    Note: Optional export list
+    Note: Optional export list (an AST_EXPORT carrier node, or 0 if absent)
     Let exports be 0
-    Let token_type be proc current_haskell_token_type from parser
+    Let token_type be proc current_haskell_token_type with parser
     If token_type is equal to TOKEN_LEFT_PAREN from Lexer:
-        Set exports to proc parse_haskell_export_list from parser
+        Set exports to proc parse_haskell_export_list with parser
     End If
 
     proc expect_haskell_token with parser, TOKEN_WHERE from Lexer
 
-    Let module_decl_node be proc create_haskell_ast_node from AST_MODULE
+    Let module_decl_node be proc create_haskell_ast_node with AST_MODULE
     proc memory_set_int64 from Layout with module_decl_node, 8, module_name
     proc memory_set_int64 from Layout with module_decl_node, 16, exports
 
@@ -1785,42 +2255,86 @@ Process called "parse_haskell_import_declaration" takes parser as Integer return
 
     proc expect_haskell_token with parser, TOKEN_IMPORT from Lexer
 
-    Let import_node be proc create_haskell_ast_node from AST_IMPORT
+    Let import_node be proc create_haskell_ast_node with AST_IMPORT
 
     Note: Optional qualified
     Let is_qualified be 0
-    Let token_type be proc current_haskell_token_type from parser
+    Let token_type be proc current_haskell_token_type with parser
     If token_type is equal to TOKEN_QUALIFIED from Lexer:
         Set is_qualified to 1
-        proc advance_haskell_parser from parser
+        proc advance_haskell_parser with parser
     End If
 
-    Let module_name be proc current_haskell_token_value from parser
+    Note: The module name is a dotted path "A.B.C". The lexer tokenises each
+    Note: segment as a separate TOKEN_CONSTRUCTOR with TOKEN_DOT between them
+    Note: (it does not fold '.' into identifiers). We therefore read the first
+    Note: segment, then while the current token is a dot, consume it and the
+    Note: following constructor segment, rebuilding the full "A.B.C" string. A
+    Note: lone segment (no following dot) round-trips unchanged.
+    Let module_name be proc current_haskell_token_value with parser
     proc expect_haskell_token with parser, TOKEN_CONSTRUCTOR from Lexer
+
+    Set token_type to proc current_haskell_token_type with parser
+    While token_type is equal to TOKEN_DOT from Lexer:
+        proc advance_haskell_parser with parser
+        Let next_segment be proc current_haskell_token_value with parser
+        proc expect_haskell_token with parser, TOKEN_CONSTRUCTOR from Lexer
+
+        Let dot_str be proc create_from_literal from StringCore with "."
+        Let with_dot be proc string_concat from StringPrim with module_name, dot_str
+        Let full_path be proc string_concat from StringPrim with with_dot, next_segment
+        proc deallocate from Layout with dot_str
+        proc deallocate from Layout with with_dot
+        Set module_name to full_path
+
+        Set token_type to proc current_haskell_token_type with parser
+    End While
 
     Note: Optional as clause
     Let alias_name be 0
-    Set token_type to proc current_haskell_token_type from parser
+    Set token_type to proc current_haskell_token_type with parser
     If token_type is equal to TOKEN_AS from Lexer:
-        proc advance_haskell_parser from parser
-        Set alias_name to proc current_haskell_token_value from parser
+        proc advance_haskell_parser with parser
+        Set alias_name to proc current_haskell_token_value with parser
         proc expect_haskell_token with parser, TOKEN_CONSTRUCTOR from Lexer
+
+        Note: Aliases may also be dotted (rare, but legal); rebuild the same way.
+        Let alias_tok be proc current_haskell_token_type with parser
+        While alias_tok is equal to TOKEN_DOT from Lexer:
+            proc advance_haskell_parser with parser
+            Let alias_segment be proc current_haskell_token_value with parser
+            proc expect_haskell_token with parser, TOKEN_CONSTRUCTOR from Lexer
+
+            Let alias_dot be proc create_from_literal from StringCore with "."
+            Let alias_with_dot be proc string_concat from StringPrim with alias_name, alias_dot
+            Let alias_full be proc string_concat from StringPrim with alias_with_dot, alias_segment
+            proc deallocate from Layout with alias_dot
+            proc deallocate from Layout with alias_with_dot
+            Set alias_name to alias_full
+
+            Set alias_tok to proc current_haskell_token_type with parser
+        End While
     End If
 
     Note: Optional hiding clause
     Let import_list be 0
-    Set token_type to proc current_haskell_token_type from parser
+    Set token_type to proc current_haskell_token_type with parser
     If token_type is equal to TOKEN_HIDING from Lexer:
-        proc advance_haskell_parser from parser
-        Set import_list to proc parse_haskell_import_list from parser
+        proc advance_haskell_parser with parser
+        Set import_list to proc parse_haskell_import_list with parser
     Otherwise:
         If token_type is equal to TOKEN_LEFT_PAREN from Lexer:
-            Set import_list to proc parse_haskell_import_list from parser
+            Set import_list to proc parse_haskell_import_list with parser
         End If
     End If
 
+    Note: Import node layout: value @8 = module name, children @16 = selective
+    Note: import list (or 0), slot @24 = qualified flag (0/1), slot @32 = alias
+    Note: name (or 0). The get_import_* accessors read these slots.
     proc memory_set_int64 from Layout with import_node, 8, module_name
     proc memory_set_int64 from Layout with import_node, 16, import_list
+    proc memory_set_int64 from Layout with import_node, 24, is_qualified
+    proc memory_set_int64 from Layout with import_node, 32, alias_name
 
     Return import_node
 End Process
@@ -1835,39 +2349,52 @@ Process called "parse_haskell_export_list" takes parser as Integer returns Integ
 
     proc expect_haskell_token with parser, TOKEN_LEFT_PAREN from Lexer
 
-    Let exports be 0  Note: List of exports
+    Note: Carrier whose children are one AST_EXPORT node per exported name.
+    Let export_carrier be proc create_haskell_ast_node with AST_EXPORT
+    Let exports be proc create from List
 
     While 1 is equal to 1:
-        Let token_type be proc current_haskell_token_type from parser
+        Let token_type be proc current_haskell_token_type with parser
 
         If token_type is equal to TOKEN_RIGHT_PAREN from Lexer:
             Break
         End If
-
-        Let export_name be proc current_haskell_token_value from parser
-
-        If token_type is equal to TOKEN_IDENTIFIER from Lexer:
-            proc advance_haskell_parser from parser
-        Otherwise:
-            If token_type is equal to TOKEN_CONSTRUCTOR from Lexer:
-                proc advance_haskell_parser from parser
-            Otherwise:
-                Return 0  Note: Error
-            End If
+        If token_type is equal to TOKEN_EOF from Lexer:
+            Break
         End If
 
-        Set exports to export_name
-
-        Set token_type to proc current_haskell_token_type from parser
         If token_type is equal to TOKEN_COMMA from Lexer:
-            proc advance_haskell_parser from parser
+            proc advance_haskell_parser with parser
             Continue
         End If
+
+        If token_type is equal to TOKEN_IDENTIFIER from Lexer:
+            Let export_name be proc current_haskell_token_value with parser
+            Let export_node be proc create_haskell_ast_node with AST_EXPORT
+            proc memory_set_int64 from Layout with export_node, 8, export_name
+            proc append from List with exports, export_node
+            proc advance_haskell_parser with parser
+            Continue
+        End If
+
+        If token_type is equal to TOKEN_CONSTRUCTOR from Lexer:
+            Set export_name to proc current_haskell_token_value with parser
+            Set export_node to proc create_haskell_ast_node with AST_EXPORT
+            proc memory_set_int64 from Layout with export_node, 8, export_name
+            proc append from List with exports, export_node
+            proc advance_haskell_parser with parser
+            Continue
+        End If
+
+        Note: Unknown token inside export list - force progress so the loop
+        Note: cannot spin (e.g. parentheses around a class export "Foo(..)").
+        proc advance_haskell_parser with parser
     End While
 
     proc expect_haskell_token with parser, TOKEN_RIGHT_PAREN from Lexer
 
-    Return exports
+    proc memory_set_int64 from Layout with export_carrier, 16, exports
+    Return export_carrier
 End Process
 
 @Reasoning:
@@ -1883,19 +2410,19 @@ Process called "parse_haskell_import_list" takes parser as Integer returns Integ
     Let imports be 0  Note: List of imports
 
     While 1 is equal to 1:
-        Let token_type be proc current_haskell_token_type from parser
+        Let token_type be proc current_haskell_token_type with parser
 
         If token_type is equal to TOKEN_RIGHT_PAREN from Lexer:
             Break
         End If
 
-        Let import_name be proc current_haskell_token_value from parser
+        Let import_name be proc current_haskell_token_value with parser
 
         If token_type is equal to TOKEN_IDENTIFIER from Lexer:
-            proc advance_haskell_parser from parser
+            proc advance_haskell_parser with parser
         Otherwise:
             If token_type is equal to TOKEN_CONSTRUCTOR from Lexer:
-                proc advance_haskell_parser from parser
+                proc advance_haskell_parser with parser
             Otherwise:
                 Return 0  Note: Error
             End If
@@ -1903,9 +2430,9 @@ Process called "parse_haskell_import_list" takes parser as Integer returns Integ
 
         Set imports to import_name
 
-        Set token_type to proc current_haskell_token_type from parser
+        Set token_type to proc current_haskell_token_type with parser
         If token_type is equal to TOKEN_COMMA from Lexer:
-            proc advance_haskell_parser from parser
+            proc advance_haskell_parser with parser
             Continue
         End If
     End While
@@ -1924,11 +2451,44 @@ Note: ==========================================================================
 data/newtype because no constructor is introduced; the synonym just
 expands to its RHS at use sites.
 @End Reasoning
+@Reasoning:
+Type synonym "type Name [vars] = TargetType". Captures the synonym name in
+the value slot and the parsed target type in the children slot so the HIR
+translator and backend can render "type Name = Target".
+@End Reasoning
+@Implementation:
+Consumes "type", reads the synonym name (constructor token), skips any type
+parameter variables, consumes "=", then parses the target type via
+parse_haskell_type and stores it at offset 16. Returns the node.
+@End Implementation
 Process called "parse_haskell_type_declaration" takes parser as Integer returns Integer:
     Note: Parse type synonym declaration (type Name = Type)
 
     proc expect_haskell_token with parser, TOKEN_TYPE from Lexer
-    Let type_node be proc create_haskell_ast_node from AST_TYPE_DECLARATION
+    Let type_node be proc create_haskell_ast_node with AST_TYPE_DECLARATION
+
+    Let synonym_name be proc current_haskell_token_value with parser
+    proc expect_haskell_token with parser, TOKEN_CONSTRUCTOR from Lexer
+    proc memory_set_int64 from Layout with type_node, 8, synonym_name
+
+    Note: Skip optional type parameter variables
+    While 1 is equal to 1:
+        Let tv_type be proc current_haskell_token_type with parser
+        If tv_type is equal to TOKEN_IDENTIFIER from Lexer:
+            proc advance_haskell_parser with parser
+        Otherwise:
+            Break
+        End If
+    End While
+
+    Note: Consume '=' and parse the target type
+    Let eq_type be proc current_haskell_token_type with parser
+    If eq_type is equal to TOKEN_ASSIGN from Lexer:
+        proc advance_haskell_parser with parser
+        Let target_type be proc parse_haskell_type with parser
+        proc memory_set_int64 from Layout with type_node, 16, target_type
+    End If
+
     Return type_node
 End Process
 
@@ -1937,11 +2497,86 @@ End Process
 type wrapper with zero runtime cost. Restricted form of data declaration
 that gets the unwrap-and-rewrap pattern optimised away.
 @End Reasoning
+@Reasoning:
+Newtype "newtype Name [vars] = Constructor FieldType [deriving (...)]". A
+newtype is structurally a single-constructor data declaration; we capture
+the type name (value slot) and the single constructor node (children slot)
+plus an optional deriving list, mirroring parse_haskell_data_declaration's
+shape so the HIR data-type lowering can treat both uniformly.
+@End Reasoning
+@Implementation:
+Consumes "newtype", reads the type name, skips type-parameter variables,
+consumes "=", parses one constructor via parse_haskell_constructor, then an
+optional "deriving (...)" clause. Stores name @8, the single-element
+constructor list @16, deriving list @24.
+@End Implementation
 Process called "parse_haskell_newtype_declaration" takes parser as Integer returns Integer:
     Note: Parse newtype declaration (newtype Name = Constructor Type)
 
     proc expect_haskell_token with parser, TOKEN_NEWTYPE from Lexer
-    Let newtype_node be proc create_haskell_ast_node from AST_NEWTYPE_DECLARATION
+    Let newtype_node be proc create_haskell_ast_node with AST_NEWTYPE_DECLARATION
+
+    Let type_name be proc current_haskell_token_value with parser
+    proc expect_haskell_token with parser, TOKEN_CONSTRUCTOR from Lexer
+    proc memory_set_int64 from Layout with newtype_node, 8, type_name
+
+    Note: Skip optional type parameters
+    While 1 is equal to 1:
+        Let tv_type be proc current_haskell_token_type with parser
+        If tv_type is equal to TOKEN_IDENTIFIER from Lexer:
+            proc advance_haskell_parser with parser
+        Otherwise:
+            Break
+        End If
+    End While
+
+    Let constructors be proc create from List
+    Let eq_type be proc current_haskell_token_type with parser
+    If eq_type is equal to TOKEN_ASSIGN from Lexer:
+        proc advance_haskell_parser with parser
+        Let constructor be proc parse_haskell_constructor with parser
+        If constructor is not equal to 0:
+            proc append from List with constructors, constructor
+        End If
+    End If
+    proc memory_set_int64 from Layout with newtype_node, 16, constructors
+
+    Note: Optional deriving clause - consume to keep the parser in sync
+    Let deriving_classes be 0
+    Let deriving_type be proc current_haskell_token_type with parser
+    If deriving_type is equal to TOKEN_DERIVING from Lexer:
+        proc advance_haskell_parser with parser
+        Set deriving_classes to proc create from List
+        Let open_type be proc current_haskell_token_type with parser
+        If open_type is equal to TOKEN_LEFT_PAREN from Lexer:
+            proc advance_haskell_parser with parser
+            While 1 is equal to 1:
+                Let dt be proc current_haskell_token_type with parser
+                If dt is equal to TOKEN_RIGHT_PAREN from Lexer:
+                    proc advance_haskell_parser with parser
+                    Break
+                End If
+                If dt is equal to TOKEN_EOF from Lexer:
+                    Break
+                End If
+                If dt is equal to TOKEN_COMMA from Lexer:
+                    proc advance_haskell_parser with parser
+                    Continue
+                End If
+                Let dclass be proc parse_haskell_type_constructor with parser
+                If dclass is not equal to 0:
+                    proc append from List with deriving_classes, dclass
+                End If
+            End While
+        Otherwise:
+            Let single_dclass be proc parse_haskell_type_constructor with parser
+            If single_dclass is not equal to 0:
+                proc append from List with deriving_classes, single_dclass
+            End If
+        End If
+    End If
+    proc memory_set_int64 from Layout with newtype_node, 24, deriving_classes
+
     Return newtype_node
 End Process
 
@@ -1950,12 +2585,122 @@ End Process
 Methods are type signatures (and optional default implementations) that
 instance declarations must provide.
 @End Reasoning
+@Reasoning:
+Type class "class [Context =>] Name var ... where <indented members>".
+Captures the class name in the value slot and the member declarations
+(method type signatures and default definitions) in the children slot. The
+"where" body is layout-delimited: members are indented (column > 1) and the
+block ends when a token returns to column 1 (the next top-level
+declaration) or at EOF. An optional superclass context before "=>" is
+consumed and discarded (the bootstrap does not model superclass edges yet,
+but must stay token-synchronised).
+@End Reasoning
+@Implementation:
+Consumes "class". Reads tokens up to "where" (or end-of-line) capturing the
+first TOKEN_CONSTRUCTOR as the class name and discarding the rest of the
+head (context, class variables). If "where" is present, parses member
+declarations: skips newlines, stops at EOF or a column-1 token, and routes
+each member through parse_haskell_declaration, appending to the members
+list. Stores name @8 and members @16. Forces one-token progress on a
+zero-consuming member parse to guarantee termination.
+@End Implementation
 Process called "parse_haskell_class_declaration" takes parser as Integer returns Integer:
     Note: Parse type class declaration (class Constraint => Class var where methods)
 
     proc expect_haskell_token with parser, TOKEN_CLASS from Lexer
-    Let class_node be proc create_haskell_ast_node from AST_CLASS_DECLARATION
+    Let class_node be proc create_haskell_ast_node with AST_CLASS_DECLARATION
+
+    Note: Read the class head up to "where", capturing the class name (the
+    Note: first constructor-cased token) and discarding context/variables.
+    Let class_name be 0
+    Let saw_where be 0
+    While 1 is equal to 1:
+        Let head_type be proc current_haskell_token_type with parser
+        If head_type is equal to TOKEN_WHERE from Lexer:
+            proc advance_haskell_parser with parser
+            Set saw_where to 1
+            Break
+        End If
+        If head_type is equal to TOKEN_EOF from Lexer:
+            Break
+        End If
+        If head_type is equal to TOKEN_NEWLINE from Lexer:
+            Break
+        End If
+        If head_type is equal to TOKEN_CONSTRUCTOR from Lexer:
+            If class_name is equal to 0:
+                Set class_name to proc current_haskell_token_value with parser
+            End If
+        End If
+        proc advance_haskell_parser with parser
+    End While
+    proc memory_set_int64 from Layout with class_node, 8, class_name
+
+    Let members be proc create from List
+    If saw_where is equal to 1:
+        proc parse_haskell_where_body with parser, members
+    End If
+    proc memory_set_int64 from Layout with class_node, 16, members
+
     Return class_node
+End Process
+
+@Reasoning:
+Shared layout-delimited body parser for class and instance "where" blocks.
+Members are indented (column > 1); the block ends at EOF or when a token
+returns to column 1 (the next top-level declaration). Each member is a
+normal declaration (a method signature in a class, a method binding in an
+instance), so parse_haskell_declaration handles both. The zero-progress
+guard guarantees termination on malformed input.
+@End Reasoning
+@Implementation:
+Loops: reads the current token type; breaks on EOF; skips newline/semicolon
+separators; breaks when the current token's column is <= 1 (back at
+top-level). Records the token-advance counter before parsing a member and,
+if parse_haskell_declaration consumed nothing, force-advances one token.
+Appends each non-null parsed member to the supplied members list.
+@End Implementation
+Process called "parse_haskell_where_body" takes parser as Integer, members as Integer returns Integer:
+    Note: Parse the indented member declarations of a where-block
+
+    While 1 is equal to 1:
+        Let mtype be proc current_haskell_token_type with parser
+
+        If mtype is equal to TOKEN_EOF from Lexer:
+            Break
+        End If
+
+        If mtype is equal to TOKEN_NEWLINE from Lexer:
+            proc advance_haskell_parser with parser
+            Continue
+        End If
+        If mtype is equal to TOKEN_SEMICOLON from Lexer:
+            proc advance_haskell_parser with parser
+            Continue
+        End If
+
+        Note: A token back at column 1 begins the next top-level declaration.
+        Let col be proc current_haskell_token_column with parser
+        If col is less than or equal to 1:
+            Break
+        End If
+
+        Let before_pos be proc parser_source_position with parser
+        Let member be proc parse_haskell_declaration with parser
+        If member is not equal to 0:
+            proc append from List with members, member
+        End If
+        Let after_pos be proc parser_source_position with parser
+        If after_pos is equal to before_pos:
+            Let stuck_type be proc current_haskell_token_type with parser
+            If stuck_type is equal to TOKEN_EOF from Lexer:
+                Break
+            End If
+            proc advance_haskell_parser with parser
+        End If
+    End While
+
+    Return 1
 End Process
 
 @Reasoning:
@@ -1963,11 +2708,55 @@ End Process
 class methods for a specific type. The instance head includes the
 target type; the where-block holds the method implementations.
 @End Reasoning
+@Reasoning:
+Instance "instance [Context =>] Class Type where <indented members>".
+Captures the class name (first constructor token of the head) in the value
+slot and the method-binding members in the children slot. The "where" body
+is layout-delimited exactly like a class body, so it reuses
+parse_haskell_where_body.
+@End Reasoning
+@Implementation:
+Consumes "instance", reads the head up to "where" capturing the first
+TOKEN_CONSTRUCTOR as the class name (and discarding the instance type and
+any context), then parses the member bindings via parse_haskell_where_body.
+Stores name @8 and members @16.
+@End Implementation
 Process called "parse_haskell_instance_declaration" takes parser as Integer returns Integer:
     Note: Parse instance declaration (instance Constraint => Class Type where methods)
 
     proc expect_haskell_token with parser, TOKEN_INSTANCE from Lexer
-    Let instance_node be proc create_haskell_ast_node from AST_INSTANCE_DECLARATION
+    Let instance_node be proc create_haskell_ast_node with AST_INSTANCE_DECLARATION
+
+    Let class_name be 0
+    Let saw_where be 0
+    While 1 is equal to 1:
+        Let head_type be proc current_haskell_token_type with parser
+        If head_type is equal to TOKEN_WHERE from Lexer:
+            proc advance_haskell_parser with parser
+            Set saw_where to 1
+            Break
+        End If
+        If head_type is equal to TOKEN_EOF from Lexer:
+            Break
+        End If
+        If head_type is equal to TOKEN_NEWLINE from Lexer:
+            Break
+        End If
+        If head_type is equal to TOKEN_CONSTRUCTOR from Lexer:
+            If class_name is equal to 0:
+                Set class_name to proc current_haskell_token_value with parser
+            End If
+        End If
+        proc advance_haskell_parser with parser
+    End While
+    proc memory_set_int64 from Layout with instance_node, 8, class_name
+
+    Let members be proc create from List
+    If saw_where is equal to 1:
+        proc parse_haskell_where_body with parser, members
+    End If
+    proc memory_set_int64 from Layout with instance_node, 16, members
+
     Return instance_node
 End Process
 
@@ -1976,10 +2765,33 @@ End Process
 function with its type; multiple names can share a signature
 ("a, b :: Int").
 @End Reasoning
+@Reasoning:
+Type signature "name :: Type". Captures the signed name in the value slot
+and the parsed type in the children slot. The name token is an identifier
+(value-level binding) - parenthesised operator signatures are out of the
+bootstrap's scope and fall through to the generic skip.
+@End Reasoning
+@Implementation:
+Reads the name identifier, consumes "::", parses the type via
+parse_haskell_type, storing name at offset 8 and the type at offset 16.
+Returns the node.
+@End Implementation
 Process called "parse_haskell_signature_declaration" takes parser as Integer returns Integer:
     Note: Parse type signature (name :: Type)
 
-    Let sig_node be proc create_haskell_ast_node from AST_SIGNATURE_DECLARATION
+    Let sig_node be proc create_haskell_ast_node with AST_SIGNATURE_DECLARATION
+
+    Let sig_name be proc current_haskell_token_value with parser
+    proc expect_haskell_token with parser, TOKEN_IDENTIFIER from Lexer
+    proc memory_set_int64 from Layout with sig_node, 8, sig_name
+
+    Let colon_type be proc current_haskell_token_type with parser
+    If colon_type is equal to TOKEN_DOUBLE_COLON from Lexer:
+        proc advance_haskell_parser with parser
+        Let sig_type be proc parse_haskell_type with parser
+        proc memory_set_int64 from Layout with sig_node, 16, sig_type
+    End If
+
     Return sig_node
 End Process
 
@@ -1988,10 +2800,66 @@ End Process
 precedence (0-9). Affects how the precedence climber later resolves
 chained operator applications.
 @End Reasoning
+@Reasoning:
+Fixity declaration "infix[l|r] [prec] op1, op2, ...". The leading keyword
+has already been matched by the dispatcher; we consume it, the optional
+precedence digit, and the comma-separated operator list, storing the first
+operator name in the value slot. Fixity is metadata that does not produce a
+runtime construct, so capturing the lead operator and consuming the rest to
+stay in sync is sufficient for the translation pipeline.
+@End Reasoning
+@Implementation:
+Consumes the infix/infixl/infixr keyword. Skips an optional integer
+precedence. Records the first operator token's value at offset 8, then
+consumes any remaining comma-separated operator tokens so the parser is
+positioned at the statement boundary. Returns the node.
+@End Implementation
 Process called "parse_haskell_fixity_declaration" takes parser as Integer returns Integer:
     Note: Parse fixity declaration (infixl 5 +++)
 
-    Let fixity_node be proc create_haskell_ast_node from AST_FIXITY_DECLARATION
+    Let fixity_node be proc create_haskell_ast_node with AST_FIXITY_DECLARATION
+
+    Note: Consume the infix / infixl / infixr keyword
+    proc advance_haskell_parser with parser
+
+    Note: Optional precedence integer
+    Let prec_type be proc current_haskell_token_type with parser
+    If prec_type is equal to TOKEN_INTEGER from Lexer:
+        proc advance_haskell_parser with parser
+    End If
+
+    Note: Operator list (comma-separated)
+    Let first_op be 0
+    While 1 is equal to 1:
+        Let op_type be proc current_haskell_token_type with parser
+        If op_type is equal to TOKEN_EOF from Lexer:
+            Break
+        End If
+        If op_type is equal to TOKEN_NEWLINE from Lexer:
+            Break
+        End If
+        If op_type is equal to TOKEN_COMMA from Lexer:
+            proc advance_haskell_parser with parser
+            Continue
+        End If
+        If op_type is equal to TOKEN_OPERATOR from Lexer:
+            If first_op is equal to 0:
+                Set first_op to proc current_haskell_token_value with parser
+            End If
+            proc advance_haskell_parser with parser
+            Continue
+        End If
+        If op_type is equal to TOKEN_IDENTIFIER from Lexer:
+            If first_op is equal to 0:
+                Set first_op to proc current_haskell_token_value with parser
+            End If
+            proc advance_haskell_parser with parser
+            Continue
+        End If
+        Break
+    End While
+
+    proc memory_set_int64 from Layout with fixity_node, 8, first_op
     Return fixity_node
 End Process
 
@@ -2012,22 +2880,22 @@ Process called "parse_haskell" takes lexer as Integer returns Integer:
     module, and returns complete AST. Handles errors gracefully.
     @End Reasoning
 
-    Let parser be proc create_haskell_parser from lexer
+    Let parser be proc create_haskell_parser with lexer
     If parser is equal to 0:
         Return 0
     End If
 
-    Let ast be proc parse_haskell_module from parser
+    Let ast be proc parse_haskell_module with parser
 
     Let error_count be proc memory_get_int64 from Layout with parser, 24
     If error_count is greater than 0:
         Note: Parse errors occurred
-        proc destroy_haskell_ast_node from ast
-        proc destroy_haskell_parser from parser
+        proc destroy_haskell_ast_node with ast
+        proc destroy_haskell_parser with parser
         Return 0
     End If
 
-    proc destroy_haskell_parser from parser
+    proc destroy_haskell_parser with parser
 
     Return ast
 End Process
@@ -2078,6 +2946,305 @@ Process called "get_haskell_ast_children" takes ast_node as Integer returns Inte
     End If
 
     Return proc memory_get_int64 from Layout with ast_node, 16
+End Process
+
+Note: ============================================================================
+Note: Specialised AST Accessors (consumed by the HIR translator)
+Note: ============================================================================
+Note:
+Each accessor below reads one logical sub-part of a specific node kind from
+the canonical slot layout established by the corresponding parse_* builder:
+  value @8, children @16, slot @24, slot @32.
+These give the HIR translator a stable, intention-revealing read surface
+without it needing to know each node's raw slot offsets.
+:End Note
+
+@Reasoning:
+Lambda parameters are stored in the value slot (@8) as a list of pattern
+nodes by parse_haskell_lambda.
+@End Reasoning
+Process called "extract_lambda_parameters" takes lambda_node as Integer returns Integer:
+    If lambda_node is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Layout with lambda_node, 8
+End Process
+
+@Reasoning:
+The lambda body expression is stored in the children slot (@16).
+@End Reasoning
+Process called "get_lambda_body" takes lambda_node as Integer returns Integer:
+    If lambda_node is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Layout with lambda_node, 16
+End Process
+
+@Reasoning:
+A do-statement of kind AST_DO_EXPR stores its expression in the children
+slot (@16).
+@End Reasoning
+Process called "get_statement_expression" takes stmt_node as Integer returns Integer:
+    If stmt_node is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Layout with stmt_node, 16
+End Process
+
+@Reasoning:
+A bind statement (AST_DO_BIND) stores [pattern, expr] in its children
+list; child 0 is the bind pattern.
+@End Reasoning
+Process called "get_bind_pattern" takes stmt_node as Integer returns Integer:
+    If stmt_node is equal to 0:
+        Return 0
+    End If
+    Let children be proc memory_get_int64 from Layout with stmt_node, 16
+    If children is equal to 0:
+        Return 0
+    End If
+    Return proc list_get from List with children, 0
+End Process
+
+@Reasoning:
+A bind statement (AST_DO_BIND) stores [pattern, expr] in its children
+list; child 1 is the bound monadic action.
+@End Reasoning
+Process called "get_bind_expression" takes stmt_node as Integer returns Integer:
+    If stmt_node is equal to 0:
+        Return 0
+    End If
+    Let children be proc memory_get_int64 from Layout with stmt_node, 16
+    If children is equal to 0:
+        Return 0
+    End If
+    Let count be proc list_length from List with children
+    If count is less than 2:
+        Return 0
+    End If
+    Return proc list_get from List with children, 1
+End Process
+
+@Reasoning:
+A let do-statement (AST_DO_LET) stores the inner let-expression in its
+children slot; the let-expression's own first child is the bindings
+carrier.
+@End Reasoning
+Process called "get_let_bindings" takes stmt_node as Integer returns Integer:
+    If stmt_node is equal to 0:
+        Return 0
+    End If
+    Let let_expr be proc memory_get_int64 from Layout with stmt_node, 16
+    If let_expr is equal to 0:
+        Return 0
+    End If
+    Let let_children be proc memory_get_int64 from Layout with let_expr, 16
+    If let_children is equal to 0:
+        Return 0
+    End If
+    Return proc list_get from List with let_children, 0
+End Process
+
+@Reasoning:
+A case alternative stores its pattern in the value slot (@8).
+@End Reasoning
+Process called "get_alternative_pattern" takes alt_node as Integer returns Integer:
+    If alt_node is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Layout with alt_node, 8
+End Process
+
+@Reasoning:
+A case alternative stores its body expression in the children slot (@16).
+@End Reasoning
+Process called "get_alternative_expression" takes alt_node as Integer returns Integer:
+    If alt_node is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Layout with alt_node, 16
+End Process
+
+@Reasoning:
+A case alternative stores its optional guard in slot @24 (0 when absent).
+@End Reasoning
+Process called "get_alternative_guard" takes alt_node as Integer returns Integer:
+    If alt_node is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Layout with alt_node, 24
+End Process
+
+@Reasoning:
+A binding declaration (function/value) stores its bound name in the value
+slot (@8); used as the binding's left-hand-side identifier.
+@End Reasoning
+Process called "get_binding_pattern" takes binding_node as Integer returns Integer:
+    If binding_node is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Layout with binding_node, 8
+End Process
+
+@Reasoning:
+A binding declaration stores its right-hand-side body in the children
+slot (@16).
+@End Reasoning
+Process called "get_binding_expression" takes binding_node as Integer returns Integer:
+    If binding_node is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Layout with binding_node, 16
+End Process
+
+@Reasoning:
+An export node stores the exported symbol name in the value slot (@8).
+@End Reasoning
+Process called "get_export_symbol" takes export_node as Integer returns Integer:
+    If export_node is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Layout with export_node, 8
+End Process
+
+@Reasoning:
+An export node's kind tag lives in the children slot (@16): 0 for a plain
+value/function export. Reserved for future "Type(..)" re-export shapes.
+@End Reasoning
+Process called "get_export_type" takes export_node as Integer returns Integer:
+    If export_node is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Layout with export_node, 16
+End Process
+
+@Reasoning:
+An import node stores the imported module name in the value slot (@8).
+@End Reasoning
+Process called "get_import_module" takes import_node as Integer returns Integer:
+    If import_node is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Layout with import_node, 8
+End Process
+
+@Reasoning:
+An import node stores its optional "as" alias in slot @32 (0 when absent).
+@End Reasoning
+Process called "get_import_alias" takes import_node as Integer returns Integer:
+    If import_node is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Layout with import_node, 32
+End Process
+
+@Reasoning:
+An import node stores its qualified flag (0/1) in slot @24.
+@End Reasoning
+Process called "get_import_qualified" takes import_node as Integer returns Integer:
+    If import_node is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Layout with import_node, 24
+End Process
+
+@Reasoning:
+A function declaration stores its body expression in the children slot
+(@16); the name is in the value slot.
+@End Reasoning
+Process called "get_function_body" takes func_node as Integer returns Integer:
+    If func_node is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Layout with func_node, 16
+End Process
+
+@Reasoning:
+A comprehension generator (AST_QUALIFIER) stores its pattern in the value
+slot (@8).
+@End Reasoning
+Process called "get_generator_pattern" takes generator_node as Integer returns Integer:
+    If generator_node is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Layout with generator_node, 8
+End Process
+
+@Reasoning:
+A comprehension generator (AST_QUALIFIER) stores its source expression in
+the children slot (@16).
+@End Reasoning
+Process called "get_generator_expression" takes generator_node as Integer returns Integer:
+    If generator_node is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Layout with generator_node, 16
+End Process
+
+@Reasoning:
+A data constructor (built by parse_haskell_constructor as an AST_IDENTIFIER
+node) stores its constructor name in the value slot (@8).
+@End Reasoning
+Process called "get_constructor_name" takes constructor_node as Integer returns Integer:
+    If constructor_node is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Layout with constructor_node, 8
+End Process
+
+@Reasoning:
+A data constructor stores its positional field-type list in the children
+slot (@16); each element is a parsed type node.
+@End Reasoning
+Process called "get_constructor_fields" takes constructor_node as Integer returns Integer:
+    If constructor_node is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Layout with constructor_node, 16
+End Process
+
+@Reasoning:
+A record-syntax constructor stores the parallel field-name list in slot @24
+(0 for a positional constructor); name[i] labels field type[i].
+@End Reasoning
+Process called "get_constructor_field_names" takes constructor_node as Integer returns Integer:
+    If constructor_node is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Layout with constructor_node, 24
+End Process
+
+@Reasoning:
+The data declaration's deriving-class list lives in slot @24 (0 when no
+deriving clause is present).
+@End Reasoning
+Process called "get_data_deriving" takes data_node as Integer returns Integer:
+    If data_node is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Layout with data_node, 24
+End Process
+
+@Reasoning:
+The data declaration's type-parameter list (the lowercase variables in
+"data T a b = ...") lives in slot @32.
+@End Reasoning
+Process called "get_data_type_parameters" takes data_node as Integer returns Integer:
+    If data_node is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Layout with data_node, 32
+End Process
+
+@Reasoning:
+A type-signature member (AST_SIGNATURE_DECLARATION) stores the parsed type
+in the children slot (@16); the signed name is in the value slot (@8).
+@End Reasoning
+Process called "get_signature_type" takes sig_node as Integer returns Integer:
+    If sig_node is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Layout with sig_node, 16
 End Process
 
 Note: End of Haskell Parser

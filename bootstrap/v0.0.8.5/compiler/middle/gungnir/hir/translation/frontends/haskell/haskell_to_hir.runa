@@ -47,6 +47,7 @@ Import "compiler/middle/gungnir/hir/translation/frontends/haskell/haskell_lexer.
 Import "compiler/middle/gungnir/hir/translation/frontends/haskell/haskell_parser.runa" as Parser
 Import "compiler/middle/gungnir/hir/translation/frontends/haskell/haskell_semantic.runa" as Semantic
 Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/frontend/primitives/core/string_primitive.runa" as StringPrim
 Import "compiler/frontend/primitives/memory/layout.runa" as Layout
 Import "compiler/frontend/primitives/collections/hashtable.runa" as Dict
 Import "compiler/frontend/primitives/collections/list.runa" as List
@@ -79,6 +80,7 @@ Constant HIR_IF as Integer is 20207               Note: Conditional expression
 Constant HIR_TUPLE as Integer is 20208            Note: Tuple construction
 Constant HIR_LIST as Integer is 20209             Note: List construction
 Constant HIR_RECORD as Integer is 20210           Note: Record construction
+Constant HIR_COMPREHENSION as Integer is 20211    Note: List comprehension
 
 Note: HIR Patterns
 Constant HIR_PATTERN_VARIABLE as Integer is 20301 Note: Variable pattern
@@ -244,15 +246,46 @@ Process called "create_hir_node" takes node_type as Integer returns Integer:
         Return 0
     End If
 
-    Let type_key be proc create_string from StringCore with "node_type"
-    Let type_value be proc int_to_string from StringCore with node_type
-
-    proc set_hir_field with hir_node, type_key, type_value
-
-    proc deallocate from Layout with type_key
-    proc deallocate from Layout with type_value
+    Note: Store the HIR node-type discriminant as a raw integer under the
+    Note: "node_type" key. The backend (hir_to_haskell) reads this key and
+    Note: compares it directly against the integer HIR_* constants, so the
+    Note: producer and consumer agree on an integer-tag encoding rather than a
+    Note: stringified one. The semantic "type" key is reserved separately for
+    Note: a node's data type (e.g. a literal's "int"/"string" kind).
+    Let type_key be proc create_from_literal from StringCore with "node_type"
+    proc set_hir_field with hir_node, type_key, node_type
 
     Return hir_node
+End Process
+
+@Reasoning:
+StringCore exposes no contains-character primitive, so literal-kind
+inference (int vs float) carries its own scan, matching the lexer's and
+semantic pass's equivalent helpers.
+@End Reasoning
+@Implementation:
+Walks the NUL-terminated string by index using string_length and
+string_char_at, returning 1 on the first byte equal to target_char and
+0 otherwise (including null/empty input).
+@End Implementation
+Process called "haskell_hir_contains_char" takes str as Integer, target_char as Integer returns Integer:
+    Note: Return 1 if str contains target_char, else 0
+
+    If str is equal to 0:
+        Return 0
+    End If
+
+    Let scan_len be proc string_length from StringCore with str
+    Let idx be 0
+    While idx is less than scan_len:
+        Let scan_ch be proc string_char_at from StringCore with str, idx
+        If scan_ch is equal to target_char:
+            Return 1
+        End If
+        Set idx to idx plus 1
+    End While
+
+    Return 0
 End Process
 
 Note: ============================================================================
@@ -352,14 +385,14 @@ Process called "translate_literal" takes translator as Integer, literal_value as
     information and handles polymorphic numeric literals appropriately.
     @End Reasoning
 
-    Let hir_node be proc create_hir_node from HIR_LITERAL
+    Let hir_node be proc create_hir_node with HIR_LITERAL
 
-    Let value_key be proc create_string from StringCore with "value"
+    Let value_key be proc create_from_literal from StringCore with "value"
     proc set_hir_field with hir_node, value_key, literal_value
 
     Note: Determine literal type
-    Let type_key be proc create_string from StringCore with "type"
-    Let literal_type be proc infer_literal_hir_type from literal_value
+    Let type_key be proc create_from_literal from StringCore with "type"
+    Let literal_type be proc infer_literal_hir_type with literal_value
 
     proc set_hir_field with hir_node, type_key, literal_type
 
@@ -376,24 +409,24 @@ Process called "infer_literal_hir_type" takes literal_value as Integer returns I
     Note: Infer HIR type for literal value
 
     If literal_value is equal to 0:
-        Return proc create_string from StringCore with "unit"
+        Return proc create_from_literal from StringCore with "unit"
     End If
 
     Let first_char be proc string_char_at from StringCore with literal_value, 0
 
     Note: Character literal
     If first_char is equal to 39:  Note: '
-        Return proc create_string from StringCore with "char"
+        Return proc create_from_literal from StringCore with "char"
     End If
 
     Note: String literal
     If first_char is equal to 34:  Note: "
-        Return proc create_string from StringCore with "string"
+        Return proc create_from_literal from StringCore with "string"
     End If
 
     Note: Boolean literals
-    Let true_str be proc create_string from StringCore with "True"
-    Let false_str be proc create_string from StringCore with "False"
+    Let true_str be proc create_from_literal from StringCore with "True"
+    Let false_str be proc create_from_literal from StringCore with "False"
     Let is_bool be proc string_equals from StringCore with literal_value, true_str
     If is_bool is equal to 0:
         Set is_bool to proc string_equals from StringCore with literal_value, false_str
@@ -402,15 +435,15 @@ Process called "infer_literal_hir_type" takes literal_value as Integer returns I
     proc deallocate from Layout with false_str
 
     If is_bool is equal to 1:
-        Return proc create_string from StringCore with "bool"
+        Return proc create_from_literal from StringCore with "bool"
     End If
 
     Note: Numeric literals
-    Let has_dot be proc string_contains_char from StringCore with literal_value, 46  Note: .
+    Let has_dot be proc haskell_hir_contains_char with literal_value, 46  Note: .
     If has_dot is equal to 1:
-        Return proc create_string from StringCore with "float"
+        Return proc create_from_literal from StringCore with "float"
     Otherwise:
-        Return proc create_string from StringCore with "int"
+        Return proc create_from_literal from StringCore with "int"
     End If
 End Process
 
@@ -426,13 +459,13 @@ Process called "translate_identifier" takes translator as Integer, identifier as
     type information from semantic analysis.
     @End Reasoning
 
-    Let hir_node be proc create_hir_node from HIR_IDENTIFIER
+    Let hir_node be proc create_hir_node with HIR_IDENTIFIER
 
-    Let name_key be proc create_string from StringCore with "name"
+    Let name_key be proc create_from_literal from StringCore with "name"
     proc set_hir_field with hir_node, name_key, identifier
 
     Note: Look up type information from semantic analysis
-    Let type_key be proc create_string from StringCore with "type"
+    Let type_key be proc create_from_literal from StringCore with "type"
     Let identifier_type be proc lookup_identifier_type with translator, identifier
 
     If identifier_type is not equal to 0:
@@ -440,10 +473,10 @@ Process called "translate_identifier" takes translator as Integer, identifier as
     End If
 
     Note: Check if this is a constructor
-    Let is_constructor be proc is_haskell_constructor from identifier
+    Let is_constructor be proc is_haskell_constructor with identifier
     If is_constructor is equal to 1:
-        Let constructor_key be proc create_string from StringCore with "is_constructor"
-        Let true_str be proc create_string from StringCore with "true"
+        Let constructor_key be proc create_from_literal from StringCore with "is_constructor"
+        Let true_str be proc create_from_literal from StringCore with "true"
         proc set_hir_field with hir_node, constructor_key, true_str
         proc deallocate from Layout with constructor_key
         proc deallocate from Layout with true_str
@@ -485,7 +518,7 @@ Process called "translate_application" takes translator as Integer, app_expr as 
     partial application and currying semantics.
     @End Reasoning
 
-    Let hir_node be proc create_hir_node from HIR_APPLICATION
+    Let hir_node be proc create_hir_node with HIR_APPLICATION
 
     Let children be proc get_haskell_ast_children from Parser with app_expr
 
@@ -506,15 +539,15 @@ Process called "translate_application" takes translator as Integer, app_expr as 
     End While
 
     Note: Set function and arguments
-    Let function_key be proc create_string from StringCore with "function"
-    Let arguments_key be proc create_string from StringCore with "arguments"
+    Let function_key be proc create_from_literal from StringCore with "function"
+    Let arguments_key be proc create_from_literal from StringCore with "arguments"
 
     proc set_hir_field with hir_node, function_key, hir_function
     proc set_hir_field with hir_node, arguments_key, hir_arguments
 
     Note: Handle lazy evaluation
-    Let lazy_key be proc create_string from StringCore with "lazy_evaluation"
-    Let true_str be proc create_string from StringCore with "true"
+    Let lazy_key be proc create_from_literal from StringCore with "lazy_evaluation"
+    Let true_str be proc create_from_literal from StringCore with "true"
     proc set_hir_field with hir_node, lazy_key, true_str
 
     proc deallocate from Layout with function_key
@@ -537,36 +570,39 @@ Process called "translate_lambda" takes translator as Integer, lambda_expr as In
     support for currying and partial application.
     @End Reasoning
 
-    Let hir_node be proc create_hir_node from HIR_LAMBDA
+    Let hir_node be proc create_hir_node with HIR_LAMBDA
 
-    Let lambda_children be proc get_haskell_ast_children from Parser with lambda_expr
+    Note: The parser stores the lambda parameter-pattern list in the node's
+    Note: value slot (read via extract_lambda_parameters) and the body in the
+    Note: children slot (read via get_lambda_body).
+    Let lambda_params be proc extract_lambda_parameters from Parser with lambda_expr
 
     Note: Translate parameters
     Let hir_parameters be proc create_hir_list
-    Let children_count be proc list_length from List with lambda_children
-
-    Note: First part contains parameters, last child is body
-    Let param_count be children_count minus 1
+    Let param_count be 0
+    If lambda_params is not equal to 0:
+        Set param_count to proc list_length from List with lambda_params
+    End If
     Let param_index be 0
 
     While param_index is less than param_count:
-        Let param_pattern be proc list_get from List with lambda_children, param_index
+        Let param_pattern be proc list_get from List with lambda_params, param_index
         Let hir_param be proc translate_haskell_pattern with translator, param_pattern
         proc list_append from List with hir_parameters, hir_param
         Set param_index to param_index plus 1
     End While
 
-    Note: Translate body (last child)
-    Let body_expr be proc list_get from List with lambda_children, param_count
+    Note: Translate body
+    Let body_expr be proc get_lambda_body from Parser with lambda_expr
     Let hir_body be proc translate_haskell_expression with translator, body_expr
 
     Note: Analyze closure requirements
     Let closure_env be proc analyze_closure_requirements with translator, lambda_expr
 
     Note: Set lambda fields
-    Let params_key be proc create_string from StringCore with "parameters"
-    Let body_key be proc create_string from StringCore with "body"
-    Let closure_key be proc create_string from StringCore with "closure"
+    Let params_key be proc create_from_literal from StringCore with "parameters"
+    Let body_key be proc create_from_literal from StringCore with "body"
+    Let closure_key be proc create_from_literal from StringCore with "closure"
 
     proc set_hir_field with hir_node, params_key, hir_parameters
     proc set_hir_field with hir_node, body_key, hir_body
@@ -608,7 +644,7 @@ Process called "analyze_closure_requirements" takes translator as Integer, lambd
         Set var_index to var_index plus 1
     End While
 
-    Let bindings_key be proc create_string from StringCore with "bindings"
+    Let bindings_key be proc create_from_literal from StringCore with "bindings"
     proc set_hir_field with closure_env, bindings_key, closure_bindings
     proc deallocate from Layout with bindings_key
 
@@ -627,7 +663,7 @@ Process called "translate_let" takes translator as Integer, let_expr as Integer 
     with proper scoping and support for mutual recursion.
     @End Reasoning
 
-    Let hir_node be proc create_hir_node from HIR_LET
+    Let hir_node be proc create_hir_node with HIR_LET
 
     Let let_children be proc get_haskell_ast_children from Parser with let_expr
 
@@ -640,14 +676,14 @@ Process called "translate_let" takes translator as Integer, let_expr as Integer 
     Let hir_body be proc translate_haskell_expression with translator, body_expr
 
     Note: Set let fields
-    Let bindings_key be proc create_string from StringCore with "bindings"
-    Let body_key be proc create_string from StringCore with "body"
+    Let bindings_key be proc create_from_literal from StringCore with "bindings"
+    Let body_key be proc create_from_literal from StringCore with "body"
 
     proc set_hir_field with hir_node, bindings_key, hir_bindings
     proc set_hir_field with hir_node, body_key, hir_body
 
     Note: Handle potential recursion
-    Let recursive_key be proc create_string from StringCore with "recursive"
+    Let recursive_key be proc create_from_literal from StringCore with "recursive"
     Let recursive_analysis be proc analyze_let_recursion with translator, bindings_expr
     proc set_hir_field with hir_node, recursive_key, recursive_analysis
 
@@ -703,9 +739,9 @@ Process called "analyze_let_recursion" takes translator as Integer, bindings_exp
     End While
 
     If is_recursive is equal to 1:
-        Return proc create_string from StringCore with "true"
+        Return proc create_from_literal from StringCore with "true"
     Otherwise:
-        Return proc create_string from StringCore with "false"
+        Return proc create_from_literal from StringCore with "false"
     End If
 End Process
 
@@ -721,7 +757,7 @@ Process called "translate_case" takes translator as Integer, case_expr as Intege
     exhaustiveness checking information.
     @End Reasoning
 
-    Let hir_node be proc create_hir_node from HIR_CASE
+    Let hir_node be proc create_hir_node with HIR_CASE
 
     Let case_children be proc get_haskell_ast_children from Parser with case_expr
 
@@ -734,14 +770,14 @@ Process called "translate_case" takes translator as Integer, case_expr as Intege
     Let hir_alternatives be proc translate_case_alternatives with translator, alternatives_expr
 
     Note: Set case fields
-    Let scrutinee_key be proc create_string from StringCore with "scrutinee"
-    Let alternatives_key be proc create_string from StringCore with "alternatives"
+    Let scrutinee_key be proc create_from_literal from StringCore with "scrutinee"
+    Let alternatives_key be proc create_from_literal from StringCore with "alternatives"
 
     proc set_hir_field with hir_node, scrutinee_key, hir_scrutinee
     proc set_hir_field with hir_node, alternatives_key, hir_alternatives
 
     Note: Add exhaustiveness analysis
-    Let exhaustive_key be proc create_string from StringCore with "exhaustive"
+    Let exhaustive_key be proc create_from_literal from StringCore with "exhaustive"
     Let exhaustive_analysis be proc check_pattern_exhaustiveness with translator, alternatives_expr
     proc set_hir_field with hir_node, exhaustive_key, exhaustive_analysis
 
@@ -798,11 +834,11 @@ Process called "check_pattern_exhaustiveness" takes translator as Integer, alter
     End While
 
     If has_wildcard is equal to 1:
-        Return proc create_string from StringCore with "true"
+        Return proc create_from_literal from StringCore with "true"
     Otherwise:
-        Return proc create_string from StringCore with "false"
+        Return proc create_from_literal from StringCore with "false"
     End If
-    Return proc create_string from StringCore with "true"
+    Return proc create_from_literal from StringCore with "true"
 End Process
 
 @Reasoning:
@@ -811,7 +847,7 @@ Haskell's "if cond then x else y" requires both branches (no dangling else); HIR
 Process called "translate_if" takes translator as Integer, if_expr as Integer returns Integer:
     Note: Translate if expression to HIR
 
-    Let hir_node be proc create_hir_node from HIR_IF
+    Let hir_node be proc create_hir_node with HIR_IF
 
     Let if_children be proc get_haskell_ast_children from Parser with if_expr
 
@@ -824,9 +860,9 @@ Process called "translate_if" takes translator as Integer, if_expr as Integer re
     Let hir_then be proc translate_haskell_expression with translator, then_expr
     Let hir_else be proc translate_haskell_expression with translator, else_expr
 
-    Let condition_key be proc create_string from StringCore with "condition"
-    Let then_key be proc create_string from StringCore with "then_branch"
-    Let else_key be proc create_string from StringCore with "else_branch"
+    Let condition_key be proc create_from_literal from StringCore with "condition"
+    Let then_key be proc create_from_literal from StringCore with "then_branch"
+    Let else_key be proc create_from_literal from StringCore with "else_branch"
 
     proc set_hir_field with hir_node, condition_key, hir_condition
     proc set_hir_field with hir_node, then_key, hir_then
@@ -851,7 +887,7 @@ Process called "translate_list" takes translator as Integer, list_expr as Intege
     type information for homogeneous elements.
     @End Reasoning
 
-    Let hir_node be proc create_hir_node from HIR_LIST
+    Let hir_node be proc create_hir_node with HIR_LIST
 
     Let list_children be proc get_haskell_ast_children from Parser with list_expr
 
@@ -868,13 +904,13 @@ Process called "translate_list" takes translator as Integer, list_expr as Intege
     End While
 
     Note: Set list fields
-    Let elements_key be proc create_string from StringCore with "elements"
-    Let lazy_key be proc create_string from StringCore with "lazy"
+    Let elements_key be proc create_from_literal from StringCore with "elements"
+    Let lazy_key be proc create_from_literal from StringCore with "lazy"
 
     proc set_hir_field with hir_node, elements_key, hir_elements
 
     Note: Mark as lazy evaluation
-    Let true_str be proc create_string from StringCore with "true"
+    Let true_str be proc create_from_literal from StringCore with "true"
     proc set_hir_field with hir_node, lazy_key, true_str
 
     proc deallocate from Layout with elements_key
@@ -890,7 +926,7 @@ End Process
 Process called "translate_tuple" takes translator as Integer, tuple_expr as Integer returns Integer:
     Note: Translate tuple expression to HIR
 
-    Let hir_node be proc create_hir_node from HIR_TUPLE
+    Let hir_node be proc create_hir_node with HIR_TUPLE
 
     Let tuple_children be proc get_haskell_ast_children from Parser with tuple_expr
 
@@ -907,7 +943,7 @@ Process called "translate_tuple" takes translator as Integer, tuple_expr as Inte
     End While
 
     Note: Set tuple fields
-    Let elements_key be proc create_string from StringCore with "elements"
+    Let elements_key be proc create_from_literal from StringCore with "elements"
     proc set_hir_field with hir_node, elements_key, hir_elements
 
     proc deallocate from Layout with elements_key
@@ -927,7 +963,7 @@ Process called "translate_do" takes translator as Integer, do_expr as Integer re
     operations for monadic computations.
     @End Reasoning
 
-    Let hir_node be proc create_hir_node from HIR_EFFECT
+    Let hir_node be proc create_hir_node with HIR_EFFECT
 
     Let do_children be proc get_haskell_ast_children from Parser with do_expr
 
@@ -935,8 +971,8 @@ Process called "translate_do" takes translator as Integer, do_expr as Integer re
     Let hir_statements be proc translate_do_statements with translator, do_children
 
     Note: Set effect fields
-    Let statements_key be proc create_string from StringCore with "statements"
-    Let monad_key be proc create_string from StringCore with "monad_context"
+    Let statements_key be proc create_from_literal from StringCore with "statements"
+    Let monad_key be proc create_from_literal from StringCore with "monad_context"
 
     proc set_hir_field with hir_node, statements_key, hir_statements
 
@@ -983,12 +1019,12 @@ Process called "infer_monad_context" takes translator as Integer, do_expr as Int
     Let type_info be proc get_expression_type with symbol_table, do_expr
 
     If type_info is not equal to 0:
-        Let monad_name be proc extract_monad_name from type_info
+        Let monad_name be proc extract_monad_name with type_info
         Return monad_name
     Otherwise:
-        Return proc create_string from StringCore with "IO"
+        Return proc create_from_literal from StringCore with "IO"
     End If
-    Return proc create_string from StringCore with "IO"
+    Return proc create_from_literal from StringCore with "IO"
 End Process
 
 @Reasoning:
@@ -1003,15 +1039,39 @@ Process called "translate_comprehension" takes translator as Integer, comp_expr 
     with lazy evaluation semantics.
     @End Reasoning
 
-    Let hir_node be proc create_hir_node from HIR_LIST
+    @Implementation:
+    A comprehension is its own HIR node kind (HIR_COMPREHENSION) so the backend
+    can render "[ result | q1, q2 ]" rather than treating it as a plain list.
+    The parser's AST_COMPREHENSION node has exactly three children in order:
+    child 0 = result expression, child 1 = a generators carrier (children are
+    AST_QUALIFIER nodes), child 2 = a guards carrier (children are guard
+    expressions). We lower the result expression and reuse translate_generators
+    / translate_guards (which read those carriers) to build the "result",
+    "generators" and "guards" fields the backend consumes.
+    @End Implementation
 
-    Note: Translate comprehension to equivalent map/filter operations
-    Let hir_generator be proc translate_comprehension_generator with translator, comp_expr
+    Let hir_node be proc create_hir_node with HIR_COMPREHENSION
 
-    Let generator_key be proc create_string from StringCore with "generator"
-    proc set_hir_field with hir_node, generator_key, hir_generator
+    Let comp_children be proc get_haskell_ast_children from Parser with comp_expr
+    Let result_expr be proc list_get from List with comp_children, 0
+    Let generators_carrier be proc list_get from List with comp_children, 1
+    Let guards_carrier be proc list_get from List with comp_children, 2
 
-    proc deallocate from Layout with generator_key
+    Let result_key be proc create_from_literal from StringCore with "result"
+    Let hir_result be proc translate_haskell_expression with translator, result_expr
+    proc set_hir_field with hir_node, result_key, hir_result
+
+    Let generators_key be proc create_from_literal from StringCore with "generators"
+    Let hir_generators be proc translate_generators with translator, generators_carrier
+    proc set_hir_field with hir_node, generators_key, hir_generators
+
+    Let guards_key be proc create_from_literal from StringCore with "guards"
+    Let hir_guards be proc translate_guards with translator, guards_carrier
+    proc set_hir_field with hir_node, guards_key, hir_guards
+
+    proc deallocate from Layout with result_key
+    proc deallocate from Layout with generators_key
+    proc deallocate from Layout with guards_key
 
     Return hir_node
 End Process
@@ -1032,17 +1092,17 @@ Process called "translate_comprehension_generator" takes translator as Integer, 
 
     Note: Translate result expression
     Let hir_result be proc translate_haskell_expression with translator, result_expr
-    Let result_key be proc create_string from StringCore with "result"
+    Let result_key be proc create_from_literal from StringCore with "result"
     proc set_hir_field with generator_dict, result_key, hir_result
 
     Note: Translate generators
     Let hir_generators be proc translate_generators with translator, generators
-    Let generators_key be proc create_string from StringCore with "generators"
+    Let generators_key be proc create_from_literal from StringCore with "generators"
     proc set_hir_field with generator_dict, generators_key, hir_generators
 
     Note: Translate guards
     Let hir_guards be proc translate_guards with translator, guards
-    Let guards_key be proc create_string from StringCore with "guards"
+    Let guards_key be proc create_from_literal from StringCore with "guards"
     proc set_hir_field with generator_dict, guards_key, hir_guards
 
     proc deallocate from Layout with result_key
@@ -1092,7 +1152,7 @@ Process called "translate_haskell_pattern" takes translator as Integer, pattern 
 
     Note: Wildcard pattern
     If pattern_type is equal to AST_PATTERN_WILDCARD from Parser:
-        Return proc translate_wildcard_pattern from translator
+        Return proc translate_wildcard_pattern with translator
     End If
 
     Note: List pattern
@@ -1119,9 +1179,9 @@ A variable pattern binds the matched value to a name; we emit a HIR VariablePatt
 Process called "translate_variable_pattern" takes translator as Integer, var_name as Integer returns Integer:
     Note: Translate variable pattern to HIR
 
-    Let hir_pattern be proc create_hir_node from HIR_PATTERN_VARIABLE
+    Let hir_pattern be proc create_hir_node with HIR_PATTERN_VARIABLE
 
-    Let name_key be proc create_string from StringCore with "name"
+    Let name_key be proc create_from_literal from StringCore with "name"
     proc set_hir_field with hir_pattern, name_key, var_name
 
     proc deallocate from Layout with name_key
@@ -1135,20 +1195,20 @@ End Process
 Process called "translate_constructor_pattern" takes translator as Integer, pattern as Integer returns Integer:
     Note: Translate constructor pattern to HIR
 
-    Let hir_pattern be proc create_hir_node from HIR_PATTERN_CONSTRUCTOR
+    Let hir_pattern be proc create_hir_node with HIR_PATTERN_CONSTRUCTOR
 
     Let pattern_value be proc get_haskell_ast_value from Parser with pattern
     Let pattern_children be proc get_haskell_ast_children from Parser with pattern
 
     Note: Set constructor name
-    Let constructor_key be proc create_string from StringCore with "constructor"
+    Let constructor_key be proc create_from_literal from StringCore with "constructor"
     proc set_hir_field with hir_pattern, constructor_key, pattern_value
 
     Note: Translate argument patterns
     Let hir_args be proc create_hir_list
     Note: implementation  iterate through argument patterns
 
-    Let args_key be proc create_string from StringCore with "arguments"
+    Let args_key be proc create_from_literal from StringCore with "arguments"
     proc set_hir_field with hir_pattern, args_key, hir_args
 
     proc deallocate from Layout with constructor_key
@@ -1163,9 +1223,9 @@ Literal patterns match if and only if the scrutinee equals the literal value; HI
 Process called "translate_literal_pattern" takes translator as Integer, literal_value as Integer returns Integer:
     Note: Translate literal pattern to HIR
 
-    Let hir_pattern be proc create_hir_node from HIR_PATTERN_LITERAL
+    Let hir_pattern be proc create_hir_node with HIR_PATTERN_LITERAL
 
-    Let value_key be proc create_string from StringCore with "value"
+    Let value_key be proc create_from_literal from StringCore with "value"
     proc set_hir_field with hir_pattern, value_key, literal_value
 
     proc deallocate from Layout with value_key
@@ -1179,7 +1239,7 @@ End Process
 Process called "translate_wildcard_pattern" takes translator as Integer returns Integer:
     Note: Translate wildcard pattern to HIR
 
-    Let hir_pattern be proc create_hir_node from HIR_PATTERN_WILDCARD
+    Let hir_pattern be proc create_hir_node with HIR_PATTERN_WILDCARD
     Return hir_pattern
 End Process
 
@@ -1189,14 +1249,14 @@ End Process
 Process called "translate_list_pattern" takes translator as Integer, pattern as Integer returns Integer:
     Note: Translate list pattern to HIR
 
-    Let hir_pattern be proc create_hir_node from HIR_PATTERN_LIST
+    Let hir_pattern be proc create_hir_node with HIR_PATTERN_LIST
 
     Let pattern_children be proc get_haskell_ast_children from Parser with pattern
 
     Note: Translate element patterns
     Let hir_elements be proc create_hir_list
 
-    Let elements_key be proc create_string from StringCore with "elements"
+    Let elements_key be proc create_from_literal from StringCore with "elements"
     proc set_hir_field with hir_pattern, elements_key, hir_elements
 
     proc deallocate from Layout with elements_key
@@ -1210,14 +1270,14 @@ End Process
 Process called "translate_tuple_pattern" takes translator as Integer, pattern as Integer returns Integer:
     Note: Translate tuple pattern to HIR
 
-    Let hir_pattern be proc create_hir_node from HIR_PATTERN_TUPLE
+    Let hir_pattern be proc create_hir_node with HIR_PATTERN_TUPLE
 
     Let pattern_children be proc get_haskell_ast_children from Parser with pattern
 
     Note: Translate element patterns
     Let hir_elements be proc create_hir_list
 
-    Let elements_key be proc create_string from StringCore with "elements"
+    Let elements_key be proc create_from_literal from StringCore with "elements"
     proc set_hir_field with hir_pattern, elements_key, hir_elements
 
     proc deallocate from Layout with elements_key
@@ -1231,20 +1291,20 @@ End Process
 Process called "translate_as_pattern" takes translator as Integer, pattern as Integer returns Integer:
     Note: Translate as pattern (var@pattern) to HIR
 
-    Let hir_pattern be proc create_hir_node from HIR_PATTERN_VARIABLE
+    Let hir_pattern be proc create_hir_node with HIR_PATTERN_VARIABLE
 
     Let pattern_value be proc get_haskell_ast_value from Parser with pattern
     Let pattern_children be proc get_haskell_ast_children from Parser with pattern
 
     Note: Set variable name
-    Let name_key be proc create_string from StringCore with "name"
+    Let name_key be proc create_from_literal from StringCore with "name"
     proc set_hir_field with hir_pattern, name_key, pattern_value
 
     Note: Translate inner pattern
     Let inner_pattern be pattern_children
     Let hir_inner be proc translate_haskell_pattern with translator, inner_pattern
 
-    Let inner_key be proc create_string from StringCore with "inner_pattern"
+    Let inner_key be proc create_from_literal from StringCore with "inner_pattern"
     proc set_hir_field with hir_pattern, inner_key, hir_inner
 
     proc deallocate from Layout with name_key
@@ -1320,29 +1380,29 @@ Process called "translate_function_declaration" takes translator as Integer, fun
     lazy evaluation, and pattern matching compilation.
     @End Reasoning
 
-    Let hir_function be proc create_hir_node from HIR_FUNCTION
+    Let hir_function be proc create_hir_node with HIR_FUNCTION
 
     Let decl_value be proc get_haskell_ast_value from Parser with func_decl
     Let decl_children be proc get_haskell_ast_children from Parser with func_decl
 
     Note: Set function name
-    Let name_key be proc create_string from StringCore with "name"
+    Let name_key be proc create_from_literal from StringCore with "name"
     proc set_hir_field with hir_function, name_key, decl_value
 
     Note: Translate function body/equations
     Let body_expr be decl_children
     Let hir_body be proc translate_haskell_expression with translator, body_expr
 
-    Let body_key be proc create_string from StringCore with "body"
+    Let body_key be proc create_from_literal from StringCore with "body"
     proc set_hir_field with hir_function, body_key, hir_body
 
     Note: Add type information from semantic analysis
-    Let type_key be proc create_string from StringCore with "type"
+    Let type_key be proc create_from_literal from StringCore with "type"
     Let func_type be proc lookup_function_type with translator, decl_value
     proc set_hir_field with hir_function, type_key, func_type
 
     Note: Mark as pure function (unless in IO)
-    Let purity_key be proc create_string from StringCore with "pure"
+    Let purity_key be proc create_from_literal from StringCore with "pure"
     Let purity_analysis be proc analyze_function_purity with translator, func_decl
     proc set_hir_field with hir_function, purity_key, purity_analysis
 
@@ -1366,29 +1426,29 @@ Process called "translate_data_declaration" takes translator as Integer, data_de
     field information, and type parameters.
     @End Reasoning
 
-    Let hir_data_type be proc create_hir_node from HIR_DATA_TYPE
+    Let hir_data_type be proc create_hir_node with HIR_DATA_TYPE
 
     Let decl_value be proc get_haskell_ast_value from Parser with data_decl
     Let decl_children be proc get_haskell_ast_children from Parser with data_decl
 
     Note: Set type name
-    Let name_key be proc create_string from StringCore with "name"
+    Let name_key be proc create_from_literal from StringCore with "name"
     proc set_hir_field with hir_data_type, name_key, decl_value
 
     Note: Translate constructors
     Let constructors_expr be decl_children
     Let hir_constructors be proc translate_data_constructors with translator, constructors_expr
 
-    Let constructors_key be proc create_string from StringCore with "constructors"
+    Let constructors_key be proc create_from_literal from StringCore with "constructors"
     proc set_hir_field with hir_data_type, constructors_key, hir_constructors
 
     Note: Handle type parameters
-    Let params_key be proc create_string from StringCore with "type_parameters"
+    Let params_key be proc create_from_literal from StringCore with "type_parameters"
     Let type_params be proc extract_type_parameters with translator, data_decl
     proc set_hir_field with hir_data_type, params_key, type_params
 
     Note: Handle deriving clauses
-    Let deriving_key be proc create_string from StringCore with "deriving"
+    Let deriving_key be proc create_from_literal from StringCore with "deriving"
     Let deriving_info be proc extract_deriving_clauses with translator, data_decl
     proc set_hir_field with hir_data_type, deriving_key, deriving_info
 
@@ -1406,10 +1466,75 @@ Iterates the constructor list of a data declaration; each constructor (e.g., "Ju
 Process called "translate_data_constructors" takes translator as Integer, constructors_expr as Integer returns Integer:
     Note: Translate data constructors to HIR
 
+    @Implementation:
+    constructors_expr is the data declaration's constructor list (the parser
+    stores it in the data node's children slot). Each element is a constructor
+    node carrying the constructor name (value slot), a positional field-type
+    list, and - for record syntax - a parallel field-name list. We emit one HIR
+    constructor dict per constructor with keys "name", "arguments" (the list of
+    HIR field-type nodes the backend renders positionally) and, when the source
+    used record syntax, "field_names" (the parallel name strings). The backend's
+    translate_hir_constructor consumes exactly these keys.
+    @End Implementation
+
     Let hir_constructors be proc create_hir_list
 
-    Note: implementation  iterate through constructor list
-    Note: and translate each constructor with its field types
+    If constructors_expr is equal to 0:
+        Return hir_constructors
+    End If
+
+    Let ctor_count be proc list_length from List with constructors_expr
+    Let ctor_index be 0
+
+    While ctor_index is less than ctor_count:
+        Let ctor_node be proc list_get from List with constructors_expr, ctor_index
+
+        Let hir_ctor be proc create_hir_dict
+        Let name_key be proc create_from_literal from StringCore with "name"
+        Let arguments_key be proc create_from_literal from StringCore with "arguments"
+
+        Note: Constructor name.
+        Let ctor_name be proc get_constructor_name from Parser with ctor_node
+        proc set_hir_field with hir_ctor, name_key, ctor_name
+
+        Note: Positional field types -> a HIR list of translated type nodes.
+        Let hir_fields be proc create_hir_list
+        Let field_list be proc get_constructor_fields from Parser with ctor_node
+        If field_list is not equal to 0:
+            Let field_count be proc list_length from List with field_list
+            Let field_index be 0
+            While field_index is less than field_count:
+                Let field_type be proc list_get from List with field_list, field_index
+                Let hir_field_type be proc translate_haskell_type with translator, field_type
+                proc list_append from List with hir_fields, hir_field_type
+                Set field_index to field_index plus 1
+            End While
+        End If
+        proc set_hir_field with hir_ctor, arguments_key, hir_fields
+
+        Note: Record-syntax field names (0 for a positional constructor).
+        Let field_names be proc get_constructor_field_names from Parser with ctor_node
+        If field_names is not equal to 0:
+            Let names_key be proc create_from_literal from StringCore with "field_names"
+            Let hir_names be proc create_hir_list
+            Let name_count be proc list_length from List with field_names
+            Let name_index be 0
+            While name_index is less than name_count:
+                Let one_name be proc list_get from List with field_names, name_index
+                proc list_append from List with hir_names, one_name
+                Set name_index to name_index plus 1
+            End While
+            proc set_hir_field with hir_ctor, names_key, hir_names
+            proc deallocate from Layout with names_key
+        End If
+
+        proc list_append from List with hir_constructors, hir_ctor
+
+        proc deallocate from Layout with name_key
+        proc deallocate from Layout with arguments_key
+
+        Set ctor_index to ctor_index plus 1
+    End While
 
     Return hir_constructors
 End Process
@@ -1420,10 +1545,10 @@ End Process
 Process called "translate_type_declaration" takes translator as Integer, type_decl as Integer returns Integer:
     Note: Translate type synonym declaration to HIR
 
-    Let hir_type_alias be proc create_hir_node from HIR_TYPE_ALIAS
+    Let hir_type_alias be proc create_hir_node with HIR_TYPE_ALIAS
 
     Let decl_value be proc get_haskell_ast_value from Parser with type_decl
-    Let name_key be proc create_string from StringCore with "name"
+    Let name_key be proc create_from_literal from StringCore with "name"
     proc set_hir_field with hir_type_alias, name_key, decl_value
 
     proc deallocate from Layout with name_key
@@ -1443,19 +1568,19 @@ Process called "translate_class_declaration" takes translator as Integer, class_
     and superclass constraints.
     @End Reasoning
 
-    Let hir_type_class be proc create_hir_node from HIR_TYPE_CLASS
+    Let hir_type_class be proc create_hir_node with HIR_TYPE_CLASS
 
     Let decl_value be proc get_haskell_ast_value from Parser with class_decl
-    Let name_key be proc create_string from StringCore with "name"
+    Let name_key be proc create_from_literal from StringCore with "name"
     proc set_hir_field with hir_type_class, name_key, decl_value
 
     Note: Translate class methods
-    Let methods_key be proc create_string from StringCore with "methods"
+    Let methods_key be proc create_from_literal from StringCore with "methods"
     Let class_methods be proc translate_class_methods with translator, class_decl
     proc set_hir_field with hir_type_class, methods_key, class_methods
 
     Note: Handle superclass constraints
-    Let constraints_key be proc create_string from StringCore with "constraints"
+    Let constraints_key be proc create_from_literal from StringCore with "constraints"
     Let superclass_constraints be proc extract_superclass_constraints with translator, class_decl
     proc set_hir_field with hir_type_class, constraints_key, superclass_constraints
 
@@ -1478,16 +1603,16 @@ Process called "translate_instance_declaration" takes translator as Integer, ins
     resolution information.
     @End Reasoning
 
-    Let hir_instance be proc create_hir_node from HIR_INSTANCE
+    Let hir_instance be proc create_hir_node with HIR_INSTANCE
 
     Note: Extract instance head (class and type)
     Let instance_head be proc extract_instance_head with translator, instance_decl
 
-    Let head_key be proc create_string from StringCore with "instance_head"
+    Let head_key be proc create_from_literal from StringCore with "instance_head"
     proc set_hir_field with hir_instance, head_key, instance_head
 
     Note: Translate method implementations
-    Let implementations_key be proc create_string from StringCore with "implementations"
+    Let implementations_key be proc create_from_literal from StringCore with "implementations"
     Let method_impls be proc translate_instance_methods with translator, instance_decl
     proc set_hir_field with hir_instance, implementations_key, method_impls
 
@@ -1503,12 +1628,12 @@ End Process
 Process called "translate_signature_declaration" takes translator as Integer, sig_decl as Integer returns Integer:
     Note: Translate type signature to HIR
 
-    Let hir_signature be proc create_hir_node from HIR_TYPE_DECLARATION
+    Let hir_signature be proc create_hir_node with HIR_TYPE_DECLARATION
 
     Note: Extract function name and type
     Let sig_value be proc get_haskell_ast_value from Parser with sig_decl
 
-    Let name_key be proc create_string from StringCore with "name"
+    Let name_key be proc create_from_literal from StringCore with "name"
     proc set_hir_field with hir_signature, name_key, sig_value
 
     proc deallocate from Layout with name_key
@@ -1576,10 +1701,10 @@ Lowercase-led type names are type variables (universally quantified within their
 Process called "translate_type_variable" takes translator as Integer, type_expr as Integer returns Integer:
     Note: Translate type variable to HIR
 
-    Let hir_type_var be proc create_hir_node from HIR_TYPE_VARIABLE
+    Let hir_type_var be proc create_hir_node with HIR_TYPE_VARIABLE
 
     Let type_value be proc get_haskell_ast_value from Parser with type_expr
-    Let name_key be proc create_string from StringCore with "name"
+    Let name_key be proc create_from_literal from StringCore with "name"
     proc set_hir_field with hir_type_var, name_key, type_value
 
     proc deallocate from Layout with name_key
@@ -1593,10 +1718,10 @@ Uppercase-led type names are type constructors (Int, Maybe, IO, etc.); HIR TypeC
 Process called "translate_type_constructor" takes translator as Integer, type_expr as Integer returns Integer:
     Note: Translate type constructor to HIR
 
-    Let hir_type_con be proc create_hir_node from HIR_TYPE_PRIMITIVE
+    Let hir_type_con be proc create_hir_node with HIR_TYPE_PRIMITIVE
 
     Let type_value be proc get_haskell_ast_value from Parser with type_expr
-    Let name_key be proc create_string from StringCore with "name"
+    Let name_key be proc create_from_literal from StringCore with "name"
     proc set_hir_field with hir_type_con, name_key, type_value
 
     proc deallocate from Layout with name_key
@@ -1610,19 +1735,21 @@ End Process
 Process called "translate_function_type" takes translator as Integer, type_expr as Integer returns Integer:
     Note: Translate function type to HIR
 
-    Let hir_func_type be proc create_hir_node from HIR_TYPE_FUNCTION
+    Let hir_func_type be proc create_hir_node with HIR_TYPE_FUNCTION
 
-    Let type_children be proc get_haskell_ast_children from Parser with type_expr
-
-    Note: Translate argument and result types
-    Let arg_type_expr be proc list_get from List with type_children, 0
-    Let result_type_expr be proc list_get from List with type_children, 1
+    Note: The parser stores an AST_TYPE_FUNCTION as two DIRECT slots, not a
+    Note: children list: the argument type in the value slot (@8) and the result
+    Note: type in the children slot (@16). Reading them via list_get would treat
+    Note: a single type node as a list and dereference garbage, so we read the
+    Note: slots directly.
+    Let arg_type_expr be proc get_haskell_ast_value from Parser with type_expr
+    Let result_type_expr be proc get_haskell_ast_children from Parser with type_expr
 
     Let hir_arg_type be proc translate_haskell_type with translator, arg_type_expr
     Let hir_result_type be proc translate_haskell_type with translator, result_type_expr
 
-    Let arg_key be proc create_string from StringCore with "argument_type"
-    Let result_key be proc create_string from StringCore with "result_type"
+    Let arg_key be proc create_from_literal from StringCore with "argument_type"
+    Let result_key be proc create_from_literal from StringCore with "result_type"
 
     proc set_hir_field with hir_func_type, arg_key, hir_arg_type
     proc set_hir_field with hir_func_type, result_key, hir_result_type
@@ -1639,31 +1766,27 @@ End Process
 Process called "translate_type_application" takes translator as Integer, type_expr as Integer returns Integer:
     Note: Translate type application to HIR
 
-    Let hir_type_app be proc create_hir_node from HIR_TYPE_APPLICATION
+    Let hir_type_app be proc create_hir_node with HIR_TYPE_APPLICATION
 
-    Let type_children be proc get_haskell_ast_children from Parser with type_expr
-
-    Note: Translate constructor and arguments
-    Let type_constructor be proc list_get from List with type_children, 0
-    Let type_args be proc list_get from List with type_children, 1
+    Note: The parser builds type application "F a b" left-nested as single-arg
+    Note: AST_TYPE_APPLICATION nodes, each storing the applied-to type in the
+    Note: value slot (@8) and the single argument in the children slot (@16) -
+    Note: DIRECT slots, not a children list. We read both slots directly and
+    Note: emit a one-element argument list (deeper nesting recurses through the
+    Note: constructor side, preserving "F a b" as "((F a) b)").
+    Let type_constructor be proc get_haskell_ast_value from Parser with type_expr
+    Let type_arg be proc get_haskell_ast_children from Parser with type_expr
 
     Let hir_constructor be proc translate_haskell_type with translator, type_constructor
     Let hir_args be proc create_hir_list
 
-    Note: Translate type arguments
-    Let arg_list be proc get_haskell_ast_children from Parser with type_args
-    Let arg_count be proc list_length from List with arg_list
-    Let arg_index be 0
-
-    While arg_index is less than arg_count:
-        Let arg_type be proc list_get from List with arg_list, arg_index
-        Let hir_arg_type be proc translate_haskell_type with translator, arg_type
+    If type_arg is not equal to 0:
+        Let hir_arg_type be proc translate_haskell_type with translator, type_arg
         proc list_append from List with hir_args, hir_arg_type
-        Set arg_index to arg_index plus 1
-    End While
+    End If
 
-    Let constructor_key be proc create_string from StringCore with "constructor"
-    Let args_key be proc create_string from StringCore with "arguments"
+    Let constructor_key be proc create_from_literal from StringCore with "constructor"
+    Let args_key be proc create_from_literal from StringCore with "arguments"
 
     proc set_hir_field with hir_type_app, constructor_key, hir_constructor
     proc set_hir_field with hir_type_app, args_key, hir_args
@@ -1680,14 +1803,16 @@ End Process
 Process called "translate_list_type" takes translator as Integer, type_expr as Integer returns Integer:
     Note: Translate list type to HIR
 
-    Let hir_list_type be proc create_hir_node from HIR_TYPE_LIST
+    Let hir_list_type be proc create_hir_node with HIR_TYPE_LIST
 
-    Let type_children be proc get_haskell_ast_children from Parser with type_expr
-    Let element_type_expr be proc list_get from List with type_children, 0
+    Note: The parser stores an AST_TYPE_LIST's element type in the children slot
+    Note: (@16) as a single DIRECT type node, not a list, so we read the slot
+    Note: directly rather than via list_get.
+    Let element_type_expr be proc get_haskell_ast_children from Parser with type_expr
 
     Let hir_element_type be proc translate_haskell_type with translator, element_type_expr
 
-    Let element_key be proc create_string from StringCore with "element_type"
+    Let element_key be proc create_from_literal from StringCore with "element_type"
     proc set_hir_field with hir_list_type, element_key, hir_element_type
 
     proc deallocate from Layout with element_key
@@ -1701,7 +1826,7 @@ End Process
 Process called "translate_tuple_type" takes translator as Integer, type_expr as Integer returns Integer:
     Note: Translate tuple type to HIR
 
-    Let hir_tuple_type be proc create_hir_node from HIR_TYPE_TUPLE
+    Let hir_tuple_type be proc create_hir_node with HIR_TYPE_TUPLE
 
     Let type_children be proc get_haskell_ast_children from Parser with type_expr
 
@@ -1717,7 +1842,7 @@ Process called "translate_tuple_type" takes translator as Integer, type_expr as 
         Set elem_index to elem_index plus 1
     End While
 
-    Let elements_key be proc create_string from StringCore with "element_types"
+    Let elements_key be proc create_from_literal from StringCore with "element_types"
     proc set_hir_field with hir_tuple_type, elements_key, hir_element_types
 
     proc deallocate from Layout with elements_key
@@ -1741,30 +1866,30 @@ Process called "translate_haskell_module" takes translator as Integer, module_as
     with proper namespace management.
     @End Reasoning
 
-    Let hir_module be proc create_hir_node from HIR_MODULE
+    Let hir_module be proc create_hir_node with HIR_MODULE
 
     Let module_children be proc get_haskell_ast_children from Parser with module_ast
 
     Note: Extract module name
     Let module_value be proc get_haskell_ast_value from Parser with module_ast
     If module_value is not equal to 0:
-        Let name_key be proc create_string from StringCore with "name"
+        Let name_key be proc create_from_literal from StringCore with "name"
         proc set_hir_field with hir_module, name_key, module_value
         proc deallocate from Layout with name_key
     End If
 
     Note: Translate imports
-    Let imports_key be proc create_string from StringCore with "imports"
+    Let imports_key be proc create_from_literal from StringCore with "imports"
     Let hir_imports be proc translate_module_imports with translator, module_children
     proc set_hir_field with hir_module, imports_key, hir_imports
 
     Note: Translate exports
-    Let exports_key be proc create_string from StringCore with "exports"
+    Let exports_key be proc create_from_literal from StringCore with "exports"
     Let hir_exports be proc translate_module_exports with translator, module_children
     proc set_hir_field with hir_module, exports_key, hir_exports
 
     Note: Translate declarations
-    Let declarations_key be proc create_string from StringCore with "declarations"
+    Let declarations_key be proc create_from_literal from StringCore with "declarations"
     Let hir_declarations be proc translate_module_declarations with translator, module_children
     proc set_hir_field with hir_module, declarations_key, hir_declarations
 
@@ -1922,17 +2047,17 @@ Process called "analyze_function_purity" takes translator as Integer, func_decl 
     Let has_exceptions be proc check_for_exceptions with translator, func_body
 
     If has_io is equal to 1:
-        Return proc create_string from StringCore with "false"
+        Return proc create_from_literal from StringCore with "false"
     End If
 
     If has_mutation is equal to 1:
-        Return proc create_string from StringCore with "false"
+        Return proc create_from_literal from StringCore with "false"
     End If
 
     If has_exceptions is equal to 1:
-        Return proc create_string from StringCore with "false"
+        Return proc create_from_literal from StringCore with "false"
     End If
-    Return proc create_string from StringCore with "true"
+    Return proc create_from_literal from StringCore with "true"
 End Process
 
 @Reasoning:
@@ -1941,7 +2066,28 @@ End Process
 Process called "extract_type_parameters" takes translator as Integer, data_decl as Integer returns Integer:
     Note: Extract type parameters from data declaration
 
+    @Implementation:
+    The parser collects the lowercase type variables of "data T a b = ..." into
+    a list stored on the data node (slot @32). We copy each variable name string
+    into the HIR list the backend reads under "type_parameters" so "data T a b"
+    round-trips with its parameters intact.
+    @End Implementation
+
     Let type_params be proc create_hir_list
+
+    Let param_list be proc get_data_type_parameters from Parser with data_decl
+    If param_list is equal to 0:
+        Return type_params
+    End If
+
+    Let param_count be proc list_length from List with param_list
+    Let param_index be 0
+    While param_index is less than param_count:
+        Let param_name be proc list_get from List with param_list, param_index
+        proc list_append from List with type_params, param_name
+        Set param_index to param_index plus 1
+    End While
+
     Return type_params
 End Process
 
@@ -1951,7 +2097,32 @@ End Process
 Process called "extract_deriving_clauses" takes translator as Integer, data_decl as Integer returns Integer:
     Note: Extract deriving clauses from data declaration
 
+    @Implementation:
+    The parser stores the deriving-clause classes as a list of
+    AST_TYPE_CONSTRUCTOR nodes (slot @24), each carrying the class name in its
+    value slot. The backend's data-type emitter joins the deriving list as raw
+    name strings, so we extract each class-name string into the HIR list under
+    "deriving" - producing "deriving (Eq, Show)" on round-trip.
+    @End Implementation
+
     Let deriving_info be proc create_hir_list
+
+    Let deriving_list be proc get_data_deriving from Parser with data_decl
+    If deriving_list is equal to 0:
+        Return deriving_info
+    End If
+
+    Let class_count be proc list_length from List with deriving_list
+    Let class_index be 0
+    While class_index is less than class_count:
+        Let class_node be proc list_get from List with deriving_list, class_index
+        Let class_name be proc get_haskell_ast_value from Parser with class_node
+        If class_name is not equal to 0:
+            proc list_append from List with deriving_info, class_name
+        End If
+        Set class_index to class_index plus 1
+    End While
+
     Return deriving_info
 End Process
 
@@ -1961,7 +2132,58 @@ Walks the class body for method signatures; each method becomes a HIR ClassMetho
 Process called "translate_class_methods" takes translator as Integer, class_decl as Integer returns Integer:
     Note: Translate type class methods
 
+    @Implementation:
+    The parser stores the class "where" body members in the children slot
+    (slot @16). A class member is normally a method type signature
+    (AST_SIGNATURE_DECLARATION: name in value slot, parsed type in children
+    slot) but may also be a default-method definition (AST_FUNCTION_DECLARATION:
+    name in value slot, body in children slot). We emit one HIR method dict per
+    member carrying "name" and, for a signature, "type" (the translated type
+    node the backend renders as "<name> :: <type>"). Default bodies are carried
+    under "body" so no information is dropped.
+    @End Implementation
+
     Let class_methods be proc create_hir_list
+
+    Let members be proc get_haskell_ast_children from Parser with class_decl
+    If members is equal to 0:
+        Return class_methods
+    End If
+
+    Let member_count be proc list_length from List with members
+    Let member_index be 0
+
+    While member_index is less than member_count:
+        Let member be proc list_get from List with members, member_index
+        Let member_type be proc get_haskell_ast_type from Parser with member
+
+        Let hir_method be proc create_hir_dict
+        Let name_key be proc create_from_literal from StringCore with "name"
+        Let method_name be proc get_haskell_ast_value from Parser with member
+        proc set_hir_field with hir_method, name_key, method_name
+
+        If member_type is equal to AST_SIGNATURE_DECLARATION from Parser:
+            Let type_key be proc create_from_literal from StringCore with "type"
+            Let sig_type_node be proc get_signature_type from Parser with member
+            Let hir_method_type be proc translate_haskell_type with translator, sig_type_node
+            proc set_hir_field with hir_method, type_key, hir_method_type
+            proc deallocate from Layout with type_key
+        End If
+
+        If member_type is equal to AST_FUNCTION_DECLARATION from Parser:
+            Let body_key be proc create_from_literal from StringCore with "body"
+            Let body_node be proc get_haskell_ast_children from Parser with member
+            Let hir_body be proc translate_haskell_expression with translator, body_node
+            proc set_hir_field with hir_method, body_key, hir_body
+            proc deallocate from Layout with body_key
+        End If
+
+        proc list_append from List with class_methods, hir_method
+        proc deallocate from Layout with name_key
+
+        Set member_index to member_index plus 1
+    End While
+
     Return class_methods
 End Process
 
@@ -1981,8 +2203,21 @@ The instance head ("instance Eq (List a) where ...") is the class + type-being-i
 Process called "extract_instance_head" takes translator as Integer, instance_decl as Integer returns Integer:
     Note: Extract instance head (class and type)
 
-    Let instance_head be proc create_hir_dict
-    Return instance_head
+    @Implementation:
+    The backend's instance emitter concatenates the "instance_head" value
+    directly into "instance <head> where", so it must be a string. The parser
+    captures the class name of the instance head in the instance node's value
+    slot; we return that string (duplicated so the HIR owns its copy). A
+    nameless head (malformed instance) falls back to an empty string so the
+    emitter still produces a syntactically valid "instance where".
+    @End Implementation
+
+    Let head_name be proc get_haskell_ast_value from Parser with instance_decl
+    If head_name is equal to 0:
+        Return proc create_from_literal from StringCore with ""
+    End If
+
+    Return proc string_duplicate from StringCore with head_name
 End Process
 
 @Reasoning:
@@ -1991,7 +2226,49 @@ Walks an instance's method definitions; each must match a method declared by the
 Process called "translate_instance_methods" takes translator as Integer, instance_decl as Integer returns Integer:
     Note: Translate instance method implementations
 
+    @Implementation:
+    The parser stores the instance "where" body members in the children slot
+    (slot @16). Each member is a method binding (AST_FUNCTION_DECLARATION: name
+    in value slot, body expression in children slot). We emit one HIR
+    implementation dict per member carrying "name" and "body" (the translated
+    body expression). The backend's instance emitter renders each as
+    "<name> = <body>". Type signatures occasionally permitted inside an instance
+    body are also captured (name only) so they are not silently dropped.
+    @End Implementation
+
     Let method_impls be proc create_hir_list
+
+    Let members be proc get_haskell_ast_children from Parser with instance_decl
+    If members is equal to 0:
+        Return method_impls
+    End If
+
+    Let member_count be proc list_length from List with members
+    Let member_index be 0
+
+    While member_index is less than member_count:
+        Let member be proc list_get from List with members, member_index
+        Let member_type be proc get_haskell_ast_type from Parser with member
+
+        Let hir_impl be proc create_hir_dict
+        Let name_key be proc create_from_literal from StringCore with "name"
+        Let impl_name be proc get_haskell_ast_value from Parser with member
+        proc set_hir_field with hir_impl, name_key, impl_name
+
+        If member_type is equal to AST_FUNCTION_DECLARATION from Parser:
+            Let body_key be proc create_from_literal from StringCore with "body"
+            Let body_node be proc get_haskell_ast_children from Parser with member
+            Let hir_body be proc translate_haskell_expression with translator, body_node
+            proc set_hir_field with hir_impl, body_key, hir_body
+            proc deallocate from Layout with body_key
+        End If
+
+        proc list_append from List with method_impls, hir_impl
+        proc deallocate from Layout with name_key
+
+        Set member_index to member_index plus 1
+    End While
+
     Return method_impls
 End Process
 
@@ -2005,11 +2282,10 @@ Process called "generate_temp_variable" takes translator as Integer returns Inte
     Set counter to counter plus 1
     proc memory_set_int64 from Layout with translator, 32, counter
 
-    Let prefix be proc create_string from StringCore with "_temp"
-    Let counter_str be proc int_to_string from StringCore with counter
-    Let temp_name be proc string_concat from StringCore with prefix, counter_str
+    Let prefix be proc create_from_literal from StringCore with "_temp"
+    Let counter_str be proc integer_to_string from StringPrim with counter
+    Let temp_name be proc string_concat from StringPrim with prefix, counter_str
 
-    proc deallocate from Layout with prefix
     proc deallocate from Layout with counter_str
 
     Return temp_name
@@ -2022,7 +2298,7 @@ Process called "add_translation_error" takes translator as Integer, message as I
     Note: Add translation error to error list
 
     Let error_list be proc memory_get_int64 from Layout with translator, 56
-    Let error_msg be proc create_string from StringCore with message
+    Let error_msg be proc string_duplicate from StringCore with message
 
     proc list_push from List with error_list, error_msg
 
@@ -2084,9 +2360,9 @@ Process called "create_closure_binding" takes translator as Integer, var_name as
     Note: Create closure binding for free variable
 
     Let binding be proc create_hir_dict
-    Let name_key be proc create_string from StringCore with "name"
-    Let type_key be proc create_string from StringCore with "type"
-    Let value_key be proc create_string from StringCore with "value"
+    Let name_key be proc create_from_literal from StringCore with "name"
+    Let type_key be proc create_from_literal from StringCore with "type"
+    Let value_key be proc create_from_literal from StringCore with "value"
 
     proc set_hir_field with binding, name_key, var_name
 
@@ -2095,7 +2371,7 @@ Process called "create_closure_binding" takes translator as Integer, var_name as
     proc set_hir_field with binding, type_key, var_type
 
     Note: Value will be captured at runtime
-    Let runtime_capture be proc create_string from StringCore with "runtime_capture"
+    Let runtime_capture be proc create_from_literal from StringCore with "runtime_capture"
     proc set_hir_field with binding, value_key, runtime_capture
 
     proc deallocate from Layout with name_key
@@ -2113,8 +2389,8 @@ Process called "translate_binding" takes translator as Integer, binding_node as 
     Note: Translate individual let binding
 
     Let hir_binding be proc create_hir_dict
-    Let pattern_key be proc create_string from StringCore with "pattern"
-    Let expression_key be proc create_string from StringCore with "expression"
+    Let pattern_key be proc create_from_literal from StringCore with "pattern"
+    Let expression_key be proc create_from_literal from StringCore with "expression"
 
     Let binding_pattern be proc get_binding_pattern from Parser with binding_node
     Let binding_expr be proc get_binding_expression from Parser with binding_node
@@ -2132,6 +2408,39 @@ Process called "translate_binding" takes translator as Integer, binding_node as 
 End Process
 
 @Reasoning:
+Extracts the bound name from a binding's left-hand side. The LHS may be a
+bare name string (function/value binding, where get_binding_pattern
+returns the name directly) or a variable-pattern AST node whose name is in
+its value slot. This normaliser returns the name string in both cases.
+@End Reasoning
+@Implementation:
+Returns 0 for a null input. Reads the first word: an AST variable/
+constructor pattern node carries one of the parser's AST pattern type tags
+(>= AST_PATTERN_VARIABLE), in which case the bound name lives in the
+node's value slot @8. Any other input is assumed to already be the name
+string and is returned unchanged.
+@End Implementation
+Process called "extract_pattern_name" takes binding_pattern as Integer returns Integer:
+    Note: Return the bound name string from a binding LHS
+
+    If binding_pattern is equal to 0:
+        Return 0
+    End If
+
+    Let first_word be proc memory_get_int64 from Layout with binding_pattern, 0
+
+    Note: AST pattern node tags occupy the 4001..4099 range in the parser.
+    If first_word is greater than or equal to AST_PATTERN_VARIABLE from Parser:
+        If first_word is less than 4100:
+            Return proc memory_get_int64 from Layout with binding_pattern, 8
+        End If
+    End If
+
+    Note: Already a name string
+    Return binding_pattern
+End Process
+
+@Reasoning:
 Detects whether a binding's RHS references the binding's own LHS name; positive matches indicate recursion and require letrec-style emission.
 @End Reasoning
 Process called "check_self_reference" takes translator as Integer, binding_node as Integer returns Integer:
@@ -2139,7 +2448,7 @@ Process called "check_self_reference" takes translator as Integer, binding_node 
 
     Let binding_pattern be proc get_binding_pattern from Parser with binding_node
     Let binding_expr be proc get_binding_expression from Parser with binding_node
-    Let pattern_name be proc extract_pattern_name from binding_pattern
+    Let pattern_name be proc extract_pattern_name with binding_pattern
     Let referenced_vars be proc extract_referenced_variables with translator, binding_expr
 
     Let ref_count be proc list_length from List with referenced_vars
@@ -2166,9 +2475,9 @@ Process called "translate_case_alternative" takes translator as Integer, alt_nod
     Note: Translate single case alternative
 
     Let hir_alternative be proc create_hir_dict
-    Let pattern_key be proc create_string from StringCore with "pattern"
-    Let expression_key be proc create_string from StringCore with "expression"
-    Let guard_key be proc create_string from StringCore with "guard"
+    Let pattern_key be proc create_from_literal from StringCore with "pattern"
+    Let expression_key be proc create_from_literal from StringCore with "expression"
+    Let guard_key be proc create_from_literal from StringCore with "guard"
 
     Let alt_pattern be proc get_alternative_pattern from Parser with alt_node
     Let alt_expr be proc get_alternative_expression from Parser with alt_node
@@ -2222,15 +2531,15 @@ Process called "translate_do_statement" takes translator as Integer, stmt_node a
 
     Let hir_statement be proc create_hir_dict
     Let stmt_type be proc get_haskell_ast_type from Parser with stmt_node
-    Let type_key be proc create_string from StringCore with "type"
+    Let type_key be proc create_from_literal from StringCore with "type"
 
     Note: Expression statement
     If stmt_type is equal to AST_DO_EXPR from Parser:
-        Let expr_key be proc create_string from StringCore with "expression"
+        Let expr_key be proc create_from_literal from StringCore with "expression"
         Let stmt_expr be proc get_statement_expression from Parser with stmt_node
         Let hir_expr be proc translate_haskell_expression with translator, stmt_expr
 
-        Let do_expr_type be proc create_string from StringCore with "expression"
+        Let do_expr_type be proc create_from_literal from StringCore with "expression"
         proc set_hir_field with hir_statement, type_key, do_expr_type
         proc set_hir_field with hir_statement, expr_key, hir_expr
 
@@ -2240,8 +2549,8 @@ Process called "translate_do_statement" takes translator as Integer, stmt_node a
 
     Note: Bind statement (pattern <- expression)
     If stmt_type is equal to AST_DO_BIND from Parser:
-        Let pattern_key be proc create_string from StringCore with "pattern"
-        Set expr_key to proc create_string from StringCore with "expression"
+        Let pattern_key be proc create_from_literal from StringCore with "pattern"
+        Set expr_key to proc create_from_literal from StringCore with "expression"
 
         Let stmt_pattern be proc get_bind_pattern from Parser with stmt_node
         Set stmt_expr to proc get_bind_expression from Parser with stmt_node
@@ -2249,7 +2558,7 @@ Process called "translate_do_statement" takes translator as Integer, stmt_node a
         Let hir_pattern be proc translate_haskell_pattern with translator, stmt_pattern
         Set hir_expr to proc translate_haskell_expression with translator, stmt_expr
 
-        Let bind_type be proc create_string from StringCore with "bind"
+        Let bind_type be proc create_from_literal from StringCore with "bind"
         proc set_hir_field with hir_statement, type_key, bind_type
         proc set_hir_field with hir_statement, pattern_key, hir_pattern
         proc set_hir_field with hir_statement, expr_key, hir_expr
@@ -2261,11 +2570,11 @@ Process called "translate_do_statement" takes translator as Integer, stmt_node a
 
     Note: Let statement
     If stmt_type is equal to AST_DO_LET from Parser:
-        Let bindings_key be proc create_string from StringCore with "bindings"
+        Let bindings_key be proc create_from_literal from StringCore with "bindings"
         Let stmt_bindings be proc get_let_bindings from Parser with stmt_node
         Let hir_bindings be proc translate_let_bindings with translator, stmt_bindings
 
-        Let let_type be proc create_string from StringCore with "let"
+        Let let_type be proc create_from_literal from StringCore with "let"
         proc set_hir_field with hir_statement, type_key, let_type
         proc set_hir_field with hir_statement, bindings_key, hir_bindings
 
@@ -2284,13 +2593,13 @@ Process called "extract_monad_name" takes type_info as Integer returns Integer:
     Note: Extract monad name from type information
 
     Note: Parse type to find monad constructor
-    Let type_constructor be proc get_type_constructor from type_info
+    Let type_constructor be proc get_type_constructor with type_info
 
     Note: Common monads
-    Let io_type be proc create_string from StringCore with "IO"
-    Let maybe_type be proc create_string from StringCore with "Maybe"
-    Let list_type be proc create_string from StringCore with "[]"
-    Let state_type be proc create_string from StringCore with "State"
+    Let io_type be proc create_from_literal from StringCore with "IO"
+    Let maybe_type be proc create_from_literal from StringCore with "Maybe"
+    Let list_type be proc create_from_literal from StringCore with "[]"
+    Let state_type be proc create_from_literal from StringCore with "State"
 
     Let io_match be proc string_compare from StringCore with type_constructor, io_type
     If io_match is equal to 0:
@@ -2371,8 +2680,8 @@ Process called "translate_generator" takes translator as Integer, generator as I
     Note: Translate single generator (pattern <- expression)
 
     Let hir_generator be proc create_hir_dict
-    Let pattern_key be proc create_string from StringCore with "pattern"
-    Let expression_key be proc create_string from StringCore with "expression"
+    Let pattern_key be proc create_from_literal from StringCore with "pattern"
+    Let expression_key be proc create_from_literal from StringCore with "expression"
 
     Let gen_pattern be proc get_generator_pattern from Parser with generator
     Let gen_expr be proc get_generator_expression from Parser with generator
@@ -2396,9 +2705,9 @@ Process called "translate_import_declaration" takes translator as Integer, impor
     Note: Translate import declaration to HIR
 
     Let hir_import be proc create_hir_dict
-    Let module_key be proc create_string from StringCore with "module"
-    Let qualified_key be proc create_string from StringCore with "qualified"
-    Let alias_key be proc create_string from StringCore with "alias"
+    Let module_key be proc create_from_literal from StringCore with "module"
+    Let qualified_key be proc create_from_literal from StringCore with "qualified"
+    Let alias_key be proc create_from_literal from StringCore with "alias"
 
     Let import_module be proc get_import_module from Parser with import_node
     Let is_qualified be proc get_import_qualified from Parser with import_node
@@ -2407,7 +2716,7 @@ Process called "translate_import_declaration" takes translator as Integer, impor
     proc set_hir_field with hir_import, module_key, import_module
 
     If is_qualified is equal to 1:
-        Let true_str be proc create_string from StringCore with "true"
+        Let true_str be proc create_from_literal from StringCore with "true"
         proc set_hir_field with hir_import, qualified_key, true_str
         proc deallocate from Layout with true_str
     End If
@@ -2430,8 +2739,8 @@ Process called "translate_export_declaration" takes translator as Integer, expor
     Note: Translate export declaration to HIR
 
     Let hir_export be proc create_hir_dict
-    Let symbol_key be proc create_string from StringCore with "symbol"
-    Let type_key be proc create_string from StringCore with "type"
+    Let symbol_key be proc create_from_literal from StringCore with "symbol"
+    Let type_key be proc create_from_literal from StringCore with "type"
 
     Let export_symbol be proc get_export_symbol from Parser with export_node
     Let export_type be proc get_export_type from Parser with export_node
@@ -2479,7 +2788,7 @@ Extracts the outermost type constructor from a possibly-applied type ("Maybe Int
 @End Reasoning
 Process called "get_type_constructor" takes type_info as Integer returns Integer:
     Note: Extract type constructor from type info
-    Return proc create_string from StringCore with "IO"
+    Return proc create_from_literal from StringCore with "IO"
 End Process
 
 @Reasoning:
@@ -2557,14 +2866,14 @@ Process called "translate_haskell_to_hir" takes haskell_ast as Integer, semantic
     Let hir_module be proc translate_haskell_module with translator, haskell_ast
 
     Note: Check for translation errors
-    Let error_count be proc get_translation_error_count from translator
+    Let error_count be proc get_translation_error_count with translator
 
     If error_count is greater than 0:
-        proc destroy_haskell_to_hir_translator from translator
+        proc destroy_haskell_to_hir_translator with translator
         Return 0
     End If
 
-    proc destroy_haskell_to_hir_translator from translator
+    proc destroy_haskell_to_hir_translator with translator
 
     Return hir_module
 End Process
