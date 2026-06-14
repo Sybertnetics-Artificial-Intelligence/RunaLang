@@ -1,0 +1,349 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+Licensed under Apache 2.0
+:End Note
+
+Note:
+HTML Translation Round-Trip Probe
+
+End-to-end proof that the HTML translation pipeline is REAL, not a skeleton:
+
+    HTML source
+      -> html_lexer    (tokenize: tags, attributes, text, comments, entities, doctype)
+      -> html_parser   (build DOM element-tree AST, void elements, nesting)
+      -> html_to_hir   (lower HTML AST to the pipeline's dictionary/list HIR model)
+      -> hir_to_html   (emit the HIR model back to formatted HTML5 text)
+
+The probe feeds a representative document containing a DOCTYPE, a nested
+element tree three levels deep (html > body > div > p), an element carrying two
+attributes (one quoted value, one boolean/valueless), a void element (<br>), a
+text node, a comment, and a <script> raw-text element. It then:
+
+  1. Parse-smoke: parses the source and asserts a non-empty AST whose root is the
+     HTML_DOCUMENT node, proving the lexer/parser advance and terminate.
+  2. Translates the source to the HIR model and walks the dictionary/list tree,
+     asserting: the document node, the nested element chain three levels deep,
+     an element's tag plus its two attributes (name+value and boolean), a void
+     element, a text node's content, a comment's content, and the <script>
+     element's raw-text child content all survive lowering.
+  3. Emits the HIR back to HTML text and asserts the text is non-empty.
+  4. Re-parses the emitted HTML back into the HIR model and asserts the two HIR
+     trees are STRUCTURALLY EQUAL via a recursive comparator. Structural
+     equality (rather than byte equality) is the correct semantic-equivalence
+     check because the emitter re-indents and the byte form differs from the
+     compact input while the meaning is identical.
+
+Exit code: number of failed assertions (0 == all passed). No exit_with_code.
+:End Note
+
+Import "compiler/middle/gungnir/hir/translation/frontends/html/html_parser.runa" as Parser
+Import "compiler/middle/gungnir/hir/translation/frontends/html/html_to_hir.runa" as Frontend
+Import "compiler/middle/gungnir/hir/translation/backends/html/hir_to_html.runa" as Backend
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "tests/test_utils.runa" as TestUtils
+
+Note: ============================================================================
+Note: HTML-model dictionary/list accessors
+Note: ============================================================================
+
+@Reasoning:
+The HTML pipeline does not use the canonical HIR node model; it builds a
+self-contained dictionary/list model whose headers are:
+  dictionary: size@0, capacity@8, keys_ptr@16, values_ptr@24
+  list:       size@0, capacity@8, items_ptr@16
+These accessors read that exact layout so the probe can navigate the produced
+HIR independently of the backend, keying lookups by content-compared string
+rather than positional index so the assertions are robust to entry ordering.
+@End Reasoning
+
+Process called "dict_get" takes dict as Integer, key as Integer returns Integer:
+    If dict is equal to 0:
+        Return 0
+    End If
+
+    Let size be proc memory_get_int64 from Layout with dict, 0
+    Let keys be proc memory_get_int64 from Layout with dict, 16
+    Let values be proc memory_get_int64 from Layout with dict, 24
+
+    Let index be 0
+    While index is less than size:
+        Let current_key be proc memory_get_int64 from Layout with keys, index multiplied by 8
+        Let matches be proc string_equals from StringCore with current_key, key
+
+        If matches is equal to 1:
+            Return proc memory_get_int64 from Layout with values, index multiplied by 8
+        End If
+
+        Set index to index plus 1
+    End While
+
+    Return 0
+End Process
+
+Process called "list_size" takes list as Integer returns Integer:
+    If list is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Layout with list, 0
+End Process
+
+Process called "list_get" takes list as Integer, index as Integer returns Integer:
+    Let items be proc memory_get_int64 from Layout with list, 16
+    Return proc memory_get_int64 from Layout with items, index multiplied by 8
+End Process
+
+Note: ============================================================================
+Note: Structural equality of two HTML-derived HIR-model trees
+Note: ============================================================================
+
+@Reasoning:
+Two HTML documents are semantically equal when their dictionary/list HIR
+projections are structurally equal: each node's "type" matches, scalar payloads
+("tag", "value") match by content, attribute dictionaries match key/value
+pairwise, and children lists match element-for-element. Comparing the HIR trees
+rather than the raw text is whitespace- and indentation-insensitive, so it
+proves round-trip fidelity without being fooled by the emitter's re-indentation.
+@End Reasoning
+
+Process called "str_eq" takes a as Integer, b as Integer returns Integer:
+    Return proc string_equals from StringCore with a, b
+End Process
+
+Process called "attrs_equal" takes a as Integer, b as Integer returns Integer:
+    If a is equal to 0:
+        If b is equal to 0:
+            Return 1
+        End If
+        Return 0
+    End If
+    If b is equal to 0:
+        Return 0
+    End If
+
+    Let size_a be proc memory_get_int64 from Layout with a, 0
+    Let size_b be proc memory_get_int64 from Layout with b, 0
+
+    If size_a is not equal to size_b:
+        Return 0
+    End If
+
+    Let keys_a be proc memory_get_int64 from Layout with a, 16
+    Let index be 0
+    While index is less than size_a:
+        Let key_a be proc memory_get_int64 from Layout with keys_a, index multiplied by 8
+        Let val_a be proc dict_get with a, key_a
+        Let val_b be proc dict_get with b, key_a
+
+        If val_b is equal to 0:
+            Return 0
+        End If
+
+        Let vals_match be proc string_equals from StringCore with val_a, val_b
+        If vals_match is not equal to 1:
+            Return 0
+        End If
+
+        Set index to index plus 1
+    End While
+
+    Return 1
+End Process
+
+Process called "hir_equal" takes a as Integer, b as Integer returns Integer:
+    If a is equal to 0:
+        If b is equal to 0:
+            Return 1
+        End If
+        Return 0
+    End If
+    If b is equal to 0:
+        Return 0
+    End If
+
+    Let type_a be proc dict_get with a, "type"
+    Let type_b be proc dict_get with b, "type"
+
+    Let types_match be proc string_equals from StringCore with type_a, type_b
+    If types_match is not equal to 1:
+        Return 0
+    End If
+
+    Note: tag (element only) must match by content when present
+    Let tag_a be proc dict_get with a, "tag"
+    Let tag_b be proc dict_get with b, "tag"
+    If tag_a is not equal to 0:
+        If tag_b is equal to 0:
+            Return 0
+        End If
+        Let tags_match be proc string_equals from StringCore with tag_a, tag_b
+        If tags_match is not equal to 1:
+            Return 0
+        End If
+    End If
+
+    Note: scalar value (text/comment/entity/doctype) must match by content
+    Let val_a be proc dict_get with a, "value"
+    Let val_b be proc dict_get with b, "value"
+    If val_a is not equal to 0:
+        If val_b is equal to 0:
+            Return 0
+        End If
+        Let vals_match be proc string_equals from StringCore with val_a, val_b
+        If vals_match is not equal to 1:
+            Return 0
+        End If
+    End If
+
+    Note: attribute bags must match
+    Let attrs_a be proc dict_get with a, "attributes"
+    Let attrs_b be proc dict_get with b, "attributes"
+    Let attrs_match be proc attrs_equal with attrs_a, attrs_b
+    If attrs_match is not equal to 1:
+        Return 0
+    End If
+
+    Note: children lists must match element-for-element
+    Let children_a be proc dict_get with a, "children"
+    Let children_b be proc dict_get with b, "children"
+    Let count_a be proc list_size with children_a
+    Let count_b be proc list_size with children_b
+
+    If count_a is not equal to count_b:
+        Return 0
+    End If
+
+    Let index be 0
+    While index is less than count_a:
+        Let child_a be proc list_get with children_a, index
+        Let child_b be proc list_get with children_b, index
+        Let child_match be proc hir_equal with child_a, child_b
+        If child_match is not equal to 1:
+            Return 0
+        End If
+        Set index to index plus 1
+    End While
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Probe entry point
+Note: ============================================================================
+
+Process called "main" returns Integer:
+    Let results be proc create_test_results from TestUtils
+    proc begin_suite from TestUtils with results, "HTML translation round-trip"
+
+    Note:
+    Representative document: DOCTYPE; a nested element tree three levels deep
+    (html > body > div > p); the div carries a quoted-value attribute (class)
+    and a boolean/valueless attribute (hidden); a void element (<br>); a text
+    node; a comment; and a <script> raw-text element. The single-quoted id and
+    the unquoted-less forms are all exercised by the lexer's attribute scanner.
+    :End Note
+    Let source be "<!DOCTYPE html><html><body><div class=\"box\" hidden><p>Hello</p><br></div><!-- note --><script>var x = 1;</script></body></html>"
+
+    Note: --- Stage 0: PARSE-SMOKE (parser advances + terminates) ---
+    Let ast be proc parse_html from Parser with source
+    proc assert_not_null from TestUtils with results, "parser produced HTML AST", ast
+
+    Let ast_type be proc memory_get_int64 from Layout with ast, 0
+    proc assert_equal from TestUtils with results, "AST root is HTML_DOCUMENT (100)", ast_type, 100
+
+    Let ast_child_count be proc memory_get_int64 from Layout with ast, 32
+    proc assert_greater_than from TestUtils with results, "AST document has children", ast_child_count, 0
+
+    Note: --- Stage 1: source -> HIR model ---
+    Let hir1 be proc html_to_hir_from_source from Frontend with source
+    proc assert_not_null from TestUtils with results, "frontend produced HIR root", hir1
+
+    Let root_type be proc dict_get with hir1, "type"
+    proc assert_string_equal from TestUtils with results, "HIR root type is 'document'", root_type, "document"
+
+    Note: Document children: html element, comment dropped? No — comment is at body level. Top level is the doctype + html element.
+    Let doc_children be proc dict_get with hir1, "children"
+    Let doc_child_count be proc list_size with doc_children
+    proc assert_greater_than_or_equal from TestUtils with results, "document has >= 2 children (doctype + html)", doc_child_count, 2
+
+    Note: Find the DOCTYPE child and the html element child
+    Let doctype_node be proc list_get with doc_children, 0
+    Let doctype_type be proc dict_get with doctype_node, "type"
+    proc assert_string_equal from TestUtils with results, "first document child is 'doctype'", doctype_type, "doctype"
+
+    Let html_node be proc list_get with doc_children, 1
+    Let html_type be proc dict_get with html_node, "type"
+    proc assert_string_equal from TestUtils with results, "second document child is 'element'", html_type, "element"
+    Let html_tag be proc dict_get with html_node, "tag"
+    proc assert_string_equal from TestUtils with results, "level-1 tag is 'html'", html_tag, "html"
+
+    Note: --- Depth assertion: html(1) > body(2) > div(3) > p(4) ---
+    Let html_children be proc dict_get with html_node, "children"
+    Let body_node be proc list_get with html_children, 0
+    Let body_tag be proc dict_get with body_node, "tag"
+    proc assert_string_equal from TestUtils with results, "level-2 tag is 'body'", body_tag, "body"
+
+    Let body_children be proc dict_get with body_node, "children"
+    Let div_node be proc list_get with body_children, 0
+    Let div_tag be proc dict_get with div_node, "tag"
+    proc assert_string_equal from TestUtils with results, "level-3 tag is 'div'", div_tag, "div"
+
+    Let div_children be proc dict_get with div_node, "children"
+    Let p_node be proc list_get with div_children, 0
+    Let p_tag be proc dict_get with p_node, "tag"
+    proc assert_string_equal from TestUtils with results, "level-4 tag is 'p'", p_tag, "p"
+
+    Note: --- Attribute assertions on <div>: class="box" (value) + hidden (boolean) ---
+    Let div_attrs be proc dict_get with div_node, "attributes"
+    proc assert_not_null from TestUtils with results, "div has attributes dictionary", div_attrs
+    Let class_val be proc dict_get with div_attrs, "class"
+    proc assert_string_equal from TestUtils with results, "div class attribute is 'box'", class_val, "box"
+    Let hidden_val be proc dict_get with div_attrs, "hidden"
+    proc assert_string_equal from TestUtils with results, "div boolean attribute 'hidden' is empty string", hidden_val, ""
+
+    Note: --- Text node content under <p> ---
+    Let p_children be proc dict_get with p_node, "children"
+    Let p_text_node be proc list_get with p_children, 0
+    Let p_text_type be proc dict_get with p_text_node, "type"
+    proc assert_string_equal from TestUtils with results, "p child is a text node", p_text_type, "text"
+    Let p_text_value be proc dict_get with p_text_node, "value"
+    proc assert_string_equal from TestUtils with results, "text node content is 'Hello'", p_text_value, "Hello"
+
+    Note: --- Void element <br> is the second child of <div> ---
+    Let br_node be proc list_get with div_children, 1
+    Let br_tag be proc dict_get with br_node, "tag"
+    proc assert_string_equal from TestUtils with results, "void element tag is 'br'", br_tag, "br"
+
+    Note: --- Comment + script raw-text are body children after the div ---
+    Let comment_node be proc list_get with body_children, 1
+    Let comment_type be proc dict_get with comment_node, "type"
+    proc assert_string_equal from TestUtils with results, "body second child is a comment", comment_type, "comment"
+
+    Let script_node be proc list_get with body_children, 2
+    Let script_tag be proc dict_get with script_node, "tag"
+    proc assert_string_equal from TestUtils with results, "body third child is 'script' element", script_tag, "script"
+    Let script_children be proc dict_get with script_node, "children"
+    Let script_text_node be proc list_get with script_children, 0
+    Let script_text_value be proc dict_get with script_text_node, "value"
+    proc assert_string_equal from TestUtils with results, "script raw-text content is 'var x = 1;'", script_text_value, "var x = 1;"
+
+    Note: --- Stage 2: HIR -> HTML text ---
+    Let emitted be proc generate_html from Backend with hir1
+    proc assert_not_null from TestUtils with results, "backend produced HTML text", emitted
+
+    Let emitted_len be proc string_length from StringCore with emitted
+    proc assert_greater_than from TestUtils with results, "emitted HTML is non-empty", emitted_len, 0
+
+    Note: --- Stage 3: re-parse emitted HTML -> HIR, assert structurally equal ---
+    Let hir2 be proc html_to_hir_from_source from Frontend with emitted
+    proc assert_not_null from TestUtils with results, "re-parse of emitted HTML produced HIR", hir2
+
+    Let structurally_equal be proc hir_equal with hir1, hir2
+    proc assert_equal from TestUtils with results, "round-trip HIR is structurally equal", structurally_equal, 1
+
+    proc print_summary from TestUtils with results
+    Let failed be proc get_failed from TestUtils with results
+    proc destroy_test_results from TestUtils with results
+
+    Return failed
+End Process

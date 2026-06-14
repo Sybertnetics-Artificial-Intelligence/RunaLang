@@ -72,7 +72,14 @@ A flat byte-array cursor plus line/column tracking is sufficient because HTML is
 @End Reasoning
 
 @Implementation:
-Five 8-byte slots: source bytes pointer, source byte length, current byte position, current line (1-based), current column (1-based). Total record size is 40 bytes.
+Seven 8-byte slots: source bytes pointer, source byte length, current byte
+position, current line (1-based), current column (1-based), in_tag flag
+(1 while the cursor is between a tag's '<name' and its closing '>' / '/>',
+0 in element content), and raw_tag (0 = none, 1 = inside a <script> body,
+2 = inside a <style> body). The in_tag flag lets next_token distinguish
+attribute identifiers from element text content; raw_tag lets it treat
+script/style bodies as a single opaque text run rather than parsing the
+markup inside them. Total record size is 56 bytes.
 @End Implementation
 
 Type called "Lexer":
@@ -81,6 +88,8 @@ Type called "Lexer":
     position as Integer
     line as Integer
     column as Integer
+    in_tag as Integer
+    raw_tag as Integer
 End Type
 
 Note: ============================================================================
@@ -113,7 +122,7 @@ Initialising the lexer separately from tokenisation lets callers reuse a single 
 @End Reasoning
 
 @Implementation:
-Rejects null source. Computes source_length via string_length (treating source as NUL-terminated bytes). Allocates 40 bytes and initialises slot 0=source, 8=length, 16=0 (position), 24=1 (line), 32=1 (column).
+Rejects null source. Computes source_length via string_length (treating source as NUL-terminated bytes). Allocates 56 bytes and initialises slot 0=source, 8=length, 16=0 (position), 24=1 (line), 32=1 (column), 40=0 (in_tag), 48=0 (raw_tag).
 @End Implementation
 
 Process called "create_lexer" takes source as Integer returns Integer:
@@ -125,7 +134,7 @@ Process called "create_lexer" takes source as Integer returns Integer:
 
     Let source_length be proc string_length from StringCore with source
 
-    Let lexer_size be 40
+    Let lexer_size be 56
     Let lexer be proc allocate from Layout with lexer_size
 
     If lexer is equal to 0:
@@ -137,6 +146,8 @@ Process called "create_lexer" takes source as Integer returns Integer:
     proc memory_set_int64 from Layout with lexer, 16, 0
     proc memory_set_int64 from Layout with lexer, 24, 1
     proc memory_set_int64 from Layout with lexer, 32, 1
+    proc memory_set_int64 from Layout with lexer, 40, 0
+    proc memory_set_int64 from Layout with lexer, 48, 0
 
     Return lexer
 End Process
@@ -324,12 +335,12 @@ Composes is_alpha and is_digit, plus explicit 45 (hyphen) and 95 (underscore). R
 Process called "is_alphanumeric" takes char as Integer returns Integer:
     Note: Check if character is alphanumeric
 
-    Let is_alpha_result be proc is_alpha from char
+    Let is_alpha_result be proc is_alpha with char
     If is_alpha_result is equal to 1:
         Return 1
     End If
 
-    Let is_digit_result be proc is_digit from char
+    Let is_digit_result be proc is_digit with char
     If is_digit_result is equal to 1:
         Return 1
     End If
@@ -393,14 +404,14 @@ Process called "skip_whitespace_in_tag" takes lexer as Integer returns Integer:
     Note: Skip whitespace inside tags only
 
     While 1 is equal to 1:
-        Let char be proc peek_char from lexer
-        Let is_ws be proc is_whitespace from char
+        Let char be proc peek_char with lexer
+        Let is_ws be proc is_whitespace with char
 
         If is_ws is equal to 0:
             Break
         End If
 
-        proc advance_char from lexer
+        proc advance_char with lexer
     End While
 
     Return 1
@@ -418,6 +429,64 @@ Tag and attribute names share the same lexical shape (identifier characters unti
 Records start_position, line, and column before consuming. Loops advancing while is_alphanumeric holds. Computes length = end_position - start_position and constructs a TOKEN_IDENTIFIER whose text pointer is source+start_position (no copy).
 @End Implementation
 
+@Reasoning:
+When an opening tag's name is "script" or "style" the lexer must switch to
+raw-text mode for the element body. Detecting this requires comparing the name
+about to be scanned, case-insensitively, against the two raw-element names. This
+helper peeks the upcoming name bytes without consuming them so the regular
+scan_tag_name still produces the TOKEN_IDENTIFIER the parser expects.
+@End Reasoning
+
+@Implementation:
+Peeks bytes at the cursor against "script" then "style" using case-insensitive
+folding and requires the byte immediately after the candidate name to be a
+non-identifier byte (so "scripted" is not mistaken for "script"). Returns 1 for
+script, 2 for style, 0 otherwise. Pure: does not advance the cursor.
+@End Implementation
+
+Process called "name_peek_equals" takes lexer as Integer, name as Integer, name_length as Integer returns Integer:
+    Note: Case-insensitively compare the upcoming tag name to a candidate
+
+    Let index be 0
+    While index is less than name_length:
+        Let src_char be proc peek_ahead with lexer, index
+        Let expected be proc memory_get_byte from Layout with name, index
+
+        Let folded be proc to_lower_ascii with src_char
+        Let expected_folded be proc to_lower_ascii with expected
+
+        If folded is not equal to expected_folded:
+            Return 0
+        End If
+
+        Set index to index plus 1
+    End While
+
+    Let after_char be proc peek_ahead with lexer, name_length
+    Let after_alnum be proc is_alphanumeric with after_char
+    If after_alnum is equal to 1:
+        Return 0
+    End If
+
+    Return 1
+End Process
+
+Process called "name_is_raw" takes lexer as Integer returns Integer:
+    Note: Classify the upcoming open-tag name as script (1), style (2), or none (0)
+
+    Let is_script be proc name_peek_equals with lexer, "script", 6
+    If is_script is equal to 1:
+        Return 1
+    End If
+
+    Let is_style be proc name_peek_equals with lexer, "style", 5
+    If is_style is equal to 1:
+        Return 2
+    End If
+
+    Return 0
+End Process
+
 Process called "scan_tag_name" takes lexer as Integer returns Integer:
     Note: Scan tag name or attribute name
 
@@ -427,14 +496,14 @@ Process called "scan_tag_name" takes lexer as Integer returns Integer:
     Let column be proc memory_get_int64 from Layout with lexer, 32
 
     While 1 is equal to 1:
-        Let char be proc peek_char from lexer
-        Let is_alnum be proc is_alphanumeric from char
+        Let char be proc peek_char with lexer
+        Let is_alnum be proc is_alphanumeric with char
 
         If is_alnum is equal to 0:
             Break
         End If
 
-        proc advance_char from lexer
+        proc advance_char with lexer
     End While
 
     Let end_position be proc memory_get_int64 from Layout with lexer, 16
@@ -464,12 +533,12 @@ Process called "scan_attribute_value" takes lexer as Integer returns Integer:
     Let line be proc memory_get_int64 from Layout with lexer, 24
     Let column be proc memory_get_int64 from Layout with lexer, 32
 
-    Let quote_char be proc advance_char from lexer
+    Let quote_char be proc advance_char with lexer
 
     Let start_position be proc memory_get_int64 from Layout with lexer, 16
 
     While 1 is equal to 1:
-        Let char be proc peek_char from lexer
+        Let char be proc peek_char with lexer
 
         If char is equal to 0:
             Break
@@ -479,13 +548,13 @@ Process called "scan_attribute_value" takes lexer as Integer returns Integer:
             Break
         End If
 
-        proc advance_char from lexer
+        proc advance_char with lexer
     End While
 
     Let end_position be proc memory_get_int64 from Layout with lexer, 16
     Let length be end_position minus start_position
 
-    proc advance_char from lexer
+    proc advance_char with lexer
 
     Let text_ptr be source plus start_position
 
@@ -501,7 +570,13 @@ Text content runs from the current position until either a tag-start ("<", byte 
 @End Reasoning
 
 @Implementation:
-Records start_position, line, column. Loops advancing while peek_char is not 0, 60, or 38. Returns 0 if the run is empty to avoid zero-length text tokens cluttering the stream. Emits TOKEN_TEXT with text pointing into source+start_position.
+Records start_position, line, column. Loops advancing while peek_char is not 0,
+60, or 38, tracking whether any non-whitespace byte was seen. A run with no
+content bytes is inter-element formatting whitespace, which is insignificant in
+the document tree; rather than emit a whitespace-only text token (which would
+not survive the emitter's re-indentation on round-trip) the scanner discards it
+and returns the next real token. A zero-length run (cursor already on a stop
+byte) also defers to next_token so the dispatcher makes forward progress.
 @End Implementation
 
 Process called "scan_text" takes lexer as Integer returns Integer:
@@ -512,8 +587,10 @@ Process called "scan_text" takes lexer as Integer returns Integer:
     Let line be proc memory_get_int64 from Layout with lexer, 24
     Let column be proc memory_get_int64 from Layout with lexer, 32
 
+    Let saw_content be 0
+
     While 1 is equal to 1:
-        Let char be proc peek_char from lexer
+        Let char be proc peek_char with lexer
 
         If char is equal to 0:
             Break
@@ -527,14 +604,23 @@ Process called "scan_text" takes lexer as Integer returns Integer:
             Break
         End If
 
-        proc advance_char from lexer
+        Let char_ws be proc is_whitespace with char
+        If char_ws is equal to 0:
+            Set saw_content to 1
+        End If
+
+        proc advance_char with lexer
     End While
 
     Let end_position be proc memory_get_int64 from Layout with lexer, 16
     Let length be end_position minus start_position
 
     If length is equal to 0:
-        Return 0
+        Return proc next_token with lexer
+    End If
+
+    If saw_content is equal to 0:
+        Return proc next_token with lexer
     End If
 
     Let text_ptr be source plus start_position
@@ -561,15 +647,15 @@ Process called "scan_comment" takes lexer as Integer returns Integer:
     Let line be proc memory_get_int64 from Layout with lexer, 24
     Let column be proc memory_get_int64 from Layout with lexer, 32
 
-    proc advance_char from lexer
-    proc advance_char from lexer
-    proc advance_char from lexer
-    proc advance_char from lexer
+    proc advance_char with lexer
+    proc advance_char with lexer
+    proc advance_char with lexer
+    proc advance_char with lexer
 
     Let start_position be proc memory_get_int64 from Layout with lexer, 16
 
     While 1 is equal to 1:
-        Let char be proc peek_char from lexer
+        Let char be proc peek_char with lexer
 
         If char is equal to 0:
             Break
@@ -586,15 +672,15 @@ Process called "scan_comment" takes lexer as Integer returns Integer:
             End If
         End If
 
-        proc advance_char from lexer
+        proc advance_char with lexer
     End While
 
     Let end_position be proc memory_get_int64 from Layout with lexer, 16
     Let length be end_position minus start_position
 
-    proc advance_char from lexer
-    proc advance_char from lexer
-    proc advance_char from lexer
+    proc advance_char with lexer
+    proc advance_char with lexer
+    proc advance_char with lexer
 
     Let text_ptr be source plus start_position
 
@@ -606,38 +692,68 @@ Note: DOCTYPE Scanning
 Note: ============================================================================
 
 @Reasoning:
-DOCTYPE declarations end at the first ">" and do not allow ">" inside. Capturing the entire body including "<!DOCTYPE" prefix simplifies downstream rendering — the parser stores the declaration verbatim and reproduces it on output.
+DOCTYPE declarations end at the first ">" and do not allow ">" inside. The
+TOKEN_DOCTYPE value carries only the internal subset (e.g. "html") rather than
+the "<!DOCTYPE ... >" envelope, because the backend re-applies the envelope when
+emitting. Storing only the subset makes the declaration round-trip exactly: the
+emitted "<!DOCTYPE html>" re-lexes to the same "html" value instead of nesting a
+second envelope.
 @End Reasoning
 
 @Implementation:
-Records start_position with the cursor still at "<" (the prefix has not been consumed by callers for DOCTYPE), then loops advancing until peek_char hits ">" (62) or 0. On finding ">" advances one more to consume it. Emits TOKEN_DOCTYPE containing the full delcaration text including delimiters.
+The cursor enters on "<" with "<!D"/"<!d" already confirmed by the dispatcher.
+Advances past "<!", then past the alphabetic keyword ("DOCTYPE"/"doctype"), then
+skips any whitespace. Records start_position at the internal subset and loops
+advancing until ">" (62) or end-of-source (0), consuming the ">" when found.
+Emits TOKEN_DOCTYPE whose text covers only the internal subset between the
+keyword and ">".
 @End Implementation
 
 Process called "scan_doctype" takes lexer as Integer returns Integer:
     Note: Scan DOCTYPE declaration
 
     Let source be proc memory_get_int64 from Layout with lexer, 0
-    Let start_position be proc memory_get_int64 from Layout with lexer, 16
     Let line be proc memory_get_int64 from Layout with lexer, 24
     Let column be proc memory_get_int64 from Layout with lexer, 32
 
+    Note: Consume "<!" then the DOCTYPE keyword
+    proc advance_char with lexer
+    proc advance_char with lexer
+
     While 1 is equal to 1:
-        Let char be proc peek_char from lexer
+        Let kw_char be proc peek_char with lexer
+        Let kw_alpha be proc is_alpha with kw_char
+        If kw_alpha is equal to 0:
+            Break
+        End If
+        proc advance_char with lexer
+    End While
+
+    proc skip_whitespace_in_tag with lexer
+
+    Let start_position be proc memory_get_int64 from Layout with lexer, 16
+
+    While 1 is equal to 1:
+        Let char be proc peek_char with lexer
 
         If char is equal to 0:
             Break
         End If
 
         If char is equal to 62:
-            proc advance_char from lexer
             Break
         End If
 
-        proc advance_char from lexer
+        proc advance_char with lexer
     End While
 
     Let end_position be proc memory_get_int64 from Layout with lexer, 16
     Let length be end_position minus start_position
+
+    Let close_char be proc peek_char with lexer
+    If close_char is equal to 62:
+        proc advance_char with lexer
+    End If
 
     Let text_ptr be source plus start_position
 
@@ -664,17 +780,17 @@ Process called "scan_entity" takes lexer as Integer returns Integer:
     Let line be proc memory_get_int64 from Layout with lexer, 24
     Let column be proc memory_get_int64 from Layout with lexer, 32
 
-    proc advance_char from lexer
+    proc advance_char with lexer
 
     While 1 is equal to 1:
-        Let char be proc peek_char from lexer
+        Let char be proc peek_char with lexer
 
         If char is equal to 0:
             Break
         End If
 
         If char is equal to 59:
-            proc advance_char from lexer
+            proc advance_char with lexer
             Break
         End If
 
@@ -682,7 +798,7 @@ Process called "scan_entity" takes lexer as Integer returns Integer:
             Break
         End If
 
-        proc advance_char from lexer
+        proc advance_char with lexer
     End While
 
     Let end_position be proc memory_get_int64 from Layout with lexer, 16
@@ -691,6 +807,126 @@ Process called "scan_entity" takes lexer as Integer returns Integer:
     Let text_ptr be source plus start_position
 
     Return proc create_token with TOKEN_ENTITY, text_ptr, length, line, column, 0
+End Process
+
+Note: ============================================================================
+Note: Raw-Text (script/style) Scanning
+Note: ============================================================================
+
+@Reasoning:
+The contents of <script> and <style> elements are CDATA/raw text in the HTML
+spec: '<' inside them does not start a tag and '&' does not start an entity.
+Parsing them as markup would corrupt any embedded JavaScript ("a < b") or CSS.
+The lexer therefore captures the entire body verbatim as one TOKEN_TEXT,
+stopping only at the matching end tag ("</script" or "</style", followed by
+'>' or whitespace), which is detected with case-insensitive lookahead.
+@End Reasoning
+
+@Implementation:
+Records start_position. Loops: on EOF (0) break; when the current byte is '<'
+(60) and peek_ahead 1 is '/' (47), compares the following bytes against the
+expected end-tag name (raw_tag 1 -> "script", 2 -> "style") case-insensitively;
+on a full match it breaks with the cursor parked on the '<' so the normal
+dispatcher emits the closing tag. Otherwise advances one byte. Emits a single
+TOKEN_TEXT covering [start_position, end_position). Clears raw_tag to 0 so the
+dispatcher resumes ordinary content tokenisation after the end tag.
+@End Implementation
+
+Process called "to_lower_ascii" takes char as Integer returns Integer:
+    Note: Fold an ASCII uppercase letter to lowercase; pass others through
+
+    If char is greater than or equal to 65:
+        If char is less than or equal to 90:
+            Return char plus 32
+        End If
+    End If
+
+    Return char
+End Process
+
+Process called "raw_matches_at" takes lexer as Integer, name as Integer, name_length as Integer returns Integer:
+    Note: Case-insensitively check that the end-tag name follows "</" at the cursor
+
+    Let index be 0
+    While index is less than name_length:
+        Let offset be index plus 2
+        Let src_char be proc peek_ahead with lexer, offset
+        Let expected be proc memory_get_byte from Layout with name, index
+
+        Let folded be proc to_lower_ascii with src_char
+        Let expected_folded be proc to_lower_ascii with expected
+
+        If folded is not equal to expected_folded:
+            Return 0
+        End If
+
+        Set index to index plus 1
+    End While
+
+    Note: The matched name must be followed by '>' or whitespace, not more name bytes
+    Let after_offset be name_length plus 2
+    Let after_char be proc peek_ahead with lexer, after_offset
+
+    If after_char is equal to 62:
+        Return 1
+    End If
+
+    Let after_ws be proc is_whitespace with after_char
+    If after_ws is equal to 1:
+        Return 1
+    End If
+
+    Return 0
+End Process
+
+Process called "scan_raw_text" takes lexer as Integer returns Integer:
+    Note: Scan a <script>/<style> raw-text body verbatim
+
+    Let source be proc memory_get_int64 from Layout with lexer, 0
+    Let start_position be proc memory_get_int64 from Layout with lexer, 16
+    Let line be proc memory_get_int64 from Layout with lexer, 24
+    Let column be proc memory_get_int64 from Layout with lexer, 32
+    Let raw_tag be proc memory_get_int64 from Layout with lexer, 48
+
+    Let name be "script"
+    Let name_length be 6
+    If raw_tag is equal to 2:
+        Set name to "style"
+        Set name_length to 5
+    End If
+
+    While 1 is equal to 1:
+        Let char be proc peek_char with lexer
+
+        If char is equal to 0:
+            Break
+        End If
+
+        If char is equal to 60:
+            Let slash be proc peek_ahead with lexer, 1
+            If slash is equal to 47:
+                Let is_end be proc raw_matches_at with lexer, name, name_length
+                If is_end is equal to 1:
+                    Break
+                End If
+            End If
+        End If
+
+        proc advance_char with lexer
+    End While
+
+    Let end_position be proc memory_get_int64 from Layout with lexer, 16
+    Let length be end_position minus start_position
+
+    proc memory_set_int64 from Layout with lexer, 48, 0
+
+    If length is equal to 0:
+        Return proc next_token with lexer
+    End If
+
+    Let text_ptr be source plus start_position
+
+    Return proc create_token with TOKEN_TEXT, text_ptr, length, line, column, 0
 End Process
 
 Note: ============================================================================
@@ -708,7 +944,17 @@ This dispatcher distinguishes the seven major HTML lexical categories using one 
 Process called "next_token" takes lexer as Integer returns Integer:
     Note: Get next token from HTML source
 
-    Let char be proc peek_char from lexer
+    Let in_tag be proc memory_get_int64 from Layout with lexer, 40
+    Let raw_tag be proc memory_get_int64 from Layout with lexer, 48
+
+    Note: In element content with a pending script/style body, capture it raw
+    If in_tag is equal to 0:
+        If raw_tag is not equal to 0:
+            Return proc scan_raw_text with lexer
+        End If
+    End If
+
+    Let char be proc peek_char with lexer
 
     If char is equal to 0:
         Let line be proc memory_get_int64 from Layout with lexer, 24
@@ -716,6 +962,8 @@ Process called "next_token" takes lexer as Integer returns Integer:
         Return proc create_token with TOKEN_EOF, 0, 0, line, column, 0
     End If
 
+    Note: A '<' may begin a comment, DOCTYPE, closing tag, or opening tag in any
+    Note: context; it always interrupts content text.
     If char is equal to 60:
         Let next1 be proc peek_ahead with lexer, 1
         Let next2 be proc peek_ahead with lexer, 2
@@ -724,83 +972,106 @@ Process called "next_token" takes lexer as Integer returns Integer:
         If next1 is equal to 33:
             If next2 is equal to 45:
                 If next3 is equal to 45:
-                    Return proc scan_comment from lexer
+                    Return proc scan_comment with lexer
                 End If
             End If
 
             If next2 is equal to 68:
-                Return proc scan_doctype from lexer
+                Return proc scan_doctype with lexer
             End If
 
             If next2 is equal to 100:
-                Return proc scan_doctype from lexer
+                Return proc scan_doctype with lexer
             End If
         End If
 
         If next1 is equal to 47:
             Set line to proc memory_get_int64 from Layout with lexer, 24
             Set column to proc memory_get_int64 from Layout with lexer, 32
-            proc advance_char from lexer
-            proc advance_char from lexer
+            proc advance_char with lexer
+            proc advance_char with lexer
+            proc memory_set_int64 from Layout with lexer, 40, 3
             Return proc create_token with TOKEN_TAG_CLOSE, 0, 0, line, column, 0
         End If
 
         Set line to proc memory_get_int64 from Layout with lexer, 24
         Set column to proc memory_get_int64 from Layout with lexer, 32
-        proc advance_char from lexer
+        proc advance_char with lexer
+        proc memory_set_int64 from Layout with lexer, 40, 1
         Return proc create_token with TOKEN_TAG_OPEN, 0, 0, line, column, 0
     End If
 
-    If char is equal to 62:
-        Set line to proc memory_get_int64 from Layout with lexer, 24
-        Set column to proc memory_get_int64 from Layout with lexer, 32
-        proc advance_char from lexer
-        Return proc create_token with TOKEN_TAG_END, 0, 0, line, column, 0
-    End If
-
-    If char is equal to 47:
-        Let next be proc peek_ahead with lexer, 1
-
-        If next is equal to 62:
+    Note: Inside a tag (open name, attributes, or close tag) tokens are markup
+    If in_tag is not equal to 0:
+        If char is equal to 62:
             Set line to proc memory_get_int64 from Layout with lexer, 24
             Set column to proc memory_get_int64 from Layout with lexer, 32
-            proc advance_char from lexer
-            proc advance_char from lexer
-            Return proc create_token with TOKEN_SELF_CLOSE, 0, 0, line, column, 0
+            proc advance_char with lexer
+            proc memory_set_int64 from Layout with lexer, 40, 0
+            Return proc create_token with TOKEN_TAG_END, 0, 0, line, column, 0
         End If
+
+        If char is equal to 47:
+            Let next be proc peek_ahead with lexer, 1
+
+            If next is equal to 62:
+                Set line to proc memory_get_int64 from Layout with lexer, 24
+                Set column to proc memory_get_int64 from Layout with lexer, 32
+                proc advance_char with lexer
+                proc advance_char with lexer
+                proc memory_set_int64 from Layout with lexer, 40, 0
+                proc memory_set_int64 from Layout with lexer, 48, 0
+                Return proc create_token with TOKEN_SELF_CLOSE, 0, 0, line, column, 0
+            End If
+        End If
+
+        If char is equal to 61:
+            Set line to proc memory_get_int64 from Layout with lexer, 24
+            Set column to proc memory_get_int64 from Layout with lexer, 32
+            proc advance_char with lexer
+            Return proc create_token with TOKEN_EQUALS, 0, 0, line, column, 0
+        End If
+
+        If char is equal to 34:
+            Return proc scan_attribute_value with lexer
+        End If
+
+        If char is equal to 39:
+            Return proc scan_attribute_value with lexer
+        End If
+
+        Let is_ws_tag be proc is_whitespace with char
+        If is_ws_tag is equal to 1:
+            proc skip_whitespace_in_tag with lexer
+            Return proc next_token with lexer
+        End If
+
+        Let is_alpha_tag be proc is_alpha with char
+        If is_alpha_tag is equal to 1:
+            Note: The first identifier in an open tag is the tag name; detect
+            Note: script/style so the body can be captured as raw text, then
+            Note: move to the attribute sub-state.
+            If in_tag is equal to 1:
+                Let raw_kind be proc name_is_raw with lexer
+                If raw_kind is not equal to 0:
+                    proc memory_set_int64 from Layout with lexer, 48, raw_kind
+                End If
+                proc memory_set_int64 from Layout with lexer, 40, 2
+            End If
+            Return proc scan_tag_name with lexer
+        End If
+
+        Note: Any other byte inside a tag (malformed) advances one to guarantee
+        Note: forward progress and is reported as a single-byte text token.
+        Return proc scan_text with lexer
     End If
 
-    If char is equal to 61:
-        Set line to proc memory_get_int64 from Layout with lexer, 24
-        Set column to proc memory_get_int64 from Layout with lexer, 32
-        proc advance_char from lexer
-        Return proc create_token with TOKEN_EQUALS, 0, 0, line, column, 0
-    End If
-
-    If char is equal to 34:
-        Return proc scan_attribute_value from lexer
-    End If
-
-    If char is equal to 39:
-        Return proc scan_attribute_value from lexer
-    End If
-
+    Note: Element content: entities and text only
     If char is equal to 38:
-        Return proc scan_entity from lexer
+        Return proc scan_entity with lexer
     End If
 
-    Let is_ws be proc is_whitespace from char
-    If is_ws is equal to 1:
-        proc skip_whitespace_in_tag from lexer
-        Return proc next_token from lexer
-    End If
-
-    Let is_alpha_result be proc is_alpha from char
-    If is_alpha_result is equal to 1:
-        Return proc scan_tag_name from lexer
-    End If
-
-    Return proc scan_text from lexer
+    Return proc scan_text with lexer
 End Process
 
 Note: End of HTML Lexer

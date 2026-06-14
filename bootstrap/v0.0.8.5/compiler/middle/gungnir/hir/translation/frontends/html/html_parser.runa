@@ -186,7 +186,7 @@ Compares the parser's current token type against expected_type and returns 1 on 
 Process called "check_token_type" takes parser as Integer, expected_type as Integer returns Integer:
     Note: Check if current token matches expected type
 
-    Let current_type be proc current_token_type from parser
+    Let current_type be proc current_token_type with parser
 
     If current_type is equal to expected_type:
         Return 1
@@ -213,7 +213,7 @@ Process called "expect_token" takes parser as Integer, expected_type as Integer,
         Return 0
     End If
 
-    proc advance_token from parser
+    proc advance_token with parser
     Return 1
 End Process
 
@@ -250,11 +250,20 @@ Process called "create_ast_node" takes node_type as Integer returns Integer:
 End Process
 
 @Reasoning:
-Children arrays are allocated lazily on first append, so leaf nodes never pay the cost of an empty children buffer. The fixed 240-byte capacity (30 slots) covers every well-formed HTML element observed in the test corpus.
+Children arrays are allocated lazily on first append, so leaf nodes never pay the
+cost of an empty children buffer, and they grow geometrically so an element with
+any number of children (large tables, long lists) is stored without overrunning a
+fixed bound. The node's otherwise-unused metadata slot (offset 40) doubles as the
+children-array capacity counter.
 @End Reasoning
 
 @Implementation:
-If the children pointer at offset 24 is null, allocates a 240-byte items array and stores it back. Writes child into the items at slot child_count*8, then increments child_count at offset 32.
+On first append (children pointer at offset 24 is null) allocates a 30-slot
+(240-byte) items array and records capacity 30 in the metadata slot at offset 40.
+When the array is full (child_count == capacity) doubles it: allocates a new
+array of capacity*2 slots, copies the existing children, frees the old array,
+repoints offset 24, and updates the capacity at offset 40. Then writes child at
+slot child_count*8 and increments child_count at offset 32.
 @End Implementation
 
 Process called "add_child" takes parent as Integer, child as Integer returns Integer:
@@ -262,11 +271,35 @@ Process called "add_child" takes parent as Integer, child as Integer returns Int
 
     Let child_count be proc memory_get_int64 from Layout with parent, 32
     Let children be proc memory_get_int64 from Layout with parent, 24
+    Let capacity be proc memory_get_int64 from Layout with parent, 40
 
     If children is equal to 0:
-        Let children_size be 240
+        Set capacity to 30
+        Let children_size be capacity multiplied by 8
         Set children to proc allocate from Layout with children_size
         proc memory_set_int64 from Layout with parent, 24, children
+        proc memory_set_int64 from Layout with parent, 40, capacity
+    End If
+
+    If child_count is greater than or equal to capacity:
+        Let new_capacity be capacity multiplied by 2
+        Let new_bytes be new_capacity multiplied by 8
+
+        Let new_children be proc allocate from Layout with new_bytes
+
+        Let index be 0
+        While index is less than child_count:
+            Let old_child be proc memory_get_int64 from Layout with children, index multiplied by 8
+            proc memory_set_int64 from Layout with new_children, index multiplied by 8, old_child
+            Set index to index plus 1
+        End While
+
+        proc deallocate from Layout with children
+
+        Set children to new_children
+
+        proc memory_set_int64 from Layout with parent, 24, new_children
+        proc memory_set_int64 from Layout with parent, 40, new_capacity
     End If
 
     proc memory_set_int64 from Layout with children, child_count multiplied by 8, child
@@ -292,67 +325,67 @@ Builds an HTML_DOCUMENT root, then loops on current_token_type: dispatches token
 Process called "parse_html" takes source as Integer returns Integer:
     Note: Parse complete HTML document
 
-    Let parser be proc create_parser from source
+    Let parser be proc create_parser with source
 
     If parser is equal to 0:
         Return 0
     End If
 
-    Let document be proc create_ast_node from HTML_DOCUMENT
+    Let document be proc create_ast_node with HTML_DOCUMENT
 
     While 1 is equal to 1:
-        Let token_type be proc current_token_type from parser
+        Let token_type be proc current_token_type with parser
 
         If token_type is equal to 99:
             Break
         End If
 
         If token_type is equal to 10:
-            Let doctype be proc parse_doctype from parser
+            Let doctype be proc parse_doctype with parser
             If doctype is not equal to 0:
                 proc add_child with document, doctype
             Otherwise:
                 Break
             End If
-        End If
-
-        If token_type is equal to 9:
-            Let comment be proc parse_comment from parser
-            If comment is not equal to 0:
-                proc add_child with document, comment
+        Otherwise:
+            If token_type is equal to 9:
+                Let comment be proc parse_comment with parser
+                If comment is not equal to 0:
+                    proc add_child with document, comment
+                Otherwise:
+                    Break
+                End If
             Otherwise:
-                Break
+                If token_type is equal to 1:
+                    Let element be proc parse_element with parser
+                    If element is not equal to 0:
+                        proc add_child with document, element
+                    Otherwise:
+                        Break
+                    End If
+                Otherwise:
+                    If token_type is equal to 8:
+                        Let text be proc parse_text with parser
+                        If text is not equal to 0:
+                            proc add_child with document, text
+                        Otherwise:
+                            Break
+                        End If
+                    Otherwise:
+                        If token_type is equal to 11:
+                            Let entity be proc parse_entity with parser
+                            If entity is not equal to 0:
+                                proc add_child with document, entity
+                            Otherwise:
+                                Break
+                            End If
+                        Otherwise:
+                            proc advance_token with parser
+                        End If
+                    End If
+                End If
             End If
         End If
-
-        If token_type is equal to 1:
-            Let element be proc parse_element from parser
-            If element is not equal to 0:
-                proc add_child with document, element
-            Otherwise:
-                Break
-            End If
-        End If
-
-        If token_type is equal to 8:
-            Let text be proc parse_text from parser
-            If text is not equal to 0:
-                proc add_child with document, text
-            Otherwise:
-                Break
-            End If
-        End If
-
-        If token_type is equal to 11:
-            Let entity be proc parse_entity from parser
-            If entity is not equal to 0:
-                proc add_child with document, entity
-            Otherwise:
-                Break
-            End If
-        End If
-
-        proc advance_token from parser
     End While
 
     Return document
@@ -373,16 +406,16 @@ Creates an HTML_DOCTYPE node, reads the value bytes pointer and length from the 
 Process called "parse_doctype" takes parser as Integer returns Integer:
     Note: Parse DOCTYPE declaration
 
-    Let doctype be proc create_ast_node from HTML_DOCTYPE
+    Let doctype be proc create_ast_node with HTML_DOCTYPE
 
     Let token be proc memory_get_int64 from Layout with parser, 8
     Let value_ptr be proc memory_get_int64 from Layout with token, 8
     Let value_len be proc memory_get_int64 from Layout with token, 16
 
-    Let value be proc create_string_from_bytes from StringCore with value_ptr, value_len
+    Let value be proc create_string_from_bytes with value_ptr, value_len
     proc memory_set_int64 from Layout with doctype, 16, value
 
-    proc advance_token from parser
+    proc advance_token with parser
 
     Return doctype
 End Process
@@ -402,11 +435,11 @@ Element parsing is the most stateful path: it must distinguish self-closing tags
 Process called "parse_element" takes parser as Integer returns Integer:
     Note: Parse HTML element with attributes and children
 
-    Let element be proc create_ast_node from HTML_ELEMENT
+    Let element be proc create_ast_node with HTML_ELEMENT
 
     proc expect_token with parser, 1, "Expected '<'"
 
-    Let token_type be proc current_token_type from parser
+    Let token_type be proc current_token_type with parser
 
     If token_type is not equal to 5:
         Return 0
@@ -415,13 +448,13 @@ Process called "parse_element" takes parser as Integer returns Integer:
     Let token be proc memory_get_int64 from Layout with parser, 8
     Let name_ptr be proc memory_get_int64 from Layout with token, 8
     Let name_len be proc memory_get_int64 from Layout with token, 16
-    Let name be proc create_string_from_bytes from StringCore with name_ptr, name_len
+    Let name be proc create_string_from_bytes with name_ptr, name_len
     proc memory_set_int64 from Layout with element, 8, name
 
-    proc advance_token from parser
+    proc advance_token with parser
 
     While 1 is equal to 1:
-        Set token_type to proc current_token_type from parser
+        Set token_type to proc current_token_type with parser
 
         If token_type is equal to 3:
             Break
@@ -432,29 +465,34 @@ Process called "parse_element" takes parser as Integer returns Integer:
         End If
 
         If token_type is equal to 5:
-            Let attribute be proc parse_attribute from parser
-            If attribute is not equal to 0:
-                proc add_child with element, attribute
+            Let attribute be proc parse_attribute with parser
+            If attribute is equal to 0:
+                Break
             End If
+            proc add_child with element, attribute
+        Otherwise:
+            Note: Any other token (EOF, stray markup) ends the attribute list
+            Note: and guarantees forward progress so the loop cannot spin.
+            Break
         End If
     End While
 
-    Set token_type to proc current_token_type from parser
+    Set token_type to proc current_token_type with parser
 
     If token_type is equal to 4:
-        proc advance_token from parser
+        proc advance_token with parser
         Return element
     End If
 
     proc expect_token with parser, 3, "Expected '>'"
 
-    Let is_void be proc is_void_element from name
+    Let is_void be proc is_void_element with name
     If is_void is equal to 1:
         Return element
     End If
 
     While 1 is equal to 1:
-        Set token_type to proc current_token_type from parser
+        Set token_type to proc current_token_type with parser
 
         If token_type is equal to 99:
             Break
@@ -465,49 +503,49 @@ Process called "parse_element" takes parser as Integer returns Integer:
         End If
 
         If token_type is equal to 1:
-            Let child_element be proc parse_element from parser
+            Let child_element be proc parse_element with parser
             If child_element is not equal to 0:
                 proc add_child with element, child_element
             Otherwise:
                 Break
             End If
-        End If
-
-        If token_type is equal to 8:
-            Let text be proc parse_text from parser
-            If text is not equal to 0:
-                proc add_child with element, text
+        Otherwise:
+            If token_type is equal to 8:
+                Let text be proc parse_text with parser
+                If text is not equal to 0:
+                    proc add_child with element, text
+                Otherwise:
+                    Break
+                End If
             Otherwise:
-                Break
+                If token_type is equal to 9:
+                    Let comment be proc parse_comment with parser
+                    If comment is not equal to 0:
+                        proc add_child with element, comment
+                    Otherwise:
+                        Break
+                    End If
+                Otherwise:
+                    If token_type is equal to 11:
+                        Let entity be proc parse_entity with parser
+                        If entity is not equal to 0:
+                            proc add_child with element, entity
+                        Otherwise:
+                            Break
+                        End If
+                    Otherwise:
+                        proc advance_token with parser
+                    End If
+                End If
             End If
         End If
-
-        If token_type is equal to 9:
-            Let comment be proc parse_comment from parser
-            If comment is not equal to 0:
-                proc add_child with element, comment
-            Otherwise:
-                Break
-            End If
-        End If
-
-        If token_type is equal to 11:
-            Let entity be proc parse_entity from parser
-            If entity is not equal to 0:
-                proc add_child with element, entity
-            Otherwise:
-                Break
-            End If
-        End If
-
-        proc advance_token from parser
     End While
 
     proc expect_token with parser, 2, "Expected '</'"
 
-    Set token_type to proc current_token_type from parser
+    Set token_type to proc current_token_type with parser
     If token_type is equal to 5:
-        proc advance_token from parser
+        proc advance_token with parser
     End If
 
     proc expect_token with parser, 3, "Expected '>'"
@@ -530,31 +568,31 @@ Creates an HTML_ATTRIBUTE node, captures the name from the current identifier to
 Process called "parse_attribute" takes parser as Integer returns Integer:
     Note: Parse element attribute
 
-    Let attribute be proc create_ast_node from HTML_ATTRIBUTE
+    Let attribute be proc create_ast_node with HTML_ATTRIBUTE
 
     Let token be proc memory_get_int64 from Layout with parser, 8
     Let name_ptr be proc memory_get_int64 from Layout with token, 8
     Let name_len be proc memory_get_int64 from Layout with token, 16
-    Let name be proc create_string_from_bytes from StringCore with name_ptr, name_len
+    Let name be proc create_string_from_bytes with name_ptr, name_len
     proc memory_set_int64 from Layout with attribute, 8, name
 
-    proc advance_token from parser
+    proc advance_token with parser
 
-    Let token_type be proc current_token_type from parser
+    Let token_type be proc current_token_type with parser
 
     If token_type is equal to 6:
-        proc advance_token from parser
+        proc advance_token with parser
 
-        Set token_type to proc current_token_type from parser
+        Set token_type to proc current_token_type with parser
 
         If token_type is equal to 7:
             Set token to proc memory_get_int64 from Layout with parser, 8
             Let value_ptr be proc memory_get_int64 from Layout with token, 8
             Let value_len be proc memory_get_int64 from Layout with token, 16
-            Let value be proc create_string_from_bytes from StringCore with value_ptr, value_len
+            Let value be proc create_string_from_bytes with value_ptr, value_len
             proc memory_set_int64 from Layout with attribute, 16, value
 
-            proc advance_token from parser
+            proc advance_token with parser
         End If
     End If
 
@@ -576,16 +614,16 @@ Creates an HTML_TEXT node, reads the text bytes pointer and length from the curr
 Process called "parse_text" takes parser as Integer returns Integer:
     Note: Parse text content
 
-    Let text_node be proc create_ast_node from HTML_TEXT
+    Let text_node be proc create_ast_node with HTML_TEXT
 
     Let token be proc memory_get_int64 from Layout with parser, 8
     Let value_ptr be proc memory_get_int64 from Layout with token, 8
     Let value_len be proc memory_get_int64 from Layout with token, 16
 
-    Let value be proc create_string_from_bytes from StringCore with value_ptr, value_len
+    Let value be proc create_string_from_bytes with value_ptr, value_len
     proc memory_set_int64 from Layout with text_node, 16, value
 
-    proc advance_token from parser
+    proc advance_token with parser
 
     Return text_node
 End Process
@@ -601,16 +639,16 @@ Creates an HTML_COMMENT node, reads bytes/length from the current token, constru
 Process called "parse_comment" takes parser as Integer returns Integer:
     Note: Parse HTML comment
 
-    Let comment be proc create_ast_node from HTML_COMMENT
+    Let comment be proc create_ast_node with HTML_COMMENT
 
     Let token be proc memory_get_int64 from Layout with parser, 8
     Let value_ptr be proc memory_get_int64 from Layout with token, 8
     Let value_len be proc memory_get_int64 from Layout with token, 16
 
-    Let value be proc create_string_from_bytes from StringCore with value_ptr, value_len
+    Let value be proc create_string_from_bytes with value_ptr, value_len
     proc memory_set_int64 from Layout with comment, 16, value
 
-    proc advance_token from parser
+    proc advance_token with parser
 
     Return comment
 End Process
@@ -626,16 +664,16 @@ Creates an HTML_ENTITY node, reads the entity body from the current token, const
 Process called "parse_entity" takes parser as Integer returns Integer:
     Note: Parse HTML entity
 
-    Let entity be proc create_ast_node from HTML_ENTITY
+    Let entity be proc create_ast_node with HTML_ENTITY
 
     Let token be proc memory_get_int64 from Layout with parser, 8
     Let value_ptr be proc memory_get_int64 from Layout with token, 8
     Let value_len be proc memory_get_int64 from Layout with token, 16
 
-    Let value be proc create_string_from_bytes from StringCore with value_ptr, value_len
+    Let value be proc create_string_from_bytes with value_ptr, value_len
     proc memory_set_int64 from Layout with entity, 16, value
 
-    proc advance_token from parser
+    proc advance_token with parser
 
     Return entity
 End Process
@@ -649,103 +687,78 @@ HTML5 spec lists void elements that never have a closing tag (area, base, br, co
 @End Reasoning
 
 @Implementation:
-Constructs each candidate name string, calls string_equals against tag_name, deallocates the candidate, and returns 1 on first match. Returns 0 if none matched. The deallocation after every check is important because each create_string allocates a new buffer.
+Compares tag_name against each of the 13 HTML void-element names using string_equals with a read-only string literal as the second operand, and returns 1 on the first match. Returns 0 if none matched. String literals are NUL-terminated pointers into the read-only data segment, so no allocation or deallocation is required.
 @End Implementation
 
 @Performance_Hints:
-Linear in the number of void elements (13). Hot enough on big documents that switching to an interned-symbol table would help, but kept simple for the bootstrap.
+O(13) string comparisons in the worst case with zero allocation. An
+interned-symbol table is the faster alternative on hot paths over large documents.
 @End Performance_Hints
 
 Process called "is_void_element" takes tag_name as Integer returns Integer:
     Note: Check if element is a void element (no closing tag)
 
-    Let area be proc create_string from StringCore with "area"
-    Let match be proc string_equals from StringCore with tag_name, area
-    proc deallocate from Layout with area
+    Let match be proc string_equals from StringCore with tag_name, "area"
     If match is equal to 1:
         Return 1
     End If
 
-    Let base be proc create_string from StringCore with "base"
-    Set match to proc string_equals from StringCore with tag_name, base
-    proc deallocate from Layout with base
+    Set match to proc string_equals from StringCore with tag_name, "base"
     If match is equal to 1:
         Return 1
     End If
 
-    Let br be proc create_string from StringCore with "br"
-    Set match to proc string_equals from StringCore with tag_name, br
-    proc deallocate from Layout with br
+    Set match to proc string_equals from StringCore with tag_name, "br"
     If match is equal to 1:
         Return 1
     End If
 
-    Let col be proc create_string from StringCore with "col"
-    Set match to proc string_equals from StringCore with tag_name, col
-    proc deallocate from Layout with col
+    Set match to proc string_equals from StringCore with tag_name, "col"
     If match is equal to 1:
         Return 1
     End If
 
-    Let embed be proc create_string from StringCore with "embed"
-    Set match to proc string_equals from StringCore with tag_name, embed
-    proc deallocate from Layout with embed
+    Set match to proc string_equals from StringCore with tag_name, "embed"
     If match is equal to 1:
         Return 1
     End If
 
-    Let hr be proc create_string from StringCore with "hr"
-    Set match to proc string_equals from StringCore with tag_name, hr
-    proc deallocate from Layout with hr
+    Set match to proc string_equals from StringCore with tag_name, "hr"
     If match is equal to 1:
         Return 1
     End If
 
-    Let img be proc create_string from StringCore with "img"
-    Set match to proc string_equals from StringCore with tag_name, img
-    proc deallocate from Layout with img
+    Set match to proc string_equals from StringCore with tag_name, "img"
     If match is equal to 1:
         Return 1
     End If
 
-    Let input be proc create_string from StringCore with "input"
-    Set match to proc string_equals from StringCore with tag_name, input
-    proc deallocate from Layout with input
+    Set match to proc string_equals from StringCore with tag_name, "input"
     If match is equal to 1:
         Return 1
     End If
 
-    Let link be proc create_string from StringCore with "link"
-    Set match to proc string_equals from StringCore with tag_name, link
-    proc deallocate from Layout with link
+    Set match to proc string_equals from StringCore with tag_name, "link"
     If match is equal to 1:
         Return 1
     End If
 
-    Let meta be proc create_string from StringCore with "meta"
-    Set match to proc string_equals from StringCore with tag_name, meta
-    proc deallocate from Layout with meta
+    Set match to proc string_equals from StringCore with tag_name, "meta"
     If match is equal to 1:
         Return 1
     End If
 
-    Let source be proc create_string from StringCore with "source"
-    Set match to proc string_equals from StringCore with tag_name, source
-    proc deallocate from Layout with source
+    Set match to proc string_equals from StringCore with tag_name, "source"
     If match is equal to 1:
         Return 1
     End If
 
-    Let track be proc create_string from StringCore with "track"
-    Set match to proc string_equals from StringCore with tag_name, track
-    proc deallocate from Layout with track
+    Set match to proc string_equals from StringCore with tag_name, "track"
     If match is equal to 1:
         Return 1
     End If
 
-    Let wbr be proc create_string from StringCore with "wbr"
-    Set match to proc string_equals from StringCore with tag_name, wbr
-    proc deallocate from Layout with wbr
+    Set match to proc string_equals from StringCore with tag_name, "wbr"
     If match is equal to 1:
         Return 1
     End If
@@ -770,7 +783,7 @@ Process called "create_string_from_bytes" takes bytes as Integer, length as Inte
         Return 0
     End If
 
-    proc memory_copy from Layout with str, 0, bytes, 0, length
+    proc memory_copy from Layout with str, bytes, length
     proc memory_set_byte from Layout with str, length, 0
 
     Return str
