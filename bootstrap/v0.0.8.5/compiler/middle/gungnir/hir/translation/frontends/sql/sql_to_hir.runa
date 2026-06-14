@@ -217,6 +217,10 @@ Process called "translate_sql_node_to_hir" takes context as Integer, sql_node as
         Return proc translate_sql_identifier with context, sql_node
     End If
 
+    If node_type is equal to SQL_COLUMN_DEF from Parser:
+        Return proc translate_sql_column_def with context, sql_node
+    End If
+
     If node_type is equal to SQL_BINARY_OP from Parser:
         Return proc translate_sql_binary_op with context, sql_node
     End If
@@ -309,12 +313,44 @@ Process called "translate_sql_literal" takes context as Integer, sql_node as Int
 End Process
 
 @Reasoning:
-SQL identifiers (column names, table names, etc.) lower to HIR string
-literals because SQL is data-oriented rather than program-oriented; the
-HIR doesn't have an "identifier" concept that matches SQL's name semantics.
+SQL identifiers (column names, table names, `*`, etc.) lower to an HIR
+dictionary {type: identifier, name: <string>} rather than a bare HIR
+string literal. The distinction is essential: a bare HIR string literal is
+reserved for SQL string-literal values, which the emitter single-quotes,
+whereas an identifier must be emitted unquoted (or double-quoted only when
+reserved). Tagging identifiers separately keeps `WHERE name = 'John'`
+emitting `name` as a bare column and `'John'` as a quoted literal.
 @End Reasoning
+@Implementation:
+Reads the identifier text at offset 8; on null records an error and returns
+0. Builds a dictionary literal tagged "identifier" with the name stored as
+an HIR string literal under the "name" key.
+@End Implementation
 Process called "translate_sql_identifier" takes context as Integer, sql_node as Integer returns Integer:
-    Note: Translate SQL identifier to HIR string
+    Note: Translate SQL identifier to HIR identifier dictionary
+
+    Let value be proc memory_get_int64 from Layout with sql_node, 8
+
+    If value is equal to 0:
+        proc set_translation_error with context, "Identifier has no value"
+        Return 0
+    End If
+
+    Let hir_ident_dict be proc create_hir_dictionary_literal from HIR
+    Let ident_type be proc create_hir_string_literal from HIR with "identifier"
+    proc add_dictionary_entry from HIR with hir_ident_dict, "type", ident_type
+    Let ident_name be proc create_hir_string_literal from HIR with value
+    proc add_dictionary_entry from HIR with hir_ident_dict, "name", ident_name
+    Return hir_ident_dict
+End Process
+
+@Reasoning:
+Legacy raw-string identifier lowering retained for internal callers that
+specifically need the bare string payload (none currently), preserved to
+avoid silently changing any future call site's contract.
+@End Reasoning
+Process called "translate_sql_identifier_raw" takes context as Integer, sql_node as Integer returns Integer:
+    Note: Translate SQL identifier to a bare HIR string literal
 
     Let value be proc memory_get_int64 from Layout with sql_node, 8
 
@@ -326,6 +362,99 @@ Process called "translate_sql_identifier" takes context as Integer, sql_node as 
     Let hir_string be proc create_hir_string_literal from HIR with value
 
     Return hir_string
+End Process
+
+@Reasoning:
+A CREATE TABLE / ALTER TABLE column definition lowers to {type: column_def,
+name, datatype, constraints: [...]}. The SQL_COLUMN_DEF node's children are
+ordered: child[0] is the column name (SQL_IDENTIFIER), child[1] is the data
+type (SQL_IDENTIFIER carrying the full type spelling), and any remaining
+children are constraint markers (SQL_IDENTIFIER nodes whose value is the
+constraint spelling such as "NOT NULL", "PRIMARY KEY", "UNIQUE", "DEFAULT";
+a DEFAULT constraint carries its default-value expression as its own child).
+Preserving the column name, datatype, and constraint list lets hir_to_sql
+re-emit a faithful column definition.
+@End Reasoning
+@Implementation:
+Reads the children list. Emits the name string from child[0]'s value and the
+datatype string from child[1]'s value (both stored at SQLNode offset 8).
+Walks children[2..] building a constraints list: each constraint's spelling
+(its value at offset 8) becomes an HIR string literal; a DEFAULT constraint
+also contributes its grandchild default-value expression, lowered and stored
+under the "default" key of the same dict so the value survives.
+@End Implementation
+Process called "translate_sql_column_def" takes context as Integer, sql_node as Integer returns Integer:
+    Note: Translate a column definition to HIR dictionary
+
+    Let children be proc memory_get_int64 from Layout with sql_node, 16
+    Let children_count be proc size from List with children
+
+    Let hir_dict be proc create_hir_dictionary_literal from HIR
+
+    Note: Add type field
+    Let type_value be proc create_hir_string_literal from HIR with "column_def"
+    proc add_dictionary_entry from HIR with hir_dict, "type", type_value
+
+    Note: Column name (child 0)
+    If children_count is greater than 0:
+        Let name_node be proc get_at from List with children, 0
+        Let name_str be proc memory_get_int64 from Layout with name_node, 8
+
+        If name_str is not equal to 0:
+            Let name_value be proc create_hir_string_literal from HIR with name_str
+            proc add_dictionary_entry from HIR with hir_dict, "name", name_value
+        End If
+    End If
+
+    Note: Column datatype (child 1)
+    If children_count is greater than 1:
+        Let type_node be proc get_at from List with children, 1
+        Let datatype_str be proc memory_get_int64 from Layout with type_node, 8
+
+        If datatype_str is not equal to 0:
+            Let datatype_value be proc create_hir_string_literal from HIR with datatype_str
+            proc add_dictionary_entry from HIR with hir_dict, "datatype", datatype_value
+        End If
+    End If
+
+    Note: Constraints (children 2..) and optional DEFAULT value
+    Let constraints_list be proc create_hir_list_literal from HIR
+    Let default_value_hir be 0
+
+    Let index be 2
+    While index is less than children_count:
+        Let constraint_node be proc get_at from List with children, index
+        Let constraint_str be proc memory_get_int64 from Layout with constraint_node, 8
+
+        If constraint_str is not equal to 0:
+            Let constraint_value be proc create_hir_string_literal from HIR with constraint_str
+            proc add_list_element from HIR with constraints_list, constraint_value
+        End If
+
+        Note: A DEFAULT constraint carries its value expression as a grandchild
+        Let constraint_children be proc memory_get_int64 from Layout with constraint_node, 16
+
+        If constraint_children is not equal to 0:
+            Let gc_count be proc size from List with constraint_children
+
+            If gc_count is greater than 0:
+                Let default_node be proc get_at from List with constraint_children, 0
+                Set default_value_hir to proc translate_sql_node_to_hir with context, default_node
+            End If
+        End If
+
+        Set index to index plus 1
+    End While
+
+    Note: Add constraints field
+    proc add_dictionary_entry from HIR with hir_dict, "constraints", constraints_list
+
+    Note: Add default field (if a DEFAULT constraint provided a value)
+    If default_value_hir is not equal to 0:
+        proc add_dictionary_entry from HIR with hir_dict, "default", default_value_hir
+    End If
+
+    Return hir_dict
 End Process
 
 @Reasoning:
@@ -623,50 +752,57 @@ Process called "translate_sql_select" takes context as Integer, sql_node as Inte
     Let offset_value be 0
 
     Let index be 0
-    Let parsing_columns be 1  Note: Start by parsing column list
 
     While index is less than children_count:
         Let child_node be proc get_at from List with children, index
         Let child_type be proc memory_get_int64 from Layout with child_node, 0
 
-        Note: Check child type to categorize
-        If child_type is equal to SQL_WHERE from Parser:
+        Note: Each clause carries a distinct marker node type so columns
+        Note: (which are identifiers) are never confused with the FROM table
+        Note: (also an identifier). Anything that is not a recognised marker is
+        Note: a SELECT-list column.
+        If child_type is equal to SQL_FROM from Parser:
+            Let from_inner be proc memory_get_int64 from Layout with child_node, 16
+            Let from_inner_count be proc size from List with from_inner
+
+            If from_inner_count is greater than 0:
+                Let from_table_node be proc get_at from List with from_inner, 0
+                Set from_table to proc translate_sql_node_to_hir with context, from_table_node
+            End If
+        Otherwise If child_type is equal to SQL_WHERE from Parser:
             Set where_clause to proc translate_sql_where with context, child_node
-            Set parsing_columns to 0
         Otherwise If child_type is equal to SQL_JOIN from Parser:
             Let hir_join be proc translate_sql_join with context, child_node
 
             If hir_join is not equal to 0:
                 proc add_list_element from HIR with joins_list, hir_join
             End If
-
-            Set parsing_columns to 0
         Otherwise If child_type is equal to SQL_GROUP_BY from Parser:
             Set group_by_clause to proc translate_sql_group_by with context, child_node
-            Set parsing_columns to 0
         Otherwise If child_type is equal to SQL_ORDER_BY from Parser:
             Set order_by_clause to proc translate_sql_order_by with context, child_node
-            Set parsing_columns to 0
-        Otherwise:
-            Note: If still parsing columns, add to column list
-            Note: Otherwise, check if it's FROM table, LIMIT, or OFFSET
-            If parsing_columns is equal to 1:
-                Let hir_col be proc translate_sql_node_to_hir with context, child_node
+        Otherwise If child_type is equal to SQL_LIMIT from Parser:
+            Let limit_inner be proc memory_get_int64 from Layout with child_node, 16
+            Let limit_inner_count be proc size from List with limit_inner
 
-                If hir_col is not equal to 0:
-                    proc add_list_element from HIR with columns_list, hir_col
-                End If
-            Otherwise:
-                Note: Check if this is the FROM table
-                If from_table is equal to 0:
-                    Set from_table to proc translate_sql_node_to_hir with context, child_node
-                Otherwise If limit_value is equal to 0:
-                    Note: Could be LIMIT
-                    Set limit_value to proc translate_sql_node_to_hir with context, child_node
-                Otherwise:
-                    Note: Could be OFFSET
-                    Set offset_value to proc translate_sql_node_to_hir with context, child_node
-                End If
+            If limit_inner_count is greater than 0:
+                Let limit_inner_node be proc get_at from List with limit_inner, 0
+                Set limit_value to proc translate_sql_node_to_hir with context, limit_inner_node
+            End If
+        Otherwise If child_type is equal to SQL_OFFSET from Parser:
+            Let offset_inner be proc memory_get_int64 from Layout with child_node, 16
+            Let offset_inner_count be proc size from List with offset_inner
+
+            If offset_inner_count is greater than 0:
+                Let offset_inner_node be proc get_at from List with offset_inner, 0
+                Set offset_value to proc translate_sql_node_to_hir with context, offset_inner_node
+            End If
+        Otherwise:
+            Note: A SELECT-list column expression
+            Let hir_col be proc translate_sql_node_to_hir with context, child_node
+
+            If hir_col is not equal to 0:
+                proc add_list_element from HIR with columns_list, hir_col
             End If
         End If
 

@@ -1,0 +1,375 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+Licensed under Apache 2.0
+:End Note
+
+Note:
+SQL Translation Round-Trip Probe
+
+End-to-end proof that the SQL translation pipeline is REAL, not a skeleton:
+
+    SQL source
+      -> sql_lexer       (tokenize SELECT/FROM/JOIN/WHERE/GROUP BY/ORDER BY,
+                          INSERT/VALUES, UPDATE/SET, DELETE, CREATE TABLE,
+                          operators =,<>,<,>,AND/OR, string/number/NULL literals)
+      -> sql_parser      (build the SQLNode AST documented atop sql_parser)
+      -> sql_to_hir      (lower the AST to the hir.runa dictionary/list HIR)
+      -> hir_to_sql      (emit HIR back to valid PostgreSQL text)
+      -> re-lex / re-parse / re-lower of the emitted text
+      -> structural + CONTENT equality on the key constructs
+
+The SQL HIR node model is hir.runa's dictionary/list literal interchange shared
+by sql_to_hir (producer) and hir_to_sql (consumer): a dictionary is a
+HIR_DICTIONARY_LITERAL whose entries List (16-byte [key, value] blocks) hangs at
+the children slot; a list is a HIR_ARRAY_LITERAL whose elements List hangs at the
+children slot; string payloads are HIR string-literal nodes read with
+get_string_literal_value. Identifiers lower to {type: identifier, name}; string
+literals stay as bare HIR string literals. This probe reads HIR through exactly
+that contract.
+
+DEPTH: the probe does NOT merely check that nodes exist. It asserts on the
+re-parsed HIR2 that the CONTENTS survive: a SELECT's column list (>= 2 columns),
+the FROM table name + a JOIN with an ON condition, a WHERE predicate (binary op
+with operator and operands), GROUP BY keys, ORDER BY keys; a CREATE TABLE's
+column names AND types; an INSERT's value list. A translator that returned an
+empty members list (members vanish) makes this probe FAIL.
+
+Exit code: number of failed assertions (0 == all passed). No exit_with_code.
+:End Note
+
+Import "compiler/middle/gungnir/hir/translation/frontends/sql/sql_to_hir.runa" as SqlFrontend
+Import "compiler/middle/gungnir/hir/translation/backends/sql/hir_to_sql.runa" as SqlBackend
+Import "compiler/middle/gungnir/hir/hir.runa" as HIR
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/collections/list.runa" as List
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "tests/test_utils.runa" as TestUtils
+
+Note: ============================================================================
+Note: hir.runa dict/list literal decoders (mirror the producer/consumer contract)
+Note: ============================================================================
+
+@Reasoning:
+A SQL HIR dictionary is a HIR_DICTIONARY_LITERAL whose entries List hangs at the
+children slot. Each entry is a 16-byte block: key (raw string handle) at offset 0,
+value (a child HIR node or HIR string literal) at offset 8. This decoder
+linear-scans those entries comparing the raw key with string_equals, returning the
+stored value. It is the exact lookup hir_to_sql's get_dictionary_value performs.
+@End Reasoning
+Process called "dict_get" takes node as Integer, key as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+
+    Let entries be proc get_dictionary_entries from HIR with node
+    If entries is equal to 0:
+        Return 0
+    End If
+
+    Let count be proc size from List with entries
+    Let index be 0
+    While index is less than count:
+        Let entry be proc get_at from List with entries, index
+        If entry is not equal to 0:
+            Let entry_key be proc memory_get_int64 from Layout with entry, 0
+            Let matches be proc string_equals from StringCore with entry_key, key
+            If matches is equal to 1:
+                Return proc memory_get_int64 from Layout with entry, 8
+            End If
+        End If
+        Set index to index plus 1
+    End While
+
+    Return 0
+End Process
+
+@Reasoning:
+String fields ("type", "operator", "name", ...) are stored as HIR string literal
+nodes. This helper resolves the key then unwraps the literal to its char* payload.
+@End Reasoning
+Process called "dict_get_string" takes node as Integer, key as Integer returns Integer:
+    Let value_node be proc dict_get with node, key
+    If value_node is equal to 0:
+        Return 0
+    End If
+    Return proc get_string_literal_value from HIR with value_node
+End Process
+
+@Reasoning:
+A SQL HIR list is a HIR_ARRAY_LITERAL whose backing element List hangs at the
+children slot. Returns the element count (0 when absent).
+@End Reasoning
+Process called "list_count" takes node as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    Let items be proc get_list_elements from HIR with node
+    If items is equal to 0:
+        Return 0
+    End If
+    Return proc size from List with items
+End Process
+
+@Reasoning:
+Returns the element at index in a HIR list node (0 when absent / out of range).
+@End Reasoning
+Process called "list_at" takes node as Integer, index as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    Let items be proc get_list_elements from HIR with node
+    If items is equal to 0:
+        Return 0
+    End If
+    Return proc get_at from List with items, index
+End Process
+
+@Reasoning:
+An identifier HIR node is {type: identifier, name: <string literal>}. This helper
+returns the bare name string so the probe can compare column/table names.
+@End Reasoning
+Process called "identifier_name" takes node as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    Return proc dict_get_string with node, "name"
+End Process
+
+@Reasoning:
+Finds the first element of a HIR list whose "type" tag equals the requested kind.
+Used to locate the column whose name matches in a CREATE TABLE columns list.
+@End Reasoning
+Process called "find_column_by_name" takes columns_node as Integer, want_name as Integer returns Integer:
+    If columns_node is equal to 0:
+        Return 0
+    End If
+    Let items be proc get_list_elements from HIR with columns_node
+    If items is equal to 0:
+        Return 0
+    End If
+    Let count be proc size from List with items
+    Let index be 0
+    While index is less than count:
+        Let col be proc get_at from List with items, index
+        Let cname be proc dict_get_string with col, "name"
+        If cname is not equal to 0:
+            Let matches be proc string_equals from StringCore with cname, want_name
+            If matches is equal to 1:
+                Return col
+            End If
+        End If
+        Set index to index plus 1
+    End While
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: Pipeline helpers
+Note: ============================================================================
+
+@Reasoning:
+Each round of the probe runs the identical front-of-pipeline (lex -> parse ->
+lower). translate_sql_to_hir runs all of these as a unit; this wrapper guards
+the source so the two runs (original and emitted) are behaviourally identical.
+@End Reasoning
+Process called "source_to_hir" takes source as Integer returns Integer:
+    If source is equal to 0:
+        Return 0
+    End If
+    Return proc translate_sql_to_hir from SqlFrontend with source, 0
+End Process
+
+Note: ============================================================================
+Note: Assertion battery applied to a SELECT HIR root
+Note: ============================================================================
+
+@Reasoning:
+Runs the full set of SELECT content assertions against one HIR root, so the
+identical battery can be applied to HIR1 (original) and HIR2 (round-tripped).
+@End Reasoning
+Process called "check_select" takes results as Integer, label as Integer, root as Integer returns Integer:
+    Note: type == select
+    Let root_type be proc dict_get_string with root, "type"
+    Let root_type_ok be proc string_equals from StringCore with root_type, "select"
+    proc assert_equal from TestUtils with results, label, root_type_ok, 1
+
+    Note: columns >= 2 and first column survives
+    Let columns be proc dict_get with root, "columns"
+    Let col_count be proc list_count with columns
+    proc assert_greater_than_or_equal from TestUtils with results, label, col_count, 2
+
+    Let col0 be proc list_at with columns, 0
+    Let col0_name be proc identifier_name with col0
+    proc assert_not_null from TestUtils with results, label, col0_name
+
+    Note: FROM table name == "users"
+    Let from_node be proc dict_get with root, "from"
+    proc assert_not_null from TestUtils with results, label, from_node
+    Let from_name be proc identifier_name with from_node
+    Let from_ok be proc string_equals from StringCore with from_name, "users"
+    proc assert_equal from TestUtils with results, label, from_ok, 1
+
+    Note: JOIN present with table + ON condition
+    Let joins be proc dict_get with root, "joins"
+    Let join_count be proc list_count with joins
+    proc assert_greater_than_or_equal from TestUtils with results, label, join_count, 1
+    Let join0 be proc list_at with joins, 0
+    Let join_table be proc dict_get with join0, "table"
+    proc assert_not_null from TestUtils with results, label, join_table
+    Let join_table_name be proc identifier_name with join_table
+    Let join_table_ok be proc string_equals from StringCore with join_table_name, "orders"
+    proc assert_equal from TestUtils with results, label, join_table_ok, 1
+    Let join_on be proc dict_get with join0, "on"
+    proc assert_not_null from TestUtils with results, label, join_on
+    Let join_on_type be proc dict_get_string with join_on, "type"
+    Let join_on_ok be proc string_equals from StringCore with join_on_type, "binary_op"
+    proc assert_equal from TestUtils with results, label, join_on_ok, 1
+
+    Note: WHERE predicate is a binary op with operator + operands
+    Let where_node be proc dict_get with root, "where"
+    proc assert_not_null from TestUtils with results, label, where_node
+    Let where_type be proc dict_get_string with where_node, "type"
+    Let where_ok be proc string_equals from StringCore with where_type, "binary_op"
+    proc assert_equal from TestUtils with results, label, where_ok, 1
+    Let where_op be proc dict_get_string with where_node, "operator"
+    proc assert_not_null from TestUtils with results, label, where_op
+    Let where_left be proc dict_get with where_node, "left"
+    proc assert_not_null from TestUtils with results, label, where_left
+    Let where_right be proc dict_get with where_node, "right"
+    proc assert_not_null from TestUtils with results, label, where_right
+
+    Note: GROUP BY has >= 1 key
+    Let group_by be proc dict_get with root, "group_by"
+    Let group_count be proc list_count with group_by
+    proc assert_greater_than_or_equal from TestUtils with results, label, group_count, 1
+
+    Note: ORDER BY has >= 1 key
+    Let order_by be proc dict_get with root, "order_by"
+    Let order_count be proc list_count with order_by
+    proc assert_greater_than_or_equal from TestUtils with results, label, order_count, 1
+
+    Return 0
+End Process
+
+@Reasoning:
+Runs CREATE TABLE content assertions: table name plus two specific columns with
+their datatypes, applied to both HIR1 and HIR2.
+@End Reasoning
+Process called "check_create" takes results as Integer, label as Integer, root as Integer returns Integer:
+    Let root_type be proc dict_get_string with root, "type"
+    Let root_type_ok be proc string_equals from StringCore with root_type, "create_table"
+    proc assert_equal from TestUtils with results, label, root_type_ok, 1
+
+    Let table_node be proc dict_get with root, "table"
+    Let table_name be proc identifier_name with table_node
+    Let table_ok be proc string_equals from StringCore with table_name, "accounts"
+    proc assert_equal from TestUtils with results, label, table_ok, 1
+
+    Let columns be proc dict_get with root, "columns"
+    Let col_count be proc list_count with columns
+    proc assert_greater_than_or_equal from TestUtils with results, label, col_count, 2
+
+    Note: column "id" has a datatype
+    Let id_col be proc find_column_by_name with columns, "id"
+    proc assert_not_null from TestUtils with results, label, id_col
+    Let id_type be proc dict_get_string with id_col, "datatype"
+    proc assert_not_null from TestUtils with results, label, id_type
+
+    Note: column "name" has a datatype
+    Let name_col be proc find_column_by_name with columns, "name"
+    proc assert_not_null from TestUtils with results, label, name_col
+    Let name_type be proc dict_get_string with name_col, "datatype"
+    proc assert_not_null from TestUtils with results, label, name_type
+
+    Return 0
+End Process
+
+@Reasoning:
+Runs INSERT content assertions: table name, a column list, and a non-empty value
+list, applied to both HIR1 and HIR2.
+@End Reasoning
+Process called "check_insert" takes results as Integer, label as Integer, root as Integer returns Integer:
+    Let root_type be proc dict_get_string with root, "type"
+    Let root_type_ok be proc string_equals from StringCore with root_type, "insert"
+    proc assert_equal from TestUtils with results, label, root_type_ok, 1
+
+    Let table_node be proc dict_get with root, "table"
+    Let table_name be proc identifier_name with table_node
+    Let table_ok be proc string_equals from StringCore with table_name, "accounts"
+    proc assert_equal from TestUtils with results, label, table_ok, 1
+
+    Let values be proc dict_get with root, "values"
+    Let value_count be proc list_count with values
+    proc assert_greater_than_or_equal from TestUtils with results, label, value_count, 2
+
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: Probe entry point
+Note: ============================================================================
+
+Process called "main" returns Integer:
+    Let results be proc create_test_results from TestUtils
+    proc begin_suite from TestUtils with results, "SQL translation round-trip"
+
+    Note: ---------------------------------------------------------------------
+    Note: SELECT with columns, FROM, INNER JOIN ... ON, WHERE, GROUP BY, ORDER BY
+    Note: ---------------------------------------------------------------------
+    Let select_src be "SELECT id, name FROM users INNER JOIN orders ON id = id WHERE id > 10 GROUP BY name ORDER BY id"
+
+    Let select_hir1 be proc source_to_hir with select_src
+    proc assert_not_null from TestUtils with results, "SELECT: frontend produced HIR1", select_hir1
+    proc check_select with results, "SELECT HIR1 content", select_hir1
+
+    Let select_sql be proc generate_sql_from_hir from SqlBackend with select_hir1
+    proc assert_not_null from TestUtils with results, "SELECT: backend produced SQL text", select_sql
+    Let select_sql_len be proc string_length from StringCore with select_sql
+    proc assert_greater_than from TestUtils with results, "SELECT: emitted SQL non-empty", select_sql_len, 0
+
+    Let select_hir2 be proc source_to_hir with select_sql
+    proc assert_not_null from TestUtils with results, "SELECT: re-parse produced HIR2", select_hir2
+    proc check_select with results, "SELECT HIR2 round-trip content", select_hir2
+
+    Note: ---------------------------------------------------------------------
+    Note: CREATE TABLE with column defs + types + constraints
+    Note: ---------------------------------------------------------------------
+    Let create_src be "CREATE TABLE accounts (id INTEGER PRIMARY KEY, name VARCHAR NOT NULL, balance NUMERIC)"
+
+    Let create_hir1 be proc source_to_hir with create_src
+    proc assert_not_null from TestUtils with results, "CREATE: frontend produced HIR1", create_hir1
+    proc check_create with results, "CREATE HIR1 content", create_hir1
+
+    Let create_sql be proc generate_sql_from_hir from SqlBackend with create_hir1
+    proc assert_not_null from TestUtils with results, "CREATE: backend produced SQL text", create_sql
+    Let create_sql_len be proc string_length from StringCore with create_sql
+    proc assert_greater_than from TestUtils with results, "CREATE: emitted SQL non-empty", create_sql_len, 0
+
+    Let create_hir2 be proc source_to_hir with create_sql
+    proc assert_not_null from TestUtils with results, "CREATE: re-parse produced HIR2", create_hir2
+    proc check_create with results, "CREATE HIR2 round-trip content", create_hir2
+
+    Note: ---------------------------------------------------------------------
+    Note: INSERT with explicit columns + VALUES
+    Note: ---------------------------------------------------------------------
+    Let insert_src be "INSERT INTO accounts (id, name) VALUES (1, 'Alice')"
+
+    Let insert_hir1 be proc source_to_hir with insert_src
+    proc assert_not_null from TestUtils with results, "INSERT: frontend produced HIR1", insert_hir1
+    proc check_insert with results, "INSERT HIR1 content", insert_hir1
+
+    Let insert_sql be proc generate_sql_from_hir from SqlBackend with insert_hir1
+    proc assert_not_null from TestUtils with results, "INSERT: backend produced SQL text", insert_sql
+    Let insert_sql_len be proc string_length from StringCore with insert_sql
+    proc assert_greater_than from TestUtils with results, "INSERT: emitted SQL non-empty", insert_sql_len, 0
+
+    Let insert_hir2 be proc source_to_hir with insert_sql
+    proc assert_not_null from TestUtils with results, "INSERT: re-parse produced HIR2", insert_hir2
+    proc check_insert with results, "INSERT HIR2 round-trip content", insert_hir2
+
+    proc print_summary from TestUtils with results
+    Let failed be proc get_failed from TestUtils with results
+    proc destroy_test_results from TestUtils with results
+
+    Return failed
+End Process

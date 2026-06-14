@@ -24,6 +24,118 @@ Import "compiler/frontend/primitives/collections/list.runa" as List
 Import "compiler/frontend/primitives/memory/layout.runa" as Layout
 
 Note: ========================================
+Note: HIR Accessor Helpers
+Note: ========================================
+
+@Reasoning:
+The canonical HIR module exposes dictionary contents as a flat entries
+List (16-byte [key, value] blocks) and list contents as an elements List.
+These thin helpers adapt the canonical accessors to the by-key / by-index
+shape the SQL generator uses, mirroring the C backend's helper layer so
+the generation code reads as straight-line "look up key, emit value".
+@End Reasoning
+
+@Implementation:
+get_dictionary_value scans the entries List comparing each entry's key
+(string_equals) against the requested key and returns the matching value
+pointer (offset 8) or 0. The value accessors and list accessors forward
+to the canonical typed accessors in HIR.
+@End Implementation
+
+Process called "get_dictionary_value" takes dict_node as Integer, key as Integer returns Integer:
+    Note: Look up a value by string key in a HIR dictionary literal
+
+    If dict_node is equal to 0:
+        Return 0
+    End If
+
+    If key is equal to 0:
+        Return 0
+    End If
+
+    Let entries be proc get_dictionary_entries from HIR with dict_node
+
+    If entries is equal to 0:
+        Return 0
+    End If
+
+    Let count be proc size from List with entries
+    Let index be 0
+
+    While index is less than count:
+        Let entry be proc get_at from List with entries, index
+
+        If entry is not equal to 0:
+            Let entry_key be proc memory_get_int64 from Layout with entry, 0
+            Let matches be proc string_equals from StringCore with entry_key, key
+
+            If matches is equal to 1:
+                Return proc memory_get_int64 from Layout with entry, 8
+            End If
+        End If
+
+        Set index to index plus 1
+    End While
+
+    Return 0
+End Process
+
+@Reasoning:
+String / boolean / integer / float payload extraction routed through the
+canonical typed literal accessors so the SQL generator never duplicates
+the node_type + value_type validation that HIR already performs.
+@End Reasoning
+
+Process called "get_hir_string_value" takes node as Integer returns Integer:
+    Note: Extract the string payload of a HIR string literal
+    Return proc get_string_literal_value from HIR with node
+End Process
+
+Process called "get_hir_boolean_value" takes node as Integer returns Integer:
+    Note: Extract the 0/1 payload of a HIR boolean literal
+    Return proc get_boolean_literal_value from HIR with node
+End Process
+
+Process called "get_hir_integer_value" takes node as Integer returns Integer:
+    Note: Extract the int64 payload of a HIR integer literal
+    Return proc get_integer_literal_value from HIR with node
+End Process
+
+Process called "get_hir_float_value" takes node as Integer returns Integer:
+    Note: Extract the IEEE-754 bit payload of a HIR float literal
+    Return proc get_float_literal_value from HIR with node
+End Process
+
+@Reasoning:
+List element count and element-by-index lookups built on the canonical
+elements List so the SQL generator iterates HIR lists uniformly.
+@End Reasoning
+
+Process called "get_list_element_count" takes node as Integer returns Integer:
+    Note: Count elements of a HIR list literal
+
+    Let elements be proc get_list_elements from HIR with node
+
+    If elements is equal to 0:
+        Return 0
+    End If
+
+    Return proc size from List with elements
+End Process
+
+Process called "get_list_element" takes node as Integer, index as Integer returns Integer:
+    Note: Fetch the element at index from a HIR list literal
+
+    Let elements be proc get_list_elements from HIR with node
+
+    If elements is equal to 0:
+        Return 0
+    End If
+
+    Return proc get_at from List with elements, index
+End Process
+
+Note: ========================================
 Note: SQL Generator Context
 Note: ========================================
 
@@ -121,7 +233,7 @@ Process called "generate_sql_from_hir" takes hir_node as Integer returns Integer
     Let emitter be proc memory_get_int64 from Layout with context, 0
     Let sql_output be proc get_output from Emitter with emitter
 
-    proc destroy_generator_context from context
+    proc destroy_generator_context with context
 
     Return sql_output
 End Process
@@ -180,18 +292,17 @@ Unrecognised types fall through to generate_literal.
 Process called "generate_hir_node" takes context as Integer, hir_node as Integer:
     Note: Generate SQL for any HIR node (dictionary dispatch)
 
-    Let node_type be proc get_hir_node_type from HIR with hir_node
-
     Note: Check for dictionary type (all SQL structures are dictionaries)
-    If node_type is not equal to 7:  Note: HIR_DICTIONARY_LITERAL = 7
+    Let is_dict be proc is_dictionary_literal from HIR with hir_node
+    If is_dict is not equal to 1:
         Note: Not a dictionary, might be literal - generate literal
         proc generate_literal with context, hir_node
         Return
     End If
 
     Note: Get "type" field from dictionary
-    Let type_key be proc create_string from StringCore with "type"
-    Let type_value be proc get_dictionary_value from HIR with hir_node, type_key
+    Let type_key be proc string_duplicate from StringCore with "type"
+    Let type_value be proc get_dictionary_value with hir_node, type_key
     proc deallocate from Layout with type_key
 
     If type_value is equal to 0:
@@ -201,11 +312,11 @@ Process called "generate_hir_node" takes context as Integer, hir_node as Integer
     End If
 
     Note: Extract type string value
-    Let type_str be proc get_hir_string_value from HIR with type_value
+    Let type_str be proc get_hir_string_value with type_value
     Let type_len be proc string_length from StringCore with type_str
 
     Note: Dispatch based on type string
-    Let select_type be proc create_string from StringCore with "select"
+    Let select_type be proc string_duplicate from StringCore with "select"
     If proc string_equals from StringCore with type_str, select_type is equal to 1:
         proc deallocate from Layout with select_type
         proc generate_select_statement with context, hir_node
@@ -213,7 +324,7 @@ Process called "generate_hir_node" takes context as Integer, hir_node as Integer
     End If
     proc deallocate from Layout with select_type
 
-    Let insert_type be proc create_string from StringCore with "insert"
+    Let insert_type be proc string_duplicate from StringCore with "insert"
     If proc string_equals from StringCore with type_str, insert_type is equal to 1:
         proc deallocate from Layout with insert_type
         proc generate_insert_statement with context, hir_node
@@ -221,7 +332,7 @@ Process called "generate_hir_node" takes context as Integer, hir_node as Integer
     End If
     proc deallocate from Layout with insert_type
 
-    Let binary_op_type be proc create_string from StringCore with "binary_op"
+    Let binary_op_type be proc string_duplicate from StringCore with "binary_op"
     If proc string_equals from StringCore with type_str, binary_op_type is equal to 1:
         proc deallocate from Layout with binary_op_type
         proc generate_binary_operation with context, hir_node
@@ -229,7 +340,7 @@ Process called "generate_hir_node" takes context as Integer, hir_node as Integer
     End If
     proc deallocate from Layout with binary_op_type
 
-    Let function_type be proc create_string from StringCore with "function"
+    Let function_type be proc string_duplicate from StringCore with "function"
     If proc string_equals from StringCore with type_str, function_type is equal to 1:
         proc deallocate from Layout with function_type
         proc generate_function_call with context, hir_node
@@ -237,7 +348,7 @@ Process called "generate_hir_node" takes context as Integer, hir_node as Integer
     End If
     proc deallocate from Layout with function_type
 
-    Let column_type be proc create_string from StringCore with "column"
+    Let column_type be proc string_duplicate from StringCore with "column"
     If proc string_equals from StringCore with type_str, column_type is equal to 1:
         proc deallocate from Layout with column_type
         proc generate_column_reference with context, hir_node
@@ -245,7 +356,7 @@ Process called "generate_hir_node" takes context as Integer, hir_node as Integer
     End If
     proc deallocate from Layout with column_type
 
-    Let join_type be proc create_string from StringCore with "join"
+    Let join_type be proc string_duplicate from StringCore with "join"
     If proc string_equals from StringCore with type_str, join_type is equal to 1:
         proc deallocate from Layout with join_type
         proc generate_join_clause with context, hir_node
@@ -253,7 +364,7 @@ Process called "generate_hir_node" takes context as Integer, hir_node as Integer
     End If
     proc deallocate from Layout with join_type
 
-    Let update_type be proc create_string from StringCore with "update"
+    Let update_type be proc string_duplicate from StringCore with "update"
     If proc string_equals from StringCore with type_str, update_type is equal to 1:
         proc deallocate from Layout with update_type
         proc generate_update_statement with context, hir_node
@@ -261,7 +372,7 @@ Process called "generate_hir_node" takes context as Integer, hir_node as Integer
     End If
     proc deallocate from Layout with update_type
 
-    Let delete_type be proc create_string from StringCore with "delete"
+    Let delete_type be proc string_duplicate from StringCore with "delete"
     If proc string_equals from StringCore with type_str, delete_type is equal to 1:
         proc deallocate from Layout with delete_type
         proc generate_delete_statement with context, hir_node
@@ -269,7 +380,7 @@ Process called "generate_hir_node" takes context as Integer, hir_node as Integer
     End If
     proc deallocate from Layout with delete_type
 
-    Let create_table_type be proc create_string from StringCore with "create_table"
+    Let create_table_type be proc string_duplicate from StringCore with "create_table"
     If proc string_equals from StringCore with type_str, create_table_type is equal to 1:
         proc deallocate from Layout with create_table_type
         proc generate_create_table_statement with context, hir_node
@@ -277,7 +388,7 @@ Process called "generate_hir_node" takes context as Integer, hir_node as Integer
     End If
     proc deallocate from Layout with create_table_type
 
-    Let alter_table_type be proc create_string from StringCore with "alter_table"
+    Let alter_table_type be proc string_duplicate from StringCore with "alter_table"
     If proc string_equals from StringCore with type_str, alter_table_type is equal to 1:
         proc deallocate from Layout with alter_table_type
         proc generate_alter_table_statement with context, hir_node
@@ -285,13 +396,37 @@ Process called "generate_hir_node" takes context as Integer, hir_node as Integer
     End If
     proc deallocate from Layout with alter_table_type
 
-    Let drop_type be proc create_string from StringCore with "drop"
+    Let drop_type be proc string_duplicate from StringCore with "drop"
     If proc string_equals from StringCore with type_str, drop_type is equal to 1:
         proc deallocate from Layout with drop_type
         proc generate_drop_statement with context, hir_node
         Return
     End If
     proc deallocate from Layout with drop_type
+
+    Let column_def_type be proc string_duplicate from StringCore with "column_def"
+    If proc string_equals from StringCore with type_str, column_def_type is equal to 1:
+        proc deallocate from Layout with column_def_type
+        proc generate_column_def with context, hir_node
+        Return
+    End If
+    proc deallocate from Layout with column_def_type
+
+    Let identifier_type be proc string_duplicate from StringCore with "identifier"
+    If proc string_equals from StringCore with type_str, identifier_type is equal to 1:
+        proc deallocate from Layout with identifier_type
+        proc generate_identifier with context, hir_node
+        Return
+    End If
+    proc deallocate from Layout with identifier_type
+
+    Let column_ref_type be proc string_duplicate from StringCore with "column_ref"
+    If proc string_equals from StringCore with type_str, column_ref_type is equal to 1:
+        proc deallocate from Layout with column_ref_type
+        proc generate_column_reference with context, hir_node
+        Return
+    End If
+    proc deallocate from Layout with column_ref_type
 
     Note: Unknown type, treat as literal
     proc generate_literal with context, hir_node
@@ -331,12 +466,12 @@ Process called "generate_select_statement" takes context as Integer, select_dict
     proc emit_char from Emitter with emitter, 32  Note: space
 
     Note: Check for DISTINCT
-    Let distinct_key be proc create_string from StringCore with "distinct"
-    Let distinct_value be proc get_dictionary_value from HIR with select_dict, distinct_key
+    Let distinct_key be proc string_duplicate from StringCore with "distinct"
+    Let distinct_value be proc get_dictionary_value with select_dict, distinct_key
     proc deallocate from Layout with distinct_key
 
     If distinct_value is not equal to 0:
-        Let is_distinct be proc get_hir_boolean_value from HIR with distinct_value
+        Let is_distinct be proc get_hir_boolean_value with distinct_value
 
         If is_distinct is equal to 1:
             proc emit_keyword from Emitter with emitter, "DISTINCT"
@@ -345,8 +480,8 @@ Process called "generate_select_statement" takes context as Integer, select_dict
     End If
 
     Note: Generate SELECT list (columns)
-    Let columns_key be proc create_string from StringCore with "columns"
-    Let columns_list be proc get_dictionary_value from HIR with select_dict, columns_key
+    Let columns_key be proc string_duplicate from StringCore with "columns"
+    Let columns_list be proc get_dictionary_value with select_dict, columns_key
     proc deallocate from Layout with columns_key
 
     If columns_list is not equal to 0:
@@ -356,8 +491,8 @@ Process called "generate_select_statement" takes context as Integer, select_dict
     End If
 
     Note: FROM clause
-    Let from_key be proc create_string from StringCore with "from"
-    Let from_value be proc get_dictionary_value from HIR with select_dict, from_key
+    Let from_key be proc string_duplicate from StringCore with "from"
+    Let from_value be proc get_dictionary_value with select_dict, from_key
     proc deallocate from Layout with from_key
 
     If from_value is not equal to 0:
@@ -365,29 +500,21 @@ Process called "generate_select_statement" takes context as Integer, select_dict
         proc emit_keyword from Emitter with emitter, "FROM"
         proc emit_char from Emitter with emitter, 32  Note: space
 
-        Note: FROM value can be a string or nested structure
-        Let from_type be proc get_hir_node_type from HIR with from_value
-
-        If from_type is equal to 5:  Note: HIR_STRING_LITERAL = 5
-            Let table_name be proc get_hir_string_value from HIR with from_value
-            proc emit_identifier from Emitter with emitter, table_name
-        Otherwise:
-            Note: Nested query or expression
-            proc generate_hir_node with context, from_value
-        End If
+        Note: FROM value is an identifier dict, a nested query, or expression
+        proc generate_name_identifier with context, from_value
     End If
 
     Note: JOIN clauses
-    Let joins_key be proc create_string from StringCore with "joins"
-    Let joins_list be proc get_dictionary_value from HIR with select_dict, joins_key
+    Let joins_key be proc string_duplicate from StringCore with "joins"
+    Let joins_list be proc get_dictionary_value with select_dict, joins_key
     proc deallocate from Layout with joins_key
 
     If joins_list is not equal to 0:
-        Let joins_count be proc get_list_element_count from HIR with joins_list
+        Let joins_count be proc get_list_element_count with joins_list
         Let i be 0
 
         While i is less than joins_count:
-            Let join_node be proc get_list_element from HIR with joins_list, i
+            Let join_node be proc get_list_element with joins_list, i
 
             proc emit_char from Emitter with emitter, 32  Note: space
             proc generate_join_clause with context, join_node
@@ -397,8 +524,8 @@ Process called "generate_select_statement" takes context as Integer, select_dict
     End If
 
     Note: WHERE clause
-    Let where_key be proc create_string from StringCore with "where"
-    Let where_value be proc get_dictionary_value from HIR with select_dict, where_key
+    Let where_key be proc string_duplicate from StringCore with "where"
+    Let where_value be proc get_dictionary_value with select_dict, where_key
     proc deallocate from Layout with where_key
 
     If where_value is not equal to 0:
@@ -409,8 +536,8 @@ Process called "generate_select_statement" takes context as Integer, select_dict
     End If
 
     Note: GROUP BY clause
-    Let group_by_key be proc create_string from StringCore with "group_by"
-    Let group_by_list be proc get_dictionary_value from HIR with select_dict, group_by_key
+    Let group_by_key be proc string_duplicate from StringCore with "group_by"
+    Let group_by_list be proc get_dictionary_value with select_dict, group_by_key
     proc deallocate from Layout with group_by_key
 
     If group_by_list is not equal to 0:
@@ -423,8 +550,8 @@ Process called "generate_select_statement" takes context as Integer, select_dict
     End If
 
     Note: HAVING clause
-    Let having_key be proc create_string from StringCore with "having"
-    Let having_value be proc get_dictionary_value from HIR with select_dict, having_key
+    Let having_key be proc string_duplicate from StringCore with "having"
+    Let having_value be proc get_dictionary_value with select_dict, having_key
     proc deallocate from Layout with having_key
 
     If having_value is not equal to 0:
@@ -435,8 +562,8 @@ Process called "generate_select_statement" takes context as Integer, select_dict
     End If
 
     Note: ORDER BY clause
-    Let order_by_key be proc create_string from StringCore with "order_by"
-    Let order_by_list be proc get_dictionary_value from HIR with select_dict, order_by_key
+    Let order_by_key be proc string_duplicate from StringCore with "order_by"
+    Let order_by_list be proc get_dictionary_value with select_dict, order_by_key
     proc deallocate from Layout with order_by_key
 
     If order_by_list is not equal to 0:
@@ -449,8 +576,8 @@ Process called "generate_select_statement" takes context as Integer, select_dict
     End If
 
     Note: LIMIT clause
-    Let limit_key be proc create_string from StringCore with "limit"
-    Let limit_value be proc get_dictionary_value from HIR with select_dict, limit_key
+    Let limit_key be proc string_duplicate from StringCore with "limit"
+    Let limit_value be proc get_dictionary_value with select_dict, limit_key
     proc deallocate from Layout with limit_key
 
     If limit_value is not equal to 0:
@@ -461,8 +588,8 @@ Process called "generate_select_statement" takes context as Integer, select_dict
     End If
 
     Note: OFFSET clause
-    Let offset_key be proc create_string from StringCore with "offset"
-    Let offset_value be proc get_dictionary_value from HIR with select_dict, offset_key
+    Let offset_key be proc string_duplicate from StringCore with "offset"
+    Let offset_value be proc get_dictionary_value with select_dict, offset_key
     proc deallocate from Layout with offset_key
 
     If offset_value is not equal to 0:
@@ -509,18 +636,17 @@ Process called "generate_insert_statement" takes context as Integer, insert_dict
     proc emit_char from Emitter with emitter, 32  Note: space
 
     Note: Table name
-    Let table_key be proc create_string from StringCore with "table"
-    Let table_value be proc get_dictionary_value from HIR with insert_dict, table_key
+    Let table_key be proc string_duplicate from StringCore with "table"
+    Let table_value be proc get_dictionary_value with insert_dict, table_key
     proc deallocate from Layout with table_key
 
     If table_value is not equal to 0:
-        Let table_name be proc get_hir_string_value from HIR with table_value
-        proc emit_identifier from Emitter with emitter, table_name
+        proc generate_name_identifier with context, table_value
     End If
 
     Note: Column list (optional)
-    Let columns_key be proc create_string from StringCore with "columns"
-    Let columns_list be proc get_dictionary_value from HIR with insert_dict, columns_key
+    Let columns_key be proc string_duplicate from StringCore with "columns"
+    Let columns_list be proc get_dictionary_value with insert_dict, columns_key
     proc deallocate from Layout with columns_key
 
     If columns_list is not equal to 0:
@@ -536,8 +662,8 @@ Process called "generate_insert_statement" takes context as Integer, insert_dict
     proc emit_char from Emitter with emitter, 32  Note: space
 
     Note: Values list
-    Let values_key be proc create_string from StringCore with "values"
-    Let values_list be proc get_dictionary_value from HIR with insert_dict, values_key
+    Let values_key be proc string_duplicate from StringCore with "values"
+    Let values_list be proc get_dictionary_value with insert_dict, values_key
     proc deallocate from Layout with values_key
 
     If values_list is not equal to 0:
@@ -578,16 +704,16 @@ Process called "generate_join_clause" takes context as Integer, join_dict as Int
     Let emitter be proc memory_get_int64 from Layout with context, 0
 
     Note: Join type (INNER, LEFT, RIGHT, FULL OUTER)
-    Let join_type_key be proc create_string from StringCore with "join_type"
-    Let join_type_value be proc get_dictionary_value from HIR with join_dict, join_type_key
+    Let join_type_key be proc string_duplicate from StringCore with "join_type"
+    Let join_type_value be proc get_dictionary_value with join_dict, join_type_key
     proc deallocate from Layout with join_type_key
 
     If join_type_value is not equal to 0:
-        Let join_type_str be proc get_hir_string_value from HIR with join_type_value
+        Let join_type_str be proc get_hir_string_value with join_type_value
         Let join_type_len be proc string_length from StringCore with join_type_str
 
         Note: Emit join type if not INNER (INNER is default)
-        Let inner_str be proc create_string from StringCore with "INNER"
+        Let inner_str be proc string_duplicate from StringCore with "INNER"
         Let is_inner be proc string_equals from StringCore with join_type_str, inner_str
         proc deallocate from Layout with inner_str
 
@@ -602,18 +728,17 @@ Process called "generate_join_clause" takes context as Integer, join_dict as Int
     proc emit_char from Emitter with emitter, 32  Note: space
 
     Note: Table name
-    Let table_key be proc create_string from StringCore with "table"
-    Let table_value be proc get_dictionary_value from HIR with join_dict, table_key
+    Let table_key be proc string_duplicate from StringCore with "table"
+    Let table_value be proc get_dictionary_value with join_dict, table_key
     proc deallocate from Layout with table_key
 
     If table_value is not equal to 0:
-        Let table_name be proc get_hir_string_value from HIR with table_value
-        proc emit_identifier from Emitter with emitter, table_name
+        proc generate_name_identifier with context, table_value
     End If
 
     Note: ON condition
-    Let on_key be proc create_string from StringCore with "on"
-    Let on_value be proc get_dictionary_value from HIR with join_dict, on_key
+    Let on_key be proc string_duplicate from StringCore with "on"
+    Let on_value be proc get_dictionary_value with join_dict, on_key
     proc deallocate from Layout with on_key
 
     If on_value is not equal to 0:
@@ -651,18 +776,18 @@ Process called "generate_binary_operation" takes context as Integer, binary_op_d
     Let emitter be proc memory_get_int64 from Layout with context, 0
 
     Note: Get operator
-    Let operator_key be proc create_string from StringCore with "operator"
-    Let operator_value be proc get_dictionary_value from HIR with binary_op_dict, operator_key
+    Let operator_key be proc string_duplicate from StringCore with "operator"
+    Let operator_value be proc get_dictionary_value with binary_op_dict, operator_key
     proc deallocate from Layout with operator_key
 
     Note: Get left operand
-    Let left_key be proc create_string from StringCore with "left"
-    Let left_value be proc get_dictionary_value from HIR with binary_op_dict, left_key
+    Let left_key be proc string_duplicate from StringCore with "left"
+    Let left_value be proc get_dictionary_value with binary_op_dict, left_key
     proc deallocate from Layout with left_key
 
     Note: Get right operand
-    Let right_key be proc create_string from StringCore with "right"
-    Let right_value be proc get_dictionary_value from HIR with binary_op_dict, right_key
+    Let right_key be proc string_duplicate from StringCore with "right"
+    Let right_value be proc get_dictionary_value with binary_op_dict, right_key
     proc deallocate from Layout with right_key
 
     Note: Generate: left operator right
@@ -673,7 +798,7 @@ Process called "generate_binary_operation" takes context as Integer, binary_op_d
     proc emit_char from Emitter with emitter, 32  Note: space
 
     If operator_value is not equal to 0:
-        Let operator_str be proc get_hir_string_value from HIR with operator_value
+        Let operator_str be proc get_hir_string_value with operator_value
         proc emit_operator from Emitter with emitter, operator_str
     End If
 
@@ -702,20 +827,20 @@ Process called "generate_function_call" takes context as Integer, function_dict 
     Let emitter be proc memory_get_int64 from Layout with context, 0
 
     Note: Function name
-    Let name_key be proc create_string from StringCore with "name"
-    Let name_value be proc get_dictionary_value from HIR with function_dict, name_key
+    Let name_key be proc string_duplicate from StringCore with "name"
+    Let name_value be proc get_dictionary_value with function_dict, name_key
     proc deallocate from Layout with name_key
 
     If name_value is not equal to 0:
-        Let function_name be proc get_hir_string_value from HIR with name_value
+        Let function_name be proc get_hir_string_value with name_value
         proc emit_identifier from Emitter with emitter, function_name
     End If
 
     Note: Arguments
     proc emit_char from Emitter with emitter, 40  Note: (
 
-    Let args_key be proc create_string from StringCore with "args"
-    Let args_list be proc get_dictionary_value from HIR with function_dict, args_key
+    Let args_key be proc string_duplicate from StringCore with "args"
+    Let args_list be proc get_dictionary_value with function_dict, args_key
     proc deallocate from Layout with args_key
 
     If args_list is not equal to 0:
@@ -732,7 +857,35 @@ aliasing ("AS alias") is appended when the alias slot is set.
 @End Reasoning
 
 @Implementation:
-Reads "table", "name", and "alias" from the dict. Emits "<table>." when
+Reads "name" (the identifier string literal) and emits it through
+emit_identifier so reserved words are quoted and bare names stay unquoted.
+@End Implementation
+
+Process called "generate_identifier" takes context as Integer, identifier_dict as Integer:
+    Note: Generate a bare SQL identifier from {type: identifier, name}
+
+    Let emitter be proc memory_get_int64 from Layout with context, 0
+
+    Let name_key be proc string_duplicate from StringCore with "name"
+    Let name_value be proc get_dictionary_value with identifier_dict, name_key
+    proc deallocate from Layout with name_key
+
+    If name_value is not equal to 0:
+        Let ident_name be proc get_hir_string_value with name_value
+
+        Note: The wildcard `*` is a bare token, never a quoted identifier.
+        Let is_star be proc string_equals from StringCore with ident_name, "*"
+
+        If is_star is equal to 1:
+            proc emit_char from Emitter with emitter, 42  Note: *
+        Otherwise:
+            proc emit_identifier from Emitter with emitter, ident_name
+        End If
+    End If
+End Process
+
+@Implementation:
+Reads "table", "column", and "alias" from the dict. Emits "<table>." when
 the table prefix is present, then the column name through
 emit_identifier. Appends " AS <alias>" when alias is set.
 @End Implementation
@@ -743,29 +896,29 @@ Process called "generate_column_reference" takes context as Integer, column_dict
     Let emitter be proc memory_get_int64 from Layout with context, 0
 
     Note: Optional table name
-    Let table_key be proc create_string from StringCore with "table"
-    Let table_value be proc get_dictionary_value from HIR with column_dict, table_key
+    Let table_key be proc string_duplicate from StringCore with "table"
+    Let table_value be proc get_dictionary_value with column_dict, table_key
     proc deallocate from Layout with table_key
 
     If table_value is not equal to 0:
-        Let table_name be proc get_hir_string_value from HIR with table_value
+        Let table_name be proc get_hir_string_value with table_value
         proc emit_identifier from Emitter with emitter, table_name
         proc emit_char from Emitter with emitter, 46  Note: .
     End If
 
     Note: Column name
-    Let name_key be proc create_string from StringCore with "name"
-    Let name_value be proc get_dictionary_value from HIR with column_dict, name_key
+    Let name_key be proc string_duplicate from StringCore with "column"
+    Let name_value be proc get_dictionary_value with column_dict, name_key
     proc deallocate from Layout with name_key
 
     If name_value is not equal to 0:
-        Let column_name be proc get_hir_string_value from HIR with name_value
+        Let column_name be proc get_hir_string_value with name_value
         proc emit_identifier from Emitter with emitter, column_name
     End If
 
     Note: Optional alias
-    Let alias_key be proc create_string from StringCore with "alias"
-    Let alias_value be proc get_dictionary_value from HIR with column_dict, alias_key
+    Let alias_key be proc string_duplicate from StringCore with "alias"
+    Let alias_value be proc get_dictionary_value with column_dict, alias_key
     proc deallocate from Layout with alias_key
 
     If alias_value is not equal to 0:
@@ -773,7 +926,7 @@ Process called "generate_column_reference" takes context as Integer, column_dict
         proc emit_keyword from Emitter with emitter, "AS"
         proc emit_char from Emitter with emitter, 32  Note: space
 
-        Let alias_name be proc get_hir_string_value from HIR with alias_value
+        Let alias_name be proc get_hir_string_value with alias_value
         proc emit_identifier from Emitter with emitter, alias_name
     End If
 End Process
@@ -804,32 +957,35 @@ Process called "generate_literal" takes context as Integer, hir_node as Integer:
     Note: Generate literal value
 
     Let emitter be proc memory_get_int64 from Layout with context, 0
-    Let node_type be proc get_hir_node_type from HIR with hir_node
+
+    Note: String literal
+    Let is_string be proc is_string_literal from HIR with hir_node
+    If is_string is equal to 1:
+        Let string_value be proc get_hir_string_value with hir_node
+        proc emit_string_literal from Emitter with emitter, string_value
+        Return
+    End If
 
     Note: Integer literal
-    If node_type is equal to 3:  Note: HIR_INTEGER_LITERAL = 3
-        Let int_value be proc get_hir_integer_value from HIR with hir_node
+    Let is_integer be proc is_integer_literal from HIR with hir_node
+    If is_integer is equal to 1:
+        Let int_value be proc get_hir_integer_value with hir_node
         proc emit_integer from Emitter with emitter, int_value
         Return
     End If
 
     Note: Float literal
-    If node_type is equal to 4:  Note: HIR_FLOAT_LITERAL = 4
-        Let float_value be proc get_hir_float_value from HIR with hir_node
+    Let is_float be proc is_float_literal from HIR with hir_node
+    If is_float is equal to 1:
+        Let float_value be proc get_hir_float_value with hir_node
         proc emit_float from Emitter with emitter, float_value
         Return
     End If
 
-    Note: String literal
-    If node_type is equal to 5:  Note: HIR_STRING_LITERAL = 5
-        Let string_value be proc get_hir_string_value from HIR with hir_node
-        proc emit_string_literal from Emitter with emitter, string_value
-        Return
-    End If
-
     Note: Boolean literal
-    If node_type is equal to 6:  Note: HIR_BOOLEAN_LITERAL = 6
-        Let bool_value be proc get_hir_boolean_value from HIR with hir_node
+    Let is_boolean be proc is_boolean_literal from HIR with hir_node
+    If is_boolean is equal to 1:
+        Let bool_value be proc get_hir_boolean_value with hir_node
 
         If bool_value is equal to 1:
             proc emit_keyword from Emitter with emitter, "TRUE"
@@ -839,7 +995,7 @@ Process called "generate_literal" takes context as Integer, hir_node as Integer:
         Return
     End If
 
-    Note: NULL literal (represented as 0 in some contexts)
+    Note: NULL literal (any other literal kind, including null-tagged literals)
     proc emit_keyword from Emitter with emitter, "NULL"
 End Process
 
@@ -865,11 +1021,11 @@ through generate_hir_node and emits ", " between consecutive entries.
 Process called "generate_column_list" takes context as Integer, columns_list as Integer:
     Note: Generate comma-separated column list for SELECT
 
-    Let columns_count be proc get_list_element_count from HIR with columns_list
+    Let columns_count be proc get_list_element_count with columns_list
     Let i be 0
 
     While i is less than columns_count:
-        Let column_node be proc get_list_element from HIR with columns_list, i
+        Let column_node be proc get_list_element with columns_list, i
 
         proc generate_hir_node with context, column_node
 
@@ -898,18 +1054,18 @@ emit_identifier with ", " separators between entries.
 Process called "generate_identifier_list" takes context as Integer, identifiers_list as Integer:
     Note: Generate comma-separated identifier list
 
-    Let identifiers_count be proc get_list_element_count from HIR with identifiers_list
+    Let identifiers_count be proc get_list_element_count with identifiers_list
     Let i be 0
     Let emitter be proc memory_get_int64 from Layout with context, 0
 
     While i is less than identifiers_count:
-        Let identifier_node be proc get_list_element from HIR with identifiers_list, i
+        Let identifier_node be proc get_list_element with identifiers_list, i
 
         Note: Identifier can be a string literal
-        Let node_type be proc get_hir_node_type from HIR with identifier_node
+        Let id_is_string be proc is_string_literal from HIR with identifier_node
 
-        If node_type is equal to 5:  Note: HIR_STRING_LITERAL = 5
-            Let identifier_name be proc get_hir_string_value from HIR with identifier_node
+        If id_is_string is equal to 1:
+            Let identifier_name be proc get_hir_string_value with identifier_node
             proc emit_identifier from Emitter with emitter, identifier_name
         Otherwise:
             Note: Handle other identifier representations
@@ -940,11 +1096,11 @@ and emits ", " between consecutive entries.
 Process called "generate_expression_list" takes context as Integer, expressions_list as Integer:
     Note: Generate comma-separated expression list
 
-    Let expressions_count be proc get_list_element_count from HIR with expressions_list
+    Let expressions_count be proc get_list_element_count with expressions_list
     Let i be 0
 
     While i is less than expressions_count:
-        Let expression_node be proc get_list_element from HIR with expressions_list, i
+        Let expression_node be proc get_list_element with expressions_list, i
 
         proc generate_hir_node with context, expression_node
 
@@ -974,34 +1130,31 @@ through generate_hir_node, then emits " ASC" or " DESC" when the
 Process called "generate_order_by_list" takes context as Integer, order_by_list as Integer:
     Note: Generate comma-separated ORDER BY list with optional ASC/DESC
 
-    Let order_count be proc get_list_element_count from HIR with order_by_list
+    Let order_count be proc get_list_element_count with order_by_list
     Let i be 0
     Let emitter be proc memory_get_int64 from Layout with context, 0
 
     While i is less than order_count:
-        Let order_item be proc get_list_element from HIR with order_by_list, i
+        Let order_item be proc get_list_element with order_by_list, i
 
-        Note: Check if order_item is a dictionary with "column" and "direction"
-        Let item_type be proc get_hir_node_type from HIR with order_item
+        Note: An ORDER BY entry is an ordering-wrapper dict ONLY when it carries
+        Note: a "column" key. A bare identifier dict ({type: identifier}) is a
+        Note: plain ordering key and is dispatched directly so its name survives.
+        Let column_key be proc string_duplicate from StringCore with "column"
+        Let column_value be proc get_dictionary_value with order_item, column_key
+        proc deallocate from Layout with column_key
 
-        If item_type is equal to 7:  Note: HIR_DICTIONARY_LITERAL = 7
-            Note: Extract column
-            Let column_key be proc create_string from StringCore with "column"
-            Let column_value be proc get_dictionary_value from HIR with order_item, column_key
-            proc deallocate from Layout with column_key
-
-            If column_value is not equal to 0:
-                proc generate_hir_node with context, column_value
-            End If
+        If column_value is not equal to 0:
+            proc generate_hir_node with context, column_value
 
             Note: Extract direction (optional)
-            Let direction_key be proc create_string from StringCore with "direction"
-            Let direction_value be proc get_dictionary_value from HIR with order_item, direction_key
+            Let direction_key be proc string_duplicate from StringCore with "direction"
+            Let direction_value be proc get_dictionary_value with order_item, direction_key
             proc deallocate from Layout with direction_key
 
             If direction_value is not equal to 0:
                 proc emit_char from Emitter with emitter, 32
-                Let direction_str be proc get_hir_string_value from HIR with direction_value
+                Let direction_str be proc get_hir_string_value with direction_value
                 proc emit_keyword from Emitter with emitter, direction_str
             End If
         Otherwise:
@@ -1044,12 +1197,12 @@ Process called "generate_update_statement" takes context as Integer, hir_node as
     proc emit_char from Emitter with emitter, 32  Note: space
 
     Note: Generate table name
-    Let table_key be proc create_string from StringCore with "table"
-    Let table_value be proc get_dictionary_value from HIR with hir_node, table_key
+    Let table_key be proc string_duplicate from StringCore with "table"
+    Let table_value be proc get_dictionary_value with hir_node, table_key
     proc deallocate from Layout with table_key
 
     If table_value is not equal to 0:
-        proc generate_hir_node with context, table_value
+        proc generate_name_identifier with context, table_value
     End If
 
     proc emit_char from Emitter with emitter, 32  Note: space
@@ -1057,16 +1210,16 @@ Process called "generate_update_statement" takes context as Integer, hir_node as
     proc emit_char from Emitter with emitter, 32  Note: space
 
     Note: Generate SET assignments
-    Let assignments_key be proc create_string from StringCore with "assignments"
-    Let assignments_value be proc get_dictionary_value from HIR with hir_node, assignments_key
+    Let assignments_key be proc string_duplicate from StringCore with "assignments"
+    Let assignments_value be proc get_dictionary_value with hir_node, assignments_key
     proc deallocate from Layout with assignments_key
 
     If assignments_value is not equal to 0:
-        Let assignment_count be proc get_list_element_count from HIR with assignments_value
+        Let assignment_count be proc get_list_element_count with assignments_value
         Let i be 0
 
         While i is less than assignment_count:
-            Let assignment be proc get_list_element from HIR with assignments_value, i
+            Let assignment be proc get_list_element with assignments_value, i
             proc generate_hir_node with context, assignment
 
             If i is less than assignment_count minus 1:
@@ -1079,8 +1232,8 @@ Process called "generate_update_statement" takes context as Integer, hir_node as
     End If
 
     Note: Generate WHERE clause (if present)
-    Let where_key be proc create_string from StringCore with "where"
-    Let where_value be proc get_dictionary_value from HIR with hir_node, where_key
+    Let where_key be proc string_duplicate from StringCore with "where"
+    Let where_value be proc get_dictionary_value with hir_node, where_key
     proc deallocate from Layout with where_key
 
     If where_value is not equal to 0:
@@ -1117,17 +1270,17 @@ Process called "generate_delete_statement" takes context as Integer, hir_node as
     proc emit_char from Emitter with emitter, 32  Note: space
 
     Note: Generate table name
-    Let table_key be proc create_string from StringCore with "table"
-    Let table_value be proc get_dictionary_value from HIR with hir_node, table_key
+    Let table_key be proc string_duplicate from StringCore with "table"
+    Let table_value be proc get_dictionary_value with hir_node, table_key
     proc deallocate from Layout with table_key
 
     If table_value is not equal to 0:
-        proc generate_hir_node with context, table_value
+        proc generate_name_identifier with context, table_value
     End If
 
     Note: Generate WHERE clause (if present)
-    Let where_key be proc create_string from StringCore with "where"
-    Let where_value be proc get_dictionary_value from HIR with hir_node, where_key
+    Let where_key be proc string_duplicate from StringCore with "where"
+    Let where_value be proc get_dictionary_value with hir_node, where_key
     proc deallocate from Layout with where_key
 
     If where_value is not equal to 0:
@@ -1153,6 +1306,112 @@ Emits "CREATE TABLE <name> (", walks the columns list emitting each as
 ")".
 @End Implementation
 
+@Reasoning:
+Table / object names lower to HIR string literals. Rendering them through
+the literal path would single-quote them as string literals; SQL requires
+them rendered as identifiers (bare, or double-quoted only when reserved).
+This helper emits a name value as an identifier when it is a string
+literal and falls back to the general dispatcher for any nested form.
+@End Reasoning
+
+@Implementation:
+If the value is a HIR string literal, extract its payload and emit it via
+emit_identifier; otherwise dispatch through generate_hir_node so nested
+qualified references still render.
+@End Implementation
+
+Process called "generate_name_identifier" takes context as Integer, name_value as Integer:
+    Note: Emit a table/object name as a SQL identifier
+
+    Let emitter be proc memory_get_int64 from Layout with context, 0
+
+    Let name_is_string be proc is_string_literal from HIR with name_value
+
+    If name_is_string is equal to 1:
+        Let name_str be proc get_hir_string_value with name_value
+        proc emit_identifier from Emitter with emitter, name_str
+        Return
+    End If
+
+    proc generate_hir_node with context, name_value
+End Process
+
+@Reasoning:
+A column definition dictionary {type: column_def, name, datatype,
+constraints: [...], default?} renders as "<name> <DATATYPE> <CONSTRAINTS>"
+with the DEFAULT constraint followed by its value. The name is an
+identifier; the datatype is emitted verbatim (it already carries any
+(size) spelling); each constraint keyword is emitted uppercased.
+@End Reasoning
+
+@Implementation:
+Emits the "name" value as an identifier, a space, the "datatype" string
+verbatim, then walks the "constraints" list emitting each constraint
+keyword (space-separated). When a constraint equals "DEFAULT" and the dict
+carries a "default" value, the value is emitted after the DEFAULT keyword.
+@End Implementation
+
+Process called "generate_column_def" takes context as Integer, column_dict as Integer:
+    Note: Generate a column definition: name DATATYPE [CONSTRAINTS...]
+
+    Let emitter be proc memory_get_int64 from Layout with context, 0
+
+    Note: Column name
+    Let name_key be proc string_duplicate from StringCore with "name"
+    Let name_value be proc get_dictionary_value with column_dict, name_key
+    proc deallocate from Layout with name_key
+
+    If name_value is not equal to 0:
+        proc generate_name_identifier with context, name_value
+    End If
+
+    Note: Datatype
+    Let datatype_key be proc string_duplicate from StringCore with "datatype"
+    Let datatype_value be proc get_dictionary_value with column_dict, datatype_key
+    proc deallocate from Layout with datatype_key
+
+    If datatype_value is not equal to 0:
+        proc emit_char from Emitter with emitter, 32  Note: space
+        Let datatype_str be proc get_hir_string_value with datatype_value
+        proc emit_string from Emitter with emitter, datatype_str
+    End If
+
+    Note: Default value (looked up once, emitted after the DEFAULT keyword)
+    Let default_key be proc string_duplicate from StringCore with "default"
+    Let default_value be proc get_dictionary_value with column_dict, default_key
+    proc deallocate from Layout with default_key
+
+    Note: Constraints
+    Let constraints_key be proc string_duplicate from StringCore with "constraints"
+    Let constraints_value be proc get_dictionary_value with column_dict, constraints_key
+    proc deallocate from Layout with constraints_key
+
+    If constraints_value is not equal to 0:
+        Let constraint_count be proc get_list_element_count with constraints_value
+        Let i be 0
+
+        While i is less than constraint_count:
+            Let constraint_node be proc get_list_element with constraints_value, i
+
+            proc emit_char from Emitter with emitter, 32  Note: space
+            Let constraint_str be proc get_hir_string_value with constraint_node
+            proc emit_keyword from Emitter with emitter, constraint_str
+
+            Note: A DEFAULT constraint is followed by its value expression
+            Let is_default be proc string_equals from StringCore with constraint_str, "DEFAULT"
+
+            If is_default is equal to 1:
+                If default_value is not equal to 0:
+                    proc emit_char from Emitter with emitter, 32  Note: space
+                    proc generate_hir_node with context, default_value
+                End If
+            End If
+
+            Set i to i plus 1
+        End While
+    End If
+End Process
+
 Process called "generate_create_table_statement" takes context as Integer, hir_node as Integer:
     Note: Generate CREATE TABLE name (columns...)
 
@@ -1164,28 +1423,28 @@ Process called "generate_create_table_statement" takes context as Integer, hir_n
     proc emit_char from Emitter with emitter, 32  Note: space
 
     Note: Generate table name
-    Let table_key be proc create_string from StringCore with "table"
-    Let table_value be proc get_dictionary_value from HIR with hir_node, table_key
+    Let table_key be proc string_duplicate from StringCore with "table"
+    Let table_value be proc get_dictionary_value with hir_node, table_key
     proc deallocate from Layout with table_key
 
     If table_value is not equal to 0:
-        proc generate_hir_node with context, table_value
+        proc generate_name_identifier with context, table_value
     End If
 
     proc emit_char from Emitter with emitter, 32  Note: space
     proc emit_char from Emitter with emitter, 40  Note: (
 
     Note: Generate column definitions
-    Let columns_key be proc create_string from StringCore with "columns"
-    Let columns_value be proc get_dictionary_value from HIR with hir_node, columns_key
+    Let columns_key be proc string_duplicate from StringCore with "columns"
+    Let columns_value be proc get_dictionary_value with hir_node, columns_key
     proc deallocate from Layout with columns_key
 
     If columns_value is not equal to 0:
-        Let column_count be proc get_list_element_count from HIR with columns_value
+        Let column_count be proc get_list_element_count with columns_value
         Let i be 0
 
         While i is less than column_count:
-            Let column_def be proc get_list_element from HIR with columns_value, i
+            Let column_def be proc get_list_element with columns_value, i
             proc generate_hir_node with context, column_def
 
             If i is less than column_count minus 1:
@@ -1227,19 +1486,19 @@ Process called "generate_alter_table_statement" takes context as Integer, hir_no
     proc emit_char from Emitter with emitter, 32  Note: space
 
     Note: Generate table name
-    Let table_key be proc create_string from StringCore with "table"
-    Let table_value be proc get_dictionary_value from HIR with hir_node, table_key
+    Let table_key be proc string_duplicate from StringCore with "table"
+    Let table_value be proc get_dictionary_value with hir_node, table_key
     proc deallocate from Layout with table_key
 
     If table_value is not equal to 0:
-        proc generate_hir_node with context, table_value
+        proc generate_name_identifier with context, table_value
     End If
 
     proc emit_char from Emitter with emitter, 32  Note: space
 
     Note: Generate ALTER action
-    Let action_key be proc create_string from StringCore with "action"
-    Let action_value be proc get_dictionary_value from HIR with hir_node, action_key
+    Let action_key be proc string_duplicate from StringCore with "action"
+    Let action_value be proc get_dictionary_value with hir_node, action_key
     proc deallocate from Layout with action_key
 
     If action_value is not equal to 0:
@@ -1272,20 +1531,20 @@ Process called "generate_drop_statement" takes context as Integer, hir_node as I
     proc emit_char from Emitter with emitter, 32  Note: space
 
     Note: Generate object type
-    Let obj_type_key be proc create_string from StringCore with "object_type"
-    Let obj_type_value be proc get_dictionary_value from HIR with hir_node, obj_type_key
+    Let obj_type_key be proc string_duplicate from StringCore with "object_type"
+    Let obj_type_value be proc get_dictionary_value with hir_node, obj_type_key
     proc deallocate from Layout with obj_type_key
 
     If obj_type_value is not equal to 0:
-        Let obj_type_str be proc get_hir_string_value from HIR with obj_type_value
+        Let obj_type_str be proc get_hir_string_value with obj_type_value
 
-        Let table_str be proc create_string from StringCore with "table"
+        Let table_str be proc string_duplicate from StringCore with "table"
         If proc string_equals from StringCore with obj_type_str, table_str is equal to 1:
             proc emit_keyword from Emitter with emitter, "TABLE"
         End If
         proc deallocate from Layout with table_str
 
-        Let index_str be proc create_string from StringCore with "index"
+        Let index_str be proc string_duplicate from StringCore with "index"
         If proc string_equals from StringCore with obj_type_str, index_str is equal to 1:
             proc emit_keyword from Emitter with emitter, "INDEX"
         End If
@@ -1295,12 +1554,12 @@ Process called "generate_drop_statement" takes context as Integer, hir_node as I
     proc emit_char from Emitter with emitter, 32  Note: space
 
     Note: Generate object name
-    Let name_key be proc create_string from StringCore with "name"
-    Let name_value be proc get_dictionary_value from HIR with hir_node, name_key
+    Let name_key be proc string_duplicate from StringCore with "name"
+    Let name_value be proc get_dictionary_value with hir_node, name_key
     proc deallocate from Layout with name_key
 
     If name_value is not equal to 0:
-        proc generate_hir_node with context, name_value
+        proc generate_name_identifier with context, name_value
     End If
 End Process
 
