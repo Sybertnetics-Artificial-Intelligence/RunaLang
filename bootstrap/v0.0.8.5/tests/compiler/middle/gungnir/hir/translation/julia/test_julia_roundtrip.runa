@@ -1,0 +1,534 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+Licensed under Apache 2.0
+:End Note
+
+Note:
+Julia Translation Round-Trip Probe
+.
+End-to-end proof that the Julia translation pipeline is REAL, not a skeleton:
+.
+    Julia source
+      -> julia_lexer    (create_lexer / tokenize)
+      -> julia_parser   (create_parser / parse_program -> ASTNode tree)
+      -> julia_to_hir   (lower the ASTNode tree to the hir.runa dict/list HIR)
+      -> hir_to_julia   (emit HIR back to valid Julia text)
+      -> re-lex / re-parse / re-lower of the emitted text (HIR2)
+      -> structural + CONTENT equality on the key constructs
+.
+The Julia HIR node model is hir.runa's dictionary/list literal interchange shared
+by julia_to_hir (producer) and hir_to_julia (consumer): a dictionary is a
+HIR_DICTIONARY_LITERAL whose entries List (16-byte [key, value] blocks) hangs at
+the children slot; a list is a HIR list literal whose elements List hangs at the
+children slot; string payloads are HIR string-literal nodes read with
+get_string_literal_value. This probe reads HIR fields through exactly that
+contract (the decoders below mirror the producer/consumer).
+.
+DEPTH: the probe does NOT merely check that nodes exist. On the RE-PARSED HIR2 it
+asserts the CONTENTS survive the full round-trip:
+    - at least six top-level function names recovered by name
+    - a `::Int` typed parameter lowered to a type_annotation param
+    - a default / keyword argument (a `= default` on a parameter)
+    - an if / elseif / else chain (>= 2 branch dicts plus the else block)
+    - a for-loop with its iterator variable + iterable
+    - a struct's typed fields (>= 2 type_annotation fields)
+    - an array comprehension with a generator AND a filter clause
+    - a Dict literal whose keys survive
+    - a string literal carrying interpolation ($(...))
+.
+A translator that dropped any of these (empty body, vanished params, lost filter)
+makes the probe FAIL.
+.
+Exit code: number of failed assertions (0 == all passed).
+:End Note
+
+Import "compiler/middle/gungnir/hir/translation/frontends/julia/julia_to_hir.runa" as JuliaFrontend
+Import "compiler/middle/gungnir/hir/translation/backends/julia/hir_to_julia.runa" as JuliaBackend
+Import "compiler/middle/gungnir/hir/hir.runa" as HIR
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/collections/list.runa" as List
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "tests/test_utils.runa" as TestUtils
+
+Note: ============================================================================
+Note: hir.runa dict/list literal decoders (mirror the producer/consumer contract)
+Note: ============================================================================
+
+@Reasoning:
+A Julia HIR dictionary is a HIR_DICTIONARY_LITERAL whose entries List hangs at the
+children slot. Each entry is a 16-byte block: key (raw string handle) at offset 0,
+value (a child HIR node or HIR string literal) at offset 8. This decoder linear-
+scans those entries comparing the raw key with string_equals, returning the stored
+value. It is the exact lookup hir_to_julia's get_dictionary_value performs.
+@End Reasoning
+Process called "dict_get" takes node as Integer, key as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    Let entries be proc get_dictionary_entries from HIR with node
+    If entries is equal to 0:
+        Return 0
+    End If
+    Let count be proc size from List with entries
+    Let index be 0
+    While index is less than count:
+        Let entry be proc get_at from List with entries, index
+        If entry is not equal to 0:
+            Let entry_key be proc memory_get_int64 from Layout with entry, 0
+            Let matches be proc string_equals from StringCore with entry_key, key
+            If matches is equal to 1:
+                Return proc memory_get_int64 from Layout with entry, 8
+            End If
+        End If
+        Set index to index plus 1
+    End While
+    Return 0
+End Process
+
+@Reasoning:
+String fields ("node_type", "name", "operator", "value", ...) are stored as HIR
+string literal nodes. This helper resolves the key then unwraps the literal to its
+char* payload via get_string_literal_value.
+@End Reasoning
+Process called "dict_get_string" takes node as Integer, key as Integer returns Integer:
+    Let value_node be proc dict_get with node, key
+    If value_node is equal to 0:
+        Return 0
+    End If
+    Return proc get_string_literal_value from HIR with value_node
+End Process
+
+@Reasoning:
+Returns the backing element List of a HIR list literal so the probe can iterate
+body statements, parameters, fields, generators and pairs.
+@End Reasoning
+Process called "list_elements" takes node as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    Return proc get_list_elements from HIR with node
+End Process
+
+@Reasoning:
+Element count of a HIR list node (0 when absent).
+@End Reasoning
+Process called "list_count" takes node as Integer returns Integer:
+    Let items be proc list_elements with node
+    If items is equal to 0:
+        Return 0
+    End If
+    Return proc size from List with items
+End Process
+
+@Reasoning:
+i-th element of a HIR list node (0 when out of range / absent).
+@End Reasoning
+Process called "list_at" takes node as Integer, index as Integer returns Integer:
+    Let items be proc list_elements with node
+    If items is equal to 0:
+        Return 0
+    End If
+    Return proc get_at from List with items, index
+End Process
+
+@Reasoning:
+True (1) when a node's node_type tag equals the requested kind.
+@End Reasoning
+Process called "node_is" takes node as Integer, kind as Integer returns Integer:
+    Let nt be proc dict_get_string with node, "node_type"
+    If nt is equal to 0:
+        Return 0
+    End If
+    Return proc string_equals from StringCore with nt, kind
+End Process
+
+@Reasoning:
+Finds a top-level "function" member by name within the module body list. Returns
+the function dict or 0.
+@End Reasoning
+Process called "find_function" takes body as Integer, want_name as Integer returns Integer:
+    Let count be proc list_count with body
+    Let index be 0
+    While index is less than count:
+        Let item be proc list_at with body, index
+        Let is_fn be proc node_is with item, "function"
+        If is_fn is equal to 1:
+            Let item_name be proc dict_get_string with item, "name"
+            If item_name is not equal to 0:
+                Let ok be proc string_equals from StringCore with item_name, want_name
+                If ok is equal to 1:
+                    Return item
+                End If
+            End If
+        End If
+        Set index to index plus 1
+    End While
+    Return 0
+End Process
+
+@Reasoning:
+Counts "function" members in the module body list.
+@End Reasoning
+Process called "count_functions" takes body as Integer returns Integer:
+    Let count be proc list_count with body
+    Let found be 0
+    Let index be 0
+    While index is less than count:
+        Let item be proc list_at with body, index
+        Let is_fn be proc node_is with item, "function"
+        If is_fn is equal to 1:
+            Set found to found plus 1
+        End If
+        Set index to index plus 1
+    End While
+    Return found
+End Process
+
+@Reasoning:
+Finds the first top-level member with the requested node_type tag.
+@End Reasoning
+Process called "find_member" takes body as Integer, kind as Integer returns Integer:
+    Let count be proc list_count with body
+    Let index be 0
+    While index is less than count:
+        Let item be proc list_at with body, index
+        Let ok be proc node_is with item, kind
+        If ok is equal to 1:
+            Return item
+        End If
+        Set index to index plus 1
+    End While
+    Return 0
+End Process
+
+@Reasoning:
+Recursively searches a HIR subtree for the first node tagged with the requested
+kind. Used to locate an expression (Dict literal, comprehension, if) nested inside
+a function body without hard-coding the path. Bounded by structural recursion over
+dict entries and list elements.
+@End Reasoning
+Process called "find_deep" takes node as Integer, kind as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+
+    Let here be proc node_is with node, kind
+    If here is equal to 1:
+        Return node
+    End If
+
+    Let entries be proc get_dictionary_entries from HIR with node
+    If entries is not equal to 0:
+        Let ecount be proc size from List with entries
+        Let ei be 0
+        While ei is less than ecount:
+            Let entry be proc get_at from List with entries, ei
+            If entry is not equal to 0:
+                Let val be proc memory_get_int64 from Layout with entry, 8
+                Let found be proc find_deep with val, kind
+                If found is not equal to 0:
+                    Return found
+                End If
+            End If
+            Set ei to ei plus 1
+        End While
+    End If
+
+    Let elems be proc get_list_elements from HIR with node
+    If elems is not equal to 0:
+        Let lcount be proc size from List with elems
+        Let li be 0
+        While li is less than lcount:
+            Let el be proc get_at from List with elems, li
+            Let found2 be proc find_deep with el, kind
+            If found2 is not equal to 0:
+                Return found2
+            End If
+            Set li to li plus 1
+        End While
+    End If
+
+    Return 0
+End Process
+
+@Reasoning:
+Counts type_annotation members in a list of parameters / struct fields, so the
+probe can assert typed params and typed fields survive.
+@End Reasoning
+Process called "count_type_annotations" takes list_node as Integer returns Integer:
+    Let count be proc list_count with list_node
+    Let found be 0
+    Let index be 0
+    While index is less than count:
+        Let item be proc list_at with list_node, index
+        Let ok be proc node_is with item, "type_annotation"
+        If ok is equal to 1:
+            Set found to found plus 1
+        End If
+        Set index to index plus 1
+    End While
+    Return found
+End Process
+
+@Reasoning:
+True (1) when a parameter list contains a default / keyword argument, modelled by
+the frontend as a binary_op with the "=" operator wrapping the parameter.
+@End Reasoning
+Process called "params_have_default" takes list_node as Integer returns Integer:
+    Let count be proc list_count with list_node
+    Let index be 0
+    While index is less than count:
+        Let item be proc list_at with list_node, index
+        Let is_bin be proc node_is with item, "binary_op"
+        If is_bin is equal to 1:
+            Let op be proc dict_get_string with item, "operator"
+            If op is not equal to 0:
+                Let eq be proc string_equals from StringCore with op, "="
+                If eq is equal to 1:
+                    Return 1
+                End If
+            End If
+        End If
+        Set index to index plus 1
+    End While
+    Return 0
+End Process
+
+@Reasoning:
+True (1) when a string-literal node's raw lexeme value contains a "$(" sequence,
+i.e. it carries interpolation. The lexeme keeps quotes and interpolation verbatim
+so the check is a substring scan over the value payload (36 == '$', 40 == '(').
+@End Reasoning
+Process called "string_has_interpolation" takes node as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    Let value be proc dict_get_string with node, "value"
+    If value is equal to 0:
+        Return 0
+    End If
+    Let len be proc string_length from StringCore with value
+    Let i be 0
+    While i is less than len:
+        Let ch be proc string_char_at from StringCore with value, i
+        If ch is equal to 36:
+            Let nexti be i plus 1
+            If nexti is less than len:
+                Let ch2 be proc string_char_at from StringCore with value, nexti
+                If ch2 is equal to 40:
+                    Return 1
+                End If
+            End If
+        End If
+        Set i to i plus 1
+    End While
+    Return 0
+End Process
+
+@Reasoning:
+Locates the first string literal anywhere in a function body that carries
+interpolation, by structural recursion over dict entries and list elements.
+@End Reasoning
+Process called "find_interpolated_string" takes node as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+
+    Let is_lit be proc node_is with node, "literal"
+    If is_lit is equal to 1:
+        Let kind be proc dict_get_string with node, "literal_kind"
+        If kind is not equal to 0:
+            Let is_str be proc string_equals from StringCore with kind, "string"
+            If is_str is equal to 1:
+                Let has_interp be proc string_has_interpolation with node
+                If has_interp is equal to 1:
+                    Return node
+                End If
+            End If
+        End If
+    End If
+
+    Let entries be proc get_dictionary_entries from HIR with node
+    If entries is not equal to 0:
+        Let ecount be proc size from List with entries
+        Let ei be 0
+        While ei is less than ecount:
+            Let entry be proc get_at from List with entries, ei
+            If entry is not equal to 0:
+                Let val be proc memory_get_int64 from Layout with entry, 8
+                Let f be proc find_interpolated_string with val
+                If f is not equal to 0:
+                    Return f
+                End If
+            End If
+            Set ei to ei plus 1
+        End While
+    End If
+
+    Let elems be proc get_list_elements from HIR with node
+    If elems is not equal to 0:
+        Let lcount be proc size from List with elems
+        Let li be 0
+        While li is less than lcount:
+            Let el be proc get_at from List with elems, li
+            Let f2 be proc find_interpolated_string with el
+            If f2 is not equal to 0:
+                Return f2
+            End If
+            Set li to li plus 1
+        End While
+    End If
+
+    Return 0
+End Process
+
+@Reasoning:
+The module body list lives under the "body" key of the root "module" dict.
+@End Reasoning
+Process called "module_body" takes root as Integer returns Integer:
+    Return proc dict_get with root, "body"
+End Process
+
+Note: ============================================================================
+Note: Depth probes shared by the HIR1 and HIR2 passes
+Note: ============================================================================
+
+@Reasoning:
+Runs the full content-depth assertion battery against one HIR module (used for both
+the original HIR1 and the round-trip HIR2). Records each result in the shared
+TestResults. The `tag` string distinguishes the two passes in the summary output.
+@End Reasoning
+Process called "assert_depth" takes results as Integer, root as Integer, tag as String returns Integer:
+    Let body be proc module_body with root
+
+    Note: --- six function names ---
+    Let fn_count be proc count_functions with body
+    proc assert_greater_than_or_equal from TestUtils with results, "module has >= 6 functions", fn_count, 6
+
+    Let f_area be proc find_function with body, "area"
+    proc assert_not_null from TestUtils with results, "function 'area' present", f_area
+    Let f_scale be proc find_function with body, "scale"
+    proc assert_not_null from TestUtils with results, "function 'scale' present", f_scale
+    Let f_classify be proc find_function with body, "classify"
+    proc assert_not_null from TestUtils with results, "function 'classify' present", f_classify
+    Let f_sum_loop be proc find_function with body, "sum_loop"
+    proc assert_not_null from TestUtils with results, "function 'sum_loop' present", f_sum_loop
+    Let f_evens be proc find_function with body, "evens"
+    proc assert_not_null from TestUtils with results, "function 'evens' present", f_evens
+    Let f_config be proc find_function with body, "config"
+    proc assert_not_null from TestUtils with results, "function 'config' present", f_config
+    Let f_greet be proc find_function with body, "greet"
+    proc assert_not_null from TestUtils with results, "function 'greet' present", f_greet
+
+    Note: --- a ::Int typed param on area(r::Int) ---
+    Let area_params be proc dict_get with f_area, "parameters"
+    Let area_typed be proc count_type_annotations with area_params
+    proc assert_greater_than_or_equal from TestUtils with results, "area has a typed (::Int) param", area_typed, 1
+
+    Note: --- a default / keyword arg on scale(x, factor = 2) ---
+    Let scale_params be proc dict_get with f_scale, "parameters"
+    Let scale_has_default be proc params_have_default with scale_params
+    proc assert_equal from TestUtils with results, "scale has a default-valued param", scale_has_default, 1
+
+    Note: --- if / elseif / else inside classify ---
+    Let classify_body be proc dict_get with f_classify, "body"
+    Let if_node be proc find_deep with classify_body, "if_statement"
+    proc assert_not_null from TestUtils with results, "classify contains an if statement", if_node
+    Let branches be proc dict_get with if_node, "branches"
+    Let branch_count be proc list_count with branches
+    proc assert_greater_than_or_equal from TestUtils with results, "if has >= 2 branches (if + elseif)", branch_count, 2
+    Let else_block be proc dict_get with if_node, "else_block"
+    proc assert_not_null from TestUtils with results, "if has an else block", else_block
+
+    Note: --- for loop inside sum_loop ---
+    Let sum_body be proc dict_get with f_sum_loop, "body"
+    Let for_node be proc find_deep with sum_body, "for_loop"
+    proc assert_not_null from TestUtils with results, "sum_loop contains a for loop", for_node
+    Let for_var be proc dict_get with for_node, "iterator_variable"
+    proc assert_not_null from TestUtils with results, "for loop has an iterator variable", for_var
+    Let for_iter be proc dict_get with for_node, "iterable"
+    proc assert_not_null from TestUtils with results, "for loop has an iterable", for_iter
+
+    Note: --- struct with typed fields ---
+    Let struct_node be proc find_member with body, "struct_definition"
+    proc assert_not_null from TestUtils with results, "module has a struct definition", struct_node
+    Let struct_fields be proc dict_get with struct_node, "fields"
+    Let typed_fields be proc count_type_annotations with struct_fields
+    proc assert_greater_than_or_equal from TestUtils with results, "struct has >= 2 typed fields", typed_fields, 2
+
+    Note: --- array comprehension with generator + filter inside evens ---
+    Let evens_body be proc dict_get with f_evens, "body"
+    Let comp_node be proc find_deep with evens_body, "list_comprehension"
+    proc assert_not_null from TestUtils with results, "evens contains a comprehension", comp_node
+    Let generators be proc dict_get with comp_node, "generators"
+    Let gen_count be proc list_count with generators
+    proc assert_greater_than_or_equal from TestUtils with results, "comprehension has >= 1 generator", gen_count, 1
+    Let comp_filter be proc dict_get with comp_node, "filter"
+    proc assert_not_null from TestUtils with results, "comprehension has a filter clause", comp_filter
+
+    Note: --- Dict keys inside config: `Dict("a" => 1, "b" => 2)` parses as a
+    Note: call to Dict whose arguments are `pair` nodes, the idiomatic Julia
+    Note: spelling. We assert the call carries >= 2 pair arguments (the keys). ---
+    Let config_body be proc dict_get with f_config, "body"
+    Let dict_pair be proc find_deep with config_body, "pair"
+    proc assert_not_null from TestUtils with results, "config contains a Dict key/value pair", dict_pair
+    Let dict_call be proc find_deep with config_body, "call"
+    proc assert_not_null from TestUtils with results, "config contains the Dict(...) call", dict_call
+    Let dict_args be proc dict_get with dict_call, "arguments"
+    Let pair_count be proc list_count with dict_args
+    proc assert_greater_than_or_equal from TestUtils with results, "Dict call has >= 2 key/value pairs", pair_count, 2
+
+    Note: --- string interpolation inside greet ---
+    Let greet_body be proc dict_get with f_greet, "body"
+    Let interp be proc find_interpolated_string with greet_body
+    proc assert_not_null from TestUtils with results, "greet has an interpolated string", interp
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Probe entry point
+Note: ============================================================================
+
+Process called "main" returns Integer:
+    Let results be proc create_test_results from TestUtils
+
+    Note: A Julia program exercising the full Stage-B construct surface. Each
+    Note: function isolates one asserted construct so the depth probes can locate
+    Note: it deterministically.
+    Let source be "struct Point\nx::Int\ny::Int\nend\nfunction area(r::Int)\nreturn r * r\nend\nfunction scale(x, factor = 2)\nreturn x * factor\nend\nfunction classify(n)\nif n > 0\nreturn 1\nelseif n < 0\nreturn 2\nelse\nreturn 0\nend\nend\nfunction sum_loop(xs)\ntotal = 0\nfor v in xs\ntotal = total + v\nend\nreturn total\nend\nfunction evens(xs)\nreturn [v for v in xs if v > 0]\nend\nfunction config()\nreturn Dict(\"a\" => 1, \"b\" => 2)\nend\nfunction greet(name)\nreturn \"hello $(name) world\"\nend\n"
+
+    Note: --- Stage 0-2: source -> HIR1 ---
+    Let hir1 be proc julia_to_hir_from_source from JuliaFrontend with source
+    proc assert_not_null from TestUtils with results, "frontend produced HIR module", hir1
+
+    Let root_is_module be proc node_is with hir1, "module"
+    proc assert_equal from TestUtils with results, "HIR root is a module", root_is_module, 1
+
+    Let body1 be proc module_body with hir1
+    proc assert_not_null from TestUtils with results, "module has a body list", body1
+
+    proc assert_depth with results, hir1, "HIR1"
+
+    Note: --- Stage 3: HIR1 -> Julia text ---
+    Let emitted be proc generate_julia_from_hir from JuliaBackend with hir1
+    proc assert_not_null from TestUtils with results, "backend produced Julia text", emitted
+    Let emitted_len be proc string_length from StringCore with emitted
+    proc assert_greater_than from TestUtils with results, "emitted Julia is non-empty", emitted_len, 0
+
+    Note: --- Stage 4: re-parse emitted text -> HIR2 ---
+    Let hir2 be proc julia_to_hir_from_source from JuliaFrontend with emitted
+    proc assert_not_null from TestUtils with results, "re-parse of emitted Julia produced HIR2", hir2
+
+    Let root2_is_module be proc node_is with hir2, "module"
+    proc assert_equal from TestUtils with results, "round-trip root is a module", root2_is_module, 1
+
+    Note: --- Stage 5: CONTENT survives the round-trip ---
+    proc assert_depth with results, hir2, "HIR2"
+
+    proc print_summary from TestUtils with results
+    Let failed be proc get_failed from TestUtils with results
+    proc destroy_test_results from TestUtils with results
+
+    Return failed
+End Process

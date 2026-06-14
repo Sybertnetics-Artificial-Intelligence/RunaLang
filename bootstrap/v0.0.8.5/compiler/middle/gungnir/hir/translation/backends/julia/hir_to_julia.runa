@@ -1,51 +1,49 @@
 Note: ============================================================================
 Note: HIR -> JULIA TRANSLATOR
 Note: ============================================================================
-Note: Walks a HIRNode tree (rooted at HIR_MODULE_DEFINITION) and emits
-Note: idiomatic Julia source code into an EmitterContext output buffer.
-
-Note: Coverage:
-Note:   - Module / function / struct / abstract-type declarations
-Note:   - Let / Set / If / Match / For / While / Return / Break / Continue
-Note:   - All expression forms: literals, identifiers, binary/unary/ternary,
-Note:     calls, member access, array indexing, ranges, lambdas, casts
-Note:   - Types: Basic, Generic, Function, Array, Tuple, Optional, Union
-
-Note: Julia-specific conventions emitted:
-Note:   - struct ... end blocks for HIR_TYPE_DEFINITION
-Note:   - function name(args)::ReturnType ... end for HIR_PROCESS_DEFINITION
-Note:   - Optional types map to Union{T, Nothing}
-Note:   - Integer/Float/String/Boolean to Int64/Float64/String/Bool
-Note:   - Range expressions to a:b or a:step:b
+Note: Emits Julia source text from the model-3 dict/list-literal HIR produced by
+Note: julia_to_hir.runa.
+Note: .
+Note: This backend consumes the model-3 interchange shape (hir.runa
+Note: dictionary-literal and list-literal nodes) that the Julia frontend produces,
+Note: and re-emits valid Julia source. Producer and consumer share one
+Note: representation: a dictionary is a HIR_DICTIONARY_LITERAL whose entries List
+Note: (16-byte [key, value] blocks) hangs at the children slot; a list is a HIR
+Note: list literal whose elements List hangs at the children slot; string payloads
+Note: are HIR string literals read with get_string_literal_value. Every node carries
+Note: a "node_type" string entry.
+Note: .
+Note: The emitted text re-parses (via julia_lexer -> julia_parser -> julia_to_hir)
+Note: to a HIR that preserves the contents the round-trip probe asserts: function
+Note: names, typed params, default/keyword args, if/elseif/else, for-loops, struct
+Note: typed fields, comprehension generator + filter, Dict keys, string
+Note: interpolation.
+Note: .
+Note: Dependencies:
+Note: - compiler/middle/gungnir/hir/hir.runa
+Note: - compiler/middle/gungnir/hir/translation/backends/emitter_common.runa
+Note: - compiler/frontend/primitives/memory/layout.runa
+Note: - compiler/frontend/primitives/core/string_core.runa
+Note: - compiler/frontend/primitives/collections/list.runa
 Note: ============================================================================
 
 Import "compiler/middle/gungnir/hir/hir.runa" as HIR
 Import "compiler/middle/gungnir/hir/translation/backends/emitter_common.runa" as Emitter
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
 Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
-Import "compiler/frontend/primitives/core/memory_core.runa" as MemoryCore
-Import "compiler/frontend/primitives/collections/list.runa" as ListCore
+Import "compiler/frontend/primitives/collections/list.runa" as ListOps
 
 Note: ============================================================================
 Note: TYPE-NAME MAPPING TABLE
 Note: ============================================================================
-Note: Map Runa primitive type names to Julia equivalents. Other type identifiers
-Note: pass through unchanged so user-defined types render verbatim.
 @Reasoning:
-Runa's primitive type spelling (Integer, Float, Boolean, Character)
-differs from Julia's (Int64, Float64, Bool, Char). Mapping at code
-emission keeps the HIR canonical while still producing idiomatic
-Julia. Unknown names (user-defined types) pass through unchanged so
-custom types render verbatim.
+Runa's primitive type spelling (Integer, Float, Boolean, Character) differs
+from Julia's (Int64, Float64, Bool, Char). Mapping at code emission keeps the
+HIR canonical while still producing idiomatic Julia. Unknown names (user-defined
+types and Julia-native types already named Int64/etc.) pass through unchanged so
+custom and native types render verbatim. This also means a type that arrived as
+"Int64" round-trips as "Int64".
 @End Reasoning
-
-@Implementation:
-Linear sequence of string_equals comparisons. Integer/Integer64 map to
-Int64; Integer8/16/32 retain their width. Float/Float64 map to
-Float64; Float32 retains. String and Float32 keep their Runa name.
-Boolean -> Bool, Character -> Char, Nothing -> Nothing. Falls through
-to return runa_name on any unrecognised input.
-@End Implementation
-
 Process called "julia_map_basic_type" takes runa_name as String returns String:
     Let eq be 0
 
@@ -53,7 +51,6 @@ Process called "julia_map_basic_type" takes runa_name as String returns String:
     If eq is equal to 1:
         Return "Int64"
     End If
-
     Set eq to proc string_equals from StringCore with runa_name, "Integer8"
     If eq is equal to 1:
         Return "Int8"
@@ -70,7 +67,6 @@ Process called "julia_map_basic_type" takes runa_name as String returns String:
     If eq is equal to 1:
         Return "Int64"
     End If
-
     Set eq to proc string_equals from StringCore with runa_name, "Float"
     If eq is equal to 1:
         Return "Float64"
@@ -83,7 +79,6 @@ Process called "julia_map_basic_type" takes runa_name as String returns String:
     If eq is equal to 1:
         Return "Float64"
     End If
-
     Set eq to proc string_equals from StringCore with runa_name, "String"
     If eq is equal to 1:
         Return "String"
@@ -105,161 +100,156 @@ Process called "julia_map_basic_type" takes runa_name as String returns String:
 End Process
 
 Note: ============================================================================
-Note: HIRNode ACCESSORS
-Note: ============================================================================
-Note: Local wrappers over hir.runa accessors so the rest of the file reads as
-Note: high-level walk logic without repeating memory_get_ noise.
-Note: HIRNode layout (offsets, see hir.runa Type HIRNode):
-Note:   0:  node_type   (Integer constant - see Constant HIR_*)
-Note:   8:  line        (Integer source line)
-Note:   16: column      (Integer source column)
-Note:   24: children    (List[Integer] pointer)
-Note:   32: child_count (Integer count)
-Note:   40: value       (Integer or pointer to literal/identifier value)
-Note:   48: value_type  (Integer subtype discriminator)
+Note: HIR DICT/LIST DECODE HELPERS (model-3)
 Note: ============================================================================
 
 @Reasoning:
-Null-safe accessor for HIRNode.node_type at offset 0. Used by emit_node
-to discriminate which emit_* helper to dispatch to.
+hir.runa exposes dictionary contents only as an entries List of 16-byte
+[key(0), value(8)] blocks via get_dictionary_entries; it has no keyed lookup.
+This accessor performs the linear key scan the frontend's producer surface pairs
+with, returning the matching entry's value node or 0.
 @End Reasoning
+Process called "get_dictionary_value" takes dict_hir as Integer, key as Integer returns Integer:
+    If dict_hir is equal to 0:
+        Return 0
+    End If
+    If key is equal to 0:
+        Return 0
+    End If
 
-@Implementation:
-Null guard returns 0 (no valid HIR_* constant is zero). Otherwise
-reads i64 at offset 0 via MemoryCore.memory_get_integer.
-@End Implementation
+    Let entries be proc get_dictionary_entries from HIR with dict_hir
+    If entries is equal to 0:
+        Return 0
+    End If
 
+    Let count be proc size from ListOps with entries
+    Let index be 0
+    While index is less than count:
+        Let entry be proc get_at from ListOps with entries, index
+        If entry is not equal to 0:
+            Let entry_key be proc memory_get_int64 from Layout with entry, 0
+            Let matches be proc string_equals from StringCore with entry_key, key
+            If matches is equal to 1:
+                Return proc memory_get_int64 from Layout with entry, 8
+            End If
+        End If
+        Set index to index plus 1
+    End While
+
+    Return 0
+End Process
+
+@Reasoning:
+Resolves a keyed value stored as a HIR string literal and unwraps it to its
+char* payload. Returns 0 when absent.
+@End Reasoning
+Process called "get_dict_string_value" takes dict_hir as Integer, key as Integer returns Integer:
+    Let value be proc get_dictionary_value with dict_hir, key
+    If value is equal to 0:
+        Return 0
+    End If
+    Return proc get_string_literal_value from HIR with value
+End Process
+
+@Reasoning:
+Returns a keyed subtree (dict or list HIR node) unmodified.
+@End Reasoning
+Process called "get_dict_hir_value" takes dict_hir as Integer, key as Integer returns Integer:
+    Return proc get_dictionary_value with dict_hir, key
+End Process
+
+@Reasoning:
+The node_type tag drives the whole dispatcher. Returns the unwrapped node_type
+string for a HIR dict, or 0 for a null/typeless node.
+@End Reasoning
 Process called "node_type_of" takes node as Integer returns Integer:
     If node is equal to 0:
         Return 0
     End If
-    Return proc memory_get_integer from MemoryCore with node, 0
+    Return proc get_dict_string_value with node, "node_type"
 End Process
 
 @Reasoning:
-Accessor for the polymorphic value slot at offset 40 — used differently
-per node type: identifier name handle, literal value, operator code,
-etc. Null-safe.
+String equality shim so the dispatcher reads cleanly.
 @End Reasoning
-
-@Implementation:
-Null guard returns 0. Reads i64 at offset 40 of the HIRNode record.
-@End Implementation
-
-Process called "node_value" takes node as Integer returns Integer:
-    If node is equal to 0:
+Process called "nt_is" takes nt as Integer, tag as Integer returns Integer:
+    If nt is equal to 0:
         Return 0
     End If
-    Return proc memory_get_integer from MemoryCore with node, 40
+    Return proc string_equals from StringCore with nt, tag
 End Process
 
 @Reasoning:
-Accessor for the value-subtype discriminator at offset 48 — used by
-literal nodes to distinguish Integer/Float/String/Boolean values and by
-operator nodes to discriminate +, -, *, etc.
+Number of elements in a HIR list literal value (0 when absent/empty).
 @End Reasoning
-
-@Implementation:
-Null guard returns 0. Reads i64 at offset 48 of the HIRNode record.
-@End Implementation
-
-Process called "node_value_type" takes node as Integer returns Integer:
-    If node is equal to 0:
+Process called "list_count" takes list_hir as Integer returns Integer:
+    If list_hir is equal to 0:
         Return 0
     End If
-    Return proc memory_get_integer from MemoryCore with node, 48
+    Let elems be proc get_list_elements from HIR with list_hir
+    If elems is equal to 0:
+        Return 0
+    End If
+    Return proc size from ListOps with elems
 End Process
 
 @Reasoning:
-Accessor for the child_count field at offset 32. Cached alongside the
-children list so iteration code doesn't need to call list_size each
-time.
+i-th element of a HIR list literal value (0 when out of range).
 @End Reasoning
-
-@Implementation:
-Null guard returns 0. Reads i64 at offset 32 of the HIRNode record.
-@End Implementation
-
-Process called "node_child_count" takes node as Integer returns Integer:
-    If node is equal to 0:
+Process called "list_item" takes list_hir as Integer, index as Integer returns Integer:
+    If list_hir is equal to 0:
         Return 0
     End If
-    Return proc memory_get_integer from MemoryCore with node, 32
-End Process
-
-@Reasoning:
-Indexed child accessor: pulls the children list (offset 24) and looks
-up the requested index. Both null-node and null-children-list are
-handled, so callers can iterate up to node_child_count without
-checking.
-@End Reasoning
-
-@Implementation:
-Null guard on node. Reads children pointer at offset 24; if null
-returns 0 (empty-child case). Otherwise delegates to ListCore.list_get
-with the index. Out-of-range index is the caller's responsibility.
-@End Implementation
-
-Process called "node_child" takes node as Integer, index as Integer returns Integer:
-    If node is equal to 0:
+    Let elems be proc get_list_elements from HIR with list_hir
+    If elems is equal to 0:
         Return 0
     End If
-    Let children be proc memory_get_pointer from MemoryCore with node, 24
-    If children is equal to 0:
-        Return 0
-    End If
-    Return proc list_get from ListCore with children, index
+    Return proc get_at from ListOps with elems, index
 End Process
 
 Note: ============================================================================
-Note: ENTRY POINT
+Note: GENERATION CONTEXT / EMITTER WRAPPERS
 Note: ============================================================================
-Note: Generate a complete Julia source string for the given HIR module. Returns
-Note: the rendered text. Errors during translation are recorded on the context
-Note: but do not abort - callers can inspect emitter_has_errors after the call.
+
 @Reasoning:
-Public driver for the Julia backend. Constructs a fresh EmitterContext
-(with 4-space indent matching Julia community style), kicks off the
-recursive node walker, and returns the accumulated output.
+Thin emitter wrappers so the generators read as high-level Julia syntax rather
+than emitter plumbing. Each forwards to the shared EmitterContext (4-space
+indentation, matching the Julia style guide).
 @End Reasoning
+Process called "out_str" takes ctx as EmitterContext, text as String:
+    If text is equal to 0:
+        Return
+    End If
+    proc emitter_emit with ctx, text
+End Process
 
-@Implementation:
-Calls Emitter.create_emitter_context to allocate output buffer and
-counters. Recurses into emit_node with the module root. Returns
-Emitter.emitter_get_output which exposes the accumulated string.
-Errors are logged on the context rather than thrown so partial output
-is still recoverable.
-@End Implementation
+Process called "out_line" takes ctx as EmitterContext, text as String:
+    proc emitter_emit_line with ctx, text
+End Process
 
+Process called "out_newline" takes ctx as EmitterContext:
+    proc emitter_emit_newline with ctx
+End Process
+
+Note: ============================================================================
+Note: ENTRY POINTS
+Note: ============================================================================
+
+@Reasoning:
+Public driver for the Julia backend. Constructs a fresh EmitterContext, kicks
+off the recursive node walker over the HIR module root, and returns the
+accumulated output string.
+@End Reasoning
 Process called "generate_julia_from_hir" takes hir_module as Integer returns String:
-    Note: emitter_common defaults to 4-space indentation which matches the
-    Note: Julia community style guide, so no override needed here.
     Let ctx be proc create_emitter_context from Emitter
-
     proc emit_node with ctx, hir_module
-
     Return proc emitter_get_output from Emitter with ctx
 End Process
 
-Note: ============================================================================
-Note: DISPATCHER ENTRY POINT
-Note: ============================================================================
-Note: Single-arg wrapper matching the central dispatcher call shape in
-Note: translation.runa: `Return proc hir_to_julia from JuliaEmitter with hir_root`.
-Note: Delegates to generate_julia_from_hir which holds the actual translation
-Note: pipeline. Kept as a separate name so the dispatcher contract stays stable
-Note: even if the internal generator is renamed in the future.
 @Reasoning:
 Stable public entry name used by the central translation dispatcher in
-translation.runa. Keeping this as a thin forwarder lets the internal
-pipeline (generate_julia_from_hir) be renamed without breaking the
-dispatcher contract.
+translation.runa. Thin forwarder over generate_julia_from_hir.
 @End Reasoning
-
-@Implementation:
-Single proc call: returns generate_julia_from_hir(hir_root).
-@End Implementation
-
 Process called "hir_to_julia" takes hir_root as Integer returns String:
     Return proc generate_julia_from_hir with hir_root
 End Process
@@ -267,341 +257,507 @@ End Process
 Note: ============================================================================
 Note: DISPATCH
 Note: ============================================================================
-Note: Top-level node dispatcher. Branches on node_type to the appropriate
-Note: emit_* helper. Unknown node types emit a "# TODO: HIR_<id>" comment and
-Note: record a warning so the output is still valid Julia.
 
 @Reasoning:
-The universal HIR-node dispatcher: every other emit_* helper visits
-a single node type, while children are recursed via this function.
-Falls back to a TODO comment for unknown node kinds so the output
-stays valid Julia even when the translator hits a node it doesn't
-recognise.
+The universal node dispatcher: branches on the node_type string tag emitted by
+julia_to_hir and routes to the matching emit_* helper. Unknown tags fall through
+to emit_expression so any unmodeled leaf still renders as text rather than being
+dropped.
 @End Reasoning
-
-@Implementation:
-Null guard. Reads node_type via node_type_of. Long If/Return chain
-dispatches each HIR_* constant to the matching emit_* helper
-(emit_module, emit_function, emit_struct, emit_import, emit_let,
-emit_set, emit_const, emit_if, emit_match, emit_for, emit_while,
-emit_return, emit_block_children, emit_expression for expression
-nodes). Unrecognised types emit a `# TODO: HIR_<id>` comment.
-@End Implementation
-
 Process called "emit_node" takes ctx as EmitterContext, node as Integer:
     If node is equal to 0:
         Return
     End If
 
     Let nt be proc node_type_of with node
+    If nt is equal to 0:
+        Return
+    End If
 
-    If nt is equal to HIR.HIR_MODULE_DEFINITION:
+    Let m be 0
+
+    Set m to proc nt_is with nt, "module"
+    If m is equal to 1:
         proc emit_module with ctx, node
         Return
     End If
-    If nt is equal to HIR.HIR_PROCESS_DEFINITION:
+    Set m to proc nt_is with nt, "block"
+    If m is equal to 1:
+        proc emit_block with ctx, node
+        Return
+    End If
+    Set m to proc nt_is with nt, "function"
+    If m is equal to 1:
         proc emit_function with ctx, node
         Return
     End If
-    If nt is equal to HIR.HIR_TYPE_DEFINITION:
+    Set m to proc nt_is with nt, "macro"
+    If m is equal to 1:
+        proc emit_macro_def with ctx, node
+        Return
+    End If
+    Set m to proc nt_is with nt, "struct_definition"
+    If m is equal to 1:
         proc emit_struct with ctx, node
         Return
     End If
-    If nt is equal to HIR.HIR_IMPORT_STATEMENT:
-        proc emit_import with ctx, node
+    Set m to proc nt_is with nt, "abstract_type"
+    If m is equal to 1:
+        proc emit_abstract_type with ctx, node
         Return
     End If
-    If nt is equal to HIR.HIR_LET_STATEMENT:
-        proc emit_let with ctx, node
+    Set m to proc nt_is with nt, "primitive_type"
+    If m is equal to 1:
+        proc emit_primitive_type with ctx, node
         Return
     End If
-    If nt is equal to HIR.HIR_SET_STATEMENT:
-        proc emit_set with ctx, node
+    Set m to proc nt_is with nt, "using_statement"
+    If m is equal to 1:
+        proc emit_using_import with ctx, node, "using "
         Return
     End If
-    If nt is equal to HIR.HIR_DEFINE_STATEMENT:
-        proc emit_const with ctx, node
+    Set m to proc nt_is with nt, "import_statement"
+    If m is equal to 1:
+        proc emit_using_import with ctx, node, "import "
         Return
     End If
-    If nt is equal to HIR.HIR_IF_STATEMENT:
+    Set m to proc nt_is with nt, "export_statement"
+    If m is equal to 1:
+        proc emit_export with ctx, node
+        Return
+    End If
+    Set m to proc nt_is with nt, "const_declaration"
+    If m is equal to 1:
+        proc emit_scoped_decl with ctx, node, "const "
+        Return
+    End If
+    Set m to proc nt_is with nt, "global_declaration"
+    If m is equal to 1:
+        proc emit_scoped_decl with ctx, node, "global "
+        Return
+    End If
+    Set m to proc nt_is with nt, "local_declaration"
+    If m is equal to 1:
+        proc emit_scoped_decl with ctx, node, "local "
+        Return
+    End If
+    Set m to proc nt_is with nt, "let_block"
+    If m is equal to 1:
+        proc emit_let_block with ctx, node
+        Return
+    End If
+    Set m to proc nt_is with nt, "begin_block"
+    If m is equal to 1:
+        proc emit_begin_block with ctx, node
+        Return
+    End If
+    Set m to proc nt_is with nt, "quote_block"
+    If m is equal to 1:
+        proc emit_quote_block with ctx, node
+        Return
+    End If
+    Set m to proc nt_is with nt, "assignment"
+    If m is equal to 1:
+        proc emit_assignment with ctx, node
+        Return
+    End If
+    Set m to proc nt_is with nt, "if_statement"
+    If m is equal to 1:
         proc emit_if with ctx, node
         Return
     End If
-    If nt is equal to HIR.HIR_MATCH_STATEMENT:
-        proc emit_match with ctx, node
-        Return
-    End If
-    If nt is equal to HIR.HIR_FOR_STATEMENT:
+    Set m to proc nt_is with nt, "for_loop"
+    If m is equal to 1:
         proc emit_for with ctx, node
         Return
     End If
-    If nt is equal to HIR.HIR_WHILE_STATEMENT:
+    Set m to proc nt_is with nt, "while_loop"
+    If m is equal to 1:
         proc emit_while with ctx, node
         Return
     End If
-    If nt is equal to HIR.HIR_RETURN_STATEMENT:
+    Set m to proc nt_is with nt, "try_statement"
+    If m is equal to 1:
+        proc emit_try with ctx, node
+        Return
+    End If
+    Set m to proc nt_is with nt, "return_statement"
+    If m is equal to 1:
         proc emit_return with ctx, node
         Return
     End If
-    If nt is equal to HIR.HIR_BREAK_STATEMENT:
-        proc emitter_emit_line from Emitter with ctx, "break"
+    Set m to proc nt_is with nt, "break_statement"
+    If m is equal to 1:
+        proc out_line with ctx, "break"
         Return
     End If
-    If nt is equal to HIR.HIR_CONTINUE_STATEMENT:
-        proc emitter_emit_line from Emitter with ctx, "continue"
+    Set m to proc nt_is with nt, "continue_statement"
+    If m is equal to 1:
+        proc out_line with ctx, "continue"
         Return
     End If
-    If nt is equal to HIR.HIR_BLOCK_STATEMENT:
-        proc emit_block_children with ctx, node
-        Return
-    End If
-    If nt is equal to HIR.HIR_EXPRESSION_STATEMENT:
-        Let inner be proc node_child with node, 0
-        proc emit_expression with ctx, inner
-        proc emitter_emit_newline from Emitter with ctx
+    Set m to proc nt_is with nt, "macro_call"
+    If m is equal to 1:
+        proc emit_macro_call with ctx, node
+        proc out_newline with ctx
         Return
     End If
 
-    Note: Default - treat as expression
+    Note: Default: an expression in statement position.
     proc emit_expression with ctx, node
+    proc out_newline with ctx
+End Process
+
+@Reasoning:
+Emits each element of a HIR list of statements via emit_node. Used by module,
+function, loop, and block bodies. A null list is silently skipped.
+@End Reasoning
+Process called "emit_stmt_list" takes ctx as EmitterContext, list_hir as Integer:
+    If list_hir is equal to 0:
+        Return
+    End If
+    Let count be proc list_count with list_hir
+    Let i be 0
+    While i is less than count:
+        Let stmt be proc list_item with list_hir, i
+        proc emit_node with ctx, stmt
+        Set i to i plus 1
+    End While
 End Process
 
 Note: ============================================================================
-Note: MODULE
+Note: TOP-LEVEL CONSTRUCTS
 Note: ============================================================================
-Note: Wrap children in a Julia `module Name ... end` block.
+
 @Reasoning:
-Top-level modules emit Julia's `module Name ... end` syntax with a
-`using Base` brought in by default so common operators are available
-without explicit imports.
+The program root is tagged "module": its "body" list is the sequence of
+top-level statements. When the module has a real name it is emitted as a Julia
+`module Name ... end` block; the default synthetic name "julia_module" renders
+the body bare (no wrapper) so simple programs round-trip without a spurious
+module wrapper.
 @End Reasoning
-
-@Implementation:
-Reads the module name from node_value via julia_string_from_pointer.
-Emits `module <name>`, then `using Base`. Recurses emit_node over
-each child. Emits `end # module <name>` closer with the name in a
-comment to aid readability.
-@End Implementation
-
 Process called "emit_module" takes ctx as EmitterContext, node as Integer:
-    Let name_ptr be proc node_value with node
-    Let name_str be proc julia_string_from_pointer with name_ptr
+    Let name_str be proc get_dict_string_value with node, "name"
+    Let body be proc get_dict_hir_value with node, "body"
 
-    proc emitter_emit from Emitter with ctx, "module "
-    proc emitter_emit_line from Emitter with ctx, name_str
-
-    proc emitter_emit_line from Emitter with ctx, "using Base"
-    proc emitter_emit_newline from Emitter with ctx
-
-    Let count be proc node_child_count with node
-    Let i be 0
-    While i is less than count:
-        Let child be proc node_child with node, i
-        proc emit_node with ctx, child
-        Set i to i plus 1
-    End While
-
-    proc emitter_emit_newline from Emitter with ctx
-    proc emitter_emit from Emitter with ctx, "end # module "
-    proc emitter_emit_line from Emitter with ctx, name_str
-End Process
-
-Note: ============================================================================
-Note: IMPORTS
-Note: ============================================================================
-@Reasoning:
-Runa imports map directly to Julia's `using` directive. The module
-path string in node_value is preserved verbatim.
-@End Reasoning
-
-@Implementation:
-Pulls path string from node_value via julia_string_from_pointer.
-Emits `using <path>` followed by a newline.
-@End Implementation
-
-Process called "emit_import" takes ctx as EmitterContext, node as Integer:
-    Let path_ptr be proc node_value with node
-    Let path_str be proc julia_string_from_pointer with path_ptr
-    proc emitter_emit from Emitter with ctx, "using "
-    proc emitter_emit_line from Emitter with ctx, path_str
-End Process
-
-Note: ============================================================================
-Note: STRUCT / TYPE DEFINITION
-Note: ============================================================================
-Note: Emit:
-Note:   struct Name
-Note:       field1::Type1
-Note:       field2::Type2
-Note:   end
-@Reasoning:
-Runa Type declarations become Julia immutable structs. Each child node
-of kind HIR_FIELD_DEFINITION renders as `name::Type` indented under
-the struct keyword.
-@End Reasoning
-
-@Implementation:
-Emits `struct <name>` line. Indents one level. Iterates children;
-each one with node_type == HIR_FIELD_DEFINITION is dispatched to
-emit_field. Other child kinds are skipped. Dedents and emits the
-matching `end`, followed by a blank line.
-@End Implementation
-
-Process called "emit_struct" takes ctx as EmitterContext, node as Integer:
-    Let name_ptr be proc node_value with node
-    Let name_str be proc julia_string_from_pointer with name_ptr
-
-    proc emitter_emit from Emitter with ctx, "struct "
-    proc emitter_emit_line from Emitter with ctx, name_str
-
-    proc emitter_indent from Emitter with ctx
-
-    Let count be proc node_child_count with node
-    Let i be 0
-    While i is less than count:
-        Let field be proc node_child with node, i
-        Let ft be proc node_type_of with field
-        If ft is equal to HIR.HIR_FIELD_DEFINITION:
-            proc emit_field with ctx, field
-        End If
-        Set i to i plus 1
-    End While
-
-    proc emitter_dedent from Emitter with ctx
-    proc emitter_emit_line from Emitter with ctx, "end"
-    proc emitter_emit_newline from Emitter with ctx
-End Process
-
-@Reasoning:
-A struct field renders as `name::Type`, with the type optional (omitted
-emits just the bare name, matching Julia's untyped-field semantics).
-@End Reasoning
-
-@Implementation:
-Reads field name from node_value, emits it. If child 0 (the type
-node) exists, emits `::` then calls emit_type on it. Trailing newline
-to keep one field per line.
-@End Implementation
-
-Process called "emit_field" takes ctx as EmitterContext, node as Integer:
-    Let name_ptr be proc node_value with node
-    Let name_str be proc julia_string_from_pointer with name_ptr
-
-    proc emitter_emit from Emitter with ctx, name_str
-
-    Let type_node be proc node_child with node, 0
-    If type_node is not equal to 0:
-        proc emitter_emit from Emitter with ctx, "::"
-        proc emit_type with ctx, type_node
+    Let is_default be 0
+    If name_str is not equal to 0:
+        Set is_default to proc string_equals from StringCore with name_str, "julia_module"
     End If
 
-    proc emitter_emit_newline from Emitter with ctx
+    If name_str is equal to 0:
+        Set is_default to 1
+    End If
+
+    If is_default is equal to 1:
+        proc emit_stmt_list with ctx, body
+        Return
+    End If
+
+    proc out_str with ctx, "module "
+    proc out_line with ctx, name_str
+    proc emitter_indent with ctx
+    proc emit_stmt_list with ctx, body
+    proc emitter_dedent with ctx
+    proc out_line with ctx, "end"
 End Process
 
-Note: ============================================================================
-Note: FUNCTION / PROCESS DEFINITION
-Note: ============================================================================
-Note: Emit:
-Note:   function name(p1::T1, p2::T2)::ReturnT
-Note:       body
-Note:   end
 @Reasoning:
-HIR HIR_PROCESS_DEFINITION nodes carry parameter Lets (typed) and an
-optional return-type node together with a HIR_BLOCK_STATEMENT body
-in their children. The emitter walks the children once,
-distinguishing params, return type, and body by node type and the
-value_type flag (cvt==1 marks the return-type node).
+A nested "block" node simply renders its body statements (it is the parser's
+NODE_PROGRAM used as a statement sequence inside function/loop bodies).
 @End Reasoning
+Process called "emit_block" takes ctx as EmitterContext, node as Integer:
+    Let body be proc get_dict_hir_value with node, "body"
+    proc emit_stmt_list with ctx, body
+End Process
 
-@Implementation:
-Emits `function <name>(`. Walks children: HIR_LET_STATEMENT children
-are parameters — dispatched to emit_param with comma separators
-between them (first_param flag handles the lead). HIR_BLOCK_STATEMENT
-child becomes body_node. Otherwise, cvt==1 marks the return_type_node.
-After the param list emits `)`, optional `::<return>`, newline,
-indented body via emit_block_children, dedent, `end`, blank line.
-@End Implementation
-
+@Reasoning:
+Function definition: `function name(params)::ret ... end`. Parameters are a HIR
+list of param/type_annotation/identifier nodes rendered by emit_param_inline.
+The return type, when present, is an expression appended after `::`.
+@End Reasoning
 Process called "emit_function" takes ctx as EmitterContext, node as Integer:
-    Let name_ptr be proc node_value with node
-    Let name_str be proc julia_string_from_pointer with name_ptr
+    Let name_str be proc get_dict_string_value with node, "name"
+    Let params be proc get_dict_hir_value with node, "parameters"
+    Let ret be proc get_dict_hir_value with node, "return_type"
+    Let body be proc get_dict_hir_value with node, "body"
 
-    proc emitter_emit from Emitter with ctx, "function "
-    proc emitter_emit from Emitter with ctx, name_str
-    proc emitter_emit from Emitter with ctx, "("
-
-    Note: Child layout: param list nodes first, then optional return type
-    Note: marked by node_value_type == 1, then a HIR_BLOCK_STATEMENT body.
-    Let count be proc node_child_count with node
-    Let first_param be 1
-    Let return_type_node be 0
-    Let body_node be 0
-
-    Let i be 0
-    While i is less than count:
-        Let child be proc node_child with node, i
-        Let ct be proc node_type_of with child
-        Let cvt be proc node_value_type with child
-
-        If ct is equal to HIR.HIR_LET_STATEMENT:
-            Note: param declaration encoded as a Let
-            If first_param is equal to 0:
-                proc emitter_emit from Emitter with ctx, ", "
-            End If
-            proc emit_param with ctx, child
-            Set first_param to 0
-        Otherwise:
-            If ct is equal to HIR.HIR_BLOCK_STATEMENT:
-                Set body_node to child
-            Otherwise:
-                If cvt is equal to 1:
-                    Set return_type_node to child
-                End If
-            End If
-        End If
-
-        Set i to i plus 1
-    End While
-
-    proc emitter_emit from Emitter with ctx, ")"
-    If return_type_node is not equal to 0:
-        proc emitter_emit from Emitter with ctx, "::"
-        proc emit_type with ctx, return_type_node
+    proc out_str with ctx, "function "
+    If name_str is not equal to 0:
+        proc out_str with ctx, name_str
     End If
-    proc emitter_emit_newline from Emitter with ctx
+    proc out_str with ctx, "("
+    proc emit_param_list with ctx, params
+    proc out_str with ctx, ")"
 
-    proc emitter_indent from Emitter with ctx
-    If body_node is not equal to 0:
-        proc emit_block_children with ctx, body_node
+    If ret is not equal to 0:
+        proc out_str with ctx, "::"
+        proc emit_expression with ctx, ret
     End If
-    proc emitter_dedent from Emitter with ctx
+    proc out_newline with ctx
 
-    proc emitter_emit_line from Emitter with ctx, "end"
-    proc emitter_emit_newline from Emitter with ctx
+    proc emitter_indent with ctx
+    proc emit_node with ctx, body
+    proc emitter_dedent with ctx
+    proc out_line with ctx, "end"
 End Process
 
 @Reasoning:
-Inline parameter renderer (no trailing newline or comma) used by
-emit_function for each parameter position. Comma between params is
-the caller's responsibility.
+Macro definition: `macro name(params) ... end`.
 @End Reasoning
+Process called "emit_macro_def" takes ctx as EmitterContext, node as Integer:
+    Let name_str be proc get_dict_string_value with node, "name"
+    Let params be proc get_dict_hir_value with node, "parameters"
+    Let body be proc get_dict_hir_value with node, "body"
 
-@Implementation:
-Reads parameter name from node_value and emits it. If child 0 (type
-annotation) is non-zero, emits `::` then calls emit_type with the
-type node.
-@End Implementation
-
-Process called "emit_param" takes ctx as EmitterContext, node as Integer:
-    Let name_ptr be proc node_value with node
-    Let name_str be proc julia_string_from_pointer with name_ptr
-    proc emitter_emit from Emitter with ctx, name_str
-
-    Let type_node be proc node_child with node, 0
-    If type_node is not equal to 0:
-        proc emitter_emit from Emitter with ctx, "::"
-        proc emit_type with ctx, type_node
+    proc out_str with ctx, "macro "
+    If name_str is not equal to 0:
+        proc out_str with ctx, name_str
     End If
+    proc out_str with ctx, "("
+    proc emit_param_list with ctx, params
+    proc out_str with ctx, ")"
+    proc out_newline with ctx
+
+    proc emitter_indent with ctx
+    proc emit_node with ctx, body
+    proc emitter_dedent with ctx
+    proc out_line with ctx, "end"
+End Process
+
+@Reasoning:
+Emits a comma-separated parameter list. Each parameter is itself a HIR node
+(type_annotation -> `name::Type`, or a bare identifier) rendered inline by
+emit_expression.
+@End Reasoning
+Process called "emit_param_list" takes ctx as EmitterContext, params as Integer:
+    If params is equal to 0:
+        Return
+    End If
+    Let count be proc list_count with params
+    Let i be 0
+    While i is less than count:
+        If i is greater than 0:
+            proc out_str with ctx, ", "
+        End If
+        Let p be proc list_item with params, i
+        proc emit_expression with ctx, p
+        Set i to i plus 1
+    End While
+End Process
+
+@Reasoning:
+Struct definition: `[mutable ]struct Name ... end`. The head (parametric /
+supertype expression) is rendered when present, otherwise the bare name. Each
+field is a HIR node on its own line: a type_annotation renders `name::Type`, a
+bare identifier renders `name`.
+@End Reasoning
+Process called "emit_struct" takes ctx as EmitterContext, node as Integer:
+    Let name_str be proc get_dict_string_value with node, "name"
+    Let head be proc get_dict_hir_value with node, "head"
+    Let fields be proc get_dict_hir_value with node, "fields"
+    Let is_mut be proc get_dict_string_value with node, "is_mutable"
+
+    Let mutable_flag be 0
+    If is_mut is not equal to 0:
+        Set mutable_flag to proc string_equals from StringCore with is_mut, "1"
+    End If
+
+    If mutable_flag is equal to 1:
+        proc out_str with ctx, "mutable "
+    End If
+    proc out_str with ctx, "struct "
+    If head is not equal to 0:
+        proc emit_expression with ctx, head
+    Otherwise:
+        If name_str is not equal to 0:
+            proc out_str with ctx, name_str
+        End If
+    End If
+    proc out_newline with ctx
+
+    proc emitter_indent with ctx
+    If fields is not equal to 0:
+        Let count be proc list_count with fields
+        Let i be 0
+        While i is less than count:
+            Let field be proc list_item with fields, i
+            proc emit_expression with ctx, field
+            proc out_newline with ctx
+            Set i to i plus 1
+        End While
+    End If
+    proc emitter_dedent with ctx
+    proc out_line with ctx, "end"
+End Process
+
+@Reasoning:
+Abstract type: `abstract type Name end` or `abstract type Head end` where Head
+is a `Name <: Super` expression preserved as a subtree.
+@End Reasoning
+Process called "emit_abstract_type" takes ctx as EmitterContext, node as Integer:
+    Let name_str be proc get_dict_string_value with node, "name"
+    Let head be proc get_dict_hir_value with node, "head"
+
+    proc out_str with ctx, "abstract type "
+    If head is not equal to 0:
+        proc emit_expression with ctx, head
+    Otherwise:
+        If name_str is not equal to 0:
+            proc out_str with ctx, name_str
+        End If
+    End If
+    proc out_str with ctx, " end"
+    proc out_newline with ctx
+End Process
+
+@Reasoning:
+Primitive type: `primitive type Name Bits end`. Head (Name / `Name <: Super`)
+then the bit-width expression.
+@End Reasoning
+Process called "emit_primitive_type" takes ctx as EmitterContext, node as Integer:
+    Let name_str be proc get_dict_string_value with node, "name"
+    Let head be proc get_dict_hir_value with node, "head"
+    Let bits be proc get_dict_hir_value with node, "bits"
+
+    proc out_str with ctx, "primitive type "
+    If head is not equal to 0:
+        proc emit_expression with ctx, head
+    Otherwise:
+        If name_str is not equal to 0:
+            proc out_str with ctx, name_str
+        End If
+    End If
+    If bits is not equal to 0:
+        proc out_str with ctx, " "
+        proc emit_expression with ctx, bits
+    End If
+    proc out_str with ctx, " end"
+    proc out_newline with ctx
+End Process
+
+@Reasoning:
+using / import statement. The module name (or dotted path subtree) is rendered
+after the keyword; selective symbols (the "symbols" list) follow a colon.
+@End Reasoning
+Process called "emit_using_import" takes ctx as EmitterContext, node as Integer, keyword as String:
+    Let module_str be proc get_dict_string_value with node, "module"
+    Let head be proc get_dict_hir_value with node, "head"
+    Let symbols be proc get_dict_hir_value with node, "symbols"
+
+    proc out_str with ctx, keyword
+    If head is not equal to 0:
+        proc emit_expression with ctx, head
+    Otherwise:
+        If module_str is not equal to 0:
+            proc out_str with ctx, module_str
+        End If
+    End If
+
+    If symbols is not equal to 0:
+        Let count be proc list_count with symbols
+        If count is greater than 0:
+            proc out_str with ctx, ": "
+            Let i be 0
+            While i is less than count:
+                If i is greater than 0:
+                    proc out_str with ctx, ", "
+                End If
+                Let sym be proc list_item with symbols, i
+                proc emit_expression with ctx, sym
+                Set i to i plus 1
+            End While
+        End If
+    End If
+    proc out_newline with ctx
+End Process
+
+@Reasoning:
+export statement: `export sym1, sym2`. The exported names live in the "symbols"
+list.
+@End Reasoning
+Process called "emit_export" takes ctx as EmitterContext, node as Integer:
+    Let symbols be proc get_dict_hir_value with node, "symbols"
+
+    proc out_str with ctx, "export "
+    If symbols is not equal to 0:
+        Let count be proc list_count with symbols
+        Let i be 0
+        While i is less than count:
+            If i is greater than 0:
+                proc out_str with ctx, ", "
+            End If
+            Let sym be proc list_item with symbols, i
+            proc emit_expression with ctx, sym
+            Set i to i plus 1
+        End While
+    End If
+    proc out_newline with ctx
+End Process
+
+@Reasoning:
+const / global / local declaration: keyword followed by the wrapped declaration
+expression.
+@End Reasoning
+Process called "emit_scoped_decl" takes ctx as EmitterContext, node as Integer, keyword as String:
+    Let decl be proc get_dict_hir_value with node, "declaration"
+    proc out_str with ctx, keyword
+    If decl is not equal to 0:
+        proc emit_expression with ctx, decl
+    End If
+    proc out_newline with ctx
+End Process
+
+@Reasoning:
+let block: `let bindings... ; body... end`.
+@End Reasoning
+Process called "emit_let_block" takes ctx as EmitterContext, node as Integer:
+    Let bindings be proc get_dict_hir_value with node, "bindings"
+    Let body be proc get_dict_hir_value with node, "body"
+
+    proc out_str with ctx, "let "
+    If bindings is not equal to 0:
+        Let count be proc list_count with bindings
+        Let i be 0
+        While i is less than count:
+            If i is greater than 0:
+                proc out_str with ctx, ", "
+            End If
+            Let b be proc list_item with bindings, i
+            proc emit_expression with ctx, b
+            Set i to i plus 1
+        End While
+    End If
+    proc out_newline with ctx
+
+    proc emitter_indent with ctx
+    proc emit_node with ctx, body
+    proc emitter_dedent with ctx
+    proc out_line with ctx, "end"
+End Process
+
+@Reasoning:
+begin block: `begin body... end`.
+@End Reasoning
+Process called "emit_begin_block" takes ctx as EmitterContext, node as Integer:
+    Let body be proc get_dict_hir_value with node, "body"
+    proc out_line with ctx, "begin"
+    proc emitter_indent with ctx
+    proc emit_stmt_list with ctx, body
+    proc emitter_dedent with ctx
+    proc out_line with ctx, "end"
+End Process
+
+@Reasoning:
+quote block: `quote body... end`.
+@End Reasoning
+Process called "emit_quote_block" takes ctx as EmitterContext, node as Integer:
+    Let body be proc get_dict_hir_value with node, "body"
+    proc out_line with ctx, "quote"
+    proc emitter_indent with ctx
+    proc emit_stmt_list with ctx, body
+    proc emitter_dedent with ctx
+    proc out_line with ctx, "end"
 End Process
 
 Note: ============================================================================
@@ -609,302 +765,137 @@ Note: STATEMENTS
 Note: ============================================================================
 
 @Reasoning:
-Runa `Let name [as Type] be value` maps to Julia's
-`name[::Type] = value`. Type is optional and detected via the cvt==1
-discriminator on the child node.
+assignment statement: `target = value`.
 @End Reasoning
-
-@Implementation:
-Reads variable name from node_value. Iterates children sorting them
-into type_node (cvt==1) and init_node (everything else). If type
-present, emits `::<type>`. If init present, emits ` = <expr>`. Ends
-with a newline.
-@End Implementation
-
-Process called "emit_let" takes ctx as EmitterContext, node as Integer:
-    Let name_ptr be proc node_value with node
-    Let name_str be proc julia_string_from_pointer with name_ptr
-
-    proc emitter_emit from Emitter with ctx, name_str
-
-    Let count be proc node_child_count with node
-    Let type_node be 0
-    Let init_node be 0
-    Let i be 0
-    While i is less than count:
-        Let child be proc node_child with node, i
-        Let cvt be proc node_value_type with child
-        If cvt is equal to 1:
-            Set type_node to child
-        Otherwise:
-            Set init_node to child
-        End If
-        Set i to i plus 1
-    End While
-
-    If type_node is not equal to 0:
-        proc emitter_emit from Emitter with ctx, "::"
-        proc emit_type with ctx, type_node
-    End If
-    If init_node is not equal to 0:
-        proc emitter_emit from Emitter with ctx, " = "
-        proc emit_expression with ctx, init_node
-    End If
-    proc emitter_emit_newline from Emitter with ctx
-End Process
-
-@Reasoning:
-Runa's `Set target to value` becomes Julia's `target = value`. Both
-operands are arbitrary expressions, dispatched through emit_expression.
-@End Reasoning
-
-@Implementation:
-Reads child 0 as the LHS target and child 1 as the RHS value.
-Emits `<target> = <value>` followed by a newline.
-@End Implementation
-
-Process called "emit_set" takes ctx as EmitterContext, node as Integer:
-    Let target be proc node_child with node, 0
-    Let value be proc node_child with node, 1
+Process called "emit_assignment" takes ctx as EmitterContext, node as Integer:
+    Let target be proc get_dict_hir_value with node, "target"
+    Let value be proc get_dict_hir_value with node, "value"
 
     proc emit_expression with ctx, target
-    proc emitter_emit from Emitter with ctx, " = "
+    proc out_str with ctx, " = "
     proc emit_expression with ctx, value
-    proc emitter_emit_newline from Emitter with ctx
+    proc out_newline with ctx
 End Process
 
 @Reasoning:
-Runa Constant declarations map to Julia's `const` global definition.
-Julia const isn't lexically scoped, but for top-level constants the
-semantics match closely enough.
+if statement: branches list of {condition, body} dicts rendered as `if` then
+`elseif` for each subsequent branch; the optional "else_block" renders as
+`else`. Closed with `end`.
 @End Reasoning
-
-@Implementation:
-Reads constant name from node_value. Emits `const <name> = ` then
-child 0 (the initializer expression) via emit_expression. Trailing
-newline.
-@End Implementation
-
-Process called "emit_const" takes ctx as EmitterContext, node as Integer:
-    Let name_ptr be proc node_value with node
-    Let name_str be proc julia_string_from_pointer with name_ptr
-
-    proc emitter_emit from Emitter with ctx, "const "
-    proc emitter_emit from Emitter with ctx, name_str
-    proc emitter_emit from Emitter with ctx, " = "
-
-    Let init_node be proc node_child with node, 0
-    If init_node is not equal to 0:
-        proc emit_expression with ctx, init_node
-    End If
-    proc emitter_emit_newline from Emitter with ctx
-End Process
-
-@Reasoning:
-Standard Julia if/else syntax with `end` closer. The HIR layout puts
-condition at child 0, then-block at child 1, optional else-block at
-child 2.
-@End Reasoning
-
-@Implementation:
-Emits `if `, then the condition expression. Newline + indent. Recurses
-into then-block via emit_block_children. Dedents. If child 2 exists,
-emits `else` keyword, indents, recurses, dedents. Closes with `end`.
-@End Implementation
-
 Process called "emit_if" takes ctx as EmitterContext, node as Integer:
-    Note: Layout: child 0 = condition, child 1 = then-block, optional child 2 = else-block
-    Let cond be proc node_child with node, 0
-    Let then_block be proc node_child with node, 1
-    Let else_block be proc node_child with node, 2
+    Let branches be proc get_dict_hir_value with node, "branches"
+    Let else_block be proc get_dict_hir_value with node, "else_block"
 
-    proc emitter_emit from Emitter with ctx, "if "
-    proc emit_expression with ctx, cond
-    proc emitter_emit_newline from Emitter with ctx
-
-    proc emitter_indent from Emitter with ctx
-    If then_block is not equal to 0:
-        proc emit_block_children with ctx, then_block
-    End If
-    proc emitter_dedent from Emitter with ctx
-
-    If else_block is not equal to 0:
-        proc emitter_emit_line from Emitter with ctx, "else"
-        proc emitter_indent from Emitter with ctx
-        proc emit_block_children with ctx, else_block
-        proc emitter_dedent from Emitter with ctx
-    End If
-
-    proc emitter_emit_line from Emitter with ctx, "end"
-End Process
-
-@Reasoning:
-Julia's standard library has no built-in match expression; MLStyle.jl
-provides one but requires an external dependency. For portability the
-emitter lowers Runa Match to a chain of if/elseif comparing the subject
-expression against each when-pattern.
-@End Reasoning
-
-@Implementation:
-Reads subject from child 0; child_count tells how many when-clauses
-follow. Emits `let _subject = <subject>` to bind once. Indents.
-Iterates remaining children, expecting HIR_WHEN_CLAUSE: child 0 is
-the pattern, child 1 is the body. First arm emits `if _subject ==
-<pattern>`, subsequent arms emit `elseif _subject == <pattern>`.
-Body is indented under each arm. Closes with `end` for the let.
-@End Implementation
-
-Process called "emit_match" takes ctx as EmitterContext, node as Integer:
-    Note: Julia has no first-class match, but Match{} from MLStyle.jl matches
-    Note: closely. For portability emit an if/elseif/else chain comparing the
-    Note: subject to each when-pattern.
-    Let subject be proc node_child with node, 0
-    Let count be proc node_child_count with node
-
-    proc emitter_emit from Emitter with ctx, "let _subject = "
-    proc emit_expression with ctx, subject
-    proc emitter_emit_newline from Emitter with ctx
-    proc emitter_indent from Emitter with ctx
-
-    Let first be 1
-    Let i be 1
-    While i is less than count:
-        Let arm be proc node_child with node, i
-        Let arm_type be proc node_type_of with arm
-        If arm_type is equal to HIR.HIR_WHEN_CLAUSE:
-            Let pattern be proc node_child with arm, 0
-            Let body be proc node_child with arm, 1
-
-            If first is equal to 1:
-                proc emitter_emit from Emitter with ctx, "if _subject == "
-            Otherwise:
-                proc emitter_emit from Emitter with ctx, "elseif _subject == "
-            End If
-            proc emit_expression with ctx, pattern
-            proc emitter_emit_newline from Emitter with ctx
-
-            proc emitter_indent from Emitter with ctx
-            proc emit_node with ctx, body
-            proc emitter_dedent from Emitter with ctx
-            Set first to 0
-        End If
-        Set i to i plus 1
-    End While
-
-    If first is equal to 0:
-        proc emitter_emit_line from Emitter with ctx, "end"
-    End If
-    proc emitter_dedent from Emitter with ctx
-    proc emitter_emit_line from Emitter with ctx, "end"
-End Process
-
-@Reasoning:
-Runa `For Each var in collection` maps to Julia's `for var in
-collection`. The iteration variable is encoded as a Let node so the
-parser can attach an optional type — only the name is used here.
-@End Reasoning
-
-@Implementation:
-Reads child 0 (var Let), child 1 (collection expression), child 2
-(body block). Extracts var name. Emits `for <var> in <collection>`
-with newline. Indents, recurses body via emit_block_children, dedents,
-closes with `end`.
-@End Implementation
-
-Process called "emit_for" takes ctx as EmitterContext, node as Integer:
-    Note: For-each: child 0 = iteration variable Let, child 1 = collection expr,
-    Note: child 2 = body block.
-    Let var_decl be proc node_child with node, 0
-    Let collection be proc node_child with node, 1
-    Let body be proc node_child with node, 2
-
-    Let var_name_ptr be proc node_value with var_decl
-    Let var_name_str be proc julia_string_from_pointer with var_name_ptr
-
-    proc emitter_emit from Emitter with ctx, "for "
-    proc emitter_emit from Emitter with ctx, var_name_str
-    proc emitter_emit from Emitter with ctx, " in "
-    proc emit_expression with ctx, collection
-    proc emitter_emit_newline from Emitter with ctx
-
-    proc emitter_indent from Emitter with ctx
-    If body is not equal to 0:
-        proc emit_block_children with ctx, body
-    End If
-    proc emitter_dedent from Emitter with ctx
-
-    proc emitter_emit_line from Emitter with ctx, "end"
-End Process
-
-@Reasoning:
-Runa `While cond` maps directly to Julia's `while cond ... end`. No
-parenthesisation needed because Julia parses the condition as the
-expression following the keyword.
-@End Reasoning
-
-@Implementation:
-Reads condition (child 0) and body (child 1). Emits `while <cond>`
-with newline, indents, recurses into body via emit_block_children,
-dedents, closes with `end`.
-@End Implementation
-
-Process called "emit_while" takes ctx as EmitterContext, node as Integer:
-    Let cond be proc node_child with node, 0
-    Let body be proc node_child with node, 1
-
-    proc emitter_emit from Emitter with ctx, "while "
-    proc emit_expression with ctx, cond
-    proc emitter_emit_newline from Emitter with ctx
-
-    proc emitter_indent from Emitter with ctx
-    If body is not equal to 0:
-        proc emit_block_children with ctx, body
-    End If
-    proc emitter_dedent from Emitter with ctx
-
-    proc emitter_emit_line from Emitter with ctx, "end"
-End Process
-
-@Reasoning:
-Julia's return is a keyword followed by an optional expression. Bare
-`return` returns `nothing` implicitly. A missing child 0 produces
-exactly that.
-@End Reasoning
-
-@Implementation:
-Emits `return`. Reads child 0; if non-zero, emits a space and the
-expression. Trailing newline.
-@End Implementation
-
-Process called "emit_return" takes ctx as EmitterContext, node as Integer:
-    proc emitter_emit from Emitter with ctx, "return"
-    Let value be proc node_child with node, 0
-    If value is not equal to 0:
-        proc emitter_emit from Emitter with ctx, " "
-        proc emit_expression with ctx, value
-    End If
-    proc emitter_emit_newline from Emitter with ctx
-End Process
-
-@Reasoning:
-Iteration helper used by every statement that has a body block:
-walks the children list dispatching emit_node on each. Indentation
-and the surrounding braces/keywords are the caller's responsibility.
-@End Reasoning
-
-@Implementation:
-Reads child_count, loops i = 0..count, calls emit_node with each
-child.
-@End Implementation
-
-Process called "emit_block_children" takes ctx as EmitterContext, node as Integer:
-    Let count be proc node_child_count with node
+    Let count be proc list_count with branches
     Let i be 0
     While i is less than count:
-        Let child be proc node_child with node, i
-        proc emit_node with ctx, child
+        Let branch be proc list_item with branches, i
+        Let cond be proc get_dict_hir_value with branch, "condition"
+        Let body be proc get_dict_hir_value with branch, "body"
+
+        If i is equal to 0:
+            proc out_str with ctx, "if "
+        Otherwise:
+            proc out_str with ctx, "elseif "
+        End If
+        proc emit_expression with ctx, cond
+        proc out_newline with ctx
+
+        proc emitter_indent with ctx
+        proc emit_node with ctx, body
+        proc emitter_dedent with ctx
         Set i to i plus 1
     End While
+
+    If else_block is not equal to 0:
+        proc out_line with ctx, "else"
+        proc emitter_indent with ctx
+        proc emit_node with ctx, else_block
+        proc emitter_dedent with ctx
+    End If
+
+    proc out_line with ctx, "end"
+End Process
+
+@Reasoning:
+for loop: `for var in iterable ... end`.
+@End Reasoning
+Process called "emit_for" takes ctx as EmitterContext, node as Integer:
+    Let var be proc get_dict_hir_value with node, "iterator_variable"
+    Let iter be proc get_dict_hir_value with node, "iterable"
+    Let body be proc get_dict_hir_value with node, "body"
+
+    proc out_str with ctx, "for "
+    proc emit_expression with ctx, var
+    proc out_str with ctx, " in "
+    proc emit_expression with ctx, iter
+    proc out_newline with ctx
+
+    proc emitter_indent with ctx
+    proc emit_node with ctx, body
+    proc emitter_dedent with ctx
+    proc out_line with ctx, "end"
+End Process
+
+@Reasoning:
+while loop: `while cond ... end`.
+@End Reasoning
+Process called "emit_while" takes ctx as EmitterContext, node as Integer:
+    Let cond be proc get_dict_hir_value with node, "condition"
+    Let body be proc get_dict_hir_value with node, "body"
+
+    proc out_str with ctx, "while "
+    proc emit_expression with ctx, cond
+    proc out_newline with ctx
+
+    proc emitter_indent with ctx
+    proc emit_node with ctx, body
+    proc emitter_dedent with ctx
+    proc out_line with ctx, "end"
+End Process
+
+@Reasoning:
+try statement: `try ... [catch ...] [finally ...] end`.
+@End Reasoning
+Process called "emit_try" takes ctx as EmitterContext, node as Integer:
+    Let body be proc get_dict_hir_value with node, "body"
+    Let catch_body be proc get_dict_hir_value with node, "catch"
+    Let finally_body be proc get_dict_hir_value with node, "finally"
+
+    proc out_line with ctx, "try"
+    proc emitter_indent with ctx
+    proc emit_node with ctx, body
+    proc emitter_dedent with ctx
+
+    If catch_body is not equal to 0:
+        proc out_line with ctx, "catch"
+        proc emitter_indent with ctx
+        proc emit_node with ctx, catch_body
+        proc emitter_dedent with ctx
+    End If
+
+    If finally_body is not equal to 0:
+        proc out_line with ctx, "finally"
+        proc emitter_indent with ctx
+        proc emit_node with ctx, finally_body
+        proc emitter_dedent with ctx
+    End If
+
+    proc out_line with ctx, "end"
+End Process
+
+@Reasoning:
+return statement: `return [value]`.
+@End Reasoning
+Process called "emit_return" takes ctx as EmitterContext, node as Integer:
+    Let value be proc get_dict_hir_value with node, "value"
+    If value is equal to 0:
+        proc out_line with ctx, "return"
+        Return
+    End If
+    proc out_str with ctx, "return "
+    proc emit_expression with ctx, value
+    proc out_newline with ctx
 End Process
 
 Note: ============================================================================
@@ -912,749 +903,497 @@ Note: EXPRESSIONS
 Note: ============================================================================
 
 @Reasoning:
-Companion to emit_node but specialised for expression positions. Every
-HIR expression kind that can appear inside another expression flows
-through here. Null node degrades gracefully to `nothing`.
+Expression dispatcher. Renders a HIR expression node inline (no trailing
+newline) so it can appear inside larger expressions and statement heads.
+Branches on node_type. Unknown kinds render nothing rather than corrupting
+the output.
 @End Reasoning
-
-@Implementation:
-Null-node fast path emits `nothing`. Then long Match on node_type:
-LITERAL/IDENTIFIER/BINARY/UNARY/TERNARY/CALL/MEMBER/INDEX/
-PARENTHESIZED/INTERPOLATED_STRING/RANGE/ARRAY_LITERAL/TUPLE_LITERAL/
-LAMBDA/CAST dispatch to dedicated helpers. Unknown kinds fall through
-to `_HIR_UNKNOWN_` placeholder with a warning recorded on the emitter
-context — keeps output parseable as Julia.
-@End Implementation
-
 Process called "emit_expression" takes ctx as EmitterContext, node as Integer:
     If node is equal to 0:
-        proc emitter_emit from Emitter with ctx, "nothing"
         Return
     End If
 
     Let nt be proc node_type_of with node
+    If nt is equal to 0:
+        Return
+    End If
 
-    If nt is equal to HIR.HIR_LITERAL:
+    Let m be 0
+
+    Set m to proc nt_is with nt, "literal"
+    If m is equal to 1:
         proc emit_literal with ctx, node
         Return
     End If
-    If nt is equal to HIR.HIR_IDENTIFIER:
-        Let name_ptr be proc node_value with node
-        Let name_str be proc julia_string_from_pointer with name_ptr
-        proc emitter_emit from Emitter with ctx, name_str
-        Return
-    End If
-    If nt is equal to HIR.HIR_BINARY_EXPRESSION:
-        proc emit_binary with ctx, node
-        Return
-    End If
-    If nt is equal to HIR.HIR_UNARY_EXPRESSION:
-        proc emit_unary with ctx, node
-        Return
-    End If
-    If nt is equal to HIR.HIR_TERNARY_EXPRESSION:
-        proc emit_ternary with ctx, node
-        Return
-    End If
-    If nt is equal to HIR.HIR_CALL_EXPRESSION:
-        proc emit_call with ctx, node
-        Return
-    End If
-    If nt is equal to HIR.HIR_MEMBER_EXPRESSION:
-        proc emit_member with ctx, node
-        Return
-    End If
-    If nt is equal to HIR.HIR_INDEX_EXPRESSION:
-        proc emit_index with ctx, node
-        Return
-    End If
-    If nt is equal to HIR.HIR_PARENTHESIZED:
-        Let inner be proc node_child with node, 0
-        proc emitter_emit from Emitter with ctx, "("
-        proc emit_expression with ctx, inner
-        proc emitter_emit from Emitter with ctx, ")"
-        Return
-    End If
-    If nt is equal to HIR.HIR_INTERPOLATED_STRING:
-        proc emit_interpolated_string with ctx, node
-        Return
-    End If
-    If nt is equal to HIR.HIR_RANGE_EXPRESSION:
-        proc emit_range with ctx, node
-        Return
-    End If
-    If nt is equal to HIR.HIR_ARRAY_LITERAL:
-        proc emit_array_literal with ctx, node
-        Return
-    End If
-    If nt is equal to HIR.HIR_TUPLE_LITERAL:
-        proc emit_tuple_literal with ctx, node
-        Return
-    End If
-    If nt is equal to HIR.HIR_LAMBDA_EXPRESSION:
-        proc emit_lambda with ctx, node
-        Return
-    End If
-    If nt is equal to HIR.HIR_CAST_EXPRESSION:
-        proc emit_cast with ctx, node
-        Return
-    End If
-
-    Note: Unknown expression kind: emit a placeholder identifier so Julia
-    Note: parsing still succeeds and surface the issue via a warning.
-    proc emitter_emit from Emitter with ctx, "_HIR_UNKNOWN_"
-    proc emitter_warning from Emitter with ctx, "unhandled expression node type"
-End Process
-
-@Reasoning:
-Literal nodes carry both the lexeme (value) and a subtype tag
-(value_type) so the emitter knows whether to quote a string, normalise
-a boolean, or emit `nothing` for null. Numeric lexemes pass through
-verbatim because Julia accepts the same notation.
-@End Reasoning
-
-@Implementation:
-Reads value_str via julia_string_from_pointer and vtype via
-node_value_type. vtype dispatch: 2=string (wrap in `"..."`), 3=boolean
-(normalise to literal `true`/`false` via string_equals match),
-4=null (emit `nothing`). Default (covers 0=integer and 1=float)
-emits value_str verbatim.
-@End Implementation
-
-Process called "emit_literal" takes ctx as EmitterContext, node as Integer:
-    Let value_ptr be proc node_value with node
-    Let value_str be proc julia_string_from_pointer with value_ptr
-    Let vtype be proc node_value_type with node
-
-    Note: vtype convention: 0=integer literal, 1=float literal, 2=string,
-    Note: 3=boolean, 4=null. Strings need quoting; null maps to nothing.
-    If vtype is equal to 2:
-        proc emitter_emit from Emitter with ctx, "\""
-        proc emitter_emit from Emitter with ctx, value_str
-        proc emitter_emit from Emitter with ctx, "\""
-        Return
-    End If
-    If vtype is equal to 3:
-        Let is_true be proc string_equals from StringCore with value_str, "true"
-        If is_true is equal to 1:
-            proc emitter_emit from Emitter with ctx, "true"
-        Otherwise:
-            proc emitter_emit from Emitter with ctx, "false"
+    Set m to proc nt_is with nt, "identifier"
+    If m is equal to 1:
+        Let name be proc get_dict_string_value with node, "name"
+        If name is not equal to 0:
+            proc out_str with ctx, name
         End If
         Return
     End If
-    If vtype is equal to 4:
-        proc emitter_emit from Emitter with ctx, "nothing"
+    Set m to proc nt_is with nt, "binary_op"
+    If m is equal to 1:
+        proc emit_binary_op with ctx, node
+        Return
+    End If
+    Set m to proc nt_is with nt, "unary_op"
+    If m is equal to 1:
+        proc emit_unary_op with ctx, node
+        Return
+    End If
+    Set m to proc nt_is with nt, "ternary"
+    If m is equal to 1:
+        proc emit_ternary with ctx, node
+        Return
+    End If
+    Set m to proc nt_is with nt, "call"
+    If m is equal to 1:
+        proc emit_call with ctx, node
+        Return
+    End If
+    Set m to proc nt_is with nt, "index_access"
+    If m is equal to 1:
+        proc emit_index with ctx, node
+        Return
+    End If
+    Set m to proc nt_is with nt, "field_access"
+    If m is equal to 1:
+        proc emit_field_access with ctx, node
+        Return
+    End If
+    Set m to proc nt_is with nt, "type_annotation"
+    If m is equal to 1:
+        proc emit_type_annotation with ctx, node
+        Return
+    End If
+    Set m to proc nt_is with nt, "parametric_type"
+    If m is equal to 1:
+        proc emit_parametric_type with ctx, node
+        Return
+    End If
+    Set m to proc nt_is with nt, "where_clause"
+    If m is equal to 1:
+        proc emit_where_clause with ctx, node
+        Return
+    End If
+    Set m to proc nt_is with nt, "broadcast"
+    If m is equal to 1:
+        proc emit_unary_op with ctx, node
+        Return
+    End If
+    Set m to proc nt_is with nt, "list_comprehension"
+    If m is equal to 1:
+        proc emit_comprehension with ctx, node
+        Return
+    End If
+    Set m to proc nt_is with nt, "lambda"
+    If m is equal to 1:
+        proc emit_lambda with ctx, node
+        Return
+    End If
+    Set m to proc nt_is with nt, "pair"
+    If m is equal to 1:
+        proc emit_pair with ctx, node
+        Return
+    End If
+    Set m to proc nt_is with nt, "macro_call"
+    If m is equal to 1:
+        proc emit_macro_call with ctx, node
+        Return
+    End If
+    Set m to proc nt_is with nt, "quote_expression"
+    If m is equal to 1:
+        proc emit_quote_expr with ctx, node
+        Return
+    End If
+    Set m to proc nt_is with nt, "array_literal"
+    If m is equal to 1:
+        proc emit_array with ctx, node
+        Return
+    End If
+    Set m to proc nt_is with nt, "tuple"
+    If m is equal to 1:
+        proc emit_tuple with ctx, node
+        Return
+    End If
+    Set m to proc nt_is with nt, "dict_literal"
+    If m is equal to 1:
+        proc emit_dict_literal with ctx, node
+        Return
+    End If
+    Set m to proc nt_is with nt, "assignment"
+    If m is equal to 1:
+        Note: An assignment appearing in expression position (e.g. as a `let`
+        Note: binding or a const payload) renders without a trailing newline.
+        Let target be proc get_dict_hir_value with node, "target"
+        Let value be proc get_dict_hir_value with node, "value"
+        proc emit_expression with ctx, target
+        proc out_str with ctx, " = "
+        proc emit_expression with ctx, value
+        Return
+    End If
+End Process
+
+@Reasoning:
+Literals carry a literal_kind tag and a raw value lexeme. number / string / char
+/ symbol / boolean values are stored verbatim by the lexer (string lexemes keep
+their quotes, char lexemes keep their single quotes, symbols keep the leading
+colon), so the value is emitted unchanged and re-lexes to the same token. The
+`nothing` literal has no value lexeme and renders the keyword `nothing`.
+@End Reasoning
+Process called "emit_literal" takes ctx as EmitterContext, node as Integer:
+    Let kind be proc get_dict_string_value with node, "literal_kind"
+    Let value be proc get_dict_string_value with node, "value"
+
+    Let is_nothing be 0
+    If kind is not equal to 0:
+        Set is_nothing to proc string_equals from StringCore with kind, "nothing"
+    End If
+    If is_nothing is equal to 1:
+        proc out_str with ctx, "nothing"
         Return
     End If
 
-    Note: Default: emit numeric literal verbatim
-    proc emitter_emit from Emitter with ctx, value_str
+    If value is not equal to 0:
+        proc out_str with ctx, value
+    End If
 End Process
 
 @Reasoning:
-Binary expressions in Julia use infix syntax. The operator string from
-the HIR may need remapping (e.g. `equals` -> `==`); that's
-julia_map_binary_op's job. Spaces around the operator match Julia
-style.
+binary op: `left <op> right` where the operator is the source lexeme captured by
+the parser (e.g. "+", "==", "&&", ".+"). Spaces around the operator keep the
+output readable and re-lexable.
 @End Reasoning
+Process called "emit_binary_op" takes ctx as EmitterContext, node as Integer:
+    Let op be proc get_dict_string_value with node, "operator"
+    Let left be proc get_dict_hir_value with node, "left"
+    Let right be proc get_dict_hir_value with node, "right"
 
-@Implementation:
-Reads op string, runs julia_map_binary_op for the spelling. Pulls lhs
-(child 0) and rhs (child 1). Emits `<lhs> <op> <rhs>` with single
-spaces around the operator. Both sides recurse via emit_expression.
-@End Implementation
-
-Process called "emit_binary" takes ctx as EmitterContext, node as Integer:
-    Let op_ptr be proc node_value with node
-    Let op_str be proc julia_string_from_pointer with op_ptr
-    Let mapped be proc julia_map_binary_op with op_str
-
-    Let lhs be proc node_child with node, 0
-    Let rhs be proc node_child with node, 1
-
-    proc emit_expression with ctx, lhs
-    proc emitter_emit from Emitter with ctx, " "
-    proc emitter_emit from Emitter with ctx, mapped
-    proc emitter_emit from Emitter with ctx, " "
-    proc emit_expression with ctx, rhs
+    proc emit_expression with ctx, left
+    proc out_str with ctx, " "
+    If op is not equal to 0:
+        proc out_str with ctx, op
+    End If
+    proc out_str with ctx, " "
+    proc emit_expression with ctx, right
 End Process
 
 @Reasoning:
-Unary expressions emit `<op><operand>` with no space (Julia convention).
-Operator remapping handles `not` -> `!` and friends via
-julia_map_unary_op.
+unary op: prefix operators (`-`, `!`, `~`) emit `op operand`; the postfix
+transpose operators (`'`, `.'`) emit `operand op`. The parser stores the source
+lexeme as the operator; transpose lexemes are detected to choose postfix
+placement.
 @End Reasoning
+Process called "emit_unary_op" takes ctx as EmitterContext, node as Integer:
+    Let op be proc get_dict_string_value with node, "operator"
+    Let operand be proc get_dict_hir_value with node, "operand"
 
-@Implementation:
-Reads op string and runs julia_map_unary_op. Pulls operand (child 0).
-Emits mapped op then recurses emit_expression on operand. No space
-between them so `not x` becomes `!x` not `! x`.
-@End Implementation
+    Let is_postfix be 0
+    If op is not equal to 0:
+        Let t1 be proc string_equals from StringCore with op, "'"
+        If t1 is equal to 1:
+            Set is_postfix to 1
+        End If
+        Let t2 be proc string_equals from StringCore with op, ".'"
+        If t2 is equal to 1:
+            Set is_postfix to 1
+        End If
+    End If
 
-Process called "emit_unary" takes ctx as EmitterContext, node as Integer:
-    Let op_ptr be proc node_value with node
-    Let op_str be proc julia_string_from_pointer with op_ptr
-    Let mapped be proc julia_map_unary_op with op_str
+    If is_postfix is equal to 1:
+        proc emit_expression with ctx, operand
+        proc out_str with ctx, op
+        Return
+    End If
 
-    Let operand be proc node_child with node, 0
-
-    proc emitter_emit from Emitter with ctx, mapped
+    If op is not equal to 0:
+        proc out_str with ctx, op
+    End If
     proc emit_expression with ctx, operand
 End Process
 
 @Reasoning:
-Julia's ternary uses `cond ? then : else` syntax. The whole expression
-is wrapped in parentheses so the result is safe to embed in any
-parent context without precedence ambiguity.
+ternary: `condition ? then : else`.
 @End Reasoning
-
-@Implementation:
-Reads cond/then_e/else_e from children 0/1/2. Emits
-`(<cond> ? <then> : <else>)` with each part recursed via
-emit_expression.
-@End Implementation
-
 Process called "emit_ternary" takes ctx as EmitterContext, node as Integer:
-    Let cond be proc node_child with node, 0
-    Let then_e be proc node_child with node, 1
-    Let else_e be proc node_child with node, 2
+    Let cond be proc get_dict_hir_value with node, "condition"
+    Let then_v be proc get_dict_hir_value with node, "then_value"
+    Let else_v be proc get_dict_hir_value with node, "else_value"
 
-    proc emitter_emit from Emitter with ctx, "("
     proc emit_expression with ctx, cond
-    proc emitter_emit from Emitter with ctx, " ? "
-    proc emit_expression with ctx, then_e
-    proc emitter_emit from Emitter with ctx, " : "
-    proc emit_expression with ctx, else_e
-    proc emitter_emit from Emitter with ctx, ")"
+    proc out_str with ctx, " ? "
+    proc emit_expression with ctx, then_v
+    proc out_str with ctx, " : "
+    proc emit_expression with ctx, else_v
 End Process
 
 @Reasoning:
-Function/method call syntax `callee(arg1, arg2, ...)`. Julia
-distinguishes regular calls from member calls only by surface
-syntax — the call expression itself is uniform.
+call: `callee(arg1, arg2, ...)`. Arguments are a HIR list rendered inline.
 @End Reasoning
-
-@Implementation:
-Reads child 0 as callee; recurses to emit it. Emits `(`. Loops over
-children 1..n-1 (each is an argument), emitting `, ` separators
-between them via the i>1 check. Closes with `)`.
-@End Implementation
-
 Process called "emit_call" takes ctx as EmitterContext, node as Integer:
-    Note: Child 0 = callee, children 1..n-1 = arguments
-    Let callee be proc node_child with node, 0
-    proc emit_expression with ctx, callee
-    proc emitter_emit from Emitter with ctx, "("
+    Let callee be proc get_dict_hir_value with node, "callee"
+    Let args be proc get_dict_hir_value with node, "arguments"
 
-    Let count be proc node_child_count with node
-    Let i be 1
+    proc emit_expression with ctx, callee
+    proc out_str with ctx, "("
+    proc emit_arg_list with ctx, args
+    proc out_str with ctx, ")"
+End Process
+
+@Reasoning:
+Emits a comma-separated argument/element list inline.
+@End Reasoning
+Process called "emit_arg_list" takes ctx as EmitterContext, args as Integer:
+    If args is equal to 0:
+        Return
+    End If
+    Let count be proc list_count with args
+    Let i be 0
     While i is less than count:
-        If i is greater than 1:
-            proc emitter_emit from Emitter with ctx, ", "
+        If i is greater than 0:
+            proc out_str with ctx, ", "
         End If
-        Let arg be proc node_child with node, i
+        Let arg be proc list_item with args, i
         proc emit_expression with ctx, arg
         Set i to i plus 1
     End While
-
-    proc emitter_emit from Emitter with ctx, ")"
 End Process
 
 @Reasoning:
-Member access `object.field` directly mirrors Runa's field-access
-syntax. The field name comes from node_value rather than a child node
-because there's only one field per access.
+index access: `array[idx1, idx2, ...]`.
 @End Reasoning
-
-@Implementation:
-Reads object (child 0) and field name string. Emits the object,
-`.`, then the field name.
-@End Implementation
-
-Process called "emit_member" takes ctx as EmitterContext, node as Integer:
-    Let object be proc node_child with node, 0
-    Let field_name_ptr be proc node_value with node
-    Let field_name_str be proc julia_string_from_pointer with field_name_ptr
-
-    proc emit_expression with ctx, object
-    proc emitter_emit from Emitter with ctx, "."
-    proc emitter_emit from Emitter with ctx, field_name_str
-End Process
-
-@Reasoning:
-Indexing `collection[index]`. Julia uses 1-based indexing by default,
-which the HIR builder is expected to have already normalised — this
-emitter renders the index expression verbatim.
-@End Reasoning
-
-@Implementation:
-Reads collection (child 0) and index (child 1). Emits `<collection>[`,
-the index expression, `]`.
-@End Implementation
-
 Process called "emit_index" takes ctx as EmitterContext, node as Integer:
-    Let collection be proc node_child with node, 0
-    Let index be proc node_child with node, 1
+    Let array be proc get_dict_hir_value with node, "array"
+    Let indices be proc get_dict_hir_value with node, "indices"
 
-    proc emit_expression with ctx, collection
-    proc emitter_emit from Emitter with ctx, "["
-    proc emit_expression with ctx, index
-    proc emitter_emit from Emitter with ctx, "]"
+    proc emit_expression with ctx, array
+    proc out_str with ctx, "["
+    proc emit_arg_list with ctx, indices
+    proc out_str with ctx, "]"
 End Process
 
 @Reasoning:
-Julia ranges use `start:end` or `start:step:end`. The HIR layout
-puts start at child 0, end at child 1, and optional step at child 2.
-The emitter inverts the conventional ordering at output time so the
-step goes between start and end as Julia expects.
+field access: `object.field`.
 @End Reasoning
+Process called "emit_field_access" takes ctx as EmitterContext, node as Integer:
+    Let obj be proc get_dict_hir_value with node, "object"
+    Let field be proc get_dict_string_value with node, "field"
 
-@Implementation:
-Reads start_e/end_e/step_e from children 0/1/2. Emits start; if step
-present emits `:step`; then emits `:end`. Produces `start:end` for
-no-step and `start:step:end` otherwise.
-@End Implementation
-
-Process called "emit_range" takes ctx as EmitterContext, node as Integer:
-    Note: Range layout: start, end, optional step
-    Let start_e be proc node_child with node, 0
-    Let end_e be proc node_child with node, 1
-    Let step_e be proc node_child with node, 2
-
-    proc emit_expression with ctx, start_e
-    If step_e is not equal to 0:
-        proc emitter_emit from Emitter with ctx, ":"
-        proc emit_expression with ctx, step_e
+    proc emit_expression with ctx, obj
+    proc out_str with ctx, "."
+    If field is not equal to 0:
+        proc out_str with ctx, field
     End If
-    proc emitter_emit from Emitter with ctx, ":"
-    proc emit_expression with ctx, end_e
 End Process
 
 @Reasoning:
-Bracketed array literal `[a, b, c]`. Same syntax in Julia and Runa,
-so each child expression is emitted with comma separators.
+type annotation: `expression::type`. Used both for typed parameters/fields and
+for inline `x::T` expressions. The type expression is mapped through
+julia_map_basic_type when it is a bare identifier so Integer renders as Int64.
 @End Reasoning
+Process called "emit_type_annotation" takes ctx as EmitterContext, node as Integer:
+    Let expr be proc get_dict_hir_value with node, "expression"
+    Let type_node be proc get_dict_hir_value with node, "type"
 
-@Implementation:
-Emits `[`. Loops children, emitting `, ` between adjacent elements
-via the i>0 check. Recurses each element via emit_expression. Closes
-with `]`.
-@End Implementation
-
-Process called "emit_array_literal" takes ctx as EmitterContext, node as Integer:
-    proc emitter_emit from Emitter with ctx, "["
-    Let count be proc node_child_count with node
-    Let i be 0
-    While i is less than count:
-        If i is greater than 0:
-            proc emitter_emit from Emitter with ctx, ", "
-        End If
-        Let elem be proc node_child with node, i
-        proc emit_expression with ctx, elem
-        Set i to i plus 1
-    End While
-    proc emitter_emit from Emitter with ctx, "]"
+    proc emit_expression with ctx, expr
+    proc out_str with ctx, "::"
+    proc emit_type_expr with ctx, type_node
 End Process
 
 @Reasoning:
-Julia tuples are parenthesised: `(a, b, c)`. A single-element tuple
-requires a trailing comma `(a,)` to disambiguate from a parenthesised
-expression — the emitter handles that special case.
+Renders a type expression. A bare identifier type is mapped through
+julia_map_basic_type (Integer -> Int64 etc.); any richer type expression
+(parametric, dotted, union) renders verbatim via emit_expression.
 @End Reasoning
-
-@Implementation:
-Emits `(`. Loops children with `, ` separators. After the loop, if
-count == 1, emits an extra `,` to mark it as a tuple. Closes with `)`.
-@End Implementation
-
-Process called "emit_tuple_literal" takes ctx as EmitterContext, node as Integer:
-    proc emitter_emit from Emitter with ctx, "("
-    Let count be proc node_child_count with node
-    Let i be 0
-    While i is less than count:
-        If i is greater than 0:
-            proc emitter_emit from Emitter with ctx, ", "
+Process called "emit_type_expr" takes ctx as EmitterContext, type_node as Integer:
+    If type_node is equal to 0:
+        Return
+    End If
+    Let nt be proc node_type_of with type_node
+    Let is_ident be proc nt_is with nt, "identifier"
+    If is_ident is equal to 1:
+        Let name be proc get_dict_string_value with type_node, "name"
+        If name is not equal to 0:
+            Let mapped be proc julia_map_basic_type with name
+            proc out_str with ctx, mapped
+            Return
         End If
-        Let elem be proc node_child with node, i
-        proc emit_expression with ctx, elem
-        Set i to i plus 1
-    End While
+    End If
+    proc emit_expression with ctx, type_node
+End Process
+
+@Reasoning:
+parametric type: `base{p1, p2, ...}`.
+@End Reasoning
+Process called "emit_parametric_type" takes ctx as EmitterContext, node as Integer:
+    Let base be proc get_dict_hir_value with node, "base"
+    Let params be proc get_dict_hir_value with node, "parameters"
+
+    proc emit_expression with ctx, base
+    proc out_str with ctx, "{"
+    proc emit_arg_list with ctx, params
+    proc out_str with ctx, "}"
+End Process
+
+@Reasoning:
+where clause: `expression where {c1, c2, ...}` — a single constraint renders
+without braces (`expr where c`), matching idiomatic Julia.
+@End Reasoning
+Process called "emit_where_clause" takes ctx as EmitterContext, node as Integer:
+    Let expr be proc get_dict_hir_value with node, "expression"
+    Let constraints be proc get_dict_hir_value with node, "constraints"
+
+    proc emit_expression with ctx, expr
+    proc out_str with ctx, " where "
+    Let count be proc list_count with constraints
     If count is equal to 1:
-        proc emitter_emit from Emitter with ctx, ","
+        Let c be proc list_item with constraints, 0
+        proc emit_expression with ctx, c
+        Return
     End If
-    proc emitter_emit from Emitter with ctx, ")"
+    proc out_str with ctx, "{"
+    proc emit_arg_list with ctx, constraints
+    proc out_str with ctx, "}"
 End Process
 
 @Reasoning:
-Julia anonymous functions use `(params) -> body` syntax. Parameters
-come first as Let nodes, the body is always the last child — a layout
-chosen so the body's position is computable from child_count - 1.
+list comprehension: `[transform for v in iter (, ...) (if filter)?]`. Each
+generator is a "generator" dict with variable/iterable; the optional filter is
+appended as `if cond`.
 @End Reasoning
+Process called "emit_comprehension" takes ctx as EmitterContext, node as Integer:
+    Let transform be proc get_dict_hir_value with node, "transform"
+    Let generators be proc get_dict_hir_value with node, "generators"
+    Let filter be proc get_dict_hir_value with node, "filter"
 
-@Implementation:
-Computes body_index = child_count - 1. Emits `(`. Loops i = 0..body_index
-emitting each parameter via emit_param with `, ` separators. Emits
-`) -> `. Recurses emit_expression on the body (child at body_index).
-@End Implementation
+    proc out_str with ctx, "["
+    proc emit_expression with ctx, transform
 
-Process called "emit_lambda" takes ctx as EmitterContext, node as Integer:
-    Note: Last child is body, preceding children are param Let nodes.
-    Let count be proc node_child_count with node
-    proc emitter_emit from Emitter with ctx, "("
+    Let count be proc list_count with generators
     Let i be 0
-    Let body_index be count minus 1
-    While i is less than body_index:
-        If i is greater than 0:
-            proc emitter_emit from Emitter with ctx, ", "
+    While i is less than count:
+        Let gen be proc list_item with generators, i
+        Let var be proc get_dict_hir_value with gen, "variable"
+        Let iter be proc get_dict_hir_value with gen, "iterable"
+        If i is equal to 0:
+            proc out_str with ctx, " for "
+        Otherwise:
+            proc out_str with ctx, ", "
         End If
-        Let p be proc node_child with node, i
-        proc emit_param with ctx, p
+        proc emit_expression with ctx, var
+        proc out_str with ctx, " in "
+        proc emit_expression with ctx, iter
         Set i to i plus 1
     End While
-    proc emitter_emit from Emitter with ctx, ") -> "
 
-    Let body be proc node_child with node, body_index
+    If filter is not equal to 0:
+        proc out_str with ctx, " if "
+        proc emit_expression with ctx, filter
+    End If
+
+    proc out_str with ctx, "]"
+End Process
+
+@Reasoning:
+lambda: `(params) -> body`. Parameters are a HIR list; the single-param case
+still renders parentheses for clarity and round-trip stability.
+@End Reasoning
+Process called "emit_lambda" takes ctx as EmitterContext, node as Integer:
+    Let params be proc get_dict_hir_value with node, "parameters"
+    Let body be proc get_dict_hir_value with node, "body"
+
+    proc out_str with ctx, "("
+    proc emit_param_list with ctx, params
+    proc out_str with ctx, ") -> "
     proc emit_expression with ctx, body
 End Process
 
 @Reasoning:
-Julia uses type-as-constructor for casts: `Int64(x)` rather than C-style
-`(int)x`. The emitter therefore writes the target type first followed
-by parenthesised value.
+pair: `key => value` (Dict entry constructor).
 @End Reasoning
+Process called "emit_pair" takes ctx as EmitterContext, node as Integer:
+    Let key be proc get_dict_hir_value with node, "key"
+    Let value be proc get_dict_hir_value with node, "value"
 
-@Implementation:
-Reads value (child 0) and target_type (child 1). Emits the target
-type via emit_type, then `(`, then the value expression, then `)`.
-@End Implementation
-
-Process called "emit_cast" takes ctx as EmitterContext, node as Integer:
-    Let value be proc node_child with node, 0
-    Let target_type be proc node_child with node, 1
-
-    proc emit_type with ctx, target_type
-    proc emitter_emit from Emitter with ctx, "("
+    proc emit_expression with ctx, key
+    proc out_str with ctx, " => "
     proc emit_expression with ctx, value
-    proc emitter_emit from Emitter with ctx, ")"
 End Process
 
 @Reasoning:
-Julia interpolated strings use `"prefix $(expr) suffix"`. The HIR
-represents an interpolated string as a sequence of alternating literal
-and expression children; the emitter walks them in order, switching
-between raw output and `$(...)` interpolation.
+macro call: `@name arg1 arg2 ...` (Julia bare-arg form). Arguments are
+space-separated, which re-lexes back to the same macro-call shape.
 @End Reasoning
+Process called "emit_macro_call" takes ctx as EmitterContext, node as Integer:
+    Let name be proc get_dict_string_value with node, "name"
+    Let args be proc get_dict_hir_value with node, "arguments"
 
-@Implementation:
-Emits opening `"`. Loops children: if child node_type is HIR_LITERAL,
-emits its value verbatim; otherwise wraps it in `$(...)` and recurses
-emit_expression. Closes with `"`.
-@End Implementation
-
-@Security_Scope:
-Literal chunks are emitted unescaped. Callers must ensure that the
-HIR builder has properly escaped backslashes and double quotes in
-literal segments before reaching this emitter.
-@End Security_Scope
-
-Process called "emit_interpolated_string" takes ctx as EmitterContext, node as Integer:
-    Note: Children alternate string-literal nodes and expression nodes.
-    proc emitter_emit from Emitter with ctx, "\""
-    Let count be proc node_child_count with node
+    If name is not equal to 0:
+        proc out_str with ctx, name
+    End If
+    Let count be proc list_count with args
     Let i be 0
     While i is less than count:
-        Let part be proc node_child with node, i
-        Let pt be proc node_type_of with part
-        If pt is equal to HIR.HIR_LITERAL:
-            Let str_ptr be proc node_value with part
-            Let str_val be proc julia_string_from_pointer with str_ptr
-            proc emitter_emit from Emitter with ctx, str_val
-        Otherwise:
-            proc emitter_emit from Emitter with ctx, "$("
-            proc emit_expression with ctx, part
-            proc emitter_emit from Emitter with ctx, ")"
-        End If
+        proc out_str with ctx, " "
+        Let arg be proc list_item with args, i
+        proc emit_expression with ctx, arg
         Set i to i plus 1
     End While
-    proc emitter_emit from Emitter with ctx, "\""
-End Process
-
-Note: ============================================================================
-Note: TYPES
-Note: ============================================================================
-
-@Reasoning:
-Type expressions occur in struct fields, parameter annotations, return
-type annotations, and cast targets. Julia's type syntax differs
-significantly from Runa's (e.g. Optional<T> -> Union{T, Nothing},
-Array<T> -> Vector{T}), so each HIR type kind needs its own rendering
-rule.
-@End Reasoning
-
-@Implementation:
-Null guard emits `Any`. Dispatches on HIR type kind:
-HIR_BASIC_TYPE -> mapped name via julia_map_basic_type;
-HIR_OPTIONAL_TYPE -> `Union{T, Nothing}`;
-HIR_ARRAY_TYPE -> `Vector{T}`;
-HIR_TUPLE_TYPE -> `Tuple{T1, T2, ...}`;
-HIR_GENERIC_TYPE -> `Mapped{arg1, arg2, ...}`;
-HIR_UNION_TYPE -> `Union{T1, T2, ...}`;
-HIR_FUNCTION_TYPE -> bare `Function` (Julia can't express full
-signature in a type annotation without sigtuple objects).
-Unknown kinds fall through to `Any`.
-@End Implementation
-
-Process called "emit_type" takes ctx as EmitterContext, node as Integer:
-    If node is equal to 0:
-        proc emitter_emit from Emitter with ctx, "Any"
-        Return
-    End If
-
-    Let nt be proc node_type_of with node
-
-    If nt is equal to HIR.HIR_BASIC_TYPE:
-        Let name_ptr be proc node_value with node
-        Let name_str be proc julia_string_from_pointer with name_ptr
-        Let mapped be proc julia_map_basic_type with name_str
-        proc emitter_emit from Emitter with ctx, mapped
-        Return
-    End If
-    If nt is equal to HIR.HIR_OPTIONAL_TYPE:
-        Let inner be proc node_child with node, 0
-        proc emitter_emit from Emitter with ctx, "Union{"
-        proc emit_type with ctx, inner
-        proc emitter_emit from Emitter with ctx, ", Nothing}"
-        Return
-    End If
-    If nt is equal to HIR.HIR_ARRAY_TYPE:
-        Let elem be proc node_child with node, 0
-        proc emitter_emit from Emitter with ctx, "Vector{"
-        proc emit_type with ctx, elem
-        proc emitter_emit from Emitter with ctx, "}"
-        Return
-    End If
-    If nt is equal to HIR.HIR_TUPLE_TYPE:
-        proc emitter_emit from Emitter with ctx, "Tuple{"
-        Let count be proc node_child_count with node
-        Let i be 0
-        While i is less than count:
-            If i is greater than 0:
-                proc emitter_emit from Emitter with ctx, ", "
-            End If
-            Let elem be proc node_child with node, i
-            proc emit_type with ctx, elem
-            Set i to i plus 1
-        End While
-        proc emitter_emit from Emitter with ctx, "}"
-        Return
-    End If
-    If nt is equal to HIR.HIR_GENERIC_TYPE:
-        Let name_ptr be proc node_value with node
-        Let name_str be proc julia_string_from_pointer with name_ptr
-        Let mapped be proc julia_map_basic_type with name_str
-        proc emitter_emit from Emitter with ctx, mapped
-        proc emitter_emit from Emitter with ctx, "{"
-        Let count be proc node_child_count with node
-        Let i be 0
-        While i is less than count:
-            If i is greater than 0:
-                proc emitter_emit from Emitter with ctx, ", "
-            End If
-            Let arg be proc node_child with node, i
-            proc emit_type with ctx, arg
-            Set i to i plus 1
-        End While
-        proc emitter_emit from Emitter with ctx, "}"
-        Return
-    End If
-    If nt is equal to HIR.HIR_UNION_TYPE:
-        proc emitter_emit from Emitter with ctx, "Union{"
-        Let count be proc node_child_count with node
-        Let i be 0
-        While i is less than count:
-            If i is greater than 0:
-                proc emitter_emit from Emitter with ctx, ", "
-            End If
-            Let alt be proc node_child with node, i
-            proc emit_type with ctx, alt
-            Set i to i plus 1
-        End While
-        proc emitter_emit from Emitter with ctx, "}"
-        Return
-    End If
-    If nt is equal to HIR.HIR_FUNCTION_TYPE:
-        Note: Julia function types render as `Function`; arg signatures aren't
-        Note: expressible in Julia type annotations without sigtuple objects.
-        proc emitter_emit from Emitter with ctx, "Function"
-        Return
-    End If
-
-    proc emitter_emit from Emitter with ctx, "Any"
-End Process
-
-Note: ============================================================================
-Note: OPERATOR MAPPING
-Note: ============================================================================
-
-@Reasoning:
-Runa uses English-word operators (`plus`, `is equal to`) while Julia
-uses the symbolic forms (`+`, `==`). This mapping table covers the
-common arithmetic, comparison, and logical operators. Unknown opcodes
-pass through unchanged so user-defined operators retain their spelling.
-@End Reasoning
-
-@Implementation:
-Linear sequence of string_equals comparisons covering arithmetic
-(plus, minus, multiplied by, divided by, modulo), comparison (is
-equal to, is not equal to, is less than, is greater than, etc.),
-logical (and, or), and bitwise (bitwise and/or/xor, shifted left/
-right). Returns the mapped symbol on match, or the original op
-string on no match.
-@End Implementation
-
-Process called "julia_map_binary_op" takes runa_op as String returns String:
-    Let eq be 0
-
-    Set eq to proc string_equals from StringCore with runa_op, "plus"
-    If eq is equal to 1:
-        Return "+"
-    End If
-    Set eq to proc string_equals from StringCore with runa_op, "minus"
-    If eq is equal to 1:
-        Return "-"
-    End If
-    Set eq to proc string_equals from StringCore with runa_op, "multiplied by"
-    If eq is equal to 1:
-        Return "*"
-    End If
-    Set eq to proc string_equals from StringCore with runa_op, "divided by"
-    If eq is equal to 1:
-        Return "/"
-    End If
-    Set eq to proc string_equals from StringCore with runa_op, "modulo"
-    If eq is equal to 1:
-        Return "%"
-    End If
-    Set eq to proc string_equals from StringCore with runa_op, "is equal to"
-    If eq is equal to 1:
-        Return "=="
-    End If
-    Set eq to proc string_equals from StringCore with runa_op, "is not equal to"
-    If eq is equal to 1:
-        Return "!="
-    End If
-    Set eq to proc string_equals from StringCore with runa_op, "is less than"
-    If eq is equal to 1:
-        Return "<"
-    End If
-    Set eq to proc string_equals from StringCore with runa_op, "is greater than"
-    If eq is equal to 1:
-        Return ">"
-    End If
-    Set eq to proc string_equals from StringCore with runa_op, "is less than or equal to"
-    If eq is equal to 1:
-        Return "<="
-    End If
-    Set eq to proc string_equals from StringCore with runa_op, "is greater than or equal to"
-    If eq is equal to 1:
-        Return ">="
-    End If
-    Set eq to proc string_equals from StringCore with runa_op, "and"
-    If eq is equal to 1:
-        Return "&&"
-    End If
-    Set eq to proc string_equals from StringCore with runa_op, "or"
-    If eq is equal to 1:
-        Return "||"
-    End If
-    Set eq to proc string_equals from StringCore with runa_op, "bitwise and"
-    If eq is equal to 1:
-        Return "&"
-    End If
-    Set eq to proc string_equals from StringCore with runa_op, "bitwise or"
-    If eq is equal to 1:
-        Return "|"
-    End If
-    Set eq to proc string_equals from StringCore with runa_op, "bitwise xor"
-    If eq is equal to 1:
-        Return "^"
-    End If
-    Set eq to proc string_equals from StringCore with runa_op, "shifted left by"
-    If eq is equal to 1:
-        Return "<<"
-    End If
-    Set eq to proc string_equals from StringCore with runa_op, "shifted right by"
-    If eq is equal to 1:
-        Return ">>"
-    End If
-
-    Return runa_op
 End Process
 
 @Reasoning:
-Unary operator mapping mirrors the binary case but for prefix
-operators. `negate` and `minus` both produce `-`, `not` becomes `!`,
-`bitwise not` becomes `~`. Unknown opcodes pass through unchanged.
+quote expression: the short `:(expr)` form.
 @End Reasoning
-
-@Implementation:
-Four string_equals comparisons: negate -> "-", minus -> "-",
-not -> "!", bitwise not -> "~". Returns the mapped symbol on match,
-or runa_op on no match.
-@End Implementation
-
-Process called "julia_map_unary_op" takes runa_op as String returns String:
-    Let eq be 0
-
-    Set eq to proc string_equals from StringCore with runa_op, "negate"
-    If eq is equal to 1:
-        Return "-"
-    End If
-    Set eq to proc string_equals from StringCore with runa_op, "minus"
-    If eq is equal to 1:
-        Return "-"
-    End If
-    Set eq to proc string_equals from StringCore with runa_op, "not"
-    If eq is equal to 1:
-        Return "!"
-    End If
-    Set eq to proc string_equals from StringCore with runa_op, "bitwise not"
-    If eq is equal to 1:
-        Return "~"
-    End If
-
-    Return runa_op
+Process called "emit_quote_expr" takes ctx as EmitterContext, node as Integer:
+    Let inner be proc get_dict_hir_value with node, "expression"
+    proc out_str with ctx, ":("
+    proc emit_expression with ctx, inner
+    proc out_str with ctx, ")"
 End Process
 
-Note: ============================================================================
-Note: STRING POINTER COERCION
-Note: ============================================================================
-Note: HIR value fields are Integer-typed pointers to null-terminated strings
-Note: when they carry textual data. This helper centralizes the cast so the
-Note: rest of the file reads as if value() always returned a String.
 @Reasoning:
-HIR.value slots are Integer-typed because the IR pre-dates a unified
-string handle type. Centralising the Integer->String coercion in one
-helper keeps the rest of this file readable, and gives one place to
-add a null guard for safe traversal of nodes whose value happens to
-be 0.
+array literal: `[e1, e2, ...]`.
 @End Reasoning
+Process called "emit_array" takes ctx as EmitterContext, node as Integer:
+    Let elements be proc get_dict_hir_value with node, "elements"
+    proc out_str with ctx, "["
+    proc emit_arg_list with ctx, elements
+    proc out_str with ctx, "]"
+End Process
 
-@Implementation:
-Null guard returns the empty string. Otherwise returns the integer
-verbatim — at this bootstrap layer the integer IS the string handle,
-treated as a raw pointer to a null-terminated byte sequence consumed
-by StringCore primitives.
-@End Implementation
+@Reasoning:
+tuple literal: `(e1, e2, ...)`.
+@End Reasoning
+Process called "emit_tuple" takes ctx as EmitterContext, node as Integer:
+    Let elements be proc get_dict_hir_value with node, "elements"
+    proc out_str with ctx, "("
+    proc emit_arg_list with ctx, elements
+    proc out_str with ctx, ")"
+End Process
 
-Process called "julia_string_from_pointer" takes ptr as Integer returns String:
-    Note: In the bootstrap stage strings are represented as raw pointers to
-    Note: null-terminated byte sequences. The pointer IS the string at this
-    Note: layer; the cast is implicit in how the codegen passes it to
-    Note: string_equals/string_concat. We just guard against null.
-    If ptr is equal to 0:
-        Return ""
-    End If
-    Return ptr
+@Reasoning:
+dict literal: `Dict(k1 => v1, k2 => v2)`. The frontend's translate_dict produces
+a "pairs" list of dict_pair nodes; this renders the canonical Dict(...)
+constructor so the keys round-trip.
+@End Reasoning
+Process called "emit_dict_literal" takes ctx as EmitterContext, node as Integer:
+    Let pairs be proc get_dict_hir_value with node, "pairs"
+    proc out_str with ctx, "Dict("
+    Let count be proc list_count with pairs
+    Let i be 0
+    While i is less than count:
+        If i is greater than 0:
+            proc out_str with ctx, ", "
+        End If
+        Let pair be proc list_item with pairs, i
+        Let key be proc get_dict_hir_value with pair, "key"
+        Let value be proc get_dict_hir_value with pair, "value"
+        proc emit_expression with ctx, key
+        proc out_str with ctx, " => "
+        proc emit_expression with ctx, value
+        Set i to i plus 1
+    End While
+    proc out_str with ctx, ")"
 End Process

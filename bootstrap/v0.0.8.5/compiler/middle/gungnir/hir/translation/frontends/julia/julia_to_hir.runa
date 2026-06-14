@@ -16,49 +16,107 @@ Note: ==========================================================================
 
 Import "compiler/middle/gungnir/hir/translation/frontends/julia/julia_lexer.runa" as JLexer
 Import "compiler/middle/gungnir/hir/translation/frontends/julia/julia_parser.runa" as JParser
+Import "compiler/middle/gungnir/hir/hir.runa" as HIR
 Import "compiler/frontend/primitives/memory/layout.runa" as Layout
 Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
 Import "compiler/frontend/primitives/collections/hashtable.runa" as Dict
 Import "compiler/frontend/primitives/collections/list.runa" as List
 
 Note: ============================================================================
-Note: HIR STORAGE PRIMITIVES
+Note: HIR STORAGE PRIMITIVES (model-3 dictionary/list-literal interchange)
 Note: ============================================================================
 
 @Reasoning:
-HIR nodes in the dictionary-shaped translation pipeline are untyped
-hashtables keyed by string field names. Wrapping hashtable_create keeps
-the call sites in this file consistent with every other dictionary-shaped
-frontend (bash_to_hir, elixir_to_hir, haskell_to_hir, ...).
+HIR nodes in the model-3 translation pipeline are hir.runa
+dictionary-literal nodes whose entries are a List of 16-byte [key, value]
+blocks (add_dictionary_entry / get_dictionary_entries). Wrapping
+create_hir_dictionary_literal keeps the call sites consistent with every
+other model-3 frontend (php_to_hir, elixir_to_hir, ...). Producer and
+consumer (hir_to_julia) share exactly this representation.
 @End Reasoning
 Process called "create_hir_dict" returns Integer:
-    Return proc hashtable_create from Dict
+    Return proc create_hir_dictionary_literal from HIR
 End Process
 
 @Reasoning:
-HIR list storage uses the production dynamic list primitive. Children,
-arguments, comprehension generators, struct fields and any other ordered
-HIR collection allocate through this single helper so a future storage
-swap stays local.
+HIR list storage uses the canonical hir.runa list literal whose elements
+hang at the children slot. Children, arguments, comprehension generators,
+struct fields and any other ordered HIR collection allocate through this
+single helper so the storage stays uniform with the model-3 contract.
 @End Reasoning
 Process called "create_hir_list" returns Integer:
-    Return proc list_create from List
+    Return proc create_hir_list_literal from HIR
 End Process
 
 @Reasoning:
-Domain alias over hashtable_set so call sites can use the "set_dict_value"
-vocabulary other dictionary-shaped frontends already use.
+Stores a string-valued attribute wrapped in a HIR string literal so the
+backend's get_string_literal_value resolves it. Subtree values (HIR dict /
+list nodes) must NOT pass through here — set_dict_node stores those verbatim.
+Null key or dict short-circuits.
+@End Reasoning
+Process called "set_dict_string" takes dict as Integer, key as Integer, value as Integer returns Integer:
+    If dict is equal to 0:
+        Return 0
+    End If
+    If key is equal to 0:
+        Return 0
+    End If
+    If value is equal to 0:
+        Return 0
+    End If
+    Let value_literal be proc create_hir_string_literal from HIR with value
+    Return proc add_dictionary_entry from HIR with dict, key, value_literal
+End Process
+
+@Reasoning:
+Stores a subtree-valued attribute (a child HIR dict/list node) verbatim so
+the backend reads it back as a node/list rather than a string.
+@End Reasoning
+Process called "set_dict_node" takes dict as Integer, key as Integer, value as Integer returns Integer:
+    If dict is equal to 0:
+        Return 0
+    End If
+    If key is equal to 0:
+        Return 0
+    End If
+    Return proc add_dictionary_entry from HIR with dict, key, value
+End Process
+
+@Reasoning:
+Compatibility shim. The walker historically called set_dict_value with both
+string scalars (node_type tags, names, line numbers) and HIR subtree nodes.
+Under the model-3 contract these need different storage, so every existing
+call site is migrated to set_dict_string (scalars) or set_dict_node
+(subtrees). This shim is retained only for the line-number convenience path
+and forwards integer-line values as their decimal string.
 @End Reasoning
 Process called "set_dict_value" takes dict as Integer, key as Integer, value as Integer returns Integer:
-    Return proc hashtable_set from Dict with dict, key, value
+    Return proc set_dict_node with dict, key, value
 End Process
 
 @Reasoning:
-Corresponding alias for list_push. Walker code reading "append child to
-body" is clearer than "push" semantics.
+Records the source line for a node. Under the model-3 contract scalar
+attributes are HIR string literals; the line number is an integer and is
+not needed to reconstruct source on the round-trip path, so this helper
+intentionally drops it. Keeping a named no-op lets the per-node walkers
+remain uniform and documents that line provenance is carried by the HIR
+node's own line slot elsewhere in the pipeline, not by a dict entry.
+@End Reasoning
+Process called "set_line" takes dict as Integer, line_value as Integer returns Integer:
+    Return 1
+End Process
+
+@Reasoning:
+Appends a translated node to a HIR list literal; null-guards both operands.
 @End Reasoning
 Process called "list_append" takes lst as Integer, item as Integer returns Integer:
-    Return proc list_push from List with lst, item
+    If lst is equal to 0:
+        Return 0
+    End If
+    If item is equal to 0:
+        Return 0
+    End If
+    Return proc add_list_element from HIR with lst, item
 End Process
 
 Note: ============================================================================
@@ -308,11 +366,33 @@ Process called "translate_julia_to_hir" takes translator as Integer, node as Int
     If kind is equal to JParser.NODE_DICT:
         Return proc translate_dict with translator, node
     End If
+    If kind is equal to JParser.NODE_PRIMITIVE_TYPE:
+        Return proc translate_primitive_type with translator, node
+    End If
+    If kind is equal to JParser.NODE_CONST_DECL:
+        Return proc translate_scoped_decl with translator, node, "const_declaration"
+    End If
+    If kind is equal to JParser.NODE_GLOBAL_DECL:
+        Return proc translate_scoped_decl with translator, node, "global_declaration"
+    End If
+    If kind is equal to JParser.NODE_LOCAL_DECL:
+        Return proc translate_scoped_decl with translator, node, "local_declaration"
+    End If
+    If kind is equal to JParser.NODE_LET_BLOCK:
+        Return proc translate_let_block with translator, node
+    End If
+    If kind is equal to JParser.NODE_BEGIN_BLOCK:
+        Return proc translate_begin_block with translator, node
+    End If
+    If kind is equal to JParser.NODE_QUOTE_BLOCK:
+        Return proc translate_quote_block with translator, node
+    End If
+    If kind is equal to JParser.NODE_PAIR:
+        Return proc translate_pair with translator, node
+    End If
 
     Let hir be proc create_hir_dict
-    proc set_dict_value with hir, "node_type", "unknown_node"
-    proc set_dict_value with hir, "kind", kind
-    proc set_dict_value with hir, "line", proc ast_line with node
+    proc set_dict_string with hir, "node_type", "unknown_node"
     Return hir
 End Process
 
@@ -330,12 +410,12 @@ translated children in declaration order. The top-level program is tagged
 Process called "translate_program" takes translator as Integer, node as Integer returns Integer:
     Let hir be proc create_hir_dict
     If translator.current_module is equal to 0:
-        proc set_dict_value with hir, "node_type", "module"
-        proc set_dict_value with hir, "name", "julia_module"
+        proc set_dict_string with hir, "node_type","module"
+        proc set_dict_string with hir, "name","julia_module"
     Otherwise:
-        proc set_dict_value with hir, "node_type", "block"
+        proc set_dict_string with hir, "node_type","block"
     End If
-    proc set_dict_value with hir, "line", proc ast_line with node
+    proc set_line with hir, proc ast_line with node
 
     Let previous_module be translator.current_module
     If translator.current_module is equal to 0:
@@ -365,9 +445,9 @@ HIR "function" with name, parameters list, return_type, and body.
 @End Reasoning
 Process called "translate_function_def" takes translator as Integer, node as Integer returns Integer:
     Let hir be proc create_hir_dict
-    proc set_dict_value with hir, "node_type", "function"
-    proc set_dict_value with hir, "name", proc ast_value with node
-    proc set_dict_value with hir, "line", proc ast_line with node
+    proc set_dict_string with hir, "node_type","function"
+    proc set_dict_string with hir, "name",proc ast_value with node
+    proc set_line with hir, proc ast_line with node
 
     Let previous_function be translator.current_function
     Set translator.current_function to hir
@@ -407,10 +487,10 @@ one exists.
 @End Reasoning
 Process called "translate_macro_def" takes translator as Integer, node as Integer returns Integer:
     Let hir be proc create_hir_dict
-    proc set_dict_value with hir, "node_type", "macro"
-    proc set_dict_value with hir, "name", proc ast_value with node
-    proc set_dict_value with hir, "is_macro", "true"
-    proc set_dict_value with hir, "line", proc ast_line with node
+    proc set_dict_string with hir, "node_type","macro"
+    proc set_dict_string with hir, "name",proc ast_value with node
+    proc set_dict_string with hir, "is_macro","true"
+    proc set_line with hir, proc ast_line with node
 
     Let params be proc create_hir_list
     Let pcount be proc ast_child_count with node
@@ -432,15 +512,34 @@ Process called "translate_macro_def" takes translator as Integer, node as Intege
 End Process
 
 @Reasoning:
-NODE_STRUCT_DEF stores the struct name in the value slot and fields as
-children. Each field is itself an ASTNode (typically an identifier or
-type-annotated identifier).
+NODE_STRUCT_DEF stores a bare struct name in the value slot (or a richer
+head expression — `Name{T} <: Super` — in the left slot), the mutable flag
+at offset 48, and fields as children. Each field is itself an ASTNode
+(identifier or NODE_TYPE_ANNOTATION). The lowering records the name string,
+the is_mutable flag (as "1"/"0"), an optional head subtree, and the field
+list.
 @End Reasoning
 Process called "translate_struct_def" takes translator as Integer, node as Integer returns Integer:
     Let hir be proc create_hir_dict
-    proc set_dict_value with hir, "node_type", "struct_definition"
-    proc set_dict_value with hir, "name", proc ast_value with node
-    proc set_dict_value with hir, "line", proc ast_line with node
+    proc set_dict_string with hir, "node_type","struct_definition"
+
+    Let name_ptr be proc ast_value with node
+    If name_ptr is not equal to 0:
+        proc set_dict_string with hir, "name", name_ptr
+    End If
+
+    Let head_node be proc ast_left with node
+    If head_node is not equal to 0:
+        Let hir_head be proc translate_julia_to_hir with translator, head_node
+        proc set_dict_node with hir, "head", hir_head
+    End If
+
+    Let is_mut be proc memory_get_int64 from Layout with node, 48
+    If is_mut is equal to 1:
+        proc set_dict_string with hir, "is_mutable", "1"
+    Otherwise:
+        proc set_dict_string with hir, "is_mutable", "0"
+    End If
 
     Let fields be proc create_hir_list
     Let count be proc ast_child_count with node
@@ -451,7 +550,7 @@ Process called "translate_struct_def" takes translator as Integer, node as Integ
         proc list_append with fields, hir_field
         Set i to i plus 1
     End While
-    proc set_dict_value with hir, "fields", fields
+    proc set_dict_node with hir, "fields", fields
     Return hir
 End Process
 
@@ -462,15 +561,153 @@ single-inheritance hierarchy.
 @End Reasoning
 Process called "translate_abstract_type" takes translator as Integer, node as Integer returns Integer:
     Let hir be proc create_hir_dict
-    proc set_dict_value with hir, "node_type", "abstract_type"
-    proc set_dict_value with hir, "name", proc ast_value with node
-    proc set_dict_value with hir, "line", proc ast_line with node
+    proc set_dict_string with hir, "node_type","abstract_type"
 
-    Let supertype_node be proc ast_left with node
-    If supertype_node is not equal to 0:
-        Let hir_super be proc translate_julia_to_hir with translator, supertype_node
-        proc set_dict_value with hir, "supertype", hir_super
+    Let aname_ptr be proc ast_value with node
+    If aname_ptr is not equal to 0:
+        proc set_dict_string with hir, "name", aname_ptr
     End If
+
+    Note: When the head was not a bare identifier (e.g. `Name <: Super`),
+    Note: the whole head expression is in the left slot.
+    Let head_node be proc ast_left with node
+    If head_node is not equal to 0:
+        Let hir_head be proc translate_julia_to_hir with translator, head_node
+        proc set_dict_node with hir, "head", hir_head
+    End If
+    Return hir
+End Process
+
+@Reasoning:
+NODE_PRIMITIVE_TYPE carries a bare name (value slot) or head expression
+(right slot when `Name <: Super`) plus the bit-width expression in the left
+slot. The lowering records name, optional head, and the bits subtree.
+@End Reasoning
+Process called "translate_primitive_type" takes translator as Integer, node as Integer returns Integer:
+    Let hir be proc create_hir_dict
+    proc set_dict_string with hir, "node_type","primitive_type"
+
+    Let pname_ptr be proc ast_value with node
+    If pname_ptr is not equal to 0:
+        proc set_dict_string with hir, "name", pname_ptr
+    End If
+
+    Let head_node be proc ast_right with node
+    If head_node is not equal to 0:
+        Let hir_head be proc translate_julia_to_hir with translator, head_node
+        proc set_dict_node with hir, "head", hir_head
+    End If
+
+    Let bits_node be proc ast_left with node
+    If bits_node is not equal to 0:
+        Let hir_bits be proc translate_julia_to_hir with translator, bits_node
+        proc set_dict_node with hir, "bits", hir_bits
+    End If
+    Return hir
+End Process
+
+@Reasoning:
+const / global / local declarations wrap a single payload expression stored
+in the right slot. The lowering tags the node_type per keyword and lowers
+the payload under "declaration".
+@End Reasoning
+Process called "translate_scoped_decl" takes translator as Integer, node as Integer, tag as Integer returns Integer:
+    Let hir be proc create_hir_dict
+    proc set_dict_string with hir, "node_type", tag
+
+    Let payload_node be proc ast_right with node
+    If payload_node is not equal to 0:
+        Let hir_payload be proc translate_julia_to_hir with translator, payload_node
+        proc set_dict_node with hir, "declaration", hir_payload
+    End If
+    Return hir
+End Process
+
+@Reasoning:
+let block: comma-separated bindings (children) introduce a scope around the
+body statements (NODE_PROGRAM block in the right slot). The lowering emits
+a "let_block" with a bindings list and a body block.
+@End Reasoning
+Process called "translate_let_block" takes translator as Integer, node as Integer returns Integer:
+    Let hir be proc create_hir_dict
+    proc set_dict_string with hir, "node_type","let_block"
+
+    Let bindings be proc create_hir_list
+    Let count be proc ast_child_count with node
+    Let i be 0
+    While i is less than count:
+        Let b_node be proc ast_child_at with node, i
+        Let hir_b be proc translate_julia_to_hir with translator, b_node
+        proc list_append with bindings, hir_b
+        Set i to i plus 1
+    End While
+    proc set_dict_node with hir, "bindings", bindings
+
+    Let body_node be proc ast_right with node
+    If body_node is not equal to 0:
+        Let hir_body be proc translate_julia_to_hir with translator, body_node
+        proc set_dict_node with hir, "body", hir_body
+    End If
+    Return hir
+End Process
+
+@Reasoning:
+begin block: a statement sequence (children). Lowered to a "begin_block"
+with a body list so the backend renders `begin ... end`.
+@End Reasoning
+Process called "translate_begin_block" takes translator as Integer, node as Integer returns Integer:
+    Let hir be proc create_hir_dict
+    proc set_dict_string with hir, "node_type","begin_block"
+
+    Let body be proc create_hir_list
+    Let count be proc ast_child_count with node
+    Let i be 0
+    While i is less than count:
+        Let child be proc ast_child_at with node, i
+        Let hir_child be proc translate_julia_to_hir with translator, child
+        proc list_append with body, hir_child
+        Set i to i plus 1
+    End While
+    proc set_dict_node with hir, "body", body
+    Return hir
+End Process
+
+@Reasoning:
+quote block: a quoted statement sequence (children). Lowered to a
+"quote_block" with a body list so the backend renders `quote ... end`.
+@End Reasoning
+Process called "translate_quote_block" takes translator as Integer, node as Integer returns Integer:
+    Let hir be proc create_hir_dict
+    proc set_dict_string with hir, "node_type","quote_block"
+
+    Let body be proc create_hir_list
+    Let count be proc ast_child_count with node
+    Let i be 0
+    While i is less than count:
+        Let child be proc ast_child_at with node, i
+        Let hir_child be proc translate_julia_to_hir with translator, child
+        proc list_append with body, hir_child
+        Set i to i plus 1
+    End While
+    proc set_dict_node with hir, "body", body
+    Return hir
+End Process
+
+@Reasoning:
+NODE_PAIR is the `key => value` constructor (left slot key, right slot
+value). Lowered to a "pair" with key/value subtrees so Dict(...) round-trips
+its entries.
+@End Reasoning
+Process called "translate_pair" takes translator as Integer, node as Integer returns Integer:
+    Let hir be proc create_hir_dict
+    proc set_dict_string with hir, "node_type","pair"
+
+    Let key_node be proc ast_left with node
+    Let val_node be proc ast_right with node
+    Let hir_key be proc translate_julia_to_hir with translator, key_node
+    Let hir_val be proc translate_julia_to_hir with translator, val_node
+    proc set_dict_node with hir, "key", hir_key
+    proc set_dict_node with hir, "value", hir_val
     Return hir
 End Process
 
@@ -480,9 +717,9 @@ body as children (a sequence of definitions and statements).
 @End Reasoning
 Process called "translate_module_def" takes translator as Integer, node as Integer returns Integer:
     Let hir be proc create_hir_dict
-    proc set_dict_value with hir, "node_type", "module"
-    proc set_dict_value with hir, "name", proc ast_value with node
-    proc set_dict_value with hir, "line", proc ast_line with node
+    proc set_dict_string with hir, "node_type","module"
+    proc set_dict_string with hir, "name",proc ast_value with node
+    proc set_line with hir, proc ast_line with node
 
     Let previous_module be translator.current_module
     Set translator.current_module to hir
@@ -515,8 +752,8 @@ and value sub-nodes.
 @End Reasoning
 Process called "translate_assignment" takes translator as Integer, node as Integer returns Integer:
     Let hir be proc create_hir_dict
-    proc set_dict_value with hir, "node_type", "assignment"
-    proc set_dict_value with hir, "line", proc ast_line with node
+    proc set_dict_string with hir, "node_type","assignment"
+    proc set_line with hir, proc ast_line with node
 
     Let left_node be proc ast_left with node
     Let right_node be proc ast_right with node
@@ -537,8 +774,8 @@ last child is the else block).
 @End Reasoning
 Process called "translate_if_stmt" takes translator as Integer, node as Integer returns Integer:
     Let hir be proc create_hir_dict
-    proc set_dict_value with hir, "node_type", "if_statement"
-    proc set_dict_value with hir, "line", proc ast_line with node
+    proc set_dict_string with hir, "node_type","if_statement"
+    proc set_line with hir, proc ast_line with node
 
     Let count be proc ast_child_count with node
     Let branches be proc create_hir_list
@@ -554,7 +791,7 @@ Process called "translate_if_stmt" takes translator as Integer, node as Integer 
         Let cond_node be proc ast_child_at with node, cond_idx
         Let body_node be proc ast_child_at with node, body_idx
         Let branch be proc create_hir_dict
-        proc set_dict_value with branch, "node_type", "if_branch"
+        proc set_dict_string with branch, "node_type", "if_branch"
         Let hir_cond be proc translate_julia_to_hir with translator, cond_node
         Let hir_body be proc translate_julia_to_hir with translator, body_node
         proc set_dict_value with branch, "condition", hir_cond
@@ -580,8 +817,8 @@ iterator_variable, iterable, and body.
 @End Reasoning
 Process called "translate_for_stmt" takes translator as Integer, node as Integer returns Integer:
     Let hir be proc create_hir_dict
-    proc set_dict_value with hir, "node_type", "for_loop"
-    proc set_dict_value with hir, "line", proc ast_line with node
+    proc set_dict_string with hir, "node_type","for_loop"
+    proc set_line with hir, proc ast_line with node
 
     Let var_node be proc ast_child_at with node, 0
     Let iter_node be proc ast_child_at with node, 1
@@ -602,8 +839,8 @@ lower to HIR "while_loop".
 @End Reasoning
 Process called "translate_while_stmt" takes translator as Integer, node as Integer returns Integer:
     Let hir be proc create_hir_dict
-    proc set_dict_value with hir, "node_type", "while_loop"
-    proc set_dict_value with hir, "line", proc ast_line with node
+    proc set_dict_string with hir, "node_type","while_loop"
+    proc set_line with hir, proc ast_line with node
 
     Let cond_node be proc ast_child_at with node, 0
     Let body_node be proc ast_child_at with node, 1
@@ -622,8 +859,8 @@ catch body by the parser.
 @End Reasoning
 Process called "translate_try_stmt" takes translator as Integer, node as Integer returns Integer:
     Let hir be proc create_hir_dict
-    proc set_dict_value with hir, "node_type", "try_statement"
-    proc set_dict_value with hir, "line", proc ast_line with node
+    proc set_dict_string with hir, "node_type","try_statement"
+    proc set_line with hir, proc ast_line with node
 
     Let count be proc ast_child_count with node
     If count is greater than 0:
@@ -650,8 +887,8 @@ NODE_RETURN_STMT stores the optional return value in the right slot
 @End Reasoning
 Process called "translate_return_stmt" takes translator as Integer, node as Integer returns Integer:
     Let hir be proc create_hir_dict
-    proc set_dict_value with hir, "node_type", "return_statement"
-    proc set_dict_value with hir, "line", proc ast_line with node
+    proc set_dict_string with hir, "node_type","return_statement"
+    proc set_line with hir, proc ast_line with node
 
     Let value_node be proc ast_right with node
     If value_node is not equal to 0:
@@ -668,15 +905,15 @@ in the target language's syntax.
 @End Reasoning
 Process called "translate_break_stmt" takes translator as Integer, node as Integer returns Integer:
     Let hir be proc create_hir_dict
-    proc set_dict_value with hir, "node_type", "break_statement"
-    proc set_dict_value with hir, "line", proc ast_line with node
+    proc set_dict_string with hir, "node_type","break_statement"
+    proc set_line with hir, proc ast_line with node
     Return hir
 End Process
 
 Process called "translate_continue_stmt" takes translator as Integer, node as Integer returns Integer:
     Let hir be proc create_hir_dict
-    proc set_dict_value with hir, "node_type", "continue_statement"
-    proc set_dict_value with hir, "line", proc ast_line with node
+    proc set_dict_string with hir, "node_type","continue_statement"
+    proc set_line with hir, proc ast_line with node
     Return hir
 End Process
 
@@ -688,26 +925,40 @@ carry per-symbol detail (selective imports like `import Foo: bar, baz`).
 @End Reasoning
 Process called "translate_using_stmt" takes translator as Integer, node as Integer returns Integer:
     Let hir be proc create_hir_dict
-    proc set_dict_value with hir, "node_type", "using_statement"
-    proc set_dict_value with hir, "module", proc ast_value with node
-    proc set_dict_value with hir, "line", proc ast_line with node
+    proc set_dict_string with hir, "node_type","using_statement"
+    proc set_dict_string with hir, "module",proc ast_value with node
+    proc carry_path_head with translator, hir, node
     Return proc append_children_as_symbols with translator, hir, node
 End Process
 
 Process called "translate_import_stmt" takes translator as Integer, node as Integer returns Integer:
     Let hir be proc create_hir_dict
-    proc set_dict_value with hir, "node_type", "import_statement"
-    proc set_dict_value with hir, "module", proc ast_value with node
-    proc set_dict_value with hir, "line", proc ast_line with node
+    proc set_dict_string with hir, "node_type","import_statement"
+    proc set_dict_string with hir, "module",proc ast_value with node
+    proc carry_path_head with translator, hir, node
     Return proc append_children_as_symbols with translator, hir, node
 End Process
 
 Process called "translate_export_stmt" takes translator as Integer, node as Integer returns Integer:
     Let hir be proc create_hir_dict
-    proc set_dict_value with hir, "node_type", "export_statement"
-    proc set_dict_value with hir, "name", proc ast_value with node
-    proc set_dict_value with hir, "line", proc ast_line with node
+    proc set_dict_string with hir, "node_type","export_statement"
+    proc set_dict_string with hir, "name",proc ast_value with node
     Return proc append_children_as_symbols with translator, hir, node
+End Process
+
+@Reasoning:
+For a dotted module path (`Base.Threads`) the parser stores the whole path
+expression in the left slot rather than a bare name in the value slot. This
+helper lowers that head expression under "head" so the backend renders the
+dotted path verbatim. Absent when the path is a bare identifier.
+@End Reasoning
+Process called "carry_path_head" takes translator as Integer, hir as Integer, node as Integer returns Integer:
+    Let head_node be proc ast_left with node
+    If head_node is not equal to 0:
+        Let hir_head be proc translate_julia_to_hir with translator, head_node
+        proc set_dict_node with hir, "head", hir_head
+    End If
+    Return 1
 End Process
 
 @Reasoning:
@@ -745,9 +996,9 @@ the operator's source representation via its own token-type table.
 @End Reasoning
 Process called "translate_binary_op" takes translator as Integer, node as Integer returns Integer:
     Let hir be proc create_hir_dict
-    proc set_dict_value with hir, "node_type", "binary_op"
-    proc set_dict_value with hir, "operator", proc ast_value with node
-    proc set_dict_value with hir, "line", proc ast_line with node
+    proc set_dict_string with hir, "node_type","binary_op"
+    proc set_dict_string with hir, "operator",proc ast_value with node
+    proc set_line with hir, proc ast_line with node
 
     Let left_node be proc ast_left with node
     Let right_node be proc ast_right with node
@@ -765,9 +1016,9 @@ the operand in the right slot specifically).
 @End Reasoning
 Process called "translate_unary_op" takes translator as Integer, node as Integer returns Integer:
     Let hir be proc create_hir_dict
-    proc set_dict_value with hir, "node_type", "unary_op"
-    proc set_dict_value with hir, "operator", proc ast_value with node
-    proc set_dict_value with hir, "line", proc ast_line with node
+    proc set_dict_string with hir, "node_type","unary_op"
+    proc set_dict_string with hir, "operator",proc ast_value with node
+    proc set_line with hir, proc ast_line with node
 
     Let operand_node be proc ast_right with node
     Let hir_operand be proc translate_julia_to_hir with translator, operand_node
@@ -781,8 +1032,8 @@ as children. We lower to HIR "call" with callee and arguments list.
 @End Reasoning
 Process called "translate_call" takes translator as Integer, node as Integer returns Integer:
     Let hir be proc create_hir_dict
-    proc set_dict_value with hir, "node_type", "call"
-    proc set_dict_value with hir, "line", proc ast_line with node
+    proc set_dict_string with hir, "node_type","call"
+    proc set_line with hir, proc ast_line with node
 
     Let callee_node be proc ast_left with node
     Let hir_callee be proc translate_julia_to_hir with translator, callee_node
@@ -807,8 +1058,8 @@ children. We lower to HIR "index_access" with array and indices list.
 @End Reasoning
 Process called "translate_index" takes translator as Integer, node as Integer returns Integer:
     Let hir be proc create_hir_dict
-    proc set_dict_value with hir, "node_type", "index_access"
-    proc set_dict_value with hir, "line", proc ast_line with node
+    proc set_dict_string with hir, "node_type","index_access"
+    proc set_line with hir, proc ast_line with node
 
     Let array_node be proc ast_left with node
     Let hir_array be proc translate_julia_to_hir with translator, array_node
@@ -834,8 +1085,8 @@ object and field name.
 @End Reasoning
 Process called "translate_dot_access" takes translator as Integer, node as Integer returns Integer:
     Let hir be proc create_hir_dict
-    proc set_dict_value with hir, "node_type", "field_access"
-    proc set_dict_value with hir, "line", proc ast_line with node
+    proc set_dict_string with hir, "node_type","field_access"
+    proc set_line with hir, proc ast_line with node
 
     Let obj_node be proc ast_left with node
     Let hir_obj be proc translate_julia_to_hir with translator, obj_node
@@ -844,7 +1095,7 @@ Process called "translate_dot_access" takes translator as Integer, node as Integ
     Let field_node be proc ast_right with node
     If field_node is not equal to 0:
         Let field_name be proc ast_value with field_node
-        proc set_dict_value with hir, "field", field_name
+        proc set_dict_string with hir, "field",field_name
     End If
     Return hir
 End Process
@@ -857,8 +1108,8 @@ expression and type sub-nodes.
 @End Reasoning
 Process called "translate_type_annotation" takes translator as Integer, node as Integer returns Integer:
     Let hir be proc create_hir_dict
-    proc set_dict_value with hir, "node_type", "type_annotation"
-    proc set_dict_value with hir, "line", proc ast_line with node
+    proc set_dict_string with hir, "node_type","type_annotation"
+    proc set_line with hir, proc ast_line with node
 
     Let expr_node be proc ast_left with node
     Let type_node be proc ast_right with node
@@ -876,8 +1127,8 @@ and parameter type expressions as children. Lowered to HIR
 @End Reasoning
 Process called "translate_parametric_type" takes translator as Integer, node as Integer returns Integer:
     Let hir be proc create_hir_dict
-    proc set_dict_value with hir, "node_type", "parametric_type"
-    proc set_dict_value with hir, "line", proc ast_line with node
+    proc set_dict_string with hir, "node_type","parametric_type"
+    proc set_line with hir, proc ast_line with node
 
     Let base_node be proc ast_left with node
     Let hir_base be proc translate_julia_to_hir with translator, base_node
@@ -902,8 +1153,8 @@ Stored shape: base expression in left slot, constraints as children.
 @End Reasoning
 Process called "translate_where_clause" takes translator as Integer, node as Integer returns Integer:
     Let hir be proc create_hir_dict
-    proc set_dict_value with hir, "node_type", "where_clause"
-    proc set_dict_value with hir, "line", proc ast_line with node
+    proc set_dict_string with hir, "node_type","where_clause"
+    proc set_line with hir, proc ast_line with node
 
     Let base_node be proc ast_left with node
     Let hir_base be proc translate_julia_to_hir with translator, base_node
@@ -928,8 +1179,8 @@ children in declaration order. Lowered to HIR "ternary".
 @End Reasoning
 Process called "translate_ternary" takes translator as Integer, node as Integer returns Integer:
     Let hir be proc create_hir_dict
-    proc set_dict_value with hir, "node_type", "ternary"
-    proc set_dict_value with hir, "line", proc ast_line with node
+    proc set_dict_string with hir, "node_type","ternary"
+    proc set_line with hir, proc ast_line with node
 
     Let cond_node be proc ast_child_at with node, 0
     Let true_node be proc ast_child_at with node, 1
@@ -949,9 +1200,9 @@ wrapper around an expression. The operand is in the right slot.
 @End Reasoning
 Process called "translate_broadcast" takes translator as Integer, node as Integer returns Integer:
     Let hir be proc create_hir_dict
-    proc set_dict_value with hir, "node_type", "broadcast"
-    proc set_dict_value with hir, "operator", proc ast_value with node
-    proc set_dict_value with hir, "line", proc ast_line with node
+    proc set_dict_string with hir, "node_type","broadcast"
+    proc set_dict_string with hir, "operator",proc ast_value with node
+    proc set_line with hir, proc ast_line with node
 
     Let operand_node be proc ast_right with node
     Let hir_operand be proc translate_julia_to_hir with translator, operand_node
@@ -960,17 +1211,19 @@ Process called "translate_broadcast" takes translator as Integer, node as Intege
 End Process
 
 @Reasoning:
-NODE_COMPREHENSION stores the template expression in the left slot and
-generators as children. Lowered to HIR "list_comprehension".
+NODE_COMPREHENSION stores the template expression in the left slot,
+NODE_GENERATOR clauses as children, and an optional filter expression in the
+right slot. Lowered to HIR "list_comprehension" with a transform, a
+generators list, and an optional filter subtree so `[x for x in a if cond]`
+round-trips with its filter intact.
 @End Reasoning
 Process called "translate_comprehension" takes translator as Integer, node as Integer returns Integer:
     Let hir be proc create_hir_dict
-    proc set_dict_value with hir, "node_type", "list_comprehension"
-    proc set_dict_value with hir, "line", proc ast_line with node
+    proc set_dict_string with hir, "node_type","list_comprehension"
 
     Let template_node be proc ast_left with node
     Let hir_template be proc translate_julia_to_hir with translator, template_node
-    proc set_dict_value with hir, "transform", hir_template
+    proc set_dict_node with hir, "transform", hir_template
 
     Let generators be proc create_hir_list
     Let count be proc ast_child_count with node
@@ -981,7 +1234,13 @@ Process called "translate_comprehension" takes translator as Integer, node as In
         proc list_append with generators, hir_g
         Set i to i plus 1
     End While
-    proc set_dict_value with hir, "generators", generators
+    proc set_dict_node with hir, "generators", generators
+
+    Let filter_node be proc ast_right with node
+    If filter_node is not equal to 0:
+        Let hir_filter be proc translate_julia_to_hir with translator, filter_node
+        proc set_dict_node with hir, "filter", hir_filter
+    End If
     Return hir
 End Process
 
@@ -991,8 +1250,8 @@ comprehension. Variable in left slot, iterable in right slot.
 @End Reasoning
 Process called "translate_generator" takes translator as Integer, node as Integer returns Integer:
     Let hir be proc create_hir_dict
-    proc set_dict_value with hir, "node_type", "generator"
-    proc set_dict_value with hir, "line", proc ast_line with node
+    proc set_dict_string with hir, "node_type","generator"
+    proc set_line with hir, proc ast_line with node
 
     Let var_node be proc ast_left with node
     Let iter_node be proc ast_right with node
@@ -1009,8 +1268,8 @@ We lower to HIR "lambda".
 @End Reasoning
 Process called "translate_lambda" takes translator as Integer, node as Integer returns Integer:
     Let hir be proc create_hir_dict
-    proc set_dict_value with hir, "node_type", "lambda"
-    proc set_dict_value with hir, "line", proc ast_line with node
+    proc set_dict_string with hir, "node_type","lambda"
+    proc set_line with hir, proc ast_line with node
 
     Let params be proc create_hir_list
     Let pcount be proc ast_child_count with node
@@ -1037,8 +1296,8 @@ function call). Parameters in children, body in the right slot.
 @End Reasoning
 Process called "translate_do_block" takes translator as Integer, node as Integer returns Integer:
     Let hir be proc create_hir_dict
-    proc set_dict_value with hir, "node_type", "do_block"
-    proc set_dict_value with hir, "line", proc ast_line with node
+    proc set_dict_string with hir, "node_type","do_block"
+    proc set_line with hir, proc ast_line with node
 
     Let params be proc create_hir_list
     Let pcount be proc ast_child_count with node
@@ -1065,9 +1324,9 @@ and macro arguments as children. We lower to HIR "macro_call".
 @End Reasoning
 Process called "translate_macro_call" takes translator as Integer, node as Integer returns Integer:
     Let hir be proc create_hir_dict
-    proc set_dict_value with hir, "node_type", "macro_call"
-    proc set_dict_value with hir, "name", proc ast_value with node
-    proc set_dict_value with hir, "line", proc ast_line with node
+    proc set_dict_string with hir, "node_type","macro_call"
+    proc set_dict_string with hir, "name",proc ast_value with node
+    proc set_line with hir, proc ast_line with node
 
     Let args be proc create_hir_list
     Let count be proc ast_child_count with node
@@ -1088,8 +1347,8 @@ NODE_QUOTE_EXPR stores the quoted expression in the right slot
 @End Reasoning
 Process called "translate_quote_expr" takes translator as Integer, node as Integer returns Integer:
     Let hir be proc create_hir_dict
-    proc set_dict_value with hir, "node_type", "quote_expression"
-    proc set_dict_value with hir, "line", proc ast_line with node
+    proc set_dict_string with hir, "node_type","quote_expression"
+    proc set_line with hir, proc ast_line with node
 
     Let inner_node be proc ast_right with node
     If inner_node is not equal to 0:
@@ -1111,63 +1370,63 @@ destination language's syntax without re-parsing the value string.
 @End Reasoning
 Process called "translate_number" takes translator as Integer, node as Integer returns Integer:
     Let hir be proc create_hir_dict
-    proc set_dict_value with hir, "node_type", "literal"
-    proc set_dict_value with hir, "literal_kind", "number"
-    proc set_dict_value with hir, "value", proc ast_value with node
-    proc set_dict_value with hir, "line", proc ast_line with node
+    proc set_dict_string with hir, "node_type","literal"
+    proc set_dict_string with hir, "literal_kind","number"
+    proc set_dict_string with hir, "value", proc ast_value with node
+    proc set_line with hir, proc ast_line with node
     Return hir
 End Process
 
 Process called "translate_string" takes translator as Integer, node as Integer returns Integer:
     Let hir be proc create_hir_dict
-    proc set_dict_value with hir, "node_type", "literal"
-    proc set_dict_value with hir, "literal_kind", "string"
-    proc set_dict_value with hir, "value", proc ast_value with node
-    proc set_dict_value with hir, "line", proc ast_line with node
+    proc set_dict_string with hir, "node_type","literal"
+    proc set_dict_string with hir, "literal_kind","string"
+    proc set_dict_string with hir, "value", proc ast_value with node
+    proc set_line with hir, proc ast_line with node
     Return hir
 End Process
 
 Process called "translate_char" takes translator as Integer, node as Integer returns Integer:
     Let hir be proc create_hir_dict
-    proc set_dict_value with hir, "node_type", "literal"
-    proc set_dict_value with hir, "literal_kind", "char"
-    proc set_dict_value with hir, "value", proc ast_value with node
-    proc set_dict_value with hir, "line", proc ast_line with node
+    proc set_dict_string with hir, "node_type","literal"
+    proc set_dict_string with hir, "literal_kind","char"
+    proc set_dict_string with hir, "value", proc ast_value with node
+    proc set_line with hir, proc ast_line with node
     Return hir
 End Process
 
 Process called "translate_symbol" takes translator as Integer, node as Integer returns Integer:
     Let hir be proc create_hir_dict
-    proc set_dict_value with hir, "node_type", "literal"
-    proc set_dict_value with hir, "literal_kind", "symbol"
-    proc set_dict_value with hir, "value", proc ast_value with node
-    proc set_dict_value with hir, "line", proc ast_line with node
+    proc set_dict_string with hir, "node_type","literal"
+    proc set_dict_string with hir, "literal_kind","symbol"
+    proc set_dict_string with hir, "value", proc ast_value with node
+    proc set_line with hir, proc ast_line with node
     Return hir
 End Process
 
 Process called "translate_true" takes translator as Integer, node as Integer returns Integer:
     Let hir be proc create_hir_dict
-    proc set_dict_value with hir, "node_type", "literal"
-    proc set_dict_value with hir, "literal_kind", "boolean"
-    proc set_dict_value with hir, "value", "true"
-    proc set_dict_value with hir, "line", proc ast_line with node
+    proc set_dict_string with hir, "node_type","literal"
+    proc set_dict_string with hir, "literal_kind","boolean"
+    proc set_dict_string with hir, "value", "true"
+    proc set_line with hir, proc ast_line with node
     Return hir
 End Process
 
 Process called "translate_false" takes translator as Integer, node as Integer returns Integer:
     Let hir be proc create_hir_dict
-    proc set_dict_value with hir, "node_type", "literal"
-    proc set_dict_value with hir, "literal_kind", "boolean"
-    proc set_dict_value with hir, "value", "false"
-    proc set_dict_value with hir, "line", proc ast_line with node
+    proc set_dict_string with hir, "node_type","literal"
+    proc set_dict_string with hir, "literal_kind","boolean"
+    proc set_dict_string with hir, "value", "false"
+    proc set_line with hir, proc ast_line with node
     Return hir
 End Process
 
 Process called "translate_nothing" takes translator as Integer, node as Integer returns Integer:
     Let hir be proc create_hir_dict
-    proc set_dict_value with hir, "node_type", "literal"
-    proc set_dict_value with hir, "literal_kind", "nothing"
-    proc set_dict_value with hir, "line", proc ast_line with node
+    proc set_dict_string with hir, "node_type","literal"
+    proc set_dict_string with hir, "literal_kind","nothing"
+    proc set_line with hir, proc ast_line with node
     Return hir
 End Process
 
@@ -1177,9 +1436,9 @@ HIR "identifier"; downstream binding resolution happens in semantic.
 @End Reasoning
 Process called "translate_identifier" takes translator as Integer, node as Integer returns Integer:
     Let hir be proc create_hir_dict
-    proc set_dict_value with hir, "node_type", "identifier"
-    proc set_dict_value with hir, "name", proc ast_value with node
-    proc set_dict_value with hir, "line", proc ast_line with node
+    proc set_dict_string with hir, "node_type","identifier"
+    proc set_dict_string with hir, "name",proc ast_value with node
+    proc set_line with hir, proc ast_line with node
     Return hir
 End Process
 
@@ -1192,8 +1451,8 @@ NODE_ARRAY stores elements as children. Lowered to HIR "array_literal".
 @End Reasoning
 Process called "translate_array" takes translator as Integer, node as Integer returns Integer:
     Let hir be proc create_hir_dict
-    proc set_dict_value with hir, "node_type", "array_literal"
-    proc set_dict_value with hir, "line", proc ast_line with node
+    proc set_dict_string with hir, "node_type","array_literal"
+    proc set_line with hir, proc ast_line with node
 
     Let elements be proc create_hir_list
     Let count be proc ast_child_count with node
@@ -1213,8 +1472,8 @@ NODE_TUPLE stores tuple elements as children. Lowered to HIR "tuple".
 @End Reasoning
 Process called "translate_tuple" takes translator as Integer, node as Integer returns Integer:
     Let hir be proc create_hir_dict
-    proc set_dict_value with hir, "node_type", "tuple"
-    proc set_dict_value with hir, "line", proc ast_line with node
+    proc set_dict_string with hir, "node_type","tuple"
+    proc set_line with hir, proc ast_line with node
 
     Let elements be proc create_hir_list
     Let count be proc ast_child_count with node
@@ -1237,8 +1496,8 @@ have a structurally clear view rather than an ordering convention.
 @End Reasoning
 Process called "translate_dict" takes translator as Integer, node as Integer returns Integer:
     Let hir be proc create_hir_dict
-    proc set_dict_value with hir, "node_type", "dict_literal"
-    proc set_dict_value with hir, "line", proc ast_line with node
+    proc set_dict_string with hir, "node_type","dict_literal"
+    proc set_line with hir, proc ast_line with node
 
     Let pairs be proc create_hir_list
     Let count be proc ast_child_count with node
@@ -1250,7 +1509,7 @@ Process called "translate_dict" takes translator as Integer, node as Integer ret
         Let k_node be proc ast_child_at with node, k_idx
         Let v_node be proc ast_child_at with node, v_idx
         Let pair be proc create_hir_dict
-        proc set_dict_value with pair, "node_type", "dict_pair"
+        proc set_dict_string with pair, "node_type", "dict_pair"
         Let hir_k be proc translate_julia_to_hir with translator, k_node
         Let hir_v be proc translate_julia_to_hir with translator, v_node
         proc set_dict_value with pair, "key", hir_k
