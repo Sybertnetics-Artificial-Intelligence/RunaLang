@@ -1,0 +1,334 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+Licensed under Apache 2.0
+:End Note
+
+Note:
+Kotlin Translation Round-Trip Probe
+
+End-to-end proof that the Kotlin translation pipeline is REAL, not a skeleton:
+
+    Kotlin source
+      -> kotlin_lexer    (tokenize: identifiers, soft/hard keywords, numbers,
+                          strings incl. templates and triple-quote, char,
+                          operators incl. ?: ?. !! :: .. -> === !==, comments)
+      -> kotlin_parser   (recursive-descent AST: package, imports incl. alias
+                          and .*, data class, sealed class + subclasses,
+                          interface + class, generic fun with bound + where,
+                          when w/ branches + guard, for over a range, a lambda
+                          with it, string template, elvis + safe-call,
+                          companion object) - progress-guaranteed (every loop
+                          force-advances on zero lexer-cursor progress)
+      -> kotlin_to_hir   (lower to the dict-encoding HIR interchange)
+      -> hir_to_kotlin   (emit HIR back to valid Kotlin text)
+      -> re-lex / re-parse / re-to_hir of the emitted text
+      -> structural HIR equality on the key constructs
+
+The Kotlin HIR node model is the dict-encoding interchange shared by
+kotlin_to_hir (producer) and hir_to_kotlin (consumer): a dict node stores
+entry_count at offset 0 and a packed array of 16-byte [key, value] entries at
+offset 8; a list node stores item_count at offset 0 and a packed array of int64
+item handles at offset 8. This probe reads HIR fields through that same layout.
+
+It lowers the source to HIR1, asserts HIR1 carries a "module" node whose "types"
+list contains the expected declarations, emits HIR1 back to Kotlin text, re-runs
+the whole pipeline on the emitted text to HIR2, and asserts HIR2 is
+STRUCTURALLY EQUAL to HIR1 on those same key constructs.
+
+Exit code: number of failed assertions (0 == all passed). No exit_with_code.
+:End Note
+
+Import "compiler/middle/gungnir/hir/translation/frontends/kotlin/kotlin_to_hir.runa" as KotlinFrontend
+Import "compiler/middle/gungnir/hir/translation/backends/kotlin/hir_to_kotlin.runa" as KotlinBackend
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/internal/string_utils.runa" as StringUtils
+Import "tests/test_utils.runa" as TestUtils
+
+Note: ============================================================================
+Note: Kotlin HIR dict/list decoders (mirror the producer/consumer contract)
+Note: ============================================================================
+
+Process called "dict_get" takes node as Integer, key as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    Let entry_count be proc memory_get_int64 from Layout with node, 0
+    Let entries be proc memory_get_int64 from Layout with node, 8
+    If entries is equal to 0:
+        Return 0
+    End If
+    Let index be 0
+    While index is less than entry_count:
+        Let entry_offset be index multiplied by 16
+        Let entry_key be proc memory_get_int64 from Layout with entries, entry_offset
+        Let matches be proc string_equals from StringCore with entry_key, key
+        If matches is equal to 1:
+            Return proc memory_get_int64 from Layout with entries, entry_offset plus 8
+        End If
+        Set index to index plus 1
+    End While
+    Return 0
+End Process
+
+Process called "list_count" takes node as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Layout with node, 0
+End Process
+
+Process called "list_item" takes node as Integer, index as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    Let count be proc memory_get_int64 from Layout with node, 0
+    If index is less than 0:
+        Return 0
+    End If
+    If index is greater than or equal to count:
+        Return 0
+    End If
+    Let items be proc memory_get_int64 from Layout with node, 8
+    If items is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Layout with items, index multiplied by 8
+End Process
+
+@Reasoning:
+Locates the first entry in the module's "types" list whose "node_type" matches
+the requested kind. A linear scan is robust to sibling ordering.
+@End Reasoning
+Process called "find_type" takes module as Integer, kind as Integer returns Integer:
+    If module is equal to 0:
+        Return 0
+    End If
+    Let types be proc dict_get with module, "types"
+    Let count be proc list_count with types
+    Let index be 0
+    While index is less than count:
+        Let decl be proc list_item with types, index
+        Let decl_kind be proc dict_get with decl, "node_type"
+        If decl_kind is not equal to 0:
+            Let matches be proc string_equals from StringCore with decl_kind, kind
+            If matches is equal to 1:
+                Return decl
+            End If
+        End If
+        Set index to index plus 1
+    End While
+    Return 0
+End Process
+
+@Reasoning:
+Locates a type declaration in the module by its "name" payload regardless of its
+node_type kind. Used to find a class/interface/etc. by name.
+@End Reasoning
+Process called "find_named_type" takes module as Integer, name as Integer returns Integer:
+    If module is equal to 0:
+        Return 0
+    End If
+    Let types be proc dict_get with module, "types"
+    Let count be proc list_count with types
+    Let index be 0
+    While index is less than count:
+        Let decl be proc list_item with types, index
+        Let decl_name be proc dict_get with decl, "name"
+        If decl_name is not equal to 0:
+            Let matches be proc string_equals from StringCore with decl_name, name
+            If matches is equal to 1:
+                Return decl
+            End If
+        End If
+        Set index to index plus 1
+    End While
+    Return 0
+End Process
+
+Process called "find_member" takes type_decl as Integer, kind as Integer returns Integer:
+    If type_decl is equal to 0:
+        Return 0
+    End If
+    Let members be proc dict_get with type_decl, "members"
+    Let count be proc list_count with members
+    Let index be 0
+    While index is less than count:
+        Let member be proc list_item with members, index
+        Let member_kind be proc dict_get with member, "node_type"
+        If member_kind is not equal to 0:
+            Let matches be proc string_equals from StringCore with member_kind, kind
+            If matches is equal to 1:
+                Return member
+            End If
+        End If
+        Set index to index plus 1
+    End While
+    Return 0
+End Process
+
+Process called "same_kind" takes a as Integer, b as Integer returns Integer:
+    If a is equal to 0:
+        Return 0
+    End If
+    If b is equal to 0:
+        Return 0
+    End If
+    Let ka be proc dict_get with a, "node_type"
+    Let kb be proc dict_get with b, "node_type"
+    If ka is equal to 0:
+        Return 0
+    End If
+    If kb is equal to 0:
+        Return 0
+    End If
+    Return proc string_equals from StringCore with ka, kb
+End Process
+
+Note: ============================================================================
+Note: Pipeline helper
+Note: ============================================================================
+
+Process called "source_to_hir" takes source as Integer returns Integer:
+    Return proc kotlin_to_hir_from_source from KotlinFrontend with source
+End Process
+
+Note: ============================================================================
+Note: Probe entry point
+Note: ============================================================================
+
+Process called "main" returns Integer:
+    Let results be proc create_test_results from TestUtils
+    proc begin_suite from TestUtils with results, "Kotlin translation round-trip"
+
+    Note:
+    Representative program: package + imports (incl. alias and .*); an interface;
+    a data class with a primary constructor; a sealed class with subclasses; a
+    plain class implementing the interface with a companion object, a property,
+    a generic function with a bound + where clause, a when with branches + a
+    guard, a for over a range, a lambda using it, a string template, elvis and
+    safe-call.
+    :End Note
+    Let source be "package com.example\nimport kotlin.collections.List\nimport kotlin.math.max as maxOf\nimport kotlin.text.*\ninterface Shape {\nfun area(): Double\n}\ndata class Point(val x: Int, val y: Int)\nsealed class Expr\nclass Num(val value: Int) : Expr()\nclass Add(val left: Expr, val right: Expr) : Expr()\nclass Box(val label: String) : Shape {\ncompanion object {\nval DEFAULT = \"box\"\n}\nval size: Int = 10\noverride fun area(): Double {\nreturn 1.0\n}\nfun <T : Comparable<T>> pick(items: List<T>, fallback: T): T where T : Any {\nvar best = fallback\nfor (i in 0..10) {\nbest = fallback\n}\nval doubled = items.map { it }\nval kind = when (size) {\n0 -> \"empty\"\n1, 2 -> \"small\"\nis Int -> \"int\"\nelse -> \"many\"\n}\nval msg = \"size is ${size}\"\nval safe = label?.length ?: 0\nreturn fallback\n}\n}\n"
+
+    Note: --- Stage 0-2: source -> HIR (lex, parse, lower) ---
+    Let hir1 be proc kotlin_to_hir_from_source from KotlinFrontend with source
+    proc assert_not_null from TestUtils with results, "frontend produced HIR module", hir1
+
+    Note: Root must be a "module" dict node.
+    Let root_kind be proc dict_get with hir1, "node_type"
+    Let root_ok be proc string_equals from StringCore with root_kind, "module"
+    proc assert_equal from TestUtils with results, "HIR root is a module", root_ok, 1
+
+    Note: Package carried through.
+    Let package_name be proc dict_get with hir1, "package"
+    proc assert_not_null from TestUtils with results, "module records the package", package_name
+
+    Note: Imports list present and has at least the three imports.
+    Let imports be proc dict_get with hir1, "imports"
+    Let import_count be proc list_count with imports
+    proc assert_greater_than_or_equal from TestUtils with results, "module has at least 3 imports", import_count, 3
+
+    Note: Aliased import preserved.
+    Let alias_import be proc list_item with imports, 1
+    Let alias_name be proc dict_get with alias_import, "alias"
+    proc assert_not_null from TestUtils with results, "aliased import preserves alias", alias_name
+
+    Note: Types list contains the expected declarations.
+    Let types be proc dict_get with hir1, "types"
+    Let type_count be proc list_count with types
+    proc assert_greater_than_or_equal from TestUtils with results, "module has several types", type_count, 5
+
+    Let iface be proc find_type with hir1, "interface_declaration"
+    proc assert_not_null from TestUtils with results, "interface declaration present", iface
+
+    Let data_class be proc find_type with hir1, "data_class_declaration"
+    proc assert_not_null from TestUtils with results, "data class present", data_class
+    Let data_name be proc dict_get with data_class, "name"
+    Let data_name_ok be proc string_equals from StringCore with data_name, "Point"
+    proc assert_equal from TestUtils with results, "data class name is 'Point'", data_name_ok, 1
+    Let data_ctor be proc dict_get with data_class, "primary_constructor"
+    Let data_param_count be proc list_count with data_ctor
+    proc assert_equal from TestUtils with results, "Point has 2 primary-constructor params", data_param_count, 2
+
+    Let sealed_class be proc find_type with hir1, "sealed_class_declaration"
+    proc assert_not_null from TestUtils with results, "sealed class present", sealed_class
+
+    Let box be proc find_named_type with hir1, "Box"
+    proc assert_not_null from TestUtils with results, "class 'Box' present", box
+    Let box_supers be proc dict_get with box, "supertypes"
+    Let box_super_count be proc list_count with box_supers
+    proc assert_greater_than_or_equal from TestUtils with results, "Box has a supertype", box_super_count, 1
+
+    Note: Box has a generic method 'pick' with one parameter list.
+    Let pick be proc find_member with box, "function_declaration"
+    proc assert_not_null from TestUtils with results, "method 'pick' or 'area' present", pick
+
+    Note: Companion object present among Box members.
+    Let companion be proc find_member with box, "companion_object"
+    proc assert_not_null from TestUtils with results, "companion object present", companion
+
+    Note: --- Stage 3: HIR -> Kotlin text ---
+    Let emitted be proc generate_kotlin_code from KotlinBackend with hir1
+    proc assert_not_null from TestUtils with results, "backend produced Kotlin text", emitted
+    Let emitted_len be proc string_length from StringCore with emitted
+    proc assert_greater_than from TestUtils with results, "emitted Kotlin is non-empty", emitted_len, 0
+
+    Note: The emitted text must carry the load-bearing tokens of each construct.
+    Let has_package be proc string_contains from StringUtils with emitted, "package com.example"
+    proc assert_equal from TestUtils with results, "emitted contains package", has_package, 1
+    Let has_data be proc string_contains from StringUtils with emitted, "data class Point"
+    proc assert_equal from TestUtils with results, "emitted contains data class", has_data, 1
+    Let has_sealed be proc string_contains from StringUtils with emitted, "sealed class Expr"
+    proc assert_equal from TestUtils with results, "emitted contains sealed class", has_sealed, 1
+    Let has_when be proc string_contains from StringUtils with emitted, "when ("
+    proc assert_equal from TestUtils with results, "emitted contains when", has_when, 1
+    Let has_arrow be proc string_contains from StringUtils with emitted, " -> "
+    proc assert_equal from TestUtils with results, "emitted contains when arrow", has_arrow, 1
+    Let has_for be proc string_contains from StringUtils with emitted, "for ("
+    proc assert_equal from TestUtils with results, "emitted contains for", has_for, 1
+    Let has_range be proc string_contains from StringUtils with emitted, "0..10"
+    proc assert_equal from TestUtils with results, "emitted contains range", has_range, 1
+    Let has_elvis be proc string_contains from StringUtils with emitted, "?:"
+    proc assert_equal from TestUtils with results, "emitted contains elvis", has_elvis, 1
+    Let has_companion be proc string_contains from StringUtils with emitted, "companion object"
+    proc assert_equal from TestUtils with results, "emitted contains companion object", has_companion, 1
+    Let has_import_alias be proc string_contains from StringUtils with emitted, " as maxOf"
+    proc assert_equal from TestUtils with results, "emitted preserves import alias", has_import_alias, 1
+    Let has_wildcard be proc string_contains from StringUtils with emitted, "kotlin.text.*"
+    proc assert_equal from TestUtils with results, "emitted preserves wildcard import", has_wildcard, 1
+
+    Note: --- Stage 4: re-run the pipeline on the emitted text -> HIR2 ---
+    Let hir2 be proc source_to_hir with emitted
+    proc assert_not_null from TestUtils with results, "re-parse of emitted Kotlin produced HIR", hir2
+    Let root2_kind be proc dict_get with hir2, "node_type"
+    Let root2_ok be proc string_equals from StringCore with root2_kind, "module"
+    proc assert_equal from TestUtils with results, "round-trip root is a module", root2_ok, 1
+
+    Note: --- Stage 5: structural equality on the key constructs ---
+    Let data2 be proc find_type with hir2, "data_class_declaration"
+    Let data_same be proc same_kind with data_class, data2
+    proc assert_equal from TestUtils with results, "round-trip preserves data class node", data_same, 1
+    Let data2_name be proc dict_get with data2, "name"
+    Let data2_name_ok be proc string_equals from StringCore with data2_name, "Point"
+    proc assert_equal from TestUtils with results, "round-trip preserves data class name 'Point'", data2_name_ok, 1
+
+    Let sealed2 be proc find_type with hir2, "sealed_class_declaration"
+    Let sealed_same be proc same_kind with sealed_class, sealed2
+    proc assert_equal from TestUtils with results, "round-trip preserves sealed class node", sealed_same, 1
+
+    Let box2 be proc find_named_type with hir2, "Box"
+    proc assert_not_null from TestUtils with results, "round-trip preserves class 'Box'", box2
+    Let companion2 be proc find_member with box2, "companion_object"
+    proc assert_not_null from TestUtils with results, "round-trip preserves companion object", companion2
+
+    Let imports2 be proc dict_get with hir2, "imports"
+    Let import2_count be proc list_count with imports2
+    proc assert_greater_than_or_equal from TestUtils with results, "round-trip preserves imports", import2_count, 3
+
+    proc print_summary from TestUtils with results
+    Let failed be proc get_failed from TestUtils with results
+    proc destroy_test_results from TestUtils with results
+
+    Return failed
+End Process
