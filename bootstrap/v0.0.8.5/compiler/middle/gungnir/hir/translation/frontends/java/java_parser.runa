@@ -51,6 +51,7 @@ Dependencies:
 Import "compiler/frontend/primitives/memory/layout.runa" as Layout
 Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
 Import "compiler/middle/gungnir/hir/translation/frontends/java/java_lexer.runa" as Lexer
+Import "compiler/internal/string_utils.runa" as StringUtils
 
 Note: ============================================================================
 Note: AST Node Type Constants
@@ -105,6 +106,8 @@ Constant AST_ARRAY_TYPE as Integer is 46
 Constant AST_GENERIC_TYPE as Integer is 47
 Constant AST_WILDCARD_TYPE as Integer is 48
 Constant AST_ENUM_CONSTANT as Integer is 49
+Constant AST_DO_WHILE_STATEMENT as Integer is 50
+Constant AST_ARRAY_CREATION as Integer is 51
 
 Note: ============================================================================
 Note: Parser State Structure
@@ -352,13 +355,13 @@ the call.
 Process called "expect" takes parser as Integer, expected_type as Integer returns Integer:
     Note: Expect specific token type and advance
 
-    Let actual_type be proc current_token_type from parser
+    Let actual_type be proc current_token_type with parser
 
     If actual_type is not equal to expected_type:
         Return 0  Note: Error minus unexpected token
     End If
 
-    proc advance from parser
+    proc advance with parser
     Return 1
 End Process
 
@@ -370,7 +373,7 @@ to a branch.
 Process called "match" takes parser as Integer, token_type as Integer returns Integer:
     Note: Check if current token matches type
 
-    Let current_type be proc current_token_type from parser
+    Let current_type be proc current_token_type with parser
 
     If current_type is equal to token_type:
         Return 1
@@ -390,7 +393,7 @@ Process called "match_and_advance" takes parser as Integer, token_type as Intege
     Let matches be proc match with parser, token_type
 
     If matches is equal to 1:
-        proc advance from parser
+        proc advance with parser
         Return 1
     End If
 
@@ -409,12 +412,12 @@ to parse (indicating recovery couldn't resync, so we avoid infinite loops).
 Process called "parse_compilation_unit" takes parser as Integer returns Integer:
     Note: Parse Java compilation unit (package + imports + types)
 
-    Let cu_node be proc create_ast_node from AST_COMPILATION_UNIT
+    Let cu_node be proc create_ast_node with AST_COMPILATION_UNIT
 
     Note: Package declaration (optional)
     Let is_package be proc match with parser, TOKEN_PACKAGE from Lexer
     If is_package is equal to 1:
-        Let package_decl be proc parse_package_declaration from parser
+        Let package_decl be proc parse_package_declaration with parser
         proc add_child with cu_node, package_decl
     End If
 
@@ -425,19 +428,19 @@ Process called "parse_compilation_unit" takes parser as Integer returns Integer:
             Break
         End If
 
-        Let import_decl be proc parse_import_declaration from parser
+        Let import_decl be proc parse_import_declaration with parser
         proc add_child with cu_node, import_decl
     End While
 
     Note: Type declarations (zero or more)
     While 1 is equal to 1:
-        Let token_type be proc current_token_type from parser
+        Let token_type be proc current_token_type with parser
 
         If token_type is equal to TOKEN_EOF from Lexer:
             Break
         End If
 
-        Let type_decl be proc parse_type_declaration from parser
+        Let type_decl be proc parse_type_declaration with parser
 
         If type_decl is not equal to 0:
             proc add_child with cu_node, type_decl
@@ -457,11 +460,11 @@ requires the closing semicolon.
 Process called "parse_package_declaration" takes parser as Integer returns Integer:
     Note: Parse package declaration
 
-    Let package_node be proc create_ast_node from AST_PACKAGE_DECLARATION
+    Let package_node be proc create_ast_node with AST_PACKAGE_DECLARATION
 
     proc expect with parser, TOKEN_PACKAGE from Lexer
 
-    Let qualified_name be proc parse_qualified_name from parser
+    Let qualified_name be proc parse_qualified_name with parser
     proc set_node_name with package_node, qualified_name
 
     proc expect with parser, TOKEN_SEMICOLON from Lexer
@@ -477,7 +480,7 @@ to the name string to preserve canonical form.
 Process called "parse_import_declaration" takes parser as Integer returns Integer:
     Note: Parse import declaration
 
-    Let import_node be proc create_ast_node from AST_IMPORT_DECLARATION
+    Let import_node be proc create_ast_node with AST_IMPORT_DECLARATION
 
     proc expect with parser, TOKEN_IMPORT from Lexer
 
@@ -487,13 +490,13 @@ Process called "parse_import_declaration" takes parser as Integer returns Intege
         proc set_node_value with import_node, 1  Note: Mark as static import
     End If
 
-    Let qualified_name be proc parse_qualified_name from parser
+    Let qualified_name be proc parse_qualified_name with parser
 
     Note: Wildcard import (optional)
     Let is_dot be proc match_and_advance with parser, TOKEN_DOT from Lexer
     If is_dot is equal to 1:
         proc match_and_advance with parser, TOKEN_STAR from Lexer
-        Let wildcard_name be proc string_concat from StringCore with qualified_name, ".*"
+        Let wildcard_name be proc string_concat from StringUtils with qualified_name, ".*"
         proc set_node_name with import_node, wildcard_name
     Otherwise:
         proc set_node_name with import_node, qualified_name
@@ -513,33 +516,51 @@ handles the residual token, e.g. '*' in wildcard imports).
 Process called "parse_qualified_name" takes parser as Integer returns Integer:
     Note: Parse qualified name (e.g., java.util.List)
 
-    Let token be proc current_token from parser
+    Let token be proc current_token with parser
     Let name be proc memory_get_int64 from Layout with token, 8
 
     proc expect with parser, TOKEN_IDENTIFIER from Lexer
 
     While 1 is equal to 1:
+        Note: A dotted continuation requires a '.' followed by an identifier.
+        Note: Peek the dot WITHOUT consuming it; only commit (consume the dot
+        Note: and the identifier) when an identifier actually follows, so a
+        Note: trailing ".*" wildcard or a "." before a non-identifier is left
+        Note: intact for the caller.
         Let is_dot be proc match with parser, TOKEN_DOT from Lexer
-
         If is_dot is equal to 0:
             Break
         End If
 
-        Let next_token_type be proc current_token_type from parser
+        Note: Look one token past the dot using the lexer's scan position so we
+        Note: can decide before committing. Save and restore on a non-identifier.
+        Let lexer be proc memory_get_int64 from Layout with parser, 0
+        Let saved_scan_pos be proc memory_get_int64 from Layout with lexer, 16
+        Let saved_line be proc memory_get_int64 from Layout with lexer, 24
+        Let saved_column be proc memory_get_int64 from Layout with lexer, 32
+        Let saved_current be proc memory_get_int64 from Layout with parser, 8
+        Let saved_previous be proc memory_get_int64 from Layout with parser, 16
 
-        If next_token_type is not equal to TOKEN_IDENTIFIER from Lexer:
+        proc advance with parser  Note: consume the '.'
+        Let after_dot be proc current_token_type with parser
+
+        If after_dot is not equal to TOKEN_IDENTIFIER from Lexer:
+            Note: Not a dotted segment (e.g. ".*" wildcard); restore and stop.
+            proc memory_set_int64 from Layout with lexer, 16, saved_scan_pos
+            proc memory_set_int64 from Layout with lexer, 24, saved_line
+            proc memory_set_int64 from Layout with lexer, 32, saved_column
+            proc memory_set_int64 from Layout with parser, 8, saved_current
+            proc memory_set_int64 from Layout with parser, 16, saved_previous
             Break
         End If
 
-        proc advance from parser
-
-        Let next_token be proc current_token from parser
+        Let next_token be proc current_token with parser
         Let next_name be proc memory_get_int64 from Layout with next_token, 8
 
-        Set name to proc string_concat from StringCore with name, "."
-        Set name to proc string_concat from StringCore with name, next_name
+        Set name to proc string_concat from StringUtils with name, "."
+        Set name to proc string_concat from StringUtils with name, next_name
 
-        proc advance from parser
+        proc advance with parser  Note: consume the identifier
     End While
 
     Return name
@@ -559,9 +580,9 @@ Process called "parse_type_declaration" takes parser as Integer returns Integer:
     Note: Parse type declaration (class, interface, enum, annotation)
 
     Note: Modifiers and annotations
-    Let modifiers be proc parse_modifiers from parser
+    Let modifiers be proc parse_modifiers with parser
 
-    Let token_type be proc current_token_type from parser
+    Let token_type be proc current_token_type with parser
 
     Let type_node be 0
 
@@ -572,7 +593,25 @@ Process called "parse_type_declaration" takes parser as Integer returns Integer:
     Otherwise If token_type is equal to TOKEN_ENUM from Lexer:
         Set type_node to proc parse_enum_declaration with parser, modifiers
     Otherwise If token_type is equal to TOKEN_AT from Lexer:
-        Let next_type be proc current_token_type from parser
+        Note: '@interface' is an annotation-type declaration. Peek one token past
+        Note: '@' (without consuming it - parse_annotation_declaration expects to
+        Note: see the '@' itself) to confirm the 'interface' keyword follows.
+        Let at_lexer be proc memory_get_int64 from Layout with parser, 0
+        Let at_scan_pos be proc memory_get_int64 from Layout with at_lexer, 16
+        Let at_line be proc memory_get_int64 from Layout with at_lexer, 24
+        Let at_column be proc memory_get_int64 from Layout with at_lexer, 32
+        Let at_current be proc memory_get_int64 from Layout with parser, 8
+        Let at_previous be proc memory_get_int64 from Layout with parser, 16
+
+        proc advance with parser
+        Let next_type be proc current_token_type with parser
+
+        proc memory_set_int64 from Layout with at_lexer, 16, at_scan_pos
+        proc memory_set_int64 from Layout with at_lexer, 24, at_line
+        proc memory_set_int64 from Layout with at_lexer, 32, at_column
+        proc memory_set_int64 from Layout with parser, 8, at_current
+        proc memory_set_int64 from Layout with parser, 16, at_previous
+
         If next_type is equal to TOKEN_INTERFACE from Lexer:
             Set type_node to proc parse_annotation_declaration with parser, modifiers
         End If
@@ -590,7 +629,7 @@ position.
 Process called "parse_class_declaration" takes parser as Integer, modifiers as Integer returns Integer:
     Note: Parse class declaration
 
-    Let class_node be proc create_ast_node from AST_CLASS_DECLARATION
+    Let class_node be proc create_ast_node with AST_CLASS_DECLARATION
 
     If modifiers is not equal to 0:
         proc add_child with class_node, modifiers
@@ -598,7 +637,7 @@ Process called "parse_class_declaration" takes parser as Integer, modifiers as I
 
     proc expect with parser, TOKEN_CLASS from Lexer
 
-    Let name_token be proc current_token from parser
+    Let name_token be proc current_token with parser
     Let class_name be proc memory_get_int64 from Layout with name_token, 8
     proc set_node_name with class_node, class_name
 
@@ -607,21 +646,21 @@ Process called "parse_class_declaration" takes parser as Integer, modifiers as I
     Note: Type parameters (optional)
     Let is_lt be proc match with parser, TOKEN_LT from Lexer
     If is_lt is equal to 1:
-        Let type_params be proc parse_type_parameters from parser
+        Let type_params be proc parse_type_parameters with parser
         proc add_child with class_node, type_params
     End If
 
     Note: Extends clause (optional)
     Let is_extends be proc match_and_advance with parser, TOKEN_EXTENDS from Lexer
     If is_extends is equal to 1:
-        Let super_type be proc parse_type_reference from parser
+        Let super_type be proc parse_type_reference with parser
         proc add_child with class_node, super_type
     End If
 
     Note: Implements clause (optional)
     Let is_implements be proc match_and_advance with parser, TOKEN_IMPLEMENTS from Lexer
     If is_implements is equal to 1:
-        Let interfaces be proc parse_type_list from parser
+        Let interfaces be proc parse_type_list with parser
         proc add_child with class_node, interfaces
     End If
 
@@ -634,7 +673,7 @@ Process called "parse_class_declaration" takes parser as Integer, modifiers as I
             Break
         End If
 
-        Let member be proc parse_class_member from parser
+        Let member be proc parse_class_member with parser
         If member is not equal to 0:
             proc add_child with class_node, member
         Otherwise:
@@ -656,7 +695,7 @@ than a single super-type, and there is no implements clause.
 Process called "parse_interface_declaration" takes parser as Integer, modifiers as Integer returns Integer:
     Note: Parse interface declaration
 
-    Let interface_node be proc create_ast_node from AST_INTERFACE_DECLARATION
+    Let interface_node be proc create_ast_node with AST_INTERFACE_DECLARATION
 
     If modifiers is not equal to 0:
         proc add_child with interface_node, modifiers
@@ -664,7 +703,7 @@ Process called "parse_interface_declaration" takes parser as Integer, modifiers 
 
     proc expect with parser, TOKEN_INTERFACE from Lexer
 
-    Let name_token be proc current_token from parser
+    Let name_token be proc current_token with parser
     Let interface_name be proc memory_get_int64 from Layout with name_token, 8
     proc set_node_name with interface_node, interface_name
 
@@ -673,14 +712,14 @@ Process called "parse_interface_declaration" takes parser as Integer, modifiers 
     Note: Type parameters (optional)
     Let is_lt be proc match with parser, TOKEN_LT from Lexer
     If is_lt is equal to 1:
-        Let type_params be proc parse_type_parameters from parser
+        Let type_params be proc parse_type_parameters with parser
         proc add_child with interface_node, type_params
     End If
 
     Note: Extends clause (optional)
     Let is_extends be proc match_and_advance with parser, TOKEN_EXTENDS from Lexer
     If is_extends is equal to 1:
-        Let interfaces be proc parse_type_list from parser
+        Let interfaces be proc parse_type_list with parser
         proc add_child with interface_node, interfaces
     End If
 
@@ -693,7 +732,7 @@ Process called "parse_interface_declaration" takes parser as Integer, modifiers 
             Break
         End If
 
-        Let member be proc parse_interface_member from parser
+        Let member be proc parse_interface_member with parser
         If member is not equal to 0:
             proc add_child with interface_node, member
         Otherwise:
@@ -715,7 +754,7 @@ methods/fields defined on the enum.
 Process called "parse_enum_declaration" takes parser as Integer, modifiers as Integer returns Integer:
     Note: Parse enum declaration
 
-    Let enum_node be proc create_ast_node from AST_ENUM_DECLARATION
+    Let enum_node be proc create_ast_node with AST_ENUM_DECLARATION
 
     If modifiers is not equal to 0:
         proc add_child with enum_node, modifiers
@@ -723,7 +762,7 @@ Process called "parse_enum_declaration" takes parser as Integer, modifiers as In
 
     proc expect with parser, TOKEN_ENUM from Lexer
 
-    Let name_token be proc current_token from parser
+    Let name_token be proc current_token with parser
     Let enum_name be proc memory_get_int64 from Layout with name_token, 8
     proc set_node_name with enum_node, enum_name
 
@@ -732,7 +771,7 @@ Process called "parse_enum_declaration" takes parser as Integer, modifiers as In
     Note: Implements clause (optional)
     Let is_implements be proc match_and_advance with parser, TOKEN_IMPLEMENTS from Lexer
     If is_implements is equal to 1:
-        Let interfaces be proc parse_type_list from parser
+        Let interfaces be proc parse_type_list with parser
         proc add_child with enum_node, interfaces
     End If
 
@@ -751,7 +790,7 @@ Process called "parse_enum_declaration" takes parser as Integer, modifiers as In
             Break
         End If
 
-        Let constant be proc parse_enum_constant from parser
+        Let constant be proc parse_enum_constant with parser
         proc add_child with enum_node, constant
 
         Let is_comma be proc match_and_advance with parser, TOKEN_COMMA from Lexer
@@ -769,7 +808,7 @@ Process called "parse_enum_declaration" takes parser as Integer, modifiers as In
                 Break
             End If
 
-            Let member be proc parse_class_member from parser
+            Let member be proc parse_class_member with parser
             If member is not equal to 0:
                 proc add_child with enum_node, member
             Otherwise:
@@ -792,7 +831,7 @@ subclass semantics).
 Process called "parse_enum_constant" takes parser as Integer returns Integer:
     Note: Parse enum constant
 
-    Let constant_node be proc create_ast_node from AST_ENUM_CONSTANT
+    Let constant_node be proc create_ast_node with AST_ENUM_CONSTANT
 
     Note: Annotations (optional)
     While 1 is equal to 1:
@@ -801,11 +840,11 @@ Process called "parse_enum_constant" takes parser as Integer returns Integer:
             Break
         End If
 
-        Let annotation be proc parse_annotation from parser
+        Let annotation be proc parse_annotation with parser
         proc add_child with constant_node, annotation
     End While
 
-    Let name_token be proc current_token from parser
+    Let name_token be proc current_token with parser
     Let constant_name be proc memory_get_int64 from Layout with name_token, 8
     proc set_node_name with constant_node, constant_name
 
@@ -814,7 +853,7 @@ Process called "parse_enum_constant" takes parser as Integer returns Integer:
     Note: Arguments (optional)
     Let is_lparen be proc match_and_advance with parser, TOKEN_LPAREN from Lexer
     If is_lparen is equal to 1:
-        Let args be proc parse_argument_list from parser
+        Let args be proc parse_argument_list with parser
         proc add_child with constant_node, args
         proc expect with parser, TOKEN_RPAREN from Lexer
     End If
@@ -822,7 +861,7 @@ Process called "parse_enum_constant" takes parser as Integer returns Integer:
     Note: Class body (optional)
     Let is_lbrace be proc match with parser, TOKEN_LBRACE from Lexer
     If is_lbrace is equal to 1:
-        Let body be proc parse_class_body from parser
+        Let body be proc parse_class_body with parser
         proc add_child with constant_node, body
     End If
 
@@ -837,7 +876,7 @@ confirmed that via the dispatcher in parse_type_declaration.
 Process called "parse_annotation_declaration" takes parser as Integer, modifiers as Integer returns Integer:
     Note: Parse annotation type declaration
 
-    Let annotation_node be proc create_ast_node from AST_ANNOTATION_DECLARATION
+    Let annotation_node be proc create_ast_node with AST_ANNOTATION_DECLARATION
 
     If modifiers is not equal to 0:
         proc add_child with annotation_node, modifiers
@@ -846,7 +885,7 @@ Process called "parse_annotation_declaration" takes parser as Integer, modifiers
     proc expect with parser, TOKEN_AT from Lexer
     proc expect with parser, TOKEN_INTERFACE from Lexer
 
-    Let name_token be proc current_token from parser
+    Let name_token be proc current_token with parser
     Let annotation_name be proc memory_get_int64 from Layout with name_token, 8
     proc set_node_name with annotation_node, annotation_name
 
@@ -861,7 +900,7 @@ Process called "parse_annotation_declaration" takes parser as Integer, modifiers
             Break
         End If
 
-        Let member be proc parse_annotation_member from parser
+        Let member be proc parse_annotation_member with parser
         If member is not equal to 0:
             proc add_child with annotation_node, member
         Otherwise:
@@ -888,10 +927,10 @@ same as 'public @Override static'. Stops at the first non-modifier token.
 Process called "parse_modifiers" takes parser as Integer returns Integer:
     Note: Parse modifiers and annotations
 
-    Let modifiers_node be proc create_ast_node from AST_MODIFIER_LIST
+    Let modifiers_node be proc create_ast_node with AST_MODIFIER_LIST
 
     While 1 is equal to 1:
-        Let token_type be proc current_token_type from parser
+        Let token_type be proc current_token_type with parser
         Let is_modifier be 0
 
         If token_type is equal to TOKEN_PUBLIC from Lexer:
@@ -917,17 +956,42 @@ Process called "parse_modifiers" takes parser as Integer returns Integer:
         Otherwise If token_type is equal to TOKEN_STRICTFP from Lexer:
             Set is_modifier to 1
         Otherwise If token_type is equal to TOKEN_AT from Lexer:
-            Let annotation be proc parse_annotation from parser
+            Note: An '@' is an annotation USE here only when it is not '@interface'
+            Note: (the annotation-TYPE declaration keyword). Peek one token past
+            Note: '@' via a save/restore lookahead: if 'interface' follows, this is
+            Note: a type declaration, so stop collecting modifiers and leave the '@'
+            Note: for parse_type_declaration. Otherwise consume the annotation use.
+            Let at_lexer be proc memory_get_int64 from Layout with parser, 0
+            Let at_scan_pos be proc memory_get_int64 from Layout with at_lexer, 16
+            Let at_line be proc memory_get_int64 from Layout with at_lexer, 24
+            Let at_column be proc memory_get_int64 from Layout with at_lexer, 32
+            Let at_current be proc memory_get_int64 from Layout with parser, 8
+            Let at_previous be proc memory_get_int64 from Layout with parser, 16
+
+            proc advance with parser  Note: Look at the token after '@'
+            Let after_at be proc current_token_type with parser
+
+            proc memory_set_int64 from Layout with at_lexer, 16, at_scan_pos
+            proc memory_set_int64 from Layout with at_lexer, 24, at_line
+            proc memory_set_int64 from Layout with at_lexer, 32, at_column
+            proc memory_set_int64 from Layout with parser, 8, at_current
+            proc memory_set_int64 from Layout with parser, 16, at_previous
+
+            If after_at is equal to TOKEN_INTERFACE from Lexer:
+                Break
+            End If
+
+            Let annotation be proc parse_annotation with parser
             proc add_child with modifiers_node, annotation
             Continue
         End If
 
         If is_modifier is equal to 1:
-            Let token be proc current_token from parser
-            Let modifier_node be proc create_ast_node from AST_IDENTIFIER
+            Let token be proc current_token with parser
+            Let modifier_node be proc create_ast_node with AST_IDENTIFIER
             proc set_node_token with modifier_node, token
             proc add_child with modifiers_node, modifier_node
-            proc advance from parser
+            proc advance with parser
         Otherwise:
             Break
         End If
@@ -944,18 +1008,18 @@ parse_annotation_arguments treats both uniformly as expressions.
 Process called "parse_annotation" takes parser as Integer returns Integer:
     Note: Parse annotation usage
 
-    Let annotation_node be proc create_ast_node from AST_ANNOTATION
+    Let annotation_node be proc create_ast_node with AST_ANNOTATION
 
     proc expect with parser, TOKEN_AT from Lexer
 
-    Let name be proc parse_qualified_name from parser
+    Let name be proc parse_qualified_name with parser
     proc set_node_name with annotation_node, name
 
     Note: Annotation arguments (optional)
     Let is_lparen be proc match_and_advance with parser, TOKEN_LPAREN from Lexer
     If is_lparen is equal to 1:
         Note: Single value or name-value pairs
-        Let args be proc parse_annotation_arguments from parser
+        Let args be proc parse_annotation_arguments with parser
         proc add_child with annotation_node, args
         proc expect with parser, TOKEN_RPAREN from Lexer
     End If
@@ -972,7 +1036,7 @@ semantic passes.
 Process called "parse_annotation_arguments" takes parser as Integer returns Integer:
     Note: Parse annotation arguments
 
-    Let args_node be proc create_ast_node from AST_IDENTIFIER
+    Let args_node be proc create_ast_node with AST_IDENTIFIER
 
     While 1 is equal to 1:
         Let is_rparen be proc match with parser, TOKEN_RPAREN from Lexer
@@ -980,7 +1044,7 @@ Process called "parse_annotation_arguments" takes parser as Integer returns Inte
             Break
         End If
 
-        Let arg be proc parse_expression from parser
+        Let arg be proc parse_expression with parser
         proc add_child with args_node, arg
 
         Let is_comma be proc match_and_advance with parser, TOKEN_COMMA from Lexer
@@ -1007,9 +1071,19 @@ and field by the LPAREN/SEMICOLON discriminator.
 Process called "parse_class_member" takes parser as Integer returns Integer:
     Note: Parse class member (field, method, constructor, nested type)
 
-    Let modifiers be proc parse_modifiers from parser
+    Let modifiers be proc parse_modifiers with parser
 
-    Let token_type be proc current_token_type from parser
+    Note: Method-level generic type parameters (e.g. public <R> R map(...)).
+    Note: They appear after the modifiers and before the return type; parse and
+    Note: discard the binding here so the subsequent return-type/name/'(' logic
+    Note: sees the method signature proper. The type-parameter scope is recovered
+    Note: by the semantic pass from the declaration's own generics where needed.
+    Let has_type_params be proc match with parser, TOKEN_LT from Lexer
+    If has_type_params is equal to 1:
+        Let discarded_type_params be proc parse_type_parameters with parser
+    End If
+
+    Let token_type be proc current_token_type with parser
 
     Note: Nested type declarations
     If token_type is equal to TOKEN_CLASS from Lexer:
@@ -1024,36 +1098,60 @@ Process called "parse_class_member" takes parser as Integer returns Integer:
         Return proc parse_enum_declaration with parser, modifiers
     End If
 
-    Note: Constructor or method
-    Let lookahead_type be proc current_token_type from parser
+    Note: Nested annotation-type declaration ('@interface'). The '@interface'
+    Note: keyword pair is the only annotation-position form valid as a member
+    Note: start (annotation USES were already absorbed by parse_modifiers). Peek
+    Note: past '@' to confirm 'interface' before delegating.
+    If token_type is equal to TOKEN_AT from Lexer:
+        Let at_lexer be proc memory_get_int64 from Layout with parser, 0
+        Let at_scan_pos be proc memory_get_int64 from Layout with at_lexer, 16
+        Let at_line be proc memory_get_int64 from Layout with at_lexer, 24
+        Let at_column be proc memory_get_int64 from Layout with at_lexer, 32
+        Let at_current be proc memory_get_int64 from Layout with parser, 8
+        Let at_previous be proc memory_get_int64 from Layout with parser, 16
 
-    If lookahead_type is equal to TOKEN_IDENTIFIER from Lexer:
-        Note: Could be constructor or method/field
-        Let name_token be proc current_token from parser
-        Let member_name be proc memory_get_int64 from Layout with name_token, 8
+        proc advance with parser
+        Let after_at be proc current_token_type with parser
 
-        proc advance from parser
+        proc memory_set_int64 from Layout with at_lexer, 16, at_scan_pos
+        proc memory_set_int64 from Layout with at_lexer, 24, at_line
+        proc memory_set_int64 from Layout with at_lexer, 32, at_column
+        proc memory_set_int64 from Layout with parser, 8, at_current
+        proc memory_set_int64 from Layout with parser, 16, at_previous
 
-        Let next_type be proc current_token_type from parser
-
-        If next_type is equal to TOKEN_LPAREN from Lexer:
-            Note: Constructor
-            Return proc parse_constructor_declaration with parser, modifiers, member_name
-        Otherwise:
-            Note: Method or field - parse type and continue
-            Return proc parse_method_or_field with parser, modifiers, member_name
+        If after_at is equal to TOKEN_INTERFACE from Lexer:
+            Return proc parse_annotation_declaration with parser, modifiers
         End If
     End If
 
-    Note: Method or field with explicit type
-    Let type_ref be proc parse_type_reference from parser
+    Note: Constructor, method, or field. A member begins with either a primitive
+    Note: type keyword or an identifier that opens a reference type. In every case
+    Note: we parse a COMPLETE type reference first - this is what lets generic
+    Note: (Map<String, List<Integer>>), qualified (java.util.List), and array
+    Note: (String[]) member types be read correctly rather than being truncated by
+    Note: a one-token peek. The disambiguation is then purely on what follows the
+    Note: type: a '(' means the "type" was actually a CONSTRUCTOR name (constructors
+    Note: have no return type), so the member name is that type's simple name and the
+    Note: parameter list follows immediately; an identifier means a normal
+    Note: method/return-type or field/field-type declaration, disambiguated by
+    Note: whether a '(' follows the member name.
+    Let type_ref be proc parse_type_reference with parser
 
-    Set name_token to proc current_token from parser
-    Set member_name to proc memory_get_int64 from Layout with name_token, 8
+    Let after_type be proc current_token_type with parser
+
+    If after_type is equal to TOKEN_LPAREN from Lexer:
+        Note: Constructor: the parsed "type" is the constructor (class) name. Its
+        Note: simple name lives in the type reference node's name slot (offset 16).
+        Let ctor_name be proc memory_get_int64 from Layout with type_ref, 16
+        Return proc parse_constructor_declaration with parser, modifiers, ctor_name
+    End If
+
+    Let name_token be proc current_token with parser
+    Let member_name be proc memory_get_int64 from Layout with name_token, 8
 
     proc expect with parser, TOKEN_IDENTIFIER from Lexer
 
-    Set next_type to proc current_token_type from parser
+    Let next_type be proc current_token_type with parser
 
     If next_type is equal to TOKEN_LPAREN from Lexer:
         Note: Method
@@ -1073,9 +1171,9 @@ method-vs-field.
 Process called "parse_interface_member" takes parser as Integer returns Integer:
     Note: Parse interface member (method, field, nested type)
 
-    Let modifiers be proc parse_modifiers from parser
+    Let modifiers be proc parse_modifiers with parser
 
-    Let token_type be proc current_token_type from parser
+    Let token_type be proc current_token_type with parser
 
     Note: Nested type declarations
     If token_type is equal to TOKEN_CLASS from Lexer:
@@ -1091,14 +1189,14 @@ Process called "parse_interface_member" takes parser as Integer returns Integer:
     End If
 
     Note: Method or constant field
-    Let type_ref be proc parse_type_reference from parser
+    Let type_ref be proc parse_type_reference with parser
 
-    Let name_token be proc current_token from parser
+    Let name_token be proc current_token with parser
     Let member_name be proc memory_get_int64 from Layout with name_token, 8
 
     proc expect with parser, TOKEN_IDENTIFIER from Lexer
 
-    Let next_type be proc current_token_type from parser
+    Let next_type be proc current_token_type with parser
 
     If next_type is equal to TOKEN_LPAREN from Lexer:
         Note: Method
@@ -1117,11 +1215,11 @@ from regular interface members. Default values are AST children if present.
 Process called "parse_annotation_member" takes parser as Integer returns Integer:
     Note: Parse annotation member (annotation element)
 
-    Let modifiers be proc parse_modifiers from parser
+    Let modifiers be proc parse_modifiers with parser
 
-    Let type_ref be proc parse_type_reference from parser
+    Let type_ref be proc parse_type_reference with parser
 
-    Let name_token be proc current_token from parser
+    Let name_token be proc current_token with parser
     Let member_name be proc memory_get_int64 from Layout with name_token, 8
 
     proc expect with parser, TOKEN_IDENTIFIER from Lexer
@@ -1129,7 +1227,7 @@ Process called "parse_annotation_member" takes parser as Integer returns Integer
     proc expect with parser, TOKEN_LPAREN from Lexer
     proc expect with parser, TOKEN_RPAREN from Lexer
 
-    Let member_node be proc create_ast_node from AST_METHOD_DECLARATION
+    Let member_node be proc create_ast_node with AST_METHOD_DECLARATION
     proc set_node_name with member_node, member_name
 
     If modifiers is not equal to 0:
@@ -1141,7 +1239,7 @@ Process called "parse_annotation_member" takes parser as Integer returns Integer
     Note: Default value (optional)
     Let is_default be proc match_and_advance with parser, TOKEN_DEFAULT from Lexer
     If is_default is equal to 1:
-        Let default_value be proc parse_expression from parser
+        Let default_value be proc parse_expression with parser
         proc add_child with member_node, default_value
     End If
 
@@ -1158,7 +1256,7 @@ ParameterList ')' ['throws' TypeList] Block.
 Process called "parse_constructor_declaration" takes parser as Integer, modifiers as Integer, name as Integer returns Integer:
     Note: Parse constructor declaration
 
-    Let constructor_node be proc create_ast_node from AST_CONSTRUCTOR_DECLARATION
+    Let constructor_node be proc create_ast_node with AST_CONSTRUCTOR_DECLARATION
     proc set_node_name with constructor_node, name
 
     If modifiers is not equal to 0:
@@ -1167,7 +1265,7 @@ Process called "parse_constructor_declaration" takes parser as Integer, modifier
 
     proc expect with parser, TOKEN_LPAREN from Lexer
 
-    Let params be proc parse_parameter_list from parser
+    Let params be proc parse_parameter_list with parser
     proc add_child with constructor_node, params
 
     proc expect with parser, TOKEN_RPAREN from Lexer
@@ -1175,12 +1273,12 @@ Process called "parse_constructor_declaration" takes parser as Integer, modifier
     Note: Throws clause (optional)
     Let is_throws be proc match_and_advance with parser, TOKEN_THROWS from Lexer
     If is_throws is equal to 1:
-        Let exceptions be proc parse_type_list from parser
+        Let exceptions be proc parse_type_list with parser
         proc add_child with constructor_node, exceptions
     End If
 
     Note: Constructor body
-    Let body be proc parse_block from parser
+    Let body be proc parse_block with parser
     proc add_child with constructor_node, body
 
     Return constructor_node
@@ -1194,7 +1292,7 @@ A semicolon (no body) marks an abstract or interface method.
 Process called "parse_method_declaration_with_type" takes parser as Integer, modifiers as Integer, return_type as Integer, name as Integer returns Integer:
     Note: Parse method declaration with known type
 
-    Let method_node be proc create_ast_node from AST_METHOD_DECLARATION
+    Let method_node be proc create_ast_node with AST_METHOD_DECLARATION
     proc set_node_name with method_node, name
 
     If modifiers is not equal to 0:
@@ -1205,7 +1303,7 @@ Process called "parse_method_declaration_with_type" takes parser as Integer, mod
 
     proc expect with parser, TOKEN_LPAREN from Lexer
 
-    Let params be proc parse_parameter_list from parser
+    Let params be proc parse_parameter_list with parser
     proc add_child with method_node, params
 
     proc expect with parser, TOKEN_RPAREN from Lexer
@@ -1213,14 +1311,14 @@ Process called "parse_method_declaration_with_type" takes parser as Integer, mod
     Note: Throws clause (optional)
     Let is_throws be proc match_and_advance with parser, TOKEN_THROWS from Lexer
     If is_throws is equal to 1:
-        Let exceptions be proc parse_type_list from parser
+        Let exceptions be proc parse_type_list with parser
         proc add_child with method_node, exceptions
     End If
 
     Note: Method body or semicolon (abstract/interface method)
     Let is_semicolon be proc match_and_advance with parser, TOKEN_SEMICOLON from Lexer
     If is_semicolon is equal to 0:
-        Let body be proc parse_block from parser
+        Let body be proc parse_block with parser
         proc add_child with method_node, body
     End If
 
@@ -1235,7 +1333,7 @@ form), an optional '= initializer', and the terminating semicolon.
 Process called "parse_field_declaration_with_type" takes parser as Integer, modifiers as Integer, field_type as Integer, name as Integer returns Integer:
     Note: Parse field declaration with known type
 
-    Let field_node be proc create_ast_node from AST_FIELD_DECLARATION
+    Let field_node be proc create_ast_node with AST_FIELD_DECLARATION
     proc set_node_name with field_node, name
 
     If modifiers is not equal to 0:
@@ -1256,40 +1354,13 @@ Process called "parse_field_declaration_with_type" takes parser as Integer, modi
     Note: Initializer (optional)
     Let is_assign be proc match_and_advance with parser, TOKEN_ASSIGN from Lexer
     If is_assign is equal to 1:
-        Let initializer be proc parse_expression from parser
+        Let initializer be proc parse_expression with parser
         proc add_child with field_node, initializer
     End If
 
     proc expect with parser, TOKEN_SEMICOLON from Lexer
 
     Return field_node
-End Process
-
-@Reasoning:
-Reached when an identifier could be either a return-type reference or a
-constructor name. Now that we know the next identifier is the member name,
-we wrap type_name into a TYPE_REFERENCE node and forward to the appropriate
-method/field continuation based on LPAREN vs other.
-@End Reasoning
-Process called "parse_method_or_field" takes parser as Integer, modifiers as Integer, type_name as Integer returns Integer:
-    Note: Parse method or field when type is identifier (could be constructor)
-
-    Note: This handles ambiguous cases where identifier could be return type or constructor name
-    Let type_ref be proc create_ast_node from AST_TYPE_REFERENCE
-    proc set_node_name with type_ref, type_name
-
-    Let name_token be proc current_token from parser
-    Let member_name be proc memory_get_int64 from Layout with name_token, 8
-
-    proc expect with parser, TOKEN_IDENTIFIER from Lexer
-
-    Let next_type be proc current_token_type from parser
-
-    If next_type is equal to TOKEN_LPAREN from Lexer:
-        Return proc parse_method_declaration_with_type with parser, modifiers, type_ref, member_name
-    Otherwise:
-        Return proc parse_field_declaration_with_type with parser, modifiers, type_ref, member_name
-    End If
 End Process
 
 @Reasoning:
@@ -1300,7 +1371,7 @@ consumed here — caller validates the matching ')'.
 Process called "parse_parameter_list" takes parser as Integer returns Integer:
     Note: Parse method parameter list
 
-    Let params_node be proc create_ast_node from AST_IDENTIFIER
+    Let params_node be proc create_ast_node with AST_IDENTIFIER
 
     Let is_rparen be proc match with parser, TOKEN_RPAREN from Lexer
     If is_rparen is equal to 1:
@@ -1308,7 +1379,7 @@ Process called "parse_parameter_list" takes parser as Integer returns Integer:
     End If
 
     While 1 is equal to 1:
-        Let param be proc parse_parameter from parser
+        Let param be proc parse_parameter with parser
         proc add_child with params_node, param
 
         Let is_comma be proc match_and_advance with parser, TOKEN_COMMA from Lexer
@@ -1328,15 +1399,15 @@ stored in the node's value slot (1 = varargs). Modifiers here may include
 Process called "parse_parameter" takes parser as Integer returns Integer:
     Note: Parse method parameter
 
-    Let param_node be proc create_ast_node from AST_PARAMETER
+    Let param_node be proc create_ast_node with AST_PARAMETER
 
     Note: Modifiers (final, annotations)
-    Let modifiers be proc parse_modifiers from parser
+    Let modifiers be proc parse_modifiers with parser
     If modifiers is not equal to 0:
         proc add_child with param_node, modifiers
     End If
 
-    Let param_type be proc parse_type_reference from parser
+    Let param_type be proc parse_type_reference with parser
     proc add_child with param_node, param_type
 
     Note: Varargs (...)
@@ -1345,7 +1416,7 @@ Process called "parse_parameter" takes parser as Integer returns Integer:
         proc set_node_value with param_node, 1  Note: Mark as varargs
     End If
 
-    Let name_token be proc current_token from parser
+    Let name_token be proc current_token with parser
     Let param_name be proc memory_get_int64 from Layout with name_token, 8
     proc set_node_name with param_node, param_name
 
@@ -1368,91 +1439,91 @@ primitive nodes preserves the spelling for downstream selectors.
 Process called "parse_type_reference" takes parser as Integer returns Integer:
     Note: Parse type reference (primitive, reference, array, generic)
 
-    Let token_type be proc current_token_type from parser
+    Let token_type be proc current_token_type with parser
 
     Note: Primitive types
     If token_type is equal to TOKEN_BOOLEAN_TYPE from Lexer:
-        Let type_node be proc create_ast_node from AST_TYPE_REFERENCE
-        Let token be proc current_token from parser
+        Let type_node be proc create_ast_node with AST_TYPE_REFERENCE
+        Let token be proc current_token with parser
         proc set_node_token with type_node, token
-        proc advance from parser
+        proc advance with parser
         Return proc parse_array_dimensions with parser, type_node
     End If
 
     If token_type is equal to TOKEN_BYTE from Lexer:
-        Set type_node to proc create_ast_node from AST_TYPE_REFERENCE
-        Set token to proc current_token from parser
+        Set type_node to proc create_ast_node with AST_TYPE_REFERENCE
+        Set token to proc current_token with parser
         proc set_node_token with type_node, token
-        proc advance from parser
+        proc advance with parser
         Return proc parse_array_dimensions with parser, type_node
     End If
 
     If token_type is equal to TOKEN_SHORT from Lexer:
-        Set type_node to proc create_ast_node from AST_TYPE_REFERENCE
-        Set token to proc current_token from parser
+        Set type_node to proc create_ast_node with AST_TYPE_REFERENCE
+        Set token to proc current_token with parser
         proc set_node_token with type_node, token
-        proc advance from parser
+        proc advance with parser
         Return proc parse_array_dimensions with parser, type_node
     End If
 
     If token_type is equal to TOKEN_INT_TYPE from Lexer:
-        Set type_node to proc create_ast_node from AST_TYPE_REFERENCE
-        Set token to proc current_token from parser
+        Set type_node to proc create_ast_node with AST_TYPE_REFERENCE
+        Set token to proc current_token with parser
         proc set_node_token with type_node, token
-        proc advance from parser
+        proc advance with parser
         Return proc parse_array_dimensions with parser, type_node
     End If
 
     If token_type is equal to TOKEN_LONG_TYPE from Lexer:
-        Set type_node to proc create_ast_node from AST_TYPE_REFERENCE
-        Set token to proc current_token from parser
+        Set type_node to proc create_ast_node with AST_TYPE_REFERENCE
+        Set token to proc current_token with parser
         proc set_node_token with type_node, token
-        proc advance from parser
+        proc advance with parser
         Return proc parse_array_dimensions with parser, type_node
     End If
 
     If token_type is equal to TOKEN_FLOAT_TYPE from Lexer:
-        Set type_node to proc create_ast_node from AST_TYPE_REFERENCE
-        Set token to proc current_token from parser
+        Set type_node to proc create_ast_node with AST_TYPE_REFERENCE
+        Set token to proc current_token with parser
         proc set_node_token with type_node, token
-        proc advance from parser
+        proc advance with parser
         Return proc parse_array_dimensions with parser, type_node
     End If
 
     If token_type is equal to TOKEN_DOUBLE_TYPE from Lexer:
-        Set type_node to proc create_ast_node from AST_TYPE_REFERENCE
-        Set token to proc current_token from parser
+        Set type_node to proc create_ast_node with AST_TYPE_REFERENCE
+        Set token to proc current_token with parser
         proc set_node_token with type_node, token
-        proc advance from parser
+        proc advance with parser
         Return proc parse_array_dimensions with parser, type_node
     End If
 
     If token_type is equal to TOKEN_CHAR_TYPE from Lexer:
-        Set type_node to proc create_ast_node from AST_TYPE_REFERENCE
-        Set token to proc current_token from parser
+        Set type_node to proc create_ast_node with AST_TYPE_REFERENCE
+        Set token to proc current_token with parser
         proc set_node_token with type_node, token
-        proc advance from parser
+        proc advance with parser
         Return proc parse_array_dimensions with parser, type_node
     End If
 
     If token_type is equal to TOKEN_VOID from Lexer:
-        Set type_node to proc create_ast_node from AST_TYPE_REFERENCE
-        Set token to proc current_token from parser
+        Set type_node to proc create_ast_node with AST_TYPE_REFERENCE
+        Set token to proc current_token with parser
         proc set_node_token with type_node, token
-        proc advance from parser
+        proc advance with parser
         Return type_node
     End If
 
     Note: Reference type (qualified name with optional generics)
-    Let qualified_name be proc parse_qualified_name from parser
+    Let qualified_name be proc parse_qualified_name with parser
 
-    Set type_node to proc create_ast_node from AST_TYPE_REFERENCE
+    Set type_node to proc create_ast_node with AST_TYPE_REFERENCE
     proc set_node_name with type_node, qualified_name
 
     Note: Generic type arguments (optional)
     Let is_lt be proc match with parser, TOKEN_LT from Lexer
     If is_lt is equal to 1:
-        Let type_args be proc parse_type_arguments from parser
+        Let type_args be proc parse_type_arguments with parser
         proc add_child with type_node, type_args
     End If
 
@@ -1480,7 +1551,7 @@ Process called "parse_array_dimensions" takes parser as Integer, base_type as In
     End While
 
     If has_brackets is equal to 1:
-        Let array_type be proc create_ast_node from AST_ARRAY_TYPE
+        Let array_type be proc create_ast_node with AST_ARRAY_TYPE
         proc add_child with array_type, base_type
         Return array_type
     End If
@@ -1496,12 +1567,12 @@ parse_type_parameter and may carry extends bounds.
 Process called "parse_type_parameters" takes parser as Integer returns Integer:
     Note: Parse generic type parameters <T, U extends Base>
 
-    Let type_params_node be proc create_ast_node from AST_TYPE_PARAMETER
+    Let type_params_node be proc create_ast_node with AST_TYPE_PARAMETER
 
     proc expect with parser, TOKEN_LT from Lexer
 
     While 1 is equal to 1:
-        Let param be proc parse_type_parameter from parser
+        Let param be proc parse_type_parameter with parser
         proc add_child with type_params_node, param
 
         Let is_comma be proc match_and_advance with parser, TOKEN_COMMA from Lexer
@@ -1510,7 +1581,7 @@ Process called "parse_type_parameters" takes parser as Integer returns Integer:
         End If
     End While
 
-    proc expect with parser, TOKEN_GT from Lexer
+    proc expect_generic_close with parser
 
     Return type_params_node
 End Process
@@ -1523,9 +1594,9 @@ name; the optional bounds list (one type or intersection like
 Process called "parse_type_parameter" takes parser as Integer returns Integer:
     Note: Parse single type parameter (T extends Base bitwise and Interface)
 
-    Let param_node be proc create_ast_node from AST_TYPE_PARAMETER
+    Let param_node be proc create_ast_node with AST_TYPE_PARAMETER
 
-    Let name_token be proc current_token from parser
+    Let name_token be proc current_token with parser
     Let param_name be proc memory_get_int64 from Layout with name_token, 8
     proc set_node_name with param_node, param_name
 
@@ -1534,7 +1605,7 @@ Process called "parse_type_parameter" takes parser as Integer returns Integer:
     Note: Type bounds (extends)
     Let is_extends be proc match_and_advance with parser, TOKEN_EXTENDS from Lexer
     If is_extends is equal to 1:
-        Let bounds be proc parse_type_bound_list from parser
+        Let bounds be proc parse_type_bound_list with parser
         proc add_child with param_node, bounds
     End If
 
@@ -1550,10 +1621,10 @@ be interfaces, but that constraint is enforced semantically, not here.
 Process called "parse_type_bound_list" takes parser as Integer returns Integer:
     Note: Parse type bound list (Base bitwise and Interface1 bitwise and Interface2)
 
-    Let bounds_node be proc create_ast_node from AST_TYPE_BOUND
+    Let bounds_node be proc create_ast_node with AST_TYPE_BOUND
 
     While 1 is equal to 1:
-        Let bound_type be proc parse_type_reference from parser
+        Let bound_type be proc parse_type_reference with parser
         proc add_child with bounds_node, bound_type
 
         Let is_and be proc match_and_advance with parser, TOKEN_BITAND from Lexer
@@ -1566,6 +1637,65 @@ Process called "parse_type_bound_list" takes parser as Integer returns Integer:
 End Process
 
 @Reasoning:
+Consumes exactly ONE closing generic angle bracket. The lexer is greedy and
+merges adjacent '>' characters into the shift tokens '>>' (TOKEN_RSHIFT) and
+'>>>' (TOKEN_URSHIFT), and '>=' / '>>=' / '>>>=' when an '=' follows - which
+is correct for shift expressions but wrong inside nested generics such as
+Map<String, List<Integer>> where the trailing '>>' actually closes two
+generic scopes. This helper closes one level: a plain '>' is consumed by
+advancing; a multi-'>' token is split in place by rewriting its token type
+(at offset 0) to the token representing the remaining characters, WITHOUT
+advancing, so the next enclosing generic scope consumes the rest. This is the
+standard Java-parser angle-bracket splitting technique and lets arbitrarily
+deep nesting (List<Map<K, List<V>>>) close correctly.
+@End Reasoning
+Process called "expect_generic_close" takes parser as Integer returns Integer:
+    Let token be proc current_token with parser
+    If token is equal to 0:
+        Return 0
+    End If
+
+    Let token_type be proc memory_get_int64 from Layout with token, 0
+
+    If token_type is equal to TOKEN_GT from Lexer:
+        proc advance with parser
+        Return 1
+    End If
+
+    If token_type is equal to TOKEN_RSHIFT from Lexer:
+        Note: '>>' closes one level here; rewrite to a single '>' for the parent.
+        proc memory_set_int64 from Layout with token, 0, TOKEN_GT from Lexer
+        Return 1
+    End If
+
+    If token_type is equal to TOKEN_URSHIFT from Lexer:
+        Note: '>>>' closes one level here; rewrite to '>>' for the parent.
+        proc memory_set_int64 from Layout with token, 0, TOKEN_RSHIFT from Lexer
+        Return 1
+    End If
+
+    If token_type is equal to TOKEN_GE from Lexer:
+        Note: '>=' in type-close position closes one '>' and leaves '='.
+        proc memory_set_int64 from Layout with token, 0, TOKEN_ASSIGN from Lexer
+        Return 1
+    End If
+
+    If token_type is equal to TOKEN_RSHIFTASSIGN from Lexer:
+        Note: '>>=' closes one '>' and leaves '>='.
+        proc memory_set_int64 from Layout with token, 0, TOKEN_GE from Lexer
+        Return 1
+    End If
+
+    If token_type is equal to TOKEN_URSHIFTASSIGN from Lexer:
+        Note: '>>>=' closes one '>' and leaves '>>='.
+        proc memory_set_int64 from Layout with token, 0, TOKEN_RSHIFTASSIGN from Lexer
+        Return 1
+    End If
+
+    Return 0
+End Process
+
+@Reasoning:
 Grammar: '<' TypeArgument (',' TypeArgument)* '>'. Used at type-reference
 use sites (e.g., List<String>). Each argument may be a wildcard or a regular
 type reference.
@@ -1573,12 +1703,12 @@ type reference.
 Process called "parse_type_arguments" takes parser as Integer returns Integer:
     Note: Parse generic type arguments <String, Integer>
 
-    Let type_args_node be proc create_ast_node from AST_GENERIC_TYPE
+    Let type_args_node be proc create_ast_node with AST_GENERIC_TYPE
 
     proc expect with parser, TOKEN_LT from Lexer
 
     While 1 is equal to 1:
-        Let arg be proc parse_type_argument from parser
+        Let arg be proc parse_type_argument with parser
         proc add_child with type_args_node, arg
 
         Let is_comma be proc match_and_advance with parser, TOKEN_COMMA from Lexer
@@ -1587,7 +1717,7 @@ Process called "parse_type_arguments" takes parser as Integer returns Integer:
         End If
     End While
 
-    proc expect with parser, TOKEN_GT from Lexer
+    proc expect_generic_close with parser
 
     Return type_args_node
 End Process
@@ -1601,10 +1731,10 @@ Process called "parse_type_argument" takes parser as Integer returns Integer:
 
     Let is_question be proc match with parser, TOKEN_QUESTION from Lexer
     If is_question is equal to 1:
-        Return proc parse_wildcard_type from parser
+        Return proc parse_wildcard_type with parser
     End If
 
-    Return proc parse_type_reference from parser
+    Return proc parse_type_reference with parser
 End Process
 
 @Reasoning:
@@ -1615,14 +1745,14 @@ any, is the single child.
 Process called "parse_wildcard_type" takes parser as Integer returns Integer:
     Note: Parse wildcard type (? extends Type or ? super Type)
 
-    Let wildcard_node be proc create_ast_node from AST_WILDCARD_TYPE
+    Let wildcard_node be proc create_ast_node with AST_WILDCARD_TYPE
 
     proc expect with parser, TOKEN_QUESTION from Lexer
 
     Let is_extends be proc match_and_advance with parser, TOKEN_EXTENDS from Lexer
     If is_extends is equal to 1:
         proc set_node_value with wildcard_node, 1  Note: extends bound
-        Let bound be proc parse_type_reference from parser
+        Let bound be proc parse_type_reference with parser
         proc add_child with wildcard_node, bound
         Return wildcard_node
     End If
@@ -1630,7 +1760,7 @@ Process called "parse_wildcard_type" takes parser as Integer returns Integer:
     Let is_super be proc match_and_advance with parser, TOKEN_SUPER from Lexer
     If is_super is equal to 1:
         proc set_node_value with wildcard_node, 2  Note: super bound
-        Set bound to proc parse_type_reference from parser
+        Set bound to proc parse_type_reference with parser
         proc add_child with wildcard_node, bound
         Return wildcard_node
     End If
@@ -1646,10 +1776,10 @@ The caller is responsible for any trailing token (semicolon, brace, etc.).
 Process called "parse_type_list" takes parser as Integer returns Integer:
     Note: Parse comma-separated type list
 
-    Let list_node be proc create_ast_node from AST_IDENTIFIER
+    Let list_node be proc create_ast_node with AST_IDENTIFIER
 
     While 1 is equal to 1:
-        Let type_ref be proc parse_type_reference from parser
+        Let type_ref be proc parse_type_reference with parser
         proc add_child with list_node, type_ref
 
         Let is_comma be proc match_and_advance with parser, TOKEN_COMMA from Lexer
@@ -1673,7 +1803,7 @@ expect catch a missing brace).
 Process called "parse_block" takes parser as Integer returns Integer:
     Note: Parse block statement
 
-    Let block_node be proc create_ast_node from AST_BLOCK
+    Let block_node be proc create_ast_node with AST_BLOCK
 
     proc expect with parser, TOKEN_LBRACE from Lexer
 
@@ -1683,7 +1813,7 @@ Process called "parse_block" takes parser as Integer returns Integer:
             Break
         End If
 
-        Let stmt be proc parse_statement from parser
+        Let stmt be proc parse_statement with parser
         If stmt is not equal to 0:
             proc add_child with block_node, stmt
         Otherwise:
@@ -1705,55 +1835,59 @@ node); anything else falls through to expression-or-declaration.
 Process called "parse_statement" takes parser as Integer returns Integer:
     Note: Parse statement
 
-    Let token_type be proc current_token_type from parser
+    Let token_type be proc current_token_type with parser
 
     If token_type is equal to TOKEN_IF from Lexer:
-        Return proc parse_if_statement from parser
+        Return proc parse_if_statement with parser
     End If
 
     If token_type is equal to TOKEN_WHILE from Lexer:
-        Return proc parse_while_statement from parser
+        Return proc parse_while_statement with parser
+    End If
+
+    If token_type is equal to TOKEN_DO from Lexer:
+        Return proc parse_do_while_statement with parser
     End If
 
     If token_type is equal to TOKEN_FOR from Lexer:
-        Return proc parse_for_statement from parser
+        Return proc parse_for_statement with parser
     End If
 
     If token_type is equal to TOKEN_RETURN from Lexer:
-        Return proc parse_return_statement from parser
+        Return proc parse_return_statement with parser
     End If
 
     If token_type is equal to TOKEN_THROW from Lexer:
-        Return proc parse_throw_statement from parser
+        Return proc parse_throw_statement with parser
     End If
 
     If token_type is equal to TOKEN_TRY from Lexer:
-        Return proc parse_try_statement from parser
+        Return proc parse_try_statement with parser
     End If
 
     If token_type is equal to TOKEN_SWITCH from Lexer:
-        Return proc parse_switch_statement from parser
+        Return proc parse_switch_statement with parser
     End If
 
     If token_type is equal to TOKEN_BREAK from Lexer:
-        Return proc parse_break_statement from parser
+        Return proc parse_break_statement with parser
     End If
 
     If token_type is equal to TOKEN_CONTINUE from Lexer:
-        Return proc parse_continue_statement from parser
+        Return proc parse_continue_statement with parser
     End If
 
     If token_type is equal to TOKEN_LBRACE from Lexer:
-        Return proc parse_block from parser
+        Return proc parse_block with parser
     End If
 
     If token_type is equal to TOKEN_SEMICOLON from Lexer:
-        proc advance from parser
-        Return proc create_ast_node from AST_IDENTIFIER  Note: Empty statement
+        proc advance with parser
+        Return proc create_ast_node with AST_IDENTIFIER  Note: Empty statement
     End If
 
     Note: Expression statement or variable declaration
-    Return proc parse_expression_or_declaration from parser
+    Return proc parse_expression_or_declaration with parser
 End Process
 
 @Reasoning:
@@ -1764,23 +1898,23 @@ innermost still-open if because we parse it eagerly after the then-branch.
 Process called "parse_if_statement" takes parser as Integer returns Integer:
     Note: Parse if statement
 
-    Let if_node be proc create_ast_node from AST_IF_STATEMENT
+    Let if_node be proc create_ast_node with AST_IF_STATEMENT
 
     proc expect with parser, TOKEN_IF from Lexer
     proc expect with parser, TOKEN_LPAREN from Lexer
 
-    Let condition be proc parse_expression from parser
+    Let condition be proc parse_expression with parser
     proc add_child with if_node, condition
 
     proc expect with parser, TOKEN_RPAREN from Lexer
 
-    Let then_stmt be proc parse_statement from parser
+    Let then_stmt be proc parse_statement with parser
     proc add_child with if_node, then_stmt
 
     Note: Else clause (optional)
     Let is_else be proc match_and_advance with parser, TOKEN_ELSE from Lexer
     If is_else is equal to 1:
-        Let else_stmt be proc parse_statement from parser
+        Let else_stmt be proc parse_statement with parser
         proc add_child with if_node, else_stmt
     End If
 
@@ -1794,20 +1928,49 @@ child, the body is the second; downstream code can rely on that ordering.
 Process called "parse_while_statement" takes parser as Integer returns Integer:
     Note: Parse while statement
 
-    Let while_node be proc create_ast_node from AST_WHILE_STATEMENT
+    Let while_node be proc create_ast_node with AST_WHILE_STATEMENT
 
     proc expect with parser, TOKEN_WHILE from Lexer
     proc expect with parser, TOKEN_LPAREN from Lexer
 
-    Let condition be proc parse_expression from parser
+    Let condition be proc parse_expression with parser
     proc add_child with while_node, condition
 
     proc expect with parser, TOKEN_RPAREN from Lexer
 
-    Let body be proc parse_statement from parser
+    Let body be proc parse_statement with parser
     proc add_child with while_node, body
 
     Return while_node
+End Process
+
+@Reasoning:
+Grammar: 'do' Statement 'while' '(' Expression ')' ';'. The body executes at
+least once before the condition is tested. The body is stored as the first
+child and the condition as the second, mirroring the while-statement ordering
+inverted-evaluation aside, so HIR consumers read children[0] = body and
+children[1] = condition.
+@End Reasoning
+Process called "parse_do_while_statement" takes parser as Integer returns Integer:
+    Note: Parse do-while statement
+
+    Let do_node be proc create_ast_node with AST_DO_WHILE_STATEMENT
+
+    proc expect with parser, TOKEN_DO from Lexer
+
+    Let body be proc parse_statement with parser
+    proc add_child with do_node, body
+
+    proc expect with parser, TOKEN_WHILE from Lexer
+    proc expect with parser, TOKEN_LPAREN from Lexer
+
+    Let condition be proc parse_expression with parser
+    proc add_child with do_node, condition
+
+    proc expect with parser, TOKEN_RPAREN from Lexer
+    proc expect with parser, TOKEN_SEMICOLON from Lexer
+
+    Return do_node
 End Process
 
 @Reasoning:
@@ -1824,68 +1987,75 @@ Process called "parse_for_statement" takes parser as Integer returns Integer:
 
     Note: Check for enhanced for (for (Type var : collection))
     Note: This requires lookahead to distinguish from traditional for
-    Let is_enhanced be proc check_enhanced_for from parser
+    Let is_enhanced be proc check_enhanced_for with parser
 
     If is_enhanced is equal to 1:
-        Return proc parse_enhanced_for from parser
+        Return proc parse_enhanced_for with parser
     End If
 
-    Return proc parse_traditional_for from parser
+    Return proc parse_traditional_for with parser
 End Process
 
 @Reasoning:
 Lookahead-only predicate: speculatively scans Type Identifier ':' without
-committing, restoring current_token and previous_token before returning.
-Returns 1 if the colon was found (enhanced for-each), 0 otherwise.
-Restoration is direct field-write because Layout.memory_set_int64 makes
-that cheaper than driving the lexer backward.
+committing. Because the lexer scans on demand (no pre-tokenized buffer), a
+true rewind must restore the lexer scan position (offset 16) and line/column
+(offsets 24/32) together with the parser's current and previous token slots.
+We reuse the real parse_type_reference so the lookahead recognizes exactly
+the same type grammar the committed parse would (primitives, qualified
+names, generics, array dimensions). Returns 1 when a colon follows the type
+and binding identifier (enhanced for-each), 0 otherwise.
 @End Reasoning
 Process called "check_enhanced_for" takes parser as Integer returns Integer:
-    Note: Check if this is an enhanced for loop (for-each)
     Note: Enhanced for has pattern: Type identifier : expression
     Note: Traditional for has pattern: init; condition; increment
 
-    Note: Save current parser position for backtracking
-    Let saved_position be proc memory_get_int64 from Layout with parser, 8
-    Let saved_token be proc memory_get_int64 from Layout with parser, 16
+    Note: Save full lexer scan state and parser token slots for backtracking.
+    Let lexer be proc memory_get_int64 from Layout with parser, 0
+    Let saved_scan_pos be proc memory_get_int64 from Layout with lexer, 16
+    Let saved_line be proc memory_get_int64 from Layout with lexer, 24
+    Let saved_column be proc memory_get_int64 from Layout with lexer, 32
+    Let saved_current be proc memory_get_int64 from Layout with parser, 8
+    Let saved_previous be proc memory_get_int64 from Layout with parser, 16
 
-    Note: Try to parse enhanced for pattern: Type identifier :
-    Let has_type be proc check_type from parser
-    If has_type is equal to 0:
-        Note: No type found, restore position and return traditional for
-        proc memory_set_int64 from Layout with parser, 8, saved_position
-        proc memory_set_int64 from Layout with parser, 16, saved_token
-        Return 0
+    Note: A binding may be preceded by 'final' and/or annotations.
+    Let pre_type be proc current_token_type with parser
+    While pre_type is equal to TOKEN_FINAL from Lexer:
+        proc advance with parser
+        Set pre_type to proc current_token_type with parser
+    End While
+    While pre_type is equal to TOKEN_AT from Lexer:
+        proc advance with parser
+        Set pre_type to proc current_token_type with parser
+        If pre_type is equal to TOKEN_IDENTIFIER from Lexer:
+            proc advance with parser
+            Set pre_type to proc current_token_type with parser
+        End If
+    End While
+
+    Note: Speculatively consume a full type reference using the real grammar.
+    Let type_node be proc parse_type_reference with parser
+
+    Let result be 0
+    If type_node is not equal to 0:
+        Let after_type be proc current_token_type with parser
+        If after_type is equal to TOKEN_IDENTIFIER from Lexer:
+            proc advance with parser
+            Let after_ident be proc current_token_type with parser
+            If after_ident is equal to TOKEN_COLON from Lexer:
+                Set result to 1
+            End If
+        End If
     End If
 
-    Note: Skip the type tokens
-    proc skip_type from parser
+    Note: Restore the saved lexer and parser state regardless of outcome.
+    proc memory_set_int64 from Layout with lexer, 16, saved_scan_pos
+    proc memory_set_int64 from Layout with lexer, 24, saved_line
+    proc memory_set_int64 from Layout with lexer, 32, saved_column
+    proc memory_set_int64 from Layout with parser, 8, saved_current
+    proc memory_set_int64 from Layout with parser, 16, saved_previous
 
-    Note: Check for identifier
-    Let current_token be proc memory_get_int64 from Layout with parser, 16
-    If current_token is not equal to TOKEN_IDENTIFIER from Lexer:
-        Note: No identifier after type, restore position and return traditional for
-        proc memory_set_int64 from Layout with parser, 8, saved_position
-        proc memory_set_int64 from Layout with parser, 16, saved_token
-        Return 0
-    End If
-
-    Note: Skip identifier
-    proc advance from parser
-
-    Note: Check for colon (:)
-    Set current_token to proc memory_get_int64 from Layout with parser, 16
-    If current_token is equal to TOKEN_COLON from Lexer:
-        Note: Found enhanced for pattern: Type identifier :
-        proc memory_set_int64 from Layout with parser, 8, saved_position
-        proc memory_set_int64 from Layout with parser, 16, saved_token
-        Return 1
-    End If
-
-    Note: Not enhanced for, restore position and return traditional for
-    proc memory_set_int64 from Layout with parser, 8, saved_position
-    proc memory_set_int64 from Layout with parser, 16, saved_token
-    Return 0
+    Return result
 End Process
 
 @Reasoning:
@@ -1897,21 +2067,21 @@ used for the init so 'int i = 0' and 'i = 0' both work.
 Process called "parse_traditional_for" takes parser as Integer returns Integer:
     Note: Parse traditional for statement
 
-    Let for_node be proc create_ast_node from AST_FOR_STATEMENT
+    Let for_node be proc create_ast_node with AST_FOR_STATEMENT
 
     Note: Initializer (optional)
     Let is_semicolon be proc match with parser, TOKEN_SEMICOLON from Lexer
     If is_semicolon is equal to 0:
-        Let init be proc parse_expression_or_declaration from parser
+        Let init be proc parse_expression_or_declaration with parser
         proc add_child with for_node, init
     Otherwise:
-        proc advance from parser
+        proc advance with parser
     End If
 
     Note: Condition (optional)
     Set is_semicolon to proc match with parser, TOKEN_SEMICOLON from Lexer
     If is_semicolon is equal to 0:
-        Let condition be proc parse_expression from parser
+        Let condition be proc parse_expression with parser
         proc add_child with for_node, condition
     End If
 
@@ -1920,13 +2090,13 @@ Process called "parse_traditional_for" takes parser as Integer returns Integer:
     Note: Update (optional)
     Let is_rparen be proc match with parser, TOKEN_RPAREN from Lexer
     If is_rparen is equal to 0:
-        Let update be proc parse_expression from parser
+        Let update be proc parse_expression with parser
         proc add_child with for_node, update
     End If
 
     proc expect with parser, TOKEN_RPAREN from Lexer
 
-    Let body be proc parse_statement from parser
+    Let body be proc parse_statement with parser
     proc add_child with for_node, body
 
     Return for_node
@@ -1941,23 +2111,26 @@ are children.
 Process called "parse_enhanced_for" takes parser as Integer returns Integer:
     Note: Parse enhanced for statement (for-each)
 
-    Let for_node be proc create_ast_node from AST_ENHANCED_FOR
+    Let for_node be proc create_ast_node with AST_ENHANCED_FOR
 
-    Let element_type be proc parse_type_reference from parser
+    Note: Loop-variable type is the first child; its name is stored on the node.
+    Let element_type be proc parse_type_reference with parser
+    proc add_child with for_node, element_type
 
-    Let name_token be proc current_token from parser
+    Let name_token be proc current_token with parser
     Let element_name be proc memory_get_int64 from Layout with name_token, 8
+    proc set_node_name with for_node, element_name
 
     proc expect with parser, TOKEN_IDENTIFIER from Lexer
 
     proc expect with parser, TOKEN_COLON from Lexer
 
-    Let collection be proc parse_expression from parser
+    Let collection be proc parse_expression with parser
     proc add_child with for_node, collection
 
     proc expect with parser, TOKEN_RPAREN from Lexer
 
-    Let body be proc parse_statement from parser
+    Let body be proc parse_statement with parser
     proc add_child with for_node, body
 
     Return for_node
@@ -1970,13 +2143,13 @@ by an immediate semicolon; in that case the return node has no children.
 Process called "parse_return_statement" takes parser as Integer returns Integer:
     Note: Parse return statement
 
-    Let return_node be proc create_ast_node from AST_RETURN_STATEMENT
+    Let return_node be proc create_ast_node with AST_RETURN_STATEMENT
 
     proc expect with parser, TOKEN_RETURN from Lexer
 
     Let is_semicolon be proc match with parser, TOKEN_SEMICOLON from Lexer
     If is_semicolon is equal to 0:
-        Let value be proc parse_expression from parser
+        Let value be proc parse_expression with parser
         proc add_child with return_node, value
     End If
 
@@ -1992,11 +2165,11 @@ so we always parse an expression with no optionality check.
 Process called "parse_throw_statement" takes parser as Integer returns Integer:
     Note: Parse throw statement
 
-    Let throw_node be proc create_ast_node from AST_THROW_STATEMENT
+    Let throw_node be proc create_ast_node with AST_THROW_STATEMENT
 
     proc expect with parser, TOKEN_THROW from Lexer
 
-    Let exception be proc parse_expression from parser
+    Let exception be proc parse_expression with parser
     proc add_child with throw_node, exception
 
     proc expect with parser, TOKEN_SEMICOLON from Lexer
@@ -2013,20 +2186,20 @@ enforce that — semantic analysis catches missing handlers.
 Process called "parse_try_statement" takes parser as Integer returns Integer:
     Note: Parse try statement (with optional resources, catch, finally)
 
-    Let try_node be proc create_ast_node from AST_TRY_STATEMENT
+    Let try_node be proc create_ast_node with AST_TRY_STATEMENT
 
     proc expect with parser, TOKEN_TRY from Lexer
 
     Note: Try-with-resources (optional)
     Let is_lparen be proc match_and_advance with parser, TOKEN_LPAREN from Lexer
     If is_lparen is equal to 1:
-        Let resources be proc parse_resource_list from parser
+        Let resources be proc parse_resource_list with parser
         proc add_child with try_node, resources
         proc expect with parser, TOKEN_RPAREN from Lexer
     End If
 
     Note: Try block
-    Let try_block be proc parse_block from parser
+    Let try_block be proc parse_block with parser
     proc add_child with try_node, try_block
 
     Note: Catch clauses (zero or more)
@@ -2036,14 +2209,14 @@ Process called "parse_try_statement" takes parser as Integer returns Integer:
             Break
         End If
 
-        Let catch_clause be proc parse_catch_clause from parser
+        Let catch_clause be proc parse_catch_clause with parser
         proc add_child with try_node, catch_clause
     End While
 
     Note: Finally block (optional)
     Let is_finally be proc match_and_advance with parser, TOKEN_FINALLY from Lexer
     If is_finally is equal to 1:
-        Let finally_block be proc parse_block from parser
+        Let finally_block be proc parse_block with parser
         proc add_child with try_node, finally_block
     End If
 
@@ -2058,22 +2231,22 @@ or upstream of it depending on grammar revision.
 Process called "parse_catch_clause" takes parser as Integer returns Integer:
     Note: Parse catch clause
 
-    Let catch_node be proc create_ast_node from AST_CATCH_CLAUSE
+    Let catch_node be proc create_ast_node with AST_CATCH_CLAUSE
 
     proc expect with parser, TOKEN_CATCH from Lexer
     proc expect with parser, TOKEN_LPAREN from Lexer
 
-    Let exception_type be proc parse_type_reference from parser
+    Let exception_type be proc parse_type_reference with parser
     proc add_child with catch_node, exception_type
 
-    Let name_token be proc current_token from parser
+    Let name_token be proc current_token with parser
     Let exception_name be proc memory_get_int64 from Layout with name_token, 8
     proc set_node_name with catch_node, exception_name
 
     proc expect with parser, TOKEN_IDENTIFIER from Lexer
     proc expect with parser, TOKEN_RPAREN from Lexer
 
-    Let catch_block be proc parse_block from parser
+    Let catch_block be proc parse_block with parser
     proc add_child with catch_node, catch_block
 
     Return catch_node
@@ -2087,10 +2260,10 @@ separated by ';'. Trailing semicolons are tolerated by terminating on
 Process called "parse_resource_list" takes parser as Integer returns Integer:
     Note: Parse resource list for try-with-resources
 
-    Let resources_node be proc create_ast_node from AST_IDENTIFIER
+    Let resources_node be proc create_ast_node with AST_IDENTIFIER
 
     While 1 is equal to 1:
-        Let resource be proc parse_resource_specification from parser
+        Let resource be proc parse_resource_specification with parser
         proc add_child with resources_node, resource
 
         Let is_semicolon be proc match_and_advance with parser, TOKEN_SEMICOLON from Lexer
@@ -2115,17 +2288,17 @@ same way ordinary locals are scoped.
 Process called "parse_resource_specification" takes parser as Integer returns Integer:
     Note: Parse single resource specification
 
-    Let resource_type be proc parse_type_reference from parser
+    Let resource_type be proc parse_type_reference with parser
 
-    Let name_token be proc current_token from parser
+    Let name_token be proc current_token with parser
     Let resource_name be proc memory_get_int64 from Layout with name_token, 8
 
     proc expect with parser, TOKEN_IDENTIFIER from Lexer
     proc expect with parser, TOKEN_ASSIGN from Lexer
 
-    Let initializer be proc parse_expression from parser
+    Let initializer be proc parse_expression with parser
 
-    Let resource_node be proc create_ast_node from AST_VARIABLE_DECLARATION
+    Let resource_node be proc create_ast_node with AST_VARIABLE_DECLARATION
     proc set_node_name with resource_node, resource_name
     proc add_child with resource_node, resource_type
     proc add_child with resource_node, initializer
@@ -2142,12 +2315,12 @@ the closing brace.
 Process called "parse_switch_statement" takes parser as Integer returns Integer:
     Note: Parse switch statement
 
-    Let switch_node be proc create_ast_node from AST_SWITCH_STATEMENT
+    Let switch_node be proc create_ast_node with AST_SWITCH_STATEMENT
 
     proc expect with parser, TOKEN_SWITCH from Lexer
     proc expect with parser, TOKEN_LPAREN from Lexer
 
-    Let selector be proc parse_expression from parser
+    Let selector be proc parse_expression with parser
     proc add_child with switch_node, selector
 
     proc expect with parser, TOKEN_RPAREN from Lexer
@@ -2164,10 +2337,10 @@ Process called "parse_switch_statement" takes parser as Integer returns Integer:
         Let is_default be proc match with parser, TOKEN_DEFAULT from Lexer
 
         If is_case is equal to 1:
-            Let case_stmt be proc parse_case_statement from parser
+            Let case_stmt be proc parse_case_statement with parser
             proc add_child with switch_node, case_stmt
         Otherwise If is_default is equal to 1:
-            Let default_stmt be proc parse_default_statement from parser
+            Let default_stmt be proc parse_default_statement with parser
             proc add_child with switch_node, default_stmt
         Otherwise:
             Break
@@ -2180,19 +2353,66 @@ Process called "parse_switch_statement" takes parser as Integer returns Integer:
 End Process
 
 @Reasoning:
+The body of a switch arrow label ('case X ->' / 'default ->') is exactly one
+of: a brace block ({ ... }), or a single statement - an expression statement
+(case 1 -> 10;), a throw statement (case 2 -> throw e;), or a yield.
+A block is parsed via parse_block; everything else is delegated to
+parse_statement, which already consumes its own terminating ';' and dispatches
+throw/expression forms. Exactly one body node is produced, which the emitter
+prints after ' -> '.
+@End Reasoning
+Process called "parse_switch_arrow_body" takes parser as Integer returns Integer:
+    Note: Parse the single body of a switch arrow label.
+
+    Let is_block be proc match with parser, TOKEN_LBRACE from Lexer
+    If is_block is equal to 1:
+        Return proc parse_block with parser
+    End If
+
+    Return proc parse_statement with parser
+End Process
+
+@Reasoning:
 Grammar: 'case' Expression ':' Statement*. Case bodies extend until the
 next case/default or the enclosing '}' — fall-through is intentional and
 preserved by terminating only on those three lookaheads.
 @End Reasoning
 Process called "parse_case_statement" takes parser as Integer returns Integer:
-    Note: Parse case statement
+    Note: Parse case statement. Supports both the classic colon form
+    Note: ('case X:' followed by fall-through statements) and the Java 14+ arrow
+    Note: form ('case X -> expr;' or 'case X -> { ... }') which has exactly one
+    Note: body with no fall-through. The form is recorded in the node value slot
+    Note: (0 = classic case, 2 = arrow case) so the emitter reproduces the right
+    Note: syntax; the default clause uses 1 / 3 for the same distinction.
 
-    Let case_node be proc create_ast_node from AST_CASE_STATEMENT
+    Let case_node be proc create_ast_node with AST_CASE_STATEMENT
 
     proc expect with parser, TOKEN_CASE from Lexer
 
-    Let case_value be proc parse_expression from parser
+    Let case_value be proc parse_expression with parser
     proc add_child with case_node, case_value
+
+    Note: A switch arrow label uses '->' instead of ':'. Multiple comma-separated
+    Note: labels (case A, B ->) attach each additional selector value as a further
+    Note: child before the arrow body.
+    Let is_arrow_label be proc match with parser, TOKEN_ARROW from Lexer
+    Let is_comma_label be proc match with parser, TOKEN_COMMA from Lexer
+    If is_comma_label is equal to 1:
+        While proc match with parser, TOKEN_COMMA from Lexer is equal to 1:
+            proc advance with parser  Note: Skip comma between labels
+            Let extra_value be proc parse_expression with parser
+            proc add_child with case_node, extra_value
+        End While
+        Set is_arrow_label to proc match with parser, TOKEN_ARROW from Lexer
+    End If
+
+    If is_arrow_label is equal to 1:
+        proc set_node_value with case_node, 2  Note: arrow case
+        proc expect with parser, TOKEN_ARROW from Lexer
+        Let arrow_body be proc parse_switch_arrow_body with parser
+        proc add_child with case_node, arrow_body
+        Return case_node
+    End If
 
     proc expect with parser, TOKEN_COLON from Lexer
 
@@ -2214,7 +2434,7 @@ Process called "parse_case_statement" takes parser as Integer returns Integer:
             Break
         End If
 
-        Let stmt be proc parse_statement from parser
+        Let stmt be proc parse_statement with parser
         If stmt is not equal to 0:
             proc add_child with case_node, stmt
         Otherwise:
@@ -2232,12 +2452,24 @@ expression precedes ':' for default. Body extension rule matches the case
 clause.
 @End Reasoning
 Process called "parse_default_statement" takes parser as Integer returns Integer:
-    Note: Parse default statement
+    Note: Parse default statement. Like case, it supports both the classic colon
+    Note: form ('default:') and the arrow form ('default -> expr;' / '-> { ... }').
+    Note: Value 1 marks a classic default; value 3 marks an arrow default.
 
-    Let default_node be proc create_ast_node from AST_CASE_STATEMENT
+    Let default_node be proc create_ast_node with AST_CASE_STATEMENT
     proc set_node_value with default_node, 1  Note: Mark as default
 
     proc expect with parser, TOKEN_DEFAULT from Lexer
+
+    Let is_arrow_default be proc match with parser, TOKEN_ARROW from Lexer
+    If is_arrow_default is equal to 1:
+        proc set_node_value with default_node, 3  Note: arrow default
+        proc expect with parser, TOKEN_ARROW from Lexer
+        Let arrow_body be proc parse_switch_arrow_body with parser
+        proc add_child with default_node, arrow_body
+        Return default_node
+    End If
+
     proc expect with parser, TOKEN_COLON from Lexer
 
     Note: Default body statements
@@ -2258,7 +2490,7 @@ Process called "parse_default_statement" takes parser as Integer returns Integer
             Break
         End If
 
-        Let stmt be proc parse_statement from parser
+        Let stmt be proc parse_statement with parser
         If stmt is not equal to 0:
             proc add_child with default_node, stmt
         Otherwise:
@@ -2276,17 +2508,17 @@ node's name slot when present; an unlabeled break has no name.
 Process called "parse_break_statement" takes parser as Integer returns Integer:
     Note: Parse break statement
 
-    Let break_node be proc create_ast_node from AST_BREAK_STATEMENT
+    Let break_node be proc create_ast_node with AST_BREAK_STATEMENT
 
     proc expect with parser, TOKEN_BREAK from Lexer
 
     Note: Label (optional)
     Let is_identifier be proc match with parser, TOKEN_IDENTIFIER from Lexer
     If is_identifier is equal to 1:
-        Let label_token be proc current_token from parser
+        Let label_token be proc current_token with parser
         Let label be proc memory_get_int64 from Layout with label_token, 8
         proc set_node_name with break_node, label
-        proc advance from parser
+        proc advance with parser
     End If
 
     proc expect with parser, TOKEN_SEMICOLON from Lexer
@@ -2301,17 +2533,17 @@ handling — label refers to an enclosing labeled-loop in semantic resolution.
 Process called "parse_continue_statement" takes parser as Integer returns Integer:
     Note: Parse continue statement
 
-    Let continue_node be proc create_ast_node from AST_CONTINUE_STATEMENT
+    Let continue_node be proc create_ast_node with AST_CONTINUE_STATEMENT
 
     proc expect with parser, TOKEN_CONTINUE from Lexer
 
     Note: Label (optional)
     Let is_identifier be proc match with parser, TOKEN_IDENTIFIER from Lexer
     If is_identifier is equal to 1:
-        Let label_token be proc current_token from parser
+        Let label_token be proc current_token with parser
         Let label be proc memory_get_int64 from Layout with label_token, 8
         proc set_node_name with continue_node, label
-        proc advance from parser
+        proc advance with parser
     End If
 
     proc expect with parser, TOKEN_SEMICOLON from Lexer
@@ -2333,69 +2565,91 @@ Process called "parse_expression_or_declaration" takes parser as Integer returns
     Note: Variable declaration patterns: Type identifier [= initializer];
     Note: Expression patterns: identifier.method(), identifier[index], etc.
 
-    Note: Save parser state for backtracking
+    Note: Save FULL lexer + parser state for backtracking. The lexer scans on
+    Note: demand (no token buffer), so a rewind must restore the lexer scan
+    Note: position (offset 16) and line/column (24/32) along with the parser's
+    Note: current and previous token slots; restoring the parser slots alone
+    Note: would leave the lexer advanced and corrupt the subsequent re-parse.
+    Let bt_lexer be proc memory_get_int64 from Layout with parser, 0
+    Let saved_scan_pos be proc memory_get_int64 from Layout with bt_lexer, 16
+    Let saved_line be proc memory_get_int64 from Layout with bt_lexer, 24
+    Let saved_column be proc memory_get_int64 from Layout with bt_lexer, 32
     Let saved_position be proc memory_get_int64 from Layout with parser, 8
     Let saved_token be proc memory_get_int64 from Layout with parser, 16
 
-    Let token_type be proc current_token_type from parser
+    Let token_type be proc current_token_type with parser
 
     Note: Check for primitive type keywords indicating declaration
     If token_type is equal to TOKEN_BOOLEAN_TYPE from Lexer:
-        Return proc parse_variable_declaration from parser
+        Return proc parse_variable_declaration with parser
     End If
 
     If token_type is equal to TOKEN_BYTE from Lexer:
-        Return proc parse_variable_declaration from parser
+        Return proc parse_variable_declaration with parser
     End If
 
     If token_type is equal to TOKEN_SHORT from Lexer:
-        Return proc parse_variable_declaration from parser
+        Return proc parse_variable_declaration with parser
     End If
 
     If token_type is equal to TOKEN_INT_TYPE from Lexer:
-        Return proc parse_variable_declaration from parser
+        Return proc parse_variable_declaration with parser
     End If
 
     If token_type is equal to TOKEN_LONG_TYPE from Lexer:
-        Return proc parse_variable_declaration from parser
+        Return proc parse_variable_declaration with parser
     End If
 
     If token_type is equal to TOKEN_FLOAT_TYPE from Lexer:
-        Return proc parse_variable_declaration from parser
+        Return proc parse_variable_declaration with parser
     End If
 
     If token_type is equal to TOKEN_DOUBLE_TYPE from Lexer:
-        Return proc parse_variable_declaration from parser
+        Return proc parse_variable_declaration with parser
     End If
 
     If token_type is equal to TOKEN_CHAR_TYPE from Lexer:
-        Return proc parse_variable_declaration from parser
+        Return proc parse_variable_declaration with parser
     End If
 
-    Note: Check for class type declaration pattern: Identifier identifier [= ...]
+    Note: Reference-type local declaration: 'Type identifier [= ...]'. A leading
+    Note: identifier may begin a reference type whose full spelling can be a dotted
+    Note: qualified name (java.util.List), a generic application
+    Note: (Function<Integer,Integer>, Map<String,List<Integer>>), an array type
+    Note: (String[]), or any combination - none of which a one-token peek can see.
+    Note: We speculatively consume a complete type reference with the shared
+    Note: parse_type_reference production, then test the disambiguator: if an
+    Note: IDENTIFIER (the declared name) follows the type, this is a declaration;
+    Note: anything else means the identifier was the start of an expression (a call,
+    Note: a comparison 'a < b', a field access, an assignment, etc.). The full
+    Note: lexer + parser snapshot taken above is restored before EITHER committed
+    Note: parse so neither path double-consumes the speculatively scanned tokens.
     If token_type is equal to TOKEN_IDENTIFIER from Lexer:
-        Note: Could be class type declaration or expression - need lookahead
-        proc advance from parser  Note: Skip first identifier
-
-        Let next_token be proc current_token_type from parser
-        If next_token is equal to TOKEN_IDENTIFIER from Lexer:
-            Note: Pattern matches: Identifier identifier - likely declaration
-            proc memory_set_int64 from Layout with parser, 8, saved_position
-            proc memory_set_int64 from Layout with parser, 16, saved_token
-            Return proc parse_variable_declaration from parser
-        Otherwise:
-            Note: Pattern is: Identifier <other> - likely expression
-            proc memory_set_int64 from Layout with parser, 8, saved_position
-            proc memory_set_int64 from Layout with parser, 16, saved_token
-            Note: Fall through to parse as expression
+        Let probe_type be proc parse_type_reference with parser
+        Let is_declaration be 0
+        If probe_type is not equal to 0:
+            If proc current_token_type with parser is equal to TOKEN_IDENTIFIER from Lexer:
+                Set is_declaration to 1
+            End If
         End If
+
+        proc memory_set_int64 from Layout with bt_lexer, 16, saved_scan_pos
+        proc memory_set_int64 from Layout with bt_lexer, 24, saved_line
+        proc memory_set_int64 from Layout with bt_lexer, 32, saved_column
+        proc memory_set_int64 from Layout with parser, 8, saved_position
+        proc memory_set_int64 from Layout with parser, 16, saved_token
+
+        If is_declaration is equal to 1:
+            Return proc parse_variable_declaration with parser
+        End If
+        Note: Otherwise fall through to parse as an expression statement.
     End If
 
     Note: Otherwise, parse as expression statement
-    Let expr be proc parse_expression from parser
+    Let expr be proc parse_expression with parser
     proc expect with parser, TOKEN_SEMICOLON from Lexer
 
-    Let expr_stmt be proc create_ast_node from AST_EXPRESSION_STATEMENT
+    Let expr_stmt be proc create_ast_node with AST_EXPRESSION_STATEMENT
     proc add_child with expr_stmt, expr
 
     Return expr_stmt
@@ -2410,21 +2664,21 @@ splitting if they were observed.
 Process called "parse_variable_declaration" takes parser as Integer returns Integer:
     Note: Parse local variable declaration
 
-    Let var_type be proc parse_type_reference from parser
+    Let var_type be proc parse_type_reference with parser
 
-    Let name_token be proc current_token from parser
+    Let name_token be proc current_token with parser
     Let var_name be proc memory_get_int64 from Layout with name_token, 8
 
     proc expect with parser, TOKEN_IDENTIFIER from Lexer
 
-    Let var_node be proc create_ast_node from AST_VARIABLE_DECLARATION
+    Let var_node be proc create_ast_node with AST_VARIABLE_DECLARATION
     proc set_node_name with var_node, var_name
     proc add_child with var_node, var_type
 
     Note: Initializer (optional)
     Let is_assign be proc match_and_advance with parser, TOKEN_ASSIGN from Lexer
     If is_assign is equal to 1:
-        Let initializer be proc parse_expression from parser
+        Let initializer be proc parse_expression with parser
         proc add_child with var_node, initializer
     End If
 
@@ -2445,7 +2699,111 @@ binding strength down to primary expressions.
 Process called "parse_expression" takes parser as Integer returns Integer:
     Note: Parse expression (entry point for expression parsing)
 
-    Return proc parse_ternary_expression from parser
+    Return proc parse_assignment_expression with parser
+End Process
+
+@Reasoning:
+Assignment is Java's lowest-precedence, RIGHT-associative operator family
+(=, +=, -=, *=, /=, %=, &=, |=, ^=, <<=, >>=, >>>=). The left-hand side is
+parsed as a full conditional (ternary) expression - which subsumes the
+postfix/primary forms that can legally be an lvalue (identifier, field access,
+array access). If an assignment operator follows, the right-hand side recurses
+back into parse_assignment_expression to obtain right associativity
+(a = b = c parses as a = (b = c)). The operator token is stored in the node's
+value slot; the lowering maps it to the corresponding HIR operator.
+@End Reasoning
+Process called "parse_assignment_expression" takes parser as Integer returns Integer:
+    Note: Single-identifier lambda form: 'x -> body'. Java's grammar permits an
+    Note: unparenthesized single inferred-type parameter, which is indistinguishable
+    Note: from an ordinary identifier expression until the '->' following it is seen.
+    Note: A one-token save/restore lookahead peeks past the identifier: if the next
+    Note: token is '->', this is a lambda and is parsed directly; otherwise the
+    Note: snapshot is restored and the normal expression path runs unchanged. The
+    Note: parenthesized forms ((x) -> ..., (int a) -> ...) are handled deeper in the
+    Note: primary expression via parse_lambda_or_grouped.
+    Let lead_token_type be proc current_token_type with parser
+    If lead_token_type is equal to TOKEN_IDENTIFIER from Lexer:
+        Let lex be proc memory_get_int64 from Layout with parser, 0
+        Let snap_scan_pos be proc memory_get_int64 from Layout with lex, 16
+        Let snap_line be proc memory_get_int64 from Layout with lex, 24
+        Let snap_column be proc memory_get_int64 from Layout with lex, 32
+        Let snap_current be proc memory_get_int64 from Layout with parser, 8
+        Let snap_previous be proc memory_get_int64 from Layout with parser, 16
+
+        Let id_token be proc current_token with parser
+        Let id_name be proc memory_get_int64 from Layout with id_token, 8
+        proc advance with parser
+        Let after_id be proc current_token_type with parser
+
+        proc memory_set_int64 from Layout with lex, 16, snap_scan_pos
+        proc memory_set_int64 from Layout with lex, 24, snap_line
+        proc memory_set_int64 from Layout with lex, 32, snap_column
+        proc memory_set_int64 from Layout with parser, 8, snap_current
+        proc memory_set_int64 from Layout with parser, 16, snap_previous
+
+        If after_id is equal to TOKEN_ARROW from Lexer:
+            proc advance with parser  Note: Consume the identifier
+            proc expect with parser, TOKEN_ARROW from Lexer
+
+            Let inferred_param be proc create_ast_node with AST_PARAMETER
+            proc set_node_name with inferred_param, id_name
+
+            Let params_container be proc create_ast_node with AST_PARAMETER
+            proc add_child with params_container, inferred_param
+
+            Let lambda_node be proc create_ast_node with AST_LAMBDA_EXPRESSION
+            proc add_child with lambda_node, params_container
+
+            Let lambda_body be proc parse_lambda_body with parser
+            proc add_child with lambda_node, lambda_body
+
+            Return lambda_node
+        End If
+    End If
+
+    Let left be proc parse_ternary_expression with parser
+
+    Let token_type be proc current_token_type with parser
+    Let is_assign be 0
+    If token_type is equal to TOKEN_ASSIGN from Lexer:
+        Set is_assign to 1
+    Otherwise If token_type is equal to TOKEN_PLUSASSIGN from Lexer:
+        Set is_assign to 1
+    Otherwise If token_type is equal to TOKEN_MINUSASSIGN from Lexer:
+        Set is_assign to 1
+    Otherwise If token_type is equal to TOKEN_STARASSIGN from Lexer:
+        Set is_assign to 1
+    Otherwise If token_type is equal to TOKEN_SLASHASSIGN from Lexer:
+        Set is_assign to 1
+    Otherwise If token_type is equal to TOKEN_MODASSIGN from Lexer:
+        Set is_assign to 1
+    Otherwise If token_type is equal to TOKEN_BITANDASSIGN from Lexer:
+        Set is_assign to 1
+    Otherwise If token_type is equal to TOKEN_BITORASSIGN from Lexer:
+        Set is_assign to 1
+    Otherwise If token_type is equal to TOKEN_BITXORASSIGN from Lexer:
+        Set is_assign to 1
+    Otherwise If token_type is equal to TOKEN_LSHIFTASSIGN from Lexer:
+        Set is_assign to 1
+    Otherwise If token_type is equal to TOKEN_RSHIFTASSIGN from Lexer:
+        Set is_assign to 1
+    Otherwise If token_type is equal to TOKEN_URSHIFTASSIGN from Lexer:
+        Set is_assign to 1
+    End If
+
+    If is_assign is equal to 0:
+        Return left
+    End If
+
+    proc advance with parser
+    Let right be proc parse_assignment_expression with parser
+
+    Let assign_node be proc create_ast_node with AST_ASSIGNMENT_EXPRESSION
+    proc set_node_value with assign_node, token_type
+    proc add_child with assign_node, left
+    proc add_child with assign_node, right
+
+    Return assign_node
 End Process
 
 @Reasoning:
@@ -2456,19 +2814,19 @@ nested ternaries chain correctly (a ? b : c ? d : e parses as a ? b : (c ? d : e
 Process called "parse_ternary_expression" takes parser as Integer returns Integer:
     Note: Parse ternary conditional expression (? :)
 
-    Let expr be proc parse_logical_or_expression from parser
+    Let expr be proc parse_logical_or_expression with parser
 
     Let is_question be proc match_and_advance with parser, TOKEN_QUESTION from Lexer
     If is_question is equal to 1:
-        Let ternary_node be proc create_ast_node from AST_TERNARY_EXPRESSION
+        Let ternary_node be proc create_ast_node with AST_TERNARY_EXPRESSION
         proc add_child with ternary_node, expr
 
-        Let then_expr be proc parse_expression from parser
+        Let then_expr be proc parse_expression with parser
         proc add_child with ternary_node, then_expr
 
         proc expect with parser, TOKEN_COLON from Lexer
 
-        Let else_expr be proc parse_expression from parser
+        Let else_expr be proc parse_expression with parser
         proc add_child with ternary_node, else_expr
 
         Return ternary_node
@@ -2485,7 +2843,7 @@ node's value slot for later codegen / type-check dispatch.
 Process called "parse_logical_or_expression" takes parser as Integer returns Integer:
     Note: Parse logical OR expression (||)
 
-    Let left be proc parse_logical_and_expression from parser
+    Let left be proc parse_logical_and_expression with parser
 
     While 1 is equal to 1:
         Let is_or be proc match_and_advance with parser, TOKEN_OR from Lexer
@@ -2493,9 +2851,9 @@ Process called "parse_logical_or_expression" takes parser as Integer returns Int
             Break
         End If
 
-        Let right be proc parse_logical_and_expression from parser
+        Let right be proc parse_logical_and_expression with parser
 
-        Let binary_node be proc create_ast_node from AST_BINARY_EXPRESSION
+        Let binary_node be proc create_ast_node with AST_BINARY_EXPRESSION
         proc set_node_value with binary_node, TOKEN_OR from Lexer
         proc add_child with binary_node, left
         proc add_child with binary_node, right
@@ -2514,7 +2872,7 @@ is invoked from inside the || tier's operand parse.
 Process called "parse_logical_and_expression" takes parser as Integer returns Integer:
     Note: Parse logical AND expression (&&)
 
-    Let left be proc parse_bitwise_or_expression from parser
+    Let left be proc parse_bitwise_or_expression with parser
 
     While 1 is equal to 1:
         Let is_and be proc match_and_advance with parser, TOKEN_AND from Lexer
@@ -2522,9 +2880,9 @@ Process called "parse_logical_and_expression" takes parser as Integer returns In
             Break
         End If
 
-        Let right be proc parse_bitwise_or_expression from parser
+        Let right be proc parse_bitwise_or_expression with parser
 
-        Let binary_node be proc create_ast_node from AST_BINARY_EXPRESSION
+        Let binary_node be proc create_ast_node with AST_BINARY_EXPRESSION
         proc set_node_value with binary_node, TOKEN_AND from Lexer
         proc add_child with binary_node, left
         proc add_child with binary_node, right
@@ -2543,7 +2901,7 @@ the short-circuit '||' is a distinct token handled at the logical OR tier.
 Process called "parse_bitwise_or_expression" takes parser as Integer returns Integer:
     Note: Parse bitwise OR expression (|)
 
-    Let left be proc parse_bitwise_xor_expression from parser
+    Let left be proc parse_bitwise_xor_expression with parser
 
     While 1 is equal to 1:
         Let is_or be proc match_and_advance with parser, TOKEN_BITOR from Lexer
@@ -2551,9 +2909,9 @@ Process called "parse_bitwise_or_expression" takes parser as Integer returns Int
             Break
         End If
 
-        Let right be proc parse_bitwise_xor_expression from parser
+        Let right be proc parse_bitwise_xor_expression with parser
 
-        Let binary_node be proc create_ast_node from AST_BINARY_EXPRESSION
+        Let binary_node be proc create_ast_node with AST_BINARY_EXPRESSION
         proc set_node_value with binary_node, TOKEN_BITOR from Lexer
         proc add_child with binary_node, left
         proc add_child with binary_node, right
@@ -2571,7 +2929,7 @@ bitwise AND per Java precedence.
 Process called "parse_bitwise_xor_expression" takes parser as Integer returns Integer:
     Note: Parse bitwise XOR expression (^)
 
-    Let left be proc parse_bitwise_and_expression from parser
+    Let left be proc parse_bitwise_and_expression with parser
 
     While 1 is equal to 1:
         Let is_xor be proc match_and_advance with parser, TOKEN_BITXOR from Lexer
@@ -2579,9 +2937,9 @@ Process called "parse_bitwise_xor_expression" takes parser as Integer returns In
             Break
         End If
 
-        Let right be proc parse_bitwise_and_expression from parser
+        Let right be proc parse_bitwise_and_expression with parser
 
-        Let binary_node be proc create_ast_node from AST_BINARY_EXPRESSION
+        Let binary_node be proc create_ast_node with AST_BINARY_EXPRESSION
         proc set_node_value with binary_node, TOKEN_BITXOR from Lexer
         proc add_child with binary_node, left
         proc add_child with binary_node, right
@@ -2600,7 +2958,7 @@ short-circuit token.
 Process called "parse_bitwise_and_expression" takes parser as Integer returns Integer:
     Note: Parse bitwise AND expression (&)
 
-    Let left be proc parse_equality_expression from parser
+    Let left be proc parse_equality_expression with parser
 
     While 1 is equal to 1:
         Let is_and be proc match_and_advance with parser, TOKEN_BITAND from Lexer
@@ -2608,9 +2966,9 @@ Process called "parse_bitwise_and_expression" takes parser as Integer returns In
             Break
         End If
 
-        Let right be proc parse_equality_expression from parser
+        Let right be proc parse_equality_expression with parser
 
-        Let binary_node be proc create_ast_node from AST_BINARY_EXPRESSION
+        Let binary_node be proc create_ast_node with AST_BINARY_EXPRESSION
         proc set_node_value with binary_node, TOKEN_BITAND from Lexer
         proc add_child with binary_node, left
         proc add_child with binary_node, right
@@ -2628,10 +2986,10 @@ than bitwise but looser than relational operators per Java precedence.
 Process called "parse_equality_expression" takes parser as Integer returns Integer:
     Note: Parse equality expression (== !=)
 
-    Let left be proc parse_relational_expression from parser
+    Let left be proc parse_relational_expression with parser
 
     While 1 is equal to 1:
-        Let token_type be proc current_token_type from parser
+        Let token_type be proc current_token_type with parser
         Let is_eq be 0
 
         If token_type is equal to TOKEN_EQUAL from Lexer:
@@ -2645,11 +3003,11 @@ Process called "parse_equality_expression" takes parser as Integer returns Integ
         End If
 
         Let op_type be token_type
-        proc advance from parser
+        proc advance with parser
 
-        Let right be proc parse_relational_expression from parser
+        Let right be proc parse_relational_expression with parser
 
-        Let binary_node be proc create_ast_node from AST_BINARY_EXPRESSION
+        Let binary_node be proc create_ast_node with AST_BINARY_EXPRESSION
         proc set_node_value with binary_node, op_type
         proc add_child with binary_node, left
         proc add_child with binary_node, right
@@ -2668,10 +3026,10 @@ expression, but typed-uniformly here — semantic analysis disambiguates).
 Process called "parse_relational_expression" takes parser as Integer returns Integer:
     Note: Parse relational expression (< <= > >= instanceof)
 
-    Let left be proc parse_shift_expression from parser
+    Let left be proc parse_shift_expression with parser
 
     While 1 is equal to 1:
-        Let token_type be proc current_token_type from parser
+        Let token_type be proc current_token_type with parser
         Let is_rel be 0
 
         If token_type is equal to TOKEN_LT from Lexer:
@@ -2691,11 +3049,11 @@ Process called "parse_relational_expression" takes parser as Integer returns Int
         End If
 
         Let op_type be token_type
-        proc advance from parser
+        proc advance with parser
 
-        Let right be proc parse_shift_expression from parser
+        Let right be proc parse_shift_expression with parser
 
-        Let binary_node be proc create_ast_node from AST_BINARY_EXPRESSION
+        Let binary_node be proc create_ast_node with AST_BINARY_EXPRESSION
         proc set_node_value with binary_node, op_type
         proc add_child with binary_node, left
         proc add_child with binary_node, right
@@ -2713,10 +3071,10 @@ a separate Java token and is treated as a peer operator here.
 Process called "parse_shift_expression" takes parser as Integer returns Integer:
     Note: Parse shift expression (<< shifted right by >>>)
 
-    Let left be proc parse_additive_expression from parser
+    Let left be proc parse_additive_expression with parser
 
     While 1 is equal to 1:
-        Let token_type be proc current_token_type from parser
+        Let token_type be proc current_token_type with parser
         Let is_shift be 0
 
         If token_type is equal to TOKEN_LSHIFT from Lexer:
@@ -2732,11 +3090,11 @@ Process called "parse_shift_expression" takes parser as Integer returns Integer:
         End If
 
         Let op_type be token_type
-        proc advance from parser
+        proc advance with parser
 
-        Let right be proc parse_additive_expression from parser
+        Let right be proc parse_additive_expression with parser
 
-        Let binary_node be proc create_ast_node from AST_BINARY_EXPRESSION
+        Let binary_node be proc create_ast_node with AST_BINARY_EXPRESSION
         proc set_node_value with binary_node, op_type
         proc add_child with binary_node, left
         proc add_child with binary_node, right
@@ -2755,10 +3113,10 @@ here.
 Process called "parse_additive_expression" takes parser as Integer returns Integer:
     Note: Parse additive expression (+ -)
 
-    Let left be proc parse_multiplicative_expression from parser
+    Let left be proc parse_multiplicative_expression with parser
 
     While 1 is equal to 1:
-        Let token_type be proc current_token_type from parser
+        Let token_type be proc current_token_type with parser
         Let is_add be 0
 
         If token_type is equal to TOKEN_PLUS from Lexer:
@@ -2772,11 +3130,11 @@ Process called "parse_additive_expression" takes parser as Integer returns Integ
         End If
 
         Let op_type be token_type
-        proc advance from parser
+        proc advance with parser
 
-        Let right be proc parse_multiplicative_expression from parser
+        Let right be proc parse_multiplicative_expression with parser
 
-        Let binary_node be proc create_ast_node from AST_BINARY_EXPRESSION
+        Let binary_node be proc create_ast_node with AST_BINARY_EXPRESSION
         proc set_node_value with binary_node, op_type
         proc add_child with binary_node, left
         proc add_child with binary_node, right
@@ -2794,10 +3152,10 @@ before unary operators take over.
 Process called "parse_multiplicative_expression" takes parser as Integer returns Integer:
     Note: Parse multiplicative expression (* / %)
 
-    Let left be proc parse_unary_expression from parser
+    Let left be proc parse_unary_expression with parser
 
     While 1 is equal to 1:
-        Let token_type be proc current_token_type from parser
+        Let token_type be proc current_token_type with parser
         Let is_mul be 0
 
         If token_type is equal to TOKEN_STAR from Lexer:
@@ -2813,11 +3171,11 @@ Process called "parse_multiplicative_expression" takes parser as Integer returns
         End If
 
         Let op_type be token_type
-        proc advance from parser
+        proc advance with parser
 
-        Let right be proc parse_unary_expression from parser
+        Let right be proc parse_unary_expression with parser
 
-        Let binary_node be proc create_ast_node from AST_BINARY_EXPRESSION
+        Let binary_node be proc create_ast_node with AST_BINARY_EXPRESSION
         proc set_node_value with binary_node, op_type
         proc add_child with binary_node, left
         proc add_child with binary_node, right
@@ -2837,57 +3195,57 @@ operator token is stored in the unary node's value slot for codegen.
 Process called "parse_unary_expression" takes parser as Integer returns Integer:
     Note: Parse unary expression (++ -- + - ! ~)
 
-    Let token_type be proc current_token_type from parser
+    Let token_type be proc current_token_type with parser
 
     If token_type is equal to TOKEN_INC from Lexer:
-        proc advance from parser
-        Let operand be proc parse_unary_expression from parser
-        Let unary_node be proc create_ast_node from AST_UNARY_EXPRESSION
+        proc advance with parser
+        Let operand be proc parse_unary_expression with parser
+        Let unary_node be proc create_ast_node with AST_UNARY_EXPRESSION
         proc set_node_value with unary_node, TOKEN_INC from Lexer
         proc add_child with unary_node, operand
         Return unary_node
     End If
 
     If token_type is equal to TOKEN_DEC from Lexer:
-        proc advance from parser
-        Set operand to proc parse_unary_expression from parser
-        Set unary_node to proc create_ast_node from AST_UNARY_EXPRESSION
+        proc advance with parser
+        Set operand to proc parse_unary_expression with parser
+        Set unary_node to proc create_ast_node with AST_UNARY_EXPRESSION
         proc set_node_value with unary_node, TOKEN_DEC from Lexer
         proc add_child with unary_node, operand
         Return unary_node
     End If
 
     If token_type is equal to TOKEN_PLUS from Lexer:
-        proc advance from parser
-        Set operand to proc parse_unary_expression from parser
-        Set unary_node to proc create_ast_node from AST_UNARY_EXPRESSION
+        proc advance with parser
+        Set operand to proc parse_unary_expression with parser
+        Set unary_node to proc create_ast_node with AST_UNARY_EXPRESSION
         proc set_node_value with unary_node, TOKEN_PLUS from Lexer
         proc add_child with unary_node, operand
         Return unary_node
     End If
 
     If token_type is equal to TOKEN_MINUS from Lexer:
-        proc advance from parser
-        Set operand to proc parse_unary_expression from parser
-        Set unary_node to proc create_ast_node from AST_UNARY_EXPRESSION
+        proc advance with parser
+        Set operand to proc parse_unary_expression with parser
+        Set unary_node to proc create_ast_node with AST_UNARY_EXPRESSION
         proc set_node_value with unary_node, TOKEN_MINUS from Lexer
         proc add_child with unary_node, operand
         Return unary_node
     End If
 
     If token_type is equal to TOKEN_NOT from Lexer:
-        proc advance from parser
-        Set operand to proc parse_unary_expression from parser
-        Set unary_node to proc create_ast_node from AST_UNARY_EXPRESSION
+        proc advance with parser
+        Set operand to proc parse_unary_expression with parser
+        Set unary_node to proc create_ast_node with AST_UNARY_EXPRESSION
         proc set_node_value with unary_node, TOKEN_NOT from Lexer
         proc add_child with unary_node, operand
         Return unary_node
     End If
 
     If token_type is equal to TOKEN_TILDE from Lexer:
-        proc advance from parser
-        Set operand to proc parse_unary_expression from parser
-        Set unary_node to proc create_ast_node from AST_UNARY_EXPRESSION
+        proc advance with parser
+        Set operand to proc parse_unary_expression with parser
+        Set unary_node to proc create_ast_node with AST_UNARY_EXPRESSION
         proc set_node_value with unary_node, TOKEN_TILDE from Lexer
         proc add_child with unary_node, operand
         Return unary_node
@@ -2897,10 +3255,10 @@ Process called "parse_unary_expression" takes parser as Integer returns Integer:
     If token_type is equal to TOKEN_LPAREN from Lexer:
         Note: Could be cast or grouped expression - requires lookahead
         Note: : try to parse as cast, fallback to grouped expression
-        Return proc parse_cast_or_grouped from parser
+        Return proc parse_cast_or_grouped with parser
     End If
 
-    Return proc parse_postfix_expression from parser
+    Return proc parse_postfix_expression with parser
 End Process
 
 @Reasoning:
@@ -2912,58 +3270,213 @@ heuristic is intentionally conservative — more elaborate cast targets
 semantics by later passes if the operand is unary.
 @End Reasoning
 Process called "parse_cast_or_grouped" takes parser as Integer returns Integer:
-    Note: Parse cast expression or grouped expression
+    Note: Parse a '('-led expression: lambda, cast, or grouped expression.
+    Note: Lambda:  (params) -> body       e.g. () -> 5, (x) -> x + 1, (int a) -> a
+    Note: Cast:    (Type) operand          e.g. (int) x, (List<String>) o, (Foo[]) a
+    Note: Grouped: (expression)            e.g. (a + b)
+    Note: A lambda is detected first by scanning to the matching ')' and peeking
+    Note: for '->'; if found, the full lambda parser handles it. This unifies the
+    Note: three '('-forms behind one entry so unary-position parens resolve
+    Note: correctly (the cast/grouped distinction alone cannot see the '->').
 
-    Note: implementation - production parser needs better lookahead
+    Let lexer be proc memory_get_int64 from Layout with parser, 0
+    Let probe_scan_pos be proc memory_get_int64 from Layout with lexer, 16
+    Let probe_line be proc memory_get_int64 from Layout with lexer, 24
+    Let probe_column be proc memory_get_int64 from Layout with lexer, 32
+    Let probe_current be proc memory_get_int64 from Layout with parser, 8
+    Let probe_previous be proc memory_get_int64 from Layout with parser, 16
+
+    proc expect with parser, TOKEN_LPAREN from Lexer
+    Let probe_depth be 1
+    Let probe_scanning be 1
+    Let probe_count be 0
+    While probe_scanning is equal to 1:
+        Let probe_tok be proc current_token_type with parser
+        If probe_tok is equal to TOKEN_EOF from Lexer:
+            Set probe_scanning to 0
+        Otherwise If probe_tok is equal to TOKEN_LPAREN from Lexer:
+            Set probe_depth to probe_depth plus 1
+            proc advance with parser
+        Otherwise If probe_tok is equal to TOKEN_RPAREN from Lexer:
+            Set probe_depth to probe_depth minus 1
+            proc advance with parser
+            If probe_depth is equal to 0:
+                Set probe_scanning to 0
+            End If
+        Otherwise:
+            proc advance with parser
+        End If
+        Set probe_count to probe_count plus 1
+        If probe_count is greater than 4096:
+            Set probe_scanning to 0
+        End If
+    End While
+
+    Let probe_is_lambda be 0
+    If probe_depth is equal to 0:
+        If proc current_token_type with parser is equal to TOKEN_ARROW from Lexer:
+            Set probe_is_lambda to 1
+        End If
+    End If
+
+    Note: Restore the snapshot before committing to a concrete parse.
+    proc memory_set_int64 from Layout with lexer, 16, probe_scan_pos
+    proc memory_set_int64 from Layout with lexer, 24, probe_line
+    proc memory_set_int64 from Layout with lexer, 32, probe_column
+    proc memory_set_int64 from Layout with parser, 8, probe_current
+    proc memory_set_int64 from Layout with parser, 16, probe_previous
+
+    If probe_is_lambda is equal to 1:
+        Return proc parse_lambda_or_grouped with parser
+    End If
 
     proc expect with parser, TOKEN_LPAREN from Lexer
 
-    Note: Check if this is a cast or grouped expression
-    Note: Cast: (Type) expression
-    Note: Grouped: (expression)
+    Note: Full lexer + parser state snapshot so the type probe can be undone.
+    Let saved_scan_pos be proc memory_get_int64 from Layout with lexer, 16
+    Let saved_line be proc memory_get_int64 from Layout with lexer, 24
+    Let saved_column be proc memory_get_int64 from Layout with lexer, 32
+    Let saved_current be proc memory_get_int64 from Layout with parser, 8
+    Let saved_previous be proc memory_get_int64 from Layout with parser, 16
 
-    Note: Peek ahead to determine if this looks like a type
+    Let lead_type be proc current_token_type with parser
+    Let is_primitive be proc is_primitive_type_token with parser, lead_type
+
+    Note: Speculatively consume a type reference, then test the disambiguation.
+    Let type_node be proc parse_type_reference with parser
     Let is_cast be 0
 
-    Note: Try to parse as type
-    Let type_token be proc current_token from parser
-    Let type_token_type be proc current_token_type from parser
-
-    Note: Save parser state for backtracking via token stream position
-    Let saved_current_token be proc memory_get_int64 from Layout with parser, 8
-    Let saved_previous_token be proc memory_get_int64 from Layout with parser, 16
-
-    Note: If next token is a type keyword or identifier followed by ), likely a cast
-    If type_token_type is equal to TOKEN_IDENTIFIER from Lexer:
-        proc advance from parser
-
-        Let next_type be proc current_token_type from parser
-        If next_type is equal to TOKEN_RPAREN from Lexer:
-            Note: Pattern matches (Type) - this is a cast
-            Set is_cast to 1
+    If type_node is not equal to 0:
+        Let after_type be proc current_token_type with parser
+        If after_type is equal to TOKEN_RPAREN from Lexer:
+            proc advance with parser
+            Let after_paren be proc current_token_type with parser
+            If is_primitive is equal to 1:
+                Note: (primitive) is always a cast; the operand follows.
+                Set is_cast to 1
+            Otherwise:
+                Note: For reference types, treat as a cast only when the next
+                Note: token can begin a unary operand. This rejects (a) * b
+                Note: (grouped) while accepting (Foo) bar, (Foo) (x), (Foo) !b.
+                Set is_cast to proc token_starts_cast_operand with parser, after_paren
+            End If
         End If
-
-        Note: Restore token stream state
-        proc memory_set_int64 from Layout with parser, 8, saved_current_token
-        proc memory_set_int64 from Layout with parser, 16, saved_previous_token
     End If
 
-    If is_cast is equal to 1:
-        Note: Parse as cast expression
-        Let target_type be proc parse_type from parser
-        proc expect with parser, TOKEN_RPAREN from Lexer
-        Let value_expr be proc parse_unary_expression from parser
+    Note: Restore the snapshot; both branches re-parse from a clean position.
+    proc memory_set_int64 from Layout with lexer, 16, saved_scan_pos
+    proc memory_set_int64 from Layout with lexer, 24, saved_line
+    proc memory_set_int64 from Layout with lexer, 32, saved_column
+    proc memory_set_int64 from Layout with parser, 8, saved_current
+    proc memory_set_int64 from Layout with parser, 16, saved_previous
 
-        Let cast_node be proc create_ast_node from AST_CAST
+    If is_cast is equal to 1:
+        Let target_type be proc parse_type_reference with parser
+        proc expect with parser, TOKEN_RPAREN from Lexer
+        Let value_expr be proc parse_unary_expression with parser
+
+        Let cast_node be proc create_ast_node with AST_CAST_EXPRESSION
         proc add_child with cast_node, target_type
         proc add_child with cast_node, value_expr
         Return cast_node
     Otherwise:
-        Note: Parse as grouped expression
-        Let inner be proc parse_expression from parser
+        Let inner be proc parse_expression with parser
         proc expect with parser, TOKEN_RPAREN from Lexer
         Return inner
     End If
+End Process
+
+@Reasoning:
+Returns 1 if token_type is one of Java's eight primitive type keywords (or
+'void', which appears only in method/type position). A parenthesized
+primitive type is unambiguously a cast, so the cast disambiguator uses this
+to short-circuit the operand-lookahead heuristic.
+@End Reasoning
+Process called "is_primitive_type_token" takes parser as Integer, token_type as Integer returns Integer:
+    If token_type is equal to TOKEN_BOOLEAN_TYPE from Lexer:
+        Return 1
+    End If
+    If token_type is equal to TOKEN_BYTE from Lexer:
+        Return 1
+    End If
+    If token_type is equal to TOKEN_SHORT from Lexer:
+        Return 1
+    End If
+    If token_type is equal to TOKEN_INT_TYPE from Lexer:
+        Return 1
+    End If
+    If token_type is equal to TOKEN_LONG_TYPE from Lexer:
+        Return 1
+    End If
+    If token_type is equal to TOKEN_FLOAT_TYPE from Lexer:
+        Return 1
+    End If
+    If token_type is equal to TOKEN_DOUBLE_TYPE from Lexer:
+        Return 1
+    End If
+    If token_type is equal to TOKEN_CHAR_TYPE from Lexer:
+        Return 1
+    End If
+    Return 0
+End Process
+
+@Reasoning:
+After a reference-type cast's closing ')', the next token disambiguates a
+cast from a grouped expression. A cast operand begins with a primary-token
+(identifier, literal, 'this'/'super'/'new'), an opening parenthesis, or a
+prefix operator that is unambiguously unary in this position ('!', '~').
+Binary-only operators (+, -, *, /) after ')' indicate a grouped expression
+(e.g. (a) + b), so they return 0. '+' and '-' are deliberately excluded
+because their post-paren meaning is ambiguous and Java resolves (x) - y as
+subtraction, not a cast of -y.
+@End Reasoning
+Process called "token_starts_cast_operand" takes parser as Integer, token_type as Integer returns Integer:
+    If token_type is equal to TOKEN_IDENTIFIER from Lexer:
+        Return 1
+    End If
+    If token_type is equal to TOKEN_INT from Lexer:
+        Return 1
+    End If
+    If token_type is equal to TOKEN_LONG from Lexer:
+        Return 1
+    End If
+    If token_type is equal to TOKEN_FLOAT from Lexer:
+        Return 1
+    End If
+    If token_type is equal to TOKEN_DOUBLE from Lexer:
+        Return 1
+    End If
+    If token_type is equal to TOKEN_STRING from Lexer:
+        Return 1
+    End If
+    If token_type is equal to TOKEN_CHAR from Lexer:
+        Return 1
+    End If
+    If token_type is equal to TOKEN_BOOLEAN from Lexer:
+        Return 1
+    End If
+    If token_type is equal to TOKEN_NULL from Lexer:
+        Return 1
+    End If
+    If token_type is equal to TOKEN_THIS from Lexer:
+        Return 1
+    End If
+    If token_type is equal to TOKEN_SUPER from Lexer:
+        Return 1
+    End If
+    If token_type is equal to TOKEN_NEW from Lexer:
+        Return 1
+    End If
+    If token_type is equal to TOKEN_LPAREN from Lexer:
+        Return 1
+    End If
+    If token_type is equal to TOKEN_NOT from Lexer:
+        Return 1
+    End If
+    If token_type is equal to TOKEN_TILDE from Lexer:
+        Return 1
+    End If
+    Return 0
 End Process
 
 @Reasoning:
@@ -2975,18 +3488,18 @@ node so a chain like obj.field.method()[0] builds left-to-right.
 Process called "parse_postfix_expression" takes parser as Integer returns Integer:
     Note: Parse postfix expression (primary followed by postfix operators)
 
-    Let expr be proc parse_primary_expression from parser
+    Let expr be proc parse_primary_expression with parser
 
     While 1 is equal to 1:
-        Let token_type be proc current_token_type from parser
+        Let token_type be proc current_token_type with parser
 
         If token_type is equal to TOKEN_DOT from Lexer:
-            proc advance from parser
-            Let member_token be proc current_token from parser
+            proc advance with parser
+            Let member_token be proc current_token with parser
             Let member_name be proc memory_get_int64 from Layout with member_token, 8
             proc expect with parser, TOKEN_IDENTIFIER from Lexer
 
-            Let member_node be proc create_ast_node from AST_MEMBER_ACCESS
+            Let member_node be proc create_ast_node with AST_MEMBER_ACCESS
             proc set_node_name with member_node, member_name
             proc add_child with member_node, expr
             Set expr to member_node
@@ -2994,11 +3507,11 @@ Process called "parse_postfix_expression" takes parser as Integer returns Intege
         End If
 
         If token_type is equal to TOKEN_LBRACKET from Lexer:
-            proc advance from parser
-            Let index be proc parse_expression from parser
+            proc advance with parser
+            Let index be proc parse_expression with parser
             proc expect with parser, TOKEN_RBRACKET from Lexer
 
-            Let array_node be proc create_ast_node from AST_ARRAY_ACCESS
+            Let array_node be proc create_ast_node with AST_ARRAY_ACCESS
             proc add_child with array_node, expr
             proc add_child with array_node, index
             Set expr to array_node
@@ -3006,11 +3519,11 @@ Process called "parse_postfix_expression" takes parser as Integer returns Intege
         End If
 
         If token_type is equal to TOKEN_LPAREN from Lexer:
-            proc advance from parser
-            Let args be proc parse_argument_list from parser
+            proc advance with parser
+            Let args be proc parse_argument_list with parser
             proc expect with parser, TOKEN_RPAREN from Lexer
 
-            Let call_node be proc create_ast_node from AST_CALL_EXPRESSION
+            Let call_node be proc create_ast_node with AST_CALL_EXPRESSION
             proc add_child with call_node, expr
             proc add_child with call_node, args
             Set expr to call_node
@@ -3018,8 +3531,8 @@ Process called "parse_postfix_expression" takes parser as Integer returns Intege
         End If
 
         If token_type is equal to TOKEN_INC from Lexer:
-            proc advance from parser
-            Let unary_node be proc create_ast_node from AST_UNARY_EXPRESSION
+            proc advance with parser
+            Let unary_node be proc create_ast_node with AST_UNARY_EXPRESSION
             proc set_node_value with unary_node, TOKEN_INC from Lexer
             proc add_child with unary_node, expr
             Set expr to unary_node
@@ -3027,8 +3540,8 @@ Process called "parse_postfix_expression" takes parser as Integer returns Intege
         End If
 
         If token_type is equal to TOKEN_DEC from Lexer:
-            proc advance from parser
-            Set unary_node to proc create_ast_node from AST_UNARY_EXPRESSION
+            proc advance with parser
+            Set unary_node to proc create_ast_node with AST_UNARY_EXPRESSION
             proc set_node_value with unary_node, TOKEN_DEC from Lexer
             proc add_child with unary_node, expr
             Set expr to unary_node
@@ -3036,12 +3549,12 @@ Process called "parse_postfix_expression" takes parser as Integer returns Intege
         End If
 
         If token_type is equal to TOKEN_COLONCOLON from Lexer:
-            proc advance from parser
-            Let method_name_token be proc current_token from parser
+            proc advance with parser
+            Let method_name_token be proc current_token with parser
             Let method_name be proc memory_get_int64 from Layout with method_name_token, 8
             proc expect with parser, TOKEN_IDENTIFIER from Lexer
 
-            Let method_ref_node be proc create_ast_node from AST_METHOD_REFERENCE
+            Let method_ref_node be proc create_ast_node with AST_METHOD_REFERENCE
             proc set_node_name with method_ref_node, method_name
             proc add_child with method_ref_node, expr
             Set expr to method_ref_node
@@ -3063,79 +3576,79 @@ distinguish (params) -> body from a regular parenthesized expression.
 Process called "parse_primary_expression" takes parser as Integer returns Integer:
     Note: Parse primary expression (literals, identifiers, this, super, new, lambda)
 
-    Let token_type be proc current_token_type from parser
+    Let token_type be proc current_token_type with parser
 
     Note: Literals
     If token_type is equal to TOKEN_INT from Lexer:
-        Return proc parse_literal from parser
+        Return proc parse_literal with parser
     End If
 
     If token_type is equal to TOKEN_LONG from Lexer:
-        Return proc parse_literal from parser
+        Return proc parse_literal with parser
     End If
 
     If token_type is equal to TOKEN_FLOAT from Lexer:
-        Return proc parse_literal from parser
+        Return proc parse_literal with parser
     End If
 
     If token_type is equal to TOKEN_DOUBLE from Lexer:
-        Return proc parse_literal from parser
+        Return proc parse_literal with parser
     End If
 
     If token_type is equal to TOKEN_STRING from Lexer:
-        Return proc parse_literal from parser
+        Return proc parse_literal with parser
     End If
 
     If token_type is equal to TOKEN_CHAR from Lexer:
-        Return proc parse_literal from parser
+        Return proc parse_literal with parser
     End If
 
     If token_type is equal to TOKEN_BOOLEAN from Lexer:
-        Return proc parse_literal from parser
+        Return proc parse_literal with parser
     End If
 
     If token_type is equal to TOKEN_NULL from Lexer:
-        Return proc parse_literal from parser
+        Return proc parse_literal with parser
     End If
 
     Note: This keyword
     If token_type is equal to TOKEN_THIS from Lexer:
-        Let this_node be proc create_ast_node from AST_IDENTIFIER
-        Let token be proc current_token from parser
+        Let this_node be proc create_ast_node with AST_IDENTIFIER
+        Let token be proc current_token with parser
         proc set_node_token with this_node, token
-        proc advance from parser
+        proc advance with parser
         Return this_node
     End If
 
     Note: Super keyword
     If token_type is equal to TOKEN_SUPER from Lexer:
-        Let super_node be proc create_ast_node from AST_IDENTIFIER
-        Set token to proc current_token from parser
+        Let super_node be proc create_ast_node with AST_IDENTIFIER
+        Set token to proc current_token with parser
         proc set_node_token with super_node, token
-        proc advance from parser
+        proc advance with parser
         Return super_node
     End If
 
     Note: New expression
     If token_type is equal to TOKEN_NEW from Lexer:
-        Return proc parse_new_expression from parser
+        Return proc parse_new_expression with parser
     End If
 
     Note: Identifier (could be start of lambda)
     If token_type is equal to TOKEN_IDENTIFIER from Lexer:
-        Let id_node be proc create_ast_node from AST_IDENTIFIER
-        Set token to proc current_token from parser
+        Let id_node be proc create_ast_node with AST_IDENTIFIER
+        Set token to proc current_token with parser
         proc set_node_token with id_node, token
         Let name be proc memory_get_int64 from Layout with token, 8
         proc set_node_name with id_node, name
-        proc advance from parser
+        proc advance with parser
         Return id_node
     End If
 
     Note: Parenthesized expression or lambda
     If token_type is equal to TOKEN_LPAREN from Lexer:
         Note: Could be grouped expression or lambda parameters
-        Return proc parse_lambda_or_grouped from parser
+        Return proc parse_lambda_or_grouped with parser
     End If
 
     Note: Error: unexpected token
@@ -3151,38 +3664,113 @@ the literal.
 Process called "parse_literal" takes parser as Integer returns Integer:
     Note: Parse literal value
 
-    Let literal_node be proc create_ast_node from AST_LITERAL
+    Let literal_node be proc create_ast_node with AST_LITERAL
 
-    Let token be proc current_token from parser
+    Let token be proc current_token with parser
     proc set_node_token with literal_node, token
 
     Let value be proc memory_get_int64 from Layout with token, 8
     proc set_node_value with literal_node, value
 
-    proc advance from parser
+    proc advance with parser
 
     Return literal_node
 End Process
 
 @Reasoning:
-Grammar: 'new' Type '(' ArgumentList ')' [ClassBody]. The optional class
-body is the anonymous-subclass form (new Runnable() { public void run() {}}).
-Array allocations (new int[5]) follow a distinct grammar and are handled
-elsewhere.
+Parses a 'new' base type WITHOUT consuming any trailing array brackets. The
+plain parse_type_reference greedily absorbs '[]' as an array-type marker, which
+is correct for declarations but wrong after 'new' where '[' opens a dimension
+expression ('new int[5]'). This variant builds the AST_TYPE_REFERENCE for a
+primitive keyword or a qualified reference name with optional generic arguments
+and stops at the first '[' or '(' so the caller can decide array-creation vs
+object-creation.
+@End Reasoning
+Process called "parse_new_base_type" takes parser as Integer returns Integer:
+    Let token_type be proc current_token_type with parser
+
+    Let is_primitive be proc is_primitive_type_token with parser, token_type
+    If is_primitive is equal to 1:
+        Let prim_node be proc create_ast_node with AST_TYPE_REFERENCE
+        Let prim_token be proc current_token with parser
+        proc set_node_token with prim_node, prim_token
+        proc advance with parser
+        Return prim_node
+    End If
+
+    Let qualified_name be proc parse_qualified_name with parser
+    Let type_node be proc create_ast_node with AST_TYPE_REFERENCE
+    proc set_node_name with type_node, qualified_name
+
+    Let is_lt be proc match with parser, TOKEN_LT from Lexer
+    If is_lt is equal to 1:
+        Let type_args be proc parse_type_arguments with parser
+        proc add_child with type_node, type_args
+    End If
+
+    Return type_node
+End Process
+
+@Reasoning:
+Grammar: 'new' (
+  Type '(' ArgumentList ')' [ClassBody]                        object creation
+  | Type ('[' Expression ']')+ ('[' ']')* [ArrayInitializer]    sized array
+  | Type ('[' ']')+ ArrayInitializer                            initialized array
+). The base type is parsed without trailing brackets so the '[' vs '('
+following it selects array creation vs object (or anonymous-class) creation.
+Array creation yields an AST_ARRAY_CREATION node whose first child is the
+element type, followed by each dimension-size expression (an empty-bracket
+dimension contributes no size child), and finally an optional array-initializer
+block. Object creation keeps the original AST_OBJECT_CREATION shape:
+children = [type, arguments, optional anonymous class body].
 @End Reasoning
 Process called "parse_new_expression" takes parser as Integer returns Integer:
-    Note: Parse new expression (object creation)
-
-    Let new_node be proc create_ast_node from AST_OBJECT_CREATION
+    Note: Parse new expression (object creation or array creation)
 
     proc expect with parser, TOKEN_NEW from Lexer
 
-    Let type_ref be proc parse_type_reference from parser
+    Let type_ref be proc parse_new_base_type with parser
+
+    Let after_type be proc current_token_type with parser
+
+    If after_type is equal to TOKEN_LBRACKET from Lexer:
+        Note: Array creation.
+        Let array_node be proc create_ast_node with AST_ARRAY_CREATION
+        proc add_child with array_node, type_ref
+
+        Note: One or more dimensions. A sized dimension '[expr]' contributes its
+        Note: size expression as a child; an empty '[]' dimension contributes
+        Note: none (its presence is implied by the element type's rank, which the
+        Note: backend reconstructs from the bracket count it emits).
+        While proc match with parser, TOKEN_LBRACKET from Lexer is equal to 1:
+            proc advance with parser  Note: Consume '['
+            Let is_empty_dim be proc match with parser, TOKEN_RBRACKET from Lexer
+            If is_empty_dim is equal to 1:
+                proc advance with parser  Note: Consume ']'
+            Otherwise:
+                Let dim_expr be proc parse_expression with parser
+                proc add_child with array_node, dim_expr
+                proc expect with parser, TOKEN_RBRACKET from Lexer
+            End If
+        End While
+
+        Note: Optional array initializer: new int[]{1, 2, 3}.
+        Let has_initializer be proc match with parser, TOKEN_LBRACE from Lexer
+        If has_initializer is equal to 1:
+            Let initializer be proc parse_array_initializer with parser
+            proc add_child with array_node, initializer
+        End If
+
+        Return array_node
+    End If
+
+    Note: Object creation.
+    Let new_node be proc create_ast_node with AST_OBJECT_CREATION
     proc add_child with new_node, type_ref
 
     proc expect with parser, TOKEN_LPAREN from Lexer
 
-    Let args be proc parse_argument_list from parser
+    Let args be proc parse_argument_list with parser
     proc add_child with new_node, args
 
     proc expect with parser, TOKEN_RPAREN from Lexer
@@ -3190,11 +3778,62 @@ Process called "parse_new_expression" takes parser as Integer returns Integer:
     Note: Anonymous class body (optional)
     Let is_lbrace be proc match with parser, TOKEN_LBRACE from Lexer
     If is_lbrace is equal to 1:
-        Let body be proc parse_class_body from parser
+        Let body be proc parse_class_body with parser
         proc add_child with new_node, body
     End If
 
     Return new_node
+End Process
+
+@Reasoning:
+Grammar: '{' [Expression (',' Expression)* [',']] '}'. A brace-enclosed list of
+element expressions used as an array initializer (new int[]{1, 2, 3} or the
+RHS of a field/local array declaration). Elements are themselves expressions,
+which may include nested initializers for multidimensional arrays; a trailing
+comma before '}' is permitted by Java and tolerated here. Each element becomes
+a child of an AST_ARRAY_CREATION node flagged as an initializer by carrying no
+element-type child (its first child is an expression, not a type).
+@End Reasoning
+Process called "parse_array_initializer" takes parser as Integer returns Integer:
+    Note: Parse array initializer { e1, e2, ... }
+
+    Let init_node be proc create_ast_node with AST_ARRAY_CREATION
+    proc set_node_value with init_node, 1  Note: Mark as an initializer block
+
+    proc expect with parser, TOKEN_LBRACE from Lexer
+
+    Let is_empty be proc match with parser, TOKEN_RBRACE from Lexer
+    If is_empty is equal to 1:
+        proc advance with parser  Note: Consume '}'
+        Return init_node
+    End If
+
+    While 1 is equal to 1:
+        Note: A nested initializer ({...}) is itself an array initializer.
+        Let is_nested be proc match with parser, TOKEN_LBRACE from Lexer
+        If is_nested is equal to 1:
+            Let nested be proc parse_array_initializer with parser
+            proc add_child with init_node, nested
+        Otherwise:
+            Let element be proc parse_expression with parser
+            proc add_child with init_node, element
+        End If
+
+        Let is_comma be proc match_and_advance with parser, TOKEN_COMMA from Lexer
+        If is_comma is equal to 0:
+            Break
+        End If
+
+        Note: Tolerate a trailing comma immediately before '}'.
+        Let trailing be proc match with parser, TOKEN_RBRACE from Lexer
+        If trailing is equal to 1:
+            Break
+        End If
+    End While
+
+    proc expect with parser, TOKEN_RBRACE from Lexer
+
+    Return init_node
 End Process
 
 @Reasoning:
@@ -3206,7 +3845,7 @@ identical for downstream translation.
 Process called "parse_class_body" takes parser as Integer returns Integer:
     Note: Parse class body (for anonymous classes)
 
-    Let body_node be proc create_ast_node from AST_BLOCK
+    Let body_node be proc create_ast_node with AST_BLOCK
 
     proc expect with parser, TOKEN_LBRACE from Lexer
 
@@ -3216,7 +3855,7 @@ Process called "parse_class_body" takes parser as Integer returns Integer:
             Break
         End If
 
-        Let member be proc parse_class_member from parser
+        Let member be proc parse_class_member with parser
         If member is not equal to 0:
             proc add_child with body_node, member
         Otherwise:
@@ -3242,122 +3881,158 @@ Bounded by min(50, distance to matching paren). Used per primary expression
 beginning with '(' — typically a small fraction of total tokens.
 @End Performance_Hints
 Process called "parse_lambda_or_grouped" takes parser as Integer returns Integer:
-    Note: Parse lambda expression or grouped expression
-    Note: Lambda patterns: (params) -> body, () -> body, param -> body
+    Note: Parse lambda expression or grouped expression.
+    Note: Lambda patterns: (params) -> body, () -> body
     Note: Grouped patterns: (expression)
+    Note: The single-identifier form (x -> body) is handled at the assignment
+    Note: expression tier via a one-token lookahead, so this entry always begins
+    Note: at '(' (parenthesized parameter list or a grouped expression).
 
-    Note: Save parser state for proper lookahead
-    Let saved_position be proc memory_get_int64 from Layout with parser, 8
-    Let saved_token be proc memory_get_int64 from Layout with parser, 16
+    Note: Full lexer + parser snapshot so the lookahead can be undone cleanly.
+    Let lexer be proc memory_get_int64 from Layout with parser, 0
+    Let saved_scan_pos be proc memory_get_int64 from Layout with lexer, 16
+    Let saved_line be proc memory_get_int64 from Layout with lexer, 24
+    Let saved_column be proc memory_get_int64 from Layout with lexer, 32
+    Let saved_current be proc memory_get_int64 from Layout with parser, 8
+    Let saved_previous be proc memory_get_int64 from Layout with parser, 16
 
     proc expect with parser, TOKEN_LPAREN from Lexer
 
-    Note: Use sophisticated lookahead to distinguish lambda from grouped expression
-    Note: Look for pattern: (identifier, identifier, ...) -> or () ->
+    Note: Walk to the matching ')' tracking parenthesis depth, then peek for
+    Note: '->'. Depth tracking lets nested generic/grouped tokens inside the
+    Note: parameter region not terminate the scan early.
+    Let depth be 1
+    Let scanning be 1
     Let token_count be 0
-    Let has_arrow_after_paren be 0
-    Let is_lambda_params be 1  Note: Assume lambda until proven otherwise
-
-    Note: Scan tokens within parentheses to determine pattern
-    Let scanning_params be 1
-    While scanning_params is equal to 1:
-        Let cur_t be proc current_token_type from parser
-        If cur_t is equal to TOKEN_RPAREN from Lexer:
-            Set scanning_params to 0
-        End If
+    While scanning is equal to 1:
+        Let cur_t be proc current_token_type with parser
         If cur_t is equal to TOKEN_EOF from Lexer:
-            Set scanning_params to 0
+            Set scanning to 0
+        Otherwise If cur_t is equal to TOKEN_LPAREN from Lexer:
+            Set depth to depth plus 1
+            proc advance with parser
+        Otherwise If cur_t is equal to TOKEN_RPAREN from Lexer:
+            Set depth to depth minus 1
+            proc advance with parser
+            If depth is equal to 0:
+                Set scanning to 0
+            End If
+        Otherwise:
+            proc advance with parser
         End If
-        If scanning_params is equal to 1:
-            Let current_type be proc current_token_type from parser
-
-            Note: Lambda parameters are typically simple identifiers or types
-            Let is_simple_token be 0
-            If current_type is equal to TOKEN_IDENTIFIER from Lexer:
-                Set is_simple_token to 1
-            End If
-            If current_type is equal to TOKEN_COMMA from Lexer:
-                Set is_simple_token to 1
-            End If
-            If current_type is equal to TOKEN_INT_TYPE from Lexer:
-                Set is_simple_token to 1
-            End If
-            If current_type is equal to TOKEN_BOOLEAN_TYPE from Lexer:
-                Set is_simple_token to 1
-            End If
-            If current_type is equal to TOKEN_FINAL from Lexer:
-                Set is_simple_token to 1
-            End If
-            If is_simple_token is equal to 0:
-                Note: Complex expression found - likely grouped expression
-                Set is_lambda_params to 0
-            End If
-
-            proc advance from parser
-            Set token_count to token_count plus 1
-
-            Note: Prevent infinite loop
-            If token_count is greater than 50:
-                Set is_lambda_params to 0
-                Note: Break out of complex expressions
-            End If
+        Set token_count to token_count plus 1
+        If token_count is greater than 4096:
+            Set scanning to 0
         End If
     End While
 
-    Note: Check for arrow after closing parenthesis
-    If proc current_token_type with parser is equal to TOKEN_RPAREN from Lexer:
-        proc advance from parser  Note: Skip )
+    Let has_arrow be 0
+    If depth is equal to 0:
         If proc current_token_type with parser is equal to TOKEN_ARROW from Lexer:
-            Set has_arrow_after_paren to 1
+            Set has_arrow to 1
         End If
     End If
 
-    Note: Restore parser state and parse appropriately
-    proc memory_set_int64 from Layout with parser, 8, saved_position
-    proc memory_set_int64 from Layout with parser, 16, saved_token
+    Note: Restore to the position just before '(' for the committed parse.
+    proc memory_set_int64 from Layout with lexer, 16, saved_scan_pos
+    proc memory_set_int64 from Layout with lexer, 24, saved_line
+    proc memory_set_int64 from Layout with lexer, 32, saved_column
+    proc memory_set_int64 from Layout with parser, 8, saved_current
+    proc memory_set_int64 from Layout with parser, 16, saved_previous
 
-    Note: Parse based on pattern detected
-    Let is_confirmed_lambda be 0
-    If has_arrow_after_paren is equal to 1:
-        If is_lambda_params is equal to 1:
-            Set is_confirmed_lambda to 1
-        End If
-    End If
-    If is_confirmed_lambda is equal to 1:
-        Note: Confirmed lambda expression pattern
+    If has_arrow is equal to 1:
         proc expect with parser, TOKEN_LPAREN from Lexer
 
-        Let params_list be proc create_list
+        Note: Parameters are collected as children of a single AST_PARAMETER
+        Note: container node so the lowering can read children[0] as the whole
+        Note: parameter list and children[1] as the body.
+        Let params_container be proc create_ast_node with AST_PARAMETER
 
-        Note: Parse parameter list
         If proc current_token_type with parser is not equal to TOKEN_RPAREN from Lexer:
-            Let param be proc parse_lambda_parameter from parser
-            proc add_to_list with params_list, param
+            Let param be proc parse_lambda_parameter with parser
+            proc add_child with params_container, param
 
             While proc match with parser, TOKEN_COMMA from Lexer is equal to 1:
-                proc advance from parser  Note: Skip comma
-                Set param to proc parse_lambda_parameter from parser
-                proc add_to_list with params_list, param
+                proc advance with parser  Note: Skip comma
+                Set param to proc parse_lambda_parameter with parser
+                proc add_child with params_container, param
             End While
         End If
 
         proc expect with parser, TOKEN_RPAREN from Lexer
         proc expect with parser, TOKEN_ARROW from Lexer
 
-        Let lambda_node be proc create_ast_node from AST_LAMBDA_EXPRESSION
-        proc set_dict_value with lambda_node, "parameters", params_list
+        Let lambda_node be proc create_ast_node with AST_LAMBDA_EXPRESSION
+        proc add_child with lambda_node, params_container
 
-        Let body be proc parse_lambda_body from parser
+        Let body be proc parse_lambda_body with parser
         proc add_child with lambda_node, body
 
         Return lambda_node
     Otherwise:
-        Note: Grouped expression pattern
+        Note: Grouped expression: cast was already ruled out upstream.
         proc expect with parser, TOKEN_LPAREN from Lexer
-        Let expr be proc parse_expression from parser
+        Let expr be proc parse_expression with parser
         proc expect with parser, TOKEN_RPAREN from Lexer
         Return expr
     End If
+End Process
+
+@Reasoning:
+A lambda parameter is either a typed parameter ('Type name', including
+'final' and array/generic forms) or an inferred-type identifier ('name').
+We disambiguate with a full-state lookahead: if a type reference can be
+consumed and is followed by an identifier, it is a typed parameter; any
+other shape is treated as a bare identifier parameter. The identifier form
+produces an AST_PARAMETER node carrying only the name (no type child), which
+the lowering recognizes as an inferred-type binding.
+@End Reasoning
+Process called "parse_lambda_parameter" takes parser as Integer returns Integer:
+    Note: Parse a single lambda parameter (typed or inferred).
+
+    Let lexer be proc memory_get_int64 from Layout with parser, 0
+    Let saved_scan_pos be proc memory_get_int64 from Layout with lexer, 16
+    Let saved_line be proc memory_get_int64 from Layout with lexer, 24
+    Let saved_column be proc memory_get_int64 from Layout with lexer, 32
+    Let saved_current be proc memory_get_int64 from Layout with parser, 8
+    Let saved_previous be proc memory_get_int64 from Layout with parser, 16
+
+    Note: Lookahead: a leading 'final', a primitive type, or 'Identifier
+    Note: Identifier' signals a typed parameter. A bare 'Identifier' followed
+    Note: by ',' or ')' is an inferred-type binding.
+    Let lead_type be proc current_token_type with parser
+    Let typed be 0
+    If lead_type is equal to TOKEN_FINAL from Lexer:
+        Set typed to 1
+    End If
+    If proc is_primitive_type_token with parser, lead_type is equal to 1:
+        Set typed to 1
+    End If
+    If typed is equal to 0:
+        Let probe_type be proc parse_type_reference with parser
+        If probe_type is not equal to 0:
+            If proc current_token_type with parser is equal to TOKEN_IDENTIFIER from Lexer:
+                Set typed to 1
+            End If
+        End If
+        proc memory_set_int64 from Layout with lexer, 16, saved_scan_pos
+        proc memory_set_int64 from Layout with lexer, 24, saved_line
+        proc memory_set_int64 from Layout with lexer, 32, saved_column
+        proc memory_set_int64 from Layout with parser, 8, saved_current
+        proc memory_set_int64 from Layout with parser, 16, saved_previous
+    End If
+
+    If typed is equal to 1:
+        Return proc parse_parameter with parser
+    End If
+
+    Note: Inferred-type identifier parameter.
+    Let param_node be proc create_ast_node with AST_PARAMETER
+    Let name_token be proc current_token with parser
+    Let param_name be proc memory_get_int64 from Layout with name_token, 8
+    proc set_node_name with param_node, param_name
+    proc expect with parser, TOKEN_IDENTIFIER from Lexer
+    Return param_node
 End Process
 
 @Reasoning:
@@ -3370,10 +4045,10 @@ Process called "parse_lambda_body" takes parser as Integer returns Integer:
 
     Let is_lbrace be proc match with parser, TOKEN_LBRACE from Lexer
     If is_lbrace is equal to 1:
-        Return proc parse_block from parser
+        Return proc parse_block with parser
     End If
 
-    Return proc parse_expression from parser
+    Return proc parse_expression with parser
 End Process
 
 @Reasoning:
@@ -3384,7 +4059,7 @@ here — the caller (e.g., postfix invocation handler) expects ')'.
 Process called "parse_argument_list" takes parser as Integer returns Integer:
     Note: Parse argument list for method calls
 
-    Let args_node be proc create_ast_node from AST_IDENTIFIER
+    Let args_node be proc create_ast_node with AST_IDENTIFIER
 
     Let is_rparen be proc match with parser, TOKEN_RPAREN from Lexer
     If is_rparen is equal to 1:
@@ -3392,7 +4067,7 @@ Process called "parse_argument_list" takes parser as Integer returns Integer:
     End If
 
     While 1 is equal to 1:
-        Let arg be proc parse_expression from parser
+        Let arg be proc parse_expression with parser
         proc add_child with args_node, arg
 
         Let is_comma be proc match_and_advance with parser, TOKEN_COMMA from Lexer
@@ -3416,7 +4091,7 @@ symbol.
 Process called "parse" takes parser as Integer returns Integer:
     Note: Parse complete Java source file
 
-    Return proc parse_compilation_unit from parser
+    Return proc parse_compilation_unit with parser
 End Process
 
 Note: End of Java Parser

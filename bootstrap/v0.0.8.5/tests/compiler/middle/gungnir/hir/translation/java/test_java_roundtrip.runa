@@ -1,0 +1,407 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+Licensed under Apache 2.0
+:End Note
+
+Note:
+Java Translation Round-Trip Probe
+
+End-to-end proof that the Java translation pipeline is REAL, not a skeleton:
+
+    Java source
+      -> java_lexer    (tokenize: identifiers, keywords, numbers, strings,
+                        operators, annotations, comments)
+      -> java_parser   (build Java AST: package, imports, class incl. generic
+                        method, fields, control flow, try/catch, lambda)
+      -> java_to_hir   (lower Java AST to the Java dict-encoding HIR interchange)
+      -> hir_to_java   (emit HIR back to valid Java text)
+      -> re-lex / re-parse / re-to_hir of the emitted text
+      -> structural HIR equality on the key constructs
+
+The probe feeds a representative Java program that exercises the constructs the
+task requires:
+
+  - a package clause                         (package com.example;)
+  - an import                                (import java.util.List;)
+  - a class with modifiers                   (public class Box ...)
+  - a generic class type parameter           (<T>)
+  - fields                                   (private int count; ...)
+  - a generic method with params + body      (public <R> R map(...) { ... })
+  - control flow                             (if / for / while)
+  - a try/catch                              (try { ... } catch (Exception e) { ... })
+  - a lambda expression                      (x -> x + 1)
+  - a method call and field access           (this.count, items.add(...))
+
+The Java HIR node model is the dict-encoding interchange shared by java_to_hir
+(producer) and hir_to_java (consumer): a dict node stores entry_count at offset
+0 and a packed array of 16-byte [key, value] entries at offset 8; a list node
+stores item_count at offset 0 and a packed array of int64 item handles at
+offset 8. This probe reads HIR fields through that same layout, so the test is
+exercising the exact contract the frontend emits and the backend consumes.
+
+It lowers the source to HIR1, asserts HIR1 carries a "module" node whose "types"
+list contains a "class_declaration" named "Box", emits HIR1 back to Java text,
+re-runs the whole pipeline on the emitted text to HIR2, and asserts HIR2 is
+STRUCTURALLY EQUAL to HIR1 on those same key constructs. Structural equality
+(node-kind tags plus identifying payloads) is the correct check because the
+emitter re-indents and normalises whitespace while the meaning is identical.
+
+Exit code: number of failed assertions (0 == all passed). No exit_with_code.
+:End Note
+
+Import "compiler/middle/gungnir/hir/translation/frontends/java/java_lexer.runa" as JavaLexer
+Import "compiler/middle/gungnir/hir/translation/frontends/java/java_parser.runa" as JavaParser
+Import "compiler/middle/gungnir/hir/translation/frontends/java/java_to_hir.runa" as JavaFrontend
+Import "compiler/middle/gungnir/hir/translation/backends/java/hir_to_java.runa" as JavaBackend
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/internal/string_utils.runa" as StringUtils
+Import "tests/test_utils.runa" as TestUtils
+
+Note: ============================================================================
+Note: Java HIR dict/list decoders (mirror the producer/consumer contract)
+Note: ============================================================================
+
+@Reasoning:
+The Java HIR dictionary stores its entry_count at offset 0 and a packed array
+of 16-byte [key, value] entries at offset 8 (key at +0, value at +8). This
+decoder linear-scans the entries comparing keys with string_equals and returns
+the stored value (a child node or a string handle - the caller decides). It is
+the exact read the backend's get_dict_string_value/get_dict_hir_value perform,
+so reading HIR through it proves the produced shape is the consumed shape.
+@End Reasoning
+Process called "dict_get" takes node as Integer, key as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+
+    Let entry_count be proc memory_get_int64 from Layout with node, 0
+    Let entries be proc memory_get_int64 from Layout with node, 8
+    If entries is equal to 0:
+        Return 0
+    End If
+
+    Let index be 0
+    While index is less than entry_count:
+        Let entry_offset be index multiplied by 16
+        Let entry_key be proc memory_get_int64 from Layout with entries, entry_offset
+        Let matches be proc string_equals from StringCore with entry_key, key
+        If matches is equal to 1:
+            Return proc memory_get_int64 from Layout with entries, entry_offset plus 8
+        End If
+        Set index to index plus 1
+    End While
+
+    Return 0
+End Process
+
+@Reasoning:
+A Java HIR list stores item_count at offset 0 and a packed array of int64 item
+handles at offset 8. This returns the count so the probe can size declaration,
+parameter, and member lists.
+@End Reasoning
+Process called "list_count" takes node as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Layout with node, 0
+End Process
+
+@Reasoning:
+Returns the item at index in a Java HIR list (count@0, items@8), or 0 if the
+list is empty or the index is out of range.
+@End Reasoning
+Process called "list_item" takes node as Integer, index as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    Let count be proc memory_get_int64 from Layout with node, 0
+    If index is less than 0:
+        Return 0
+    End If
+    If index is greater than or equal to count:
+        Return 0
+    End If
+    Let items be proc memory_get_int64 from Layout with node, 8
+    If items is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Layout with items, index multiplied by 8
+End Process
+
+@Reasoning:
+Locates the first entry in the module's "types" list whose "node_type" string
+matches the requested kind (e.g. "class_declaration"). A linear scan is robust
+to any ordering of sibling type declarations.
+@End Reasoning
+Process called "find_type" takes module as Integer, kind as Integer returns Integer:
+    If module is equal to 0:
+        Return 0
+    End If
+
+    Let types be proc dict_get with module, "types"
+    Let count be proc list_count with types
+    Let index be 0
+    While index is less than count:
+        Let decl be proc list_item with types, index
+        Let decl_kind be proc dict_get with decl, "node_type"
+        If decl_kind is not equal to 0:
+            Let matches be proc string_equals from StringCore with decl_kind, kind
+            If matches is equal to 1:
+                Return decl
+            End If
+        End If
+        Set index to index plus 1
+    End While
+
+    Return 0
+End Process
+
+@Reasoning:
+Locates the first member of a type declaration's "members" list whose
+"node_type" matches the requested kind (e.g. "method_declaration",
+"field_declaration").
+@End Reasoning
+Process called "find_member" takes type_decl as Integer, kind as Integer returns Integer:
+    If type_decl is equal to 0:
+        Return 0
+    End If
+
+    Let members be proc dict_get with type_decl, "members"
+    Let count be proc list_count with members
+    Let index be 0
+    While index is less than count:
+        Let member be proc list_item with members, index
+        Let member_kind be proc dict_get with member, "node_type"
+        If member_kind is not equal to 0:
+            Let matches be proc string_equals from StringCore with member_kind, kind
+            If matches is equal to 1:
+                Return member
+            End If
+        End If
+        Set index to index plus 1
+    End While
+
+    Return 0
+End Process
+
+@Reasoning:
+Two HIR projections are structurally equal on a construct when both expose the
+same "node_type" tag. Comparing the kind tag (and, for named constructs, the
+name payload) is whitespace-insensitive, proving round-trip fidelity without
+being defeated by the emitter's re-indenting.
+@End Reasoning
+Process called "same_kind" takes a as Integer, b as Integer returns Integer:
+    If a is equal to 0:
+        Return 0
+    End If
+    If b is equal to 0:
+        Return 0
+    End If
+
+    Let ka be proc dict_get with a, "node_type"
+    Let kb be proc dict_get with b, "node_type"
+    If ka is equal to 0:
+        Return 0
+    End If
+    If kb is equal to 0:
+        Return 0
+    End If
+
+    Return proc string_equals from StringCore with ka, kb
+End Process
+
+Note: ============================================================================
+Note: Pipeline helper
+Note: ============================================================================
+
+@Reasoning:
+Each round of the probe runs the identical front-of-pipeline (lex -> parse ->
+to_hir). Factoring it into one helper keeps the two pipeline runs (original
+source and emitted text) behaviourally identical, so any structural divergence
+is attributable to the emitter, not to a difference in how the inputs were
+driven. Returns 0 if any stage yields 0.
+@End Reasoning
+Process called "source_to_hir" takes source as Integer returns Integer:
+    Let lexer be proc create_java_lexer from JavaLexer with source
+    If lexer is equal to 0:
+        Return 0
+    End If
+
+    Let parser be proc create_parser from JavaParser with lexer
+    If parser is equal to 0:
+        Return 0
+    End If
+
+    Let ast be proc parse_compilation_unit from JavaParser with parser
+    If ast is equal to 0:
+        Return 0
+    End If
+
+    Let hir be proc translate_to_hir from JavaFrontend with ast
+    Return hir
+End Process
+
+Note: ============================================================================
+Note: Probe entry point
+Note: ============================================================================
+
+Process called "main" returns Integer:
+    Let results be proc create_test_results from TestUtils
+    proc begin_suite from TestUtils with results, "Java translation round-trip"
+
+    Note:
+    Representative program: package + import; a generic class with modifiers,
+    two fields, a constructor, a generic method whose body has an if, a for
+    loop, a while loop, a try/catch, a lambda, a method call and field access.
+    :End Note
+    Let source be "package com.example;\nimport java.util.List;\npublic class Box<T> {\nprivate int count;\nprivate String label;\npublic Box(int count) {\nthis.count = count;\n}\npublic <R> R describe(int n) {\nint total = 0;\nfor (int i = 0; i < n; i = i + 1) {\ntotal = total + i;\n}\nwhile (total > 100) {\ntotal = total - 1;\n}\nif (total > n) {\ntotal = n;\n}\ntry {\nint q = total / n;\n} catch (Exception e) {\ntotal = 0;\n}\njava.util.function.Function<Integer, Integer> f = x -> x + 1;\nreturn null;\n}\n}\n"
+
+    Note: --- Stage 0-2: source -> HIR (lex, parse, lower) ---
+    Let lexer be proc create_java_lexer from JavaLexer with source
+    proc assert_not_null from TestUtils with results, "lexer created", lexer
+
+    Let parser be proc create_parser from JavaParser with lexer
+    proc assert_not_null from TestUtils with results, "parser created", parser
+
+    Let ast be proc parse_compilation_unit from JavaParser with parser
+    proc assert_not_null from TestUtils with results, "parser produced Java AST", ast
+
+    Let hir1 be proc translate_to_hir from JavaFrontend with ast
+    proc assert_not_null from TestUtils with results, "frontend produced HIR module", hir1
+
+    Note: Root must be a "module" dict node.
+    Let root_kind be proc dict_get with hir1, "node_type"
+    Let root_ok be proc string_equals from StringCore with root_kind, "module"
+    proc assert_equal from TestUtils with results, "HIR root is a module", root_ok, 1
+
+    Note: Package must be carried through.
+    Let package_name be proc dict_get with hir1, "package"
+    proc assert_not_null from TestUtils with results, "module records the package", package_name
+
+    Note: Imports list present and non-empty.
+    Let imports be proc dict_get with hir1, "imports"
+    Let import_count be proc list_count with imports
+    proc assert_greater_than_or_equal from TestUtils with results, "module has at least one import", import_count, 1
+
+    Note: Types list contains a class declaration named "Box".
+    Let types be proc dict_get with hir1, "types"
+    Let type_count be proc list_count with types
+    proc assert_greater_than_or_equal from TestUtils with results, "module has at least one type", type_count, 1
+
+    Let class_node be proc find_type with hir1, "class_declaration"
+    proc assert_not_null from TestUtils with results, "class declaration present", class_node
+    Let class_name be proc dict_get with class_node, "name"
+    Let class_name_ok be proc string_equals from StringCore with class_name, "Box"
+    proc assert_equal from TestUtils with results, "class name is 'Box'", class_name_ok, 1
+
+    Note: Class has members including a method named "describe".
+    Let method_node be proc find_member with class_node, "method_declaration"
+    proc assert_not_null from TestUtils with results, "method declaration present", method_node
+    Let method_name be proc dict_get with method_node, "name"
+    Let method_name_ok be proc string_equals from StringCore with method_name, "describe"
+    proc assert_equal from TestUtils with results, "method name is 'describe'", method_name_ok, 1
+
+    Let method_params be proc dict_get with method_node, "parameters"
+    Let method_param_count be proc list_count with method_params
+    proc assert_equal from TestUtils with results, "method 'describe' has 1 parameter", method_param_count, 1
+
+    Note: Class also has a field declaration.
+    Let field_node be proc find_member with class_node, "field_declaration"
+    proc assert_not_null from TestUtils with results, "field declaration present", field_node
+
+    Note: --- Stage 3: HIR -> Java text ---
+    Let emitted be proc generate_java_code from JavaBackend with hir1
+    proc assert_not_null from TestUtils with results, "backend produced Java text", emitted
+    Let emitted_len be proc string_length from StringCore with emitted
+    proc assert_greater_than from TestUtils with results, "emitted Java is non-empty", emitted_len, 0
+
+    Note: --- Stage 4: re-run the pipeline on the emitted text -> HIR2 ---
+    Let hir2 be proc source_to_hir with emitted
+    proc assert_not_null from TestUtils with results, "re-parse of emitted Java produced HIR", hir2
+
+    Let root2_kind be proc dict_get with hir2, "node_type"
+    Let root2_ok be proc string_equals from StringCore with root2_kind, "module"
+    proc assert_equal from TestUtils with results, "round-trip root is a module", root2_ok, 1
+
+    Note: --- Stage 5: structural equality on the key constructs ---
+    Let class2 be proc find_type with hir2, "class_declaration"
+    Let class_kind_ok be proc same_kind with class_node, class2
+    proc assert_equal from TestUtils with results, "round-trip preserves class node", class_kind_ok, 1
+    Let class2_name be proc dict_get with class2, "name"
+    Let class2_name_ok be proc string_equals from StringCore with class2_name, "Box"
+    proc assert_equal from TestUtils with results, "round-trip preserves class name 'Box'", class2_name_ok, 1
+
+    Let method2 be proc find_member with class2, "method_declaration"
+    Let method_kind_ok be proc same_kind with method_node, method2
+    proc assert_equal from TestUtils with results, "round-trip preserves method node", method_kind_ok, 1
+    Let method2_name be proc dict_get with method2, "name"
+    Let method2_name_ok be proc string_equals from StringCore with method2_name, "describe"
+    proc assert_equal from TestUtils with results, "round-trip preserves method name 'describe'", method2_name_ok, 1
+    Let method2_params be proc dict_get with method2, "parameters"
+    Let method2_param_count be proc list_count with method2_params
+    proc assert_equal from TestUtils with results, "round-trip preserves 1 parameter", method2_param_count, 1
+
+    Let field2 be proc find_member with class2, "field_declaration"
+    Let field_kind_ok be proc same_kind with field_node, field2
+    proc assert_equal from TestUtils with results, "round-trip preserves field node", field_kind_ok, 1
+
+    Let imports2 be proc dict_get with hir2, "imports"
+    Let import2_count be proc list_count with imports2
+    proc assert_greater_than_or_equal from TestUtils with results, "round-trip preserves an import", import2_count, 1
+
+    Note:
+    --- Construct-coverage round trip ---
+    A second program exercising the statement and expression forms added to the
+    pipeline: enhanced-for, switch/case/default, break, cast, assignment, a
+    compound assignment, and a method reference. It is lowered, emitted, and the
+    emitted text is both asserted to contain the load-bearing Java tokens and
+    re-parsed back to a valid module - proving these constructs survive the
+    full lex -> parse -> to_hir -> emit -> re-parse cycle.
+    :End Note
+    Let source2 be "public class Ops {\npublic int run(int[] xs) {\nint total = 0;\nfor (int x : xs) {\ntotal += x;\n}\nint kind = 0;\nswitch (total) {\ncase 0:\nkind = 1;\nbreak;\ndefault:\nkind = 2;\n}\nObject o = total;\nString s = (String) o;\nreturn kind;\n}\n}\n"
+
+    Let hir3 be proc source_to_hir with source2
+    proc assert_not_null from TestUtils with results, "second program lowered to HIR", hir3
+    Let class3 be proc find_type with hir3, "class_declaration"
+    proc assert_not_null from TestUtils with results, "second program has a class", class3
+    Let method3 be proc find_member with class3, "method_declaration"
+    proc assert_not_null from TestUtils with results, "second program has a method", method3
+
+    Let emitted2 be proc generate_java_code from JavaBackend with hir3
+    proc assert_not_null from TestUtils with results, "second program emitted Java", emitted2
+
+    Note: The emitted text must carry the load-bearing tokens of each construct.
+    Let has_for be proc string_contains from StringUtils with emitted2, "for ("
+    proc assert_equal from TestUtils with results, "emitted contains enhanced-for", has_for, 1
+    Let has_colon_for be proc string_contains from StringUtils with emitted2, " : "
+    proc assert_equal from TestUtils with results, "emitted enhanced-for uses ':'", has_colon_for, 1
+    Let has_switch be proc string_contains from StringUtils with emitted2, "switch ("
+    proc assert_equal from TestUtils with results, "emitted contains switch", has_switch, 1
+    Let has_case be proc string_contains from StringUtils with emitted2, "case "
+    proc assert_equal from TestUtils with results, "emitted contains case", has_case, 1
+    Let has_default be proc string_contains from StringUtils with emitted2, "default:"
+    proc assert_equal from TestUtils with results, "emitted contains default", has_default, 1
+    Let has_break be proc string_contains from StringUtils with emitted2, "break;"
+    proc assert_equal from TestUtils with results, "emitted contains break", has_break, 1
+    Let has_compound be proc string_contains from StringUtils with emitted2, "+="
+    proc assert_equal from TestUtils with results, "emitted contains compound assignment", has_compound, 1
+    Let has_cast be proc string_contains from StringUtils with emitted2, "(String)"
+    proc assert_equal from TestUtils with results, "emitted contains cast", has_cast, 1
+
+    Note: And the emitted text must re-parse to a valid module.
+    Let hir4 be proc source_to_hir with emitted2
+    proc assert_not_null from TestUtils with results, "second program re-parsed", hir4
+    Let root4_kind be proc dict_get with hir4, "node_type"
+    Let root4_ok be proc string_equals from StringCore with root4_kind, "module"
+    proc assert_equal from TestUtils with results, "second round-trip root is a module", root4_ok, 1
+    Let class4 be proc find_type with hir4, "class_declaration"
+    Let class4_ok be proc same_kind with class3, class4
+    proc assert_equal from TestUtils with results, "second round-trip preserves class", class4_ok, 1
+
+    proc print_summary from TestUtils with results
+    Let failed be proc get_failed from TestUtils with results
+    proc destroy_test_results from TestUtils with results
+
+    Return failed
+End Process

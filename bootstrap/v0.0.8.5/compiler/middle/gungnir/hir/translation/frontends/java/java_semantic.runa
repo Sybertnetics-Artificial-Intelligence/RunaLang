@@ -1,793 +1,1341 @@
-Note: Java Semantic Analyzer for Translation Translation System
-Note: Handles type checking, scope analysis, inheritance, generics, annotations
-Note: Supports Java 8+ features including lambdas, method references, streams
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
 
-Import "compiler/frontend/parsing/parser.runa" as Parser
-Import "compiler/frontend/lexical/lexer.runa" as Lexer
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+JAVA SEMANTIC ANALYZER - name resolution, declaration registration, modifier
+validation, and Java-rule enforcement over the REAL Java AST.
+
+The Java parser (java_parser.runa) produces a tree of ASTNode records. Every
+node is a 56-byte (7 x i64) record with this UNIFORM layout, confirmed against
+the parser and the java_to_hir lowering pass which consumes the same tree:
+
+  offset 0  node_type    one of the AST_* constants (1..49)
+  offset 8  token        token handle (source location / lexeme) or 0
+  offset 16 name         StringCore handle (identifier / qualified name) or 0
+  offset 24 value        flag/payload integer (e.g. is-static, is-varargs) or 0
+  offset 32 children     pointer to an array of child ASTNode handles or 0
+  offset 40 child_count  number of valid entries in the children array
+  offset 48 attributes   reserved metadata slot or 0
+
+This pass walks that real tree - it does NOT invent a parallel node schema - and
+enforces the SEMANTIC rules Java's grammar alone does not express:
+
+  1. Package / type / method / block / lambda scoping. A scope chain of
+     name->level symbol tables models Java's lexical nesting. A top-level
+     compilation scope is the bottom of the chain; type bodies, method bodies,
+     and nested blocks push fresh scopes. A name resolved in an enclosing scope
+     is visible; a name bound nowhere, not predeclared, and not an imported or
+     declared type is an undefined-reference error.
+
+  2. Field / parameter / local binding. Type members (fields, methods, nested
+     types) bind in the enclosing type scope; method parameters bind in the
+     method scope; locals (variable declarations, enhanced-for bindings, catch
+     parameters, lambda parameters) bind in the innermost block scope.
+
+  3. Type / interface / enum declaration registration. Named types register in a
+     dedicated type registry so type references in fields, parameters, return
+     types, extends/implements clauses, casts, and object creation resolve
+     against the predeclared java.lang surface plus the registry plus imported
+     simple names.
+
+  4. Generic type-parameter scope. A declaration's <T, U extends Bound> type
+     parameters register in a per-declaration scope so references to T and U in
+     the member's signature and body resolve, and the bounds themselves are
+     validated as type references.
+
+  5. Modifier validation. At most one access modifier (public/protected/
+     private); abstract is incompatible with final/static/private; an abstract
+     method may not have a body and a non-abstract concrete method must.
+
+  6. Import resolution. Each import registers its imported simple name (the last
+     dotted segment, or for a wildcard import the package itself) so a later
+     qualified or simple reference resolves to a known type rather than firing an
+     undefined-identifier diagnostic.
+
+The symbol tables are STRING-KEYED dictionaries (dictionary.runa over the
+content-hashing hashtable): keys are the identifier strings the parser copied
+into the node, values are the 1-based declaration level (level+1, so 0
+unambiguously means "absent"). A string key keyed by content - not an
+integer-keyed table indexed by a string pointer - is mandatory; the latter
+hashes pointer identity and corrupts on the parser's distinct heap copies.
+
+Dependencies:
+- java_parser.runa            (ASTNode shape, AST_* node constants)
+- compiler/frontend/primitives/memory/layout.runa
+- compiler/frontend/primitives/core/string_core.runa
+- compiler/frontend/primitives/collections/list.runa
+- compiler/frontend/primitives/collections/dictionary.runa
+- compiler/internal/string_utils.runa
+:End Note
+
+Import "compiler/middle/gungnir/hir/translation/frontends/java/java_parser.runa" as Parser
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/frontend/primitives/collections/list.runa" as List
+Import "compiler/frontend/primitives/collections/dictionary.runa" as Dict
+Import "compiler/internal/string_utils.runa" as StringUtils
+
+Note: ============================================================================
+Note: Analyzer State
+Note: ============================================================================
+
 @Reasoning:
-Top-level analyzer context. Carries a stacked symbol table, the active
-scope pointer, a class-hierarchy map for inheritance lookups, a separate
-generic-constraints map (bounds, variances), the annotation table for
-post-resolution metadata, accumulating error/warning lists, an imports
-list, and pointers tracking the class/method currently under analysis so
-nested AST nodes can resolve enclosing context. lambda_contexts is a stack
-because lambdas can be nested and each carries its own capture set and
-target functional interface.
+The analyzer threads its resolution state through the recursive walk in a single
+heap record. The lexical chain is modelled by current_scope (the innermost
+name->level table) and scope_stack (every enclosing scope, the compilation
+scope at the bottom); a lookup walks current_scope then the stack top-down.
+current_level is the depth of the innermost scope (0 at compilation level).
+type_registry holds every named type declared in the unit and every imported
+simple name so type references resolve. errors/warnings are append-only
+accumulators and has_error latches on the first error. builtin_types seeds the
+java.lang + primitive surface that Java code may reference without an import.
 @End Reasoning
+@Implementation:
+Nine 8-byte slots at fixed offsets 0..64, total 72 bytes:
+- global_scope (0):   Dict string-key -> level+1 (compilation scope)
+- current_scope (8):  Dict string-key -> level+1 (innermost scope)
+- scope_stack (16):   List of enclosing scope Dicts (compilation scope at bottom)
+- current_level (24): lexical depth of innermost scope (0 = compilation)
+- type_registry (32): Dict type_name -> 1 for declared/imported types
+- errors (40):        List of error message strings
+- warnings (48):      List of warning message strings
+- has_error (56):     0/1 sticky flag
+- builtin_types (64): Dict string-key -> 1 (java.lang + primitive surface)
+@End Implementation
 Type called "JavaSemanticAnalyzer":
-    symbol_table as Integer  Note: Map of scopes and symbols
-    current_scope as Integer  Note: Current scope context
-    class_hierarchy as Integer  Note: Map of class inheritance relationships
-    generic_constraints as Integer  Note: Map of generic type constraints
-    annotation_table as Integer  Note: Map of annotations and their metadata
-    error_list as Integer  Note: List of semantic errors
-    warning_list as Integer  Note: List of semantic warnings
-    imports as Integer  Note: List of imported packages and classes
-    current_class as Integer  Note: Currently analyzed class context
-    current_method as Integer  Note: Currently analyzed method context
-    lambda_contexts as Integer  Note: Stack of lambda expression contexts
+    global_scope as Integer
+    current_scope as Integer
+    scope_stack as Integer
+    current_level as Integer
+    type_registry as Integer
+    errors as Integer
+    warnings as Integer
+    has_error as Integer
+    builtin_types as Integer
 End Type
 
-@Reasoning:
-Lexical scope record. scope_type identifies the kind (class/method/block/
-lambda) so resolution rules can vary (e.g., 'this' resolves at class scope
-but is captured at lambda scope). parent_scope chains to the enclosing
-scope. access_level tracks the default visibility for entries declared
-here (matters for class bodies). is_static flags static contexts where
-'this' is unavailable.
-@End Reasoning
-Type called "JavaScope":
-    scope_type as String  Note: "class", "method", "block", "lambda"
-    parent_scope as Integer  Note: Reference to parent scope
-    symbols as Integer  Note: Map of symbol names to symbol info
-    access_level as String  Note: "public", "private", "protected", "package"
-    is_static as Integer  Note: 1 if static context, 0 otherwise
-End Type
+Note: ============================================================================
+Note: Analyzer Creation / Destruction
+Note: ============================================================================
 
 @Reasoning:
-Symbol-table entry covering classes, methods, fields, locals, and
-parameters. Carries the resolved Java type as a string for now (replaced by
-proper JavaType references after first-pass resolution), modifier set,
-annotations, generic parameters (for declarations) or type arguments (for
-uses), an initialized flag for definite-assignment checking, and source
-position for diagnostics.
-@End Reasoning
-Type called "JavaSymbol":
-    name as String
-    symbol_type as String  Note: "class", "method", "field", "variable", "parameter"
-    data_type as String  Note: Java type (String, int, List<String>, etc.)
-    modifiers as Integer  Note: List of modifiers (public, static, final, etc.)
-    scope as Integer  Note: Reference to containing scope
-    annotations as Integer  Note: List of annotations
-    generic_parameters as Integer  Note: List of generic type parameters
-    is_initialized as Integer  Note: 1 if initialized, 0 otherwise
-    line_number as Integer
-    column_number as Integer
-End Type
-
-@Reasoning:
-Resolved Java type. Separates the base name from generic arguments and
-array dimensions so type compatibility can be checked structurally.
-is_primitive disables boxing-and-null behavior for the eight primitive
-types. is_nullable is set per-use (e.g., @Nullable annotation) — primitives
-are never nullable. package_name disambiguates same-name classes across
-packages (java.util.List vs java.awt.List).
-@End Reasoning
-Type called "JavaType":
-    base_type as String  Note: "int", "String", "List", etc.
-    generic_arguments as Integer  Note: List of generic type arguments
-    array_dimensions as Integer  Note: Number of array dimensions
-    is_primitive as Integer  Note: 1 if primitive type, 0 otherwise
-    is_nullable as Integer  Note: 1 if can be null, 0 otherwise
-    package_name as String  Note: Package of the type
-End Type
-
-@Reasoning:
-Method signature record used for overload resolution and override
-checking. parameter_types is ordered (positional matching); throws_clauses
-is unordered (checked-exception propagation rules don't depend on ordering).
-generic_parameters here describes method-level type parameters (e.g.,
-<T> T identity(T x)).
-@End Reasoning
-Type called "JavaMethodSignature":
-    name as String
-    parameter_types as Integer  Note: List of parameter types
-    return_type as String
-    modifiers as Integer  Note: List of modifiers
-    generic_parameters as Integer  Note: List of generic type parameters
-    throws_clauses as Integer  Note: List of exception types
-End Type
-
-@Reasoning:
-Constructs the analyzer with empty tables, lists, and a "global" scope
-already installed and set as current. Pre-populating the global scope means
-subsequent class declarations always have a parent_scope to chain to —
-removing a null check from the hot path.
+Constructs the analyzer with empty tables, a compilation scope already installed
+and set as current, and the java.lang + primitive predeclared surface seeded.
+Pre-installing the compilation scope means subsequent declarations always have a
+parent to chain to, removing a null check from the hot path.
 @End Reasoning
 Process called "create_java_semantic_analyzer" returns Integer:
-    Note: Create new Java semantic analyzer instance
+    Let analyzer be proc allocate from Layout with 72
 
-    Let analyzer be a value of type JavaSemanticAnalyzer with
-        symbol_table as proc create_dict,
-        current_scope as 0,
-        class_hierarchy as proc create_dict,
-        generic_constraints as proc create_dict,
-        annotation_table as proc create_dict,
-        error_list as proc create_list,
-        warning_list as proc create_list,
-        imports as proc create_list,
-        current_class as 0,
-        current_method as 0,
-        lambda_contexts as proc create_stack
+    If analyzer is equal to 0:
+        Return 0
+    End If
 
-    Note: Initialize global scope
-    Let global_scope be a value of type JavaScope with
-        scope_type as "global",
-        parent_scope as 0,
-        symbols as proc create_dict,
-        access_level as "public",
-        is_static as 0
+    Let global_scope be proc create from Dict
+    Let scope_stack be proc create from List
+    Let type_registry be proc create from Dict
+    Let errors be proc create from List
+    Let warnings be proc create from List
+    Let builtin_types be proc create from Dict
 
-    proc set_dict_value with analyzer.symbol_table, "global", global_scope
-    Set analyzer.current_scope to global_scope
+    proc memory_set_int64 from Layout with analyzer, 0, global_scope
+    proc memory_set_int64 from Layout with analyzer, 8, global_scope
+    proc memory_set_int64 from Layout with analyzer, 16, scope_stack
+    proc memory_set_int64 from Layout with analyzer, 24, 0
+    proc memory_set_int64 from Layout with analyzer, 32, type_registry
+    proc memory_set_int64 from Layout with analyzer, 40, errors
+    proc memory_set_int64 from Layout with analyzer, 48, warnings
+    proc memory_set_int64 from Layout with analyzer, 56, 0
+    proc memory_set_int64 from Layout with analyzer, 64, builtin_types
+
+    proc setup_predeclared_surface with analyzer
 
     Return analyzer
 End Process
 
 @Reasoning:
-Visitor dispatch keyed on the AST node tag. Match cascade delegates to
-specialized analyzers for declarations, control-flow, and expression forms.
-The fall-through (Otherwise) recurses into children, so unknown or
-container-only nodes propagate analysis without explicit handlers.
+Releases the analyzer record. The sub-collections are owned by the analyzer but
+their string keys are borrowed from the parser's AST (the analyzer never copies
+identifier strings into the tables, only their handles), so destroying the
+collections does not free AST-owned memory. The AST is owned by the caller.
 @End Reasoning
-Process called "analyze_java_ast" takes analyzer as Integer, ast as Integer returns Integer:
-    Note: Perform complete semantic analysis of Java AST
+Process called "destroy_java_semantic_analyzer" takes analyzer as Integer returns Integer:
+    If analyzer is equal to 0:
+        Return 1
+    End If
 
-    Let node_type be proc memory_get_int64 from Layout with ast, 0
+    Let global_scope be proc memory_get_int64 from Layout with analyzer, 0
+    Let scope_stack be proc memory_get_int64 from Layout with analyzer, 16
+    Let type_registry be proc memory_get_int64 from Layout with analyzer, 32
+    Let errors be proc memory_get_int64 from Layout with analyzer, 40
+    Let warnings be proc memory_get_int64 from Layout with analyzer, 48
+    Let builtin_types be proc memory_get_int64 from Layout with analyzer, 64
 
-    Match node_type:
-        When AST_COMPILATION_UNIT from Parser:
-            Return proc analyze_compilation_unit with analyzer, ast
-        When AST_CLASS_DECLARATION from Parser:
-            Return proc analyze_class_declaration with analyzer, ast
-        When AST_METHOD_DECLARATION from Parser:
-            Return proc analyze_method_declaration with analyzer, ast
-        When AST_FIELD_DECLARATION from Parser:
-            Return proc analyze_field_declaration with analyzer, ast
-        When AST_VARIABLE_DECLARATION from Parser:
-            Return proc analyze_variable_declaration with analyzer, ast
-        When AST_BLOCK from Parser:
-            Return proc analyze_block with analyzer, ast
-        When AST_IF_STATEMENT from Parser:
-            Return proc analyze_if_statement with analyzer, ast
-        When AST_FOR_STATEMENT from Parser:
-            Return proc analyze_for_statement with analyzer, ast
-        When AST_WHILE_STATEMENT from Parser:
-            Return proc analyze_while_statement with analyzer, ast
-        When AST_TRY_STATEMENT from Parser:
-            Return proc analyze_try_statement with analyzer, ast
-        When AST_LAMBDA_EXPRESSION from Parser:
-            Return proc analyze_lambda_expression with analyzer, ast
-        When AST_METHOD_CALL from Parser:
-            Return proc analyze_method_call with analyzer, ast
-        When AST_FIELD_ACCESS from Parser:
-            Return proc analyze_field_access with analyzer, ast
-        When AST_ASSIGNMENT from Parser:
-            Return proc analyze_assignment with analyzer, ast
-        When AST_BINARY_OPERATION from Parser:
-            Return proc analyze_binary_operation with analyzer, ast
-        When AST_IDENTIFIER from Parser:
-            Return proc analyze_identifier with analyzer, ast
-        When AST_LITERAL from Parser:
-            Return proc analyze_literal with analyzer, ast
-        Otherwise:
-            Return proc analyze_children with analyzer, ast
-    End Match
+    proc destroy from Dict with global_scope
+    proc destroy from List with scope_stack
+    proc destroy from Dict with type_registry
+    proc destroy from List with errors
+    proc destroy from List with warnings
+    proc destroy from Dict with builtin_types
+
+    proc deallocate from Layout with analyzer
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Diagnostics
+Note: ============================================================================
+
+@Reasoning:
+Errors and warnings accumulate in append-only lists so a single pass surfaces
+every problem rather than aborting on the first. record_error latches has_error
+to 1 so a caller can gate lowering on one boolean without scanning the list.
+@End Reasoning
+Process called "record_error" takes analyzer as Integer, message as Integer:
+    Let errors be proc memory_get_int64 from Layout with analyzer, 40
+    proc list_append from List with errors, message
+    proc memory_set_int64 from Layout with analyzer, 56, 1
 End Process
 
 @Reasoning:
-Three-pass walk over compilation-unit children: imports first (so type
-references can resolve), then package declaration (sets context for
-unqualified names), then type declarations. The order is deliberate
-because later passes depend on the lookup tables populated by earlier
-ones.
+Warnings track non-fatal observations (unknown annotations, shadowing) that do
+not block lowering; kept separate from errors so a caller can report them
+without failing the analysis.
 @End Reasoning
-Process called "analyze_compilation_unit" takes analyzer as Integer, ast as Integer returns Integer:
-    Note: Analyze Java compilation unit (source file)
+Process called "record_warning" takes analyzer as Integer, message as Integer:
+    Let warnings be proc memory_get_int64 from Layout with analyzer, 48
+    proc list_append from List with warnings, message
+End Process
 
-    Let children be proc memory_get_int64 from Layout with ast, 32
-    Let child_count be proc memory_get_int64 from Layout with ast, 40
+Note: ============================================================================
+Note: Scope Management
+Note: ============================================================================
 
-    Note: Process imports first
+@Reasoning:
+Entering a scope pushes the current scope onto the stack, installs a fresh empty
+name table as the innermost scope, and raises the level. Type bodies, method
+bodies, lambda bodies, and nested blocks all use the same mechanism because
+Java name resolution does not need a separate boundary marker for visibility -
+an inner scope can reference any enclosing binding directly.
+@End Reasoning
+Process called "enter_scope" takes analyzer as Integer:
+    Let current be proc memory_get_int64 from Layout with analyzer, 8
+    Let stack be proc memory_get_int64 from Layout with analyzer, 16
+    Let level be proc memory_get_int64 from Layout with analyzer, 24
+
+    proc list_append from List with stack, current
+
+    Let fresh be proc create from Dict
+    proc memory_set_int64 from Layout with analyzer, 8, fresh
+    proc memory_set_int64 from Layout with analyzer, 24, level plus 1
+End Process
+
+@Reasoning:
+Exiting restores the scope saved by the matching enter_scope and lowers the
+level. The compilation scope is never popped: it is the permanent bottom
+installed at construction. The depth guard makes the underflow path a no-op
+rather than a crash if a malformed AST drives it there.
+@End Reasoning
+Process called "exit_scope" takes analyzer as Integer:
+    Let stack be proc memory_get_int64 from Layout with analyzer, 16
+    Let depth be proc size from List with stack
+
+    If depth is equal to 0:
+        Return
+    End If
+
+    Let level be proc memory_get_int64 from Layout with analyzer, 24
+    Let restored be proc list_pop from List with stack
+
+    proc memory_set_int64 from Layout with analyzer, 8, restored
+    proc memory_set_int64 from Layout with analyzer, 24, level minus 1
+End Process
+
+@Reasoning:
+Declares a name in the innermost scope at the current lexical level, encoding
+the level as level+1 so a lookup distinguishes "declared at level 0" from
+"absent" (both of which would otherwise read back as 0 from the
+value-0-means-missing dictionary). Re-declaration in the same scope overwrites;
+the caller decides whether a same-scope redeclaration is an error.
+@End Reasoning
+Process called "declare_in_scope" takes analyzer as Integer, name as Integer:
+    If name is equal to 0:
+        Return
+    End If
+
+    Let scope be proc memory_get_int64 from Layout with analyzer, 8
+    Let level be proc memory_get_int64 from Layout with analyzer, 24
+    proc set from Dict with scope, name, level plus 1
+End Process
+
+@Reasoning:
+Returns 1 if name is already bound in the innermost scope only (not an enclosing
+scope), so a caller can detect a same-block redeclaration while still permitting
+legal shadowing of an outer binding.
+@End Reasoning
+Process called "declared_in_current_scope" takes analyzer as Integer, name as Integer returns Integer:
+    If name is equal to 0:
+        Return 0
+    End If
+
+    Let scope be proc memory_get_int64 from Layout with analyzer, 8
+    Let found be proc get from Dict with scope, name
+    If found is not equal to 0:
+        Return 1
+    End If
+    Return 0
+End Process
+
+@Reasoning:
+Resolves a name to its declaration level by walking the scope chain innermost
+first: current_scope, then each stacked scope from the most recently pushed down
+to the compilation scope at the bottom. Returns the stored level+1 encoding
+(non-zero means "found") or 0 if the name is bound nowhere.
+@End Reasoning
+Process called "resolve_name" takes analyzer as Integer, name as Integer returns Integer:
+    If name is equal to 0:
+        Return 0
+    End If
+
+    Let current be proc memory_get_int64 from Layout with analyzer, 8
+    Let found be proc get from Dict with current, name
+    If found is not equal to 0:
+        Return found
+    End If
+
+    Let stack be proc memory_get_int64 from Layout with analyzer, 16
+    Let depth be proc size from List with stack
+    Let i be depth minus 1
+    While i is greater than or equal to 0:
+        Let scope be proc get from List with stack, i
+        Let hit be proc get from Dict with scope, name
+        If hit is not equal to 0:
+            Return hit
+        End If
+        Set i to i minus 1
+    End While
+
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: Type Registry
+Note: ============================================================================
+
+@Reasoning:
+Registers a named type (class/interface/enum/annotation/type-parameter or
+imported simple name) so type references resolve. Keyed by the type's simple
+name with value 1.
+@End Reasoning
+Process called "register_type" takes analyzer as Integer, name as Integer:
+    If name is equal to 0:
+        Return
+    End If
+    Let registry be proc memory_get_int64 from Layout with analyzer, 32
+    proc set from Dict with registry, name, 1
+End Process
+
+@Reasoning:
+Returns 1 if name is a known type: a primitive/java.lang predeclared type, or a
+declared/imported type in the registry. Used by type-reference validation.
+@End Reasoning
+Process called "is_known_type" takes analyzer as Integer, name as Integer returns Integer:
+    If name is equal to 0:
+        Return 0
+    End If
+
+    Let registry be proc memory_get_int64 from Layout with analyzer, 32
+    Let in_registry be proc get from Dict with registry, name
+    If in_registry is not equal to 0:
+        Return 1
+    End If
+
+    Return proc is_predeclared with analyzer, name
+End Process
+
+Note: ============================================================================
+Note: Predeclared Surface (primitives + java.lang)
+Note: ============================================================================
+
+@Reasoning:
+Java code references the eight primitive types, 'void', 'var', and the
+auto-imported java.lang types without an explicit import. Seeding them into
+builtin_types lets the undefined-identifier and unknown-type heuristics fire
+only on genuinely unknown names. The set is the primitive surface plus the
+commonly-referenced java.lang classes/interfaces.
+@End Reasoning
+Process called "setup_predeclared_surface" takes analyzer as Integer:
+    Let env be proc memory_get_int64 from Layout with analyzer, 64
+
+    Note: Primitive types and pseudo-types.
+    proc set from Dict with env, "boolean", 1
+    proc set from Dict with env, "byte", 1
+    proc set from Dict with env, "short", 1
+    proc set from Dict with env, "int", 1
+    proc set from Dict with env, "long", 1
+    proc set from Dict with env, "float", 1
+    proc set from Dict with env, "double", 1
+    proc set from Dict with env, "char", 1
+    proc set from Dict with env, "void", 1
+    proc set from Dict with env, "var", 1
+
+    Note: Literal keywords usable as expressions.
+    proc set from Dict with env, "true", 1
+    proc set from Dict with env, "false", 1
+    proc set from Dict with env, "null", 1
+    proc set from Dict with env, "this", 1
+    proc set from Dict with env, "super", 1
+
+    Note: java.lang types auto-imported into every compilation unit.
+    proc set from Dict with env, "Object", 1
+    proc set from Dict with env, "String", 1
+    proc set from Dict with env, "Integer", 1
+    proc set from Dict with env, "Long", 1
+    proc set from Dict with env, "Short", 1
+    proc set from Dict with env, "Byte", 1
+    proc set from Dict with env, "Boolean", 1
+    proc set from Dict with env, "Character", 1
+    proc set from Dict with env, "Float", 1
+    proc set from Dict with env, "Double", 1
+    proc set from Dict with env, "Number", 1
+    proc set from Dict with env, "CharSequence", 1
+    proc set from Dict with env, "Comparable", 1
+    proc set from Dict with env, "Iterable", 1
+    proc set from Dict with env, "Runnable", 1
+    proc set from Dict with env, "Thread", 1
+    proc set from Dict with env, "Throwable", 1
+    proc set from Dict with env, "Exception", 1
+    proc set from Dict with env, "RuntimeException", 1
+    proc set from Dict with env, "Error", 1
+    proc set from Dict with env, "Math", 1
+    proc set from Dict with env, "System", 1
+    proc set from Dict with env, "Class", 1
+    proc set from Dict with env, "Enum", 1
+    proc set from Dict with env, "StringBuilder", 1
+    proc set from Dict with env, "StringBuffer", 1
+    proc set from Dict with env, "Void", 1
+End Process
+
+@Reasoning:
+A name is predeclared if it is in the primitive + java.lang surface. Used by
+both type-reference validation and identifier resolution so an undefined
+diagnostic never fires on that surface.
+@End Reasoning
+Process called "is_predeclared" takes analyzer as Integer, name as Integer returns Integer:
+    If name is equal to 0:
+        Return 0
+    End If
+
+    Let env be proc memory_get_int64 from Layout with analyzer, 64
+    Let found be proc get from Dict with env, name
+    If found is not equal to 0:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: AST Field Access Helpers
+Note: ============================================================================
+
+@Reasoning:
+The parser stores the node tag at offset 0, the simple name string at offset 16,
+the value/flag integer at offset 24, the children array pointer at offset 32,
+and the child count at offset 40. Centralizing the reads keeps the analyzer
+robust to a single-point layout change.
+@End Reasoning
+Process called "node_type_of" takes node as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Layout with node, 0
+End Process
+
+Process called "node_name_of" takes node as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Layout with node, 16
+End Process
+
+Process called "node_value_of" takes node as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Layout with node, 24
+End Process
+
+Process called "node_child_count" takes node as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Layout with node, 40
+End Process
+
+Process called "node_child_at" takes node as Integer, index as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    Let children be proc memory_get_int64 from Layout with node, 32
+    If children is equal to 0:
+        Return 0
+    End If
+    Let count be proc memory_get_int64 from Layout with node, 40
+    If index is less than 0:
+        Return 0
+    End If
+    If index is greater than or equal to count:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Layout with children, index multiplied by 8
+End Process
+
+Note: ============================================================================
+Note: Top-Level Walk
+Note: ============================================================================
+
+@Reasoning:
+Public entry point. Walks a compilation unit in dependency order: imports first
+(so type references can resolve), then a declaration-registration pass that
+seeds every top-level type name into the registry (so forward references and
+mutual references between sibling types resolve), then a full analysis pass over
+each type declaration. Returns 1 if analysis completed with no errors, 0 if any
+error was recorded.
+@End Reasoning
+Process called "analyze_java_program" takes analyzer as Integer, root as Integer returns Integer:
+    If analyzer is equal to 0:
+        Return 0
+    End If
+    If root is equal to 0:
+        Return 0
+    End If
+
+    Let root_type be proc node_type_of with root
+    If root_type is not equal to AST_COMPILATION_UNIT from Parser:
+        Note: Permit a bare type declaration as the root for unit testing.
+        proc analyze_node with analyzer, root
+        Return proc analysis_succeeded with analyzer
+    End If
+
+    Let count be proc node_child_count with root
+
+    Note: Pass 1 - imports.
     Let index be 0
-    While index is less than child_count:
-        Let child be proc memory_get_int64 from Layout with children, index multiplied by 8
-        Let child_type be proc memory_get_int64 from Layout with child, 0
-
-        If child_type is equal to AST_IMPORT_DECLARATION from Parser:
-            proc analyze_import_declaration with analyzer, child
+    While index is less than count:
+        Let child be proc node_child_at with root, index
+        If proc node_type_of with child is equal to AST_IMPORT_DECLARATION from Parser:
+            proc analyze_import with analyzer, child
         End If
-
         Set index to index plus 1
     End While
 
-    Note: Process package declaration
+    Note: Pass 2 - register every top-level type name for forward resolution.
     Set index to 0
-    While index is less than child_count:
-        Set child to proc memory_get_int64 from Layout with children, index multiplied by 8
-        Set child_type to proc memory_get_int64 from Layout with child, 0
-
-        If child_type is equal to AST_PACKAGE_DECLARATION from Parser:
-            proc analyze_package_declaration with analyzer, child
+    While index is less than count:
+        Set child to proc node_child_at with root, index
+        Let ct be proc node_type_of with child
+        If proc is_type_declaration with ct is equal to 1:
+            proc register_type with analyzer, proc node_name_of with child
         End If
-
         Set index to index plus 1
     End While
 
-    Note: Process type declarations (classes, interfaces, enums)
+    Note: Pass 3 - analyze each type declaration in full.
     Set index to 0
-    While index is less than child_count:
-        Set child to proc memory_get_int64 from Layout with children, index multiplied by 8
-        Set child_type to proc memory_get_int64 from Layout with child, 0
-
-        If child_type is equal to AST_CLASS_DECLARATION from Parser or
-           child_type is equal to AST_INTERFACE_DECLARATION from Parser or
-           child_type is equal to AST_ENUM_DECLARATION from Parser:
-            proc analyze_java_ast with analyzer, child
+    While index is less than count:
+        Set child to proc node_child_at with root, index
+        Let dt be proc node_type_of with child
+        If proc is_type_declaration with dt is equal to 1:
+            proc analyze_node with analyzer, child
         End If
-
         Set index to index plus 1
     End While
 
-    Return 1
+    Return proc analysis_succeeded with analyzer
 End Process
 
 @Reasoning:
-Creates a class symbol, registers it in the enclosing scope, pushes a new
-class scope, records inheritance and interface implements in the hierarchy
-map, recurses into the body, then validates abstract/non-abstract
-completeness. The save/restore of current_scope and current_class makes
-nested classes work correctly because both fields are stacked locally.
+Returns 1 if name is one of the four top-level type-declaration node kinds.
 @End Reasoning
-Process called "analyze_class_declaration" takes analyzer as Integer, ast as Integer returns Integer:
-    Note: Analyze Java class declaration with inheritance and generics
-
-    Let class_name be proc get_ast_name from ast
-    Let modifiers be proc get_ast_modifiers from ast
-
-    Note: Create class symbol
-    Let class_symbol be a value of type JavaSymbol with
-        name as class_name,
-        symbol_type as "class",
-        data_type as class_name,
-        modifiers as modifiers,
-        scope as analyzer.current_scope,
-        annotations as proc get_ast_annotations with ast,
-        generic_parameters as proc get_ast_generic_parameters with ast,
-        is_initialized as 1,
-        line_number as proc get_ast_line with ast,
-        column_number as proc get_ast_column from ast
-
-    Note: Add class to current scope
-    proc add_symbol_to_scope with analyzer.current_scope, class_name, class_symbol
-
-    Note: Create class scope
-    Let class_scope be a value of type JavaScope with
-        scope_type as "class",
-        parent_scope as analyzer.current_scope,
-        symbols as proc create_dict,
-        access_level as proc get_access_level with modifiers,
-        is_static as proc has_modifier with modifiers, "static"
-
-    Note: Push class scope
-    Let previous_scope be analyzer.current_scope
-    Let previous_class be analyzer.current_class
-    Set analyzer.current_scope to class_scope
-    Set analyzer.current_class to class_symbol
-
-    Note: Process inheritance
-    Let extends_clause be proc get_ast_extends_clause from ast
-    If extends_clause is not equal to 0:
-        Let superclass_name be proc get_type_name from extends_clause
-        proc add_inheritance_relationship with analyzer.class_hierarchy, class_name, superclass_name
-        proc check_inheritance_validity with analyzer, class_name, superclass_name, ast
+Process called "is_type_declaration" takes node_type as Integer returns Integer:
+    If node_type is equal to AST_CLASS_DECLARATION from Parser:
+        Return 1
     End If
-
-    Note: Process interface implementations
-    Let implements_clause be proc get_ast_implements_clause from ast
-    If implements_clause is not equal to 0:
-        proc analyze_interface_implementations with analyzer, class_name, implements_clause, ast
+    If node_type is equal to AST_INTERFACE_DECLARATION from Parser:
+        Return 1
     End If
-
-    Note: Analyze class body
-    Let body be proc get_ast_body from ast
-    If body is not equal to 0:
-        proc analyze_java_ast with analyzer, body
+    If node_type is equal to AST_ENUM_DECLARATION from Parser:
+        Return 1
     End If
-
-    Note: Validate class completeness
-    proc validate_class_completeness with analyzer, class_symbol, ast
-
-    Note: Restore previous scope
-    Set analyzer.current_scope to previous_scope
-    Set analyzer.current_class to previous_class
-
-    Return 1
+    If node_type is equal to AST_ANNOTATION_DECLARATION from Parser:
+        Return 1
+    End If
+    Return 0
 End Process
 
 @Reasoning:
-Builds a method signature (used for overload-conflict detection within
-the class), creates a method symbol, pushes a method scope, analyzes
-parameters into that scope, recurses into the body, and validates return
-statement compatibility against the declared return type. Constructor
-forms (no return type) and abstract forms (no body) are handled by skipping
-respective sections when the relevant AST piece is null.
+Returns 1 when no error has been recorded.
 @End Reasoning
-Process called "analyze_method_declaration" takes analyzer as Integer, ast as Integer returns Integer:
-    Note: Analyze Java method declaration with overloading and generics
+Process called "analysis_succeeded" takes analyzer as Integer returns Integer:
+    Let has_error be proc memory_get_int64 from Layout with analyzer, 56
+    If has_error is equal to 0:
+        Return 1
+    End If
+    Return 0
+End Process
 
-    Let method_name be proc get_ast_name from ast
-    Let return_type be proc get_ast_return_type from ast
-    Let parameters be proc get_ast_parameters from ast
-    Let modifiers be proc get_ast_modifiers from ast
+Note: ============================================================================
+Note: Imports
+Note: ============================================================================
 
-    Note: Create method signature
-    Let signature be a value of type JavaMethodSignature with
-        name as method_name,
-        parameter_types as proc extract_parameter_types with parameters,
-        return_type as return_type,
-        modifiers as modifiers,
-        generic_parameters as proc get_ast_generic_parameters with ast,
-        throws_clauses as proc get_ast_throws_clauses from ast
-
-    Note: Check for method overloading conflicts
-    proc check_method_overloading with analyzer, signature, ast
-
-    Note: Create method symbol
-    Let method_symbol be a value of type JavaSymbol with
-        name as method_name,
-        symbol_type as "method",
-        data_type as return_type,
-        modifiers as modifiers,
-        scope as analyzer.current_scope,
-        annotations as proc get_ast_annotations with ast,
-        generic_parameters as signature.generic_parameters,
-        is_initialized as 1,
-        line_number as proc get_ast_line with ast,
-        column_number as proc get_ast_column from ast
-
-    Note: Add method to current scope
-    proc add_symbol_to_scope with analyzer.current_scope, method_name, method_symbol
-
-    Note: Create method scope
-    Let method_scope be a value of type JavaScope with
-        scope_type as "method",
-        parent_scope as analyzer.current_scope,
-        symbols as proc create_dict,
-        access_level as proc get_access_level with modifiers,
-        is_static as proc has_modifier with modifiers, "static"
-
-    Note: Push method scope
-    Let previous_scope be analyzer.current_scope
-    Let previous_method be analyzer.current_method
-    Set analyzer.current_scope to method_scope
-    Set analyzer.current_method to method_symbol
-
-    Note: Analyze parameters
-    If parameters is not equal to 0:
-        proc analyze_method_parameters with analyzer, parameters, ast
+@Reasoning:
+An import declaration carries a dotted name string at offset 16; a wildcard
+import ends in ".*". The imported simple name (the last dotted segment, or for
+a wildcard the segment before ".*") is registered as a known type so later
+references resolve. A static import binds a member name the same way.
+@End Reasoning
+Process called "analyze_import" takes analyzer as Integer, node as Integer:
+    Let qualified be proc node_name_of with node
+    If qualified is equal to 0:
+        Return
     End If
 
-    Note: Analyze method body
-    Let body be proc get_ast_body from ast
-    If body is not equal to 0:
-        proc analyze_java_ast with analyzer, body
-
-        Note: Check return statements match return type
-        proc validate_return_statements with analyzer, method_symbol, body, ast
+    Let simple be proc last_dotted_segment with qualified
+    If simple is equal to 0:
+        Return
     End If
 
-    Note: Validate method constraints
-    proc validate_method_constraints with analyzer, method_symbol, ast
-
-    Note: Restore previous scope
-    Set analyzer.current_scope to previous_scope
-    Set analyzer.current_method to previous_method
-
-    Return 1
+    proc register_type with analyzer, simple
 End Process
 
 @Reasoning:
-Pushes a lambda scope (so 'this' resolves to the enclosing class, not the
-lambda itself), runs analysis on parameters and body, then performs closure
-analysis to record effectively-final captures and infers the lambda's
-target functional-interface type. The inferred type is attached to the AST
-node so the translator can emit a correct anonymous-class equivalent or
-preserve the lambda form.
+Returns the substring after the final '.' in a dotted name, allocating a fresh
+owned string. A trailing ".*" wildcard yields the segment before it (the
+on-demand package's leaf), so "java.util.*" registers "util" - harmless, since
+wildcard members are validated leniently. A name with no '.' is returned as a
+duplicate so the registry owns an independent copy.
 @End Reasoning
-Process called "analyze_lambda_expression" takes analyzer as Integer, ast as Integer returns Integer:
-    Note: Analyze Java lambda expression with type inference and closure
-
-    Let parameters be proc get_ast_parameters from ast
-    Let body be proc get_ast_body from ast
-
-    Note: Create lambda scope
-    Let lambda_scope be a value of type JavaScope with
-        scope_type as "lambda",
-        parent_scope as analyzer.current_scope,
-        symbols as proc create_dict,
-        access_level as "private",
-        is_static as 0
-
-    Note: Push lambda context
-    proc push_lambda_context with analyzer.lambda_contexts, lambda_scope
-    Let previous_scope be analyzer.current_scope
-    Set analyzer.current_scope to lambda_scope
-
-    Note: Analyze lambda parameters with type inference
-    If parameters is not equal to 0:
-        proc analyze_lambda_parameters with analyzer, parameters, ast
+Process called "last_dotted_segment" takes name as Integer returns Integer:
+    Let length be proc string_length from StringCore with name
+    If length is equal to 0:
+        Return 0
     End If
 
-    Note: Analyze lambda body
-    proc analyze_java_ast with analyzer, body
+    Note: Strip a trailing ".*" wildcard suffix from consideration.
+    Let effective_end be length
+    If length is greater than or equal to 2:
+        Let last_char be proc string_char_at from StringCore with name, length minus 1
+        Let prev_char be proc string_char_at from StringCore with name, length minus 2
+        If last_char is equal to 42:
+            If prev_char is equal to 46:
+                Set effective_end to length minus 2
+            End If
+        End If
+    End If
 
-    Note: Perform closure analysis
-    proc analyze_closure_variables with analyzer, lambda_scope, ast
+    Note: Find the last '.' before effective_end.
+    Let cut be 0
+    Let i be 0
+    While i is less than effective_end:
+        Let ch be proc string_char_at from StringCore with name, i
+        If ch is equal to 46:
+            Set cut to i plus 1
+        End If
+        Set i to i plus 1
+    End While
 
-    Note: Infer functional interface type
-    Let functional_interface be proc infer_functional_interface_type with analyzer, ast
-    proc set_ast_inferred_type with ast, functional_interface
+    Let seg_len be effective_end minus cut
+    If seg_len is less than or equal to 0:
+        Return 0
+    End If
 
-    Note: Restore previous scope
-    Set analyzer.current_scope to previous_scope
-    proc pop_lambda_context with analyzer.lambda_contexts
+    Let result be proc allocate from Layout with seg_len plus 1
+    If result is equal to 0:
+        Return 0
+    End If
 
-    Return 1
+    Let j be 0
+    While j is less than seg_len:
+        Let src_char be proc string_char_at from StringCore with name, cut plus j
+        proc memory_set_byte from Layout with result, j, src_char
+        Set j to j plus 1
+    End While
+    proc memory_set_byte from Layout with result, seg_len, 0
+
+    Return result
+End Process
+
+Note: ============================================================================
+Note: Node Dispatch
+Note: ============================================================================
+
+@Reasoning:
+Visitor dispatch keyed on the AST node tag. Declarations push scopes and
+register bindings; control-flow statements push block scopes; expressions
+resolve identifiers and validate type references. The fall-through recurses into
+children so container-only nodes propagate analysis without an explicit handler.
+@End Reasoning
+Process called "analyze_node" takes analyzer as Integer, node as Integer:
+    If node is equal to 0:
+        Return
+    End If
+
+    Let nt be proc node_type_of with node
+
+    If nt is equal to AST_CLASS_DECLARATION from Parser:
+        proc analyze_type_declaration with analyzer, node
+        Return
+    End If
+    If nt is equal to AST_INTERFACE_DECLARATION from Parser:
+        proc analyze_type_declaration with analyzer, node
+        Return
+    End If
+    If nt is equal to AST_ENUM_DECLARATION from Parser:
+        proc analyze_type_declaration with analyzer, node
+        Return
+    End If
+    If nt is equal to AST_ANNOTATION_DECLARATION from Parser:
+        proc analyze_type_declaration with analyzer, node
+        Return
+    End If
+    If nt is equal to AST_METHOD_DECLARATION from Parser:
+        proc analyze_method_declaration with analyzer, node
+        Return
+    End If
+    If nt is equal to AST_CONSTRUCTOR_DECLARATION from Parser:
+        proc analyze_method_declaration with analyzer, node
+        Return
+    End If
+    If nt is equal to AST_FIELD_DECLARATION from Parser:
+        proc analyze_field_declaration with analyzer, node
+        Return
+    End If
+    If nt is equal to AST_BLOCK from Parser:
+        proc analyze_block with analyzer, node
+        Return
+    End If
+    If nt is equal to AST_VARIABLE_DECLARATION from Parser:
+        proc analyze_variable_declaration with analyzer, node
+        Return
+    End If
+    If nt is equal to AST_FOR_STATEMENT from Parser:
+        proc analyze_block_scoped with analyzer, node
+        Return
+    End If
+    If nt is equal to AST_ENHANCED_FOR from Parser:
+        proc analyze_block_scoped with analyzer, node
+        Return
+    End If
+    If nt is equal to AST_CATCH_CLAUSE from Parser:
+        proc analyze_block_scoped with analyzer, node
+        Return
+    End If
+    If nt is equal to AST_LAMBDA_EXPRESSION from Parser:
+        proc analyze_lambda with analyzer, node
+        Return
+    End If
+    If nt is equal to AST_TYPE_REFERENCE from Parser:
+        proc analyze_type_reference with analyzer, node
+        Return
+    End If
+    If nt is equal to AST_IDENTIFIER from Parser:
+        proc analyze_identifier with analyzer, node
+        Return
+    End If
+
+    Note: Container / unhandled node: recurse into children.
+    proc analyze_children with analyzer, node
 End Process
 
 @Reasoning:
-Resolves a method call: analyzes the receiver (or falls back to the
-current class for implicit-this calls), collects argument types, then runs
-overload resolution. On failure adds an error and returns 0 to halt
-propagation; on success records the inferred return type on the call node
-and checks access modifiers.
+Walks every child of a node through analyze_node. Used by container nodes
+(compilation unit fragments, expression statements, binary/call/ternary
+expressions, argument lists, type-parameter lists) that carry no binding of
+their own but whose children require analysis.
 @End Reasoning
-Process called "analyze_method_call" takes analyzer as Integer, ast as Integer returns Integer:
-    Note: Analyze Java method call with overload resolution and generics
+Process called "analyze_children" takes analyzer as Integer, node as Integer:
+    Let count be proc node_child_count with node
+    Let index be 0
+    While index is less than count:
+        Let child be proc node_child_at with node, index
+        proc analyze_node with analyzer, child
+        Set index to index plus 1
+    End While
+End Process
 
-    Let method_name be proc get_ast_method_name from ast
-    Let receiver be proc get_ast_receiver from ast
-    Let arguments be proc get_ast_arguments from ast
+Note: ============================================================================
+Note: Declarations
+Note: ============================================================================
 
-    Note: Analyze receiver expression
-    Let receiver_type be ""
-    If receiver is not equal to 0:
-        proc analyze_java_ast with analyzer, receiver
-        Set receiver_type to proc get_ast_inferred_type from receiver
-    Otherwise:
-        Note: Method call on current class or static import
-        Set receiver_type to proc get_current_class_type from analyzer
+@Reasoning:
+Analyzes a class/interface/enum/annotation declaration. The type name is
+registered in the enclosing scope and the type registry (idempotent with the
+pre-pass), modifiers are validated, a fresh type scope is pushed, the
+declaration's generic type parameters are bound into that scope, extends/
+implements clauses are validated as type references, and each member is
+analyzed. The type scope is popped on the way out so sibling declarations are
+unaffected.
+@End Reasoning
+Process called "analyze_type_declaration" takes analyzer as Integer, node as Integer:
+    Let name be proc node_name_of with node
+    proc declare_in_scope with analyzer, name
+    proc register_type with analyzer, name
+
+    Let modifiers be proc first_child_of_type with node, AST_MODIFIER_LIST from Parser
+    proc validate_modifiers with analyzer, modifiers, name
+
+    proc enter_scope with analyzer
+
+    Note: Bind generic type parameters and validate bounds.
+    Let type_params be proc first_child_of_type with node, AST_TYPE_PARAMETER from Parser
+    proc bind_type_parameters with analyzer, type_params
+
+    Note: Validate extends / implements / member declarations.
+    Let count be proc node_child_count with node
+    Let index be 0
+    While index is less than count:
+        Let child be proc node_child_at with node, index
+        Let ct be proc node_type_of with child
+        If ct is equal to AST_TYPE_REFERENCE from Parser:
+            proc analyze_type_reference with analyzer, child
+        Otherwise If ct is equal to AST_GENERIC_TYPE from Parser:
+            proc analyze_type_reference with analyzer, child
+        Otherwise If ct is equal to AST_MODIFIER_LIST from Parser:
+            Note: already validated above
+            Set ct to ct
+        Otherwise If ct is equal to AST_TYPE_PARAMETER from Parser:
+            Note: already bound above
+            Set ct to ct
+        Otherwise:
+            proc analyze_node with analyzer, child
+        End If
+        Set index to index plus 1
+    End While
+
+    proc exit_scope with analyzer
+End Process
+
+@Reasoning:
+Analyzes a method or constructor declaration. Modifiers are validated against
+the abstract/body consistency rule, a method scope is pushed, generic method
+type parameters are bound, parameters are declared and their types validated,
+the return type is validated, and the body (if present) is analyzed. The scope
+is popped on exit.
+@End Reasoning
+Process called "analyze_method_declaration" takes analyzer as Integer, node as Integer:
+    Let name be proc node_name_of with node
+    Let modifiers be proc first_child_of_type with node, AST_MODIFIER_LIST from Parser
+    proc validate_modifiers with analyzer, modifiers, name
+
+    Let body be proc first_child_of_type with node, AST_BLOCK from Parser
+    Let is_abstract be proc modifier_present with modifiers, "abstract"
+    If is_abstract is equal to 1:
+        If body is not equal to 0:
+            proc record_error with analyzer, "abstract method must not have a body"
+        End If
     End If
 
-    Note: Analyze arguments
-    Let argument_types be proc create_list
-    If arguments is not equal to 0:
-        Let arg_count be proc get_list_size from arguments
-        Let arg_index be 0
-        While arg_index is less than arg_count:
-            Let argument be proc get_list_item with arguments, arg_index
-            proc analyze_java_ast with analyzer, argument
-            Let arg_type be proc get_ast_inferred_type from argument
-            proc add_to_list with argument_types, arg_type
-            Set arg_index to arg_index plus 1
+    proc enter_scope with analyzer
+
+    Let type_params be proc first_child_of_type with node, AST_TYPE_PARAMETER from Parser
+    proc bind_type_parameters with analyzer, type_params
+
+    Note: Parameters, return type, and remaining signature pieces.
+    Let count be proc node_child_count with node
+    Let index be 0
+    While index is less than count:
+        Let child be proc node_child_at with node, index
+        Let ct be proc node_type_of with child
+        If ct is equal to AST_PARAMETER from Parser:
+            proc analyze_parameter with analyzer, child
+        Otherwise If ct is equal to AST_TYPE_REFERENCE from Parser:
+            proc analyze_type_reference with analyzer, child
+        Otherwise If ct is equal to AST_ARRAY_TYPE from Parser:
+            proc analyze_type_reference with analyzer, child
+        Otherwise If ct is equal to AST_GENERIC_TYPE from Parser:
+            proc analyze_type_reference with analyzer, child
+        Otherwise If ct is equal to AST_BLOCK from Parser:
+            proc analyze_block_body with analyzer, child
+        Otherwise If ct is equal to AST_MODIFIER_LIST from Parser:
+            Set ct to ct
+        Otherwise If ct is equal to AST_TYPE_PARAMETER from Parser:
+            Set ct to ct
+        Otherwise:
+            proc analyze_node with analyzer, child
+        End If
+        Set index to index plus 1
+    End While
+
+    proc exit_scope with analyzer
+End Process
+
+@Reasoning:
+Declares a method/constructor parameter binding in the current (method) scope
+and validates its declared type. The parameter's name is at offset 16; its type
+is the first AST_TYPE_REFERENCE/array/generic child.
+@End Reasoning
+Process called "analyze_parameter" takes analyzer as Integer, node as Integer:
+    Let name be proc node_name_of with node
+    proc declare_in_scope with analyzer, name
+
+    Let count be proc node_child_count with node
+    Let index be 0
+    While index is less than count:
+        Let child be proc node_child_at with node, index
+        Let ct be proc node_type_of with child
+        If ct is equal to AST_TYPE_REFERENCE from Parser:
+            proc analyze_type_reference with analyzer, child
+        Otherwise If ct is equal to AST_ARRAY_TYPE from Parser:
+            proc analyze_type_reference with analyzer, child
+        Otherwise If ct is equal to AST_GENERIC_TYPE from Parser:
+            proc analyze_type_reference with analyzer, child
+        End If
+        Set index to index plus 1
+    End While
+End Process
+
+@Reasoning:
+Analyzes a field declaration: declares the field name in the enclosing type
+scope, validates modifiers and the declared type, and analyzes any initializer
+expression. The field name is at offset 16; the type is the first type child;
+the remaining children are initializer expressions.
+@End Reasoning
+Process called "analyze_field_declaration" takes analyzer as Integer, node as Integer:
+    Let name be proc node_name_of with node
+    proc declare_in_scope with analyzer, name
+
+    Let modifiers be proc first_child_of_type with node, AST_MODIFIER_LIST from Parser
+    proc validate_modifiers with analyzer, modifiers, name
+
+    Let count be proc node_child_count with node
+    Let index be 0
+    While index is less than count:
+        Let child be proc node_child_at with node, index
+        Let ct be proc node_type_of with child
+        If ct is equal to AST_TYPE_REFERENCE from Parser:
+            proc analyze_type_reference with analyzer, child
+        Otherwise If ct is equal to AST_ARRAY_TYPE from Parser:
+            proc analyze_type_reference with analyzer, child
+        Otherwise If ct is equal to AST_GENERIC_TYPE from Parser:
+            proc analyze_type_reference with analyzer, child
+        Otherwise If ct is equal to AST_MODIFIER_LIST from Parser:
+            Set ct to ct
+        Otherwise:
+            proc analyze_node with analyzer, child
+        End If
+        Set index to index plus 1
+    End While
+End Process
+
+@Reasoning:
+A local variable declaration binds its name in the innermost scope and validates
+its type and initializer. A same-scope redeclaration of a local is a Java error.
+@End Reasoning
+Process called "analyze_variable_declaration" takes analyzer as Integer, node as Integer:
+    Let name be proc node_name_of with node
+    If name is not equal to 0:
+        Let already be proc declared_in_current_scope with analyzer, name
+        If already is equal to 1:
+            proc record_error with analyzer, "variable already declared in this scope"
+        End If
+        proc declare_in_scope with analyzer, name
+    End If
+
+    Let count be proc node_child_count with node
+    Let index be 0
+    While index is less than count:
+        Let child be proc node_child_at with node, index
+        Let ct be proc node_type_of with child
+        If ct is equal to AST_TYPE_REFERENCE from Parser:
+            proc analyze_type_reference with analyzer, child
+        Otherwise If ct is equal to AST_ARRAY_TYPE from Parser:
+            proc analyze_type_reference with analyzer, child
+        Otherwise If ct is equal to AST_GENERIC_TYPE from Parser:
+            proc analyze_type_reference with analyzer, child
+        Otherwise:
+            proc analyze_node with analyzer, child
+        End If
+        Set index to index plus 1
+    End While
+End Process
+
+Note: ============================================================================
+Note: Statements / Blocks
+Note: ============================================================================
+
+@Reasoning:
+A block introduces a fresh lexical scope. Its statements are analyzed within
+that scope, and the scope is popped on exit so block-local bindings do not leak.
+@End Reasoning
+Process called "analyze_block" takes analyzer as Integer, node as Integer:
+    proc enter_scope with analyzer
+    proc analyze_children with analyzer, node
+    proc exit_scope with analyzer
+End Process
+
+@Reasoning:
+Analyzes a block's statements WITHOUT pushing a new scope, used when the caller
+(method declaration) has already established the scope that the block's bindings
+(e.g. parameters) must share with the body.
+@End Reasoning
+Process called "analyze_block_body" takes analyzer as Integer, node as Integer:
+    proc analyze_children with analyzer, node
+End Process
+
+@Reasoning:
+for / enhanced-for / catch introduce a scope spanning their header bindings and
+body (a for-loop's init variable is visible in the condition, update, and body;
+an enhanced-for's loop variable in the body; a catch parameter in the catch
+block). A single scope wraps all children so those bindings resolve correctly
+and are released afterwards.
+@End Reasoning
+Process called "analyze_block_scoped" takes analyzer as Integer, node as Integer:
+    proc enter_scope with analyzer
+    proc analyze_children with analyzer, node
+    proc exit_scope with analyzer
+End Process
+
+@Reasoning:
+A lambda introduces a scope for its parameters that is visible in the body. The
+parameter container is the first child (an AST_PARAMETER node whose own children
+are the individual parameters, or which directly carries an inferred-type
+identifier name); the body is the second child. Captured enclosing bindings
+remain resolvable through the scope chain.
+@End Reasoning
+Process called "analyze_lambda" takes analyzer as Integer, node as Integer:
+    proc enter_scope with analyzer
+
+    Let params be proc node_child_at with node, 0
+    If params is not equal to 0:
+        Note: An inferred-type single parameter carries its name directly.
+        Let direct_name be proc node_name_of with params
+        If direct_name is not equal to 0:
+            proc declare_in_scope with analyzer, direct_name
+        End If
+        Note: A parenthesized list carries each parameter as a child.
+        Let pcount be proc node_child_count with params
+        Let pindex be 0
+        While pindex is less than pcount:
+            Let p be proc node_child_at with params, pindex
+            proc analyze_parameter with analyzer, p
+            Set pindex to pindex plus 1
         End While
     End If
 
-    Note: Resolve method overloading
-    Let resolved_method be proc resolve_method_overloading with analyzer, receiver_type, method_name, argument_types, ast
-
-    If resolved_method is equal to 0:
-        proc add_semantic_error with analyzer, "Cannot resolve method", ast
-        Return 0
+    Let body be proc node_child_at with node, 1
+    If body is not equal to 0:
+        proc analyze_node with analyzer, body
     End If
 
-    Note: Check access permissions
-    proc check_method_access with analyzer, resolved_method, ast
-
-    Note: Set inferred return type
-    Let return_type be proc get_method_return_type from resolved_method
-    proc set_ast_inferred_type with ast, return_type
-
-    Return 1
+    proc exit_scope with analyzer
 End Process
 
-@Reasoning:
-Layered compatibility check following JLS assignment-context rules: exact
-match, primitive widening (byte->short->int->long->float->double),
-subtype (class hierarchy), interface implementation, generic compatibility
-(parameterized type subtyping), and autoboxing/unboxing. Each layer is
-short-circuit — first to match returns 1.
-@End Reasoning
-Process called "check_type_compatibility" takes analyzer as Integer, expected_type as String, actual_type as String, ast as Integer returns Integer:
-    Note: Check if actual type is compatible with expected type
-
-    Note: Handle exact match
-    If expected_type is equal to actual_type:
-        Return 1
-    End If
-
-    Note: Handle primitive widening conversions
-    If proc is_primitive_widening_conversion with expected_type, actual_type is equal to 1:
-        Return 1
-    End If
-
-    Note: Handle inheritance relationships
-    If proc is_subtype with analyzer.class_hierarchy, actual_type, expected_type is equal to 1:
-        Return 1
-    End If
-
-    Note: Handle interface implementations
-    If proc implements_interface with analyzer.class_hierarchy, actual_type, expected_type is equal to 1:
-        Return 1
-    End If
-
-    Note: Handle generic type compatibility
-    If proc is_generic_type_compatible with expected_type, actual_type is equal to 1:
-        Return 1
-    End If
-
-    Note: Handle autoboxing/unboxing
-    If proc is_autoboxing_compatible with expected_type, actual_type is equal to 1:
-        Return 1
-    End If
-
-    Return 0
-End Process
+Note: ============================================================================
+Note: Expressions / References
+Note: ============================================================================
 
 @Reasoning:
-Implements JLS 15.12.2 overload resolution in five phases: exact match,
-widening primitive conversion, autoboxing/unboxing, widening reference
-conversion, and finally varargs. Each phase narrows the candidate set; the
-first phase yielding exactly one match wins. Multiple matches in the final
-phase are reported as ambiguous.
+Validates a type reference. The base type name is at offset 16 (qualified names
+keep their dotted form; the leading simple segment is what the registry holds).
+An unknown simple type that is neither predeclared, declared, imported, nor a
+bound type parameter produces an error. Generic arguments and array element
+types are validated recursively via children.
 @End Reasoning
-@Performance_Hints:
-O(c * p) where c is candidate count and p is parameter count, dominated
-by the filtering passes. Candidates are pre-fetched once via
-find_candidate_methods.
-@End Performance_Hints
-Process called "resolve_method_overloading" takes analyzer as Integer, receiver_type as String, method_name as String, argument_types as Integer, ast as Integer returns Integer:
-    Note: Resolve method overloading using Java's method resolution rules
-
-    Note: Find all candidate methods
-    Let candidates be proc find_candidate_methods with analyzer, receiver_type, method_name
-
-    If proc get_list_size with candidates is equal to 0:
-        Return 0  Note: No methods found
-    End If
-
-    Note: Phase 1: Exact match (no conversion)
-    Let exact_matches be proc filter_exact_matches with candidates, argument_types
-    If proc get_list_size with exact_matches is equal to 1:
-        Return proc get_list_item with exact_matches, 0
-    End If
-
-    Note: Phase 2: Widening primitive conversions
-    Let widening_matches be proc filter_widening_matches with candidates, argument_types
-    If proc get_list_size with widening_matches is equal to 1:
-        Return proc get_list_item with widening_matches, 0
-    End If
-
-    Note: Phase 3: Autoboxing/unboxing
-    Let boxing_matches be proc filter_boxing_matches with candidates, argument_types
-    If proc get_list_size with boxing_matches is equal to 1:
-        Return proc get_list_item with boxing_matches, 0
-    End If
-
-    Note: Phase 4: Widening reference conversions
-    Let reference_matches be proc filter_reference_matches with analyzer, candidates, argument_types
-    If proc get_list_size with reference_matches is equal to 1:
-        Return proc get_list_item with reference_matches, 0
-    End If
-
-    Note: Phase 5: Variable arity (varargs)
-    Let vararg_matches be proc filter_vararg_matches with candidates, argument_types
-    If proc get_list_size with vararg_matches is equal to 1:
-        Return proc get_list_item with vararg_matches, 0
-    End If
-
-    Note: If multiple matches remain, it's ambiguous
-    If proc get_list_size with candidates is greater than 1:
-        proc add_semantic_error with analyzer, "Ambiguous method call", ast
-    End If
-
-    Return 0
-End Process
-
-@Reasoning:
-Looks up declared type-parameter bounds for type_name and validates that
-each supplied generic argument satisfies the corresponding constraint.
-Arity mismatch is rejected before the per-argument check so we don't
-mis-pair bounds with arguments.
-@End Reasoning
-Process called "validate_generic_constraints" takes analyzer as Integer, type_name as String, generic_args as Integer, ast as Integer returns Integer:
-    Note: Validate generic type constraints and bounds
-
-    Let type_constraints be proc get_dict_value with analyzer.generic_constraints, type_name
-    If type_constraints is equal to 0:
-        Return 1  Note: No constraints to validate
-    End If
-
-    Let arg_count be proc get_list_size from generic_args
-    Let constraint_count be proc get_list_size from type_constraints
-
-    If arg_count is not equal to constraint_count:
-        proc add_semantic_error with analyzer, "Generic argument count mismatch", ast
-        Return 0
-    End If
-
-    Note: Validate each type argument against its constraint
-    Let index be 0
-    While index is less than arg_count:
-        Let type_arg be proc get_list_item with generic_args, index
-        Let constraint be proc get_list_item with type_constraints, index
-
-        If proc satisfies_constraint with analyzer, type_arg, constraint is equal to 0:
-            proc add_semantic_error with analyzer, "Type argument violates constraint", ast
-            Return 0
+Process called "analyze_type_reference" takes analyzer as Integer, node as Integer:
+    Let name be proc node_name_of with node
+    If name is not equal to 0:
+        Let simple be proc first_dotted_segment with name
+        Let resolved be proc is_known_type with analyzer, simple
+        If resolved is equal to 0:
+            Note: A type parameter is bound as a name in the current scope chain.
+            Let as_local be proc resolve_name with analyzer, simple
+            If as_local is equal to 0:
+                proc record_error with analyzer, "unknown type reference"
+            End If
         End If
+        If simple is not equal to 0:
+            proc deallocate from Layout with simple
+        End If
+    End If
 
+    proc analyze_children with analyzer, node
+End Process
+
+@Reasoning:
+Validates an identifier reference. 'this'/'super' and predeclared names always
+resolve. Otherwise the name must be bound in some enclosing scope, be a known
+type (static type reference), or be an imported name; if none hold it is an
+undefined reference. Member-access selectors (the right side of '.') are not
+checked here because they require type information beyond name resolution.
+@End Reasoning
+Process called "analyze_identifier" takes analyzer as Integer, node as Integer:
+    Let name be proc node_name_of with node
+    If name is equal to 0:
+        Return
+    End If
+
+    Let in_scope be proc resolve_name with analyzer, name
+    If in_scope is not equal to 0:
+        Return
+    End If
+
+    Let predeclared be proc is_predeclared with analyzer, name
+    If predeclared is equal to 1:
+        Return
+    End If
+
+    Let known_type be proc is_known_type with analyzer, name
+    If known_type is equal to 1:
+        Return
+    End If
+
+    proc record_error with analyzer, "undefined reference"
+End Process
+
+Note: ============================================================================
+Note: Generics
+Note: ============================================================================
+
+@Reasoning:
+Binds each type parameter of a declaration into the current scope and the type
+registry (so references to T resolve as both a name and a type), and validates
+each parameter's bounds as type references. The type-parameter container node
+holds AST_TYPE_PARAMETER children; each carries its name at offset 16 and its
+bound type-references as children.
+@End Reasoning
+Process called "bind_type_parameters" takes analyzer as Integer, node as Integer:
+    If node is equal to 0:
+        Return
+    End If
+
+    Note: The container may itself be a single AST_TYPE_PARAMETER or a wrapper
+    Note: whose children are AST_TYPE_PARAMETER nodes.
+    Let nt be proc node_type_of with node
+    If nt is equal to AST_TYPE_PARAMETER from Parser:
+        proc bind_one_type_parameter with analyzer, node
+        Return
+    End If
+
+    Let count be proc node_child_count with node
+    Let index be 0
+    While index is less than count:
+        Let child be proc node_child_at with node, index
+        If proc node_type_of with child is equal to AST_TYPE_PARAMETER from Parser:
+            proc bind_one_type_parameter with analyzer, child
+        End If
+        Set index to index plus 1
+    End While
+End Process
+
+@Reasoning:
+Binds a single type parameter's name and validates its bound type references.
+@End Reasoning
+Process called "bind_one_type_parameter" takes analyzer as Integer, node as Integer:
+    Let name be proc node_name_of with node
+    proc declare_in_scope with analyzer, name
+    proc register_type with analyzer, name
+
+    Let count be proc node_child_count with node
+    Let index be 0
+    While index is less than count:
+        Let child be proc node_child_at with node, index
+        Let ct be proc node_type_of with child
+        If ct is equal to AST_TYPE_REFERENCE from Parser:
+            proc analyze_type_reference with analyzer, child
+        Otherwise If ct is equal to AST_TYPE_BOUND from Parser:
+            proc analyze_children with analyzer, child
+        Otherwise If ct is equal to AST_GENERIC_TYPE from Parser:
+            proc analyze_type_reference with analyzer, child
+        End If
+        Set index to index plus 1
+    End While
+End Process
+
+Note: ============================================================================
+Note: Modifiers
+Note: ============================================================================
+
+@Reasoning:
+Validates a modifier list: at most one access modifier (public/protected/
+private); 'abstract' is incompatible with 'final', 'static', and 'private'.
+The modifier-list node carries each modifier as a child AST_IDENTIFIER (or
+AST_ANNOTATION) whose name is the modifier keyword.
+@End Reasoning
+Process called "validate_modifiers" takes analyzer as Integer, node as Integer, owner_name as Integer:
+    If node is equal to 0:
+        Return
+    End If
+
+    Let access_count be 0
+    If proc modifier_present with node, "public" is equal to 1:
+        Set access_count to access_count plus 1
+    End If
+    If proc modifier_present with node, "protected" is equal to 1:
+        Set access_count to access_count plus 1
+    End If
+    If proc modifier_present with node, "private" is equal to 1:
+        Set access_count to access_count plus 1
+    End If
+    If access_count is greater than 1:
+        proc record_error with analyzer, "conflicting access modifiers"
+    End If
+
+    Let has_abstract be proc modifier_present with node, "abstract"
+    If has_abstract is equal to 1:
+        If proc modifier_present with node, "final" is equal to 1:
+            proc record_error with analyzer, "abstract cannot combine with final"
+        End If
+        If proc modifier_present with node, "static" is equal to 1:
+            proc record_error with analyzer, "abstract cannot combine with static"
+        End If
+        If proc modifier_present with node, "private" is equal to 1:
+            proc record_error with analyzer, "abstract cannot combine with private"
+        End If
+    End If
+End Process
+
+@Reasoning:
+Returns 1 if the modifier list contains a modifier whose name equals keyword.
+Each modifier child's name is at offset 16; the comparison is by string content.
+@End Reasoning
+Process called "modifier_present" takes node as Integer, keyword as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+
+    Let count be proc memory_get_int64 from Layout with node, 40
+    Let children be proc memory_get_int64 from Layout with node, 32
+    If children is equal to 0:
+        Return 0
+    End If
+
+    Let index be 0
+    While index is less than count:
+        Let child be proc memory_get_int64 from Layout with children, index multiplied by 8
+        If child is not equal to 0:
+            Let child_name be proc memory_get_int64 from Layout with child, 16
+            If child_name is not equal to 0:
+                If proc string_equals from StringCore with child_name, keyword is equal to 1:
+                    Return 1
+                End If
+            End If
+        End If
         Set index to index plus 1
     End While
 
-    Return 1
+    Return 0
 End Process
 
+Note: ============================================================================
+Note: Child Lookup Helpers
+Note: ============================================================================
+
 @Reasoning:
-Validates a single annotation usage. Unknown annotation names produce a
-warning (not an error) since user-defined annotations are common and may be
-declared elsewhere. Parameter validation enforces declared element types
-and required defaults; target validation checks that the annotation may
-appear on the annotated element kind (class, method, field, etc.).
+Returns the first direct child of node whose node_type equals target_type, or 0
+if none. Used to locate a declaration's modifier list, type-parameter container,
+or body block among its positional children.
 @End Reasoning
-Process called "analyze_annotation" takes analyzer as Integer, annotation as Integer returns Integer:
-    Note: Analyze Java annotation usage and validate parameters
-
-    Let annotation_name be proc get_ast_name from annotation
-    Let parameters be proc get_ast_annotation_parameters from annotation
-
-    Note: Check if annotation is known
-    Let annotation_info be proc get_dict_value with analyzer.annotation_table, annotation_name
-    If annotation_info is equal to 0:
-        proc add_semantic_warning with analyzer, "Unknown annotation", annotation
-        Return 1
+Process called "first_child_of_type" takes node as Integer, target_type as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
     End If
 
-    Note: Validate annotation parameters
-    If parameters is not equal to 0:
-        proc validate_annotation_parameters with analyzer, annotation_info, parameters, annotation
-    End If
-
-    Note: Check annotation target validity
-    proc validate_annotation_target with analyzer, annotation_info, annotation
-
-    Return 1
+    Let count be proc node_child_count with node
+    Let index be 0
+    While index is less than count:
+        Let child be proc node_child_at with node, index
+        If proc node_type_of with child is equal to target_type:
+            Return child
+        End If
+        Set index to index plus 1
+    End While
+    Return 0
 End Process
 
 @Reasoning:
-Accessor returning the accumulated error list. Callers iterate this after
-the analysis pass to surface diagnostics or abort translation if non-empty.
+Returns the substring before the first '.' in a dotted name, allocating a fresh
+owned string. The leading simple segment is the one the type registry and scope
+chain hold (e.g. "Map" in "Map.Entry", "java" in "java.util.List"). A name with
+no '.' is returned as a duplicate so callers can always free the result.
+@End Reasoning
+Process called "first_dotted_segment" takes name as Integer returns Integer:
+    Let length be proc string_length from StringCore with name
+    If length is equal to 0:
+        Return 0
+    End If
+
+    Let cut be length
+    Let i be 0
+    While i is less than length:
+        Let ch be proc string_char_at from StringCore with name, i
+        If ch is equal to 46:
+            Set cut to i
+            Set i to length
+        Otherwise:
+            Set i to i plus 1
+        End If
+    End While
+
+    Let result be proc allocate from Layout with cut plus 1
+    If result is equal to 0:
+        Return 0
+    End If
+
+    Let j be 0
+    While j is less than cut:
+        Let src_char be proc string_char_at from StringCore with name, j
+        proc memory_set_byte from Layout with result, j, src_char
+        Set j to j plus 1
+    End While
+    proc memory_set_byte from Layout with result, cut, 0
+
+    Return result
+End Process
+
+Note: ============================================================================
+Note: Result Accessors
+Note: ============================================================================
+
+@Reasoning:
+Accessor returning the accumulated error list. Callers iterate this after the
+analysis pass to surface diagnostics or abort translation if non-empty.
 @End Reasoning
 Process called "get_semantic_errors" takes analyzer as Integer returns Integer:
-    Note: Return list of semantic errors found during analysis
-    Return analyzer.error_list
+    Return proc memory_get_int64 from Layout with analyzer, 40
 End Process
 
 @Reasoning:
-Accessor returning the accumulated warning list — separated from errors so
+Accessor returning the accumulated warning list - separated from errors so
 translation can proceed in the presence of warnings but halt on errors.
 @End Reasoning
 Process called "get_semantic_warnings" takes analyzer as Integer returns Integer:
-    Note: Return list of semantic warnings found during analysis
-    Return analyzer.warning_list
+    Return proc memory_get_int64 from Layout with analyzer, 48
 End Process
 
 @Reasoning:
-Records a semantic error with the message and source coordinates pulled
-from the AST node. Errors are accumulated rather than thrown so analysis
-can continue and report multiple problems per run.
+Returns the number of recorded errors.
 @End Reasoning
-Process called "add_semantic_error" takes analyzer as Integer, message as String, ast as Integer returns Integer:
-    Note: Add semantic error with location information
-
-    Let error be a value of type Dictionary[String, Any] with
-        "message" as message,
-        "line" as proc get_ast_line with ast,
-        "column" as proc get_ast_column with ast,
-        "file" as proc get_ast_file with ast,
-        "severity" as "error"
-
-    proc add_to_list with analyzer.error_list, error
-    Return 1
+Process called "semantic_error_count" takes analyzer as Integer returns Integer:
+    Let errors be proc memory_get_int64 from Layout with analyzer, 40
+    Return proc size from List with errors
 End Process
 
 @Reasoning:
-Records a semantic warning. Identical structure to add_semantic_error but
-into the warning_list — keeps the two streams separable for downstream
-gating decisions.
+Returns 1 if any error was recorded during analysis.
 @End Reasoning
-Process called "add_semantic_warning" takes analyzer as Integer, message as String, ast as Integer returns Integer:
-    Note: Add semantic warning with location information
-
-    Let warning be a value of type Dictionary[String, Any] with
-        "message" as message,
-        "line" as proc get_ast_line with ast,
-        "column" as proc get_ast_column with ast,
-        "file" as proc get_ast_file with ast,
-        "severity" as "warning"
-
-    proc add_to_list with analyzer.warning_list, warning
-    Return 1
-End Process
-
-Note: Helper processes for symbol table management, type checking, and scope analysis
-
-@Reasoning:
-Allocates the backing storage for a hash-table-style symbol dictionary
-(24-byte header). The header layout is decoded by other helpers; this
-keeps allocation behind a single name so future representation changes
-don't ripple across the analyzer.
-@End Reasoning
-Process called "create_dict" returns Integer:
-    Note: Create dictionary for symbol storage
-    Return proc memory_allocate from Layout with 24  Note: Basic hash table
-End Process
-
-@Reasoning:
-Allocates a 16-byte list header (pointer + length pair) used for
-error/warning/import collections. Same isolation rationale as create_dict.
-@End Reasoning
-Process called "create_list" returns Integer:
-    Note: Create list for collection storage
-    Return proc memory_allocate from Layout with 16  Note: Dynamic array
-End Process
-
-@Reasoning:
-Allocates a 16-byte stack header backing the lambda_contexts field. The
-stack supports nested-lambda analysis by remembering each enclosing
-lambda's scope while we descend into a nested one.
-@End Reasoning
-Process called "create_stack" returns Integer:
-    Note: Create stack for context management
-    Return proc memory_allocate from Layout with 16  Note: Stack structure
-End Process
-
-@Reasoning:
-Reads the name pointer from an AST node (offset 16) and dereferences the
-underlying token's text pointer (offset 8) to yield a String. Centralizes
-the path so the AST layout can change in one place.
-@End Reasoning
-Process called "get_ast_name" takes ast as Integer returns String:
-    Note: Extract name from AST node
-    Let name_token be proc memory_get_int64 from Layout with ast, 16
-    Return proc memory_get_string from Layout with name_token, 8
-End Process
-
-@Reasoning:
-Reads the source line number from an AST node at offset 8. Used by error
-reporting and diagnostic location.
-@End Reasoning
-Process called "get_ast_line" takes ast as Integer returns Integer:
-    Note: Extract line number from AST node
-    Return proc memory_get_int64 from Layout with ast, 8
-End Process
-
-@Reasoning:
-Reads the source column from an AST node at offset 16. Paired with
-get_ast_line for full source-position diagnostics.
-@End Reasoning
-Process called "get_ast_column" takes ast as Integer returns Integer:
-    Note: Extract column number from AST node
-    Return proc memory_get_int64 from Layout with ast, 16
+Process called "semantic_has_error" takes analyzer as Integer returns Integer:
+    Return proc memory_get_int64 from Layout with analyzer, 56
 End Process
