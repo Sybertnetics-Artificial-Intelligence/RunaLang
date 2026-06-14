@@ -7,8 +7,53 @@ Note: list comprehensions, binary syntax, records, type specs, macros
 Note: Target: Actor model, message passing, fault-tolerant systems
 Note: ============================================================================
 
+Note:
+LOCKED AST CONTRACT (frontend producer / backend + semantic consumer agreement)
+
+ErlangModule    { module_name:String, attributes:List[ErlangAttribute],
+                  functions:List[ErlangFunction], records:List[ErlangRecord],
+                  types:List[ErlangTypeDecl] }
+ErlangFunction  { name, arity, clauses:List[ErlangFunctionClause], line }
+ErlangFunctionClause { patterns:List[ErlangExpression],
+                       guards:List[List[ErlangExpression]]  (outer=OR seqs, inner=AND tests),
+                       body:List[ErlangExpression], line }
+ErlangExpression { expr_type:String, expr_data:Dictionary[String,Any], line }
+
+  expr_type tags the parser emits and the expr_data keys for each:
+    atom/integer/float/char/string -> "value"
+    var/macro/record_name           -> "name"
+    list                            -> "elements":List, "tail":expr|0
+    tuple                           -> "elements":List
+    binary                          -> "segments":List of {value,size,specifiers}
+    unary_op                        -> "operator", "operand"
+    op                              -> "operator", "left", "right"
+    call                            -> "function", "arguments":List
+    record_access                   -> "record", "field"
+    record_create                   -> "name", "fields":List of {name,value}, "base"
+    fun                             -> "type"(anonymous|local_ref|remote_ref) + form-specific keys
+    case                            -> "scrutinee", "clauses":List[ErlangFunctionClause]
+    if                              -> "clauses":List[ErlangFunctionClause]
+    receive                         -> "clauses", "after_timeout", "after_body"
+    try                             -> "try_body","of_clauses","catch_clauses","after_body"
+    begin                           -> "body":List
+    list_comprehension              -> "template", "qualifiers":List of {type:generator|filter,...}
+    binary_comprehension            -> "template", "qualifiers"
+
+PUBLIC AST API (this file): integer node-kind constants AST_* + accessors
+  get_erlang_ast_type / get_erlang_ast_value / get_erlang_ast_children and the
+  clause/pattern accessors (get_case_pattern/guard/body, get_timeout_body,
+  get_*_pattern_elements / fields / segments / *_value). The semantic analyzer
+  consumes the AST exclusively through these; the HIR backend consumes the
+  typed HIR the to-HIR lowering produces (HIRExpression{kind,data},
+  HIRStatement{stmt_type,data,...}, HIRModule{name,exports,functions,types,
+  imports}, HIRFunction{name,parameters,param_types,return_type,body,is_public}).
+:End Note
+
 Import "compiler/middle/gungnir/hir/translation/frontends/erlang/erlang_lexer.runa" as Lexer
 Import "compiler/middle/gungnir/hir/hir_nodes.runa" as HIRNodes
+Import "compiler/frontend/primitives/collections/list.runa" as ListCore
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/frontend/primitives/core/string_primitive.runa" as StringPrim
 
 Note: ============================================================================
 Note: ERLANG AST NODE TYPES
@@ -197,6 +242,529 @@ Type called "ErlangExpression":
     line as Integer
 End Type
 
+Note: ============================================================================
+Note: PUBLIC AST NODE-TYPE ENUMERATION
+Note: ============================================================================
+
+@Reasoning:
+The parser models AST nodes with a string discriminant (expr_type) for
+construction ergonomics, but consumers that dispatch on node kind in a hot
+path (the semantic analyzer's type-inference walker) need an integer
+enumeration so the dispatch compiles to an integer compare chain rather than
+a string compare per branch. These constants are the canonical public node
+kinds; get_erlang_ast_type maps a node's string tag onto exactly one of them.
+The numbering is dense and stable so external switch tables stay valid.
+@End Reasoning
+Constant AST_ATOM as Integer is 9000
+Constant AST_VARIABLE as Integer is 9001
+Constant AST_INTEGER as Integer is 9002
+Constant AST_FLOAT as Integer is 9003
+Constant AST_CHAR as Integer is 9004
+Constant AST_STRING as Integer is 9005
+Constant AST_LIST as Integer is 9006
+Constant AST_TUPLE as Integer is 9007
+Constant AST_BINARY as Integer is 9008
+Constant AST_UNARY_OP as Integer is 9009
+Constant AST_OP as Integer is 9010
+Constant AST_CALL as Integer is 9011
+Constant AST_RECORD_ACCESS as Integer is 9012
+Constant AST_RECORD_CREATE as Integer is 9013
+Constant AST_RECORD_NAME as Integer is 9014
+Constant AST_FUN as Integer is 9015
+Constant AST_CASE as Integer is 9016
+Constant AST_IF as Integer is 9017
+Constant AST_RECEIVE as Integer is 9018
+Constant AST_TRY as Integer is 9019
+Constant AST_BEGIN as Integer is 9020
+Constant AST_LIST_COMPREHENSION as Integer is 9021
+Constant AST_BINARY_COMPREHENSION as Integer is 9022
+Constant AST_MACRO as Integer is 9023
+Constant AST_LITERAL as Integer is 9024
+Constant AST_MAP as Integer is 9025
+Constant AST_SPAWN as Integer is 9026
+Constant AST_SEND as Integer is 9027
+Constant AST_LIST_PATTERN as Integer is 9028
+Constant AST_TUPLE_PATTERN as Integer is 9029
+Constant AST_MAP_PATTERN as Integer is 9030
+Constant AST_RECORD_PATTERN as Integer is 9031
+Constant AST_BINARY_PATTERN as Integer is 9032
+Constant AST_WILDCARD as Integer is 9033
+Constant AST_UNKNOWN as Integer is 9099
+
+Note: ============================================================================
+Note: PUBLIC AST ACCESSORS
+Note: ============================================================================
+
+@Reasoning:
+Resolves a node's string discriminant to its integer kind. The wildcard
+variable pattern "_" is recognised as AST_WILDCARD even though it is stored
+as a var node, because pattern analysis needs to treat it distinctly from a
+binding variable. send/spawn are not produced as dedicated tags by the
+parser (a `Pid ! Msg` send is an "op" node with operator "!", and spawn is a
+"call"); the mapping still exposes AST_SEND/AST_SPAWN so a node a future
+parser revision tags directly resolves correctly, while today's "op"/"call"
+nodes resolve to AST_OP/AST_CALL and are handled by those arms.
+@End Reasoning
+@Implementation:
+Reads expr_type via typed field access, then linear string_equals comparison
+against each known tag, returning the matching constant. The var/"_" check
+inspects expr_data "name" to split wildcard from binding variable.
+@End Implementation
+Process called "get_erlang_ast_type" that takes node as ErlangExpression returns Integer:
+    If node is equal to 0:
+        Return AST_UNKNOWN
+    End If
+
+    Let tag be node.expr_type
+
+    If proc string_equals from StringCore with tag, "atom" is equal to 1:
+        Return AST_ATOM
+    End If
+    If proc string_equals from StringCore with tag, "var" is equal to 1:
+        Let var_name be node.expr_data at key "name"
+        If proc string_equals from StringCore with var_name, "_" is equal to 1:
+            Return AST_WILDCARD
+        End If
+        Return AST_VARIABLE
+    End If
+    If proc string_equals from StringCore with tag, "integer" is equal to 1:
+        Return AST_INTEGER
+    End If
+    If proc string_equals from StringCore with tag, "float" is equal to 1:
+        Return AST_FLOAT
+    End If
+    If proc string_equals from StringCore with tag, "char" is equal to 1:
+        Return AST_CHAR
+    End If
+    If proc string_equals from StringCore with tag, "string" is equal to 1:
+        Return AST_STRING
+    End If
+    If proc string_equals from StringCore with tag, "list" is equal to 1:
+        Return AST_LIST
+    End If
+    If proc string_equals from StringCore with tag, "tuple" is equal to 1:
+        Return AST_TUPLE
+    End If
+    If proc string_equals from StringCore with tag, "binary" is equal to 1:
+        Return AST_BINARY
+    End If
+    If proc string_equals from StringCore with tag, "unary_op" is equal to 1:
+        Return AST_UNARY_OP
+    End If
+    If proc string_equals from StringCore with tag, "op" is equal to 1:
+        Return AST_OP
+    End If
+    If proc string_equals from StringCore with tag, "call" is equal to 1:
+        Return AST_CALL
+    End If
+    If proc string_equals from StringCore with tag, "record_access" is equal to 1:
+        Return AST_RECORD_ACCESS
+    End If
+    If proc string_equals from StringCore with tag, "record_create" is equal to 1:
+        Return AST_RECORD_CREATE
+    End If
+    If proc string_equals from StringCore with tag, "record_name" is equal to 1:
+        Return AST_RECORD_NAME
+    End If
+    If proc string_equals from StringCore with tag, "fun" is equal to 1:
+        Return AST_FUN
+    End If
+    If proc string_equals from StringCore with tag, "case" is equal to 1:
+        Return AST_CASE
+    End If
+    If proc string_equals from StringCore with tag, "if" is equal to 1:
+        Return AST_IF
+    End If
+    If proc string_equals from StringCore with tag, "receive" is equal to 1:
+        Return AST_RECEIVE
+    End If
+    If proc string_equals from StringCore with tag, "try" is equal to 1:
+        Return AST_TRY
+    End If
+    If proc string_equals from StringCore with tag, "begin" is equal to 1:
+        Return AST_BEGIN
+    End If
+    If proc string_equals from StringCore with tag, "list_comprehension" is equal to 1:
+        Return AST_LIST_COMPREHENSION
+    End If
+    If proc string_equals from StringCore with tag, "binary_comprehension" is equal to 1:
+        Return AST_BINARY_COMPREHENSION
+    End If
+    If proc string_equals from StringCore with tag, "macro" is equal to 1:
+        Return AST_MACRO
+    End If
+    If proc string_equals from StringCore with tag, "map" is equal to 1:
+        Return AST_MAP
+    End If
+
+    Return AST_UNKNOWN
+End Process
+
+@Reasoning:
+Returns a node's primary scalar payload as a string handle. Literal nodes
+(atom/integer/float/char/string) store it under "value"; identifier-like
+nodes (var/macro/record_name) store it under "name". Other node kinds have no
+single scalar value, so 0 is returned. This is the read path the semantic
+analyzer uses for variable-name resolution and literal classification.
+@End Reasoning
+@Implementation:
+Dispatch on expr_type: for value-bearing tags read expr_data "value"; for
+name-bearing tags read expr_data "name"; otherwise 0.
+@End Implementation
+Process called "get_erlang_ast_value" that takes node as ErlangExpression returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+
+    Let tag be node.expr_type
+
+    If proc string_equals from StringCore with tag, "var" is equal to 1:
+        Return node.expr_data at key "name"
+    End If
+    If proc string_equals from StringCore with tag, "macro" is equal to 1:
+        Return node.expr_data at key "name"
+    End If
+    If proc string_equals from StringCore with tag, "record_name" is equal to 1:
+        Return node.expr_data at key "name"
+    End If
+
+    If proc string_equals from StringCore with tag, "atom" is equal to 1:
+        Return node.expr_data at key "value"
+    End If
+    If proc string_equals from StringCore with tag, "integer" is equal to 1:
+        Return node.expr_data at key "value"
+    End If
+    If proc string_equals from StringCore with tag, "float" is equal to 1:
+        Return node.expr_data at key "value"
+    End If
+    If proc string_equals from StringCore with tag, "char" is equal to 1:
+        Return node.expr_data at key "value"
+    End If
+    If proc string_equals from StringCore with tag, "string" is equal to 1:
+        Return node.expr_data at key "value"
+    End If
+
+    Return 0
+End Process
+
+@Reasoning:
+Returns a flat List of a node's child expressions in evaluation order, the
+shape the semantic analyzer iterates with list_get/list_length. The order is
+node-kind specific and chosen so positional reads are meaningful: a call
+yields [function, arg0, arg1, ...]; an op yields [left, right]; a unary op
+yields [operand]; list/tuple yield their elements; record_access yields
+[record]; case/if/receive/begin yield their clause/body list. Nodes with no
+child expressions yield an empty list (never 0) so callers can iterate
+unconditionally.
+@End Reasoning
+@Implementation:
+Allocates a fresh list and pushes the relevant child handles read from
+expr_data by their documented keys. "elements"/"arguments"/"clauses"/"body"
+are already lists whose members are spliced in; scalar slots
+("function"/"left"/"right"/"operand"/"record") are pushed individually.
+@End Implementation
+Process called "get_erlang_ast_children" that takes node as ErlangExpression returns Integer:
+    Let children be proc list_create from ListCore
+    If node is equal to 0:
+        Return children
+    End If
+
+    Let tag be node.expr_type
+
+    If proc string_equals from StringCore with tag, "call" is equal to 1:
+        Let fn_node be node.expr_data at key "function"
+        proc list_push from ListCore with children, fn_node
+        Let args be node.expr_data at key "arguments"
+        If args is not equal to 0:
+            Let n be proc list_length from ListCore with args
+            Let i be 0
+            While i is less than n:
+                proc list_push from ListCore with children, proc list_get from ListCore with args, i
+                Set i to i plus 1
+            End While
+        End If
+        Return children
+    End If
+
+    If proc string_equals from StringCore with tag, "op" is equal to 1:
+        proc list_push from ListCore with children, node.expr_data at key "left"
+        proc list_push from ListCore with children, node.expr_data at key "right"
+        Return children
+    End If
+
+    If proc string_equals from StringCore with tag, "unary_op" is equal to 1:
+        proc list_push from ListCore with children, node.expr_data at key "operand"
+        Return children
+    End If
+
+    If proc string_equals from StringCore with tag, "list" is equal to 1:
+        Let elems be node.expr_data at key "elements"
+        If elems is not equal to 0:
+            Let n be proc list_length from ListCore with elems
+            Let i be 0
+            While i is less than n:
+                proc list_push from ListCore with children, proc list_get from ListCore with elems, i
+                Set i to i plus 1
+            End While
+        End If
+        Return children
+    End If
+
+    If proc string_equals from StringCore with tag, "tuple" is equal to 1:
+        Let elems be node.expr_data at key "elements"
+        If elems is not equal to 0:
+            Let n be proc list_length from ListCore with elems
+            Let i be 0
+            While i is less than n:
+                proc list_push from ListCore with children, proc list_get from ListCore with elems, i
+                Set i to i plus 1
+            End While
+        End If
+        Return children
+    End If
+
+    If proc string_equals from StringCore with tag, "record_access" is equal to 1:
+        proc list_push from ListCore with children, node.expr_data at key "record"
+        Return children
+    End If
+
+    If proc string_equals from StringCore with tag, "case" is equal to 1:
+        Let clauses be node.expr_data at key "clauses"
+        If clauses is not equal to 0:
+            Let n be proc list_length from ListCore with clauses
+            Let i be 0
+            While i is less than n:
+                proc list_push from ListCore with children, proc list_get from ListCore with clauses, i
+                Set i to i plus 1
+            End While
+        End If
+        Return children
+    End If
+
+    If proc string_equals from StringCore with tag, "receive" is equal to 1:
+        Let clauses be node.expr_data at key "clauses"
+        If clauses is not equal to 0:
+            Let n be proc list_length from ListCore with clauses
+            Let i be 0
+            While i is less than n:
+                proc list_push from ListCore with children, proc list_get from ListCore with clauses, i
+                Set i to i plus 1
+            End While
+        End If
+        Return children
+    End If
+
+    Return children
+End Process
+
+Note: ============================================================================
+Note: PUBLIC CASE/RECEIVE CLAUSE ACCESSORS
+Note: ============================================================================
+
+@Reasoning:
+A case/receive clause is an ErlangFunctionClause whose head pattern, guard
+sequence, and body the semantic analyzer reads positionally. The first head
+pattern is the clause's match pattern (case/receive clauses always have a
+single head pattern, unlike multi-arg function clauses). Exposing it as an
+accessor keeps the analyzer decoupled from the clause record layout.
+@End Reasoning
+@Implementation:
+Reads the patterns list and returns element 0, or 0 when there is no head
+pattern (guard-only if-clauses have an empty patterns list).
+@End Implementation
+Process called "get_case_pattern" that takes clause as ErlangFunctionClause returns Integer:
+    If clause is equal to 0:
+        Return 0
+    End If
+    Let patterns be clause.patterns
+    If patterns is equal to 0:
+        Return 0
+    End If
+    Let count be proc list_length from ListCore with patterns
+    If count is equal to 0:
+        Return 0
+    End If
+    Return proc list_get from ListCore with patterns, 0
+End Process
+
+@Reasoning:
+Returns the clause's guard structure (a list of guard-conjunction lists), or
+0 when the clause is unguarded. The analyzer treats a non-zero return as
+"guard present" and type-checks it; the list-of-lists shape models Erlang's
+`Guard1, Guard2 ; Guard3` semantics (comma = and, semicolon = or).
+@End Reasoning
+@Implementation:
+Returns clause.guards when it is a non-empty list, else 0. An empty guard
+list is normalised to 0 so callers can test presence with a single compare.
+@End Implementation
+Process called "get_case_guard" that takes clause as ErlangFunctionClause returns Integer:
+    If clause is equal to 0:
+        Return 0
+    End If
+    Let guards be clause.guards
+    If guards is equal to 0:
+        Return 0
+    End If
+    Let count be proc list_length from ListCore with guards
+    If count is equal to 0:
+        Return 0
+    End If
+    Return guards
+End Process
+
+@Reasoning:
+Returns the clause body as the list of body expressions the analyzer infers a
+result type from. The body is always a non-empty list for a well-formed
+clause; the analyzer infers the type of the final expression.
+@End Reasoning
+@Implementation:
+Returns clause.body directly (a List[ErlangExpression]).
+@End Implementation
+Process called "get_case_body" that takes clause as ErlangFunctionClause returns Integer:
+    If clause is equal to 0:
+        Return 0
+    End If
+    Return clause.body
+End Process
+
+@Reasoning:
+A receive's after-timeout clause is itself an ErlangFunctionClause whose body
+is the timeout-action expression list. The analyzer infers the timeout body's
+type to fold into the receive's overall result type, so this exposes the body
+of the after-clause.
+@End Reasoning
+@Implementation:
+Returns the clause body via get_case_body; a 0 clause yields 0 so the analyzer
+skips an absent timeout clause.
+@End Implementation
+Process called "get_timeout_body" that takes clause as ErlangFunctionClause returns Integer:
+    Return proc get_case_body with clause
+End Process
+
+@Reasoning:
+A tuple pattern node stores its element sub-patterns under the "elements" key,
+identical to a tuple expression. The analyzer iterates these to validate each
+element pattern, so this returns that element list (empty list, never 0, when
+absent so the caller can iterate unconditionally).
+@End Reasoning
+@Implementation:
+Reads expr_data "elements"; returns it when present, else a freshly created
+empty list.
+@End Implementation
+Process called "get_tuple_pattern_elements" that takes node as ErlangExpression returns Integer:
+    If node is equal to 0:
+        Return proc list_create from ListCore
+    End If
+    Let elems be node.expr_data at key "elements"
+    If elems is equal to 0:
+        Return proc list_create from ListCore
+    End If
+    Return elems
+End Process
+
+@Reasoning:
+A list pattern (an AST_LIST node) stores its head element sub-patterns under
+"elements" and an optional improper-list tail sub-pattern under "tail". The
+analyzer iterates the elements binding each, then recurses on the tail when
+present. This returns the element list (empty list, never 0, when absent).
+@End Reasoning
+@Implementation:
+Reads expr_data "elements"; returns it or a fresh empty list.
+@End Implementation
+Process called "get_list_pattern_elements" that takes node as ErlangExpression returns Integer:
+    If node is equal to 0:
+        Return proc list_create from ListCore
+    End If
+    Let elems be node.expr_data at key "elements"
+    If elems is equal to 0:
+        Return proc list_create from ListCore
+    End If
+    Return elems
+End Process
+
+@Reasoning:
+Returns the list pattern's tail sub-pattern ([H | T] style), or 0 for a proper
+list pattern with no explicit tail. The analyzer binds the tail's variables
+against the (untyped) remainder of the list.
+@End Reasoning
+@Implementation:
+Reads expr_data "tail"; returns it (0 when absent).
+@End Implementation
+Process called "get_list_pattern_tail" that takes node as ErlangExpression returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    Return node.expr_data at key "tail"
+End Process
+
+@Reasoning:
+A binary pattern (an AST_BINARY node) stores its segments under "segments";
+each segment is a {value, size, specifiers} dictionary whose "value" slot is
+the binding sub-pattern. The analyzer binds each segment's value sub-pattern.
+@End Reasoning
+@Implementation:
+Reads expr_data "segments"; returns it or a fresh empty list.
+@End Implementation
+Process called "get_binary_pattern_segments" that takes node as ErlangExpression returns Integer:
+    If node is equal to 0:
+        Return proc list_create from ListCore
+    End If
+    Let segs be node.expr_data at key "segments"
+    If segs is equal to 0:
+        Return proc list_create from ListCore
+    End If
+    Return segs
+End Process
+
+@Reasoning:
+A binary segment is a {value, size, specifiers} dictionary; its "value" entry
+is the binding sub-pattern the analyzer recurses into. Exposed as an accessor
+so the analyzer stays decoupled from the segment dictionary layout.
+@End Reasoning
+@Implementation:
+Reads the segment dictionary's "value" entry; returns 0 when absent.
+@End Implementation
+Process called "get_binary_segment_value" that takes segment as Integer returns Integer:
+    If segment is equal to 0:
+        Return 0
+    End If
+    Return segment at key "value"
+End Process
+
+@Reasoning:
+A record pattern (an AST_RECORD_CREATE node) stores its field assignments under
+"fields"; each field is a {name, value} dictionary whose "value" is the binding
+sub-pattern. The analyzer binds each field's value sub-pattern.
+@End Reasoning
+@Implementation:
+Reads expr_data "fields"; returns it or a fresh empty list.
+@End Implementation
+Process called "get_record_pattern_fields" that takes node as ErlangExpression returns Integer:
+    If node is equal to 0:
+        Return proc list_create from ListCore
+    End If
+    Let fields be node.expr_data at key "fields"
+    If fields is equal to 0:
+        Return proc list_create from ListCore
+    End If
+    Return fields
+End Process
+
+@Reasoning:
+A record field assignment is a {name, value} dictionary; its "value" entry is
+the binding sub-pattern. Exposed so the analyzer reads field sub-patterns
+without depending on the field dictionary layout.
+@End Reasoning
+@Implementation:
+Reads the field dictionary's "value" entry; returns 0 when absent.
+@End Implementation
+Process called "get_record_field_value" that takes field as Integer returns Integer:
+    If field is equal to 0:
+        Return 0
+    End If
+    Return field at key "value"
+End Process
+
 @Reasoning:
 Stateful parser context that holds the input token stream plus the
 cursor + cached current-token state. Caching current_token / lexeme /
@@ -254,11 +822,20 @@ Process called "create_erlang_parser" that takes tokens as Integer, lexemes as I
         current_line as 1,
         errors as errors_list
 
-    Note: Initialize first token
-    If length of tokens is greater than 0:
-        Set parser.current_token to tokens at index 0
-        Set parser.current_lexeme to lexemes at index 0
-        Set parser.current_line to line_numbers at index 0
+    Note:
+    The tokens/lexemes/line_numbers handles are list.runa RunaList structures
+    produced by ListCore.list_create/list_push in lex_erlang_to_arrays. They
+    MUST be read through ListCore.list_length / ListCore.list_get: the language
+    `length of` builtin lowers to string_length (null-byte scan) and `X at index`
+    lowers to raw-array pointer arithmetic that reads the size word at offset -8,
+    neither of which matches a RunaList (length at offset 8, data pointer at
+    offset 0). Using the ListCore accessors is what every other passing
+    translation frontend does for its list-backed token streams.
+    :End Note
+    If proc list_length from ListCore with tokens is greater than 0:
+        Set parser.current_token to proc list_get from ListCore with tokens, 0
+        Set parser.current_lexeme to proc list_get from ListCore with lexemes, 0
+        Set parser.current_line to proc list_get from ListCore with line_numbers, 0
     End If
 
     Return parser
@@ -286,10 +863,15 @@ EOF diagnostics report the last real source line.
 Process called "advance_parser" that takes parser as ErlangParser returns Nothing:
     Set parser.position to parser.position plus 1
 
-    If parser.position is less than length of parser.tokens:
-        Set parser.current_token to parser.tokens at index parser.position
-        Set parser.current_lexeme to parser.lexemes at index parser.position
-        Set parser.current_line to parser.line_numbers at index parser.position
+    Let tok_count be proc list_length from ListCore with parser.tokens
+    If parser.position is less than tok_count:
+        Let tok_list be parser.tokens
+        Let lex_list be parser.lexemes
+        Let line_list be parser.line_numbers
+        Let cur_pos be parser.position
+        Set parser.current_token to proc list_get from ListCore with tok_list, cur_pos
+        Set parser.current_lexeme to proc list_get from ListCore with lex_list, cur_pos
+        Set parser.current_line to proc list_get from ListCore with line_list, cur_pos
     Otherwise:
         Set parser.current_token to TOKEN_EOF
         Set parser.current_lexeme to ""
@@ -311,8 +893,12 @@ TOKEN_EOF otherwise.
 Process called "peek_token" that takes parser as ErlangParser, offset as Integer returns Integer:
     Let next_pos be parser.position plus offset
 
-    If next_pos is less than length of parser.tokens:
-        Return parser.tokens at index next_pos
+    Note: Bind the token list to a local before the ListCore calls (the stage1
+    Note: codegen mis-evaluates a field-access argument inside a comparison).
+    Let peek_tokens be parser.tokens
+    Let peek_count be proc list_length from ListCore with peek_tokens
+    If next_pos is less than peek_count:
+        Return proc list_get from ListCore with peek_tokens, next_pos
     Otherwise:
         Return TOKEN_EOF
     End If
@@ -337,7 +923,14 @@ Process called "expect_token" that takes parser as ErlangParser, expected as Int
         Call advance_parser with parser
         Return true
     Otherwise:
-        Let error_msg be "Expected token " joined with string representation of expected joined with " but got " joined with string representation of parser.current_token joined with " at line " joined with string representation of parser.current_line
+        Let expected_str be proc integer_to_string from StringPrim with expected
+        Let got_str be proc integer_to_string from StringPrim with parser.current_token
+        Let line_str be proc integer_to_string from StringPrim with parser.current_line
+        Let error_msg be proc string_concat from StringPrim with "Expected token ", expected_str
+        Set error_msg to proc string_concat from StringPrim with error_msg, " but got "
+        Set error_msg to proc string_concat from StringPrim with error_msg, got_str
+        Set error_msg to proc string_concat from StringPrim with error_msg, " at line "
+        Set error_msg to proc string_concat from StringPrim with error_msg, line_str
         Add error_msg to end of parser.errors
         Return false
     End If
@@ -384,37 +977,66 @@ Process called "parse_erlang_module" that takes parser as ErlangParser returns E
     Let records be a list containing nothing
     Let types be a list containing nothing
 
-    Note: Parse module forms until EOF
+    Note:
+    Parse module forms until EOF. The lexer fuses an attribute introducer
+    "-name" into a single dedicated token (TOKEN_MODULE, TOKEN_EXPORT, ...),
+    so the dispatch matches those fused tokens directly rather than a bare
+    TOKEN_MINUS followed by an atom. Record and type/spec/callback forms have
+    their own tokens (TOKEN_RECORD / TOKEN_TYPE / ...) which route to their
+    dedicated parsers; every other "-attr" form is a general attribute.
+    :End Note
     While parser.current_token is not equal to TOKEN_EOF:
-        Note: Module attribute
-        If match_token with parser and TOKEN_MINUS:
+        Note: Record definition
+        If match_token with parser, TOKEN_RECORD:
+            Let record be parse_record with parser
+            Add record to end of records
+
+        Note: Type/spec/callback declaration
+        Otherwise If match_token with parser, TOKEN_TYPE or match_token with parser, TOKEN_OPAQUE or match_token with parser, TOKEN_SPEC or match_token with parser, TOKEN_CALLBACK:
+            Let type_decl be parse_type_decl with parser
+            Add type_decl to end of types
+
+        Note: General module attribute (-module / -export / -import / ...)
+        Otherwise If is_attribute_token with parser.current_token is equal to 1:
             Let attr be parse_attribute with parser
 
-            Note: Extract module name from -module attribute
-            If attr.attr_type is equal to "module" and length of attr.attr_values is greater than 0:
-                Set module_name to attr.attr_values at index 0
+            Note: Extract module name from -module attribute. attr_values is a
+            Note: ListCore RunaList, so its count and element reads use
+            Note: list_length / list_get, not the string_length/raw-array builtins.
+            Note: The list handle is bound to a local before the ListCore calls
+            Note: because the stage1 codegen mis-evaluates a proc call whose
+            Note: argument is a struct field-access when that call is itself a
+            Note: subexpression of a compound boolean condition.
+            Let attr_type_name be attr.attr_type
+            Let attr_vals be attr.attr_values
+            Let attr_vals_count be proc list_length from ListCore with attr_vals
+            If attr_type_name is equal to "module" and attr_vals_count is greater than 0:
+                Set module_name to proc list_get from ListCore with attr_vals, 0
             End If
 
             Add attr to end of attributes
 
-        Note: Record definition
-        Otherwise If match_token with parser and TOKEN_RECORD:
-            Let record be parse_record with parser
-            Add record to end of records
-
-        Note: Type declaration
-        Otherwise If match_token with parser and TOKEN_TYPE or match_token with parser and TOKEN_OPAQUE or match_token with parser and TOKEN_SPEC or match_token with parser and TOKEN_CALLBACK:
-            Let type_decl be parse_type_decl with parser
-            Add type_decl to end of types
+        Note: A bare leading '-' that the lexer did not fuse (defensive)
+        Otherwise If match_token with parser, TOKEN_MINUS:
+            Let dash_attr be parse_attribute with parser
+            Let dash_attr_type_name be dash_attr.attr_type
+            Let dash_attr_vals be dash_attr.attr_values
+            Let dash_attr_vals_count be proc list_length from ListCore with dash_attr_vals
+            If dash_attr_type_name is equal to "module" and dash_attr_vals_count is greater than 0:
+                Set module_name to proc list_get from ListCore with dash_attr_vals, 0
+            End If
+            Add dash_attr to end of attributes
 
         Note: Function definition
-        Otherwise If match_token with parser and TOKEN_ATOM:
+        Otherwise If match_token with parser, TOKEN_ATOM:
             Let function be parse_function with parser
             Add function to end of functions
 
         Note: Skip unexpected tokens
         Otherwise:
-            Add "Unexpected token at line " joined with string representation of parser.current_line to end of parser.errors
+            Let unexp_line_str be proc integer_to_string from StringPrim with parser.current_line
+            Let unexp_msg be proc string_concat from StringPrim with "Unexpected token at line ", unexp_line_str
+            Add unexp_msg to end of parser.errors
             Call advance_parser with parser
         End If
     End While
@@ -432,6 +1054,94 @@ Note: ATTRIBUTE PARSING
 Note: ============================================================================
 
 @Reasoning:
+True when a token is one of the lexer's fused attribute-introducer tokens
+(-module, -export, -import, -compile, -vsn, -author, -copyright, -doc,
+-moduledoc, -behaviour/-behavior). These open a general module attribute that
+parse_attribute handles uniformly. TOKEN_RECORD / TOKEN_TYPE / TOKEN_SPEC /
+TOKEN_CALLBACK are deliberately excluded because they route to dedicated
+parsers in parse_erlang_module.
+@End Reasoning
+Process called "is_attribute_token" that takes token as Integer returns Integer:
+    If token is equal to TOKEN_MODULE:
+        Return 1
+    End If
+    If token is equal to TOKEN_EXPORT:
+        Return 1
+    End If
+    If token is equal to TOKEN_IMPORT:
+        Return 1
+    End If
+    If token is equal to TOKEN_COMPILE:
+        Return 1
+    End If
+    If token is equal to TOKEN_VSNSUFFIX:
+        Return 1
+    End If
+    If token is equal to TOKEN_AUTHOR:
+        Return 1
+    End If
+    If token is equal to TOKEN_COPYRIGHT:
+        Return 1
+    End If
+    If token is equal to TOKEN_DOC:
+        Return 1
+    End If
+    If token is equal to TOKEN_MODULEDOC:
+        Return 1
+    End If
+    If token is equal to TOKEN_BEHAVIOUR:
+        Return 1
+    End If
+    If token is equal to TOKEN_BEHAVIOR:
+        Return 1
+    End If
+    Return 0
+End Process
+
+@Reasoning:
+Maps a fused attribute-introducer token to the bare attribute name string the
+rest of the pipeline keys on ("module", "export", ...). A bare TOKEN_MINUS
+(unfused) falls back to reading the following lexeme. This is the inverse of
+the lexer's match_module_attribute table.
+@End Reasoning
+Process called "attr_type_for_token" that takes token as Integer returns Integer:
+    If token is equal to TOKEN_MODULE:
+        Return "module"
+    End If
+    If token is equal to TOKEN_EXPORT:
+        Return "export"
+    End If
+    If token is equal to TOKEN_IMPORT:
+        Return "import"
+    End If
+    If token is equal to TOKEN_COMPILE:
+        Return "compile"
+    End If
+    If token is equal to TOKEN_VSNSUFFIX:
+        Return "vsn"
+    End If
+    If token is equal to TOKEN_AUTHOR:
+        Return "author"
+    End If
+    If token is equal to TOKEN_COPYRIGHT:
+        Return "copyright"
+    End If
+    If token is equal to TOKEN_DOC:
+        Return "doc"
+    End If
+    If token is equal to TOKEN_MODULEDOC:
+        Return "moduledoc"
+    End If
+    If token is equal to TOKEN_BEHAVIOUR:
+        Return "behaviour"
+    End If
+    If token is equal to TOKEN_BEHAVIOR:
+        Return "behavior"
+    End If
+    Return 0
+End Process
+
+@Reasoning:
 "-keyword(args)." attribute forms have a uniform outer shape but each
 keyword has its own argument grammar (module=atom, export/import=
 function list, behaviour=atom, compile=term, default=generic term).
@@ -441,28 +1151,40 @@ across one routine per attribute kind.
 @End Reasoning
 
 @Implementation:
-Skips the leading "-", captures the attribute name as attr_type, then
-optionally enters a "(...)" payload. Inside the parens, loops over
-comma-separated values: module/behaviour use the raw lexeme;
-export/import dispatch to parse_function_list; compile uses
-parse_term; everything else falls through to parse_term. The loop
-breaks when no comma follows. Expects closing ")" and the mandatory
-terminating "." that ends every Erlang top-level form.
+Derives attr_type from the fused attribute token (or, for a bare unfused
+"-", from the following lexeme), then optionally enters a "(...)" payload.
+Inside the parens, loops over comma-separated values: module/behaviour use the
+raw lexeme; export/import dispatch to parse_function_list; compile uses
+parse_term; everything else falls through to parse_term. The loop breaks when
+no comma follows. Expects closing ")" and the mandatory terminating "." that
+ends every Erlang top-level form.
 @End Implementation
 Process called "parse_attribute" that takes parser as ErlangParser returns ErlangAttribute:
     Let line be parser.current_line
-    Call advance_parser with parser  Note: Skip -
-
-    Let attr_type be parser.current_lexeme
     Let attr_values be a list containing nothing
-    Call advance_parser with parser  Note: Skip attribute name
+
+    Note:
+    Derive the attribute name. When the lexer fused the introducer into a
+    dedicated token (TOKEN_MODULE, ...), map that token to its name and consume
+    the single fused token. For an unfused bare TOKEN_MINUS, consume the "-"
+    and read the following lexeme as the name.
+    :End Note
+    Let attr_type be attr_type_for_token with parser.current_token
+    If attr_type is equal to 0:
+        Note: Unfused "-" form: skip the minus, take the next lexeme as name.
+        Call advance_parser with parser
+        Set attr_type to parser.current_lexeme
+        Call advance_parser with parser
+    Otherwise:
+        Call advance_parser with parser  Note: Consume the fused -attr token
+    End If
 
     Note: Parse attribute arguments
-    If match_token with parser and TOKEN_LPAREN:
+    If match_token with parser, TOKEN_LPAREN:
         Call advance_parser with parser  Note: Skip (
 
         Note: Parse comma-separated values
-        If not match_token with parser and TOKEN_RPAREN:
+        If not match_token with parser, TOKEN_RPAREN:
             While true:
                 Note: Parse attribute value based on type
                 If attr_type is equal to "module":
@@ -487,7 +1209,7 @@ Process called "parse_attribute" that takes parser as ErlangParser returns Erlan
                 End If
 
                 Note: Check for more values
-                If match_token with parser and TOKEN_COMMA:
+                If match_token with parser, TOKEN_COMMA:
                     Call advance_parser with parser
                 Otherwise:
                     Break
@@ -495,10 +1217,10 @@ Process called "parse_attribute" that takes parser as ErlangParser returns Erlan
             End While
         End If
 
-        Call expect_token with parser and TOKEN_RPAREN
+        Call expect_token with parser, TOKEN_RPAREN
     End If
 
-    Call expect_token with parser and TOKEN_DOT
+    Call expect_token with parser, TOKEN_DOT
 
     Return a value of type ErlangAttribute with
         attr_type as attr_type,
@@ -523,16 +1245,16 @@ otherwise. Expects closing "]".
 Process called "parse_function_list" that takes parser as ErlangParser returns List[Dictionary[String, Any]]:
     Let func_list be a list containing nothing
 
-    Call expect_token with parser and TOKEN_LBRACKET
+    Call expect_token with parser, TOKEN_LBRACKET
 
-    If not match_token with parser and TOKEN_RBRACKET:
+    If not match_token with parser, TOKEN_RBRACKET:
         While true:
             Let func_name be parser.current_lexeme
             Call advance_parser with parser
 
-            Call expect_token with parser and TOKEN_SLASH
+            Call expect_token with parser, TOKEN_SLASH
 
-            Let arity be convert parser.current_lexeme to Integer
+            Let arity be proc string_to_integer from StringPrim with parser.current_lexeme
             Call advance_parser with parser
 
             Let func_info be a dictionary containing:
@@ -541,7 +1263,7 @@ Process called "parse_function_list" that takes parser as ErlangParser returns L
             End Dictionary
             Add func_info to end of func_list
 
-            If match_token with parser and TOKEN_COMMA:
+            If match_token with parser, TOKEN_COMMA:
                 Call advance_parser with parser
             Otherwise:
                 Break
@@ -549,7 +1271,7 @@ Process called "parse_function_list" that takes parser as ErlangParser returns L
         End While
     End If
 
-    Call expect_token with parser and TOKEN_RBRACKET
+    Call expect_token with parser, TOKEN_RBRACKET
 
     Return func_list
 End Process
@@ -575,23 +1297,23 @@ Process called "parse_record" that takes parser as ErlangParser returns ErlangRe
     Let line be parser.current_line
     Call advance_parser with parser  Note: Skip -record
 
-    Call expect_token with parser and TOKEN_LPAREN
+    Call expect_token with parser, TOKEN_LPAREN
 
     Let record_name be parser.current_lexeme
     Call advance_parser with parser
 
-    Call expect_token with parser and TOKEN_COMMA
+    Call expect_token with parser, TOKEN_COMMA
 
     Let fields be a list containing nothing
 
-    Call expect_token with parser and TOKEN_LBRACE
+    Call expect_token with parser, TOKEN_LBRACE
 
-    If not match_token with parser and TOKEN_RBRACE:
+    If not match_token with parser, TOKEN_RBRACE:
         While true:
             Let field be parse_record_field with parser
             Add field to end of fields
 
-            If match_token with parser and TOKEN_COMMA:
+            If match_token with parser, TOKEN_COMMA:
                 Call advance_parser with parser
             Otherwise:
                 Break
@@ -599,9 +1321,9 @@ Process called "parse_record" that takes parser as ErlangParser returns ErlangRe
         End While
     End If
 
-    Call expect_token with parser and TOKEN_RBRACE
-    Call expect_token with parser and TOKEN_RPAREN
-    Call expect_token with parser and TOKEN_DOT
+    Call expect_token with parser, TOKEN_RBRACE
+    Call expect_token with parser, TOKEN_RPAREN
+    Call expect_token with parser, TOKEN_DOT
 
     Return a value of type ErlangRecord with
         name as record_name,
@@ -617,9 +1339,9 @@ in sequence without requiring the other.
 @End Reasoning
 
 @Implementation:
-Captures the field name from current_lexeme. If TOKEN_ASSIGN follows,
+Captures the field name from current_lexeme. If TOKEN_MATCH follows,
 skips and parses a default_value via parse_expression at precedence 0.
-If TOKEN_DOUBLE_COLON follows, skips and parses field_type via
+If TOKEN_COLON_COLON follows, skips and parses field_type via
 parse_type_expr. Both default_value and field_type default to null
 when their markers are absent.
 @End Implementation
@@ -628,17 +1350,17 @@ Process called "parse_record_field" that takes parser as ErlangParser returns Er
     Let field_name be parser.current_lexeme
     Call advance_parser with parser
 
-    Let default_value be null
-    Let field_type be null
+    Let default_value be 0
+    Let field_type be 0
 
     Note: Parse default value
-    If match_token with parser and TOKEN_ASSIGN:
+    If match_token with parser, TOKEN_MATCH:
         Call advance_parser with parser
-        Set default_value to parse_expression with parser and 0
+        Set default_value to parse_expression with parser, PREC_LOOSEST
     End If
 
     Note: Parse type annotation
-    If match_token with parser and TOKEN_DOUBLE_COLON:
+    If match_token with parser, TOKEN_COLON_COLON:
         Call advance_parser with parser
         Set field_type to parse_type_expr with parser
     End If
@@ -675,25 +1397,25 @@ Process called "parse_type_decl" that takes parser as ErlangParser returns Erlan
 
     Let name be ""
     Let type_vars be a list containing nothing
-    Let type_expr be null
+    Let type_expr be 0
 
     Note: Parse name and parameters
-    If match_token with parser and TOKEN_ATOM:
+    If match_token with parser, TOKEN_ATOM:
         Set name to parser.current_lexeme
         Call advance_parser with parser
 
         Note: Parse type variables
-        If match_token with parser and TOKEN_LPAREN:
+        If match_token with parser, TOKEN_LPAREN:
             Call advance_parser with parser
 
-            If not match_token with parser and TOKEN_RPAREN:
+            If not match_token with parser, TOKEN_RPAREN:
                 While true:
-                    If match_token with parser and TOKEN_VARIABLE:
+                    If match_token with parser, TOKEN_VARIABLE:
                         Add parser.current_lexeme to end of type_vars
                         Call advance_parser with parser
                     End If
 
-                    If match_token with parser and TOKEN_COMMA:
+                    If match_token with parser, TOKEN_COMMA:
                         Call advance_parser with parser
                     Otherwise:
                         Break
@@ -701,16 +1423,16 @@ Process called "parse_type_decl" that takes parser as ErlangParser returns Erlan
                 End While
             End If
 
-            Call expect_token with parser and TOKEN_RPAREN
+            Call expect_token with parser, TOKEN_RPAREN
         End If
     End If
 
-    Call expect_token with parser and TOKEN_DOUBLE_COLON
+    Call expect_token with parser, TOKEN_COLON_COLON
 
     Note: Parse type expression
     Set type_expr to parse_type_expr with parser
 
-    Call expect_token with parser and TOKEN_DOT
+    Call expect_token with parser, TOKEN_DOT
 
     Return a value of type ErlangTypeDecl with
         decl_type as decl_type,
@@ -745,22 +1467,22 @@ Process called "parse_type_expr" that takes parser as ErlangParser returns Erlan
     Let type_args be a list containing nothing
 
     Note: Parse type expression
-    If match_token with parser and TOKEN_ATOM:
+    If match_token with parser, TOKEN_ATOM:
         Set type_kind to "atom"
         Add parser.current_lexeme to end of type_args
         Call advance_parser with parser
 
         Note: Parameterized type
-        If match_token with parser and TOKEN_LPAREN:
+        If match_token with parser, TOKEN_LPAREN:
             Set type_kind to "parameterized"
             Call advance_parser with parser
 
-            If not match_token with parser and TOKEN_RPAREN:
+            If not match_token with parser, TOKEN_RPAREN:
                 While true:
                     Let arg_type be parse_type_expr with parser
                     Add arg_type to end of type_args
 
-                    If match_token with parser and TOKEN_COMMA:
+                    If match_token with parser, TOKEN_COMMA:
                         Call advance_parser with parser
                     Otherwise:
                         Break
@@ -768,35 +1490,35 @@ Process called "parse_type_expr" that takes parser as ErlangParser returns Erlan
                 End While
             End If
 
-            Call expect_token with parser and TOKEN_RPAREN
+            Call expect_token with parser, TOKEN_RPAREN
         End If
 
-    Otherwise If match_token with parser and TOKEN_VARIABLE:
+    Otherwise If match_token with parser, TOKEN_VARIABLE:
         Set type_kind to "var"
         Add parser.current_lexeme to end of type_args
         Call advance_parser with parser
 
-    Otherwise If match_token with parser and TOKEN_LBRACKET:
+    Otherwise If match_token with parser, TOKEN_LBRACKET:
         Set type_kind to "list"
         Call advance_parser with parser
 
-        If not match_token with parser and TOKEN_RBRACKET:
+        If not match_token with parser, TOKEN_RBRACKET:
             Let elem_type be parse_type_expr with parser
             Add elem_type to end of type_args
         End If
 
-        Call expect_token with parser and TOKEN_RBRACKET
+        Call expect_token with parser, TOKEN_RBRACKET
 
-    Otherwise If match_token with parser and TOKEN_LBRACE:
+    Otherwise If match_token with parser, TOKEN_LBRACE:
         Set type_kind to "tuple"
         Call advance_parser with parser
 
-        If not match_token with parser and TOKEN_RBRACE:
+        If not match_token with parser, TOKEN_RBRACE:
             While true:
                 Set elem_type to parse_type_expr with parser
                 Add elem_type to end of type_args
 
-                If match_token with parser and TOKEN_COMMA:
+                If match_token with parser, TOKEN_COMMA:
                     Call advance_parser with parser
                 Otherwise:
                     Break
@@ -804,21 +1526,21 @@ Process called "parse_type_expr" that takes parser as ErlangParser returns Erlan
             End While
         End If
 
-        Call expect_token with parser and TOKEN_RBRACE
+        Call expect_token with parser, TOKEN_RBRACE
 
-    Otherwise If match_token with parser and TOKEN_FUN:
+    Otherwise If match_token with parser, TOKEN_FUN:
         Set type_kind to "fun"
         Call advance_parser with parser
 
-        Call expect_token with parser and TOKEN_LPAREN
+        Call expect_token with parser, TOKEN_LPAREN
 
         Note: Parse parameter types
-        If not match_token with parser and TOKEN_RPAREN:
+        If not match_token with parser, TOKEN_RPAREN:
             While true:
                 Let param_type be parse_type_expr with parser
                 Add param_type to end of type_args
 
-                If match_token with parser and TOKEN_COMMA:
+                If match_token with parser, TOKEN_COMMA:
                     Call advance_parser with parser
                 Otherwise:
                     Break
@@ -826,25 +1548,25 @@ Process called "parse_type_expr" that takes parser as ErlangParser returns Erlan
             End While
         End If
 
-        Call expect_token with parser and TOKEN_RPAREN
-        Call expect_token with parser and TOKEN_ARROW
+        Call expect_token with parser, TOKEN_RPAREN
+        Call expect_token with parser, TOKEN_ARROW
 
         Note: Parse return type
         Let return_type be parse_type_expr with parser
         Add return_type to end of type_args
 
-    Otherwise If match_token with parser and TOKEN_LBIN:
+    Otherwise If match_token with parser, TOKEN_LBIN:
         Set type_kind to "binary"
         Call advance_parser with parser
-        Call expect_token with parser and TOKEN_RBIN
+        Call expect_token with parser, TOKEN_RBIN
     End If
 
     Note: Handle union types (type1() | type2())
-    If match_token with parser and TOKEN_LIST_CONS:
+    If match_token with parser, TOKEN_LIST_CONS:
         Let union_types be a list containing nothing
         Add a value of type ErlangTypeExpr with type_kind as type_kind, type_args as type_args, line as line to end of union_types
 
-        While match_token with parser and TOKEN_LIST_CONS:
+        While match_token with parser, TOKEN_LIST_CONS:
             Call advance_parser with parser
             Let next_type be parse_type_expr with parser
             Add next_type to end of union_types
@@ -893,17 +1615,22 @@ Process called "parse_function" that takes parser as ErlangParser returns Erlang
         Let clause be parse_function_clause with parser
         Add clause to end of clauses
 
-        Note: Calculate arity from first clause
-        If length of clauses is equal to 1:
-            Set arity to length of clause.patterns
+        Note: Calculate arity from first clause. clauses and clause.patterns are
+        Note: ListCore RunaLists; their counts come from list_length. clause.patterns
+        Note: is bound to a local first (field-access proc-call arguments are
+        Note: mis-evaluated by the stage1 codegen).
+        Let clause_count be proc list_length from ListCore with clauses
+        If clause_count is equal to 1:
+            Let clause_patterns be clause.patterns
+            Set arity to proc list_length from ListCore with clause_patterns
         End If
 
         Note: Check for more clauses
-        If match_token with parser and TOKEN_SEMICOLON:
+        If match_token with parser, TOKEN_SEMICOLON:
             Call advance_parser with parser
 
             Note: Next clause must have same name
-            If not match_token with parser and TOKEN_ATOM or not parser.current_lexeme is equal to func_name:
+            If not match_token with parser, TOKEN_ATOM or not parser.current_lexeme is equal to func_name:
                 Break
             End If
 
@@ -913,7 +1640,7 @@ Process called "parse_function" that takes parser as ErlangParser returns Erlang
         End If
     End While
 
-    Call expect_token with parser and TOKEN_DOT
+    Call expect_token with parser, TOKEN_DOT
 
     Return a value of type ErlangFunction with
         name as func_name,
@@ -945,14 +1672,14 @@ Process called "parse_function_clause" that takes parser as ErlangParser returns
     Let body be a list containing nothing
 
     Note: Parse parameter patterns
-    Call expect_token with parser and TOKEN_LPAREN
+    Call expect_token with parser, TOKEN_LPAREN
 
-    If not match_token with parser and TOKEN_RPAREN:
+    If not match_token with parser, TOKEN_RPAREN:
         While true:
             Let pattern be parse_pattern with parser
             Add pattern to end of patterns
 
-            If match_token with parser and TOKEN_COMMA:
+            If match_token with parser, TOKEN_COMMA:
                 Call advance_parser with parser
             Otherwise:
                 Break
@@ -960,22 +1687,22 @@ Process called "parse_function_clause" that takes parser as ErlangParser returns
         End While
     End If
 
-    Call expect_token with parser and TOKEN_RPAREN
+    Call expect_token with parser, TOKEN_RPAREN
 
     Note: Parse guard clauses
-    If match_token with parser and TOKEN_WHEN:
+    If match_token with parser, TOKEN_WHEN:
         Call advance_parser with parser
         Set guards to parse_guards with parser
     End If
 
-    Call expect_token with parser and TOKEN_ARROW
+    Call expect_token with parser, TOKEN_ARROW
 
     Note: Parse body expressions
     While true:
-        Let expr be parse_expression with parser and 0
+        Let expr be parse_expression with parser, PREC_LOOSEST
         Add expr to end of body
 
-        If match_token with parser and TOKEN_COMMA:
+        If match_token with parser, TOKEN_COMMA:
             Call advance_parser with parser
         Otherwise:
             Break
@@ -1012,10 +1739,10 @@ Process called "parse_guards" that takes parser as ErlangParser returns List[Lis
 
         Note: Parse guard tests separated by commas
         While true:
-            Let guard_expr be parse_expression with parser and 0
+            Let guard_expr be parse_expression with parser, PREC_LOOSEST
             Add guard_expr to end of guard_seq
 
-            If match_token with parser and TOKEN_COMMA:
+            If match_token with parser, TOKEN_COMMA:
                 Call advance_parser with parser
             Otherwise:
                 Break
@@ -1024,7 +1751,7 @@ Process called "parse_guards" that takes parser as ErlangParser returns List[Lis
 
         Add guard_seq to end of guard_seqs
 
-        If match_token with parser and TOKEN_SEMICOLON:
+        If match_token with parser, TOKEN_SEMICOLON:
             Call advance_parser with parser
         Otherwise:
             Break
@@ -1051,12 +1778,22 @@ pattern and expression contexts.
 Delegates entirely to parse_expression with min_precedence=0.
 @End Implementation
 Process called "parse_pattern" that takes parser as ErlangParser returns ErlangExpression:
-    Return parse_expression with parser and 0
+    Return parse_expression with parser, PREC_LOOSEST
 End Process
 
 Note: ============================================================================
 Note: EXPRESSION PARSING (with precedence climbing)
 Note: ============================================================================
+
+Note:
+Loosest operator ceiling. The precedence table is lower-is-tighter with real
+operators occupying 1..12, so 13 is looser than every operator. Every
+top-level parse_expression entry point passes this so the precedence-climbing
+loop (which consumes operators strictly tighter than the ceiling) parses a
+complete expression rather than stopping at the first operator. Only the
+internal recursion in parse_expression passes a computed (smaller) ceiling.
+:End Note
+Constant PREC_LOOSEST as Integer is 13
 
 @Reasoning:
 Lookup table for Erlang's 12-tier operator precedence, encoded as
@@ -1069,7 +1806,7 @@ ruled out by construction.
 
 @Implementation:
 Sequential If-chain. Returns 1 for ":" (remote call), 2 for "#"
-(record), 3 for "." (field access), 4 for *///div/rem/band
+(record), 4 for *///div/rem/band
 (multiplicative), 5 for +/-/bor/bxor/bsl/bsr (additive/bitwise),
 6 for ++/-- (list concat), 7 for == ///= < > <= >= =:= =/=
 (comparison), 8 for andalso, 9 for orelse, 10 for "|" (list cons),
@@ -1086,9 +1823,16 @@ Process called "get_operator_precedence" that takes token as Integer returns Int
         Return 2  Note: Record access #
     End If
 
-    If token is equal to TOKEN_DOT:
-        Return 3  Note: Map/record field access (not statement dot)
-    End If
+    Note:
+    TOKEN_DOT is the statement terminator ("f() -> body.") in this grammar.
+    Record field access is lexed/parsed through TOKEN_HASH in parse_postfix
+    (#record access), never through a bare ".", so the dot must never be
+    treated as a binary operator: doing so makes the precedence-climbing loop
+    swallow the clause-terminating period and try to parse the following
+    declaration as a right operand, corrupting the body expression. It is
+    therefore deliberately absent from the operator table and falls through to
+    the 999 (non-operator) sentinel so it always stops expression parsing.
+    :End Note
 
     If token is equal to TOKEN_STAR or token is equal to TOKEN_SLASH or token is equal to TOKEN_DIV or token is equal to TOKEN_REM or token is equal to TOKEN_BAND:
         Return 4  Note: Multiplicative
@@ -1098,11 +1842,11 @@ Process called "get_operator_precedence" that takes token as Integer returns Int
         Return 5  Note: Additive and bitwise
     End If
 
-    If token is equal to TOKEN_PLUS_PLUS or token is equal to TOKEN_MINUS_MINUS:
+    If token is equal to TOKEN_PLUS_PLUS or token is equal to TOKEN_LIST_SUBTRACT:
         Return 6  Note: List concatenation
     End If
 
-    If token is equal to TOKEN_EQUAL_EQUAL or token is equal to TOKEN_SLASH_EQUAL or token is equal to TOKEN_LESS or token is equal to TOKEN_GREATER or token is equal to TOKEN_LESS_EQUAL or token is equal to TOKEN_GREATER_EQUAL or token is equal to TOKEN_EXACT_EQUAL or token is equal to TOKEN_EXACT_NOT_EQUAL:
+    If token is equal to TOKEN_EQUAL or token is equal to TOKEN_NOT_EQUAL or token is equal to TOKEN_LESS or token is equal to TOKEN_GREATER or token is equal to TOKEN_LESS_EQUAL or token is equal to TOKEN_GREATER_EQUAL or token is equal to TOKEN_EXACT_EQUAL or token is equal to TOKEN_EXACT_NOT_EQUAL:
         Return 7  Note: Comparison
     End If
 
@@ -1122,7 +1866,7 @@ Process called "get_operator_precedence" that takes token as Integer returns Int
         Return 11  Note: Send message !
     End If
 
-    If token is equal to TOKEN_ASSIGN:
+    If token is equal to TOKEN_MATCH:
         Return 12  Note: Match =
     End If
 
@@ -1138,11 +1882,11 @@ precedence, for left-associative ones it must be strictly higher.
 @End Reasoning
 
 @Implementation:
-Single If check against TOKEN_ASSIGN, TOKEN_SEND, or TOKEN_LIST_CONS.
+Single If check against TOKEN_MATCH, TOKEN_SEND, or TOKEN_LIST_CONS.
 Returns true only for those three.
 @End Implementation
 Process called "is_right_associative" that takes token as Integer returns Boolean:
-    If token is equal to TOKEN_ASSIGN or token is equal to TOKEN_SEND or token is equal to TOKEN_LIST_CONS:
+    If token is equal to TOKEN_MATCH or token is equal to TOKEN_SEND or token is equal to TOKEN_LIST_CONS:
         Return true
     End If
 
@@ -1171,7 +1915,16 @@ precedence, builds an ErlangExpression with expr_type="op" carrying
 Process called "parse_expression" that takes parser as ErlangParser, min_precedence as Integer returns ErlangExpression:
     Let left be parse_primary_expression with parser
 
-    Note: Precedence climbing for binary operators
+    Note:
+    Precedence climbing for binary operators. The operator table is
+    lower-is-tighter (":" = 1 binds tightest, "=" = 12 binds loosest), so an
+    operator is consumed only while its precedence is strictly LESS than the
+    caller's min_precedence ceiling. A non-operator token returns 999 from
+    get_operator_precedence and therefore always stops the loop. Top-level
+    callers pass PREC_LOOSEST (13, looser than every real operator) so a full
+    expression is consumed; the recursive call below passes the computed
+    next-operand ceiling.
+    :End Note
     While true:
         Let op_precedence be get_operator_precedence with parser.current_token
 
@@ -1190,7 +1943,7 @@ Process called "parse_expression" that takes parser as ErlangParser, min_precede
             Set next_min_prec to op_precedence minus 1
         End If
 
-        Let right be parse_expression with parser and next_min_prec
+        Let right be parse_expression with parser, next_min_prec
 
         Note: Create binary operator expression
         Let expr_data be a dictionary containing:
@@ -1235,110 +1988,150 @@ Process called "parse_primary_expression" that takes parser as ErlangParser retu
     Let expr_type be ""
     Let expr_data be a dictionary containing nothing
 
+    Note:
+    Each leaf builder constructs its expr_data as a single dictionary literal
+    rather than incrementally storing into the pre-declared empty dictionary.
+    The incremental "Set expr_data at key" store of a leaf value does not
+    round-trip through the stage1 codegen: a later `get`/`at key` read of the
+    value returns 0/empty, which would drop atom text, variable names, and
+    literal values from the translated HIR and the emitted source.
+    :End Note
     Note: Atom literal
-    If match_token with parser and TOKEN_ATOM:
+    If match_token with parser, TOKEN_ATOM:
         Set expr_type to "atom"
-        Set expr_data at key "value" to parser.current_lexeme
+        Let atom_lexeme be parser.current_lexeme
+        Set expr_data to a dictionary containing:
+            "value" as atom_lexeme
+        End Dictionary
         Call advance_parser with parser
 
     Note: Variable
-    Otherwise If match_token with parser and TOKEN_VARIABLE:
+    Otherwise If match_token with parser, TOKEN_VARIABLE:
         Set expr_type to "var"
-        Set expr_data at key "name" to parser.current_lexeme
+        Let var_lexeme be parser.current_lexeme
+        Set expr_data to a dictionary containing:
+            "name" as var_lexeme
+        End Dictionary
         Call advance_parser with parser
 
     Note: Integer literal
-    Otherwise If match_token with parser and TOKEN_INTEGER:
+    Otherwise If match_token with parser, TOKEN_INTEGER:
         Set expr_type to "integer"
-        Set expr_data at key "value" to convert parser.current_lexeme to Integer
+        Let int_lexeme be parser.current_lexeme
+        Let int_value be proc string_to_integer from StringPrim with int_lexeme
+        Set expr_data to a dictionary containing:
+            "value" as int_value
+        End Dictionary
         Call advance_parser with parser
 
-    Note: Float literal
-    Otherwise If match_token with parser and TOKEN_FLOAT:
+    Note: Float literal. No float-parsing primitive exists, and the float's
+    Note: textual form is what must survive the round-trip, so the lexeme string
+    Note: is stored verbatim; the emitter re-emits it unchanged.
+    Otherwise If match_token with parser, TOKEN_FLOAT:
         Set expr_type to "float"
-        Set expr_data at key "value" to convert parser.current_lexeme to Float
+        Let float_lexeme be parser.current_lexeme
+        Set expr_data to a dictionary containing:
+            "value" as float_lexeme
+        End Dictionary
         Call advance_parser with parser
 
     Note: Character literal
-    Otherwise If match_token with parser and TOKEN_CHAR:
+    Otherwise If match_token with parser, TOKEN_CHAR:
         Set expr_type to "char"
-        Set expr_data at key "value" to parser.current_lexeme
+        Let char_lexeme be parser.current_lexeme
+        Set expr_data to a dictionary containing:
+            "value" as char_lexeme
+        End Dictionary
         Call advance_parser with parser
 
     Note: String literal
-    Otherwise If match_token with parser and TOKEN_STRING:
+    Otherwise If match_token with parser, TOKEN_STRING:
         Set expr_type to "string"
-        Set expr_data at key "value" to parser.current_lexeme
+        Let string_lexeme be parser.current_lexeme
+        Set expr_data to a dictionary containing:
+            "value" as string_lexeme
+        End Dictionary
         Call advance_parser with parser
 
     Note: List literal
-    Otherwise If match_token with parser and TOKEN_LBRACKET:
+    Otherwise If match_token with parser, TOKEN_LBRACKET:
         Return parse_list with parser
 
     Note: Tuple literal
-    Otherwise If match_token with parser and TOKEN_LBRACE:
+    Otherwise If match_token with parser, TOKEN_LBRACE:
         Return parse_tuple with parser
 
     Note: Binary literal
-    Otherwise If match_token with parser and TOKEN_LBIN:
+    Otherwise If match_token with parser, TOKEN_LBIN:
         Return parse_binary with parser
 
     Note: Parenthesized expression
-    Otherwise If match_token with parser and TOKEN_LPAREN:
+    Otherwise If match_token with parser, TOKEN_LPAREN:
         Call advance_parser with parser
-        Let expr be parse_expression with parser and 0
-        Call expect_token with parser and TOKEN_RPAREN
+        Let expr be parse_expression with parser, PREC_LOOSEST
+        Call expect_token with parser, TOKEN_RPAREN
         Return expr
 
     Note: Fun expression (anonymous function)
-    Otherwise If match_token with parser and TOKEN_FUN:
+    Otherwise If match_token with parser, TOKEN_FUN:
         Return parse_fun_expression with parser
 
     Note: Case expression
-    Otherwise If match_token with parser and TOKEN_CASE:
+    Otherwise If match_token with parser, TOKEN_CASE:
         Return parse_case_expression with parser
 
     Note: If expression
-    Otherwise If match_token with parser and TOKEN_IF:
+    Otherwise If match_token with parser, TOKEN_IF:
         Return parse_if_expression with parser
 
     Note: Receive expression
-    Otherwise If match_token with parser and TOKEN_RECEIVE:
+    Otherwise If match_token with parser, TOKEN_RECEIVE:
         Return parse_receive_expression with parser
 
     Note: Try expression
-    Otherwise If match_token with parser and TOKEN_TRY:
+    Otherwise If match_token with parser, TOKEN_TRY:
         Return parse_try_expression with parser
 
     Note: Begin-end block
-    Otherwise If match_token with parser and TOKEN_BEGIN:
+    Otherwise If match_token with parser, TOKEN_BEGIN:
         Return parse_begin_expression with parser
 
     Note: Unary operators
-    Otherwise If match_token with parser and TOKEN_MINUS or match_token with parser and TOKEN_PLUS or match_token with parser and TOKEN_BNOT or match_token with parser and TOKEN_NOT:
+    Otherwise If match_token with parser, TOKEN_MINUS or match_token with parser, TOKEN_PLUS or match_token with parser, TOKEN_BNOT or match_token with parser, TOKEN_NOT:
         Let op_lexeme be parser.current_lexeme
         Call advance_parser with parser
         Let operand be parse_primary_expression with parser
 
         Set expr_type to "unary_op"
-        Set expr_data at key "operator" to op_lexeme
-        Set expr_data at key "operand" to operand
+        Note:
+        Built as a dictionary literal so the "operand" sub-expression handle
+        round-trips through the stage1 codegen; an incremental "Set at key" of
+        a handle value into the shared expr_data reads back as 0 downstream.
+        :End Note
+        Set expr_data to a dictionary containing:
+            "operator" as op_lexeme,
+            "operand" as operand
+        End Dictionary
 
     Note: Macro variable
-    Otherwise If match_token with parser and TOKEN_QUESTION:
+    Otherwise If match_token with parser, TOKEN_QUESTION:
         Call advance_parser with parser
         Let macro_name be parser.current_lexeme
         Call advance_parser with parser
 
         Set expr_type to "macro"
-        Set expr_data at key "name" to macro_name
+        Set expr_data to a dictionary containing:
+            "name" as macro_name
+        End Dictionary
 
     Note: Record creation or access
-    Otherwise If match_token with parser and TOKEN_HASH:
+    Otherwise If match_token with parser, TOKEN_HASH:
         Return parse_record_expr with parser
 
     Otherwise:
-        Add "Unexpected token in expression at line " joined with string representation of line to end of parser.errors
+        Let expr_line_str be proc integer_to_string from StringPrim with line
+        Let expr_err_msg be proc string_concat from StringPrim with "Unexpected token in expression at line ", expr_line_str
+        Add expr_err_msg to end of parser.errors
         Call advance_parser with parser
         Set expr_type to "error"
     End If
@@ -1349,7 +2142,7 @@ Process called "parse_primary_expression" that takes parser as ErlangParser retu
         expr_data as expr_data,
         line as line
 
-    Set result to parse_postfix with parser and result
+    Set result to parse_postfix with parser, result
 
     Return result
 End Process
@@ -1374,18 +2167,18 @@ Process called "parse_postfix" that takes parser as ErlangParser, expr as Erlang
 
     While true:
         Note: Function call
-        If match_token with parser and TOKEN_LPAREN:
+        If match_token with parser, TOKEN_LPAREN:
             Let line be parser.current_line
             Call advance_parser with parser
 
             Let args be a list containing nothing
 
-            If not match_token with parser and TOKEN_RPAREN:
+            If not match_token with parser, TOKEN_RPAREN:
                 While true:
-                    Let arg be parse_expression with parser and 0
+                    Let arg be parse_expression with parser, PREC_LOOSEST
                     Add arg to end of args
 
-                    If match_token with parser and TOKEN_COMMA:
+                    If match_token with parser, TOKEN_COMMA:
                         Call advance_parser with parser
                     Otherwise:
                         Break
@@ -1393,33 +2186,45 @@ Process called "parse_postfix" that takes parser as ErlangParser, expr as Erlang
                 End While
             End If
 
-            Call expect_token with parser and TOKEN_RPAREN
+            Call expect_token with parser, TOKEN_RPAREN
 
+            Note:
+            Dictionary literal so the "function" sub-expression handle and the
+            "arguments" list round-trip through the stage1 codegen; incremental
+            "Set at key" of these handle values reads back as 0 downstream.
+            :End Note
             Let call_data be a dictionary containing:
                 "function" as result,
                 "arguments" as args
             End Dictionary
 
+            Let pf_call_kind be "call"
             Set result to a value of type ErlangExpression with
-                expr_type as "call",
+                expr_type as pf_call_kind,
                 expr_data as call_data,
                 line as line
 
         Note: Record field access
-        Otherwise If match_token with parser and TOKEN_HASH:
+        Otherwise If match_token with parser, TOKEN_HASH:
             Set line to parser.current_line
             Call advance_parser with parser
 
             Let field_name be parser.current_lexeme
             Call advance_parser with parser
 
+            Note:
+            Dictionary literal so the "record" sub-expression handle round-trips
+            through the stage1 codegen; an incremental "Set at key" of the handle
+            reads back as 0 downstream.
+            :End Note
             Let access_data be a dictionary containing:
                 "record" as result,
                 "field" as field_name
             End Dictionary
 
+            Let pf_access_kind be "record_access"
             Set result to a value of type ErlangExpression with
-                expr_type as "record_access",
+                expr_type as pf_access_kind,
                 expr_data as access_data,
                 line as line
 
@@ -1456,20 +2261,20 @@ Process called "parse_list" that takes parser as ErlangParser returns ErlangExpr
     Call advance_parser with parser  Note: Skip [
 
     Let elements be a list containing nothing
-    Let tail be null
+    Let tail be 0
 
-    If not match_token with parser and TOKEN_RBRACKET:
+    If not match_token with parser, TOKEN_RBRACKET:
         Note: Parse list elements
         While true:
-            Let elem be parse_expression with parser and 0
+            Let elem be parse_expression with parser, PREC_LOOSEST
             Add elem to end of elements
 
-            If match_token with parser and TOKEN_COMMA:
+            If match_token with parser, TOKEN_COMMA:
                 Call advance_parser with parser
-            Otherwise If match_token with parser and TOKEN_LIST_CONS:
+            Otherwise If match_token with parser, TOKEN_LIST_CONS:
                 Note: List with tail [H|T]
                 Call advance_parser with parser
-                Set tail to parse_expression with parser and 0
+                Set tail to parse_expression with parser, PREC_LOOSEST
                 Break
             Otherwise:
                 Break
@@ -1477,11 +2282,12 @@ Process called "parse_list" that takes parser as ErlangParser returns ErlangExpr
         End While
     End If
 
-    Call expect_token with parser and TOKEN_RBRACKET
+    Call expect_token with parser, TOKEN_RBRACKET
 
-    Note: Check for list comprehension
-    If length of elements is equal to 1 and match_token with parser and TOKEN_DOUBLE_LIST_CONS:
-        Return parse_list_comprehension with parser and elements at index 0
+    Note: Check for list comprehension. elements is a ListCore RunaList: its count
+    Note: and element access use list_length / list_get.
+    If proc list_length from ListCore with elements is equal to 1 and match_token with parser, TOKEN_DOUBLE_LIST_CONS:
+        Return parse_list_comprehension with parser, proc list_get from ListCore with elements, 0
     End If
 
     Let list_data be a dictionary containing:
@@ -1512,12 +2318,12 @@ Process called "parse_tuple" that takes parser as ErlangParser returns ErlangExp
 
     Let elements be a list containing nothing
 
-    If not match_token with parser and TOKEN_RBRACE:
+    If not match_token with parser, TOKEN_RBRACE:
         While true:
-            Let elem be parse_expression with parser and 0
+            Let elem be parse_expression with parser, PREC_LOOSEST
             Add elem to end of elements
 
-            If match_token with parser and TOKEN_COMMA:
+            If match_token with parser, TOKEN_COMMA:
                 Call advance_parser with parser
             Otherwise:
                 Break
@@ -1525,7 +2331,7 @@ Process called "parse_tuple" that takes parser as ErlangParser returns ErlangExp
         End While
     End If
 
-    Call expect_token with parser and TOKEN_RBRACE
+    Call expect_token with parser, TOKEN_RBRACE
 
     Let tuple_data be a dictionary containing:
         "elements" as elements
@@ -1561,29 +2367,29 @@ Process called "parse_binary" that takes parser as ErlangParser returns ErlangEx
 
     Let segments be a list containing nothing
 
-    If not match_token with parser and TOKEN_RBIN:
+    If not match_token with parser, TOKEN_RBIN:
         While true:
-            Let value be parse_expression with parser and 0
+            Let value be parse_expression with parser, PREC_LOOSEST
 
             Note: Parse binary segment specifiers (Size, Type)
-            Let size be null
+            Let size be 0
             Let specifiers be a list containing nothing
 
-            If match_token with parser and TOKEN_COLON:
+            If match_token with parser, TOKEN_COLON:
                 Call advance_parser with parser
-                Set size to parse_expression with parser and 0
+                Set size to parse_expression with parser, PREC_LOOSEST
 
                 Note: Parse type specifiers
-                If match_token with parser and TOKEN_SLASH:
+                If match_token with parser, TOKEN_SLASH:
                     Call advance_parser with parser
 
                     While true:
-                        If match_token with parser and TOKEN_ATOM:
+                        If match_token with parser, TOKEN_ATOM:
                             Add parser.current_lexeme to end of specifiers
                             Call advance_parser with parser
                         End If
 
-                        If match_token with parser and TOKEN_MINUS:
+                        If match_token with parser, TOKEN_MINUS:
                             Call advance_parser with parser
                         Otherwise:
                             Break
@@ -1592,6 +2398,11 @@ Process called "parse_binary" that takes parser as ErlangParser returns ErlangEx
                 End If
             End If
 
+            Note:
+            Dictionary literal so the "value"/"size" sub-expression handles
+            round-trip through the stage1 codegen; incremental "Set at key" of
+            these handle values reads back as 0 downstream.
+            :End Note
             Let segment_data be a dictionary containing:
                 "value" as value,
                 "size" as size,
@@ -1600,7 +2411,7 @@ Process called "parse_binary" that takes parser as ErlangParser returns ErlangEx
 
             Add segment_data to end of segments
 
-            If match_token with parser and TOKEN_COMMA:
+            If match_token with parser, TOKEN_COMMA:
                 Call advance_parser with parser
             Otherwise:
                 Break
@@ -1608,19 +2419,25 @@ Process called "parse_binary" that takes parser as ErlangParser returns ErlangEx
         End While
     End If
 
-    Call expect_token with parser and TOKEN_RBIN
+    Call expect_token with parser, TOKEN_RBIN
 
-    Note: Check for binary comprehension
-    If length of segments is equal to 1 and match_token with parser and TOKEN_DOUBLE_LIST_CONS:
-        Return parse_binary_comprehension with parser and segments at index 0
+    Note: Check for binary comprehension. segments is a ListCore RunaList: its
+    Note: count and element access use list_length / list_get.
+    If proc list_length from ListCore with segments is equal to 1 and match_token with parser, TOKEN_DOUBLE_LIST_CONS:
+        Return parse_binary_comprehension with parser, proc list_get from ListCore with segments, 0
     End If
 
+    Note:
+    Dictionary literal so the "segments" list round-trips through the stage1
+    codegen; an incremental "Set at key" reads back as 0 downstream.
+    :End Note
     Let binary_data be a dictionary containing:
         "segments" as segments
     End Dictionary
 
+    Let binary_kind be "binary"
     Return a value of type ErlangExpression with
-        expr_type as "binary",
+        expr_type as binary_kind,
         expr_data as binary_data,
         line as line
 End Process
@@ -1651,40 +2468,48 @@ Process called "parse_fun_expression" that takes parser as ErlangParser returns 
     Let expr_data be a dictionary containing nothing
 
     Note: Named function reference: fun Module:Function/Arity or fun Function/Arity
-    If match_token with parser and TOKEN_ATOM:
+    If match_token with parser, TOKEN_ATOM:
         Let first_name be parser.current_lexeme
         Call advance_parser with parser
 
-        If match_token with parser and TOKEN_COLON:
+        If match_token with parser, TOKEN_COLON:
             Note: Remote function reference: fun Module:Function/Arity
             Call advance_parser with parser
             Let func_name be parser.current_lexeme
             Call advance_parser with parser
-            Call expect_token with parser and TOKEN_SLASH
-            Let arity be convert parser.current_lexeme to Integer
+            Call expect_token with parser, TOKEN_SLASH
+            Let arity be proc string_to_integer from StringPrim with parser.current_lexeme
             Call advance_parser with parser
 
-            Set expr_data at key "type" to "remote_ref"
-            Set expr_data at key "module" to first_name
-            Set expr_data at key "function" to func_name
-            Set expr_data at key "arity" to arity
+            Note:
+            Dictionary literal so every entry round-trips through the stage1
+            codegen; incremental "Set at key" stores read back as 0 downstream.
+            :End Note
+            Set expr_data to a dictionary containing:
+                "type" as "remote_ref",
+                "module" as first_name,
+                "function" as func_name,
+                "arity" as arity
+            End Dictionary
 
-        Otherwise If match_token with parser and TOKEN_SLASH:
+        Otherwise If match_token with parser, TOKEN_SLASH:
             Note: Local function reference: fun Function/Arity
             Call advance_parser with parser
-            Set arity to convert parser.current_lexeme to Integer
+            Set arity to proc string_to_integer from StringPrim with parser.current_lexeme
             Call advance_parser with parser
 
-            Set expr_data at key "type" to "local_ref"
-            Set expr_data at key "function" to first_name
-            Set expr_data at key "arity" to arity
+            Set expr_data to a dictionary containing:
+                "type" as "local_ref",
+                "function" as first_name,
+                "arity" as arity
+            End Dictionary
 
         Otherwise:
             Add "Expected : or / after function name in fun expression" to end of parser.errors
         End If
 
     Note: Anonymous function: fun (Args) -> Body end
-    Otherwise If match_token with parser and TOKEN_LPAREN:
+    Otherwise If match_token with parser, TOKEN_LPAREN:
         Let clauses be a list containing nothing
 
         While true:
@@ -1693,15 +2518,15 @@ Process called "parse_fun_expression" that takes parser as ErlangParser returns 
             Let guards be a list containing nothing
             Let body be a list containing nothing
 
-            Call expect_token with parser and TOKEN_LPAREN
+            Call expect_token with parser, TOKEN_LPAREN
 
             Note: Parse parameters
-            If not match_token with parser and TOKEN_RPAREN:
+            If not match_token with parser, TOKEN_RPAREN:
                 While true:
                     Let pattern be parse_pattern with parser
                     Add pattern to end of patterns
 
-                    If match_token with parser and TOKEN_COMMA:
+                    If match_token with parser, TOKEN_COMMA:
                         Call advance_parser with parser
                     Otherwise:
                         Break
@@ -1709,22 +2534,22 @@ Process called "parse_fun_expression" that takes parser as ErlangParser returns 
                 End While
             End If
 
-            Call expect_token with parser and TOKEN_RPAREN
+            Call expect_token with parser, TOKEN_RPAREN
 
             Note: Parse guards
-            If match_token with parser and TOKEN_WHEN:
+            If match_token with parser, TOKEN_WHEN:
                 Call advance_parser with parser
                 Set guards to parse_guards with parser
             End If
 
-            Call expect_token with parser and TOKEN_ARROW
+            Call expect_token with parser, TOKEN_ARROW
 
             Note: Parse body
             While true:
-                Let expr be parse_expression with parser and 0
+                Let expr be parse_expression with parser, PREC_LOOSEST
                 Add expr to end of body
 
-                If match_token with parser and TOKEN_COMMA:
+                If match_token with parser, TOKEN_COMMA:
                     Call advance_parser with parser
                 Otherwise:
                     Break
@@ -1740,17 +2565,19 @@ Process called "parse_fun_expression" that takes parser as ErlangParser returns 
             Add clause to end of clauses
 
             Note: Check for more clauses
-            If match_token with parser and TOKEN_SEMICOLON:
+            If match_token with parser, TOKEN_SEMICOLON:
                 Call advance_parser with parser
             Otherwise:
                 Break
             End If
         End While
 
-        Call expect_token with parser and TOKEN_END
+        Call expect_token with parser, TOKEN_END
 
-        Set expr_data at key "type" to "anonymous"
-        Set expr_data at key "clauses" to clauses
+        Set expr_data to a dictionary containing:
+            "type" as "anonymous",
+            "clauses" as clauses
+        End Dictionary
     End If
 
     Return a value of type ErlangExpression with
@@ -1777,31 +2604,40 @@ Process called "parse_case_expression" that takes parser as ErlangParser returns
     Let line be parser.current_line
     Call advance_parser with parser  Note: Skip case
 
-    Let scrutinee be parse_expression with parser and 0
+    Let scrutinee be parse_expression with parser, PREC_LOOSEST
 
-    Call expect_token with parser and TOKEN_OF
+    Call expect_token with parser, TOKEN_OF
 
     Let clauses be a list containing nothing
 
     Note: Parse case clauses
-    While not match_token with parser and TOKEN_END:
+    While not match_token with parser, TOKEN_END:
         Let clause be parse_case_clause with parser
         Add clause to end of clauses
 
-        If match_token with parser and TOKEN_SEMICOLON:
+        If match_token with parser, TOKEN_SEMICOLON:
             Call advance_parser with parser
         End If
     End While
 
-    Call expect_token with parser and TOKEN_END
+    Call expect_token with parser, TOKEN_END
 
+    Note:
+    case_data is built as a single dictionary literal rather than an empty
+    dictionary followed by incremental "Set ... at key" stores. The incremental
+    store form does not round-trip through the stage1 codegen here (the
+    later read of "scrutinee"/"clauses" returns 0), whereas the dictionary
+    literal initialiser stores the entries so they read back correctly - the
+    same construction used for binary-operator nodes in parse_expression.
+    :End Note
     Let case_data be a dictionary containing:
         "scrutinee" as scrutinee,
         "clauses" as clauses
     End Dictionary
 
+    Let case_kind be "case"
     Return a value of type ErlangExpression with
-        expr_type as "case",
+        expr_type as case_kind,
         expr_data as case_data,
         line as line
 End Process
@@ -1828,19 +2664,19 @@ Process called "parse_case_clause" that takes parser as ErlangParser returns Erl
     Let patterns be a list containing pattern
 
     Let guards be a list containing nothing
-    If match_token with parser and TOKEN_WHEN:
+    If match_token with parser, TOKEN_WHEN:
         Call advance_parser with parser
         Set guards to parse_guards with parser
     End If
 
-    Call expect_token with parser and TOKEN_ARROW
+    Call expect_token with parser, TOKEN_ARROW
 
     Let body be a list containing nothing
     While true:
-        Let expr be parse_expression with parser and 0
+        Let expr be parse_expression with parser, PREC_LOOSEST
         Add expr to end of body
 
-        If match_token with parser and TOKEN_COMMA:
+        If match_token with parser, TOKEN_COMMA:
             Call advance_parser with parser
         Otherwise:
             Break
@@ -1876,18 +2712,18 @@ Process called "parse_if_expression" that takes parser as ErlangParser returns E
     Let clauses be a list containing nothing
 
     Note: Parse if clauses (guards only, no patterns)
-    While not match_token with parser and TOKEN_END:
+    While not match_token with parser, TOKEN_END:
         Let clause_line be parser.current_line
         Let guards be parse_guards with parser
 
-        Call expect_token with parser and TOKEN_ARROW
+        Call expect_token with parser, TOKEN_ARROW
 
         Let body be a list containing nothing
         While true:
-            Let expr be parse_expression with parser and 0
+            Let expr be parse_expression with parser, PREC_LOOSEST
             Add expr to end of body
 
-            If match_token with parser and TOKEN_COMMA:
+            If match_token with parser, TOKEN_COMMA:
                 Call advance_parser with parser
             Otherwise:
                 Break
@@ -1902,12 +2738,12 @@ Process called "parse_if_expression" that takes parser as ErlangParser returns E
 
         Add clause to end of clauses
 
-        If match_token with parser and TOKEN_SEMICOLON:
+        If match_token with parser, TOKEN_SEMICOLON:
             Call advance_parser with parser
         End If
     End While
 
-    Call expect_token with parser and TOKEN_END
+    Call expect_token with parser, TOKEN_END
 
     Let if_data be a dictionary containing:
         "clauses" as clauses
@@ -1942,30 +2778,30 @@ Process called "parse_receive_expression" that takes parser as ErlangParser retu
     Call advance_parser with parser  Note: Skip receive
 
     Let clauses be a list containing nothing
-    Let after_timeout be null
+    Let after_timeout be 0
     Let after_body be a list containing nothing
 
     Note: Parse receive clauses
-    While not match_token with parser and TOKEN_AFTER and not match_token with parser and TOKEN_END:
+    While not match_token with parser, TOKEN_AFTER and not match_token with parser, TOKEN_END:
         Let clause be parse_case_clause with parser
         Add clause to end of clauses
 
-        If match_token with parser and TOKEN_SEMICOLON:
+        If match_token with parser, TOKEN_SEMICOLON:
             Call advance_parser with parser
         End If
     End While
 
     Note: Parse optional after clause
-    If match_token with parser and TOKEN_AFTER:
+    If match_token with parser, TOKEN_AFTER:
         Call advance_parser with parser
-        Set after_timeout to parse_expression with parser and 0
-        Call expect_token with parser and TOKEN_ARROW
+        Set after_timeout to parse_expression with parser, PREC_LOOSEST
+        Call expect_token with parser, TOKEN_ARROW
 
         While true:
-            Let expr be parse_expression with parser and 0
+            Let expr be parse_expression with parser, PREC_LOOSEST
             Add expr to end of after_body
 
-            If match_token with parser and TOKEN_COMMA:
+            If match_token with parser, TOKEN_COMMA:
                 Call advance_parser with parser
             Otherwise:
                 Break
@@ -1973,16 +2809,22 @@ Process called "parse_receive_expression" that takes parser as ErlangParser retu
         End While
     End If
 
-    Call expect_token with parser and TOKEN_END
+    Call expect_token with parser, TOKEN_END
 
+    Note:
+    Dictionary literal so the "clauses" list and "after_timeout" sub-expression
+    handle round-trip through the stage1 codegen; incremental "Set at key" of
+    these handle values reads back as 0 downstream.
+    :End Note
     Let receive_data be a dictionary containing:
         "clauses" as clauses,
         "after_timeout" as after_timeout,
         "after_body" as after_body
     End Dictionary
 
+    Let receive_kind be "receive"
     Return a value of type ErlangExpression with
-        expr_type as "receive",
+        expr_type as receive_kind,
         expr_data as receive_data,
         line as line
 End Process
@@ -2014,11 +2856,11 @@ Process called "parse_try_expression" that takes parser as ErlangParser returns 
 
     Note: Parse try body
     Let try_body be a list containing nothing
-    While not match_token with parser and TOKEN_OF and not match_token with parser and TOKEN_CATCH and not match_token with parser and TOKEN_AFTER:
-        Let expr be parse_expression with parser and 0
+    While not match_token with parser, TOKEN_OF and not match_token with parser, TOKEN_CATCH and not match_token with parser, TOKEN_AFTER:
+        Let expr be parse_expression with parser, PREC_LOOSEST
         Add expr to end of try_body
 
-        If match_token with parser and TOKEN_COMMA:
+        If match_token with parser, TOKEN_COMMA:
             Call advance_parser with parser
         Otherwise:
             Break
@@ -2027,14 +2869,14 @@ Process called "parse_try_expression" that takes parser as ErlangParser returns 
 
     Note: Parse optional 'of' clauses
     Let of_clauses be a list containing nothing
-    If match_token with parser and TOKEN_OF:
+    If match_token with parser, TOKEN_OF:
         Call advance_parser with parser
 
-        While not match_token with parser and TOKEN_CATCH and not match_token with parser and TOKEN_AFTER and not match_token with parser and TOKEN_END:
+        While not match_token with parser, TOKEN_CATCH and not match_token with parser, TOKEN_AFTER and not match_token with parser, TOKEN_END:
             Let clause be parse_case_clause with parser
             Add clause to end of of_clauses
 
-            If match_token with parser and TOKEN_SEMICOLON:
+            If match_token with parser, TOKEN_SEMICOLON:
                 Call advance_parser with parser
             End If
         End While
@@ -2042,42 +2884,48 @@ Process called "parse_try_expression" that takes parser as ErlangParser returns 
 
     Note: Parse catch clauses
     Let catch_clauses be a list containing nothing
-    If match_token with parser and TOKEN_CATCH:
+    If match_token with parser, TOKEN_CATCH:
         Call advance_parser with parser
 
-        While not match_token with parser and TOKEN_AFTER and not match_token with parser and TOKEN_END:
+        While not match_token with parser, TOKEN_AFTER and not match_token with parser, TOKEN_END:
             Let clause_line be parser.current_line
 
             Note: Parse exception pattern (Class:Pattern or Pattern)
-            Let exception_class be null
+            Let exception_class be 0
             Let exception_pattern be parse_pattern with parser
 
-            If match_token with parser and TOKEN_COLON:
+            If match_token with parser, TOKEN_COLON:
                 Call advance_parser with parser
                 Set exception_class to exception_pattern
                 Set exception_pattern to parse_pattern with parser
             End If
 
             Let guards be a list containing nothing
-            If match_token with parser and TOKEN_WHEN:
+            If match_token with parser, TOKEN_WHEN:
                 Call advance_parser with parser
                 Set guards to parse_guards with parser
             End If
 
-            Call expect_token with parser and TOKEN_ARROW
+            Call expect_token with parser, TOKEN_ARROW
 
             Let body be a list containing nothing
             While true:
-                Set expr to parse_expression with parser and 0
+                Set expr to parse_expression with parser, PREC_LOOSEST
                 Add expr to end of body
 
-                If match_token with parser and TOKEN_COMMA:
+                If match_token with parser, TOKEN_COMMA:
                     Call advance_parser with parser
                 Otherwise:
                     Break
                 End If
             End While
 
+            Note:
+            Dictionary literal so the "exception_pattern" handle and the
+            "guards"/"body" lists round-trip through the stage1 codegen;
+            incremental "Set at key" of these handle values reads back as 0
+            downstream.
+            :End Note
             Let catch_data be a dictionary containing:
                 "exception_class" as exception_class,
                 "exception_pattern" as exception_pattern,
@@ -2087,7 +2935,7 @@ Process called "parse_try_expression" that takes parser as ErlangParser returns 
 
             Add catch_data to end of catch_clauses
 
-            If match_token with parser and TOKEN_SEMICOLON:
+            If match_token with parser, TOKEN_SEMICOLON:
                 Call advance_parser with parser
             End If
         End While
@@ -2095,14 +2943,14 @@ Process called "parse_try_expression" that takes parser as ErlangParser returns 
 
     Note: Parse optional after clause
     Let after_body be a list containing nothing
-    If match_token with parser and TOKEN_AFTER:
+    If match_token with parser, TOKEN_AFTER:
         Call advance_parser with parser
 
-        While not match_token with parser and TOKEN_END:
-            Set expr to parse_expression with parser and 0
+        While not match_token with parser, TOKEN_END:
+            Set expr to parse_expression with parser, PREC_LOOSEST
             Add expr to end of after_body
 
-            If match_token with parser and TOKEN_COMMA:
+            If match_token with parser, TOKEN_COMMA:
                 Call advance_parser with parser
             Otherwise:
                 Break
@@ -2110,8 +2958,13 @@ Process called "parse_try_expression" that takes parser as ErlangParser returns 
         End While
     End If
 
-    Call expect_token with parser and TOKEN_END
+    Call expect_token with parser, TOKEN_END
 
+    Note:
+    Dictionary literal so the try-section lists round-trip through the stage1
+    codegen; incremental "Set at key" of these handle values reads back as 0
+    downstream.
+    :End Note
     Let try_data be a dictionary containing:
         "try_body" as try_body,
         "of_clauses" as of_clauses,
@@ -2119,8 +2972,9 @@ Process called "parse_try_expression" that takes parser as ErlangParser returns 
         "after_body" as after_body
     End Dictionary
 
+    Let try_kind be "try"
     Return a value of type ErlangExpression with
-        expr_type as "try",
+        expr_type as try_kind,
         expr_data as try_data,
         line as line
 End Process
@@ -2144,18 +2998,18 @@ Process called "parse_begin_expression" that takes parser as ErlangParser return
 
     Let body be a list containing nothing
 
-    While not match_token with parser and TOKEN_END:
-        Let expr be parse_expression with parser and 0
+    While not match_token with parser, TOKEN_END:
+        Let expr be parse_expression with parser, PREC_LOOSEST
         Add expr to end of body
 
-        If match_token with parser and TOKEN_COMMA:
+        If match_token with parser, TOKEN_COMMA:
             Call advance_parser with parser
         Otherwise:
             Break
         End If
     End While
 
-    Call expect_token with parser and TOKEN_END
+    Call expect_token with parser, TOKEN_END
 
     Let begin_data be a dictionary containing:
         "body" as body
@@ -2190,16 +3044,37 @@ Process called "parse_list_comprehension" that takes parser as ErlangParser, tem
 
     Let qualifiers be a list containing nothing
 
+    Note: Pre-bind the dictionary key/tag string literals so the code generator
+    Note: materialises their data slots reliably (string literals used directly
+    Note: as dictionary keys/values in deeply-nested builders can otherwise be
+    Note: assigned a slot index past what the emitter writes).
+    Let lc_type_key be "type"
+    Let lc_pattern_key be "pattern"
+    Let lc_list_key be "list"
+    Let lc_binary_key be "binary"
+    Let lc_expression_key be "expression"
+    Let lc_template_key be "template"
+    Let lc_qualifiers_key be "qualifiers"
+    Let lc_generator_tag be "generator"
+    Let lc_binary_generator_tag be "binary_generator"
+    Let lc_filter_tag be "filter"
+
     Note: Parse comprehension qualifiers (generators and filters)
     While true:
         Note: Generator: Pattern <- List
-        If peek_token with parser and 1 is equal to TOKEN_LARROW:
+        If peek_token with parser, 1 is equal to TOKEN_LARROW:
             Let pattern be parse_pattern with parser
-            Call expect_token with parser and TOKEN_LARROW
-            Let list_expr be parse_expression with parser and 0
+            Call expect_token with parser, TOKEN_LARROW
+            Let list_expr be parse_expression with parser, PREC_LOOSEST
 
+            Note:
+            Qualifier dictionaries are built as literals so the "pattern" and
+            "list"/"binary"/"expression" sub-expression handles round-trip
+            through the stage1 codegen; incremental "Set at key" of these handle
+            values reads back as 0 downstream.
+            :End Note
             Let generator_data be a dictionary containing:
-                "type" as "generator",
+                "type" as lc_generator_tag,
                 "pattern" as pattern,
                 "list" as list_expr
             End Dictionary
@@ -2207,13 +3082,13 @@ Process called "parse_list_comprehension" that takes parser as ErlangParser, tem
             Add generator_data to end of qualifiers
 
         Note: Binary generator: Pattern <= Binary
-        Otherwise If peek_token with parser and 1 is equal to TOKEN_LBINARROW:
+        Otherwise If peek_token with parser, 1 is equal to TOKEN_LBINARROW:
             Set pattern to parse_pattern with parser
-            Call expect_token with parser and TOKEN_LBINARROW
-            Let binary_expr be parse_expression with parser and 0
+            Call expect_token with parser, TOKEN_LBINARROW
+            Let binary_expr be parse_expression with parser, PREC_LOOSEST
 
             Set generator_data to a dictionary containing:
-                "type" as "binary_generator",
+                "type" as lc_binary_generator_tag,
                 "pattern" as pattern,
                 "binary" as binary_expr
             End Dictionary
@@ -2222,32 +3097,37 @@ Process called "parse_list_comprehension" that takes parser as ErlangParser, tem
 
         Note: Filter: BoolExpression
         Otherwise:
-            Let filter_expr be parse_expression with parser and 0
+            Let filter_expr be parse_expression with parser, PREC_LOOSEST
 
             Let filter_data be a dictionary containing:
-                "type" as "filter",
+                "type" as lc_filter_tag,
                 "expression" as filter_expr
             End Dictionary
 
             Add filter_data to end of qualifiers
         End If
 
-        If match_token with parser and TOKEN_COMMA:
+        If match_token with parser, TOKEN_COMMA:
             Call advance_parser with parser
         Otherwise:
             Break
         End If
     End While
 
-    Call expect_token with parser and TOKEN_RBRACKET
+    Call expect_token with parser, TOKEN_RBRACKET
 
+    Note:
+    comp_data built as a literal so the "template" handle and the "qualifiers"
+    list round-trip; incremental "Set at key" reads back as 0 downstream.
+    :End Note
     Let comp_data be a dictionary containing:
         "template" as template,
         "qualifiers" as qualifiers
     End Dictionary
 
+    Let lc_kind be "list_comprehension"
     Return a value of type ErlangExpression with
-        expr_type as "list_comprehension",
+        expr_type as lc_kind,
         expr_data as comp_data,
         line as line
 End Process
@@ -2275,10 +3155,10 @@ Process called "parse_binary_comprehension" that takes parser as ErlangParser, t
 
     Note: Parse comprehension qualifiers (same as list comprehension)
     While true:
-        If peek_token with parser and 1 is equal to TOKEN_LARROW:
+        If peek_token with parser, 1 is equal to TOKEN_LARROW:
             Let pattern be parse_pattern with parser
-            Call expect_token with parser and TOKEN_LARROW
-            Let list_expr be parse_expression with parser and 0
+            Call expect_token with parser, TOKEN_LARROW
+            Let list_expr be parse_expression with parser, PREC_LOOSEST
 
             Let generator_data be a dictionary containing:
                 "type" as "generator",
@@ -2288,10 +3168,10 @@ Process called "parse_binary_comprehension" that takes parser as ErlangParser, t
 
             Add generator_data to end of qualifiers
 
-        Otherwise If peek_token with parser and 1 is equal to TOKEN_LBINARROW:
+        Otherwise If peek_token with parser, 1 is equal to TOKEN_LBINARROW:
             Set pattern to parse_pattern with parser
-            Call expect_token with parser and TOKEN_LBINARROW
-            Let binary_expr be parse_expression with parser and 0
+            Call expect_token with parser, TOKEN_LBINARROW
+            Let binary_expr be parse_expression with parser, PREC_LOOSEST
 
             Set generator_data to a dictionary containing:
                 "type" as "binary_generator",
@@ -2302,7 +3182,7 @@ Process called "parse_binary_comprehension" that takes parser as ErlangParser, t
             Add generator_data to end of qualifiers
 
         Otherwise:
-            Let filter_expr be parse_expression with parser and 0
+            Let filter_expr be parse_expression with parser, PREC_LOOSEST
 
             Let filter_data be a dictionary containing:
                 "type" as "filter",
@@ -2312,14 +3192,14 @@ Process called "parse_binary_comprehension" that takes parser as ErlangParser, t
             Add filter_data to end of qualifiers
         End If
 
-        If match_token with parser and TOKEN_COMMA:
+        If match_token with parser, TOKEN_COMMA:
             Call advance_parser with parser
         Otherwise:
             Break
         End If
     End While
 
-    Call expect_token with parser and TOKEN_RBIN
+    Call expect_token with parser, TOKEN_RBIN
 
     Let comp_data be a dictionary containing:
         "template" as template,
@@ -2362,30 +3242,30 @@ Process called "parse_record_expr" that takes parser as ErlangParser returns Erl
     End Dictionary
 
     Note: Record creation or update
-    If match_token with parser and TOKEN_LBRACE:
+    If match_token with parser, TOKEN_LBRACE:
         Call advance_parser with parser
 
         Let fields be a list containing nothing
-        Let base_record be null
+        Let base_record be 0
 
         Note: Check for record update: #record{BaseExpr | field=value}
-        If not match_token with parser and TOKEN_RBRACE and not match_token with parser and TOKEN_ATOM:
-            Set base_record to parse_expression with parser and 0
+        If not match_token with parser, TOKEN_RBRACE and not match_token with parser, TOKEN_ATOM:
+            Set base_record to parse_expression with parser, PREC_LOOSEST
 
-            If match_token with parser and TOKEN_LIST_CONS:
+            If match_token with parser, TOKEN_LIST_CONS:
                 Call advance_parser with parser
             End If
         End If
 
         Note: Parse field assignments
-        If not match_token with parser and TOKEN_RBRACE:
+        If not match_token with parser, TOKEN_RBRACE:
             While true:
                 Let field_name be parser.current_lexeme
                 Call advance_parser with parser
 
-                Call expect_token with parser and TOKEN_ASSIGN
+                Call expect_token with parser, TOKEN_MATCH
 
-                Let field_value be parse_expression with parser and 0
+                Let field_value be parse_expression with parser, PREC_LOOSEST
 
                 Let field_data be a dictionary containing:
                     "name" as field_name,
@@ -2394,7 +3274,7 @@ Process called "parse_record_expr" that takes parser as ErlangParser returns Erl
 
                 Add field_data to end of fields
 
-                If match_token with parser and TOKEN_COMMA:
+                If match_token with parser, TOKEN_COMMA:
                     Call advance_parser with parser
                 Otherwise:
                     Break
@@ -2402,14 +3282,23 @@ Process called "parse_record_expr" that takes parser as ErlangParser returns Erl
             End While
         End If
 
-        Call expect_token with parser and TOKEN_RBRACE
+        Call expect_token with parser, TOKEN_RBRACE
 
-        Set expr_data at key "fields" to fields
-        Set expr_data at key "base" to base_record
+        Note:
+        Rebuild expr_data as a single dictionary literal carrying the record
+        name, the "fields" list and the "base" handle: incremental "Set at key"
+        of the "fields"/"base" values into the existing dict reads back as 0
+        downstream under the stage1 codegen.
+        :End Note
+        Let create_data be a dictionary containing:
+            "name" as record_name,
+            "fields" as fields,
+            "base" as base_record
+        End Dictionary
 
         Return a value of type ErlangExpression with
             expr_type as "record_create",
-            expr_data as expr_data,
+            expr_data as create_data,
             line as line
 
     Note: Record field access is handled in postfix parsing
@@ -2440,55 +3329,48 @@ return either a string handle, an integer, or a list pointer.
 @End Implementation
 Process called "parse_term" that takes parser as ErlangParser returns Integer:
 
-    If match_token with parser and TOKEN_ATOM:
+    Note:
+    Erlang terms in attribute position are static data. To keep them faithfully
+    round-trippable without the backend needing runtime type inspection (which
+    the code generator cannot perform), parse_term emits the term's canonical
+    Erlang TEXT directly and returns it as a String. Atoms/integers/strings
+    yield their source lexeme; lists yield "[e1, e2, ...]"; tuples yield
+    "{e1, e2, ...}". The emitter then writes the term verbatim.
+    :End Note
+
+    If match_token with parser, TOKEN_ATOM:
         Let value be parser.current_lexeme
         Call advance_parser with parser
         Return value
     End If
 
-    If match_token with parser and TOKEN_INTEGER:
-        Set value to convert parser.current_lexeme to Integer
-        Call advance_parser with parser
-        Return value
-    End If
-
-    If match_token with parser and TOKEN_STRING:
+    If match_token with parser, TOKEN_INTEGER:
         Set value to parser.current_lexeme
         Call advance_parser with parser
         Return value
     End If
 
-    If match_token with parser and TOKEN_LBRACKET:
-        Let list be a list containing nothing
+    If match_token with parser, TOKEN_STRING:
+        Set value to parser.current_lexeme
         Call advance_parser with parser
-
-        If not match_token with parser and TOKEN_RBRACKET:
-            While true:
-                Let elem be parse_term with parser
-                Add elem to end of list
-
-                If match_token with parser and TOKEN_COMMA:
-                    Call advance_parser with parser
-                Otherwise:
-                    Break
-                End If
-            End While
-        End If
-
-        Call expect_token with parser and TOKEN_RBRACKET
-        Return list
+        Return value
     End If
 
-    If match_token with parser and TOKEN_LBRACE:
-        Let tuple be a list containing nothing
+    If match_token with parser, TOKEN_LBRACKET:
+        Let list_text be "["
         Call advance_parser with parser
 
-        If not match_token with parser and TOKEN_RBRACE:
+        If not match_token with parser, TOKEN_RBRACKET:
+            Let first be 1
             While true:
-                Set elem to parse_term with parser
-                Add elem to end of tuple
+                If first is equal to 0:
+                    Set list_text to list_text joined with ", "
+                End If
+                Set first to 0
+                Let elem be parse_term with parser
+                Set list_text to list_text joined with elem
 
-                If match_token with parser and TOKEN_COMMA:
+                If match_token with parser, TOKEN_COMMA:
                     Call advance_parser with parser
                 Otherwise:
                     Break
@@ -2496,12 +3378,40 @@ Process called "parse_term" that takes parser as ErlangParser returns Integer:
             End While
         End If
 
-        Call expect_token with parser and TOKEN_RBRACE
-        Return tuple
+        Call expect_token with parser, TOKEN_RBRACKET
+        Set list_text to list_text joined with "]"
+        Return list_text
+    End If
+
+    If match_token with parser, TOKEN_LBRACE:
+        Let tuple_text be "{"
+        Call advance_parser with parser
+
+        If not match_token with parser, TOKEN_RBRACE:
+            Let tfirst be 1
+            While true:
+                If tfirst is equal to 0:
+                    Set tuple_text to tuple_text joined with ", "
+                End If
+                Set tfirst to 0
+                Set elem to parse_term with parser
+                Set tuple_text to tuple_text joined with elem
+
+                If match_token with parser, TOKEN_COMMA:
+                    Call advance_parser with parser
+                Otherwise:
+                    Break
+                End If
+            End While
+        End If
+
+        Call expect_token with parser, TOKEN_RBRACE
+        Set tuple_text to tuple_text joined with "}"
+        Return tuple_text
     End If
 
     Note: Default: return null
-    Return null
+    Return 0
 End Process
 
 Note: ============================================================================
@@ -2528,10 +3438,14 @@ Process called "parse_erlang" that takes tokens as Integer, lexemes as Integer, 
     Let parser be create_erlang_parser with tokens, lexemes, line_numbers
     Let module be parse_erlang_module with parser
 
-    Note: Report any parse errors
-    If length of parser.errors is greater than 0:
+    Note: Report any parse errors. parser.errors is a ListCore RunaList, so its
+    Note: element count is read with list_length (not the string_length-backed
+    Note: `length of` builtin).
+    Let parser_errors be parser.errors
+    Let error_count be proc list_length from ListCore with parser_errors
+    If error_count is greater than 0:
         Note: Errors detected during parsing
-        For Each error in parser.errors:
+        For Each error in parser_errors:
             Note: Error: {error}
         End For
     End If

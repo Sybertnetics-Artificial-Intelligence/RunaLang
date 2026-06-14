@@ -1,0 +1,557 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+Licensed under Apache 2.0
+:End Note
+
+Note:
+Erlang Translation Round-Trip Probe
+
+End-to-end proof that the Erlang translation pipeline is REAL, not a skeleton:
+
+    Erlang source
+      -> erlang_lexer      (tokenize: -module/-export/-record/-type, def clauses,
+                            when guards, atoms, lists, tuples, case/of, list
+                            comprehensions, maps-as-tuples, binaries)
+      -> erlang_parser     (build the typed ErlangModule AST: a -module + -export,
+                            a -record of 2 fields, two multi-clause guarded
+                            functions, a function with a case of 2 clauses, a
+                            function with a list comprehension generator+filter)
+      -> erlang_to_hir     (lower the ErlangModule to the real HIRModule)
+      -> hir_to_erlang     (raise the HIRModule back to an ErlangModule)
+      -> erlang_printer    (emit the ErlangModule back to valid Erlang text)
+      -> re-lex / re-parse  (re-parse the emitted text into ErlangModule2)
+      -> structural + CONTENT equality on the key constructs
+
+The Erlang pipeline uses the typed ErlangModule frontend AST (hir_nodes-backed
+HIRModule in the middle). erlang_printer (the file under test) prints the
+ErlangModule the backend raises from HIR, so the round-trip drives the printer
+on real translated output, then re-parses to prove the printed text is valid
+Erlang carrying the original content.
+
+DEPTH: the probe does NOT merely check that nodes exist. On the re-parsed
+ErlangModule2 it asserts the CONTENTS survive: the -module name; >= 6 function
+names; a multi-clause function (clause count > 1); a `when` guard's presence on
+a clause; a -record's 2 field names; a list-comprehension generator + filter;
+a case's clause count. A translator that dropped members or a printer that
+emitted unparseable text makes this probe FAIL.
+
+Exit code: number of failed assertions (0 == all passed). No exit_with_code.
+:End Note
+
+Import "compiler/middle/gungnir/hir/translation/frontends/erlang/erlang_lexer.runa" as ErlangLexer
+Import "compiler/middle/gungnir/hir/translation/frontends/erlang/erlang_parser.runa" as ErlangParser
+Import "compiler/middle/gungnir/hir/translation/frontends/erlang/erlang_to_hir.runa" as ErlangFrontend
+Import "compiler/middle/gungnir/hir/translation/frontends/erlang/erlang_printer.runa" as ErlangPrinter
+Import "compiler/middle/gungnir/hir/translation/backends/erlang/hir_to_erlang.runa" as ErlangBackend
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/collections/list.runa" as List
+Import "compiler/frontend/primitives/collections/dictionary.runa" as Dict
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "tests/test_utils.runa" as TestUtils
+
+Note: ============================================================================
+Note: Typed-AST field decoders (read struct fields through Layout offsets)
+Note: ============================================================================
+Note:
+The frontend AST nodes are 8-byte-packed Runa structs. The probe reaches them
+through proc list_get / dict get which return raw Integer handles, so struct
+fields are read by their byte offset rather than `.field` (the compiler cannot
+resolve a typed field on an Integer-typed handle). The offsets mirror the Type
+declarations in erlang_parser.runa exactly:
+
+    ErlangModule        : module_name@0, attributes@8, functions@16, records@24, types@32
+    ErlangFunction      : name@0, arity@8, clauses@16, line@24
+    ErlangFunctionClause: patterns@0, guards@8, body@16, line@24
+    ErlangRecord        : name@0, fields@8, line@16
+    ErlangRecordField   : name@0, default_value@8, field_type@16, line@24
+    ErlangExpression    : expr_type@0, expr_data@8, line@16
+:End Note
+
+Note: ============================================================================
+Note: Pipeline helpers
+Note: ============================================================================
+
+@Reasoning:
+Drives the front-of-pipeline (create lexer -> lex into the parallel token/lexeme/
+line arrays -> create parser -> parse) into the typed ErlangModule AST. Both
+round-trip rounds (original source and emitted text) run this identical helper so
+any structural divergence is attributable to the emitter under test, not to a
+difference in how the inputs were driven. The lexer stores its three parallel
+arrays into reserved slots at offsets 40/48/56, exactly as erlang_to_hir_from_source
+reads them; this helper mirrors that contract.
+@End Reasoning
+Process called "source_to_module" takes source as Integer returns Integer:
+    If source is equal to 0:
+        Return 0
+    End If
+
+    Let lexer be proc create_erlang_lexer from ErlangLexer with source
+    If lexer is equal to 0:
+        Return 0
+    End If
+
+    proc lex_erlang_to_arrays from ErlangFrontend with lexer
+
+    Let tokens_list be proc memory_get_int64 from Layout with lexer, 40
+    Let lexemes_list be proc memory_get_int64 from Layout with lexer, 48
+    Let lines_list be proc memory_get_int64 from Layout with lexer, 56
+
+    Let parser be proc create_erlang_parser from ErlangParser with tokens_list, lexemes_list, lines_list
+    Let erl_module be proc parse_erlang_module from ErlangParser with parser
+    Return erl_module
+End Process
+
+@Reasoning:
+Locates a function in a module's functions list by name. The functions field is a
+RunaList of ErlangFunction structs whose name is the first field (offset 0). A
+linear scan is robust to function order and count.
+@End Reasoning
+Process called "find_function" takes functions as Integer, want_name as Integer returns Integer:
+    If functions is equal to 0:
+        Return 0
+    End If
+    Let count be proc list_length from List with functions
+    Let index be 0
+    While index is less than count:
+        Let func be proc list_get from List with functions, index
+        If func is not equal to 0:
+            Let func_name be proc memory_get_int64 from Layout with func, 0
+            Let matches be proc string_equals from StringCore with func_name, want_name
+            If matches is equal to 1:
+                Return func
+            End If
+        End If
+        Set index to index plus 1
+    End While
+    Return 0
+End Process
+
+@Reasoning:
+Finds the first expression of a given expr_type tag inside a function's clause
+bodies. Each clause's body is a List of ErlangExpression; the probe scans every
+clause body for a node whose expr_type matches the requested kind (e.g. "case",
+"list_comprehension", "record_create"). Bounded by clause count and body length,
+so it always terminates.
+@End Reasoning
+Process called "find_expr_in_function" takes func as Integer, tag as Integer returns Integer:
+    If func is equal to 0:
+        Return 0
+    End If
+    Let clauses be proc memory_get_int64 from Layout with func, 16
+    Let clause_count be proc list_length from List with clauses
+    Let ci be 0
+    While ci is less than clause_count:
+        Let clause be proc list_get from List with clauses, ci
+        If clause is not equal to 0:
+            Let body be proc memory_get_int64 from Layout with clause, 16
+            Let body_count be proc list_length from List with body
+            Let bi be 0
+            While bi is less than body_count:
+                Let stmt be proc list_get from List with body, bi
+                If stmt is not equal to 0:
+                    Let stmt_type be proc memory_get_int64 from Layout with stmt, 0
+                    Let matches be proc string_equals from StringCore with stmt_type, tag
+                    If matches is equal to 1:
+                        Return stmt
+                    End If
+                End If
+                Set bi to bi plus 1
+            End While
+        End If
+        Set ci to ci plus 1
+    End While
+    Return 0
+End Process
+
+@Reasoning:
+Returns 1 if a record-field list (RunaList of ErlangRecordField) contains a field
+whose name matches the target, else 0. Used to assert the -record field name set
+survives round-trip. The field name is the first field (offset 0) of each struct.
+@End Reasoning
+Process called "record_has_field" takes fields as Integer, want_name as Integer returns Integer:
+    If fields is equal to 0:
+        Return 0
+    End If
+    Let count be proc list_length from List with fields
+    Let index be 0
+    While index is less than count:
+        Let field be proc list_get from List with fields, index
+        If field is not equal to 0:
+            Let field_name be proc memory_get_int64 from Layout with field, 0
+            Let matches be proc string_equals from StringCore with field_name, want_name
+            If matches is equal to 1:
+                Return 1
+            End If
+        End If
+        Set index to index plus 1
+    End While
+    Return 0
+End Process
+
+@Reasoning:
+Returns 1 if a list-comprehension's qualifier list (RunaList of {type,...} dicts)
+contains a qualifier whose "type" key equals the target ("generator" or "filter"),
+else 0. Proves both the generator (Pat <- List) and the filter survive round-trip.
+@End Reasoning
+Process called "qualifiers_have_type" takes qualifiers as Integer, want_type as Integer returns Integer:
+    If qualifiers is equal to 0:
+        Return 0
+    End If
+    Let count be proc list_length from List with qualifiers
+    Let index be 0
+    While index is less than count:
+        Let qual be proc list_get from List with qualifiers, index
+        If qual is not equal to 0:
+            Let qual_type be proc get from Dict with qual, "type"
+            If qual_type is not equal to 0:
+                Let matches be proc string_equals from StringCore with qual_type, want_type
+                If matches is equal to 1:
+                    Return 1
+                End If
+            End If
+        End If
+        Set index to index plus 1
+    End While
+    Return 0
+End Process
+
+@Reasoning:
+Returns the head-variable name bound by a function clause's first parameter
+pattern, or 0 when that pattern is not a plain variable. A clause's patterns
+list is at offset 0 (ErlangFunctionClause.patterns); patterns[0] is an
+ErlangExpression with expr_type at offset 0 and expr_data at offset 8. For a
+variable pattern the expr_data dict carries the bound name under key "name".
+Used to prove the emitted clause head binds the original source identifier
+rather than a synthetic arg0.
+@End Reasoning
+Process called "head_var_name" takes clause as Integer returns Integer:
+    If clause is equal to 0:
+        Return 0
+    End If
+    Let patterns be proc memory_get_int64 from Layout with clause, 0
+    If patterns is equal to 0:
+        Return 0
+    End If
+    Let pcount be proc list_length from List with patterns
+    If pcount is equal to 0:
+        Return 0
+    End If
+    Let head be proc list_get from List with patterns, 0
+    If head is equal to 0:
+        Return 0
+    End If
+    Let head_type be proc memory_get_int64 from Layout with head, 0
+    Let is_var be proc string_equals from StringCore with head_type, "var"
+    If is_var is equal to 0:
+        Return 0
+    End If
+    Let head_data be proc memory_get_int64 from Layout with head, 8
+    Let name be proc get from Dict with head_data, "name"
+    Return name
+End Process
+
+@Reasoning:
+Returns 1 if any expression in a clause's body references a variable whose name
+matches want_name, else 0. The clause body is at offset 16; each body element
+is an ErlangExpression. A direct top-level var reference (expr_type "var" with
+expr_data["name"] == want_name) proves the head binding is actually used by the
+body - the unified-binding fidelity check for helper(N) -> N. Bounded by body
+length so it always terminates.
+@End Reasoning
+Process called "body_references_var" takes clause as Integer, want_name as Integer returns Integer:
+    If clause is equal to 0:
+        Return 0
+    End If
+    If want_name is equal to 0:
+        Return 0
+    End If
+    Let body be proc memory_get_int64 from Layout with clause, 16
+    If body is equal to 0:
+        Return 0
+    End If
+    Let bcount be proc list_length from List with body
+    Let bi be 0
+    While bi is less than bcount:
+        Let bexpr be proc list_get from List with body, bi
+        If bexpr is not equal to 0:
+            Let btype be proc memory_get_int64 from Layout with bexpr, 0
+            Let b_is_var be proc string_equals from StringCore with btype, "var"
+            If b_is_var is equal to 1:
+                Let bdata be proc memory_get_int64 from Layout with bexpr, 8
+                Let bname be proc get from Dict with bdata, "name"
+                If bname is not equal to 0:
+                    Let same be proc string_equals from StringCore with bname, want_name
+                    If same is equal to 1:
+                        Return 1
+                    End If
+                End If
+            End If
+        End If
+        Set bi to bi plus 1
+    End While
+    Return 0
+End Process
+
+@Reasoning:
+Returns 1 if a case-clause list contains a clause whose first pattern is the
+atom literal want_value (e.g. the atom 'ok'), else 0. Each case clause is an
+ErlangFunctionClause whose patterns list (offset 0) holds the match pattern at
+index 0; an atom pattern is an ErlangExpression with expr_type "atom" and
+expr_data["value"] == want_value. This proves the case clause's literal pattern
+survives the round-trip instead of being flattened to the wildcard '_'.
+@End Reasoning
+Process called "case_clause_has_atom_pattern" takes clauses as Integer, want_value as Integer returns Integer:
+    If clauses is equal to 0:
+        Return 0
+    End If
+    Let ccount be proc list_length from List with clauses
+    Let ci be 0
+    While ci is less than ccount:
+        Let clause be proc list_get from List with clauses, ci
+        If clause is not equal to 0:
+            Let patterns be proc memory_get_int64 from Layout with clause, 0
+            If patterns is not equal to 0:
+                Let pcount be proc list_length from List with patterns
+                If pcount is greater than 0:
+                    Let pat be proc list_get from List with patterns, 0
+                    If pat is not equal to 0:
+                        Let pat_type be proc memory_get_int64 from Layout with pat, 0
+                        Let is_atom be proc string_equals from StringCore with pat_type, "atom"
+                        If is_atom is equal to 1:
+                            Let pat_data be proc memory_get_int64 from Layout with pat, 8
+                            Let pat_value be proc get from Dict with pat_data, "value"
+                            If pat_value is not equal to 0:
+                                Let same be proc string_equals from StringCore with pat_value, want_value
+                                If same is equal to 1:
+                                    Return 1
+                                End If
+                            End If
+                        End If
+                    End If
+                End If
+            End If
+        End If
+        Set ci to ci plus 1
+    End While
+    Return 0
+End Process
+
+@Reasoning:
+Returns the variable name a comprehension's first generator qualifier binds, or
+0 when no generator qualifier carries a variable pattern. A generator qualifier
+is a {type:"generator", pattern:..., list:...} dict; its "pattern" is an
+ErlangExpression whose expr_type (offset 0) is "var" with expr_data["name"] the
+bound variable. This proves the generator's pattern variable survives the
+round-trip instead of becoming '_'.
+@End Reasoning
+Process called "generator_pattern_var_name" takes qualifiers as Integer returns Integer:
+    If qualifiers is equal to 0:
+        Return 0
+    End If
+    Let count be proc list_length from List with qualifiers
+    Let index be 0
+    While index is less than count:
+        Let qual be proc list_get from List with qualifiers, index
+        If qual is not equal to 0:
+            Let qual_type be proc get from Dict with qual, "type"
+            If qual_type is not equal to 0:
+                Let is_gen be proc string_equals from StringCore with qual_type, "generator"
+                If is_gen is equal to 1:
+                    Let pat be proc get from Dict with qual, "pattern"
+                    If pat is not equal to 0:
+                        Let pat_type be proc memory_get_int64 from Layout with pat, 0
+                        Let is_var be proc string_equals from StringCore with pat_type, "var"
+                        If is_var is equal to 1:
+                            Let pat_data be proc memory_get_int64 from Layout with pat, 8
+                            Let pat_name be proc get from Dict with pat_data, "name"
+                            Return pat_name
+                        End If
+                    End If
+                End If
+            End If
+        End If
+        Set index to index plus 1
+    End While
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: Probe entry point
+Note: ============================================================================
+
+Process called "main" returns Integer:
+    Let results be proc create_test_results from TestUtils
+    proc begin_suite from TestUtils with results, "Erlang translation round-trip"
+
+    Note:
+    Representative program exercising the full declaration surface:
+    - -module(calc) + -export of 6 functions
+    - -record(point, {x, y}) of 2 fields
+    - classify/1 : two guarded clauses (when X > 0 / when X < 0) -- multi-clause + guard
+    - helper/1   : a single clause returning its argument
+    - categorize/1 : a case of 2 pattern clauses
+    - squares/0  : a list comprehension with a generator AND a filter
+    - make_point/2 : a record creation
+    - add/2      : a binary-op body
+    :End Note
+    Let source be "-module(calc).\n-export([classify/1, helper/1, categorize/1, squares/0, make_point/2, add/2]).\n-record(point, {x, y}).\nclassify(X) when X > 0 ->\n    positive;\nclassify(X) when X < 0 ->\n    negative.\nhelper(N) ->\n    N.\ncategorize(V) ->\n    case V of\n        ok ->\n            good;\n        error ->\n            bad\n    end.\nsquares() ->\n    [X * X || X <- [1, 2, 3, 4], X > 2].\nmake_point(A, B) ->\n    #point{x = A, y = B}.\nadd(A, B) ->\n    A + B.\n"
+
+    Note: --- Stage 0: source -> ErlangModule1 (lex, parse) ---
+    Let mod1 be proc source_to_module with source
+    proc assert_not_null from TestUtils with results, "frontend produced ErlangModule", mod1
+
+    Let mod1_name be proc memory_get_int64 from Layout with mod1, 0
+    Let mod1_name_ok be proc string_equals from StringCore with mod1_name, "calc"
+    proc assert_equal from TestUtils with results, "module name is 'calc'", mod1_name_ok, 1
+
+    Let mod1_functions be proc memory_get_int64 from Layout with mod1, 16
+    Let mod1_fn_count be proc list_length from List with mod1_functions
+    proc assert_greater_than_or_equal from TestUtils with results, "module has at least 6 functions", mod1_fn_count, 6
+
+    Note: --- Stage 1: ErlangModule1 -> HIRModule ---
+    Let hir1 be proc translate_erlang_module_to_hir from ErlangFrontend with mod1
+    proc assert_not_null from TestUtils with results, "frontend lowered module to HIR", hir1
+
+    Note: --- Stage 2: HIRModule -> ErlangModule (backend raises HIR back to AST) ---
+    Let raised be proc generate_erlang_module_from_hir from ErlangBackend with hir1
+    proc assert_not_null from TestUtils with results, "backend raised HIR to ErlangModule", raised
+
+    Note: --- Stage 3: ErlangModule -> Erlang text (PRINTER UNDER TEST) ---
+    Let config be proc create_emitter_config from ErlangPrinter
+    proc assert_not_null from TestUtils with results, "printer emitter config created", config
+
+    Let emitted be proc emit_module from ErlangPrinter with raised, config
+    proc assert_not_null from TestUtils with results, "printer produced Erlang text", emitted
+    Let emitted_len be proc string_length from StringCore with emitted
+    proc assert_greater_than from TestUtils with results, "emitted Erlang is non-empty", emitted_len, 0
+
+    Note: --- Stage 4: re-parse the emitted text -> ErlangModule2 ---
+    Let mod2 be proc source_to_module with emitted
+    proc assert_not_null from TestUtils with results, "re-parse of emitted Erlang produced ErlangModule2", mod2
+
+    Note: --- Stage 5: CONTENT equality on the key constructs (ErlangModule2) ---
+
+    Note: module name survives
+    Let mod2_name be proc memory_get_int64 from Layout with mod2, 0
+    Let mod2_name_ok be proc string_equals from StringCore with mod2_name, "calc"
+    proc assert_equal from TestUtils with results, "round-trip preserves module name 'calc'", mod2_name_ok, 1
+
+    Note: function names + count survive (depth, not just existence)
+    Let mod2_functions be proc memory_get_int64 from Layout with mod2, 16
+    Let mod2_fn_count be proc list_length from List with mod2_functions
+    proc assert_greater_than_or_equal from TestUtils with results, "round-trip preserves >= 6 functions", mod2_fn_count, 6
+
+    Let classify2 be proc find_function with mod2_functions, "classify"
+    proc assert_not_null from TestUtils with results, "round-trip preserves function 'classify'", classify2
+    Let helper2 be proc find_function with mod2_functions, "helper"
+    proc assert_not_null from TestUtils with results, "round-trip preserves function 'helper'", helper2
+    Let categorize2 be proc find_function with mod2_functions, "categorize"
+    proc assert_not_null from TestUtils with results, "round-trip preserves function 'categorize'", categorize2
+    Let squares2 be proc find_function with mod2_functions, "squares"
+    proc assert_not_null from TestUtils with results, "round-trip preserves function 'squares'", squares2
+    Let make_point2 be proc find_function with mod2_functions, "make_point"
+    proc assert_not_null from TestUtils with results, "round-trip preserves function 'make_point'", make_point2
+    Let add2 be proc find_function with mod2_functions, "add"
+    proc assert_not_null from TestUtils with results, "round-trip preserves function 'add'", add2
+
+    Note: multi-clause function survives (classify has 2 clauses)
+    Let classify2_clauses be proc memory_get_int64 from Layout with classify2, 16
+    Let classify2_clause_count be proc list_length from List with classify2_clauses
+    proc assert_greater_than from TestUtils with results, "round-trip preserves classify multi-clause (> 1)", classify2_clause_count, 1
+
+    Note: when-guard survives on classify's first clause
+    Let classify2_clause0 be proc list_get from List with classify2_clauses, 0
+    proc assert_not_null from TestUtils with results, "round-trip classify clause 0 present", classify2_clause0
+    Let classify2_guards be proc memory_get_int64 from Layout with classify2_clause0, 8
+    Let classify2_guard_count be proc list_length from List with classify2_guards
+    proc assert_greater_than_or_equal from TestUtils with results, "round-trip preserves classify 'when' guard", classify2_guard_count, 1
+
+    Note: -record field names survive (point has x and y)
+    Let mod2_records be proc memory_get_int64 from Layout with mod2, 24
+    Let mod2_record_count be proc list_length from List with mod2_records
+    proc assert_greater_than_or_equal from TestUtils with results, "round-trip preserves >= 1 record", mod2_record_count, 1
+    Let point2 be proc list_get from List with mod2_records, 0
+    proc assert_not_null from TestUtils with results, "round-trip record 0 present", point2
+    Let point2_fields be proc memory_get_int64 from Layout with point2, 8
+    Let point2_field_count be proc list_length from List with point2_fields
+    proc assert_equal from TestUtils with results, "round-trip preserves record's 2 fields", point2_field_count, 2
+    Let has_x be proc record_has_field with point2_fields, "x"
+    proc assert_equal from TestUtils with results, "round-trip preserves record field 'x'", has_x, 1
+    Let has_y be proc record_has_field with point2_fields, "y"
+    proc assert_equal from TestUtils with results, "round-trip preserves record field 'y'", has_y, 1
+
+    Note: case clause count survives (categorize's case has 2 clauses)
+    Let case2 be proc find_expr_in_function with categorize2, "case"
+    proc assert_not_null from TestUtils with results, "round-trip preserves case node in categorize/1", case2
+    Let case2_data be proc memory_get_int64 from Layout with case2, 8
+    Let case2_clauses be proc get from Dict with case2_data, "clauses"
+    Let case2_clause_count be proc list_length from List with case2_clauses
+    proc assert_equal from TestUtils with results, "round-trip preserves case's 2 clauses", case2_clause_count, 2
+
+    Note: list-comprehension generator + filter survive (squares)
+    Let lc2 be proc find_expr_in_function with squares2, "list_comprehension"
+    proc assert_not_null from TestUtils with results, "round-trip preserves list comprehension in squares/0", lc2
+    Let lc2_data be proc memory_get_int64 from Layout with lc2, 8
+    Let lc2_qualifiers be proc get from Dict with lc2_data, "qualifiers"
+    Let lc2_qual_count be proc list_length from List with lc2_qualifiers
+    proc assert_greater_than_or_equal from TestUtils with results, "round-trip comprehension has >= 2 qualifiers", lc2_qual_count, 2
+    Let has_generator be proc qualifiers_have_type with lc2_qualifiers, "generator"
+    proc assert_equal from TestUtils with results, "round-trip preserves comprehension generator", has_generator, 1
+    Let has_filter be proc qualifiers_have_type with lc2_qualifiers, "filter"
+    proc assert_equal from TestUtils with results, "round-trip preserves comprehension filter", has_filter, 1
+
+    Note: ============================================================================
+    Note: --- Stage 6: FIDELITY assertions (GAP 1 + GAP 2) ---
+    Note: ============================================================================
+    Note:
+    These assertions are stronger than structural existence: they prove the
+    emitted Erlang is FAITHFUL, not lossy. They FAIL on the pre-fix behaviour
+    (synthetic arg0 heads, and clause/generator patterns flattened to '_') and
+    PASS once the source parameter names and clause/generator patterns survive
+    the round-trip.
+    :End Note
+
+    Note: (a) FIDELITY: a function clause's PARAMETER NAME is the head variable
+    Note: AND matches a reference in the body. helper(N) -> N must round-trip as
+    Note: a head variable "N" whose name also appears as a "var" reference in the
+    Note: clause body - proving the binding is unified (not arg0 with a dangling
+    Note: body reference to N). A lossy emitter prints helper(arg0) -> N, leaving
+    Note: N unbound; this asserts the head var equals a body var.
+    Let helper2_clauses be proc memory_get_int64 from Layout with helper2, 16
+    Let helper2_clause0 be proc list_get from List with helper2_clauses, 0
+    proc assert_not_null from TestUtils with results, "fidelity helper clause 0 present", helper2_clause0
+    Let helper2_head_name be proc head_var_name with helper2_clause0
+    proc assert_not_null from TestUtils with results, "fidelity helper head var present", helper2_head_name
+    Let helper2_head_is_n be proc string_equals from StringCore with helper2_head_name, "N"
+    proc assert_equal from TestUtils with results, "fidelity helper head var is source name 'N' (not arg0)", helper2_head_is_n, 1
+    Let helper2_body_binds_head be proc body_references_var with helper2_clause0, helper2_head_name
+    proc assert_equal from TestUtils with results, "fidelity helper body references the head var (binding unified)", helper2_body_binds_head, 1
+
+    Note: (b) FIDELITY: a case clause's PATTERN literal value survives. The
+    Note: categorize/1 case has a clause matching the atom 'ok'; on the re-parsed
+    Note: HIR2 that clause's pattern must be the atom 'ok', NOT the wildcard '_'.
+    Let case2b be proc find_expr_in_function with categorize2, "case"
+    proc assert_not_null from TestUtils with results, "fidelity case node present in categorize", case2b
+    Let case2b_data be proc memory_get_int64 from Layout with case2b, 8
+    Let case2b_clauses be proc get from Dict with case2b_data, "clauses"
+    Let case2b_has_ok be proc case_clause_has_atom_pattern with case2b_clauses, "ok"
+    proc assert_equal from TestUtils with results, "fidelity case clause pattern 'ok' survives (not '_')", case2b_has_ok, 1
+
+    Note: (c) FIDELITY: a comprehension generator's pattern variable survives.
+    Note: squares/0 has [X * X || X <- [...], X > 2]; the generator's pattern is
+    Note: the variable X and must round-trip as the var "X", NOT '_'.
+    Let lc2c be proc find_expr_in_function with squares2, "list_comprehension"
+    proc assert_not_null from TestUtils with results, "fidelity comprehension node present in squares", lc2c
+    Let lc2c_data be proc memory_get_int64 from Layout with lc2c, 8
+    Let lc2c_qualifiers be proc get from Dict with lc2c_data, "qualifiers"
+    Let lc2c_gen_var be proc generator_pattern_var_name with lc2c_qualifiers
+    proc assert_not_null from TestUtils with results, "fidelity comprehension generator pattern present", lc2c_gen_var
+    Let lc2c_gen_is_x be proc string_equals from StringCore with lc2c_gen_var, "X"
+    proc assert_equal from TestUtils with results, "fidelity comprehension generator pattern var 'X' survives (not '_')", lc2c_gen_is_x, 1
+
+    proc print_summary from TestUtils with results
+    Let failed be proc get_failed from TestUtils with results
+    proc destroy_test_results from TestUtils with results
+
+    Return failed
+End Process

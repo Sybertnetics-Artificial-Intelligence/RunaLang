@@ -6,6 +6,7 @@ Note: ==========================================================================
 
 Import "compiler/frontend/lexical/lexer.runa" as LexerCore
 Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/frontend/primitives/core/string_primitive.runa" as StringPrim
 Import "compiler/frontend/primitives/memory/layout.runa" as Layout
 
 Note: ============================================================================
@@ -100,6 +101,10 @@ Constant TOKEN_DOUBLE_DOT as Integer is 7122
 Constant TOKEN_TRIPLE_DOT as Integer is 7123
 Constant TOKEN_COLONEQUAL as Integer is 7124
 Constant TOKEN_AT as Integer is 7125
+Note: Comprehension and generator operators
+Constant TOKEN_LARROW as Integer is 7126            Note: <-  (list generator)
+Constant TOKEN_LBINARROW as Integer is 7127         Note: <=  (binary generator)
+Constant TOKEN_DOUBLE_LIST_CONS as Integer is 7128  Note: ||  (comprehension bar)
 
 Note: Delimiters
 Constant TOKEN_LPAREN as Integer is 7150
@@ -189,12 +194,25 @@ Process called "create_erlang_lexer" takes source_code as Integer returns Intege
     @End Reasoning
 
     Let source_len be proc string_length from StringCore with source_code
-    Let lexer be proc allocate from Layout with 40
+    Note:
+    64 bytes = 8 fields x 8: source@0, pos@8, len@16, current_line@24,
+    current_column@32, and the three parallel-array slots tokens@40,
+    lexemes@48, lines@56 that lex_erlang_to_arrays populates. The earlier
+    40-byte allocation omitted the three array slots, so writing them
+    overflowed the heap block and corrupted adjacent allocations (the parser
+    then read an empty/garbage token list and indexed out of bounds). The
+    array slots are zero-initialised so a caller that never runs the lexing
+    pass still reads clean 0s.
+    :End Note
+    Let lexer be proc allocate from Layout with 64
     proc memory_set_int64 from Layout with lexer, 0, source_code
     proc memory_set_int64 from Layout with lexer, 8, 0
     proc memory_set_int64 from Layout with lexer, 16, source_len
     proc memory_set_int64 from Layout with lexer, 24, 1
     proc memory_set_int64 from Layout with lexer, 32, 1
+    proc memory_set_int64 from Layout with lexer, 40, 0
+    proc memory_set_int64 from Layout with lexer, 48, 0
+    proc memory_set_int64 from Layout with lexer, 56, 0
 
     Return lexer
 End Process
@@ -239,7 +257,7 @@ Process called "next_token" takes lexer as Integer returns Integer:
     module attributes (-module), operators (!, ?, ::), and binary syntax <<>>.
     @End Reasoning
 
-    proc skip_whitespace_and_comments from lexer
+    proc skip_whitespace_and_comments with lexer
 
     Let pos be proc memory_get_int64 from Layout with lexer, 8
     Let len be proc memory_get_int64 from Layout with lexer, 16
@@ -256,28 +274,28 @@ Process called "next_token" takes lexer as Integer returns Integer:
         If pos plus 1 is less than len:
             Let next_ch be proc string_char_at from StringCore with source, pos plus 1
             If proc is_lowercase_letter with next_ch is equal to 1:
-                Return proc lex_module_attribute from lexer
+                Return proc lex_module_attribute with lexer
             End If
         End If
     End If
 
     Note: Check for atoms (lowercase or quoted)
     If proc is_lowercase_letter with ch is equal to 1:
-        Return proc lex_atom from lexer
+        Return proc lex_atom with lexer
     End If
 
     Note: Check for quoted atoms
     If ch is equal to 39:  Note: '
-        Return proc lex_quoted_atom from lexer
+        Return proc lex_quoted_atom with lexer
     End If
 
     Note: Check for Variables (uppercase or underscore)
     If proc is_uppercase_letter with ch is equal to 1:
-        Return proc lex_variable from lexer
+        Return proc lex_variable with lexer
     End If
 
     If ch is equal to 95:  Note: _
-        Return proc lex_variable from lexer
+        Return proc lex_variable with lexer
     End If
 
     Note: Check for macro variables (?NAME)
@@ -285,33 +303,41 @@ Process called "next_token" takes lexer as Integer returns Integer:
         If pos plus 1 is less than len:
             Set next_ch to proc string_char_at from StringCore with source, pos plus 1
             If proc is_uppercase_letter with next_ch is equal to 1:
-                Return proc lex_macro_variable from lexer
+                Return proc lex_macro_variable with lexer
             End If
         End If
     End If
 
     Note: Check for numbers
     If proc is_digit with ch is equal to 1:
-        Return proc lex_number from lexer
+        Return proc lex_number with lexer
     End If
 
     Note: Check for strings
     If ch is equal to 34:  Note: "
-        Return proc lex_string from lexer
+        Return proc lex_string with lexer
     End If
 
     Note: Check for character literals
     If ch is equal to 36:  Note: $
-        Return proc lex_char from lexer
+        Return proc lex_char with lexer
     End If
 
-    Note: Check for binary syntax <<
+    Note: Check for binary syntax << and comprehension generators <- / <=
     If ch is equal to 60:  Note: <
         If pos plus 1 is less than len:
             Set next_ch to proc string_char_at from StringCore with source, pos plus 1
-            If next_ch is equal to 60:
+            If next_ch is equal to 60:  Note: <<
                 proc memory_set_int64 from Layout with lexer, 8, pos plus 2
                 Return proc create_token with TOKEN_LBIN, pos, pos plus 2
+            End If
+            If next_ch is equal to 45:  Note: <- (list generator)
+                proc memory_set_int64 from Layout with lexer, 8, pos plus 2
+                Return proc create_token with TOKEN_LARROW, pos, pos plus 2
+            End If
+            If next_ch is equal to 61:  Note: <= (binary generator)
+                proc memory_set_int64 from Layout with lexer, 8, pos plus 2
+                Return proc create_token with TOKEN_LBINARROW, pos, pos plus 2
             End If
         End If
     End If
@@ -328,7 +354,7 @@ Process called "next_token" takes lexer as Integer returns Integer:
     End If
 
     Note: Check for operators and punctuation
-    Return proc lex_operator_or_punct from lexer
+    Return proc lex_operator_or_punct with lexer
 End Process
 
 Note: ============================================================================
@@ -352,9 +378,9 @@ Process called "skip_whitespace_and_comments" takes lexer as Integer returns Int
     Note: Skip whitespace and comments
 
     While 1 is equal to 1:
-        proc skip_whitespace from lexer
+        proc skip_whitespace with lexer
 
-        Let skipped_comment be proc try_skip_comment from lexer
+        Let skipped_comment be proc try_skip_comment with lexer
         If skipped_comment is equal to 0:
             Return 1
         End If
@@ -389,22 +415,22 @@ Process called "skip_whitespace" takes lexer as Integer returns Integer:
         Let ch be proc string_char_at from StringCore with source, pos
 
         If ch is equal to 32:  Note: Space
-            proc advance_position from lexer
+            proc advance_position with lexer
             Set pos to pos plus 1
 
         Otherwise:
             If ch is equal to 9:  Note: Tab
-                proc advance_position from lexer
+                proc advance_position with lexer
                 Set pos to pos plus 1
 
             Otherwise:
                 If ch is equal to 10:  Note: Newline
-                    proc advance_newline from lexer
+                    proc advance_newline with lexer
                     Set pos to pos plus 1
 
                 Otherwise:
                     If ch is equal to 13:  Note: Carriage return
-                        proc advance_position from lexer
+                        proc advance_position with lexer
                         Set pos to pos plus 1
 
                     Otherwise:
@@ -448,7 +474,7 @@ Process called "try_skip_comment" takes lexer as Integer returns Integer:
 
     Note: Check for % comment
     If ch is equal to 37:  Note: %
-        proc advance_position from lexer
+        proc advance_position with lexer
         Set pos to pos plus 1
 
         While pos is less than len:
@@ -456,7 +482,7 @@ Process called "try_skip_comment" takes lexer as Integer returns Integer:
             If ch is equal to 10:  Note: Newline
                 Return 1
             End If
-            proc advance_position from lexer
+            proc advance_position with lexer
             Set pos to pos plus 1
         End While
 
@@ -502,20 +528,19 @@ Process called "lex_atom" takes lexer as Integer returns Integer:
     Let len be proc memory_get_int64 from Layout with lexer, 16
     Let pos be start_pos
 
-    While pos is less than len:
-        Let ch be proc string_char_at from StringCore with source, pos
-        Let is_atom_char be proc is_atom_char from ch
-
-        If is_atom_char is equal to 0:
-            If 1 is equal to 1:
-                Note: End of atom
-                If 1 is not equal to 1:
-                    Note: Force break
-                End If
+    Let scanning be 1
+    While scanning is equal to 1:
+        If pos is greater than or equal to len:
+            Set scanning to 0
+        Otherwise:
+            Let ch be proc string_char_at from StringCore with source, pos
+            Let is_atom_char be proc is_atom_char with ch
+            If is_atom_char is equal to 0:
+                Set scanning to 0
+            Otherwise:
+                Set pos to pos plus 1
             End If
         End If
-
-        Set pos to pos plus 1
     End While
 
     proc memory_set_int64 from Layout with lexer, 8, pos
@@ -572,7 +597,7 @@ Process called "lex_quoted_atom" takes lexer as Integer returns Integer:
 
         Otherwise:
             If ch is equal to 10:  Note: Newline
-                proc advance_newline from lexer
+                proc advance_newline with lexer
                 Set pos to pos plus 1
 
             Otherwise:
@@ -609,20 +634,19 @@ Process called "lex_variable" takes lexer as Integer returns Integer:
     Let len be proc memory_get_int64 from Layout with lexer, 16
     Let pos be start_pos
 
-    While pos is less than len:
-        Let ch be proc string_char_at from StringCore with source, pos
-        Let is_var_char be proc is_atom_char from ch
-
-        If is_var_char is equal to 0:
-            If 1 is equal to 1:
-                Note: End of variable
-                If 1 is not equal to 1:
-                    Note: Force break
-                End If
+    Let scanning be 1
+    While scanning is equal to 1:
+        If pos is greater than or equal to len:
+            Set scanning to 0
+        Otherwise:
+            Let ch be proc string_char_at from StringCore with source, pos
+            Let is_var_char be proc is_atom_char with ch
+            If is_var_char is equal to 0:
+                Set scanning to 0
+            Otherwise:
+                Set pos to pos plus 1
             End If
         End If
-
-        Set pos to pos plus 1
     End While
 
     proc memory_set_int64 from Layout with lexer, 8, pos
@@ -650,20 +674,19 @@ Process called "lex_macro_variable" takes lexer as Integer returns Integer:
     Let len be proc memory_get_int64 from Layout with lexer, 16
     Let pos be start_pos plus 1  Note: Skip ?
 
-    While pos is less than len:
-        Let ch be proc string_char_at from StringCore with source, pos
-        Let is_var_char be proc is_atom_char from ch
-
-        If is_var_char is equal to 0:
-            If 1 is equal to 1:
-                Note: End of macro variable
-                If 1 is not equal to 1:
-                    Note: Force break
-                End If
+    Let scanning be 1
+    While scanning is equal to 1:
+        If pos is greater than or equal to len:
+            Set scanning to 0
+        Otherwise:
+            Let ch be proc string_char_at from StringCore with source, pos
+            Let is_var_char be proc is_atom_char with ch
+            If is_var_char is equal to 0:
+                Set scanning to 0
+            Otherwise:
+                Set pos to pos plus 1
             End If
         End If
-
-        Set pos to pos plus 1
     End While
 
     proc memory_set_int64 from Layout with lexer, 8, pos
@@ -697,20 +720,25 @@ Process called "lex_module_attribute" takes lexer as Integer returns Integer:
     Let len be proc memory_get_int64 from Layout with lexer, 16
     Let pos be start_pos plus 1  Note: Skip -
 
-    While pos is less than len:
-        Let ch be proc string_char_at from StringCore with source, pos
-        Let is_atom_char be proc is_atom_char from ch
-
-        If is_atom_char is equal to 0:
-            If 1 is equal to 1:
-                Note: End of attribute
-                If 1 is not equal to 1:
-                    Note: Force break
-                End If
+    Note:
+    Scan the attribute keyword: advance while the character is a valid atom
+    character (letters, digits, underscore, @) and stop at the first character
+    that is not (e.g. the "(" or whitespace following "-module"). The keyword
+    span is [start_pos+1, pos).
+    :End Note
+    Let scanning be 1
+    While scanning is equal to 1:
+        If pos is greater than or equal to len:
+            Set scanning to 0
+        Otherwise:
+            Let ch be proc string_char_at from StringCore with source, pos
+            Let is_atom_char be proc is_atom_char with ch
+            If is_atom_char is equal to 0:
+                Set scanning to 0
+            Otherwise:
+                Set pos to pos plus 1
             End If
         End If
-
-        Set pos to pos plus 1
     End While
 
     proc memory_set_int64 from Layout with lexer, 8, pos
@@ -759,7 +787,7 @@ Process called "match_erlang_keyword" takes source as Integer, start as Integer,
     Note: Match Erlang keywords
 
     Let len be end_pos minus start
-    Let text be proc substring from StringCore with source, start, len
+    Let text be proc string_substring from StringPrim with source, start, len
 
     Note: Control flow keywords
     If proc string_equals from StringCore with text, "after" is equal to 1:
@@ -898,7 +926,7 @@ Process called "match_module_attribute" takes source as Integer, start as Intege
     Note: Match module attributes
 
     Let len be end_pos minus start
-    Let text be proc substring from StringCore with source, start, len
+    Let text be proc string_substring from StringPrim with source, start, len
 
     If proc string_equals from StringCore with text, "module" is equal to 1:
         Return TOKEN_MODULE
@@ -1064,19 +1092,17 @@ Process called "lex_number" takes lexer as Integer returns Integer:
     Let base be 10
 
     Note: Lex integer part
-    While pos is less than len:
-        Let ch be proc string_char_at from StringCore with source, pos
-        Let is_digit_val be proc is_digit from ch
-
-        If is_digit_val is equal to 1:
-            Set pos to pos plus 1
-
+    Let scanning_int be 1
+    While scanning_int is equal to 1:
+        If pos is greater than or equal to len:
+            Set scanning_int to 0
         Otherwise:
-            If 1 is equal to 1:
-                Note: Break
-                If 1 is not equal to 1:
-                    Note: Force break
-                End If
+            Let ch be proc string_char_at from StringCore with source, pos
+            Let is_digit_val be proc is_digit with ch
+            If is_digit_val is equal to 1:
+                Set pos to pos plus 1
+            Otherwise:
+                Set scanning_int to 0
             End If
         End If
     End While
@@ -1088,32 +1114,28 @@ Process called "lex_number" takes lexer as Integer returns Integer:
         If ch is equal to 35:  Note: #
             Note: Extract base
             Let base_len be pos minus start_pos
-            Let base_str be proc substring from StringCore with source, start_pos, base_len
-            Set base to proc string_to_integer from StringCore with base_str
+            Let base_str be proc string_substring from StringPrim with source, start_pos, base_len
+            Set base to proc string_to_integer from StringPrim with base_str
 
             Set pos to pos plus 1
 
             Note: Lex digits in specified base
-            While pos is less than len:
-                Set ch to proc string_char_at from StringCore with source, pos
-                Let is_valid be 0
-
-                If base is less than or equal to 10:
-                    Set is_valid to proc is_digit from ch
-
+            Let scanning_base be 1
+            While scanning_base is equal to 1:
+                If pos is greater than or equal to len:
+                    Set scanning_base to 0
                 Otherwise:
-                    Set is_valid to proc is_hex_digit from ch
-                End If
-
-                If is_valid is equal to 1:
-                    Set pos to pos plus 1
-
-                Otherwise:
-                    If 1 is equal to 1:
-                        Note: Break
-                        If 1 is not equal to 1:
-                            Note: Force break
-                        End If
+                    Set ch to proc string_char_at from StringCore with source, pos
+                    Let is_valid be 0
+                    If base is less than or equal to 10:
+                        Set is_valid to proc is_digit with ch
+                    Otherwise:
+                        Set is_valid to proc is_hex_digit with ch
+                    End If
+                    If is_valid is equal to 1:
+                        Set pos to pos plus 1
+                    Otherwise:
+                        Set scanning_base to 0
                     End If
                 End If
             End While
@@ -1132,19 +1154,17 @@ Process called "lex_number" takes lexer as Integer returns Integer:
             Set pos to pos plus 1
 
             Note: Lex fractional part
-            While pos is less than len:
-                Set ch to proc string_char_at from StringCore with source, pos
-                Set is_digit_val to proc is_digit from ch
-
-                If is_digit_val is equal to 1:
-                    Set pos to pos plus 1
-
+            Let scanning_frac be 1
+            While scanning_frac is equal to 1:
+                If pos is greater than or equal to len:
+                    Set scanning_frac to 0
                 Otherwise:
-                    If 1 is equal to 1:
-                        Note: Break
-                        If 1 is not equal to 1:
-                            Note: Force break
-                        End If
+                    Set ch to proc string_char_at from StringCore with source, pos
+                    Set is_digit_val to proc is_digit with ch
+                    If is_digit_val is equal to 1:
+                        Set pos to pos plus 1
+                    Otherwise:
+                        Set scanning_frac to 0
                     End If
                 End If
             End While
@@ -1169,19 +1189,17 @@ Process called "lex_number" takes lexer as Integer returns Integer:
                 End If
             End If
 
-            While pos is less than len:
-                Set ch to proc string_char_at from StringCore with source, pos
-                Set is_digit_val to proc is_digit from ch
-
-                If is_digit_val is equal to 1:
-                    Set pos to pos plus 1
-
+            Let scanning_exp be 1
+            While scanning_exp is equal to 1:
+                If pos is greater than or equal to len:
+                    Set scanning_exp to 0
                 Otherwise:
-                    If 1 is equal to 1:
-                        Note: Break
-                        If 1 is not equal to 1:
-                            Note: Force break
-                        End If
+                    Set ch to proc string_char_at from StringCore with source, pos
+                    Set is_digit_val to proc is_digit with ch
+                    If is_digit_val is equal to 1:
+                        Set pos to pos plus 1
+                    Otherwise:
+                        Set scanning_exp to 0
                     End If
                 End If
             End While
@@ -1201,19 +1219,17 @@ Process called "lex_number" takes lexer as Integer returns Integer:
                 End If
             End If
 
-            While pos is less than len:
-                Set ch to proc string_char_at from StringCore with source, pos
-                Set is_digit_val to proc is_digit from ch
-
-                If is_digit_val is equal to 1:
-                    Set pos to pos plus 1
-
+            Let scanning_exp be 1
+            While scanning_exp is equal to 1:
+                If pos is greater than or equal to len:
+                    Set scanning_exp to 0
                 Otherwise:
-                    If 1 is equal to 1:
-                        Note: Break
-                        If 1 is not equal to 1:
-                            Note: Force break
-                        End If
+                    Set ch to proc string_char_at from StringCore with source, pos
+                    Set is_digit_val to proc is_digit with ch
+                    If is_digit_val is equal to 1:
+                        Set pos to pos plus 1
+                    Otherwise:
+                        Set scanning_exp to 0
                     End If
                 End If
             End While
@@ -1276,7 +1292,7 @@ Process called "lex_string" takes lexer as Integer returns Integer:
 
         Otherwise:
             If ch is equal to 10:  Note: Newline
-                proc advance_newline from lexer
+                proc advance_newline with lexer
                 Set pos to pos plus 1
 
             Otherwise:
@@ -1438,6 +1454,15 @@ Process called "lex_operator_or_punct" takes lexer as Integer returns Integer:
                 Set pos to pos plus 1
                 proc memory_set_int64 from Layout with lexer, 8, pos
                 Return proc create_token with TOKEN_LIST_SUBTRACT, start_pos, pos
+            End If
+        End If
+
+        Note: Comprehension bar ||
+        If ch is equal to 124:  Note: |
+            If next_ch is equal to 124:  Note: ||
+                Set pos to pos plus 1
+                proc memory_set_int64 from Layout with lexer, 8, pos
+                Return proc create_token with TOKEN_DOUBLE_LIST_CONS, start_pos, pos
             End If
         End If
 
@@ -1688,17 +1713,17 @@ is_digit -> 1; '_' (95) -> 1; '@' (64) -> 1; else 0.
 Process called "is_atom_char" takes ch as Integer returns Integer:
     Note: Check if character is valid in atom or variable
 
-    Let is_lower be proc is_lowercase_letter from ch
+    Let is_lower be proc is_lowercase_letter with ch
     If is_lower is equal to 1:
         Return 1
     End If
 
-    Let is_upper be proc is_uppercase_letter from ch
+    Let is_upper be proc is_uppercase_letter with ch
     If is_upper is equal to 1:
         Return 1
     End If
 
-    Let is_digit_val be proc is_digit from ch
+    Let is_digit_val be proc is_digit with ch
     If is_digit_val is equal to 1:
         Return 1
     End If
@@ -1721,17 +1746,19 @@ accurate for non-newline characters.
 @End Reasoning
 
 @Implementation:
-Reads position (offset 8) and column (offset 24); writes back pos+1
-to offset 8 and col+1 to offset 24. Returns 1.
+Reads position (offset 8) and current_column (offset 32); writes back
+pos+1 to offset 8 and col+1 to offset 32. The current_line counter at
+offset 24 is intentionally left untouched - only advance_newline bumps
+it. Returns 1.
 @End Implementation
 Process called "advance_position" takes lexer as Integer returns Integer:
     Note: Advance position and column
 
     Let pos be proc memory_get_int64 from Layout with lexer, 8
-    Let col be proc memory_get_int64 from Layout with lexer, 24
+    Let col be proc memory_get_int64 from Layout with lexer, 32
 
     proc memory_set_int64 from Layout with lexer, 8, pos plus 1
-    proc memory_set_int64 from Layout with lexer, 24, col plus 1
+    proc memory_set_int64 from Layout with lexer, 32, col plus 1
 
     Return 1
 End Process
@@ -1744,21 +1771,22 @@ strings with embedded LFs.
 @End Reasoning
 
 @Implementation:
-Reads position (offset 8). Writes pos+1 to offset 8, line+1 to offset
-16 (NOTE: this routine writes to offset 16 which the type declares
-as 'len'; the field naming is misleading - the 16 slot is reused as
-current_line counter for the active scan, distinct from the
-record's documented layout). Resets column at offset 24 to 1.
+Reads position (offset 8) and current_line (offset 24). Writes pos+1
+to offset 8 (advancing past the LF byte), line+1 to offset 24
+(current_line), and resets current_column at offset 32 to 1. The
+source length at offset 16 is left untouched - it is a fixed value
+cached once at create_erlang_lexer and must never be mutated, or the
+EOF guard (pos >= len) in next_token misfires.
 @End Implementation
 Process called "advance_newline" takes lexer as Integer returns Integer:
     Note: Advance position for newline
 
     Let pos be proc memory_get_int64 from Layout with lexer, 8
-    Let line be proc memory_get_int64 from Layout with lexer, 16
+    Let line be proc memory_get_int64 from Layout with lexer, 24
 
     proc memory_set_int64 from Layout with lexer, 8, pos plus 1
-    proc memory_set_int64 from Layout with lexer, 16, line plus 1
-    proc memory_set_int64 from Layout with lexer, 24, 1
+    proc memory_set_int64 from Layout with lexer, 24, line plus 1
+    proc memory_set_int64 from Layout with lexer, 32, 1
 
     Return 1
 End Process

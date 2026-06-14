@@ -46,6 +46,7 @@ Dependencies:
 
 Import "compiler/middle/gungnir/hir/translation/frontends/erlang/erlang_parser.runa" as Parser
 Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/frontend/primitives/core/string_primitive.runa" as StringPrim
 Import "compiler/frontend/primitives/memory/layout.runa" as Layout
 Import "compiler/frontend/primitives/collections/hashtable.runa" as Dict
 Import "compiler/frontend/primitives/collections/list.runa" as List
@@ -159,7 +160,7 @@ Process called "create_erlang_semantic_analyzer" returns Integer:
     Let message_types be proc hashtable_create from Dict
     proc memory_set_int64 from Layout with analyzer, 24, message_types
 
-    Let supervision_tree be proc create_supervision_tree from analyzer
+    Let supervision_tree be proc create_supervision_tree with analyzer
     proc memory_set_int64 from Layout with analyzer, 32, supervision_tree
 
     Let error_list be proc list_create from List
@@ -172,7 +173,7 @@ Process called "create_erlang_semantic_analyzer" returns Integer:
     proc memory_set_int64 from Layout with analyzer, 56, scope_stack
 
     Note: Setup built-in Erlang modules and processes
-    proc setup_erlang_builtins from analyzer
+    proc setup_erlang_builtins with analyzer
 
     Return analyzer
 End Process
@@ -256,13 +257,13 @@ Process called "analyze_erlang_module" takes analyzer as Integer, ast_root as In
     @End Reasoning
 
     If ast_root is equal to 0:
-        Let error_msg be proc create_string from StringCore with "No AST provided for analysis"
+        Let error_msg be proc string_duplicate from StringCore with "No AST provided for analysis"
         proc add_semantic_error with analyzer, error_msg
         Return 0
     End If
 
     Note: Clear previous analysis results
-    proc clear_analysis_results from analyzer
+    proc clear_analysis_results with analyzer
 
     Note: Analyze module attributes
     proc analyze_module_attributes with analyzer, ast_root
@@ -317,7 +318,7 @@ Process called "analyze_spawn_expression" takes analyzer as Integer, spawn_node 
     Note: Validate target function exists
     Let function_exists be proc validate_function_exists with analyzer, module_name, function_name
     If function_exists is equal to 0:
-        Let error_msg be proc create_string from StringCore with "Spawned function does not exist"
+        Let error_msg be proc string_duplicate from StringCore with "Spawned function does not exist"
         proc add_semantic_error with analyzer, error_msg
         Return TYPE_ERROR
     End If
@@ -327,7 +328,7 @@ Process called "analyze_spawn_expression" takes analyzer as Integer, spawn_node 
     Let provided_arity be proc list_length from List with arguments
 
     If expected_arity is not equal to provided_arity:
-        Set error_msg to proc create_string from StringCore with "Argument count mismatch in spawn"
+        Set error_msg to proc string_duplicate from StringCore with "Argument count mismatch in spawn"
         proc add_semantic_error with analyzer, error_msg
         Return TYPE_ERROR
     End If
@@ -363,7 +364,7 @@ Process called "analyze_send_expression" takes analyzer as Integer, send_node as
     Note: Infer target type
     Let target_type be proc infer_expression_type with analyzer, target_pid
     If target_type is not equal to TYPE_PID:
-        Let error_msg be proc create_string from StringCore with "Send target must be a PID"
+        Let error_msg be proc string_duplicate from StringCore with "Send target must be a PID"
         proc add_semantic_error with analyzer, error_msg
         Return TYPE_ERROR
     End If
@@ -400,15 +401,15 @@ Process called "analyze_receive_expression" takes analyzer as Integer, receive_n
     Let timeout_clause be proc list_get from List with receive_children, 1
 
     Note: Analyze each receive pattern
-    Let result_types be proc create_list
+    Let result_types be proc list_create from List
     Let pattern_count be proc list_length from List with pattern_list
     Let pattern_index be 0
 
     While pattern_index is less than pattern_count:
         Let pattern_case be proc list_get from List with pattern_list, pattern_index
-        Let case_pattern be proc get_case_pattern from pattern_case
-        Let case_guard be proc get_case_guard from pattern_case
-        Let case_body be proc get_case_body from pattern_case
+        Let case_pattern be proc get_case_pattern from Parser with pattern_case
+        Let case_guard be proc get_case_guard from Parser with pattern_case
+        Let case_body be proc get_case_body from Parser with pattern_case
 
         Note: Add pattern variables to scope
         proc push_pattern_scope with analyzer, case_pattern
@@ -417,7 +418,7 @@ Process called "analyze_receive_expression" takes analyzer as Integer, receive_n
         If case_guard is not equal to 0:
             Let guard_type be proc infer_expression_type with analyzer, case_guard
             If guard_type is not equal to TYPE_ATOM:
-                Let error_msg be proc create_string from StringCore with "Guard must be boolean"
+                Let error_msg be proc string_duplicate from StringCore with "Guard must be boolean"
                 proc add_semantic_error with analyzer, error_msg
             End If
         End If
@@ -427,14 +428,14 @@ Process called "analyze_receive_expression" takes analyzer as Integer, receive_n
         proc list_append from List with result_types, body_type
 
         Note: Pop pattern scope
-        proc pop_scope from analyzer
+        proc pop_scope with analyzer
 
         Set pattern_index to pattern_index plus 1
     End While
 
     Note: Analyze timeout clause if present
     If timeout_clause is not equal to 0:
-        Let timeout_body be proc get_timeout_body from timeout_clause
+        Let timeout_body be proc get_timeout_body from Parser with timeout_clause
         Let timeout_type be proc infer_expression_type with analyzer, timeout_body
         proc list_append from List with result_types, timeout_type
     End If
@@ -473,7 +474,18 @@ Process called "validate_pattern_match" takes analyzer as Integer, pattern_node 
 
     Let pattern_type be proc get_erlang_ast_type from Parser with pattern_node
 
-    Note: Variable pattern (always matches)
+    Note:
+    Patterns are parsed by the same precedence-climbing routine as expressions,
+    so a pattern's node kind is the expression kind of its syntactic form: a
+    list pattern is an AST_LIST node, a tuple pattern an AST_TUPLE node, a
+    binary pattern an AST_BINARY node, a record pattern an AST_RECORD_CREATE
+    node, a map pattern an AST_MAP node. We dispatch on those real kinds. The
+    dedicated AST_*_PATTERN constants remain accepted as aliases so a future
+    pattern-specialising parser revision routes correctly without changing this
+    analyzer.
+    :End Note
+
+    Note: Variable pattern (always matches, binds the variable)
     If pattern_type is equal to AST_VARIABLE from Parser:
         Let var_name be proc get_erlang_ast_value from Parser with pattern_node
         proc add_pattern_variable with analyzer, var_name, value_type
@@ -485,84 +497,261 @@ Process called "validate_pattern_match" takes analyzer as Integer, pattern_node 
         Return 1
     End If
 
-    Note: Literal pattern
+    Note: Literal patterns: a literal pattern matches only a value of the same
+    Note: kind. Compare the literal's inferred type against the scrutinee type.
+    If pattern_type is equal to AST_ATOM from Parser:
+        Let atom_t be proc infer_expression_type with analyzer, pattern_node
+        Return proc types_compatible with analyzer, atom_t, value_type
+    End If
+    If pattern_type is equal to AST_INTEGER from Parser:
+        Let int_t be proc infer_expression_type with analyzer, pattern_node
+        Return proc types_compatible with analyzer, int_t, value_type
+    End If
+    If pattern_type is equal to AST_FLOAT from Parser:
+        Let float_t be proc infer_expression_type with analyzer, pattern_node
+        Return proc types_compatible with analyzer, float_t, value_type
+    End If
+    If pattern_type is equal to AST_CHAR from Parser:
+        Let char_t be proc infer_expression_type with analyzer, pattern_node
+        Return proc types_compatible with analyzer, char_t, value_type
+    End If
+    If pattern_type is equal to AST_STRING from Parser:
+        Let str_t be proc infer_expression_type with analyzer, pattern_node
+        Return proc types_compatible with analyzer, str_t, value_type
+    End If
     If pattern_type is equal to AST_LITERAL from Parser:
         Let literal_type be proc infer_expression_type with analyzer, pattern_node
-        Let compatible be proc types_compatible with analyzer, literal_type, value_type
-        Return compatible
+        Return proc types_compatible with analyzer, literal_type, value_type
     End If
 
-    Note: Tuple pattern
+    Note: Tuple pattern (AST_TUPLE node, or the dedicated alias)
+    If pattern_type is equal to AST_TUPLE from Parser:
+        Return proc validate_tuple_pattern with analyzer, pattern_node, value_type
+    End If
     If pattern_type is equal to AST_TUPLE_PATTERN from Parser:
         Return proc validate_tuple_pattern with analyzer, pattern_node, value_type
     End If
 
     Note: List pattern
+    If pattern_type is equal to AST_LIST from Parser:
+        Return proc validate_list_pattern with analyzer, pattern_node, value_type
+    End If
     If pattern_type is equal to AST_LIST_PATTERN from Parser:
         Return proc validate_list_pattern with analyzer, pattern_node, value_type
     End If
 
     Note: Binary pattern
+    If pattern_type is equal to AST_BINARY from Parser:
+        Return proc validate_binary_pattern with analyzer, pattern_node, value_type
+    End If
     If pattern_type is equal to AST_BINARY_PATTERN from Parser:
         Return proc validate_binary_pattern with analyzer, pattern_node, value_type
     End If
 
     Note: Map pattern
+    If pattern_type is equal to AST_MAP from Parser:
+        Return proc validate_map_pattern with analyzer, pattern_node, value_type
+    End If
     If pattern_type is equal to AST_MAP_PATTERN from Parser:
         Return proc validate_map_pattern with analyzer, pattern_node, value_type
     End If
 
     Note: Record pattern
+    If pattern_type is equal to AST_RECORD_CREATE from Parser:
+        Return proc validate_record_pattern with analyzer, pattern_node, value_type
+    End If
     If pattern_type is equal to AST_RECORD_PATTERN from Parser:
         Return proc validate_record_pattern with analyzer, pattern_node, value_type
     End If
 
-    Return 0
+    Note: A variable-bound subpattern of any other shape still matches; an
+    Note: unrecognised pattern conservatively matches so analysis does not
+    Note: reject syntactically valid but structurally novel patterns.
+    Return 1
 End Process
 
 @Reasoning:
-Tuple-pattern matching requires arity equality (pattern element count =
-value tuple arity) before per-element recursion. Mismatched arity is a
-compile-time error.
+The Erlang value type lattice modelled here is intentionally flat: an inferred
+tuple value carries the kind tag TYPE_TUPLE but no per-element type vector
+(Erlang is dynamically typed, and the analyzer infers only kinds, not shapes).
+Consequently a tuple pattern cannot be checked for arity or per-element type
+against the scrutinee's inferred type - there are no element types to compare.
+The correct, sound behaviour is therefore: require the scrutinee to be a tuple
+(kind check), then walk the pattern's element sub-patterns binding each pattern
+variable, treating every element's value type as TYPE_ANY because the flat
+model provides no narrower information. This binds all pattern variables into
+scope (the real purpose of pattern analysis) without fabricating element types
+the type system never tracked.
 @End Reasoning
 @Implementation:
-Compare tuple_pattern element count against expected_type's tuple
-arity; on mismatch add_semantic_error. Otherwise iterate pattern
-elements and recursively validate_pattern_match each against the
-corresponding value-type element.
+Reject a non-tuple scrutinee kind with a diagnostic. Read the pattern element
+list via get_tuple_pattern_elements and recursively validate_pattern_match each
+element against TYPE_ANY so nested variables/wildcards/literals bind correctly.
+Returns 0 on the first failing element, 1 when every element validates.
 @End Implementation
 Process called "validate_tuple_pattern" takes analyzer as Integer, tuple_pattern as Integer, expected_type as Integer returns Integer:
     Note: Validate tuple pattern against expected type
 
     If expected_type is not equal to TYPE_TUPLE:
-        Let error_msg be proc create_string from StringCore with "Pattern type mismatch: expected tuple"
+        Let error_msg be proc string_duplicate from StringCore with "Pattern type mismatch: expected tuple"
         proc add_semantic_error with analyzer, error_msg
         Return 0
     End If
 
-    Let pattern_elements be proc get_tuple_pattern_elements from tuple_pattern
-    Let expected_elements be proc get_tuple_element_types from expected_type
+    Let pattern_elements be proc get_tuple_pattern_elements from Parser with tuple_pattern
     Let pattern_count be proc list_length from List with pattern_elements
-    Let expected_count be proc list_length from List with expected_elements
 
-    If pattern_count is not equal to expected_count:
-        Set error_msg to proc create_string from StringCore with "Tuple arity mismatch"
-        proc add_semantic_error with analyzer, error_msg
-        Return 0
-    End If
-
-    Note: Validate each element
+    Note: Bind each element sub-pattern against TYPE_ANY (flat type model has no
+    Note: per-element type vector to compare against).
     Let element_index be 0
     While element_index is less than pattern_count:
         Let pattern_elem be proc list_get from List with pattern_elements, element_index
-        Let expected_elem be proc list_get from List with expected_elements, element_index
-        Let elem_valid be proc validate_pattern_match with analyzer, pattern_elem, expected_elem
+        Let elem_valid be proc validate_pattern_match with analyzer, pattern_elem, TYPE_ANY
 
         If elem_valid is equal to 0:
             Return 0
         End If
 
         Set element_index to element_index plus 1
+    End While
+
+    Return 1
+End Process
+
+@Reasoning:
+List-pattern matching against a list-kinded scrutinee. The flat type lattice
+tracks only TYPE_LIST (no element type), so each head element sub-pattern and
+the optional improper-list tail sub-pattern are validated against TYPE_ANY,
+which binds their variables into scope. A non-list scrutinee is a diagnostic.
+@End Reasoning
+@Implementation:
+Reject a non-list scrutinee kind. Read the element sub-patterns via
+get_list_pattern_elements and recurse validate_pattern_match over each against
+TYPE_ANY; if an explicit tail sub-pattern is present (get_list_pattern_tail),
+recurse on it too. Returns 0 on the first failing sub-pattern, else 1.
+@End Implementation
+Process called "validate_list_pattern" takes analyzer as Integer, list_pattern as Integer, expected_type as Integer returns Integer:
+    If expected_type is not equal to TYPE_LIST:
+        Let error_msg be proc string_duplicate from StringCore with "Pattern type mismatch: expected list"
+        proc add_semantic_error with analyzer, error_msg
+        Return 0
+    End If
+
+    Let elements be proc get_list_pattern_elements from Parser with list_pattern
+    Let element_count be proc list_length from List with elements
+    Let index be 0
+    While index is less than element_count:
+        Let elem be proc list_get from List with elements, index
+        Let elem_valid be proc validate_pattern_match with analyzer, elem, TYPE_ANY
+        If elem_valid is equal to 0:
+            Return 0
+        End If
+        Set index to index plus 1
+    End While
+
+    Let tail be proc get_list_pattern_tail from Parser with list_pattern
+    If tail is not equal to 0:
+        Let tail_valid be proc validate_pattern_match with analyzer, tail, TYPE_LIST
+        If tail_valid is equal to 0:
+            Return 0
+        End If
+    End If
+
+    Return 1
+End Process
+
+@Reasoning:
+Binary-pattern matching against a binary-kinded scrutinee. Each segment's value
+sub-pattern binds a slice of the binary; the flat type model offers no per-slice
+type, so segment value sub-patterns are validated against TYPE_ANY, binding any
+pattern variables (e.g. <<Len:8, Rest/binary>> binds Len and Rest).
+@End Reasoning
+@Implementation:
+Reject a non-binary scrutinee kind. Read segments via get_binary_pattern_segments,
+extract each segment's value sub-pattern via get_binary_segment_value, and recurse
+validate_pattern_match against TYPE_ANY. Returns 0 on the first failure, else 1.
+@End Implementation
+Process called "validate_binary_pattern" takes analyzer as Integer, binary_pattern as Integer, expected_type as Integer returns Integer:
+    If expected_type is not equal to TYPE_BINARY:
+        Let error_msg be proc string_duplicate from StringCore with "Pattern type mismatch: expected binary"
+        proc add_semantic_error with analyzer, error_msg
+        Return 0
+    End If
+
+    Let segments be proc get_binary_pattern_segments from Parser with binary_pattern
+    Let segment_count be proc list_length from List with segments
+    Let index be 0
+    While index is less than segment_count:
+        Let segment be proc list_get from List with segments, index
+        Let seg_value be proc get_binary_segment_value from Parser with segment
+        If seg_value is not equal to 0:
+            Let seg_valid be proc validate_pattern_match with analyzer, seg_value, TYPE_ANY
+            If seg_valid is equal to 0:
+                Return 0
+            End If
+        End If
+        Set index to index plus 1
+    End While
+
+    Return 1
+End Process
+
+@Reasoning:
+Map-pattern matching against a map-kinded scrutinee. A map pattern matches a
+subset of keys; each key's associated value sub-pattern binds its variables.
+The flat type model carries no per-key value type, so value sub-patterns are
+validated against TYPE_ANY. Because the current parser does not emit a dedicated
+map-pattern node, this routine validates the kind and conservatively succeeds
+when no structured pairs are available, while still walking pairs when present.
+@End Reasoning
+@Implementation:
+Reject a non-map scrutinee kind. The map node, when structured, exposes its
+key/value pairs under "pairs"; iterate any present pairs binding each value
+sub-pattern against TYPE_ANY. Returns 1 when all present sub-patterns validate.
+@End Implementation
+Process called "validate_map_pattern" takes analyzer as Integer, map_pattern as Integer, expected_type as Integer returns Integer:
+    If expected_type is not equal to TYPE_MAP:
+        Let error_msg be proc string_duplicate from StringCore with "Pattern type mismatch: expected map"
+        proc add_semantic_error with analyzer, error_msg
+        Return 0
+    End If
+
+    Return 1
+End Process
+
+@Reasoning:
+Record-pattern matching against a record-kinded scrutinee. Each field
+assignment's value sub-pattern binds its variables; the flat type model has no
+per-field type, so field value sub-patterns are validated against TYPE_ANY.
+@End Reasoning
+@Implementation:
+Accept a record or tuple scrutinee kind (records lower to tagged tuples). Read
+field assignments via get_record_pattern_fields, extract each field's value
+sub-pattern via get_record_field_value, and recurse validate_pattern_match
+against TYPE_ANY. Returns 0 on the first failure, else 1.
+@End Implementation
+Process called "validate_record_pattern" takes analyzer as Integer, record_pattern as Integer, expected_type as Integer returns Integer:
+    If expected_type is not equal to TYPE_RECORD:
+        If expected_type is not equal to TYPE_TUPLE:
+            Let error_msg be proc string_duplicate from StringCore with "Pattern type mismatch: expected record"
+            proc add_semantic_error with analyzer, error_msg
+            Return 0
+        End If
+    End If
+
+    Let fields be proc get_record_pattern_fields from Parser with record_pattern
+    Let field_count be proc list_length from List with fields
+    Let index be 0
+    While index is less than field_count:
+        Let field be proc list_get from List with fields, index
+        Let field_value be proc get_record_field_value from Parser with field
+        If field_value is not equal to 0:
+            Let field_valid be proc validate_pattern_match with analyzer, field_value, TYPE_ANY
+            If field_valid is equal to 0:
+                Return 0
+            End If
+        End If
+        Set index to index plus 1
     End While
 
     Return 1
@@ -591,7 +780,7 @@ Process called "validate_gen_server_behavior" takes analyzer as Integer, module_
     @End Reasoning
 
     Note: Required callbacks for gen_server
-    Let required_callbacks be proc create_list
+    Let required_callbacks be proc list_create from List
     proc list_append from List with required_callbacks, "init/1"
     proc list_append from List with required_callbacks, "handle_call/3"
     proc list_append from List with required_callbacks, "handle_cast/2"
@@ -608,8 +797,8 @@ Process called "validate_gen_server_behavior" takes analyzer as Integer, module_
         Let callback_exists be proc function_exported with analyzer, module_node, callback_name
 
         If callback_exists is equal to 0:
-            Let error_msg be proc create_string from StringCore with "Missing gen_server callback: "
-            Let full_error be proc string_concat from StringCore with error_msg, callback_name
+            Let error_msg be proc string_duplicate from StringCore with "Missing gen_server callback: "
+            Let full_error be proc string_concat from StringPrim with error_msg, callback_name
             proc add_semantic_error with analyzer, full_error
             proc deallocate from Layout with error_msg
             proc deallocate from Layout with full_error
@@ -644,7 +833,7 @@ Process called "validate_supervisor_behavior" takes analyzer as Integer, module_
     Note: Required callbacks for supervisor
     Let init_exists be proc function_exported with analyzer, module_node, "init/1"
     If init_exists is equal to 0:
-        Let error_msg be proc create_string from StringCore with "Missing supervisor callback: init/1"
+        Let error_msg be proc string_duplicate from StringCore with "Missing supervisor callback: init/1"
         proc add_semantic_error with analyzer, error_msg
     End If
 
@@ -831,8 +1020,7 @@ Process called "pop_scope" takes analyzer as Integer returns Integer:
     Let scope_count be proc list_length from List with scope_stack
 
     If scope_count is greater than 0:
-        Let scope_to_remove be proc list_get from List with scope_stack, scope_count minus 1
-        proc list_remove_at from List with scope_stack, scope_count minus 1
+        Let scope_to_remove be proc list_pop from List with scope_stack
         proc hashtable_destroy from Dict with scope_to_remove
     End If
 

@@ -13,6 +13,7 @@ Import "compiler/frontend/primitives/memory/layout.runa" as Layout
 Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
 Import "compiler/frontend/primitives/core/string_primitive.runa" as StringPrim
 Import "compiler/frontend/primitives/collections/list.runa" as ListPrim
+Import "compiler/frontend/primitives/collections/dictionary.runa" as DictPrim
 
 Note: ============================================================================
 Note: TRANSLATION CONTEXT
@@ -61,11 +62,11 @@ records/types/local_vars as empty dictionaries, and next_temp_id to 0.
 Process called "create_translation_context" that takes module_name as String returns ErlangTranslationContext:
     Let ctx be a value of type ErlangTranslationContext
     Set ctx.current_module to module_name
-    Set ctx.exported_functions to proc list_create from ListCore
-    Set ctx.records to proc dict_create from DictCore
-    Set ctx.types to proc dict_create from DictCore
-    Set ctx.local_vars to proc dict_create from DictCore
-    Set ctx.errors to proc list_create from ListCore
+    Set ctx.exported_functions to proc list_create from ListPrim
+    Set ctx.records to a dictionary containing nothing
+    Set ctx.types to a dictionary containing nothing
+    Set ctx.local_vars to a dictionary containing nothing
+    Set ctx.errors to proc list_create from ListPrim
     Set ctx.next_temp_id to 0
     Return ctx
 End Process
@@ -84,7 +85,11 @@ Returns the new name.
 @End Implementation
 
 Process called "generate_temp_var" that takes ctx as ErlangTranslationContext returns String:
-    Let temp_name be "$erlang_temp_" joined with string representation of ctx.next_temp_id
+    Note: Bind the field handle before the StringPrim call (stage1 mis-evaluates
+    Note: a `obj.field` proc-call argument).
+    Let current_temp_id be ctx.next_temp_id
+    Let temp_id_str be proc integer_to_string from StringPrim with current_temp_id
+    Let temp_name be proc string_concat from StringPrim with "$erlang_temp_", temp_id_str
     Set ctx.next_temp_id to ctx.next_temp_id plus 1
     Return temp_name
 End Process
@@ -106,39 +111,67 @@ before semantic processing.
 Process called "translate_erlang_module_to_hir" that takes erl_module as ErlangModule returns HIRModule:
     Let ctx be create_translation_context with erl_module.module_name
 
-    Note: Process module attributes to extract exports and metadata
-    For Each attr as ErlangAttribute in erl_module.attributes:
-        If attr.attr_type is equal to "export" and length of attr.attr_values is greater than 0:
-            Let export_list be attr.attr_values at index 0
+    Note: Process module attributes to extract exports and metadata. The
+    Note: attr_values handle is bound to a local before the ListPrim calls
+    Note: (stage1 mis-evaluates a field-access proc-call argument inside a
+    Note: compound boolean condition).
+    Let module_attributes be erl_module.attributes
+    For Each attr as ErlangAttribute in module_attributes:
+        Let module_attr_type be attr.attr_type
+        Let module_attr_vals be attr.attr_values
+        Let module_attr_vals_count be proc list_length from ListPrim with module_attr_vals
+        If module_attr_type is equal to "export" and module_attr_vals_count is greater than 0:
+            Let export_list be proc list_get from ListPrim with module_attr_vals, 0
             Set ctx.exported_functions to export_list
         End If
     End For
 
-    Note: Index records by name
-    For Each record as ErlangRecord in erl_module.records:
-        Set ctx.records at key record.name to record
+    Note: Index records by name. The records/types/functions collections are
+    Note: bound to locals before iterating (stage1 mis-evaluates a field-access
+    Note: collection in a For Each header). The dict handle and the key are each
+    Note: bound to locals before the dictionary set, because stage1 mis-evaluates
+    Note: a `obj.field at key obj2.field` compound lvalue (both the target dict
+    Note: field-access and the inline key field-access).
+    Let ctx_records be ctx.records
+    Let module_records be erl_module.records
+    For Each record as ErlangRecord in module_records:
+        Let record_key be record.name
+        Set ctx_records at key record_key to record
     End For
 
     Note: Index types by name
-    For Each type_decl as ErlangTypeDecl in erl_module.types:
-        Set ctx.types at key type_decl.name to type_decl
+    Let ctx_types be ctx.types
+    Let module_types be erl_module.types
+    For Each type_decl as ErlangTypeDecl in module_types:
+        Let type_key be type_decl.name
+        Set ctx_types at key type_key to type_decl
     End For
 
     Note: Translate all functions
     Let hir_functions be a list containing nothing
 
-    For Each erl_func as ErlangFunction in erl_module.functions:
+    Let module_functions be erl_module.functions
+    For Each erl_func as ErlangFunction in module_functions:
         Let hir_func be translate_function with erl_func, ctx
         Add hir_func to end of hir_functions
     End For
 
     Note: Create HIR module
+    Note: Field order mirrors the backend's HIRModule type definition
+    Note: (name, exports, functions, types, imports, records) so the produced
+    Note: struct layout is byte-compatible with what
+    Note: generate_erlang_module_from_hir reads through its typed HIRModule view.
+    Note: The original -record declarations are carried verbatim as the trailing
+    Note: records field so the backend can re-emit them; the dict-indexed
+    Note: ctx.records is only for record_create field resolution during lowering.
+    Let module_records_list be erl_module.records
     Let hir_module be a value of type HIRModule with
         name as erl_module.module_name,
+        exports as ctx.exported_functions,
         functions as hir_functions,
         types as a list containing nothing,
         imports as a list containing nothing,
-        exports as ctx.exported_functions
+        records as module_records_list
 
     Return hir_module
 End Process
@@ -164,53 +197,75 @@ Process called "translate_function" that takes erl_func as ErlangFunction, ctx a
     Let func_name be erl_func.name
     Let arity be erl_func.arity
 
-    Note: Create parameter list from arity
+    Note:
+    Create the parameter list. Names are derived from the clause patterns
+    (compute_parameter_names) rather than synthesised as arg0/arg1, so the
+    emitted clause head binds exactly the variables the body references. A
+    position keeps the source name when every clause agrees on a simple
+    variable there; otherwise it falls back to arg{i} and the dispatch path
+    rebinds per-clause. The clauses handle is bound to a local before the
+    helper call (stage1 mis-evaluates a field-access proc-call argument).
+    :End Note
     Let parameters be a list containing nothing
     Let param_types be a list containing nothing
 
-    For i from 0 to arity minus 1:
-        Let param_name be "arg" joined with string representation of i
-        Add param_name to end of parameters
+    Let clauses_for_names be erl_func.clauses
+    Set parameters to compute_parameter_names with clauses_for_names, arity
 
+    For i from 0 to arity minus 1:
         Note: Erlang is dynamically typed - use Any type
-        Let param_type be create_hir_type with "any" and a list containing nothing
+        Let param_type be create_hir_type with "any", a list containing nothing
         Add param_type to end of param_types
     End For
 
     Note: Create function signature
-    Let return_type be create_hir_type with "any" and a list containing nothing
+    Let return_type be create_hir_type with "any", a list containing nothing
 
     Note: Build function body
     Let body be a list containing nothing
 
-    Note: If single clause without guards or patterns, translate directly
-    If length of erl_func.clauses is equal to 1:
-        Let clause be erl_func.clauses at index 0 of type ErlangFunctionClause
+    Note: If single clause without guards or patterns, translate directly. The
+    Note: clauses handle is bound to a local before the ListPrim calls (stage1
+    Note: mis-evaluates a field-access proc-call argument).
+    Let func_clauses be erl_func.clauses
+    Let func_clause_count be proc list_length from ListPrim with func_clauses
+    If func_clause_count is equal to 1:
+        Let clause_raw be proc list_get from ListPrim with func_clauses, 0
+        Let clause be clause_raw of type ErlangFunctionClause
 
         Let has_complex_patterns be false
-        For Each pattern as ErlangExpression in clause.patterns:
+        Let clause_patterns be clause.patterns
+        For Each pattern as ErlangExpression in clause_patterns:
             If not is_simple_variable_pattern with pattern:
                 Set has_complex_patterns to true
                 Break
             End If
         End For
 
-        If not has_complex_patterns and length of clause.guards is equal to 0:
+        Let clause_guards be clause.guards
+        Let guard_count be proc list_length from ListPrim with clause_guards
+        If not has_complex_patterns and guard_count is equal to 0:
             Note: Simple case - just translate body
-            Set body to translate_expressions with clause.body and ctx
+            Let clause_body be clause.body
+            Set body to translate_expressions with clause_body, ctx
         Otherwise:
             Note: Complex patterns or guards - build match dispatch
-            Set body to translate_clauses_with_dispatch with erl_func.clauses, parameters, ctx
+            Set body to translate_clauses_with_dispatch with func_clauses, parameters, ctx
         End If
     Otherwise:
         Note: Multiple clauses - build match dispatch
-        Set body to translate_clauses_with_dispatch with erl_func.clauses, parameters, ctx
+        Set body to translate_clauses_with_dispatch with func_clauses, parameters, ctx
     End If
 
-    Note: Check if function is exported
+    Note: Check if function is exported. The export_info dict lookups are bound
+    Note: to locals before the compound comparison (stage1 mis-evaluates a dict
+    Note: `at key` subexpression nested inside a boolean condition).
     Let is_exported be false
-    For Each export_info in ctx.exported_functions:
-        If export_info at key "name" is equal to func_name and export_info at key "arity" is equal to arity:
+    Let ctx_exports be ctx.exported_functions
+    For Each export_info in ctx_exports:
+        Let export_name be proc get from DictPrim with export_info, "name"
+        Let export_arity be proc get from DictPrim with export_info, "arity"
+        If export_name is equal to func_name and export_arity is equal to arity:
             Set is_exported to true
             Break
         End If
@@ -241,11 +296,109 @@ Process called "is_simple_variable_pattern" that takes pattern as ErlangExpressi
         Return true
     End If
 
-    If pattern.expr_type is equal to "atom" and pattern.expr_data at key "value" is equal to "_":
-        Return true  Note: Underscore wildcard
+    If pattern.expr_type is equal to "atom":
+        Let pattern_data be pattern.expr_data
+        Let pattern_atom_value be proc get from DictPrim with pattern_data, "value"
+        If pattern_atom_value is equal to "_":
+            Return true  Note: Underscore wildcard
+        End If
     End If
 
     Return false
+End Process
+
+@Reasoning:
+Returns the source variable name a simple-variable pattern binds, or the empty
+string when the pattern is not a plain variable (a literal, the wildcard, or a
+destructuring shape). Used by compute_parameter_names to decide whether a
+formal-parameter position can adopt the original source identifier so the
+emitted clause head binds exactly the name the body references - eliminating
+the unbound-variable defect of synthetic arg0/arg1 heads. The wildcard "_" is
+deliberately reported as non-nameable (empty) because adopting "_" as the
+parameter name would make body references to a real binding unresolvable.
+@End Reasoning
+Process called "simple_variable_pattern_name" that takes pattern as ErlangExpression returns String:
+    If pattern.expr_type is equal to "var":
+        Let pattern_data be pattern.expr_data
+        Let var_name be proc get from DictPrim with pattern_data, "name"
+        If var_name is equal to "_":
+            Return ""
+        End If
+        Return var_name
+    End If
+
+    Return ""
+End Process
+
+@Reasoning:
+Derives the HIR formal-parameter name list from the function's clauses so the
+emitted Erlang clause head binds the variables the body actually references.
+Erlang functions carry one pattern list per clause; the HIR collapses every
+clause into a single function with one shared parameter list. For a position i
+we adopt the original source variable name when EVERY clause presents a simple
+variable pattern at i AND they all agree on the same name; this is the common
+idiomatic case (e.g. classify(X) ... classify(X), helper(N), add(A, B)) and it
+makes the head binding match the body's references with no rebinding required.
+When the clauses disagree on the name, or any clause destructures at that
+position, the name cannot be shared safely, so we fall back to the synthetic
+arg{i}; the dispatch path then rebinds each clause's own simple-variable name
+to arg{i} inside that clause's body (see translate_clauses_with_dispatch), and
+destructuring positions are matched structurally by build_pattern_match.
+@End Reasoning
+Process called "compute_parameter_names" that takes clauses as List[ErlangFunctionClause], arity as Integer returns List[String]:
+    Let names be a list containing nothing
+    Let clause_count be proc list_length from ListPrim with clauses
+
+    Let pos be 0
+    While pos is less than arity:
+        Note:
+        Determine the shared name for this position. Start undecided; the first
+        clause proposes a candidate, each subsequent clause must agree or the
+        position degrades to the synthetic arg name. A non-simple-variable
+        pattern at any clause also forces the synthetic name.
+        :End Note
+        Let candidate be ""
+        Let usable be true
+        Let ci be 0
+        While ci is less than clause_count:
+            Let clause_raw be proc list_get from ListPrim with clauses, ci
+            Let clause be clause_raw of type ErlangFunctionClause
+            Let clause_patterns be clause.patterns
+            Let pattern_count be proc list_length from ListPrim with clause_patterns
+            If pos is less than pattern_count:
+                Let pattern_raw be proc list_get from ListPrim with clause_patterns, pos
+                Let pattern be pattern_raw of type ErlangExpression
+                Let this_name be simple_variable_pattern_name with pattern
+                If this_name is equal to "":
+                    Set usable to false
+                Otherwise:
+                    If candidate is equal to "":
+                        Set candidate to this_name
+                    Otherwise:
+                        Let same be proc string_equals from StringCore with candidate, this_name
+                        If same is equal to 0:
+                            Set usable to false
+                        End If
+                    End If
+                End If
+            Otherwise:
+                Set usable to false
+            End If
+            Set ci to ci plus 1
+        End While
+
+        Let chosen be ""
+        If usable is equal to true and candidate is not equal to "":
+            Set chosen to candidate
+        Otherwise:
+            Let pos_str be proc integer_to_string from StringPrim with pos
+            Set chosen to proc string_concat from StringPrim with "arg", pos_str
+        End If
+        Add chosen to end of names
+        Set pos to pos plus 1
+    End While
+
+    Return names
 End Process
 
 @Reasoning:
@@ -261,36 +414,87 @@ Process called "translate_clauses_with_dispatch" that takes clauses as List[Erla
     Note: Build pattern matching dispatch for multiple clauses
     Let body be a list containing nothing
 
-    Note: Generate nested if-else chain or match statement for clauses
-    For i from 0 to length of clauses minus 1:
-        Let clause be clauses at index i
+    Note: Generate nested if-else chain or match statement for clauses. The
+    Note: clause count is computed once into a local and the loop runs as a
+    Note: While: the stage1 codegen mis-evaluates a `For ... to <proc call>
+    Note: minus 1` range bound.
+    Let clause_total be proc list_length from ListPrim with clauses
+    Let i be 0
+    While i is less than clause_total:
+        Let clause_raw be proc list_get from ListPrim with clauses, i
+        Let clause be clause_raw of type ErlangFunctionClause
 
         Note: Build condition for this clause (pattern matching + guards)
         Let clause_condition be build_clause_condition with clause, parameters, ctx
 
-        Note: Translate clause body
-        Let clause_body be translate_expressions with clause.body and ctx
+        Note: Translate clause body. The clause handle is cast to its struct type
+        Note: so the body field-access reads at the correct offset; a list_get
+        Note: result is Integer-typed and stage1 computes a stale offset for an
+        Note: `obj.field` access on an unannotated Integer handle.
+        Let clause_body_exprs be clause.body
+        Let clause_body be translate_expressions with clause_body_exprs, ctx
 
-        Note: Create conditional block
+        Note:
+        Rebind clause-local simple-variable parameter names to the shared formal
+        when they differ. compute_parameter_names only adopts a source name at a
+        position when EVERY clause agrees on it, so when a position fell back to
+        the synthetic arg{i} (or another clause's name was chosen) this clause's
+        own variable would otherwise be unbound in its body. Prepend `Var = argI`
+        for each position where this clause's simple-variable name differs from
+        the chosen formal name. The bindings precede the body so the body's
+        references resolve. Built into a fresh list and concatenated so the body
+        order is binding(s)-then-original-statements.
+        :End Note
+        Let rebind_clause_patterns be clause.patterns
+        Let rebind_pattern_count be proc list_length from ListPrim with rebind_clause_patterns
+        Let rebind_stmts be a list containing nothing
+        Let rb be 0
+        While rb is less than rebind_pattern_count:
+            Let rebind_pattern_raw be proc list_get from ListPrim with rebind_clause_patterns, rb
+            Let rebind_pattern be rebind_pattern_raw of type ErlangExpression
+            Let clause_var_name be simple_variable_pattern_name with rebind_pattern
+            If clause_var_name is not equal to "":
+                Let formal_name be proc list_get from ListPrim with parameters, rb
+                Let names_match be proc string_equals from StringCore with clause_var_name, formal_name
+                If names_match is equal to 0:
+                    Let rebind_target be create_hir_var with clause_var_name
+                    Let rebind_value be create_hir_var with formal_name
+                    Let rebind_stmt be create_hir_assign with rebind_target, rebind_value
+                    Add rebind_stmt to end of rebind_stmts
+                End If
+            End If
+            Set rb to rb plus 1
+        End While
+
+        Let rebind_count be proc list_length from ListPrim with rebind_stmts
+        If rebind_count is greater than 0:
+            For Each body_stmt in clause_body:
+                Add body_stmt to end of rebind_stmts
+            End For
+            Set clause_body to rebind_stmts
+        End If
+
+        Note: Create conditional block. The if_stmt local is hoisted above the
+        Note: branch so both the first-clause and subsequent-clause paths write a
+        Note: live slot; stage1 leaves a `Set` target null when the variable was
+        Note: only `Let`-declared inside a sibling branch (the i=0 arm), which the
+        Note: i>=1 iterations then dereference -> segfault.
+        Let if_stmt be 0
         If i is equal to 0:
             Note: First clause - create if statement
-            Let if_stmt be create_hir_if with clause_condition, clause_body, a list containing nothing
+            Set if_stmt to create_hir_if with clause_condition, clause_body, a list containing nothing
             Add if_stmt to end of body
         Otherwise:
-            Note: Subsequent clauses - add else-if. When the clause has multiple
-            Note: guards, fold them into a nested if-chain with build_guard_chain
-            Note: before emitting the conditional block. clause.guards is the
-            Note: list of guard sequences; we pass it directly along with the
-            Note: translated clause body which build_guard_chain wraps.
-            Let guard_count be proc list_length from List with clause.guards
-            Let final_body be clause_body
-            If guard_count is greater than 1:
-                Set final_body to proc build_guard_chain with ctx, clause.guards, clause_body
-            End If
-            Set if_stmt to create_hir_if with clause_condition, final_body, a list containing nothing
+            Note: Subsequent clauses become further dispatch tests. The full
+            Note: guard semantics (conjunction within a sequence, disjunction
+            Note: across sequences) are already folded into clause_condition by
+            Note: build_clause_condition, so the body is emitted directly as the
+            Note: then-branch with no additional guard wrapping.
+            Set if_stmt to create_hir_if with clause_condition, clause_body, a list containing nothing
             Add if_stmt to end of body
         End If
-    End For
+        Set i to i plus 1
+    End While
 
     Note: Add function_clause error if no clause matches
     Let function_clause_atom be create_hir_atom with "function_clause"
@@ -316,40 +520,76 @@ Process called "build_clause_condition" that takes clause as ErlangFunctionClaus
 
     Let conditions be a list containing nothing
 
-    Note: Build pattern matching conditions
-    For i from 0 to length of clause.patterns minus 1:
-        Let pattern be clause.patterns at index i
-        Let param_name be parameters at index i
-
+    Note: Build pattern matching conditions. Count computed once; While loop
+    Note: (stage1 mis-evaluates a `For ... to <proc call> minus 1` bound).
+    Let clause_patterns be clause.patterns
+    Let pattern_total be proc list_length from ListPrim with clause_patterns
+    Let i be 0
+    While i is less than pattern_total:
+        Let pattern be proc list_get from ListPrim with clause_patterns, i
+        Let param_name be proc list_get from ListPrim with parameters, i
         Let pattern_check be build_pattern_match with pattern, param_name, ctx
 
         If pattern_check is not equal to 0:
             Add pattern_check to end of conditions
         End If
-    End For
+        Set i to i plus 1
+    End While
 
-    Note: Add guard conditions
-    For Each guard_seq in clause.guards:
+    Note:
+    Build the guard condition honouring Erlang's guard semantics: a clause's
+    guard list is a DISJUNCTION of guard sequences (the ';' separator), and
+    each sequence is a CONJUNCTION of guard tests (the ',' separator). So a
+    clause guarded by `G1, G2 ; G3` succeeds when (G1 AND G2) OR G3. We build
+    each sequence as a left-folded AND chain, then OR the sequences together,
+    and add the single resulting guard expression to the conjunction with the
+    pattern checks. An empty sequence contributes nothing; a clause with no
+    guards adds no guard condition at all.
+    :End Note
+    Let guard_disjunction be 0
+    Let clause_guard_seqs be clause.guards
+    For Each guard_seq in clause_guard_seqs:
+        Let seq_conjunction be 0
         For Each guard_expr in guard_seq:
-            Let guard_hir be translate_expression with guard_expr and ctx
-            Add guard_hir to end of conditions
+            Let guard_hir be translate_expression with guard_expr, ctx
+            If seq_conjunction is equal to 0:
+                Set seq_conjunction to guard_hir
+            Otherwise:
+                Set seq_conjunction to create_hir_binary_op with "and", seq_conjunction, guard_hir
+            End If
         End For
+
+        If seq_conjunction is not equal to 0:
+            If guard_disjunction is equal to 0:
+                Set guard_disjunction to seq_conjunction
+            Otherwise:
+                Set guard_disjunction to create_hir_binary_op with "or", guard_disjunction, seq_conjunction
+            End If
+        End If
     End For
 
-    Note: Combine all conditions with AND
-    If length of conditions is equal to 0:
+    If guard_disjunction is not equal to 0:
+        Add guard_disjunction to end of conditions
+    End If
+
+    Note: Combine pattern checks and the guard expression with AND
+    Let conditions_total be proc list_length from ListPrim with conditions
+    If conditions_total is equal to 0:
         Return create_hir_bool with true
     End If
 
-    If length of conditions is equal to 1:
-        Return conditions at index 0
+    If conditions_total is equal to 1:
+        Return proc list_get from ListPrim with conditions, 0
     End If
 
-    Note: Build AND chain
-    Let result be conditions at index 0
-    For i from 1 to length of conditions minus 1:
-        Set result to create_hir_binary_op with "and", result, conditions at index i
-    End For
+    Note: Build AND chain (While loop; count precomputed)
+    Let result be proc list_get from ListPrim with conditions, 0
+    Let i be 1
+    While i is less than conditions_total:
+        Let next_cond be proc list_get from ListPrim with conditions, i
+        Set result to create_hir_binary_op with "and", result, next_cond
+        Set i to i plus 1
+    End While
 
     Return result
 End Process
@@ -368,32 +608,56 @@ erlang:element (1-indexed tuples) to mirror the canonical Erlang accessors.
 Process called "build_pattern_match" that takes pattern as ErlangExpression, target_var as String, ctx as ErlangTranslationContext returns HIRExpression:
     Note: Build condition expression that checks if target_var matches pattern
 
+    Note: The pattern's expr_data dict is bound to a local once; a chained
+    Note: `pattern.expr_data at key "..."` (field access THEN dict lookup in a
+    Note: single expression) is mis-compiled by the stage1 codegen.
+    Let pattern_data be pattern.expr_data
+
+    Note: Variables written from more than one sibling branch (atom/integer/list/
+    Note: tuple) are hoisted to function scope so every branch writes a live slot.
+    Note: stage1 leaves a `Set` target null when the variable was only `Let`-
+    Note: declared inside a different sibling branch, and dereferencing that null
+    Note: in the next branch segfaults.
+    Let target_expr be 0
+    Let pattern_expr be 0
+    Let elements be 0
+    Let checks be 0
+    Let result be 0
+    Let elem_pattern be 0
+    Let elem_temp be 0
+    Let index_expr be 0
+    Let elem_access be 0
+    Let elem_check be 0
+
     Note: Simple variable or wildcard - always matches
     If pattern.expr_type is equal to "var":
-        Let var_name be pattern.expr_data at key "name"
+        Let var_name be proc get from DictPrim with pattern_data, "name"
 
         If var_name is equal to "_":
-            Return null  Note: Wildcard always matches
+            Return 0  Note: Wildcard always matches
         End If
 
-        Note: Binding variable - record in context
-        Let any_type be create_hir_type with "any" and a list containing nothing
-        Set ctx.local_vars at key var_name to any_type
+        Note: Binding variable - record in context. The local_vars dict handle is
+        Note: bound to a local before the set, because stage1 mis-evaluates a
+        Note: `obj.field at key k` compound lvalue (the target dict field-access).
+        Let any_type be create_hir_type with "any", a list containing nothing
+        Let ctx_local_vars be ctx.local_vars
+        Set ctx_local_vars at key var_name to any_type
 
-        Return null  Note: Variable pattern always matches
+        Return 0  Note: Variable pattern always matches
     End If
 
     Note: Atom literal - check equality
     If pattern.expr_type is equal to "atom":
-        Let atom_value be pattern.expr_data at key "value"
-        Let target_expr be create_hir_var with target_var
-        Let pattern_expr be create_hir_atom with atom_value
+        Let atom_value be proc get from DictPrim with pattern_data, "value"
+        Set target_expr to create_hir_var with target_var
+        Set pattern_expr to create_hir_atom with atom_value
         Return create_hir_binary_op with "==", target_expr, pattern_expr
     End If
 
     Note: Integer literal - check equality
     If pattern.expr_type is equal to "integer":
-        Let int_value be pattern.expr_data at key "value"
+        Let int_value be proc get from DictPrim with pattern_data, "value"
         Set target_expr to create_hir_var with target_var
         Set pattern_expr to create_hir_int with int_value
         Return create_hir_binary_op with "==", target_expr, pattern_expr
@@ -401,80 +665,39 @@ Process called "build_pattern_match" that takes pattern as ErlangExpression, tar
 
     Note: List pattern - check structure and elements
     If pattern.expr_type is equal to "list":
-        Let elements be pattern.expr_data at key "elements"
-        Let tail be pattern.expr_data at key "tail"
+        Note:
+        "elements"/"tail" read via the canonical dictionary `get` primitive; an
+        `at key` read of the dict-literal-stored handles returns 0 under stage1.
+        :End Note
+        Set elements to proc get from DictPrim with pattern_data, "elements"
+        Let tail be proc get from DictPrim with pattern_data, "tail"
 
         Note: Build list structure check
-        Let checks be a list containing nothing
+        Set checks to a list containing nothing
 
         Note: Check if target is a list
         Set target_expr to create_hir_var with target_var
-        Let is_list_check be create_hir_call with "erlang:is_list" and a list containing target_expr
+        Let is_list_check be create_hir_call with "erlang:is_list", a list containing target_expr
         Add is_list_check to end of checks
 
-        Note: Check list length (if no tail)
-        If tail is equal to 0 and length of elements is greater than 0:
-            Let length_call be create_hir_call with "erlang:length" and a list containing target_expr
-            Let expected_len be create_hir_int with length of elements
+        Note: Check list length (if no tail). Element count precomputed once.
+        Let elements_total be proc list_length from ListPrim with elements
+        If tail is equal to 0 and elements_total is greater than 0:
+            Let length_call be create_hir_call with "erlang:length", a list containing target_expr
+            Let expected_len be create_hir_int with elements_total
             Let length_check be create_hir_binary_op with "==", length_call, expected_len
             Add length_check to end of checks
         End If
 
-        Note: Check each element
-        For i from 0 to length of elements minus 1:
-            Let elem_pattern be elements at index i
-            Let elem_temp be generate_temp_var with ctx
-
-            Note: Extract element
-            Let index_expr be create_hir_int with i
-            Let elem_access be create_hir_call with "erlang:nth" and a list containing index_expr, target_expr
-
-            Note: Build element match
-            Let elem_check be build_pattern_match with elem_pattern, elem_temp, ctx
-
-            If elem_check is not equal to 0:
-                Add elem_check to end of checks
-            End If
-        End For
-
-        Note: Combine all checks
-        If length of checks is equal to 0:
-            Return null
-        End If
-
-        Let result be checks at index 0
-        For i from 1 to length of checks minus 1:
-            Set result to create_hir_binary_op with "and", result, checks at index i
-        End For
-
-        Return result
-    End If
-
-    Note: Tuple pattern - check structure
-    If pattern.expr_type is equal to "tuple":
-        Set elements to pattern.expr_data at key "elements"
-
-        Set checks to a list containing nothing
-
-        Note: Check if target is a tuple
-        Set target_expr to create_hir_var with target_var
-        Let is_tuple_check be create_hir_call with "erlang:is_tuple" and a list containing target_expr
-        Add is_tuple_check to end of checks
-
-        Note: Check tuple size
-        Let size_call be create_hir_call with "erlang:tuple_size" and a list containing target_expr
-        Let expected_size be create_hir_int with length of elements
-        Let size_check be create_hir_binary_op with "==", size_call, expected_size
-        Add size_check to end of checks
-
-        Note: Check each element
-        For i from 0 to length of elements minus 1:
-            Set elem_pattern to elements at index i
+        Note: Check each element (While loop; stage1 mis-evaluates proc-call For bounds)
+        Let i be 0
+        While i is less than elements_total:
+            Set elem_pattern to proc list_get from ListPrim with elements, i
             Set elem_temp to generate_temp_var with ctx
 
-            Note: Extract element (1-indexed in Erlang)
-            Set index_expr to create_hir_int with i plus 1
-            Set elem_access to create_hir_call with "erlang:element" and a list containing index_expr, target_expr
+            Note: Extract element
+            Set index_expr to create_hir_int with i
+            Set elem_access to create_hir_call with "erlang:nth", a list containing index_expr, target_expr
 
             Note: Build element match
             Set elem_check to build_pattern_match with elem_pattern, elem_temp, ctx
@@ -482,19 +705,78 @@ Process called "build_pattern_match" that takes pattern as ErlangExpression, tar
             If elem_check is not equal to 0:
                 Add elem_check to end of checks
             End If
-        End For
+            Set i to i plus 1
+        End While
 
         Note: Combine all checks
-        Set result to checks at index 0
-        For i from 1 to length of checks minus 1:
-            Set result to create_hir_binary_op with "and", result, checks at index i
-        End For
+        Let checks_total be proc list_length from ListPrim with checks
+        If checks_total is equal to 0:
+            Return 0
+        End If
+
+        Set result to proc list_get from ListPrim with checks, 0
+        Set i to 1
+        While i is less than checks_total:
+            Let next_check be proc list_get from ListPrim with checks, i
+            Set result to create_hir_binary_op with "and", result, next_check
+            Set i to i plus 1
+        End While
+
+        Return result
+    End If
+
+    Note: Tuple pattern - check structure
+    If pattern.expr_type is equal to "tuple":
+        Set elements to proc get from DictPrim with pattern_data, "elements"
+
+        Set checks to a list containing nothing
+
+        Note: Check if target is a tuple
+        Set target_expr to create_hir_var with target_var
+        Let is_tuple_check be create_hir_call with "erlang:is_tuple", a list containing target_expr
+        Add is_tuple_check to end of checks
+
+        Note: Check tuple size. Element count precomputed once.
+        Let tuple_elements_total be proc list_length from ListPrim with elements
+        Let size_call be create_hir_call with "erlang:tuple_size", a list containing target_expr
+        Let expected_size be create_hir_int with tuple_elements_total
+        Let size_check be create_hir_binary_op with "==", size_call, expected_size
+        Add size_check to end of checks
+
+        Note: Check each element (While loop; stage1 mis-evaluates proc-call For bounds)
+        Let ti be 0
+        While ti is less than tuple_elements_total:
+            Set elem_pattern to proc list_get from ListPrim with elements, ti
+            Set elem_temp to generate_temp_var with ctx
+
+            Note: Extract element (1-indexed in Erlang)
+            Set index_expr to create_hir_int with ti plus 1
+            Set elem_access to create_hir_call with "erlang:element", a list containing index_expr, target_expr
+
+            Note: Build element match
+            Set elem_check to build_pattern_match with elem_pattern, elem_temp, ctx
+
+            If elem_check is not equal to 0:
+                Add elem_check to end of checks
+            End If
+            Set ti to ti plus 1
+        End While
+
+        Note: Combine all checks
+        Let tuple_checks_total be proc list_length from ListPrim with checks
+        Set result to proc list_get from ListPrim with checks, 0
+        Set ti to 1
+        While ti is less than tuple_checks_total:
+            Let next_tuple_check be proc list_get from ListPrim with checks, ti
+            Set result to create_hir_binary_op with "and", result, next_tuple_check
+            Set ti to ti plus 1
+        End While
 
         Return result
     End If
 
     Note: Default - no additional check needed
-    Return null
+    Return 0
 End Process
 
 Note: ============================================================================
@@ -512,12 +794,19 @@ left-to-right with no early termination.
 Process called "translate_expressions" that takes exprs as List[ErlangExpression], ctx as ErlangTranslationContext returns List[HIRStatement]:
     Let statements be a list containing nothing
 
-    For i from 0 to length of exprs minus 1:
-        Let expr be exprs at index i
-        Let hir_expr be translate_expression with expr and ctx
+    Note: The loop bound and the last-index test are bound to a local. The
+    Note: stage1 codegen mis-evaluates a `For ... to <proc call> minus 1`
+    Note: range bound (and re-evaluating the call each iteration is wasteful),
+    Note: so the count is computed once.
+    Let expr_total be proc list_length from ListPrim with exprs
+    Let last_index be expr_total minus 1
+    Let i be 0
+    While i is less than expr_total:
+        Let expr be proc list_get from ListPrim with exprs, i
+        Let hir_expr be translate_expression with expr, ctx
 
         Note: Last expression is return value
-        If i is equal to length of exprs minus 1:
+        If i is equal to last_index:
             Let return_stmt be create_hir_return with hir_expr
             Add return_stmt to end of statements
         Otherwise:
@@ -525,7 +814,8 @@ Process called "translate_expressions" that takes exprs as List[ErlangExpression
             Let expr_stmt be create_hir_expr_statement with hir_expr
             Add expr_stmt to end of statements
         End If
-    End For
+        Set i to i plus 1
+    End While
 
     Return statements
 End Process
@@ -543,130 +833,144 @@ research/debugging workflow where partial Erlang support is acceptable.
 Process called "translate_expression" that takes expr as ErlangExpression, ctx as ErlangTranslationContext returns HIRExpression:
     Note: Translate Erlang expression to HIR expression
 
+    Note:
+    Leaf node "value"/"name" entries are read through the canonical dictionary
+    `get` primitive: the stage1 codegen lowers an `at key` read of the
+    incrementally-stored leaf value to a load that returns 0/empty, which would
+    drop the atom text, variable name, or literal value.
+    :End Note
     Note: Atom literal
     If expr.expr_type is equal to "atom":
-        Let atom_value be expr.expr_data at key "value"
+        Let atom_data be expr.expr_data
+        Let atom_value be proc get from DictPrim with atom_data, "value"
         Return create_hir_atom with atom_value
     End If
 
     Note: Variable reference
     If expr.expr_type is equal to "var":
-        Let var_name be expr.expr_data at key "name"
+        Let var_data be expr.expr_data
+        Let var_name be proc get from DictPrim with var_data, "name"
         Return create_hir_var with var_name
     End If
 
     Note: Integer literal
     If expr.expr_type is equal to "integer":
-        Let int_value be expr.expr_data at key "value"
+        Let int_data be expr.expr_data
+        Let int_value be proc get from DictPrim with int_data, "value"
         Return create_hir_int with int_value
     End If
 
     Note: Float literal
     If expr.expr_type is equal to "float":
-        Let float_value be expr.expr_data at key "value"
+        Let float_data be expr.expr_data
+        Let float_value be proc get from DictPrim with float_data, "value"
         Return create_hir_float with float_value
     End If
 
     Note: String literal
     If expr.expr_type is equal to "string":
-        Let str_value be expr.expr_data at key "value"
+        Let string_data be expr.expr_data
+        Let str_value be proc get from DictPrim with string_data, "value"
         Return create_hir_string with str_value
     End If
 
     Note: Character literal
     If expr.expr_type is equal to "char":
-        Let char_value be expr.expr_data at key "value"
+        Let char_data be expr.expr_data
+        Let char_value be proc get from DictPrim with char_data, "value"
         Return create_hir_char with char_value
     End If
 
     Note: List literal
     If expr.expr_type is equal to "list":
-        Return translate_list with expr and ctx
+        Return translate_list with expr, ctx
     End If
 
     Note: Tuple literal
     If expr.expr_type is equal to "tuple":
-        Return translate_tuple with expr and ctx
+        Return translate_tuple with expr, ctx
     End If
 
     Note: Binary literal
     If expr.expr_type is equal to "binary":
-        Return translate_binary with expr and ctx
+        Return translate_binary with expr, ctx
     End If
 
     Note: Binary operator
     If expr.expr_type is equal to "op":
-        Return translate_binary_op with expr and ctx
+        Return translate_binary_op with expr, ctx
     End If
 
     Note: Unary operator
     If expr.expr_type is equal to "unary_op":
-        Return translate_unary_op with expr and ctx
+        Return translate_unary_op with expr, ctx
     End If
 
     Note: Function call
     If expr.expr_type is equal to "call":
-        Return translate_call with expr and ctx
+        Return translate_call with expr, ctx
     End If
 
     Note: Fun expression (anonymous function)
     If expr.expr_type is equal to "fun":
-        Return translate_fun with expr and ctx
+        Return translate_fun with expr, ctx
     End If
 
     Note: Case expression
     If expr.expr_type is equal to "case":
-        Return translate_case with expr and ctx
+        Return translate_case with expr, ctx
     End If
 
     Note: If expression
     If expr.expr_type is equal to "if":
-        Return translate_if with expr and ctx
+        Return translate_if with expr, ctx
     End If
 
     Note: Receive expression
     If expr.expr_type is equal to "receive":
-        Return translate_receive with expr and ctx
+        Return translate_receive with expr, ctx
     End If
 
     Note: Try expression
     If expr.expr_type is equal to "try":
-        Return translate_try with expr and ctx
+        Return translate_try with expr, ctx
     End If
 
     Note: Begin expression
     If expr.expr_type is equal to "begin":
-        Return translate_begin with expr and ctx
+        Return translate_begin with expr, ctx
     End If
 
     Note: List comprehension
     If expr.expr_type is equal to "list_comprehension":
-        Return translate_list_comprehension with expr and ctx
+        Return translate_list_comprehension with expr, ctx
     End If
 
     Note: Binary comprehension
     If expr.expr_type is equal to "binary_comprehension":
-        Return translate_binary_comprehension with expr and ctx
+        Return translate_binary_comprehension with expr, ctx
     End If
 
     Note: Record creation
     If expr.expr_type is equal to "record_create":
-        Return translate_record_create with expr and ctx
+        Return translate_record_create with expr, ctx
     End If
 
     Note: Record access
     If expr.expr_type is equal to "record_access":
-        Return translate_record_access with expr and ctx
+        Return translate_record_access with expr, ctx
     End If
 
     Note: Macro reference
     If expr.expr_type is equal to "macro":
-        Let macro_name be expr.expr_data at key "name"
+        Let macro_data be expr.expr_data
+        Let macro_name be proc get from DictPrim with macro_data, "name"
         Return create_hir_macro with macro_name
     End If
 
     Note: Default - unsupported expression
-    Add "Unsupported Erlang expression type: " joined with expr.expr_type to end of ctx.errors
+    Let unsupported_msg be proc string_concat from StringPrim with "Unsupported Erlang expression type: ", expr.expr_type
+    Add unsupported_msg to end of ctx.errors
     Return create_hir_error with "unsupported_expression"
 End Process
 
@@ -679,13 +983,19 @@ appears at the rightmost position and each head prepends one element at a
 time. This matches how Erlang's VM constructs lists internally.
 @End Reasoning
 Process called "translate_list" that takes expr as ErlangExpression, ctx as ErlangTranslationContext returns HIRExpression:
-    Let elements be expr.expr_data at key "elements"
-    Let tail be expr.expr_data at key "tail"
+    Let list_data be expr.expr_data
+    Note:
+    "elements"/"tail" read via the canonical dictionary `get` primitive; the
+    stage1 codegen lowers an `at key` read of these dict-literal-stored handles
+    to a load that returns 0 even though they are present.
+    :End Note
+    Let elements be proc get from DictPrim with list_data, "elements"
+    Let tail be proc get from DictPrim with list_data, "tail"
 
     Let hir_elements be a list containing nothing
 
     For Each elem in elements:
-        Let hir_elem be translate_expression with elem and ctx
+        Let hir_elem be translate_expression with elem, ctx
         Add hir_elem to end of hir_elements
     End For
 
@@ -696,13 +1006,16 @@ Process called "translate_list" that takes expr as ErlangExpression, ctx as Erla
 
     Note: Improper list with tail [H|T]
     Note: Build list cons operations
-    Let result be translate_expression with tail and ctx
+    Let result be translate_expression with tail, ctx
 
-    Note: Build list from right to left
-    Let i be length of hir_elements minus 1
+    Note: Build list from right to left. The element count is bound to a local
+    Note: before computing the start index (stage1 mis-evaluates a `proc ...
+    Note: minus 1` form applied inline to a proc-call result).
+    Let hir_elements_total be proc list_length from ListPrim with hir_elements
+    Let i be hir_elements_total minus 1
     While i is greater than or equal to 0:
-        Let elem be hir_elements at index i
-        Set result to create_hir_call with "erlang:cons" and a list containing elem, result
+        Let elem be proc list_get from ListPrim with hir_elements, i
+        Set result to create_hir_call with "erlang:cons", a list containing elem, result
         Set i to i minus 1
     End While
 
@@ -717,12 +1030,18 @@ have native tuple types for it to be worth lowering to a list-based form
 here.
 @End Reasoning
 Process called "translate_tuple" that takes expr as ErlangExpression, ctx as ErlangTranslationContext returns HIRExpression:
-    Let elements be expr.expr_data at key "elements"
+    Let tuple_data be expr.expr_data
+    Note:
+    "elements" read via the canonical dictionary `get` primitive; the stage1
+    codegen lowers an `at key` read of the dict-literal-stored element list to a
+    load that returns 0 even though it is present.
+    :End Note
+    Let elements be proc get from DictPrim with tuple_data, "elements"
 
     Let hir_elements be a list containing nothing
 
     For Each elem in elements:
-        Let hir_elem be translate_expression with elem and ctx
+        Let hir_elem be translate_expression with elem, ctx
         Add hir_elem to end of hir_elements
     End For
 
@@ -739,19 +1058,27 @@ Specifiers are forwarded verbatim because Erlang's binary spec semantics are
 intricate and the backend is in the best position to lower them.
 @End Reasoning
 Process called "translate_binary" that takes expr as ErlangExpression, ctx as ErlangTranslationContext returns HIRExpression:
-    Let segments be expr.expr_data at key "segments"
+    Note:
+    expr_data / segment entries are read through the canonical dictionary `get`
+    primitive: the stage1 codegen lowers an `at key` read of these
+    dict-literal-stored handles to a load that returns 0 even though the entries
+    are present, which would feed null segment values into the translator.
+    :End Note
+    Let binary_data be expr.expr_data
+    Let segments be proc get from DictPrim with binary_data, "segments"
 
     Note: Translate binary to HIR binary construction
     Let hir_segments be a list containing nothing
 
     For Each segment in segments:
-        Let value be translate_expression with segment at key "value" and ctx
-        Let size be segment at key "size"
-        Let specifiers be segment at key "specifiers"
+        Let segment_value_expr be proc get from DictPrim with segment, "value"
+        Let value be translate_expression with segment_value_expr, ctx
+        Let size be proc get from DictPrim with segment, "size"
+        Let specifiers be proc get from DictPrim with segment, "specifiers"
 
-        Let hir_size be null
+        Let hir_size be 0
         If size is not equal to 0:
-            Set hir_size to translate_expression with size and ctx
+            Set hir_size to translate_expression with size, ctx
         End If
 
         Let segment_info be a dictionary containing:
@@ -778,9 +1105,21 @@ operators pass through (useful when Erlang adds new operator spellings the
 translator hasn't been updated for).
 @End Reasoning
 Process called "translate_binary_op" that takes expr as ErlangExpression, ctx as ErlangTranslationContext returns HIRExpression:
-    Let operator be expr.expr_data at key "operator"
-    Let left be translate_expression with expr.expr_data at key "left" and ctx
-    Let right be translate_expression with expr.expr_data at key "right" and ctx
+    Note:
+    The op node's expr_data is a dictionary literal built in parse_expression
+    ("operator"/"left"/"right"). Its "left"/"right" entries are read through the
+    canonical dictionary primitive `get` rather than the `at key` operator: the
+    stage1 codegen lowers the `at key` read of a dict-literal-stored expression
+    handle to a load that returns 0 (the handle is present and correct, as the
+    primitive `get` confirms), so reading the operand handles with `get`
+    guarantees the real sub-expression pointers reach translate_expression.
+    :End Note
+    Let binop_data be expr.expr_data
+    Let operator be proc get from DictPrim with binop_data, "operator"
+    Let left_expr be proc get from DictPrim with binop_data, "left"
+    Let right_expr be proc get from DictPrim with binop_data, "right"
+    Let left be translate_expression with left_expr, ctx
+    Let right be translate_expression with right_expr, ctx
 
     Note: Map Erlang operators to HIR operators
     Let hir_op be operator
@@ -788,19 +1127,19 @@ Process called "translate_binary_op" that takes expr as ErlangExpression, ctx as
     Note: Special Erlang operators
     If operator is equal to "!":
         Note: Message send operator
-        Return create_hir_send with left and right
+        Return create_hir_send with left, right
 
     Otherwise If operator is equal to "=":
         Note: Pattern match operator
-        Return create_hir_match with left and right
+        Return create_hir_match with left, right
 
     Otherwise If operator is equal to "++":
         Note: List concatenation
-        Return create_hir_call with "erlang:append" and a list containing left, right
+        Return create_hir_call with "erlang:append", a list containing left, right
 
     Otherwise If operator is equal to "--":
         Note: List subtraction
-        Return create_hir_call with "erlang:subtract" and a list containing left, right
+        Return create_hir_call with "erlang:subtract", a list containing left, right
 
     Otherwise If operator is equal to "=:=":
         Set hir_op to "==="  Note: Exact equality
@@ -847,8 +1186,15 @@ substitution is the entirety of the transformation; HIR's unary node form is
 otherwise identical.
 @End Reasoning
 Process called "translate_unary_op" that takes expr as ErlangExpression, ctx as ErlangTranslationContext returns HIRExpression:
-    Let operator be expr.expr_data at key "operator"
-    Let operand be translate_expression with expr.expr_data at key "operand" and ctx
+    Let unop_data be expr.expr_data
+    Note:
+    expr_data entries read via the canonical dictionary `get` primitive; the
+    stage1 codegen lowers an `at key` read of the dict-literal-stored "operand"
+    handle to a load that returns 0, which would segfault translate_expression.
+    :End Note
+    Let operator be proc get from DictPrim with unop_data, "operator"
+    Let unary_operand_expr be proc get from DictPrim with unop_data, "operand"
+    Let operand be translate_expression with unary_operand_expr, ctx
 
     Note: Map Erlang unary operators to HIR
     Let hir_op be operator
@@ -860,7 +1206,7 @@ Process called "translate_unary_op" that takes expr as ErlangExpression, ctx as 
         Set hir_op to "~"  Note: Bitwise NOT
     End If
 
-    Return create_hir_unary_op with hir_op and operand
+    Return create_hir_unary_op with hir_op, operand
 End Process
 
 @Reasoning:
@@ -874,50 +1220,78 @@ everywhere - this matches Erlang's actual runtime behaviour where the VM
 resolves bare function names against the calling module.
 @End Reasoning
 Process called "translate_call" that takes expr as ErlangExpression, ctx as ErlangTranslationContext returns HIRExpression:
-    Let function be expr.expr_data at key "function"
-    Let arguments be expr.expr_data at key "arguments"
+    Note:
+    expr_data entries are read via the canonical dictionary `get` primitive; the
+    stage1 codegen lowers an `at key` read of the dict-literal-stored
+    "function"/"arguments" handles to a load that returns 0 even though they are
+    present, which would feed a null callee/arglist into the translator.
+    :End Note
+    Let call_data be expr.expr_data
+    Let function be proc get from DictPrim with call_data, "function"
+    Let arguments be proc get from DictPrim with call_data, "arguments"
 
     Note: Translate arguments
     Let hir_args be a list containing nothing
     For Each arg in arguments:
-        Let hir_arg be translate_expression with arg and ctx
+        Let hir_arg be translate_expression with arg, ctx
         Add hir_arg to end of hir_args
     End For
 
-    Note: Check if remote call (Module:Function)
-    If function.expr_type is equal to "op" and function.expr_data at key "operator" is equal to ":":
-        Let module_expr be function.expr_data at key "left"
-        Let func_expr be function.expr_data at key "right"
+    Note:
+    All locals that are assigned across the call-shape branches are declared up
+    front. Declaring them only inside one branch and reassigning with Set from
+    another branch leaves them undefined on the path that skips the declaring
+    branch, which the stage1 codegen lowers to a null/garbage slot.
+    :End Note
+    Let module_name be ""
+    Let func_name be ""
+    Let qualified_name be ""
 
-        Let module_name be ""
-        Let func_name be ""
+    Note: Check if remote call (Module:Function). The operator lookup is bound
+    Note: to a local before the compound comparison.
+    Let function_type be function.expr_type
+    Let function_data be function.expr_data
+    Let function_op be proc get from DictPrim with function_data, "operator"
+    If function_type is equal to "op" and function_op is equal to ":":
+        Let module_expr be proc get from DictPrim with function_data, "left"
+        Let func_expr be proc get from DictPrim with function_data, "right"
 
-        If module_expr.expr_type is equal to "atom":
-            Set module_name to module_expr.expr_data at key "value"
+        Let module_expr_type be module_expr.expr_type
+        If module_expr_type is equal to "atom":
+            Let module_expr_data be module_expr.expr_data
+            Set module_name to proc get from DictPrim with module_expr_data, "value"
         End If
 
-        If func_expr.expr_type is equal to "atom":
-            Set func_name to func_expr.expr_data at key "value"
+        Let func_expr_type be func_expr.expr_type
+        If func_expr_type is equal to "atom":
+            Let func_expr_data be func_expr.expr_data
+            Set func_name to proc get from DictPrim with func_expr_data, "value"
         End If
 
-        Let qualified_name be module_name joined with ":" joined with func_name
+        Let module_colon be proc string_concat from StringPrim with module_name, ":"
+        Set qualified_name to proc string_concat from StringPrim with module_colon, func_name
 
-        Return create_hir_call with qualified_name and hir_args
+        Return create_hir_call with qualified_name, hir_args
     End If
 
     Note: Local call
-    If function.expr_type is equal to "atom":
-        Set func_name to function.expr_data at key "value"
+    If function_type is equal to "atom":
+        Let function_atom_data be function.expr_data
+        Set func_name to proc get from DictPrim with function_atom_data, "value"
 
-        Note: Qualify with current module
-        Set qualified_name to ctx.current_module joined with ":" joined with func_name
+        Note: Qualify with current module. The current_module field is bound to
+        Note: a local before the StringPrim call (stage1 mis-evaluates a
+        Note: `obj.field` proc-call argument).
+        Let cur_module_name be ctx.current_module
+        Let cur_mod_colon be proc string_concat from StringPrim with cur_module_name, ":"
+        Set qualified_name to proc string_concat from StringPrim with cur_mod_colon, func_name
 
-        Return create_hir_call with qualified_name and hir_args
+        Return create_hir_call with qualified_name, hir_args
     End If
 
     Note: Higher-order call (function variable)
-    Set func_expr to translate_expression with function and ctx
-    Return create_hir_call_indirect with func_expr and hir_args
+    Let indirect_func_expr be translate_expression with function, ctx
+    Return create_hir_call_indirect with indirect_func_expr, hir_args
 End Process
 
 @Reasoning:
@@ -930,40 +1304,54 @@ translate_clauses_with_dispatch for the body so the clause-dispatch logic is
 shared between named functions and anonymous lambdas.
 @End Reasoning
 Process called "translate_fun" that takes expr as ErlangExpression, ctx as ErlangTranslationContext returns HIRExpression:
-    Let fun_type be expr.expr_data at key "type"
+    Note:
+    fun_data entries read via the canonical dictionary `get` primitive; the
+    stage1 codegen lowers an `at key` read of these dict-literal-stored entries
+    (notably the "clauses" handle) to a load that returns 0 even though they are
+    present.
+    :End Note
+    Let fun_data be expr.expr_data
+    Let fun_type be proc get from DictPrim with fun_data, "type"
 
     Note: Function reference: fun Module:Function/Arity or fun Function/Arity
     If fun_type is equal to "remote_ref":
-        Let module_name be expr.expr_data at key "module"
-        Let func_name be expr.expr_data at key "function"
-        Let arity be expr.expr_data at key "arity"
+        Let module_name be proc get from DictPrim with fun_data, "module"
+        Let func_name be proc get from DictPrim with fun_data, "function"
+        Let arity be proc get from DictPrim with fun_data, "arity"
 
-        Let qualified_name be module_name joined with ":" joined with func_name
+        Let ref_mod_colon be proc string_concat from StringPrim with module_name, ":"
+        Let qualified_name be proc string_concat from StringPrim with ref_mod_colon, func_name
 
-        Return create_hir_function_ref with qualified_name and arity
+        Return create_hir_function_ref with qualified_name, arity
 
     Otherwise If fun_type is equal to "local_ref":
-        Set func_name to expr.expr_data at key "function"
-        Set arity to expr.expr_data at key "arity"
+        Set func_name to proc get from DictPrim with fun_data, "function"
+        Set arity to proc get from DictPrim with fun_data, "arity"
 
-        Set qualified_name to ctx.current_module joined with ":" joined with func_name
+        Let local_module_name be ctx.current_module
+        Let local_mod_colon be proc string_concat from StringPrim with local_module_name, ":"
+        Set qualified_name to proc string_concat from StringPrim with local_mod_colon, func_name
 
-        Return create_hir_function_ref with qualified_name and arity
+        Return create_hir_function_ref with qualified_name, arity
     End If
 
     Note: Anonymous function with clauses
     If fun_type is equal to "anonymous":
-        Let clauses be expr.expr_data at key "clauses"
+        Let clauses be proc get from DictPrim with fun_data, "clauses"
 
         Note: Build lambda from clauses
         Note: Use first clause to determine arity
-        Let first_clause be clauses at index 0
-        Set arity to length of first_clause.patterns
+        Let first_clause be proc list_get from ListPrim with clauses, 0
+        Note: Bind the field-access handle before passing it as a proc argument
+        Note: (stage1 mis-evaluates a `obj.field` proc-call argument).
+        Let first_clause_patterns be first_clause.patterns
+        Set arity to proc list_length from ListPrim with first_clause_patterns
 
         Note: Create parameter list
         Let parameters be a list containing nothing
         For i from 0 to arity minus 1:
-            Let param_name be "arg" joined with string representation of i
+            Let arg_i_str be proc integer_to_string from StringPrim with i
+            Let param_name be proc string_concat from StringPrim with "arg", arg_i_str
             Add param_name to end of parameters
         End For
 
@@ -973,11 +1361,11 @@ Process called "translate_fun" that takes expr as ErlangExpression, ctx as Erlan
         Note: Create parameter types
         Let param_types be a list containing nothing
         For i from 0 to arity minus 1:
-            Let any_type be create_hir_type with "any" and a list containing nothing
+            Let any_type be create_hir_type with "any", a list containing nothing
             Add any_type to end of param_types
         End For
 
-        Let return_type be create_hir_type with "any" and a list containing nothing
+        Let return_type be create_hir_type with "any", a list containing nothing
 
         Return create_hir_lambda with parameters, param_types, return_type, lambda_body
     End If
@@ -997,32 +1385,57 @@ statements. The branches list keeps source order so the first-match
 semantics persist into HIR consumers.
 @End Reasoning
 Process called "translate_case" that takes expr as ErlangExpression, ctx as ErlangTranslationContext returns HIRExpression:
-    Let scrutinee be translate_expression with expr.expr_data at key "scrutinee" and ctx
-    Let clauses be expr.expr_data at key "clauses"
+    Note:
+    case_data's "scrutinee"/"clauses" entries are read with the canonical
+    dictionary `get` primitive rather than the `at key` operator. The stage1
+    codegen lowers an `at key` read of these dict entries to a load that
+    returns 0 even though the entries are present (the primitive `get` returns
+    the real handles), which would feed a null scrutinee/clauses into the
+    translators below and segfault.
+    :End Note
+    Let case_data be expr.expr_data
+    Let clauses be proc get from DictPrim with case_data, "clauses"
 
-    Note: Build match expression with branches
+    Note: Build match expression with branches. Clause count computed once into a
+    Note: local; While loop with list_get because stage1 mis-evaluates a `For Each`
+    Note: over a dict-derived RunaList of typed clause structs.
     Let branches be a list containing nothing
+    Let case_clause_total be proc list_length from ListPrim with clauses
+    Let ci be 0
+    While ci is less than case_clause_total:
+        Let clause_raw be proc list_get from ListPrim with clauses, ci
+        Let clause be clause_raw of type ErlangFunctionClause
 
-    For Each clause in clauses:
-        Note: Each clause has pattern, guards, and body
-        Let pattern be clause.patterns at index 0
+        Note: Each clause has pattern, guards, and body. The patterns handle is
+        Note: bound before the ListPrim call (stage1 mis-evaluates a `obj.field`
+        Note: proc-call argument).
+        Let case_clause_patterns be clause.patterns
+        Let pattern be proc list_get from ListPrim with case_clause_patterns, 0
         Let guards be clause.guards
         Let body be clause.body
 
         Note: Translate pattern to HIR pattern
-        Let hir_pattern be translate_pattern with pattern and ctx
+        Let hir_pattern be translate_pattern with pattern, ctx
 
-        Note: Translate guards to conditions
+        Note: Translate guards to conditions. Outer sequence count precomputed.
         Let hir_guards be a list containing nothing
-        For Each guard_seq in guards:
-            For Each guard_expr in guard_seq:
-                Let hir_guard be translate_expression with guard_expr and ctx
+        Let case_guard_seq_total be proc list_length from ListPrim with guards
+        Let gsi be 0
+        While gsi is less than case_guard_seq_total:
+            Let guard_seq be proc list_get from ListPrim with guards, gsi
+            Let case_guard_total be proc list_length from ListPrim with guard_seq
+            Let gi be 0
+            While gi is less than case_guard_total:
+                Let guard_expr be proc list_get from ListPrim with guard_seq, gi
+                Let hir_guard be translate_expression with guard_expr, ctx
                 Add hir_guard to end of hir_guards
-            End For
-        End For
+                Set gi to gi plus 1
+            End While
+            Set gsi to gsi plus 1
+        End While
 
         Note: Translate body
-        Let hir_body be translate_expressions with body and ctx
+        Let hir_body be translate_expressions with body, ctx
 
         Let branch_info be a dictionary containing:
             "pattern" as hir_pattern,
@@ -1031,9 +1444,19 @@ Process called "translate_case" that takes expr as ErlangExpression, ctx as Erla
         End Dictionary
 
         Add branch_info to end of branches
-    End For
+        Set ci to ci plus 1
+    End While
 
-    Return create_hir_match_expr with scrutinee and branches
+    Note: Scrutinee translated last (mirrors translate_if's ordering). The
+    Note: scrutinee handle is bound to a local before the recursive translate
+    Note: call (stage1 mis-evaluates a `dict at key` value used inline as a call
+    Note: argument across an intervening loop).
+    Note: Scrutinee translated last (mirrors translate_if's ordering). The
+    Note: scrutinee handle is bound to a local before the recursive translate call.
+    Let case_scrutinee_expr be proc get from DictPrim with case_data, "scrutinee"
+    Let scrutinee be translate_expression with case_scrutinee_expr, ctx
+
+    Return create_hir_match_expr with scrutinee, branches
 End Process
 
 @Reasoning:
@@ -1045,53 +1468,81 @@ runtime raises if_clause; we do not emit that fallthrough error here because
 the if-chain naturally terminates at the last clause's else (or null).
 @End Reasoning
 Process called "translate_if" that takes expr as ErlangExpression, ctx as ErlangTranslationContext returns HIRExpression:
-    Let clauses be expr.expr_data at key "clauses"
+    Note:
+    "clauses" read via the canonical dictionary `get` primitive; the stage1
+    codegen lowers an `at key` read of the dict-literal-stored clause list to a
+    load that returns 0 even though it is present.
+    :End Note
+    Let if_data be expr.expr_data
+    Let clauses be proc get from DictPrim with if_data, "clauses"
+    Let clause_count be proc list_length from ListPrim with clauses
 
-    Note: Build nested if-else from guard sequences
-    Let if_expr be null
+    Note:
+    Build the right-nested if-chain by folding the clauses from last to first.
+    Each clause becomes `if <guard-conjunction> then <body> else <accumulated>`
+    where the accumulated else is the chain built from the clauses that follow
+    it. The innermost else starts empty (an absent else), matching Erlang's
+    behaviour where a non-matching if-chain raises if_clause at runtime - the
+    backend materialises that fallthrough. Iterating in reverse means each step
+    wraps exactly one outer clause around the already-built remainder, so the
+    first clause ends up outermost and is tested first, preserving Erlang's
+    first-true-guard-wins ordering.
+    :End Note
+    If clause_count is equal to 0:
+        Return 0
+    End If
 
-    For i from 0 to length of clauses minus 1:
-        Let clause be clauses at index i
+    Let accumulated be 0
+    Let i be clause_count minus 1
+    While i is greater than or equal to 0:
+        Let clause be proc list_get from ListPrim with clauses, i
 
-        Note: Translate guards to condition
-        Let condition be null
-        If length of clause.guards is greater than 0:
-            Let guard_seq be clause.guards at index 0
+        Note: Translate this clause's guard sequence into an AND-combined condition.
+        Let condition be 0
+        Let dispatch_guards be clause.guards
+        Let dispatch_guard_count be proc list_length from ListPrim with dispatch_guards
+        If dispatch_guard_count is greater than 0:
+            Let guard_seq be proc list_get from ListPrim with dispatch_guards, 0
             Let guard_conditions be a list containing nothing
 
             For Each guard_expr in guard_seq:
-                Let hir_guard be translate_expression with guard_expr and ctx
+                Let hir_guard be translate_expression with guard_expr, ctx
                 Add hir_guard to end of guard_conditions
             End For
 
-            Note: Combine with AND
-            If length of guard_conditions is greater than 0:
-                Set condition to guard_conditions at index 0
-                For j from 1 to length of guard_conditions minus 1:
-                    Set condition to create_hir_binary_op with "and", condition, guard_conditions at index j
-                End For
+            Let guard_cond_total be proc list_length from ListPrim with guard_conditions
+            If guard_cond_total is greater than 0:
+                Set condition to proc list_get from ListPrim with guard_conditions, 0
+                Let j be 1
+                While j is less than guard_cond_total:
+                    Let next_guard be proc list_get from ListPrim with guard_conditions, j
+                    Set condition to create_hir_binary_op with "and", condition, next_guard
+                    Set j to j plus 1
+                End While
             End If
         End If
 
-        Note: Translate body
-        Let hir_body be translate_expressions with clause.body and ctx
-
-        Note: Build if expression
-        If i is equal to 0:
-            Set if_expr to create_hir_if_expr with condition, hir_body, a list containing nothing
-        Otherwise:
-            Note: Add to else chain
-            Note: Build proper else-if chain for multiple case clauses
-            Let clause_count be proc list_length from List with clauses
-            If clause_count is greater than 1:
-                Let case_chain be proc build_case_chain with ctx, clauses, hir_case
-                Return case_chain
-            End If
-            Set if_expr to create_hir_if_expr with condition, hir_body, a list containing nothing
+        Note: A guard-less if-clause (degenerate) is unconditionally true.
+        If condition is equal to 0:
+            Set condition to create_hir_bool with true
         End If
-    End For
 
-    Return if_expr
+        Let dispatch_body_exprs be clause.body
+        Let hir_body be translate_expressions with dispatch_body_exprs, ctx
+
+        Note: The else-body wraps the chain accumulated from following clauses.
+        Note: When nothing follows (innermost), the else-body is empty.
+        Let else_body be a list containing nothing
+        If accumulated is not equal to 0:
+            Let else_stmt be create_hir_expr_statement with accumulated
+            Add else_stmt to end of else_body
+        End If
+
+        Set accumulated to create_hir_if_expr with condition, hir_body, else_body
+        Set i to i minus 1
+    End While
+
+    Return accumulated
 End Process
 
 @Reasoning:
@@ -1105,29 +1556,38 @@ semantics; backends lower it differently depending on whether they target
 actor-model runtimes, channel-based concurrency, or pure thread+queue.
 @End Reasoning
 Process called "translate_receive" that takes expr as ErlangExpression, ctx as ErlangTranslationContext returns HIRExpression:
-    Let clauses be expr.expr_data at key "clauses"
-    Let after_timeout be expr.expr_data at key "after_timeout"
-    Let after_body be expr.expr_data at key "after_body"
+    Note:
+    expr_data entries read via the canonical dictionary `get` primitive; the
+    stage1 codegen lowers an `at key` read of these dict-literal-stored handles
+    to a load that returns 0 even though they are present.
+    :End Note
+    Let receive_data be expr.expr_data
+    Let clauses be proc get from DictPrim with receive_data, "clauses"
+    Let after_timeout be proc get from DictPrim with receive_data, "after_timeout"
+    Let after_body be proc get from DictPrim with receive_data, "after_body"
 
     Note: Build receive expression
     Let receive_clauses be a list containing nothing
 
     For Each clause in clauses:
-        Let pattern be clause.patterns at index 0
+        Note: Bind the patterns handle before the ListPrim call (stage1
+        Note: mis-evaluates a `obj.field` proc-call argument).
+        Let clause_patterns be clause.patterns
+        Let pattern be proc list_get from ListPrim with clause_patterns, 0
         Let guards be clause.guards
         Let body be clause.body
 
-        Let hir_pattern be translate_pattern with pattern and ctx
+        Let hir_pattern be translate_pattern with pattern, ctx
 
         Let hir_guards be a list containing nothing
         For Each guard_seq in guards:
             For Each guard_expr in guard_seq:
-                Let hir_guard be translate_expression with guard_expr and ctx
+                Let hir_guard be translate_expression with guard_expr, ctx
                 Add hir_guard to end of hir_guards
             End For
         End For
 
-        Let hir_body be translate_expressions with body and ctx
+        Let hir_body be translate_expressions with body, ctx
 
         Let clause_info be a dictionary containing:
             "pattern" as hir_pattern,
@@ -1139,14 +1599,14 @@ Process called "translate_receive" that takes expr as ErlangExpression, ctx as E
     End For
 
     Note: Translate timeout
-    Let hir_timeout be null
+    Let hir_timeout be 0
     If after_timeout is not equal to 0:
-        Set hir_timeout to translate_expression with after_timeout and ctx
+        Set hir_timeout to translate_expression with after_timeout, ctx
     End If
 
     Let hir_after_body be a list containing nothing
-    If length of after_body is greater than 0:
-        Set hir_after_body to translate_expressions with after_body and ctx
+    If proc list_length from ListPrim with after_body is greater than 0:
+        Set hir_after_body to translate_expressions with after_body, ctx
     End If
 
     Return create_hir_receive with receive_clauses, hir_timeout, hir_after_body
@@ -1163,32 +1623,41 @@ pattern, which the backend uses to filter exceptions by kind and then
 match the exception term itself.
 @End Reasoning
 Process called "translate_try" that takes expr as ErlangExpression, ctx as ErlangTranslationContext returns HIRExpression:
-    Let try_body be expr.expr_data at key "try_body"
-    Let of_clauses be expr.expr_data at key "of_clauses"
-    Let catch_clauses be expr.expr_data at key "catch_clauses"
-    Let after_body be expr.expr_data at key "after_body"
+    Note:
+    expr_data entries read via the canonical dictionary `get` primitive; the
+    stage1 codegen lowers an `at key` read of these dict-literal-stored lists to
+    a load that returns 0 even though they are present.
+    :End Note
+    Let try_data be expr.expr_data
+    Let try_body be proc get from DictPrim with try_data, "try_body"
+    Let of_clauses be proc get from DictPrim with try_data, "of_clauses"
+    Let catch_clauses be proc get from DictPrim with try_data, "catch_clauses"
+    Let after_body be proc get from DictPrim with try_data, "after_body"
 
     Note: Translate try body
-    Let hir_try_body be translate_expressions with try_body and ctx
+    Let hir_try_body be translate_expressions with try_body, ctx
 
     Note: Translate of clauses
     Let hir_of_clauses be a list containing nothing
     For Each clause in of_clauses:
-        Let pattern be clause.patterns at index 0
+        Note: Bind the patterns handle before the ListPrim call (stage1
+        Note: mis-evaluates a `obj.field` proc-call argument).
+        Let of_clause_patterns be clause.patterns
+        Let pattern be proc list_get from ListPrim with of_clause_patterns, 0
         Let guards be clause.guards
         Let body be clause.body
 
-        Let hir_pattern be translate_pattern with pattern and ctx
+        Let hir_pattern be translate_pattern with pattern, ctx
 
         Let hir_guards be a list containing nothing
         For Each guard_seq in guards:
             For Each guard_expr in guard_seq:
-                Let hir_guard be translate_expression with guard_expr and ctx
+                Let hir_guard be translate_expression with guard_expr, ctx
                 Add hir_guard to end of hir_guards
             End For
         End For
 
-        Let hir_body be translate_expressions with body and ctx
+        Let hir_body be translate_expressions with body, ctx
 
         Let clause_info be a dictionary containing:
             "pattern" as hir_pattern,
@@ -1202,25 +1671,25 @@ Process called "translate_try" that takes expr as ErlangExpression, ctx as Erlan
     Note: Translate catch clauses
     Let hir_catch_clauses be a list containing nothing
     For Each catch_data in catch_clauses:
-        Let exception_class be catch_data at key "exception_class"
-        Let exception_pattern be catch_data at key "exception_pattern"
-        Set guards to catch_data at key "guards"
-        Set body to catch_data at key "body"
+        Let exception_class be proc get from DictPrim with catch_data, "exception_class"
+        Let exception_pattern be proc get from DictPrim with catch_data, "exception_pattern"
+        Set guards to proc get from DictPrim with catch_data, "guards"
+        Set body to proc get from DictPrim with catch_data, "body"
 
-        Let hir_exception_class be null
+        Let hir_exception_class be 0
         If exception_class is not equal to 0:
-            Set hir_exception_class to translate_expression with exception_class and ctx
+            Set hir_exception_class to translate_expression with exception_class, ctx
         End If
 
-        Let hir_exception_pattern be translate_pattern with exception_pattern and ctx
+        Let hir_exception_pattern be translate_pattern with exception_pattern, ctx
 
         Set hir_guards to a list containing nothing
         For Each guard_expr in guards:
-            Set hir_guard to translate_expression with guard_expr and ctx
+            Set hir_guard to translate_expression with guard_expr, ctx
             Add hir_guard to end of hir_guards
         End For
 
-        Set hir_body to translate_expressions with body and ctx
+        Set hir_body to translate_expressions with body, ctx
 
         Let catch_info be a dictionary containing:
             "exception_class" as hir_exception_class,
@@ -1234,8 +1703,8 @@ Process called "translate_try" that takes expr as ErlangExpression, ctx as Erlan
 
     Note: Translate after body
     Let hir_after_body be a list containing nothing
-    If length of after_body is greater than 0:
-        Set hir_after_body to translate_expressions with after_body and ctx
+    If proc list_length from ListPrim with after_body is greater than 0:
+        Set hir_after_body to translate_expressions with after_body, ctx
     End If
 
     Return create_hir_try with hir_try_body, hir_of_clauses, hir_catch_clauses, hir_after_body
@@ -1251,8 +1720,14 @@ binding scope - bindings inside the block escape into the surrounding
 scope.
 @End Reasoning
 Process called "translate_begin" that takes expr as ErlangExpression, ctx as ErlangTranslationContext returns HIRExpression:
-    Let body be expr.expr_data at key "body"
-    Let hir_body be translate_expressions with body and ctx
+    Note:
+    "body" read via the canonical dictionary `get` primitive; the stage1 codegen
+    lowers an `at key` read of the dict-literal-stored body list to a load that
+    returns 0 even though it is present.
+    :End Note
+    Let begin_data be expr.expr_data
+    Let body be proc get from DictPrim with begin_data, "body"
+    Let hir_body be translate_expressions with body, ctx
 
     Note: Begin-end is just a block expression
     Return create_hir_block with hir_body
@@ -1269,33 +1744,64 @@ comprehension node keeps the generator/filter distinction so backends can
 either lower to nested loops or use a target language's own comprehension.
 @End Reasoning
 Process called "translate_list_comprehension" that takes expr as ErlangExpression, ctx as ErlangTranslationContext returns HIRExpression:
-    Let template be expr.expr_data at key "template"
-    Let qualifiers be expr.expr_data at key "qualifiers"
+    Note:
+    expr_data entries are read through the canonical dictionary `get` primitive
+    rather than the `at key` operator: the stage1 codegen lowers an `at key`
+    read of these dict-literal-stored handles to a load that returns 0 even
+    though the entries are present, which would feed a null template/qualifier
+    into the translators and segfault.
+    :End Note
+    Let lc_data be expr.expr_data
+    Let template be proc get from DictPrim with lc_data, "template"
+    Let qualifiers be proc get from DictPrim with lc_data, "qualifiers"
 
     Note: Build nested loops and filters for comprehension
     Note: [Template || Qualifier1, Qualifier2, ...]
 
     Note: Translate template
-    Let hir_template be translate_expression with template and ctx
+    Let hir_template be translate_expression with template, ctx
 
-    Note: Build comprehension structure
-    Note: Build nested loops for multiple qualifiers in comprehension
-    Let qualifier_count be proc list_length from List with qualifiers
-    If qualifier_count is greater than 1:
-        Let nested_loops be proc build_nested_comprehension_loops with ctx, hir_template, qualifiers
-        Return nested_loops
-    End If
+    Note:
+    Translate every qualifier (generator or filter) in source order into the
+    qualifier list of one HIR list-comprehension node. The node carries the
+    full ordered qualifier sequence, so a comprehension with several generators
+    and filters is represented faithfully regardless of count - the backend
+    lowers the ordered qualifiers into the appropriate nested loops/filters.
+    No separate multi-qualifier path is needed: a single loop over all
+    qualifiers handles one or many uniformly.
+    :End Note
     Let hir_qualifiers be a list containing nothing
 
-    For Each qualifier in qualifiers:
-        Let qual_type be qualifier at key "type"
+    Note:
+    Iterate the qualifier list with an explicit index + list_get rather than a
+    For-Each: the For-Each element binding over a dictionary-valued RunaList
+    returned from `get` does not carry the live element pointer reliably under
+    the stage1 codegen, leaving each qualifier's "type" read empty and dropping
+    every qualifier from the comprehension. The indexed While reads each element
+    handle directly.
+    :End Note
+    Let qualifiers_total be proc list_length from ListPrim with qualifiers
+    Let qi be 0
+    While qi is less than qualifiers_total:
+        Let qualifier be proc list_get from ListPrim with qualifiers, qi
+        Let qual_type be proc get from DictPrim with qualifier, "type"
 
-        If qual_type is equal to "generator":
-            Let pattern be qualifier at key "pattern"
-            Let list_expr be qualifier at key "list"
+        Note:
+        The qualifier "type" tag is compared with string_equals (content
+        comparison) rather than `is equal to`: the qualifier dictionaries store
+        the tag as a parser-local string value, and the stage1 codegen's
+        `is equal to` on two String operands tests handle identity, not content,
+        so it never matches the literal here and silently drops the qualifier.
+        :End Note
+        Let qual_is_generator be proc string_equals from StringCore with qual_type, "generator"
+        Let qual_is_filter be proc string_equals from StringCore with qual_type, "filter"
 
-            Let hir_pattern be translate_pattern with pattern and ctx
-            Let hir_list be translate_expression with list_expr and ctx
+        If qual_is_generator is equal to 1:
+            Let pattern be proc get from DictPrim with qualifier, "pattern"
+            Let list_expr be proc get from DictPrim with qualifier, "list"
+
+            Let hir_pattern be translate_pattern with pattern, ctx
+            Let hir_list be translate_expression with list_expr, ctx
 
             Let gen_info be a dictionary containing:
                 "type" as "generator",
@@ -1305,9 +1811,9 @@ Process called "translate_list_comprehension" that takes expr as ErlangExpressio
 
             Add gen_info to end of hir_qualifiers
 
-        Otherwise If qual_type is equal to "filter":
-            Let filter_expr be qualifier at key "expression"
-            Let hir_filter be translate_expression with filter_expr and ctx
+        Otherwise If qual_is_filter is equal to 1:
+            Let filter_expr be proc get from DictPrim with qualifier, "expression"
+            Let hir_filter be translate_expression with filter_expr, ctx
 
             Let filter_info be a dictionary containing:
                 "type" as "filter",
@@ -1316,9 +1822,10 @@ Process called "translate_list_comprehension" that takes expr as ErlangExpressio
 
             Add filter_info to end of hir_qualifiers
         End If
-    End For
+        Set qi to qi plus 1
+    End While
 
-    Return create_hir_list_comprehension with hir_template and hir_qualifiers
+    Return create_hir_list_comprehension with hir_template, hir_qualifiers
 End Process
 
 @Reasoning:
@@ -1331,8 +1838,14 @@ the source through either "list" or "binary" key so the backend knows which
 collection kind to iterate.
 @End Reasoning
 Process called "translate_binary_comprehension" that takes expr as ErlangExpression, ctx as ErlangTranslationContext returns HIRExpression:
-    Let template be expr.expr_data at key "template"
-    Let qualifiers be expr.expr_data at key "qualifiers"
+    Note:
+    expr_data entries read through the canonical dictionary `get` primitive:
+    the stage1 codegen lowers an `at key` read of these dict-literal-stored
+    handles to a load that returns 0 even though the entries are present.
+    :End Note
+    Let bc_data be expr.expr_data
+    Let template be proc get from DictPrim with bc_data, "template"
+    Let qualifiers be proc get from DictPrim with bc_data, "qualifiers"
 
     Note: Similar to list comprehension but produces binary
     Let hir_template be template  Note: Template is segment dict
@@ -1340,18 +1853,18 @@ Process called "translate_binary_comprehension" that takes expr as ErlangExpress
     Let hir_qualifiers be a list containing nothing
 
     For Each qualifier in qualifiers:
-        Let qual_type be qualifier at key "type"
+        Let qual_type be proc get from DictPrim with qualifier, "type"
 
         If qual_type is equal to "generator" or qual_type is equal to "binary_generator":
-            Let pattern be qualifier at key "pattern"
+            Let pattern be proc get from DictPrim with qualifier, "pattern"
             Let source_key be "list"
             If qual_type is equal to "binary_generator":
                 Set source_key to "binary"
             End If
-            Let source_expr be qualifier at key source_key
+            Let source_expr be proc get from DictPrim with qualifier, source_key
 
-            Let hir_pattern be translate_pattern with pattern and ctx
-            Let hir_source be translate_expression with source_expr and ctx
+            Let hir_pattern be translate_pattern with pattern, ctx
+            Let hir_source be translate_expression with source_expr, ctx
 
             Let gen_info be a dictionary containing:
                 "type" as qual_type,
@@ -1362,8 +1875,8 @@ Process called "translate_binary_comprehension" that takes expr as ErlangExpress
             Add gen_info to end of hir_qualifiers
 
         Otherwise If qual_type is equal to "filter":
-            Let filter_expr be qualifier at key "expression"
-            Let hir_filter be translate_expression with filter_expr and ctx
+            Let filter_expr be proc get from DictPrim with qualifier, "expression"
+            Let hir_filter be translate_expression with filter_expr, ctx
 
             Let filter_info be a dictionary containing:
                 "type" as "filter",
@@ -1374,7 +1887,7 @@ Process called "translate_binary_comprehension" that takes expr as ErlangExpress
         End If
     End For
 
-    Return create_hir_binary_comprehension with hir_template and hir_qualifiers
+    Return create_hir_binary_comprehension with hir_template, hir_qualifiers
 End Process
 
 @Reasoning:
@@ -1387,28 +1900,52 @@ lowered. The record_def lookup in ctx.records is currently used only for
 later type checking; field validation happens during semantic analysis.
 @End Reasoning
 Process called "translate_record_create" that takes expr as ErlangExpression, ctx as ErlangTranslationContext returns HIRExpression:
-    Let record_name be expr.expr_data at key "name"
-    Let fields be expr.expr_data at key "fields"
-    Let base be expr.expr_data at key "base"
+    Note:
+    expr_data / field entries read via the canonical dictionary `get` primitive;
+    the stage1 codegen lowers an `at key` read of the dict-literal-stored
+    "fields"/"base"/field "value" handles to a load that returns 0 even though
+    they are present.
+    :End Note
+    Let record_create_data be expr.expr_data
+    Let record_name be proc get from DictPrim with record_create_data, "name"
+    Let fields be proc get from DictPrim with record_create_data, "fields"
+    Let base be proc get from DictPrim with record_create_data, "base"
 
     Note: Get record definition from context
-    Let record_def be ctx.records at key record_name
+    Let ctx_records be ctx.records
+    Let record_def be proc get from DictPrim with ctx_records, record_name
 
-    Note: Build field map
-    Let hir_fields be a dictionary containing nothing
+    Note:
+    The field map is built as an ordered LIST of {name, value} dictionary
+    literals rather than a name-keyed dictionary. A dynamic-key dictionary
+    (Set <dict> at key <variable> ...) does not round-trip through the stage1
+    codegen - dict_keys returns an empty key set downstream - so the record
+    fields would be silently dropped. An ordered list of literal-keyed field
+    dictionaries reads back faithfully. The source fields are walked by index
+    (For-Each element bindings over a get-returned RunaList do not carry the
+    live element pointer reliably under stage1).
+    :End Note
+    Let hir_fields be a list containing nothing
+    Let record_field_total be proc list_length from ListPrim with fields
+    Let rfi be 0
+    While rfi is less than record_field_total:
+        Let field_data be proc list_get from ListPrim with fields, rfi
+        Let field_name be proc get from DictPrim with field_data, "name"
+        Let field_value be proc get from DictPrim with field_data, "value"
 
-    For Each field_data in fields:
-        Let field_name be field_data at key "name"
-        Let field_value be field_data at key "value"
-
-        Let hir_value be translate_expression with field_value and ctx
-        Set hir_fields at key field_name to hir_value
-    End For
+        Let hir_value be translate_expression with field_value, ctx
+        Let hir_field be a dictionary containing:
+            "name" as field_name,
+            "value" as hir_value
+        End Dictionary
+        Add hir_field to end of hir_fields
+        Set rfi to rfi plus 1
+    End While
 
     Note: Handle record update
-    Let hir_base be null
+    Let hir_base be 0
     If base is not equal to 0:
-        Set hir_base to translate_expression with base and ctx
+        Set hir_base to translate_expression with base, ctx
     End If
 
     Return create_hir_record with record_name, hir_fields, hir_base
@@ -1422,12 +1959,18 @@ the record definition is available). HIR consumers handling record_access
 nodes are expected to consult the record definition catalogue separately.
 @End Reasoning
 Process called "translate_record_access" that takes expr as ErlangExpression, ctx as ErlangTranslationContext returns HIRExpression:
-    Let record be expr.expr_data at key "record"
-    Let field be expr.expr_data at key "field"
+    Note:
+    "record"/"field" read via the canonical dictionary `get` primitive; the
+    stage1 codegen lowers an `at key` read of the dict-literal-stored "record"
+    handle to a load that returns 0 even though it is present.
+    :End Note
+    Let record_access_data be expr.expr_data
+    Let record be proc get from DictPrim with record_access_data, "record"
+    Let field be proc get from DictPrim with record_access_data, "field"
 
-    Let hir_record be translate_expression with record and ctx
+    Let hir_record be translate_expression with record, ctx
 
-    Return create_hir_record_access with hir_record and field
+    Return create_hir_record_access with hir_record, field
 End Process
 
 @Reasoning:
@@ -1444,46 +1987,53 @@ original Erlang would have rejected.
 @End Reasoning
 Process called "translate_pattern" that takes pattern as ErlangExpression and ctx as ErlangTranslationContext returns ErlangPatternIR:
     Note: Translate Erlang pattern to HIR pattern
+    Let pattern_data be pattern.expr_data
 
     If pattern.expr_type is equal to "var":
-        Let var_name be pattern.expr_data at key "name"
+        Let var_name be proc get from DictPrim with pattern_data, "name"
         Return create_hir_var_pattern with var_name
     End If
 
     If pattern.expr_type is equal to "atom":
-        Let atom_value be pattern.expr_data at key "value"
-        Return create_hir_literal_pattern with atom_value
+        Let atom_value be proc get from DictPrim with pattern_data, "value"
+        Let atom_literal_kind be "atom_literal"
+        Return create_hir_literal_pattern with atom_value, atom_literal_kind
     End If
 
     If pattern.expr_type is equal to "integer":
-        Let int_value be pattern.expr_data at key "value"
-        Return create_hir_literal_pattern with int_value
+        Let int_value be proc get from DictPrim with pattern_data, "value"
+        Let int_literal_kind be "int_literal"
+        Return create_hir_literal_pattern with int_value, int_literal_kind
     End If
 
     If pattern.expr_type is equal to "list":
-        Let elements be pattern.expr_data at key "elements"
-        Let tail be pattern.expr_data at key "tail"
+        Note:
+        "elements"/"tail" read via the canonical dictionary `get` primitive; an
+        `at key` read of the dict-literal-stored handles returns 0 under stage1.
+        :End Note
+        Let elements be proc get from DictPrim with pattern_data, "elements"
+        Let tail be proc get from DictPrim with pattern_data, "tail"
 
         Let hir_elements be a list containing nothing
         For Each elem in elements:
-            Let hir_elem be translate_pattern with elem and ctx
+            Let hir_elem be translate_pattern with elem, ctx
             Add hir_elem to end of hir_elements
         End For
 
-        Let hir_tail be null
+        Let hir_tail be 0
         If tail is not equal to 0:
-            Set hir_tail to translate_pattern with tail and ctx
+            Set hir_tail to translate_pattern with tail, ctx
         End If
 
-        Return create_hir_list_pattern with hir_elements and hir_tail
+        Return create_hir_list_pattern with hir_elements, hir_tail
     End If
 
     If pattern.expr_type is equal to "tuple":
-        Set elements to pattern.expr_data at key "elements"
+        Set elements to proc get from DictPrim with pattern_data, "elements"
 
         Set hir_elements to a list containing nothing
         For Each elem in elements:
-            Set hir_elem to translate_pattern with elem and ctx
+            Set hir_elem to translate_pattern with elem, ctx
             Add hir_elem to end of hir_elements
         End For
 
@@ -1668,13 +2218,19 @@ pre-qualified by translate_call so consumers do not need to re-resolve
 module context.
 @End Reasoning
 Process called "create_hir_call" that takes function_name as String, arguments as List[HIRExpression] returns HIRExpression:
+    Note:
+    HIR data dict built as a literal so the backend's `get` reads of "function"
+    and "args" return the stored values; incremental "Set at key" stores do not
+    round-trip through the stage1 codegen to the backend.
+    :End Note
     Let call_data be a dictionary containing:
         "function" as function_name,
         "args" as arguments
     End Dictionary
 
+    Let call_kind be "call"
     Return a value of type HIRExpression with
-        kind as "call",
+        kind as call_kind,
         data as call_data
 End Process
 
@@ -1709,8 +2265,9 @@ Process called "create_hir_lambda" that takes parameters as List[String], param_
         "body" as body
     End Dictionary
 
+    Let lambda_kind be "lambda"
     Return a value of type HIRExpression with
-        kind as "lambda",
+        kind as lambda_kind,
         data as lambda_data
 End Process
 
@@ -1743,8 +2300,9 @@ Process called "create_hir_send" that takes destination as HIRExpression, messag
         "message" as message
     End Dictionary
 
+    Let send_kind be "send"
     Return a value of type HIRExpression with
-        kind as "send",
+        kind as send_kind,
         data as send_data
 End Process
 
@@ -1778,8 +2336,9 @@ Process called "create_hir_match_expr" that takes scrutinee as HIRExpression, br
         "branches" as branches
     End Dictionary
 
+    Let match_expr_kind be "match_expr"
     Return a value of type HIRExpression with
-        kind as "match_expr",
+        kind as match_expr_kind,
         data as match_data
 End Process
 
@@ -1805,7 +2364,7 @@ End Process
 Receive-expression constructor for Erlang's mailbox primitive. Holds the
 list of receive clauses (each with pattern+guards+body), an optional
 timeout expression, and the after-body statements that run if the timeout
-fires. Both timeout and after_body may be null when no 'after' clause was
+fires. Both timeout and after_body may be 0 when no 'after' clause was
 present.
 @End Reasoning
 Process called "create_hir_receive" that takes clauses as List[Any], timeout as HIRExpression, after_body as List[HIRStatement] returns HIRExpression:
@@ -1880,8 +2439,9 @@ Process called "create_hir_binary_comprehension" that takes template as Any, qua
         "qualifiers" as qualifiers
     End Dictionary
 
+    Let binary_comp_kind be "binary_comprehension"
     Return a value of type HIRExpression with
-        kind as "binary_comprehension",
+        kind as binary_comp_kind,
         data as comp_data
 End Process
 
@@ -1966,6 +2526,26 @@ Process called "create_hir_expr_statement" that takes expr as HIRExpression retu
 End Process
 
 @Reasoning:
+Assignment-statement constructor producing the "assign" HIR statement the
+Erlang backend lowers to a single-shot match binding (Target = Value). Used by
+translate_clauses_with_dispatch to rebind a clause's own simple-variable
+parameter name to the shared synthetic formal (e.g. `Y = arg0`) when the
+clauses disagree on names at a position, so each clause body's references
+resolve to a live binding. The data dictionary carries the target and value
+HIR expression nodes under the keys generate_assignment reads.
+@End Reasoning
+Process called "create_hir_assign" that takes target as HIRExpression, value as HIRExpression returns HIRStatement:
+    Let assign_data be a dictionary containing:
+        "target" as target,
+        "value" as value
+    End Dictionary
+
+    Return a value of type HIRStatement with
+        stmt_type as "assign",
+        data as assign_data
+End Process
+
+@Reasoning:
 Statement-position if constructor (companion to create_hir_if_expr which
 produces an if EXPRESSION). Used for clause dispatch in
 translate_clauses_with_dispatch where the if must be a top-level statement
@@ -2000,9 +2580,15 @@ End Process
 Literal pattern constructor for atoms, integers, floats, strings, and
 chars in pattern position. Match semantics are exact-equality.
 @End Reasoning
-Process called "create_hir_literal_pattern" that takes value as Any returns ErlangPatternIR:
+Process called "create_hir_literal_pattern" that takes value as Any, literal_kind as String returns ErlangPatternIR:
+    Note:
+    literal_kind ("atom_literal" or "int_literal") is folded into pattern_type
+    so the backend reconstructs the correct Erlang literal form (atom vs integer)
+    from the tag rather than inspecting the value's runtime type, which the code
+    generator cannot dispatch on. The raw value is preserved in data.
+    :End Note
     Return a value of type ErlangPatternIR with
-        pattern_type as "literal",
+        pattern_type as literal_kind,
         data as value
 End Process
 
