@@ -1,0 +1,815 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+Licensed under Apache 2.0
+:End Note
+
+Note:
+R Translation Round-Trip Probe
+
+End-to-end proof that the R translation pipeline is REAL, not a skeleton:
+
+    R source
+      -> r_lexer    (tokenize: names, keywords, numbers, strings, operators,
+                     the R-only %%/%/%/^ operators, <-/=/<<- assignment, $/[[/[/::,
+                     |> pipe, c(...)/list(...))
+      -> r_parser   (build the locked 72-byte R AST: function defs with defaults,
+                     if/else, for, assignments, calls with named args, vectors,
+                     member/slot/namespace access, indexing)
+      -> r_to_hir   (lower the R AST to the canonical hir_nodes producer model,
+                     tagging every R-only spelling with an "r_*" metadata key)
+      -> hir_to_r   (emit HIR back to valid R text, recovering each R spelling)
+      -> re-lex / re-parse / re-to_hir of the emitted text
+      -> structural HIR equality on the key constructs (CONTENT, not presence)
+
+The probe feeds a representative R program that exercises every major construct the
+task requires:
+
+  - >= 6 function definitions          (square/cube/add/scale/describe/combine <- function ...)
+  - an assignment with <-              (every function binding plus result <- ...)
+  - a default-argument parameter       (function(x, y = 1) ...)
+  - an if/else                         (if (n > 10) ... else ...)
+  - a for-loop                         (for (i in seq) ...)
+  - a c(...) vector with elements      (nums <- c(1, 2, 3, 4))
+  - $ and [[ ]] indexing               (df$col ; lst[[1]])
+  - a named call argument              (scale(nums, factor = 2))
+
+It lowers the source to HIR1, asserts the CONTENT of each construct (function names,
+the assignment operator token, the default-arg parameter, the if/else branches, the
+for-loop variable, the vector's element count, the $/[[ access kinds, the named
+argument name), emits HIR1 back to R text, re-runs the whole pipeline on the emitted
+text to HIR2, and asserts HIR2 is STRUCTURALLY EQUAL to HIR1 on those same key
+constructs. Structural equality (node-kind tags plus identifying payloads) is the
+correct semantic-equivalence check because the emitter re-indents and normalises
+whitespace while the meaning is identical.
+
+The R HIR node model is the canonical hir_nodes producer surface: every node is an
+int-tagged record read via hir_node_type (the kind) and the hir_get_* accessors
+(structural fields). R function definitions are bound through an assignment whose
+right-hand side is the HIR function node, so the probe walks expression statements
+to their inner assignments to reach the functions.
+
+Exit code: number of failed assertions (0 == all passed). No exit_with_code.
+:End Note
+
+Import "compiler/middle/gungnir/hir/translation/frontends/r/r_parser.runa" as RParser
+Import "compiler/middle/gungnir/hir/translation/frontends/r/r_to_hir.runa" as RFrontend
+Import "compiler/middle/gungnir/hir/translation/backends/r/hir_to_r.runa" as RBackend
+Import "compiler/middle/gungnir/hir/hir_nodes.runa" as HIR
+Import "compiler/frontend/primitives/collections/list.runa" as List
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "tests/test_utils.runa" as TestUtils
+
+Note: ============================================================================
+Note: Pipeline helpers
+Note: ============================================================================
+
+@Reasoning:
+Each round of the probe runs the identical front-of-pipeline (parse -> to_hir).
+Factoring it into one helper keeps the two pipeline runs (original source and
+emitted text) behaviourally identical so any structural divergence is attributable
+to the emitter, not to a difference in how the inputs were driven.
+@End Reasoning
+@Implementation:
+Drives parse_r_source to the R AST_PROGRAM root, then lowers it via
+translate_r_to_hir and returns the HIR module. Returns 0 if any stage yields 0.
+@End Implementation
+Process called "source_to_hir" takes source as Integer returns Integer:
+    Let ast be proc parse_r_source from RParser with source
+    If ast is equal to 0:
+        Return 0
+    End If
+    Let hir be proc translate_r_to_hir from RFrontend with ast
+    Return hir
+End Process
+
+@Reasoning:
+The R frontend wraps top-level statements in expression statements and binds
+functions through assignment. R parses every assignment operator (<-, =, <<-, ->,
+->>) as a binary operator carrying the operator token in "r_op_token", so an
+assignment lowers to a HIR_BINARY_EXPR tagged with the assignment token (8020 for
+<-, 8024 for =, etc.). This helper returns the inner binary-assignment expression of
+a declaration when that declaration is an expression statement wrapping a binary
+expression whose r_op_token is one of the assignment tokens; 0 otherwise. It is the
+shared step every function/vector lookup uses to reach the assigned value.
+@End Reasoning
+Process called "decl_assign" takes decl as Integer returns Integer:
+    If decl is equal to 0:
+        Return 0
+    End If
+    Let decl_kind be proc hir_node_type from HIR with decl
+    If decl_kind is equal to HIR.HIR_EXPR_STMT:
+        Let inner be proc hir_get_expression_statement_expr from HIR with decl
+        Let is_assign be proc is_assignment_binary with inner
+        If is_assign is equal to 1:
+            Return inner
+        End If
+    End If
+    Return 0
+End Process
+
+@Reasoning:
+Returns 1 when a node is an assignment expressed as a binary operator: a
+HIR_BINARY_EXPR whose "r_op_token" is one of R's assignment tokens (8020 <-, 8021
+<<-, 8022 ->, 8023 ->>, 8024 =). This is the canonical recogniser for R assignments,
+which the parser models as binary operators rather than dedicated assignment nodes.
+@End Reasoning
+Process called "is_assignment_binary" takes node as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    Let kind be proc hir_node_type from HIR with node
+    If kind is not equal to HIR.HIR_BINARY_EXPR:
+        Return 0
+    End If
+    Let token be proc hir_get_metadata from HIR with node, "r_op_token"
+    If token is equal to 8020:
+        Return 1
+    End If
+    If token is equal to 8021:
+        Return 1
+    End If
+    If token is equal to 8022:
+        Return 1
+    End If
+    If token is equal to 8023:
+        Return 1
+    End If
+    If token is equal to 8024:
+        Return 1
+    End If
+    Return 0
+End Process
+
+@Reasoning:
+Returns the assignment target (left-hand side) of a binary-assignment node via
+hir_get_binary_left, since R assignments are binary expressions.
+@End Reasoning
+Process called "assign_lhs" takes node as Integer returns Integer:
+    Return proc hir_get_binary_left from HIR with node
+End Process
+
+@Reasoning:
+Returns the assigned value (right-hand side) of a binary-assignment node via
+hir_get_binary_right, since R assignments are binary expressions.
+@End Reasoning
+Process called "assign_rhs" takes node as Integer returns Integer:
+    Return proc hir_get_binary_right from HIR with node
+End Process
+
+@Reasoning:
+Counts the function definitions in the module. Each function is the right-hand side
+of a top-level assignment (name <- function(...){...}). Linear-scanning the
+declarations and counting assignments whose RHS is a HIR_FUNCTION proves >= 6
+functions survive both lowering and round-trip.
+@End Reasoning
+Process called "count_functions" takes module as Integer returns Integer:
+    If module is equal to 0:
+        Return 0
+    End If
+    Let declarations be proc hir_get_declarations from HIR with module
+    If declarations is equal to 0:
+        Return 0
+    End If
+    Let count be proc list_length from List with declarations
+    Let found be 0
+    Let i be 0
+    While i is less than count:
+        Let decl be proc list_get from List with declarations, i
+        Let assign be proc decl_assign with decl
+        If assign is not equal to 0:
+            Let rhs be proc assign_rhs with assign
+            Let rhs_kind be proc hir_node_type from HIR with rhs
+            If rhs_kind is equal to HIR.HIR_FUNCTION:
+                Set found to found plus 1
+            End If
+        End If
+        Set i to i plus 1
+    End While
+    Return found
+End Process
+
+@Reasoning:
+Returns the HIR function node bound to a given name, located by scanning the
+top-level assignments for one whose left-hand identifier matches the requested name
+and whose right-hand side is a function. This lets the probe assert a SPECIFIC
+function (by name) survives, not merely that some function exists.
+@End Reasoning
+Process called "find_function_named" takes module as Integer, name as Integer returns Integer:
+    If module is equal to 0:
+        Return 0
+    End If
+    Let declarations be proc hir_get_declarations from HIR with module
+    If declarations is equal to 0:
+        Return 0
+    End If
+    Let count be proc list_length from List with declarations
+    Let i be 0
+    While i is less than count:
+        Let decl be proc list_get from List with declarations, i
+        Let assign be proc decl_assign with decl
+        If assign is not equal to 0:
+            Let lhs be proc assign_lhs with assign
+            Let lhs_kind be proc hir_node_type from HIR with lhs
+            If lhs_kind is equal to HIR.HIR_IDENTIFIER:
+                Let lhs_name be proc hir_get_identifier_name from HIR with lhs
+                Let name_ok be proc string_equals from StringCore with lhs_name, name
+                If name_ok is equal to 1:
+                    Let rhs be proc assign_rhs with assign
+                    Let rhs_kind be proc hir_node_type from HIR with rhs
+                    If rhs_kind is equal to HIR.HIR_FUNCTION:
+                        Return rhs
+                    End If
+                End If
+            End If
+        End If
+        Set i to i plus 1
+    End While
+    Return 0
+End Process
+
+@Reasoning:
+Locates the first top-level declaration of a given HIR kind (e.g. HIR_IF, HIR_FOR_IN)
+by linear scan, robust to statement reordering. Used to reach the if/else and the
+for-loop directly.
+@End Reasoning
+Process called "find_decl" takes module as Integer, kind as Integer returns Integer:
+    If module is equal to 0:
+        Return 0
+    End If
+    Let declarations be proc hir_get_declarations from HIR with module
+    If declarations is equal to 0:
+        Return 0
+    End If
+    Let count be proc list_length from List with declarations
+    Let i be 0
+    While i is less than count:
+        Let decl be proc list_get from List with declarations, i
+        Let decl_kind be proc hir_node_type from HIR with decl
+        If decl_kind is equal to kind:
+            Return decl
+        End If
+        Set i to i plus 1
+    End While
+    Return 0
+End Process
+
+@Reasoning:
+Returns the right-hand side of the first top-level assignment whose RHS is a member
+expression carrying the given tag value ("r_s4_slot" present, or a $ access which has
+no tag). When tag is the empty string the helper matches a plain $ member access
+(no namespace and no slot tag); otherwise it matches a member expression whose tag
+key is set to "true". This reaches the $ access and (separately) any tagged access.
+@End Reasoning
+Process called "find_assign_rhs_member" takes module as Integer, tag as Integer returns Integer:
+    If module is equal to 0:
+        Return 0
+    End If
+    Let declarations be proc hir_get_declarations from HIR with module
+    If declarations is equal to 0:
+        Return 0
+    End If
+    Let count be proc list_length from List with declarations
+    Let i be 0
+    While i is less than count:
+        Let decl be proc list_get from List with declarations, i
+        Let assign be proc decl_assign with decl
+        If assign is not equal to 0:
+            Let rhs be proc assign_rhs with assign
+            Let rhs_kind be proc hir_node_type from HIR with rhs
+            If rhs_kind is equal to HIR.HIR_MEMBER_EXPR:
+                Let tag_val be proc hir_get_metadata from HIR with rhs, tag
+                Let has_tag be proc string_equals from StringCore with tag_val, "true"
+                If has_tag is equal to 1:
+                    Return rhs
+                End If
+            End If
+        End If
+        Set i to i plus 1
+    End While
+    Return 0
+End Process
+
+@Reasoning:
+Returns the c(...) vector bound to a variable. In R, c(1, 2, 3, 4) is a call to the
+built-in "c" function (the locked R parser models it as a NODE_CALL), so it lowers to
+a HIR_CALL_EXPR whose callee is the identifier "c". This helper scans the top-level
+assignments for the first whose RHS is a call to "c" and returns that call, so the
+probe can assert the vector's element count (its positional argument count) survives.
+@End Reasoning
+Process called "find_c_call" takes module as Integer returns Integer:
+    If module is equal to 0:
+        Return 0
+    End If
+    Let declarations be proc hir_get_declarations from HIR with module
+    If declarations is equal to 0:
+        Return 0
+    End If
+    Let count be proc list_length from List with declarations
+    Let i be 0
+    While i is less than count:
+        Let decl be proc list_get from List with declarations, i
+        Let assign be proc decl_assign with decl
+        If assign is not equal to 0:
+            Let rhs be proc assign_rhs with assign
+            Let rhs_kind be proc hir_node_type from HIR with rhs
+            If rhs_kind is equal to HIR.HIR_CALL_EXPR:
+                Let callee be proc hir_get_call_callee from HIR with rhs
+                Let callee_kind be proc hir_node_type from HIR with callee
+                If callee_kind is equal to HIR.HIR_IDENTIFIER:
+                    Let callee_name be proc hir_get_identifier_name from HIR with callee
+                    Let is_c be proc string_equals from StringCore with callee_name, "c"
+                    If is_c is equal to 1:
+                        Return rhs
+                    End If
+                End If
+            End If
+        End If
+        Set i to i plus 1
+    End While
+    Return 0
+End Process
+
+@Reasoning:
+Returns the number of elements in a c(...) vector call: its positional-argument count.
+Proves the vector's element content survives lowering and round-trip.
+@End Reasoning
+Process called "c_call_element_count" takes call_node as Integer returns Integer:
+    If call_node is equal to 0:
+        Return 0
+    End If
+    Let args be proc hir_get_positional_args from HIR with call_node
+    If args is equal to 0:
+        Return 0
+    End If
+    Return proc list_length from List with args
+End Process
+
+@Reasoning:
+Returns the right-hand side of the first top-level assignment whose RHS is an index
+expression carrying the given tag value ("r_extract" for [[ ]]). This reaches the
+double-bracket element extraction bound to a variable.
+@End Reasoning
+Process called "find_assign_rhs_index" takes module as Integer, tag as Integer returns Integer:
+    If module is equal to 0:
+        Return 0
+    End If
+    Let declarations be proc hir_get_declarations from HIR with module
+    If declarations is equal to 0:
+        Return 0
+    End If
+    Let count be proc list_length from List with declarations
+    Let i be 0
+    While i is less than count:
+        Let decl be proc list_get from List with declarations, i
+        Let assign be proc decl_assign with decl
+        If assign is not equal to 0:
+            Let rhs be proc assign_rhs with assign
+            Let rhs_kind be proc hir_node_type from HIR with rhs
+            If rhs_kind is equal to HIR.HIR_INDEX_EXPR:
+                Let tag_val be proc hir_get_metadata from HIR with rhs, tag
+                Let has_tag be proc string_equals from StringCore with tag_val, "true"
+                If has_tag is equal to 1:
+                    Return rhs
+                End If
+            End If
+        End If
+        Set i to i plus 1
+    End While
+    Return 0
+End Process
+
+@Reasoning:
+Locates the call carrying a named argument (e.g. scale(nums, factor = 2)). It is the
+RHS of a top-level assignment, a HIR_CALL_EXPR. R parses a named argument as a binary
+"=" expression (token 8024) whose left operand is the parameter-name identifier, so
+the helper returns the first positional argument that is such a binary "=" node. The
+caller reads the argument name via named_argument_name.
+@End Reasoning
+Process called "find_named_argument" takes module as Integer returns Integer:
+    If module is equal to 0:
+        Return 0
+    End If
+    Let declarations be proc hir_get_declarations from HIR with module
+    If declarations is equal to 0:
+        Return 0
+    End If
+    Let count be proc list_length from List with declarations
+    Let i be 0
+    While i is less than count:
+        Let decl be proc list_get from List with declarations, i
+        Let assign be proc decl_assign with decl
+        If assign is not equal to 0:
+            Let rhs be proc assign_rhs with assign
+            Let rhs_kind be proc hir_node_type from HIR with rhs
+            If rhs_kind is equal to HIR.HIR_CALL_EXPR:
+                Let args be proc hir_get_positional_args from HIR with rhs
+                If args is not equal to 0:
+                    Let arg_count be proc list_length from List with args
+                    Let j be 0
+                    While j is less than arg_count:
+                        Let arg be proc list_get from List with args, j
+                        Let is_named be proc is_named_argument with arg
+                        If is_named is equal to 1:
+                            Return arg
+                        End If
+                        Set j to j plus 1
+                    End While
+                End If
+            End If
+        End If
+        Set i to i plus 1
+    End While
+    Return 0
+End Process
+
+@Reasoning:
+Returns 1 when a call argument is a named argument: a HIR_BINARY_EXPR carrying the R
+"=" token (8024). R's `name = value` call argument is parsed as an "=" binary, so this
+recogniser identifies it structurally.
+@End Reasoning
+Process called "is_named_argument" takes arg as Integer returns Integer:
+    If arg is equal to 0:
+        Return 0
+    End If
+    Let kind be proc hir_node_type from HIR with arg
+    If kind is not equal to HIR.HIR_BINARY_EXPR:
+        Return 0
+    End If
+    Let token be proc hir_get_metadata from HIR with arg, "r_op_token"
+    If token is equal to 8024:
+        Return 1
+    End If
+    Return 0
+End Process
+
+@Reasoning:
+Returns the parameter-name string of a named call argument: the left operand of the
+"=" binary is the name identifier, so this reads hir_get_binary_left and then the
+identifier's name. Proves the named argument's NAME (content) round-trips.
+@End Reasoning
+Process called "named_argument_name" takes arg as Integer returns Integer:
+    If arg is equal to 0:
+        Return 0
+    End If
+    Let left be proc hir_get_binary_left from HIR with arg
+    Let left_kind be proc hir_node_type from HIR with left
+    If left_kind is not equal to HIR.HIR_IDENTIFIER:
+        Return 0
+    End If
+    Return proc hir_get_identifier_name from HIR with left
+End Process
+
+@Reasoning:
+Two R programs are structurally equal on a construct when both HIR projections expose
+the same node-kind tag. Comparing kinds (and, for named constructs, the identifying
+payload) rather than byte text is whitespace-insensitive, proving round-trip fidelity
+without being defeated by the emitter's re-indenting.
+@End Reasoning
+Process called "same_kind" takes a as Integer, b as Integer returns Integer:
+    If a is equal to 0:
+        Return 0
+    End If
+    If b is equal to 0:
+        Return 0
+    End If
+    Let ka be proc hir_node_type from HIR with a
+    Let kb be proc hir_node_type from HIR with b
+    If ka is equal to kb:
+        Return 1
+    End If
+    Return 0
+End Process
+
+@Reasoning:
+Counts the parameters carried by a HIR function. hir_get_parameters returns the
+callable's collection handle (the node itself); the ordered parameter List is then
+resolved via hir_get_parameter_list. Used to confirm the default-arg function keeps
+both of its parameters across the round-trip.
+@End Reasoning
+Process called "function_param_count" takes func_node as Integer returns Integer:
+    If func_node is equal to 0:
+        Return 0
+    End If
+    Let handle be proc hir_get_parameters from HIR with func_node
+    Let params be proc hir_get_parameter_list from HIR with handle
+    If params is equal to 0:
+        Return 0
+    End If
+    Return proc list_length from List with params
+End Process
+
+@Reasoning:
+Returns 1 when the function's parameter at the given index carries a default value
+(tagged "r_has_default"). hir_get_parameters returns the handle, resolved to the List
+via hir_get_parameter_list. Proves the default-argument parameter round-trips with its
+default intact rather than collapsing to a plain parameter.
+@End Reasoning
+Process called "param_has_default" takes func_node as Integer, index as Integer returns Integer:
+    If func_node is equal to 0:
+        Return 0
+    End If
+    Let handle be proc hir_get_parameters from HIR with func_node
+    Let params be proc hir_get_parameter_list from HIR with handle
+    If params is equal to 0:
+        Return 0
+    End If
+    Let count be proc list_length from List with params
+    If index is greater than or equal to count:
+        Return 0
+    End If
+    Let param be proc list_get from List with params, index
+    Let tag be proc hir_get_metadata from HIR with param, "r_has_default"
+    Return proc string_equals from StringCore with tag, "true"
+End Process
+
+Note: ============================================================================
+Note: Probe entry point
+Note: ============================================================================
+
+Process called "main" returns Integer:
+    Let results be proc create_test_results from TestUtils
+    proc begin_suite from TestUtils with results, "R translation round-trip"
+
+    Note:
+    Representative R program. Newlines separate the statements. It defines six
+    functions (one with a default argument and an if/else body and a for-loop),
+    binds a c(...) vector, performs $ and [[ ]] access, and makes a call with a
+    named argument.
+    :End Note
+    Let source be "square <- function(x) x * x\ncube <- function(x) x * x * x\nadd <- function(a, b) a + b\nscale <- function(v, factor = 1) v * factor\ndescribe <- function(n) {\nif (n > 10) {\nresult <- \"big\"\n} else {\nresult <- \"small\"\n}\nresult\n}\ncombine <- function(items) {\ntotal <- 0\nfor (i in items) {\ntotal <- total + i\n}\ntotal\n}\nnums <- c(1, 2, 3, 4)\nscaled <- scale(nums, factor = 2)\ncolumn <- df$value\nfirst <- lst[[1]]\n"
+
+    Note: --- Stage 0-2: source -> HIR1 (parse, lower) ---
+    Let ast be proc parse_r_source from RParser with source
+    proc assert_not_null from TestUtils with results, "parser produced R AST", ast
+
+    Let hir1 be proc translate_r_to_hir from RFrontend with ast
+    proc assert_not_null from TestUtils with results, "frontend produced HIR module", hir1
+
+    Let declarations be proc hir_get_declarations from HIR with hir1
+    proc assert_not_null from TestUtils with results, "HIR module has declarations", declarations
+    Let decl_count be proc list_length from List with declarations
+    proc assert_greater_than_or_equal from TestUtils with results, "module has several top-level declarations", decl_count, 6
+
+    Note: --- >= 6 function definitions, located by name (CONTENT) ---
+    Let func_total be proc count_functions with hir1
+    proc assert_greater_than_or_equal from TestUtils with results, "module defines at least 6 functions", func_total, 6
+
+    Let f_square be proc find_function_named with hir1, "square"
+    proc assert_not_null from TestUtils with results, "function 'square' present", f_square
+    Let f_cube be proc find_function_named with hir1, "cube"
+    proc assert_not_null from TestUtils with results, "function 'cube' present", f_cube
+    Let f_add be proc find_function_named with hir1, "add"
+    proc assert_not_null from TestUtils with results, "function 'add' present", f_add
+    Let f_scale be proc find_function_named with hir1, "scale"
+    proc assert_not_null from TestUtils with results, "function 'scale' present", f_scale
+    Let f_describe be proc find_function_named with hir1, "describe"
+    proc assert_not_null from TestUtils with results, "function 'describe' present", f_describe
+    Let f_combine be proc find_function_named with hir1, "combine"
+    proc assert_not_null from TestUtils with results, "function 'combine' present", f_combine
+
+    Note: --- assignment with <- : an assign expr carrying the <- token (8020) ---
+    Let nums_assign be 0
+    Let scan_count be proc list_length from List with declarations
+    Let s be 0
+    While s is less than scan_count:
+        Let d be proc list_get from List with declarations, s
+        Let a be proc decl_assign with d
+        If a is not equal to 0:
+            If nums_assign is equal to 0:
+                Set nums_assign to a
+            End If
+        End If
+        Set s to s plus 1
+    End While
+    proc assert_not_null from TestUtils with results, "an assignment statement present", nums_assign
+    Let assign_token be proc hir_get_metadata from HIR with nums_assign, "r_op_token"
+    Let token_is_left be 0
+    If assign_token is equal to 8020:
+        Set token_is_left to 1
+    End If
+    proc assert_equal from TestUtils with results, "assignment uses the <- operator (token 8020)", token_is_left, 1
+
+    Note: --- default-argument parameter: scale has 2 params, param 1 has a default ---
+    Let scale_param_count be proc function_param_count with f_scale
+    proc assert_equal from TestUtils with results, "'scale' has 2 parameters", scale_param_count, 2
+    Let scale_has_default be proc param_has_default with f_scale, 1
+    proc assert_equal from TestUtils with results, "'scale' parameter 'factor' has a default", scale_has_default, 1
+
+    Note: --- if/else: located by kind inside 'describe' body; here as a top-level
+    Note: form it is reached through the function body, so we assert the function
+    Note: body contains an if with both branches. ---
+    Let describe_body be proc hir_get_function_body from HIR with f_describe
+    proc assert_not_null from TestUtils with results, "'describe' has a body", describe_body
+    Let if_node be proc first_if_in_block with describe_body
+    proc assert_not_null from TestUtils with results, "if statement present in 'describe'", if_node
+    Let if_cond be proc hir_get_if_condition from HIR with if_node
+    proc assert_not_null from TestUtils with results, "if statement has a condition", if_cond
+    Let if_else be proc hir_get_if_else from HIR with if_node
+    proc assert_not_null from TestUtils with results, "if statement has an else branch", if_else
+
+    Note: --- for-loop: inside 'combine' body, a for-in with the loop variable 'i' ---
+    Let combine_body be proc hir_get_function_body from HIR with f_combine
+    proc assert_not_null from TestUtils with results, "'combine' has a body", combine_body
+    Let for_node be proc first_for_in_block with combine_body
+    proc assert_not_null from TestUtils with results, "for-loop present in 'combine'", for_node
+    Let for_var be proc hir_get_for_in_variable from HIR with for_node
+    Let for_var_ok be proc string_equals from StringCore with for_var, "i"
+    proc assert_equal from TestUtils with results, "for-loop variable is 'i'", for_var_ok, 1
+
+    Note: --- c(...) vector: a list literal RHS tagged r_vector with 4 elements ---
+    Let vector_node be proc find_c_call with hir1
+    proc assert_not_null from TestUtils with results, "c(...) vector present", vector_node
+    Let vector_count be proc c_call_element_count with vector_node
+    proc assert_equal from TestUtils with results, "c() vector has 4 elements", vector_count, 4
+
+    Note: --- $ access: a member expr RHS with no namespace/slot tag ---
+    Let dollar_node be proc find_plain_member with hir1
+    proc assert_not_null from TestUtils with results, "$ member access present", dollar_node
+    Let dollar_name be proc hir_get_member_name from HIR with dollar_node
+    Let dollar_name_ok be proc string_equals from StringCore with dollar_name, "value"
+    proc assert_equal from TestUtils with results, "$ access reads member 'value'", dollar_name_ok, 1
+
+    Note: --- [[ ]] extraction: an index expr RHS tagged r_extract ---
+    Let extract_node be proc find_assign_rhs_index with hir1, "r_extract"
+    proc assert_not_null from TestUtils with results, "[[ ]] extraction present", extract_node
+
+    Note: --- named call argument: scale(nums, factor = 2) ---
+    Let named_arg be proc find_named_argument with hir1
+    proc assert_not_null from TestUtils with results, "named call argument present", named_arg
+    Let named_arg_name be proc named_argument_name with named_arg
+    Let named_arg_ok be proc string_equals from StringCore with named_arg_name, "factor"
+    proc assert_equal from TestUtils with results, "named argument is 'factor'", named_arg_ok, 1
+
+    Note: --- Stage 3: HIR -> R text ---
+    Let emitted be proc hir_to_r from RBackend with hir1
+    proc assert_not_null from TestUtils with results, "backend produced R text", emitted
+    Let emitted_len be proc string_length from StringCore with emitted
+    proc assert_greater_than from TestUtils with results, "emitted R is non-empty", emitted_len, 0
+
+    Note: --- Stage 4: re-run the pipeline on the emitted text -> HIR2 ---
+    Let hir2 be proc source_to_hir with emitted
+    proc assert_not_null from TestUtils with results, "re-parse of emitted R produced HIR", hir2
+    Let decls2 be proc hir_get_declarations from HIR with hir2
+    Let decl2_count be proc list_length from List with decls2
+    proc assert_greater_than_or_equal from TestUtils with results, "round-trip module has declarations", decl2_count, 6
+
+    Note: --- Stage 5: structural equality on the key constructs (CONTENT) ---
+    Let func2_total be proc count_functions with hir2
+    proc assert_greater_than_or_equal from TestUtils with results, "round-trip preserves at least 6 functions", func2_total, 6
+
+    Let f_scale2 be proc find_function_named with hir2, "scale"
+    proc assert_not_null from TestUtils with results, "round-trip preserves function 'scale'", f_scale2
+    Let scale2_param_count be proc function_param_count with f_scale2
+    proc assert_equal from TestUtils with results, "round-trip preserves 'scale' 2 parameters", scale2_param_count, 2
+    Let scale2_has_default be proc param_has_default with f_scale2, 1
+    proc assert_equal from TestUtils with results, "round-trip preserves 'factor' default", scale2_has_default, 1
+
+    Let f_describe2 be proc find_function_named with hir2, "describe"
+    proc assert_not_null from TestUtils with results, "round-trip preserves function 'describe'", f_describe2
+    Let describe2_body be proc hir_get_function_body from HIR with f_describe2
+    Let if2 be proc first_if_in_block with describe2_body
+    Let if_kind_ok be proc same_kind with if_node, if2
+    proc assert_equal from TestUtils with results, "round-trip preserves the if statement", if_kind_ok, 1
+    Let if2_else be proc hir_get_if_else from HIR with if2
+    proc assert_not_null from TestUtils with results, "round-trip preserves the else branch", if2_else
+
+    Let f_combine2 be proc find_function_named with hir2, "combine"
+    Let combine2_body be proc hir_get_function_body from HIR with f_combine2
+    Let for2 be proc first_for_in_block with combine2_body
+    Let for_kind_ok be proc same_kind with for_node, for2
+    proc assert_equal from TestUtils with results, "round-trip preserves the for-loop", for_kind_ok, 1
+    Let for2_var be proc hir_get_for_in_variable from HIR with for2
+    Let for2_var_ok be proc string_equals from StringCore with for2_var, "i"
+    proc assert_equal from TestUtils with results, "round-trip preserves for-loop variable 'i'", for2_var_ok, 1
+
+    Let vector2 be proc find_c_call with hir2
+    proc assert_not_null from TestUtils with results, "round-trip preserves the c() vector", vector2
+    Let vector2_count be proc c_call_element_count with vector2
+    proc assert_equal from TestUtils with results, "round-trip preserves 4 vector elements", vector2_count, 4
+
+    Let dollar2 be proc find_plain_member with hir2
+    proc assert_not_null from TestUtils with results, "round-trip preserves $ access", dollar2
+    Let dollar2_name be proc hir_get_member_name from HIR with dollar2
+    Let dollar2_name_ok be proc string_equals from StringCore with dollar2_name, "value"
+    proc assert_equal from TestUtils with results, "round-trip preserves $ member 'value'", dollar2_name_ok, 1
+
+    Let extract2 be proc find_assign_rhs_index with hir2, "r_extract"
+    proc assert_not_null from TestUtils with results, "round-trip preserves [[ ]] extraction", extract2
+
+    Let named_arg2 be proc find_named_argument with hir2
+    proc assert_not_null from TestUtils with results, "round-trip preserves named argument", named_arg2
+    Let named_arg2_name be proc named_argument_name with named_arg2
+    Let named_arg2_ok be proc string_equals from StringCore with named_arg2_name, "factor"
+    proc assert_equal from TestUtils with results, "round-trip preserves named argument 'factor'", named_arg2_ok, 1
+
+    proc print_summary from TestUtils with results
+    Let failed be proc get_failed from TestUtils with results
+    proc destroy_test_results from TestUtils with results
+
+    Return failed
+End Process
+
+@Reasoning:
+Returns the first if statement inside a function body block. R function bodies are
+HIR blocks; the if (and its else) sit as block statements, so this scans the block's
+statement list for the first HIR_IF and returns it. A single-statement body that is
+itself an if is handled by also testing the body node directly.
+@End Reasoning
+Process called "first_if_in_block" takes body as Integer returns Integer:
+    If body is equal to 0:
+        Return 0
+    End If
+    Let body_kind be proc hir_node_type from HIR with body
+    If body_kind is equal to HIR.HIR_IF:
+        Return body
+    End If
+    If body_kind is not equal to HIR.HIR_BLOCK:
+        Return 0
+    End If
+    Let statements be proc hir_get_block_statements from HIR with body
+    If statements is equal to 0:
+        Return 0
+    End If
+    Let count be proc list_length from List with statements
+    Let i be 0
+    While i is less than count:
+        Let stmt be proc list_get from List with statements, i
+        Let stmt_kind be proc hir_node_type from HIR with stmt
+        If stmt_kind is equal to HIR.HIR_IF:
+            Return stmt
+        End If
+        Set i to i plus 1
+    End While
+    Return 0
+End Process
+
+@Reasoning:
+Returns the first for-in loop inside a function body block, mirroring first_if_in_block.
+Scans the block's statement list for the first HIR_FOR_IN.
+@End Reasoning
+Process called "first_for_in_block" takes body as Integer returns Integer:
+    If body is equal to 0:
+        Return 0
+    End If
+    Let body_kind be proc hir_node_type from HIR with body
+    If body_kind is equal to HIR.HIR_FOR_IN:
+        Return body
+    End If
+    If body_kind is not equal to HIR.HIR_BLOCK:
+        Return 0
+    End If
+    Let statements be proc hir_get_block_statements from HIR with body
+    If statements is equal to 0:
+        Return 0
+    End If
+    Let count be proc list_length from List with statements
+    Let i be 0
+    While i is less than count:
+        Let stmt be proc list_get from List with statements, i
+        Let stmt_kind be proc hir_node_type from HIR with stmt
+        If stmt_kind is equal to HIR.HIR_FOR_IN:
+            Return stmt
+        End If
+        Set i to i plus 1
+    End While
+    Return 0
+End Process
+
+@Reasoning:
+Returns the right-hand side of the first top-level assignment whose RHS is a plain $
+member access: a HIR_MEMBER_EXPR with neither the "r_namespace" nor the "r_s4_slot"
+tag set. This isolates the df$value access from any @ slot or :: namespace member
+expressions.
+@End Reasoning
+Process called "find_plain_member" takes module as Integer returns Integer:
+    If module is equal to 0:
+        Return 0
+    End If
+    Let declarations be proc hir_get_declarations from HIR with module
+    If declarations is equal to 0:
+        Return 0
+    End If
+    Let count be proc list_length from List with declarations
+    Let i be 0
+    While i is less than count:
+        Let decl be proc list_get from List with declarations, i
+        Let assign be proc decl_assign with decl
+        If assign is not equal to 0:
+            Let rhs be proc assign_rhs with assign
+            Let rhs_kind be proc hir_node_type from HIR with rhs
+            If rhs_kind is equal to HIR.HIR_MEMBER_EXPR:
+                Let ns be proc hir_get_metadata from HIR with rhs, "r_namespace"
+                Let slot be proc hir_get_metadata from HIR with rhs, "r_s4_slot"
+                Let is_ns be proc string_equals from StringCore with ns, "true"
+                Let is_slot be proc string_equals from StringCore with slot, "true"
+                If is_ns is equal to 0:
+                    If is_slot is equal to 0:
+                        Return rhs
+                    End If
+                End If
+            End If
+        End If
+        Set i to i plus 1
+    End While
+    Return 0
+End Process

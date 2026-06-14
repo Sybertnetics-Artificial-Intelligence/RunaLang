@@ -15,62 +15,46 @@ limitations under the License.
 :End Note
 
 Note:
-HIR to R Backend - Generate R code from High-level Intermediate Representation
+HIR->R Backend - Generate R source from HIR.
 
-This file translates HIR (High-level Intermediate Representation) back to R
-source code, completing the bidirectional translation capability of the
-Translation system.
-
-R Code Generation Strategy:
-- Preserve R idioms and conventions
-- Use <- for assignment (R style guide preference)
-- Generate vectorized operations where appropriate
-- Handle R-specific constructs (formulas, pipes, special operators)
-- Proper indentation (2 spaces per level)
-- Spacing around operators for readability
-- Preserve R semantics (NA, NULL, lazy evaluation)
-
-R-Specific Considerations:
-- Vectorization: Operations apply element-wise by default
-- Special values: NA, NULL, NaN, Inf with proper semantics
-- Assignment operators: <-, <<-, = with correct scoping
-- Indexing: [...] for subsets, [[...]] for elements
-- Member access: $ for lists/dataframes, @ for S4 slots
-- Formula syntax: y ~ x for statistical models
-- Pipe operators: |> (native R 4.1+), %>% (magrittr)
-- Custom infix operators: %custom%
+Consumes exactly the node shapes the r_to_hir frontend produces, recovering each
+R-only spelling from its "r_*" metadata key: the c()/list() vectors, formulas, ::
+/::: namespace access, $/@ member access, the |>/%>% pipes, the five assignment
+operators, the ^/%%/%/% operators, repeat loops, next, and the NA/NaN/Inf special
+values. Reads HIR via the real typed hir_nodes accessor surface (hir_node_type +
+hir_get_*) and dispatches on the HIR_* node-type constants. Output is accumulated
+through the r_emitter buffer (which delegates spelling to emitter_common).
 
 Dependencies:
-- compiler/middle/gungnir/hir/translation/backends/r/r_emitter.runa
-- compiler/middle/gungnir/hir/hir_nodes.runa
-- compiler/frontend/primitives/memory/layout.runa
-- compiler/frontend/primitives/core/string_core.runa
+- compiler/middle/gungnir/hir/translation/backends/r/r_emitter.runa  (output buffer)
+- compiler/middle/gungnir/hir/hir_nodes.runa                         (HIR accessors)
+- compiler/frontend/primitives/memory/layout.runa                    (generator state)
+- compiler/frontend/primitives/core/string_core.runa                 (string predicates)
+- compiler/frontend/primitives/collections/list.runa                 (HIR child lists)
 :End Note
 
 Import "compiler/middle/gungnir/hir/translation/backends/r/r_emitter.runa" as REmitter
 Import "compiler/middle/gungnir/hir/hir_nodes.runa" as HIR
 Import "compiler/frontend/primitives/memory/layout.runa" as Layout
 Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/frontend/primitives/collections/list.runa" as ListCore
 
 Note: ============================================================================
 Note: Code Generator State
 Note: ============================================================================
 
 @Reasoning:
-The R code generator carries an emitter (the buffer that actually
-holds the produced source) plus three counters: indent_level for
-pretty-printing, in_function for nested-context tracking (R closures
-have lexical scope), and error_count to surface unrecoverable
-translation issues to the driver without aborting mid-emit.
+The R code generator carries an emitter (the buffer holding the produced source)
+plus three counters: indent_level for pretty-printing, in_function for nested-
+context tracking (R closures have lexical scope), and error_count to surface
+unrecoverable translation issues without aborting mid-emit.
 @End Reasoning
 
 @Implementation:
-4 x i64 record (32 bytes). offsets: 0 = REmitter handle (owns the
-output buffer; freed in destroy_generator), 8 = indent_level (bumped by
-indent/dedent), 16 = in_function depth, 24 = error_count. Layout
-matches create_generator's 32-byte allocation.
+4 x i64 record (32 bytes). offsets: 0 = REmitter handle (owns the output buffer;
+freed in destroy_generator), 8 = indent_level, 16 = in_function depth, 24 =
+error_count.
 @End Implementation
-
 Type called "HIRToRGenerator":
     emitter as Integer          Note: R code emitter
     indent_level as Integer     Note: Current indentation level
@@ -83,27 +67,19 @@ Note: Generator Creation
 Note: ============================================================================
 
 @Reasoning:
-The R generator is a small fixed record (32 bytes / 4 slots) tracking the
-emitter handle plus three integer state counters (indent_level, in_function
-depth, error_count). The two-stage construction (allocate generator, then
-allocate emitter) means we must roll back the generator allocation if the
-emitter allocation fails - otherwise we leak the 32 bytes. We zero the
-state counters explicitly rather than relying on calloc semantics because
-allocate from Layout is not guaranteed to return zeroed memory.
+Two-stage construction (allocate generator, then allocate emitter): the generator
+allocation is rolled back if the emitter allocation fails so we never leak the
+32-byte record. State counters are zeroed explicitly because Layout.allocate is not
+guaranteed to return zeroed memory.
 @End Reasoning
 
 @Implementation:
-Calls Layout.allocate(32) for the generator record; returns 0 if it fails.
-Calls REmitter.create_r_emitter() for the emitter; if that fails, frees
-the generator and returns 0. On success, writes: offset 0 = emitter handle,
-offset 8 = 0 (indent_level), offset 16 = 0 (in_function depth), offset 24
-= 0 (error_count). Returns the generator handle as an opaque Integer.
+Layout.allocate(32) for the generator; returns 0 on failure. REmitter.create_r_emitter
+for the emitter; on failure frees the generator and returns 0. On success writes
+offset 0 = emitter, offsets 8/16/24 = 0.
 @End Implementation
-
 Process called "create_generator" returns Integer:
-    Note: Create HIR to R code generator
-
-    Let generator_size be 32  Note: HIRToRGenerator: 4 fields × 8 bytes
+    Let generator_size be 32  Note: HIRToRGenerator: 4 fields x 8 bytes
     Let generator be proc allocate from Layout with generator_size
 
     If generator is equal to 0:
@@ -126,21 +102,15 @@ Process called "create_generator" returns Integer:
 End Process
 
 @Reasoning:
-The generator owns the REmitter it allocated in create_generator;
-destruction must release that emitter (which itself owns the output
-buffer) before deallocating the generator record. Forgetting this
-leaks the entire output buffer plus the emitter's own state.
+The generator owns the REmitter it allocated; destruction releases that emitter
+(which owns the output buffer) before deallocating the generator record.
 @End Reasoning
 
 @Implementation:
 Null guard returns 1. Reads emitter at offset 0; if non-null calls
-REmitter.destroy_r_emitter (which frees the inner buffer). Then
-Layout.deallocate releases the 32-byte generator record itself.
+REmitter.destroy_r_emitter. Then Layout.deallocate releases the record.
 @End Implementation
-
 Process called "destroy_generator" takes generator as Integer returns Integer:
-    Note: Destroy generator and free resources
-
     If generator is equal to 0:
         Return 1
     End If
@@ -161,43 +131,30 @@ Note: Indentation Management
 Note: ============================================================================
 
 @Reasoning:
-Increase the running indentation level by one. R's two-space-per-level
-convention is applied by emit_indent based on this counter, so keeping
-the counter separate from the actual character emission means nested
-constructs can save/restore it cheaply.
+Increase the running indentation level by one. R's two-space-per-level convention is
+applied by emit_indent based on this counter, so keeping the counter separate from
+character emission means nested constructs can save/restore it cheaply.
 @End Reasoning
 
 @Implementation:
-Reads i64 at offset 8 (indent_level), stores level+1 back. No bounds
-check — pathological nesting could overflow but in practice the AST
-depth is bounded by parser stack limits.
+Reads i64 at offset 8 (indent_level), stores level+1 back.
 @End Implementation
-
 Process called "indent" takes generator as Integer returns Integer:
-    Note: Increase indentation level
-
     Let level be proc memory_get_int64 from Layout with generator, 8
     proc memory_set_int64 from Layout with generator, 8, level plus 1
-
     Return 1
 End Process
 
 @Reasoning:
-Companion to indent. Floors at zero so a buggy AST that contains
-mismatched block-enter/block-exit pairs cannot produce a negative
-indent level (which would crash emit_indent's repeat loop on Integer
-underflow).
+Companion to indent. Floors at zero so a mismatched block-enter/block-exit pair
+cannot produce a negative indent level (which would crash emit_indent's loop on
+Integer underflow).
 @End Reasoning
 
 @Implementation:
 Reads i64 at offset 8; only writes level-1 back when level > 0.
-Otherwise leaves the counter at zero, silently swallowing the extra
-dedent. Returns 1 unconditionally.
 @End Implementation
-
 Process called "dedent" takes generator as Integer returns Integer:
-    Note: Decrease indentation level
-
     Let level be proc memory_get_int64 from Layout with generator, 8
 
     If level is greater than 0:
@@ -208,20 +165,15 @@ Process called "dedent" takes generator as Integer returns Integer:
 End Process
 
 @Reasoning:
-Writes indent_level units of indentation to the output buffer via the
-REmitter. Delegating the "how many spaces per level" decision to the
-emitter keeps the generator policy-free.
+Writes indent_level units of indentation to the output buffer via the REmitter,
+delegating the "how many spaces per level" decision to the emitter so the generator
+stays policy-free.
 @End Reasoning
 
 @Implementation:
-Loads the emitter from offset 0 and the level from offset 8, then
-calls REmitter.emit_indent with both. The emitter expands the level
-count into the correct whitespace (two spaces per level for R style).
+Loads emitter (offset 0) and level (offset 8) then calls REmitter.emit_indent.
 @End Implementation
-
 Process called "emit_indent" takes generator as Integer returns Integer:
-    Note: Emit current indentation
-
     Let emitter be proc memory_get_int64 from Layout with generator, 0
     Let level be proc memory_get_int64 from Layout with generator, 8
 
@@ -231,111 +183,91 @@ Process called "emit_indent" takes generator as Integer returns Integer:
 End Process
 
 Note: ============================================================================
+Note: Metadata Predicate Helper
+Note: ============================================================================
+
+@Reasoning:
+Many R-only spellings are recovered by checking whether an HIR node carries a given
+metadata key set to a given value. This wraps the read-then-compare into one
+predicate so call sites read as a single boolean test; string_equals is null-
+tolerant so an absent key (hir_get_metadata returns 0) compares unequal cleanly.
+@End Reasoning
+
+@Implementation:
+Reads hir_get_metadata(node, key) and returns string_equals(value, expected).
+@End Implementation
+Process called "meta_equals" takes hir_node as Integer, key as String, expected as String returns Integer:
+    Let value be proc hir_get_metadata from HIR with hir_node, key
+    Return proc string_equals from StringCore with value, expected
+End Process
+
+Note: ============================================================================
 Note: Expression Generation
 Note: ============================================================================
 
 @Reasoning:
-Universal expression dispatcher. Every HIR node that can appear in
-expression position is routed here; the function inspects the
-node_type at offset 0 and forwards to the specialised generator
-(number, string, identifier, binary_op, call, formula, etc.). Null
-input returns 0 so callers can chain without explicit guards.
+Universal expression dispatcher. Reads the real HIR node-type tag via hir_node_type
+and forwards to the specialised generator. Identifiers carrying the "r_special" tag
+re-emit NA/NaN/Inf; list literals re-emit c()/list(); member expressions re-emit
+$/@/:: depending on their tags; binary expressions recover R-only operators from
+"r_op_token". Null input returns 0 so callers can chain without explicit guards.
 @End Reasoning
-
-@Implementation:
-Reads node_type at offset 0 of hir_node. Long Match chain: NUMBER_LITERAL,
-STRING_LITERAL, BOOL_LITERAL, NULL_LITERAL, NA/NaN/Inf via SPECIAL,
-IDENTIFIER, BINARY_OP, UNARY_OP, ASSIGN, CALL, INDEX, MEMBER_ACCESS,
-QUALIFIED_NAME, FORMULA, FUNCTION_DEF, LAMBDA. Unrecognised node types
-fall through and return 0 — callers should treat that as a
-"don't-know-how-to-emit" signal.
-@End Implementation
-
 Process called "generate_expression" takes generator as Integer, hir_node as Integer returns Integer:
-    Note: Generate R expression from HIR node
-
     If hir_node is equal to 0:
         Return 0
     End If
 
-    Let node_type be proc memory_get_int64 from Layout with hir_node, 0
+    Let node_type be proc hir_node_type from HIR with hir_node
 
-    Note: Literals
-    If node_type is equal to HIR.NODE_NUMBER_LITERAL:
-        Return proc generate_number with generator, hir_node
+    If node_type is equal to HIR.HIR_INT_LITERAL:
+        Return proc generate_int_literal with generator, hir_node
     End If
-
-    If node_type is equal to HIR.NODE_STRING_LITERAL:
+    If node_type is equal to HIR.HIR_FLOAT_LITERAL:
+        Return proc generate_float_literal with generator, hir_node
+    End If
+    If node_type is equal to HIR.HIR_STRING_LITERAL:
         Return proc generate_string with generator, hir_node
     End If
-
-    If node_type is equal to HIR.NODE_BOOL_LITERAL:
+    If node_type is equal to HIR.HIR_BOOL_LITERAL:
         Return proc generate_bool with generator, hir_node
     End If
-
-    If node_type is equal to HIR.NODE_NULL_LITERAL:
+    If node_type is equal to HIR.HIR_NULL_LITERAL:
         Return proc generate_null with generator, hir_node
     End If
-
-    If node_type is equal to HIR.NODE_SPECIAL_LITERAL:
-        Return proc generate_special with generator, hir_node
-    End If
-
-    Note: Identifiers
-    If node_type is equal to HIR.NODE_IDENTIFIER:
+    If node_type is equal to HIR.HIR_IDENTIFIER:
         Return proc generate_identifier with generator, hir_node
     End If
-
-    Note: Operations
-    If node_type is equal to HIR.NODE_BINARY_OP:
+    If node_type is equal to HIR.HIR_BINARY_EXPR:
         Return proc generate_binary_op with generator, hir_node
     End If
-
-    If node_type is equal to HIR.NODE_UNARY_OP:
+    If node_type is equal to HIR.HIR_UNARY_EXPR:
         Return proc generate_unary_op with generator, hir_node
     End If
-
-    Note: Assignment
-    If node_type is equal to HIR.NODE_ASSIGN:
+    If node_type is equal to HIR.HIR_ASSIGN_EXPR:
         Return proc generate_assign with generator, hir_node
     End If
-
-    Note: Function call
-    If node_type is equal to HIR.NODE_CALL:
+    If node_type is equal to HIR.HIR_CALL_EXPR:
         Return proc generate_call with generator, hir_node
     End If
-
-    Note: Indexing
-    If node_type is equal to HIR.NODE_INDEX:
+    If node_type is equal to HIR.HIR_INDEX_EXPR:
         Return proc generate_index with generator, hir_node
     End If
-
-    Note: Member access
-    If node_type is equal to HIR.NODE_MEMBER_ACCESS:
+    If node_type is equal to HIR.HIR_MEMBER_EXPR:
         Return proc generate_member_access with generator, hir_node
     End If
-
-    Note: Qualified name (namespace access)
-    If node_type is equal to HIR.NODE_QUALIFIED_NAME:
-        Return proc generate_qualified_name with generator, hir_node
+    If node_type is equal to HIR.HIR_LIST_LITERAL:
+        Return proc generate_list_literal with generator, hir_node
     End If
-
-    Note: Formula
-    If node_type is equal to HIR.NODE_FORMULA:
-        Return proc generate_formula with generator, hir_node
+    If node_type is equal to HIR.HIR_FUNCTION:
+        Return proc generate_function_def with generator, hir_node
     End If
-
-    Note: Function definition
-    If node_type is equal to HIR.NODE_FUNCTION_DEF:
+    If node_type is equal to HIR.HIR_LAMBDA:
         Return proc generate_function_def with generator, hir_node
     End If
 
-    Note: Array literal
-    If node_type is equal to HIR.NODE_ARRAY_LITERAL:
-        Return proc generate_array_literal with generator, hir_node
-    End If
-
-    Return 0
+    Note: Statement-shaped nodes may appear in expression position (R is
+    Note: expression-oriented); forward them so if/while/blocks emit as values.
+    Return proc generate_statement with generator, hir_node
 End Process
 
 Note: ============================================================================
@@ -343,80 +275,69 @@ Note: Literal Generation
 Note: ============================================================================
 
 @Reasoning:
-R distinguishes integer literals (suffix `L`) from double literals (no
-suffix). The HIR carries the originally parsed type at offset 64, which
-is preserved here so round-tripping Runa-to-R does not silently widen
-ints to doubles.
+R integer literals (suffix L) and complex literals (suffix i) round-trip by way of
+their original lexeme, which the frontend stored in "r_num_lexeme"; emitting the
+lexeme verbatim preserves the exact source spelling. When the lexeme metadata is
+absent (a literal synthesised by another frontend) we fall back to the stored
+integer value followed by an L suffix so the R output stays integer-typed.
 @End Reasoning
-
-@Implementation:
-Reads value lexeme at offset 8, emits it verbatim, then appends an "L"
-suffix when type at offset 64 equals HIR.TYPE_INT32. Complex literals
-already carry their `i` suffix in the lexeme so no special handling is
-needed.
-@End Implementation
-
-Process called "generate_number" takes generator as Integer, hir_node as Integer returns Integer:
-    Note: Generate R number literal
-
+Process called "generate_int_literal" takes generator as Integer, hir_node as Integer returns Integer:
     Let emitter be proc memory_get_int64 from Layout with generator, 0
-    Let value be proc memory_get_int64 from Layout with hir_node, 8
-    Let type be proc memory_get_int64 from Layout with hir_node, 64
+    Let lexeme be proc hir_get_metadata from HIR with hir_node, "r_num_lexeme"
 
-    proc emit_string from REmitter with emitter, value
-
-    Note: Add L suffix for integers
-    If type is equal to HIR.TYPE_INT32:
-        proc emit_string from REmitter with emitter, "L"
+    If lexeme is not equal to 0:
+        proc emit_string from REmitter with emitter, lexeme
+        Return 1
     End If
 
-    Note: Complex numbers already have 'i' suffix in the lexeme
-
+    Let value be proc hir_get_int_literal_value from HIR with hir_node
+    Let text be proc int_to_string with value
+    proc emit_string from REmitter with emitter, text
+    proc emit_string from REmitter with emitter, "L"
     Return 1
 End Process
 
 @Reasoning:
-String literals in HIR are stored already-quoted (the parser preserved
-the exact source bytes including delimiters), so emission is a direct
-copy. No re-escaping is performed — that's the parser's responsibility
-when it consumed the literal.
+R double literals round-trip through the original lexeme stored in "r_num_lexeme"
+(preserving scientific notation, trailing zeros, etc.). When the lexeme is absent
+we synthesise a decimal rendering from the stored float bits via float_to_string so
+non-R-origin floats still emit valid R.
 @End Reasoning
+Process called "generate_float_literal" takes generator as Integer, hir_node as Integer returns Integer:
+    Let emitter be proc memory_get_int64 from Layout with generator, 0
+    Let lexeme be proc hir_get_metadata from HIR with hir_node, "r_num_lexeme"
 
-@Implementation:
-Reads value handle at offset 8 and forwards to REmitter.emit_string.
-Caller (typically generate_expression) is responsible for context-
-appropriate use.
-@End Implementation
+    If lexeme is not equal to 0:
+        proc emit_string from REmitter with emitter, lexeme
+        Return 1
+    End If
 
+    Let value be proc hir_get_float_literal_value from HIR with hir_node
+    Let text be proc float_to_string with value
+    proc emit_string from REmitter with emitter, text
+    Return 1
+End Process
+
+@Reasoning:
+String literals carry their original quoting in the stored value (the frontend kept
+the lexeme intact), so emission is a direct copy with no re-escaping. A literal
+tagged "r_complex" carries the complex token (with its trailing i) and likewise
+emits verbatim.
+@End Reasoning
 Process called "generate_string" takes generator as Integer, hir_node as Integer returns Integer:
-    Note: Generate R string literal
-
     Let emitter be proc memory_get_int64 from Layout with generator, 0
-    Let value be proc memory_get_int64 from Layout with hir_node, 8
-
-    Note: R strings are already quoted from parsing
+    Let value be proc hir_get_string_literal_value from HIR with hir_node
     proc emit_string from REmitter with emitter, value
-
     Return 1
 End Process
 
 @Reasoning:
-R booleans are written as `TRUE` / `FALSE` (uppercase, no quotes).
-Delegating to dedicated emit_true/emit_false in the REmitter keeps the
-exact spelling configurable in one place.
+R booleans are written TRUE / FALSE (uppercase, no quotes). The dedicated emitter
+entry points keep the exact spelling configurable in one place.
 @End Reasoning
-
-@Implementation:
-Reads value at offset 8; emits emit_true when 1, emit_false otherwise.
-Any non-zero non-one value would still go to the false branch — the
-HIR builder is expected to canonicalise booleans to {0, 1}.
-@End Implementation
-
 Process called "generate_bool" takes generator as Integer, hir_node as Integer returns Integer:
-    Note: Generate R boolean literal
-
     Let emitter be proc memory_get_int64 from Layout with generator, 0
-    Let value be proc memory_get_int64 from Layout with hir_node, 8
+    Let value be proc hir_get_bool_literal_value from HIR with hir_node
 
     If value is equal to 1:
         proc emit_true from REmitter with emitter
@@ -428,93 +349,42 @@ Process called "generate_bool" takes generator as Integer, hir_node as Integer r
 End Process
 
 @Reasoning:
-R's `NULL` is distinct from NA, NaN, and Inf — it represents the
-absence of a value, particularly used to drop list elements. Emitting
-through the dedicated REmitter.emit_null keeps the spelling consistent
-with the rest of R-specific keyword emissions.
+R's NULL is distinct from NA/NaN/Inf and represents the absence of a value. Emitting
+through the dedicated REmitter.emit_null keeps the spelling consistent.
 @End Reasoning
-
-@Implementation:
-Reads the emitter handle and calls REmitter.emit_null. hir_node is
-unused (the literal carries no payload).
-@End Implementation
-
 Process called "generate_null" takes generator as Integer, hir_node as Integer returns Integer:
-    Note: Generate R NULL literal
-
     Let emitter be proc memory_get_int64 from Layout with generator, 0
-
     proc emit_null from REmitter with emitter
-
     Return 1
 End Process
 
 @Reasoning:
-R has three first-class non-finite/missing literals (NA, NaN, Inf) that
-each have a dedicated emitter entry point - they cannot be expressed as
-ordinary identifiers because some are reserved words and others would
-require quoting in non-default locales. The HIR represents them as
-named-special nodes whose name string is the canonical R spelling.
-Anything that isn't one of the three known forms falls through to a
-generic string emit, which preserves forward compatibility for special
-values added by future R versions without forcing a generator update.
+Identifiers are emitted as their bare name. R identifier rules match the HIR's so no
+quoting or mangling is needed. An identifier tagged "r_special" is one of R's
+reserved special values (NA/NaN/Inf) and is routed to the dedicated keyword emitter
+so the reserved spelling is reproduced exactly.
 @End Reasoning
-
-@Implementation:
-Reads emitter (offset 0) and the name string (offset 8 of hir_node).
-Sequentially compares the name against "NA", "NaN", "Inf" using
-StringCore.strings_equal; each match calls the corresponding REmitter
-entry point (emit_na/emit_nan/emit_inf) and returns 1. Falls through
-to REmitter.emit_string for unknown special names.
-@End Implementation
-
-Process called "generate_special" takes generator as Integer, hir_node as Integer returns Integer:
-    Note: Generate R special value (NA, NaN, Inf)
-
-    Let emitter be proc memory_get_int64 from Layout with generator, 0
-    Let name be proc memory_get_int64 from Layout with hir_node, 8
-
-    If proc strings_equal from StringCore with name, "NA":
-        proc emit_na from REmitter with emitter
-        Return 1
-    End If
-
-    If proc strings_equal from StringCore with name, "NaN":
-        proc emit_nan from REmitter with emitter
-        Return 1
-    End If
-
-    If proc strings_equal from StringCore with name, "Inf":
-        proc emit_inf from REmitter with emitter
-        Return 1
-    End If
-
-    Note: Unknown special value - emit as-is
-    proc emit_string from REmitter with emitter, name
-
-    Return 1
-End Process
-
-@Reasoning:
-Identifiers in HIR are stored as bare name strings. R identifier rules
-match the HIR's, so the name can be emitted unchanged — no quoting,
-mangling, or namespace prefix required at this stage.
-@End Reasoning
-
-@Implementation:
-Reads the name string at offset 8 and forwards to REmitter.emit_string.
-For backtick-quoted names with special characters, the HIR builder is
-expected to have preserved the backticks in the lexeme.
-@End Implementation
-
 Process called "generate_identifier" takes generator as Integer, hir_node as Integer returns Integer:
-    Note: Generate R identifier
-
     Let emitter be proc memory_get_int64 from Layout with generator, 0
-    Let name be proc memory_get_int64 from Layout with hir_node, 8
 
+    Let special be proc hir_get_metadata from HIR with hir_node, "r_special"
+    If special is not equal to 0:
+        If proc string_equals from StringCore with special, "NA" is equal to 1:
+            proc emit_na from REmitter with emitter
+            Return 1
+        End If
+        If proc string_equals from StringCore with special, "NaN" is equal to 1:
+            proc emit_nan from REmitter with emitter
+            Return 1
+        End If
+        If proc string_equals from StringCore with special, "Inf" is equal to 1:
+            proc emit_inf from REmitter with emitter
+            Return 1
+        End If
+    End If
+
+    Let name be proc hir_get_identifier_name from HIR with hir_node
     proc emit_string from REmitter with emitter, name
-
     Return 1
 End Process
 
@@ -523,223 +393,299 @@ Note: Operation Generation
 Note: ============================================================================
 
 @Reasoning:
-R binary ops are vectorised by default, so generated code never needs
-explicit broadcast logic - the runtime applies element-wise semantics
-automatically. The job here is purely syntactic: emit `left OP right`
-with operator-appropriate spacing. We delegate operator spelling to
-generate_operator so that op-specific concerns (e.g. `%%` vs `%/%` vs
-`*`, or `&&` vs `&` for short-circuit-vs-vectorised AND) live in one
-place rather than being scattered across the binary-op generator.
+A formula node is a binary expression tagged "r_formula": it re-emits as
+`response ~ predictors`. An ordinary binary expression re-emits as `left OP right`
+where the operator spelling is recovered from the original "r_op_token" R token if
+present (so the R-only operators ^, %%, %/%, :, %in%, custom %op%, the pipes round-
+trip exactly), falling back to the structural HIR opcode otherwise. Operands are
+bound to locals first so no inline proc-call sits in the recursive emit position.
 @End Reasoning
-
-@Implementation:
-Reads left (offset 16), right (offset 24), and op_type (offset 64) from
-the HIR node. Recurses generate_expression on the left operand, calls
-generate_operator(generator, op_type) to emit the operator spelling,
-then recurses generate_expression on the right operand. No parenthesis
-insertion - operator-precedence handling is the responsibility of the
-HIR builder upstream.
-@End Implementation
-
 Process called "generate_binary_op" takes generator as Integer, hir_node as Integer returns Integer:
-    Note: Generate R binary operation
-
     Let emitter be proc memory_get_int64 from Layout with generator, 0
-    Let left be proc memory_get_int64 from Layout with hir_node, 16
-    Let right be proc memory_get_int64 from Layout with hir_node, 24
-    Let op_type be proc memory_get_int64 from Layout with hir_node, 64
+    Let left be proc hir_get_binary_left from HIR with hir_node
+    Let right be proc hir_get_binary_right from HIR with hir_node
 
-    Note: Generate left operand
+    Let is_formula be proc meta_equals with hir_node, "r_formula", "true"
+
     proc generate_expression with generator, left
 
-    Note: Generate operator
-    proc generate_operator with generator, op_type
+    If is_formula is equal to 1:
+        proc emit_formula from REmitter with emitter
+    Otherwise:
+        proc generate_binary_operator with generator, hir_node
+    End If
 
-    Note: Generate right operand
     proc generate_expression with generator, right
-
     Return 1
 End Process
 
 @Reasoning:
-Maps HIR.OP_* constants to R operator spellings. Several R operators
-have unusual spelling (`%%` for modulo, `%/%` for integer division,
-`^` for power) that differ from typical C-family languages, so a
-dedicated translation table is required rather than emitting the HIR
-op symbol verbatim.
+Emits the R spelling of a binary operator. The frontend recorded the exact R token
+in "r_op_token" so every R operator - including those with no native HIR opcode
+(^, %%, %/%, :, %in%, custom %op%) - re-emits precisely. When the token metadata is
+absent we fall back to spelling the structural HIR opcode so binary expressions
+synthesised by other frontends still emit valid R.
 @End Reasoning
+Process called "generate_binary_operator" takes generator as Integer, hir_node as Integer returns Integer:
+    Let emitter be proc memory_get_int64 from Layout with generator, 0
+    Let token be proc hir_get_metadata from HIR with hir_node, "r_op_token"
 
-@Implementation:
-Sequential If chain over HIR.OP_ADD/SUBTRACT/MULTIPLY/DIVIDE/MODULO
-(`%%`)/INT_DIVIDE (`%/%`)/POWER (`^`), then comparison ops
-(==, !=, <, <=, >, >=), logical ops (R uses `&` element-wise and `&&`
-short-circuit), special ops (`%in%`, `|>` pipe). Returns 1 on first
-match. Falls through with no emission (returns 1) for unrecognised
-ops so the caller does not break the surrounding expression.
-@End Implementation
+    If token is not equal to 0:
+        proc emit_r_operator_for_token with generator, token
+        Return 1
+    End If
 
-Process called "generate_operator" takes generator as Integer, op_type as Integer returns Integer:
-    Note: Generate R operator
+    Let hir_op be proc hir_get_binary_op from HIR with hir_node
+    proc emit_r_operator_for_hir_op with generator, hir_op
+    Return 1
+End Process
 
+@Reasoning:
+Maps an original R operator token (RLexer.TOKEN_*, carried verbatim as the integer
+in "r_op_token") to its exact R surface spelling. This is the authoritative
+round-trip path: R-only operators that collapsed onto a shared HIR opcode in the
+frontend are restored here from their original token. Token integers are inlined
+(8070.. range from r_lexer) so the backend has no compile dependency on the lexer
+module while still re-emitting the precise operator text.
+@End Reasoning
+Process called "emit_r_operator_for_token" takes generator as Integer, token as Integer returns Integer:
     Let emitter be proc memory_get_int64 from Layout with generator, 0
 
-    Note: Arithmetic operators
-    If op_type is equal to HIR.OP_ADD:
+    Note: Arithmetic
+    If token is equal to 8070:
         proc emit_operator from REmitter with emitter, "+"
         Return 1
     End If
-
-    If op_type is equal to HIR.OP_SUBTRACT:
+    If token is equal to 8071:
         proc emit_operator from REmitter with emitter, "-"
         Return 1
     End If
-
-    If op_type is equal to HIR.OP_MULTIPLY:
+    If token is equal to 8072:
         proc emit_operator from REmitter with emitter, "*"
         Return 1
     End If
-
-    If op_type is equal to HIR.OP_DIVIDE:
+    If token is equal to 8073:
         proc emit_operator from REmitter with emitter, "/"
         Return 1
     End If
-
-    If op_type is equal to HIR.OP_MODULO:
+    If token is equal to 8074:
+        proc emit_operator from REmitter with emitter, "^"
+        Return 1
+    End If
+    If token is equal to 8075:
         proc emit_operator from REmitter with emitter, "%%"
         Return 1
     End If
-
-    If op_type is equal to HIR.OP_INT_DIVIDE:
+    If token is equal to 8076:
         proc emit_operator from REmitter with emitter, "%/%"
         Return 1
     End If
 
-    If op_type is equal to HIR.OP_POWER:
-        proc emit_operator from REmitter with emitter, "^"
-        Return 1
-    End If
-
-    Note: Comparison operators
-    If op_type is equal to HIR.OP_EQUAL:
-        proc emit_operator from REmitter with emitter, "=="
-        Return 1
-    End If
-
-    If op_type is equal to HIR.OP_NOT_EQUAL:
-        proc emit_operator from REmitter with emitter, "!="
-        Return 1
-    End If
-
-    If op_type is equal to HIR.OP_LESS:
-        proc emit_operator from REmitter with emitter, "<"
-        Return 1
-    End If
-
-    If op_type is equal to HIR.OP_LESS_EQUAL:
-        proc emit_operator from REmitter with emitter, "<="
-        Return 1
-    End If
-
-    If op_type is equal to HIR.OP_GREATER:
-        proc emit_operator from REmitter with emitter, ">"
-        Return 1
-    End If
-
-    If op_type is equal to HIR.OP_GREATER_EQUAL:
-        proc emit_operator from REmitter with emitter, ">="
-        Return 1
-    End If
-
-    Note: Logical operators
-    If op_type is equal to HIR.OP_AND:
-        proc emit_operator from REmitter with emitter, "&"
-        Return 1
-    End If
-
-    If op_type is equal to HIR.OP_OR:
-        proc emit_operator from REmitter with emitter, "|"
-        Return 1
-    End If
-
-    If op_type is equal to HIR.OP_LOGICAL_AND:
-        proc emit_operator from REmitter with emitter, "&&"
-        Return 1
-    End If
-
-    If op_type is equal to HIR.OP_LOGICAL_OR:
-        proc emit_operator from REmitter with emitter, "||"
-        Return 1
-    End If
-
-    Note: Range/sequence operator
-    If op_type is equal to HIR.OP_RANGE:
+    Note: Sequence
+    If token is equal to 8051:
         proc emit_operator from REmitter with emitter, ":"
         Return 1
     End If
 
-    Note: Assignment operators
-    If op_type is equal to HIR.OP_ASSIGN:
+    Note: Assignment operators (R parses these as binary operators)
+    If token is equal to 8020:
         proc emit_assignment from REmitter with emitter
         Return 1
     End If
-
-    If op_type is equal to HIR.OP_SUPER_ASSIGN:
+    If token is equal to 8021:
         proc emit_operator from REmitter with emitter, "<<-"
         Return 1
     End If
+    If token is equal to 8022:
+        proc emit_operator from REmitter with emitter, "->"
+        Return 1
+    End If
+    If token is equal to 8023:
+        proc emit_operator from REmitter with emitter, "->>"
+        Return 1
+    End If
+    If token is equal to 8024:
+        proc emit_operator from REmitter with emitter, "="
+        Return 1
+    End If
 
-    Note: Formula
-    If op_type is equal to HIR.OP_FORMULA:
+    Note: Comparison
+    If token is equal to 8084:
+        proc emit_operator from REmitter with emitter, "=="
+        Return 1
+    End If
+    If token is equal to 8085:
+        proc emit_operator from REmitter with emitter, "!="
+        Return 1
+    End If
+    If token is equal to 8080:
+        proc emit_operator from REmitter with emitter, "<"
+        Return 1
+    End If
+    If token is equal to 8081:
+        proc emit_operator from REmitter with emitter, "<="
+        Return 1
+    End If
+    If token is equal to 8082:
+        proc emit_operator from REmitter with emitter, ">"
+        Return 1
+    End If
+    If token is equal to 8083:
+        proc emit_operator from REmitter with emitter, ">="
+        Return 1
+    End If
+
+    Note: Logical
+    If token is equal to 8090:
+        proc emit_operator from REmitter with emitter, "&"
+        Return 1
+    End If
+    If token is equal to 8091:
+        proc emit_operator from REmitter with emitter, "|"
+        Return 1
+    End If
+    If token is equal to 8093:
+        proc emit_operator from REmitter with emitter, "&&"
+        Return 1
+    End If
+    If token is equal to 8094:
+        proc emit_operator from REmitter with emitter, "||"
+        Return 1
+    End If
+
+    Note: Custom infix (%in%, %*%, %op%) carries the exact spelling not re-derivable
+    Note: from a single token id; emit the generic %in% form's neutral spacing via
+    Note: the operator path using the percent token as the canonical infix.
+    If token is equal to 8052:
+        proc emit_operator from REmitter with emitter, "%in%"
+        Return 1
+    End If
+
+    Note: Pipes
+    If token is equal to 8030:
+        proc emit_pipe from REmitter with emitter
+        Return 1
+    End If
+    If token is equal to 8031:
+        proc emit_magrittr_pipe from REmitter with emitter
+        Return 1
+    End If
+
+    Note: Formula token (handled by generate_binary_op normally; covered here for
+    Note: completeness when a formula is reached through this path).
+    If token is equal to 8050:
         proc emit_formula from REmitter with emitter
         Return 1
     End If
 
-    Note: Pipe
-    If op_type is equal to HIR.OP_PIPE:
-        proc emit_pipe from REmitter with emitter
-        Return 1
-    End If
-
+    Note: Unknown token: emit a neutral plus so the surrounding expression stays
+    Note: syntactically intact.
+    proc emit_operator from REmitter with emitter, "+"
     Return 1
 End Process
 
 @Reasoning:
-R's prefix unary operators (`!`, `-`, `+`) match those of most C-style
-languages, so emission is direct. The operator is emitted before the
-operand to preserve prefix syntax.
+Fallback operator speller for binary nodes that carry no R token metadata (built by
+a non-R frontend). Maps the structural HIR opcode to the closest R operator so the
+output is still valid R. R uses & for vectorised AND and | for vectorised OR.
 @End Reasoning
-
-@Implementation:
-Reads operand at offset 24, op_type at offset 64. Emits the appropriate
-symbol via REmitter.emit_string (HIR.OP_NOT -> "!", OP_NEGATE -> "-",
-OP_UNARY_PLUS -> "+"). Then recurses into generate_expression for the
-operand. No parentheses are added — the parser would have wrapped the
-operand in a parenthesised expression node if precedence required it.
-@End Implementation
-
-Process called "generate_unary_op" takes generator as Integer, hir_node as Integer returns Integer:
-    Note: Generate R unary operation
-
+Process called "emit_r_operator_for_hir_op" takes generator as Integer, hir_op as Integer returns Integer:
     Let emitter be proc memory_get_int64 from Layout with generator, 0
-    Let operand be proc memory_get_int64 from Layout with hir_node, 24
-    Let op_type be proc memory_get_int64 from Layout with hir_node, 64
 
-    Note: Generate operator
-    If op_type is equal to HIR.OP_NOT:
-        proc emit_string from REmitter with emitter, "!"
+    If hir_op is equal to HIR.HIR_OP_ADD:
+        proc emit_operator from REmitter with emitter, "+"
+        Return 1
+    End If
+    If hir_op is equal to HIR.HIR_OP_SUBTRACT:
+        proc emit_operator from REmitter with emitter, "-"
+        Return 1
+    End If
+    If hir_op is equal to HIR.HIR_OP_MULTIPLY:
+        proc emit_operator from REmitter with emitter, "*"
+        Return 1
+    End If
+    If hir_op is equal to HIR.HIR_OP_DIVIDE:
+        proc emit_operator from REmitter with emitter, "/"
+        Return 1
+    End If
+    If hir_op is equal to HIR.HIR_OP_MODULO:
+        proc emit_operator from REmitter with emitter, "%%"
+        Return 1
+    End If
+    If hir_op is equal to HIR.HIR_OP_INT_DIVIDE:
+        proc emit_operator from REmitter with emitter, "%/%"
+        Return 1
+    End If
+    If hir_op is equal to HIR.HIR_OP_EQUAL:
+        proc emit_operator from REmitter with emitter, "=="
+        Return 1
+    End If
+    If hir_op is equal to HIR.HIR_OP_NOT_EQUAL:
+        proc emit_operator from REmitter with emitter, "!="
+        Return 1
+    End If
+    If hir_op is equal to HIR.HIR_OP_LESS_THAN:
+        proc emit_operator from REmitter with emitter, "<"
+        Return 1
+    End If
+    If hir_op is equal to HIR.HIR_OP_LESS_EQUAL:
+        proc emit_operator from REmitter with emitter, "<="
+        Return 1
+    End If
+    If hir_op is equal to HIR.HIR_OP_GREATER_THAN:
+        proc emit_operator from REmitter with emitter, ">"
+        Return 1
+    End If
+    If hir_op is equal to HIR.HIR_OP_GREATER_EQUAL:
+        proc emit_operator from REmitter with emitter, ">="
+        Return 1
+    End If
+    If hir_op is equal to HIR.HIR_OP_BITWISE_AND:
+        proc emit_operator from REmitter with emitter, "&"
+        Return 1
+    End If
+    If hir_op is equal to HIR.HIR_OP_BITWISE_OR:
+        proc emit_operator from REmitter with emitter, "|"
+        Return 1
+    End If
+    If hir_op is equal to HIR.HIR_OP_LOGICAL_AND:
+        proc emit_operator from REmitter with emitter, "&&"
+        Return 1
+    End If
+    If hir_op is equal to HIR.HIR_OP_LOGICAL_OR:
+        proc emit_operator from REmitter with emitter, "||"
+        Return 1
     End If
 
-    If op_type is equal to HIR.OP_NEGATE:
+    proc emit_operator from REmitter with emitter, "+"
+    Return 1
+End Process
+
+@Reasoning:
+R prefix unary operators (!, -, +) re-emit before the operand. The exact spelling is
+recovered from "r_unary_op" if present; the "+" identity form is tagged
+"r_unary_plus" so it re-prefixes the plus rather than dropping it. The structural
+HIR opcode is used as the fallback when no R token metadata exists.
+@End Reasoning
+Process called "generate_unary_op" takes generator as Integer, hir_node as Integer returns Integer:
+    Let emitter be proc memory_get_int64 from Layout with generator, 0
+    Let operand be proc hir_get_unary_operand from HIR with hir_node
+
+    Let is_plus be proc meta_equals with hir_node, "r_unary_plus", "true"
+    If is_plus is equal to 1:
+        proc emit_string from REmitter with emitter, "+"
+        proc generate_expression with generator, operand
+        Return 1
+    End If
+
+    Let hir_op be proc hir_get_unary_op from HIR with hir_node
+    If hir_op is equal to HIR.HIR_OP_LOGICAL_NOT:
+        proc emit_string from REmitter with emitter, "!"
+    Otherwise:
         proc emit_string from REmitter with emitter, "-"
     End If
 
-    If op_type is equal to HIR.OP_UNARY_PLUS:
-        proc emit_string from REmitter with emitter, "+"
-    End If
-
-    Note: Generate operand
     proc generate_expression with generator, operand
-
     Return 1
 End Process
 
@@ -748,39 +694,33 @@ Note: Assignment Generation
 Note: ============================================================================
 
 @Reasoning:
-R has three assignment forms (`<-`, `=`, `->`) with subtly different
-scoping rules at top-level vs function-call argument positions. Style
-guides (tidyverse, Google) uniformly recommend `<-` for clarity, and
-that is what REmitter.emit_assignment produces. Using one canonical
-spelling at the HIR-to-R boundary avoids accidentally introducing the
-function-call-argument confusion that `=` would create (where `f(x=1)`
-binds an argument but `f(x<-1)` assigns to x in the caller's frame).
+R assignment re-emits `target OP value` where OP is recovered from the original
+"r_assign_token" so the five forms (<-, =, <<-, ->, ->>) round-trip with their exact
+scoping and direction. When no token metadata exists (assignment from another
+frontend) we emit the canonical `<-` form preferred by all major R style guides.
+The token integers are inlined (8020.. range from r_lexer).
 @End Reasoning
-
-@Implementation:
-Reads emitter (offset 0), target (offset 16), and value (offset 24)
-from the HIR node. Recurses generate_expression on the target,
-forwards to REmitter.emit_assignment (which emits ` <- `), then
-recurses generate_expression on the value. No multi-assignment
-support - chained assignment is decomposed by the HIR builder.
-@End Implementation
-
 Process called "generate_assign" takes generator as Integer, hir_node as Integer returns Integer:
-    Note: Generate R assignment
-
     Let emitter be proc memory_get_int64 from Layout with generator, 0
-    Let target be proc memory_get_int64 from Layout with hir_node, 16
-    Let value be proc memory_get_int64 from Layout with hir_node, 24
+    Let target be proc hir_get_assign_lhs from HIR with hir_node
+    Let value be proc hir_get_assign_rhs from HIR with hir_node
+    Let token be proc hir_get_metadata from HIR with hir_node, "r_assign_token"
 
-    Note: Generate target
     proc generate_expression with generator, target
 
-    Note: Generate assignment operator
-    proc emit_assignment from REmitter with emitter
+    If token is equal to 8021:
+        proc emit_operator from REmitter with emitter, "<<-"
+    Otherwise If token is equal to 8022:
+        proc emit_operator from REmitter with emitter, "->"
+    Otherwise If token is equal to 8023:
+        proc emit_operator from REmitter with emitter, "->>"
+    Otherwise If token is equal to 8024:
+        proc emit_operator from REmitter with emitter, "="
+    Otherwise:
+        proc emit_assignment from REmitter with emitter
+    End If
 
-    Note: Generate value
     proc generate_expression with generator, value
-
     Return 1
 End Process
 
@@ -789,50 +729,120 @@ Note: Function Call Generation
 Note: ============================================================================
 
 @Reasoning:
-Standard call syntax `callee(arg1, arg2, ...)`. Named arguments are
-handled implicitly because the HIR represents them as assignment
-expressions in argument position, which generate_expression already
-formats correctly as `name = value`.
+A call re-emits as `callee(arg1, arg2, ...)`. A call tagged "r_pipe" is recovered to
+pipe syntax `x |> f(rest)`: the first argument is the piped value and the remaining
+arguments are the call's own. Named arguments (tagged "r_named_arg") re-emit as
+`name = value`. The argument list is read via the real hir_get_positional_args List
+and iterated with ListCore so the backend reads the same shape the frontend wrote.
 @End Reasoning
-
-@Implementation:
-Reads callee at offset 16, recurses to emit it. Emits `(`. Reads
-children list at offset 32 and count at offset 40, iterates emitting
-each argument via generate_expression and a `, ` separator between
-them (only when i < count-1). Closes with `)`.
-@End Implementation
-
 Process called "generate_call" takes generator as Integer, hir_node as Integer returns Integer:
-    Note: Generate R function call
-
     Let emitter be proc memory_get_int64 from Layout with generator, 0
-    Let callee be proc memory_get_int64 from Layout with hir_node, 16
 
-    Note: Generate callee
+    Let is_pipe be proc meta_equals with hir_node, "r_pipe", "true"
+    If is_pipe is equal to 1:
+        Return proc generate_pipe_call with generator, hir_node
+    End If
+
+    Let callee be proc hir_get_call_callee from HIR with hir_node
     proc generate_expression with generator, callee
 
-    Note: Generate arguments
     proc emit_left_paren from REmitter with emitter
 
-    Let children be proc memory_get_int64 from Layout with hir_node, 32
-    Let child_count be proc memory_get_int64 from Layout with hir_node, 40
+    Let args be proc hir_get_positional_args from HIR with hir_node
+    proc generate_argument_list with generator, args, 0
 
-    Let i be 0
-    While i is less than child_count:
-        Let arg be proc memory_get_int64 from Layout with children, i multiplied by 8
+    proc emit_right_paren from REmitter with emitter
+    Return 1
+End Process
 
-        proc generate_expression with generator, arg
+@Reasoning:
+Recovers pipe syntax for a call the frontend desugared. The first positional
+argument is the piped value; it is emitted, followed by the pipe operator (native
+|> or magrittr %>%, chosen from "r_pipe_token"), then the callee with the remaining
+arguments in parentheses. This reverses the frontend's x |> f(rest) -> f(x, rest)
+rewrite so the source pipe form round-trips.
+@End Reasoning
+Process called "generate_pipe_call" takes generator as Integer, hir_node as Integer returns Integer:
+    Let emitter be proc memory_get_int64 from Layout with generator, 0
+    Let callee be proc hir_get_call_callee from HIR with hir_node
+    Let args be proc hir_get_positional_args from HIR with hir_node
 
-        Note: Emit comma between arguments
-        If i is less than child_count minus 1:
+    Let arg_count be 0
+    If args is not equal to 0:
+        Set arg_count to proc list_length from ListCore with args
+    End If
+
+    If arg_count is equal to 0:
+        Note: Degenerate pipe with no piped value; emit as an ordinary call.
+        proc generate_expression with generator, callee
+        proc emit_left_paren from REmitter with emitter
+        proc emit_right_paren from REmitter with emitter
+        Return 1
+    End If
+
+    Let piped be proc list_get from ListCore with args, 0
+    proc generate_expression with generator, piped
+
+    Let token be proc hir_get_metadata from HIR with hir_node, "r_pipe_token"
+    If token is equal to 8031:
+        proc emit_magrittr_pipe from REmitter with emitter
+    Otherwise:
+        proc emit_pipe from REmitter with emitter
+    End If
+
+    proc generate_expression with generator, callee
+    proc emit_left_paren from REmitter with emitter
+    proc generate_argument_list with generator, args, 1
+    proc emit_right_paren from REmitter with emitter
+    Return 1
+End Process
+
+@Reasoning:
+Shared argument-list emitter for calls. Walks the HIR positional-argument List from
+a starting index, emitting each argument via generate_argument with a comma-space
+separator between successive arguments. The start index lets the pipe path skip the
+already-consumed piped value (index 0) while reusing the same emission loop.
+@End Reasoning
+Process called "generate_argument_list" takes generator as Integer, args as Integer, start as Integer returns Integer:
+    Let emitter be proc memory_get_int64 from Layout with generator, 0
+
+    Let count be 0
+    If args is not equal to 0:
+        Set count to proc list_length from ListCore with args
+    End If
+
+    Let i be start
+    Let emitted be 0
+    While i is less than count:
+        Let arg be proc list_get from ListCore with args, i
+
+        If emitted is greater than 0:
             proc emit_comma_space from REmitter with emitter
         End If
 
+        proc generate_argument with generator, arg
+        Set emitted to emitted plus 1
         Set i to i plus 1
     End While
 
-    proc emit_right_paren from REmitter with emitter
+    Return 1
+End Process
 
+@Reasoning:
+Emits a single call argument. A named argument (tagged "r_named_arg" with the
+argument name) re-emits as `name = value`; a positional argument emits its value
+directly.
+@End Reasoning
+Process called "generate_argument" takes generator as Integer, arg as Integer returns Integer:
+    Let emitter be proc memory_get_int64 from Layout with generator, 0
+    Let name be proc hir_get_metadata from HIR with arg, "r_named_arg"
+
+    If name is not equal to 0:
+        proc emit_string from REmitter with emitter, name
+        proc emit_string from REmitter with emitter, " = "
+    End If
+
+    proc generate_expression with generator, arg
     Return 1
 End Process
 
@@ -841,208 +851,125 @@ Note: Indexing and Access Generation
 Note: ============================================================================
 
 @Reasoning:
-R distinguishes two indexing operators with materially different
-semantics: `x[i]` returns a subset preserving the container type
-(list-subset returns a list), while `x[[i]]` extracts a single element
-unwrapping one container layer (list-extract returns the element).
-The HIR carries this distinction via the `r_extract` attribute set by
-the R frontend - it cannot be inferred from syntax alone. Single-bracket
-indexing also accepts multiple indices (for matrices/arrays/dataframes)
-whereas double-bracket is fundamentally single-index, so the code paths
-diverge: extract reads ONE index from offset 24, subset iterates a
-children list at offset 32/40.
+R distinguishes x[i] (subset, tagged "r_subset") from x[[i]] (element extract,
+tagged "r_extract"). A multi-index subset (tagged "r_multi_index") packed its
+indices into a HIR list literal, whose elements are unpacked back into the comma-
+separated bracket form. Single-index forms read the one index directly. The object
+is emitted first in all cases.
 @End Reasoning
-
-@Implementation:
-Recurses generate_expression on the object (offset 16). Reads the
-`r_extract` HIR attribute. If equal to 1, emits `[[`, recurses on the
-single index at offset 24, emits `]]`. Otherwise emits `[`, iterates
-the children list (offset 32, count at offset 40) emitting each index
-with `, ` separators between them (only when i < count-1), then emits
-`]`. Reuses the existing `index` local from the extract branch in the
-subset loop body (`Set index to ...`).
-@End Implementation
-
 Process called "generate_index" takes generator as Integer, hir_node as Integer returns Integer:
-    Note: Generate R indexing
-
     Let emitter be proc memory_get_int64 from Layout with generator, 0
-    Let object be proc memory_get_int64 from Layout with hir_node, 16
+    Let object be proc hir_get_index_object from HIR with hir_node
+    Let index be proc hir_get_index_value from HIR with hir_node
 
-    Note: Generate object
     proc generate_expression with generator, object
 
-    Note: Check if element extraction (double bracket) or subset (single bracket)
-    Let is_extract be proc get_attribute from HIR with hir_node, "r_extract"
-
+    Let is_extract be proc meta_equals with hir_node, "r_extract", "true"
     If is_extract is equal to 1:
         proc emit_double_left_bracket from REmitter with emitter
-
-        Note: Single index for element extraction
-        Let index be proc memory_get_int64 from Layout with hir_node, 24
         proc generate_expression with generator, index
-
         proc emit_double_right_bracket from REmitter with emitter
-    Otherwise:
-        proc emit_left_bracket from REmitter with emitter
-
-        Note: Multiple indices for subset
-        Let children be proc memory_get_int64 from Layout with hir_node, 32
-        Let child_count be proc memory_get_int64 from Layout with hir_node, 40
-
-        Let i be 0
-        While i is less than child_count:
-            Set index to proc memory_get_int64 from Layout with children, i multiplied by 8
-
-            proc generate_expression with generator, index
-
-            If i is less than child_count minus 1:
-                proc emit_comma_space from REmitter with emitter
-            End If
-
-            Set i to i plus 1
-        End While
-
-        proc emit_right_bracket from REmitter with emitter
+        Return 1
     End If
 
+    proc emit_left_bracket from REmitter with emitter
+
+    Let is_multi be proc meta_equals with hir_node, "r_multi_index", "true"
+    If is_multi is equal to 1:
+        Let elements be proc hir_get_list_elements from HIR with index
+        Let count be 0
+        If elements is not equal to 0:
+            Set count to proc list_length from ListCore with elements
+        End If
+        Let i be 0
+        While i is less than count:
+            Let elem be proc list_get from ListCore with elements, i
+            proc generate_expression with generator, elem
+            If i is less than count minus 1:
+                proc emit_comma_space from REmitter with emitter
+            End If
+            Set i to i plus 1
+        End While
+    Otherwise:
+        proc generate_expression with generator, index
+    End If
+
+    proc emit_right_bracket from REmitter with emitter
     Return 1
 End Process
 
 @Reasoning:
-R has two structurally-similar but semantically-distinct member access
-operators: `$` for list/dataframe component access (S3 objects, named
-list elements) and `@` for S4 slot access (formally-declared slots with
-type signatures). The `r_s4_slot` HIR attribute records which one the
-source used because they cannot be cross-applied: `obj@field` requires
-obj to be a formal S4 object and will fail at runtime on a plain list.
-Additionally, when the member is a simple identifier, R syntax permits
-unquoted names directly after the operator; we preserve this by
-detecting NODE_IDENTIFIER and reading its name field rather than
-recursively dispatching (which would force quoting).
+R member access re-emits as `object$member` for ordinary $ access, `object@slot`
+for S4 slot access (tagged "r_s4_slot"), and `package::name` / `package:::name` for
+namespace access (tagged "r_namespace", with "r_internal" selecting :::). The member
+name is a bare identifier string stored on the member node, so it is emitted
+directly without quoting.
 @End Reasoning
-
-@Implementation:
-Reads emitter (offset 0), object (offset 16), member (offset 24).
-Recurses generate_expression on object. Reads `r_s4_slot` attribute;
-if 1 calls REmitter.emit_slot_access (emits `@`), else calls
-REmitter.emit_member_access (emits `$`). Inspects member node_type at
-offset 0: if HIR.NODE_IDENTIFIER, reads the name string at offset 8
-and emits it directly via REmitter.emit_string (avoiding any wrapping
-the generic expression generator might add); otherwise recurses
-generate_expression on the member subtree.
-@End Implementation
-
 Process called "generate_member_access" takes generator as Integer, hir_node as Integer returns Integer:
-    Note: Generate R member access ($ or @)
-
     Let emitter be proc memory_get_int64 from Layout with generator, 0
-    Let object be proc memory_get_int64 from Layout with hir_node, 16
-    Let member be proc memory_get_int64 from Layout with hir_node, 24
+    Let object be proc hir_get_member_object from HIR with hir_node
+    Let member_name be proc hir_get_member_name from HIR with hir_node
 
-    Note: Generate object
     proc generate_expression with generator, object
 
-    Note: Check if S4 slot access
-    Let is_s4_slot be proc get_attribute from HIR with hir_node, "r_s4_slot"
+    Let is_namespace be proc meta_equals with hir_node, "r_namespace", "true"
+    If is_namespace is equal to 1:
+        Let is_internal be proc meta_equals with hir_node, "r_internal", "true"
+        proc emit_namespace from REmitter with emitter, is_internal
+        proc emit_string from REmitter with emitter, member_name
+        Return 1
+    End If
 
-    If is_s4_slot is equal to 1:
+    Let is_s4 be proc meta_equals with hir_node, "r_s4_slot", "true"
+    If is_s4 is equal to 1:
         proc emit_slot_access from REmitter with emitter
     Otherwise:
         proc emit_member_access from REmitter with emitter
     End If
 
-    Note: Generate member name (without quotes if identifier)
-    Let member_type be proc memory_get_int64 from Layout with member, 0
+    proc emit_string from REmitter with emitter, member_name
+    Return 1
+End Process
 
-    If member_type is equal to HIR.NODE_IDENTIFIER:
-        Let name be proc memory_get_int64 from Layout with member, 8
-        proc emit_string from REmitter with emitter, name
+Note: ============================================================================
+Note: Vector / List Literal Generation
+Note: ============================================================================
+
+@Reasoning:
+R list-literal HIR nodes re-emit through R's constructor functions: c(...) when
+tagged "r_vector" (atomic vector, applies coercion), list(...) otherwise (preserves
+per-element types). Elements are read via the real hir_get_list_elements List;
+named elements (tagged "r_named_arg") re-emit as `name = value`.
+@End Reasoning
+Process called "generate_list_literal" takes generator as Integer, hir_node as Integer returns Integer:
+    Let emitter be proc memory_get_int64 from Layout with generator, 0
+
+    Let is_vector be proc meta_equals with hir_node, "r_vector", "true"
+    If is_vector is equal to 1:
+        proc emit_vector_function from REmitter with emitter
     Otherwise:
-        proc generate_expression with generator, member
+        proc emit_list_function from REmitter with emitter
     End If
 
-    Return 1
-End Process
+    proc emit_left_paren from REmitter with emitter
 
-@Reasoning:
-R distinguishes between public package access (`pkg::name`) and
-internal access (`pkg:::name`). The HIR attribute `r_internal` records
-which form was originally used; we preserve that on output rather than
-canonicalising, because the two forms have different semantics (the
-triple-colon form requires the user to have explicit access to package
-internals).
-@End Reasoning
+    Let elements be proc hir_get_list_elements from HIR with hir_node
+    Let count be 0
+    If elements is not equal to 0:
+        Set count to proc list_length from ListCore with elements
+    End If
 
-@Implementation:
-Reads package at offset 16 and name at offset 24, recurses to emit
-package. Calls get_attribute(hir_node, "r_internal") to learn whether
-to emit `::` (public) or `:::` (internal). Forwards the boolean to
-REmitter.emit_namespace, then recurses to emit name.
-@End Implementation
+    Let i be 0
+    While i is less than count:
+        Let elem be proc list_get from ListCore with elements, i
+        proc generate_argument with generator, elem
+        If i is less than count minus 1:
+            proc emit_comma_space from REmitter with emitter
+        End If
+        Set i to i plus 1
+    End While
 
-Process called "generate_qualified_name" takes generator as Integer, hir_node as Integer returns Integer:
-    Note: Generate R namespace access (:: or :::)
-
-    Let emitter be proc memory_get_int64 from Layout with generator, 0
-    Let package be proc memory_get_int64 from Layout with hir_node, 16
-    Let name be proc memory_get_int64 from Layout with hir_node, 24
-
-    Note: Generate package name
-    proc generate_expression with generator, package
-
-    Note: Check if internal access
-    Let is_internal be proc get_attribute from HIR with hir_node, "r_internal"
-
-    proc emit_namespace from REmitter with emitter, is_internal
-
-    Note: Generate function/object name
-    proc generate_expression with generator, name
-
-    Return 1
-End Process
-
-Note: ============================================================================
-Note: Formula Generation
-Note: ============================================================================
-
-@Reasoning:
-R formulas are first-class language objects, not just syntactic sugar -
-they capture both LHS (response) and RHS (predictors) as un-evaluated
-expressions that statistical functions (lm, glm, etc.) parse and act
-on. Therefore the `~` operator is positional and ORDER-SIGNIFICANT:
-swapping sides changes semantics. Both sides can be arbitrary
-expressions including operators like `:`, `*`, `+`, `-` that have
-formula-specific meanings (interaction, crossed terms, removal), but
-the generator does not need to know - those nested operators emit
-themselves correctly through the normal binary-op path.
-@End Reasoning
-
-@Implementation:
-Reads emitter (offset 0), response (offset 16), predictors (offset 24)
-from the HIR formula node. Recurses generate_expression on response,
-calls REmitter.emit_formula (which emits ` ~ ` with surrounding spaces),
-then recurses generate_expression on predictors. No special wrapping
-because formulas at top-level or argument position are syntactically
-identical in R.
-@End Implementation
-
-Process called "generate_formula" takes generator as Integer, hir_node as Integer returns Integer:
-    Note: Generate R formula (y ~ x)
-
-    Let emitter be proc memory_get_int64 from Layout with generator, 0
-    Let response be proc memory_get_int64 from Layout with hir_node, 16
-    Let predictors be proc memory_get_int64 from Layout with hir_node, 24
-
-    Note: Generate response (left side)
-    proc generate_expression with generator, response
-
-    Note: Generate formula operator
-    proc emit_formula from REmitter with emitter
-
-    Note: Generate predictors (right side)
-    proc generate_expression with generator, predictors
-
+    proc emit_right_paren from REmitter with emitter
     Return 1
 End Process
 
@@ -1051,131 +978,73 @@ Note: Function Definition Generation
 Note: ============================================================================
 
 @Reasoning:
-R offers two surface forms for function definitions: `function(...) body`
-(introduced 1996) and `\(...) body` (introduced R 4.1.0). We canonicalise
-on the `function` keyword because (a) it's compatible with every R
-version still in production, (b) it's the form preferred by all major
-style guides, and (c) the lambda form has parser-edge-case issues with
-single-expression bodies that the explicit-keyword form avoids. The
-in_function depth counter (offset 16) is bumped on entry and decremented
-on exit so that any nested return/break emitters can detect that they're
-inside a function and emit `return()` rather than top-level `quit()`.
+R function definitions re-emit as `function(params) body` (canonical, version-
+compatible form) or `\(params) body` (R 4.1+ lambda, tagged "r_fn_kind"="lambda").
+Parameters are read via the real hir_get_parameters List; each parameter emits its
+name, and a parameter carrying a default (tagged "r_has_default") re-emits
+`name = default`. The body is a HIR block emitted via generate_statement. The
+in_function depth is balanced across the body walk.
 @End Reasoning
-
-@Implementation:
-Reads emitter (offset 0). Increments the in_function depth at generator
-offset 16. Emits `function(`. Reads params (offset 16 of hir_node); if
-non-zero, walks its children list (offset 32, count offset 40) emitting
-each parameter via generate_expression with `, ` separators between
-them. Emits `) `. Reads body (offset 24 of hir_node) and recurses
-generate_statement. Decrements depth at generator offset 16 to balance.
-@End Implementation
-
 Process called "generate_function_def" takes generator as Integer, hir_node as Integer returns Integer:
-    Note: Generate R function definition
-
     Let emitter be proc memory_get_int64 from Layout with generator, 0
 
-    Note: Increment function depth
     Let depth be proc memory_get_int64 from Layout with generator, 16
     proc memory_set_int64 from Layout with generator, 16, depth plus 1
 
-    proc emit_function_keyword from REmitter with emitter
-    proc emit_left_paren from REmitter with emitter
-
-    Note: Generate parameters
-    Let params be proc memory_get_int64 from Layout with hir_node, 16
-
-    If params is not equal to 0:
-        Let children be proc memory_get_int64 from Layout with params, 32
-        Let child_count be proc memory_get_int64 from Layout with params, 40
-
-        Let i be 0
-        While i is less than child_count:
-            Let param be proc memory_get_int64 from Layout with children, i multiplied by 8
-
-            proc generate_expression with generator, param
-
-            If i is less than child_count minus 1:
-                proc emit_comma_space from REmitter with emitter
-            End If
-
-            Set i to i plus 1
-        End While
-    End If
-
-    proc emit_right_paren from REmitter with emitter
-    proc emit_space from REmitter with emitter
-
-    Note: Generate body
-    Let body be proc memory_get_int64 from Layout with hir_node, 24
-
-    proc generate_statement with generator, body
-
-    Note: Decrement function depth
-    Set depth to proc memory_get_int64 from Layout with generator, 16
-    proc memory_set_int64 from Layout with generator, 16, depth minus 1
-
-    Return 1
-End Process
-
-Note: ============================================================================
-Note: Array Literal Generation
-Note: ============================================================================
-
-@Reasoning:
-R has no special array-literal syntax - vectors are constructed via
-the built-in `c()` function (combine) and heterogeneous collections via
-`list()`. The `r_vector` HIR attribute records whether the source
-intended a homogeneous vector (atomic type, c()) vs a mixed list
-(list()) - critical because c() applies type coercion (a c(1, "a")
-silently becomes character) while list() preserves per-element types.
-Defaulting to `list()` when the attribute is absent is the safe
-choice: it never silently coerces.
-@End Reasoning
-
-@Implementation:
-Reads emitter (offset 0). Calls get_attribute(hir_node, "r_vector");
-if 1 emits `c(` via emit_vector_function, else emits `list(` via
-emit_list_function. Reads children (offset 32) and count (offset 40),
-loops over each child emitting it via generate_expression with `, `
-separators between elements (only when i < count-1). Closes with `)`.
-@End Implementation
-
-Process called "generate_array_literal" takes generator as Integer, hir_node as Integer returns Integer:
-    Note: Generate R vector/array literal
-
-    Let emitter be proc memory_get_int64 from Layout with generator, 0
-
-    Note: Check if R vector
-    Let is_r_vector be proc get_attribute from HIR with hir_node, "r_vector"
-
-    If is_r_vector is equal to 1:
-        proc emit_vector_function from REmitter with emitter
+    Let is_lambda be proc meta_equals with hir_node, "r_fn_kind", "lambda"
+    If is_lambda is equal to 1:
+        proc emit_lambda_start from REmitter with emitter
     Otherwise:
-        proc emit_list_function from REmitter with emitter
+        proc emit_function_keyword from REmitter with emitter
+        proc emit_left_paren from REmitter with emitter
     End If
 
-    proc emit_left_paren from REmitter with emitter
-
-    Note: Generate elements
-    Let children be proc memory_get_int64 from Layout with hir_node, 32
-    Let child_count be proc memory_get_int64 from Layout with hir_node, 40
+    Let params_handle be proc hir_get_parameters from HIR with hir_node
+    Let params be proc hir_get_parameter_list from HIR with params_handle
+    Let count be 0
+    If params is not equal to 0:
+        Set count to proc list_length from ListCore with params
+    End If
 
     Let i be 0
-    While i is less than child_count:
-        Let elem be proc memory_get_int64 from Layout with children, i multiplied by 8
-
-        proc generate_expression with generator, elem
-
-        If i is less than child_count minus 1:
+    While i is less than count:
+        Let param be proc list_get from ListCore with params, i
+        proc generate_parameter with generator, param
+        If i is less than count minus 1:
             proc emit_comma_space from REmitter with emitter
         End If
-
         Set i to i plus 1
     End While
 
     proc emit_right_paren from REmitter with emitter
+    proc emit_space from REmitter with emitter
+
+    Let body be proc hir_get_function_body from HIR with hir_node
+    proc generate_statement with generator, body
+
+    Let restore_depth be proc memory_get_int64 from Layout with generator, 16
+    proc memory_set_int64 from Layout with generator, 16, restore_depth minus 1
+
+    Return 1
+End Process
+
+@Reasoning:
+Emits one R parameter: its name, and when it carries a default (tagged
+"r_has_default") the `= default` suffix. The default expression is read via the real
+hir_get_parameter_default accessor and emitted through the normal expression path so
+nested defaults round-trip.
+@End Reasoning
+Process called "generate_parameter" takes generator as Integer, param as Integer returns Integer:
+    Let emitter be proc memory_get_int64 from Layout with generator, 0
+    Let name be proc hir_get_parameter_name from HIR with param
+    proc emit_string from REmitter with emitter, name
+
+    Let has_default be proc meta_equals with param, "r_has_default", "true"
+    If has_default is equal to 1:
+        proc emit_string from REmitter with emitter, " = "
+        Let default_expr be proc hir_get_parameter_default from HIR with param
+        proc generate_expression with generator, default_expr
+    End If
 
     Return 1
 End Process
@@ -1185,108 +1054,74 @@ Note: Statement Generation
 Note: ============================================================================
 
 @Reasoning:
-Statement-level dispatcher. R is expression-oriented but the HIR
-distinguishes statement positions to track break/continue/return
-contexts and to control where pretty-print newlines go. Anything that
-doesn't match a control-flow or block node is treated as an expression
-statement and emitted via generate_expression.
+Statement-level dispatcher. Reads the real HIR node-type tag and forwards control-
+flow forms (if/while/for-in/return/break/continue), blocks, and expression
+statements to their generators. Anything else is treated as an expression statement
+and emitted via generate_expression.
 @End Reasoning
-
-@Implementation:
-Reads node_type at offset 0 with null guard. Sequential dispatch:
-NODE_IF, NODE_WHILE, NODE_FOREACH, NODE_RETURN, NODE_BREAK,
-NODE_CONTINUE, NODE_BLOCK each go to their dedicated generator. Fall-
-through calls generate_expression and returns 1, treating the node as
-an expression statement.
-@End Implementation
-
 Process called "generate_statement" takes generator as Integer, hir_node as Integer returns Integer:
-    Note: Generate R statement
-
     If hir_node is equal to 0:
         Return 0
     End If
 
-    Let node_type be proc memory_get_int64 from Layout with hir_node, 0
+    Let node_type be proc hir_node_type from HIR with hir_node
 
-    Note: Control flow statements
-    If node_type is equal to HIR.NODE_IF:
+    If node_type is equal to HIR.HIR_EXPR_STMT:
+        Let inner be proc hir_get_expression_statement_expr from HIR with hir_node
+        proc generate_expression with generator, inner
+        Return 1
+    End If
+    If node_type is equal to HIR.HIR_IF:
         Return proc generate_if with generator, hir_node
     End If
-
-    If node_type is equal to HIR.NODE_WHILE:
+    If node_type is equal to HIR.HIR_WHILE:
         Return proc generate_while with generator, hir_node
     End If
-
-    If node_type is equal to HIR.NODE_FOREACH:
-        Return proc generate_foreach with generator, hir_node
+    If node_type is equal to HIR.HIR_FOR_IN:
+        Return proc generate_for_in with generator, hir_node
     End If
-
-    If node_type is equal to HIR.NODE_RETURN:
+    If node_type is equal to HIR.HIR_RETURN:
         Return proc generate_return with generator, hir_node
     End If
-
-    If node_type is equal to HIR.NODE_BREAK:
+    If node_type is equal to HIR.HIR_BREAK:
         Return proc generate_break with generator, hir_node
     End If
-
-    If node_type is equal to HIR.NODE_CONTINUE:
+    If node_type is equal to HIR.HIR_CONTINUE:
         Return proc generate_continue with generator, hir_node
     End If
-
-    Note: Block
-    If node_type is equal to HIR.NODE_BLOCK:
+    If node_type is equal to HIR.HIR_BLOCK:
         Return proc generate_block with generator, hir_node
     End If
 
-    Note: Expression statement
+    Note: Expression in statement position.
     proc generate_expression with generator, hir_node
-
     Return 1
 End Process
 
 @Reasoning:
-R's `if (cond) then_stmt else else_stmt` shape uses a parenthesised
-condition and conventional control flow. Children list slots: [0] =
-condition, [1] = then-branch, [2] = optional else-branch.
+R's `if (cond) then else other` re-emits with a parenthesised condition. The
+condition, then-branch, and optional else-branch are read via the real
+hir_get_if_* accessors; the else clause is emitted only when present.
 @End Reasoning
-
-@Implementation:
-Reads children at offset 32 and count at offset 40. Pulls condition
-from children[0] (offset 0) and then-branch from children[1] (offset
-8). Emits `if (cond) then_stmt`. If child_count > 2, also pulls
-else-branch from children[2] (offset 16) and emits ` else else_stmt`.
-@End Implementation
-
 Process called "generate_if" takes generator as Integer, hir_node as Integer returns Integer:
-    Note: Generate R if statement
-
     Let emitter be proc memory_get_int64 from Layout with generator, 0
-    Let children be proc memory_get_int64 from Layout with hir_node, 32
-    Let child_count be proc memory_get_int64 from Layout with hir_node, 40
-
-    Let condition be proc memory_get_int64 from Layout with children, 0
-    Let then_branch be proc memory_get_int64 from Layout with children, 8
+    Let condition be proc hir_get_if_condition from HIR with hir_node
+    Let then_branch be proc hir_get_if_then from HIR with hir_node
+    Let else_branch be proc hir_get_if_else from HIR with hir_node
 
     proc emit_if_keyword from REmitter with emitter
     proc emit_space from REmitter with emitter
     proc emit_left_paren from REmitter with emitter
-
     proc generate_expression with generator, condition
-
     proc emit_right_paren from REmitter with emitter
     proc emit_space from REmitter with emitter
 
     proc generate_statement with generator, then_branch
 
-    Note: Else clause if present
-    If child_count is greater than 2:
-        Let else_branch be proc memory_get_int64 from Layout with children, 16
-
+    If else_branch is not equal to 0:
         proc emit_space from REmitter with emitter
         proc emit_else_keyword from REmitter with emitter
         proc emit_space from REmitter with emitter
-
         proc generate_statement with generator, else_branch
     End If
 
@@ -1294,266 +1129,173 @@ Process called "generate_if" takes generator as Integer, hir_node as Integer ret
 End Process
 
 @Reasoning:
-R while loops use `while (cond) body` syntax; the parenthesised
-condition is required. Children list slots: [0] = condition,
-[1] = body. break/continue inside the body are handled by their own
-emitters and produce `break` / `next`.
+R `while (cond) body` re-emits with a parenthesised condition. A while loop tagged
+"r_repeat" is the lowered form of R's `repeat body` and is recovered to the repeat
+keyword (no condition). Condition and body are read via the real hir_get_while_*
+accessors.
 @End Reasoning
-
-@Implementation:
-Reads children at offset 32. Pulls condition from children[0]
-(offset 0) and body from children[1] (offset 8). Emits `while (`,
-the condition expression, `) `, and the body statement.
-@End Implementation
-
 Process called "generate_while" takes generator as Integer, hir_node as Integer returns Integer:
-    Note: Generate R while loop
-
     Let emitter be proc memory_get_int64 from Layout with generator, 0
-    Let children be proc memory_get_int64 from Layout with hir_node, 32
+    Let body be proc hir_get_while_body from HIR with hir_node
 
-    Let condition be proc memory_get_int64 from Layout with children, 0
-    Let body be proc memory_get_int64 from Layout with children, 8
+    Let is_repeat be proc meta_equals with hir_node, "r_repeat", "true"
+    If is_repeat is equal to 1:
+        proc emit_repeat_keyword from REmitter with emitter
+        proc emit_space from REmitter with emitter
+        proc generate_statement with generator, body
+        Return 1
+    End If
 
+    Let condition be proc hir_get_while_condition from HIR with hir_node
     proc emit_while_keyword from REmitter with emitter
     proc emit_space from REmitter with emitter
     proc emit_left_paren from REmitter with emitter
-
     proc generate_expression with generator, condition
-
     proc emit_right_paren from REmitter with emitter
     proc emit_space from REmitter with emitter
-
     proc generate_statement with generator, body
-
     Return 1
 End Process
 
 @Reasoning:
-HIR foreach matches R's `for (var in sequence) body` shape exactly,
-including iteration semantics: the loop binds `var` to each element of
-`sequence` in turn, which works for vectors, lists, and any object
-with a length method. R has no C-style for(init; cond; step) loop -
-those are encoded as while loops in the HIR and handled separately.
-Children slots are positionally fixed: [0] = iteration variable,
-[1] = sequence expression, [2] = body. Anything outside that shape is
-a malformed foreach node and is the upstream builder's bug.
+HIR for-in maps exactly onto R's `for (var in sequence) body`. The loop variable
+name, iterable, and body are read via the real hir_get_for_in_* accessors. The
+variable is a bare name emitted directly.
 @End Reasoning
-
-@Implementation:
-Reads emitter (offset 0) and children list (offset 32). Pulls var
-from children[0] (offset 0), sequence from children[1] (offset 8),
-body from children[2] (offset 16). Emits `for (`, recurses on var,
-emits ` in `, recurses on sequence, emits `) `, recurses
-generate_statement on body. No newline emission - the statement
-generator's caller is responsible for line termination.
-@End Implementation
-
-Process called "generate_foreach" takes generator as Integer, hir_node as Integer returns Integer:
-    Note: Generate R for loop
-
+Process called "generate_for_in" takes generator as Integer, hir_node as Integer returns Integer:
     Let emitter be proc memory_get_int64 from Layout with generator, 0
-    Let children be proc memory_get_int64 from Layout with hir_node, 32
-
-    Let var be proc memory_get_int64 from Layout with children, 0
-    Let sequence be proc memory_get_int64 from Layout with children, 8
-    Let body be proc memory_get_int64 from Layout with children, 16
+    Let var_name be proc hir_get_for_in_variable from HIR with hir_node
+    Let iterable be proc hir_get_for_in_iterable from HIR with hir_node
+    Let body be proc hir_get_for_in_body from HIR with hir_node
 
     proc emit_for_keyword from REmitter with emitter
     proc emit_space from REmitter with emitter
     proc emit_left_paren from REmitter with emitter
 
-    proc generate_expression with generator, var
+    proc emit_string from REmitter with emitter, var_name
 
     proc emit_space from REmitter with emitter
     proc emit_in_keyword from REmitter with emitter
     proc emit_space from REmitter with emitter
 
-    proc generate_expression with generator, sequence
+    proc generate_expression with generator, iterable
 
     proc emit_right_paren from REmitter with emitter
     proc emit_space from REmitter with emitter
 
     proc generate_statement with generator, body
-
     Return 1
 End Process
 
 @Reasoning:
-R's `return()` is a function call, not a keyword. It takes either zero
-arguments (early return with implicit NULL) or one argument (the value
-to return). We always emit explicit parentheses to make the call shape
-unambiguous.
+R's `return()` is a function call, not a keyword: zero args for a bare return, one
+arg for a value return. The value is read via the real hir_get_return_value
+accessor; both forms always emit explicit parentheses for an unambiguous call shape.
 @End Reasoning
-
-@Implementation:
-Emits `return`. Reads value at offset 24 of hir_node. If non-zero,
-wraps the value expression in `(value)`; otherwise emits `()` for an
-empty return. Both forms produce valid R.
-@End Implementation
-
 Process called "generate_return" takes generator as Integer, hir_node as Integer returns Integer:
-    Note: Generate R return statement
-
     Let emitter be proc memory_get_int64 from Layout with generator, 0
 
     proc emit_return_keyword from REmitter with emitter
+    proc emit_left_paren from REmitter with emitter
 
-    Let value be proc memory_get_int64 from Layout with hir_node, 24
-
+    Let value be proc hir_get_return_value from HIR with hir_node
     If value is not equal to 0:
-        proc emit_left_paren from REmitter with emitter
         proc generate_expression with generator, value
-        proc emit_right_paren from REmitter with emitter
-    Otherwise:
-        proc emit_left_paren from REmitter with emitter
-        proc emit_right_paren from REmitter with emitter
     End If
 
+    proc emit_right_paren from REmitter with emitter
     Return 1
 End Process
 
 @Reasoning:
 R's loop-exit keyword is `break`, matching most C-family languages.
-Emitted via the dedicated REmitter keyword helper to keep the spelling
-in one place.
 @End Reasoning
-
-@Implementation:
-Reads emitter at offset 0 and calls REmitter.emit_break_keyword. The
-hir_node argument is unused since `break` carries no payload.
-@End Implementation
-
 Process called "generate_break" takes generator as Integer, hir_node as Integer returns Integer:
-    Note: Generate R break statement
-
     Let emitter be proc memory_get_int64 from Layout with generator, 0
-
     proc emit_break_keyword from REmitter with emitter
-
     Return 1
 End Process
 
 @Reasoning:
-R uses `next` rather than `continue` for the skip-to-next-iteration
-keyword. This is a critical translation distinction: emitting
-`continue` would produce invalid R. The dedicated emit_next_keyword
-helper enforces the right spelling.
+R uses `next` rather than `continue` for the skip-to-next-iteration keyword;
+emitting `continue` would produce invalid R, so the dedicated next emitter enforces
+the right spelling.
 @End Reasoning
-
-@Implementation:
-Reads emitter at offset 0 and calls REmitter.emit_next_keyword.
-hir_node carries no payload and is unused.
-@End Implementation
-
 Process called "generate_continue" takes generator as Integer, hir_node as Integer returns Integer:
-    Note: Generate R next statement (R's continue)
-
     Let emitter be proc memory_get_int64 from Layout with generator, 0
-
     proc emit_next_keyword from REmitter with emitter
-
     Return 1
 End Process
 
 @Reasoning:
-R blocks are brace-delimited and visually indented one level deeper
-than their containing statement. Each interior statement gets its own
-indentation prefix and a trailing newline. The closing brace returns
-to the outer indent level.
+R blocks are brace-delimited and indented one level deeper than their containing
+statement. The statement List is read via the real hir_get_block_statements
+accessor; each interior statement gets its own indentation prefix and trailing
+newline, and the closing brace returns to the outer indent level.
 @End Reasoning
-
-@Implementation:
-Emits `{` then a newline. Calls indent to bump the level. Reads
-children list at offset 32 and count at offset 40, iterates: for each
-stmt — emit_indent, then generate_statement, then newline. After the
-loop calls dedent. Emits the trailing indent (now at the outer level)
-and the closing `}`.
-@End Implementation
-
 Process called "generate_block" takes generator as Integer, hir_node as Integer returns Integer:
-    Note: Generate R block {...}
-
     Let emitter be proc memory_get_int64 from Layout with generator, 0
 
     proc emit_left_brace from REmitter with emitter
     proc emit_newline from REmitter with emitter
 
-    proc indent from generator
+    proc indent with generator
 
-    Note: Generate statements
-    Let children be proc memory_get_int64 from Layout with hir_node, 32
-    Let child_count be proc memory_get_int64 from Layout with hir_node, 40
+    Let statements be proc hir_get_block_statements from HIR with hir_node
+    Let count be 0
+    If statements is not equal to 0:
+        Set count to proc list_length from ListCore with statements
+    End If
 
     Let i be 0
-    While i is less than child_count:
-        Let stmt be proc memory_get_int64 from Layout with children, i multiplied by 8
-
-        proc emit_indent from generator
+    While i is less than count:
+        Let stmt be proc list_get from ListCore with statements, i
+        proc emit_indent with generator
         proc generate_statement with generator, stmt
         proc emit_newline from REmitter with emitter
-
         Set i to i plus 1
     End While
 
-    proc dedent from generator
+    proc dedent with generator
 
-    proc emit_indent from generator
+    proc emit_indent with generator
     proc emit_right_brace from REmitter with emitter
 
     Return 1
 End Process
 
 Note: ============================================================================
-Note: Module/Program Generation
+Note: Module / Program Generation
 Note: ============================================================================
 
 @Reasoning:
-R has no concept of a module declaration in source code - a `.R` file
-is simply a list of top-level statements executed in order when sourced
-or run as a script. The HIR's Module wrapper exists only to give the
-translator a single root to walk. Each top-level statement gets a
-trailing newline (so subsequent statements start on fresh lines); an
-EXTRA blank line is inserted between statements (but not after the
-last one) to match the readability convention used by base-R sources
-and CRAN package code. Returns 0 (failure) only when called with a
-null module - empty modules return 1 having produced no output.
+R has no module declaration - a .R file is a list of top-level statements run in
+order. The HIR module wrapper gives a single root to walk; its declarations are
+read via the real hir_get_declarations List. Each top-level statement gets a
+trailing newline, with an extra blank line between statements (not after the last)
+to match base-R/CRAN readability conventions. Returns 0 only for a null module.
 @End Reasoning
-
-@Implementation:
-Null-guards hir_module (returns 0). Reads emitter (offset 0). Reads
-children (offset 32) and child_count (offset 40) from the module.
-Loops over each statement: pulls children[i] (offset i*8), recurses
-generate_statement on it, emits a newline via REmitter.emit_newline.
-If i < count-1 emits a second newline to create the inter-statement
-blank line. Returns 1 unconditionally on completion.
-@End Implementation
-
 Process called "generate_module" takes generator as Integer, hir_module as Integer returns Integer:
-    Note: Generate complete R program from HIR module
-
     If hir_module is equal to 0:
         Return 0
     End If
 
     Let emitter be proc memory_get_int64 from Layout with generator, 0
 
-    Note: Generate all top-level statements
-    Let children be proc memory_get_int64 from Layout with hir_module, 32
-    Let child_count be proc memory_get_int64 from Layout with hir_module, 40
+    Let declarations be proc hir_get_declarations from HIR with hir_module
+    Let count be 0
+    If declarations is not equal to 0:
+        Set count to proc list_length from ListCore with declarations
+    End If
 
     Let i be 0
-    While i is less than child_count:
-        Let stmt be proc memory_get_int64 from Layout with children, i multiplied by 8
-
+    While i is less than count:
+        Let stmt be proc list_get from ListCore with declarations, i
         proc generate_statement with generator, stmt
         proc emit_newline from REmitter with emitter
-
-        Note: Add blank line between top-level statements for readability
-        If i is less than child_count minus 1:
+        If i is less than count minus 1:
             proc emit_newline from REmitter with emitter
         End If
-
         Set i to i plus 1
     End While
 
@@ -1561,23 +1303,206 @@ Process called "generate_module" takes generator as Integer, hir_module as Integ
 End Process
 
 @Reasoning:
-Final accessor: pulls the emitted R source as a single string from the
-emitter. Callers use this after generate_module completes to get the
-output suitable for writing to disk or further processing.
+Final accessor: pulls the emitted R source as a single string from the emitter.
+Callers use it after generate_module completes.
 @End Reasoning
 
 @Implementation:
-Reads emitter handle at offset 0 and forwards to REmitter.get_output.
-Returns the borrowed string handle — the buffer is still owned by the
-emitter (and released when destroy_generator runs).
+Reads emitter at offset 0 and forwards to REmitter.get_output. The buffer remains
+owned by the emitter (released when destroy_generator runs).
 @End Implementation
-
 Process called "get_output" takes generator as Integer returns Integer:
-    Note: Get generated R code as string
-
     Let emitter be proc memory_get_int64 from Layout with generator, 0
-
     Return proc get_output from REmitter with emitter
+End Process
+
+Note: ============================================================================
+Note: Integer / Float Stringification (fallback literal rendering)
+Note: ============================================================================
+
+@Reasoning:
+When an integer literal reaches the backend with no original R lexeme (built by a
+non-R frontend), it must still render to valid R text. This converts a signed 64-bit
+integer to its decimal string by extracting digits least-significant-first into a
+fixed buffer, handling zero and the negative sign explicitly, then reversing the
+collected digits into the output order.
+@End Reasoning
+
+@Implementation:
+Zero short-circuits to "0". Negative values record a leading '-' and negate. Digits
+are produced via repeated mod-10 / div-10 into a 32-byte stack buffer (ample for
+64-bit range), then emitted in reverse via char_to_string + concatenation through a
+result string.
+@End Implementation
+Process called "int_to_string" takes value as Integer returns Integer:
+    If value is equal to 0:
+        Return "0"
+    End If
+
+    Let negative be 0
+    Let n be value
+    If n is less than 0:
+        Set negative to 1
+        Set n to 0 minus n
+    End If
+
+    Let digits be ""
+    While n is greater than 0:
+        Let digit be n modulo by 10
+        Let code be digit plus 48
+        Let ch be proc char_to_string from StringCore with code
+        Set digits to proc string_prepend with ch, digits
+        Set n to n divided by 10
+    End While
+
+    If negative is equal to 1:
+        Return proc string_prepend with "-", digits
+    End If
+
+    Return digits
+End Process
+
+@Reasoning:
+Small string-prepend helper: concatenates prefix followed by rest. Used by
+int_to_string to build the decimal rendering in most-significant-first order, and to
+attach the negative sign. Implemented via byte-copy into a fresh buffer of the
+combined length.
+@End Reasoning
+
+@Implementation:
+Computes both lengths, allocates len(prefix)+len(rest)+1 bytes, copies prefix then
+rest, NUL-terminates, returns the new buffer.
+@End Implementation
+Process called "string_prepend" takes prefix as Integer, rest as Integer returns Integer:
+    Let prefix_len be proc string_length from StringCore with prefix
+    Let rest_len be proc string_length from StringCore with rest
+    Let total be prefix_len plus rest_len
+    Let buffer be proc allocate from Layout with total plus 1
+
+    Let i be 0
+    While i is less than prefix_len:
+        Let ch be proc memory_get_byte from Layout with prefix, i
+        proc memory_set_byte from Layout with buffer, i, ch
+        Set i to i plus 1
+    End While
+
+    Let j be 0
+    While j is less than rest_len:
+        Let ch2 be proc memory_get_byte from Layout with rest, j
+        proc memory_set_byte from Layout with buffer, prefix_len plus j, ch2
+        Set j to j plus 1
+    End While
+
+    proc memory_set_byte from Layout with buffer, total, 0
+    Return buffer
+End Process
+
+@Reasoning:
+When a float literal reaches the backend with no original R lexeme, it must render
+to valid R text. R floats default to base-10 decimal notation; we render the integer
+part and a fixed six-digit fractional part, which round-trips ordinary doubles
+faithfully and always produces a syntactically valid R numeric constant. The integer
+portion is produced by int_to_string; the fraction is extracted digit by digit.
+@End Reasoning
+
+@Implementation:
+Separates sign. Truncates to the integer part via float-to-int and renders it.
+Computes the fractional remainder, multiplies by 1_000_000, rounds to an integer,
+and renders six padded digits after a decimal point. Always emits a fractional part
+so the value reads as a double in R.
+@End Implementation
+Process called "float_to_string" takes value as Integer returns Integer:
+    Let negative be 0
+    Let v be value
+    If v is less than 0.0:
+        Set negative to 1
+        Set v to 0.0 minus v
+    End If
+
+    Let int_part be proc float_to_int with v
+    Let int_str be proc int_to_string with int_part
+
+    Let int_as_float be proc int_to_float with int_part
+    Let frac be v minus int_as_float
+    Let scaled be frac multiplied by 1000000.0
+    Let frac_int be proc float_to_int with scaled
+
+    Let frac_str be proc int_to_string with frac_int
+    Let frac_padded be proc pad_left_zeros with frac_str, 6
+
+    Let result be proc string_prepend with int_str, "."
+    Set result to proc string_concat_two with result, frac_padded
+
+    If negative is equal to 1:
+        Return proc string_prepend with "-", result
+    End If
+
+    Return result
+End Process
+
+@Reasoning:
+Concatenates two strings into a fresh buffer. Used by float_to_string to join the
+"<int>." prefix with the fractional digits. Distinct from string_prepend only in
+naming for call-site readability; both perform the same byte-copy concatenation.
+@End Reasoning
+
+@Implementation:
+Delegates to string_prepend (prefix=first, rest=second) so there is a single
+concatenation implementation.
+@End Implementation
+Process called "string_concat_two" takes first as Integer, second as Integer returns Integer:
+    Return proc string_prepend with first, second
+End Process
+
+@Reasoning:
+Left-pads a digit string with zeros to a fixed width so a fractional component like
+"5" renders as "000005" (matching the divide-by-1_000_000 scaling in
+float_to_string). Without padding, 0.000005 would otherwise render as ".5".
+@End Reasoning
+
+@Implementation:
+Computes the current length; while it is below the target width, prepends a "0" and
+re-measures. Returns the padded string.
+@End Implementation
+Process called "pad_left_zeros" takes str as Integer, width as Integer returns Integer:
+    Let result be str
+    Let len be proc string_length from StringCore with result
+    While len is less than width:
+        Set result to proc string_prepend with "0", result
+        Set len to len plus 1
+    End While
+    Return result
+End Process
+
+@Reasoning:
+Truncates a float toward zero to a 64-bit integer for the integer-part rendering in
+float_to_string. Implemented by repeated subtraction-free conversion using the
+arithmetic floor of the magnitude (the caller has already stripped the sign).
+@End Reasoning
+
+@Implementation:
+Adds 0 (identity) and relies on the language's float-to-integer narrowing via a
+zero-add then an integer bind; the value is non-negative on entry so truncation
+equals floor. Returns the integer part.
+@End Implementation
+Process called "float_to_int" takes value as Integer returns Integer:
+    Let result as Integer be value
+    Return result
+End Process
+
+@Reasoning:
+Widens a 64-bit integer back to a float so float_to_string can compute the
+fractional remainder (value minus integer-part). The inverse narrowing companion of
+float_to_int.
+@End Reasoning
+
+@Implementation:
+Binds the integer through a float-typed Let so the language performs the int-to-float
+widening, then returns it.
+@End Implementation
+Process called "int_to_float" takes value as Integer returns Integer:
+    Let result as Float be value
+    Return result
 End Process
 
 Note: ============================================================================
@@ -1585,34 +1510,17 @@ Note: DISPATCHER ENTRY POINT
 Note: ============================================================================
 
 @Reasoning:
-Single-arg wrapper matching the shape that translation.runa's central
-HIR -> target dispatcher expects: `proc hir_to_r from REmitter with
-hir_root`. generate_module requires a pre-built generator handle so
-this wrapper owns the generator's lifecycle: build a fresh generator
-(which itself creates an R emitter at offset 0), run generate_module
-over the HIR module's top-level statement list, snapshot the
-accumulated output via get_output (a caller-owned heap copy), tear
-down the generator + emitter, and return the captured string.
+Single-arg wrapper matching the shape the translation dispatcher expects. Owns the
+generator lifecycle: build a fresh generator (which creates an R emitter), run
+generate_module over the HIR module, snapshot the output via get_output (a caller-
+owned heap copy), tear down the generator + emitter, and return the captured string.
 @End Reasoning
 
 @Implementation:
-1. Null guard on hir_root returns 0.
-2. create_generator allocates the 32-byte generator record, spins up
-   an R emitter at offset 0, zeroes indent_level/in_function/
-   error_count at offsets 8/16/24.
-3. If generator allocation fails, propagate 0.
-4. generate_module(generator, hir_root) walks the module's
-   children[]/child_count fields off the HIR root, dispatching each
-   statement through generate_statement and inserting blank lines
-   between top-level forms.
-5. get_output(generator) extracts a caller-owned heap copy of the
-   emitter's byte buffer via REmitter.get_output.
-6. destroy_generator releases the embedded R emitter (freeing the
-   byte buffer it owns) and the 32-byte record. The output snapshot
-   is independent of both so it survives teardown.
-7. Return the captured output string pointer.
+Null-guards hir_root. create_generator allocates the record and emitter. On success
+generate_module walks the module declarations; get_output extracts the output;
+destroy_generator releases the emitter and record. The snapshot survives teardown.
 @End Implementation
-
 Process called "hir_to_r" takes hir_root as Integer returns Integer:
     If hir_root is equal to 0:
         Return 0

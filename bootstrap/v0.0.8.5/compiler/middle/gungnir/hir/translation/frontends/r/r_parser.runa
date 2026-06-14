@@ -43,6 +43,59 @@ Import "compiler/middle/gungnir/hir/translation/frontends/r/r_lexer.runa" as RLe
 Import "compiler/frontend/primitives/memory/layout.runa" as Layout
 Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
 
+Note:
+============================================================================
+R AST CONTRACT (LOCKED) - the shape r_to_hir.runa must consume
+============================================================================
+
+Every AST node is a 72-byte ASTNode record. Field offsets are invariant:
+    0  node_type     One of the NODE_* constants below
+    8  value         String pointer for leaf nodes (lexeme / name / number text)
+    16 left          Primary child (object / callee / target / lhs / package)
+    24 right         Secondary child (operand / value / member / name / body)
+    32 children      Pointer to a heap array of child node pointers
+    40 child_count   Number of entries in the children array
+    48 line          Source line
+    56 column        Source column
+    64 token_type    Original operator/flag token (BINARY_OP/UNARY_OP/ASSIGN/
+                     NAMESPACE store the originating RLexer.TOKEN_* here)
+
+Per-node-kind field usage (what r_to_hir reads):
+    NODE_NUMBER / NODE_COMPLEX / NODE_STRING / NODE_IDENTIFIER:
+        value(8) = lexeme/name string.
+    NODE_TRUE / NODE_FALSE / NODE_NULL / NODE_NA / NODE_NAN / NODE_INF:
+        no payload (kind alone carries meaning).
+    NODE_BINARY_OP: left(16), right(24), token_type(64)=operator RLexer.TOKEN_*.
+    NODE_UNARY_OP:  right(24)=operand, token_type(64)=operator RLexer.TOKEN_*.
+    NODE_ASSIGN:    left(16)=target, right(24)=value. (Default-arg params reuse
+                    this: left=param name identifier, right=default expr.)
+    NODE_CALL:      left(16)=callee, children(32)/child_count(40)=arguments.
+    NODE_INDEX:     left(16)=object, children(32)/child_count(40)=indices.
+    NODE_DOUBLE_INDEX: left(16)=object, right(24)=single index.
+    NODE_MEMBER_ACCESS / NODE_SLOT_ACCESS: left(16)=object,
+                    right(24)=member/slot identifier node (NODE_IDENTIFIER).
+    NODE_NAMESPACE: left(16)=package id, right(24)=name id,
+                    token_type(64)=is_internal flag (0 for ::, 1 for :::).
+    NODE_FORMULA:   left(16)=response, right(24)=predictors.
+    NODE_FUNCTION_DEF / NODE_LAMBDA: children(32)/child_count(40)=parameters
+                    (bare NODE_IDENTIFIER, or NODE_ASSIGN for defaults),
+                    right(24)=body statement.
+    NODE_VECTOR:    children(32)/child_count(40)=elements (c(...)).
+    NODE_IF_STMT:   children[0]=condition, children[1]=then, children[2]=else
+                    (else present only when child_count > 2).
+    NODE_WHILE_STMT: children[0]=condition, children[1]=body.
+    NODE_FOR_STMT:  children[0]=loop var id, children[1]=sequence, children[2]=body.
+    NODE_REPEAT_STMT: children[0]=body.
+    NODE_RETURN_STMT: right(24)=value (0 when bare return).
+    NODE_BREAK_STMT / NODE_NEXT_STMT: no payload.
+    NODE_EXPRESSION_STMT: left(16)=wrapped expression.
+    NODE_BLOCK / NODE_PROGRAM: children(32)/child_count(40)=statements.
+
+Entry points:
+    parse_r_source(source) -> NODE_PROGRAM root (full lex + parse driver).
+    tokenize_all(source, count_out) -> contiguous RToken array (lexer bridge).
+:End Note
+
 Note: ============================================================================
 Note: AST Node Types
 Note: ============================================================================
@@ -193,6 +246,142 @@ Process called "destroy_parser" takes parser as Integer returns Integer:
     proc deallocate from Layout with parser
 
     Return 1
+End Process
+
+Note: ============================================================================
+Note: Lexer Bridge: Tokenize Whole Source Into A Contiguous Array
+Note: ============================================================================
+
+@Reasoning:
+The R lexer (r_lexer.runa) emits one RToken at a time as a separately-allocated
+40-byte record, but RParser indexes its token stream as a single contiguous
+array (tokens + index*40). tokenize_all bridges the two: it drives the lexer to
+exhaustion and copies each 40-byte token into a contiguous, growable buffer so
+the parser's pointer arithmetic is valid. The trailing EOF token is included so
+current_token returns it (rather than 0) at the end of input.
+@End Reasoning
+
+@Implementation:
+Creates an RLexer over source, then repeatedly calls RLexer.next_token, copying
+each token's 40 bytes into a contiguous array that doubles when full. Stops after
+copying the EOF token. Writes the final element count through the count_out
+pointer (an 8-byte caller-allocated cell) and returns the array base pointer.
+Returns 0 on allocation failure.
+@End Implementation
+
+Process called "tokenize_all" takes source as Integer, count_out as Integer returns Integer:
+    Note: Lex the entire source into a contiguous array of 40-byte RTokens
+
+    Let lexer be proc create_r_lexer from RLexer with source
+    If lexer is equal to 0:
+        Return 0
+    End If
+
+    Let capacity be 64
+    Let token_size be 40
+    Let array be proc allocate from Layout with capacity multiplied by token_size
+    If array is equal to 0:
+        proc destroy_r_lexer from RLexer with lexer
+        Return 0
+    End If
+
+    Let count be 0
+    Let looping be 1
+    While looping is equal to 1:
+        Let tok be proc next_token from RLexer with lexer
+        If tok is equal to 0:
+            Set looping to 0
+        Otherwise:
+            Note: Grow the array if full
+            If count is greater than or equal to capacity:
+                Let new_capacity be capacity multiplied by 2
+                Let new_array be proc allocate from Layout with new_capacity multiplied by token_size
+                If new_array is equal to 0:
+                    proc destroy_r_lexer from RLexer with lexer
+                    Return 0
+                End If
+                Let copy_bytes be count multiplied by token_size
+                Let b be 0
+                While b is less than copy_bytes:
+                    Let byte_val be proc memory_get_byte from Layout with array, b
+                    proc memory_set_byte from Layout with new_array, b, byte_val
+                    Set b to b plus 1
+                End While
+                proc deallocate from Layout with array
+                Set array to new_array
+                Set capacity to new_capacity
+            End If
+
+            Note: Copy the 40-byte token into slot `count`
+            Let dest be array plus count multiplied by token_size
+            Let field0 be proc memory_get_int64 from Layout with tok, 0
+            Let field1 be proc memory_get_int64 from Layout with tok, 8
+            Let field2 be proc memory_get_int64 from Layout with tok, 16
+            Let field3 be proc memory_get_int64 from Layout with tok, 24
+            Let field4 be proc memory_get_int64 from Layout with tok, 32
+            proc memory_set_int64 from Layout with dest, 0, field0
+            proc memory_set_int64 from Layout with dest, 8, field1
+            proc memory_set_int64 from Layout with dest, 16, field2
+            proc memory_set_int64 from Layout with dest, 24, field3
+            proc memory_set_int64 from Layout with dest, 32, field4
+            Set count to count plus 1
+
+            Note: Stop after copying the EOF token
+            If field0 is equal to RLexer.TOKEN_EOF:
+                Set looping to 0
+            End If
+        End If
+    End While
+
+    proc destroy_r_lexer from RLexer with lexer
+
+    proc memory_set_int64 from Layout with count_out, 0, count
+
+    Return array
+End Process
+
+@Reasoning:
+Single-call driver for the whole R frontend pipeline: source text in, AST root
+out. This is the entry point that tests and r_to_hir use, so they never have to
+hand-assemble the lexer/array/parser triple themselves.
+@End Reasoning
+
+@Implementation:
+Allocates an 8-byte count cell, calls tokenize_all to materialise the token
+array, constructs a parser over (array, count) via create_parser, runs
+parse_program, destroys the parser (the AST it produced is independent of the
+parser record), and returns the program AST root. Returns 0 if tokenisation or
+parser construction fails.
+@End Implementation
+
+Process called "parse_r_source" takes source as Integer returns Integer:
+    Note: Lex + parse an R source string into a program AST
+
+    Let count_cell be proc allocate from Layout with 8
+    If count_cell is equal to 0:
+        Return 0
+    End If
+    proc memory_set_int64 from Layout with count_cell, 0, 0
+
+    Let tokens be proc tokenize_all with source, count_cell
+    If tokens is equal to 0:
+        proc deallocate from Layout with count_cell
+        Return 0
+    End If
+
+    Let token_count be proc memory_get_int64 from Layout with count_cell, 0
+    proc deallocate from Layout with count_cell
+
+    Let parser be proc create_parser with tokens, token_count
+    If parser is equal to 0:
+        Return 0
+    End If
+
+    Let program be proc parse_program with parser
+
+    proc destroy_parser with parser
+
+    Return program
 End Process
 
 Note: ============================================================================
@@ -379,7 +568,7 @@ Fetches current_token, returns 0 if EOF, otherwise compares the token's type fie
 Process called "match_token" takes parser as Integer, token_type as Integer returns Integer:
     Note: Check if current token matches type
 
-    Let token be proc current_token from parser
+    Let token be proc current_token with parser
 
     If token is equal to 0:
         Return 0
@@ -408,7 +597,7 @@ Process called "consume" takes parser as Integer, token_type as Integer, message
     Let matches be proc match_token with parser, token_type
 
     If matches is equal to 1:
-        proc advance from parser
+        proc advance with parser
         Return 1
     End If
 
@@ -640,7 +829,7 @@ Switch over current_token type: numeric/string literals build leaf nodes; "(" re
 Process called "parse_primary" takes parser as Integer returns Integer:
     Note: Parse primary expression
 
-    Let token be proc current_token from parser
+    Let token be proc current_token with parser
 
     If token is equal to 0:
         Return 0
@@ -650,78 +839,78 @@ Process called "parse_primary" takes parser as Integer returns Integer:
 
     Note: Literals
     If token_type is equal to RLexer.TOKEN_NUMBER:
-        Let node be proc create_node from NODE_NUMBER
+        Let node be proc create_node with NODE_NUMBER
         Let lexeme be proc memory_get_int64 from Layout with token, 8
         proc memory_set_int64 from Layout with node, 8, lexeme
-        proc advance from parser
+        proc advance with parser
         Return node
     End If
 
     If token_type is equal to RLexer.TOKEN_COMPLEX:
-        Set node to proc create_node from NODE_COMPLEX
+        Set node to proc create_node with NODE_COMPLEX
         Set lexeme to proc memory_get_int64 from Layout with token, 8
         proc memory_set_int64 from Layout with node, 8, lexeme
-        proc advance from parser
+        proc advance with parser
         Return node
     End If
 
     If token_type is equal to RLexer.TOKEN_STRING:
-        Set node to proc create_node from NODE_STRING
+        Set node to proc create_node with NODE_STRING
         Set lexeme to proc memory_get_int64 from Layout with token, 8
         proc memory_set_int64 from Layout with node, 8, lexeme
-        proc advance from parser
+        proc advance with parser
         Return node
     End If
 
     If token_type is equal to RLexer.TOKEN_TRUE:
-        Set node to proc create_node from NODE_TRUE
-        proc advance from parser
+        Set node to proc create_node with NODE_TRUE
+        proc advance with parser
         Return node
     End If
 
     If token_type is equal to RLexer.TOKEN_FALSE:
-        Set node to proc create_node from NODE_FALSE
-        proc advance from parser
+        Set node to proc create_node with NODE_FALSE
+        proc advance with parser
         Return node
     End If
 
     If token_type is equal to RLexer.TOKEN_NULL:
-        Set node to proc create_node from NODE_NULL
-        proc advance from parser
+        Set node to proc create_node with NODE_NULL
+        proc advance with parser
         Return node
     End If
 
     If token_type is equal to RLexer.TOKEN_NA:
-        Set node to proc create_node from NODE_NA
-        proc advance from parser
+        Set node to proc create_node with NODE_NA
+        proc advance with parser
         Return node
     End If
 
     If token_type is equal to RLexer.TOKEN_NAN:
-        Set node to proc create_node from NODE_NAN
-        proc advance from parser
+        Set node to proc create_node with NODE_NAN
+        proc advance with parser
         Return node
     End If
 
     If token_type is equal to RLexer.TOKEN_INF:
-        Set node to proc create_node from NODE_INF
-        proc advance from parser
+        Set node to proc create_node with NODE_INF
+        proc advance with parser
         Return node
     End If
 
     Note: Identifiers
     If token_type is equal to RLexer.TOKEN_IDENTIFIER:
-        Set node to proc create_node from NODE_IDENTIFIER
+        Set node to proc create_node with NODE_IDENTIFIER
         Set lexeme to proc memory_get_int64 from Layout with token, 8
         proc memory_set_int64 from Layout with node, 8, lexeme
-        proc advance from parser
+        proc advance with parser
         Return node
     End If
 
     Note: Grouped expression
     If token_type is equal to RLexer.TOKEN_LEFT_PAREN:
-        proc advance from parser
-        Let expr be proc parse_expression from parser
+        proc advance with parser
+        Let expr be proc parse_expression with parser
         proc consume with parser, RLexer.TOKEN_RIGHT_PAREN, "Expected ')'"
         Return expr
     End If
@@ -729,14 +918,14 @@ Process called "parse_primary" takes parser as Integer returns Integer:
     Note: Vector/List literal c(...)
     If token_type is equal to RLexer.TOKEN_IDENTIFIER:
         Set lexeme to proc memory_get_int64 from Layout with token, 8
-        Let is_c be proc strings_equal from StringCore with lexeme, "c"
+        Let is_c be proc string_equals from StringCore with lexeme, "c"
 
         If is_c is equal to 1:
             Let next_token be proc peek_token with parser, 1
             If next_token is not equal to 0:
                 Let next_type be proc memory_get_int64 from Layout with next_token, 0
                 If next_type is equal to RLexer.TOKEN_LEFT_PAREN:
-                    Return proc parse_vector from parser
+                    Return proc parse_vector with parser
                 End If
             End If
         End If
@@ -744,12 +933,12 @@ Process called "parse_primary" takes parser as Integer returns Integer:
 
     Note: Function definition
     If token_type is equal to RLexer.TOKEN_FUNCTION:
-        Return proc parse_function_definition from parser
+        Return proc parse_function_definition with parser
     End If
 
     Note: Lambda (backslash syntax)
     If token_type is equal to RLexer.TOKEN_BACKSLASH:
-        Return proc parse_lambda from parser
+        Return proc parse_lambda with parser
     End If
 
     Return 0
@@ -770,7 +959,7 @@ Calls parse_primary, then loops re-dispatching on the next token: TOKEN_LPAREN -
 Process called "parse_postfix" takes parser as Integer returns Integer:
     Note: Parse postfix expressions (calls, indexing, member access)
 
-    Let expr be proc parse_primary from parser
+    Let expr be proc parse_primary with parser
 
     If expr is equal to 0:
         Return 0
@@ -778,7 +967,7 @@ Process called "parse_postfix" takes parser as Integer returns Integer:
 
     Note: Parse postfix operators in a loop
     While 1 is equal to 1:
-        Let token be proc current_token from parser
+        Let token be proc current_token with parser
 
         If token is equal to 0:
             Return expr
@@ -851,86 +1040,37 @@ Process called "parse_call" takes parser as Integer, callee as Integer returns I
 
     proc consume with parser, RLexer.TOKEN_LEFT_PAREN, "Expected '('"
 
-    Let node be proc create_node from NODE_CALL
+    Let node be proc create_node with NODE_CALL
     proc memory_set_int64 from Layout with node, 16, callee  Note: Set callee as left child
 
-    Note: Parse arguments
-    Let token be proc current_token from parser
+    Note: Parse arguments (positional or name=value, comma-separated)
+    Let token be proc current_token with parser
     If token is not equal to 0:
         Let token_type be proc memory_get_int64 from Layout with token, 0
 
         If token_type is not equal to RLexer.TOKEN_RIGHT_PAREN:
             Note: Parse first argument
-            Let arg be proc parse_expression from parser
+            Let arg be proc parse_expression with parser
             If arg is not equal to 0:
                 proc add_child with node, arg
             End If
 
-            Note: Parse remaining arguments
-            While 1 is equal to 1:
-                Set token to proc current_token from parser
-                If token is equal to 0:
-                    Note: Break
-                    Set token to 0
-                Otherwise:
-                    Set token_type to proc memory_get_int64 from Layout with token, 0
+            Note: Parse remaining arguments. Forward progress is guaranteed:
+            Note: every iteration either consumes a comma + one argument or
+            Note: stops at the first non-comma token, so the loop cannot spin.
+            Set token to proc current_token with parser
+            While token is not equal to 0:
+                Set token_type to proc memory_get_int64 from Layout with token, 0
 
-                    If token_type is equal to RLexer.TOKEN_COMMA:
-                        proc advance from parser
-                        Set arg to proc parse_expression from parser
-                        If arg is not equal to 0:
-                            proc add_child with node, arg
-                        End If
-                    Otherwise:
-                        Note: Break
-                        Set token to 0
+                If token_type is equal to RLexer.TOKEN_COMMA:
+                    proc advance with parser
+                    Set arg to proc parse_expression with parser
+                    If arg is not equal to 0:
+                        proc add_child with node, arg
                     End If
-                End If
-
-                If token is equal to 0:
-                    Note: Break outer loop
-                    Set token to 0
+                    Set token to proc current_token with parser
                 Otherwise:
-                    Note: Continue
-                    Set token to 1
-                End If
-
-                If token is equal to 0:
-                    Note: Exit loop
-                    Set token_type to RLexer.TOKEN_RIGHT_PAREN
-                End If
-
-                If token_type is equal to RLexer.TOKEN_RIGHT_PAREN:
-                    Note: Break
-                    Set token to 0
-                End If
-
-                If token is equal to 0:
-                    Note: Break
-                    Set token_type to 0
-                Otherwise:
-                    Note: Continue loop
-                    Set token_type to 1
-                End If
-
-                If token_type is equal to 0:
-                    Note: Exit
-                    Set token to 0
-                End If
-
-                If token is equal to 0:
-                    Note: Actually break
-                    Set token to 1
-                Otherwise:
-                    Set token to 0
-                End If
-
-                If token is equal to 1:
-                    Note: Break
-                    Set token to RLexer.TOKEN_RIGHT_PAREN
-                Otherwise:
-                    Note: Continue
-                    Set token to 0
+                    Set token to 0  Note: Not a comma - stop argument list
                 End If
             End While
         End If
@@ -954,33 +1094,33 @@ Process called "parse_index" takes parser as Integer, object as Integer returns 
 
     proc consume with parser, RLexer.TOKEN_LEFT_BRACKET, "Expected '['"
 
-    Let node be proc create_node from NODE_INDEX
+    Let node be proc create_node with NODE_INDEX
     proc memory_set_int64 from Layout with node, 16, object  Note: Set object as left child
 
     Note: Parse indices (can be multiple, comma-separated)
-    Let token be proc current_token from parser
+    Let token be proc current_token with parser
     If token is not equal to 0:
         Let token_type be proc memory_get_int64 from Layout with token, 0
 
         If token_type is not equal to RLexer.TOKEN_RIGHT_BRACKET:
             Note: Parse first index
-            Let index be proc parse_expression from parser
+            Let index be proc parse_expression with parser
             If index is not equal to 0:
                 proc add_child with node, index
             End If
 
             Note: Parse remaining indices
-            Set token to proc current_token from parser
+            Set token to proc current_token with parser
             While token is not equal to 0:
                 Set token_type to proc memory_get_int64 from Layout with token, 0
 
                 If token_type is equal to RLexer.TOKEN_COMMA:
-                    proc advance from parser
-                    Set index to proc parse_expression from parser
+                    proc advance with parser
+                    Set index to proc parse_expression with parser
                     If index is not equal to 0:
                         proc add_child with node, index
                     End If
-                    Set token to proc current_token from parser
+                    Set token to proc current_token with parser
                 Otherwise:
                     Set token to 0  Note: Break
                 End If
@@ -1006,11 +1146,11 @@ Process called "parse_double_index" takes parser as Integer, object as Integer r
 
     proc consume with parser, RLexer.TOKEN_DOUBLE_LEFT_BRACKET, "Expected '[[''"
 
-    Let node be proc create_node from NODE_DOUBLE_INDEX
+    Let node be proc create_node with NODE_DOUBLE_INDEX
     proc memory_set_int64 from Layout with node, 16, object  Note: Set object as left child
 
     Note: Parse index
-    Let index be proc parse_expression from parser
+    Let index be proc parse_expression with parser
     If index is not equal to 0:
         proc memory_set_int64 from Layout with node, 24, index  Note: Set index as right child
     End If
@@ -1033,27 +1173,27 @@ Process called "parse_member_access" takes parser as Integer, object as Integer 
 
     proc consume with parser, RLexer.TOKEN_DOLLAR, "Expected '$'"
 
-    Let node be proc create_node from NODE_MEMBER_ACCESS
+    Let node be proc create_node with NODE_MEMBER_ACCESS
     proc memory_set_int64 from Layout with node, 16, object  Note: Set object as left child
 
     Note: Parse member name (identifier or string)
-    Let token be proc current_token from parser
+    Let token be proc current_token with parser
     If token is not equal to 0:
         Let token_type be proc memory_get_int64 from Layout with token, 0
 
         If token_type is equal to RLexer.TOKEN_IDENTIFIER:
-            Let member be proc create_node from NODE_IDENTIFIER
+            Let member be proc create_node with NODE_IDENTIFIER
             Let lexeme be proc memory_get_int64 from Layout with token, 8
             proc memory_set_int64 from Layout with member, 8, lexeme
             proc memory_set_int64 from Layout with node, 24, member  Note: Set member as right child
-            proc advance from parser
+            proc advance with parser
         Otherwise:
             If token_type is equal to RLexer.TOKEN_STRING:
-                Set member to proc create_node from NODE_STRING
+                Set member to proc create_node with NODE_STRING
                 Set lexeme to proc memory_get_int64 from Layout with token, 8
                 proc memory_set_int64 from Layout with member, 8, lexeme
                 proc memory_set_int64 from Layout with node, 24, member
-                proc advance from parser
+                proc advance with parser
             End If
         End If
     End If
@@ -1074,20 +1214,20 @@ Process called "parse_slot_access" takes parser as Integer, object as Integer re
 
     proc consume with parser, RLexer.TOKEN_AT, "Expected '@'"
 
-    Let node be proc create_node from NODE_SLOT_ACCESS
+    Let node be proc create_node with NODE_SLOT_ACCESS
     proc memory_set_int64 from Layout with node, 16, object  Note: Set object as left child
 
     Note: Parse slot name (identifier)
-    Let token be proc current_token from parser
+    Let token be proc current_token with parser
     If token is not equal to 0:
         Let token_type be proc memory_get_int64 from Layout with token, 0
 
         If token_type is equal to RLexer.TOKEN_IDENTIFIER:
-            Let slot be proc create_node from NODE_IDENTIFIER
+            Let slot be proc create_node with NODE_IDENTIFIER
             Let lexeme be proc memory_get_int64 from Layout with token, 8
             proc memory_set_int64 from Layout with slot, 8, lexeme
             proc memory_set_int64 from Layout with node, 24, slot  Note: Set slot as right child
-            proc advance from parser
+            proc advance with parser
         End If
     End If
 
@@ -1111,21 +1251,21 @@ Process called "parse_namespace" takes parser as Integer, package as Integer, is
         proc consume with parser, RLexer.TOKEN_TRIPLE_COLON, "Expected ':::'"
     End If
 
-    Let node be proc create_node from NODE_NAMESPACE
+    Let node be proc create_node with NODE_NAMESPACE
     proc memory_set_int64 from Layout with node, 16, package  Note: Set package as left child
     proc memory_set_int64 from Layout with node, 64, is_internal  Note: Store internal flag in token_type field
 
     Note: Parse function/object name
-    Let token be proc current_token from parser
+    Let token be proc current_token with parser
     If token is not equal to 0:
         Let token_type be proc memory_get_int64 from Layout with token, 0
 
         If token_type is equal to RLexer.TOKEN_IDENTIFIER:
-            Let name be proc create_node from NODE_IDENTIFIER
+            Let name be proc create_node with NODE_IDENTIFIER
             Let lexeme be proc memory_get_int64 from Layout with token, 8
             proc memory_set_int64 from Layout with name, 8, lexeme
             proc memory_set_int64 from Layout with node, 24, name  Note: Set name as right child
-            proc advance from parser
+            proc advance with parser
         End If
     End If
 
@@ -1147,43 +1287,43 @@ Checks current token for TOKEN_MINUS, TOKEN_PLUS, TOKEN_NOT, TOKEN_TILDE. If pre
 Process called "parse_unary" takes parser as Integer returns Integer:
     Note: Parse unary expression
 
-    Let token be proc current_token from parser
+    Let token be proc current_token with parser
 
     If token is equal to 0:
-        Return proc parse_postfix from parser
+        Return proc parse_postfix with parser
     End If
 
     Let token_type be proc memory_get_int64 from Layout with token, 0
 
     Note: Unary operators: !, -, +
     If token_type is equal to RLexer.TOKEN_BANG:
-        proc advance from parser
-        Let node be proc create_node from NODE_UNARY_OP
+        proc advance with parser
+        Let node be proc create_node with NODE_UNARY_OP
         proc memory_set_int64 from Layout with node, 64, RLexer.TOKEN_BANG
-        Let operand be proc parse_unary from parser
+        Let operand be proc parse_unary with parser
         proc memory_set_int64 from Layout with node, 24, operand  Note: Set operand as right child
         Return node
     End If
 
     If token_type is equal to RLexer.TOKEN_MINUS:
-        proc advance from parser
-        Set node to proc create_node from NODE_UNARY_OP
+        proc advance with parser
+        Set node to proc create_node with NODE_UNARY_OP
         proc memory_set_int64 from Layout with node, 64, RLexer.TOKEN_MINUS
-        Set operand to proc parse_unary from parser
+        Set operand to proc parse_unary with parser
         proc memory_set_int64 from Layout with node, 24, operand
         Return node
     End If
 
     If token_type is equal to RLexer.TOKEN_PLUS:
-        proc advance from parser
-        Set node to proc create_node from NODE_UNARY_OP
+        proc advance with parser
+        Set node to proc create_node with NODE_UNARY_OP
         proc memory_set_int64 from Layout with node, 64, RLexer.TOKEN_PLUS
-        Set operand to proc parse_unary from parser
+        Set operand to proc parse_unary with parser
         proc memory_set_int64 from Layout with node, 24, operand
         Return node
     End If
 
-    Return proc parse_postfix from parser
+    Return proc parse_postfix with parser
 End Process
 
 Note: ============================================================================
@@ -1211,21 +1351,21 @@ Process called "parse_binary" takes parser as Integer, min_precedence as Integer
     special operators (|>, %>%, ~).
     @End Reasoning
 
-    Let left be proc parse_unary from parser
+    Let left be proc parse_unary with parser
 
     If left is equal to 0:
         Return 0
     End If
 
     While 1 is equal to 1:
-        Let token be proc current_token from parser
+        Let token be proc current_token with parser
 
         If token is equal to 0:
             Return left
         End If
 
         Let token_type be proc memory_get_int64 from Layout with token, 0
-        Let precedence be proc get_precedence from token_type
+        Let precedence be proc get_precedence with token_type
 
         If precedence is equal to 0:
             Return left
@@ -1236,11 +1376,11 @@ Process called "parse_binary" takes parser as Integer, min_precedence as Integer
         End If
 
         Note: Consume operator
-        proc advance from parser
+        proc advance with parser
 
         Note: Determine next min precedence (handle right-associativity)
         Let next_min be precedence plus 1
-        Let is_right_assoc be proc is_right_associative from token_type
+        Let is_right_assoc be proc is_right_associative with token_type
 
         If is_right_assoc is equal to 1:
             Set next_min to precedence  Note: Right-associative
@@ -1254,7 +1394,7 @@ Process called "parse_binary" takes parser as Integer, min_precedence as Integer
         End If
 
         Note: Create binary operation node
-        Let node be proc create_node from NODE_BINARY_OP
+        Let node be proc create_node with NODE_BINARY_OP
         proc memory_set_int64 from Layout with node, 64, token_type  Note: Store operator type
         proc memory_set_int64 from Layout with node, 16, left
         proc memory_set_int64 from Layout with node, 24, right
@@ -1302,32 +1442,32 @@ Process called "parse_function_definition" takes parser as Integer returns Integ
     proc consume with parser, RLexer.TOKEN_FUNCTION, "Expected 'function'"
     proc consume with parser, RLexer.TOKEN_LEFT_PAREN, "Expected '('"
 
-    Let node be proc create_node from NODE_FUNCTION_DEF
+    Let node be proc create_node with NODE_FUNCTION_DEF
 
     Note: Parse parameters
-    Let token be proc current_token from parser
+    Let token be proc current_token with parser
     If token is not equal to 0:
         Let token_type be proc memory_get_int64 from Layout with token, 0
 
         If token_type is not equal to RLexer.TOKEN_RIGHT_PAREN:
             Note: Parse first parameter
-            Let param be proc parse_parameter from parser
+            Let param be proc parse_parameter with parser
             If param is not equal to 0:
                 proc add_child with node, param
             End If
 
             Note: Parse remaining parameters
-            Set token to proc current_token from parser
+            Set token to proc current_token with parser
             While token is not equal to 0:
                 Set token_type to proc memory_get_int64 from Layout with token, 0
 
                 If token_type is equal to RLexer.TOKEN_COMMA:
-                    proc advance from parser
-                    Set param to proc parse_parameter from parser
+                    proc advance with parser
+                    Set param to proc parse_parameter with parser
                     If param is not equal to 0:
                         proc add_child with node, param
                     End If
-                    Set token to proc current_token from parser
+                    Set token to proc current_token with parser
                 Otherwise:
                     Set token to 0  Note: Break
                 End If
@@ -1338,7 +1478,7 @@ Process called "parse_function_definition" takes parser as Integer returns Integ
     proc consume with parser, RLexer.TOKEN_RIGHT_PAREN, "Expected ')'"
 
     Note: Parse body (can be single expression or block)
-    Let body be proc parse_statement from parser
+    Let body be proc parse_statement with parser
     proc memory_set_int64 from Layout with node, 24, body  Note: Store body as right child
 
     Return node
@@ -1355,7 +1495,7 @@ Captures the parameter identifier (or TOKEN_TRIPLE_DOT for variadic). If followe
 Process called "parse_parameter" takes parser as Integer returns Integer:
     Note: Parse function parameter (with optional default value)
 
-    Let token be proc current_token from parser
+    Let token be proc current_token with parser
 
     If token is equal to 0:
         Return 0
@@ -1365,31 +1505,31 @@ Process called "parse_parameter" takes parser as Integer returns Integer:
 
     Note: Check for ... (varargs)
     If token_type is equal to RLexer.TOKEN_DOT_DOT_DOT:
-        Let node be proc create_node from NODE_IDENTIFIER
+        Let node be proc create_node with NODE_IDENTIFIER
         proc memory_set_int64 from Layout with node, 8, proc string_from_literal with "..."
-        proc advance from parser
+        proc advance with parser
         Return node
     End If
 
     Note: Parameter name
     If token_type is equal to RLexer.TOKEN_IDENTIFIER:
-        Let param_name be proc create_node from NODE_IDENTIFIER
+        Let param_name be proc create_node with NODE_IDENTIFIER
         Let lexeme be proc memory_get_int64 from Layout with token, 8
         proc memory_set_int64 from Layout with param_name, 8, lexeme
-        proc advance from parser
+        proc advance with parser
 
         Note: Check for default value
-        Set token to proc current_token from parser
+        Set token to proc current_token with parser
         If token is not equal to 0:
             Set token_type to proc memory_get_int64 from Layout with token, 0
 
             If token_type is equal to RLexer.TOKEN_EQUAL_ASSIGN:
-                proc advance from parser
+                proc advance with parser
 
                 Note: Create assignment node for default value
-                Let assign_node be proc create_node from NODE_ASSIGN
+                Let assign_node be proc create_node with NODE_ASSIGN
                 proc memory_set_int64 from Layout with assign_node, 16, param_name
-                Let default_value be proc parse_expression from parser
+                Let default_value be proc parse_expression with parser
                 proc memory_set_int64 from Layout with assign_node, 24, default_value
 
                 Return assign_node
@@ -1420,32 +1560,32 @@ Process called "parse_lambda" takes parser as Integer returns Integer:
     proc consume with parser, RLexer.TOKEN_BACKSLASH, "Expected '\\'"
     proc consume with parser, RLexer.TOKEN_LEFT_PAREN, "Expected '('"
 
-    Let node be proc create_node from NODE_LAMBDA
+    Let node be proc create_node with NODE_LAMBDA
 
     Note: Parse parameters
-    Let token be proc current_token from parser
+    Let token be proc current_token with parser
     If token is not equal to 0:
         Let token_type be proc memory_get_int64 from Layout with token, 0
 
         If token_type is not equal to RLexer.TOKEN_RIGHT_PAREN:
             Note: Parse first parameter
-            Let param be proc parse_parameter from parser
+            Let param be proc parse_parameter with parser
             If param is not equal to 0:
                 proc add_child with node, param
             End If
 
             Note: Parse remaining parameters
-            Set token to proc current_token from parser
+            Set token to proc current_token with parser
             While token is not equal to 0:
                 Set token_type to proc memory_get_int64 from Layout with token, 0
 
                 If token_type is equal to RLexer.TOKEN_COMMA:
-                    proc advance from parser
-                    Set param to proc parse_parameter from parser
+                    proc advance with parser
+                    Set param to proc parse_parameter with parser
                     If param is not equal to 0:
                         proc add_child with node, param
                     End If
-                    Set token to proc current_token from parser
+                    Set token to proc current_token with parser
                 Otherwise:
                     Set token to 0  Note: Break
                 End If
@@ -1456,7 +1596,7 @@ Process called "parse_lambda" takes parser as Integer returns Integer:
     proc consume with parser, RLexer.TOKEN_RIGHT_PAREN, "Expected ')'"
 
     Note: Parse body expression
-    Let body be proc parse_expression from parser
+    Let body be proc parse_expression with parser
     proc memory_set_int64 from Layout with node, 24, body  Note: Store body as right child
 
     Return node
@@ -1480,32 +1620,32 @@ Process called "parse_vector" takes parser as Integer returns Integer:
     proc consume with parser, RLexer.TOKEN_IDENTIFIER, "Expected 'c'"
     proc consume with parser, RLexer.TOKEN_LEFT_PAREN, "Expected '('"
 
-    Let node be proc create_node from NODE_VECTOR
+    Let node be proc create_node with NODE_VECTOR
 
     Note: Parse elements
-    Let token be proc current_token from parser
+    Let token be proc current_token with parser
     If token is not equal to 0:
         Let token_type be proc memory_get_int64 from Layout with token, 0
 
         If token_type is not equal to RLexer.TOKEN_RIGHT_PAREN:
             Note: Parse first element
-            Let elem be proc parse_expression from parser
+            Let elem be proc parse_expression with parser
             If elem is not equal to 0:
                 proc add_child with node, elem
             End If
 
             Note: Parse remaining elements
-            Set token to proc current_token from parser
+            Set token to proc current_token with parser
             While token is not equal to 0:
                 Set token_type to proc memory_get_int64 from Layout with token, 0
 
                 If token_type is equal to RLexer.TOKEN_COMMA:
-                    proc advance from parser
-                    Set elem to proc parse_expression from parser
+                    proc advance with parser
+                    Set elem to proc parse_expression with parser
                     If elem is not equal to 0:
                         proc add_child with node, elem
                     End If
-                    Set token to proc current_token from parser
+                    Set token to proc current_token with parser
                 Otherwise:
                     Set token to 0  Note: Break
                 End If
@@ -1533,7 +1673,7 @@ Switch over current token type checking for control-flow keywords. Each branch a
 Process called "parse_statement" takes parser as Integer returns Integer:
     Note: Parse statement
 
-    Let token be proc current_token from parser
+    Let token be proc current_token with parser
 
     If token is equal to 0:
         Return 0
@@ -1543,39 +1683,39 @@ Process called "parse_statement" takes parser as Integer returns Integer:
 
     Note: Control flow statements
     If token_type is equal to RLexer.TOKEN_IF:
-        Return proc parse_if_statement from parser
+        Return proc parse_if_statement with parser
     End If
 
     If token_type is equal to RLexer.TOKEN_WHILE:
-        Return proc parse_while_statement from parser
+        Return proc parse_while_statement with parser
     End If
 
     If token_type is equal to RLexer.TOKEN_FOR:
-        Return proc parse_for_statement from parser
+        Return proc parse_for_statement with parser
     End If
 
     If token_type is equal to RLexer.TOKEN_REPEAT:
-        Return proc parse_repeat_statement from parser
+        Return proc parse_repeat_statement with parser
     End If
 
     If token_type is equal to RLexer.TOKEN_BREAK:
-        Let node be proc create_node from NODE_BREAK_STMT
-        proc advance from parser
+        Let node be proc create_node with NODE_BREAK_STMT
+        proc advance with parser
         Return node
     End If
 
     If token_type is equal to RLexer.TOKEN_NEXT:
-        Set node to proc create_node from NODE_NEXT_STMT
-        proc advance from parser
+        Set node to proc create_node with NODE_NEXT_STMT
+        proc advance with parser
         Return node
     End If
 
     If token_type is equal to RLexer.TOKEN_RETURN:
-        proc advance from parser
-        Set node to proc create_node from NODE_RETURN_STMT
+        proc advance with parser
+        Set node to proc create_node with NODE_RETURN_STMT
 
         Note: Parse return value if present
-        Set token to proc current_token from parser
+        Set token to proc current_token with parser
         If token is not equal to 0:
             Set token_type to proc memory_get_int64 from Layout with token, 0
 
@@ -1583,7 +1723,7 @@ Process called "parse_statement" takes parser as Integer returns Integer:
             If token_type is not equal to RLexer.TOKEN_SEMICOLON:
                 If token_type is not equal to RLexer.TOKEN_NEWLINE:
                     If token_type is not equal to RLexer.TOKEN_RIGHT_BRACE:
-                        Let value be proc parse_expression from parser
+                        Let value be proc parse_expression with parser
                         proc memory_set_int64 from Layout with node, 24, value
                     End If
                 End If
@@ -1595,14 +1735,14 @@ Process called "parse_statement" takes parser as Integer returns Integer:
 
     Note: Block statement
     If token_type is equal to RLexer.TOKEN_LEFT_BRACE:
-        Return proc parse_block from parser
+        Return proc parse_block with parser
     End If
 
     Note: Expression statement
-    Let expr be proc parse_expression from parser
+    Let expr be proc parse_expression with parser
 
     If expr is not equal to 0:
-        Let stmt_node be proc create_node from NODE_EXPRESSION_STMT
+        Let stmt_node be proc create_node with NODE_EXPRESSION_STMT
         proc memory_set_int64 from Layout with stmt_node, 16, expr
         Return stmt_node
     End If
@@ -1624,24 +1764,24 @@ Process called "parse_if_statement" takes parser as Integer returns Integer:
     proc consume with parser, RLexer.TOKEN_IF, "Expected 'if'"
     proc consume with parser, RLexer.TOKEN_LEFT_PAREN, "Expected '('"
 
-    Let condition be proc parse_expression from parser
+    Let condition be proc parse_expression with parser
 
     proc consume with parser, RLexer.TOKEN_RIGHT_PAREN, "Expected ')'"
 
-    Let then_branch be proc parse_statement from parser
+    Let then_branch be proc parse_statement with parser
 
-    Let node be proc create_node from NODE_IF_STMT
+    Let node be proc create_node with NODE_IF_STMT
     proc add_child with node, condition
     proc add_child with node, then_branch
 
     Note: Check for else clause
-    Let token be proc current_token from parser
+    Let token be proc current_token with parser
     If token is not equal to 0:
         Let token_type be proc memory_get_int64 from Layout with token, 0
 
         If token_type is equal to RLexer.TOKEN_ELSE:
-            proc advance from parser
-            Let else_branch be proc parse_statement from parser
+            proc advance with parser
+            Let else_branch be proc parse_statement with parser
             proc add_child with node, else_branch
         End If
     End If
@@ -1663,13 +1803,13 @@ Process called "parse_while_statement" takes parser as Integer returns Integer:
     proc consume with parser, RLexer.TOKEN_WHILE, "Expected 'while'"
     proc consume with parser, RLexer.TOKEN_LEFT_PAREN, "Expected '('"
 
-    Let condition be proc parse_expression from parser
+    Let condition be proc parse_expression with parser
 
     proc consume with parser, RLexer.TOKEN_RIGHT_PAREN, "Expected ')'"
 
-    Let body be proc parse_statement from parser
+    Let body be proc parse_statement with parser
 
-    Let node be proc create_node from NODE_WHILE_STMT
+    Let node be proc create_node with NODE_WHILE_STMT
     proc add_child with node, condition
     proc add_child with node, body
 
@@ -1691,31 +1831,31 @@ Process called "parse_for_statement" takes parser as Integer returns Integer:
     proc consume with parser, RLexer.TOKEN_LEFT_PAREN, "Expected '('"
 
     Note: Parse loop variable
-    Let token be proc current_token from parser
+    Let token be proc current_token with parser
     Let var_node be 0
 
     If token is not equal to 0:
         Let token_type be proc memory_get_int64 from Layout with token, 0
 
         If token_type is equal to RLexer.TOKEN_IDENTIFIER:
-            Set var_node to proc create_node from NODE_IDENTIFIER
+            Set var_node to proc create_node with NODE_IDENTIFIER
             Let lexeme be proc memory_get_int64 from Layout with token, 8
             proc memory_set_int64 from Layout with var_node, 8, lexeme
-            proc advance from parser
+            proc advance with parser
         End If
     End If
 
     proc consume with parser, RLexer.TOKEN_IN, "Expected 'in'"
 
     Note: Parse sequence
-    Let sequence be proc parse_expression from parser
+    Let sequence be proc parse_expression with parser
 
     proc consume with parser, RLexer.TOKEN_RIGHT_PAREN, "Expected ')'"
 
     Note: Parse body
-    Let body be proc parse_statement from parser
+    Let body be proc parse_statement with parser
 
-    Let node be proc create_node from NODE_FOR_STMT
+    Let node be proc create_node with NODE_FOR_STMT
     proc add_child with node, var_node
     proc add_child with node, sequence
     proc add_child with node, body
@@ -1736,9 +1876,9 @@ Process called "parse_repeat_statement" takes parser as Integer returns Integer:
 
     proc consume with parser, RLexer.TOKEN_REPEAT, "Expected 'repeat'"
 
-    Let body be proc parse_statement from parser
+    Let body be proc parse_statement with parser
 
-    Let node be proc create_node from NODE_REPEAT_STMT
+    Let node be proc create_node with NODE_REPEAT_STMT
     proc add_child with node, body
 
     Return node
@@ -1757,64 +1897,42 @@ Process called "parse_block" takes parser as Integer returns Integer:
 
     proc consume with parser, RLexer.TOKEN_LEFT_BRACE, "Expected '{'"
 
-    Let node be proc create_node from NODE_BLOCK
+    Let node be proc create_node with NODE_BLOCK
 
-    Note: Parse statements until closing brace
-    While 1 is equal to 1:
-        Let token be proc current_token from parser
+    Note: Parse statements until closing brace or EOF. A forward-progress guard
+    Note: captures the cursor each iteration and breaks if parse_statement failed
+    Note: to advance, so a malformed token can never spin the loop.
+    Let looping be 1
+    While looping is equal to 1:
+        Let token be proc current_token with parser
 
         If token is equal to 0:
-            Note: Break
-            Set token to 0
+            Set looping to 0
         Otherwise:
             Let token_type be proc memory_get_int64 from Layout with token, 0
 
             If token_type is equal to RLexer.TOKEN_RIGHT_BRACE:
-                Note: Break
-                Set token to 0
+                Set looping to 0
             Otherwise:
-                Note: Skip newlines and semicolons
                 If token_type is equal to RLexer.TOKEN_NEWLINE:
-                    proc advance from parser
-                    Set token to 1  Note: Continue
+                    proc advance with parser
                 Otherwise:
                     If token_type is equal to RLexer.TOKEN_SEMICOLON:
-                        proc advance from parser
-                        Set token to 1  Note: Continue
+                        proc advance with parser
                     Otherwise:
-                        Note: Parse statement
-                        Let stmt be proc parse_statement from parser
+                        Let pos_before be proc memory_get_int64 from Layout with parser, 16
+                        Let stmt be proc parse_statement with parser
                         If stmt is not equal to 0:
                             proc add_child with node, stmt
                         End If
-                        Set token to 1  Note: Continue
+                        Let pos_after be proc memory_get_int64 from Layout with parser, 16
+                        If pos_after is equal to pos_before:
+                            Note: No forward progress - force-advance to avoid a spin
+                            proc advance with parser
+                        End If
                     End If
                 End If
             End If
-        End If
-
-        If token is equal to 0:
-            Note: Break loop
-            Set token_type to RLexer.TOKEN_RIGHT_BRACE
-        End If
-
-        If token_type is equal to RLexer.TOKEN_RIGHT_BRACE:
-            Note: Exit
-            Set token to 0
-        End If
-
-        If token is equal to 0:
-            Note: Break
-            Set token to 1
-        Otherwise:
-            Set token to 0
-        End If
-
-        If token is equal to 1:
-            Note: Break
-            Set token to RLexer.TOKEN_EOF
-        Otherwise:
-            Set token to 0
         End If
     End While
 
@@ -1848,64 +1966,41 @@ Process called "parse_program" takes parser as Integer returns Integer:
     which are evaluated and their results printed.
     @End Reasoning
 
-    Let program be proc create_node from NODE_PROGRAM
+    Let program be proc create_node with NODE_PROGRAM
 
-    Note: Parse statements until EOF
-    While 1 is equal to 1:
-        Let token be proc current_token from parser
+    Note: Parse top-level statements until EOF. The forward-progress guard
+    Note: mirrors parse_block: if parse_statement fails to consume any token we
+    Note: force one advance so an unparseable token cannot spin the loop.
+    Let looping be 1
+    While looping is equal to 1:
+        Let token be proc current_token with parser
 
         If token is equal to 0:
-            Note: Break
-            Set token to 0
+            Set looping to 0
         Otherwise:
             Let token_type be proc memory_get_int64 from Layout with token, 0
 
             If token_type is equal to RLexer.TOKEN_EOF:
-                Note: Break
-                Set token to 0
+                Set looping to 0
             Otherwise:
-                Note: Skip newlines and semicolons
                 If token_type is equal to RLexer.TOKEN_NEWLINE:
-                    proc advance from parser
-                    Set token to 1  Note: Continue
+                    proc advance with parser
                 Otherwise:
                     If token_type is equal to RLexer.TOKEN_SEMICOLON:
-                        proc advance from parser
-                        Set token to 1  Note: Continue
+                        proc advance with parser
                     Otherwise:
-                        Note: Parse statement
-                        Let stmt be proc parse_statement from parser
+                        Let pos_before be proc memory_get_int64 from Layout with parser, 16
+                        Let stmt be proc parse_statement with parser
                         If stmt is not equal to 0:
                             proc add_child with program, stmt
                         End If
-                        Set token to 1  Note: Continue
+                        Let pos_after be proc memory_get_int64 from Layout with parser, 16
+                        If pos_after is equal to pos_before:
+                            proc advance with parser
+                        End If
                     End If
                 End If
             End If
-        End If
-
-        If token is equal to 0:
-            Note: Break loop
-            Set token_type to RLexer.TOKEN_EOF
-        End If
-
-        If token_type is equal to RLexer.TOKEN_EOF:
-            Note: Exit
-            Set token to 0
-        End If
-
-        If token is equal to 0:
-            Note: Break
-            Set token to 1
-        Otherwise:
-            Set token to 0
-        End If
-
-        If token is equal to 1:
-            Note: Break
-            Set token to RLexer.TOKEN_EOF
-        Otherwise:
-            Set token to 0
         End If
     End While
 

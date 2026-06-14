@@ -15,55 +15,50 @@ limitations under the License.
 :End Note
 
 Note:
-R to HIR Translator - Convert R AST to High-level Intermediate Representation
+R->HIR Translator - Complete translation from the R AST to HIR.
 
-This file translates R Abstract Syntax Tree (AST) nodes into HIR (High-level
-Intermediate Representation), enabling universal language translation through
-the Translation system.
-
-R-Specific Translation Challenges:
-- Vectorized operations: R operates on vectors by default, not scalars
-- Special values: NA (missing), NULL (null object), NaN, Inf
-- Multiple assignment operators with different scoping (<-, <<-, =)
-- Formula syntax for statistical models (y ~ x)
-- Custom infix operators (%anything%)
-- Pipe operators (|>, %>%)
-- Indexing semantics: [...] vs [[...]]
-- Member access: $ (lists/dataframes), @ (S4 slots)
-- Namespace access: :: (exported), ::: (internal)
-- Dynamic typing with implicit coercion
-- Lazy evaluation of function arguments
-- Varargs (...) in functions
+Lowers the locked 72-byte R AST (offsets documented atop r_parser.runa) into the
+real typed hir_nodes producer surface (model 1 - same family as ruby/dart/java).
+Every R-only construct (vectors, formulas, namespace access, S4 slots, pipes, the
+five assignment operators, the %%/%/%/^/%in% operators, special values NA/NaN/Inf)
+is lowered to the nearest HIR node and tagged with an "r_*" metadata key so
+hir_to_r can recover the exact R spelling on the way back out.
 
 Dependencies:
-- compiler/middle/gungnir/hir/translation/frontends/r/r_parser.runa
-- compiler/middle/gungnir/hir/hir_nodes.runa
-- compiler/frontend/primitives/memory/layout.runa
-- compiler/frontend/primitives/core/string_core.runa
+- compiler/middle/gungnir/hir/translation/frontends/r/r_parser.runa  (AST contract)
+- compiler/middle/gungnir/hir/translation/frontends/r/r_lexer.runa   (TOKEN_* constants)
+- compiler/middle/gungnir/hir/hir_nodes.runa                         (HIR producers)
+- compiler/frontend/primitives/memory/layout.runa                    (AST field reads)
+- compiler/frontend/primitives/core/string_core.runa                 (string predicates)
+- compiler/internal/string_utils.runa                                (number/string parsing)
 :End Note
 
 Import "compiler/middle/gungnir/hir/translation/frontends/r/r_parser.runa" as RParser
+Import "compiler/middle/gungnir/hir/translation/frontends/r/r_lexer.runa" as RLexer
 Import "compiler/middle/gungnir/hir/hir_nodes.runa" as HIR
 Import "compiler/frontend/primitives/memory/layout.runa" as Layout
 Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/internal/string_utils.runa" as StringUtils
 
 Note: ============================================================================
 Note: Translator State
 Note: ============================================================================
 
 @Reasoning:
-RToHIRTranslator carries the state needed during the R AST -> HIR translation walk: scope depth, function nesting depth (for closure capture tracking), error counter, and a symbol-table pointer for name resolution.
+RToHIRTranslator carries the bridge state for the R AST -> HIR walk: a scope
+counter, a function-nesting depth (used so nested closures can be tagged), and an
+error counter. The HIR module root populated by translate_program is held so the
+public entry points can return it after the walk completes.
 @End Reasoning
 
 @Implementation:
-Four 8-byte fields total 32 bytes, accessed via Layout offsets 0,8,16,24.
+Four 8-byte fields total 32 bytes at offsets 0,8,16,24.
 @End Implementation
-
 Type called "RToHIRTranslator":
     current_scope as Integer     Note: Current scope level
     function_depth as Integer    Note: Function nesting depth
     error_count as Integer       Note: Number of errors encountered
-    symbol_table as Integer      Note: Symbol table for name resolution
+    hir_module as Integer        Note: HIR module being constructed
 End Type
 
 Note: ============================================================================
@@ -71,27 +66,16 @@ Note: Translator Creation
 Note: ============================================================================
 
 @Reasoning:
-Allocates an RToHIRTranslator with all counters zeroed. Owns its memory; caller must call destroy_translator. Returns 0 on allocation failure.
+Allocates an RToHIRTranslator with all counters zeroed. Owns its memory; the
+caller releases it via destroy_translator. Returns 0 on allocation failure.
 @End Reasoning
 
 @Implementation:
-Allocates 32 bytes via Layout and zero-initialises current_scope, function_depth, error_count, and symbol_table at offsets 0,8,16,24.
+Allocates 32 bytes via Layout and zero-initialises current_scope, function_depth,
+error_count, and hir_module at offsets 0,8,16,24.
 @End Implementation
-
-@Security_Scope:
-Returns heap-allocated translator; caller owns release via destroy_translator.
-@End Security_Scope
-
 Process called "create_translator" returns Integer:
-    Note: Create R to HIR translator
-
-    @Reasoning:
-    Initialize translator state for converting R AST to HIR.
-    Tracks scope, function depth, and symbol tables for proper
-    semantic translation.
-    @End Reasoning
-
-    Let translator_size be 32  Note: RToHIRTranslator: 4 fields × 8 bytes
+    Let translator_size be 32  Note: RToHIRTranslator: 4 fields x 8 bytes
     Let translator be proc allocate from Layout with translator_size
 
     If translator is equal to 0:
@@ -101,7 +85,7 @@ Process called "create_translator" returns Integer:
     proc memory_set_int64 from Layout with translator, 0, 0   Note: current_scope = 0
     proc memory_set_int64 from Layout with translator, 8, 0   Note: function_depth = 0
     proc memory_set_int64 from Layout with translator, 16, 0  Note: error_count = 0
-    proc memory_set_int64 from Layout with translator, 24, 0  Note: symbol_table = NULL
+    proc memory_set_int64 from Layout with translator, 24, 0  Note: hir_module = NULL
 
     Return translator
 End Process
@@ -113,10 +97,7 @@ Releases the translator struct. Null-tolerant for failure paths.
 @Implementation:
 Null-checks then calls Layout.deallocate. Always returns 1.
 @End Implementation
-
 Process called "destroy_translator" takes translator as Integer returns Integer:
-    Note: Destroy translator and free memory
-
     If translator is equal to 0:
         Return 1
     End If
@@ -127,98 +108,15 @@ Process called "destroy_translator" takes translator as Integer returns Integer:
 End Process
 
 Note: ============================================================================
-Note: Type Mapping (R → HIR)
-Note: ============================================================================
-
-@Reasoning:
-Bridges R's dynamic type names to HIR's static type system. R "numeric" -> HIR Float64, "integer" -> Int32, "logical" -> Bool, "character" -> String, "complex" -> a pair-of-Float64 struct, and vector forms become HIR Array types.
-@End Reasoning
-
-@Implementation:
-String-equality cascade over r_type_name comparing against R's canonical type names; returns the corresponding HIR TYPE_* constant. Falls back to TYPE_ANY for unknown names so the translation completes even when type inference was incomplete.
-@End Implementation
-
-Process called "r_type_to_hir" takes r_type_name as Integer returns Integer:
-    Note: Map R type name to HIR type
-
-    @Reasoning:
-    R has dynamic typing but internally uses specific storage modes.
-    We map R's conceptual types to HIR's static type system.
-    R vectors become arrays in HIR, and R's special values map
-    to optional types or special float values.
-    @End Reasoning
-
-    Note: Numeric types
-    If proc strings_equal from StringCore with r_type_name, "numeric":
-        Return proc TYPE_FLOAT64 from HIR  Note: R's default numeric is double
-    End If
-
-    If proc strings_equal from StringCore with r_type_name, "double":
-        Return proc TYPE_FLOAT64 from HIR
-    End If
-
-    If proc strings_equal from StringCore with r_type_name, "integer":
-        Return proc TYPE_INT32 from HIR  Note: R integers are 32-bit
-    End If
-
-    If proc strings_equal from StringCore with r_type_name, "complex":
-        Return proc TYPE_COMPLEX128 from HIR  Note: R complex is 128-bit (2×64-bit floats)
-    End If
-
-    Note: Character/String
-    If proc strings_equal from StringCore with r_type_name, "character":
-        Return proc TYPE_STRING from HIR
-    End If
-
-    Note: Logical (boolean)
-    If proc strings_equal from StringCore with r_type_name, "logical":
-        Return proc TYPE_BOOL from HIR
-    End If
-
-    Note: Special types
-    If proc strings_equal from StringCore with r_type_name, "NULL":
-        Return proc TYPE_NULL from HIR
-    End If
-
-    If proc strings_equal from StringCore with r_type_name, "list":
-        Return proc TYPE_ARRAY from HIR  Note: R lists are heterogeneous arrays
-    End If
-
-    If proc strings_equal from StringCore with r_type_name, "vector":
-        Return proc TYPE_ARRAY from HIR
-    End If
-
-    If proc strings_equal from StringCore with r_type_name, "data.frame":
-        Return proc TYPE_STRUCT from HIR  Note: Data frames are structured types
-    End If
-
-    If proc strings_equal from StringCore with r_type_name, "matrix":
-        Return proc TYPE_ARRAY from HIR  Note: Matrices are 2D arrays
-    End If
-
-    If proc strings_equal from StringCore with r_type_name, "function":
-        Return proc TYPE_FUNCTION from HIR
-    End If
-
-    Note: Default to dynamic type
-    Return proc TYPE_ANY from HIR
-End Process
-
-Note: ============================================================================
 Note: Expression Translation
 Note: ============================================================================
 
 @Reasoning:
-Central dispatcher for R expression -> HIR translation. Inspects r_node's node_type and routes to the appropriate translate_* handler so each AST shape produces the correct HIR construct.
+Central dispatcher for R expression -> HIR translation. Reads r_node's node_type
+from AST offset 0 and routes to the matching translate_* handler so each AST shape
+produces the correct HIR construct. Null input and unknown kinds return 0.
 @End Reasoning
-
-@Implementation:
-Switch over node_type: NUMBER -> translate_number, STRING -> translate_string, IDENTIFIER -> translate_identifier, TRUE/FALSE -> create_hir_bool, NULL/NA/NaN/Inf -> the matching special-value constructor, BINARY_OP -> translate_binary_op, UNARY_OP -> translate_unary_op, CALL -> translate_call, INDEX/DOUBLE_INDEX/MEMBER/SLOT/NAMESPACE -> the matching translator, FORMULA -> translate_formula, FUNCTION_DEF -> translate_function_def, VECTOR -> translate_vector, PIPE -> translate_pipe.
-@End Implementation
-
 Process called "translate_expression" takes translator as Integer, r_node as Integer returns Integer:
-    Note: Translate R expression to HIR
-
     If r_node is equal to 0:
         Return 0
     End If
@@ -226,117 +124,101 @@ Process called "translate_expression" takes translator as Integer, r_node as Int
     Let node_type be proc memory_get_int64 from Layout with r_node, 0
 
     Note: Literals
-    If node_type is equal to proc NODE_NUMBER from RParser:
+    If node_type is equal to RParser.NODE_NUMBER:
         Return proc translate_number with translator, r_node
     End If
-
-    If node_type is equal to proc NODE_COMPLEX from RParser:
+    If node_type is equal to RParser.NODE_COMPLEX:
         Return proc translate_complex with translator, r_node
     End If
-
-    If node_type is equal to proc NODE_STRING from RParser:
+    If node_type is equal to RParser.NODE_STRING:
         Return proc translate_string with translator, r_node
     End If
-
-    If node_type is equal to proc NODE_TRUE from RParser:
-        Return proc create_hir_bool with 1
+    If node_type is equal to RParser.NODE_TRUE:
+        Return proc translate_bool with translator, 1
     End If
-
-    If node_type is equal to proc NODE_FALSE from RParser:
-        Return proc create_hir_bool with 0
+    If node_type is equal to RParser.NODE_FALSE:
+        Return proc translate_bool with translator, 0
     End If
-
-    If node_type is equal to proc NODE_NULL from RParser:
-        Return proc create_hir_null
+    If node_type is equal to RParser.NODE_NULL:
+        Return proc hir_create_null_literal from HIR
     End If
-
-    If node_type is equal to proc NODE_NA from RParser:
-        Return proc create_hir_na
+    If node_type is equal to RParser.NODE_NA:
+        Return proc translate_special with translator, "NA"
     End If
-
-    If node_type is equal to proc NODE_NAN from RParser:
-        Return proc create_hir_nan
+    If node_type is equal to RParser.NODE_NAN:
+        Return proc translate_special with translator, "NaN"
     End If
-
-    If node_type is equal to proc NODE_INF from RParser:
-        Return proc create_hir_inf
+    If node_type is equal to RParser.NODE_INF:
+        Return proc translate_special with translator, "Inf"
     End If
 
     Note: Identifiers
-    If node_type is equal to proc NODE_IDENTIFIER from RParser:
+    If node_type is equal to RParser.NODE_IDENTIFIER:
         Return proc translate_identifier with translator, r_node
     End If
 
-    Note: Binary operations
-    If node_type is equal to proc NODE_BINARY_OP from RParser:
+    Note: Operations
+    If node_type is equal to RParser.NODE_BINARY_OP:
         Return proc translate_binary_op with translator, r_node
     End If
-
-    Note: Unary operations
-    If node_type is equal to proc NODE_UNARY_OP from RParser:
+    If node_type is equal to RParser.NODE_UNARY_OP:
         Return proc translate_unary_op with translator, r_node
     End If
-
-    Note: Assignment
-    If node_type is equal to proc NODE_ASSIGN from RParser:
+    If node_type is equal to RParser.NODE_ASSIGN:
         Return proc translate_assign with translator, r_node
     End If
 
-    Note: Function call
-    If node_type is equal to proc NODE_CALL from RParser:
+    Note: Calls and indexing
+    If node_type is equal to RParser.NODE_CALL:
         Return proc translate_call with translator, r_node
     End If
-
-    Note: Indexing
-    If node_type is equal to proc NODE_INDEX from RParser:
+    If node_type is equal to RParser.NODE_INDEX:
         Return proc translate_index with translator, r_node
     End If
-
-    If node_type is equal to proc NODE_DOUBLE_INDEX from RParser:
+    If node_type is equal to RParser.NODE_DOUBLE_INDEX:
         Return proc translate_double_index with translator, r_node
     End If
 
-    Note: Member/slot access
-    If node_type is equal to proc NODE_MEMBER_ACCESS from RParser:
+    Note: Member / slot / namespace access
+    If node_type is equal to RParser.NODE_MEMBER_ACCESS:
         Return proc translate_member_access with translator, r_node
     End If
-
-    If node_type is equal to proc NODE_SLOT_ACCESS from RParser:
+    If node_type is equal to RParser.NODE_SLOT_ACCESS:
         Return proc translate_slot_access with translator, r_node
     End If
-
-    Note: Namespace access
-    If node_type is equal to proc NODE_NAMESPACE from RParser:
+    If node_type is equal to RParser.NODE_NAMESPACE:
         Return proc translate_namespace with translator, r_node
     End If
 
     Note: Formula
-    If node_type is equal to proc NODE_FORMULA from RParser:
+    If node_type is equal to RParser.NODE_FORMULA:
         Return proc translate_formula with translator, r_node
     End If
 
-    Note: Function definition
-    If node_type is equal to proc NODE_FUNCTION_DEF from RParser:
-        Return proc translate_function_def with translator, r_node
+    Note: Function definition / lambda
+    If node_type is equal to RParser.NODE_FUNCTION_DEF:
+        Return proc translate_function_def with translator, r_node, 0
     End If
-
-    Note: Lambda
-    If node_type is equal to proc NODE_LAMBDA from RParser:
-        Return proc translate_lambda with translator, r_node
+    If node_type is equal to RParser.NODE_LAMBDA:
+        Return proc translate_function_def with translator, r_node, 1
     End If
 
     Note: Pipe
-    If node_type is equal to proc NODE_PIPE from RParser:
+    If node_type is equal to RParser.NODE_PIPE:
         Return proc translate_pipe with translator, r_node
     End If
 
-    Note: Vector/List
-    If node_type is equal to proc NODE_VECTOR from RParser:
+    Note: Vector / list literal
+    If node_type is equal to RParser.NODE_VECTOR:
         Return proc translate_vector with translator, r_node
     End If
+    If node_type is equal to RParser.NODE_LIST:
+        Return proc translate_list with translator, r_node
+    End If
 
-    Note: Unknown node type
-    Return 0
+    Note: A statement-shaped node in expression position still lowers (R is
+    Note: expression-oriented: if/while/for/blocks are values).
+    Return proc translate_statement with translator, r_node
 End Process
 
 Note: ============================================================================
@@ -344,415 +226,221 @@ Note: Literal Translation
 Note: ============================================================================
 
 @Reasoning:
-Translates an R numeric literal AST node into an HIR Float64 constant. The L suffix (integer) is handled by the lexer producing TOKEN_INTEGER, not here.
+R numeric literals carry their lexeme verbatim (e.g. "42", "3.14", "1e10", "10L").
+HIR distinguishes integer and float literals; the trailing "L" marks an R integer,
+otherwise R numbers are doubles. We parse the lexeme into the native value and
+retain the exact source spelling in "r_num_lexeme" so the backend reproduces the
+original text (including the L suffix and scientific forms).
 @End Reasoning
-
-@Implementation:
-Reads the lexeme string from the R node, parses it via StringCore.parse_double (handling decimal, scientific, and hex shapes), and emits an HirNodes.create_literal_float64 with the parsed value.
-@End Implementation
-
 Process called "translate_number" takes translator as Integer, r_node as Integer returns Integer:
-    Note: Translate R number literal to HIR
-
     Let lexeme be proc memory_get_int64 from Layout with r_node, 8
-
-    Note: Create HIR number node
-    Let hir_node be proc create_node from HIR with NODE_NUMBER_LITERAL
-
-    proc memory_set_int64 from Layout with hir_node, 8, lexeme  Note: Store lexeme
-
-    Note: Determine if integer or float (R numbers are float by default unless L suffix)
-    Let is_integer be proc string_ends_with with lexeme, "L"
+    Let is_integer be proc string_ends_with from StringUtils with lexeme, "L"
 
     If is_integer is equal to 1:
-        proc memory_set_int64 from Layout with hir_node, 64, proc TYPE_INT32 from HIR
-    Otherwise:
-        proc memory_set_int64 from Layout with hir_node, 64, proc TYPE_FLOAT64 from HIR
+        Let ival be proc string_to_integer from StringUtils with lexeme
+        Let hir_int be proc hir_create_int_literal from HIR with ival
+        proc hir_set_metadata from HIR with hir_int, "r_num_lexeme", lexeme
+        proc hir_set_metadata from HIR with hir_int, "r_int_suffix", "true"
+        Return hir_int
     End If
 
-    Return hir_node
+    Let fval be proc string_to_float from StringUtils with lexeme
+    Let hir_float be proc hir_create_float_literal from HIR with fval
+    proc hir_set_metadata from HIR with hir_float, "r_num_lexeme", lexeme
+    Return hir_float
 End Process
 
 @Reasoning:
-Translates an R complex literal (e.g. 3i, 2.5i) into an HIR complex-number struct construction. R complex literals carry only the imaginary part - the real part is implicitly 0.
+R complex literals (e.g. "2i", "3.5i") carry only the imaginary part; the real
+part is implicitly 0. HIR has no complex literal, so we carry the full lexeme on a
+string literal tagged "r_complex" - this preserves the exact token (including the
+trailing "i") and lets the backend re-emit it verbatim without losing precision.
 @End Reasoning
-
-@Implementation:
-Strips the trailing 'i' from the lexeme, parses the remaining string as a double, then emits HirNodes.create_struct_init for the complex type with real=0 and imag=parsed value.
-@End Implementation
-
 Process called "translate_complex" takes translator as Integer, r_node as Integer returns Integer:
-    Note: Translate R complex number to HIR
-
-    @Reasoning:
-    R complex numbers (e.g., 1+2i) need to be represented as
-    complex type in HIR. This maps to a structure with real
-    and imaginary components.
-    @End Reasoning
-
     Let lexeme be proc memory_get_int64 from Layout with r_node, 8
-
-    Let hir_node be proc create_node from HIR with NODE_NUMBER_LITERAL
-    proc memory_set_int64 from Layout with hir_node, 8, lexeme
-    proc memory_set_int64 from Layout with hir_node, 64, proc TYPE_COMPLEX128 from HIR
-
-    Return hir_node
+    Let hir_str be proc hir_create_string_literal from HIR with lexeme
+    proc hir_set_metadata from HIR with hir_str, "r_complex", "true"
+    Return hir_str
 End Process
 
 @Reasoning:
-Translates an R string literal into an HIR string constant. The parser has already stripped surrounding quotes and decoded escape sequences via process_escape_sequences; this routine just wraps the decoded value as an HIR literal.
+R string literals arrive from the lexer with their surrounding quote characters
+attached in the value slot. The HIR string literal stores the raw lexeme directly;
+keeping the original quoting in the lexeme means the backend re-emits the exact
+source token without re-escaping. We tag "r_string_lexeme" for symmetry with the
+other literal carriers.
 @End Reasoning
-
-@Implementation:
-Reads the decoded lexeme from the R node and emits HirNodes.create_literal_string.
-@End Implementation
-
 Process called "translate_string" takes translator as Integer, r_node as Integer returns Integer:
-    Note: Translate R string literal to HIR
-
     Let lexeme be proc memory_get_int64 from Layout with r_node, 8
-
-    Let hir_node be proc create_node from HIR with NODE_STRING_LITERAL
-    proc memory_set_int64 from Layout with hir_node, 8, lexeme
-    proc memory_set_int64 from Layout with hir_node, 64, proc TYPE_STRING from HIR
-
-    Return hir_node
+    Let hir_str be proc hir_create_string_literal from HIR with lexeme
+    proc hir_set_metadata from HIR with hir_str, "r_string_lexeme", lexeme
+    Return hir_str
 End Process
 
 @Reasoning:
-Translates a bare identifier reference into an HIR variable load. Symbol resolution against the translator's symbol_table happens here so the HIR node carries the resolved binding kind (local, upvalue, global).
+A bare identifier reference resolves at runtime against the lexical scope; at
+translation time we record only the textual name. R identifiers (including
+backtick-quoted names whose backticks the lexer preserved in the lexeme) map
+directly onto a HIR identifier with no transformation.
 @End Reasoning
-
-@Implementation:
-Reads the identifier name from the R node, queries translator.symbol_table to determine binding scope, then emits HirNodes.create_variable_ref with the resolved scope tag.
-@End Implementation
-
 Process called "translate_identifier" takes translator as Integer, r_node as Integer returns Integer:
-    Note: Translate R identifier to HIR
-
     Let name be proc memory_get_int64 from Layout with r_node, 8
+    If name is equal to 0:
+        Return proc hir_create_identifier from HIR with ""
+    End If
+    Return proc hir_create_identifier from HIR with name
+End Process
 
-    Let hir_node be proc create_node from HIR with NODE_IDENTIFIER
-    proc memory_set_int64 from Layout with hir_node, 8, name
+@Reasoning:
+Emits an HIR bool literal for R's TRUE / FALSE (and the T / F shortforms, which the
+lexer normalises to the same kinds). The caller passes 1 for TRUE and 0 for FALSE.
+@End Reasoning
+Process called "translate_bool" takes translator as Integer, value as Integer returns Integer:
+    Return proc hir_create_bool_literal from HIR with value
+End Process
 
-    Return hir_node
+@Reasoning:
+R's NA, NaN, and Inf are first-class non-finite/missing literals with reserved
+spellings. HIR has no dedicated node for them, so each lowers to an identifier
+carrying the canonical R spelling tagged "r_special"; the backend recognises the
+tag and re-emits the exact keyword (NA / NaN / Inf) rather than a bare name.
+@End Reasoning
+Process called "translate_special" takes translator as Integer, name as String returns Integer:
+    Let hir_id be proc hir_create_identifier from HIR with name
+    proc hir_set_metadata from HIR with hir_id, "r_special", name
+    Return hir_id
 End Process
 
 Note: ============================================================================
-Note: Special Value Creation
+Note: Binary / Unary Operation Translation
 Note: ============================================================================
 
 @Reasoning:
-Emits an HIR Bool constant for R's TRUE / FALSE. Value is passed in as the integer 1 (TRUE) or 0 (FALSE) so the same routine handles both shortforms (T/F also parse to the same shape).
+R binary operators (left at offset 16, right at offset 24, the original token at
+offset 64) map onto HIR binary opcodes where one exists. R has operators with no
+direct HIR opcode (^ power, %% modulo, %/% integer division, : sequence, %in%,
+custom %op%, ~ formula, the five assignment forms, the pipes); those lower to the
+nearest structural HIR opcode and are disambiguated by the "r_op_token" metadata,
+which carries the exact RLexer.TOKEN_* so the backend re-emits the precise R
+spelling. The two operands are translated recursively first, then bound to locals,
+so the call to hir_create_binary_expr takes already-evaluated arguments.
 @End Reasoning
-
-@Implementation:
-Calls HirNodes.create_literal_bool(value).
-@End Implementation
-
-Process called "create_hir_bool" takes value as Integer returns Integer:
-    Note: Create HIR boolean literal
-
-    Let hir_node be proc create_node from HIR with NODE_BOOL_LITERAL
-    proc memory_set_int64 from Layout with hir_node, 8, value
-    proc memory_set_int64 from Layout with hir_node, 64, proc TYPE_BOOL from HIR
-
-    Return hir_node
-End Process
-
-@Reasoning:
-Emits an HIR null constant for R's NULL. NULL in R is a distinct singleton type, not a missing-value marker; the HIR representation matches with a dedicated null literal node.
-@End Reasoning
-
-@Implementation:
-Calls HirNodes.create_literal_null().
-@End Implementation
-
-Process called "create_hir_null" returns Integer:
-    Note: Create HIR null literal
-
-    Let hir_node be proc create_node from HIR with NODE_NULL_LITERAL
-    proc memory_set_int64 from Layout with hir_node, 64, proc TYPE_NULL from HIR
-
-    Return hir_node
-End Process
-
-@Reasoning:
-Emits the HIR representation for R's NA (Not Available) sentinel. NA is the "missing value" marker - distinct from NULL because it has a type (NA_integer_, NA_real_, etc.) and participates in vector operations as a propagating sentinel.
-@End Reasoning
-
-@Implementation:
-Calls HirNodes.create_literal_na(), which marks the value with the NA bit pattern matching R's internal representation.
-@End Implementation
-
-Process called "create_hir_na" returns Integer:
-    Note: Create HIR NA (missing value) literal
-
-    @Reasoning:
-    R's NA (Not Available) represents missing data. In HIR, this
-    maps to an optional type with no value, or a special sentinel.
-    We use a custom NA literal node for proper semantics.
-    @End Reasoning
-
-    Let hir_node be proc create_node from HIR with NODE_SPECIAL_LITERAL
-    proc memory_set_int64 from Layout with hir_node, 8, proc string_from_literal with "NA"
-    proc memory_set_int64 from Layout with hir_node, 64, proc TYPE_ANY from HIR  Note: NA can have any type
-
-    Return hir_node
-End Process
-
-@Reasoning:
-Emits an HIR Float64 constant carrying the IEEE 754 NaN bit pattern for R's NaN. Distinct from NA - NaN arises from invalid arithmetic (0/0); NA is the explicit missing-value marker.
-@End Reasoning
-
-@Implementation:
-Calls HirNodes.create_literal_float64 with the IEEE NaN payload.
-@End Implementation
-
-Process called "create_hir_nan" returns Integer:
-    Note: Create HIR NaN (Not a Number) literal
-
-    Let hir_node be proc create_node from HIR with NODE_SPECIAL_LITERAL
-    proc memory_set_int64 from Layout with hir_node, 8, proc string_from_literal with "NaN"
-    proc memory_set_int64 from Layout with hir_node, 64, proc TYPE_FLOAT64 from HIR
-
-    Return hir_node
-End Process
-
-@Reasoning:
-Emits an HIR Float64 constant carrying IEEE 754 +Infinity for R's Inf. Negative infinity (-Inf) is constructed by wrapping Inf in a unary negate node by the caller.
-@End Reasoning
-
-@Implementation:
-Calls HirNodes.create_literal_float64 with the IEEE +Inf payload.
-@End Implementation
-
-Process called "create_hir_inf" returns Integer:
-    Note: Create HIR Infinity literal
-
-    Let hir_node be proc create_node from HIR with NODE_SPECIAL_LITERAL
-    proc memory_set_int64 from Layout with hir_node, 8, proc string_from_literal with "Inf"
-    proc memory_set_int64 from Layout with hir_node, 64, proc TYPE_FLOAT64 from HIR
-
-    Return hir_node
-End Process
-
-Note: ============================================================================
-Note: Binary Operation Translation
-Note: ============================================================================
-
-@Reasoning:
-Translates a binary operator AST node into the matching HIR binary op. Both operands are recursively translated; the operator token is mapped via r_operator_to_hir.
-@End Reasoning
-
-@Implementation:
-Recursively translates r_node.left and r_node.right via translate_expression, maps r_node.token_type via r_operator_to_hir to obtain the HIR opcode, then emits HirBuilder.create_binary_op with the three pieces.
-@End Implementation
-
 Process called "translate_binary_op" takes translator as Integer, r_node as Integer returns Integer:
-    Note: Translate R binary operation to HIR
-
-    @Reasoning:
-    R binary operations are vectorized by default - they operate
-    element-wise on vectors. We translate to HIR with appropriate
-    operator mapping and mark for vectorization.
-    @End Reasoning
-
     Let left_r be proc memory_get_int64 from Layout with r_node, 16
     Let right_r be proc memory_get_int64 from Layout with r_node, 24
-    Let op_type be proc memory_get_int64 from Layout with r_node, 64
+    Let op_token be proc memory_get_int64 from Layout with r_node, 64
 
-    Note: Translate operands
     Let left_hir be proc translate_expression with translator, left_r
     Let right_hir be proc translate_expression with translator, right_r
 
-    Note: Map R operator to HIR operator
-    Let hir_op be proc r_operator_to_hir from op_type
+    Let hir_op be proc r_token_to_hir_op with op_token
+    Let hir_binary be proc hir_create_binary_expr from HIR with hir_op, left_hir, right_hir
 
-    Note: Create HIR binary operation
-    Let hir_node be proc create_node from HIR with NODE_BINARY_OP
-    proc memory_set_int64 from Layout with hir_node, 16, left_hir
-    proc memory_set_int64 from Layout with hir_node, 24, right_hir
-    proc memory_set_int64 from Layout with hir_node, 64, hir_op
+    Note: Carry the exact R operator token so R-only operators round-trip.
+    proc hir_set_metadata from HIR with hir_binary, "r_op_token", op_token
 
-    Note: Mark as vectorized (R default behavior)
-    proc set_attribute from HIR with hir_node, "vectorized", 1
-
-    Return hir_node
+    Return hir_binary
 End Process
 
 @Reasoning:
-Translation table from R operator token constants to HIR opcode constants. R has more arithmetic operators than HIR (e.g. %%, %/%, ^, %in%), so several R ops map onto HIR's general "binary op with subtype" form.
+Maps an R operator token (RLexer.TOKEN_*) to the nearest HIR binary opcode. The
+mapping is an unrolled comparison cascade because R's operator set is small and
+fixed. Operators without a native HIR opcode (^, :, %in%, custom %op%, ~, pipes,
+the assignment forms) use HIR_OP_ADD as a structural fallback; the "r_op_token"
+metadata the caller attaches is authoritative for re-emission.
 @End Reasoning
-
-@Implementation:
-Cascade matching r_op against R's TOKEN_PLUS/MINUS/STAR/SLASH/CARET/PERCENT/INT_DIV/etc. constants. Returns the corresponding HIR OP_* constant. Comparison and logical operators are direct mappings; the formula-related ~ falls through to a dedicated OP_FORMULA.
-@End Implementation
-
-Process called "r_operator_to_hir" takes r_op as Integer returns Integer:
-    Note: Map R operator token to HIR operator
-
-    Note: Arithmetic operators
-    If r_op is equal to proc TOKEN_PLUS from RParser:
-        Return proc OP_ADD from HIR
+Process called "r_token_to_hir_op" takes op_token as Integer returns Integer:
+    Note: Arithmetic
+    If op_token is equal to RLexer.TOKEN_PLUS:
+        Return HIR.HIR_OP_ADD
+    End If
+    If op_token is equal to RLexer.TOKEN_MINUS:
+        Return HIR.HIR_OP_SUBTRACT
+    End If
+    If op_token is equal to RLexer.TOKEN_STAR:
+        Return HIR.HIR_OP_MULTIPLY
+    End If
+    If op_token is equal to RLexer.TOKEN_SLASH:
+        Return HIR.HIR_OP_DIVIDE
+    End If
+    If op_token is equal to RLexer.TOKEN_PERCENT:
+        Return HIR.HIR_OP_MODULO
+    End If
+    If op_token is equal to RLexer.TOKEN_INT_DIV:
+        Return HIR.HIR_OP_INT_DIVIDE
+    End If
+    If op_token is equal to RLexer.TOKEN_CARET:
+        Return HIR.HIR_OP_MULTIPLY  Note: power; r_op_token recovers ^
     End If
 
-    If r_op is equal to proc TOKEN_MINUS from RParser:
-        Return proc OP_SUBTRACT from HIR
+    Note: Comparison
+    If op_token is equal to RLexer.TOKEN_EQ:
+        Return HIR.HIR_OP_EQUAL
+    End If
+    If op_token is equal to RLexer.TOKEN_NE:
+        Return HIR.HIR_OP_NOT_EQUAL
+    End If
+    If op_token is equal to RLexer.TOKEN_LT:
+        Return HIR.HIR_OP_LESS_THAN
+    End If
+    If op_token is equal to RLexer.TOKEN_LE:
+        Return HIR.HIR_OP_LESS_EQUAL
+    End If
+    If op_token is equal to RLexer.TOKEN_GT:
+        Return HIR.HIR_OP_GREATER_THAN
+    End If
+    If op_token is equal to RLexer.TOKEN_GE:
+        Return HIR.HIR_OP_GREATER_EQUAL
     End If
 
-    If r_op is equal to proc TOKEN_STAR from RParser:
-        Return proc OP_MULTIPLY from HIR
+    Note: Logical
+    If op_token is equal to RLexer.TOKEN_AND:
+        Return HIR.HIR_OP_BITWISE_AND  Note: vectorized & ; r_op_token recovers spelling
+    End If
+    If op_token is equal to RLexer.TOKEN_OR:
+        Return HIR.HIR_OP_BITWISE_OR   Note: vectorized | ; r_op_token recovers spelling
+    End If
+    If op_token is equal to RLexer.TOKEN_AND_SHORT:
+        Return HIR.HIR_OP_LOGICAL_AND
+    End If
+    If op_token is equal to RLexer.TOKEN_OR_SHORT:
+        Return HIR.HIR_OP_LOGICAL_OR
     End If
 
-    If r_op is equal to proc TOKEN_SLASH from RParser:
-        Return proc OP_DIVIDE from HIR
-    End If
-
-    If r_op is equal to proc TOKEN_PERCENT from RParser:
-        Return proc OP_MODULO from HIR
-    End If
-
-    If r_op is equal to proc TOKEN_INT_DIV from RParser:
-        Return proc OP_INT_DIVIDE from HIR  Note: Integer division
-    End If
-
-    If r_op is equal to proc TOKEN_CARET from RParser:
-        Return proc OP_POWER from HIR
-    End If
-
-    Note: Comparison operators
-    If r_op is equal to proc TOKEN_EQUAL from RParser:
-        Return proc OP_EQUAL from HIR
-    End If
-
-    If r_op is equal to proc TOKEN_NOT_EQUAL from RParser:
-        Return proc OP_NOT_EQUAL from HIR
-    End If
-
-    If r_op is equal to proc TOKEN_LESS from RParser:
-        Return proc OP_LESS from HIR
-    End If
-
-    If r_op is equal to proc TOKEN_LESS_EQUAL from RParser:
-        Return proc OP_LESS_EQUAL from HIR
-    End If
-
-    If r_op is equal to proc TOKEN_GREATER from RParser:
-        Return proc OP_GREATER from HIR
-    End If
-
-    If r_op is equal to proc TOKEN_GREATER_EQUAL from RParser:
-        Return proc OP_GREATER_EQUAL from HIR
-    End If
-
-    Note: Logical operators (vectorized)
-    If r_op is equal to proc TOKEN_AND from RParser:
-        Return proc OP_AND from HIR
-    End If
-
-    If r_op is equal to proc TOKEN_OR from RParser:
-        Return proc OP_OR from HIR
-    End If
-
-    Note: Logical operators (short-circuit)
-    If r_op is equal to proc TOKEN_LOGICAL_AND from RParser:
-        Return proc OP_LOGICAL_AND from HIR
-    End If
-
-    If r_op is equal to proc TOKEN_LOGICAL_OR from RParser:
-        Return proc OP_LOGICAL_OR from HIR
-    End If
-
-    Note: Sequence operator
-    If r_op is equal to proc TOKEN_COLON from RParser:
-        Return proc OP_RANGE from HIR  Note: : creates sequences in R
-    End If
-
-    Note: Assignment operators
-    If r_op is equal to proc TOKEN_LEFT_ASSIGN from RParser:
-        Return proc OP_ASSIGN from HIR
-    End If
-
-    If r_op is equal to proc TOKEN_LEFT_SUPER_ASSIGN from RParser:
-        Return proc OP_SUPER_ASSIGN from HIR  Note: Parent scope assignment
-    End If
-
-    If r_op is equal to proc TOKEN_RIGHT_ASSIGN from RParser:
-        Return proc OP_ASSIGN from HIR  Note: Right assignment (flipped)
-    End If
-
-    If r_op is equal to proc TOKEN_RIGHT_SUPER_ASSIGN from RParser:
-        Return proc OP_SUPER_ASSIGN from HIR
-    End If
-
-    If r_op is equal to proc TOKEN_EQUAL_ASSIGN from RParser:
-        Return proc OP_ASSIGN from HIR
-    End If
-
-    Note: Formula operator
-    If r_op is equal to proc TOKEN_TILDE from RParser:
-        Return proc OP_FORMULA from HIR  Note: Statistical formula
-    End If
-
-    Note: Pipe operators
-    If r_op is equal to proc TOKEN_PIPE from RParser:
-        Return proc OP_PIPE from HIR
-    End If
-
-    If r_op is equal to proc TOKEN_MAGRITTR_PIPE from RParser:
-        Return proc OP_PIPE from HIR
-    End If
-
-    Note: Default to custom operator
-    Return proc OP_CUSTOM from HIR
+    Note: Sequence / namespace / formula / pipe / assignment / custom infix have
+    Note: no native opcode; r_op_token is authoritative.
+    Return HIR.HIR_OP_ADD
 End Process
 
-Note: ============================================================================
-Note: Unary Operation Translation
-Note: ============================================================================
-
 @Reasoning:
-Translates a unary R operator into an HIR unary op. R prefix operators are: -, +, ! and ~ (one-sided formula). The + form is folded away (positive prefix is a no-op).
+R prefix unary operators are -, +, and !. The operand is at offset 24 and the
+operator token at offset 64. We translate the operand, map the token to the HIR
+unary opcode (! -> logical-not, - -> negate, + -> negate-as-structural with an
+"r_unary" tag so the backend re-prefixes "+"), and carry the exact token so the
+backend reproduces the source spelling.
 @End Reasoning
-
-@Implementation:
-Recursively translates the operand via translate_expression, then dispatches: TOKEN_MINUS -> HIR OP_NEG, TOKEN_NOT -> HIR OP_LOGICAL_NOT, TOKEN_PLUS -> returns operand unchanged, TOKEN_TILDE -> HIR formula constructor.
-@End Implementation
-
 Process called "translate_unary_op" takes translator as Integer, r_node as Integer returns Integer:
-    Note: Translate R unary operation to HIR
-
     Let operand_r be proc memory_get_int64 from Layout with r_node, 24
-    Let op_type be proc memory_get_int64 from Layout with r_node, 64
-
-    Note: Translate operand
+    Let op_token be proc memory_get_int64 from Layout with r_node, 64
     Let operand_hir be proc translate_expression with translator, operand_r
 
-    Note: Map operator
-    Let hir_op be proc OP_NEGATE from HIR
-
-    If op_type is equal to proc TOKEN_BANG from RParser:
-        Set hir_op to proc OP_NOT from HIR
+    If op_token is equal to RLexer.TOKEN_NOT:
+        Let hir_not be proc hir_create_unary_expr from HIR with HIR.HIR_OP_LOGICAL_NOT, operand_hir
+        proc hir_set_metadata from HIR with hir_not, "r_unary_op", op_token
+        Return hir_not
     End If
 
-    If op_type is equal to proc TOKEN_MINUS from RParser:
-        Set hir_op to proc OP_NEGATE from HIR
+    If op_token is equal to RLexer.TOKEN_PLUS:
+        Let hir_plus be proc hir_create_unary_expr from HIR with HIR.HIR_OP_NEGATE, operand_hir
+        proc hir_set_metadata from HIR with hir_plus, "r_unary_op", op_token
+        proc hir_set_metadata from HIR with hir_plus, "r_unary_plus", "true"
+        Return hir_plus
     End If
 
-    If op_type is equal to proc TOKEN_PLUS from RParser:
-        Set hir_op to proc OP_UNARY_PLUS from HIR
-    End If
-
-    Note: Create HIR unary operation
-    Let hir_node be proc create_node from HIR with NODE_UNARY_OP
-    proc memory_set_int64 from Layout with hir_node, 24, operand_hir
-    proc memory_set_int64 from Layout with hir_node, 64, hir_op
-
-    Note: Mark as vectorized
-    proc set_attribute from HIR with hir_node, "vectorized", 1
-
-    Return hir_node
+    Note: Default and TOKEN_MINUS: arithmetic negation.
+    Let hir_neg be proc hir_create_unary_expr from HIR with HIR.HIR_OP_NEGATE, operand_hir
+    proc hir_set_metadata from HIR with hir_neg, "r_unary_op", op_token
+    Return hir_neg
 End Process
 
 Note: ============================================================================
@@ -760,36 +448,25 @@ Note: Assignment Translation
 Note: ============================================================================
 
 @Reasoning:
-Translates R's assignment operators (<-, =, ->, <<-, ->>) into HIR store nodes. The super-assign forms (<<-/->>) emit a parent-scope store rather than a local store; the direction of -> / ->> reverses left and right operands.
+R has five assignment operators with distinct scoping and direction: <- and = bind
+in the current scope, <<- and ->> bind in the parent scope (super-assignment),
+and -> / ->> reverse the operand order. The parser has already normalised target
+to the left slot (offset 16) and value to the right slot (offset 24) regardless of
+direction, so we always read target=left and value=right; the original token at
+offset 64 is carried in "r_assign_token" so the backend re-emits the exact
+operator (preserving super-assignment and right-assignment semantics).
 @End Reasoning
-
-@Implementation:
-Inspects r_node.token_type. Builds HirBuilder.create_assign with target (left for <-, right for ->) and value (right for <-, left for ->). For <<-/->> emits HirBuilder.create_super_assign which walks the symbol_table parent chain.
-@End Implementation
-
 Process called "translate_assign" takes translator as Integer, r_node as Integer returns Integer:
-    Note: Translate R assignment to HIR
-
-    @Reasoning:
-    R has multiple assignment operators with different scoping semantics:
-    - <- and = assign in current scope
-    - <<- and ->> assign in parent scope (super assignment)
-    We preserve these semantics in HIR.
-    @End Reasoning
-
     Let target_r be proc memory_get_int64 from Layout with r_node, 16
     Let value_r be proc memory_get_int64 from Layout with r_node, 24
+    Let assign_token be proc memory_get_int64 from Layout with r_node, 64
 
-    Note: Translate target and value
     Let target_hir be proc translate_expression with translator, target_r
     Let value_hir be proc translate_expression with translator, value_r
 
-    Note: Create HIR assignment
-    Let hir_node be proc create_node from HIR with NODE_ASSIGN
-    proc memory_set_int64 from Layout with hir_node, 16, target_hir
-    proc memory_set_int64 from Layout with hir_node, 24, value_hir
-
-    Return hir_node
+    Let hir_assign be proc hir_create_assign_expr from HIR with target_hir, HIR.HIR_ASSIGN_SIMPLE, value_hir
+    proc hir_set_metadata from HIR with hir_assign, "r_assign_token", assign_token
+    Return hir_assign
 End Process
 
 Note: ============================================================================
@@ -797,42 +474,54 @@ Note: Function Call Translation
 Note: ============================================================================
 
 @Reasoning:
-Translates an R function call into an HIR call. Both positional and named arguments must be preserved because R does named-arg matching at call site; HIR carries a "named args" map alongside positional args.
+An R call (callee at offset 16, argument nodes in the children array at offsets
+32/40) maps onto a HIR call. R named arguments arrive as NODE_ASSIGN children
+(name = value); they are translated as assignment expressions in argument position
+and tagged "r_named_arg" so the backend re-emits the "name = value" call-site form.
+Each argument is bound to a local before being added so no inline proc-call sits in
+the add-argument call position.
 @End Reasoning
-
-@Implementation:
-Recursively translates the callee, then iterates r_node.children: each child is either a bare expression (positional) or a NODE_NAMED_ARG carrying (name, value). Emits HirBuilder.create_call with the callee, positional args list, and named args map.
-@End Implementation
-
 Process called "translate_call" takes translator as Integer, r_node as Integer returns Integer:
-    Note: Translate R function call to HIR
-
     Let callee_r be proc memory_get_int64 from Layout with r_node, 16
-
-    Note: Translate callee
     Let callee_hir be proc translate_expression with translator, callee_r
 
-    Note: Create HIR call node
-    Let hir_node be proc create_node from HIR with NODE_CALL
-    proc memory_set_int64 from Layout with hir_node, 16, callee_hir
+    Let hir_call be proc hir_create_call_expr from HIR with callee_hir
+    proc translate_arguments_into with translator, hir_call, r_node
 
-    Note: Translate arguments
+    Return hir_call
+End Process
+
+@Reasoning:
+Shared helper that walks the children array of a call/index node and appends each
+entry as a HIR argument. A NODE_ASSIGN child is a named argument (R "name = value")
+so it is lowered to an assignment expression and tagged "r_named_arg" with the
+argument name string; bare children become positional arguments. This is the
+single argument-lowering path so named-argument handling lives in one place.
+@End Reasoning
+Process called "translate_arguments_into" takes translator as Integer, hir_call as Integer, r_node as Integer returns Integer:
     Let children be proc memory_get_int64 from Layout with r_node, 32
     Let child_count be proc memory_get_int64 from Layout with r_node, 40
 
     Let i be 0
     While i is less than child_count:
-        Let arg_r be proc memory_get_int64 from Layout with children, i multiplied by 8
+        Let offset be i multiplied by 8
+        Let arg_r be proc memory_get_int64 from Layout with children, offset
         Let arg_hir be proc translate_expression with translator, arg_r
 
         If arg_hir is not equal to 0:
-            proc add_child from HIR with hir_node, arg_hir
+            Let arg_type be proc memory_get_int64 from Layout with arg_r, 0
+            If arg_type is equal to RParser.NODE_ASSIGN:
+                Let name_r be proc memory_get_int64 from Layout with arg_r, 16
+                Let name_str be proc memory_get_int64 from Layout with name_r, 8
+                proc hir_set_metadata from HIR with arg_hir, "r_named_arg", name_str
+            End If
+            proc hir_add_argument from HIR with hir_call, arg_hir
         End If
 
         Set i to i plus 1
     End While
 
-    Return hir_node
+    Return 1
 End Process
 
 Note: ============================================================================
@@ -840,197 +529,122 @@ Note: Indexing Translation
 Note: ============================================================================
 
 @Reasoning:
-Translates R single-bracket indexing x[i,j,drop=FALSE] into an HIR subset operation. Empty index positions (x[,1]) are passed as a sentinel HIR null because they mean "all rows".
+R single-bracket indexing x[i, j] (object at offset 16, indices in the children
+array at offsets 32/40) returns a subset preserving the container type. HIR's index
+expression takes a single index, so the common single-index case uses it directly;
+multiple indices (matrix/dataframe access) are packed into a HIR list literal index
+tagged "r_multi_index" so the backend re-emits the comma-separated bracket form.
+The whole node is tagged "r_subset" to distinguish [ from [[ on the way back.
 @End Reasoning
-
-@Implementation:
-Translates the indexed object, then translates each comma-separated index expression (substituting an HIR null for empty positions). Emits HirBuilder.create_subset_op with object + indices list. drop=FALSE / named extras become named args on the subset node.
-@End Implementation
-
 Process called "translate_index" takes translator as Integer, r_node as Integer returns Integer:
-    Note: Translate R [...] indexing to HIR
-
-    @Reasoning:
-    R's single bracket indexing [...] extracts subsets and can use
-    multiple indices for multi-dimensional objects. Returns objects
-    of the same type as the original.
-    @End Reasoning
-
     Let object_r be proc memory_get_int64 from Layout with r_node, 16
-
-    Note: Translate object
     Let object_hir be proc translate_expression with translator, object_r
 
-    Note: Create HIR index node
-    Let hir_node be proc create_node from HIR with NODE_INDEX
-    proc memory_set_int64 from Layout with hir_node, 16, object_hir
-
-    Note: Translate indices
     Let children be proc memory_get_int64 from Layout with r_node, 32
     Let child_count be proc memory_get_int64 from Layout with r_node, 40
 
+    If child_count is equal to 1:
+        Let only_r be proc memory_get_int64 from Layout with children, 0
+        Let only_hir be proc translate_expression with translator, only_r
+        Let hir_index be proc hir_create_index_expr from HIR with object_hir, only_hir
+        proc hir_set_metadata from HIR with hir_index, "r_subset", "true"
+        Return hir_index
+    End If
+
+    Let multi be proc hir_create_list_literal from HIR
     Let i be 0
     While i is less than child_count:
-        Let index_r be proc memory_get_int64 from Layout with children, i multiplied by 8
-        Let index_hir be proc translate_expression with translator, index_r
-
-        If index_hir is not equal to 0:
-            proc add_child from HIR with hir_node, index_hir
-        End If
-
+        Let offset be i multiplied by 8
+        Let elem_r be proc memory_get_int64 from Layout with children, offset
+        Let elem_hir be proc translate_expression with translator, elem_r
+        proc hir_add_list_element from HIR with multi, elem_hir
         Set i to i plus 1
     End While
 
-    Note: Mark as subset indexing (R [...])
-    proc set_attribute from HIR with hir_node, "r_subset", 1
-
-    Return hir_node
+    Let hir_multi be proc hir_create_index_expr from HIR with object_hir, multi
+    proc hir_set_metadata from HIR with hir_multi, "r_subset", "true"
+    proc hir_set_metadata from HIR with hir_multi, "r_multi_index", "true"
+    Return hir_multi
 End Process
 
 @Reasoning:
-Translates R double-bracket indexing x[[i]] into an HIR element-extract operation. Distinct from translate_index because the return type is the raw element rather than a sub-structure.
+R double-bracket indexing x[[i]] (object at offset 16, single index at offset 24)
+extracts a single element, unwrapping one container layer. It maps directly onto a
+HIR index expression tagged "r_extract" so the backend re-emits [[...]] rather than
+[...].
 @End Reasoning
-
-@Implementation:
-Translates the indexed object and the single (or matrix-style two) index expressions, then emits HirBuilder.create_element_extract with object and index.
-@End Implementation
-
 Process called "translate_double_index" takes translator as Integer, r_node as Integer returns Integer:
-    Note: Translate R [[...]] indexing to HIR
-
-    @Reasoning:
-    R's double bracket indexing [[...]] extracts single elements
-    and returns the element itself (not wrapped in a container).
-    This is distinct from [...] which returns a subset.
-    @End Reasoning
-
     Let object_r be proc memory_get_int64 from Layout with r_node, 16
     Let index_r be proc memory_get_int64 from Layout with r_node, 24
 
-    Note: Translate object and index
     Let object_hir be proc translate_expression with translator, object_r
     Let index_hir be proc translate_expression with translator, index_r
 
-    Note: Create HIR index node
-    Let hir_node be proc create_node from HIR with NODE_INDEX
-    proc memory_set_int64 from Layout with hir_node, 16, object_hir
-    proc memory_set_int64 from Layout with hir_node, 24, index_hir
-
-    Note: Mark as element extraction (R [[...]])
-    proc set_attribute from HIR with hir_node, "r_extract", 1
-
-    Return hir_node
+    Let hir_index be proc hir_create_index_expr from HIR with object_hir, index_hir
+    proc hir_set_metadata from HIR with hir_index, "r_extract", "true"
+    Return hir_index
 End Process
 
 Note: ============================================================================
-Note: Member and Slot Access Translation
+Note: Member / Slot / Namespace Access Translation
 Note: ============================================================================
 
 @Reasoning:
-Translates R's $ member access (df$col) into an HIR field-access op. The field name is treated as a literal string, not as a sub-expression - matching R's evaluation semantics for $.
+R's $ member access (df$col) has the object at offset 16 and the member identifier
+node at offset 24. The member name is a literal name, not an evaluated expression,
+so we read it directly from the identifier's value slot and build a HIR member
+expression (object.member). It carries no extra tag - $ is the default member form
+the backend emits.
 @End Reasoning
-
-@Implementation:
-Translates r_node.left (the object). Reads r_node.right.value as the bare field-name string. Emits HirBuilder.create_field_access(object, field_name).
-@End Implementation
-
 Process called "translate_member_access" takes translator as Integer, r_node as Integer returns Integer:
-    Note: Translate R $ member access to HIR
-
-    @Reasoning:
-    R's $ operator accesses named elements in lists and columns
-    in data frames. Translates to property access in HIR.
-    @End Reasoning
-
     Let object_r be proc memory_get_int64 from Layout with r_node, 16
     Let member_r be proc memory_get_int64 from Layout with r_node, 24
 
-    Note: Translate object and member
     Let object_hir be proc translate_expression with translator, object_r
-    Let member_hir be proc translate_expression with translator, member_r
+    Let member_name be proc memory_get_int64 from Layout with member_r, 8
 
-    Note: Create HIR member access
-    Let hir_node be proc create_node from HIR with NODE_MEMBER_ACCESS
-    proc memory_set_int64 from Layout with hir_node, 16, object_hir
-    proc memory_set_int64 from Layout with hir_node, 24, member_hir
-
-    Return hir_node
+    Return proc hir_create_member_expr from HIR with object_hir, member_name
 End Process
 
 @Reasoning:
-Translates R's @ S4 slot access into an HIR slot-access op. S4 slots are statically-typed unlike S3 $ members, so the HIR carries the resolved slot type when available from the semantic context.
+R's @ S4 slot access (obj@slot) shares the member-access shape (object at offset
+16, slot identifier at offset 24) but has stricter S4 semantics that cannot be
+cross-applied with $. We build a HIR member expression and tag it "r_s4_slot" so
+the backend re-emits "@" rather than "$".
 @End Reasoning
-
-@Implementation:
-Translates r_node.left (object). Reads r_node.right.value as the slot-name string. Emits HirBuilder.create_slot_access(object, slot_name).
-@End Implementation
-
 Process called "translate_slot_access" takes translator as Integer, r_node as Integer returns Integer:
-    Note: Translate R @ slot access to HIR
-
-    @Reasoning:
-    R's @ operator accesses slots in S4 objects (R's formal OOP system).
-    Similar to member access but with stricter typing semantics.
-    @End Reasoning
-
     Let object_r be proc memory_get_int64 from Layout with r_node, 16
     Let slot_r be proc memory_get_int64 from Layout with r_node, 24
 
-    Note: Translate object and slot
     Let object_hir be proc translate_expression with translator, object_r
-    Let slot_hir be proc translate_expression with translator, slot_r
+    Let slot_name be proc memory_get_int64 from Layout with slot_r, 8
 
-    Note: Create HIR member access (with S4 slot attribute)
-    Let hir_node be proc create_node from HIR with NODE_MEMBER_ACCESS
-    proc memory_set_int64 from Layout with hir_node, 16, object_hir
-    proc memory_set_int64 from Layout with hir_node, 24, slot_hir
-
-    Note: Mark as S4 slot access
-    proc set_attribute from HIR with hir_node, "r_s4_slot", 1
-
-    Return hir_node
+    Let hir_member be proc hir_create_member_expr from HIR with object_hir, slot_name
+    proc hir_set_metadata from HIR with hir_member, "r_s4_slot", "true"
+    Return hir_member
 End Process
 
-Note: ============================================================================
-Note: Namespace Access Translation
-Note: ============================================================================
-
 @Reasoning:
-Translates R's pkg::fn or pkg:::fn namespace access. The :: form references the package's exported symbol; ::: bypasses export control and references internal symbols. HIR carries this distinction so the linker can enforce visibility.
+R's pkg::name (exported) and pkg:::name (internal) namespace access has the package
+identifier at offset 16, the name identifier at offset 24, and the internal flag at
+offset 64 (0 for ::, 1 for :::). HIR models qualified access as a member expression
+(package.name) tagged "r_namespace"; the internal-vs-exported distinction is carried
+in "r_internal" so the backend re-emits the correct :: / ::: separator.
 @End Reasoning
-
-@Implementation:
-Reads the package name and symbol name from the R node. Emits HirBuilder.create_namespace_ref(package_name, symbol_name, is_internal). The is_internal flag is set when the original token was TOKEN_TRIPLE_COLON.
-@End Implementation
-
 Process called "translate_namespace" takes translator as Integer, r_node as Integer returns Integer:
-    Note: Translate R :: or ::: namespace access to HIR
-
-    @Reasoning:
-    R's :: accesses exported functions from packages, while :::
-    accesses internal (non-exported) functions. This translates
-    to qualified name access in HIR.
-    @End Reasoning
-
     Let package_r be proc memory_get_int64 from Layout with r_node, 16
     Let name_r be proc memory_get_int64 from Layout with r_node, 24
     Let is_internal be proc memory_get_int64 from Layout with r_node, 64
 
-    Note: Translate package and name
     Let package_hir be proc translate_expression with translator, package_r
-    Let name_hir be proc translate_expression with translator, name_r
+    Let name_str be proc memory_get_int64 from Layout with name_r, 8
 
-    Note: Create HIR qualified name
-    Let hir_node be proc create_node from HIR with NODE_QUALIFIED_NAME
-    proc memory_set_int64 from Layout with hir_node, 16, package_hir
-    proc memory_set_int64 from Layout with hir_node, 24, name_hir
-
-    Note: Mark if internal access
+    Let hir_member be proc hir_create_member_expr from HIR with package_hir, name_str
+    proc hir_set_metadata from HIR with hir_member, "r_namespace", "true"
     If is_internal is equal to 1:
-        proc set_attribute from HIR with hir_node, "r_internal", 1
+        proc hir_set_metadata from HIR with hir_member, "r_internal", "true"
     End If
-
-    Return hir_node
+    Return hir_member
 End Process
 
 Note: ============================================================================
@@ -1038,121 +652,144 @@ Note: Formula Translation
 Note: ============================================================================
 
 @Reasoning:
-Translates an R formula (y ~ x1 + x2) into an HIR formula constructor. Formulas are unevaluated R values; HIR represents them as a structured node carrying the LHS, RHS, and the source environment for later evaluation.
+An R formula (response ~ predictors) is a first-class, order-significant language
+object with the response at offset 16 and the predictors at offset 24. HIR has no
+formula node, so we model it as a binary expression carrying both sides and tag it
+"r_formula" so the backend re-emits the "~" operator. Both sides translate through
+the ordinary expression path so nested formula operators (:, *, +, -) round-trip
+as their normal binary forms.
 @End Reasoning
-
-@Implementation:
-Translates the response (left of ~) and the predictors expression tree (right of ~). Builds HirBuilder.create_formula(response, predictors, env_ref) where env_ref is a reference to the current scope for delayed evaluation.
-@End Implementation
-
 Process called "translate_formula" takes translator as Integer, r_node as Integer returns Integer:
-    Note: Translate R formula (y ~ x) to HIR
-
-    @Reasoning:
-    R's formula syntax (y ~ x1 + x2) is fundamental to statistical
-    modeling. We preserve this as a special formula type in HIR
-    for proper semantic representation.
-    @End Reasoning
-
     Let left_r be proc memory_get_int64 from Layout with r_node, 16
     Let right_r be proc memory_get_int64 from Layout with r_node, 24
 
-    Note: Translate both sides
     Let left_hir be proc translate_expression with translator, left_r
     Let right_hir be proc translate_expression with translator, right_r
 
-    Note: Create HIR formula node
-    Let hir_node be proc create_node from HIR with NODE_FORMULA
-    proc memory_set_int64 from Layout with hir_node, 16, left_hir  Note: Response
-    proc memory_set_int64 from Layout with hir_node, 24, right_hir  Note: Predictors
-
-    Return hir_node
+    Let hir_formula be proc hir_create_binary_expr from HIR with HIR.HIR_OP_ADD, left_hir, right_hir
+    proc hir_set_metadata from HIR with hir_formula, "r_formula", "true"
+    Return hir_formula
 End Process
 
 Note: ============================================================================
-Note: Function Definition Translation
+Note: Function Definition / Lambda Translation
 Note: ============================================================================
 
 @Reasoning:
-Translates an R function definition `function(args) body` into an HIR function literal. Function_depth is incremented while the body translates so closure capture analysis can run.
+An R function definition `function(params) body` (and the R 4.1+ \(params) body
+lambda) keeps its parameters in the children array (offsets 32/40) and the body
+statement at offset 24. A parameter is either a bare NODE_IDENTIFIER or a
+NODE_ASSIGN (name = default). We build a HIR function, add a HIR parameter per
+entry (defaults preserved on the parameter), lower the body into a HIR block, and
+tag the kind so the backend re-emits "function" or the "\\" lambda form.
+function_depth is bumped during the body walk so nested closures can be reasoned
+about.
 @End Reasoning
-
-@Implementation:
-Bumps translator.function_depth. Iterates parameters, translating each (default expressions become HIR thunk-like closures). Translates body via translate_expression or translate_block. Emits HirBuilder.create_function_literal with parameter list, body, and the captured-variable list. Restores function_depth on exit.
-@End Implementation
-
-Process called "translate_function_def" takes translator as Integer, r_node as Integer returns Integer:
-    Note: Translate R function definition to HIR
-
-    @Reasoning:
-    R functions support default arguments, varargs (...), and
-    lazy evaluation. We translate to HIR function with appropriate
-    metadata for these features.
-    @End Reasoning
-
-    Note: Increment function depth
+Process called "translate_function_def" takes translator as Integer, r_node as Integer, is_lambda as Integer returns Integer:
     Let depth be proc memory_get_int64 from Layout with translator, 8
     proc memory_set_int64 from Layout with translator, 8, depth plus 1
 
-    Note: Create HIR function node
-    Let hir_node be proc create_node from HIR with NODE_FUNCTION_DEF
+    Let hir_function be proc hir_create_function from HIR
 
-    Note: Translate parameters
+    Note: Parameters live in the children array.
     Let children be proc memory_get_int64 from Layout with r_node, 32
     Let child_count be proc memory_get_int64 from Layout with r_node, 40
 
-    Let params_node be proc create_node from HIR with NODE_PARAMETER_LIST
-
     Let i be 0
     While i is less than child_count:
-        Let param_r be proc memory_get_int64 from Layout with children, i multiplied by 8
-        Let param_hir be proc translate_expression with translator, param_r
-
-        If param_hir is not equal to 0:
-            proc add_child from HIR with params_node, param_hir
-        End If
-
+        Let offset be i multiplied by 8
+        Let param_r be proc memory_get_int64 from Layout with children, offset
+        proc add_parameter_from_node with translator, hir_function, param_r
         Set i to i plus 1
     End While
 
-    proc memory_set_int64 from Layout with hir_node, 16, params_node
-
-    Note: Translate body
+    Note: Body is a single statement (commonly a block) at offset 24.
     Let body_r be proc memory_get_int64 from Layout with r_node, 24
-    Let body_hir be proc translate_statement with translator, body_r
+    Let body_hir be proc translate_function_body with translator, body_r
+    proc hir_set_function_body from HIR with hir_function, body_hir
 
-    proc memory_set_int64 from Layout with hir_node, 24, body_hir
+    If is_lambda is equal to 1:
+        proc hir_set_metadata from HIR with hir_function, "r_fn_kind", "lambda"
+    Otherwise:
+        proc hir_set_metadata from HIR with hir_function, "r_fn_kind", "function"
+    End If
+    proc hir_set_metadata from HIR with hir_function, "r_anonymous", "true"
 
-    Note: Mark with R function attributes
-    proc set_attribute from HIR with hir_node, "r_function", 1
-    proc set_attribute from HIR with hir_node, "lazy_eval", 1  Note: R uses lazy evaluation
+    Let restore_depth be proc memory_get_int64 from Layout with translator, 8
+    proc memory_set_int64 from Layout with translator, 8, restore_depth minus 1
 
-    Note: Decrement function depth
-    Set depth to proc memory_get_int64 from Layout with translator, 8
-    proc memory_set_int64 from Layout with translator, 8, depth minus 1
-
-    Return hir_node
+    Return hir_function
 End Process
 
-Note: ============================================================================
-Note: Lambda Translation
-Note: ============================================================================
+@Reasoning:
+Adds one HIR parameter to a function from an R parameter AST node. A bare
+NODE_IDENTIFIER is a plain parameter; a NODE_ASSIGN is a defaulted parameter whose
+name is the left identifier and whose default expression is the right child. The
+varargs "..." parameter is a NODE_IDENTIFIER whose name is "...", which round-trips
+verbatim. The default expression, when present, is attached via
+hir_set_parameter_default so the backend re-emits "name = default".
+@End Reasoning
+Process called "add_parameter_from_node" takes translator as Integer, hir_function as Integer, param_r as Integer returns Integer:
+    If param_r is equal to 0:
+        Return 0
+    End If
+
+    Let param_type be proc memory_get_int64 from Layout with param_r, 0
+    Let hir_param be proc hir_create_parameter from HIR
+
+    If param_type is equal to RParser.NODE_ASSIGN:
+        Let name_r be proc memory_get_int64 from Layout with param_r, 16
+        Let default_r be proc memory_get_int64 from Layout with param_r, 24
+        Let param_name be proc memory_get_int64 from Layout with name_r, 8
+        proc hir_set_parameter_name from HIR with hir_param, param_name
+
+        Let default_hir be proc translate_expression with translator, default_r
+        proc hir_set_parameter_default from HIR with hir_param, default_hir
+        proc hir_set_metadata from HIR with hir_param, "r_has_default", "true"
+    Otherwise:
+        Let param_name be proc memory_get_int64 from Layout with param_r, 8
+        proc hir_set_parameter_name from HIR with hir_param, param_name
+    End If
+
+    proc hir_add_parameter from HIR with hir_function, hir_param
+    Return 1
+End Process
 
 @Reasoning:
-Translates R 4.1+ backslash lambda \(args) body into the same HIR shape as a regular function. Identical semantics to translate_function_def - the syntactic difference is just shorthand.
+A function body is a single R statement - usually a NODE_BLOCK, but R also permits
+a single expression body (function(x) x + 1). We always produce a HIR block so the
+function body is a uniform statement node: a block body is lowered statement by
+statement, while a single-expression body is wrapped in a one-statement block.
 @End Reasoning
+Process called "translate_function_body" takes translator as Integer, body_r as Integer returns Integer:
+    Let hir_block be proc hir_create_block from HIR
+    If body_r is equal to 0:
+        Return hir_block
+    End If
 
-@Implementation:
-Delegates to translate_function_def-style logic: bumps function_depth, translates parameters and body, emits HirBuilder.create_function_literal.
-@End Implementation
+    Let body_type be proc memory_get_int64 from Layout with body_r, 0
+    If body_type is equal to RParser.NODE_BLOCK:
+        Let children be proc memory_get_int64 from Layout with body_r, 32
+        Let child_count be proc memory_get_int64 from Layout with body_r, 40
+        Let i be 0
+        While i is less than child_count:
+            Let offset be i multiplied by 8
+            Let stmt_r be proc memory_get_int64 from Layout with children, offset
+            Let stmt_hir be proc translate_statement with translator, stmt_r
+            If stmt_hir is not equal to 0:
+                proc hir_add_statement from HIR with hir_block, stmt_hir
+            End If
+            Set i to i plus 1
+        End While
+        Return hir_block
+    End If
 
-Process called "translate_lambda" takes translator as Integer, r_node as Integer returns Integer:
-    Note: Translate R lambda (\(x) expr) to HIR
-
-    Note: R lambdas are syntactic sugar for function()
-    Note: Translate as anonymous function
-
-    Return proc translate_function_def with translator, r_node
+    Note: Single-expression body.
+    Let single_hir be proc translate_statement with translator, body_r
+    If single_hir is not equal to 0:
+        proc hir_add_statement from HIR with hir_block, single_hir
+    End If
+    Return hir_block
 End Process
 
 Note: ============================================================================
@@ -1160,81 +797,100 @@ Note: Pipe Translation
 Note: ============================================================================
 
 @Reasoning:
-Translates R pipe operators (|> native, %>% magrittr) into ordinary HIR calls by rewriting `x |> f(args)` to `f(x, args)`. The two pipe shapes differ in placeholder handling (magrittr supports `.` placeholders); both reduce to standard calls after rewriting.
+R pipe operators (|> native, %>% magrittr) pass the left-hand value as the first
+argument to the right-hand call: x |> f(args) becomes f(x, args). The piped value
+is at offset 16 and the right operand at offset 24. We translate the value, then
+build (or extend) a call: if the right side is already a NODE_CALL we prepend the
+value as the first argument; otherwise we wrap the right side in a one-argument
+call. The result is tagged "r_pipe" so the backend can re-collapse to pipe syntax.
 @End Reasoning
-
-@Implementation:
-Translates left and right. If right is already a call expression, prepends the left translation as the first positional arg. If right is a bare identifier, wraps it in a one-arg call(left). Emits HirBuilder.create_call with the rewritten shape.
-@End Implementation
-
 Process called "translate_pipe" takes translator as Integer, r_node as Integer returns Integer:
-    Note: Translate R pipe operator to HIR
-
-    @Reasoning:
-    R's pipe operators (|> and %>%) pass the left-hand side as
-    the first argument to the right-hand side function. This is
-    syntactic sugar that we expand in HIR.
-    @End Reasoning
-
-    Let left_r be proc memory_get_int64 from Layout with r_node, 16
+    Let value_r be proc memory_get_int64 from Layout with r_node, 16
     Let right_r be proc memory_get_int64 from Layout with r_node, 24
+    Let pipe_token be proc memory_get_int64 from Layout with r_node, 64
 
-    Note: Translate left (piped value) and right (function)
-    Let value_hir be proc translate_expression with translator, left_r
+    Let value_hir be proc translate_expression with translator, value_r
+    Let right_type be proc memory_get_int64 from Layout with right_r, 0
+
+    If right_type is equal to RParser.NODE_CALL:
+        Let callee_r be proc memory_get_int64 from Layout with right_r, 16
+        Let callee_hir be proc translate_expression with translator, callee_r
+        Let hir_call be proc hir_create_call_expr from HIR with callee_hir
+        proc hir_add_argument from HIR with hir_call, value_hir
+        proc translate_arguments_into with translator, hir_call, right_r
+        proc hir_set_metadata from HIR with hir_call, "r_pipe", "true"
+        proc hir_set_metadata from HIR with hir_call, "r_pipe_token", pipe_token
+        Return hir_call
+    End If
+
     Let func_hir be proc translate_expression with translator, right_r
-
-    Note: Create function call with piped value as first argument
-    Let hir_node be proc create_node from HIR with NODE_CALL
-    proc memory_set_int64 from Layout with hir_node, 16, func_hir
-    proc add_child from HIR with hir_node, value_hir
-
-    Return hir_node
+    Let hir_wrap be proc hir_create_call_expr from HIR with func_hir
+    proc hir_add_argument from HIR with hir_wrap, value_hir
+    proc hir_set_metadata from HIR with hir_wrap, "r_pipe", "true"
+    proc hir_set_metadata from HIR with hir_wrap, "r_pipe_token", pipe_token
+    Return hir_wrap
 End Process
 
 Note: ============================================================================
-Note: Vector Translation
+Note: Vector / List Translation
 Note: ============================================================================
 
 @Reasoning:
-Translates the R vector literal c(...) into an HIR array constructor. If all elements share the same scalar type the HIR Array can be specialised; otherwise it falls back to a polymorphic list.
+R's c(...) vector literal combines values into an atomic vector; its elements are
+the children at offsets 32/40. We lower it to a HIR list literal tagged "r_vector"
+so the backend re-emits c(...). Named vector elements arrive as NODE_ASSIGN
+children and are tagged "r_named_arg" so name = value pairs round-trip.
 @End Reasoning
-
-@Implementation:
-Iterates r_node.children translating each element via translate_expression. Probes the element types: if homogeneous, emits HirBuilder.create_array with the specific element type. Otherwise emits HirBuilder.create_list (heterogeneous).
-@End Implementation
-
 Process called "translate_vector" takes translator as Integer, r_node as Integer returns Integer:
-    Note: Translate R vector literal c(...) to HIR
+    Let hir_list be proc hir_create_list_literal from HIR
+    proc add_vector_elements with translator, hir_list, r_node
+    proc hir_set_metadata from HIR with hir_list, "r_vector", "true"
+    Return hir_list
+End Process
 
-    @Reasoning:
-    R vectors are fundamental data structures. The c() function
-    creates vectors by combining values. We translate to HIR
-    array literal.
-    @End Reasoning
+@Reasoning:
+R's list(...) literal builds a heterogeneous list preserving per-element types; its
+elements are the children at offsets 32/40. We lower it to a HIR list literal tagged
+"r_list" so the backend re-emits list(...) (rather than c(...) which would coerce).
+@End Reasoning
+Process called "translate_list" takes translator as Integer, r_node as Integer returns Integer:
+    Let hir_list be proc hir_create_list_literal from HIR
+    proc add_vector_elements with translator, hir_list, r_node
+    proc hir_set_metadata from HIR with hir_list, "r_list", "true"
+    Return hir_list
+End Process
 
-    Note: Create HIR array literal
-    Let hir_node be proc create_node from HIR with NODE_ARRAY_LITERAL
-
-    Note: Translate elements
+@Reasoning:
+Shared element-collection helper for c()/list(): walks the children array and adds
+each element to the HIR list literal in source order. A NODE_ASSIGN element is a
+named entry (name = value) tagged "r_named_arg" with its name so named vectors and
+lists round-trip; bare elements are positional. Each element is bound to a local
+before being added so no inline proc-call sits in the add position.
+@End Reasoning
+Process called "add_vector_elements" takes translator as Integer, hir_list as Integer, r_node as Integer returns Integer:
     Let children be proc memory_get_int64 from Layout with r_node, 32
     Let child_count be proc memory_get_int64 from Layout with r_node, 40
 
     Let i be 0
     While i is less than child_count:
-        Let elem_r be proc memory_get_int64 from Layout with children, i multiplied by 8
+        Let offset be i multiplied by 8
+        Let elem_r be proc memory_get_int64 from Layout with children, offset
         Let elem_hir be proc translate_expression with translator, elem_r
 
         If elem_hir is not equal to 0:
-            proc add_child from HIR with hir_node, elem_hir
+            Let elem_type be proc memory_get_int64 from Layout with elem_r, 0
+            If elem_type is equal to RParser.NODE_ASSIGN:
+                Let name_r be proc memory_get_int64 from Layout with elem_r, 16
+                Let name_str be proc memory_get_int64 from Layout with name_r, 8
+                proc hir_set_metadata from HIR with elem_hir, "r_named_arg", name_str
+            End If
+            proc hir_add_list_element from HIR with hir_list, elem_hir
         End If
 
         Set i to i plus 1
     End While
 
-    Note: Mark as R vector
-    proc set_attribute from HIR with hir_node, "r_vector", 1
-
-    Return hir_node
+    Return 1
 End Process
 
 Note: ============================================================================
@@ -1242,136 +898,104 @@ Note: Statement Translation
 Note: ============================================================================
 
 @Reasoning:
-Dispatches a top-level statement to the appropriate translate_* handler. Statements are everything-is-an-expression in R, so most cases fall through to translate_expression; the routine exists so control flow forms can short-circuit to their dedicated translators.
+Statement dispatcher. R is expression-oriented, so most statement-position nodes
+fall through to translate_expression; the control-flow forms (if/while/for/repeat/
+break/next/return), the expression-statement wrapper, and brace blocks have
+dedicated handlers. An expression in statement position is wrapped in a HIR
+expression statement so the block/module statement lists are uniform.
 @End Reasoning
-
-@Implementation:
-Switch over node_type: IF -> translate_if, WHILE -> translate_while, FOR -> translate_for, REPEAT -> translate_repeat, BREAK -> translate_break, NEXT -> translate_next, RETURN -> translate_return, BLOCK -> translate_block. Default -> translate_expression.
-@End Implementation
-
 Process called "translate_statement" takes translator as Integer, r_node as Integer returns Integer:
-    Note: Translate R statement to HIR
-
     If r_node is equal to 0:
         Return 0
     End If
 
     Let node_type be proc memory_get_int64 from Layout with r_node, 0
 
-    Note: Expression statement
-    If node_type is equal to proc NODE_EXPRESSION_STMT from RParser:
+    If node_type is equal to RParser.NODE_EXPRESSION_STMT:
         Let expr_r be proc memory_get_int64 from Layout with r_node, 16
-        Return proc translate_expression with translator, expr_r
+        Let expr_hir be proc translate_expression with translator, expr_r
+        Return proc hir_create_expression_statement from HIR with expr_hir
     End If
-
-    Note: Return statement
-    If node_type is equal to proc NODE_RETURN_STMT from RParser:
+    If node_type is equal to RParser.NODE_RETURN_STMT:
         Return proc translate_return with translator, r_node
     End If
-
-    Note: Control flow
-    If node_type is equal to proc NODE_IF_STMT from RParser:
+    If node_type is equal to RParser.NODE_IF_STMT:
         Return proc translate_if with translator, r_node
     End If
-
-    If node_type is equal to proc NODE_WHILE_STMT from RParser:
+    If node_type is equal to RParser.NODE_WHILE_STMT:
         Return proc translate_while with translator, r_node
     End If
-
-    If node_type is equal to proc NODE_FOR_STMT from RParser:
+    If node_type is equal to RParser.NODE_FOR_STMT:
         Return proc translate_for with translator, r_node
     End If
-
-    If node_type is equal to proc NODE_REPEAT_STMT from RParser:
+    If node_type is equal to RParser.NODE_REPEAT_STMT:
         Return proc translate_repeat with translator, r_node
     End If
-
-    If node_type is equal to proc NODE_BREAK_STMT from RParser:
+    If node_type is equal to RParser.NODE_BREAK_STMT:
         Return proc translate_break with translator, r_node
     End If
-
-    If node_type is equal to proc NODE_NEXT_STMT from RParser:
+    If node_type is equal to RParser.NODE_NEXT_STMT:
         Return proc translate_next with translator, r_node
     End If
-
-    Note: Block
-    If node_type is equal to proc NODE_BLOCK from RParser:
+    If node_type is equal to RParser.NODE_BLOCK:
         Return proc translate_block with translator, r_node
     End If
 
-    Return 0
+    Note: Bare expression in statement position -> expression-statement wrapper.
+    Let bare_hir be proc translate_expression with translator, r_node
+    Return proc hir_create_expression_statement from HIR with bare_hir
 End Process
 
 @Reasoning:
-Translates `return(value)` (R's explicit return) into an HIR Return node. Without an argument, returns invisibly NULL per R semantics.
+R's return(value) (value at offset 24, 0 when bare) maps onto a HIR return. A bare
+return becomes a HIR return with no value; a value return attaches the lowered
+expression.
 @End Reasoning
-
-@Implementation:
-If r_node.right is non-null, translates the value expression and emits HirBuilder.create_return(value). If null, emits HirBuilder.create_return(HirBuilder.create_literal_null()).
-@End Implementation
-
 Process called "translate_return" takes translator as Integer, r_node as Integer returns Integer:
-    Note: Translate R return statement to HIR
-
+    Let hir_return be proc hir_create_return from HIR
     Let value_r be proc memory_get_int64 from Layout with r_node, 24
-
-    Let hir_node be proc create_node from HIR with NODE_RETURN
 
     If value_r is not equal to 0:
         Let value_hir be proc translate_expression with translator, value_r
-        proc memory_set_int64 from Layout with hir_node, 24, value_hir
+        proc hir_set_return_value from HIR with hir_return, value_hir
     End If
 
-    Return hir_node
+    Return hir_return
 End Process
 
 @Reasoning:
-Translates `if (cond) then else otherwise` into an HIR conditional. R treats if as an expression so the HIR node carries the result type. Missing else branch yields HIR null for that arm.
+R's if (children[0]=condition, children[1]=then, children[2]=else when present)
+maps onto a HIR if. The condition is an expression; the then- and else-branches are
+statements (commonly blocks). The else branch is set only when child_count > 2.
 @End Reasoning
-
-@Implementation:
-Translates the condition expression. Translates the then-branch as a statement. If r_node has an else branch, translates it; otherwise uses HirBuilder.create_literal_null. Emits HirBuilder.create_if(cond, then, else).
-@End Implementation
-
 Process called "translate_if" takes translator as Integer, r_node as Integer returns Integer:
-    Note: Translate R if statement to HIR
-
-    Note: Get branches from children
     Let children be proc memory_get_int64 from Layout with r_node, 32
     Let child_count be proc memory_get_int64 from Layout with r_node, 40
 
     Let condition_r be proc memory_get_int64 from Layout with children, 0
     Let then_r be proc memory_get_int64 from Layout with children, 8
 
-    Note: Translate condition and then branch
     Let condition_hir be proc translate_expression with translator, condition_r
     Let then_hir be proc translate_statement with translator, then_r
 
-    Let hir_node be proc create_node from HIR with NODE_IF
-    proc add_child from HIR with hir_node, condition_hir
-    proc add_child from HIR with hir_node, then_hir
+    Let hir_if be proc hir_create_if from HIR
+    proc hir_set_if_condition from HIR with hir_if, condition_hir
+    proc hir_set_if_then from HIR with hir_if, then_hir
 
-    Note: Translate else branch if present
     If child_count is greater than 2:
         Let else_r be proc memory_get_int64 from Layout with children, 16
         Let else_hir be proc translate_statement with translator, else_r
-        proc add_child from HIR with hir_node, else_hir
+        proc hir_set_if_else from HIR with hir_if, else_hir
     End If
 
-    Return hir_node
+    Return hir_if
 End Process
 
 @Reasoning:
-Translates `while (cond) body` into an HIR while loop. R while returns NULL invisibly at runtime; the HIR loop carries the same result-type convention.
+R's while (children[0]=condition, children[1]=body) maps onto a HIR while loop. The
+condition is an expression; the body is a statement (commonly a block).
 @End Reasoning
-
-@Implementation:
-Translates the condition expression and the body statement. Emits HirBuilder.create_while(cond, body).
-@End Implementation
-
 Process called "translate_while" takes translator as Integer, r_node as Integer returns Integer:
-    Note: Translate R while loop to HIR
-
     Let children be proc memory_get_int64 from Layout with r_node, 32
 
     Let condition_r be proc memory_get_int64 from Layout with children, 0
@@ -1380,249 +1004,165 @@ Process called "translate_while" takes translator as Integer, r_node as Integer 
     Let condition_hir be proc translate_expression with translator, condition_r
     Let body_hir be proc translate_statement with translator, body_r
 
-    Let hir_node be proc create_node from HIR with NODE_WHILE
-    proc add_child from HIR with hir_node, condition_hir
-    proc add_child from HIR with hir_node, body_hir
+    Let hir_while be proc hir_create_while from HIR
+    proc hir_set_while_condition from HIR with hir_while, condition_hir
+    proc hir_set_while_body from HIR with hir_while, body_hir
 
-    Return hir_node
+    Return hir_while
 End Process
 
 @Reasoning:
-Translates `for (var in iter) body` into an HIR for-each loop. The loop variable's binding persists in the enclosing scope after the loop terminates, matching R semantics - so the HIR node hoists the variable declaration to the outer scope.
+R's for (var in sequence) body (children[0]=loop var id, children[1]=sequence,
+children[2]=body) maps onto a HIR for-in loop. The loop variable name comes from
+the identifier node's value slot; the sequence is an expression; the body is a
+statement (commonly a block).
 @End Reasoning
-
-@Implementation:
-Translates the iterable expression and the body. Records the loop variable name and emits HirBuilder.create_for_each(var_name, iterable, body) with hoist_var=true.
-@End Implementation
-
 Process called "translate_for" takes translator as Integer, r_node as Integer returns Integer:
-    Note: Translate R for loop to HIR
-
-    @Reasoning:
-    R's for loop iterates over sequences/vectors (for (var in seq)).
-    This maps to HIR's foreach construct.
-    @End Reasoning
-
     Let children be proc memory_get_int64 from Layout with r_node, 32
 
     Let var_r be proc memory_get_int64 from Layout with children, 0
     Let sequence_r be proc memory_get_int64 from Layout with children, 8
     Let body_r be proc memory_get_int64 from Layout with children, 16
 
-    Let var_hir be proc translate_expression with translator, var_r
+    Let var_name be proc memory_get_int64 from Layout with var_r, 8
     Let sequence_hir be proc translate_expression with translator, sequence_r
     Let body_hir be proc translate_statement with translator, body_r
 
-    Let hir_node be proc create_node from HIR with NODE_FOREACH
-    proc add_child from HIR with hir_node, var_hir
-    proc add_child from HIR with hir_node, sequence_hir
-    proc add_child from HIR with hir_node, body_hir
+    Let hir_for be proc hir_create_for_in from HIR
+    proc hir_set_for_in_variable from HIR with hir_for, var_name
+    proc hir_set_for_in_iterable from HIR with hir_for, sequence_hir
+    proc hir_set_for_in_body from HIR with hir_for, body_hir
 
-    Return hir_node
+    Return hir_for
 End Process
 
 @Reasoning:
-Translates `repeat body` into an HIR infinite loop. There is no exit condition - the loop exits only via break or return inside the body. Lowered to `while(true) body` shape in HIR.
+R's repeat body (children[0]=body) is an infinite loop exited only via break or
+return. We lower it to a HIR while loop with a constant-true condition tagged
+"r_repeat" so the backend re-emits the "repeat" keyword rather than "while (TRUE)".
 @End Reasoning
-
-@Implementation:
-Translates the body statement. Emits HirBuilder.create_while(create_literal_bool(1), body).
-@End Implementation
-
 Process called "translate_repeat" takes translator as Integer, r_node as Integer returns Integer:
-    Note: Translate R repeat loop to HIR
-
-    @Reasoning:
-    R's repeat is an infinite loop (use break to exit).
-    Translates to while(true) in HIR.
-    @End Reasoning
-
     Let children be proc memory_get_int64 from Layout with r_node, 32
     Let body_r be proc memory_get_int64 from Layout with children, 0
 
     Let body_hir be proc translate_statement with translator, body_r
+    Let true_cond be proc hir_create_bool_literal from HIR with 1
 
-    Note: Create while(true) loop
-    Let hir_node be proc create_node from HIR with NODE_WHILE
-    Let true_node be proc create_hir_bool with 1
-    proc add_child from HIR with hir_node, true_node
-    proc add_child from HIR with hir_node, body_hir
+    Let hir_while be proc hir_create_while from HIR
+    proc hir_set_while_condition from HIR with hir_while, true_cond
+    proc hir_set_while_body from HIR with hir_while, body_hir
+    proc hir_set_metadata from HIR with hir_while, "r_repeat", "true"
 
-    Return hir_node
+    Return hir_while
 End Process
 
 @Reasoning:
-Translates R's `break` keyword into an HIR break node. Exits the innermost enclosing loop, matching R semantics. No operand.
+R's break keyword exits the innermost loop; it maps onto a HIR break with no
+payload.
 @End Reasoning
-
-@Implementation:
-Emits HirBuilder.create_break().
-@End Implementation
-
 Process called "translate_break" takes translator as Integer, r_node as Integer returns Integer:
-    Note: Translate R break statement to HIR
-
-    Let hir_node be proc create_node from HIR with NODE_BREAK
-
-    Return hir_node
+    Return proc hir_create_break from HIR
 End Process
 
 @Reasoning:
-Translates R's `next` keyword (continue in other languages) into an HIR continue node. Skips to the next iteration of the innermost loop. No operand.
+R's next keyword (continue in other languages) skips to the next loop iteration; it
+maps onto a HIR continue tagged "r_next" so the backend re-emits "next" rather than
+"continue".
 @End Reasoning
-
-@Implementation:
-Emits HirBuilder.create_continue().
-@End Implementation
-
 Process called "translate_next" takes translator as Integer, r_node as Integer returns Integer:
-    Note: Translate R next statement to HIR (continue)
-
-    Let hir_node be proc create_node from HIR with NODE_CONTINUE
-
-    Return hir_node
+    Let hir_continue be proc hir_create_continue from HIR
+    proc hir_set_metadata from HIR with hir_continue, "r_next", "true"
+    Return hir_continue
 End Process
 
 @Reasoning:
-Translates a brace block `{stmt1; stmt2; ...}` into an HIR block. The block's value is the value of its last statement per R semantics. Scope is shared with the enclosing context (R does not introduce a new scope per brace).
+A brace block {stmt1; stmt2; ...} (statements in the children array at offsets
+32/40) maps onto a HIR block. Each child is lowered as a statement and added in
+source order; the block's value is its last statement per R semantics.
 @End Reasoning
-
-@Implementation:
-Iterates r_node.children translating each via translate_statement. Collects translations into a list. Emits HirBuilder.create_block(stmts) with result_is_last=true.
-@End Implementation
-
 Process called "translate_block" takes translator as Integer, r_node as Integer returns Integer:
-    Note: Translate R block {...} to HIR
+    Let hir_block be proc hir_create_block from HIR
 
-    Let hir_node be proc create_node from HIR with NODE_BLOCK
-
-    Note: Translate statements
     Let children be proc memory_get_int64 from Layout with r_node, 32
     Let child_count be proc memory_get_int64 from Layout with r_node, 40
 
     Let i be 0
     While i is less than child_count:
-        Let stmt_r be proc memory_get_int64 from Layout with children, i multiplied by 8
+        Let offset be i multiplied by 8
+        Let stmt_r be proc memory_get_int64 from Layout with children, offset
         Let stmt_hir be proc translate_statement with translator, stmt_r
-
         If stmt_hir is not equal to 0:
-            proc add_child from HIR with hir_node, stmt_hir
+            proc hir_add_statement from HIR with hir_block, stmt_hir
         End If
-
         Set i to i plus 1
     End While
 
-    Return hir_node
+    Return hir_block
 End Process
 
 Note: ============================================================================
-Note: Program Translation
+Note: Program / Top-Level Translation
 Note: ============================================================================
 
 @Reasoning:
-Top-level entry point. Translates the entire R program (a sequence of top-level statements) into the corresponding HIR module. This is the public API the compiler driver invokes.
+The NODE_PROGRAM root holds the top-level statements of the .R file in the children
+array (offsets 32/40). Each is lowered to HIR and added as a top-level declaration
+on the HIR module so module-level consumers that iterate hir_get_declarations see
+the file's statements directly, matching the ruby/dart program-lowering convention.
+Every source statement is emitted (no silent drops): each translated statement that
+is non-null is added.
 @End Reasoning
-
-@Implementation:
-Iterates r_program.children calling translate_statement on each. Collects results into a list and emits HirBuilder.create_module(statements).
-@End Implementation
-
-@Performance_Hints:
-O(n) in AST node count; each statement is translated exactly once.
-@End Performance_Hints
-
 Process called "translate_program" takes translator as Integer, r_program as Integer returns Integer:
-    Note: Translate complete R program to HIR
+    Let hir_module be proc hir_create_module from HIR
+    proc hir_set_module_name from HIR with hir_module, "r_module"
+    proc memory_set_int64 from Layout with translator, 24, hir_module
 
-    @Reasoning:
-    R programs consist of top-level statements and expressions.
-    We translate to HIR module with a main function containing
-    all top-level code.
-    @End Reasoning
+    If r_program is equal to 0:
+        Return hir_module
+    End If
 
-    Let hir_module be proc create_node from HIR with NODE_MODULE
-
-    Note: Translate all top-level statements
     Let children be proc memory_get_int64 from Layout with r_program, 32
     Let child_count be proc memory_get_int64 from Layout with r_program, 40
 
     Let i be 0
     While i is less than child_count:
-        Let stmt_r be proc memory_get_int64 from Layout with children, i multiplied by 8
-        Let stmt_hir be proc translate_statement with translator, stmt_r
-
-        If stmt_hir is not equal to 0:
-            proc add_child from HIR with hir_module, stmt_hir
+        Let offset be i multiplied by 8
+        Let stmt_r be proc memory_get_int64 from Layout with children, offset
+        Let decl_hir be proc translate_statement with translator, stmt_r
+        If decl_hir is not equal to 0:
+            proc hir_add_declaration from HIR with hir_module, decl_hir
         End If
-
         Set i to i plus 1
     End While
 
     Return hir_module
 End Process
 
-Note: ============================================================================
-Note: Helper Functions
-Note: ============================================================================
-
 @Reasoning:
-String utility used during literal translation. Strips surrounding quotes from a raw lexeme and returns the decoded content as a fresh string. Mirror of the same-named helper in r_parser.
+Public translator-style entry point: builds an RToHIRTranslator, lowers the program
+root, then releases the translator and returns the HIR module. Mirrors the
+ruby/dart translate_*_to_hir façade.
 @End Reasoning
-
-@Implementation:
-Skips the first byte (opening quote), captures bytes until the matching closing quote, allocates a fresh string, returns it.
-@End Implementation
-
-Process called "string_from_literal" takes literal as Integer returns Integer:
-    Note: Create string from C string literal (helper)
-
-    Return literal
+Process called "translate_r_to_hir" takes r_program as Integer returns Integer:
+    Let translator be proc create_translator
+    If translator is equal to 0:
+        Return 0
+    End If
+    Let hir_module be proc translate_program with translator, r_program
+    proc destroy_translator with translator
+    Return hir_module
 End Process
 
 @Reasoning:
-String predicate used to detect L (integer) and i (complex) suffixes during literal translation. Returns 1 if str ends with suffix, 0 otherwise.
+Public single-arg façade invoked by the translation dispatcher's R arm. Wires the
+full source -> HIR pipeline: parse_r_source lexes and parses the source into a
+NODE_PROGRAM root, then translate_r_to_hir lowers it. A parse failure (0 root)
+short-circuits to 0 so downstream stages never see a half-formed module.
 @End Reasoning
-
-@Implementation:
-Computes both lengths via StringCore.string_length, returns 0 if suffix is longer than str. Otherwise byte-compares the last suffix-length bytes of str against suffix.
-@End Implementation
-
-Process called "string_ends_with" takes str as Integer, suffix as Integer returns Integer:
-    Note: Check if string ends with suffix
-
-    @Reasoning:
-    Helper to check for suffixes like 'L' in integer literals.
-    Used to determine R number types.
-    @End Reasoning
-
-    If str is equal to 0:
+Process called "r_to_hir_from_source" takes source_code as Integer returns Integer:
+    Let ast_root be proc parse_r_source from RParser with source_code
+    If ast_root is equal to 0:
         Return 0
     End If
-
-    If suffix is equal to 0:
-        Return 0
-    End If
-
-    Let str_len be proc string_length from StringCore with str
-    Let suffix_len be proc string_length from StringCore with suffix
-
-    If suffix_len is greater than str_len:
-        Return 0
-    End If
-
-    Let offset be str_len minus suffix_len
-    Let i be 0
-
-    While i is less than suffix_len:
-        Let str_ch be proc memory_get_byte from Layout with str, offset plus i
-        Let suffix_ch be proc memory_get_byte from Layout with suffix, i
-
-        If str_ch is not equal to suffix_ch:
-            Return 0
-        End If
-
-        Set i to i plus 1
-    End While
-
-    Return 1
+    Return proc translate_r_to_hir with ast_root
 End Process
