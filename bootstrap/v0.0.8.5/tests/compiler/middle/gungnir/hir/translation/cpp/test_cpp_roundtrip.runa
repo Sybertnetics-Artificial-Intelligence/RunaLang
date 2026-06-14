@@ -1,0 +1,336 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+Licensed under Apache 2.0
+:End Note
+
+Note:
+C++ Translation Round-Trip Probe
+
+End-to-end proof that the C++ translation pipeline is REAL, not a skeleton:
+
+    C++ source
+      -> cpp_lexer    (tokenize: keywords as distinct tokens, identifiers,
+                       numbers/chars/strings, the full operator set incl :: -> <=>,
+                       preprocessor directives)
+      -> cpp_parser   (build C++ AST: preprocessor lines, namespaces, enum class,
+                       a template class with members + methods, inheritance,
+                       control flow incl. range-for + switch, a lambda)
+      -> cpp_to_hir   (lower to the hir.runa dictionary/list literal HIR)
+      -> hir_to_cpp   (emit HIR back to valid C++ text)
+      -> re-lex / re-parse / re-to_hir of the emitted text
+      -> structural HIR equality on the key constructs
+
+The C++ HIR node model is hir.runa's dictionary/list literal interchange shared by
+cpp_to_hir (producer) and hir_to_cpp (consumer): a dictionary is a
+HIR_DICTIONARY_LITERAL whose entries List (16-byte [key, value] blocks) hangs at
+the children slot (offset 24); a list is a HIR_ARRAY_LITERAL whose elements List
+hangs at offset 24; string payloads are HIR string-literal nodes read with
+get_string_literal_value. This probe reads HIR fields through exactly that
+contract.
+
+It lowers the source to HIR1, asserts HIR1 carries a cpp_program whose declarations
+include a class named "Stack" and a namespace named "demo", emits HIR1 back to C++
+text, re-runs the whole pipeline on the emitted text to HIR2, and asserts HIR2 is
+STRUCTURALLY EQUAL to HIR1 on those same key constructs. Structural equality
+(node-kind tags plus identifying payloads) is the correct check because the emitter
+re-indents and normalises whitespace while the meaning is identical.
+
+Exit code: number of failed assertions (0 == all passed). No exit_with_code.
+:End Note
+
+Import "compiler/middle/gungnir/hir/translation/frontends/cpp/cpp_parser.runa" as CppParser
+Import "compiler/middle/gungnir/hir/translation/frontends/cpp/cpp_to_hir.runa" as CppFrontend
+Import "compiler/middle/gungnir/hir/translation/backends/cpp/hir_to_cpp.runa" as CppBackend
+Import "compiler/middle/gungnir/hir/hir.runa" as HIR
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/collections/list.runa" as List
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "tests/test_utils.runa" as TestUtils
+
+Note: ============================================================================
+Note: hir.runa dict/list literal decoders (mirror the producer/consumer contract)
+Note: ============================================================================
+
+@Reasoning:
+A C++ HIR dictionary is a HIR_DICTIONARY_LITERAL whose entries List hangs at the
+children slot. Each entry is a 16-byte block: key (raw string handle) at offset 0,
+value (a child HIR node or HIR string literal) at offset 8. This decoder
+linear-scans those entries comparing the raw key with string_equals, returning the
+stored value - the exact lookup the backend's dict_get performs.
+@End Reasoning
+Process called "dict_get" takes node as Integer, key as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+
+    Let entries be proc get_dictionary_entries from HIR with node
+    If entries is equal to 0:
+        Return 0
+    End If
+
+    Let count be proc size from List with entries
+    Let index be 0
+    While index is less than count:
+        Let entry be proc get_at from List with entries, index
+        If entry is not equal to 0:
+            Let entry_key be proc memory_get_int64 from Layout with entry, 0
+            Let matches be proc string_equals from StringCore with entry_key, key
+            If matches is equal to 1:
+                Return proc memory_get_int64 from Layout with entry, 8
+            End If
+        End If
+        Set index to index plus 1
+    End While
+
+    Return 0
+End Process
+
+@Reasoning:
+The "_type" discriminator and other string fields are HIR string literal nodes.
+This helper looks the key up via dict_get and extracts the underlying char*.
+@End Reasoning
+Process called "dict_get_string" takes node as Integer, key as Integer returns Integer:
+    Let value_node be proc dict_get with node, key
+    If value_node is equal to 0:
+        Return 0
+    End If
+    Return proc get_string_literal_value from HIR with value_node
+End Process
+
+@Reasoning:
+A C++ HIR list is a HIR_ARRAY_LITERAL whose backing element List hangs at the
+children slot. Returning that List lets the probe iterate declarations / members.
+@End Reasoning
+Process called "list_elements" takes node as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    Return proc get_list_elements from HIR with node
+End Process
+
+@Reasoning:
+Locates the first declaration in the program's "declarations" list whose "_type"
+string matches the requested kind. Linear scan is robust to the surrounding
+preprocessor and namespace declarations.
+@End Reasoning
+Process called "find_decl" takes program as Integer, type_name as Integer returns Integer:
+    If program is equal to 0:
+        Return 0
+    End If
+
+    Let declarations be proc dict_get with program, "declarations"
+    If declarations is equal to 0:
+        Return 0
+    End If
+
+    Let items be proc list_elements with declarations
+    If items is equal to 0:
+        Return 0
+    End If
+
+    Let count be proc size from List with items
+    Let index be 0
+    While index is less than count:
+        Let decl be proc get_at from List with items, index
+        Let decl_type be proc dict_get_string with decl, "_type"
+        If decl_type is not equal to 0:
+            Let matches be proc string_equals from StringCore with decl_type, type_name
+            If matches is equal to 1:
+                Return decl
+            End If
+        End If
+        Set index to index plus 1
+    End While
+
+    Return 0
+End Process
+
+@Reasoning:
+Two HIR projections are structurally equal on a construct when both expose the
+same "_type" tag. Comparing the kind tag is whitespace-insensitive, proving
+round-trip fidelity without being defeated by the emitter's re-indenting.
+@End Reasoning
+Process called "same_type" takes a as Integer, b as Integer returns Integer:
+    If a is equal to 0:
+        Return 0
+    End If
+    If b is equal to 0:
+        Return 0
+    End If
+
+    Let ta be proc dict_get_string with a, "_type"
+    Let tb be proc dict_get_string with b, "_type"
+    If ta is equal to 0:
+        Return 0
+    End If
+    If tb is equal to 0:
+        Return 0
+    End If
+
+    Return proc string_equals from StringCore with ta, tb
+End Process
+
+Note: ============================================================================
+Note: Pipeline helper
+Note: ============================================================================
+
+@Reasoning:
+Each round of the probe runs the identical front-of-pipeline (parse -> to_hir).
+Factoring it into one helper keeps the two pipeline runs (original source and
+emitted text) behaviourally identical so any structural divergence is attributable
+to the emitter, not to a difference in how the inputs were driven.
+@End Reasoning
+@Implementation:
+Builds a C++ parser over the source, drives a full parse to the C++ AST root, then
+lowers the AST to the hir.runa dictionary/list HIR via translate_cpp_to_hir.
+Returns 0 if any stage yields 0.
+@End Implementation
+Process called "source_to_hir" takes source as Integer returns Integer:
+    Let parser be proc create_cpp_parser from CppParser with source
+    If parser is equal to 0:
+        Return 0
+    End If
+
+    Let ast be proc parse_cpp_program from CppParser with parser
+    If ast is equal to 0:
+        Return 0
+    End If
+
+    Let hir be proc translate_cpp_to_hir from CppFrontend with ast
+    Return hir
+End Process
+
+Note: ============================================================================
+Note: Probe entry point
+Note: ============================================================================
+
+Process called "main" returns Integer:
+    Let results be proc create_test_results from TestUtils
+    proc begin_suite from TestUtils with results, "C++ translation round-trip"
+
+    Note:
+    Representative program exercising the constructs the task requires: a
+    header-guard preprocessor chain, a system include and an object macro, an
+    enum class, a namespace, a template class with a base class, data members,
+    a constructor, methods with control flow (if/else, range-for, switch), and a
+    method whose body uses a lambda.
+    :End Note
+    Let source be "#ifndef STACK_H\n#define STACK_H\n#include <vector>\n#define CAP 16\nenum class Color { Red, Green, Blue };\nnamespace demo {\ntemplate<typename T>\nclass Stack : public Container {\npublic:\nint count;\nT data;\nStack(int n) {\ncount = n;\n}\nint classify(int v) {\nint total = 0;\nif (v > 0) {\ntotal = total + 1;\n} else {\ntotal = total - 1;\n}\nfor (int x : data) {\ntotal = total + x;\n}\nswitch (v) {\ncase 0:\ntotal = total + 10;\nbreak;\ndefault:\ntotal = total + 1;\n}\nreturn total;\n}\nint apply(int y) {\nauto f = [count](int z) { return z + count; };\nreturn f(y);\n}\nprivate:\nint hidden;\n};\n}\n#endif\n"
+
+    Note: --- Stage 0-2: source -> HIR (parse, lower) ---
+    Let parser be proc create_cpp_parser from CppParser with source
+    proc assert_not_null from TestUtils with results, "parser created", parser
+
+    Let ast be proc parse_cpp_program from CppParser with parser
+    proc assert_not_null from TestUtils with results, "parser produced C++ AST", ast
+
+    Let hir1 be proc translate_cpp_to_hir from CppFrontend with ast
+    proc assert_not_null from TestUtils with results, "frontend produced HIR program", hir1
+
+    Note: Program must be a dict node tagged "cpp_program".
+    Let prog_type be proc dict_get_string with hir1, "_type"
+    Let prog_type_ok be proc string_equals from StringCore with prog_type, "cpp_program"
+    proc assert_equal from TestUtils with results, "HIR root is a cpp_program", prog_type_ok, 1
+
+    Note: Program must expose a non-empty declarations list.
+    Let declarations be proc dict_get with hir1, "declarations"
+    proc assert_not_null from TestUtils with results, "program has declarations", declarations
+    Let decl_items be proc list_elements with declarations
+    proc assert_not_null from TestUtils with results, "declarations is a list", decl_items
+    Let decl_count be proc size from List with decl_items
+    proc assert_greater_than_or_equal from TestUtils with results, "at least three top-level declarations", decl_count, 3
+
+    Note: --- enum class: located by kind, name checked ---
+    Let enum_node be proc find_decl with hir1, "enum"
+    proc assert_not_null from TestUtils with results, "enum node present", enum_node
+    Let enum_name be proc dict_get_string with enum_node, "name"
+    Let enum_name_ok be proc string_equals from StringCore with enum_name, "Color"
+    proc assert_equal from TestUtils with results, "enum name is 'Color'", enum_name_ok, 1
+    Let enum_scoped be proc dict_get_string with enum_node, "scoped"
+    Let enum_scoped_ok be proc string_equals from StringCore with enum_scoped, "scoped"
+    proc assert_equal from TestUtils with results, "enum is scoped (enum class)", enum_scoped_ok, 1
+
+    Note: --- namespace: located by kind, name checked, contains a template ---
+    Let ns_node be proc find_decl with hir1, "namespace"
+    proc assert_not_null from TestUtils with results, "namespace node present", ns_node
+    Let ns_name be proc dict_get_string with ns_node, "name"
+    Let ns_name_ok be proc string_equals from StringCore with ns_name, "demo"
+    proc assert_equal from TestUtils with results, "namespace name is 'demo'", ns_name_ok, 1
+
+    Let ns_decls be proc dict_get with ns_node, "declarations"
+    proc assert_not_null from TestUtils with results, "namespace has declarations", ns_decls
+    Let ns_items be proc list_elements with ns_decls
+    Let ns_count be proc size from List with ns_items
+    proc assert_greater_than_or_equal from TestUtils with results, "namespace has at least one member", ns_count, 1
+
+    Note: --- template inside the namespace, with a class declaration ---
+    Let template_node be proc find_decl with ns_node, "template"
+    proc assert_not_null from TestUtils with results, "template node present in namespace", template_node
+    Let template_params be proc dict_get with template_node, "parameters"
+    proc assert_not_null from TestUtils with results, "template has parameters", template_params
+    Let class_node be proc dict_get with template_node, "declaration"
+    proc assert_not_null from TestUtils with results, "template wraps a declaration", class_node
+    Let class_type be proc dict_get_string with class_node, "_type"
+    Let class_type_ok be proc string_equals from StringCore with class_type, "class"
+    proc assert_equal from TestUtils with results, "templated declaration is a class", class_type_ok, 1
+    Let class_name be proc dict_get_string with class_node, "name"
+    Let class_name_ok be proc string_equals from StringCore with class_name, "Stack"
+    proc assert_equal from TestUtils with results, "class name is 'Stack'", class_name_ok, 1
+
+    Note: class must have inheritance and members
+    Let inheritance be proc dict_get with class_node, "inheritance"
+    proc assert_not_null from TestUtils with results, "class has inheritance", inheritance
+    Let members be proc dict_get with class_node, "members"
+    proc assert_not_null from TestUtils with results, "class has members", members
+    Let member_items be proc list_elements with members
+    Let member_count be proc size from List with member_items
+    proc assert_greater_than_or_equal from TestUtils with results, "class has multiple members", member_count, 3
+
+    Note: --- Stage 3: HIR -> C++ text ---
+    Let emitted be proc hir_to_cpp from CppBackend with hir1
+    proc assert_not_null from TestUtils with results, "backend produced C++ text", emitted
+    Let emitted_len be proc string_length from StringCore with emitted
+    proc assert_greater_than from TestUtils with results, "emitted C++ is non-empty", emitted_len, 0
+
+    Note: --- Stage 4: re-run the pipeline on the emitted text -> HIR2 ---
+    Let hir2 be proc source_to_hir with emitted
+    proc assert_not_null from TestUtils with results, "re-parse of emitted C++ produced HIR", hir2
+
+    Let prog2_type be proc dict_get_string with hir2, "_type"
+    Let prog2_type_ok be proc string_equals from StringCore with prog2_type, "cpp_program"
+    proc assert_equal from TestUtils with results, "round-trip root is a cpp_program", prog2_type_ok, 1
+
+    Note: --- Stage 5: structural equality on the key constructs ---
+    Let enum2 be proc find_decl with hir2, "enum"
+    Let enum_type_ok be proc same_type with enum_node, enum2
+    proc assert_equal from TestUtils with results, "round-trip preserves enum node", enum_type_ok, 1
+    Let enum2_name be proc dict_get_string with enum2, "name"
+    Let enum2_name_ok be proc string_equals from StringCore with enum2_name, "Color"
+    proc assert_equal from TestUtils with results, "round-trip preserves enum name 'Color'", enum2_name_ok, 1
+
+    Let ns2 be proc find_decl with hir2, "namespace"
+    Let ns_type_ok be proc same_type with ns_node, ns2
+    proc assert_equal from TestUtils with results, "round-trip preserves namespace node", ns_type_ok, 1
+    Let ns2_name be proc dict_get_string with ns2, "name"
+    Let ns2_name_ok be proc string_equals from StringCore with ns2_name, "demo"
+    proc assert_equal from TestUtils with results, "round-trip preserves namespace name 'demo'", ns2_name_ok, 1
+
+    Let template2 be proc find_decl with ns2, "template"
+    proc assert_not_null from TestUtils with results, "round-trip preserves template node", template2
+    Let class2 be proc dict_get with template2, "declaration"
+    Let class2_name be proc dict_get_string with class2, "name"
+    Let class2_name_ok be proc string_equals from StringCore with class2_name, "Stack"
+    proc assert_equal from TestUtils with results, "round-trip preserves class name 'Stack'", class2_name_ok, 1
+    Let inheritance2 be proc dict_get with class2, "inheritance"
+    proc assert_not_null from TestUtils with results, "round-trip preserves inheritance", inheritance2
+    Let members2 be proc dict_get with class2, "members"
+    Let member2_items be proc list_elements with members2
+    Let member2_count be proc size from List with member2_items
+    proc assert_greater_than_or_equal from TestUtils with results, "round-trip preserves class members", member2_count, 3
+
+    proc print_summary from TestUtils with results
+    Let failed be proc get_failed from TestUtils with results
+    proc destroy_test_results from TestUtils with results
+
+    Return failed
+End Process

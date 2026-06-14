@@ -1,1022 +1,408 @@
-Note: ========================================
-Note: C++ Lexer
-Note: ========================================
-Note: Lexer for C++ programming language
-Note: Part of the Translation translation system
-Note: Token Types: Keywords, Identifiers, Operators, Literals, Symbols
-Note: Supports C++11/14/17 syntax
-Note: ========================================
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
 
-Import "compiler/frontend/primitives/collections/list.runa" as List
-Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+C++ Lexer - Tokenizer for the C++ programming language.
+
+Produces a stream of single-lookahead tokens consumed by cpp_parser.runa. The
+lexer recognises the full C++17 token set: preprocessor directives, distinct
+keyword tokens (so the parser can branch on TOKEN_CLASS / TOKEN_NAMESPACE /
+TOKEN_PUBLIC and friends rather than re-comparing keyword text), identifiers,
+integer/float/char/string literals (including raw strings and user-defined
+suffixes), and the complete C++ operator/punctuator set including the
+multi-byte operators (::, ->, .*, ->*, <<=, >>=, <=>, ...).
+
+Contract (mirrors the C frontend):
+- create_cpp_lexer(source) -> lexer handle (owns its own state, 0 on OOM)
+- next_token(lexer)        -> integer token TYPE; also caches the lexeme so
+                              current_lexeme can re-read it without re-lexing
+- current_lexeme(lexer)    -> borrowed pointer to the current token's lexeme
+                              (a freshly allocated NUL-terminated copy owned by
+                              the lexer, freed on the next next_token or destroy)
+- destroy_cpp_lexer(lexer) -> frees all owned state
+
+Forward-progress guarantee: every call to next_token advances the byte cursor
+by at least one byte for any non-EOF input, and returns TOKEN_EOF terminally
+once the cursor reaches end of source. Unknown bytes are consumed and reported
+as TOKEN_ERROR (still advancing) so the parser's statement loops can never spin
+on a non-advancing token.
+
+Dependencies:
+- compiler/frontend/primitives/memory/layout.runa
+- compiler/frontend/primitives/core/string_core.runa
+:End Note
+
 Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
 
-Constant TOKEN_KEYWORD as Integer is 1
-Constant TOKEN_IDENTIFIER as Integer is 2
-Constant TOKEN_NUMBER as Integer is 3
-Constant TOKEN_STRING as Integer is 4
-Constant TOKEN_CHAR as Integer is 5
-Constant TOKEN_OPERATOR as Integer is 6
-Constant TOKEN_LPAREN as Integer is 7
-Constant TOKEN_RPAREN as Integer is 8
-Constant TOKEN_LBRACE as Integer is 9
-Constant TOKEN_RBRACE as Integer is 10
-Constant TOKEN_LBRACKET as Integer is 11
-Constant TOKEN_RBRACKET as Integer is 12
-Constant TOKEN_SEMICOLON as Integer is 13
-Constant TOKEN_COMMA as Integer is 14
-Constant TOKEN_COLON as Integer is 15
-Constant TOKEN_SCOPE as Integer is 16
-Constant TOKEN_ARROW as Integer is 17
-Constant TOKEN_DOT as Integer is 18
-Constant TOKEN_PREPROCESSOR as Integer is 19
-Constant TOKEN_TEMPLATE as Integer is 20
-Constant TOKEN_NAMESPACE as Integer is 21
-Constant TOKEN_EOF as Integer is 0
+Note: ============================================================================
+Note: Token Type Constants
+Note: ============================================================================
+
+Constant TOKEN_ERROR as Integer is 0
+Constant TOKEN_EOF as Integer is 1
+
+Note: --- Type / storage / qualifier keywords ---
+Constant TOKEN_VOID as Integer is 10
+Constant TOKEN_BOOL as Integer is 11
+Constant TOKEN_CHAR as Integer is 12
+Constant TOKEN_SHORT as Integer is 13
+Constant TOKEN_INT as Integer is 14
+Constant TOKEN_LONG as Integer is 15
+Constant TOKEN_FLOAT as Integer is 16
+Constant TOKEN_DOUBLE as Integer is 17
+Constant TOKEN_SIGNED as Integer is 18
+Constant TOKEN_UNSIGNED as Integer is 19
+Constant TOKEN_AUTO as Integer is 20
+Constant TOKEN_CONST as Integer is 21
+Constant TOKEN_CONSTEXPR as Integer is 22
+Constant TOKEN_VOLATILE as Integer is 23
+Constant TOKEN_MUTABLE as Integer is 24
+Constant TOKEN_STATIC as Integer is 25
+Constant TOKEN_EXTERN as Integer is 26
+Constant TOKEN_INLINE as Integer is 27
+Constant TOKEN_REGISTER as Integer is 28
+Constant TOKEN_WCHAR_T as Integer is 29
+
+Note: --- Aggregate / OOP keywords ---
+Constant TOKEN_CLASS as Integer is 40
+Constant TOKEN_STRUCT as Integer is 41
+Constant TOKEN_UNION as Integer is 42
+Constant TOKEN_ENUM as Integer is 43
+Constant TOKEN_NAMESPACE as Integer is 44
+Constant TOKEN_TEMPLATE as Integer is 45
+Constant TOKEN_TYPENAME as Integer is 46
+Constant TOKEN_USING as Integer is 47
+Constant TOKEN_TYPEDEF as Integer is 48
+Constant TOKEN_PUBLIC as Integer is 49
+Constant TOKEN_PRIVATE as Integer is 50
+Constant TOKEN_PROTECTED as Integer is 51
+Constant TOKEN_VIRTUAL as Integer is 52
+Constant TOKEN_OVERRIDE as Integer is 53
+Constant TOKEN_FINAL as Integer is 54
+Constant TOKEN_FRIEND as Integer is 55
+Constant TOKEN_OPERATOR as Integer is 56
+Constant TOKEN_EXPLICIT as Integer is 57
+
+Note: --- Control flow keywords ---
+Constant TOKEN_IF as Integer is 70
+Constant TOKEN_ELSE as Integer is 71
+Constant TOKEN_FOR as Integer is 72
+Constant TOKEN_WHILE as Integer is 73
+Constant TOKEN_DO as Integer is 74
+Constant TOKEN_SWITCH as Integer is 75
+Constant TOKEN_CASE as Integer is 76
+Constant TOKEN_DEFAULT as Integer is 77
+Constant TOKEN_RETURN as Integer is 78
+Constant TOKEN_BREAK as Integer is 79
+Constant TOKEN_CONTINUE as Integer is 80
+Constant TOKEN_GOTO as Integer is 81
+Constant TOKEN_TRY as Integer is 82
+Constant TOKEN_CATCH as Integer is 83
+Constant TOKEN_THROW as Integer is 84
+
+Note: --- Expression keywords ---
+Constant TOKEN_NEW as Integer is 90
+Constant TOKEN_DELETE as Integer is 91
+Constant TOKEN_THIS as Integer is 92
+Constant TOKEN_SIZEOF as Integer is 93
+Constant TOKEN_NULLPTR as Integer is 94
+Constant TOKEN_TRUE as Integer is 95
+Constant TOKEN_FALSE as Integer is 96
+Constant TOKEN_STATIC_CAST as Integer is 97
+Constant TOKEN_DYNAMIC_CAST as Integer is 98
+Constant TOKEN_REINTERPRET_CAST as Integer is 99
+Constant TOKEN_CONST_CAST as Integer is 100
+
+Note: --- Literals / identifiers ---
+Constant TOKEN_IDENTIFIER as Integer is 120
+Constant TOKEN_INTEGER as Integer is 121
+Constant TOKEN_FLOAT_LITERAL as Integer is 122
+Constant TOKEN_CHAR_LITERAL as Integer is 123
+Constant TOKEN_STRING_LITERAL as Integer is 124
+
+Note: --- Preprocessor (whole directive captured as one token) ---
+Constant TOKEN_PREPROCESSOR as Integer is 130
+Constant TOKEN_HASH as Integer is 131
+
+Note: --- Operators ---
+Constant TOKEN_PLUS as Integer is 150
+Constant TOKEN_MINUS as Integer is 151
+Constant TOKEN_STAR as Integer is 152
+Constant TOKEN_SLASH as Integer is 153
+Constant TOKEN_PERCENT as Integer is 154
+Constant TOKEN_ASSIGN as Integer is 155
+Constant TOKEN_EQ as Integer is 156
+Constant TOKEN_NE as Integer is 157
+Constant TOKEN_LESS as Integer is 158
+Constant TOKEN_GREATER as Integer is 159
+Constant TOKEN_LE as Integer is 160
+Constant TOKEN_GE as Integer is 161
+Constant TOKEN_SPACESHIP as Integer is 162
+Constant TOKEN_LAND as Integer is 163
+Constant TOKEN_LOR as Integer is 164
+Constant TOKEN_NOT as Integer is 165
+Constant TOKEN_AMP as Integer is 166
+Constant TOKEN_PIPE as Integer is 167
+Constant TOKEN_CARET as Integer is 168
+Constant TOKEN_TILDE as Integer is 169
+Constant TOKEN_LSHIFT as Integer is 170
+Constant TOKEN_RSHIFT as Integer is 171
+Constant TOKEN_INCREMENT as Integer is 172
+Constant TOKEN_DECREMENT as Integer is 173
+Constant TOKEN_PLUS_ASSIGN as Integer is 174
+Constant TOKEN_MINUS_ASSIGN as Integer is 175
+Constant TOKEN_STAR_ASSIGN as Integer is 176
+Constant TOKEN_SLASH_ASSIGN as Integer is 177
+Constant TOKEN_PERCENT_ASSIGN as Integer is 178
+Constant TOKEN_AMP_ASSIGN as Integer is 179
+Constant TOKEN_PIPE_ASSIGN as Integer is 180
+Constant TOKEN_CARET_ASSIGN as Integer is 181
+Constant TOKEN_LSHIFT_ASSIGN as Integer is 182
+Constant TOKEN_RSHIFT_ASSIGN as Integer is 183
+Constant TOKEN_ARROW as Integer is 184
+Constant TOKEN_ARROW_STAR as Integer is 185
+Constant TOKEN_DOT_STAR as Integer is 186
+Constant TOKEN_SCOPE as Integer is 187
+Constant TOKEN_ELLIPSIS as Integer is 188
+
+Note: --- Punctuators ---
+Constant TOKEN_LPAREN as Integer is 200
+Constant TOKEN_RPAREN as Integer is 201
+Constant TOKEN_LBRACE as Integer is 202
+Constant TOKEN_RBRACE as Integer is 203
+Constant TOKEN_LBRACKET as Integer is 204
+Constant TOKEN_RBRACKET as Integer is 205
+Constant TOKEN_SEMICOLON as Integer is 206
+Constant TOKEN_COMMA as Integer is 207
+Constant TOKEN_DOT as Integer is 208
+Constant TOKEN_COLON as Integer is 209
+Constant TOKEN_QUESTION as Integer is 210
+
+Note: ============================================================================
+Note: Lexer State Structure
+Note: ============================================================================
 
 @Reasoning:
-C++ tokens carry a borrowed pointer + length into source rather than a
-defensively copied string. position is the byte offset where the token
-started (for diagnostics). No line/column slot because they're computed
-on demand by walking source[..position] when an error fires.
+The lexer is byte-positioned over the source. token_start records where the
+lexeme currently being read began; token_type and token_lexeme cache the most
+recently produced token so the parser can re-read its type and text without
+re-lexing. error_message is sticky on first lexing failure. The cached lexeme is
+a freshly allocated NUL-terminated copy so the parser may keep a borrowed
+reference until the next next_token call replaces it.
 @End Reasoning
 
 @Implementation:
-32-byte record (4 x i64) at offsets 0..24: token_type (TOKEN_*), value
-(byte pointer into source), value_length (count), position (byte offset
-of token start).
-@End Implementation
-
-Type called "CppToken":
-    token_type as Integer
-    value as Integer
-    value_length as Integer
-    position as Integer
-End Type
-
-@Reasoning:
-Pre-pass lexer: tokenises ALL of source up-front into a List rather than
-streaming one token at a time. This is appropriate for C++ because the
-parser repeatedly backtracks (greatest-prefix template-id parsing) and
-re-lexing on every speculation would be wasteful.
-@End Reasoning
-
-@Implementation:
-32-byte record (4 x i64) at offsets 0..24: source (StringCore handle),
-source_length (cached byte count), position (current scan cursor),
-tokens (List of CppToken pointers, owned by the lexer and freed by
-destroy_lexer via destroy from List).
+80-byte record (10 x i64) at offsets 0..72: source (StringCore handle), length
+(cached source byte count), position (byte cursor), line (1-based), column
+(1-based), token_start (cursor at last token start), token_type (last emitted
+token type), token_lexeme (owned NUL-terminated copy of last lexeme, freed on
+replace/destroy), error_message (owned, 0 if clean), reserved (0).
 @End Implementation
 
 Type called "CppLexer":
-    source as Integer
-    source_length as Integer
-    position as Integer
-    tokens as Integer
+    source as Integer          Note: Source code string
+    length as Integer          Note: Source length in bytes
+    position as Integer        Note: Current byte cursor
+    line as Integer            Note: Current line (1-based)
+    column as Integer          Note: Current column (1-based)
+    token_start as Integer     Note: Start byte of current token
+    token_type as Integer      Note: Last emitted token type
+    token_lexeme as Integer    Note: Owned NUL-terminated copy of last lexeme
+    error_message as Integer   Note: Sticky error message or 0
+    reserved as Integer        Note: Reserved for future use
 End Type
 
+Note: ============================================================================
+Note: Lexer Creation and Destruction
+Note: ============================================================================
+
 @Reasoning:
-Lexer factory: allocates the lexer record, caches source_length, and
-creates the empty tokens list.
+Heap-allocates the 80-byte CppLexer and primes it for first-byte consumption:
+position 0, line 1, column 1. token_lexeme/error_message are null so
+destroy_cpp_lexer's conditional frees are safe.
 @End Reasoning
 
 @Implementation:
-Allocates 32 bytes. Writes source at offset 0; computes and stores
-source_length at offset 8; zeroes position at offset 16; creates a List
-via List.create and stores at offset 24. Returns the lexer.
+Layout.allocate(80); OOM returns 0. Caches source byte length once at offset 8.
+Writes the documented fields at offsets 0/8/16/24/32/40/48/56/64/72.
 @End Implementation
 
-Process called "create_lexer" takes source as Integer returns Integer:
-    Note: Create new lexer for C++ source
+Process called "create_cpp_lexer" takes source as Integer returns Integer:
+    Note: Create C++ lexer from source code
 
-    Let lexer be proc allocate from Layout with 32
+    Let lexer be proc allocate from Layout with 80
+    If lexer is equal to 0:
+        Return 0
+    End If
+
+    Let src_length be proc string_length from StringCore with source
+
     proc memory_set_int64 from Layout with lexer, 0, source
-    Let source_len be proc string_length from StringCore with source
-    proc memory_set_int64 from Layout with lexer, 8, source_len
-    proc memory_set_int64 from Layout with lexer, 16, 0
-    Let tokens be proc create from List
-    proc memory_set_int64 from Layout with lexer, 24, tokens
+    proc memory_set_int64 from Layout with lexer, 8, src_length
+    proc memory_set_int64 from Layout with lexer, 16, 0   Note: position
+    proc memory_set_int64 from Layout with lexer, 24, 1   Note: line
+    proc memory_set_int64 from Layout with lexer, 32, 1   Note: column
+    proc memory_set_int64 from Layout with lexer, 40, 0   Note: token_start
+    proc memory_set_int64 from Layout with lexer, 48, 0   Note: token_type
+    proc memory_set_int64 from Layout with lexer, 56, 0   Note: token_lexeme
+    proc memory_set_int64 from Layout with lexer, 64, 0   Note: error_message
+    proc memory_set_int64 from Layout with lexer, 72, 0   Note: reserved
+
     Return lexer
 End Process
 
 @Reasoning:
-Releases the token list and the lexer record. Source string is NOT
-owned by the lexer (caller passed it in) so it's not freed here.
+Releases the two heap-owned resources a CppLexer may hold (token_lexeme,
+error_message) and the record. Null handle is a no-op so paired create/destroy
+never crashes after an OOM-failed create.
 @End Reasoning
 
 @Implementation:
-Reads tokens at offset 24, destroys via List.destroy (which iterates and
-frees each token entry as well). Then deallocates the lexer record.
+Null-checks lexer. Frees token_lexeme (offset 56) and error_message (offset 64)
+only if non-zero, then deallocates the 80-byte record. Returns 1.
 @End Implementation
 
-Process called "destroy_lexer" takes lexer as Integer:
-    Note: Free lexer and token list
+Process called "destroy_cpp_lexer" takes lexer as Integer returns Integer:
+    Note: Destroy C++ lexer and free resources
 
-    Let tokens be proc memory_get_int64 from Layout with lexer, 24
-    proc destroy from List with tokens
+    If lexer is equal to 0:
+        Return 1
+    End If
+
+    Let token_lexeme be proc memory_get_int64 from Layout with lexer, 56
+    If token_lexeme is not equal to 0:
+        proc deallocate from Layout with token_lexeme
+    End If
+
+    Let error_message be proc memory_get_int64 from Layout with lexer, 64
+    If error_message is not equal to 0:
+        proc deallocate from Layout with error_message
+    End If
+
     proc deallocate from Layout with lexer
+    Return 1
 End Process
 
+Note: ============================================================================
+Note: Character Access
+Note: ============================================================================
+
 @Reasoning:
-Drives the lexer pass from start to EOF. Each iteration skips whitespace
-and comments then calls next_token; non-EOF tokens are pushed onto the
-tokens list. EOF token (type 0) or null return ends the loop.
+Cursor read with no advance. Returns 0 at EOF (treated as a terminal sentinel;
+real NUL bytes in C++ source are not part of the practical corpus).
 @End Reasoning
 
 @Implementation:
-Infinite while loop: skip_whitespace then next_token; null or
-token_type==0 (EOF) breaks. Otherwise push the token onto tokens list
-via List.push.
+Reads position/length at offsets 16/8. Past EOF returns 0; otherwise reads the
+byte at source+position.
 @End Implementation
 
-Process called "tokenize" takes lexer as Integer:
-    Note: Main tokenization loop
-
-    While 1 is equal to 1:
-        proc skip_whitespace from lexer
-        Let token be proc next_token from lexer
-        If token is equal to 0:
-            Break
-        End If
-        Let token_type be proc memory_get_int64 from Layout with token, 0
-        If token_type is equal to 0:
-            Break
-        End If
-        Let tokens be proc memory_get_int64 from Layout with lexer, 24
-        proc push from List with tokens, token
-    End While
-End Process
-
-@Reasoning:
-Combined whitespace + comment skip. Handles four whitespace bytes and
-the two C++ comment forms (// line comment, /* block comment */) so the
-main lex loop sees only token-relevant bytes.
-@End Reasoning
-
-@Implementation:
-Reads position/source_length/source. Inner while loops on position. Each
-iteration: byte at position is checked against 32/9/10/13 (whitespace,
-advance). If '/' (47), peeks next: '/' (47) triggers skip_line_comment;
-'*' (42) triggers skip_block_comment; anything else writes position
-back to lexer and returns. Any non-whitespace, non-'/' byte also
-returns. Writes the updated position back at offset 16 on exit.
-@End Implementation
-
-Process called "skip_whitespace" takes lexer as Integer:
-    Note: Skip whitespace and comments
+Process called "peek_char" takes lexer as Integer returns Integer:
+    Note: Peek current byte without advancing
 
     Let position be proc memory_get_int64 from Layout with lexer, 16
-    Let source_length be proc memory_get_int64 from Layout with lexer, 8
+    Let length be proc memory_get_int64 from Layout with lexer, 8
+
+    If position is greater than or equal to length:
+        Return 0
+    End If
+
     Let source be proc memory_get_int64 from Layout with lexer, 0
-
-    While position is less than source_length:
-        Let char be proc memory_get_byte from Layout with source, position
-
-        Note: Skip whitespace characters
-        If char is equal to 32:  Note: Space
-            Set position to position plus 1
-        Otherwise:
-            If char is equal to 9:  Note: Tab
-                Set position to position plus 1
-            Otherwise:
-                If char is equal to 10:  Note: Newline
-                    Set position to position plus 1
-                Otherwise:
-                    If char is equal to 13:  Note: Carriage return
-                        Set position to position plus 1
-                    Otherwise:
-                        Note: Check for comments
-                        If char is equal to 47:  Note: /
-                            If position plus 1 is less than source_length:
-                                Let next_char be proc memory_get_byte from Layout with source, position plus 1
-                                If next_char is equal to 47:  Note: // comment
-                                    proc skip_line_comment from lexer
-                                    Set position to proc memory_get_int64 from Layout with lexer, 16
-                                Otherwise:
-                                    If next_char is equal to 42:  Note: /* comment
-                                        proc skip_block_comment from lexer
-                                        Set position to proc memory_get_int64 from Layout with lexer, 16
-                                    Otherwise:
-                                        proc memory_set_int64 from Layout with lexer, 16, position
-                                        Return
-                                    End If
-                                End If
-                            Otherwise:
-                                proc memory_set_int64 from Layout with lexer, 16, position
-                                Return
-                            End If
-                        Otherwise:
-                            proc memory_set_int64 from Layout with lexer, 16, position
-                            Return
-                        End If
-                    End If
-                End If
-            End If
-        End If
-    End While
-    proc memory_set_int64 from Layout with lexer, 16, position
+    Return proc memory_get_byte from Layout with source, position
 End Process
 
 @Reasoning:
-Drains a // line comment from current position to end-of-line. Consumes
-the newline so the next token starts on the next line.
+Look ahead one byte past the cursor without advancing - used to recognise
+two-byte operators and the 0x / 0b numeric prefixes.
 @End Reasoning
 
 @Implementation:
-Advances position by 2 (past "//"). Loops position until source_length:
-LF (10) increments past and breaks; any other byte just advances.
-Writes updated position to offset 16.
+Reads position/length. If position+1 is past EOF returns 0; otherwise reads the
+byte at source+position+1.
 @End Implementation
 
-Process called "skip_line_comment" takes lexer as Integer:
-    Note: Skip // comment until end of line
+Process called "peek_char_at" takes lexer as Integer, offset as Integer returns Integer:
+    Note: Peek byte at cursor+offset without advancing
 
     Let position be proc memory_get_int64 from Layout with lexer, 16
-    Set position to position plus 2  Note: Skip //
-    Let source_length be proc memory_get_int64 from Layout with lexer, 8
+    Let length be proc memory_get_int64 from Layout with lexer, 8
+    Let target be position plus offset
+
+    If target is greater than or equal to length:
+        Return 0
+    End If
+
     Let source be proc memory_get_int64 from Layout with lexer, 0
-
-    While position is less than source_length:
-        Let char be proc memory_get_byte from Layout with source, position
-        If char is equal to 10:  Note: Newline
-            Set position to position plus 1
-            Break
-        End If
-        Set position to position plus 1
-    End While
-    proc memory_set_int64 from Layout with lexer, 16, position
+    Return proc memory_get_byte from Layout with source, target
 End Process
 
 @Reasoning:
-Drains a /* ... */ block comment. C++ does NOT allow nesting (matches
-the first '*/' regardless of intervening '/*'). On EOF without terminator
-silently exits to avoid hanging the lexer; the parser will produce errors
-downstream.
+Cursor-advancing read maintaining line/column. Column bumps first; LF resets
+column to 1 and bumps line.
 @End Reasoning
 
 @Implementation:
-Advances position by 2 (past "/*"). Loops position < source_length - 1
-(need at least one byte to peek ahead): '*' followed by '/' advances
-position by 2 and breaks; otherwise advances by 1. Writes updated
-position to offset 16.
+Reads position/length. Past EOF returns 0. Reads byte at source+position, bumps
+position by 1, bumps column by 1, and on LF (10) bumps line and resets column.
+Returns the consumed byte.
 @End Implementation
 
-Process called "skip_block_comment" takes lexer as Integer:
-    Note: Skip /* comment */ block
+Process called "advance_char" takes lexer as Integer returns Integer:
+    Note: Consume and return current byte, maintaining line/column
 
     Let position be proc memory_get_int64 from Layout with lexer, 16
-    Set position to position plus 2  Note: Skip /*
-    Let source_length be proc memory_get_int64 from Layout with lexer, 8
-    Let source be proc memory_get_int64 from Layout with lexer, 0
+    Let length be proc memory_get_int64 from Layout with lexer, 8
 
-    While position is less than source_length minus 1:
-        Let char be proc memory_get_byte from Layout with source, position
-        Let next_char be proc memory_get_byte from Layout with source, position plus 1
-        If char is equal to 42:  Note: *
-            If next_char is equal to 47:  Note: /
-                Set position to position plus 2
-                Break
-            End If
-        End If
-        Set position to position plus 1
-    End While
-    proc memory_set_int64 from Layout with lexer, 16, position
-End Process
-
-@Reasoning:
-Single-byte dispatcher. C++ syntax has many leading-byte discriminators:
-'#' starts preprocessor, '"' starts string, '\'' starts char, digit
-starts number, alpha/underscore starts identifier (which may be a
-keyword), everything else is an operator/punctuator.
-@End Reasoning
-
-@Implementation:
-Reads position/source_length; if past EOF returns TOKEN_EOF (type 0).
-Reads byte at position. Dispatches: '#' (35) -> lex_preprocessor; '"'
-(34) -> lex_string; '\'' (39) -> lex_char; digit -> lex_number; alpha
-(via is_alpha) -> lex_identifier; otherwise -> lex_operator. Each
-sub-lexer is responsible for advancing position past its token.
-@End Implementation
-
-Process called "next_token" takes lexer as Integer returns Integer:
-    Note: Get next token from source
-
-    Let position be proc memory_get_int64 from Layout with lexer, 16
-    Let source_length be proc memory_get_int64 from Layout with lexer, 8
-
-    If position is greater than or equal to source_length:
-        Return proc create_token with 0, 0, 0, position
+    If position is greater than or equal to length:
+        Return 0
     End If
 
     Let source be proc memory_get_int64 from Layout with lexer, 0
     Let char be proc memory_get_byte from Layout with source, position
 
-    Note: Check for preprocessor directive
-    If char is equal to 35:  Note: #
-        Return proc lex_preprocessor from lexer
-    End If
-
-    Note: Check for string literal
-    If char is equal to 34:  Note: "
-        Return proc lex_string from lexer
-    End If
-
-    Note: Check for character literal
-    If char is equal to 39:  Note: '
-        Return proc lex_char from lexer
-    End If
-
-    Note: Check for number
-    Let is_digit be 0
-    If char is greater than or equal to 48:
-        If char is less than or equal to 57:
-            Set is_digit to 1
-        End If
-    End If
-    If is_digit is equal to 1:
-        Return proc lex_number from lexer
-    End If
-
-    Note: Check for identifier or keyword
-    Let is_alpha be proc is_alpha from char
-    If is_alpha is equal to 1:
-        Return proc lex_identifier from lexer
-    End If
-
-    Note: Check for operators and symbols
-    Return proc lex_operator from lexer
-End Process
-
-@Reasoning:
-Preprocessor directives are captured as a single token spanning the '#'
-through end-of-line. Line-continuation (backslash-newline) is honored
-because directives can span multiple lines via "\". The parser hands the
-directive to the preprocessor pipeline for full expansion.
-@End Reasoning
-
-@Implementation:
-Records start_pos. Walks position: LF (10) consumes and breaks; '\\'
-(92) followed by LF advances by 2 to continue on next line; bare '\\'
-just advances; everything else advances by 1. Emits TOKEN_PREPROCESSOR
-with the full slice from start_pos.
-@End Implementation
-
-Process called "lex_preprocessor" takes lexer as Integer returns Integer:
-    Note: Lex preprocessor directive
-
-    Let position be proc memory_get_int64 from Layout with lexer, 16
-    Let source be proc memory_get_int64 from Layout with lexer, 0
-    Let source_length be proc memory_get_int64 from Layout with lexer, 8
-    Let start_pos be position
-
-    Note: Consume until end of line (handling line continuations)
-    While position is less than source_length:
-        Let char be proc memory_get_byte from Layout with source, position
-        If char is equal to 10:  Note: Newline
-            Set position to position plus 1
-            Break
-        End If
-        If char is equal to 92:  Note: Backslash (line continuation)
-            If position plus 1 is less than source_length:
-                Let next_char be proc memory_get_byte from Layout with source, position plus 1
-                If next_char is equal to 10:
-                    Set position to position plus 2
-                    Note: Continue to next line
-                Otherwise:
-                    Set position to position plus 1
-                End If
-            Otherwise:
-                Set position to position plus 1
-            End If
-        Otherwise:
-            Set position to position plus 1
-        End If
-    End While
-
-    proc memory_set_int64 from Layout with lexer, 16, position
-    Let length be position minus start_pos
-    Return proc create_token with TOKEN_PREPROCESSOR, source plus start_pos, length, start_pos
-End Process
-
-@Reasoning:
-C++ string literals support backslash escape sequences. The token slice
-includes the opening and closing quotes; the parser strips them during
-literal evaluation. Raw strings (R"(...)) and wide strings (L"...",
-u"...", U"...") are not specially handled here - the parser detects
-them by inspecting the prefix.
-@End Reasoning
-
-@Implementation:
-Records start_pos including the opening '"'. Advances past it. Loops:
-'"' (34) consumes and breaks; '\\' (92) consumes both itself and the
-next byte (escape); other bytes advance by 1. Emits TOKEN_STRING with
-the slice including both quotes.
-@End Implementation
-
-Process called "lex_string" takes lexer as Integer returns Integer:
-    Note: Lex string literal
-
-    Let position be proc memory_get_int64 from Layout with lexer, 16
-    Let source be proc memory_get_int64 from Layout with lexer, 0
-    Let source_length be proc memory_get_int64 from Layout with lexer, 8
-    Let start_pos be position
-    Set position to position plus 1  Note: Skip opening quote
-
-    While position is less than source_length:
-        Let char be proc memory_get_byte from Layout with source, position
-        If char is equal to 34:  Note: Closing quote
-            Set position to position plus 1
-            Break
-        End If
-        If char is equal to 92:  Note: Backslash (escape)
-            Set position to position plus 2
-        Otherwise:
-            Set position to position plus 1
-        End If
-    End While
-
-    proc memory_set_int64 from Layout with lexer, 16, position
-    Let length be position minus start_pos
-    Return proc create_token with TOKEN_STRING, source plus start_pos, length, start_pos
-End Process
-
-@Reasoning:
-Character literals 'x' or '\n' etc. Same escape semantics as strings;
-treated separately because the parser distinguishes 'x' (CHAR type)
-from "x" (string).
-@End Reasoning
-
-@Implementation:
-Records start_pos. Advances past opening '\''. Loops: '\'' (39) consumes
-and breaks; '\\' (92) consumes both itself and the next byte (escape);
-other bytes advance by 1. Emits TOKEN_CHAR with the slice including
-both quotes.
-@End Implementation
-
-Process called "lex_char" takes lexer as Integer returns Integer:
-    Note: Lex character literal
-
-    Let position be proc memory_get_int64 from Layout with lexer, 16
-    Let source be proc memory_get_int64 from Layout with lexer, 0
-    Let source_length be proc memory_get_int64 from Layout with lexer, 8
-    Let start_pos be position
-    Set position to position plus 1  Note: Skip opening quote
-
-    While position is less than source_length:
-        Let char be proc memory_get_byte from Layout with source, position
-        If char is equal to 39:  Note: Closing quote
-            Set position to position plus 1
-            Break
-        End If
-        If char is equal to 92:  Note: Backslash (escape)
-            Set position to position plus 2
-        Otherwise:
-            Set position to position plus 1
-        End If
-    End While
-
-    proc memory_set_int64 from Layout with lexer, 16, position
-    Let length be position minus start_pos
-    Return proc create_token with TOKEN_CHAR, source plus start_pos, length, start_pos
-End Process
-
-@Reasoning:
-C++ numeric literals: decimal integer, hex (0x...), binary (0b...),
-octal (0...), decimal float (with optional exponent), and any of these
-with suffix (u, l, ll, f, etc.). The lexer captures the entire span as
-one TOKEN_NUMBER; the parser/back-end interprets the value.
-@End Reasoning
-
-@Implementation:
-Records start_pos. If first byte is '0' and second is 'x' (120),
-advances two bytes and loops is_hex_digit. If first is '0' and second
-is 'b' (98), advances two bytes and loops on '0'/'1' bytes. Otherwise
-loops digits, then handles optional '.' for float (more digits), then
-optional 'e'/'E' for exponent (optional sign, more digits). Type/length
-suffixes are also slurped if present. Emits TOKEN_NUMBER with the full
-slice.
-@End Implementation
-
-Process called "lex_number" takes lexer as Integer returns Integer:
-    Note: Lex number (integer, float, hex, octal, binary)
-
-    Let position be proc memory_get_int64 from Layout with lexer, 16
-    Let source be proc memory_get_int64 from Layout with lexer, 0
-    Let source_length be proc memory_get_int64 from Layout with lexer, 8
-    Let start_pos be position
-
-    Note: Check for hex (0x), octal (0), or binary (0b)
-    Let char be proc memory_get_byte from Layout with source, position
-    If char is equal to 48:  Note: 0
-        If position plus 1 is less than source_length:
-            Let next_char be proc memory_get_byte from Layout with source, position plus 1
-            If next_char is equal to 120:  Note: x (hex)
-                Set position to position plus 2
-                While position is less than source_length:
-                    Let hex_char be proc memory_get_byte from Layout with source, position
-                    Let is_hex be proc is_hex_digit from hex_char
-                    If is_hex is not equal to 1:
-                        Break
-                    End If
-                    Set position to position plus 1
-                End While
-                proc memory_set_int64 from Layout with lexer, 16, position
-                Let length be position minus start_pos
-                Return proc create_token with TOKEN_NUMBER, source plus start_pos, length, start_pos
-            End If
-            If next_char is equal to 98:  Note: b (binary)
-                Set position to position plus 2
-                While position is less than source_length:
-                    Let bin_char be proc memory_get_byte from Layout with source, position
-                    If bin_char is not equal to 48:
-                        If bin_char is not equal to 49:
-                            Break
-                        End If
-                    End If
-                    Set position to position plus 1
-                End While
-                proc memory_set_int64 from Layout with lexer, 16, position
-                Set length to position minus start_pos
-                Return proc create_token with TOKEN_NUMBER, source plus start_pos, length, start_pos
-            End If
-        End If
-    End If
-
-    Note: Lex decimal number (with possible float)
-    While position is less than source_length:
-        Let digit_char be proc memory_get_byte from Layout with source, position
-        Let is_digit be 0
-        If digit_char is greater than or equal to 48:
-            If digit_char is less than or equal to 57:
-                Set is_digit to 1
-            End If
-        End If
-        If is_digit is equal to 1:
-            Set position to position plus 1
-        Otherwise:
-            If digit_char is equal to 46:  Note: Decimal point
-                Set position to position plus 1
-            Otherwise:
-                If digit_char is equal to 101:  Note: e (exponent)
-                    Set position to position plus 1
-                    Note: Handle optional +/- after e
-                    If position is less than source_length:
-                        Let exp_char be proc memory_get_byte from Layout with source, position
-                        If exp_char is equal to 43:  Note: +
-                            Set position to position plus 1
-                        Otherwise:
-                            If exp_char is equal to 45:  Note: -
-                                Set position to position plus 1
-                            End If
-                        End If
-                        End If
-                    Otherwise:
-                    If digit_char is equal to 102:  Note: f (float suffix)
-                        Set position to position plus 1
-                        Break
-                    Otherwise:
-                        If digit_char is equal to 108:  Note: l (long suffix)
-                            Set position to position plus 1
-                            Break
-                        Otherwise:
-                            Break
-                        End If
-                    End If
-                End If
-            End If
-        End If
-    End While
-
-    proc memory_set_int64 from Layout with lexer, 16, position
-    Set length to position minus start_pos
-    Return proc create_token with TOKEN_NUMBER, source plus start_pos, length, start_pos
-End Process
-
-@Reasoning:
-C++ identifiers are letter/underscore-start followed by alnum or
-underscore. After scanning, classify_keyword distinguishes keywords from
-identifiers. The lexer doesn't need to know which token type the keyword
-maps to - that's classify_keyword's job.
-@End Reasoning
-
-@Implementation:
-Records start_pos. Loops position: byte that is_alnum OR equal to '_'
-(95) advances; otherwise breaks. Computes length = position - start_pos.
-Calls classify_keyword(source+start_pos, length) which returns either
-the matching TOKEN_* keyword constant or TOKEN_IDENTIFIER. Emits token
-with the resolved type and the slice.
-@End Implementation
-
-Process called "lex_identifier" takes lexer as Integer returns Integer:
-    Note: Lex identifier or keyword
-
-    Let position be proc memory_get_int64 from Layout with lexer, 16
-    Let source be proc memory_get_int64 from Layout with lexer, 0
-    Let source_length be proc memory_get_int64 from Layout with lexer, 8
-    Let start_pos be position
-
-    While position is less than source_length:
-        Let char be proc memory_get_byte from Layout with source, position
-        Let is_alnum be proc is_alnum from char
-        If is_alnum is not equal to 1:
-            If char is not equal to 95:  Note: Underscore
-                Break
-            End If
-        End If
-        Set position to position plus 1
-    End While
-
-    proc memory_set_int64 from Layout with lexer, 16, position
-    Let length be position minus start_pos
-
-    Note: Classify as keyword or identifier
-    Let token_type be proc classify_keyword with source plus start_pos, length
-    Return proc create_token with token_type, source plus start_pos, length, start_pos
-End Process
-
-@Reasoning:
-C++ has a long list of multi-byte operators: ::, ->, ->*, .*, ==, !=,
-<=, >=, &&, ||, <<, >>, <<=, >>=, +=, -=, *=, /=, %=, &=, |=, ^=, ++,
---, ?, ..., etc. The lexer tries the LONGEST match first by checking
-two-byte combos before single-byte fallbacks; this ensures "->" doesn't
-get lexed as "-" then ">".
-@End Reasoning
-
-@Implementation:
-Reads current and next byte (when available). Two-byte combinations are
-matched first via nested If blocks (::, ->, ==, !=, <=, >=, &&, ||,
-<<, >>, ++, --, +=, -=, *=, /=, %=, &=, |=, ^=). Three-byte combos
-(<<=, >>=, ...) are handled in nested branches. Falls through to
-single-byte tokens for ( ) { } [ ] ; , . + - * / % & | ^ ~ ! < > = ?
-:. Unknown bytes return TOKEN_UNKNOWN.
-@End Implementation
-
-Process called "lex_operator" takes lexer as Integer returns Integer:
-    Note: Lex operator or symbol
-
-    Let position be proc memory_get_int64 from Layout with lexer, 16
-    Let source be proc memory_get_int64 from Layout with lexer, 0
-    Let source_length be proc memory_get_int64 from Layout with lexer, 8
-    Let char be proc memory_get_byte from Layout with source, position
-
-    Note: Check for two-character operators first
-    If position plus 1 is less than source_length:
-        Let next_char be proc memory_get_byte from Layout with source, position plus 1
-
-        Note: Scope resolution ::
-        If char is equal to 58:
-            If next_char is equal to 58:
-                proc memory_set_int64 from Layout with lexer, 16, position plus 2
-                Return proc create_token with TOKEN_SCOPE, source plus position, 2, position
-            End If
-        End If
-
-        Note: Arrow ->
-        If char is equal to 45:
-            If next_char is equal to 62:
-                proc memory_set_int64 from Layout with lexer, 16, position plus 2
-                Return proc create_token with TOKEN_ARROW, source plus position, 2, position
-            End If
-        End If
-
-        Note: Other two-char operators
-        Let is_two_char be 0
-        If char is equal to 43:  Note: +
-            If next_char is equal to 43:  Note: ++
-                Set is_two_char to 1
-            Otherwise:
-                If next_char is equal to 61:  Note: +=
-                    Set is_two_char to 1
-                End If
-            End If
-        End If
-        If char is equal to 45:  Note: -
-            If next_char is equal to 45:  Note: --
-                Set is_two_char to 1
-            Otherwise:
-                If next_char is equal to 61:  Note: -=
-                    Set is_two_char to 1
-                End If
-            End If
-        End If
-        If char is equal to 61:  Note: =
-            If next_char is equal to 61:  Note: ==
-                Set is_two_char to 1
-            End If
-        End If
-        If char is equal to 33:  Note: !
-            If next_char is equal to 61:  Note: !=
-                Set is_two_char to 1
-            End If
-        End If
-        If char is equal to 60:  Note: <
-            If next_char is equal to 61:  Note: <=
-                Set is_two_char to 1
-            Otherwise:
-                If next_char is equal to 60:  Note: <<
-                    Set is_two_char to 1
-                End If
-            End If
-        End If
-        If char is equal to 62:  Note: >
-            If next_char is equal to 61:  Note: >=
-                Set is_two_char to 1
-            Otherwise:
-                If next_char is equal to 62:  Note: >>
-                    Set is_two_char to 1
-                End If
-            End If
-        End If
-        If char is equal to 38:  Note: &
-            If next_char is equal to 38:  Note: &&
-                Set is_two_char to 1
-            Otherwise:
-                If next_char is equal to 61:  Note: &=
-                    Set is_two_char to 1
-                End If
-            End If
-        End If
-        If char is equal to 124:  Note: |
-            If next_char is equal to 124:  Note: ||
-                Set is_two_char to 1
-            Otherwise:
-                If next_char is equal to 61:  Note: |=
-                    Set is_two_char to 1
-                End If
-            End If
-        End If
-
-        If is_two_char is equal to 1:
-            proc memory_set_int64 from Layout with lexer, 16, position plus 2
-            Return proc create_token with TOKEN_OPERATOR, source plus position, 2, position
-        End If
-    End If
-
-    Note: Single-character symbols and operators
-    If char is equal to 40:  Note: (
-        proc memory_set_int64 from Layout with lexer, 16, position plus 1
-        Return proc create_token with TOKEN_LPAREN, source plus position, 1, position
-    End If
-    If char is equal to 41:  Note: )
-        proc memory_set_int64 from Layout with lexer, 16, position plus 1
-        Return proc create_token with TOKEN_RPAREN, source plus position, 1, position
-    End If
-    If char is equal to 123:  Note: {
-        proc memory_set_int64 from Layout with lexer, 16, position plus 1
-        Return proc create_token with TOKEN_LBRACE, source plus position, 1, position
-    End If
-    If char is equal to 125:  Note: }
-        proc memory_set_int64 from Layout with lexer, 16, position plus 1
-        Return proc create_token with TOKEN_RBRACE, source plus position, 1, position
-    End If
-    If char is equal to 91:  Note: [
-        proc memory_set_int64 from Layout with lexer, 16, position plus 1
-        Return proc create_token with TOKEN_LBRACKET, source plus position, 1, position
-    End If
-    If char is equal to 93:  Note: ]
-        proc memory_set_int64 from Layout with lexer, 16, position plus 1
-        Return proc create_token with TOKEN_RBRACKET, source plus position, 1, position
-    End If
-    If char is equal to 59:  Note: ;
-        proc memory_set_int64 from Layout with lexer, 16, position plus 1
-        Return proc create_token with TOKEN_SEMICOLON, source plus position, 1, position
-    End If
-    If char is equal to 44:  Note: ,
-        proc memory_set_int64 from Layout with lexer, 16, position plus 1
-        Return proc create_token with TOKEN_COMMA, source plus position, 1, position
-    End If
-    If char is equal to 58:  Note: :
-        proc memory_set_int64 from Layout with lexer, 16, position plus 1
-        Return proc create_token with TOKEN_COLON, source plus position, 1, position
-    End If
-    If char is equal to 46:  Note: .
-        proc memory_set_int64 from Layout with lexer, 16, position plus 1
-        Return proc create_token with TOKEN_DOT, source plus position, 1, position
-    End If
-
-    Note: Single-character operator
     proc memory_set_int64 from Layout with lexer, 16, position plus 1
-    Return proc create_token with TOKEN_OPERATOR, source plus position, 1, position
+
+    Let column be proc memory_get_int64 from Layout with lexer, 32
+    proc memory_set_int64 from Layout with lexer, 32, column plus 1
+
+    If char is equal to 10:
+        Let line be proc memory_get_int64 from Layout with lexer, 24
+        proc memory_set_int64 from Layout with lexer, 24, line plus 1
+        proc memory_set_int64 from Layout with lexer, 32, 1
+    End If
+
+    Return char
 End Process
 
+Note: ============================================================================
+Note: Character Classification
+Note: ============================================================================
+
 @Reasoning:
-C++ has many keywords (~80 in C++20). Linear scan is grouped by lexeme
-length to fast-fail mismatches: a 3-byte lexeme is compared only against
-3-byte keywords ("int", "for", "new"), etc. This dramatically shrinks
-the comparison count per call.
+Identifier-start classifier: letter or underscore. UCN escapes are out of scope
+for the practical corpus.
 @End Reasoning
 
 @Implementation:
-Inspects length and dispatches to a length-specific block. Each block
-runs match_string against every C++ keyword of that length; first
-match returns TOKEN_KEYWORD (the type is generic - the parser sub-
-divides by lexeme content). No match returns TOKEN_IDENTIFIER.
-@End Implementation
-
-@Performance_Hints:
-O(K_L) where K_L is the number of keywords of length L (typically 2-10).
-Could be replaced by a perfect hash; not bottleneck per profiling.
-@End Performance_Hints
-
-Process called "classify_keyword" takes text as Integer, length as Integer returns Integer:
-    Note: Classify identifier as C++ keyword or regular identifier
-
-    Note: Storage class and type keywords
-    If length is equal to 3:
-        Let is_int be proc match_string with text, "int", 3
-        If is_int is equal to 1:
-            Return TOKEN_KEYWORD
-        End If
-    End If
-
-    If length is equal to 4:
-        Let is_void be proc match_string with text, "void", 4
-        If is_void is equal to 1:
-            Return TOKEN_KEYWORD
-        End If
-        Let is_bool be proc match_string with text, "bool", 4
-        If is_bool is equal to 1:
-            Return TOKEN_KEYWORD
-        End If
-        Let is_char be proc match_string with text, "char", 4
-        If is_char is equal to 1:
-            Return TOKEN_KEYWORD
-        End If
-        Let is_long be proc match_string with text, "long", 4
-        If is_long is equal to 1:
-            Return TOKEN_KEYWORD
-        End If
-        Let is_auto be proc match_string with text, "auto", 4
-        If is_auto is equal to 1:
-            Return TOKEN_KEYWORD
-        End If
-    End If
-
-    If length is equal to 5:
-        Let is_class be proc match_string with text, "class", 5
-        If is_class is equal to 1:
-            Return TOKEN_KEYWORD
-        End If
-        Let is_short be proc match_string with text, "short", 5
-        If is_short is equal to 1:
-            Return TOKEN_KEYWORD
-        End If
-        Let is_float be proc match_string with text, "float", 5
-        If is_float is equal to 1:
-            Return TOKEN_KEYWORD
-        End If
-        Let is_const be proc match_string with text, "const", 5
-        If is_const is equal to 1:
-            Return TOKEN_KEYWORD
-        End If
-        Let is_using be proc match_string with text, "using", 5
-        If is_using is equal to 1:
-            Return TOKEN_KEYWORD
-        End If
-    End If
-
-    If length is equal to 6:
-        Let is_public be proc match_string with text, "public", 6
-        If is_public is equal to 1:
-            Return TOKEN_KEYWORD
-        End If
-        Let is_double be proc match_string with text, "double", 6
-        If is_double is equal to 1:
-            Return TOKEN_KEYWORD
-        End If
-        Let is_struct be proc match_string with text, "struct", 6
-        If is_struct is equal to 1:
-            Return TOKEN_KEYWORD
-        End If
-        Let is_return be proc match_string with text, "return", 6
-        If is_return is equal to 1:
-            Return TOKEN_KEYWORD
-        End If
-        Let is_static be proc match_string with text, "static", 6
-        If is_static is equal to 1:
-            Return TOKEN_KEYWORD
-        End If
-    End If
-
-    If length is equal to 7:
-        Let is_private be proc match_string with text, "private", 7
-        If is_private is equal to 1:
-            Return TOKEN_KEYWORD
-        End If
-        Let is_virtual be proc match_string with text, "virtual", 7
-        If is_virtual is equal to 1:
-            Return TOKEN_KEYWORD
-        End If
-        Let is_typedef be proc match_string with text, "typedef", 7
-        If is_typedef is equal to 1:
-            Return TOKEN_KEYWORD
-        End If
-    End If
-
-    If length is equal to 8:
-        Let is_template be proc match_string with text, "template", 8
-        If is_template is equal to 1:
-            Return TOKEN_TEMPLATE
-        End If
-        Let is_operator be proc match_string with text, "operator", 8
-        If is_operator is equal to 1:
-            Return TOKEN_KEYWORD
-        End If
-    End If
-
-    If length is equal to 9:
-        Let is_namespace be proc match_string with text, "namespace", 9
-        If is_namespace is equal to 1:
-            Return TOKEN_NAMESPACE
-        End If
-        Let is_protected be proc match_string with text, "protected", 9
-        If is_protected is equal to 1:
-            Return TOKEN_KEYWORD
-        End If
-    End If
-
-    Note: Control flow keywords
-    If length is equal to 2:
-        Let is_if be proc match_string with text, "if", 2
-        If is_if is equal to 1:
-            Return TOKEN_KEYWORD
-        End If
-    End If
-
-    If length is equal to 3:
-        Let is_for be proc match_string with text, "for", 3
-        If is_for is equal to 1:
-            Return TOKEN_KEYWORD
-        End If
-        Let is_new be proc match_string with text, "new", 3
-        If is_new is equal to 1:
-            Return TOKEN_KEYWORD
-        End If
-        Let is_try be proc match_string with text, "try", 3
-        If is_try is equal to 1:
-            Return TOKEN_KEYWORD
-        End If
-    End If
-
-    If length is equal to 4:
-        Let is_else be proc match_string with text, "else", 4
-        If is_else is equal to 1:
-            Return TOKEN_KEYWORD
-        End If
-    End If
-
-    If length is equal to 5:
-        Let is_while be proc match_string with text, "while", 5
-        If is_while is equal to 1:
-            Return TOKEN_KEYWORD
-        End If
-        Let is_break be proc match_string with text, "break", 5
-        If is_break is equal to 1:
-            Return TOKEN_KEYWORD
-        End If
-        Let is_catch be proc match_string with text, "catch", 5
-        If is_catch is equal to 1:
-            Return TOKEN_KEYWORD
-        End If
-        Let is_throw be proc match_string with text, "throw", 5
-        If is_throw is equal to 1:
-            Return TOKEN_KEYWORD
-        End If
-    End If
-
-    If length is equal to 6:
-        Let is_switch be proc match_string with text, "switch", 6
-        If is_switch is equal to 1:
-            Return TOKEN_KEYWORD
-        End If
-        Let is_delete be proc match_string with text, "delete", 6
-        If is_delete is equal to 1:
-            Return TOKEN_KEYWORD
-        End If
-    End If
-
-    If length is equal to 8:
-        Let is_continue be proc match_string with text, "continue", 8
-        If is_continue is equal to 1:
-            Return TOKEN_KEYWORD
-        End If
-    End If
-
-    Note: Not a keyword, return as identifier
-    Return TOKEN_IDENTIFIER
-End Process
-
-@Reasoning:
-Identifier-start classifier: C++ identifiers begin with letter or
-underscore. UCN escapes (\uXXXX) are not supported in this lexer.
-@End Reasoning
-
-@Implementation:
-'a'..'z' (97..122) or 'A'..'Z' (65..90) or '_' (95) -> 1; else 0.
+'a'..'z' (97..122) or 'A'..'Z' (65..90) or '_' (95) -> 1, else 0.
 @End Implementation
 
 Process called "is_alpha" takes char as Integer returns Integer:
-    Note: Check if character is alphabetic
+    Note: Is byte a letter or underscore
 
     If char is greater than or equal to 97:
         If char is less than or equal to 122:
@@ -1028,50 +414,63 @@ Process called "is_alpha" takes char as Integer returns Integer:
             Return 1
         End If
     End If
-    If char is equal to 95:  Note: Underscore
+    If char is equal to 95:
         Return 1
     End If
     Return 0
 End Process
 
 @Reasoning:
-Identifier-tail classifier composing is_alpha with digit check.
+Digit classifier for numeric scanning.
 @End Reasoning
 
 @Implementation:
-is_alpha -> 1, otherwise '0'..'9' (48..57) -> 1, else 0.
+'0'..'9' (48..57) -> 1, else 0.
+@End Implementation
+
+Process called "is_digit" takes char as Integer returns Integer:
+    Note: Is byte a decimal digit
+
+    If char is greater than or equal to 48:
+        If char is less than or equal to 57:
+            Return 1
+        End If
+    End If
+    Return 0
+End Process
+
+@Reasoning:
+Identifier-tail classifier composing is_alpha with is_digit.
+@End Reasoning
+
+@Implementation:
+is_alpha or is_digit -> 1, else 0.
 @End Implementation
 
 Process called "is_alnum" takes char as Integer returns Integer:
-    Note: Check if character is alphanumeric
+    Note: Is byte alphanumeric or underscore
 
-    Let is_alpha_char be proc is_alpha from char
-    If is_alpha_char is equal to 1:
+    Let a be proc is_alpha with char
+    If a is equal to 1:
         Return 1
     End If
-    If char is greater than or equal to 48:
-        If char is less than or equal to 57:
-            Return 1
-        End If
-    End If
-    Return 0
+    Return proc is_digit with char
 End Process
 
 @Reasoning:
-Hex classifier for 0x... literal scanning.
+Hex classifier for 0x... literals.
 @End Reasoning
 
 @Implementation:
-'0'..'9' (48..57) or 'a'..'f' (97..102) or 'A'..'F' (65..70) -> 1.
+'0'..'9' or 'a'..'f' (97..102) or 'A'..'F' (65..70) -> 1.
 @End Implementation
 
 Process called "is_hex_digit" takes char as Integer returns Integer:
-    Note: Check if character is hex digit
+    Note: Is byte a hexadecimal digit
 
-    If char is greater than or equal to 48:
-        If char is less than or equal to 57:
-            Return 1
-        End If
+    Let d be proc is_digit with char
+    If d is equal to 1:
+        Return 1
     End If
     If char is greater than or equal to 97:
         If char is less than or equal to 102:
@@ -1086,22 +485,516 @@ Process called "is_hex_digit" takes char as Integer returns Integer:
     Return 0
 End Process
 
+Note: ============================================================================
+Note: Whitespace and Comment Skipping
+Note: ============================================================================
+
 @Reasoning:
-Byte-by-byte string comparison used by classify_keyword. Caller has
-already verified the length matches.
+Combined whitespace + comment skip so the token dispatcher only ever sees a
+token-relevant lead byte. Handles the four whitespace bytes and the two C++
+comment forms (// line, /* block */).
 @End Reasoning
 
 @Implementation:
-Loops i 0..length comparing memory_get_byte(text, i) against
-memory_get_byte(target, i); any mismatch returns 0. Full match returns 1.
+Loops: whitespace bytes (32/9/10/13) are consumed via advance_char. '/' followed
+by '/' drains to end-of-line; '/' followed by '*' drains to the matching '*/'.
+Any other byte (or a lone '/') ends the skip. The loop always advances on
+whitespace/comment bytes so it terminates at EOF.
 @End Implementation
 
-Process called "match_string" takes text as Integer, target as String, length as Integer returns Integer:
-    Note: Compare string with target
+Process called "skip_whitespace_and_comments" takes lexer as Integer:
+    Note: Skip whitespace and both comment forms
 
+    While 1 is equal to 1:
+        Let char be proc peek_char with lexer
+
+        If char is equal to 0:
+            Return
+        End If
+
+        If char is equal to 32:
+            proc advance_char with lexer
+            Continue
+        End If
+        If char is equal to 9:
+            proc advance_char with lexer
+            Continue
+        End If
+        If char is equal to 10:
+            proc advance_char with lexer
+            Continue
+        End If
+        If char is equal to 13:
+            proc advance_char with lexer
+            Continue
+        End If
+
+        If char is equal to 47:  Note: '/'
+            Let next be proc peek_char_at with lexer, 1
+            If next is equal to 47:  Note: // line comment
+                proc advance_char with lexer
+                proc advance_char with lexer
+                While 1 is equal to 1:
+                    Let c be proc peek_char with lexer
+                    If c is equal to 0:
+                        Return
+                    End If
+                    If c is equal to 10:
+                        proc advance_char with lexer
+                        Break
+                    End If
+                    proc advance_char with lexer
+                End While
+                Continue
+            End If
+            If next is equal to 42:  Note: /* block comment */
+                proc advance_char with lexer
+                proc advance_char with lexer
+                While 1 is equal to 1:
+                    Let c be proc peek_char with lexer
+                    If c is equal to 0:
+                        Return
+                    End If
+                    If c is equal to 42:  Note: '*'
+                        Let after be proc peek_char_at with lexer, 1
+                        If after is equal to 47:  Note: '/'
+                            proc advance_char with lexer
+                            proc advance_char with lexer
+                            Break
+                        End If
+                    End If
+                    proc advance_char with lexer
+                End While
+                Continue
+            End If
+            Return
+        End If
+
+        Return
+    End While
+End Process
+
+Note: ============================================================================
+Note: Lexeme Capture
+Note: ============================================================================
+
+@Reasoning:
+Once a token's byte span [token_start, position) is known, capture a fresh
+NUL-terminated copy and store it as the lexer's current lexeme. The previous
+lexeme copy is freed first so the parser's single-lookahead model never leaks.
+@End Reasoning
+
+@Implementation:
+Reads token_start (offset 40) and position (offset 16); allocates len+1 bytes,
+copies the span byte-by-byte from source, NUL-terminates, frees the prior
+token_lexeme (offset 56) if any, and stores the new copy. Token type is recorded
+at offset 48.
+@End Implementation
+
+Process called "finish_token" takes lexer as Integer, token_type as Integer returns Integer:
+    Note: Capture the [token_start, position) span as the current lexeme; return type
+
+    Let start be proc memory_get_int64 from Layout with lexer, 40
+    Let position be proc memory_get_int64 from Layout with lexer, 16
+    Let source be proc memory_get_int64 from Layout with lexer, 0
+    Let len be position minus start
+
+    Let buffer be proc allocate from Layout with len plus 1
+    Let i be 0
+    While i is less than len:
+        Let byte be proc memory_get_byte from Layout with source, start plus i
+        proc memory_set_byte from Layout with buffer, i, byte
+        Set i to i plus 1
+    End While
+    proc memory_set_byte from Layout with buffer, len, 0
+
+    Let old_lexeme be proc memory_get_int64 from Layout with lexer, 56
+    If old_lexeme is not equal to 0:
+        proc deallocate from Layout with old_lexeme
+    End If
+
+    proc memory_set_int64 from Layout with lexer, 56, buffer
+    proc memory_set_int64 from Layout with lexer, 48, token_type
+
+    Return token_type
+End Process
+
+@Reasoning:
+Accessor for the cached lexeme of the most recently produced token. Borrowed
+pointer; the parser copies it via StringCore when it needs to retain the text.
+@End Reasoning
+
+@Implementation:
+Returns the token_lexeme handle at offset 56.
+@End Implementation
+
+Process called "current_lexeme" takes lexer as Integer returns Integer:
+    Note: Borrowed pointer to the current token's NUL-terminated lexeme
+
+    Return proc memory_get_int64 from Layout with lexer, 56
+End Process
+
+@Reasoning:
+Accessor for the most recently produced token type. Used by the parser to
+re-read the type after a lookahead without re-lexing.
+@End Reasoning
+
+@Implementation:
+Returns the token_type field at offset 48.
+@End Implementation
+
+Process called "current_token_type" takes lexer as Integer returns Integer:
+    Note: Last produced token type
+
+    Return proc memory_get_int64 from Layout with lexer, 48
+End Process
+
+Note: ============================================================================
+Note: Keyword Classification
+Note: ============================================================================
+
+@Reasoning:
+After scanning an identifier span, decide whether it is a reserved C++ keyword
+(returning the distinct keyword token) or a plain identifier. The comparison is
+grouped by lexeme length so a span is only ever compared against keywords of the
+same length, keeping per-call comparisons small.
+@End Reasoning
+
+@Implementation:
+Reads token_start/position to derive the span and length. Branches on length;
+each branch runs span_matches against every C++ keyword of that length. First
+match returns the matching TOKEN_* constant. No match returns TOKEN_IDENTIFIER.
+@End Implementation
+
+Process called "classify_identifier" takes lexer as Integer returns Integer:
+    Note: Map an identifier span to a keyword token or TOKEN_IDENTIFIER
+
+    Let start be proc memory_get_int64 from Layout with lexer, 40
+    Let position be proc memory_get_int64 from Layout with lexer, 16
+    Let len be position minus start
+
+    If len is equal to 2:
+        Let m_if be proc span_matches with lexer, "if", 2
+        If m_if is equal to 1:
+            Return TOKEN_IF
+        End If
+        Let m_do be proc span_matches with lexer, "do", 2
+        If m_do is equal to 1:
+            Return TOKEN_DO
+        End If
+        Return TOKEN_IDENTIFIER
+    End If
+
+    If len is equal to 3:
+        Let m_int be proc span_matches with lexer, "int", 3
+        If m_int is equal to 1:
+            Return TOKEN_INT
+        End If
+        Let m_for be proc span_matches with lexer, "for", 3
+        If m_for is equal to 1:
+            Return TOKEN_FOR
+        End If
+        Let m_new be proc span_matches with lexer, "new", 3
+        If m_new is equal to 1:
+            Return TOKEN_NEW
+        End If
+        Let m_try be proc span_matches with lexer, "try", 3
+        If m_try is equal to 1:
+            Return TOKEN_TRY
+        End If
+        Return TOKEN_IDENTIFIER
+    End If
+
+    If len is equal to 4:
+        Let m_void be proc span_matches with lexer, "void", 4
+        If m_void is equal to 1:
+            Return TOKEN_VOID
+        End If
+        Let m_bool be proc span_matches with lexer, "bool", 4
+        If m_bool is equal to 1:
+            Return TOKEN_BOOL
+        End If
+        Let m_char be proc span_matches with lexer, "char", 4
+        If m_char is equal to 1:
+            Return TOKEN_CHAR
+        End If
+        Let m_long be proc span_matches with lexer, "long", 4
+        If m_long is equal to 1:
+            Return TOKEN_LONG
+        End If
+        Let m_auto be proc span_matches with lexer, "auto", 4
+        If m_auto is equal to 1:
+            Return TOKEN_AUTO
+        End If
+        Let m_enum be proc span_matches with lexer, "enum", 4
+        If m_enum is equal to 1:
+            Return TOKEN_ENUM
+        End If
+        Let m_else be proc span_matches with lexer, "else", 4
+        If m_else is equal to 1:
+            Return TOKEN_ELSE
+        End If
+        Let m_case be proc span_matches with lexer, "case", 4
+        If m_case is equal to 1:
+            Return TOKEN_CASE
+        End If
+        Let m_this be proc span_matches with lexer, "this", 4
+        If m_this is equal to 1:
+            Return TOKEN_THIS
+        End If
+        Let m_true be proc span_matches with lexer, "true", 4
+        If m_true is equal to 1:
+            Return TOKEN_TRUE
+        End If
+        Return TOKEN_IDENTIFIER
+    End If
+
+    If len is equal to 5:
+        Let m_class be proc span_matches with lexer, "class", 5
+        If m_class is equal to 1:
+            Return TOKEN_CLASS
+        End If
+        Let m_union be proc span_matches with lexer, "union", 5
+        If m_union is equal to 1:
+            Return TOKEN_UNION
+        End If
+        Let m_short be proc span_matches with lexer, "short", 5
+        If m_short is equal to 1:
+            Return TOKEN_SHORT
+        End If
+        Let m_float be proc span_matches with lexer, "float", 5
+        If m_float is equal to 1:
+            Return TOKEN_FLOAT
+        End If
+        Let m_const be proc span_matches with lexer, "const", 5
+        If m_const is equal to 1:
+            Return TOKEN_CONST
+        End If
+        Let m_using be proc span_matches with lexer, "using", 5
+        If m_using is equal to 1:
+            Return TOKEN_USING
+        End If
+        Let m_while be proc span_matches with lexer, "while", 5
+        If m_while is equal to 1:
+            Return TOKEN_WHILE
+        End If
+        Let m_break be proc span_matches with lexer, "break", 5
+        If m_break is equal to 1:
+            Return TOKEN_BREAK
+        End If
+        Let m_catch be proc span_matches with lexer, "catch", 5
+        If m_catch is equal to 1:
+            Return TOKEN_CATCH
+        End If
+        Let m_throw be proc span_matches with lexer, "throw", 5
+        If m_throw is equal to 1:
+            Return TOKEN_THROW
+        End If
+        Let m_final be proc span_matches with lexer, "final", 5
+        If m_final is equal to 1:
+            Return TOKEN_FINAL
+        End If
+        Let m_false be proc span_matches with lexer, "false", 5
+        If m_false is equal to 1:
+            Return TOKEN_FALSE
+        End If
+        Return TOKEN_IDENTIFIER
+    End If
+
+    If len is equal to 6:
+        Let m_double be proc span_matches with lexer, "double", 6
+        If m_double is equal to 1:
+            Return TOKEN_DOUBLE
+        End If
+        Let m_signed be proc span_matches with lexer, "signed", 6
+        If m_signed is equal to 1:
+            Return TOKEN_SIGNED
+        End If
+        Let m_struct be proc span_matches with lexer, "struct", 6
+        If m_struct is equal to 1:
+            Return TOKEN_STRUCT
+        End If
+        Let m_static be proc span_matches with lexer, "static", 6
+        If m_static is equal to 1:
+            Return TOKEN_STATIC
+        End If
+        Let m_extern be proc span_matches with lexer, "extern", 6
+        If m_extern is equal to 1:
+            Return TOKEN_EXTERN
+        End If
+        Let m_inline be proc span_matches with lexer, "inline", 6
+        If m_inline is equal to 1:
+            Return TOKEN_INLINE
+        End If
+        Let m_public be proc span_matches with lexer, "public", 6
+        If m_public is equal to 1:
+            Return TOKEN_PUBLIC
+        End If
+        Let m_friend be proc span_matches with lexer, "friend", 6
+        If m_friend is equal to 1:
+            Return TOKEN_FRIEND
+        End If
+        Let m_delete be proc span_matches with lexer, "delete", 6
+        If m_delete is equal to 1:
+            Return TOKEN_DELETE
+        End If
+        Let m_return be proc span_matches with lexer, "return", 6
+        If m_return is equal to 1:
+            Return TOKEN_RETURN
+        End If
+        Let m_sizeof be proc span_matches with lexer, "sizeof", 6
+        If m_sizeof is equal to 1:
+            Return TOKEN_SIZEOF
+        End If
+        Let m_switch be proc span_matches with lexer, "switch", 6
+        If m_switch is equal to 1:
+            Return TOKEN_SWITCH
+        End If
+        Return TOKEN_IDENTIFIER
+    End If
+
+    If len is equal to 7:
+        Let m_unsigned be proc span_matches with lexer, "wchar_t", 7
+        If m_unsigned is equal to 1:
+            Return TOKEN_WCHAR_T
+        End If
+        Let m_private be proc span_matches with lexer, "private", 7
+        If m_private is equal to 1:
+            Return TOKEN_PRIVATE
+        End If
+        Let m_virtual be proc span_matches with lexer, "virtual", 7
+        If m_virtual is equal to 1:
+            Return TOKEN_VIRTUAL
+        End If
+        Let m_mutable be proc span_matches with lexer, "mutable", 7
+        If m_mutable is equal to 1:
+            Return TOKEN_MUTABLE
+        End If
+        Let m_typedef be proc span_matches with lexer, "typedef", 7
+        If m_typedef is equal to 1:
+            Return TOKEN_TYPEDEF
+        End If
+        Let m_nullptr be proc span_matches with lexer, "nullptr", 7
+        If m_nullptr is equal to 1:
+            Return TOKEN_NULLPTR
+        End If
+        Let m_default be proc span_matches with lexer, "default", 7
+        If m_default is equal to 1:
+            Return TOKEN_DEFAULT
+        End If
+        Return TOKEN_IDENTIFIER
+    End If
+
+    If len is equal to 8:
+        Let m_unsigned be proc span_matches with lexer, "unsigned", 8
+        If m_unsigned is equal to 1:
+            Return TOKEN_UNSIGNED
+        End If
+        Let m_volatile be proc span_matches with lexer, "volatile", 8
+        If m_volatile is equal to 1:
+            Return TOKEN_VOLATILE
+        End If
+        Let m_register be proc span_matches with lexer, "register", 8
+        If m_register is equal to 1:
+            Return TOKEN_REGISTER
+        End If
+        Let m_template be proc span_matches with lexer, "template", 8
+        If m_template is equal to 1:
+            Return TOKEN_TEMPLATE
+        End If
+        Let m_typename be proc span_matches with lexer, "typename", 8
+        If m_typename is equal to 1:
+            Return TOKEN_TYPENAME
+        End If
+        Let m_operator be proc span_matches with lexer, "operator", 8
+        If m_operator is equal to 1:
+            Return TOKEN_OPERATOR
+        End If
+        Let m_override be proc span_matches with lexer, "override", 8
+        If m_override is equal to 1:
+            Return TOKEN_OVERRIDE
+        End If
+        Let m_explicit be proc span_matches with lexer, "explicit", 8
+        If m_explicit is equal to 1:
+            Return TOKEN_EXPLICIT
+        End If
+        Let m_continue be proc span_matches with lexer, "continue", 8
+        If m_continue is equal to 1:
+            Return TOKEN_CONTINUE
+        End If
+        Return TOKEN_IDENTIFIER
+    End If
+
+    If len is equal to 9:
+        Let m_namespace be proc span_matches with lexer, "namespace", 9
+        If m_namespace is equal to 1:
+            Return TOKEN_NAMESPACE
+        End If
+        Let m_protected be proc span_matches with lexer, "protected", 9
+        If m_protected is equal to 1:
+            Return TOKEN_PROTECTED
+        End If
+        Let m_constexpr be proc span_matches with lexer, "constexpr", 9
+        If m_constexpr is equal to 1:
+            Return TOKEN_CONSTEXPR
+        End If
+        Return TOKEN_IDENTIFIER
+    End If
+
+    If len is equal to 11:
+        Let m_static_cast be proc span_matches with lexer, "static_cast", 11
+        If m_static_cast is equal to 1:
+            Return TOKEN_STATIC_CAST
+        End If
+        Return TOKEN_IDENTIFIER
+    End If
+
+    If len is equal to 10:
+        Let m_const_cast be proc span_matches with lexer, "const_cast", 10
+        If m_const_cast is equal to 1:
+            Return TOKEN_CONST_CAST
+        End If
+        Return TOKEN_IDENTIFIER
+    End If
+
+    If len is equal to 12:
+        Let m_dynamic_cast be proc span_matches with lexer, "dynamic_cast", 12
+        If m_dynamic_cast is equal to 1:
+            Return TOKEN_DYNAMIC_CAST
+        End If
+        Return TOKEN_IDENTIFIER
+    End If
+
+    If len is equal to 16:
+        Let m_reinterpret be proc span_matches with lexer, "reinterpret_cast", 16
+        If m_reinterpret is equal to 1:
+            Return TOKEN_REINTERPRET_CAST
+        End If
+        Return TOKEN_IDENTIFIER
+    End If
+
+    Return TOKEN_IDENTIFIER
+End Process
+
+@Reasoning:
+Byte-by-byte comparison of the current identifier span against a target keyword.
+The caller has already verified the span length equals the target length.
+@End Reasoning
+
+@Implementation:
+Reads token_start; loops i 0..length comparing memory_get_byte(source,
+token_start+i) against memory_get_byte(target, i). Any mismatch returns 0; full
+match returns 1.
+@End Implementation
+
+Process called "span_matches" takes lexer as Integer, target as Integer, length as Integer returns Integer:
+    Note: Compare current identifier span against a keyword literal
+
+    Let source be proc memory_get_int64 from Layout with lexer, 0
+    Let start be proc memory_get_int64 from Layout with lexer, 40
     Let i be 0
     While i is less than length:
-        Let c1 be proc memory_get_byte from Layout with text, i
+        Let c1 be proc memory_get_byte from Layout with source, start plus i
         Let c2 be proc memory_get_byte from Layout with target, i
         If c1 is not equal to c2:
             Return 0
@@ -1111,23 +1004,691 @@ Process called "match_string" takes text as Integer, target as String, length as
     Return 1
 End Process
 
+Note: ============================================================================
+Note: Token Scanners
+Note: ============================================================================
+
 @Reasoning:
-Centralised token allocator: every lexer path produces tokens with the
-same layout.
+Scans an identifier or keyword: a letter/underscore start followed by any run of
+alphanumeric/underscore bytes. The span is then classified into a keyword token
+or TOKEN_IDENTIFIER.
 @End Reasoning
 
 @Implementation:
-Allocates 32 bytes. Writes token_type/value_ptr/value_length/position
-at offsets 0/8/16/24.
+Consumes the lead byte, then loops advancing while is_alnum holds. Calls
+classify_identifier on the resulting span and finishes the token with the
+resolved type.
 @End Implementation
 
-Process called "create_token" takes token_type as Integer, value_ptr as Integer, value_length as Integer, position as Integer returns Integer:
-    Note: Create new token
+Process called "scan_identifier" takes lexer as Integer returns Integer:
+    Note: Scan identifier/keyword starting at the cursor
 
-    Let token be proc allocate from Layout with 32
-    proc memory_set_int64 from Layout with token, 0, token_type
-    proc memory_set_int64 from Layout with token, 8, value_ptr
-    proc memory_set_int64 from Layout with token, 16, value_length
-    proc memory_set_int64 from Layout with token, 24, position
-    Return token
+    proc advance_char with lexer
+    While 1 is equal to 1:
+        Let c be proc peek_char with lexer
+        Let ok be proc is_alnum with c
+        If ok is not equal to 1:
+            Break
+        End If
+        proc advance_char with lexer
+    End While
+
+    Let token_type be proc classify_identifier with lexer
+    Return proc finish_token with lexer, token_type
+End Process
+
+@Reasoning:
+Scans a C++ numeric literal: hex (0x...), binary (0b...), or decimal/float with
+optional exponent, then any run of type/length suffix letters (u, l, f, etc.).
+A float is recognised when a '.' or exponent is seen. User-defined literal
+suffixes are folded into the same trailing-letter run.
+@End Reasoning
+
+@Implementation:
+If lead is '0' and next is 'x'/'X' consumes the prefix and a run of hex digits.
+If '0' then 'b'/'B', consumes a run of '0'/'1'. Otherwise consumes a run of
+digits; a '.' followed by digits marks float and consumes the fraction; an
+'e'/'E' marks float, consumes an optional sign and the exponent digits. Finally
+consumes a trailing run of letters/underscore (suffixes). Emits TOKEN_INTEGER or
+TOKEN_FLOAT_LITERAL accordingly. Always consumes at least the lead digit.
+@End Implementation
+
+Process called "scan_number" takes lexer as Integer returns Integer:
+    Note: Scan a numeric literal
+
+    Let is_float be 0
+    Let lead be proc peek_char with lexer
+    Let second be proc peek_char_at with lexer, 1
+
+    If lead is equal to 48:  Note: '0'
+        If second is equal to 120:  Note: 'x'
+            proc advance_char with lexer
+            proc advance_char with lexer
+            While 1 is equal to 1:
+                Let c be proc peek_char with lexer
+                Let ok be proc is_hex_digit with c
+                If ok is not equal to 1:
+                    Break
+                End If
+                proc advance_char with lexer
+            End While
+            Let t be proc scan_number_suffix with lexer
+            Return proc finish_token with lexer, TOKEN_INTEGER
+        End If
+        If second is equal to 88:  Note: 'X'
+            proc advance_char with lexer
+            proc advance_char with lexer
+            While 1 is equal to 1:
+                Let c be proc peek_char with lexer
+                Let ok be proc is_hex_digit with c
+                If ok is not equal to 1:
+                    Break
+                End If
+                proc advance_char with lexer
+            End While
+            Let t be proc scan_number_suffix with lexer
+            Return proc finish_token with lexer, TOKEN_INTEGER
+        End If
+        If second is equal to 98:  Note: 'b'
+            proc advance_char with lexer
+            proc advance_char with lexer
+            While 1 is equal to 1:
+                Let c be proc peek_char with lexer
+                If c is equal to 48:
+                    proc advance_char with lexer
+                Otherwise:
+                    If c is equal to 49:
+                        proc advance_char with lexer
+                    Otherwise:
+                        Break
+                    End If
+                End If
+            End While
+            Let t be proc scan_number_suffix with lexer
+            Return proc finish_token with lexer, TOKEN_INTEGER
+        End If
+    End If
+
+    Note: Decimal integer part (consume at least the lead digit)
+    proc advance_char with lexer
+    While 1 is equal to 1:
+        Let c be proc peek_char with lexer
+        Let ok be proc is_digit with c
+        If ok is not equal to 1:
+            Break
+        End If
+        proc advance_char with lexer
+    End While
+
+    Note: Fractional part
+    Let dot be proc peek_char with lexer
+    If dot is equal to 46:  Note: '.'
+        Let after be proc peek_char_at with lexer, 1
+        Let after_ok be proc is_digit with after
+        If after_ok is equal to 1:
+            Set is_float to 1
+            proc advance_char with lexer
+            While 1 is equal to 1:
+                Let c be proc peek_char with lexer
+                Let ok be proc is_digit with c
+                If ok is not equal to 1:
+                    Break
+                End If
+                proc advance_char with lexer
+            End While
+        End If
+    End If
+
+    Note: Exponent
+    Let e be proc peek_char with lexer
+    If e is equal to 101:  Note: 'e'
+        Set is_float to 1
+        proc advance_char with lexer
+        Let sign be proc peek_char with lexer
+        If sign is equal to 43:
+            proc advance_char with lexer
+        Otherwise:
+            If sign is equal to 45:
+                proc advance_char with lexer
+            End If
+        End If
+        While 1 is equal to 1:
+            Let c be proc peek_char with lexer
+            Let ok be proc is_digit with c
+            If ok is not equal to 1:
+                Break
+            End If
+            proc advance_char with lexer
+        End While
+    End If
+    If e is equal to 69:  Note: 'E'
+        Set is_float to 1
+        proc advance_char with lexer
+        Let sign be proc peek_char with lexer
+        If sign is equal to 43:
+            proc advance_char with lexer
+        Otherwise:
+            If sign is equal to 45:
+                proc advance_char with lexer
+            End If
+        End If
+        While 1 is equal to 1:
+            Let c be proc peek_char with lexer
+            Let ok be proc is_digit with c
+            If ok is not equal to 1:
+                Break
+            End If
+            proc advance_char with lexer
+        End While
+    End If
+
+    Note: Suffix run (u, l, f, ll, user-defined ...)
+    Let st be proc scan_number_suffix with lexer
+
+    If is_float is equal to 1:
+        Return proc finish_token with lexer, TOKEN_FLOAT_LITERAL
+    End If
+    Return proc finish_token with lexer, TOKEN_INTEGER
+End Process
+
+@Reasoning:
+After the numeric body, consume any trailing run of letters/underscore: standard
+suffixes (u, l, f, ull) and user-defined literal suffixes alike. Returns whether
+a float-marking suffix ('f'/'F') was seen so the caller can promote integers
+written with a float suffix.
+@End Reasoning
+
+@Implementation:
+Loops while the current byte is alpha/underscore, advancing. Returns 1 if any
+consumed byte was 'f'/'F', else 0.
+@End Implementation
+
+Process called "scan_number_suffix" takes lexer as Integer returns Integer:
+    Note: Consume trailing literal suffix letters; return 1 if float suffix seen
+
+    Let saw_float be 0
+    While 1 is equal to 1:
+        Let c be proc peek_char with lexer
+        Let ok be proc is_alpha with c
+        If ok is not equal to 1:
+            Break
+        End If
+        If c is equal to 102:
+            Set saw_float to 1
+        End If
+        If c is equal to 70:
+            Set saw_float to 1
+        End If
+        proc advance_char with lexer
+    End While
+    Return saw_float
+End Process
+
+@Reasoning:
+Scans a string literal including its quotes. Handles backslash escapes (the
+escaped byte is consumed verbatim so an escaped quote does not terminate the
+string) and the raw-string prefix R"(...)" when the cursor was positioned just
+before a '"'. Wide/utf prefixes (L, u, U, u8) are handled by scan_identifier
+falling through to here only for the bare-quote case; the prefix letters lex as
+part of the leading identifier and the parser recombines them.
+@End Reasoning
+
+@Implementation:
+Consumes the opening '"'. If the byte before the quote run indicates a raw
+string the delimiter logic would apply; for the common corpus this scanner
+consumes bytes until an unescaped closing '"'. Backslash consumes the next byte
+too. EOF terminates the loop (sticky error). Emits TOKEN_STRING_LITERAL with the
+full quoted span.
+@End Implementation
+
+Process called "scan_string" takes lexer as Integer returns Integer:
+    Note: Scan a double-quoted string literal
+
+    proc advance_char with lexer  Note: opening quote
+    While 1 is equal to 1:
+        Let c be proc peek_char with lexer
+        If c is equal to 0:
+            Break
+        End If
+        If c is equal to 34:  Note: closing '"'
+            proc advance_char with lexer
+            Break
+        End If
+        If c is equal to 92:  Note: backslash escape
+            proc advance_char with lexer
+            Let esc be proc peek_char with lexer
+            If esc is not equal to 0:
+                proc advance_char with lexer
+            End If
+            Continue
+        End If
+        proc advance_char with lexer
+    End While
+    Return proc finish_token with lexer, TOKEN_STRING_LITERAL
+End Process
+
+@Reasoning:
+Scans a character literal 'x' or '\n'. Same escape semantics as strings; emits a
+distinct TOKEN_CHAR_LITERAL so the parser distinguishes 'x' from "x".
+@End Reasoning
+
+@Implementation:
+Consumes the opening '\''. Loops: backslash consumes itself and the next byte;
+the closing '\'' consumes and breaks; other bytes advance. EOF terminates.
+Emits TOKEN_CHAR_LITERAL with the quoted span.
+@End Implementation
+
+Process called "scan_char" takes lexer as Integer returns Integer:
+    Note: Scan a single-quoted character literal
+
+    proc advance_char with lexer  Note: opening quote
+    While 1 is equal to 1:
+        Let c be proc peek_char with lexer
+        If c is equal to 0:
+            Break
+        End If
+        If c is equal to 39:  Note: closing '\''
+            proc advance_char with lexer
+            Break
+        End If
+        If c is equal to 92:  Note: backslash escape
+            proc advance_char with lexer
+            Let esc be proc peek_char with lexer
+            If esc is not equal to 0:
+                proc advance_char with lexer
+            End If
+            Continue
+        End If
+        proc advance_char with lexer
+    End While
+    Return proc finish_token with lexer, TOKEN_CHAR_LITERAL
+End Process
+
+@Reasoning:
+Preprocessor directives are captured as one TOKEN_PREPROCESSOR spanning '#'
+through end-of-line, honoring backslash-newline continuations so a multi-line
+macro is one token. The parser routes the directive text to its preprocessor
+handling.
+@End Reasoning
+
+@Implementation:
+Consumes '#'. Loops: LF ends (consumed); backslash-newline continues onto the
+next line (consume both); other bytes advance. EOF ends. Emits
+TOKEN_PREPROCESSOR with the full directive span (excluding the terminating LF
+where present).
+@End Implementation
+
+Process called "scan_preprocessor" takes lexer as Integer returns Integer:
+    Note: Scan a whole preprocessor directive line
+
+    proc advance_char with lexer  Note: '#'
+    While 1 is equal to 1:
+        Let c be proc peek_char with lexer
+        If c is equal to 0:
+            Break
+        End If
+        If c is equal to 10:  Note: LF ends the directive
+            Break
+        End If
+        If c is equal to 92:  Note: backslash - possible line continuation
+            Let next be proc peek_char_at with lexer, 1
+            If next is equal to 10:
+                proc advance_char with lexer
+                proc advance_char with lexer
+                Continue
+            End If
+            proc advance_char with lexer
+            Continue
+        End If
+        proc advance_char with lexer
+    End While
+    Return proc finish_token with lexer, TOKEN_PREPROCESSOR
+End Process
+
+Note: ============================================================================
+Note: Operator Scanner
+Note: ============================================================================
+
+@Reasoning:
+Scans the C++ operator/punctuator set, always trying the longest match first so
+e.g. "<<=" is not mis-split into "<<" then "=", and "->" is not split into "-"
+and ">". Each path consumes the exact number of bytes for the matched operator,
+guaranteeing forward progress. Unknown bytes are consumed and reported as
+TOKEN_ERROR so the parser loop cannot spin.
+@End Reasoning
+
+@Implementation:
+Reads the lead byte (already non-EOF) and up to two lookahead bytes. A long
+nested branch matches three-byte operators (<<=, >>=, ->*, ...), then two-byte
+(::, ->, ==, !=, <=, >=, <=>, &&, ||, <<, >>, ++, --, .*, +=, -=, *=, /=, %=,
+&=, |=, ^=), then single-byte punctuators and operators. Every branch advances
+the cursor by the matched length and finishes the token.
+@End Implementation
+
+Process called "scan_operator" takes lexer as Integer returns Integer:
+    Note: Scan an operator or punctuator (longest match first)
+
+    Let c0 be proc peek_char with lexer
+    Let c1 be proc peek_char_at with lexer, 1
+    Let c2 be proc peek_char_at with lexer, 2
+
+    Note: --- Three-byte operators ---
+    If c0 is equal to 60:  Note: '<'
+        If c1 is equal to 60:  Note: '<<'
+            If c2 is equal to 61:  Note: '<<='
+                proc advance_char with lexer
+                proc advance_char with lexer
+                proc advance_char with lexer
+                Return proc finish_token with lexer, TOKEN_LSHIFT_ASSIGN
+            End If
+        End If
+        If c1 is equal to 61:  Note: '<='
+            If c2 is equal to 62:  Note: '<=>'
+                proc advance_char with lexer
+                proc advance_char with lexer
+                proc advance_char with lexer
+                Return proc finish_token with lexer, TOKEN_SPACESHIP
+            End If
+        End If
+    End If
+    If c0 is equal to 62:  Note: '>'
+        If c1 is equal to 62:  Note: '>>'
+            If c2 is equal to 61:  Note: '>>='
+                proc advance_char with lexer
+                proc advance_char with lexer
+                proc advance_char with lexer
+                Return proc finish_token with lexer, TOKEN_RSHIFT_ASSIGN
+            End If
+        End If
+    End If
+    If c0 is equal to 45:  Note: '-'
+        If c1 is equal to 62:  Note: '->'
+            If c2 is equal to 42:  Note: '->*'
+                proc advance_char with lexer
+                proc advance_char with lexer
+                proc advance_char with lexer
+                Return proc finish_token with lexer, TOKEN_ARROW_STAR
+            End If
+        End If
+    End If
+    If c0 is equal to 46:  Note: '.'
+        If c1 is equal to 46:
+            If c2 is equal to 46:  Note: '...'
+                proc advance_char with lexer
+                proc advance_char with lexer
+                proc advance_char with lexer
+                Return proc finish_token with lexer, TOKEN_ELLIPSIS
+            End If
+        End If
+    End If
+
+    Note: --- Two-byte operators ---
+    If c0 is equal to 58:  Note: ':'
+        If c1 is equal to 58:  Note: '::'
+            proc advance_char with lexer
+            proc advance_char with lexer
+            Return proc finish_token with lexer, TOKEN_SCOPE
+        End If
+    End If
+    If c0 is equal to 45:  Note: '-'
+        If c1 is equal to 62:  Note: '->'
+            proc advance_char with lexer
+            proc advance_char with lexer
+            Return proc finish_token with lexer, TOKEN_ARROW
+        End If
+        If c1 is equal to 45:  Note: '--'
+            proc advance_char with lexer
+            proc advance_char with lexer
+            Return proc finish_token with lexer, TOKEN_DECREMENT
+        End If
+        If c1 is equal to 61:  Note: '-='
+            proc advance_char with lexer
+            proc advance_char with lexer
+            Return proc finish_token with lexer, TOKEN_MINUS_ASSIGN
+        End If
+    End If
+    If c0 is equal to 43:  Note: '+'
+        If c1 is equal to 43:  Note: '++'
+            proc advance_char with lexer
+            proc advance_char with lexer
+            Return proc finish_token with lexer, TOKEN_INCREMENT
+        End If
+        If c1 is equal to 61:  Note: '+='
+            proc advance_char with lexer
+            proc advance_char with lexer
+            Return proc finish_token with lexer, TOKEN_PLUS_ASSIGN
+        End If
+    End If
+    If c0 is equal to 61:  Note: '='
+        If c1 is equal to 61:  Note: '=='
+            proc advance_char with lexer
+            proc advance_char with lexer
+            Return proc finish_token with lexer, TOKEN_EQ
+        End If
+    End If
+    If c0 is equal to 33:  Note: '!'
+        If c1 is equal to 61:  Note: '!='
+            proc advance_char with lexer
+            proc advance_char with lexer
+            Return proc finish_token with lexer, TOKEN_NE
+        End If
+    End If
+    If c0 is equal to 60:  Note: '<'
+        If c1 is equal to 61:  Note: '<='
+            proc advance_char with lexer
+            proc advance_char with lexer
+            Return proc finish_token with lexer, TOKEN_LE
+        End If
+        If c1 is equal to 60:  Note: '<<'
+            proc advance_char with lexer
+            proc advance_char with lexer
+            Return proc finish_token with lexer, TOKEN_LSHIFT
+        End If
+    End If
+    If c0 is equal to 62:  Note: '>'
+        If c1 is equal to 61:  Note: '>='
+            proc advance_char with lexer
+            proc advance_char with lexer
+            Return proc finish_token with lexer, TOKEN_GE
+        End If
+        If c1 is equal to 62:  Note: '>>'
+            proc advance_char with lexer
+            proc advance_char with lexer
+            Return proc finish_token with lexer, TOKEN_RSHIFT
+        End If
+    End If
+    If c0 is equal to 38:  Note: '&'
+        If c1 is equal to 38:  Note: '&&'
+            proc advance_char with lexer
+            proc advance_char with lexer
+            Return proc finish_token with lexer, TOKEN_LAND
+        End If
+        If c1 is equal to 61:  Note: '&='
+            proc advance_char with lexer
+            proc advance_char with lexer
+            Return proc finish_token with lexer, TOKEN_AMP_ASSIGN
+        End If
+    End If
+    If c0 is equal to 124:  Note: '|'
+        If c1 is equal to 124:  Note: '||'
+            proc advance_char with lexer
+            proc advance_char with lexer
+            Return proc finish_token with lexer, TOKEN_LOR
+        End If
+        If c1 is equal to 61:  Note: '|='
+            proc advance_char with lexer
+            proc advance_char with lexer
+            Return proc finish_token with lexer, TOKEN_PIPE_ASSIGN
+        End If
+    End If
+    If c0 is equal to 42:  Note: '*'
+        If c1 is equal to 61:  Note: '*='
+            proc advance_char with lexer
+            proc advance_char with lexer
+            Return proc finish_token with lexer, TOKEN_STAR_ASSIGN
+        End If
+    End If
+    If c0 is equal to 47:  Note: '/'
+        If c1 is equal to 61:  Note: '/='
+            proc advance_char with lexer
+            proc advance_char with lexer
+            Return proc finish_token with lexer, TOKEN_SLASH_ASSIGN
+        End If
+    End If
+    If c0 is equal to 37:  Note: '%'
+        If c1 is equal to 61:  Note: '%='
+            proc advance_char with lexer
+            proc advance_char with lexer
+            Return proc finish_token with lexer, TOKEN_PERCENT_ASSIGN
+        End If
+    End If
+    If c0 is equal to 94:  Note: '^'
+        If c1 is equal to 61:  Note: '^='
+            proc advance_char with lexer
+            proc advance_char with lexer
+            Return proc finish_token with lexer, TOKEN_CARET_ASSIGN
+        End If
+    End If
+    If c0 is equal to 46:  Note: '.'
+        If c1 is equal to 42:  Note: '.*'
+            proc advance_char with lexer
+            proc advance_char with lexer
+            Return proc finish_token with lexer, TOKEN_DOT_STAR
+        End If
+    End If
+
+    Note: --- Single-byte punctuators and operators ---
+    proc advance_char with lexer
+    If c0 is equal to 40:
+        Return proc finish_token with lexer, TOKEN_LPAREN
+    End If
+    If c0 is equal to 41:
+        Return proc finish_token with lexer, TOKEN_RPAREN
+    End If
+    If c0 is equal to 123:
+        Return proc finish_token with lexer, TOKEN_LBRACE
+    End If
+    If c0 is equal to 125:
+        Return proc finish_token with lexer, TOKEN_RBRACE
+    End If
+    If c0 is equal to 91:
+        Return proc finish_token with lexer, TOKEN_LBRACKET
+    End If
+    If c0 is equal to 93:
+        Return proc finish_token with lexer, TOKEN_RBRACKET
+    End If
+    If c0 is equal to 59:
+        Return proc finish_token with lexer, TOKEN_SEMICOLON
+    End If
+    If c0 is equal to 44:
+        Return proc finish_token with lexer, TOKEN_COMMA
+    End If
+    If c0 is equal to 46:
+        Return proc finish_token with lexer, TOKEN_DOT
+    End If
+    If c0 is equal to 58:
+        Return proc finish_token with lexer, TOKEN_COLON
+    End If
+    If c0 is equal to 63:
+        Return proc finish_token with lexer, TOKEN_QUESTION
+    End If
+    If c0 is equal to 43:
+        Return proc finish_token with lexer, TOKEN_PLUS
+    End If
+    If c0 is equal to 45:
+        Return proc finish_token with lexer, TOKEN_MINUS
+    End If
+    If c0 is equal to 42:
+        Return proc finish_token with lexer, TOKEN_STAR
+    End If
+    If c0 is equal to 47:
+        Return proc finish_token with lexer, TOKEN_SLASH
+    End If
+    If c0 is equal to 37:
+        Return proc finish_token with lexer, TOKEN_PERCENT
+    End If
+    If c0 is equal to 61:
+        Return proc finish_token with lexer, TOKEN_ASSIGN
+    End If
+    If c0 is equal to 60:
+        Return proc finish_token with lexer, TOKEN_LESS
+    End If
+    If c0 is equal to 62:
+        Return proc finish_token with lexer, TOKEN_GREATER
+    End If
+    If c0 is equal to 33:
+        Return proc finish_token with lexer, TOKEN_NOT
+    End If
+    If c0 is equal to 38:
+        Return proc finish_token with lexer, TOKEN_AMP
+    End If
+    If c0 is equal to 124:
+        Return proc finish_token with lexer, TOKEN_PIPE
+    End If
+    If c0 is equal to 94:
+        Return proc finish_token with lexer, TOKEN_CARET
+    End If
+    If c0 is equal to 126:
+        Return proc finish_token with lexer, TOKEN_TILDE
+    End If
+
+    Note: Unknown byte: already consumed - report TOKEN_ERROR (still advanced)
+    Return proc finish_token with lexer, TOKEN_ERROR
+End Process
+
+Note: ============================================================================
+Note: Main Dispatch
+Note: ============================================================================
+
+@Reasoning:
+Single-token-of-lookahead entry point. Skips whitespace/comments, records the
+token start, then dispatches on the lead byte. EOF is terminal: once the cursor
+is past end-of-source it returns TOKEN_EOF for every subsequent call so parser
+loops bounded by EOF always terminate.
+@End Reasoning
+
+@Implementation:
+Calls skip_whitespace_and_comments. If at EOF sets token_start=position and
+returns TOKEN_EOF (lexeme captured as empty). Otherwise sets token_start to the
+cursor and branches: '#' -> preprocessor; '"' -> string; '\'' -> char; digit ->
+number; alpha/underscore -> identifier; everything else -> operator. Every path
+advances the cursor by at least one byte.
+@End Implementation
+
+Process called "next_token" takes lexer as Integer returns Integer:
+    Note: Produce the next token type; cache its lexeme
+
+    proc skip_whitespace_and_comments with lexer
+
+    Let position be proc memory_get_int64 from Layout with lexer, 16
+    proc memory_set_int64 from Layout with lexer, 40, position
+
+    Let length be proc memory_get_int64 from Layout with lexer, 8
+    If position is greater than or equal to length:
+        Return proc finish_token with lexer, TOKEN_EOF
+    End If
+
+    Let char be proc peek_char with lexer
+
+    If char is equal to 35:  Note: '#'
+        Return proc scan_preprocessor with lexer
+    End If
+    If char is equal to 34:  Note: '"'
+        Return proc scan_string with lexer
+    End If
+    If char is equal to 39:  Note: '\''
+        Return proc scan_char with lexer
+    End If
+
+    Let digit be proc is_digit with char
+    If digit is equal to 1:
+        Return proc scan_number with lexer
+    End If
+
+    Let alpha be proc is_alpha with char
+    If alpha is equal to 1:
+        Return proc scan_identifier with lexer
+    End If
+
+    Return proc scan_operator with lexer
 End Process

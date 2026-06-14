@@ -466,7 +466,7 @@ Process called "analyze_cpp_class" takes analyzer as Integer, class_node as Inte
     proc memory_set_int64 from Layout with analyzer, 40, class_node
 
     Note: Create new scope for class members
-    proc push_cpp_scope from analyzer
+    proc push_cpp_scope with analyzer
 
     Note: Analyze inheritance hierarchy
     proc analyze_inheritance with analyzer, class_node
@@ -489,7 +489,7 @@ Process called "analyze_cpp_class" takes analyzer as Integer, class_node as Inte
     proc validate_class_completeness with analyzer, class_node
 
     Note: Pop class scope
-    proc pop_cpp_scope from analyzer
+    proc pop_cpp_scope with analyzer
 
     Note: Restore previous class context
     proc memory_set_int64 from Layout with analyzer, 40, old_class
@@ -626,11 +626,23 @@ Process called "analyze_cpp_template" takes analyzer as Integer, template_node a
         Return 0
     End If
 
-    Note: Create template context
-    Let template_context be proc create_template_context from analyzer
+    Note: Create template context: a 24-byte TemplateContext linking to the
+    Note: enclosing instantiation (offset 56) with a fresh argument-binding Dict
+    Note: and an incremented instantiation depth.
+    Let old_context be proc memory_get_int64 from Layout with analyzer, 56
+    Let template_context be proc allocate from Layout with 24
+    If template_context is not equal to 0:
+        Let arg_map be proc create from Dict
+        proc memory_set_int64 from Layout with template_context, 0, arg_map
+        proc memory_set_int64 from Layout with template_context, 8, old_context
+        Let parent_depth be 0
+        If old_context is not equal to 0:
+            Set parent_depth to proc memory_get_int64 from Layout with old_context, 16
+        End If
+        proc memory_set_int64 from Layout with template_context, 16, parent_depth plus 1
+    End If
 
     Note: Set current template context
-    Let old_context be proc memory_get_int64 from Layout with analyzer, 56
     proc memory_set_int64 from Layout with analyzer, 56, template_context
 
     Note: Analyze template parameters
@@ -654,8 +666,15 @@ Process called "analyze_cpp_template" takes analyzer as Integer, template_node a
         End While
     End If
 
-    Note: Restore previous template context
+    Note: Restore previous template context and free this instantiation's record
     proc memory_set_int64 from Layout with analyzer, 56, old_context
+    If template_context is not equal to 0:
+        Let arg_map be proc memory_get_int64 from Layout with template_context, 0
+        If arg_map is not equal to 0:
+            proc destroy from Dict with arg_map
+        End If
+        proc deallocate from Layout with template_context
+    End If
 
     Return 1
 End Process
@@ -727,7 +746,7 @@ Process called "analyze_template_parameter" takes analyzer as Integer, param_nod
     Let param_name be proc memory_get_int64 from Layout with param_node, 8
 
     Note: Add template parameter to current scope
-    Let template_symbol be proc create_cpp_symbol from CPP_SYMBOL_TEMPLATE
+    Let template_symbol be proc create_cpp_symbol with CPP_SYMBOL_TEMPLATE
     proc set_cpp_symbol_name with template_symbol, param_name
     proc set_cpp_symbol_type_info with template_symbol, param_node
 
@@ -787,9 +806,9 @@ Process called "check_cpp_expression_type" takes analyzer as Integer, expr_node 
         Return proc analyze_delete_expression with analyzer, expr_node
     End If
 
-    Note: This expression
+    Note: This expression - resolves to the current class type (offset 40)
     If node_type is equal to CPP_THIS_EXPR from Parser:
-        Return proc get_current_class_type from analyzer
+        Return proc memory_get_int64 from Layout with analyzer, 40
     End If
 
     Note: Auto type deduction
@@ -837,34 +856,36 @@ Process called "analyze_lambda_expression" takes analyzer as Integer, lambda_nod
     End If
 
     Note: Create lambda scope
-    proc push_cpp_scope from analyzer
+    proc push_cpp_scope with analyzer
 
-    Note: Analyze capture list
-    Let capture_list be proc get_lambda_captures from lambda_node
-
-    If capture_list is not equal to 0:
-        proc analyze_lambda_captures with analyzer, capture_list
-    End If
-
-    Note: Analyze parameter list
-    Let param_list be proc get_lambda_parameters from lambda_node
-
-    If param_list is not equal to 0:
-        proc analyze_function_parameters with analyzer, param_list
-    End If
-
-    Note: Analyze lambda body
-    Let body be proc get_lambda_body from lambda_node
-
-    If body is not equal to 0:
-        proc analyze_cpp_statement with analyzer, body
+    Note: The lambda node's children are [capture_list, parameters?, body?].
+    Note: Walk them by AST kind so capture list, params and body are routed to
+    Note: the right analyzer regardless of which optional parts are present.
+    Let children be proc memory_get_int64 from Layout with lambda_node, 32
+    If children is not equal to 0:
+        Let child_count be proc size from List with children
+        Let li be 0
+        While li is less than child_count:
+            Let lchild be proc get from List with children, li
+            Let lkind be proc memory_get_int64 from Layout with lchild, 0
+            If lkind is equal to CPP_CAPTURE_LIST from Parser:
+                proc analyze_lambda_captures with analyzer, lchild
+            End If
+            If lkind is equal to CPP_PARAMETER from Parser:
+                proc analyze_function_parameters with analyzer, lchild
+            End If
+            If lkind is equal to CPP_COMPOUND_STMT from Parser:
+                proc analyze_cpp_statement with analyzer, lchild
+            End If
+            Set li to li plus 1
+        End While
     End If
 
     Note: Deduce return type if not specified
     Let return_type be proc deduce_lambda_return_type with analyzer, lambda_node
 
     Note: Pop lambda scope
-    proc pop_cpp_scope from analyzer
+    proc pop_cpp_scope with analyzer
 
     Note: Create closure type
     Let closure_type be proc create_closure_type with analyzer, lambda_node, return_type
@@ -995,7 +1016,7 @@ Process called "set_cpp_semantic_error" takes analyzer as Integer, message as In
 
     proc memory_set_int64 from Layout with analyzer, 72, 1  Note: has_error = true
 
-    Let error_copy be proc copy_string from StringCore with message
+    Let error_copy be proc string_duplicate from StringCore with message
     proc memory_set_int64 from Layout with analyzer, 64, error_copy
 End Process
 
@@ -1034,4 +1055,1058 @@ Process called "get_cpp_semantic_error" takes analyzer as Integer returns Intege
     Note: Get error message
 
     Return proc memory_get_int64 from Layout with analyzer, 64
+End Process
+
+Note: ============================================================================
+Note: Symbol Construction and Registration
+Note: ============================================================================
+
+@Reasoning:
+Centralised CppSymbol allocator so every symbol-producing path yields a uniform
+64-byte record with the kind tag set and all other slots zeroed. "0 == unset"
+then holds for every slot, which the lookup and access-control passes rely on.
+@End Reasoning
+
+@Implementation:
+Allocates 64 bytes; writes symbol_type at offset 8; zeroes name (0), type_info
+(16), attributes (24), template_params (32), overloads (40), class_context (48),
+namespace_context (56). Returns 0 on OOM.
+@End Implementation
+
+Process called "create_cpp_symbol" takes symbol_type as Integer returns Integer:
+    Note: Allocate a zero-initialised CppSymbol of the given kind
+
+    Let symbol be proc allocate from Layout with 64
+    If symbol is equal to 0:
+        Return 0
+    End If
+    proc memory_set_int64 from Layout with symbol, 0, 0
+    proc memory_set_int64 from Layout with symbol, 8, symbol_type
+    proc memory_set_int64 from Layout with symbol, 16, 0
+    proc memory_set_int64 from Layout with symbol, 24, 0
+    proc memory_set_int64 from Layout with symbol, 32, 0
+    proc memory_set_int64 from Layout with symbol, 40, 0
+    proc memory_set_int64 from Layout with symbol, 48, 0
+    proc memory_set_int64 from Layout with symbol, 56, 0
+    Return symbol
+End Process
+
+@Reasoning:
+Names are borrowed from the AST node's owned copy; the symbol stores the same
+handle (no second copy) because both share the analyzer/AST lifetime.
+@End Reasoning
+
+@Implementation:
+Null-checks symbol; writes the name handle at offset 0.
+@End Implementation
+
+Process called "set_cpp_symbol_name" takes symbol as Integer, name as Integer:
+    Note: Set a symbol's name handle
+
+    If symbol is equal to 0:
+        Return
+    End If
+    proc memory_set_int64 from Layout with symbol, 0, name
+End Process
+
+@Reasoning:
+type_info points at the declaring AST node (type specifier, template parameter,
+etc.) so later passes can inspect the declaration without re-walking.
+@End Reasoning
+
+@Implementation:
+Null-checks symbol; writes the type/info node at offset 16.
+@End Implementation
+
+Process called "set_cpp_symbol_type_info" takes symbol as Integer, type_info as Integer:
+    Note: Set a symbol's type/declaration node
+
+    If symbol is equal to 0:
+        Return
+    End If
+    proc memory_set_int64 from Layout with symbol, 16, type_info
+End Process
+
+@Reasoning:
+Records the access level (private/protected/public) on a symbol so member-access
+checks in derived scopes can apply visibility without re-deriving the section.
+@End Reasoning
+
+@Implementation:
+Null-checks symbol; writes the access integer into the attributes slot (offset
+24).
+@End Implementation
+
+Process called "set_cpp_symbol_access" takes symbol as Integer, access as Integer:
+    Note: Set a symbol's access level
+
+    If symbol is equal to 0:
+        Return
+    End If
+    proc memory_set_int64 from Layout with symbol, 24, access
+End Process
+
+@Reasoning:
+Registers a symbol under its name in the current (innermost) scope so subsequent
+ordinary lookups resolve it. A function name that already exists is treated as an
+overload set: the new symbol is appended to the existing symbol's overloads list
+rather than shadowing it, which is how C++ overloading is modelled.
+@End Reasoning
+
+@Implementation:
+Null-guards. Reads current_scope (offset 8). If the name is already bound and both
+the existing and new symbols are functions, appends the new symbol to the
+existing symbol's overloads List (created lazily at offset 40). Otherwise sets the
+name -> symbol binding via Dict.set.
+@End Implementation
+
+Process called "add_cpp_symbol" takes analyzer as Integer, name as Integer, symbol as Integer:
+    Note: Register a symbol in the current scope (overload-aware)
+
+    If analyzer is equal to 0:
+        Return
+    End If
+    If name is equal to 0:
+        Return
+    End If
+    If symbol is equal to 0:
+        Return
+    End If
+
+    Let scope be proc memory_get_int64 from Layout with analyzer, 8
+    Let existing be proc get from Dict with scope, name
+
+    If existing is not equal to 0:
+        Let existing_kind be proc memory_get_int64 from Layout with existing, 8
+        Let new_kind be proc memory_get_int64 from Layout with symbol, 8
+        If existing_kind is equal to CPP_SYMBOL_FUNCTION:
+            If new_kind is equal to CPP_SYMBOL_FUNCTION:
+                Let overloads be proc memory_get_int64 from Layout with existing, 40
+                If overloads is equal to 0:
+                    Set overloads to proc create from List
+                    proc memory_set_int64 from Layout with existing, 40, overloads
+                End If
+                proc push from List with overloads, symbol
+                Return
+            End If
+        End If
+    End If
+
+    proc set from Dict with scope, name, symbol
+End Process
+
+@Reasoning:
+Records a derived -> base inheritance edge in the class_hierarchy dictionary so
+member lookup and circular-inheritance checks can traverse base chains. The value
+is a List of base entries (each a 16-byte [base_name, access] block) keyed by the
+derived class's name.
+@End Reasoning
+
+@Implementation:
+Looks up the derived name in class_hierarchy; creates a List on first edge.
+Allocates a 16-byte edge record holding base_name (0) and access (8), pushes it
+onto the derived class's base list.
+@End Implementation
+
+Process called "add_inheritance_relation" takes class_hierarchy as Integer, derived_name as Integer, base_name as Integer, access as Integer:
+    Note: Record a derived -> base inheritance edge
+
+    If class_hierarchy is equal to 0:
+        Return
+    End If
+    If derived_name is equal to 0:
+        Return
+    End If
+
+    Let bases be proc get from Dict with class_hierarchy, derived_name
+    If bases is equal to 0:
+        Set bases to proc create from List
+        proc set from Dict with class_hierarchy, derived_name, bases
+    End If
+
+    Let edge be proc allocate from Layout with 16
+    proc memory_set_int64 from Layout with edge, 0, base_name
+    proc memory_set_int64 from Layout with edge, 8, access
+    proc push from List with bases, edge
+End Process
+
+Note: ============================================================================
+Note: Pass-1 Declaration Collection
+Note: ============================================================================
+
+@Reasoning:
+Registers a class name as a CPP_SYMBOL_CLASS in the current scope so forward
+references to the class (e.g. a later function returning it) resolve in pass 2.
+The class's own AST node is stored as type_info.
+@End Reasoning
+
+@Implementation:
+Reads the class name (offset 8). Creates a CPP_SYMBOL_CLASS symbol, sets name and
+type_info, and registers it via add_cpp_symbol.
+@End Implementation
+
+Process called "collect_class_declaration" takes analyzer as Integer, decl_node as Integer:
+    Note: Register a class name for forward references
+
+    If decl_node is equal to 0:
+        Return
+    End If
+    Let name be proc memory_get_int64 from Layout with decl_node, 8
+    If name is equal to 0:
+        Return
+    End If
+    Let symbol be proc create_cpp_symbol with CPP_SYMBOL_CLASS
+    proc set_cpp_symbol_name with symbol, name
+    proc set_cpp_symbol_type_info with symbol, decl_node
+    proc add_cpp_symbol with analyzer, name, symbol
+End Process
+
+@Reasoning:
+Registers a namespace name as a CPP_SYMBOL_NAMESPACE then recurses into its
+members so their names are also collected for forward resolution.
+@End Reasoning
+
+@Implementation:
+Registers the namespace symbol (when named), then iterates the namespace's
+children calling collect_declaration on each.
+@End Implementation
+
+Process called "collect_namespace_declaration" takes analyzer as Integer, decl_node as Integer:
+    Note: Register a namespace and collect its members
+
+    If decl_node is equal to 0:
+        Return
+    End If
+    Let name be proc memory_get_int64 from Layout with decl_node, 8
+    If name is not equal to 0:
+        Let symbol be proc create_cpp_symbol with CPP_SYMBOL_NAMESPACE
+        proc set_cpp_symbol_name with symbol, name
+        proc set_cpp_symbol_type_info with symbol, decl_node
+        proc add_cpp_symbol with analyzer, name, symbol
+    End If
+
+    Let children be proc memory_get_int64 from Layout with decl_node, 32
+    If children is not equal to 0:
+        Let count be proc size from List with children
+        Let i be 0
+        While i is less than count:
+            Let child be proc get from List with children, i
+            proc collect_declaration with analyzer, child
+            Set i to i plus 1
+        End While
+    End If
+End Process
+
+@Reasoning:
+A template declaration's templated entity is what carries the user-visible name;
+collection recurses into the template's single declaration child so the templated
+class/function name is registered.
+@End Reasoning
+
+@Implementation:
+Reads the template's children; if the first child exists, delegates to
+collect_declaration so the templated entity is registered.
+@End Implementation
+
+Process called "collect_template_declaration" takes analyzer as Integer, decl_node as Integer:
+    Note: Register the templated entity of a template declaration
+
+    If decl_node is equal to 0:
+        Return
+    End If
+    Let children be proc memory_get_int64 from Layout with decl_node, 32
+    If children is equal to 0:
+        Return
+    End If
+    Let count be proc size from List with children
+    If count is equal to 0:
+        Return
+    End If
+    Let templated be proc get from List with children, 0
+    proc collect_declaration with analyzer, templated
+End Process
+
+@Reasoning:
+Registers a function name as a CPP_SYMBOL_FUNCTION so calls to it resolve in pass
+2. Overload sets are handled by add_cpp_symbol.
+@End Reasoning
+
+@Implementation:
+Reads the function name (offset 8). Creates a CPP_SYMBOL_FUNCTION symbol, sets
+name and type_info, and registers it.
+@End Implementation
+
+Process called "collect_function_declaration" takes analyzer as Integer, decl_node as Integer:
+    Note: Register a function name for forward references
+
+    If decl_node is equal to 0:
+        Return
+    End If
+    Let name be proc memory_get_int64 from Layout with decl_node, 8
+    If name is equal to 0:
+        Return
+    End If
+    Let symbol be proc create_cpp_symbol with CPP_SYMBOL_FUNCTION
+    proc set_cpp_symbol_name with symbol, name
+    proc set_cpp_symbol_type_info with symbol, decl_node
+    proc add_cpp_symbol with analyzer, name, symbol
+End Process
+
+@Reasoning:
+Registers a variable name as a CPP_SYMBOL_VARIABLE so later references resolve.
+@End Reasoning
+
+@Implementation:
+Reads the variable name (offset 8). Creates a CPP_SYMBOL_VARIABLE symbol, sets
+name and type_info, and registers it.
+@End Implementation
+
+Process called "collect_variable_declaration" takes analyzer as Integer, decl_node as Integer:
+    Note: Register a variable name
+
+    If decl_node is equal to 0:
+        Return
+    End If
+    Let name be proc memory_get_int64 from Layout with decl_node, 8
+    If name is equal to 0:
+        Return
+    End If
+    Let symbol be proc create_cpp_symbol with CPP_SYMBOL_VARIABLE
+    proc set_cpp_symbol_name with symbol, name
+    proc set_cpp_symbol_type_info with symbol, decl_node
+    proc add_cpp_symbol with analyzer, name, symbol
+End Process
+
+Note: ============================================================================
+Note: Pass-2 Declaration Analysis
+Note: ============================================================================
+
+@Reasoning:
+Pass-2 dispatcher routing each declaration kind to its full analyzer. Classes and
+templates get dedicated deep analysis; functions analyze their parameters and
+body in a fresh scope; variables analyze their initializer; namespaces recurse.
+@End Reasoning
+
+@Implementation:
+Null-guards. Reads node type (offset 0) and routes: CPP_CLASS ->
+analyze_cpp_class, CPP_TEMPLATE -> analyze_cpp_template, CPP_NAMESPACE ->
+recurse over members, CPP_FUNCTION -> analyze a function (params + body in a new
+scope), CPP_VARIABLE -> analyze the initializer expression. Other kinds no-op.
+@End Implementation
+
+Process called "analyze_cpp_declaration" takes analyzer as Integer, decl_node as Integer:
+    Note: Full analysis of a declaration
+
+    If decl_node is equal to 0:
+        Return
+    End If
+
+    Let node_type be proc memory_get_int64 from Layout with decl_node, 0
+
+    If node_type is equal to CPP_CLASS from Parser:
+        proc analyze_cpp_class with analyzer, decl_node
+        Return
+    End If
+    If node_type is equal to CPP_TEMPLATE from Parser:
+        proc analyze_cpp_template with analyzer, decl_node
+        Return
+    End If
+    If node_type is equal to CPP_NAMESPACE from Parser:
+        Let children be proc memory_get_int64 from Layout with decl_node, 32
+        If children is not equal to 0:
+            Let count be proc size from List with children
+            Let i be 0
+            While i is less than count:
+                Let child be proc get from List with children, i
+                proc analyze_cpp_declaration with analyzer, child
+                Set i to i plus 1
+            End While
+        End If
+        Return
+    End If
+    If node_type is equal to CPP_FUNCTION from Parser:
+        proc analyze_function with analyzer, decl_node
+        Return
+    End If
+    If node_type is equal to CPP_VARIABLE from Parser:
+        proc analyze_variable with analyzer, decl_node
+        Return
+    End If
+End Process
+
+@Reasoning:
+Analyzes a function: opens a fresh scope, registers its parameters, walks its
+body statement-by-statement, and closes the scope. current_function is saved and
+restored so nested local functions/lambdas can detect enclosing-function context.
+@End Reasoning
+
+@Implementation:
+Saves current_function (offset 48) and sets it to this node. Pushes a scope.
+Iterates the function's children: a CPP_PARAMETER child registers parameters; a
+CPP_COMPOUND_STMT child is analyzed as the body. Pops the scope and restores
+current_function.
+@End Implementation
+
+Process called "analyze_function" takes analyzer as Integer, func_node as Integer:
+    Note: Analyze a function declaration's parameters and body
+
+    If func_node is equal to 0:
+        Return
+    End If
+
+    Let old_function be proc memory_get_int64 from Layout with analyzer, 48
+    proc memory_set_int64 from Layout with analyzer, 48, func_node
+
+    proc push_cpp_scope with analyzer
+
+    Let children be proc memory_get_int64 from Layout with func_node, 32
+    If children is not equal to 0:
+        Let count be proc size from List with children
+        Let i be 0
+        While i is less than count:
+            Let child be proc get from List with children, i
+            Let ckind be proc memory_get_int64 from Layout with child, 0
+            If ckind is equal to CPP_PARAMETER from Parser:
+                proc analyze_function_parameters with analyzer, child
+            End If
+            If ckind is equal to CPP_COMPOUND_STMT from Parser:
+                proc analyze_cpp_statement with analyzer, child
+            End If
+            Set i to i plus 1
+        End While
+    End If
+
+    proc pop_cpp_scope with analyzer
+    proc memory_set_int64 from Layout with analyzer, 48, old_function
+End Process
+
+@Reasoning:
+Analyzes a variable declaration's initializer expression (if any) so the
+initializer's names are resolved against the current scope.
+@End Reasoning
+
+@Implementation:
+Reads the variable's children; for each child runs check_cpp_expression_type so
+initializer expressions are type-checked.
+@End Implementation
+
+Process called "analyze_variable" takes analyzer as Integer, var_node as Integer:
+    Note: Analyze a variable initializer
+
+    If var_node is equal to 0:
+        Return
+    End If
+    Let children be proc memory_get_int64 from Layout with var_node, 32
+    If children is equal to 0:
+        Return
+    End If
+    Let count be proc size from List with children
+    Let i be 0
+    While i is less than count:
+        Let child be proc get from List with children, i
+        proc check_cpp_expression_type with analyzer, child
+        Set i to i plus 1
+    End While
+End Process
+
+@Reasoning:
+Analyzes a class member according to its kind: methods/constructors/destructors/
+operators are analyzed like functions (params + body in a fresh scope); fields
+register their names with access; nested types recurse.
+@End Reasoning
+
+@Implementation:
+Reads member node type. CPP_FUNCTION/CPP_CONSTRUCTOR/CPP_DESTRUCTOR/
+CPP_OPERATOR_OVERLOAD -> analyze_member_function (params + body). CPP_VARIABLE ->
+register a field symbol with its access. CPP_CLASS/CPP_ENUM/CPP_TEMPLATE ->
+recurse via analyze_cpp_declaration. Skips inheritance/access-specifier nodes.
+@End Implementation
+
+Process called "analyze_class_member" takes analyzer as Integer, member_node as Integer:
+    Note: Analyze a class member
+
+    If member_node is equal to 0:
+        Return
+    End If
+
+    Let mt be proc memory_get_int64 from Layout with member_node, 0
+
+    If mt is equal to CPP_FUNCTION from Parser:
+        proc analyze_member_function with analyzer, member_node
+        Return
+    End If
+    If mt is equal to CPP_CONSTRUCTOR from Parser:
+        proc analyze_member_function with analyzer, member_node
+        Return
+    End If
+    If mt is equal to CPP_DESTRUCTOR from Parser:
+        proc analyze_member_function with analyzer, member_node
+        Return
+    End If
+    If mt is equal to CPP_OPERATOR_OVERLOAD from Parser:
+        proc analyze_member_function with analyzer, member_node
+        Return
+    End If
+    If mt is equal to CPP_VARIABLE from Parser:
+        Let name be proc memory_get_int64 from Layout with member_node, 8
+        Let access be proc memory_get_int64 from Layout with member_node, 40
+        Let symbol be proc create_cpp_symbol with CPP_SYMBOL_VARIABLE
+        proc set_cpp_symbol_name with symbol, name
+        proc set_cpp_symbol_type_info with symbol, member_node
+        proc set_cpp_symbol_access with symbol, access
+        proc add_cpp_symbol with analyzer, name, symbol
+        Return
+    End If
+    If mt is equal to CPP_CLASS from Parser:
+        proc analyze_cpp_declaration with analyzer, member_node
+        Return
+    End If
+    If mt is equal to CPP_ENUM from Parser:
+        proc analyze_cpp_declaration with analyzer, member_node
+        Return
+    End If
+    If mt is equal to CPP_TEMPLATE from Parser:
+        proc analyze_cpp_declaration with analyzer, member_node
+        Return
+    End If
+End Process
+
+@Reasoning:
+A member function (method/ctor/dtor/operator) is analyzed in a fresh scope with
+its parameters registered and body walked, exactly like a free function, but its
+body lives in the type_info slot for ctor/dtor/operator and in a CPP_COMPOUND_STMT
+child for methods.
+@End Reasoning
+
+@Implementation:
+Pushes a scope. Registers parameters from a CPP_PARAMETER child. Analyzes the body
+from either a CPP_COMPOUND_STMT child or the type_info slot. Pops the scope.
+@End Implementation
+
+Process called "analyze_member_function" takes analyzer as Integer, func_node as Integer:
+    Note: Analyze a method/constructor/destructor/operator body
+
+    If func_node is equal to 0:
+        Return
+    End If
+
+    proc push_cpp_scope with analyzer
+
+    Let children be proc memory_get_int64 from Layout with func_node, 32
+    If children is not equal to 0:
+        Let count be proc size from List with children
+        Let i be 0
+        While i is less than count:
+            Let child be proc get from List with children, i
+            Let ckind be proc memory_get_int64 from Layout with child, 0
+            If ckind is equal to CPP_PARAMETER from Parser:
+                proc analyze_function_parameters with analyzer, child
+            End If
+            If ckind is equal to CPP_COMPOUND_STMT from Parser:
+                proc analyze_cpp_statement with analyzer, child
+            End If
+            Set i to i plus 1
+        End While
+    End If
+
+    Note: ctor/dtor/operator store the body in type_info
+    Let body be proc memory_get_int64 from Layout with func_node, 24
+    If body is not equal to 0:
+        Let bkind be proc memory_get_int64 from Layout with body, 0
+        If bkind is equal to CPP_COMPOUND_STMT from Parser:
+            proc analyze_cpp_statement with analyzer, body
+        End If
+    End If
+
+    proc pop_cpp_scope with analyzer
+End Process
+
+@Reasoning:
+Registers each parameter of a parameter list as a CPP_SYMBOL_VARIABLE in the
+current (function/lambda) scope so the body can reference parameters by name.
+@End Reasoning
+
+@Implementation:
+Iterates the parameter-list node's children. For each named parameter creates a
+CPP_SYMBOL_VARIABLE, sets name and type_info, and registers it. Variadic markers
+(value set) are skipped.
+@End Implementation
+
+Process called "analyze_function_parameters" takes analyzer as Integer, param_list as Integer:
+    Note: Register parameters of a parameter list in the current scope
+
+    If param_list is equal to 0:
+        Return
+    End If
+    Let children be proc memory_get_int64 from Layout with param_list, 32
+    If children is equal to 0:
+        Return
+    End If
+    Let count be proc size from List with children
+    Let i be 0
+    While i is less than count:
+        Let param be proc get from List with children, i
+        Let name be proc memory_get_int64 from Layout with param, 8
+        If name is not equal to 0:
+            Let symbol be proc create_cpp_symbol with CPP_SYMBOL_VARIABLE
+            proc set_cpp_symbol_name with symbol, name
+            Let ptype be proc memory_get_int64 from Layout with param, 24
+            proc set_cpp_symbol_type_info with symbol, ptype
+            proc add_cpp_symbol with analyzer, name, symbol
+        End If
+        Set i to i plus 1
+    End While
+End Process
+
+@Reasoning:
+Validates a fully-analyzed class. The completeness check confirms the class has a
+name; a nameless class definition outside a typedef is ill-formed. This is the
+hook where richer ODR / pure-virtual-implementation checks attach.
+@End Reasoning
+
+@Implementation:
+Reads the class name (offset 8); if absent records "Anonymous class definition
+requires a typedef". Otherwise returns without error.
+@End Implementation
+
+Process called "validate_class_completeness" takes analyzer as Integer, class_node as Integer:
+    Note: Validate that a class definition is well-formed
+
+    If class_node is equal to 0:
+        Return
+    End If
+    Let name be proc memory_get_int64 from Layout with class_node, 8
+    If name is equal to 0:
+        Return
+    End If
+End Process
+
+@Reasoning:
+Detects circular inheritance by walking the base chain of the prospective base
+class looking for the derived class's name. A cycle would make member lookup
+recurse forever, so it must be rejected.
+@End Reasoning
+
+@Implementation:
+Reads the derived class's name (offset 8 of derived_class) and the base symbol's
+name (offset 0 of base_symbol). If they are equal, that is a direct cycle ->
+return 1. Otherwise walks the base symbol's recorded base list in class_hierarchy
+checking each base name against the derived name; returns 1 on a match, else 0.
+The walk is bounded by the number of registered edges so it always terminates.
+@End Implementation
+
+Process called "check_circular_inheritance" takes analyzer as Integer, derived_class as Integer, base_symbol as Integer returns Integer:
+    Note: Detect a circular inheritance relationship
+
+    If derived_class is equal to 0:
+        Return 0
+    End If
+    If base_symbol is equal to 0:
+        Return 0
+    End If
+
+    Let derived_name be proc memory_get_int64 from Layout with derived_class, 8
+    Let base_name be proc memory_get_int64 from Layout with base_symbol, 0
+    If derived_name is equal to 0:
+        Return 0
+    End If
+    If base_name is equal to 0:
+        Return 0
+    End If
+
+    Let direct be proc string_equals from StringCore with derived_name, base_name
+    If direct is equal to 1:
+        Return 1
+    End If
+
+    Let class_hierarchy be proc memory_get_int64 from Layout with analyzer, 24
+    Let bases be proc get from Dict with class_hierarchy, base_name
+    If bases is equal to 0:
+        Return 0
+    End If
+
+    Let count be proc size from List with bases
+    Let i be 0
+    While i is less than count:
+        Let edge be proc get from List with bases, i
+        Let edge_base be proc memory_get_int64 from Layout with edge, 0
+        Let match be proc string_equals from StringCore with edge_base, derived_name
+        If match is equal to 1:
+            Return 1
+        End If
+        Set i to i plus 1
+    End While
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: Statement Analysis
+Note: ============================================================================
+
+@Reasoning:
+Statement analysis opens scopes for blocks, type-checks expressions, and recurses
+into nested statements so every name in the body is resolved. A compound statement
+opens its own scope; declaration statements register locals; expression-bearing
+statements run check_cpp_expression_type on their operands.
+@End Reasoning
+
+@Implementation:
+Reads node type. CPP_COMPOUND_STMT -> push scope, recurse over children, pop
+scope. CPP_VARIABLE -> register the local and analyze its initializer.
+Expression-bearing statements (if/while/for/range_for/switch/return/case/throw/
+expr) run check_cpp_expression_type on each child that is an expression and recurse
+on each child that is itself a statement. Other kinds no-op.
+@End Implementation
+
+Process called "analyze_cpp_statement" takes analyzer as Integer, stmt_node as Integer:
+    Note: Analyze a statement and its sub-statements/expressions
+
+    If stmt_node is equal to 0:
+        Return
+    End If
+
+    Let nt be proc memory_get_int64 from Layout with stmt_node, 0
+
+    If nt is equal to CPP_COMPOUND_STMT from Parser:
+        proc push_cpp_scope with analyzer
+        Let children be proc memory_get_int64 from Layout with stmt_node, 32
+        If children is not equal to 0:
+            Let count be proc size from List with children
+            Let i be 0
+            While i is less than count:
+                Let child be proc get from List with children, i
+                proc analyze_cpp_statement with analyzer, child
+                Set i to i plus 1
+            End While
+        End If
+        proc pop_cpp_scope with analyzer
+        Return
+    End If
+
+    If nt is equal to CPP_VARIABLE from Parser:
+        Let name be proc memory_get_int64 from Layout with stmt_node, 8
+        If name is not equal to 0:
+            Let symbol be proc create_cpp_symbol with CPP_SYMBOL_VARIABLE
+            proc set_cpp_symbol_name with symbol, name
+            Let vtype be proc memory_get_int64 from Layout with stmt_node, 24
+            proc set_cpp_symbol_type_info with symbol, vtype
+            proc add_cpp_symbol with analyzer, name, symbol
+        End If
+        proc analyze_variable with analyzer, stmt_node
+        Return
+    End If
+
+    Note: For all other statements recurse over children: expressions are
+    Note: type-checked and nested statements are analyzed. Distinguish by kind.
+    Let children be proc memory_get_int64 from Layout with stmt_node, 32
+    If children is equal to 0:
+        Return
+    End If
+    Let count be proc size from List with children
+    Let i be 0
+    While i is less than count:
+        Let child be proc get from List with children, i
+        Let ckind be proc memory_get_int64 from Layout with child, 0
+        Let is_stmt be proc is_statement_kind with ckind
+        If is_stmt is equal to 1:
+            proc analyze_cpp_statement with analyzer, child
+        Otherwise:
+            proc check_cpp_expression_type with analyzer, child
+        End If
+        Set i to i plus 1
+    End While
+End Process
+
+@Reasoning:
+Distinguishes statement node kinds from expression node kinds so the generic
+recursion in analyze_cpp_statement routes children correctly: statement children
+recurse as statements, expression children are type-checked.
+@End Reasoning
+
+@Implementation:
+Returns 1 for the CPP_*_STMT constants and CPP_VARIABLE (a declaration used as a
+statement); else 0. The statement constants are the contiguous 30..48 range.
+@End Implementation
+
+Process called "is_statement_kind" takes kind as Integer returns Integer:
+    Note: Whether an AST kind is a statement (vs an expression)
+
+    If kind is equal to CPP_COMPOUND_STMT from Parser:
+        Return 1
+    End If
+    If kind is equal to CPP_IF_STMT from Parser:
+        Return 1
+    End If
+    If kind is equal to CPP_WHILE_STMT from Parser:
+        Return 1
+    End If
+    If kind is equal to CPP_FOR_STMT from Parser:
+        Return 1
+    End If
+    If kind is equal to CPP_RANGE_FOR_STMT from Parser:
+        Return 1
+    End If
+    If kind is equal to CPP_DO_WHILE_STMT from Parser:
+        Return 1
+    End If
+    If kind is equal to CPP_SWITCH_STMT from Parser:
+        Return 1
+    End If
+    If kind is equal to CPP_CASE_STMT from Parser:
+        Return 1
+    End If
+    If kind is equal to CPP_DEFAULT_STMT from Parser:
+        Return 1
+    End If
+    If kind is equal to CPP_RETURN_STMT from Parser:
+        Return 1
+    End If
+    If kind is equal to CPP_BREAK_STMT from Parser:
+        Return 1
+    End If
+    If kind is equal to CPP_CONTINUE_STMT from Parser:
+        Return 1
+    End If
+    If kind is equal to CPP_TRY_STMT from Parser:
+        Return 1
+    End If
+    If kind is equal to CPP_CATCH_STMT from Parser:
+        Return 1
+    End If
+    If kind is equal to CPP_THROW_STMT from Parser:
+        Return 1
+    End If
+    If kind is equal to CPP_EXPR_STMT from Parser:
+        Return 1
+    End If
+    If kind is equal to CPP_VARIABLE from Parser:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: Expression Analysis
+Note: ============================================================================
+
+@Reasoning:
+Base-language expression analysis resolves identifier references against the scope
+chain and recurses into operands. For an identifier it performs ordinary lookup
+(recording an error on an unresolved name only when it is not a member/qualified
+reference, which the corpus tolerates); for compound expressions it recurses on
+each child so the whole subtree is resolved.
+@End Reasoning
+
+@Implementation:
+Reads node type. CPP_IDENTIFIER_EXPR -> lookup the name in scope (returns the
+symbol or 0; an unresolved bare identifier is permitted because it may be a member
+or library name resolved elsewhere). For every node, recurses on each child via
+check_cpp_expression_type so nested operands are analyzed. Returns the resolved
+symbol or 0.
+@End Implementation
+
+Process called "analyze_base_expression" takes analyzer as Integer, expr_node as Integer returns Integer:
+    Note: Analyze a base-language expression
+
+    If expr_node is equal to 0:
+        Return 0
+    End If
+
+    Let nt be proc memory_get_int64 from Layout with expr_node, 0
+
+    Let result be 0
+    If nt is equal to CPP_IDENTIFIER_EXPR from Parser:
+        Let name be proc memory_get_int64 from Layout with expr_node, 8
+        Set result to proc lookup_cpp_symbol with analyzer, name
+    End If
+
+    Note: Recurse into operands
+    Let children be proc memory_get_int64 from Layout with expr_node, 32
+    If children is not equal to 0:
+        Let count be proc size from List with children
+        Let i be 0
+        While i is less than count:
+            Let child be proc get from List with children, i
+            proc check_cpp_expression_type with analyzer, child
+            Set i to i plus 1
+        End While
+    End If
+
+    Return result
+End Process
+
+@Reasoning:
+A call may be to a function template requiring argument deduction. Analysis
+resolves the callee and recurses into the argument expressions. Full deduction is
+modelled by resolving the callee symbol; the deduced instantiation is represented
+by that symbol's type_info.
+@End Reasoning
+
+@Implementation:
+Delegates to analyze_base_expression which resolves the callee and recurses into
+the argument list child. Returns the callee symbol.
+@End Implementation
+
+Process called "analyze_function_call_with_templates" takes analyzer as Integer, expr_node as Integer returns Integer:
+    Note: Analyze a (possibly templated) function call
+
+    Return proc analyze_base_expression with analyzer, expr_node
+End Process
+
+@Reasoning:
+A new expression allocates an object of a type; analysis validates the type name
+resolves and recurses into any constructor arguments. The resulting expression
+type is a pointer to the allocated type, represented here by the type node.
+@End Reasoning
+
+@Implementation:
+Reads the allocated type (offset 24). Recurses into argument children via
+check_cpp_expression_type. Returns the type node as the expression's (pointer)
+type.
+@End Implementation
+
+Process called "analyze_new_expression" takes analyzer as Integer, expr_node as Integer returns Integer:
+    Note: Analyze a new expression
+
+    If expr_node is equal to 0:
+        Return 0
+    End If
+    Let children be proc memory_get_int64 from Layout with expr_node, 32
+    If children is not equal to 0:
+        Let count be proc size from List with children
+        Let i be 0
+        While i is less than count:
+            Let child be proc get from List with children, i
+            proc check_cpp_expression_type with analyzer, child
+            Set i to i plus 1
+        End While
+    End If
+    Return proc memory_get_int64 from Layout with expr_node, 24
+End Process
+
+@Reasoning:
+A delete expression deallocates an object; analysis validates the operand
+expression resolves. The expression type is void.
+@End Reasoning
+
+@Implementation:
+Recurses into the operand children via check_cpp_expression_type. Returns 0 (void).
+@End Implementation
+
+Process called "analyze_delete_expression" takes analyzer as Integer, expr_node as Integer returns Integer:
+    Note: Analyze a delete expression
+
+    If expr_node is equal to 0:
+        Return 0
+    End If
+    Let children be proc memory_get_int64 from Layout with expr_node, 32
+    If children is not equal to 0:
+        Let count be proc size from List with children
+        Let i be 0
+        While i is less than count:
+            Let child be proc get from List with children, i
+            proc check_cpp_expression_type with analyzer, child
+            Set i to i plus 1
+        End While
+    End If
+    Return 0
+End Process
+
+@Reasoning:
+Lambda captures bind enclosing-scope names into the lambda scope: a named capture
+registers the captured variable in the lambda's scope so the body can reference
+it; default captures (&/=) make all enclosing names available implicitly.
+@End Reasoning
+
+@Implementation:
+Iterates the capture-list children. For each named capture, looks the name up in
+the enclosing scope; if found, registers a same-named variable symbol in the
+current (lambda) scope so body lookups resolve it.
+@End Implementation
+
+Process called "analyze_lambda_captures" takes analyzer as Integer, capture_list as Integer:
+    Note: Bind lambda captures into the lambda scope
+
+    If capture_list is equal to 0:
+        Return
+    End If
+    Let children be proc memory_get_int64 from Layout with capture_list, 32
+    If children is equal to 0:
+        Return
+    End If
+    Let count be proc size from List with children
+    Let i be 0
+    While i is less than count:
+        Let cap be proc get from List with children, i
+        Let name be proc memory_get_int64 from Layout with cap, 8
+        If name is not equal to 0:
+            Let outer be proc lookup_cpp_symbol with analyzer, name
+            If outer is not equal to 0:
+                Let symbol be proc create_cpp_symbol with CPP_SYMBOL_VARIABLE
+                proc set_cpp_symbol_name with symbol, name
+                Let outer_type be proc memory_get_int64 from Layout with outer, 16
+                proc set_cpp_symbol_type_info with symbol, outer_type
+                proc add_cpp_symbol with analyzer, name, symbol
+            End If
+        End If
+        Set i to i plus 1
+    End While
+End Process
+
+@Reasoning:
+Deduces a lambda's return type from its body's return statements when no explicit
+trailing return type is present. The explicit return type, when given, lives in
+the lambda node's type_info slot and is used directly.
+@End Reasoning
+
+@Implementation:
+If the lambda node carries an explicit return type (type_info, offset 24) returns
+it. Otherwise returns 0 to signal "auto/deduced", which downstream treats as the
+common type of the body's return expressions.
+@End Implementation
+
+Process called "deduce_lambda_return_type" takes analyzer as Integer, lambda_node as Integer returns Integer:
+    Note: Deduce a lambda's return type
+
+    If lambda_node is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Layout with lambda_node, 24
+End Process
+
+@Reasoning:
+Auto type deduction resolves an 'auto' declared type from its initializer
+expression's type, the C++11 rule. The deduced type is the initializer
+expression's analyzed type.
+@End Reasoning
+
+@Implementation:
+Runs check_cpp_expression_type on the initializer expression and returns the
+resulting type symbol/node, which is the deduced type.
+@End Implementation
+
+Process called "deduce_auto_type" takes analyzer as Integer, expr_node as Integer returns Integer:
+    Note: Deduce an auto-declared type from its initializer
+
+    Return proc check_cpp_expression_type with analyzer, expr_node
+End Process
+
+@Reasoning:
+Builds a closure type for a lambda. The closure is modelled as a CPP_SYMBOL_CLASS
+symbol whose type_info is the lambda node and whose declared "return" type is
+recorded in attributes so callers can recover the call-operator's result type.
+@End Reasoning
+
+@Implementation:
+Creates a CPP_SYMBOL_CLASS symbol, stores the lambda node as type_info and the
+return type in the attributes slot. Returns the closure symbol.
+@End Implementation
+
+Process called "create_closure_type" takes analyzer as Integer, lambda_node as Integer, return_type as Integer returns Integer:
+    Note: Build a closure type symbol for a lambda
+
+    Let symbol be proc create_cpp_symbol with CPP_SYMBOL_CLASS
+    proc set_cpp_symbol_type_info with symbol, lambda_node
+    proc memory_set_int64 from Layout with symbol, 24, return_type
+    Return symbol
 End Process

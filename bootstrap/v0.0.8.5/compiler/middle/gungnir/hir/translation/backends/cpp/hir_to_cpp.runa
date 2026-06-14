@@ -15,28 +15,36 @@ limitations under the License.
 :End Note
 
 Note:
-HIR to C++ Code Generator - Converts Runa HIR to idiomatic C++ code
+HIR to C++ Code Generator - emits idiomatic C++ from the hir.runa dictionary/list
+literal interchange produced by cpp_to_hir.runa.
 
-This file translates Runa High-level Intermediate Representation back to
-idiomatic C++ source code, preserving all C++ language features including:
-- Classes, inheritance, and polymorphism
-- Templates and generic programming
-- RAII and exception handling
-- Lambda expressions and closures
-- Operator overloading
-- Namespace organization
-- Modern C++ features (auto, range-for, etc.)
+The HIR model is the dictionary/list literal form: a dict is a
+HIR_DICTIONARY_LITERAL whose entries List holds [key, value] blocks; a list is a
+HIR_ARRAY_LITERAL whose elements List holds child nodes; strings are HIR string
+literals read with get_string_literal_value. This backend reads that exact shape
+via local dict_get / list_elements helpers (mirroring hir_to_c) and walks each
+construct's keys, emitting C++ text through cpp_emitter.
 
-The generated C++ code maintains semantic equivalence with the original
-while following C++ best practices and style conventions.
+It consumes the keys cpp_to_hir produces: program/declarations; class with name/
+inheritance/template_parameters/members; function with name/return_type/
+parameters/body/access; variable with name/var_type/initializer; the statement
+tags (compound/if/while/for/range_for/do_while/switch/case/return/break/continue/
+try/throw/expression); and the expression tags (literal/identifier/binary/
+assignment/unary/ternary/call/subscript/member_access/cast/sizeof/new/delete/this/
+lambda).
+
+Backends MUST NOT import translation.runa - this file depends only on hir.runa,
+the cpp_emitter, and the primitives.
 
 Dependencies:
+- compiler/middle/gungnir/hir/translation/backends/cpp/cpp_emitter.runa
 - compiler/middle/gungnir/hir/hir.runa
 - compiler/frontend/primitives/memory/layout.runa
 - compiler/frontend/primitives/core/string_core.runa
 - compiler/frontend/primitives/collections/list.runa
 :End Note
 
+Import "compiler/middle/gungnir/hir/translation/backends/cpp/cpp_emitter.runa" as Emitter
 Import "compiler/middle/gungnir/hir/hir.runa" as HIR
 Import "compiler/frontend/primitives/memory/layout.runa" as Layout
 Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
@@ -47,143 +55,248 @@ Note: Code Generation Context
 Note: ============================================================================
 
 @Reasoning:
-72-byte C++ codegen context tracking output buffer, indentation,
-namespace/class/template nesting state, required #include tracking,
-and forward declarations. Multi-pass C++ codegen needs all of these
-because emission of e.g. a member function reference requires the
-parent class context, and using a custom type may require an additional
-#include.
+Context carried through every generate_* call: the emitter, the indent depth, and
+a sticky error channel. Bundling them means deep recursion doesn't thread them
+through every call.
 @End Reasoning
 
 @Implementation:
-Nine 8-byte fields at offsets 0..64: output_buffer, indent_level,
-current_namespace, template_context, class_context, includes (List),
-forward_decls (List), error_message, has_error.
+4 x i64 at offsets 0/8/16/24: emitter pointer, indent depth, error message
+pointer, has_error flag. Allocated as 32 bytes.
 @End Implementation
 
-Type called "CppCodeGenContext":
-    output_buffer as Integer      Note: String buffer for generated code
-    indent_level as Integer       Note: Current indentation level
-    current_namespace as Integer  Note: Current namespace context
-    template_context as Integer   Note: Current template instantiation
-    class_context as Integer      Note: Current class being generated
-    includes as Integer           Note: Set of required #include statements
-    forward_decls as Integer      Note: Forward declarations needed
-    error_message as Integer      Note: Error message (if any)
-    has_error as Integer          Note: Boolean: 1 if error occurred
+Type called "CppGenContext":
+    emitter as Integer
+    indent_level as Integer
+    error_message as Integer
+    has_error as Integer
 End Type
 
-Note: ============================================================================
-Note: Context Management
-Note: ============================================================================
-
 @Reasoning:
-Allocate and initialise a CppCodeGenContext. Performs all allocations
-(context, string buffer, lists) at once so callers see a fully-built
-context or null on any failure.
+Allocates a context with a fresh emitter. Used once per top-level translation.
 @End Reasoning
 
 @Implementation:
-Allocates 72 bytes for the context, a 16KB string buffer, an empty
-includes list, and an empty forward_decls list. On any failure, frees
-all previously-allocated pieces and returns 0. Otherwise writes the
-nine pointer/value fields and returns the context pointer.
+Allocates 32 bytes and an emitter; unwinds on either OOM. Zeroes indent/error.
 @End Implementation
 
 Process called "create_cpp_codegen_context" returns Integer:
-    Note: Create code generation context
+    Note: Create a C++ code generation context
 
-    Let context_size be 72  Note: CppCodeGenContext: 9 fields × 8 bytes
-    Let context be proc allocate from Layout with context_size
-
+    Let context be proc allocate from Layout with 32
     If context is equal to 0:
         Return 0
     End If
 
-    Let output_buffer be proc create_string_buffer from StringCore with 16384
-
-    If output_buffer is equal to 0:
+    Let emitter be proc create_cpp_emitter from Emitter
+    If emitter is equal to 0:
         proc deallocate from Layout with context
         Return 0
     End If
 
-    Let includes be proc create from List
-
-    If includes is equal to 0:
-        proc destroy_string_buffer from StringCore with output_buffer
-        proc deallocate from Layout with context
-        Return 0
-    End If
-
-    Let forward_decls be proc create from List
-
-    If forward_decls is equal to 0:
-        proc destroy_string_buffer from StringCore with output_buffer
-        proc destroy from List with includes
-        proc deallocate from Layout with context
-        Return 0
-    End If
-
-    proc memory_set_int64 from Layout with context, 0, output_buffer
-    proc memory_set_int64 from Layout with context, 8, 0   Note: indent_level = 0
-    proc memory_set_int64 from Layout with context, 16, 0  Note: current_namespace = null
-    proc memory_set_int64 from Layout with context, 24, 0  Note: template_context = null
-    proc memory_set_int64 from Layout with context, 32, 0  Note: class_context = null
-    proc memory_set_int64 from Layout with context, 40, includes
-    proc memory_set_int64 from Layout with context, 48, forward_decls
-    proc memory_set_int64 from Layout with context, 56, 0  Note: error_message = null
-    proc memory_set_int64 from Layout with context, 64, 0  Note: has_error = false
-
+    proc memory_set_int64 from Layout with context, 0, emitter
+    proc memory_set_int64 from Layout with context, 8, 0
+    proc memory_set_int64 from Layout with context, 16, 0
+    proc memory_set_int64 from Layout with context, 24, 0
     Return context
 End Process
 
 @Reasoning:
-Free all resources owned by a CppCodeGenContext: the output buffer,
-the includes list, the forward_decls list, the error message if any,
-and the context itself.
+Frees the emitter, any error string, and the context. Safe on a null context.
 @End Reasoning
 
 @Implementation:
-Null check returns 1. Otherwise reads each owned pointer from its
-offset and frees via the appropriate destructor (StringCore for the
-buffer, List for the two lists, Layout for the message and context).
+Null check; destroys the emitter and frees the error string when present; frees
+the 32-byte context.
 @End Implementation
 
-@Security_Scope:
-Caller must drop the context pointer after this call.
-@End Security_Scope
-
 Process called "destroy_cpp_codegen_context" takes context as Integer returns Integer:
-    Note: Destroy code generation context
+    Note: Destroy a C++ code generation context
 
     If context is equal to 0:
         Return 1
     End If
 
-    Let output_buffer be proc memory_get_int64 from Layout with context, 0
-    Let includes be proc memory_get_int64 from Layout with context, 40
-    Let forward_decls be proc memory_get_int64 from Layout with context, 48
-    Let error_message be proc memory_get_int64 from Layout with context, 56
-
-    If output_buffer is not equal to 0:
-        proc destroy_string_buffer from StringCore with output_buffer
+    Let emitter be proc memory_get_int64 from Layout with context, 0
+    If emitter is not equal to 0:
+        proc destroy_cpp_emitter from Emitter with emitter
     End If
 
-    If includes is not equal to 0:
-        proc destroy from List with includes
-    End If
-
-    If forward_decls is not equal to 0:
-        proc destroy from List with forward_decls
-    End If
-
+    Let error_message be proc memory_get_int64 from Layout with context, 16
     If error_message is not equal to 0:
         proc deallocate from Layout with error_message
     End If
 
     proc deallocate from Layout with context
-
     Return 1
+End Process
+
+@Reasoning:
+Records a sticky codegen error with an owned message copy.
+@End Reasoning
+
+@Implementation:
+Sets has_error (offset 24) and stores a string_duplicate of the message at offset
+16.
+@End Implementation
+
+Process called "set_cpp_codegen_error" takes context as Integer, message as Integer:
+    Note: Record a sticky codegen error
+
+    proc memory_set_int64 from Layout with context, 24, 1
+    Let copy be proc string_duplicate from StringCore with message
+    proc memory_set_int64 from Layout with context, 16, copy
+End Process
+
+Note: ============================================================================
+Note: Emit helpers
+Note: ============================================================================
+
+@Reasoning:
+Append raw code text to the emitter buffer - the lowest-level emission primitive
+used by every higher-level generator.
+@End Reasoning
+
+@Implementation:
+Reads the emitter (offset 0) and forwards to cpp_emit_string.
+@End Implementation
+
+Process called "emit" takes context as Integer, code as Integer:
+    Note: Emit raw code text
+
+    Let emitter be proc memory_get_int64 from Layout with context, 0
+    proc cpp_emit_string from Emitter with emitter, code
+End Process
+
+@Reasoning:
+Emit a newline followed by the current indent prefix so subsequent emits land at
+the right column.
+@End Reasoning
+
+@Implementation:
+Emits LF then indent_level worth of indentation via cpp_emit_indent.
+@End Implementation
+
+Process called "emit_newline" takes context as Integer:
+    Note: Emit newline plus current indentation
+
+    Let emitter be proc memory_get_int64 from Layout with context, 0
+    proc cpp_emit_newline from Emitter with emitter
+    Let indent be proc memory_get_int64 from Layout with context, 8
+    proc cpp_emit_indent from Emitter with emitter, indent
+End Process
+
+@Reasoning:
+Step into / out of a nested block. Decrement clamps at zero so error recovery
+cannot underflow the indent.
+@End Reasoning
+
+@Implementation:
+increment reads indent (offset 8) and writes +1; decrement writes -1 when > 0.
+@End Implementation
+
+Process called "increment_indent" takes context as Integer:
+    Note: Increase indentation level
+
+    Let indent be proc memory_get_int64 from Layout with context, 8
+    proc memory_set_int64 from Layout with context, 8, indent plus 1
+End Process
+
+Process called "decrement_indent" takes context as Integer:
+    Note: Decrease indentation level
+
+    Let indent be proc memory_get_int64 from Layout with context, 8
+    If indent is greater than 0:
+        proc memory_set_int64 from Layout with context, 8, indent minus 1
+    End If
+End Process
+
+Note: ============================================================================
+Note: HIR dictionary / list access helpers
+Note: ============================================================================
+
+@Reasoning:
+The C++ HIR uses hir.runa's dictionary/list literal model: a dict's entries List
+hangs at the children slot, each entry a 16-byte [key, value] block; a list's
+elements hang at the same slot. hir.runa exposes get_dictionary_entries /
+get_list_elements and the literal predicates but no by-key lookup, so these thin
+backend-private helpers implement the linear by-key scan and the string
+extraction every generator uses - mirroring the convention every dict-model
+backend follows.
+@End Reasoning
+
+@Implementation:
+dict_get linear-scans the entries List comparing the raw key with string_equals,
+returning the paired value pointer or 0. dict_get_string extracts the string value
+of a key via get_string_literal_value. list_elements returns a node's backing
+element List.
+@End Implementation
+
+Process called "dict_get" takes node as Integer, key as Integer returns Integer:
+    Note: Look up a value by key in a HIR dictionary literal
+
+    If node is equal to 0:
+        Return 0
+    End If
+    Let entries be proc get_dictionary_entries from HIR with node
+    If entries is equal to 0:
+        Return 0
+    End If
+    Let count be proc size from List with entries
+    Let index be 0
+    While index is less than count:
+        Let entry be proc get_at from List with entries, index
+        If entry is not equal to 0:
+            Let entry_key be proc memory_get_int64 from Layout with entry, 0
+            Let matches be proc string_equals from StringCore with entry_key, key
+            If matches is equal to 1:
+                Return proc memory_get_int64 from Layout with entry, 8
+            End If
+        End If
+        Set index to index plus 1
+    End While
+    Return 0
+End Process
+
+@Reasoning:
+String-valued dictionary lookup, returning 0 when the key is absent or not a
+string literal.
+@End Reasoning
+
+@Implementation:
+dict_get then, if the value is a string literal, get_string_literal_value; else 0.
+@End Implementation
+
+Process called "dict_get_string" takes node as Integer, key as Integer returns Integer:
+    Note: Get a string value from a HIR dict
+
+    Let value be proc dict_get with node, key
+    If value is equal to 0:
+        Return 0
+    End If
+    Let is_str be proc is_string_literal from HIR with value
+    If is_str is equal to 0:
+        Return 0
+    End If
+    Return proc get_string_literal_value from HIR with value
+End Process
+
+@Reasoning:
+Returns the element List backing a HIR list literal so generators iterate with
+List.size and List.get_at.
+@End Reasoning
+
+@Implementation:
+Forwards to get_list_elements.
+@End Implementation
+
+Process called "list_elements" takes node as Integer returns Integer:
+    Note: Backing element List of a HIR list literal
+
+    If node is equal to 0:
+        Return 0
+    End If
+    Return proc get_list_elements from HIR with node
 End Process
 
 Note: ============================================================================
@@ -191,827 +304,1922 @@ Note: Main Code Generation Entry Point
 Note: ============================================================================
 
 @Reasoning:
-Top-level translator: emits a C++ source file from a HIR program node.
-Generates the file header, walks top-level declarations, and renders
-any accumulated #include statements.
+Top-level translator: walks the program's "declarations" list dispatching each
+through generate_cpp_declaration. No file header banner is emitted so the output
+re-parses cleanly (a banner comment would still re-parse, but keeping output
+minimal makes round-trip structural comparison robust).
 @End Reasoning
 
 @Implementation:
-Emits the file header banner via emit_cpp_file_header. Iterates the
-program's declaration list and dispatches each through
-generate_cpp_declaration. Final pass collects required headers and
-emits them as #include statements at the top of the buffer.
+Null-guards. Reads "declarations"; iterates the element list calling
+generate_cpp_declaration; short-circuits on the sticky error flag. Returns 1.
 @End Implementation
 
 Process called "generate_cpp_from_hir" takes context as Integer, hir_program as Integer returns Integer:
-    Note: Generate complete C++ source from HIR program
-
-    @Reasoning:
-    Convert HIR program to C++ source including header generation,
-    proper include directives, namespace organization, and all
-    language constructs in idiomatic C++ style.
-    @End Reasoning
+    Note: Generate a complete C++ source from a HIR program
 
     If context is equal to 0:
         Return 0
     End If
-
     If hir_program is equal to 0:
         proc set_cpp_codegen_error with context, "Null HIR program"
         Return 0
     End If
 
-    Note: Generate file header comment
-    proc emit_cpp_file_header from context
-
-    Note: Collect dependencies first
-    proc collect_cpp_dependencies with context, hir_program
-
-    Note: Generate include statements
-    proc emit_cpp_includes from context
-
-    Note: Generate forward declarations
-    proc emit_cpp_forward_declarations from context
-
-    Note: Generate declarations
-    Let declarations be proc get_dictionary_value from HIR with hir_program, "declarations"
-
-    If declarations is not equal to 0:
-        Let decl_count be proc get_list_length from HIR with declarations
-        Let i be 0
-
-        While i is less than decl_count:
-            Let declaration be proc get_list_element from HIR with declarations, i
-            proc generate_cpp_declaration with context, declaration
-
-            Let has_error be proc memory_get_int64 from Layout with context, 64
-            If has_error is equal to 1:
-                Return 0
-            End If
-
-            Set i to i plus 1
-        End While
+    Let declarations be proc dict_get with hir_program, "declarations"
+    If declarations is equal to 0:
+        Return 1
     End If
+
+    Let items be proc list_elements with declarations
+    If items is equal to 0:
+        Return 1
+    End If
+    Let count be proc size from List with items
+    Let i be 0
+    While i is less than count:
+        Let decl be proc get_at from List with items, i
+        proc generate_cpp_declaration with context, decl
+
+        Let has_error be proc memory_get_int64 from Layout with context, 24
+        If has_error is equal to 1:
+            Return 0
+        End If
+        Set i to i plus 1
+    End While
 
     Return 1
 End Process
 
 @Reasoning:
-Top-level declaration dispatcher. C++ allows classes, templates,
-functions, variables, namespaces, type aliases, and using-declarations
-at file scope. This routes each HIR declaration to its specialised
+Top-level declaration dispatcher routing each HIR _type to its specialised
 generator.
 @End Reasoning
 
 @Implementation:
-Reads the declaration's _type discriminator and probes against the
-known shapes (class, template, function, variable, namespace, ...),
-dispatching to generate_cpp_class, generate_cpp_template, etc.
+Reads "_type" and probes against the known declaration shapes (class/namespace/
+template/function/variable/typedef/enum/using/preprocessor), dispatching to the
+matching generator. Unknown types are skipped.
 @End Implementation
 
-Process called "generate_cpp_declaration" takes context as Integer, decl_hir as Integer returns Integer:
-    Note: Generate C++ declaration from HIR
+Process called "generate_cpp_declaration" takes context as Integer, decl as Integer returns Integer:
+    Note: Generate a C++ declaration from HIR
 
-    @Reasoning:
-    Handle all HIR declaration types and convert them to appropriate
-    C++ syntax including proper formatting, access specifiers, and
-    language-specific constructs.
-    @End Reasoning
-
-    If decl_hir is equal to 0:
+    If decl is equal to 0:
         Return 0
     End If
 
-    Let decl_type be proc get_dictionary_value from HIR with decl_hir, "_type"
-    Let type_string be proc get_hir_string_value from HIR with decl_type
+    Let type_string be proc dict_get_string with decl, "_type"
+    If type_string is equal to 0:
+        Return 0
+    End If
 
-    Note: Class declaration
     Let is_class be proc string_equals from StringCore with type_string, "class"
     If is_class is equal to 1:
-        Return proc generate_cpp_class with context, decl_hir
+        Return proc generate_cpp_class with context, decl
     End If
-
-    Note: Namespace declaration
     Let is_namespace be proc string_equals from StringCore with type_string, "namespace"
     If is_namespace is equal to 1:
-        Return proc generate_cpp_namespace with context, decl_hir
+        Return proc generate_cpp_namespace with context, decl
     End If
-
-    Note: Template declaration
     Let is_template be proc string_equals from StringCore with type_string, "template"
     If is_template is equal to 1:
-        Return proc generate_cpp_template with context, decl_hir
+        Return proc generate_cpp_template with context, decl
     End If
-
-    Note: Function declaration
     Let is_function be proc string_equals from StringCore with type_string, "function"
     If is_function is equal to 1:
-        Return proc generate_cpp_function with context, decl_hir
+        Return proc generate_cpp_function with context, decl
     End If
-
-    Note: Variable declaration
     Let is_variable be proc string_equals from StringCore with type_string, "variable"
     If is_variable is equal to 1:
-        Return proc generate_cpp_variable with context, decl_hir
+        Return proc generate_cpp_variable with context, decl
     End If
-
-    Note: Typedef declaration
     Let is_typedef be proc string_equals from StringCore with type_string, "typedef"
     If is_typedef is equal to 1:
-        Return proc generate_cpp_typedef with context, decl_hir
+        Return proc generate_cpp_typedef with context, decl
     End If
-
-    Note: Enum declaration
     Let is_enum be proc string_equals from StringCore with type_string, "enum"
     If is_enum is equal to 1:
-        Return proc generate_cpp_enum with context, decl_hir
+        Return proc generate_cpp_enum with context, decl
+    End If
+    Let is_using be proc string_equals from StringCore with type_string, "using"
+    If is_using is equal to 1:
+        Return proc generate_cpp_using with context, decl
+    End If
+    Let is_pp be proc string_equals from StringCore with type_string, "preprocessor"
+    If is_pp is equal to 1:
+        Return proc generate_cpp_preprocessor with context, decl
+    End If
+    Let is_ctor be proc string_equals from StringCore with type_string, "constructor"
+    If is_ctor is equal to 1:
+        Return proc generate_cpp_constructor with context, decl
+    End If
+    Let is_dtor be proc string_equals from StringCore with type_string, "destructor"
+    If is_dtor is equal to 1:
+        Return proc generate_cpp_destructor with context, decl
+    End If
+    Let is_op be proc string_equals from StringCore with type_string, "operator"
+    If is_op is equal to 1:
+        Return proc generate_cpp_operator with context, decl
     End If
 
-    Note: Unknown declaration type - skip
-    Return 1
+    Return 0
 End Process
 
 Note: ============================================================================
-Note: Class Generation
+Note: Preprocessor / Using / Typedef
 Note: ============================================================================
 
 @Reasoning:
-Emit a C++ class definition. Handles the class header (class name +
-base list), access-specifier sections, and members. Pushes the class
-context so member emitters can reference it.
+A preprocessor directive is emitted verbatim on its own line so #include/#define/
+#ifdef round-trip exactly.
 @End Reasoning
 
 @Implementation:
-Saves the previous class_context, sets it to this class. Emits
-"class Name" + base specifiers + " {". Calls generate_cpp_class_members
-which interleaves public/protected/private sections. Closes with "};"
-and restores the previous class_context.
+Emits the directive text followed by a newline.
 @End Implementation
 
-Process called "generate_cpp_class" takes context as Integer, class_hir as Integer returns Integer:
-    Note: Generate C++ class declaration/definition
+Process called "generate_cpp_preprocessor" takes context as Integer, decl as Integer returns Integer:
+    Note: Emit a preprocessor directive
 
-    @Reasoning:
-    Convert HIR class to C++ class including inheritance lists, access
-    specifiers, member functions, constructors, destructors, and proper
-    formatting with indentation.
-    @End Reasoning
-
-    proc emit_cpp_newline from context
-
-    Note: Handle template parameters if present
-    Let template_params be proc get_dictionary_value from HIR with class_hir, "template_parameters"
-    If template_params is not equal to 0:
-        proc generate_cpp_template_declaration with context, template_params
+    Let text be proc dict_get_string with decl, "text"
+    If text is not equal to 0:
+        proc emit with context, text
     End If
-
-    Note: Generate class declaration
-    proc emit_cpp_code with context, "class "
-
-    Let class_name be proc get_dictionary_value from HIR with class_hir, "name"
-    Let name_string be proc get_hir_string_value from HIR with class_name
-    proc emit_cpp_code with context, name_string
-
-    Note: Generate inheritance list
-    Let inheritance be proc get_dictionary_value from HIR with class_hir, "inheritance"
-    If inheritance is not equal to 0:
-        proc emit_cpp_code with context, " : "
-        proc generate_cpp_inheritance_list with context, inheritance
-    End If
-
-    proc emit_cpp_code with context, " {"
-    proc emit_cpp_newline from context
-
-    Note: Set class context
-    Let old_class be proc memory_get_int64 from Layout with context, 32
-    proc memory_set_int64 from Layout with context, 32, class_hir
-
-    proc increment_cpp_indent from context
-
-    Note: Generate class members organized by access level
-    proc generate_cpp_class_members with context, class_hir
-
-    proc decrement_cpp_indent from context
-
-    proc emit_cpp_code with context, "};"
-    proc emit_cpp_newline from context
-
-    Note: Restore class context
-    proc memory_set_int64 from Layout with context, 32, old_class
-
+    proc emit_newline with context
     Return 1
 End Process
 
 @Reasoning:
-Emit a class's members grouped under public/protected/private access
-specifier sections. Only emits a section if it has any members, so
-empty access sections are not printed.
+Emits 'using name = type;' (alias), 'using namespace name;' (directive), or
+'using name;' (declaration) according to the recorded kind.
 @End Reasoning
 
 @Implementation:
-Walks the class's member list and bucket-sorts by access level. For
-each non-empty bucket, emits the "public:" / "protected:" / "private:"
-keyword then iterates the bucket calling generate_cpp_class_member.
+Reads kind. "namespace" emits 'using namespace <name>;'. "alias" emits 'using
+<name> = <type>;'. Otherwise 'using <name>;'.
+@End Implementation
+
+Process called "generate_cpp_using" takes context as Integer, decl as Integer returns Integer:
+    Note: Emit a using declaration
+
+    Let kind be proc dict_get_string with decl, "kind"
+    Let name be proc dict_get_string with decl, "name"
+
+    Let is_ns be proc string_equals from StringCore with kind, "namespace"
+    If is_ns is equal to 1:
+        proc emit with context, "using namespace "
+        proc emit with context, name
+        proc emit with context, ";"
+        proc emit_newline with context
+        Return 1
+    End If
+
+    Let is_alias be proc string_equals from StringCore with kind, "alias"
+    If is_alias is equal to 1:
+        proc emit with context, "using "
+        proc emit with context, name
+        proc emit with context, " = "
+        Let target be proc dict_get with decl, "target"
+        proc generate_cpp_type with context, target
+        proc emit with context, ";"
+        proc emit_newline with context
+        Return 1
+    End If
+
+    proc emit with context, "using "
+    proc emit with context, name
+    proc emit with context, ";"
+    proc emit_newline with context
+    Return 1
+End Process
+
+@Reasoning:
+Emits 'typedef <type> <name>;'.
+@End Reasoning
+
+@Implementation:
+Emits "typedef ", the underlying type, a space, the name, ";".
+@End Implementation
+
+Process called "generate_cpp_typedef" takes context as Integer, decl as Integer returns Integer:
+    Note: Emit a typedef
+
+    proc emit with context, "typedef "
+    Let underlying be proc dict_get with decl, "underlying"
+    proc generate_cpp_type with context, underlying
+    proc emit with context, " "
+    Let name be proc dict_get_string with decl, "name"
+    proc emit with context, name
+    proc emit with context, ";"
+    proc emit_newline with context
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Namespace
+Note: ============================================================================
+
+@Reasoning:
+Emits 'namespace name { declarations }'. Anonymous namespaces omit the name.
+@End Reasoning
+
+@Implementation:
+Emits "namespace " + name (when present) + " {", raises indent, walks the
+"declarations" list, lowers indent, emits "}".
+@End Implementation
+
+Process called "generate_cpp_namespace" takes context as Integer, decl as Integer returns Integer:
+    Note: Emit a namespace
+
+    proc emit with context, "namespace "
+    Let name be proc dict_get_string with decl, "name"
+    If name is not equal to 0:
+        proc emit with context, name
+        proc emit with context, " "
+    End If
+    proc emit with context, "{"
+    proc increment_indent with context
+    proc emit_newline with context
+
+    Let decls be proc dict_get with decl, "declarations"
+    If decls is not equal to 0:
+        Let items be proc list_elements with decls
+        Let count be proc size from List with items
+        Let i be 0
+        While i is less than count:
+            Let child be proc get_at from List with items, i
+            proc generate_cpp_declaration with context, child
+            Set i to i plus 1
+        End While
+    End If
+
+    proc decrement_indent with context
+    proc emit_newline with context
+    proc emit with context, "}"
+    proc emit_newline with context
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Class
+Note: ============================================================================
+
+@Reasoning:
+Emits a class definition: optional template prefix, 'class Name', inheritance
+list, '{', members grouped by access section, '};'.
+@End Reasoning
+
+@Implementation:
+Emits a template<...> prefix when "template_parameters" is present. Emits "class "
++ name + an inheritance " : base, ..." clause + " {". Raises indent. Emits members
+grouped by access via generate_cpp_class_members. Lowers indent and emits "};".
+@End Implementation
+
+Process called "generate_cpp_class" takes context as Integer, decl as Integer returns Integer:
+    Note: Emit a class definition
+
+    Let tparams be proc dict_get with decl, "template_parameters"
+    If tparams is not equal to 0:
+        proc generate_cpp_template_params with context, tparams
+        proc emit_newline with context
+    End If
+
+    proc emit with context, "class "
+    Let name be proc dict_get_string with decl, "name"
+    proc emit with context, name
+
+    Let inheritance be proc dict_get with decl, "inheritance"
+    If inheritance is not equal to 0:
+        proc generate_cpp_inheritance with context, inheritance
+    End If
+
+    proc emit with context, " {"
+    proc increment_indent with context
+    proc emit_newline with context
+
+    proc generate_cpp_class_members with context, decl
+
+    proc decrement_indent with context
+    proc emit_newline with context
+    proc emit with context, "};"
+    proc emit_newline with context
+    Return 1
+End Process
+
+@Reasoning:
+Emits the inheritance clause ' : access Base, access Base2'.
+@End Reasoning
+
+@Implementation:
+Emits " : ", then per base its access keyword + name, comma-separated.
+@End Implementation
+
+Process called "generate_cpp_inheritance" takes context as Integer, inheritance as Integer returns Integer:
+    Note: Emit a base-class inheritance clause
+
+    proc emit with context, " : "
+    Let items be proc list_elements with inheritance
+    If items is equal to 0:
+        Return 1
+    End If
+    Let count be proc size from List with items
+    Let i be 0
+    While i is less than count:
+        If i is greater than 0:
+            proc emit with context, ", "
+        End If
+        Let base be proc get_at from List with items, i
+        Let access be proc dict_get_string with base, "access"
+        If access is not equal to 0:
+            proc emit with context, access
+            proc emit with context, " "
+        End If
+        Let bname be proc dict_get_string with base, "name"
+        proc emit with context, bname
+        Set i to i plus 1
+    End While
+    Return 1
+End Process
+
+@Reasoning:
+Emits class members grouped under public/protected/private access sections, only
+printing a section when it has members.
+@End Reasoning
+
+@Implementation:
+Buckets the "members" list by their "access" string into three Lists. For each
+non-empty bucket emits the label then each member via generate_cpp_class_member.
+Members without access default to private.
 @End Implementation
 
 Process called "generate_cpp_class_members" takes context as Integer, class_hir as Integer:
-    Note: Generate class members organized by access level
+    Note: Emit class members grouped by access
 
-    @Reasoning:
-    Organize class members by access level (public, protected, private)
-    and generate appropriate access specifiers and member declarations.
-    @End Reasoning
-
-    Let members be proc get_dictionary_value from HIR with class_hir, "members"
-
+    Let members be proc dict_get with class_hir, "members"
     If members is equal to 0:
         Return
     End If
+    Let items be proc list_elements with members
+    If items is equal to 0:
+        Return
+    End If
 
-    Note: Organize members by access level
     Let public_members be proc create from List
     Let protected_members be proc create from List
     Let private_members be proc create from List
 
-    Let member_count be proc get_list_length from HIR with members
+    Let count be proc size from List with items
     Let i be 0
-
-    While i is less than member_count:
-        Let member be proc get_list_element from HIR with members, i
-        Let access be proc get_dictionary_value from HIR with member, "access"
-
+    While i is less than count:
+        Let member be proc get_at from List with items, i
+        Let access be proc dict_get_string with member, "access"
+        Let placed be 0
         If access is not equal to 0:
-            Let access_string be proc get_hir_string_value from HIR with access
-
-            Let is_public be proc string_equals from StringCore with access_string, "public"
-            Let is_protected be proc string_equals from StringCore with access_string, "protected"
-            Let is_private be proc string_equals from StringCore with access_string, "private"
-
-            If is_public is equal to 1:
+            Let is_pub be proc string_equals from StringCore with access, "public"
+            If is_pub is equal to 1:
                 proc push from List with public_members, member
+                Set placed to 1
             End If
-
-            If is_protected is equal to 1:
+            Let is_prot be proc string_equals from StringCore with access, "protected"
+            If is_prot is equal to 1:
                 proc push from List with protected_members, member
+                Set placed to 1
             End If
-
-            If is_private is equal to 1:
+            Let is_priv be proc string_equals from StringCore with access, "private"
+            If is_priv is equal to 1:
                 proc push from List with private_members, member
+                Set placed to 1
             End If
-        Otherwise:
-            Note: Default to private for class
+        End If
+        If placed is equal to 0:
             proc push from List with private_members, member
         End If
-
         Set i to i plus 1
     End While
 
-    Note: Generate public members
-    Let public_count be proc size from List with public_members
-    If public_count is greater than 0:
-        proc emit_cpp_code with context, "public:"
-        proc emit_cpp_newline from context
-        proc increment_cpp_indent from context
+    proc emit_access_section with context, "public:", public_members
+    proc emit_access_section with context, "protected:", protected_members
+    proc emit_access_section with context, "private:", private_members
 
-        Let j be 0
-        While j is less than public_count:
-            Set member to proc get from List with public_members, j
-            proc generate_cpp_class_member with context, member
-            Set j to j plus 1
-        End While
-
-        proc decrement_cpp_indent from context
-    End If
-
-    Note: Generate protected members
-    Let protected_count be proc size from List with protected_members
-    If protected_count is greater than 0:
-        proc emit_cpp_code with context, "protected:"
-        proc emit_cpp_newline from context
-        proc increment_cpp_indent from context
-
-        Set j to 0
-        While j is less than protected_count:
-            Set member to proc get from List with protected_members, j
-            proc generate_cpp_class_member with context, member
-            Set j to j plus 1
-        End While
-
-        proc decrement_cpp_indent from context
-    End If
-
-    Note: Generate private members
-    Let private_count be proc size from List with private_members
-    If private_count is greater than 0:
-        proc emit_cpp_code with context, "private:"
-        proc emit_cpp_newline from context
-        proc increment_cpp_indent from context
-
-        Set j to 0
-        While j is less than private_count:
-            Set member to proc get from List with private_members, j
-            proc generate_cpp_class_member with context, member
-            Set j to j plus 1
-        End While
-
-        proc decrement_cpp_indent from context
-    End If
-
-    Note: Clean up lists
     proc destroy from List with public_members
     proc destroy from List with protected_members
     proc destroy from List with private_members
 End Process
 
 @Reasoning:
-Emit a single class member (field, method, constructor, destructor,
-operator overload, or nested type).
+Emits one access section (label + indented members) only when the bucket is
+non-empty.
 @End Reasoning
 
 @Implementation:
-Reads the member's _type discriminator. Methods/constructors/operators
-dispatch to function emission. Fields emit "type name [= init];".
-Nested types recurse into the appropriate declaration emitter.
+If the bucket has members, emits the label, raises indent, iterates the bucket
+calling generate_cpp_class_member, lowers indent.
 @End Implementation
 
-Process called "generate_cpp_class_member" takes context as Integer, member_hir as Integer:
-    Note: Generate individual class member
+Process called "emit_access_section" takes context as Integer, label as Integer, bucket as Integer:
+    Note: Emit one access section if non-empty
 
-    Let member_type be proc get_dictionary_value from HIR with member_hir, "_type"
-    Let type_string be proc get_hir_string_value from HIR with member_type
-
-    Note: Constructor
-    Let is_constructor be proc string_equals from StringCore with type_string, "constructor"
-    If is_constructor is equal to 1:
-        proc generate_cpp_constructor with context, member_hir
+    Let count be proc size from List with bucket
+    If count is equal to 0:
         Return
     End If
 
-    Note: Destructor
-    Let is_destructor be proc string_equals from StringCore with type_string, "destructor"
-    If is_destructor is equal to 1:
-        proc generate_cpp_destructor with context, member_hir
+    proc emit with context, label
+    proc increment_indent with context
+    proc emit_newline with context
+
+    Let i be 0
+    While i is less than count:
+        Let member be proc get_at from List with bucket, i
+        proc generate_cpp_class_member with context, member
+        Set i to i plus 1
+    End While
+
+    proc decrement_indent with context
+    proc emit_newline with context
+End Process
+
+@Reasoning:
+Emits a single class member by dispatching on its _type to the function/variable/
+constructor/destructor/operator generator.
+@End Reasoning
+
+@Implementation:
+Reads "_type" and routes accordingly.
+@End Implementation
+
+Process called "generate_cpp_class_member" takes context as Integer, member as Integer:
+    Note: Emit a single class member
+
+    Let type_string be proc dict_get_string with member, "_type"
+    If type_string is equal to 0:
         Return
     End If
 
-    Note: Member function
-    Let is_function be proc string_equals from StringCore with type_string, "function"
-    If is_function is equal to 1:
-        proc generate_cpp_function with context, member_hir
+    Let is_ctor be proc string_equals from StringCore with type_string, "constructor"
+    If is_ctor is equal to 1:
+        proc generate_cpp_constructor with context, member
         Return
     End If
-
-    Note: Member variable
-    Let is_variable be proc string_equals from StringCore with type_string, "variable"
-    If is_variable is equal to 1:
-        proc generate_cpp_variable with context, member_hir
+    Let is_dtor be proc string_equals from StringCore with type_string, "destructor"
+    If is_dtor is equal to 1:
+        proc generate_cpp_destructor with context, member
+        Return
+    End If
+    Let is_op be proc string_equals from StringCore with type_string, "operator"
+    If is_op is equal to 1:
+        proc generate_cpp_operator with context, member
+        Return
+    End If
+    Let is_func be proc string_equals from StringCore with type_string, "function"
+    If is_func is equal to 1:
+        proc generate_cpp_function with context, member
+        Return
+    End If
+    Let is_var be proc string_equals from StringCore with type_string, "variable"
+    If is_var is equal to 1:
+        proc generate_cpp_variable with context, member
         Return
     End If
 End Process
 
 Note: ============================================================================
-Note: Template Generation
+Note: Template
 Note: ============================================================================
 
 @Reasoning:
-Emit a C++ template declaration "template<P1, P2, ...> X" where X is
-the templated class, function, or alias.
+Emits 'template<...> declaration'.
 @End Reasoning
 
 @Implementation:
-Saves the previous template_context, sets it to this template. Calls
-generate_cpp_template_declaration to emit "template<...>". Recurses
-into the templated body (class/function/alias). Restores the previous
-template_context.
+Emits the template<...> prefix from "parameters", a newline, then the templated
+"declaration".
 @End Implementation
 
-Process called "generate_cpp_template" takes context as Integer, template_hir as Integer returns Integer:
-    Note: Generate C++ template declaration
+Process called "generate_cpp_template" takes context as Integer, decl as Integer returns Integer:
+    Note: Emit a template declaration
 
-    @Reasoning:
-    Convert HIR template to C++ template syntax including parameter lists,
-    constraints, and the templated declaration with proper formatting.
-    @End Reasoning
-
-    Let template_params be proc get_dictionary_value from HIR with template_hir, "parameters"
-
-    If template_params is not equal to 0:
-        proc generate_cpp_template_declaration with context, template_params
+    Let params be proc dict_get with decl, "parameters"
+    If params is not equal to 0:
+        proc generate_cpp_template_params with context, params
+        proc emit_newline with context
     End If
 
-    Let declaration be proc get_dictionary_value from HIR with template_hir, "declaration"
-
-    If declaration is not equal to 0:
-        proc generate_cpp_declaration with context, declaration
+    Let inner be proc dict_get with decl, "declaration"
+    If inner is not equal to 0:
+        proc generate_cpp_declaration with context, inner
     End If
-
     Return 1
 End Process
 
 @Reasoning:
-Emit the "template<P1, P2, ...>" prefix. Each parameter (type, value,
-template-template) is rendered by generate_cpp_template_parameter.
+Emits 'template<P1, P2, ...>' rendering each parameter.
 @End Reasoning
 
 @Implementation:
-Emits "template<", iterates the parameter list calling
-generate_cpp_template_parameter with comma separators, emits ">".
+Emits "template<", iterates the parameter list with comma separators calling
+generate_cpp_template_param, emits ">".
 @End Implementation
 
-Process called "generate_cpp_template_declaration" takes context as Integer, params_hir as Integer:
-    Note: Generate template parameter list
+Process called "generate_cpp_template_params" takes context as Integer, params as Integer:
+    Note: Emit a template parameter list
 
-    proc emit_cpp_code with context, "template<"
-
-    Let param_count be proc get_list_length from HIR with params_hir
-    Let i be 0
-
-    While i is less than param_count:
-        If i is greater than 0:
-            proc emit_cpp_code with context, ", "
-        End If
-
-        Let param be proc get_list_element from HIR with params_hir, i
-        proc generate_cpp_template_parameter with context, param
-
-        Set i to i plus 1
-    End While
-
-    proc emit_cpp_code with context, ">"
-    proc emit_cpp_newline from context
+    proc emit with context, "template<"
+    Let items be proc list_elements with params
+    If items is not equal to 0:
+        Let count be proc size from List with items
+        Let i be 0
+        While i is less than count:
+            If i is greater than 0:
+                proc emit with context, ", "
+            End If
+            Let param be proc get_at from List with items, i
+            proc generate_cpp_template_param with context, param
+            Set i to i plus 1
+        End While
+    End If
+    proc emit with context, ">"
 End Process
 
 @Reasoning:
-Emit one template parameter declaration. C++ template parameters come
-in three shapes: type ("typename T"), value ("int N"), and
-template-template ("template<class> class TT").
+Emits one template parameter: 'typename T' / 'class T' for type parameters, or
+'<type> N' for non-type parameters, with an optional '= default'.
 @End Reasoning
 
 @Implementation:
-Reads the parameter's kind and dispatches. Type parameters emit
-"typename " + name (or "class " if requested). Value parameters emit
-the parameter type + " " + name. Default values are emitted as
-"= default_expr" when present.
+Reads "kind". typename/class emit the keyword + name. non_type emits the type (or
+'auto') + name. A "default" entry emits '= <expr>'.
 @End Implementation
 
-Process called "generate_cpp_template_parameter" takes context as Integer, param_hir as Integer:
-    Note: Generate individual template parameter
+Process called "generate_cpp_template_param" takes context as Integer, param as Integer:
+    Note: Emit a single template parameter
 
-    Let param_kind be proc get_dictionary_value from HIR with param_hir, "kind"
-    Let kind_string be proc get_hir_string_value from HIR with param_kind
+    Let kind be proc dict_get_string with param, "kind"
+    Let name be proc dict_get_string with param, "name"
 
-    Let param_name be proc get_dictionary_value from HIR with param_hir, "name"
-    Let name_string be proc get_hir_string_value from HIR with param_name
-
-    Note: Type parameter
-    Let is_typename be proc string_equals from StringCore with kind_string, "typename"
-    Let is_class be proc string_equals from StringCore with kind_string, "class"
-
+    Let is_typename be proc string_equals from StringCore with kind, "typename"
     If is_typename is equal to 1:
-        proc emit_cpp_code with context, "typename "
-        proc emit_cpp_code with context, name_string
-    End If
-
-    If is_class is equal to 1:
-        proc emit_cpp_code with context, "class "
-        proc emit_cpp_code with context, name_string
-    End If
-
-    Note: Non-type parameter - emit specific type or auto (C++20)
-    Let is_non_type be proc string_equals from StringCore with kind_string, "non_type"
-    If is_non_type is equal to 1:
-        Note: Check if type information is available in HIR
-        Let param_type be proc get_dictionary_value from HIR with param_hir, "type"
-
-        If param_type is not equal to 0:
-            Note: Generate the type from HIR type information
-            proc generate_cpp_type with context, param_type
-            proc emit_cpp_code with context, " "
-            proc emit_cpp_code with context, name_string
+        proc emit with context, "typename "
+        proc emit with context, name
+    Otherwise:
+        Let is_class be proc string_equals from StringCore with kind, "class"
+        If is_class is equal to 1:
+            proc emit with context, "class "
+            proc emit with context, name
         Otherwise:
-            Note: No type specified - use auto (valid C++20 for non-type template parameters)
-            proc emit_cpp_code with context, "auto "
-            proc emit_cpp_code with context, name_string
+            Let ptype be proc dict_get with param, "type"
+            If ptype is not equal to 0:
+                proc generate_cpp_type with context, ptype
+                proc emit with context, " "
+                proc emit with context, name
+            Otherwise:
+                proc emit with context, "auto "
+                proc emit with context, name
+            End If
         End If
     End If
 
-    Note: Handle default value if present
-    Let default_value be proc get_dictionary_value from HIR with param_hir, "default"
+    Let default_value be proc dict_get with param, "default"
     If default_value is not equal to 0:
-        proc emit_cpp_code with context, " = "
+        proc emit with context, " = "
         proc generate_cpp_expression with context, default_value
     End If
 End Process
 
 Note: ============================================================================
-Note: Expression Generation
+Note: Enum
 Note: ============================================================================
 
 @Reasoning:
-Translate any HIR expression into a C++ expression. C++ expressions
-span literals, identifiers, member access, function calls, lambdas,
-arithmetic/logical/comparison operators, new/delete, and casts.
+Emits 'enum [class] Name [: underlying] { v1, v2 = expr, ... };'.
 @End Reasoning
 
 @Implementation:
-Reads the expression's _type and dispatches to the matching emitter
-(literal, identifier, member, call, lambda, binary, unary, cast, new,
-delete). Unknown expression types record an error and emit a stub.
+Emits "enum " + ("class " when scoped) + name, optional ": underlying", " {",
+each enumerator (name + optional "= value") comma-separated, "};".
 @End Implementation
 
-Process called "generate_cpp_expression" takes context as Integer, expr_hir as Integer returns Integer:
-    Note: Generate C++ expression from HIR
+Process called "generate_cpp_enum" takes context as Integer, decl as Integer returns Integer:
+    Note: Emit an enum declaration
 
-    @Reasoning:
-    Convert HIR expressions to C++ syntax including lambda expressions,
-    new/delete operations, scope resolution, and all C++ specific operators.
-    @End Reasoning
+    proc emit with context, "enum "
+    Let scoped be proc dict_get_string with decl, "scoped"
+    If scoped is not equal to 0:
+        Let is_scoped be proc string_equals from StringCore with scoped, "scoped"
+        If is_scoped is equal to 1:
+            proc emit with context, "class "
+        End If
+    End If
+    Let name be proc dict_get_string with decl, "name"
+    proc emit with context, name
 
-    If expr_hir is equal to 0:
-        proc emit_cpp_code with context, "nullptr"
-        Return 1
+    Let underlying be proc dict_get with decl, "underlying"
+    If underlying is not equal to 0:
+        proc emit with context, " : "
+        proc generate_cpp_type with context, underlying
     End If
 
-    Let expr_type be proc get_dictionary_value from HIR with expr_hir, "_type"
-    Let type_string be proc get_hir_string_value from HIR with expr_type
+    proc emit with context, " {"
+    proc increment_indent with context
+    proc emit_newline with context
 
-    Note: Lambda expression
-    Let is_lambda be proc string_equals from StringCore with type_string, "lambda"
-    If is_lambda is equal to 1:
-        Return proc generate_cpp_lambda with context, expr_hir
+    Let values be proc dict_get with decl, "values"
+    If values is not equal to 0:
+        Let items be proc list_elements with values
+        Let count be proc size from List with items
+        Let i be 0
+        While i is less than count:
+            If i is greater than 0:
+                proc emit with context, ","
+                proc emit_newline with context
+            End If
+            Let ev be proc get_at from List with items, i
+            Let evname be proc dict_get_string with ev, "name"
+            proc emit with context, evname
+            Let evval be proc dict_get with ev, "value"
+            If evval is not equal to 0:
+                proc emit with context, " = "
+                proc generate_cpp_expression with context, evval
+            End If
+            Set i to i plus 1
+        End While
     End If
 
-    Note: New expression
-    Let is_new be proc string_equals from StringCore with type_string, "new"
-    If is_new is equal to 1:
-        Return proc generate_cpp_new_expression with context, expr_hir
-    End If
-
-    Note: Delete expression
-    Let is_delete be proc string_equals from StringCore with type_string, "delete"
-    If is_delete is equal to 1:
-        Return proc generate_cpp_delete_expression with context, expr_hir
-    End If
-
-    Note: This expression
-    Let is_this be proc string_equals from StringCore with type_string, "this"
-    If is_this is equal to 1:
-        proc emit_cpp_code with context, "this"
-        Return 1
-    End If
-
-    Note: Scope resolution
-    Let is_scope be proc string_equals from StringCore with type_string, "scope_resolution"
-    If is_scope is equal to 1:
-        Return proc generate_cpp_scope_resolution with context, expr_hir
-    End If
-
-    Note: Fall back to base expression generation
-    Return proc generate_base_cpp_expression with context, expr_hir
-End Process
-
-@Reasoning:
-Emit a C++ lambda "[capture](params) -> ret { body }". Captures default
-to "[]" (no captures) unless the HIR specifies a capture mode.
-@End Reasoning
-
-@Implementation:
-Reads capture mode, parameter list, return type, and body. Emits "[",
-capture clause, "](", parameter list, ") -> ", return type, " {",
-body via generate_cpp_block, "}".
-@End Implementation
-
-Process called "generate_cpp_lambda" takes context as Integer, lambda_hir as Integer returns Integer:
-    Note: Generate C++ lambda expression
-
-    @Reasoning:
-    Convert HIR lambda to C++ lambda syntax including capture lists,
-    parameter lists, return types, and body with proper formatting.
-    @End Reasoning
-
-    proc emit_cpp_code with context, "["
-
-    Note: Generate capture list
-    Let captures be proc get_dictionary_value from HIR with lambda_hir, "captures"
-    If captures is not equal to 0:
-        proc generate_cpp_capture_list with context, captures
-    End If
-
-    proc emit_cpp_code with context, "]"
-
-    Note: Generate parameter list
-    Let parameters be proc get_dictionary_value from HIR with lambda_hir, "parameters"
-    If parameters is not equal to 0:
-        proc emit_cpp_code with context, "("
-        proc generate_cpp_parameter_list with context, parameters
-        proc emit_cpp_code with context, ")"
-    End If
-
-    Note: Generate return type if specified
-    Let return_type be proc get_dictionary_value from HIR with lambda_hir, "return_type"
-    If return_type is not equal to 0:
-        proc emit_cpp_code with context, " -> "
-        proc generate_cpp_type with context, return_type
-    End If
-
-    Note: Generate body
-    proc emit_cpp_code with context, " {"
-    proc emit_cpp_newline from context
-    proc increment_cpp_indent from context
-
-    Let body be proc get_dictionary_value from HIR with lambda_hir, "body"
-    If body is not equal to 0:
-        proc generate_cpp_statement with context, body
-    End If
-
-    proc decrement_cpp_indent from context
-    proc emit_cpp_code with context, "}"
-
+    proc decrement_indent with context
+    proc emit_newline with context
+    proc emit with context, "};"
+    proc emit_newline with context
     Return 1
 End Process
 
 Note: ============================================================================
-Note: Code Emission Utilities
+Note: Function / Constructor / Destructor / Operator
 Note: ============================================================================
 
 @Reasoning:
-Append raw code text to the output buffer. Used by all higher-level
-emitters as the lowest-level emission primitive.
+Emits 'ret name(params) { body }' or 'ret name(params);' for a declaration.
 @End Reasoning
 
 @Implementation:
-Forwards to StringCore's buffer_append on the context's output_buffer.
+Emits the return type + space + name + "(" + parameters + ")". If a body is
+present emits a brace block via generate_cpp_block; otherwise ";".
 @End Implementation
 
-Process called "emit_cpp_code" takes context as Integer, code as Integer:
-    Note: Emit code to output buffer
+Process called "generate_cpp_function" takes context as Integer, decl as Integer returns Integer:
+    Note: Emit a function/method
 
-    Let output_buffer be proc memory_get_int64 from Layout with context, 0
-    proc append_to_string_buffer from StringCore with output_buffer, code
+    Let ret be proc dict_get with decl, "return_type"
+    If ret is not equal to 0:
+        proc generate_cpp_type with context, ret
+        proc emit with context, " "
+    End If
+
+    Let name be proc dict_get_string with decl, "name"
+    proc emit with context, name
+
+    proc emit with context, "("
+    Let params be proc dict_get with decl, "parameters"
+    If params is not equal to 0:
+        proc generate_cpp_parameters with context, params
+    End If
+    proc emit with context, ")"
+
+    Let body be proc dict_get with decl, "body"
+    If body is not equal to 0:
+        proc emit with context, " "
+        proc generate_cpp_block with context, body
+        proc emit_newline with context
+    Otherwise:
+        proc emit with context, ";"
+        proc emit_newline with context
+    End If
+    Return 1
 End Process
 
 @Reasoning:
-Emit a line terminator plus the indent prefix for the next line so
-subsequent emit_cpp_code calls land at the correct column.
+Emits 'Name(params) { body }' for a constructor.
 @End Reasoning
 
 @Implementation:
-Appends "\n", then appends indent_level * 4 spaces (C++ convention).
+Emits the name + parameter list + body or ";".
 @End Implementation
 
-Process called "emit_cpp_newline" takes context as Integer:
-    Note: Emit newline with proper indentation
+Process called "generate_cpp_constructor" takes context as Integer, decl as Integer returns Integer:
+    Note: Emit a constructor
 
-    Let output_buffer be proc memory_get_int64 from Layout with context, 0
-    proc append_to_string_buffer from StringCore with output_buffer, "\n"
+    Let name be proc dict_get_string with decl, "name"
+    proc emit with context, name
+    proc emit with context, "("
+    Let params be proc dict_get with decl, "parameters"
+    If params is not equal to 0:
+        proc generate_cpp_parameters with context, params
+    End If
+    proc emit with context, ")"
 
-    Note: Add indentation for next line
-    Let indent_level be proc memory_get_int64 from Layout with context, 8
+    Let body be proc dict_get with decl, "body"
+    If body is not equal to 0:
+        proc emit with context, " "
+        proc generate_cpp_block with context, body
+        proc emit_newline with context
+    Otherwise:
+        proc emit with context, ";"
+        proc emit_newline with context
+    End If
+    Return 1
+End Process
+
+@Reasoning:
+Emits '~Name() { body }' for a destructor.
+@End Reasoning
+
+@Implementation:
+Emits "~" + name + "()" + body or ";".
+@End Implementation
+
+Process called "generate_cpp_destructor" takes context as Integer, decl as Integer returns Integer:
+    Note: Emit a destructor
+
+    proc emit with context, "~"
+    Let name be proc dict_get_string with decl, "name"
+    proc emit with context, name
+    proc emit with context, "()"
+
+    Let body be proc dict_get with decl, "body"
+    If body is not equal to 0:
+        proc emit with context, " "
+        proc generate_cpp_block with context, body
+        proc emit_newline with context
+    Otherwise:
+        proc emit with context, ";"
+        proc emit_newline with context
+    End If
+    Return 1
+End Process
+
+@Reasoning:
+Emits 'operator SYM(params) { body }'.
+@End Reasoning
+
+@Implementation:
+Emits "operator" + symbol + parameter list + body or ";".
+@End Implementation
+
+Process called "generate_cpp_operator" takes context as Integer, decl as Integer returns Integer:
+    Note: Emit an operator overload
+
+    proc emit with context, "operator"
+    Let sym be proc dict_get_string with decl, "symbol"
+    If sym is not equal to 0:
+        proc emit with context, sym
+    End If
+    proc emit with context, "("
+    Let params be proc dict_get with decl, "parameters"
+    If params is not equal to 0:
+        proc generate_cpp_parameters with context, params
+    End If
+    proc emit with context, ")"
+
+    Let body be proc dict_get with decl, "body"
+    If body is not equal to 0:
+        proc emit with context, " "
+        proc generate_cpp_block with context, body
+        proc emit_newline with context
+    Otherwise:
+        proc emit with context, ";"
+        proc emit_newline with context
+    End If
+    Return 1
+End Process
+
+@Reasoning:
+Emits a comma-separated parameter list, each as 'type name' or '...'.
+@End Reasoning
+
+@Implementation:
+Iterates the parameter list; a variadic parameter emits "..."; otherwise emits the
+parameter type + space + name.
+@End Implementation
+
+Process called "generate_cpp_parameters" takes context as Integer, params as Integer:
+    Note: Emit a parameter list
+
+    Let items be proc list_elements with params
+    If items is equal to 0:
+        Return
+    End If
+    Let count be proc size from List with items
     Let i be 0
-
-    While i is less than indent_level:
-        proc append_to_string_buffer from StringCore with output_buffer, "    "
+    While i is less than count:
+        If i is greater than 0:
+            proc emit with context, ", "
+        End If
+        Let param be proc get_at from List with items, i
+        Let variadic be proc dict_get_string with param, "variadic"
+        If variadic is not equal to 0:
+            proc emit with context, "..."
+        Otherwise:
+            Let ptype be proc dict_get with param, "param_type"
+            proc generate_cpp_type with context, ptype
+            Let pname be proc dict_get_string with param, "name"
+            If pname is not equal to 0:
+                proc emit with context, " "
+                proc emit with context, pname
+            End If
+        End If
         Set i to i plus 1
     End While
 End Process
 
+Note: ============================================================================
+Note: Variable
+Note: ============================================================================
+
 @Reasoning:
-Step into a nested C++ block. Called before emitting a function body,
-class body, or any braced compound.
+Emits 'type name [= initializer];'.
 @End Reasoning
 
 @Implementation:
-Reads the indent_level field, increments, writes back.
+Emits the variable type + space + name, an optional "= initializer", then ";".
 @End Implementation
 
-Process called "increment_cpp_indent" takes context as Integer:
-    Note: Increase indentation level
+Process called "generate_cpp_variable" takes context as Integer, decl as Integer returns Integer:
+    Note: Emit a variable declaration
 
-    Let current_indent be proc memory_get_int64 from Layout with context, 8
-    proc memory_set_int64 from Layout with context, 8, current_indent plus 1
-End Process
-
-@Reasoning:
-Step out of a nested C++ block. Clamped at zero so emit-failures
-do not underflow the indent.
-@End Reasoning
-
-@Implementation:
-Reads indent_level; writes back level-1 if greater than zero.
-@End Implementation
-
-Process called "decrement_cpp_indent" takes context as Integer:
-    Note: Decrease indentation level
-
-    Let current_indent be proc memory_get_int64 from Layout with context, 8
-    If current_indent is greater than 0:
-        proc memory_set_int64 from Layout with context, 8, current_indent minus 1
+    Let vtype be proc dict_get with decl, "var_type"
+    If vtype is not equal to 0:
+        proc generate_cpp_type with context, vtype
+        proc emit with context, " "
     End If
+
+    Let name be proc dict_get_string with decl, "name"
+    proc emit with context, name
+
+    Let init be proc dict_get with decl, "initializer"
+    If init is not equal to 0:
+        proc emit with context, " = "
+        proc generate_cpp_expression with context, init
+    End If
+
+    proc emit with context, ";"
+    proc emit_newline with context
+    Return 1
 End Process
 
+Note: ============================================================================
+Note: Types
+Note: ============================================================================
+
 @Reasoning:
-Emit a standard banner comment at the top of every generated C++ file.
-Marks output as generated and warns against hand-editing.
+Emits a C++ type. HIR types are either a string literal (a plain type name) or a
+dict tagged "pointer"/"reference"/"template_type". Pointer/reference recurse on
+the base; template types emit 'Name<args>'.
 @End Reasoning
 
 @Implementation:
-Emits a "/* ... */" block declaring the file as auto-generated from
-HIR. Closes with a blank line so the first declaration is visually
-separated.
+If the node is a string literal, emits its value. If a dict, dispatches on
+"_type": "pointer" -> base + "*"; "reference" -> base + "&" (or "&&" when rvalue);
+"template_type" -> name + "<" + args + ">". Null emits "void".
 @End Implementation
 
-Process called "emit_cpp_file_header" takes context as Integer:
-    Note: Generate file header comment
+Process called "generate_cpp_type" takes context as Integer, type_hir as Integer returns Integer:
+    Note: Emit a C++ type
 
-    proc emit_cpp_code with context, "// Generated by Runa C++ Backend"
-    proc emit_cpp_newline from context
-    proc emit_cpp_code with context, "// Do not modify this file directly"
-    proc emit_cpp_newline from context
-    proc emit_cpp_newline from context
+    If type_hir is equal to 0:
+        proc emit with context, "void"
+        Return 1
+    End If
+
+    Let is_str be proc is_string_literal from HIR with type_hir
+    If is_str is equal to 1:
+        Let name be proc get_string_literal_value from HIR with type_hir
+        proc emit with context, name
+        Return 1
+    End If
+
+    Let kind be proc dict_get_string with type_hir, "_type"
+    If kind is equal to 0:
+        proc emit with context, "auto"
+        Return 1
+    End If
+
+    Let is_ptr be proc string_equals from StringCore with kind, "pointer"
+    If is_ptr is equal to 1:
+        Let base be proc dict_get with type_hir, "base"
+        proc generate_cpp_type with context, base
+        proc emit with context, "*"
+        Return 1
+    End If
+
+    Let is_ref be proc string_equals from StringCore with kind, "reference"
+    If is_ref is equal to 1:
+        Let base be proc dict_get with type_hir, "base"
+        proc generate_cpp_type with context, base
+        Let refkind be proc dict_get_string with type_hir, "kind"
+        Let is_rvalue be 0
+        If refkind is not equal to 0:
+            Set is_rvalue to proc string_equals from StringCore with refkind, "rvalue"
+        End If
+        If is_rvalue is equal to 1:
+            proc emit with context, "&&"
+        Otherwise:
+            proc emit with context, "&"
+        End If
+        Return 1
+    End If
+
+    Let is_tmpl be proc string_equals from StringCore with kind, "template_type"
+    If is_tmpl is equal to 1:
+        Let name be proc dict_get_string with type_hir, "name"
+        proc emit with context, name
+        proc emit with context, "<"
+        Let args be proc dict_get with type_hir, "template_args"
+        If args is not equal to 0:
+            Let items be proc list_elements with args
+            Let count be proc size from List with items
+            Let i be 0
+            While i is less than count:
+                If i is greater than 0:
+                    proc emit with context, ", "
+                End If
+                Let arg be proc get_at from List with items, i
+                proc generate_cpp_expression with context, arg
+                Set i to i plus 1
+            End While
+        End If
+        proc emit with context, ">"
+        Return 1
+    End If
+
+    proc emit with context, "auto"
+    Return 1
 End Process
 
+Note: ============================================================================
+Note: Statements
+Note: ============================================================================
+
 @Reasoning:
-Record a fatal codegen error on the context. Once latched, the
-has_error flag remains set until destroy_cpp_codegen_context.
+Emits a compound block '{ statements }' with each statement on its own indented
+line.
 @End Reasoning
 
 @Implementation:
-Frees any previously-stored message string, copies the new message
-into a fresh allocation, stores it at offset 56, and sets has_error
-at offset 64 to 1.
+Emits "{", raises indent, walks the "statements" list emitting each on a fresh
+line via generate_cpp_statement, lowers indent, emits "}".
 @End Implementation
 
-Process called "set_cpp_codegen_error" takes context as Integer, message as Integer:
-    Note: Set code generation error
+Process called "generate_cpp_block" takes context as Integer, block_hir as Integer returns Integer:
+    Note: Emit a compound statement block
 
-    proc memory_set_int64 from Layout with context, 64, 1  Note: has_error = true
+    proc emit with context, "{"
+    proc increment_indent with context
 
-    Let error_copy be proc copy_string from StringCore with message
-    proc memory_set_int64 from Layout with context, 56, error_copy
+    Let stmts be proc dict_get with block_hir, "statements"
+    If stmts is not equal to 0:
+        Let items be proc list_elements with stmts
+        Let count be proc size from List with items
+        Let i be 0
+        While i is less than count:
+            proc emit_newline with context
+            Let stmt be proc get_at from List with items, i
+            proc generate_cpp_statement with context, stmt
+            Set i to i plus 1
+        End While
+    End If
+
+    proc decrement_indent with context
+    proc emit_newline with context
+    proc emit with context, "}"
+    Return 1
 End Process
 
 @Reasoning:
-Extract the accumulated C++ source as a String for return to the
-caller. Called once at end-of-translation.
+Statement dispatcher routing each statement _type to its generator.
 @End Reasoning
 
 @Implementation:
-Returns the output_buffer's accumulated content via
-StringCore.string_from_buffer. Caller takes ownership of the returned
-String.
+Reads "_type" and routes to the matching generator. compound recurses to
+generate_cpp_block; declarations (variable) emit via generate_cpp_variable.
 @End Implementation
 
-@Security_Scope:
-Caller owns the returned String.
-@End Security_Scope
+Process called "generate_cpp_statement" takes context as Integer, stmt as Integer returns Integer:
+    Note: Emit a single statement
+
+    If stmt is equal to 0:
+        Return 1
+    End If
+
+    Let type_string be proc dict_get_string with stmt, "_type"
+    If type_string is equal to 0:
+        Return 1
+    End If
+
+    Let is_compound be proc string_equals from StringCore with type_string, "compound"
+    If is_compound is equal to 1:
+        Return proc generate_cpp_block with context, stmt
+    End If
+    Let is_if be proc string_equals from StringCore with type_string, "if"
+    If is_if is equal to 1:
+        Return proc generate_cpp_if with context, stmt
+    End If
+    Let is_while be proc string_equals from StringCore with type_string, "while"
+    If is_while is equal to 1:
+        Return proc generate_cpp_while with context, stmt
+    End If
+    Let is_for be proc string_equals from StringCore with type_string, "for"
+    If is_for is equal to 1:
+        Return proc generate_cpp_for with context, stmt
+    End If
+    Let is_range_for be proc string_equals from StringCore with type_string, "range_for"
+    If is_range_for is equal to 1:
+        Return proc generate_cpp_range_for with context, stmt
+    End If
+    Let is_do be proc string_equals from StringCore with type_string, "do_while"
+    If is_do is equal to 1:
+        Return proc generate_cpp_do_while with context, stmt
+    End If
+    Let is_switch be proc string_equals from StringCore with type_string, "switch"
+    If is_switch is equal to 1:
+        Return proc generate_cpp_switch with context, stmt
+    End If
+    Let is_case be proc string_equals from StringCore with type_string, "case"
+    If is_case is equal to 1:
+        proc emit with context, "case "
+        Let val be proc dict_get with stmt, "value"
+        proc generate_cpp_expression with context, val
+        proc emit with context, ":"
+        Return 1
+    End If
+    Let is_default be proc string_equals from StringCore with type_string, "default"
+    If is_default is equal to 1:
+        proc emit with context, "default:"
+        Return 1
+    End If
+    Let is_return be proc string_equals from StringCore with type_string, "return"
+    If is_return is equal to 1:
+        proc emit with context, "return"
+        Let val be proc dict_get with stmt, "value"
+        If val is not equal to 0:
+            proc emit with context, " "
+            proc generate_cpp_expression with context, val
+        End If
+        proc emit with context, ";"
+        Return 1
+    End If
+    Let is_break be proc string_equals from StringCore with type_string, "break"
+    If is_break is equal to 1:
+        proc emit with context, "break;"
+        Return 1
+    End If
+    Let is_continue be proc string_equals from StringCore with type_string, "continue"
+    If is_continue is equal to 1:
+        proc emit with context, "continue;"
+        Return 1
+    End If
+    Let is_try be proc string_equals from StringCore with type_string, "try"
+    If is_try is equal to 1:
+        Return proc generate_cpp_try with context, stmt
+    End If
+    Let is_throw be proc string_equals from StringCore with type_string, "throw"
+    If is_throw is equal to 1:
+        proc emit with context, "throw"
+        Let val be proc dict_get with stmt, "value"
+        If val is not equal to 0:
+            proc emit with context, " "
+            proc generate_cpp_expression with context, val
+        End If
+        proc emit with context, ";"
+        Return 1
+    End If
+    Let is_expr be proc string_equals from StringCore with type_string, "expression"
+    If is_expr is equal to 1:
+        Let e be proc dict_get with stmt, "expr"
+        proc generate_cpp_expression with context, e
+        proc emit with context, ";"
+        Return 1
+    End If
+    Let is_empty be proc string_equals from StringCore with type_string, "empty"
+    If is_empty is equal to 1:
+        proc emit with context, ";"
+        Return 1
+    End If
+    Let is_var be proc string_equals from StringCore with type_string, "variable"
+    If is_var is equal to 1:
+        Return proc generate_cpp_variable_inline with context, stmt
+    End If
+
+    Return 1
+End Process
+
+@Reasoning:
+A variable declaration used as a statement is emitted inline (no trailing newline
+because the block loop manages line breaks).
+@End Reasoning
+
+@Implementation:
+Emits 'type name [= init];' without the trailing newline generate_cpp_variable
+adds.
+@End Implementation
+
+Process called "generate_cpp_variable_inline" takes context as Integer, decl as Integer returns Integer:
+    Note: Emit an inline variable declaration statement
+
+    Let vtype be proc dict_get with decl, "var_type"
+    If vtype is not equal to 0:
+        proc generate_cpp_type with context, vtype
+        proc emit with context, " "
+    End If
+    Let name be proc dict_get_string with decl, "name"
+    proc emit with context, name
+    Let init be proc dict_get with decl, "initializer"
+    If init is not equal to 0:
+        proc emit with context, " = "
+        proc generate_cpp_expression with context, init
+    End If
+    proc emit with context, ";"
+    Return 1
+End Process
+
+@Reasoning:
+Emits 'if (cond) then [else ...]'.
+@End Reasoning
+
+@Implementation:
+Emits "if (" + condition + ") " + then-statement; if an "else" is present emits
+" else " + else-statement.
+@End Implementation
+
+Process called "generate_cpp_if" takes context as Integer, stmt as Integer returns Integer:
+    Note: Emit an if statement
+
+    proc emit with context, "if ("
+    Let cond be proc dict_get with stmt, "condition"
+    proc generate_cpp_expression with context, cond
+    proc emit with context, ") "
+
+    Let then_stmt be proc dict_get with stmt, "then"
+    proc generate_cpp_statement with context, then_stmt
+
+    Let else_stmt be proc dict_get with stmt, "else"
+    If else_stmt is not equal to 0:
+        proc emit with context, " else "
+        proc generate_cpp_statement with context, else_stmt
+    End If
+    Return 1
+End Process
+
+@Reasoning:
+Emits 'while (cond) body'.
+@End Reasoning
+
+@Implementation:
+Emits "while (" + condition + ") " + body.
+@End Implementation
+
+Process called "generate_cpp_while" takes context as Integer, stmt as Integer returns Integer:
+    Note: Emit a while loop
+
+    proc emit with context, "while ("
+    Let cond be proc dict_get with stmt, "condition"
+    proc generate_cpp_expression with context, cond
+    proc emit with context, ") "
+    Let body be proc dict_get with stmt, "body"
+    proc generate_cpp_statement with context, body
+    Return 1
+End Process
+
+@Reasoning:
+Emits 'for (init; cond; step) body'. Init is a declaration/expression; the body is
+the loop body statement.
+@End Reasoning
+
+@Implementation:
+Emits "for (" then the init (a statement emitted inline, already including its own
+';'), then the condition + "; ", the step, ") ", then the body. Missing clauses
+emit nothing but keep the separating semicolons.
+@End Implementation
+
+Process called "generate_cpp_for" takes context as Integer, stmt as Integer returns Integer:
+    Note: Emit a classic for loop
+
+    proc emit with context, "for ("
+    Let init be proc dict_get with stmt, "init"
+    If init is not equal to 0:
+        proc generate_cpp_statement with context, init
+    Otherwise:
+        proc emit with context, ";"
+    End If
+    proc emit with context, " "
+
+    Let cond be proc dict_get with stmt, "condition"
+    If cond is not equal to 0:
+        proc generate_cpp_expression with context, cond
+    End If
+    proc emit with context, "; "
+
+    Let step be proc dict_get with stmt, "step"
+    If step is not equal to 0:
+        proc generate_cpp_expression with context, step
+    End If
+    proc emit with context, ") "
+
+    Let body be proc dict_get with stmt, "body"
+    proc generate_cpp_statement with context, body
+    Return 1
+End Process
+
+@Reasoning:
+Emits 'for (decl : range) body'.
+@End Reasoning
+
+@Implementation:
+Emits "for (" + the declaration (inline, including its type/name) + " : " + range
++ ") " + body. The declaration's trailing ';' from the inline emitter is trimmed
+by emitting the declaration's parts directly.
+@End Implementation
+
+Process called "generate_cpp_range_for" takes context as Integer, stmt as Integer returns Integer:
+    Note: Emit a range-based for loop
+
+    proc emit with context, "for ("
+
+    Let decl be proc dict_get with stmt, "declaration"
+    If decl is not equal to 0:
+        Let vtype be proc dict_get with decl, "var_type"
+        If vtype is not equal to 0:
+            proc generate_cpp_type with context, vtype
+            proc emit with context, " "
+        End If
+        Let name be proc dict_get_string with decl, "name"
+        proc emit with context, name
+    End If
+
+    proc emit with context, " : "
+    Let range be proc dict_get with stmt, "range"
+    proc generate_cpp_expression with context, range
+    proc emit with context, ") "
+
+    Let body be proc dict_get with stmt, "body"
+    proc generate_cpp_statement with context, body
+    Return 1
+End Process
+
+@Reasoning:
+Emits 'do body while (cond);'.
+@End Reasoning
+
+@Implementation:
+Emits "do " + body + " while (" + condition + ");".
+@End Implementation
+
+Process called "generate_cpp_do_while" takes context as Integer, stmt as Integer returns Integer:
+    Note: Emit a do-while loop
+
+    proc emit with context, "do "
+    Let body be proc dict_get with stmt, "body"
+    proc generate_cpp_statement with context, body
+    proc emit with context, " while ("
+    Let cond be proc dict_get with stmt, "condition"
+    proc generate_cpp_expression with context, cond
+    proc emit with context, ");"
+    Return 1
+End Process
+
+@Reasoning:
+Emits 'switch (cond) body'.
+@End Reasoning
+
+@Implementation:
+Emits "switch (" + condition + ") " + body.
+@End Implementation
+
+Process called "generate_cpp_switch" takes context as Integer, stmt as Integer returns Integer:
+    Note: Emit a switch statement
+
+    proc emit with context, "switch ("
+    Let cond be proc dict_get with stmt, "condition"
+    proc generate_cpp_expression with context, cond
+    proc emit with context, ") "
+    Let body be proc dict_get with stmt, "body"
+    proc generate_cpp_statement with context, body
+    Return 1
+End Process
+
+@Reasoning:
+Emits 'try body catch(...) {...} ...' for each handler.
+@End Reasoning
+
+@Implementation:
+Emits "try " + body, then per handler "catch (type name) " + handler body. A
+catch-all handler emits "catch (...)".
+@End Implementation
+
+Process called "generate_cpp_try" takes context as Integer, stmt as Integer returns Integer:
+    Note: Emit a try/catch statement
+
+    proc emit with context, "try "
+    Let body be proc dict_get with stmt, "body"
+    proc generate_cpp_statement with context, body
+
+    Let handlers be proc dict_get with stmt, "handlers"
+    If handlers is not equal to 0:
+        Let items be proc list_elements with handlers
+        Let count be proc size from List with items
+        Let i be 0
+        While i is less than count:
+            Let handler be proc get_at from List with items, i
+            proc emit with context, " catch ("
+            Let exc_type be proc dict_get with handler, "exception_type"
+            If exc_type is not equal to 0:
+                proc generate_cpp_type with context, exc_type
+                Let hname be proc dict_get_string with handler, "name"
+                If hname is not equal to 0:
+                    proc emit with context, " "
+                    proc emit with context, hname
+                End If
+            Otherwise:
+                proc emit with context, "..."
+            End If
+            proc emit with context, ") "
+            Let hbody be proc dict_get with handler, "body"
+            proc generate_cpp_statement with context, hbody
+            Set i to i plus 1
+        End While
+    End If
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Expressions
+Note: ============================================================================
+
+@Reasoning:
+Expression dispatcher routing each expression _type to its generator. Null emits
+nothing so optional operands degrade gracefully.
+@End Reasoning
+
+@Implementation:
+Reads "_type" and routes: literal/identifier/binary/assignment/unary/ternary/call/
+subscript/member_access/cast/sizeof/new/delete/this/lambda. Unknown types emit
+nothing.
+@End Implementation
+
+Process called "generate_cpp_expression" takes context as Integer, expr as Integer returns Integer:
+    Note: Emit a C++ expression
+
+    If expr is equal to 0:
+        Return 1
+    End If
+
+    Let type_string be proc dict_get_string with expr, "_type"
+    If type_string is equal to 0:
+        Return 1
+    End If
+
+    Let is_lit be proc string_equals from StringCore with type_string, "literal"
+    If is_lit is equal to 1:
+        Return proc generate_cpp_literal with context, expr
+    End If
+    Let is_id be proc string_equals from StringCore with type_string, "identifier"
+    If is_id is equal to 1:
+        Let name be proc dict_get_string with expr, "name"
+        proc emit with context, name
+        Return 1
+    End If
+    Let is_bin be proc string_equals from StringCore with type_string, "binary"
+    If is_bin is equal to 1:
+        Return proc generate_cpp_binary with context, expr
+    End If
+    Let is_assign be proc string_equals from StringCore with type_string, "assignment"
+    If is_assign is equal to 1:
+        Return proc generate_cpp_assignment with context, expr
+    End If
+    Let is_unary be proc string_equals from StringCore with type_string, "unary"
+    If is_unary is equal to 1:
+        Return proc generate_cpp_unary with context, expr
+    End If
+    Let is_tern be proc string_equals from StringCore with type_string, "ternary"
+    If is_tern is equal to 1:
+        Return proc generate_cpp_ternary with context, expr
+    End If
+    Let is_call be proc string_equals from StringCore with type_string, "call"
+    If is_call is equal to 1:
+        Return proc generate_cpp_call with context, expr
+    End If
+    Let is_sub be proc string_equals from StringCore with type_string, "subscript"
+    If is_sub is equal to 1:
+        Return proc generate_cpp_subscript with context, expr
+    End If
+    Let is_member be proc string_equals from StringCore with type_string, "member_access"
+    If is_member is equal to 1:
+        Return proc generate_cpp_member with context, expr
+    End If
+    Let is_cast be proc string_equals from StringCore with type_string, "cast"
+    If is_cast is equal to 1:
+        Return proc generate_cpp_cast with context, expr
+    End If
+    Let is_sizeof be proc string_equals from StringCore with type_string, "sizeof"
+    If is_sizeof is equal to 1:
+        Return proc generate_cpp_sizeof with context, expr
+    End If
+    Let is_new be proc string_equals from StringCore with type_string, "new"
+    If is_new is equal to 1:
+        Return proc generate_cpp_new with context, expr
+    End If
+    Let is_delete be proc string_equals from StringCore with type_string, "delete"
+    If is_delete is equal to 1:
+        Return proc generate_cpp_delete with context, expr
+    End If
+    Let is_this be proc string_equals from StringCore with type_string, "this"
+    If is_this is equal to 1:
+        proc emit with context, "this"
+        Return 1
+    End If
+    Let is_lambda be proc string_equals from StringCore with type_string, "lambda"
+    If is_lambda is equal to 1:
+        Return proc generate_cpp_lambda with context, expr
+    End If
+
+    Return 1
+End Process
+
+@Reasoning:
+Emits a literal verbatim. The literal text already includes quotes for string/char
+literals as captured by the lexer.
+@End Reasoning
+
+@Implementation:
+Emits the "value" text. A braced initializer (kind "braced_init") emits
+'{ e1, e2, ... }' from the "elements" list.
+@End Implementation
+
+Process called "generate_cpp_literal" takes context as Integer, expr as Integer returns Integer:
+    Note: Emit a literal
+
+    Let kind be proc dict_get_string with expr, "literal_kind"
+    If kind is not equal to 0:
+        Let is_braced be proc string_equals from StringCore with kind, "braced_init"
+        If is_braced is equal to 1:
+            proc emit with context, "{"
+            Let elems be proc dict_get with expr, "elements"
+            If elems is not equal to 0:
+                Let items be proc list_elements with elems
+                Let count be proc size from List with items
+                Let i be 0
+                While i is less than count:
+                    If i is greater than 0:
+                        proc emit with context, ", "
+                    End If
+                    Let e be proc get_at from List with items, i
+                    proc generate_cpp_expression with context, e
+                    Set i to i plus 1
+                End While
+            End If
+            proc emit with context, "}"
+            Return 1
+        End If
+    End If
+
+    Let value be proc dict_get_string with expr, "value"
+    If value is not equal to 0:
+        proc emit with context, value
+    End If
+    Return 1
+End Process
+
+@Reasoning:
+Emits '(left OP right)' parenthesised to preserve precedence faithfully through
+round-trips.
+@End Reasoning
+
+@Implementation:
+Emits "(" + left + " " + operator + " " + right + ")".
+@End Implementation
+
+Process called "generate_cpp_binary" takes context as Integer, expr as Integer returns Integer:
+    Note: Emit a binary expression
+
+    proc emit with context, "("
+    Let left be proc dict_get with expr, "left"
+    proc generate_cpp_expression with context, left
+    proc emit with context, " "
+    Let op be proc dict_get_string with expr, "operator"
+    proc emit with context, op
+    proc emit with context, " "
+    Let right be proc dict_get with expr, "right"
+    proc generate_cpp_expression with context, right
+    proc emit with context, ")"
+    Return 1
+End Process
+
+@Reasoning:
+Emits 'target OP value' for an assignment (right-associative, no extra parens at
+statement level).
+@End Reasoning
+
+@Implementation:
+Emits target + " " + operator + " " + value.
+@End Implementation
+
+Process called "generate_cpp_assignment" takes context as Integer, expr as Integer returns Integer:
+    Note: Emit an assignment
+
+    Let target be proc dict_get with expr, "target"
+    proc generate_cpp_expression with context, target
+    proc emit with context, " "
+    Let op be proc dict_get_string with expr, "operator"
+    proc emit with context, op
+    proc emit with context, " "
+    Let value be proc dict_get with expr, "value"
+    proc generate_cpp_expression with context, value
+    Return 1
+End Process
+
+@Reasoning:
+Emits a prefix or postfix unary expression with parentheses around the operand for
+precedence safety.
+@End Reasoning
+
+@Implementation:
+Reads "fixity". Prefix emits operator + "(" + operand + ")"; postfix emits "(" +
+operand + ")" + operator.
+@End Implementation
+
+Process called "generate_cpp_unary" takes context as Integer, expr as Integer returns Integer:
+    Note: Emit a unary expression
+
+    Let op be proc dict_get_string with expr, "operator"
+    Let fixity be proc dict_get_string with expr, "fixity"
+    Let operand be proc dict_get with expr, "operand"
+
+    Let is_postfix be 0
+    If fixity is not equal to 0:
+        Set is_postfix to proc string_equals from StringCore with fixity, "postfix"
+    End If
+
+    If is_postfix is equal to 1:
+        proc emit with context, "("
+        proc generate_cpp_expression with context, operand
+        proc emit with context, ")"
+        proc emit with context, op
+    Otherwise:
+        proc emit with context, op
+        proc emit with context, "("
+        proc generate_cpp_expression with context, operand
+        proc emit with context, ")"
+    End If
+    Return 1
+End Process
+
+@Reasoning:
+Emits '(cond ? then : else)'.
+@End Reasoning
+
+@Implementation:
+Emits "(" + condition + " ? " + then + " : " + else + ")".
+@End Implementation
+
+Process called "generate_cpp_ternary" takes context as Integer, expr as Integer returns Integer:
+    Note: Emit a ternary expression
+
+    proc emit with context, "("
+    Let cond be proc dict_get with expr, "condition"
+    proc generate_cpp_expression with context, cond
+    proc emit with context, " ? "
+    Let then_e be proc dict_get with expr, "then"
+    proc generate_cpp_expression with context, then_e
+    proc emit with context, " : "
+    Let else_e be proc dict_get with expr, "else"
+    proc generate_cpp_expression with context, else_e
+    proc emit with context, ")"
+    Return 1
+End Process
+
+@Reasoning:
+Emits 'callee(arg, arg, ...)'.
+@End Reasoning
+
+@Implementation:
+Emits the callee + "(" + comma-separated arguments + ")".
+@End Implementation
+
+Process called "generate_cpp_call" takes context as Integer, expr as Integer returns Integer:
+    Note: Emit a call expression
+
+    Let callee be proc dict_get with expr, "callee"
+    proc generate_cpp_expression with context, callee
+    proc emit with context, "("
+    Let args be proc dict_get with expr, "arguments"
+    If args is not equal to 0:
+        Let items be proc list_elements with args
+        Let count be proc size from List with items
+        Let i be 0
+        While i is less than count:
+            If i is greater than 0:
+                proc emit with context, ", "
+            End If
+            Let arg be proc get_at from List with items, i
+            proc generate_cpp_expression with context, arg
+            Set i to i plus 1
+        End While
+    End If
+    proc emit with context, ")"
+    Return 1
+End Process
+
+@Reasoning:
+Emits 'object[index]'.
+@End Reasoning
+
+@Implementation:
+Emits object + "[" + index + "]".
+@End Implementation
+
+Process called "generate_cpp_subscript" takes context as Integer, expr as Integer returns Integer:
+    Note: Emit a subscript expression
+
+    Let obj be proc dict_get with expr, "object"
+    proc generate_cpp_expression with context, obj
+    proc emit with context, "["
+    Let idx be proc dict_get with expr, "index"
+    proc generate_cpp_expression with context, idx
+    proc emit with context, "]"
+    Return 1
+End Process
+
+@Reasoning:
+Emits 'object.member', 'object->member', or 'object::member' according to the
+access kind.
+@End Reasoning
+
+@Implementation:
+Reads "access_kind". member -> "."; arrow -> "->"; scope -> "::". Emits object +
+op + member.
+@End Implementation
+
+Process called "generate_cpp_member" takes context as Integer, expr as Integer returns Integer:
+    Note: Emit a member-access expression
+
+    Let obj be proc dict_get with expr, "object"
+    proc generate_cpp_expression with context, obj
+
+    Let kind be proc dict_get_string with expr, "access_kind"
+    Let is_arrow be 0
+    Let is_scope be 0
+    If kind is not equal to 0:
+        Set is_arrow to proc string_equals from StringCore with kind, "arrow"
+        Set is_scope to proc string_equals from StringCore with kind, "scope"
+    End If
+    If is_arrow is equal to 1:
+        proc emit with context, "->"
+    Otherwise:
+        If is_scope is equal to 1:
+            proc emit with context, "::"
+        Otherwise:
+            proc emit with context, "."
+        End If
+    End If
+
+    Let member be proc dict_get_string with expr, "member"
+    proc emit with context, member
+    Return 1
+End Process
+
+@Reasoning:
+Emits 'cast_kind<type>(operand)' for a named cast.
+@End Reasoning
+
+@Implementation:
+Emits the cast kind + "<" + target type + ">(" + operand + ")".
+@End Implementation
+
+Process called "generate_cpp_cast" takes context as Integer, expr as Integer returns Integer:
+    Note: Emit a named cast
+
+    Let kind be proc dict_get_string with expr, "cast_kind"
+    proc emit with context, kind
+    proc emit with context, "<"
+    Let ty be proc dict_get with expr, "target_type"
+    proc generate_cpp_type with context, ty
+    proc emit with context, ">("
+    Let operand be proc dict_get with expr, "operand"
+    proc generate_cpp_expression with context, operand
+    proc emit with context, ")"
+    Return 1
+End Process
+
+@Reasoning:
+Emits 'sizeof(type)' or 'sizeof(operand)'.
+@End Reasoning
+
+@Implementation:
+If an operand_type is present emits "sizeof(" + type + ")"; otherwise "sizeof(" +
+operand + ")".
+@End Implementation
+
+Process called "generate_cpp_sizeof" takes context as Integer, expr as Integer returns Integer:
+    Note: Emit a sizeof expression
+
+    proc emit with context, "sizeof("
+    Let ty be proc dict_get with expr, "operand_type"
+    If ty is not equal to 0:
+        proc generate_cpp_type with context, ty
+    Otherwise:
+        Let operand be proc dict_get with expr, "operand"
+        proc generate_cpp_expression with context, operand
+    End If
+    proc emit with context, ")"
+    Return 1
+End Process
+
+@Reasoning:
+Emits 'new Type(args)'.
+@End Reasoning
+
+@Implementation:
+Emits "new " + type; if arguments are present emits "(" + comma-separated args +
+")".
+@End Implementation
+
+Process called "generate_cpp_new" takes context as Integer, expr as Integer returns Integer:
+    Note: Emit a new expression
+
+    proc emit with context, "new "
+    Let ty be proc dict_get with expr, "new_type"
+    proc generate_cpp_type with context, ty
+
+    Let args be proc dict_get with expr, "arguments"
+    If args is not equal to 0:
+        Let items be proc list_elements with args
+        Let count be proc size from List with items
+        If count is greater than 0:
+            proc emit with context, "("
+            Let i be 0
+            While i is less than count:
+                If i is greater than 0:
+                    proc emit with context, ", "
+                End If
+                Let arg be proc get_at from List with items, i
+                proc generate_cpp_expression with context, arg
+                Set i to i plus 1
+            End While
+            proc emit with context, ")"
+        End If
+    End If
+    Return 1
+End Process
+
+@Reasoning:
+Emits 'delete operand' or 'delete[] operand'.
+@End Reasoning
+
+@Implementation:
+Emits "delete" + ("[] " when array, else " ") + operand.
+@End Implementation
+
+Process called "generate_cpp_delete" takes context as Integer, expr as Integer returns Integer:
+    Note: Emit a delete expression
+
+    proc emit with context, "delete"
+    Let arr be proc dict_get_string with expr, "array"
+    If arr is not equal to 0:
+        proc emit with context, "[] "
+    Otherwise:
+        proc emit with context, " "
+    End If
+    Let operand be proc dict_get with expr, "operand"
+    proc generate_cpp_expression with context, operand
+    Return 1
+End Process
+
+@Reasoning:
+Emits a lambda '[captures](params) -> ret { body }'.
+@End Reasoning
+
+@Implementation:
+Emits "[" + capture clause + "](" + parameters + ")", an optional " -> ret", then
+the body block.
+@End Implementation
+
+Process called "generate_cpp_lambda" takes context as Integer, expr as Integer returns Integer:
+    Note: Emit a lambda expression
+
+    proc emit with context, "["
+    Let captures be proc dict_get with expr, "captures"
+    If captures is not equal to 0:
+        Let items be proc list_elements with captures
+        Let count be proc size from List with items
+        Let i be 0
+        While i is less than count:
+            If i is greater than 0:
+                proc emit with context, ", "
+            End If
+            Let cap be proc get_at from List with items, i
+            Let cname be proc dict_get_string with cap, "name"
+            If cname is not equal to 0:
+                proc emit with context, cname
+            Otherwise:
+                Let mode be proc dict_get_string with cap, "mode"
+                If mode is not equal to 0:
+                    Let is_ref be proc string_equals from StringCore with mode, "by_reference"
+                    If is_ref is equal to 1:
+                        proc emit with context, "&"
+                    End If
+                    Let is_val be proc string_equals from StringCore with mode, "by_value"
+                    If is_val is equal to 1:
+                        proc emit with context, "="
+                    End If
+                    Let is_this be proc string_equals from StringCore with mode, "this"
+                    If is_this is equal to 1:
+                        proc emit with context, "this"
+                    End If
+                End If
+            End If
+            Set i to i plus 1
+        End While
+    End If
+    proc emit with context, "]("
+
+    Let params be proc dict_get with expr, "parameters"
+    If params is not equal to 0:
+        proc generate_cpp_parameters with context, params
+    End If
+    proc emit with context, ")"
+
+    Let ret be proc dict_get with expr, "return_type"
+    If ret is not equal to 0:
+        proc emit with context, " -> "
+        proc generate_cpp_type with context, ret
+    End If
+
+    proc emit with context, " "
+    Let body be proc dict_get with expr, "body"
+    If body is not equal to 0:
+        proc generate_cpp_block with context, body
+    End If
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Output Retrieval and Public API
+Note: ============================================================================
+
+@Reasoning:
+Extracts the accumulated C++ source as a fresh String for return to the caller.
+@End Reasoning
+
+@Implementation:
+Reads the emitter and forwards to cpp_get_output.
+@End Implementation
 
 Process called "get_cpp_generated_code" takes context as Integer returns Integer:
-    Note: Get final generated C++ code
+    Note: Get the final generated C++ source
 
-    Let output_buffer be proc memory_get_int64 from Layout with context, 0
-    Return proc get_string_buffer_contents from StringCore with output_buffer
+    Let emitter be proc memory_get_int64 from Layout with context, 0
+    Return proc cpp_get_output from Emitter with emitter
 End Process
 
-Note: ============================================================================
-Note: Public API
-Note: ============================================================================
-
 @Reasoning:
-Public one-call driver: build context, generate, extract output,
-destroy context, return string.
+Public one-call driver matching the C backend's hir_to_c naming: build context,
+generate, extract output, destroy context, return the string.
 @End Reasoning
 
 @Implementation:
-Creates a context. On failure returns 0. Calls generate_cpp_from_hir.
-On codegen error returns 0 after destroying the context. Otherwise
-extracts the generated code, destroys the context, and returns the
-output string.
+Creates a context (0 on OOM). Runs generate_cpp_from_hir; on error destroys and
+returns 0. Otherwise extracts the code, destroys the context, returns the string.
 @End Implementation
 
-Process called "hir_to_cpp" takes hir_program as Integer returns Integer:
-    Note: Main public API - convert HIR to C++ source code
-
-    @Reasoning:
-    Primary entry point for HIR to C++ translation. Creates context,
-    performs code generation, and returns C++ source code suitable
-    for compilation with standard C++ compilers.
-    @End Reasoning
+Process called "generate_cpp_from_hir_string" takes hir_program as Integer returns Integer:
+    Note: HIR -> C++ source string
 
     Let context be proc create_cpp_codegen_context
-
     If context is equal to 0:
         Return 0
     End If
 
     Let success be proc generate_cpp_from_hir with context, hir_program
-
     If success is equal to 0:
-        proc destroy_cpp_codegen_context from context
+        proc destroy_cpp_codegen_context with context
         Return 0
     End If
 
-    Let generated_code be proc get_cpp_generated_code from context
-    proc destroy_cpp_codegen_context from context
+    Let code be proc get_cpp_generated_code with context
+    proc destroy_cpp_codegen_context with context
+    Return code
+End Process
 
-    Return generated_code
+@Reasoning:
+Primary public entry point: convert HIR to C++ source. Mirrors hir_to_c so the
+dispatcher and round-trip test invoke a consistent name.
+@End Reasoning
+
+@Implementation:
+Delegates to generate_cpp_from_hir_string.
+@End Implementation
+
+Process called "hir_to_cpp" takes hir_program as Integer returns Integer:
+    Note: Public API - convert HIR to C++ source code
+
+    Return proc generate_cpp_from_hir_string with hir_program
 End Process

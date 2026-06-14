@@ -15,22 +15,23 @@ limitations under the License.
 :End Note
 
 Note:
-C++ to HIR Translator - Converts C++ AST to Runa High-level Intermediate Representation
+C++ to HIR Translator - lowers a C++ AST into the hir.runa dictionary/list
+literal interchange.
 
-This file translates semantically analyzed C++ AST nodes into Runa HIR format,
-preserving C++ semantics including:
-- Object-oriented features (classes, inheritance, polymorphism)
-- Template instantiations and generic programming constructs
-- RAII and resource management patterns
-- Exception handling mechanisms
-- Operator overloading
-- Lambda expressions and closures
-- Reference semantics and move operations
-- Namespace and scope information
+The HIR model is the dictionary/list literal form shared by the c/go/json/csharp
+frontends: a dictionary is a HIR_DICTIONARY_LITERAL whose entries List holds
+16-byte [key, value] blocks; a list is a HIR_ARRAY_LITERAL whose elements List
+holds child nodes; string payloads are HIR string-literal nodes. Each translated
+construct becomes a dict tagged with a "_type" string the hir_to_cpp backend
+dispatches on (program/class/function/variable/template/namespace/enum/typedef/
+using/preprocessor and the statement/expression tags).
 
-The HIR maintains enough information to enable round-trip translation
-back to idiomatic C++ code while being suitable for further optimization
-and code generation passes.
+Producer/consumer contract keys:
+- program: _type, _source_language, declarations(list)
+- class:   _type, name, inheritance, template_parameters, members(list)
+- function:_type, name, return_type, parameters(list), body, access
+- variable:_type, name, var_type, initializer, access
+- statements/expressions carry their operands as nested dicts/lists.
 
 Dependencies:
 - cpp_parser.runa
@@ -53,97 +54,71 @@ Note: Translation Context
 Note: ============================================================================
 
 @Reasoning:
-C++ to HIR translation is fundamentally non-local: a name's HIR form depends
-on the enclosing class (this-vs-static), the active template instantiation
-(typename substitution), the current namespace path (qualified-name emission),
-and the live lambda capture list (capture-this vs capture-copy). The context
-carries those four cursors plus a sticky error channel so deeply-recursive
-translation walks can short-circuit cleanly.
+C++ to HIR translation threads four cursors: enclosing class, active template,
+namespace path, and live lambda - plus a sticky error channel so deep recursion
+can bail cleanly.
 @End Reasoning
 
 @Implementation:
-A 48-byte record (6 x i64 slots) at offsets 0/8/16/24/32/40: class_context
-(current Class HIR pointer or 0), template_context (current template params
-pointer or 0), namespace_stack (List of namespace name strings),
-lambda_context (current Lambda HIR pointer or 0), error_message (owned
-StringCore copy, freed in destroy), has_error (0/1 sticky flag).
+48-byte record (6 x i64) at offsets 0/8/16/24/32/40: class_context,
+template_context, namespace_stack (List), lambda_context, error_message (owned),
+has_error.
 @End Implementation
 
 Type called "CppTranslationContext":
-    class_context as Integer      Note: Current class being translated
-    template_context as Integer   Note: Current template instantiation
-    namespace_stack as Integer    Note: Stack of namespace contexts
-    lambda_context as Integer     Note: Current lambda capture context
-    error_message as Integer      Note: Translation error message
-    has_error as Integer          Note: Boolean: 1 if error occurred
+    class_context as Integer
+    template_context as Integer
+    namespace_stack as Integer
+    lambda_context as Integer
+    error_message as Integer
+    has_error as Integer
 End Type
 
-Note: ============================================================================
-Note: Context Management
-Note: ============================================================================
-
 @Reasoning:
-Allocates and zero-initialises the CppTranslationContext, the cursor object
-that every recursive translation function threads through. Class/template/
-lambda pointers start null because a fresh translation begins outside any
-enclosing scope; the namespace stack is a real List so push/pop can use
-amortised O(1) operations without reallocating the context block.
+Allocates and zero-initialises the context, threading every recursive translation
+call. namespace_stack is a real List for amortised push/pop.
 @End Reasoning
 
 @Implementation:
-Two-step allocation: 48-byte struct first, then the List for namespace_stack.
-If either allocation fails, ownership is unwound (context is freed before
-returning 0) so the function never leaks. All six fields are written via
-memory_set_int64 at the byte offsets matching the Type declaration: 0
-(class), 8 (template), 16 (namespace stack), 24 (lambda), 32 (error
-message), 40 (has_error). Returns the context pointer or 0 on OOM.
+Allocates the 48-byte struct then the namespace List; unwinds on OOM. Writes the
+six fields.
 @End Implementation
 
 Process called "create_cpp_translation_context" returns Integer:
-    Note: Create translation context for C++ to HIR conversion
+    Note: Create translation context
 
-    Let context_size be 48  Note: CppTranslationContext: 6 fields × 8 bytes
-    Let context be proc allocate from Layout with context_size
-
+    Let context be proc allocate from Layout with 48
     If context is equal to 0:
         Return 0
     End If
 
     Let namespace_stack be proc create from List
-
     If namespace_stack is equal to 0:
         proc deallocate from Layout with context
         Return 0
     End If
 
-    proc memory_set_int64 from Layout with context, 0, 0   Note: class_context = null
-    proc memory_set_int64 from Layout with context, 8, 0   Note: template_context = null
+    proc memory_set_int64 from Layout with context, 0, 0
+    proc memory_set_int64 from Layout with context, 8, 0
     proc memory_set_int64 from Layout with context, 16, namespace_stack
-    proc memory_set_int64 from Layout with context, 24, 0  Note: lambda_context = null
-    proc memory_set_int64 from Layout with context, 32, 0  Note: error_message = null
-    proc memory_set_int64 from Layout with context, 40, 0  Note: has_error = false
+    proc memory_set_int64 from Layout with context, 24, 0
+    proc memory_set_int64 from Layout with context, 32, 0
+    proc memory_set_int64 from Layout with context, 40, 0
 
     Return context
 End Process
 
 @Reasoning:
-Frees the context and every owned resource it points at. Two heap-owned
-slots can outlive the translation walk: the namespace_stack List (always
-owned) and the error_message StringCore copy (only owned when an error
-fired). A null context is treated as already-destroyed and returns success
-so callers don't have to track a separate "context-built" flag.
+Frees the context and its owned namespace List and error message copy. Null
+context returns success.
 @End Reasoning
 
 @Implementation:
-Reads slots 16 (namespace stack) and 32 (error message), invokes the
-type-specific destructor when non-null, then deallocates the 48-byte
-context block itself. Returns 1 unconditionally on success; the only
-failure surface is hitting a null context, which is also reported as 1
-because the contract is "after this call nothing remains to free".
+Reads slots 16 and 32, destroys/frees when non-null, deallocates the context.
 @End Implementation
 
 Process called "destroy_cpp_translation_context" takes context as Integer returns Integer:
-    Note: Destroy translation context and free resources
+    Note: Destroy translation context
 
     If context is equal to 0:
         Return 1
@@ -155,14 +130,294 @@ Process called "destroy_cpp_translation_context" takes context as Integer return
     If namespace_stack is not equal to 0:
         proc destroy from List with namespace_stack
     End If
-
     If error_message is not equal to 0:
         proc deallocate from Layout with error_message
     End If
 
     proc deallocate from Layout with context
-
     Return 1
+End Process
+
+@Reasoning:
+Records the sticky-error state with an owned copy of the message.
+@End Reasoning
+
+@Implementation:
+Sets has_error (offset 40) and stores a string_duplicate of message at offset 32.
+@End Implementation
+
+Process called "set_cpp_translation_error" takes context as Integer, message as Integer:
+    Note: Set translation error state
+
+    proc memory_set_int64 from Layout with context, 40, 1
+    Let copy be proc string_duplicate from StringCore with message
+    proc memory_set_int64 from Layout with context, 32, copy
+End Process
+
+Note: ============================================================================
+Note: AST accessors (slot offsets per cpp_parser.runa CppASTNode)
+Note: ============================================================================
+
+@Reasoning:
+The translator reads parser AST nodes by their documented slot offsets:
+node_type@0, name@8, value@16, type_info@24, children@32, attributes@40,
+template_params@48. These thin accessors keep the offsets in one place.
+@End Reasoning
+
+@Implementation:
+Each returns the i64 at the matching offset; 0 for a null node.
+@End Implementation
+
+Process called "node_type_of" takes node as Integer returns Integer:
+    Note: AST node type tag
+
+    If node is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Layout with node, 0
+End Process
+
+Process called "node_name_of" takes node as Integer returns Integer:
+    Note: AST node name handle
+
+    If node is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Layout with node, 8
+End Process
+
+Process called "node_value_of" takes node as Integer returns Integer:
+    Note: AST node value handle
+
+    If node is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Layout with node, 16
+End Process
+
+Process called "node_type_info_of" takes node as Integer returns Integer:
+    Note: AST node declared-type handle
+
+    If node is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Layout with node, 24
+End Process
+
+Process called "node_children_of" takes node as Integer returns Integer:
+    Note: AST node children list handle
+
+    If node is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Layout with node, 32
+End Process
+
+Process called "node_attributes_of" takes node as Integer returns Integer:
+    Note: AST node attributes (access level)
+
+    If node is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Layout with node, 40
+End Process
+
+Process called "node_template_params_of" takes node as Integer returns Integer:
+    Note: AST node template parameter list handle
+
+    If node is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Layout with node, 48
+End Process
+
+@Reasoning:
+A child at a given index, or 0 when absent. Used to reach an ordered child like a
+function body or an enumerator initializer.
+@End Reasoning
+
+@Implementation:
+Reads the children List; bounds-checks index; returns the element or 0.
+@End Implementation
+
+Process called "child_at" takes node as Integer, index as Integer returns Integer:
+    Note: Nth child of a node or 0
+
+    Let children be proc node_children_of with node
+    If children is equal to 0:
+        Return 0
+    End If
+    Let count be proc size from List with children
+    If index is greater than or equal to count:
+        Return 0
+    End If
+    Return proc get from List with children, index
+End Process
+
+Note: ============================================================================
+Note: HIR helpers
+Note: ============================================================================
+
+@Reasoning:
+Convenience wrapper that attaches a string-valued entry to a HIR dictionary,
+encapsulating the create-string-literal + add-entry pair every dict producer
+repeats.
+@End Reasoning
+
+@Implementation:
+Creates a HIR string literal for value (when non-zero) and adds it under key.
+@End Implementation
+
+Process called "put_string" takes dict as Integer, key as Integer, value as Integer:
+    Note: Add a string entry to a HIR dict
+
+    If value is equal to 0:
+        Return
+    End If
+    Let sv be proc create_hir_string_literal from HIR with value
+    proc add_dictionary_entry from HIR with dict, key, sv
+End Process
+
+@Reasoning:
+Attaches an already-built HIR sub-node under a key, guarding against null so
+optional fields are simply omitted.
+@End Reasoning
+
+@Implementation:
+If node non-zero, adds it under key.
+@End Implementation
+
+Process called "put_node" takes dict as Integer, key as Integer, node as Integer:
+    Note: Add a HIR node entry to a dict
+
+    If node is equal to 0:
+        Return
+    End If
+    proc add_dictionary_entry from HIR with dict, key, node
+End Process
+
+@Reasoning:
+Maps the access-level integer (0/1/2) to the canonical lowercase keyword for HIR
+so the backend can reproduce access sections.
+@End Reasoning
+
+@Implementation:
+0 -> "private", 1 -> "protected", 2 -> "public", else "private".
+@End Implementation
+
+Process called "access_level_to_string" takes access_level as Integer returns Integer:
+    Note: Access level to keyword string
+
+    If access_level is equal to 1:
+        Return "protected"
+    End If
+    If access_level is equal to 2:
+        Return "public"
+    End If
+    Return "private"
+End Process
+
+Note: ============================================================================
+Note: Type Translation
+Note: ============================================================================
+
+@Reasoning:
+Lowers a CPP_TYPE_NODE chain (with pointer/reference wrappers) into a HIR type
+representation. Plain types become a HIR string literal of the type name;
+pointer/reference wrappers become a dict tagged "pointer"/"reference" with a
+nested "base" type so the backend reproduces indirection. Template-id types
+carry a "template_args" list.
+@End Reasoning
+
+@Implementation:
+Dispatches on node_type: CPP_POINTER_TYPE -> dict {_type:"pointer", base:<inner>}.
+CPP_REFERENCE_TYPE -> dict {_type:"reference", base:<inner>, kind:<rvalue?>}.
+CPP_AUTO_TYPE -> string "auto". Otherwise a string of the type name; a non-null
+template_params slot adds a "template_args" list of translated args.
+@End Implementation
+
+Process called "translate_type_to_hir" takes context as Integer, type_node as Integer returns Integer:
+    Note: Translate a type node to HIR
+
+    If type_node is equal to 0:
+        Return proc create_hir_string_literal from HIR with "void"
+    End If
+
+    Let nt be proc node_type_of with type_node
+
+    If nt is equal to CPP_POINTER_TYPE from Parser:
+        Let d be proc create_hir_dictionary_literal from HIR
+        proc put_string with d, "_type", "pointer"
+        Let inner be proc node_type_info_of with type_node
+        Let base be proc translate_type_to_hir with context, inner
+        proc put_node with d, "base", base
+        Return d
+    End If
+
+    If nt is equal to CPP_REFERENCE_TYPE from Parser:
+        Let d be proc create_hir_dictionary_literal from HIR
+        proc put_string with d, "_type", "reference"
+        Let kind be proc node_value_of with type_node
+        If kind is not equal to 0:
+            proc put_string with d, "kind", kind
+        End If
+        Let inner be proc node_type_info_of with type_node
+        Let base be proc translate_type_to_hir with context, inner
+        proc put_node with d, "base", base
+        Return d
+    End If
+
+    If nt is equal to CPP_AUTO_TYPE from Parser:
+        Return proc create_hir_string_literal from HIR with "auto"
+    End If
+
+    Note: Plain / template-id type
+    Let name be proc node_name_of with type_node
+    Let targs be proc node_template_params_of with type_node
+    If targs is equal to 0:
+        If name is equal to 0:
+            Return proc create_hir_string_literal from HIR with "auto"
+        End If
+        Return proc create_hir_string_literal from HIR with name
+    End If
+
+    Let d be proc create_hir_dictionary_literal from HIR
+    proc put_string with d, "_type", "template_type"
+    proc put_string with d, "name", name
+    Let arglist be proc translate_template_arg_list_to_hir with context, targs
+    proc put_node with d, "template_args", arglist
+    Return d
+End Process
+
+@Reasoning:
+Lowers a template argument list into a HIR list of argument expressions/types.
+@End Reasoning
+
+@Implementation:
+Iterates the arg-list node's children translating each as an expression (covers
+both type-name args and constant expressions) into a HIR list.
+@End Implementation
+
+Process called "translate_template_arg_list_to_hir" takes context as Integer, list_node as Integer returns Integer:
+    Note: Translate a template argument list to a HIR list
+
+    Let hir_list be proc create_hir_list_literal from HIR
+    Let children be proc node_children_of with list_node
+    If children is equal to 0:
+        Return hir_list
+    End If
+
+    Let count be proc size from List with children
+    Let i be 0
+    While i is less than count:
+        Let child be proc get from List with children, i
+        Let arg be proc translate_cpp_expression_to_hir with context, child
+        If arg is not equal to 0:
+            proc add_list_element from HIR with hir_list, arg
+        End If
+        Set i to i plus 1
+    End While
+    Return hir_list
 End Process
 
 Note: ============================================================================
@@ -170,210 +425,157 @@ Note: Main Translation Entry Points
 Note: ============================================================================
 
 @Reasoning:
-Top-of-tree walk over the C++ translation unit. Output is a HIR dictionary
-literal tagged _type="program" with _source_language="cpp" so downstream
-HIR consumers can route language-specific lowering. Children of the
-program node are iterated in source order to preserve declaration order,
-which C++ semantics require (ODR, forward declarations).
+Top-of-tree walk over the translation unit. Output is a dict tagged "cpp_program"
+with _source_language "cpp" carrying a "declarations" list in source order.
 @End Reasoning
 
 @Implementation:
-Children list lives at offset 32 of the program AST node. After validating
-context and program_node (both must be non-null), creates the HIR program
-dict, attaches _type and _source_language string entries, then iterates
-the child list dispatching each through translate_cpp_declaration_to_hir.
-Sticky-error short-circuit: the has_error flag at context offset 40 is
-checked after every child translation and abandons the walk on first
-failure to avoid emitting partial HIR.
+Validates context/program. Builds the program dict, attaches _type and
+_source_language, iterates the children list dispatching each through
+translate_cpp_declaration_to_hir, and short-circuits on the sticky error flag.
 @End Implementation
 
 Process called "translate_cpp_program_to_hir" takes context as Integer, program_node as Integer returns Integer:
-    Note: Translate C++ program to HIR representation
+    Note: Translate a C++ program to HIR
 
     If context is equal to 0:
         Return 0
     End If
-
     If program_node is equal to 0:
         proc set_cpp_translation_error with context, "Null program node"
         Return 0
     End If
 
     Let hir_program be proc create_hir_dictionary_literal from HIR
+    proc put_string with hir_program, "_type", "cpp_program"
+    proc put_string with hir_program, "_source_language", "cpp"
 
-    Note: Set program type
-    Let type_value be proc create_hir_string_literal from HIR with "program"
-    proc add_dictionary_entry from HIR with hir_program, "_type", type_value
-
-    Note: Set source language
-    Let lang_value be proc create_hir_string_literal from HIR with "cpp"
-    proc add_dictionary_entry from HIR with hir_program, "_source_language", lang_value
-
-    Note: Create declarations list
     Let declarations_list be proc create_hir_list_literal from HIR
-
-    Let children be proc memory_get_int64 from Layout with program_node, 32
+    Let children be proc node_children_of with program_node
 
     If children is not equal to 0:
-        Let child_count be proc size from List with children
+        Let count be proc size from List with children
         Let i be 0
-
-        While i is less than child_count:
+        While i is less than count:
             Let child be proc get from List with children, i
             Let hir_decl be proc translate_cpp_declaration_to_hir with context, child
-
             If hir_decl is not equal to 0:
                 proc add_list_element from HIR with declarations_list, hir_decl
             End If
-
-            Let has_error be proc memory_get_int64 from Layout with context, 40
-            If has_error is equal to 1:
-                Return 0
-            End If
-
             Set i to i plus 1
         End While
     End If
 
     proc add_dictionary_entry from HIR with hir_program, "declarations", declarations_list
-
     Return hir_program
 End Process
 
 @Reasoning:
-Dispatcher over the seven top-level declaration kinds that can appear in a
-C++ translation unit: class, namespace, template, function, variable,
-typedef, and enum. Each translates through its dedicated lowering function
-so this node remains a thin switch — no shared logic — keeping per-kind
-HIR shape decisions local to their handlers.
+Dispatcher over the top-level declaration kinds. Each routes to a dedicated
+lowering function so per-kind HIR shape stays local.
 @End Reasoning
 
 @Implementation:
-The node-type tag lives at offset 0 of every C++ AST node. Compares against
-the CPP_CLASS, CPP_NAMESPACE, CPP_TEMPLATE, CPP_FUNCTION, CPP_VARIABLE,
-CPP_TYPEDEF, CPP_ENUM constants from the Parser module. Unknown tags
-record an error on the context and emit an UnknownDeclaration HIR error
-node so the walk can continue and report all failures rather than just
-the first. Null decl_node returns 0 silently (no-op).
+Reads node_type; compares against the CPP_* declaration constants and routes.
+Unknown kinds emit a dict tagged "unknown" rather than aborting so the walk
+continues. Null returns 0.
 @End Implementation
 
 Process called "translate_cpp_declaration_to_hir" takes context as Integer, decl_node as Integer returns Integer:
-    Note: Translate C++ declaration to HIR
+    Note: Translate a top-level declaration to HIR
 
     If decl_node is equal to 0:
         Return 0
     End If
 
-    Let node_type be proc memory_get_int64 from Layout with decl_node, 0
+    Let nt be proc node_type_of with decl_node
 
-    Note: Class declaration
-    If node_type is equal to CPP_CLASS from Parser:
+    If nt is equal to CPP_CLASS from Parser:
         Return proc translate_cpp_class_to_hir with context, decl_node
     End If
-
-    Note: Namespace declaration
-    If node_type is equal to CPP_NAMESPACE from Parser:
+    If nt is equal to CPP_NAMESPACE from Parser:
         Return proc translate_cpp_namespace_to_hir with context, decl_node
     End If
-
-    Note: Template declaration
-    If node_type is equal to CPP_TEMPLATE from Parser:
+    If nt is equal to CPP_TEMPLATE from Parser:
         Return proc translate_cpp_template_to_hir with context, decl_node
     End If
-
-    Note: Function declaration
-    If node_type is equal to CPP_FUNCTION from Parser:
+    If nt is equal to CPP_FUNCTION from Parser:
         Return proc translate_cpp_function_to_hir with context, decl_node
     End If
-
-    Note: Variable declaration
-    If node_type is equal to CPP_VARIABLE from Parser:
+    If nt is equal to CPP_VARIABLE from Parser:
         Return proc translate_cpp_variable_to_hir with context, decl_node
     End If
-
-    Note: Typedef declaration
-    If node_type is equal to CPP_TYPEDEF from Parser:
+    If nt is equal to CPP_TYPEDEF from Parser:
         Return proc translate_cpp_typedef_to_hir with context, decl_node
     End If
-
-    Note: Enum declaration
-    If node_type is equal to CPP_ENUM from Parser:
+    If nt is equal to CPP_ENUM from Parser:
         Return proc translate_cpp_enum_to_hir with context, decl_node
     End If
+    If nt is equal to CPP_USING from Parser:
+        Return proc translate_cpp_using_to_hir with context, decl_node
+    End If
+    If nt is equal to CPP_PREPROCESSOR from Parser:
+        Return proc translate_cpp_preprocessor_to_hir with context, decl_node
+    End If
 
-    Note: Unknown declaration type
-    proc set_cpp_translation_error with context, "Unknown declaration type encountered"
-    Return proc create_hir_error_node from HIR with "UnknownDeclaration"
+    Let d be proc create_hir_dictionary_literal from HIR
+    proc put_string with d, "_type", "unknown"
+    Return d
 End Process
 
 Note: ============================================================================
-Note: Class Translation
+Note: Class / Namespace
 Note: ============================================================================
 
 @Reasoning:
-Lowers a C++ class definition while temporarily installing it as the
-current class_context so nested members can resolve `this`, name lookup,
-and access-control questions through the context cursor. The previous
-class is saved and restored to support nested class declarations.
+Lowers a class definition, installing it as class_context so members can resolve
+their access. Inheritance and template parameters become sub-trees; members are a
+list each carrying their access string.
 @End Reasoning
 
 @Implementation:
-Reads class name from AST offset 8, inheritance from a dedicated helper,
-template params from offset 48 (set only on templated classes), and the
-member list from the children at offset 32. Each member is dispatched
-through translate_class_member_to_hir which itself may recurse into
-function/variable lowering. The class_context slot (offset 0 on the
-context) is swapped via load-modify-restore so exception escape paths
-won't corrupt the cursor.
+Builds a dict tagged "class" with name. Saves/restores class_context. Translates
+the inheritance child (CPP_INHERITANCE) into an "inheritance" list, the template
+params into "template_parameters", and the member children into a "members" list
+via translate_class_member_to_hir.
 @End Implementation
 
 Process called "translate_cpp_class_to_hir" takes context as Integer, class_node as Integer returns Integer:
-    Note: Translate C++ class to HIR preserving OOP semantics
+    Note: Translate a C++ class to HIR
 
     Let hir_class be proc create_hir_dictionary_literal from HIR
+    proc put_string with hir_class, "_type", "class"
 
-    Note: Set class type
-    Let type_value be proc create_hir_string_literal from HIR with "class"
-    proc add_dictionary_entry from HIR with hir_class, "_type", type_value
+    Let name be proc node_name_of with class_node
+    proc put_string with hir_class, "name", name
 
-    Note: Add class name
-    Let class_name be proc memory_get_int64 from Layout with class_node, 8
-    If class_name is not equal to 0:
-        Let name_value be proc create_hir_string_literal from HIR with class_name
-        proc add_dictionary_entry from HIR with hir_class, "name", name_value
-    End If
-
-    Note: Set current class context
     Let old_class be proc memory_get_int64 from Layout with context, 0
     proc memory_set_int64 from Layout with context, 0, class_node
 
-    Note: Translate inheritance
-    Let inheritance_list be proc translate_inheritance_to_hir with context, class_node
-    If inheritance_list is not equal to 0:
-        proc add_dictionary_entry from HIR with hir_class, "inheritance", inheritance_list
+    Let tparams be proc node_template_params_of with class_node
+    If tparams is not equal to 0:
+        Let hir_tparams be proc translate_template_params_to_hir with context, tparams
+        proc put_node with hir_class, "template_parameters", hir_tparams
     End If
 
-    Note: Translate template parameters if templated
-    Let template_params be proc memory_get_int64 from Layout with class_node, 48
-    If template_params is not equal to 0:
-        Let hir_template_params be proc translate_template_params_to_hir with context, template_params
-        proc add_dictionary_entry from HIR with hir_class, "template_parameters", hir_template_params
-    End If
-
-    Note: Translate class members
     Let members_list be proc create_hir_list_literal from HIR
-    Let children be proc memory_get_int64 from Layout with class_node, 32
+    Let children be proc node_children_of with class_node
 
     If children is not equal to 0:
-        Let child_count be proc size from List with children
+        Let count be proc size from List with children
         Let i be 0
-
-        While i is less than child_count:
+        While i is less than count:
             Let member be proc get from List with children, i
-            Let hir_member be proc translate_class_member_to_hir with context, member
+            Let mt be proc node_type_of with member
 
-            If hir_member is not equal to 0:
-                proc add_list_element from HIR with members_list, hir_member
+            If mt is equal to CPP_INHERITANCE from Parser:
+                Let inh be proc translate_inheritance_to_hir with context, member
+                proc put_node with hir_class, "inheritance", inh
+            Otherwise:
+                Let hir_member be proc translate_class_member_to_hir with context, member
+                If hir_member is not equal to 0:
+                    proc add_list_element from HIR with members_list, hir_member
+                End If
             End If
 
             Set i to i plus 1
@@ -382,507 +584,1620 @@ Process called "translate_cpp_class_to_hir" takes context as Integer, class_node
 
     proc add_dictionary_entry from HIR with hir_class, "members", members_list
 
-    Note: Restore previous class context
     proc memory_set_int64 from Layout with context, 0, old_class
-
     Return hir_class
 End Process
 
 @Reasoning:
-Member-scoped dispatcher that fans out into the five member node kinds
-(constructor, destructor, operator overload, member function, member
-variable) and silently drops access-specifier nodes (public:, private:,
-protected:) because access info travels on the member itself, not as
-its own HIR node. Member functions/variables additionally receive an
-"access" string attribute lifted from offset 40 of the AST node.
+Lowers the base-class list into a HIR list of base dicts each carrying the base
+name and access keyword.
 @End Reasoning
 
 @Implementation:
-Tag at offset 0 determines the routing. CPP_CONSTRUCTOR/CPP_DESTRUCTOR/
-CPP_OPERATOR_OVERLOAD each have dedicated lowerers. CPP_FUNCTION and
-CPP_VARIABLE share the top-level lowerers but then mutate the returned
-HIR dict to add an access entry derived from access_level_to_string.
-CPP_ACCESS_SPECIFIER returns 0 because the parser already attached the
-new visibility to subsequent members; emitting it again would duplicate.
-Unknown tags also return 0 silently — class parsing is permissive.
+Iterates the CPP_INHERITANCE node's CPP_BASE_CLASS children, building per-base
+dicts {_type:"base", name, access}.
+@End Implementation
+
+Process called "translate_inheritance_to_hir" takes context as Integer, inheritance_node as Integer returns Integer:
+    Note: Translate a base-class list to HIR
+
+    Let hir_list be proc create_hir_list_literal from HIR
+    Let children be proc node_children_of with inheritance_node
+    If children is equal to 0:
+        Return hir_list
+    End If
+
+    Let count be proc size from List with children
+    Let i be 0
+    While i is less than count:
+        Let base be proc get from List with children, i
+        Let d be proc create_hir_dictionary_literal from HIR
+        proc put_string with d, "_type", "base"
+        Let bname be proc node_name_of with base
+        proc put_string with d, "name", bname
+        Let access be proc node_attributes_of with base
+        Let access_str be proc access_level_to_string with access
+        proc put_string with d, "access", access_str
+        proc add_list_element from HIR with hir_list, d
+        Set i to i plus 1
+    End While
+    Return hir_list
+End Process
+
+@Reasoning:
+Member dispatcher. Constructors/destructors/operators get dedicated lowerers;
+functions and variables reuse the top-level lowerers then gain an "access" string;
+access specifier and inheritance nodes are not emitted as members.
+@End Reasoning
+
+@Implementation:
+Routes by node_type. For function/variable members, lowers via the shared lowerer
+then adds an access entry derived from the access attribute.
 @End Implementation
 
 Process called "translate_class_member_to_hir" takes context as Integer, member_node as Integer returns Integer:
-    Note: Translate class member to HIR
+    Note: Translate a class member to HIR
 
     If member_node is equal to 0:
         Return 0
     End If
 
-    Let node_type be proc memory_get_int64 from Layout with member_node, 0
+    Let nt be proc node_type_of with member_node
 
-    Note: Constructor
-    If node_type is equal to CPP_CONSTRUCTOR from Parser:
+    If nt is equal to CPP_CONSTRUCTOR from Parser:
         Return proc translate_constructor_to_hir with context, member_node
     End If
-
-    Note: Destructor
-    If node_type is equal to CPP_DESTRUCTOR from Parser:
+    If nt is equal to CPP_DESTRUCTOR from Parser:
         Return proc translate_destructor_to_hir with context, member_node
     End If
-
-    Note: Operator overload
-    If node_type is equal to CPP_OPERATOR_OVERLOAD from Parser:
+    If nt is equal to CPP_OPERATOR_OVERLOAD from Parser:
         Return proc translate_operator_overload_to_hir with context, member_node
     End If
-
-    Note: Member function
-    If node_type is equal to CPP_FUNCTION from Parser:
-        Let hir_function be proc translate_cpp_function_to_hir with context, member_node
-
-        Note: Add member-specific attributes
-        Let access_level be proc memory_get_int64 from Layout with member_node, 40
-        Let access_string be proc access_level_to_string from access_level
-        Let access_value be proc create_hir_string_literal from HIR with access_string
-        proc add_dictionary_entry from HIR with hir_function, "access", access_value
-
-        Return hir_function
+    If nt is equal to CPP_FUNCTION from Parser:
+        Let f be proc translate_cpp_function_to_hir with context, member_node
+        Let access be proc node_attributes_of with member_node
+        Let access_str be proc access_level_to_string with access
+        proc put_string with f, "access", access_str
+        Return f
+    End If
+    If nt is equal to CPP_VARIABLE from Parser:
+        Let v be proc translate_cpp_variable_to_hir with context, member_node
+        Let access be proc node_attributes_of with member_node
+        Let access_str be proc access_level_to_string with access
+        proc put_string with v, "access", access_str
+        Return v
+    End If
+    If nt is equal to CPP_TEMPLATE from Parser:
+        Let t be proc translate_cpp_template_to_hir with context, member_node
+        Return t
+    End If
+    If nt is equal to CPP_ENUM from Parser:
+        Return proc translate_cpp_enum_to_hir with context, member_node
     End If
 
-    Note: Member variable
-    If node_type is equal to CPP_VARIABLE from Parser:
-        Let hir_variable be proc translate_cpp_variable_to_hir with context, member_node
-
-        Note: Add member-specific attributes
-        Set access_level to proc memory_get_int64 from Layout with member_node, 40
-        Set access_string to proc access_level_to_string from access_level
-        Set access_value to proc create_hir_string_literal from HIR with access_string
-        proc add_dictionary_entry from HIR with hir_variable, "access", access_value
-
-        Return hir_variable
-    End If
-
-    Note: Access specifier (handled by parser, skip in HIR)
-    If node_type is equal to CPP_ACCESS_SPECIFIER from Parser:
-        Return 0
-    End If
-
-    Note: Unknown member type
     Return 0
 End Process
 
-Note: ============================================================================
-Note: Template Translation
-Note: ============================================================================
-
 @Reasoning:
-Lowers a template-declaration prefix (template<...>) plus its single
-templated entity. The HIR shape is a dict tagged "template" carrying a
-"parameters" list and one "declaration" child, so consumers can pattern
-match on _type=="template" before descending into the wrapped class or
-function. Setting template_context on the way down enables nested
-typename substitution during sub-translations.
+Lowers a namespace into a dict tagged "namespace" with name and a declarations
+list, recursing on each member through the top-level declaration dispatcher.
 @End Reasoning
 
 @Implementation:
-Reads template parameter list at offset 48 and the wrapped declaration as
-the first child (children list at offset 32). Pushes template_node into
-context offset 8 so any expression below it can detect "we're inside a
-template" via context inspection. The previous template context is saved
-on stack-local old_template_context and restored unconditionally so
-sibling templates can declare distinct parameter packs.
+Builds {_type:"namespace", name, declarations:[...]}. Anonymous namespaces leave
+name unset.
 @End Implementation
 
-Process called "translate_cpp_template_to_hir" takes context as Integer, template_node as Integer returns Integer:
-    Note: Translate C++ template to HIR preserving generic programming semantics
+Process called "translate_cpp_namespace_to_hir" takes context as Integer, ns_node as Integer returns Integer:
+    Note: Translate a namespace to HIR
 
-    Let hir_template be proc create_hir_dictionary_literal from HIR
+    Let d be proc create_hir_dictionary_literal from HIR
+    proc put_string with d, "_type", "namespace"
+    Let name be proc node_name_of with ns_node
+    proc put_string with d, "name", name
 
-    Note: Set template type
-    Let type_value be proc create_hir_string_literal from HIR with "template"
-    proc add_dictionary_entry from HIR with hir_template, "_type", type_value
-
-    Note: Translate template parameters
-    Let template_params be proc memory_get_int64 from Layout with template_node, 48
-    If template_params is not equal to 0:
-        Let hir_params be proc translate_template_params_to_hir with context, template_params
-        proc add_dictionary_entry from HIR with hir_template, "parameters", hir_params
-    End If
-
-    Note: Set template context
-    Let old_template_context be proc memory_get_int64 from Layout with context, 8
-    proc memory_set_int64 from Layout with context, 8, template_node
-
-    Note: Translate templated declaration
-    Let children be proc memory_get_int64 from Layout with template_node, 32
-
+    Let decls be proc create_hir_list_literal from HIR
+    Let children be proc node_children_of with ns_node
     If children is not equal to 0:
-        Let child_count be proc size from List with children
-        If child_count is greater than 0:
-            Let templated_decl be proc get from List with children, 0
-            Let hir_decl be proc translate_cpp_declaration_to_hir with context, templated_decl
-
+        Let count be proc size from List with children
+        Let i be 0
+        While i is less than count:
+            Let member be proc get from List with children, i
+            Let hir_decl be proc translate_cpp_declaration_to_hir with context, member
             If hir_decl is not equal to 0:
-                proc add_dictionary_entry from HIR with hir_template, "declaration", hir_decl
+                proc add_list_element from HIR with decls, hir_decl
             End If
-        End If
+            Set i to i plus 1
+        End While
     End If
 
-    Note: Restore template context
-    proc memory_set_int64 from Layout with context, 8, old_template_context
+    proc add_dictionary_entry from HIR with d, "declarations", decls
+    Return d
+End Process
 
-    Return hir_template
+Note: ============================================================================
+Note: Function / Constructor / Destructor / Operator
+Note: ============================================================================
+
+@Reasoning:
+Lowers a function/method into a dict tagged "function" with name, return type,
+parameter list, and body. The body is the function's compound-statement child;
+the parameter list is the CPP_PARAMETER child.
+@End Reasoning
+
+@Implementation:
+Builds {_type:"function", name, return_type, parameters, body}. The return type
+is the node's type_info; parameters come from the first CPP_PARAMETER child; the
+body is the first CPP_COMPOUND_STMT child (or type_info for ctors via their own
+lowerer).
+@End Implementation
+
+Process called "translate_cpp_function_to_hir" takes context as Integer, func_node as Integer returns Integer:
+    Note: Translate a function/method to HIR
+
+    Let d be proc create_hir_dictionary_literal from HIR
+    proc put_string with d, "_type", "function"
+    Let name be proc node_name_of with func_node
+    proc put_string with d, "name", name
+
+    Let ret be proc node_type_info_of with func_node
+    Let hir_ret be proc translate_type_to_hir with context, ret
+    proc put_node with d, "return_type", hir_ret
+
+    Note: Parameters and body from children
+    Let children be proc node_children_of with func_node
+    If children is not equal to 0:
+        Let count be proc size from List with children
+        Let i be 0
+        While i is less than count:
+            Let child be proc get from List with children, i
+            Let ct be proc node_type_of with child
+            If ct is equal to CPP_PARAMETER from Parser:
+                Let params be proc translate_function_params_to_hir with context, child
+                proc put_node with d, "parameters", params
+            End If
+            If ct is equal to CPP_COMPOUND_STMT from Parser:
+                Let body be proc translate_cpp_statement_to_hir with context, child
+                proc put_node with d, "body", body
+            End If
+            Set i to i plus 1
+        End While
+    End If
+
+    Return d
 End Process
 
 @Reasoning:
-Lowers a parameter-list AST subtree into a HIR list of parameter dicts.
-The list shape matters: HIR consumers iterate in declaration order to
-preserve parameter-pack expansion semantics and to keep diagnostic
-"parameter N" messages stable across translation passes.
+Lowers a parameter list into a HIR list of parameter dicts each carrying name and
+type, preserving declaration order.
 @End Reasoning
 
 @Implementation:
-Children of the params_node live at offset 32. Iterates the entire list
-calling translate_template_param_to_hir on each child; null results
-(rare, only on malformed input) are skipped so a single bad parameter
-doesn't corrupt downstream ordinal indexing of the surviving entries.
+Iterates the parameter-list node's CPP_PARAMETER children, building {_type:
+"parameter", name, param_type} or {_type:"parameter", variadic:true} for '...'.
+@End Implementation
+
+Process called "translate_function_params_to_hir" takes context as Integer, params_node as Integer returns Integer:
+    Note: Translate a parameter list to a HIR list
+
+    Let hir_list be proc create_hir_list_literal from HIR
+    Let children be proc node_children_of with params_node
+    If children is equal to 0:
+        Return hir_list
+    End If
+
+    Let count be proc size from List with children
+    Let i be 0
+    While i is less than count:
+        Let param be proc get from List with children, i
+        Let d be proc create_hir_dictionary_literal from HIR
+        proc put_string with d, "_type", "parameter"
+
+        Let val be proc node_value_of with param
+        If val is not equal to 0:
+            proc put_string with d, "variadic", "true"
+        Otherwise:
+            Let pname be proc node_name_of with param
+            proc put_string with d, "name", pname
+            Let pty be proc node_type_info_of with param
+            Let hir_ty be proc translate_type_to_hir with context, pty
+            proc put_node with d, "param_type", hir_ty
+        End If
+
+        proc add_list_element from HIR with hir_list, d
+        Set i to i plus 1
+    End While
+    Return hir_list
+End Process
+
+@Reasoning:
+Lowers a constructor into a dict tagged "constructor" with the parameter list and
+body (the body lives in the constructor node's type_info slot).
+@End Reasoning
+
+@Implementation:
+Builds {_type:"constructor", name, parameters, body, access}. Parameters from the
+CPP_PARAMETER child; body from type_info.
+@End Implementation
+
+Process called "translate_constructor_to_hir" takes context as Integer, ctor_node as Integer returns Integer:
+    Note: Translate a constructor to HIR
+
+    Let d be proc create_hir_dictionary_literal from HIR
+    proc put_string with d, "_type", "constructor"
+    Let name be proc node_name_of with ctor_node
+    proc put_string with d, "name", name
+
+    Let params_child be proc child_at with ctor_node, 0
+    Let pt be proc node_type_of with params_child
+    If pt is equal to CPP_PARAMETER from Parser:
+        Let params be proc translate_function_params_to_hir with context, params_child
+        proc put_node with d, "parameters", params
+    End If
+
+    Let body_node be proc node_type_info_of with ctor_node
+    If body_node is not equal to 0:
+        Let body be proc translate_cpp_statement_to_hir with context, body_node
+        proc put_node with d, "body", body
+    End If
+
+    Let access be proc node_attributes_of with ctor_node
+    Let access_str be proc access_level_to_string with access
+    proc put_string with d, "access", access_str
+    Return d
+End Process
+
+@Reasoning:
+Lowers a destructor into a dict tagged "destructor" with name, body, and access.
+@End Reasoning
+
+@Implementation:
+Builds {_type:"destructor", name, body, access}. Body from type_info.
+@End Implementation
+
+Process called "translate_destructor_to_hir" takes context as Integer, dtor_node as Integer returns Integer:
+    Note: Translate a destructor to HIR
+
+    Let d be proc create_hir_dictionary_literal from HIR
+    proc put_string with d, "_type", "destructor"
+    Let name be proc node_name_of with dtor_node
+    proc put_string with d, "name", name
+
+    Let body_node be proc node_type_info_of with dtor_node
+    If body_node is not equal to 0:
+        Let body be proc translate_cpp_statement_to_hir with context, body_node
+        proc put_node with d, "body", body
+    End If
+
+    Let access be proc node_attributes_of with dtor_node
+    Let access_str be proc access_level_to_string with access
+    proc put_string with d, "access", access_str
+    Return d
+End Process
+
+@Reasoning:
+Lowers an operator overload into a dict tagged "operator" with the operator
+symbol, parameters, body, and access.
+@End Reasoning
+
+@Implementation:
+Builds {_type:"operator", symbol, parameters, body, access}. Symbol from value;
+parameters from the CPP_PARAMETER child; body from type_info.
+@End Implementation
+
+Process called "translate_operator_overload_to_hir" takes context as Integer, op_node as Integer returns Integer:
+    Note: Translate an operator overload to HIR
+
+    Let d be proc create_hir_dictionary_literal from HIR
+    proc put_string with d, "_type", "operator"
+    Let sym be proc node_value_of with op_node
+    proc put_string with d, "symbol", sym
+
+    Let params_child be proc child_at with op_node, 0
+    Let pt be proc node_type_of with params_child
+    If pt is equal to CPP_PARAMETER from Parser:
+        Let params be proc translate_function_params_to_hir with context, params_child
+        proc put_node with d, "parameters", params
+    End If
+
+    Let body_node be proc node_type_info_of with op_node
+    If body_node is not equal to 0:
+        Let body be proc translate_cpp_statement_to_hir with context, body_node
+        proc put_node with d, "body", body
+    End If
+
+    Let access be proc node_attributes_of with op_node
+    Let access_str be proc access_level_to_string with access
+    proc put_string with d, "access", access_str
+    Return d
+End Process
+
+Note: ============================================================================
+Note: Variable / Typedef / Using / Enum / Preprocessor
+Note: ============================================================================
+
+@Reasoning:
+Lowers a variable declaration into a dict tagged "variable" with name, type, and
+optional initializer (the variable node's first non-dimension child expression).
+@End Reasoning
+
+@Implementation:
+Builds {_type:"variable", name, var_type, initializer?}. The type is type_info;
+the initializer is the first child expression if present.
+@End Implementation
+
+Process called "translate_cpp_variable_to_hir" takes context as Integer, var_node as Integer returns Integer:
+    Note: Translate a variable declaration to HIR
+
+    Let d be proc create_hir_dictionary_literal from HIR
+    proc put_string with d, "_type", "variable"
+    Let name be proc node_name_of with var_node
+    proc put_string with d, "name", name
+
+    Let ty be proc node_type_info_of with var_node
+    Let hir_ty be proc translate_type_to_hir with context, ty
+    proc put_node with d, "var_type", hir_ty
+
+    Let init_child be proc child_at with var_node, 0
+    If init_child is not equal to 0:
+        Let init be proc translate_cpp_expression_to_hir with context, init_child
+        proc put_node with d, "initializer", init
+    End If
+
+    Return d
+End Process
+
+@Reasoning:
+Lowers a typedef into a dict tagged "typedef" with the alias name and underlying
+type.
+@End Reasoning
+
+@Implementation:
+Builds {_type:"typedef", name, underlying}.
+@End Implementation
+
+Process called "translate_cpp_typedef_to_hir" takes context as Integer, td_node as Integer returns Integer:
+    Note: Translate a typedef to HIR
+
+    Let d be proc create_hir_dictionary_literal from HIR
+    proc put_string with d, "_type", "typedef"
+    Let name be proc node_name_of with td_node
+    proc put_string with d, "name", name
+    Let ty be proc node_type_info_of with td_node
+    Let hir_ty be proc translate_type_to_hir with context, ty
+    proc put_node with d, "underlying", hir_ty
+    Return d
+End Process
+
+@Reasoning:
+Lowers a using declaration/directive/alias into a dict tagged "using" with the
+name, kind (namespace/alias/declaration), and an optional aliased type.
+@End Reasoning
+
+@Implementation:
+Builds {_type:"using", name, kind, target?}. Kind from value; target from
+type_info for aliases.
+@End Implementation
+
+Process called "translate_cpp_using_to_hir" takes context as Integer, using_node as Integer returns Integer:
+    Note: Translate a using declaration to HIR
+
+    Let d be proc create_hir_dictionary_literal from HIR
+    proc put_string with d, "_type", "using"
+    Let name be proc node_name_of with using_node
+    proc put_string with d, "name", name
+    Let kind be proc node_value_of with using_node
+    proc put_string with d, "kind", kind
+    Let ty be proc node_type_info_of with using_node
+    If ty is not equal to 0:
+        Let hir_ty be proc translate_type_to_hir with context, ty
+        proc put_node with d, "target", hir_ty
+    End If
+    Return d
+End Process
+
+@Reasoning:
+Lowers a preprocessor directive into a dict tagged "preprocessor" carrying the
+verbatim directive text so HIR can round-trip #include/#define/#ifdef etc.
+@End Reasoning
+
+@Implementation:
+Builds {_type:"preprocessor", text}.
+@End Implementation
+
+Process called "translate_cpp_preprocessor_to_hir" takes context as Integer, pp_node as Integer returns Integer:
+    Note: Translate a preprocessor directive to HIR
+
+    Let d be proc create_hir_dictionary_literal from HIR
+    proc put_string with d, "_type", "preprocessor"
+    Let text be proc node_value_of with pp_node
+    proc put_string with d, "text", text
+    Return d
+End Process
+
+@Reasoning:
+Lowers an enum into a dict tagged "enum" with name, scoped flag, underlying type,
+and a list of enumerator dicts (name + optional value expression).
+@End Reasoning
+
+@Implementation:
+Builds {_type:"enum", name, scoped, underlying?, values:[...]}. Each enumerator
+child becomes {_type:"enum_value", name, value?}.
+@End Implementation
+
+Process called "translate_cpp_enum_to_hir" takes context as Integer, enum_node as Integer returns Integer:
+    Note: Translate an enum to HIR
+
+    Let d be proc create_hir_dictionary_literal from HIR
+    proc put_string with d, "_type", "enum"
+    Let name be proc node_name_of with enum_node
+    proc put_string with d, "name", name
+    Let scoped be proc node_value_of with enum_node
+    proc put_string with d, "scoped", scoped
+
+    Let ty be proc node_type_info_of with enum_node
+    If ty is not equal to 0:
+        Let hir_ty be proc translate_type_to_hir with context, ty
+        proc put_node with d, "underlying", hir_ty
+    End If
+
+    Let values be proc create_hir_list_literal from HIR
+    Let children be proc node_children_of with enum_node
+    If children is not equal to 0:
+        Let count be proc size from List with children
+        Let i be 0
+        While i is less than count:
+            Let ev be proc get from List with children, i
+            Let evd be proc create_hir_dictionary_literal from HIR
+            proc put_string with evd, "_type", "enum_value"
+            Let evname be proc node_name_of with ev
+            proc put_string with evd, "name", evname
+            Let init_child be proc child_at with ev, 0
+            If init_child is not equal to 0:
+                Let init be proc translate_cpp_expression_to_hir with context, init_child
+                proc put_node with evd, "value", init
+            End If
+            proc add_list_element from HIR with values, evd
+            Set i to i plus 1
+        End While
+    End If
+
+    proc add_dictionary_entry from HIR with d, "values", values
+    Return d
+End Process
+
+Note: ============================================================================
+Note: Template
+Note: ============================================================================
+
+@Reasoning:
+Lowers a template prefix plus its templated entity into {_type:"template",
+parameters:[...], declaration:<entity>}. template_context is installed during the
+body translation.
+@End Reasoning
+
+@Implementation:
+Builds the template dict, translates the parameter list, pushes template_context,
+lowers the single declaration child, restores context.
+@End Implementation
+
+Process called "translate_cpp_template_to_hir" takes context as Integer, template_node as Integer returns Integer:
+    Note: Translate a template to HIR
+
+    Let d be proc create_hir_dictionary_literal from HIR
+    proc put_string with d, "_type", "template"
+
+    Let tparams be proc node_template_params_of with template_node
+    If tparams is not equal to 0:
+        Let hir_params be proc translate_template_params_to_hir with context, tparams
+        proc put_node with d, "parameters", hir_params
+    End If
+
+    Let old_template be proc memory_get_int64 from Layout with context, 8
+    proc memory_set_int64 from Layout with context, 8, template_node
+
+    Let decl be proc child_at with template_node, 0
+    If decl is not equal to 0:
+        Let hir_decl be proc translate_cpp_declaration_to_hir with context, decl
+        proc put_node with d, "declaration", hir_decl
+    End If
+
+    proc memory_set_int64 from Layout with context, 8, old_template
+    Return d
+End Process
+
+@Reasoning:
+Lowers a template parameter list into a HIR list of parameter dicts each carrying
+name, kind (typename/class/non_type), and optional default.
+@End Reasoning
+
+@Implementation:
+Iterates the param-list node's children calling translate_template_param_to_hir.
 @End Implementation
 
 Process called "translate_template_params_to_hir" takes context as Integer, params_node as Integer returns Integer:
     Note: Translate template parameter list to HIR
 
-    Let hir_params be proc create_hir_list_literal from HIR
-
-    Let children be proc memory_get_int64 from Layout with params_node, 32
-
-    If children is not equal to 0:
-        Let child_count be proc size from List with children
-        Let i be 0
-
-        While i is less than child_count:
-            Let param be proc get from List with children, i
-            Let hir_param be proc translate_template_param_to_hir with context, param
-
-            If hir_param is not equal to 0:
-                proc add_list_element from HIR with hir_params, hir_param
-            End If
-
-            Set i to i plus 1
-        End While
+    Let hir_list be proc create_hir_list_literal from HIR
+    Let children be proc node_children_of with params_node
+    If children is equal to 0:
+        Return hir_list
     End If
 
-    Return hir_params
+    Let count be proc size from List with children
+    Let i be 0
+    While i is less than count:
+        Let param be proc get from List with children, i
+        Let hir_param be proc translate_template_param_to_hir with context, param
+        If hir_param is not equal to 0:
+            proc add_list_element from HIR with hir_list, hir_param
+        End If
+        Set i to i plus 1
+    End While
+    Return hir_list
 End Process
 
 @Reasoning:
-Each template parameter becomes a HIR dict with name, kind, and optional
-default. The kind string ("typename"/"class"/"non_type") is what lets
-downstream tooling reproduce the exact source spelling — C++ treats
-"class T" and "typename T" as synonyms but users see them differently.
+Each template parameter becomes {_type:"template_parameter", name, kind,
+default?}. The kind string lets the backend reproduce the typename/class spelling
+or a non-type parameter type.
 @End Reasoning
 
 @Implementation:
-Pulls name from offset 8, kind tag from offset 16 (translated through
-template_param_kind_to_string), and optional default expression from
-the first element of the children list at offset 32. The default
-expression is recursively lowered through translate_cpp_expression_to_hir,
-which is the only callsite that recurses back into expression lowering
-from the template path — important for `template<int N = compute()>`
-where the default is itself a constant expression.
+Reads name (offset 8) and the kind tag (value@16 holds TOKEN_TYPENAME/TOKEN_CLASS;
+absent means non_type). For non-type parameters the type_info carries the type.
+A default child expression becomes "default".
 @End Implementation
 
 Process called "translate_template_param_to_hir" takes context as Integer, param_node as Integer returns Integer:
-    Note: Translate individual template parameter to HIR
+    Note: Translate a single template parameter to HIR
 
-    Let hir_param be proc create_hir_dictionary_literal from HIR
+    Let d be proc create_hir_dictionary_literal from HIR
+    proc put_string with d, "_type", "template_parameter"
 
-    Note: Set parameter type
-    Let type_value be proc create_hir_string_literal from HIR with "template_parameter"
-    proc add_dictionary_entry from HIR with hir_param, "_type", type_value
+    Let name be proc node_name_of with param_node
+    proc put_string with d, "name", name
 
-    Note: Add parameter name
-    Let param_name be proc memory_get_int64 from Layout with param_node, 8
-    If param_name is not equal to 0:
-        Let name_value be proc create_hir_string_literal from HIR with param_name
-        proc add_dictionary_entry from HIR with hir_param, "name", name_value
+    Let kind_tag be proc node_value_of with param_node
+    Let kind_str be proc template_param_kind_to_string with kind_tag
+    proc put_string with d, "kind", kind_str
+
+    Let ty be proc node_type_info_of with param_node
+    If ty is not equal to 0:
+        Let hir_ty be proc translate_type_to_hir with context, ty
+        proc put_node with d, "type", hir_ty
     End If
 
-    Note: Add parameter kind
-    Let param_value be proc memory_get_int64 from Layout with param_node, 16
-    Let kind_string be proc template_param_kind_to_string from param_value
-    Let kind_value be proc create_hir_string_literal from HIR with kind_string
-    proc add_dictionary_entry from HIR with hir_param, "kind", kind_value
-
-    Note: Add default value if present
-    Let children be proc memory_get_int64 from Layout with param_node, 32
-    If children is not equal to 0:
-        Let child_count be proc size from List with children
-        If child_count is greater than 0:
-            Let default_value be proc get from List with children, 0
-            Let hir_default be proc translate_cpp_expression_to_hir with context, default_value
-            proc add_dictionary_entry from HIR with hir_param, "default", hir_default
+    Let default_child be proc child_at with param_node, 0
+    If default_child is not equal to 0:
+        Let dt be proc node_type_of with default_child
+        If dt is not equal to CPP_TEMPLATE_PARAM from Parser:
+            Let dflt be proc translate_cpp_expression_to_hir with context, default_child
+            proc put_node with d, "default", dflt
         End If
     End If
 
-    Return hir_param
+    Return d
 End Process
 
-Note: ============================================================================
-Note: Expression Translation
-Note: ============================================================================
-
 @Reasoning:
-Expression dispatcher specialised for C++-only forms (lambda, new, delete,
-this, ::, ->) before delegating to the base-language expression lowerer.
-This split lets translate_base_expression_to_hir stay clean of C++isms
-and reused by both the C and C++ frontends, while the C++-specific forms
-each receive their own HIR shape.
+Maps the parameter kind tag to its HIR spelling. typename and class round-trip
+distinctly; everything else is non_type.
 @End Reasoning
 
 @Implementation:
-Tag at offset 0 selects the path. Six C++-specific tags route to
-dedicated lowerers: CPP_LAMBDA, CPP_NEW_EXPR, CPP_DELETE_EXPR,
-CPP_THIS_EXPR, CPP_SCOPE_RESOLUTION, CPP_ARROW_EXPR. Anything else falls
-through to translate_base_expression_to_hir, which handles literals,
-binary/unary operators, function calls, and identifier references shared
-with C. Null expr_node short-circuits to 0 — callers must treat that as
-"absent expression" rather than error.
+TOKEN_TYPENAME (46) -> "typename"; TOKEN_CLASS (40) -> "class"; else "non_type".
 @End Implementation
 
-Process called "translate_cpp_expression_to_hir" takes context as Integer, expr_node as Integer returns Integer:
-    Note: Translate C++ expression to HIR
+Process called "template_param_kind_to_string" takes kind as Integer returns Integer:
+    Note: Template parameter kind to string
 
-    If expr_node is equal to 0:
-        Return 0
+    If kind is equal to 46:
+        Return "typename"
     End If
-
-    Let node_type be proc memory_get_int64 from Layout with expr_node, 0
-
-    Note: Lambda expression
-    If node_type is equal to CPP_LAMBDA from Parser:
-        Return proc translate_lambda_to_hir with context, expr_node
+    If kind is equal to 40:
+        Return "class"
     End If
-
-    Note: New expression
-    If node_type is equal to CPP_NEW_EXPR from Parser:
-        Return proc translate_new_expr_to_hir with context, expr_node
-    End If
-
-    Note: Delete expression
-    If node_type is equal to CPP_DELETE_EXPR from Parser:
-        Return proc translate_delete_expr_to_hir with context, expr_node
-    End If
-
-    Note: This expression
-    If node_type is equal to CPP_THIS_EXPR from Parser:
-        Return proc translate_this_expr_to_hir with context, expr_node
-    End If
-
-    Note: Scope resolution expression
-    If node_type is equal to CPP_SCOPE_RESOLUTION from Parser:
-        Return proc translate_scope_resolution_to_hir with context, expr_node
-    End If
-
-    Note: Arrow member access
-    If node_type is equal to CPP_ARROW_EXPR from Parser:
-        Return proc translate_arrow_expr_to_hir with context, expr_node
-    End If
-
-    Note: Fall back to base expression types
-    Return proc translate_base_expression_to_hir with context, expr_node
-End Process
-
-@Reasoning:
-Lambdas in C++ are closures: the capture list materialises an anonymous
-struct with copy- or reference-bound members, parameters define the call
-operator's signature, and the body executes with those captures live.
-HIR represents this as a single dict with three child entries so a later
-closure-conversion pass can hoist the capture struct without re-parsing.
-@End Reasoning
-
-@Implementation:
-Reads captures, parameters, and body through the parser's getter helpers
-(get_lambda_captures/_parameters/_body) which already abstract the
-storage offsets. Pushes lambda_node into context offset 24 across the
-body translation so nested expressions can detect lambda scope (e.g.,
-implicit-this capture decisions). The previous lambda context is saved
-locally and restored after body translation completes — supports nested
-lambdas where the inner closure captures from the outer's frame.
-@End Implementation
-
-Process called "translate_lambda_to_hir" takes context as Integer, lambda_node as Integer returns Integer:
-    Note: Translate C++ lambda expression to HIR
-
-    Let hir_lambda be proc create_hir_dictionary_literal from HIR
-
-    Note: Set lambda type
-    Let type_value be proc create_hir_string_literal from HIR with "lambda"
-    proc add_dictionary_entry from HIR with hir_lambda, "_type", type_value
-
-    Note: Translate capture list
-    Let captures be proc get_lambda_captures from lambda_node
-    If captures is not equal to 0:
-        Let hir_captures be proc translate_capture_list_to_hir with context, captures
-        proc add_dictionary_entry from HIR with hir_lambda, "captures", hir_captures
-    End If
-
-    Note: Translate parameters
-    Let parameters be proc get_lambda_parameters from lambda_node
-    If parameters is not equal to 0:
-        Let hir_params be proc translate_function_params_to_hir with context, parameters
-        proc add_dictionary_entry from HIR with hir_lambda, "parameters", hir_params
-    End If
-
-    Note: Set lambda context
-    Let old_lambda_context be proc memory_get_int64 from Layout with context, 24
-    proc memory_set_int64 from Layout with context, 24, lambda_node
-
-    Note: Translate body
-    Let body be proc get_lambda_body from lambda_node
-    If body is not equal to 0:
-        Let hir_body be proc translate_cpp_statement_to_hir with context, body
-        proc add_dictionary_entry from HIR with hir_lambda, "body", hir_body
-    End If
-
-    Note: Restore lambda context
-    proc memory_set_int64 from Layout with context, 24, old_lambda_context
-
-    Return hir_lambda
+    Return "non_type"
 End Process
 
 Note: ============================================================================
-Note: Statement Translation
+Note: Statements
 Note: ============================================================================
 
 @Reasoning:
-Statement dispatcher for the C++-only statement forms (range-for from
-C++11, try/catch, throw) with everything else falling through to the
-base-language statement lowerer. Splitting C++-specific statements out
-keeps the C frontend's shared base lowerer free of exception-handling
-machinery it doesn't need.
+Statement dispatcher producing one HIR dict per statement form. The compound
+statement is tagged "compound" with a "statements" list; control-flow statements
+carry their operands as nested HIR. Unknown statements degrade to an empty dict so
+the walk never aborts.
 @End Reasoning
 
 @Implementation:
-Tag at offset 0 routes between CPP_RANGE_FOR_STMT, CPP_TRY_STMT, and
-CPP_THROW_STMT. Everything else delegates to translate_base_statement_to_hir
-which handles if/while/for/switch/return etc. Null stmt_node returns 0
-to signal "no statement", matching the convention used elsewhere in
-this translator.
+Routes on node_type to the dedicated lowerer for each CPP_*_STMT. Expression
+statements unwrap their single child expression. Null returns 0.
 @End Implementation
 
 Process called "translate_cpp_statement_to_hir" takes context as Integer, stmt_node as Integer returns Integer:
-    Note: Translate C++ statement to HIR
+    Note: Translate a statement to HIR
 
     If stmt_node is equal to 0:
         Return 0
     End If
 
-    Let node_type be proc memory_get_int64 from Layout with stmt_node, 0
+    Let nt be proc node_type_of with stmt_node
 
-    Note: Range-based for loop (C++11)
-    If node_type is equal to CPP_RANGE_FOR_STMT from Parser:
+    If nt is equal to CPP_COMPOUND_STMT from Parser:
+        Return proc translate_compound_to_hir with context, stmt_node
+    End If
+    If nt is equal to CPP_IF_STMT from Parser:
+        Return proc translate_if_to_hir with context, stmt_node
+    End If
+    If nt is equal to CPP_WHILE_STMT from Parser:
+        Return proc translate_while_to_hir with context, stmt_node
+    End If
+    If nt is equal to CPP_FOR_STMT from Parser:
+        Return proc translate_for_to_hir with context, stmt_node
+    End If
+    If nt is equal to CPP_RANGE_FOR_STMT from Parser:
         Return proc translate_range_for_to_hir with context, stmt_node
     End If
-
-    Note: Try-catch statement
-    If node_type is equal to CPP_TRY_STMT from Parser:
-        Return proc translate_try_stmt_to_hir with context, stmt_node
+    If nt is equal to CPP_DO_WHILE_STMT from Parser:
+        Return proc translate_do_while_to_hir with context, stmt_node
+    End If
+    If nt is equal to CPP_SWITCH_STMT from Parser:
+        Return proc translate_switch_to_hir with context, stmt_node
+    End If
+    If nt is equal to CPP_CASE_STMT from Parser:
+        Return proc translate_case_to_hir with context, stmt_node
+    End If
+    If nt is equal to CPP_DEFAULT_STMT from Parser:
+        Let dd be proc create_hir_dictionary_literal from HIR
+        proc put_string with dd, "_type", "default"
+        Return dd
+    End If
+    If nt is equal to CPP_RETURN_STMT from Parser:
+        Return proc translate_return_to_hir with context, stmt_node
+    End If
+    If nt is equal to CPP_BREAK_STMT from Parser:
+        Let bd be proc create_hir_dictionary_literal from HIR
+        proc put_string with bd, "_type", "break"
+        Return bd
+    End If
+    If nt is equal to CPP_CONTINUE_STMT from Parser:
+        Let cd be proc create_hir_dictionary_literal from HIR
+        proc put_string with cd, "_type", "continue"
+        Return cd
+    End If
+    If nt is equal to CPP_TRY_STMT from Parser:
+        Return proc translate_try_to_hir with context, stmt_node
+    End If
+    If nt is equal to CPP_THROW_STMT from Parser:
+        Return proc translate_throw_to_hir with context, stmt_node
+    End If
+    If nt is equal to CPP_EXPR_STMT from Parser:
+        Return proc translate_expr_stmt_to_hir with context, stmt_node
+    End If
+    If nt is equal to CPP_VARIABLE from Parser:
+        Return proc translate_cpp_variable_to_hir with context, stmt_node
     End If
 
-    Note: Throw statement
-    If node_type is equal to CPP_THROW_STMT from Parser:
-        Return proc translate_throw_stmt_to_hir with context, stmt_node
+    Note: A bare declaration used as a statement (local variable etc.)
+    Return proc translate_cpp_declaration_to_hir with context, stmt_node
+End Process
+
+@Reasoning:
+Lowers a compound block into {_type:"compound", statements:[...]} preserving order.
+@End Reasoning
+
+@Implementation:
+Iterates children translating each statement into a "statements" list.
+@End Implementation
+
+Process called "translate_compound_to_hir" takes context as Integer, node as Integer returns Integer:
+    Note: Translate a compound statement to HIR
+
+    Let d be proc create_hir_dictionary_literal from HIR
+    proc put_string with d, "_type", "compound"
+
+    Let stmts be proc create_hir_list_literal from HIR
+    Let children be proc node_children_of with node
+    If children is not equal to 0:
+        Let count be proc size from List with children
+        Let i be 0
+        While i is less than count:
+            Let child be proc get from List with children, i
+            Let hir_stmt be proc translate_cpp_statement_to_hir with context, child
+            If hir_stmt is not equal to 0:
+                proc add_list_element from HIR with stmts, hir_stmt
+            End If
+            Set i to i plus 1
+        End While
     End If
 
-    Note: Fall back to base statement types
-    Return proc translate_base_statement_to_hir with context, stmt_node
+    proc add_dictionary_entry from HIR with d, "statements", stmts
+    Return d
+End Process
+
+@Reasoning:
+Lowers an if statement into {_type:"if", condition, then, else?}.
+@End Reasoning
+
+@Implementation:
+Children are [cond, then, else?]. Translates condition as an expression, then/else
+as statements.
+@End Implementation
+
+Process called "translate_if_to_hir" takes context as Integer, node as Integer returns Integer:
+    Note: Translate an if statement to HIR
+
+    Let d be proc create_hir_dictionary_literal from HIR
+    proc put_string with d, "_type", "if"
+
+    Let cond be proc child_at with node, 0
+    Let hir_cond be proc translate_cpp_expression_to_hir with context, cond
+    proc put_node with d, "condition", hir_cond
+
+    Let then_stmt be proc child_at with node, 1
+    Let hir_then be proc translate_cpp_statement_to_hir with context, then_stmt
+    proc put_node with d, "then", hir_then
+
+    Let else_stmt be proc child_at with node, 2
+    If else_stmt is not equal to 0:
+        Let hir_else be proc translate_cpp_statement_to_hir with context, else_stmt
+        proc put_node with d, "else", hir_else
+    End If
+
+    Return d
+End Process
+
+@Reasoning:
+Lowers a while loop into {_type:"while", condition, body}.
+@End Reasoning
+
+@Implementation:
+Children [cond, body].
+@End Implementation
+
+Process called "translate_while_to_hir" takes context as Integer, node as Integer returns Integer:
+    Note: Translate a while loop to HIR
+
+    Let d be proc create_hir_dictionary_literal from HIR
+    proc put_string with d, "_type", "while"
+
+    Let cond be proc child_at with node, 0
+    Let hir_cond be proc translate_cpp_expression_to_hir with context, cond
+    proc put_node with d, "condition", hir_cond
+
+    Let body be proc child_at with node, 1
+    Let hir_body be proc translate_cpp_statement_to_hir with context, body
+    proc put_node with d, "body", hir_body
+    Return d
+End Process
+
+@Reasoning:
+Lowers a classic for loop into {_type:"for", init, condition, step, body}. Some
+clauses may be absent; the parser appends only the present ones so the last child
+is the body.
+@End Reasoning
+
+@Implementation:
+Translates the first child as init (statement-or-expression), the body as the last
+child statement, and the middle children as condition/step expressions. Because
+empty clauses are simply omitted, the body is identified as the last child.
+@End Implementation
+
+Process called "translate_for_to_hir" takes context as Integer, node as Integer returns Integer:
+    Note: Translate a classic for loop to HIR
+
+    Let d be proc create_hir_dictionary_literal from HIR
+    proc put_string with d, "_type", "for"
+
+    Let children be proc node_children_of with node
+    If children is equal to 0:
+        Return d
+    End If
+    Let count be proc size from List with children
+
+    Note: First child = init; last child = body; middle = condition/step
+    If count is greater than 0:
+        Let init be proc get from List with children, 0
+        Let hir_init be proc translate_cpp_statement_to_hir with context, init
+        proc put_node with d, "init", hir_init
+    End If
+    If count is greater than 1:
+        Let body_index be count minus 1
+        Let body be proc get from List with children, body_index
+        Let hir_body be proc translate_cpp_statement_to_hir with context, body
+        proc put_node with d, "body", hir_body
+    End If
+    If count is greater than 2:
+        Let cond be proc get from List with children, 1
+        Let hir_cond be proc translate_cpp_expression_to_hir with context, cond
+        proc put_node with d, "condition", hir_cond
+    End If
+    If count is greater than 3:
+        Let step be proc get from List with children, 2
+        Let hir_step be proc translate_cpp_expression_to_hir with context, step
+        proc put_node with d, "step", hir_step
+    End If
+
+    Return d
+End Process
+
+@Reasoning:
+Lowers a range-based for into {_type:"range_for", declaration, range, body}.
+@End Reasoning
+
+@Implementation:
+Children [decl, range, body].
+@End Implementation
+
+Process called "translate_range_for_to_hir" takes context as Integer, node as Integer returns Integer:
+    Note: Translate a range-based for loop to HIR
+
+    Let d be proc create_hir_dictionary_literal from HIR
+    proc put_string with d, "_type", "range_for"
+
+    Let decl be proc child_at with node, 0
+    Let hir_decl be proc translate_cpp_statement_to_hir with context, decl
+    proc put_node with d, "declaration", hir_decl
+
+    Let range be proc child_at with node, 1
+    Let hir_range be proc translate_cpp_expression_to_hir with context, range
+    proc put_node with d, "range", hir_range
+
+    Let body be proc child_at with node, 2
+    Let hir_body be proc translate_cpp_statement_to_hir with context, body
+    proc put_node with d, "body", hir_body
+    Return d
+End Process
+
+@Reasoning:
+Lowers a do-while into {_type:"do_while", body, condition}.
+@End Reasoning
+
+@Implementation:
+Children [body, cond].
+@End Implementation
+
+Process called "translate_do_while_to_hir" takes context as Integer, node as Integer returns Integer:
+    Note: Translate a do-while loop to HIR
+
+    Let d be proc create_hir_dictionary_literal from HIR
+    proc put_string with d, "_type", "do_while"
+
+    Let body be proc child_at with node, 0
+    Let hir_body be proc translate_cpp_statement_to_hir with context, body
+    proc put_node with d, "body", hir_body
+
+    Let cond be proc child_at with node, 1
+    Let hir_cond be proc translate_cpp_expression_to_hir with context, cond
+    proc put_node with d, "condition", hir_cond
+    Return d
+End Process
+
+@Reasoning:
+Lowers a switch into {_type:"switch", condition, body}.
+@End Reasoning
+
+@Implementation:
+Children [cond, body].
+@End Implementation
+
+Process called "translate_switch_to_hir" takes context as Integer, node as Integer returns Integer:
+    Note: Translate a switch statement to HIR
+
+    Let d be proc create_hir_dictionary_literal from HIR
+    proc put_string with d, "_type", "switch"
+
+    Let cond be proc child_at with node, 0
+    Let hir_cond be proc translate_cpp_expression_to_hir with context, cond
+    proc put_node with d, "condition", hir_cond
+
+    Let body be proc child_at with node, 1
+    Let hir_body be proc translate_cpp_statement_to_hir with context, body
+    proc put_node with d, "body", hir_body
+    Return d
+End Process
+
+@Reasoning:
+Lowers a case label into {_type:"case", value}.
+@End Reasoning
+
+@Implementation:
+Child[0] is the case constant expression.
+@End Implementation
+
+Process called "translate_case_to_hir" takes context as Integer, node as Integer returns Integer:
+    Note: Translate a case label to HIR
+
+    Let d be proc create_hir_dictionary_literal from HIR
+    proc put_string with d, "_type", "case"
+    Let val be proc child_at with node, 0
+    Let hir_val be proc translate_cpp_expression_to_hir with context, val
+    proc put_node with d, "value", hir_val
+    Return d
+End Process
+
+@Reasoning:
+Lowers a return into {_type:"return", value?}.
+@End Reasoning
+
+@Implementation:
+Child[0] is the optional return expression.
+@End Implementation
+
+Process called "translate_return_to_hir" takes context as Integer, node as Integer returns Integer:
+    Note: Translate a return statement to HIR
+
+    Let d be proc create_hir_dictionary_literal from HIR
+    proc put_string with d, "_type", "return"
+    Let val be proc child_at with node, 0
+    If val is not equal to 0:
+        Let hir_val be proc translate_cpp_expression_to_hir with context, val
+        proc put_node with d, "value", hir_val
+    End If
+    Return d
+End Process
+
+@Reasoning:
+Lowers a try statement into {_type:"try", body, handlers:[...]} where each handler
+is {_type:"catch", exception_type?, name?, body}.
+@End Reasoning
+
+@Implementation:
+Child[0] is the try body. Subsequent CPP_CATCH_STMT children become handler dicts
+in a "handlers" list.
+@End Implementation
+
+Process called "translate_try_to_hir" takes context as Integer, node as Integer returns Integer:
+    Note: Translate a try/catch statement to HIR
+
+    Let d be proc create_hir_dictionary_literal from HIR
+    proc put_string with d, "_type", "try"
+
+    Let try_body be proc child_at with node, 0
+    Let hir_body be proc translate_cpp_statement_to_hir with context, try_body
+    proc put_node with d, "body", hir_body
+
+    Let handlers be proc create_hir_list_literal from HIR
+    Let children be proc node_children_of with node
+    If children is not equal to 0:
+        Let count be proc size from List with children
+        Let i be 1
+        While i is less than count:
+            Let handler be proc get from List with children, i
+            Let hd be proc create_hir_dictionary_literal from HIR
+            proc put_string with hd, "_type", "catch"
+            Let exc_type be proc node_type_info_of with handler
+            If exc_type is not equal to 0:
+                Let hir_ty be proc translate_type_to_hir with context, exc_type
+                proc put_node with hd, "exception_type", hir_ty
+            End If
+            Let hname be proc node_name_of with handler
+            proc put_string with hd, "name", hname
+            Let hbody be proc child_at with handler, 0
+            Let hir_hbody be proc translate_cpp_statement_to_hir with context, hbody
+            proc put_node with hd, "body", hir_hbody
+            proc add_list_element from HIR with handlers, hd
+            Set i to i plus 1
+        End While
+    End If
+
+    proc add_dictionary_entry from HIR with d, "handlers", handlers
+    Return d
+End Process
+
+@Reasoning:
+Lowers a throw into {_type:"throw", value?}.
+@End Reasoning
+
+@Implementation:
+Child[0] is the optional thrown expression.
+@End Implementation
+
+Process called "translate_throw_to_hir" takes context as Integer, node as Integer returns Integer:
+    Note: Translate a throw statement to HIR
+
+    Let d be proc create_hir_dictionary_literal from HIR
+    proc put_string with d, "_type", "throw"
+    Let val be proc child_at with node, 0
+    If val is not equal to 0:
+        Let hir_val be proc translate_cpp_expression_to_hir with context, val
+        proc put_node with d, "value", hir_val
+    End If
+    Return d
+End Process
+
+@Reasoning:
+Lowers an expression statement into {_type:"expression", expr}. An empty
+statement (no child) yields {_type:"empty"}.
+@End Reasoning
+
+@Implementation:
+Child[0] is the expression; absent yields the empty form.
+@End Implementation
+
+Process called "translate_expr_stmt_to_hir" takes context as Integer, node as Integer returns Integer:
+    Note: Translate an expression statement to HIR
+
+    Let child be proc child_at with node, 0
+    If child is equal to 0:
+        Let e be proc create_hir_dictionary_literal from HIR
+        proc put_string with e, "_type", "empty"
+        Return e
+    End If
+
+    Let d be proc create_hir_dictionary_literal from HIR
+    proc put_string with d, "_type", "expression"
+    Let hir_expr be proc translate_cpp_expression_to_hir with context, child
+    proc put_node with d, "expr", hir_expr
+    Return d
 End Process
 
 Note: ============================================================================
-Note: Utility Functions
+Note: Expressions
 Note: ============================================================================
 
 @Reasoning:
-Records the sticky-error state so deeply-recursive translation walks can
-detect failure on the next iteration and bail. The message string is
-copied (rather than aliased) so the caller's transient diagnostic buffer
-can be freed independently — important because most error sites pass a
-literal that may be in a Note region, not heap memory.
+Expression dispatcher producing one HIR dict per expression form. Literals carry
+their text and kind; identifiers carry a name; binary/unary carry an operator and
+operands; calls/subscripts/members carry their parts; lambdas/new/delete/this/
+scope/cast each get their own shape.
 @End Reasoning
 
 @Implementation:
-Sets has_error at context offset 40 to 1 and stores an owned copy of
-the message string at offset 32. The copy is allocated through
-copy_string from StringCore which owns the new buffer; the matching
-free happens in destroy_cpp_translation_context. No previous error
-message is freed here — first-error-wins semantics, intentional to
-preserve the original cause through repeated failure annotations.
+Routes on node_type to each lowerer. Null returns 0.
 @End Implementation
 
-Process called "set_cpp_translation_error" takes context as Integer, message as Integer:
-    Note: Set translation error state
+Process called "translate_cpp_expression_to_hir" takes context as Integer, expr_node as Integer returns Integer:
+    Note: Translate an expression to HIR
 
-    proc memory_set_int64 from Layout with context, 40, 1  Note: has_error = true
+    If expr_node is equal to 0:
+        Return 0
+    End If
 
-    Let error_copy be proc copy_string from StringCore with message
-    proc memory_set_int64 from Layout with context, 32, error_copy
+    Let nt be proc node_type_of with expr_node
+
+    If nt is equal to CPP_LITERAL_EXPR from Parser:
+        Return proc translate_literal_to_hir with context, expr_node
+    End If
+    If nt is equal to CPP_IDENTIFIER_EXPR from Parser:
+        Let d be proc create_hir_dictionary_literal from HIR
+        proc put_string with d, "_type", "identifier"
+        Let name be proc node_name_of with expr_node
+        proc put_string with d, "name", name
+        Return d
+    End If
+    If nt is equal to CPP_BINARY_EXPR from Parser:
+        Return proc translate_binary_to_hir with context, expr_node
+    End If
+    If nt is equal to CPP_ASSIGN_EXPR from Parser:
+        Return proc translate_assign_to_hir with context, expr_node
+    End If
+    If nt is equal to CPP_UNARY_EXPR from Parser:
+        Return proc translate_unary_to_hir with context, expr_node
+    End If
+    If nt is equal to CPP_POSTFIX_EXPR from Parser:
+        Return proc translate_postfix_to_hir with context, expr_node
+    End If
+    If nt is equal to CPP_TERNARY_EXPR from Parser:
+        Return proc translate_ternary_to_hir with context, expr_node
+    End If
+    If nt is equal to CPP_CALL_EXPR from Parser:
+        Return proc translate_call_to_hir with context, expr_node
+    End If
+    If nt is equal to CPP_SUBSCRIPT_EXPR from Parser:
+        Return proc translate_subscript_to_hir with context, expr_node
+    End If
+    If nt is equal to CPP_MEMBER_EXPR from Parser:
+        Return proc translate_member_to_hir with context, expr_node, "member"
+    End If
+    If nt is equal to CPP_ARROW_EXPR from Parser:
+        Return proc translate_member_to_hir with context, expr_node, "arrow"
+    End If
+    If nt is equal to CPP_SCOPE_RESOLUTION from Parser:
+        Return proc translate_member_to_hir with context, expr_node, "scope"
+    End If
+    If nt is equal to CPP_PAREN_EXPR from Parser:
+        Let inner be proc child_at with expr_node, 0
+        Return proc translate_cpp_expression_to_hir with context, inner
+    End If
+    If nt is equal to CPP_CAST_EXPR from Parser:
+        Return proc translate_cast_to_hir with context, expr_node
+    End If
+    If nt is equal to CPP_SIZEOF_EXPR from Parser:
+        Return proc translate_sizeof_to_hir with context, expr_node
+    End If
+    If nt is equal to CPP_NEW_EXPR from Parser:
+        Return proc translate_new_to_hir with context, expr_node
+    End If
+    If nt is equal to CPP_DELETE_EXPR from Parser:
+        Return proc translate_delete_to_hir with context, expr_node
+    End If
+    If nt is equal to CPP_THIS_EXPR from Parser:
+        Let td be proc create_hir_dictionary_literal from HIR
+        proc put_string with td, "_type", "this"
+        Return td
+    End If
+    If nt is equal to CPP_LAMBDA from Parser:
+        Return proc translate_lambda_to_hir with context, expr_node
+    End If
+    If nt is equal to CPP_VARIABLE from Parser:
+        Return proc translate_cpp_variable_to_hir with context, expr_node
+    End If
+
+    Let d be proc create_hir_dictionary_literal from HIR
+    proc put_string with d, "_type", "unknown_expr"
+    Return d
 End Process
 
 @Reasoning:
-HIR emission needs the textual form of the C++ access modifier ("private",
-"protected", "public") for annotations on class members. The semantic layer
-encodes these as small integers 0/1/2 to keep AST nodes compact; this helper
-gives the HIR printer the canonical lowercase keyword exactly as it appears
-in C++ source so round-tripping is faithful.
+Lowers a literal into {_type:"literal", value, literal_kind}.
 @End Reasoning
 
 @Implementation:
-Branch on the integer code: 0 -> "private", 1 -> "protected", 2 -> "public".
-Any other code returns "unknown" rather than aborting, so the printer can
-keep emitting and the error surfaces in the diagnostic stream. Each return
-allocates a fresh StringCore string (owned by the caller).
+The literal text is in name; the kind tag is in value.
 @End Implementation
 
-Process called "access_level_to_string" takes access_level as Integer returns Integer:
-    Note: Convert access level number to string
+Process called "translate_literal_to_hir" takes context as Integer, node as Integer returns Integer:
+    Note: Translate a literal to HIR
 
-    If access_level is equal to 0:
-        Return proc create_string from StringCore with "private"
+    Let d be proc create_hir_dictionary_literal from HIR
+    proc put_string with d, "_type", "literal"
+    Let text be proc node_name_of with node
+    proc put_string with d, "value", text
+    Let kind be proc node_value_of with node
+    proc put_string with d, "literal_kind", kind
+
+    Note: A braced initializer reuses the literal node with kind "braced_init"
+    Let children be proc node_children_of with node
+    If children is not equal to 0:
+        Let elems be proc create_hir_list_literal from HIR
+        Let count be proc size from List with children
+        Let i be 0
+        While i is less than count:
+            Let child be proc get from List with children, i
+            Let e be proc translate_cpp_expression_to_hir with context, child
+            If e is not equal to 0:
+                proc add_list_element from HIR with elems, e
+            End If
+            Set i to i plus 1
+        End While
+        proc add_dictionary_entry from HIR with d, "elements", elems
     End If
 
-    If access_level is equal to 1:
-        Return proc create_string from StringCore with "protected"
-    End If
-
-    If access_level is equal to 2:
-        Return proc create_string from StringCore with "public"
-    End If
-
-    Return proc create_string from StringCore with "unknown"
+    Return d
 End Process
 
 @Reasoning:
-Template parameters in C++ have three kinds: typename T, class T (legacy
-spelling of typename), and non-type template parameter (e.g., int N). The
-parser distinguishes typename/class by the literal keyword token; everything
-else collapses to non_type. HIR must preserve the spelling because "class T"
-and "typename T" are user-visible and round-trip both ways.
+Lowers a binary expression into {_type:"binary", operator, left, right} with a
+cpp_operator metadata tag for C++-specific operators (<=> spaceship) so HIR can
+faithfully reproduce them.
 @End Reasoning
 
 @Implementation:
-Compares against TOKEN_TYPENAME and TOKEN_CLASS imported from the parser
-module; matches return the literal keyword string. The catch-all "non_type"
-covers integer/pointer/template-template parameters. Returns a fresh owned
-StringCore string the HIR layer takes ownership of.
+Operator from value; children [left, right]. For the spaceship operator the
+operator string is "<=>" which the backend reproduces directly.
 @End Implementation
 
-Process called "template_param_kind_to_string" takes kind as Integer returns Integer:
-    Note: Convert template parameter kind to string
+Process called "translate_binary_to_hir" takes context as Integer, node as Integer returns Integer:
+    Note: Translate a binary expression to HIR
 
-    If kind is equal to TOKEN_TYPENAME from Parser:
-        Return proc create_string from StringCore with "typename"
+    Let d be proc create_hir_dictionary_literal from HIR
+    proc put_string with d, "_type", "binary"
+    Let op be proc node_value_of with node
+    proc put_string with d, "operator", op
+
+    Let left be proc child_at with node, 0
+    Let hir_left be proc translate_cpp_expression_to_hir with context, left
+    proc put_node with d, "left", hir_left
+
+    Let right be proc child_at with node, 1
+    Let hir_right be proc translate_cpp_expression_to_hir with context, right
+    proc put_node with d, "right", hir_right
+    Return d
+End Process
+
+@Reasoning:
+Lowers an assignment into {_type:"assignment", operator, target, value}.
+@End Reasoning
+
+@Implementation:
+Operator from value; children [target, value].
+@End Implementation
+
+Process called "translate_assign_to_hir" takes context as Integer, node as Integer returns Integer:
+    Note: Translate an assignment to HIR
+
+    Let d be proc create_hir_dictionary_literal from HIR
+    proc put_string with d, "_type", "assignment"
+    Let op be proc node_value_of with node
+    proc put_string with d, "operator", op
+
+    Let target be proc child_at with node, 0
+    Let hir_target be proc translate_cpp_expression_to_hir with context, target
+    proc put_node with d, "target", hir_target
+
+    Let value be proc child_at with node, 1
+    Let hir_value be proc translate_cpp_expression_to_hir with context, value
+    proc put_node with d, "value", hir_value
+    Return d
+End Process
+
+@Reasoning:
+Lowers a prefix unary into {_type:"unary", operator, operand, fixity:"prefix"}.
+@End Reasoning
+
+@Implementation:
+Operator from value; child[0] operand.
+@End Implementation
+
+Process called "translate_unary_to_hir" takes context as Integer, node as Integer returns Integer:
+    Note: Translate a unary expression to HIR
+
+    Let d be proc create_hir_dictionary_literal from HIR
+    proc put_string with d, "_type", "unary"
+    Let op be proc node_value_of with node
+    proc put_string with d, "operator", op
+    proc put_string with d, "fixity", "prefix"
+    Let operand be proc child_at with node, 0
+    Let hir_operand be proc translate_cpp_expression_to_hir with context, operand
+    proc put_node with d, "operand", hir_operand
+    Return d
+End Process
+
+@Reasoning:
+Lowers a postfix unary into {_type:"unary", operator, operand, fixity:"postfix"}.
+@End Reasoning
+
+@Implementation:
+Operator from value; child[0] operand; fixity "postfix".
+@End Implementation
+
+Process called "translate_postfix_to_hir" takes context as Integer, node as Integer returns Integer:
+    Note: Translate a postfix expression to HIR
+
+    Let d be proc create_hir_dictionary_literal from HIR
+    proc put_string with d, "_type", "unary"
+    Let op be proc node_value_of with node
+    proc put_string with d, "operator", op
+    proc put_string with d, "fixity", "postfix"
+    Let operand be proc child_at with node, 0
+    Let hir_operand be proc translate_cpp_expression_to_hir with context, operand
+    proc put_node with d, "operand", hir_operand
+    Return d
+End Process
+
+@Reasoning:
+Lowers a ternary into {_type:"ternary", condition, then, else}.
+@End Reasoning
+
+@Implementation:
+Children [cond, then, else].
+@End Implementation
+
+Process called "translate_ternary_to_hir" takes context as Integer, node as Integer returns Integer:
+    Note: Translate a ternary to HIR
+
+    Let d be proc create_hir_dictionary_literal from HIR
+    proc put_string with d, "_type", "ternary"
+
+    Let cond be proc child_at with node, 0
+    Let hir_cond be proc translate_cpp_expression_to_hir with context, cond
+    proc put_node with d, "condition", hir_cond
+
+    Let then_e be proc child_at with node, 1
+    Let hir_then be proc translate_cpp_expression_to_hir with context, then_e
+    proc put_node with d, "then", hir_then
+
+    Let else_e be proc child_at with node, 2
+    Let hir_else be proc translate_cpp_expression_to_hir with context, else_e
+    proc put_node with d, "else", hir_else
+    Return d
+End Process
+
+@Reasoning:
+Lowers a call into {_type:"call", callee, arguments:[...]}.
+@End Reasoning
+
+@Implementation:
+Child[0] callee; child[1] is the argument-list node whose children are the args.
+@End Implementation
+
+Process called "translate_call_to_hir" takes context as Integer, node as Integer returns Integer:
+    Note: Translate a call expression to HIR
+
+    Let d be proc create_hir_dictionary_literal from HIR
+    proc put_string with d, "_type", "call"
+
+    Let callee be proc child_at with node, 0
+    Let hir_callee be proc translate_cpp_expression_to_hir with context, callee
+    proc put_node with d, "callee", hir_callee
+
+    Let args_node be proc child_at with node, 1
+    Let args be proc create_hir_list_literal from HIR
+    Let arg_children be proc node_children_of with args_node
+    If arg_children is not equal to 0:
+        Let count be proc size from List with arg_children
+        Let i be 0
+        While i is less than count:
+            Let arg be proc get from List with arg_children, i
+            Let hir_arg be proc translate_cpp_expression_to_hir with context, arg
+            If hir_arg is not equal to 0:
+                proc add_list_element from HIR with args, hir_arg
+            End If
+            Set i to i plus 1
+        End While
+    End If
+    proc add_dictionary_entry from HIR with d, "arguments", args
+    Return d
+End Process
+
+@Reasoning:
+Lowers a subscript into {_type:"subscript", object, index}.
+@End Reasoning
+
+@Implementation:
+Children [object, index].
+@End Implementation
+
+Process called "translate_subscript_to_hir" takes context as Integer, node as Integer returns Integer:
+    Note: Translate a subscript expression to HIR
+
+    Let d be proc create_hir_dictionary_literal from HIR
+    proc put_string with d, "_type", "subscript"
+
+    Let obj be proc child_at with node, 0
+    Let hir_obj be proc translate_cpp_expression_to_hir with context, obj
+    proc put_node with d, "object", hir_obj
+
+    Let idx be proc child_at with node, 1
+    Let hir_idx be proc translate_cpp_expression_to_hir with context, idx
+    proc put_node with d, "index", hir_idx
+    Return d
+End Process
+
+@Reasoning:
+Lowers '.', '->', and '::' member access into {_type:"member_access", access_kind,
+object, member}.
+@End Reasoning
+
+@Implementation:
+The access kind ("member"/"arrow"/"scope") distinguishes the operator; child[0] is
+the object; name is the member.
+@End Implementation
+
+Process called "translate_member_to_hir" takes context as Integer, node as Integer, kind as Integer returns Integer:
+    Note: Translate a member-access expression to HIR
+
+    Let d be proc create_hir_dictionary_literal from HIR
+    proc put_string with d, "_type", "member_access"
+    proc put_string with d, "access_kind", kind
+
+    Let obj be proc child_at with node, 0
+    Let hir_obj be proc translate_cpp_expression_to_hir with context, obj
+    proc put_node with d, "object", hir_obj
+
+    Let member be proc node_name_of with node
+    proc put_string with d, "member", member
+    Return d
+End Process
+
+@Reasoning:
+Lowers a named cast into {_type:"cast", cast_kind, target_type, operand}.
+@End Reasoning
+
+@Implementation:
+Cast kind from value; target type from type_info; child[0] operand.
+@End Implementation
+
+Process called "translate_cast_to_hir" takes context as Integer, node as Integer returns Integer:
+    Note: Translate a cast expression to HIR
+
+    Let d be proc create_hir_dictionary_literal from HIR
+    proc put_string with d, "_type", "cast"
+    Let kind be proc node_value_of with node
+    proc put_string with d, "cast_kind", kind
+
+    Let ty be proc node_type_info_of with node
+    Let hir_ty be proc translate_type_to_hir with context, ty
+    proc put_node with d, "target_type", hir_ty
+
+    Let operand be proc child_at with node, 0
+    Let hir_operand be proc translate_cpp_expression_to_hir with context, operand
+    proc put_node with d, "operand", hir_operand
+    Return d
+End Process
+
+@Reasoning:
+Lowers sizeof into {_type:"sizeof", operand_type?|operand?}.
+@End Reasoning
+
+@Implementation:
+If type_info present emits the type form; else the first child is the operand
+expression.
+@End Implementation
+
+Process called "translate_sizeof_to_hir" takes context as Integer, node as Integer returns Integer:
+    Note: Translate a sizeof expression to HIR
+
+    Let d be proc create_hir_dictionary_literal from HIR
+    proc put_string with d, "_type", "sizeof"
+    Let ty be proc node_type_info_of with node
+    If ty is not equal to 0:
+        Let hir_ty be proc translate_type_to_hir with context, ty
+        proc put_node with d, "operand_type", hir_ty
+    Otherwise:
+        Let operand be proc child_at with node, 0
+        Let hir_operand be proc translate_cpp_expression_to_hir with context, operand
+        proc put_node with d, "operand", hir_operand
+    End If
+    Return d
+End Process
+
+@Reasoning:
+Lowers new into {_type:"new", new_type, arguments:[...]}.
+@End Reasoning
+
+@Implementation:
+Type from type_info; any argument-list child supplies arguments.
+@End Implementation
+
+Process called "translate_new_to_hir" takes context as Integer, node as Integer returns Integer:
+    Note: Translate a new expression to HIR
+
+    Let d be proc create_hir_dictionary_literal from HIR
+    proc put_string with d, "_type", "new"
+    Let ty be proc node_type_info_of with node
+    Let hir_ty be proc translate_type_to_hir with context, ty
+    proc put_node with d, "new_type", hir_ty
+
+    Let args be proc create_hir_list_literal from HIR
+    Let children be proc node_children_of with node
+    If children is not equal to 0:
+        Let count be proc size from List with children
+        Let i be 0
+        While i is less than count:
+            Let child be proc get from List with children, i
+            Let ct be proc node_type_of with child
+            If ct is equal to CPP_TEMPLATE_ARG_LIST from Parser:
+                Let ac be proc node_children_of with child
+                If ac is not equal to 0:
+                    Let acount be proc size from List with ac
+                    Let j be 0
+                    While j is less than acount:
+                        Let arg be proc get from List with ac, j
+                        Let hir_arg be proc translate_cpp_expression_to_hir with context, arg
+                        If hir_arg is not equal to 0:
+                            proc add_list_element from HIR with args, hir_arg
+                        End If
+                        Set j to j plus 1
+                    End While
+                End If
+            Otherwise:
+                Let hir_e be proc translate_cpp_expression_to_hir with context, child
+                If hir_e is not equal to 0:
+                    proc add_list_element from HIR with args, hir_e
+                End If
+            End If
+            Set i to i plus 1
+        End While
+    End If
+    proc add_dictionary_entry from HIR with d, "arguments", args
+    Return d
+End Process
+
+@Reasoning:
+Lowers delete into {_type:"delete", array?, operand}.
+@End Reasoning
+
+@Implementation:
+The array form is recorded from value; child[0] operand.
+@End Implementation
+
+Process called "translate_delete_to_hir" takes context as Integer, node as Integer returns Integer:
+    Note: Translate a delete expression to HIR
+
+    Let d be proc create_hir_dictionary_literal from HIR
+    proc put_string with d, "_type", "delete"
+    Let arr be proc node_value_of with node
+    If arr is not equal to 0:
+        proc put_string with d, "array", "true"
+    End If
+    Let operand be proc child_at with node, 0
+    Let hir_operand be proc translate_cpp_expression_to_hir with context, operand
+    proc put_node with d, "operand", hir_operand
+    Return d
+End Process
+
+@Reasoning:
+Lowers a lambda into {_type:"lambda", captures:[...], parameters:[...],
+return_type?, body}. lambda_context is installed during body translation.
+@End Reasoning
+
+@Implementation:
+Child[0] is the capture list; an optional CPP_PARAMETER child supplies parameters;
+type_info is the return type; the CPP_COMPOUND_STMT child is the body.
+@End Implementation
+
+Process called "translate_lambda_to_hir" takes context as Integer, node as Integer returns Integer:
+    Note: Translate a lambda to HIR
+
+    Let d be proc create_hir_dictionary_literal from HIR
+    proc put_string with d, "_type", "lambda"
+
+    Let old_lambda be proc memory_get_int64 from Layout with context, 24
+    proc memory_set_int64 from Layout with context, 24, node
+
+    Let children be proc node_children_of with node
+    If children is not equal to 0:
+        Let count be proc size from List with children
+        Let i be 0
+        While i is less than count:
+            Let child be proc get from List with children, i
+            Let ct be proc node_type_of with child
+            If ct is equal to CPP_CAPTURE_LIST from Parser:
+                Let caps be proc translate_capture_list_to_hir with context, child
+                proc put_node with d, "captures", caps
+            End If
+            If ct is equal to CPP_PARAMETER from Parser:
+                Let params be proc translate_function_params_to_hir with context, child
+                proc put_node with d, "parameters", params
+            End If
+            If ct is equal to CPP_COMPOUND_STMT from Parser:
+                Let body be proc translate_cpp_statement_to_hir with context, child
+                proc put_node with d, "body", body
+            End If
+            Set i to i plus 1
+        End While
     End If
 
-    If kind is equal to TOKEN_CLASS from Parser:
-        Return proc create_string from StringCore with "class"
+    Let ret be proc node_type_info_of with node
+    If ret is not equal to 0:
+        Let hir_ret be proc translate_type_to_hir with context, ret
+        proc put_node with d, "return_type", hir_ret
     End If
 
-    Return proc create_string from StringCore with "non_type"
+    proc memory_set_int64 from Layout with context, 24, old_lambda
+    Return d
+End Process
+
+@Reasoning:
+Lowers a lambda capture list into a HIR list of capture dicts each carrying a name
+or a default-capture mode (by_value/by_reference/this).
+@End Reasoning
+
+@Implementation:
+Iterates the capture-list children building {_type:"capture", name?|mode?}.
+@End Implementation
+
+Process called "translate_capture_list_to_hir" takes context as Integer, list_node as Integer returns Integer:
+    Note: Translate a lambda capture list to HIR
+
+    Let hir_list be proc create_hir_list_literal from HIR
+    Let children be proc node_children_of with list_node
+    If children is equal to 0:
+        Return hir_list
+    End If
+
+    Let count be proc size from List with children
+    Let i be 0
+    While i is less than count:
+        Let cap be proc get from List with children, i
+        Let d be proc create_hir_dictionary_literal from HIR
+        proc put_string with d, "_type", "capture"
+        Let name be proc node_name_of with cap
+        If name is not equal to 0:
+            proc put_string with d, "name", name
+        Otherwise:
+            Let mode be proc node_value_of with cap
+            proc put_string with d, "mode", mode
+        End If
+        proc add_list_element from HIR with hir_list, d
+        Set i to i plus 1
+    End While
+    Return hir_list
 End Process
 
 Note: ============================================================================
@@ -890,27 +2205,19 @@ Note: Public API
 Note: ============================================================================
 
 @Reasoning:
-Public-API wrapper that owns the lifetime of the translation context.
-Callers pass in an already-built C++ AST and receive a HIR tree or 0
-on failure — they never see the context object itself. This isolation
-keeps the C++ frontend's internal state invisible to the rest of the
-compiler driver.
+Public wrapper owning the translation context lifetime. Callers pass a C++ AST and
+receive a HIR tree or 0 on failure.
 @End Reasoning
 
 @Implementation:
-Three steps: create context (returns 0 on OOM), run translation walk,
-destroy context. The has_error flag at context offset 40 is consulted
-after translation; if set, the partial HIR result is discarded by
-returning 0 instead of the dictionary. destroy_cpp_translation_context
-is called on both success and failure paths so no context is leaked
-regardless of outcome.
+Creates the context, runs the program walk, consults has_error, destroys the
+context on both paths, returns the HIR or 0.
 @End Implementation
 
 Process called "cpp_ast_to_hir" takes cpp_ast as Integer returns Integer:
-    Note: Main public API - convert C++ AST to HIR
+    Note: Convert a C++ AST to HIR
 
     Let context be proc create_cpp_translation_context
-
     If context is equal to 0:
         Return 0
     End If
@@ -918,36 +2225,43 @@ Process called "cpp_ast_to_hir" takes cpp_ast as Integer returns Integer:
     Let hir_result be proc translate_cpp_program_to_hir with context, cpp_ast
 
     Let has_error be proc memory_get_int64 from Layout with context, 40
-
     If has_error is equal to 1:
-        proc destroy_cpp_translation_context from context
+        proc destroy_cpp_translation_context with context
         Return 0
     End If
 
-    proc destroy_cpp_translation_context from context
-
+    proc destroy_cpp_translation_context with context
     Return hir_result
 End Process
 
 @Reasoning:
-Public single-arg facade invoked by the translation dispatcher's
-LANG_CPP arm. Wires the full source -> HIR pipeline: the Parser's
-create_cpp_parser builds both the lexer and parser state from raw
-source, parse_cpp_program walks the token stream into a CPP_PROGRAM
-AST root, and cpp_ast_to_hir lowers it into HIR with its own
-context lifecycle.
+Public single-arg facade matching the C frontend's translate_c_to_hir naming so
+the dispatcher and round-trip test invoke a consistent entry point.
 @End Reasoning
 
 @Implementation:
-parser = Parser.create_cpp_parser(source); on parser == 0 return 0;
-ast = Parser.parse_cpp_program(parser); if ast == 0 return 0;
-return cpp_ast_to_hir(ast). The parser owns its lexer and is not
-explicitly destroyed here -- the parser handle is consumed by the
-caller of cpp_ast_to_hir (which is the dispatcher itself); the
-lifetime is bounded by the calling translate_to_hir frame.
+Delegates to cpp_ast_to_hir.
+@End Implementation
+
+Process called "translate_cpp_to_hir" takes cpp_ast as Integer returns Integer:
+    Note: Public entry: C++ AST -> HIR
+
+    Return proc cpp_ast_to_hir with cpp_ast
+End Process
+
+@Reasoning:
+Source-to-HIR facade wiring the parser and the translator: build a parser over the
+source, parse the program, lower the AST.
+@End Reasoning
+
+@Implementation:
+create_cpp_parser; parse_cpp_program; cpp_ast_to_hir. Returns 0 if any stage
+fails.
 @End Implementation
 
 Process called "cpp_to_hir_from_source" takes source_code as Integer returns Integer:
+    Note: Source -> HIR pipeline
+
     Let parser be proc create_cpp_parser from Parser with source_code
     If parser is equal to 0:
         Return 0

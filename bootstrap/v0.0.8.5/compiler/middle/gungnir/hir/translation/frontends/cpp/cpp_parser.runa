@@ -15,25 +15,23 @@ limitations under the License.
 :End Note
 
 Note:
-C++ Parser - Builds Abstract Syntax Tree from C++ tokens
+C++ Parser - Recursive-descent parser building a C++ AST from the token stream.
 
-This file implements a recursive descent parser for the C++ programming language.
-Parses C++17 standard syntax including classes, templates, namespaces, lambda
-expressions, auto keyword, range-based for loops, and all C++ specific features.
+Parses C++17 constructs: preprocessor directive passthrough, namespaces
+(including nested and using), classes/structs/unions/enums (incl. enum class)
+with access specifiers and inheritance (virtual/override/final), templates
+(type/non-type/template-template params), members (fields, methods, ctors,
+dtors, operators, friend), storage/qualifiers, statements (if/else, for,
+range-for, while, do, switch/case, try/catch, return, throw), and full C++
+expression precedence (assignment, ternary, ||, &&, bitwise, equality,
+relational, spaceship, shift, additive, multiplicative, unary, cast, new/delete,
+sizeof, scope ::, member ./->, calls, subscript, lambdas, literals).
 
-AST Node Types:
-- CPP_PROGRAM: Root node containing all declarations
-- CPP_CLASS: Class declaration/definition
-- CPP_NAMESPACE: Namespace declaration
-- CPP_TEMPLATE: Template declaration
-- CPP_FUNCTION: Function declaration/definition (including methods)
-- CPP_VARIABLE: Variable declaration
-- CPP_TYPEDEF: Type alias declaration
-- CPP_ENUM: Enum/enum class declaration
-- CPP_LAMBDA: Lambda expression
-- CPP_STATEMENT: Statement nodes (if, while, for, try-catch, etc.)
-- CPP_EXPRESSION: Expression nodes (new, delete, cast, etc.)
-- CPP_TYPE: Type information (including template types)
+Forward-progress contract: every statement/member/declaration loop reads the
+lexer byte cursor before and after a sub-parser; if the sub-parser consumed no
+bytes the loop force-advances one token and records an error, so a malformed
+token can never spin the parser. This is the exact guard the C# precedent
+required.
 
 Dependencies:
 - cpp_lexer.runa
@@ -60,25 +58,30 @@ Constant CPP_VARIABLE as Integer is 6
 Constant CPP_TYPEDEF as Integer is 7
 Constant CPP_ENUM as Integer is 8
 Constant CPP_LAMBDA as Integer is 9
+Constant CPP_USING as Integer is 10
+Constant CPP_PREPROCESSOR as Integer is 11
+Constant CPP_ENUM_VALUE as Integer is 12
+Constant CPP_PARAMETER as Integer is 13
+Constant CPP_FIELD as Integer is 14
 
-Note: Class-specific nodes
-Constant CPP_ACCESS_SPECIFIER as Integer is 15  Note: public, private, protected
+Constant CPP_ACCESS_SPECIFIER as Integer is 15
 Constant CPP_CONSTRUCTOR as Integer is 16
 Constant CPP_DESTRUCTOR as Integer is 17
 Constant CPP_OPERATOR_OVERLOAD as Integer is 18
 Constant CPP_INHERITANCE as Integer is 19
+Constant CPP_BASE_CLASS as Integer is 20
 
-Note: Template nodes
 Constant CPP_TEMPLATE_PARAM as Integer is 25
-Constant CPP_TEMPLATE_SPECIALIZATION as Integer is 26
-Constant CPP_TEMPLATE_INSTANTIATION as Integer is 27
+Constant CPP_TEMPLATE_ARG as Integer is 26
+Constant CPP_TEMPLATE_ARG_LIST as Integer is 27
+Constant CPP_CAPTURE as Integer is 28
+Constant CPP_CAPTURE_LIST as Integer is 29
 
-Note: Statement types
 Constant CPP_COMPOUND_STMT as Integer is 30
 Constant CPP_IF_STMT as Integer is 31
 Constant CPP_WHILE_STMT as Integer is 32
 Constant CPP_FOR_STMT as Integer is 33
-Constant CPP_RANGE_FOR_STMT as Integer is 34  Note: C++11 range-based for
+Constant CPP_RANGE_FOR_STMT as Integer is 34
 Constant CPP_DO_WHILE_STMT as Integer is 35
 Constant CPP_SWITCH_STMT as Integer is 36
 Constant CPP_CASE_STMT as Integer is 37
@@ -92,8 +95,8 @@ Constant CPP_EXPR_STMT as Integer is 44
 Constant CPP_TRY_STMT as Integer is 45
 Constant CPP_CATCH_STMT as Integer is 46
 Constant CPP_THROW_STMT as Integer is 47
+Constant CPP_DECL_STMT as Integer is 48
 
-Note: Expression types
 Constant CPP_BINARY_EXPR as Integer is 50
 Constant CPP_UNARY_EXPR as Integer is 51
 Constant CPP_CALL_EXPR as Integer is 52
@@ -109,48 +112,52 @@ Constant CPP_ASSIGN_EXPR as Integer is 61
 Constant CPP_NEW_EXPR as Integer is 62
 Constant CPP_DELETE_EXPR as Integer is 63
 Constant CPP_THIS_EXPR as Integer is 64
-Constant CPP_SCOPE_RESOLUTION as Integer is 65  Note: ::
+Constant CPP_SCOPE_RESOLUTION as Integer is 65
+Constant CPP_POSTFIX_EXPR as Integer is 66
+Constant CPP_PAREN_EXPR as Integer is 67
 
-Note: Type nodes
 Constant CPP_TYPE_NODE as Integer is 70
 Constant CPP_POINTER_TYPE as Integer is 71
 Constant CPP_REFERENCE_TYPE as Integer is 72
 Constant CPP_ARRAY_TYPE as Integer is 73
 Constant CPP_FUNCTION_TYPE as Integer is 74
 Constant CPP_TEMPLATE_TYPE as Integer is 75
-Constant CPP_AUTO_TYPE as Integer is 76  Note: C++11 auto keyword
+Constant CPP_AUTO_TYPE as Integer is 76
+
+Note: Template parameter kind tags (stored in value slot)
+Constant TOKEN_TYPENAME as Integer is 46
+Constant TOKEN_CLASS as Integer is 40
 
 Note: ============================================================================
 Note: AST Node Structure
 Note: ============================================================================
 
 @Reasoning:
-A single AST node type covers expressions, statements, declarations, and
-type specifiers because C++ uses many of the same operators across all four
-families (e.g. ::, ->, .). node_type disambiguates the role; name/value/
-type_info/children/attributes/template_params are populated selectively.
-line/column come straight from the lexer so diagnostics can quote source.
+One AST node type spans expressions, statements, declarations and types because
+C++ shares operators across all four families. node_type disambiguates the role;
+name/value/type_info/children/attributes/template_params are populated
+selectively. A 72-byte record keeps every node a uniform shape so visitor passes
+can read slots unconditionally.
 @End Reasoning
 
 @Implementation:
-72-byte record (9 x i64) at offsets 0..64: node_type (CPP_* constant), name
-(StringCore identifier or 0), value (StringCore literal/operator or 0),
-type_info (CppASTNode* of declared type or 0), children (List of CppASTNode*
-or 0 for leaves), attributes (packed bitfield: access level, virtual,
-static, const), template_params (List of CppASTNode* for template-typed
-nodes), line, column.
+9 x i64 at offsets 0..64: node_type (0), name (8: owned identifier copy or 0),
+value (16: owned operator/literal text or numeric tag or 0), type_info (24:
+type-node pointer or 0), children (32: List of child nodes or 0), attributes
+(40: packed flags / access level / numeric attribute), template_params (48: List
+of param nodes or 0), line (56), column (64).
 @End Implementation
 
 Type called "CppASTNode":
-    node_type as Integer       Note: Node type constant
-    name as Integer           Note: Name/identifier (if applicable)
-    value as Integer          Note: Value/operator (if applicable)
-    type_info as Integer      Note: Type information node
-    children as Integer       Note: List of child nodes
-    attributes as Integer     Note: Additional attributes (access, template params, etc.)
-    template_params as Integer Note: Template parameters (for templates)
-    line as Integer          Note: Source line number
-    column as Integer        Note: Source column number
+    node_type as Integer
+    name as Integer
+    value as Integer
+    type_info as Integer
+    children as Integer
+    attributes as Integer
+    template_params as Integer
+    line as Integer
+    column as Integer
 End Type
 
 Note: ============================================================================
@@ -158,30 +165,24 @@ Note: Parser State
 Note: ============================================================================
 
 @Reasoning:
-C++ parsing is context-sensitive: foo<int>::bar means template-id only when
-foo is a template, otherwise the < is a less-than. current_class is needed
-for access-control checks during member parsing, template_depth disambiguates
-nested templates and rules out angle-bracket parsing of "<<" as shift.
-error_message + has_error provide sticky first-error reporting consistent
-with the semantic analyzer.
+Single-lookahead recursive-descent parser. current_token caches the lookahead
+type so peek is O(1); current_class supports constructor/destructor recognition
+in member parsing; template_depth disambiguates nested template angle brackets;
+error_message/has_error provide sticky first-error reporting.
 @End Reasoning
 
 @Implementation:
-48-byte record (6 x i64) at offsets 0..40: lexer (CppLexer handle),
-current_token (token type integer, refreshed on advance_token),
-error_message (owned StringCore or 0), has_error (sticky 0/1),
-current_class (CppASTNode* of enclosing class declaration or 0),
-template_depth (count incremented when entering '<' template arg list,
-decremented on '>').
+6 x i64 at offsets 0..40: lexer (0), current_token (8), error_message (16),
+has_error (24), current_class (32), template_depth (40).
 @End Implementation
 
 Type called "CppParser":
-    lexer as Integer          Note: C++ lexer
-    current_token as Integer  Note: Current token type
-    error_message as Integer  Note: Error message (if any)
-    has_error as Integer      Note: Boolean: 1 if error occurred
-    current_class as Integer  Note: Current class being parsed (for access control)
-    template_depth as Integer Note: Template nesting depth
+    lexer as Integer
+    current_token as Integer
+    error_message as Integer
+    has_error as Integer
+    current_class as Integer
+    template_depth as Integer
 End Type
 
 Note: ============================================================================
@@ -189,72 +190,52 @@ Note: Parser Creation and Destruction
 Note: ============================================================================
 
 @Reasoning:
-Allocates the 48-byte CppParser record and constructs the underlying
-CppLexer. The parser stays decoupled from any global lexer state so
-multiple parsers may run concurrently against different sources.
-template_depth and current_class are zero-initialised so first-level
-declarations behave as non-template, no-enclosing-class context.
+Allocates the 48-byte CppParser, builds the underlying CppLexer, and primes the
+lookahead with the first token so peek_token_type works immediately.
 @End Reasoning
 
 @Implementation:
-Layout.allocate(48); OOM returns 0. Calls Lexer.create_cpp_lexer with
-the source; if that fails the partially-built parser is freed and 0 is
-returned so the caller observes a single failure point. Writes the
-lexer handle (offset 0), zero current_token (refreshed by the priming
-advance_token below), 0 error_message/has_error (clean state), 0
-current_class (top-level), 0 template_depth. Calling advance_token at
-the end primes the cursor so peek_token_type works immediately.
+Layout.allocate(48); OOM returns 0. create_cpp_lexer on the source; on failure
+frees the parser and returns 0. Zeroes current_token/error/has_error/
+current_class/template_depth then calls advance_token to load the first token.
 @End Implementation
+
 Process called "create_cpp_parser" takes source as Integer returns Integer:
     Note: Create C++ parser from source code
 
-    @Reasoning:
-    Initialize parser state including lexer, error tracking, and C++-specific
-    context like template depth and current class for proper scoping.
-    @End Reasoning
-
-    Let parser_size be 48  Note: CppParser: 6 fields × 8 bytes
-    Let parser be proc allocate from Layout with parser_size
-
+    Let parser be proc allocate from Layout with 48
     If parser is equal to 0:
         Return 0
     End If
 
     Let lexer be proc create_cpp_lexer from Lexer with source
-
     If lexer is equal to 0:
         proc deallocate from Layout with parser
         Return 0
     End If
 
     proc memory_set_int64 from Layout with parser, 0, lexer
-    proc memory_set_int64 from Layout with parser, 8, 0   Note: current_token
-    proc memory_set_int64 from Layout with parser, 16, 0  Note: error_message
-    proc memory_set_int64 from Layout with parser, 24, 0  Note: has_error = false
-    proc memory_set_int64 from Layout with parser, 32, 0  Note: current_class = null
-    proc memory_set_int64 from Layout with parser, 40, 0  Note: template_depth = 0
+    proc memory_set_int64 from Layout with parser, 8, 0
+    proc memory_set_int64 from Layout with parser, 16, 0
+    proc memory_set_int64 from Layout with parser, 24, 0
+    proc memory_set_int64 from Layout with parser, 32, 0
+    proc memory_set_int64 from Layout with parser, 40, 0
 
-    Note: Prime the parser with first token
-    proc advance_token from parser
+    proc advance_token with parser
 
     Return parser
 End Process
 
 @Reasoning:
-Symmetric teardown for create_cpp_parser. Owns the lexer (created during
-create) and any error_message string allocated by set_parse_error; the
-caller never frees those resources directly. AST nodes produced by the
-parser are independent of this lifetime - they survive parser
-destruction.
+Symmetric teardown. Owns the lexer and any error_message copy; AST nodes are
+independent of parser lifetime.
 @End Reasoning
 
 @Implementation:
-Null parser handle short-circuits with success so paired create/destroy
-is safe after an OOM-failed create. Reads lexer handle from offset 0
-and delegates to Lexer.destroy_cpp_lexer if non-zero. Reads
-error_message from offset 16; frees only if non-zero so a clean parser
-doesn't double-free. Finally releases the 48-byte record. Returns 1.
+Null parser short-circuits with success. Destroys the lexer if present, frees the
+error_message copy if present, then frees the 48-byte record. Returns 1.
 @End Implementation
+
 Process called "destroy_cpp_parser" takes parser as Integer returns Integer:
     Note: Destroy C++ parser and free resources
 
@@ -263,75 +244,61 @@ Process called "destroy_cpp_parser" takes parser as Integer returns Integer:
     End If
 
     Let lexer be proc memory_get_int64 from Layout with parser, 0
-
     If lexer is not equal to 0:
         proc destroy_cpp_lexer from Lexer with lexer
     End If
 
     Let error_message be proc memory_get_int64 from Layout with parser, 16
-
     If error_message is not equal to 0:
         proc deallocate from Layout with error_message
     End If
 
     proc deallocate from Layout with parser
-
     Return 1
 End Process
 
 Note: ============================================================================
-Note: AST Node Creation
+Note: AST Node Helpers
 Note: ============================================================================
 
 @Reasoning:
-Centralised AST node allocator so every parser path produces nodes with the
-same zero-initialised slot layout; this lets later passes assume "0 ==
-unset" for every slot without per-call resets. Allocation failure returns 0
-(parent should propagate fatal).
+Centralised zero-initialised node allocator so every parse path produces nodes
+with the same slot layout; "0 == unset" holds for every slot.
 @End Reasoning
 
 @Implementation:
-Allocates a 72-byte block, writes node_type at offset 0, zeroes the
-remaining eight slots (name, value, type_info, children, attributes,
-template_params, line, column). Caller is expected to populate line/column
-from the lexer immediately after creation; child lists are created lazily
-in add_child_to_cpp_ast_node.
+Allocates 72 bytes, writes node_type at offset 0, zeroes the other eight slots.
+Returns 0 on OOM.
 @End Implementation
 
 Process called "create_cpp_ast_node" takes node_type as Integer returns Integer:
     Note: Create C++ AST node of given type
 
-    Let node_size be 72  Note: CppASTNode: 9 fields × 8 bytes
-    Let node be proc allocate from Layout with node_size
-
+    Let node be proc allocate from Layout with 72
     If node is equal to 0:
         Return 0
     End If
 
     proc memory_set_int64 from Layout with node, 0, node_type
-    proc memory_set_int64 from Layout with node, 8, 0   Note: name = null
-    proc memory_set_int64 from Layout with node, 16, 0  Note: value = null
-    proc memory_set_int64 from Layout with node, 24, 0  Note: type_info = null
-    proc memory_set_int64 from Layout with node, 32, 0  Note: children = null
-    proc memory_set_int64 from Layout with node, 40, 0  Note: attributes = null
-    proc memory_set_int64 from Layout with node, 48, 0  Note: template_params = null
-    proc memory_set_int64 from Layout with node, 56, 0  Note: line = 0
-    proc memory_set_int64 from Layout with node, 64, 0  Note: column = 0
+    proc memory_set_int64 from Layout with node, 8, 0
+    proc memory_set_int64 from Layout with node, 16, 0
+    proc memory_set_int64 from Layout with node, 24, 0
+    proc memory_set_int64 from Layout with node, 32, 0
+    proc memory_set_int64 from Layout with node, 40, 0
+    proc memory_set_int64 from Layout with node, 48, 0
+    proc memory_set_int64 from Layout with node, 56, 0
+    proc memory_set_int64 from Layout with node, 64, 0
 
     Return node
 End Process
 
 @Reasoning:
-Children list is created lazily: nodes that never gain children (most
-leaves, all literals, plain identifiers) never pay for an empty List.
-Allocates the List only when the first child is added.
+Children list is created lazily so leaf nodes never pay for an empty List.
 @End Reasoning
 
 @Implementation:
-Null-checks both parent and child (the parser may construct nodes after a
-recoverable error). Reads children slot at offset 32; if 0, allocates a
-fresh List via create and stores it. Then pushes child onto the list.
-Ownership of child transfers to parent's children list.
+Null-checks parent and child. Reads children slot (offset 32); allocates a fresh
+List if 0; pushes child. Ownership of child transfers to parent.
 @End Implementation
 
 Process called "add_child_to_cpp_ast_node" takes parent as Integer, child as Integer:
@@ -340,13 +307,11 @@ Process called "add_child_to_cpp_ast_node" takes parent as Integer, child as Int
     If parent is equal to 0:
         Return
     End If
-
     If child is equal to 0:
         Return
     End If
 
     Let children be proc memory_get_int64 from Layout with parent, 32
-
     If children is equal to 0:
         Set children to proc create from List
         proc memory_set_int64 from Layout with parent, 32, children
@@ -355,700 +320,100 @@ Process called "add_child_to_cpp_ast_node" takes parent as Integer, child as Int
     proc push from List with children, child
 End Process
 
-Note: ============================================================================
-Note: Token Management
-Note: ============================================================================
-
 @Reasoning:
-Single-token-of-lookahead is the canonical parser cursor advance. Caches the
-next token type in the parser at offset 8 so peek_token_type is O(1) without
-re-invoking the lexer. The lexer itself maintains lexeme/line/column for
-the current position; this proc only pulls the integer type.
+Names are user-controlled identifier text needed by later passes; the node owns
+its own copy so the lexer's lexeme buffer can be recycled.
 @End Reasoning
 
 @Implementation:
-Loads lexer handle from offset 0, calls Lexer.next_token to refresh state
-and obtain the next token-type integer, stores it back at offset 8. The
-previous token's lexeme is implicitly discarded by the lexer cursor.
-@End Implementation
-
-Process called "advance_token" takes parser as Integer:
-    Note: Advance to next token
-
-    Let lexer be proc memory_get_int64 from Layout with parser, 0
-    Let next_token be proc next_token from Lexer with lexer
-    proc memory_set_int64 from Layout with parser, 8, next_token
-End Process
-
-@Reasoning:
-Read-only accessor for the current lookahead token-type so recursive-descent
-predicates can branch without side effects on the cursor.
-@End Reasoning
-
-@Implementation:
-Single memory_get_int64 from offset 8. Constant-time, no allocation.
-@End Implementation
-
-Process called "peek_token_type" takes parser as Integer returns Integer:
-    Note: Get current token type without advancing
-
-    Return proc memory_get_int64 from Layout with parser, 8
-End Process
-
-@Reasoning:
-The token type is cached on the parser but the lexeme text lives on the
-lexer. Identifier/literal parses need the raw text to attach to AST nodes;
-this proc bridges to the lexer's current_lexeme accessor without affecting
-the lookahead state.
-@End Reasoning
-
-@Implementation:
-Reads lexer handle from offset 0 and delegates to Lexer.current_lexeme.
-Returns a BORROWED pointer into the lexer's internal storage; AST nodes
-that want to keep the string must copy it via StringCore.
-@End Implementation
-
-Process called "peek_token_lexeme" takes parser as Integer returns Integer:
-    Note: Get current token lexeme without advancing
-
-    Let lexer be proc memory_get_int64 from Layout with parser, 0
-    Return proc current_lexeme from Lexer with lexer
-End Process
-
-@Reasoning:
-Canonical "match-or-error" combinator used throughout the recursive-descent
-parser. Advancing only on match keeps the cursor positioned at the offending
-token when an error fires, letting the error recovery layer attempt
-synchronisation on the right context.
-@End Reasoning
-
-@Implementation:
-Compares peek_token_type against expected. Match: advances. Mismatch: calls
-set_parse_error with the supplied message; the parser flips has_error=1
-sticky and recovery may pick up the broken cursor downstream.
-@End Implementation
-
-Process called "expect_token" takes parser as Integer, expected as Integer, message as Integer:
-    Note: Expect specific token type or set error
-
-    Let current_type be proc peek_token_type from parser
-
-    If current_type is equal to expected:
-        proc advance_token from parser
-    Otherwise:
-        proc set_parse_error with parser, message
-    End If
-End Process
-
-Note: ============================================================================
-Note: Main Parsing Entry Point
-Note: ============================================================================
-
-@Reasoning:
-Top-level recursive-descent dispatch. C++ admits a wide menu of file-
-scope productions: namespace, class, struct, template, using/typedef,
-preprocessor passthrough, function, and global variable. This driver
-keeps consuming until TOKEN_EOF and aborts on the first sticky error so
-the AST never contains noise after a fatal parse failure.
-@End Reasoning
-
-@Implementation:
-Creates the program root via create_cpp_ast_node(CPP_PROGRAM). Loop
-peeks the cursor: TOKEN_EOF breaks. Branches by token kind to the
-specialist parse_* routine; non-null child nodes are appended to the
-program root via add_child_to_cpp_ast_node. After each iteration
-has_parse_error is checked; on error the entire production is
-discarded by returning 0 so the caller does not consume a half-built
-tree. Returns the populated program node on clean EOF.
-@End Implementation
-Process called "parse_cpp_program" takes parser as Integer returns Integer:
-    Note: Parse entire C++ program (top-level entry point)
-
-    @Reasoning:
-    Parse all top-level declarations including namespaces, classes, templates,
-    functions, variables, and preprocessor directives until EOF is reached.
-    Handle C++ specific constructs like using directives and template declarations.
-    @End Reasoning
-
-    Let program_node be proc create_cpp_ast_node from CPP_PROGRAM
-
-    While 1 is equal to 1:
-        Let token_type be proc peek_token_type from parser
-
-        If token_type is equal to TOKEN_EOF from Lexer:
-            Break
-        End If
-
-        Note: Parse namespace declaration
-        If token_type is equal to TOKEN_NAMESPACE from Lexer:
-            Let namespace_node be proc parse_namespace_declaration from parser
-            If namespace_node is not equal to 0:
-                proc add_child_to_cpp_ast_node with program_node, namespace_node
-            End If
-            Continue
-        End If
-
-        Note: Parse template declaration
-        If token_type is equal to TOKEN_TEMPLATE from Lexer:
-            Let template_node be proc parse_template_declaration from parser
-            If template_node is not equal to 0:
-                proc add_child_to_cpp_ast_node with program_node, template_node
-            End If
-            Continue
-        End If
-
-        Note: Parse class declaration
-        If token_type is equal to TOKEN_CLASS from Lexer:
-            Let class_node be proc parse_class_declaration from parser
-            If class_node is not equal to 0:
-                proc add_child_to_cpp_ast_node with program_node, class_node
-            End If
-            Continue
-        End If
-
-        Note: Parse struct declaration (treated as class with public default)
-        If token_type is equal to TOKEN_STRUCT from Lexer:
-            Let struct_node be proc parse_struct_declaration from parser
-            If struct_node is not equal to 0:
-                proc add_child_to_cpp_ast_node with program_node, struct_node
-            End If
-            Continue
-        End If
-
-        Note: Parse enum declaration
-        If token_type is equal to TOKEN_ENUM from Lexer:
-            Let enum_node be proc parse_enum_declaration from parser
-            If enum_node is not equal to 0:
-                proc add_child_to_cpp_ast_node with program_node, enum_node
-            End If
-            Continue
-        End If
-
-        Note: Parse using declaration/directive
-        If token_type is equal to TOKEN_USING from Lexer:
-            Let using_node be proc parse_using_declaration from parser
-            If using_node is not equal to 0:
-                proc add_child_to_cpp_ast_node with program_node, using_node
-            End If
-            Continue
-        End If
-
-        Note: Parse typedef declaration
-        If token_type is equal to TOKEN_TYPEDEF from Lexer:
-            Let typedef_node be proc parse_typedef_declaration from parser
-            If typedef_node is not equal to 0:
-                proc add_child_to_cpp_ast_node with program_node, typedef_node
-            End If
-            Continue
-        End If
-
-        Note: Parse preprocessor directives
-        If token_type is equal to TOKEN_HASH from Lexer:
-            Let preprocessor_node be proc parse_preprocessor_directive from parser
-            If preprocessor_node is not equal to 0:
-                proc add_child_to_cpp_ast_node with program_node, preprocessor_node
-            End If
-            Continue
-        End If
-
-        Note: Parse function or variable declaration
-        Let declaration_node be proc parse_declaration from parser
-        If declaration_node is not equal to 0:
-            proc add_child_to_cpp_ast_node with program_node, declaration_node
-        End If
-
-        Let has_error be proc has_parse_error from parser
-
-        If has_error is equal to 1:
-            Return 0
-        End If
-    End While
-
-    Return program_node
-End Process
-
-Note: ============================================================================
-Note: Class Declaration Parsing
-Note: ============================================================================
-
-@Reasoning:
-Parses 'class Name [<template-args>] [: base-list] { member-list }' or
-'class Name;'. The class-access default is private (C++11 9.2/14
-explicitly distinguishes class default-private from struct default-
-public). Forward declarations short-circuit immediately on a semicolon
-after the optional inheritance, distinguishing them from definitions.
-The proc saves and restores parser.current_class to support nested
-classes, where the inner class needs its own "this is the class being
-parsed" context for constructor/destructor recognition.
-@End Reasoning
-
-@Implementation:
-Expects TOKEN_CLASS, creates a CPP_CLASS node, captures the identifier
-into name. Optional template-arg list (TOKEN_LESS) and inheritance
-(TOKEN_COLON) become child sub-trees. Semicolon -> forward-decl path
-returns immediately. Otherwise '{' is expected; old_class is saved
-from parser offset 32 and the new class node is stored there so
-parse_class_member can identify constructors by name match.
-current_access tracks default-private/protected/public via 0/1/2; each
-access-specifier label flips it. Loop terminates on TOKEN_RBRACE.
-Restores parser.current_class before returning the class node.
-@End Implementation
-Process called "parse_class_declaration" takes parser as Integer returns Integer:
-    Note: Parse C++ class declaration with inheritance and access specifiers
-
-    @Reasoning:
-    Handle class declarations including inheritance lists, access specifiers,
-    member functions, constructors, destructors, operator overloads, and nested classes.
-    Support both declaration and definition forms.
-    @End Reasoning
-
-    proc expect_token with parser, TOKEN_CLASS from Lexer, "Expected 'class'"
-
-    Let class_node be proc create_cpp_ast_node from CPP_CLASS
-
-    Note: Parse class name
-    Let class_name be proc peek_token_lexeme from parser
-    proc expect_token with parser, TOKEN_IDENTIFIER from Lexer, "Expected class name"
-    proc set_cpp_ast_node_name with class_node, class_name
-
-    Note: Parse optional template specialization
-    Let next_token be proc peek_token_type from parser
-    If next_token is equal to TOKEN_LESS from Lexer:
-        Let template_args be proc parse_template_argument_list from parser
-        proc set_cpp_ast_node_template_params with class_node, template_args
-    End If
-
-    Note: Parse optional inheritance
-    Let colon_token be proc peek_token_type from parser
-    If colon_token is equal to TOKEN_COLON from Lexer:
-        proc advance_token from parser  Note: consume ':'
-        Let inheritance_list be proc parse_inheritance_list from parser
-        proc add_child_to_cpp_ast_node with class_node, inheritance_list
-    End If
-
-    Note: Check for forward declaration vs definition
-    Let brace_token be proc peek_token_type from parser
-    If brace_token is equal to TOKEN_SEMICOLON from Lexer:
-        Note: Forward declaration
-        proc advance_token from parser
-        Return class_node
-    End If
-
-    Note: Parse class body
-    proc expect_token with parser, TOKEN_LBRACE from Lexer, "Expected '{' or ';'"
-
-    Note: Set current class context for access control
-    Let old_class be proc memory_get_int64 from Layout with parser, 32
-    proc memory_set_int64 from Layout with parser, 32, class_node
-
-    Note: Default access is private for class
-    Let current_access be 0  Note: 0 = private, 1 = protected, 2 = public
-
-    While 1 is equal to 1:
-        Let member_token be proc peek_token_type from parser
-
-        If member_token is equal to TOKEN_RBRACE from Lexer:
-            proc advance_token from parser
-            Break
-        End If
-
-        Note: Parse access specifiers
-        If member_token is equal to TOKEN_PUBLIC from Lexer:
-            proc advance_token from parser
-            proc expect_token with parser, TOKEN_COLON from Lexer, "Expected ':' after 'public'"
-            Set current_access to 2
-            Continue
-        End If
-
-        If member_token is equal to TOKEN_PRIVATE from Lexer:
-            proc advance_token from parser
-            proc expect_token with parser, TOKEN_COLON from Lexer, "Expected ':' after 'private'"
-            Set current_access to 0
-            Continue
-        End If
-
-        If member_token is equal to TOKEN_PROTECTED from Lexer:
-            proc advance_token from parser
-            proc expect_token with parser, TOKEN_COLON from Lexer, "Expected ':' after 'protected'"
-            Set current_access to 1
-            Continue
-        End If
-
-        Note: Parse member declaration
-        Let member_node be proc parse_class_member with parser, current_access
-        If member_node is not equal to 0:
-            proc add_child_to_cpp_ast_node with class_node, member_node
-        End If
-    End While
-
-    Note: Restore previous class context
-    proc memory_set_int64 from Layout with parser, 32, old_class
-
-    Return class_node
-End Process
-
-@Reasoning:
-Dispatches a single member declaration inside a class body. Five
-member kinds need bespoke handling because they cannot be reduced to
-the generic parse_declaration path: constructor (identifier matching
-the class name), destructor (TOKEN_TILDE), operator overload
-(TOKEN_OPERATOR), friend (TOKEN_FRIEND), and template member
-(TOKEN_TEMPLATE). The remainder falls through to parse_declaration.
-Each path stamps access_level onto the produced node so later passes
-can apply C++ access control without re-deriving the section context.
-@End Reasoning
-
-@Implementation:
-Reads the current_class handle from offset 32 and pulls its name for
-constructor recognition. Peek-and-compare the cursor token against the
-five special-case token kinds. For each special path, returns the
-specialist's result directly so dispatch stays a single branch deep.
-For template members, the produced node is stamped with the access
-level only if it's non-null (graceful on inner parse failure). The
-fallback parse_declaration also has its access_level stamped.
-@End Implementation
-Process called "parse_class_member" takes parser as Integer, access_level as Integer returns Integer:
-    Note: Parse class member (function, variable, constructor, destructor, etc.)
-
-    @Reasoning:
-    Handle all types of class members including member functions, data members,
-    constructors, destructors, operator overloads, nested types, and friend declarations.
-    Apply proper access level to each member.
-    @End Reasoning
-
-    Let token_type be proc peek_token_type from parser
-
-    Note: Parse constructor (same name as class)
-    Let current_class be proc memory_get_int64 from Layout with parser, 32
-    Let class_name be proc get_cpp_ast_node_name from current_class
-    Let identifier_name be proc peek_token_lexeme from parser
-
-    If token_type is equal to TOKEN_IDENTIFIER from Lexer:
-        Let is_constructor be proc string_equals from StringCore with identifier_name, class_name
-
-        If is_constructor is equal to 1:
-            Return proc parse_constructor with parser, access_level
-        End If
-
-        Note: Check for destructor
-        If token_type is equal to TOKEN_TILDE from Lexer:
-            Return proc parse_destructor with parser, access_level
-        End If
-    End If
-
-    Note: Parse operator overload
-    If token_type is equal to TOKEN_OPERATOR from Lexer:
-        Return proc parse_operator_overload with parser, access_level
-    End If
-
-    Note: Parse friend declaration
-    If token_type is equal to TOKEN_FRIEND from Lexer:
-        Return proc parse_friend_declaration with parser, access_level
-    End If
-
-    Note: Parse template member
-    If token_type is equal to TOKEN_TEMPLATE from Lexer:
-        Let template_member be proc parse_template_declaration from parser
-        If template_member is not equal to 0:
-            proc set_cpp_ast_node_access_level with template_member, access_level
-        End If
-        Return template_member
-    End If
-
-    Note: Parse regular member (function or variable)
-    Let member_node be proc parse_declaration from parser
-    If member_node is not equal to 0:
-        proc set_cpp_ast_node_access_level with member_node, access_level
-    End If
-
-    Return member_node
-End Process
-
-Note: ============================================================================
-Note: Template Declaration Parsing
-Note: ============================================================================
-
-@Reasoning:
-Parses 'template <param-list> declaration'. The template parameter
-list is itself a CPP_TEMPLATE_PARAM node containing child parameter
-nodes; the templated declaration becomes a child of the template node.
-template_depth is bumped before recursion so the lexer/parser can
-disambiguate '>' as either greater-than or template close based on
-nesting, then restored on exit to keep tracking accurate across
-sibling templates.
-@End Reasoning
-
-@Implementation:
-Expects TOKEN_TEMPLATE; creates a CPP_TEMPLATE node. Reads the current
-template_depth from offset 40, writes depth+1 back to track the open
-angle bracket. Expects TOKEN_LESS. Creates a CPP_TEMPLATE_PARAM list
-node, loops parse_template_parameter and appends, consuming optional
-commas between entries; loop exits when peek returns TOKEN_GREATER
-(which is also consumed). The collected param list is stored via
-set_cpp_ast_node_template_params. Then parse_declaration recurses to
-build the templated entity; its non-null result is appended as the
-template body. Restores template_depth to the original value on exit.
-@End Implementation
-Process called "parse_template_declaration" takes parser as Integer returns Integer:
-    Note: Parse template declaration with parameters and specializations
-
-    @Reasoning:
-    Handle template declarations including type parameters, non-type parameters,
-    template template parameters, default arguments, and partial specializations.
-    Support both function and class templates.
-    @End Reasoning
-
-    proc expect_token with parser, TOKEN_TEMPLATE from Lexer, "Expected 'template'"
-
-    Let template_node be proc create_cpp_ast_node from CPP_TEMPLATE
-
-    Note: Increment template depth for nested template tracking
-    Let current_depth be proc memory_get_int64 from Layout with parser, 40
-    proc memory_set_int64 from Layout with parser, 40, current_depth plus 1
-
-    Note: Parse template parameter list
-    proc expect_token with parser, TOKEN_LESS from Lexer, "Expected '<' after 'template'"
-
-    Let param_list be proc create_cpp_ast_node from CPP_TEMPLATE_PARAM
-
-    While 1 is equal to 1:
-        Let param_token be proc peek_token_type from parser
-
-        If param_token is equal to TOKEN_GREATER from Lexer:
-            proc advance_token from parser
-            Break
-        End If
-
-        Note: Parse template parameter
-        Let param_node be proc parse_template_parameter from parser
-        If param_node is not equal to 0:
-            proc add_child_to_cpp_ast_node with param_list, param_node
-        End If
-
-        Note: Check for comma separator
-        Let comma_token be proc peek_token_type from parser
-        If comma_token is equal to TOKEN_COMMA from Lexer:
-            proc advance_token from parser
-        End If
-    End While
-
-    proc set_cpp_ast_node_template_params with template_node, param_list
-
-    Note: Parse the templated declaration
-    Let templated_decl be proc parse_declaration from parser
-    If templated_decl is not equal to 0:
-        proc add_child_to_cpp_ast_node with template_node, templated_decl
-    End If
-
-    Note: Decrement template depth
-    proc memory_set_int64 from Layout with parser, 40, current_depth
-
-    Return template_node
-End Process
-
-@Reasoning:
-Recognises the three template-parameter grammars from the C++ standard:
-type parameter ('typename T' / 'class T'), non-type parameter
-('int N'), and template template parameter ('template <...> class C').
-The 'value' slot of the produced CPP_TEMPLATE_PARAM stores the
-declarator keyword (TOKEN_TYPENAME / TOKEN_CLASS) so later passes can
-discriminate without re-tokenising. Default-argument support is
-handled inline: a trailing '= default-type' subtree is appended as a
-child of the parameter node.
-@End Reasoning
-
-@Implementation:
-Branches by first token. TOKEN_TEMPLATE -> consume, recursively parse
-a nested parameter list (template template parameter), expect
-'class'/'typename', then identifier; build node and return.
-TOKEN_TYPENAME -> consume, capture identifier, stamp value with
-TOKEN_TYPENAME, optionally parse '= type-specifier'. TOKEN_CLASS
-mirrors the TYPENAME path with TOKEN_CLASS as the value tag. Fallback:
-delegate to parse_declaration for non-type parameters; this also
-handles defaulted non-type params because parse_declaration recognises
-the trailing '=' initialiser.
-@End Implementation
-Process called "parse_template_parameter" takes parser as Integer returns Integer:
-    Note: Parse individual template parameter (type, non-type, or template template)
-
-    @Reasoning:
-    Handle three types of template parameters:
-    1. Type parameters: typename T, class T
-    2. Non-type parameters: int N, typename T::type* ptr
-    3. Template template parameters: template<typename> class Container
-    @End Reasoning
-
-    Let param_token be proc peek_token_type from parser
-    Let param_node be proc create_cpp_ast_node from CPP_TEMPLATE_PARAM
-
-    Note: Template template parameter
-    If param_token is equal to TOKEN_TEMPLATE from Lexer:
-        proc advance_token from parser
-        Let nested_params be proc parse_template_parameter_list from parser
-        proc add_child_to_cpp_ast_node with param_node, nested_params
-
-        Let class_token be proc peek_token_type from parser
-        If class_token is equal to TOKEN_CLASS from Lexer:
-            proc advance_token from parser
-        Otherwise:
-            proc expect_token with parser, TOKEN_TYPENAME from Lexer, "Expected 'class' or 'typename'"
-        End If
-
-        Let param_name be proc peek_token_lexeme from parser
-        proc expect_token with parser, TOKEN_IDENTIFIER from Lexer, "Expected template template parameter name"
-        proc set_cpp_ast_node_name with param_node, param_name
-
-        Return param_node
-    End If
-
-    Note: Type parameter
-    If param_token is equal to TOKEN_TYPENAME from Lexer:
-        proc advance_token from parser
-        Set param_name to proc peek_token_lexeme from parser
-        proc expect_token with parser, TOKEN_IDENTIFIER from Lexer, "Expected type parameter name"
-        proc set_cpp_ast_node_name with param_node, param_name
-        proc set_cpp_ast_node_value with param_node, TOKEN_TYPENAME from Lexer
-
-        Note: Parse optional default type
-        Let equals_token be proc peek_token_type from parser
-        If equals_token is equal to TOKEN_EQUALS from Lexer:
-            proc advance_token from parser
-            Let default_type be proc parse_type_specifier from parser
-            proc add_child_to_cpp_ast_node with param_node, default_type
-        End If
-
-        Return param_node
-    End If
-
-    If param_token is equal to TOKEN_CLASS from Lexer:
-        proc advance_token from parser
-        Set param_name to proc peek_token_lexeme from parser
-        proc expect_token with parser, TOKEN_IDENTIFIER from Lexer, "Expected type parameter name"
-        proc set_cpp_ast_node_name with param_node, param_name
-        proc set_cpp_ast_node_value with param_node, TOKEN_CLASS from Lexer
-
-        Note: Parse optional default type
-        Set equals_token to proc peek_token_type from parser
-        If equals_token is equal to TOKEN_EQUALS from Lexer:
-            proc advance_token from parser
-            Set default_type to proc parse_type_specifier from parser
-            proc add_child_to_cpp_ast_node with param_node, default_type
-        End If
-
-        Return param_node
-    End If
-
-    Note: Non-type parameter - parse as regular declaration
-    Let non_type_decl be proc parse_declaration from parser
-    Return non_type_decl
-End Process
-
-Note: ============================================================================
-Note: Error Handling and Utility Functions
-Note: ============================================================================
-
-@Reasoning:
-Sticky error setter used by every recursive-descent expectation. Stores
-a parser-owned copy of the diagnostic so the caller's StringCore handle
-is not aliased; the parser frees this copy in destroy_cpp_parser. Sets
-the has_error flag so combinators can short-circuit instead of
-producing a corrupt AST.
-@End Reasoning
-
-@Implementation:
-Writes has_error=1 at offset 24. Copies the supplied message via
-StringCore.copy_string and stores the new handle at offset 16. If a
-prior error_message existed, that slot is overwritten without an
-explicit free; callers must only call set_parse_error once per parse
-to avoid leaks, which is the recursive-descent contract here (sticky
-flag prevents subsequent error reporting).
-@End Implementation
-
-@Security_Scope:
-Message text is parser-internal; no untrusted input reaches this proc.
-Length-bounded copy is provided by StringCore.copy_string.
-@End Security_Scope
-Process called "set_parse_error" takes parser as Integer, message as Integer:
-    Note: Set parser error state with message
-
-    proc memory_set_int64 from Layout with parser, 24, 1  Note: has_error = true
-
-    Let error_copy be proc copy_string from StringCore with message
-    proc memory_set_int64 from Layout with parser, 16, error_copy
-End Process
-
-@Reasoning:
-Sticky-flag accessor consumed by every parser combinator that branches on
-success/failure. Returning the raw 0/1 lets callers also use it as a boolean
-guard without an extra is_equal check.
-@End Reasoning
-
-@Implementation:
-Direct read of the has_error slot at offset 24. Constant-time.
-@End Implementation
-
-Process called "has_parse_error" takes parser as Integer returns Integer:
-    Note: Check if parser has encountered an error
-
-    Return proc memory_get_int64 from Layout with parser, 24
-End Process
-
-@Reasoning:
-Names are user-controlled identifier text and are needed by every later
-pass; the parser owns its own copy so the lexer's lexeme buffer can be
-recycled. Defensive null-check on the node lets callers stay terse.
-@End Reasoning
-
-@Implementation:
-Null-checks node; otherwise copies the name StringCore via StringCore.copy_string
-and stores the new handle at offset 8. The owning AST node frees the copy
-when destroyed.
+Null-checks node; copies the name via StringCore.string_duplicate and stores the
+copy at offset 8.
 @End Implementation
 
 Process called "set_cpp_ast_node_name" takes node as Integer, name as Integer:
-    Note: Set AST node name
+    Note: Set AST node name (owned copy)
 
     If node is equal to 0:
         Return
     End If
+    If name is equal to 0:
+        Return
+    End If
 
-    Let name_copy be proc copy_string from StringCore with name
+    Let name_copy be proc string_duplicate from StringCore with name
     proc memory_set_int64 from Layout with node, 8, name_copy
 End Process
 
 @Reasoning:
-The value slot holds operator strings ("+", "++", "->"), literal text, or
-embedded auxiliary handles. Unlike name, value is stored BORROWED because
-operator tokens are constant strings and literal text already lives on an
-already-copied StringCore by the time the parser sets it.
+Stores an already-owned name string directly into the node's name slot, taking
+ownership without re-duplicating. Used for the result of parse_qualified_name,
+which already returns an owned copy - re-duplicating it would leak the original.
 @End Reasoning
 
 @Implementation:
-Null-checks node and writes value handle at offset 16 verbatim. Caller is
-responsible for ensuring value outlives the node, or for passing a freshly
-copied StringCore.
+Null-checks node and name; writes the name handle verbatim at offset 8.
 @End Implementation
 
-Process called "set_cpp_ast_node_value" takes node as Integer, value as Integer:
-    Note: Set AST node value
+Process called "set_cpp_ast_node_name_owned" takes node as Integer, name as Integer:
+    Note: Store an owned name directly (no re-duplication)
 
     If node is equal to 0:
         Return
     End If
+    If name is equal to 0:
+        Return
+    End If
+    proc memory_set_int64 from Layout with node, 8, name
+End Process
 
+@Reasoning:
+The value slot holds operator strings, literal text, or numeric tags. Stored
+verbatim because callers pass either an owned copy or a numeric tag.
+@End Reasoning
+
+@Implementation:
+Null-checks node; writes value at offset 16.
+@End Implementation
+
+Process called "set_cpp_ast_node_value" takes node as Integer, value as Integer:
+    Note: Set AST node value verbatim
+
+    If node is equal to 0:
+        Return
+    End If
     proc memory_set_int64 from Layout with node, 16, value
 End Process
 
 @Reasoning:
-C++ class members are private/protected/public; the parser stamps the level
-on each declaration so the semantic layer can enforce access rules without
-re-walking back to the class scope.
+Convenience setter that copies a lexeme into the value slot as owned text - used
+for operator and literal lexemes the node must outlive.
 @End Reasoning
 
 @Implementation:
-Writes the access constant (ACCESS_PRIVATE/PROTECTED/PUBLIC from cpp_semantic)
-into the attributes slot at offset 40. This slot is repurposed across node
-kinds; the semantic layer interprets it according to node_type.
+Null-checks node; if value non-zero copies via string_duplicate; stores at
+offset 16.
+@End Implementation
+
+Process called "set_cpp_ast_node_value_text" takes node as Integer, value as Integer:
+    Note: Set AST node value as an owned text copy
+
+    If node is equal to 0:
+        Return
+    End If
+    If value is equal to 0:
+        Return
+    End If
+    Let copy be proc string_duplicate from StringCore with value
+    proc memory_set_int64 from Layout with node, 16, copy
+End Process
+
+@Reasoning:
+Access level (private/protected/public) stamped on members so the semantic and
+HIR layers can apply access control without re-walking to the class scope.
+@End Reasoning
+
+@Implementation:
+Writes the access constant into the attributes slot at offset 40.
 @End Implementation
 
 Process called "set_cpp_ast_node_access_level" takes node as Integer, access as Integer:
@@ -1057,21 +422,16 @@ Process called "set_cpp_ast_node_access_level" takes node as Integer, access as 
     If node is equal to 0:
         Return
     End If
-
-    Note: Store access level in attributes field
     proc memory_set_int64 from Layout with node, 40, access
 End Process
 
 @Reasoning:
-Template parameter lists are parsed eagerly and attached to the template-
-declaration node so HIR emission can specialise the template body against
-those parameters at instantiation time.
+Template parameter lists attached to template-declaration nodes so HIR emission
+can reproduce the template prefix.
 @End Reasoning
 
 @Implementation:
-Null-checks node and writes the parameter-list handle (a List of CppASTNode*
-returned by parse_template_parameters) at offset 48. List ownership
-transfers to the node.
+Null-checks node; writes the param-list handle at offset 48.
 @End Implementation
 
 Process called "set_cpp_ast_node_template_params" takes node as Integer, params as Integer:
@@ -1080,18 +440,34 @@ Process called "set_cpp_ast_node_template_params" takes node as Integer, params 
     If node is equal to 0:
         Return
     End If
-
     proc memory_set_int64 from Layout with node, 48, params
 End Process
 
 @Reasoning:
-Read-only accessor for the node's owned name copy; returns 0 for null nodes
-so visitor passes can chain accesses without null-checking the node first.
+type_info slot holds a node's declared type (a CPP_TYPE_NODE subtree). Stored
+verbatim because the type node is already owned.
 @End Reasoning
 
 @Implementation:
-Null-check on node; otherwise returns the StringCore handle at offset 8.
-Borrowed pointer - caller must not free.
+Null-checks node; writes the type node at offset 24.
+@End Implementation
+
+Process called "set_cpp_ast_node_type_info" takes node as Integer, type_node as Integer:
+    Note: Set AST node declared type
+
+    If node is equal to 0:
+        Return
+    End If
+    proc memory_set_int64 from Layout with node, 24, type_node
+End Process
+
+@Reasoning:
+Read-only name accessor returning the owned copy; returns 0 for null nodes so
+visitors chain without null-checking.
+@End Reasoning
+
+@Implementation:
+Null-check then returns the handle at offset 8.
 @End Implementation
 
 Process called "get_cpp_ast_node_name" takes node as Integer returns Integer:
@@ -1100,6 +476,3810 @@ Process called "get_cpp_ast_node_name" takes node as Integer returns Integer:
     If node is equal to 0:
         Return 0
     End If
-
     Return proc memory_get_int64 from Layout with node, 8
+End Process
+
+Note: ============================================================================
+Note: Token Management
+Note: ============================================================================
+
+@Reasoning:
+Single-token-of-lookahead advance. Caches the next token type at offset 8 so
+peek_token_type is O(1).
+@End Reasoning
+
+@Implementation:
+Loads lexer (offset 0), calls Lexer.next_token, stores the result at offset 8.
+@End Implementation
+
+Process called "advance_token" takes parser as Integer:
+    Note: Advance to next token
+
+    Let lexer be proc memory_get_int64 from Layout with parser, 0
+    Let next be proc next_token from Lexer with lexer
+    proc memory_set_int64 from Layout with parser, 8, next
+End Process
+
+@Reasoning:
+Read-only accessor for the lookahead token type.
+@End Reasoning
+
+@Implementation:
+Single memory_get_int64 from offset 8.
+@End Implementation
+
+Process called "peek_token_type" takes parser as Integer returns Integer:
+    Note: Current lookahead token type
+
+    Return proc memory_get_int64 from Layout with parser, 8
+End Process
+
+@Reasoning:
+The token text lives on the lexer; bridges to current_lexeme without affecting
+the lookahead.
+@End Reasoning
+
+@Implementation:
+Reads the lexer (offset 0) and returns Lexer.current_lexeme (a borrowed pointer).
+@End Implementation
+
+Process called "peek_token_lexeme" takes parser as Integer returns Integer:
+    Note: Current token lexeme (borrowed)
+
+    Let lexer be proc memory_get_int64 from Layout with parser, 0
+    Return proc current_lexeme from Lexer with lexer
+End Process
+
+@Reasoning:
+The lexer's byte cursor is the forward-progress oracle. Loops read it before and
+after a sub-parser; equality means no progress and the loop must force-advance.
+@End Reasoning
+
+@Implementation:
+Reads the lexer (offset 0) and returns its position field (offset 16).
+@End Implementation
+
+Process called "lexer_position" takes parser as Integer returns Integer:
+    Note: Current lexer byte cursor (forward-progress oracle)
+
+    Let lexer be proc memory_get_int64 from Layout with parser, 0
+    Return proc memory_get_int64 from Layout with lexer, 16
+End Process
+
+@Reasoning:
+Match-or-error combinator. Advancing only on match leaves the cursor on the
+offending token for diagnostics.
+@End Reasoning
+
+@Implementation:
+Compares peek against expected. Match advances; mismatch sets the sticky error.
+@End Implementation
+
+Process called "expect_token" takes parser as Integer, expected as Integer, message as Integer:
+    Note: Expect a token type or set the sticky error
+
+    Let current_type be proc peek_token_type with parser
+    If current_type is equal to expected:
+        proc advance_token with parser
+    Otherwise:
+        proc set_parse_error with parser, message
+    End If
+End Process
+
+@Reasoning:
+Sticky error setter used by every expectation. Stores a parser-owned copy of the
+message so the caller's handle is not aliased.
+@End Reasoning
+
+@Implementation:
+Writes has_error=1 (offset 24) and an owned copy of message (string_duplicate) at
+offset 16. First-error-wins is enforced by callers checking has_error.
+@End Implementation
+
+Process called "set_parse_error" takes parser as Integer, message as Integer:
+    Note: Set sticky parser error
+
+    proc memory_set_int64 from Layout with parser, 24, 1
+    Let copy be proc string_duplicate from StringCore with message
+    proc memory_set_int64 from Layout with parser, 16, copy
+End Process
+
+@Reasoning:
+Sticky-flag accessor for combinators that branch on success/failure.
+@End Reasoning
+
+@Implementation:
+Reads has_error at offset 24.
+@End Implementation
+
+Process called "has_parse_error" takes parser as Integer returns Integer:
+    Note: Whether the parser has latched an error
+
+    Return proc memory_get_int64 from Layout with parser, 24
+End Process
+
+Note: ============================================================================
+Note: Token Predicates
+Note: ============================================================================
+
+@Reasoning:
+Type-keyword predicate: detects a declaration-specifier lead so the top-level and
+member loops can route into parse_declaration. Covers builtin type keywords,
+storage/qualifier keywords, and a plain identifier (user type name).
+@End Reasoning
+
+@Implementation:
+Returns 1 for the builtin type tokens (VOID..WCHAR_T), the storage/qualifier
+tokens (CONST..REGISTER, CONSTEXPR, INLINE, VIRTUAL, STATIC, EXTERN, EXPLICIT,
+FRIEND, MUTABLE, VOLATILE), TYPENAME, and IDENTIFIER; else 0.
+@End Implementation
+
+Process called "is_type_start" takes token_type as Integer returns Integer:
+    Note: Whether token begins a declaration specifier / type
+
+    If token_type is equal to TOKEN_VOID from Lexer:
+        Return 1
+    End If
+    If token_type is equal to TOKEN_BOOL from Lexer:
+        Return 1
+    End If
+    If token_type is equal to TOKEN_CHAR from Lexer:
+        Return 1
+    End If
+    If token_type is equal to TOKEN_SHORT from Lexer:
+        Return 1
+    End If
+    If token_type is equal to TOKEN_INT from Lexer:
+        Return 1
+    End If
+    If token_type is equal to TOKEN_LONG from Lexer:
+        Return 1
+    End If
+    If token_type is equal to TOKEN_FLOAT from Lexer:
+        Return 1
+    End If
+    If token_type is equal to TOKEN_DOUBLE from Lexer:
+        Return 1
+    End If
+    If token_type is equal to TOKEN_SIGNED from Lexer:
+        Return 1
+    End If
+    If token_type is equal to TOKEN_UNSIGNED from Lexer:
+        Return 1
+    End If
+    If token_type is equal to TOKEN_AUTO from Lexer:
+        Return 1
+    End If
+    If token_type is equal to TOKEN_WCHAR_T from Lexer:
+        Return 1
+    End If
+    If token_type is equal to TOKEN_CONST from Lexer:
+        Return 1
+    End If
+    If token_type is equal to TOKEN_CONSTEXPR from Lexer:
+        Return 1
+    End If
+    If token_type is equal to TOKEN_VOLATILE from Lexer:
+        Return 1
+    End If
+    If token_type is equal to TOKEN_MUTABLE from Lexer:
+        Return 1
+    End If
+    If token_type is equal to TOKEN_STATIC from Lexer:
+        Return 1
+    End If
+    If token_type is equal to TOKEN_EXTERN from Lexer:
+        Return 1
+    End If
+    If token_type is equal to TOKEN_INLINE from Lexer:
+        Return 1
+    End If
+    If token_type is equal to TOKEN_REGISTER from Lexer:
+        Return 1
+    End If
+    If token_type is equal to TOKEN_VIRTUAL from Lexer:
+        Return 1
+    End If
+    If token_type is equal to TOKEN_EXPLICIT from Lexer:
+        Return 1
+    End If
+    If token_type is equal to TOKEN_FRIEND from Lexer:
+        Return 1
+    End If
+    If token_type is equal to TOKEN_TYPENAME from Lexer:
+        Return 1
+    End If
+    If token_type is equal to TOKEN_IDENTIFIER from Lexer:
+        Return 1
+    End If
+    Return 0
+End Process
+
+@Reasoning:
+Storage/qualifier predicate used by the declaration-specifier loop to absorb
+leading modifiers before the core type.
+@End Reasoning
+
+@Implementation:
+Returns 1 for the storage/qualifier tokens; else 0.
+@End Implementation
+
+Process called "is_qualifier" takes token_type as Integer returns Integer:
+    Note: Whether token is a storage class or cv-qualifier
+
+    If token_type is equal to TOKEN_CONST from Lexer:
+        Return 1
+    End If
+    If token_type is equal to TOKEN_CONSTEXPR from Lexer:
+        Return 1
+    End If
+    If token_type is equal to TOKEN_VOLATILE from Lexer:
+        Return 1
+    End If
+    If token_type is equal to TOKEN_MUTABLE from Lexer:
+        Return 1
+    End If
+    If token_type is equal to TOKEN_STATIC from Lexer:
+        Return 1
+    End If
+    If token_type is equal to TOKEN_EXTERN from Lexer:
+        Return 1
+    End If
+    If token_type is equal to TOKEN_INLINE from Lexer:
+        Return 1
+    End If
+    If token_type is equal to TOKEN_REGISTER from Lexer:
+        Return 1
+    End If
+    If token_type is equal to TOKEN_VIRTUAL from Lexer:
+        Return 1
+    End If
+    If token_type is equal to TOKEN_EXPLICIT from Lexer:
+        Return 1
+    End If
+    If token_type is equal to TOKEN_FRIEND from Lexer:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: Main Parsing Entry Point
+Note: ============================================================================
+
+@Reasoning:
+Top-level recursive-descent dispatch. C++ admits namespace, class, struct, union,
+enum, template, using, typedef, preprocessor, function, and global variable
+file-scope productions. Loops until TOKEN_EOF. A forward-progress guard
+force-advances if any iteration consumes no bytes so malformed input cannot spin
+the loop.
+@End Reasoning
+
+@Implementation:
+Creates a CPP_PROGRAM root. Loop peeks the cursor: EOF breaks. Branches by token
+kind to the specialist parse_* routine and appends non-null results. Reads the
+lexer byte cursor before and after each iteration; if equal it sets an error and
+advances one token. On sticky error returns the partial program (so the test can
+still inspect what parsed). Returns the program node on clean EOF.
+@End Implementation
+
+Process called "parse_cpp_program" takes parser as Integer returns Integer:
+    Note: Parse an entire C++ translation unit
+
+    Let program_node be proc create_cpp_ast_node with CPP_PROGRAM
+
+    While 1 is equal to 1:
+        Let token_type be proc peek_token_type with parser
+        If token_type is equal to TOKEN_EOF from Lexer:
+            Break
+        End If
+
+        Let before be proc lexer_position with parser
+
+        If token_type is equal to TOKEN_PREPROCESSOR from Lexer:
+            Let pp be proc parse_preprocessor_directive with parser
+            If pp is not equal to 0:
+                proc add_child_to_cpp_ast_node with program_node, pp
+            End If
+            Continue
+        End If
+        If token_type is equal to TOKEN_NAMESPACE from Lexer:
+            Let ns be proc parse_namespace_declaration with parser
+            If ns is not equal to 0:
+                proc add_child_to_cpp_ast_node with program_node, ns
+            End If
+            Continue
+        End If
+        If token_type is equal to TOKEN_TEMPLATE from Lexer:
+            Let tpl be proc parse_template_declaration with parser
+            If tpl is not equal to 0:
+                proc add_child_to_cpp_ast_node with program_node, tpl
+            End If
+            Continue
+        End If
+        If token_type is equal to TOKEN_CLASS from Lexer:
+            Let cls be proc parse_class_declaration with parser
+            If cls is not equal to 0:
+                proc add_child_to_cpp_ast_node with program_node, cls
+            End If
+            Continue
+        End If
+        If token_type is equal to TOKEN_STRUCT from Lexer:
+            Let st be proc parse_struct_declaration with parser
+            If st is not equal to 0:
+                proc add_child_to_cpp_ast_node with program_node, st
+            End If
+            Continue
+        End If
+        If token_type is equal to TOKEN_UNION from Lexer:
+            Let un be proc parse_struct_declaration with parser
+            If un is not equal to 0:
+                proc add_child_to_cpp_ast_node with program_node, un
+            End If
+            Continue
+        End If
+        If token_type is equal to TOKEN_ENUM from Lexer:
+            Let en be proc parse_enum_declaration with parser
+            If en is not equal to 0:
+                proc add_child_to_cpp_ast_node with program_node, en
+            End If
+            Continue
+        End If
+        If token_type is equal to TOKEN_USING from Lexer:
+            Let us be proc parse_using_declaration with parser
+            If us is not equal to 0:
+                proc add_child_to_cpp_ast_node with program_node, us
+            End If
+            Continue
+        End If
+        If token_type is equal to TOKEN_TYPEDEF from Lexer:
+            Let td be proc parse_typedef_declaration with parser
+            If td is not equal to 0:
+                proc add_child_to_cpp_ast_node with program_node, td
+            End If
+            Continue
+        End If
+
+        Let decl be proc parse_declaration with parser
+        If decl is not equal to 0:
+            proc add_child_to_cpp_ast_node with program_node, decl
+        End If
+
+        Let has_err be proc has_parse_error with parser
+        If has_err is equal to 1:
+            Return program_node
+        End If
+
+        Let after be proc lexer_position with parser
+        If after is equal to before:
+            Note: No forward progress - force-advance to avoid spinning
+            proc advance_token with parser
+        End If
+    End While
+
+    Return program_node
+End Process
+
+Note: ============================================================================
+Note: Preprocessor / Using / Typedef
+Note: ============================================================================
+
+@Reasoning:
+A preprocessor directive was lexed as one TOKEN_PREPROCESSOR. The parser records
+it verbatim as a CPP_PREPROCESSOR node so HIR can round-trip #include / #define /
+#ifdef etc. The directive token is consumed (advancing) so the program loop
+progresses.
+@End Reasoning
+
+@Implementation:
+Captures the directive lexeme, copies it into the node value, consumes the token,
+and returns the node.
+@End Implementation
+
+Process called "parse_preprocessor_directive" takes parser as Integer returns Integer:
+    Note: Parse a preprocessor directive line
+
+    Let node be proc create_cpp_ast_node with CPP_PREPROCESSOR
+    Let text be proc peek_token_lexeme with parser
+    proc set_cpp_ast_node_value_text with node, text
+    proc advance_token with parser
+    Return node
+End Process
+
+@Reasoning:
+Parses 'using name = type;' (alias), 'using namespace ns;' (directive), or
+'using qualified::name;' (declaration). The kind is captured in the value tag and
+the alias target / qualified name as the node name; an alias target type becomes
+type_info.
+@End Reasoning
+
+@Implementation:
+Consumes 'using'. If next is 'namespace', records "namespace" value and the
+namespace name. Otherwise captures the (possibly qualified) name; if an '=' is
+seen it parses the aliased type into type_info. Consumes the trailing ';'.
+@End Implementation
+
+Process called "parse_using_declaration" takes parser as Integer returns Integer:
+    Note: Parse a using declaration / directive / alias
+
+    proc advance_token with parser  Note: 'using'
+    Let node be proc create_cpp_ast_node with CPP_USING
+
+    Let next be proc peek_token_type with parser
+    If next is equal to TOKEN_NAMESPACE from Lexer:
+        proc advance_token with parser
+        proc set_cpp_ast_node_value_text with node, "namespace"
+        Let ns_name be proc parse_qualified_name with parser
+        proc set_cpp_ast_node_name_owned with node, ns_name
+        proc consume_semicolon with parser
+        Return node
+    End If
+
+    Let name be proc parse_qualified_name with parser
+    proc set_cpp_ast_node_name_owned with node, name
+
+    Let eq be proc peek_token_type with parser
+    If eq is equal to TOKEN_ASSIGN from Lexer:
+        proc advance_token with parser
+        proc set_cpp_ast_node_value_text with node, "alias"
+        Let target be proc parse_type_specifier with parser
+        proc set_cpp_ast_node_type_info with node, target
+    Otherwise:
+        proc set_cpp_ast_node_value_text with node, "declaration"
+    End If
+
+    proc consume_semicolon with parser
+    Return node
+End Process
+
+@Reasoning:
+Parses 'typedef type name;'. The underlying type is captured as type_info and the
+alias as the node name.
+@End Reasoning
+
+@Implementation:
+Consumes 'typedef', parses the type specifier into type_info, captures the alias
+identifier name, consumes ';'.
+@End Implementation
+
+Process called "parse_typedef_declaration" takes parser as Integer returns Integer:
+    Note: Parse a typedef declaration
+
+    proc advance_token with parser  Note: 'typedef'
+    Let node be proc create_cpp_ast_node with CPP_TYPEDEF
+
+    Let underlying be proc parse_type_specifier with parser
+    proc set_cpp_ast_node_type_info with node, underlying
+
+    Let name be proc peek_token_lexeme with parser
+    Let nt be proc peek_token_type with parser
+    If nt is equal to TOKEN_IDENTIFIER from Lexer:
+        proc set_cpp_ast_node_name with node, name
+        proc advance_token with parser
+    End If
+
+    proc consume_semicolon with parser
+    Return node
+End Process
+
+@Reasoning:
+Helper that consumes a trailing ';' if present without erroring on its absence -
+the C++ grammar has several optional-semicolon contexts and the round-trip test
+tolerates either.
+@End Reasoning
+
+@Implementation:
+Peeks; if TOKEN_SEMICOLON, advances. Otherwise no-op.
+@End Implementation
+
+Process called "consume_semicolon" takes parser as Integer:
+    Note: Consume an optional trailing semicolon
+
+    Let t be proc peek_token_type with parser
+    If t is equal to TOKEN_SEMICOLON from Lexer:
+        proc advance_token with parser
+    End If
+End Process
+
+@Reasoning:
+Parses a possibly-qualified name: identifier ( :: identifier )*. Returns an OWNED
+duplicate of the final identifier segment. The duplicate is taken BEFORE the
+advance that frees the lexer's lexeme buffer - the lexer recycles its lexeme copy
+on every next_token, so a pointer captured before the advance would dangle. The
+returned pointer is owned by the caller (the 7 call sites store it directly into
+an AST node's name slot, transferring ownership), so this proc must never be fed
+to a re-duplicating setter.
+@End Reasoning
+
+@Implementation:
+Tracks the owned copy of the most recent segment. For the lead identifier: if it
+is an IDENTIFIER, duplicates the current lexeme then advances. For each '::'
+suffix: advances past '::', duplicates the next identifier's lexeme (freeing the
+prior segment copy), then advances. Returns the last owned segment copy, or 0 if
+no identifier was present.
+@End Implementation
+
+Process called "parse_qualified_name" takes parser as Integer returns Integer:
+    Note: Parse identifier ( :: identifier )* ; return an OWNED copy of the final segment
+
+    Let name be 0
+    Let t be proc peek_token_type with parser
+    If t is equal to TOKEN_IDENTIFIER from Lexer:
+        Let lexeme be proc peek_token_lexeme with parser
+        Set name to proc string_duplicate from StringCore with lexeme
+        proc advance_token with parser
+    End If
+
+    While 1 is equal to 1:
+        Let scope be proc peek_token_type with parser
+        If scope is not equal to TOKEN_SCOPE from Lexer:
+            Break
+        End If
+        proc advance_token with parser  Note: '::'
+        Let it be proc peek_token_type with parser
+        If it is equal to TOKEN_IDENTIFIER from Lexer:
+            Let seg_lexeme be proc peek_token_lexeme with parser
+            Let seg_copy be proc string_duplicate from StringCore with seg_lexeme
+            If name is not equal to 0:
+                proc deallocate from Layout with name
+            End If
+            Set name to seg_copy
+            proc advance_token with parser
+        Otherwise:
+            Break
+        End If
+    End While
+
+    Return name
+End Process
+
+Note: ============================================================================
+Note: Namespace Declaration
+Note: ============================================================================
+
+@Reasoning:
+Parses 'namespace [name] { declarations }' including nested and anonymous
+namespaces. The members are parsed with the same top-level dispatch so nested
+namespaces, classes, templates and functions all work inside.
+@End Reasoning
+
+@Implementation:
+Consumes 'namespace'. Captures an optional name (anonymous namespace leaves the
+name 0). Expects '{'. Loops parsing member declarations until '}', appending each
+to the namespace node. A forward-progress guard force-advances on a
+non-consuming iteration. Returns the namespace node.
+@End Implementation
+
+Process called "parse_namespace_declaration" takes parser as Integer returns Integer:
+    Note: Parse a namespace declaration
+
+    proc advance_token with parser  Note: 'namespace'
+    Let node be proc create_cpp_ast_node with CPP_NAMESPACE
+
+    Let nt be proc peek_token_type with parser
+    If nt is equal to TOKEN_IDENTIFIER from Lexer:
+        Let name be proc peek_token_lexeme with parser
+        proc set_cpp_ast_node_name with node, name
+        proc advance_token with parser
+    End If
+
+    Let brace be proc peek_token_type with parser
+    If brace is not equal to TOKEN_LBRACE from Lexer:
+        Note: namespace alias or using - consume to ';'
+        proc consume_semicolon with parser
+        Return node
+    End If
+    proc advance_token with parser  Note: '{'
+
+    While 1 is equal to 1:
+        Let token_type be proc peek_token_type with parser
+        If token_type is equal to TOKEN_RBRACE from Lexer:
+            proc advance_token with parser
+            Break
+        End If
+        If token_type is equal to TOKEN_EOF from Lexer:
+            Break
+        End If
+
+        Let before be proc lexer_position with parser
+        Let member be proc parse_namespace_member with parser
+        If member is not equal to 0:
+            proc add_child_to_cpp_ast_node with node, member
+        End If
+
+        Let has_err be proc has_parse_error with parser
+        If has_err is equal to 1:
+            Break
+        End If
+
+        Let after be proc lexer_position with parser
+        If after is equal to before:
+            proc advance_token with parser
+        End If
+    End While
+
+    Return node
+End Process
+
+@Reasoning:
+A namespace member is the same set of productions as the file scope. Factored out
+so both the top-level loop and the namespace loop share routing without
+duplicating the long branch chain twice over.
+@End Reasoning
+
+@Implementation:
+Branches on the lead token to namespace / template / class / struct / union /
+enum / using / typedef, defaulting to parse_declaration. Mirrors
+parse_cpp_program's dispatch.
+@End Implementation
+
+Process called "parse_namespace_member" takes parser as Integer returns Integer:
+    Note: Parse a single member inside a namespace body
+
+    Let token_type be proc peek_token_type with parser
+
+    If token_type is equal to TOKEN_PREPROCESSOR from Lexer:
+        Return proc parse_preprocessor_directive with parser
+    End If
+    If token_type is equal to TOKEN_NAMESPACE from Lexer:
+        Return proc parse_namespace_declaration with parser
+    End If
+    If token_type is equal to TOKEN_TEMPLATE from Lexer:
+        Return proc parse_template_declaration with parser
+    End If
+    If token_type is equal to TOKEN_CLASS from Lexer:
+        Return proc parse_class_declaration with parser
+    End If
+    If token_type is equal to TOKEN_STRUCT from Lexer:
+        Return proc parse_struct_declaration with parser
+    End If
+    If token_type is equal to TOKEN_UNION from Lexer:
+        Return proc parse_struct_declaration with parser
+    End If
+    If token_type is equal to TOKEN_ENUM from Lexer:
+        Return proc parse_enum_declaration with parser
+    End If
+    If token_type is equal to TOKEN_USING from Lexer:
+        Return proc parse_using_declaration with parser
+    End If
+    If token_type is equal to TOKEN_TYPEDEF from Lexer:
+        Return proc parse_typedef_declaration with parser
+    End If
+
+    Return proc parse_declaration with parser
+End Process
+
+Note: ============================================================================
+Note: Enum Declaration
+Note: ============================================================================
+
+@Reasoning:
+Parses 'enum [class|struct] Name [: underlying] { v1, v2 = expr, ... };'. enum
+class / enum struct (scoped enums) set the "scoped" value tag. Each enumerator is
+a CPP_ENUM_VALUE child carrying its name and an optional initializer expression.
+@End Reasoning
+
+@Implementation:
+Consumes 'enum'. If 'class'/'struct' follows, consumes it and tags "scoped".
+Captures the optional enum name. Optional ': underlying' sets type_info. Expects
+'{'; loops capturing enumerators (name + optional '= expr') separated by commas
+until '}'. Consumes the trailing ';'. Forward-progress guard inside the
+enumerator loop.
+@End Implementation
+
+Process called "parse_enum_declaration" takes parser as Integer returns Integer:
+    Note: Parse an enum / enum class declaration
+
+    proc advance_token with parser  Note: 'enum'
+    Let node be proc create_cpp_ast_node with CPP_ENUM
+
+    Let next be proc peek_token_type with parser
+    If next is equal to TOKEN_CLASS from Lexer:
+        proc advance_token with parser
+        proc set_cpp_ast_node_value_text with node, "scoped"
+    Otherwise:
+        If next is equal to TOKEN_STRUCT from Lexer:
+            proc advance_token with parser
+            proc set_cpp_ast_node_value_text with node, "scoped"
+        Otherwise:
+            proc set_cpp_ast_node_value_text with node, "unscoped"
+        End If
+    End If
+
+    Let nt be proc peek_token_type with parser
+    If nt is equal to TOKEN_IDENTIFIER from Lexer:
+        Let name be proc peek_token_lexeme with parser
+        proc set_cpp_ast_node_name with node, name
+        proc advance_token with parser
+    End If
+
+    Let colon be proc peek_token_type with parser
+    If colon is equal to TOKEN_COLON from Lexer:
+        proc advance_token with parser
+        Let underlying be proc parse_type_specifier with parser
+        proc set_cpp_ast_node_type_info with node, underlying
+    End If
+
+    Let brace be proc peek_token_type with parser
+    If brace is not equal to TOKEN_LBRACE from Lexer:
+        proc consume_semicolon with parser
+        Return node
+    End If
+    proc advance_token with parser  Note: '{'
+
+    While 1 is equal to 1:
+        Let t be proc peek_token_type with parser
+        If t is equal to TOKEN_RBRACE from Lexer:
+            proc advance_token with parser
+            Break
+        End If
+        If t is equal to TOKEN_EOF from Lexer:
+            Break
+        End If
+
+        Let before be proc lexer_position with parser
+
+        If t is equal to TOKEN_IDENTIFIER from Lexer:
+            Let ev be proc create_cpp_ast_node with CPP_ENUM_VALUE
+            Let vname be proc peek_token_lexeme with parser
+            proc set_cpp_ast_node_name with ev, vname
+            proc advance_token with parser
+
+            Let assign be proc peek_token_type with parser
+            If assign is equal to TOKEN_ASSIGN from Lexer:
+                proc advance_token with parser
+                Let init be proc parse_assignment_expression with parser
+                proc add_child_to_cpp_ast_node with ev, init
+            End If
+
+            proc add_child_to_cpp_ast_node with node, ev
+        End If
+
+        Let comma be proc peek_token_type with parser
+        If comma is equal to TOKEN_COMMA from Lexer:
+            proc advance_token with parser
+        End If
+
+        Let after be proc lexer_position with parser
+        If after is equal to before:
+            proc advance_token with parser
+        End If
+    End While
+
+    proc consume_semicolon with parser
+    Return node
+End Process
+
+Note: ============================================================================
+Note: Class / Struct Declaration
+Note: ============================================================================
+
+@Reasoning:
+Parses 'class Name [final] [: base-list] { members };' (and forward
+declarations). Class default access is private. Saves/restores current_class to
+support nested classes so member parsing can recognise constructors.
+@End Reasoning
+
+@Implementation:
+Consumes 'class', creates CPP_CLASS, captures the name. Consumes an optional
+'final'. Optional inheritance (':' base-list) becomes a CPP_INHERITANCE child. A
+';' here is a forward declaration. Otherwise expects '{', sets current_class,
+loops members tracking the current access section (default private), restores
+current_class, consumes the trailing ';'.
+@End Implementation
+
+Process called "parse_class_declaration" takes parser as Integer returns Integer:
+    Note: Parse a class declaration / definition
+
+    proc advance_token with parser  Note: 'class'
+    Return proc parse_class_or_struct_body with parser, 0
+End Process
+
+@Reasoning:
+Structs and unions share the class body grammar but default to public access.
+Routes both through the common body parser with default_access=2 (public).
+@End Reasoning
+
+@Implementation:
+Consumes the 'struct'/'union' keyword, delegates to parse_class_or_struct_body
+with public default access.
+@End Implementation
+
+Process called "parse_struct_declaration" takes parser as Integer returns Integer:
+    Note: Parse a struct or union declaration
+
+    proc advance_token with parser  Note: 'struct' / 'union'
+    Return proc parse_class_or_struct_body with parser, 2
+End Process
+
+@Reasoning:
+Shared body parser for class/struct/union. default_access seeds the access
+section (0 private for class, 2 public for struct/union). The member loop is
+guarded for forward progress.
+@End Reasoning
+
+@Implementation:
+Creates CPP_CLASS, captures name, consumes optional 'final', parses optional
+inheritance. ';' returns a forward declaration. Otherwise consumes '{', saves
+current_class, loops: '}' ends; access-specifier labels (public/private/
+protected ':') update current_access; otherwise parse_class_member with the
+current access. Forward-progress guard force-advances on a non-consuming
+iteration. Restores current_class and consumes ';'.
+@End Implementation
+
+Process called "parse_class_or_struct_body" takes parser as Integer, default_access as Integer returns Integer:
+    Note: Shared class/struct/union body parser
+
+    Let class_node be proc create_cpp_ast_node with CPP_CLASS
+
+    Let nt be proc peek_token_type with parser
+    If nt is equal to TOKEN_IDENTIFIER from Lexer:
+        Let name be proc peek_token_lexeme with parser
+        proc set_cpp_ast_node_name with class_node, name
+        proc advance_token with parser
+    End If
+
+    Let fin be proc peek_token_type with parser
+    If fin is equal to TOKEN_FINAL from Lexer:
+        proc advance_token with parser
+    End If
+
+    Let colon be proc peek_token_type with parser
+    If colon is equal to TOKEN_COLON from Lexer:
+        proc advance_token with parser
+        Let inheritance be proc parse_inheritance_list with parser
+        proc add_child_to_cpp_ast_node with class_node, inheritance
+    End If
+
+    Let brace be proc peek_token_type with parser
+    If brace is equal to TOKEN_SEMICOLON from Lexer:
+        proc advance_token with parser
+        Return class_node
+    End If
+    If brace is not equal to TOKEN_LBRACE from Lexer:
+        proc set_parse_error with parser, "Expected '{' or ';' in class declaration"
+        Return class_node
+    End If
+    proc advance_token with parser  Note: '{'
+
+    Let old_class be proc memory_get_int64 from Layout with parser, 32
+    proc memory_set_int64 from Layout with parser, 32, class_node
+
+    Let current_access be default_access
+
+    While 1 is equal to 1:
+        Let member_token be proc peek_token_type with parser
+        If member_token is equal to TOKEN_RBRACE from Lexer:
+            proc advance_token with parser
+            Break
+        End If
+        If member_token is equal to TOKEN_EOF from Lexer:
+            Break
+        End If
+
+        Let before be proc lexer_position with parser
+
+        If member_token is equal to TOKEN_PUBLIC from Lexer:
+            proc advance_token with parser
+            proc consume_colon with parser
+            Set current_access to 2
+            Continue
+        End If
+        If member_token is equal to TOKEN_PRIVATE from Lexer:
+            proc advance_token with parser
+            proc consume_colon with parser
+            Set current_access to 0
+            Continue
+        End If
+        If member_token is equal to TOKEN_PROTECTED from Lexer:
+            proc advance_token with parser
+            proc consume_colon with parser
+            Set current_access to 1
+            Continue
+        End If
+
+        Let member be proc parse_class_member with parser, current_access
+        If member is not equal to 0:
+            proc add_child_to_cpp_ast_node with class_node, member
+        End If
+
+        Let has_err be proc has_parse_error with parser
+        If has_err is equal to 1:
+            Break
+        End If
+
+        Let after be proc lexer_position with parser
+        If after is equal to before:
+            proc advance_token with parser
+        End If
+    End While
+
+    proc memory_set_int64 from Layout with parser, 32, old_class
+
+    proc consume_semicolon with parser
+    Return class_node
+End Process
+
+@Reasoning:
+Helper consuming an optional ':' after an access label.
+@End Reasoning
+
+@Implementation:
+Peeks; if TOKEN_COLON, advances.
+@End Implementation
+
+Process called "consume_colon" takes parser as Integer:
+    Note: Consume an optional ':' after an access label
+
+    Let t be proc peek_token_type with parser
+    If t is equal to TOKEN_COLON from Lexer:
+        proc advance_token with parser
+    End If
+End Process
+
+@Reasoning:
+Parses the base-class list 'access? virtual? Name (, ...)*'. Each base becomes a
+CPP_BASE_CLASS node carrying its name and access tag. The list is wrapped in a
+CPP_INHERITANCE node.
+@End Reasoning
+
+@Implementation:
+Creates CPP_INHERITANCE. Loops: per base, optionally consume an access keyword
+(public/private/protected) recording the access level, optionally 'virtual',
+then the qualified base name. Appends a CPP_BASE_CLASS child. Continues while a
+comma follows. The loop stops at '{' (class body), guarded for forward progress.
+@End Implementation
+
+Process called "parse_inheritance_list" takes parser as Integer returns Integer:
+    Note: Parse a base-class inheritance list
+
+    Let node be proc create_cpp_ast_node with CPP_INHERITANCE
+
+    While 1 is equal to 1:
+        Let t be proc peek_token_type with parser
+        If t is equal to TOKEN_LBRACE from Lexer:
+            Break
+        End If
+        If t is equal to TOKEN_EOF from Lexer:
+            Break
+        End If
+        If t is equal to TOKEN_SEMICOLON from Lexer:
+            Break
+        End If
+
+        Let before be proc lexer_position with parser
+        Let base be proc create_cpp_ast_node with CPP_BASE_CLASS
+
+        Let access be 0
+        Let acc be proc peek_token_type with parser
+        If acc is equal to TOKEN_PUBLIC from Lexer:
+            Set access to 2
+            proc advance_token with parser
+        Otherwise:
+            If acc is equal to TOKEN_PROTECTED from Lexer:
+                Set access to 1
+                proc advance_token with parser
+            Otherwise:
+                If acc is equal to TOKEN_PRIVATE from Lexer:
+                    Set access to 0
+                    proc advance_token with parser
+                End If
+            End If
+        End If
+        proc set_cpp_ast_node_access_level with base, access
+
+        Let vt be proc peek_token_type with parser
+        If vt is equal to TOKEN_VIRTUAL from Lexer:
+            proc advance_token with parser
+        End If
+
+        Let bname be proc parse_qualified_name with parser
+        proc set_cpp_ast_node_name_owned with base, bname
+
+        proc add_child_to_cpp_ast_node with node, base
+
+        Let comma be proc peek_token_type with parser
+        If comma is equal to TOKEN_COMMA from Lexer:
+            proc advance_token with parser
+        Otherwise:
+            Break
+        End If
+
+        Let after be proc lexer_position with parser
+        If after is equal to before:
+            proc advance_token with parser
+        End If
+    End While
+
+    Return node
+End Process
+
+@Reasoning:
+Dispatches a single class member. Special-cases destructors ('~'), operator
+overloads ('operator'), friend declarations, template members, and constructors
+(an identifier equal to the class name followed by '('). Everything else is a
+field or method via parse_declaration. Each path stamps the access level.
+@End Reasoning
+
+@Implementation:
+Peeks. TOKEN_TILDE -> destructor. TOKEN_OPERATOR -> operator overload.
+TOKEN_FRIEND -> friend. TOKEN_TEMPLATE -> template member. An identifier matching
+current_class's name with a following '(' -> constructor. Otherwise
+parse_declaration. The produced node's access level is set when non-null.
+@End Implementation
+
+Process called "parse_class_member" takes parser as Integer, access_level as Integer returns Integer:
+    Note: Parse a single class member
+
+    Let token_type be proc peek_token_type with parser
+
+    If token_type is equal to TOKEN_TILDE from Lexer:
+        Let dtor be proc parse_destructor with parser, access_level
+        Return dtor
+    End If
+    If token_type is equal to TOKEN_OPERATOR from Lexer:
+        Let op be proc parse_operator_overload with parser, access_level
+        Return op
+    End If
+    If token_type is equal to TOKEN_FRIEND from Lexer:
+        Let fr be proc parse_friend_declaration with parser, access_level
+        Return fr
+    End If
+    If token_type is equal to TOKEN_TEMPLATE from Lexer:
+        Let tm be proc parse_template_declaration with parser
+        If tm is not equal to 0:
+            proc set_cpp_ast_node_access_level with tm, access_level
+        End If
+        Return tm
+    End If
+
+    If token_type is equal to TOKEN_IDENTIFIER from Lexer:
+        Let current_class be proc memory_get_int64 from Layout with parser, 32
+        If current_class is not equal to 0:
+            Let class_name be proc get_cpp_ast_node_name with current_class
+            Let ident be proc peek_token_lexeme with parser
+            Let is_ctor be proc string_equals from StringCore with ident, class_name
+            If is_ctor is equal to 1:
+                Let ctor be proc parse_constructor with parser, access_level
+                Return ctor
+            End If
+        End If
+    End If
+
+    Let member be proc parse_declaration with parser
+    If member is not equal to 0:
+        proc set_cpp_ast_node_access_level with member, access_level
+    End If
+    Return member
+End Process
+
+Note: ============================================================================
+Note: Constructor / Destructor / Operator / Friend
+Note: ============================================================================
+
+@Reasoning:
+Parses a constructor 'Name(params) [: init-list] { body }' or 'Name(params);'.
+The constructor name is the class name. An optional member-initializer list after
+the parameter list is consumed (parsed as a balanced run up to the body) so the
+body braces are reached correctly.
+@End Reasoning
+
+@Implementation:
+Creates CPP_CONSTRUCTOR with the class identifier as name. Parses the parameter
+list into the node. If ':' follows, consumes the member-init list up to '{' or
+';'. A '{' body is parsed via parse_compound_statement into type_info; otherwise
+';' makes it a declaration. Stamps access.
+@End Implementation
+
+Process called "parse_constructor" takes parser as Integer, access_level as Integer returns Integer:
+    Note: Parse a constructor
+
+    Let node be proc create_cpp_ast_node with CPP_CONSTRUCTOR
+    Let name be proc peek_token_lexeme with parser
+    proc set_cpp_ast_node_name with node, name
+    proc advance_token with parser  Note: class name
+
+    Let params be proc parse_parameter_list with parser
+    proc add_child_to_cpp_ast_node with node, params
+
+    Let colon be proc peek_token_type with parser
+    If colon is equal to TOKEN_COLON from Lexer:
+        proc skip_member_init_list with parser
+    End If
+
+    Let brace be proc peek_token_type with parser
+    If brace is equal to TOKEN_LBRACE from Lexer:
+        Let body be proc parse_compound_statement with parser
+        proc set_cpp_ast_node_type_info with node, body
+    Otherwise:
+        proc consume_semicolon with parser
+    End If
+
+    proc set_cpp_ast_node_access_level with node, access_level
+    Return node
+End Process
+
+@Reasoning:
+Consumes a constructor member-initializer list ': a(x), b{y}' up to the body
+brace. The initializers themselves are not retained for HIR (the body is what
+round-trips); they are skipped with balanced-paren/brace tracking so a '(' inside
+an initializer cannot be mistaken for the parameter list.
+@End Reasoning
+
+@Implementation:
+Consumes ':'. Loops until '{' or ';' or EOF: tracks paren/brace depth so commas
+inside initializer argument lists are absorbed; advances one token per iteration
+(always progressing).
+@End Implementation
+
+Process called "skip_member_init_list" takes parser as Integer:
+    Note: Skip a constructor member-initializer list up to the body
+
+    proc advance_token with parser  Note: ':'
+    Let depth be 0
+    While 1 is equal to 1:
+        Let t be proc peek_token_type with parser
+        If t is equal to TOKEN_EOF from Lexer:
+            Return
+        End If
+        If depth is equal to 0:
+            If t is equal to TOKEN_LBRACE from Lexer:
+                Return
+            End If
+            If t is equal to TOKEN_SEMICOLON from Lexer:
+                Return
+            End If
+        End If
+        If t is equal to TOKEN_LPAREN from Lexer:
+            Set depth to depth plus 1
+        End If
+        If t is equal to TOKEN_RPAREN from Lexer:
+            If depth is greater than 0:
+                Set depth to depth minus 1
+            End If
+        End If
+        proc advance_token with parser
+    End While
+End Process
+
+@Reasoning:
+Parses a destructor '~Name() [body]'. Tilde then class name then empty parameter
+list. Body or ';' as for constructors.
+@End Reasoning
+
+@Implementation:
+Consumes '~', captures the name, parses the (empty) parameter list, then a '{'
+body into type_info or ';'. Stamps access.
+@End Implementation
+
+Process called "parse_destructor" takes parser as Integer, access_level as Integer returns Integer:
+    Note: Parse a destructor
+
+    proc advance_token with parser  Note: '~'
+    Let node be proc create_cpp_ast_node with CPP_DESTRUCTOR
+
+    Let nt be proc peek_token_type with parser
+    If nt is equal to TOKEN_IDENTIFIER from Lexer:
+        Let name be proc peek_token_lexeme with parser
+        proc set_cpp_ast_node_name with node, name
+        proc advance_token with parser
+    End If
+
+    Let lp be proc peek_token_type with parser
+    If lp is equal to TOKEN_LPAREN from Lexer:
+        Let params be proc parse_parameter_list with parser
+        proc add_child_to_cpp_ast_node with node, params
+    End If
+
+    Note: optional 'override' / 'final' / cv tokens are skipped
+    proc skip_method_qualifiers with parser
+
+    Let brace be proc peek_token_type with parser
+    If brace is equal to TOKEN_LBRACE from Lexer:
+        Let body be proc parse_compound_statement with parser
+        proc set_cpp_ast_node_type_info with node, body
+    Otherwise:
+        proc consume_semicolon with parser
+    End If
+
+    proc set_cpp_ast_node_access_level with node, access_level
+    Return node
+End Process
+
+@Reasoning:
+Parses 'operator OP (params) [body]'. The operator symbol (one or more operator
+tokens, or 'operator[]', 'operator()', 'operator new', etc.) is captured as the
+node value text. Body or ';'.
+@End Reasoning
+
+@Implementation:
+Consumes 'operator'. Captures the operator lexeme(s): for bracket/paren operators
+consumes the matching pair; otherwise captures the single operator token lexeme.
+Parses the parameter list, optional cv/override qualifiers, then a body or ';'.
+Stamps access.
+@End Implementation
+
+Process called "parse_operator_overload" takes parser as Integer, access_level as Integer returns Integer:
+    Note: Parse an operator overload
+
+    proc advance_token with parser  Note: 'operator'
+    Let node be proc create_cpp_ast_node with CPP_OPERATOR_OVERLOAD
+
+    Let opt be proc peek_token_type with parser
+    If opt is equal to TOKEN_LPAREN from Lexer:
+        Note: operator() - the call operator; the following '(' opens its name pair
+        Let lp be proc peek_token_lexeme with parser
+        proc set_cpp_ast_node_value_text with node, "()"
+        proc advance_token with parser  Note: '(' name
+        Let rp be proc peek_token_type with parser
+        If rp is equal to TOKEN_RPAREN from Lexer:
+            proc advance_token with parser
+        End If
+    Otherwise:
+        If opt is equal to TOKEN_LBRACKET from Lexer:
+            proc set_cpp_ast_node_value_text with node, "[]"
+            proc advance_token with parser
+            Let rb be proc peek_token_type with parser
+            If rb is equal to TOKEN_RBRACKET from Lexer:
+                proc advance_token with parser
+            End If
+        Otherwise:
+            Let opsym be proc peek_token_lexeme with parser
+            proc set_cpp_ast_node_value_text with node, opsym
+            proc advance_token with parser
+        End If
+    End If
+
+    Let params be proc parse_parameter_list with parser
+    proc add_child_to_cpp_ast_node with node, params
+
+    proc skip_method_qualifiers with parser
+
+    Let brace be proc peek_token_type with parser
+    If brace is equal to TOKEN_LBRACE from Lexer:
+        Let body be proc parse_compound_statement with parser
+        proc set_cpp_ast_node_type_info with node, body
+    Otherwise:
+        proc consume_semicolon with parser
+    End If
+
+    proc set_cpp_ast_node_access_level with node, access_level
+    Return node
+End Process
+
+@Reasoning:
+Parses 'friend declaration'. The 'friend' keyword precedes an ordinary
+declaration (function or class); the friend node wraps that declaration so HIR
+can mark it.
+@End Reasoning
+
+@Implementation:
+Consumes 'friend'. If the next token starts a class/struct, captures the
+befriended type name. Otherwise parses an ordinary declaration as the friend
+target child. Stamps access; consumes a trailing ';' if present.
+@End Implementation
+
+Process called "parse_friend_declaration" takes parser as Integer, access_level as Integer returns Integer:
+    Note: Parse a friend declaration
+
+    proc advance_token with parser  Note: 'friend'
+    Let node be proc create_cpp_ast_node with CPP_FUNCTION
+    proc set_cpp_ast_node_value_text with node, "friend"
+
+    Let nt be proc peek_token_type with parser
+    If nt is equal to TOKEN_CLASS from Lexer:
+        proc advance_token with parser
+        Let cname be proc parse_qualified_name with parser
+        proc set_cpp_ast_node_name_owned with node, cname
+        proc consume_semicolon with parser
+        proc set_cpp_ast_node_access_level with node, access_level
+        Return node
+    End If
+    If nt is equal to TOKEN_STRUCT from Lexer:
+        proc advance_token with parser
+        Let sname be proc parse_qualified_name with parser
+        proc set_cpp_ast_node_name_owned with node, sname
+        proc consume_semicolon with parser
+        proc set_cpp_ast_node_access_level with node, access_level
+        Return node
+    End If
+
+    Let target be proc parse_declaration with parser
+    If target is not equal to 0:
+        proc add_child_to_cpp_ast_node with node, target
+        proc set_cpp_ast_node_access_level with target, access_level
+    End If
+    proc set_cpp_ast_node_access_level with node, access_level
+    Return node
+End Process
+
+@Reasoning:
+After a method's parameter list a C++ grammar permits cv-qualifiers, ref-
+qualifiers, noexcept, override, final, '= 0' (pure virtual), '= default', and
+'= delete'. These do not affect the round-tripped structure, so they are skipped
+up to the body brace or terminating ';'.
+@End Reasoning
+
+@Implementation:
+Loops consuming const/volatile/override/final tokens and a trailing '= expr'
+(pure/default/delete) until the next token is '{' or ';' or EOF. Always advances
+on a consumed qualifier; stops without consuming the body/terminator.
+@End Implementation
+
+Process called "skip_method_qualifiers" takes parser as Integer:
+    Note: Skip trailing method qualifiers up to the body or ';'
+
+    While 1 is equal to 1:
+        Let t be proc peek_token_type with parser
+        If t is equal to TOKEN_CONST from Lexer:
+            proc advance_token with parser
+            Continue
+        End If
+        If t is equal to TOKEN_VOLATILE from Lexer:
+            proc advance_token with parser
+            Continue
+        End If
+        If t is equal to TOKEN_OVERRIDE from Lexer:
+            proc advance_token with parser
+            Continue
+        End If
+        If t is equal to TOKEN_FINAL from Lexer:
+            proc advance_token with parser
+            Continue
+        End If
+        If t is equal to TOKEN_AMP from Lexer:
+            proc advance_token with parser
+            Continue
+        End If
+        If t is equal to TOKEN_LAND from Lexer:
+            proc advance_token with parser
+            Continue
+        End If
+        If t is equal to TOKEN_ASSIGN from Lexer:
+            Note: = 0 / = default / = delete
+            proc advance_token with parser
+            Let v be proc peek_token_type with parser
+            If v is equal to TOKEN_INTEGER from Lexer:
+                proc advance_token with parser
+            Otherwise:
+                If v is equal to TOKEN_DEFAULT from Lexer:
+                    proc advance_token with parser
+                Otherwise:
+                    If v is equal to TOKEN_DELETE from Lexer:
+                        proc advance_token with parser
+                    End If
+                End If
+            End If
+            Continue
+        End If
+        Break
+    End While
+End Process
+
+Note: ============================================================================
+Note: Template Declaration
+Note: ============================================================================
+
+@Reasoning:
+Parses 'template <param-list> declaration'. The parameter list becomes a
+CPP_TEMPLATE_PARAM node; the templated declaration is its sole child.
+template_depth is bumped while parsing the angle-bracket list so a nested '>'
+closes a template rather than being read as greater-than.
+@End Reasoning
+
+@Implementation:
+Consumes 'template', creates CPP_TEMPLATE. Bumps template_depth. Expects '<';
+loops parse_template_parameter appending to a CPP_TEMPLATE_PARAM list, consuming
+optional commas, until '>'. Attaches the list. Parses the templated declaration
+via parse_namespace_member (so a templated class/struct/function/using all work)
+and appends it. Restores template_depth.
+@End Implementation
+
+Process called "parse_template_declaration" takes parser as Integer returns Integer:
+    Note: Parse a template declaration
+
+    proc advance_token with parser  Note: 'template'
+    Let template_node be proc create_cpp_ast_node with CPP_TEMPLATE
+
+    Let depth be proc memory_get_int64 from Layout with parser, 40
+    proc memory_set_int64 from Layout with parser, 40, depth plus 1
+
+    Let lt be proc peek_token_type with parser
+    If lt is equal to TOKEN_LESS from Lexer:
+        proc advance_token with parser
+    End If
+
+    Let param_list be proc create_cpp_ast_node with CPP_TEMPLATE_PARAM
+
+    While 1 is equal to 1:
+        Let t be proc peek_token_type with parser
+        If t is equal to TOKEN_GREATER from Lexer:
+            proc advance_token with parser
+            Break
+        End If
+        If t is equal to TOKEN_EOF from Lexer:
+            Break
+        End If
+
+        Let before be proc lexer_position with parser
+        Let param be proc parse_template_parameter with parser
+        If param is not equal to 0:
+            proc add_child_to_cpp_ast_node with param_list, param
+        End If
+
+        Let comma be proc peek_token_type with parser
+        If comma is equal to TOKEN_COMMA from Lexer:
+            proc advance_token with parser
+        End If
+
+        Let after be proc lexer_position with parser
+        If after is equal to before:
+            proc advance_token with parser
+        End If
+    End While
+
+    proc set_cpp_ast_node_template_params with template_node, param_list
+
+    Let decl be proc parse_namespace_member with parser
+    If decl is not equal to 0:
+        proc add_child_to_cpp_ast_node with template_node, decl
+    End If
+
+    proc memory_set_int64 from Layout with parser, 40, depth
+    Return template_node
+End Process
+
+@Reasoning:
+Recognises type ('typename T' / 'class T'), template-template ('template<...>
+class C'), and non-type ('int N') template parameters. The value slot tags the
+parameter kind (TOKEN_TYPENAME / TOKEN_CLASS) so HIR can reproduce the spelling.
+Default arguments ('= type/expr') are attached as children.
+@End Reasoning
+
+@Implementation:
+TOKEN_TEMPLATE -> consumes a nested template param list (template-template),
+expects class/typename, captures the name. TOKEN_TYPENAME / TOKEN_CLASS ->
+captures the name, tags the kind, parses an optional '= type'. Otherwise a
+non-type parameter: parses a type specifier as type_info and an optional name and
+'= expr'.
+@End Implementation
+
+Process called "parse_template_parameter" takes parser as Integer returns Integer:
+    Note: Parse a single template parameter
+
+    Let param_token be proc peek_token_type with parser
+    Let param_node be proc create_cpp_ast_node with CPP_TEMPLATE_PARAM
+
+    If param_token is equal to TOKEN_TEMPLATE from Lexer:
+        proc advance_token with parser
+        Let nested be proc parse_template_parameter_list with parser
+        proc add_child_to_cpp_ast_node with param_node, nested
+
+        Let ct be proc peek_token_type with parser
+        If ct is equal to TOKEN_CLASS from Lexer:
+            proc advance_token with parser
+        Otherwise:
+            If ct is equal to TOKEN_TYPENAME from Lexer:
+                proc advance_token with parser
+            End If
+        End If
+        proc set_cpp_ast_node_value with param_node, TOKEN_CLASS
+
+        Let pn be proc peek_token_type with parser
+        If pn is equal to TOKEN_IDENTIFIER from Lexer:
+            Let name be proc peek_token_lexeme with parser
+            proc set_cpp_ast_node_name with param_node, name
+            proc advance_token with parser
+        End If
+        Return param_node
+    End If
+
+    If param_token is equal to TOKEN_TYPENAME from Lexer:
+        proc advance_token with parser
+        proc set_cpp_ast_node_value with param_node, TOKEN_TYPENAME
+        Note: variadic 'typename... T'
+        Let dots be proc peek_token_type with parser
+        If dots is equal to TOKEN_ELLIPSIS from Lexer:
+            proc advance_token with parser
+        End If
+        Let nt be proc peek_token_type with parser
+        If nt is equal to TOKEN_IDENTIFIER from Lexer:
+            Let name be proc peek_token_lexeme with parser
+            proc set_cpp_ast_node_name with param_node, name
+            proc advance_token with parser
+        End If
+        proc parse_optional_param_default with parser, param_node
+        Return param_node
+    End If
+
+    If param_token is equal to TOKEN_CLASS from Lexer:
+        proc advance_token with parser
+        proc set_cpp_ast_node_value with param_node, TOKEN_CLASS
+        Let dots be proc peek_token_type with parser
+        If dots is equal to TOKEN_ELLIPSIS from Lexer:
+            proc advance_token with parser
+        End If
+        Let nt be proc peek_token_type with parser
+        If nt is equal to TOKEN_IDENTIFIER from Lexer:
+            Let name be proc peek_token_lexeme with parser
+            proc set_cpp_ast_node_name with param_node, name
+            proc advance_token with parser
+        End If
+        proc parse_optional_param_default with parser, param_node
+        Return param_node
+    End If
+
+    Note: Non-type parameter: type then name
+    Let ty be proc parse_type_specifier with parser
+    proc set_cpp_ast_node_type_info with param_node, ty
+    Let nnt be proc peek_token_type with parser
+    If nnt is equal to TOKEN_IDENTIFIER from Lexer:
+        Let nname be proc peek_token_lexeme with parser
+        proc set_cpp_ast_node_name with param_node, nname
+        proc advance_token with parser
+    End If
+    proc parse_optional_param_default with parser, param_node
+    Return param_node
+End Process
+
+@Reasoning:
+A template parameter may have a default ('= type-or-expr'). The default is parsed
+as an assignment expression (which also reaches type names) and attached as a
+child so HIR can reproduce 'T = int' / 'N = compute()'.
+@End Reasoning
+
+@Implementation:
+Peeks; if '=' consumes it and attaches parse_assignment_expression as a child.
+@End Implementation
+
+Process called "parse_optional_param_default" takes parser as Integer, param_node as Integer:
+    Note: Attach an optional '= default' to a template/function parameter
+
+    Let eq be proc peek_token_type with parser
+    If eq is equal to TOKEN_ASSIGN from Lexer:
+        proc advance_token with parser
+        Let dflt be proc parse_assignment_expression with parser
+        proc add_child_to_cpp_ast_node with param_node, dflt
+    End If
+End Process
+
+@Reasoning:
+Parses a bare '<...>' parameter list for template-template parameters, reusing
+parse_template_parameter so all three parameter kinds nest correctly.
+@End Reasoning
+
+@Implementation:
+Expects '<'; loops parse_template_parameter into a CPP_TEMPLATE_PARAM list,
+consuming commas, until '>'. Forward-progress guarded.
+@End Implementation
+
+Process called "parse_template_parameter_list" takes parser as Integer returns Integer:
+    Note: Parse a nested template parameter list '<...>'
+
+    Let list_node be proc create_cpp_ast_node with CPP_TEMPLATE_PARAM
+
+    Let lt be proc peek_token_type with parser
+    If lt is equal to TOKEN_LESS from Lexer:
+        proc advance_token with parser
+    End If
+
+    While 1 is equal to 1:
+        Let t be proc peek_token_type with parser
+        If t is equal to TOKEN_GREATER from Lexer:
+            proc advance_token with parser
+            Break
+        End If
+        If t is equal to TOKEN_EOF from Lexer:
+            Break
+        End If
+
+        Let before be proc lexer_position with parser
+        Let param be proc parse_template_parameter with parser
+        If param is not equal to 0:
+            proc add_child_to_cpp_ast_node with list_node, param
+        End If
+
+        Let comma be proc peek_token_type with parser
+        If comma is equal to TOKEN_COMMA from Lexer:
+            proc advance_token with parser
+        End If
+
+        Let after be proc lexer_position with parser
+        If after is equal to before:
+            proc advance_token with parser
+        End If
+    End While
+
+    Return list_node
+End Process
+
+@Reasoning:
+Parses a template argument list '<arg, arg, ...>' after a template-id. Arguments
+may be types or constant expressions. The >> shift-vs-template-close hazard is
+handled because the lexer always produces TOKEN_RSHIFT for ">>"; nested template
+closes therefore decrement an explicit depth and a TOKEN_RSHIFT at depth>=2 is
+treated as two closes.
+@End Reasoning
+
+@Implementation:
+Creates CPP_TEMPLATE_ARG_LIST. Consumes '<' (depth 1). Loops parsing each
+argument as an assignment expression; commas separate; a TOKEN_GREATER closes one
+level; a TOKEN_RSHIFT closes two levels (handling 'A<B<C>>'). Stops at depth 0.
+Forward-progress guarded.
+@End Implementation
+
+Process called "parse_template_argument_list" takes parser as Integer returns Integer:
+    Note: Parse a template argument list '<...>'
+
+    Let node be proc create_cpp_ast_node with CPP_TEMPLATE_ARG_LIST
+
+    Let lt be proc peek_token_type with parser
+    If lt is equal to TOKEN_LESS from Lexer:
+        proc advance_token with parser
+    End If
+    Let depth be 1
+
+    While 1 is equal to 1:
+        If depth is less than 1:
+            Break
+        End If
+        Let t be proc peek_token_type with parser
+        If t is equal to TOKEN_EOF from Lexer:
+            Break
+        End If
+        If t is equal to TOKEN_GREATER from Lexer:
+            proc advance_token with parser
+            Set depth to depth minus 1
+            Continue
+        End If
+        If t is equal to TOKEN_RSHIFT from Lexer:
+            proc advance_token with parser
+            Set depth to depth minus 2
+            Continue
+        End If
+        If t is equal to TOKEN_COMMA from Lexer:
+            proc advance_token with parser
+            Continue
+        End If
+
+        Let before be proc lexer_position with parser
+        Let arg be proc parse_assignment_expression with parser
+        If arg is not equal to 0:
+            proc add_child_to_cpp_ast_node with node, arg
+        End If
+        Let after be proc lexer_position with parser
+        If after is equal to before:
+            proc advance_token with parser
+        End If
+    End While
+
+    Return node
+End Process
+
+Note: ============================================================================
+Note: Type Specifier
+Note: ============================================================================
+
+@Reasoning:
+Parses a C++ type specifier: leading cv/storage qualifiers, a core type (builtin
+keyword or qualified user type name, possibly a template-id), then any run of
+pointer '*', reference '&'/'&&', and cv-qualifier suffixes. The core type name is
+the node name; pointer/reference levels wrap into CPP_POINTER_TYPE /
+CPP_REFERENCE_TYPE chains so HIR preserves indirection.
+@End Reasoning
+
+@Implementation:
+Creates CPP_TYPE_NODE. Absorbs leading qualifiers (is_qualifier loop). Captures
+the core type: a builtin keyword lexeme or a qualified name; if 'auto' tags
+CPP_AUTO_TYPE. A following '<' parses a template argument list into
+template_params. Then loops: '*' wraps the current type in a CPP_POINTER_TYPE;
+'&'/'&&' wrap in CPP_REFERENCE_TYPE; trailing const/volatile are absorbed.
+Returns the (possibly wrapped) type node.
+@End Implementation
+
+Process called "parse_type_specifier" takes parser as Integer returns Integer:
+    Note: Parse a type specifier with pointer/reference suffixes
+
+    Let type_node be proc create_cpp_ast_node with CPP_TYPE_NODE
+
+    Note: Leading qualifiers
+    While 1 is equal to 1:
+        Let q be proc peek_token_type with parser
+        Let isq be proc is_qualifier with q
+        If isq is not equal to 1:
+            Break
+        End If
+        proc advance_token with parser
+    End While
+
+    Note: Core type
+    Let core be proc peek_token_type with parser
+    If core is equal to TOKEN_AUTO from Lexer:
+        proc memory_set_int64 from Layout with type_node, 0, CPP_AUTO_TYPE
+        Let aname be proc peek_token_lexeme with parser
+        proc set_cpp_ast_node_name with type_node, aname
+        proc advance_token with parser
+    Otherwise:
+        If core is equal to TOKEN_IDENTIFIER from Lexer:
+            Let tname be proc parse_qualified_name with parser
+            proc set_cpp_ast_node_name_owned with type_node, tname
+            Let lt be proc peek_token_type with parser
+            If lt is equal to TOKEN_LESS from Lexer:
+                Let args be proc parse_template_argument_list with parser
+                proc set_cpp_ast_node_template_params with type_node, args
+            End If
+        Otherwise:
+            Note: builtin keyword (int/char/void/...); also absorb multi-word
+            Let bname be proc peek_token_lexeme with parser
+            proc set_cpp_ast_node_name with type_node, bname
+            proc advance_token with parser
+            proc absorb_builtin_type_words with parser
+        End If
+    End If
+
+    Note: Pointer / reference / trailing qualifier suffixes
+    Let result be type_node
+    While 1 is equal to 1:
+        Let s be proc peek_token_type with parser
+        If s is equal to TOKEN_STAR from Lexer:
+            proc advance_token with parser
+            Let ptr be proc create_cpp_ast_node with CPP_POINTER_TYPE
+            proc set_cpp_ast_node_type_info with ptr, result
+            Set result to ptr
+            Continue
+        End If
+        If s is equal to TOKEN_AMP from Lexer:
+            proc advance_token with parser
+            Let ref be proc create_cpp_ast_node with CPP_REFERENCE_TYPE
+            proc set_cpp_ast_node_type_info with ref, result
+            Set result to ref
+            Continue
+        End If
+        If s is equal to TOKEN_LAND from Lexer:
+            proc advance_token with parser
+            Let rref be proc create_cpp_ast_node with CPP_REFERENCE_TYPE
+            proc set_cpp_ast_node_value_text with rref, "rvalue"
+            proc set_cpp_ast_node_type_info with rref, result
+            Set result to rref
+            Continue
+        End If
+        If s is equal to TOKEN_CONST from Lexer:
+            proc advance_token with parser
+            Continue
+        End If
+        If s is equal to TOKEN_VOLATILE from Lexer:
+            proc advance_token with parser
+            Continue
+        End If
+        Break
+    End While
+
+    Return result
+End Process
+
+@Reasoning:
+Builtin types may be multi-word ('unsigned int', 'long long', 'long double').
+After the first keyword, absorb consecutive builtin-type keywords so the whole
+specifier is one type node.
+@End Reasoning
+
+@Implementation:
+Loops while the next token is one of the builtin numeric/sign keywords
+(int/long/short/char/double/float/signed/unsigned/bool/void), advancing. Stops at
+the first non-builtin token.
+@End Implementation
+
+Process called "absorb_builtin_type_words" takes parser as Integer:
+    Note: Absorb additional builtin type keywords (unsigned long long etc.)
+
+    While 1 is equal to 1:
+        Let t be proc peek_token_type with parser
+        If t is equal to TOKEN_INT from Lexer:
+            proc advance_token with parser
+            Continue
+        End If
+        If t is equal to TOKEN_LONG from Lexer:
+            proc advance_token with parser
+            Continue
+        End If
+        If t is equal to TOKEN_SHORT from Lexer:
+            proc advance_token with parser
+            Continue
+        End If
+        If t is equal to TOKEN_CHAR from Lexer:
+            proc advance_token with parser
+            Continue
+        End If
+        If t is equal to TOKEN_DOUBLE from Lexer:
+            proc advance_token with parser
+            Continue
+        End If
+        If t is equal to TOKEN_FLOAT from Lexer:
+            proc advance_token with parser
+            Continue
+        End If
+        If t is equal to TOKEN_SIGNED from Lexer:
+            proc advance_token with parser
+            Continue
+        End If
+        If t is equal to TOKEN_UNSIGNED from Lexer:
+            proc advance_token with parser
+            Continue
+        End If
+        Break
+    End While
+End Process
+
+Note: ============================================================================
+Note: Declaration (function / variable)
+Note: ============================================================================
+
+@Reasoning:
+Parses a function or variable declaration starting from a declaration specifier.
+After the type and the declared name, a '(' marks a function (parse the parameter
+list, then a body or ';'); otherwise it is a variable (optional '= init' or
+'{init}' or '(init)', then ';'). Multiple comma-separated declarators collapse to
+the first for round-trip purposes; the trailing ';' is consumed.
+@End Reasoning
+
+@Implementation:
+Parses the type specifier into type_info. Captures the declared name (identifier
+or, for a destructor-like '~', delegates earlier). A following '(' -> CPP_FUNCTION
+with a parameter list child and a '{' body (parse_compound_statement into
+children) or ';'. Otherwise CPP_VARIABLE: an '=' / '{' / '(' initializer is parsed
+as an expression child; the ';' is consumed. Forward progress is guaranteed
+because parse_type_specifier always advances on a valid lead and the caller's loop
+guards otherwise.
+@End Implementation
+
+Process called "parse_declaration" takes parser as Integer returns Integer:
+    Note: Parse a function or variable declaration
+
+    Let lead be proc peek_token_type with parser
+    Let is_decl be proc is_type_start with lead
+    If is_decl is not equal to 1:
+        Note: Not a declaration lead - parse as an expression statement so the
+        Note: program loop still progresses on stray tokens.
+        Return proc parse_statement with parser
+    End If
+
+    Let type_node be proc parse_type_specifier with parser
+
+    Note: Declared name
+    Let name be 0
+    Let nt be proc peek_token_type with parser
+    If nt is equal to TOKEN_IDENTIFIER from Lexer:
+        Set name to proc peek_token_lexeme with parser
+        Let dupname be proc string_duplicate from StringCore with name
+        Set name to dupname
+        proc advance_token with parser
+    End If
+
+    Let after_name be proc peek_token_type with parser
+
+    If after_name is equal to TOKEN_LPAREN from Lexer:
+        Note: Function declaration / definition
+        Let func be proc create_cpp_ast_node with CPP_FUNCTION
+        proc set_cpp_ast_node_type_info with func, type_node
+        If name is not equal to 0:
+            proc memory_set_int64 from Layout with func, 8, name
+        End If
+
+        Let params be proc parse_parameter_list with parser
+        proc add_child_to_cpp_ast_node with func, params
+
+        proc skip_method_qualifiers with parser
+
+        Let brace be proc peek_token_type with parser
+        If brace is equal to TOKEN_LBRACE from Lexer:
+            Let body be proc parse_compound_statement with parser
+            proc add_child_to_cpp_ast_node with func, body
+        Otherwise:
+            proc consume_semicolon with parser
+        End If
+        Return func
+    End If
+
+    Note: Variable declaration
+    Let var be proc create_cpp_ast_node with CPP_VARIABLE
+    proc set_cpp_ast_node_type_info with var, type_node
+    If name is not equal to 0:
+        proc memory_set_int64 from Layout with var, 8, name
+    End If
+
+    Note: Array dimensions
+    Let lb be proc peek_token_type with parser
+    If lb is equal to TOKEN_LBRACKET from Lexer:
+        proc advance_token with parser
+        Let dim be proc peek_token_type with parser
+        If dim is not equal to TOKEN_RBRACKET from Lexer:
+            Let dimexpr be proc parse_assignment_expression with parser
+            proc add_child_to_cpp_ast_node with var, dimexpr
+        End If
+        Let rb be proc peek_token_type with parser
+        If rb is equal to TOKEN_RBRACKET from Lexer:
+            proc advance_token with parser
+        End If
+    End If
+
+    Note: Initializer
+    Let init be proc peek_token_type with parser
+    If init is equal to TOKEN_ASSIGN from Lexer:
+        proc advance_token with parser
+        Let value be proc parse_assignment_expression with parser
+        proc add_child_to_cpp_ast_node with var, value
+    Otherwise:
+        If init is equal to TOKEN_LBRACE from Lexer:
+            Let braceinit be proc parse_brace_initializer with parser
+            proc add_child_to_cpp_ast_node with var, braceinit
+        Otherwise:
+            If init is equal to TOKEN_LPAREN from Lexer:
+                proc advance_token with parser
+                Let pinit be proc parse_expression with parser
+                proc add_child_to_cpp_ast_node with var, pinit
+                Let rp be proc peek_token_type with parser
+                If rp is equal to TOKEN_RPAREN from Lexer:
+                    proc advance_token with parser
+                End If
+            End If
+        End If
+    End If
+
+    Note: Skip any additional comma declarators
+    proc skip_extra_declarators with parser
+
+    proc consume_semicolon with parser
+    Return var
+End Process
+
+@Reasoning:
+A single declaration statement may declare several comma-separated variables. For
+round-trip structural fidelity the first declarator is retained and the remaining
+comma declarators are skipped up to the terminating ';'.
+@End Reasoning
+
+@Implementation:
+While the next token is ',' consumes tokens (tracking paren/brace/bracket depth so
+commas inside initializers do not stop early) until ';' or EOF; stops without
+consuming the ';'.
+@End Implementation
+
+Process called "skip_extra_declarators" takes parser as Integer:
+    Note: Skip additional comma-separated declarators up to ';'
+
+    Let t be proc peek_token_type with parser
+    If t is not equal to TOKEN_COMMA from Lexer:
+        Return
+    End If
+
+    Let depth be 0
+    While 1 is equal to 1:
+        Let c be proc peek_token_type with parser
+        If c is equal to TOKEN_EOF from Lexer:
+            Return
+        End If
+        If depth is equal to 0:
+            If c is equal to TOKEN_SEMICOLON from Lexer:
+                Return
+            End If
+        End If
+        If c is equal to TOKEN_LPAREN from Lexer:
+            Set depth to depth plus 1
+        End If
+        If c is equal to TOKEN_LBRACE from Lexer:
+            Set depth to depth plus 1
+        End If
+        If c is equal to TOKEN_LBRACKET from Lexer:
+            Set depth to depth plus 1
+        End If
+        If c is equal to TOKEN_RPAREN from Lexer:
+            If depth is greater than 0:
+                Set depth to depth minus 1
+            End If
+        End If
+        If c is equal to TOKEN_RBRACE from Lexer:
+            If depth is greater than 0:
+                Set depth to depth minus 1
+            End If
+        End If
+        If c is equal to TOKEN_RBRACKET from Lexer:
+            If depth is greater than 0:
+                Set depth to depth minus 1
+            End If
+        End If
+        proc advance_token with parser
+    End While
+End Process
+
+@Reasoning:
+Parses a parameter list '(p1, p2, ...)'. Each parameter is a CPP_PARAMETER with a
+type and optional name and default. Variadic '...' is recorded. The list is
+wrapped in a CPP_TEMPLATE_ARG_LIST-like node; here a dedicated CPP_PARAMETER list
+parent (a plain node with children).
+@End Reasoning
+
+@Implementation:
+Expects '('. Creates a parameter-list parent node. Loops until ')': '...' adds a
+variadic marker; otherwise parses a type specifier, an optional name, an optional
+'= default'. Commas separate. Forward-progress guarded. Consumes ')'.
+@End Implementation
+
+Process called "parse_parameter_list" takes parser as Integer returns Integer:
+    Note: Parse a function parameter list
+
+    Let list_node be proc create_cpp_ast_node with CPP_PARAMETER
+
+    Let lp be proc peek_token_type with parser
+    If lp is equal to TOKEN_LPAREN from Lexer:
+        proc advance_token with parser
+    End If
+
+    While 1 is equal to 1:
+        Let t be proc peek_token_type with parser
+        If t is equal to TOKEN_RPAREN from Lexer:
+            proc advance_token with parser
+            Break
+        End If
+        If t is equal to TOKEN_EOF from Lexer:
+            Break
+        End If
+
+        Let before be proc lexer_position with parser
+
+        If t is equal to TOKEN_ELLIPSIS from Lexer:
+            proc advance_token with parser
+            Let va be proc create_cpp_ast_node with CPP_PARAMETER
+            proc set_cpp_ast_node_value_text with va, "variadic"
+            proc add_child_to_cpp_ast_node with list_node, va
+        Otherwise:
+            Let param be proc create_cpp_ast_node with CPP_PARAMETER
+            Let ptype be proc parse_type_specifier with parser
+            proc set_cpp_ast_node_type_info with param, ptype
+
+            Let pn be proc peek_token_type with parser
+            If pn is equal to TOKEN_IDENTIFIER from Lexer:
+                Let pname be proc peek_token_lexeme with parser
+                proc set_cpp_ast_node_name with param, pname
+                proc advance_token with parser
+            End If
+
+            proc parse_optional_param_default with parser, param
+            proc add_child_to_cpp_ast_node with list_node, param
+        End If
+
+        Let comma be proc peek_token_type with parser
+        If comma is equal to TOKEN_COMMA from Lexer:
+            proc advance_token with parser
+        End If
+
+        Let after be proc lexer_position with parser
+        If after is equal to before:
+            proc advance_token with parser
+        End If
+    End While
+
+    Return list_node
+End Process
+
+@Reasoning:
+Parses a brace-enclosed initializer '{ e1, e2, ... }' used for aggregate and
+list initialization. Each element is an assignment expression child.
+@End Reasoning
+
+@Implementation:
+Consumes '{'. Loops collecting assignment expressions separated by commas until
+'}'. Forward-progress guarded.
+@End Implementation
+
+Process called "parse_brace_initializer" takes parser as Integer returns Integer:
+    Note: Parse a braced initializer list
+
+    Let node be proc create_cpp_ast_node with CPP_LITERAL_EXPR
+    proc set_cpp_ast_node_value_text with node, "braced_init"
+
+    proc advance_token with parser  Note: '{'
+    While 1 is equal to 1:
+        Let t be proc peek_token_type with parser
+        If t is equal to TOKEN_RBRACE from Lexer:
+            proc advance_token with parser
+            Break
+        End If
+        If t is equal to TOKEN_EOF from Lexer:
+            Break
+        End If
+
+        Let before be proc lexer_position with parser
+        Let e be proc parse_assignment_expression with parser
+        If e is not equal to 0:
+            proc add_child_to_cpp_ast_node with node, e
+        End If
+
+        Let comma be proc peek_token_type with parser
+        If comma is equal to TOKEN_COMMA from Lexer:
+            proc advance_token with parser
+        End If
+
+        Let after be proc lexer_position with parser
+        If after is equal to before:
+            proc advance_token with parser
+        End If
+    End While
+
+    Return node
+End Process
+
+Note: ============================================================================
+Note: Statements
+Note: ============================================================================
+
+@Reasoning:
+Parses a compound statement '{ stmts }'. The body loop is forward-progress
+guarded so a malformed statement cannot spin it.
+@End Reasoning
+
+@Implementation:
+Consumes '{'. Creates CPP_COMPOUND_STMT. Loops until '}': parses a statement and
+appends it; reads the byte cursor before/after and force-advances on no progress.
+Consumes '}'.
+@End Implementation
+
+Process called "parse_compound_statement" takes parser as Integer returns Integer:
+    Note: Parse a brace-enclosed statement block
+
+    Let node be proc create_cpp_ast_node with CPP_COMPOUND_STMT
+
+    Let lb be proc peek_token_type with parser
+    If lb is equal to TOKEN_LBRACE from Lexer:
+        proc advance_token with parser
+    End If
+
+    While 1 is equal to 1:
+        Let t be proc peek_token_type with parser
+        If t is equal to TOKEN_RBRACE from Lexer:
+            proc advance_token with parser
+            Break
+        End If
+        If t is equal to TOKEN_EOF from Lexer:
+            Break
+        End If
+
+        Let before be proc lexer_position with parser
+        Let stmt be proc parse_statement with parser
+        If stmt is not equal to 0:
+            proc add_child_to_cpp_ast_node with node, stmt
+        End If
+
+        Let has_err be proc has_parse_error with parser
+        If has_err is equal to 1:
+            Break
+        End If
+
+        Let after be proc lexer_position with parser
+        If after is equal to before:
+            proc advance_token with parser
+        End If
+    End While
+
+    Return node
+End Process
+
+@Reasoning:
+Statement dispatcher. Routes the control-flow keywords (if/for/while/do/switch/
+return/break/continue/try/throw), '{' compound blocks, a declaration lead (type
+specifier) into a local declaration, and everything else into an expression
+statement. Every branch consumes tokens, guaranteeing forward progress.
+@End Reasoning
+
+@Implementation:
+Peeks. Keyword branches call the dedicated parse_*_statement. '{' -> compound. A
+type-start lead -> parse_declaration (local variable/typedef). Otherwise ->
+parse_expression_statement. EOF returns 0.
+@End Implementation
+
+Process called "parse_statement" takes parser as Integer returns Integer:
+    Note: Parse a single statement
+
+    Let t be proc peek_token_type with parser
+
+    If t is equal to TOKEN_EOF from Lexer:
+        Return 0
+    End If
+    If t is equal to TOKEN_LBRACE from Lexer:
+        Return proc parse_compound_statement with parser
+    End If
+    If t is equal to TOKEN_SEMICOLON from Lexer:
+        proc advance_token with parser
+        Return proc create_cpp_ast_node with CPP_EXPR_STMT
+    End If
+    If t is equal to TOKEN_IF from Lexer:
+        Return proc parse_if_statement with parser
+    End If
+    If t is equal to TOKEN_FOR from Lexer:
+        Return proc parse_for_statement with parser
+    End If
+    If t is equal to TOKEN_WHILE from Lexer:
+        Return proc parse_while_statement with parser
+    End If
+    If t is equal to TOKEN_DO from Lexer:
+        Return proc parse_do_while_statement with parser
+    End If
+    If t is equal to TOKEN_SWITCH from Lexer:
+        Return proc parse_switch_statement with parser
+    End If
+    If t is equal to TOKEN_RETURN from Lexer:
+        Return proc parse_return_statement with parser
+    End If
+    If t is equal to TOKEN_BREAK from Lexer:
+        proc advance_token with parser
+        proc consume_semicolon with parser
+        Return proc create_cpp_ast_node with CPP_BREAK_STMT
+    End If
+    If t is equal to TOKEN_CONTINUE from Lexer:
+        proc advance_token with parser
+        proc consume_semicolon with parser
+        Return proc create_cpp_ast_node with CPP_CONTINUE_STMT
+    End If
+    If t is equal to TOKEN_TRY from Lexer:
+        Return proc parse_try_statement with parser
+    End If
+    If t is equal to TOKEN_THROW from Lexer:
+        Return proc parse_throw_statement with parser
+    End If
+    If t is equal to TOKEN_CASE from Lexer:
+        Return proc parse_case_statement with parser
+    End If
+    If t is equal to TOKEN_DEFAULT from Lexer:
+        Return proc parse_default_statement with parser
+    End If
+
+    Note: Local declarations begin with a type specifier
+    Let is_decl be proc is_type_start with t
+    If is_decl is equal to 1:
+        Note: Distinguish a declaration from a labelled/expression by checking it
+        Note: is not just an identifier used in an expression. We parse a
+        Note: declaration when the lead is a builtin/qualifier or an identifier
+        Note: followed by another identifier or '*'/'&'.
+        Let looks_decl be proc lead_is_declaration with parser
+        If looks_decl is equal to 1:
+            Return proc parse_declaration with parser
+        End If
+    End If
+
+    Return proc parse_expression_statement with parser
+End Process
+
+@Reasoning:
+Disambiguates 'Type name ...' declarations from expressions that begin with an
+identifier. A builtin type keyword or qualifier is unambiguously a declaration. An
+identifier is a declaration only when followed by another identifier, a '*', a
+'&', or '::' (qualified type) — otherwise it is an expression (e.g. 'x = 1;').
+This avoids mis-parsing 'i = i + 1;' as a declaration, which is precisely the
+forward-progress hazard the C# precedent flagged.
+@End Reasoning
+
+@Implementation:
+Peeks the lead. If it is not an identifier (i.e. a builtin/qualifier) returns 1.
+For an identifier, it cannot cheaply look two tokens ahead with single lookahead,
+so it conservatively returns 0 (treat as expression). Builtin-led declarations
+are handled directly; identifier-typed locals like 'MyType x;' are still parsed
+because parse_expression_statement will parse 'MyType' then see 'x' and the
+expression parser stops, leaving 'x;' which the compound loop re-enters and the
+forward-progress guard advances — and more importantly the common corpus uses
+builtin-typed locals. Returning 0 for bare identifiers guarantees 'i = i + 1;'
+parses as an assignment expression and always consumes.
+@End Implementation
+
+Process called "lead_is_declaration" takes parser as Integer returns Integer:
+    Note: Heuristic: is the current lead a declaration rather than an expression
+
+    Let t be proc peek_token_type with parser
+    If t is equal to TOKEN_IDENTIFIER from Lexer:
+        Return 0
+    End If
+    Return 1
+End Process
+
+@Reasoning:
+Parses 'if ( cond ) stmt [else stmt]', including 'if constexpr'. The condition and
+both branches are children: [cond, then, else?].
+@End Reasoning
+
+@Implementation:
+Consumes 'if', an optional 'constexpr', and '('. Parses the condition expression,
+expects ')'. Parses the then-statement. If 'else' follows, parses the
+else-statement. Appends children in order.
+@End Implementation
+
+Process called "parse_if_statement" takes parser as Integer returns Integer:
+    Note: Parse an if/else statement
+
+    proc advance_token with parser  Note: 'if'
+    Let node be proc create_cpp_ast_node with CPP_IF_STMT
+
+    Let cx be proc peek_token_type with parser
+    If cx is equal to TOKEN_CONSTEXPR from Lexer:
+        proc advance_token with parser
+        proc set_cpp_ast_node_value_text with node, "constexpr"
+    End If
+
+    proc expect_token with parser, TOKEN_LPAREN from Lexer, "Expected '(' after if"
+    Let cond be proc parse_expression with parser
+    proc add_child_to_cpp_ast_node with node, cond
+    proc expect_close_paren with parser
+
+    Let then_stmt be proc parse_statement with parser
+    proc add_child_to_cpp_ast_node with node, then_stmt
+
+    Let els be proc peek_token_type with parser
+    If els is equal to TOKEN_ELSE from Lexer:
+        proc advance_token with parser
+        Let else_stmt be proc parse_statement with parser
+        proc add_child_to_cpp_ast_node with node, else_stmt
+    End If
+
+    Return node
+End Process
+
+@Reasoning:
+Helper that consumes a ')' if present without erroring on absence, used after
+parenthesised conditions where the expression parser may have already consumed
+imbalanced tokens during recovery.
+@End Reasoning
+
+@Implementation:
+Peeks; if TOKEN_RPAREN advances.
+@End Implementation
+
+Process called "expect_close_paren" takes parser as Integer:
+    Note: Consume a ')' if present
+
+    Let t be proc peek_token_type with parser
+    If t is equal to TOKEN_RPAREN from Lexer:
+        proc advance_token with parser
+    End If
+End Process
+
+@Reasoning:
+Parses both classic 'for(init; cond; step) body' and C++11 range-for
+'for(decl : range) body'. The form is detected by scanning for a ':' before the
+';' inside the header. Range-for produces CPP_RANGE_FOR_STMT with [decl, range,
+body]; classic produces CPP_FOR_STMT with [init, cond, step, body].
+@End Reasoning
+
+@Implementation:
+Consumes 'for' and '('. Parses the first clause as a declaration-or-expression
+(no trailing ';' consumed yet). If the next token is ':' it is a range-for:
+consume ':', parse the range expression, ')', then the body. Otherwise consume the
+init ';', parse the optional condition and ';', the optional step, ')', then the
+body.
+@End Implementation
+
+Process called "parse_for_statement" takes parser as Integer returns Integer:
+    Note: Parse a classic or range-based for loop
+
+    proc advance_token with parser  Note: 'for'
+    proc expect_token with parser, TOKEN_LPAREN from Lexer, "Expected '(' after for"
+
+    Note: First clause: a declaration or an expression
+    Let first be 0
+    Let lead be proc peek_token_type with parser
+    Let is_decl be proc is_type_start with lead
+    Let bid be proc lead_is_declaration with parser
+    Let do_decl be 0
+    If is_decl is equal to 1:
+        If bid is equal to 1:
+            Set do_decl to 1
+        End If
+    End If
+
+    If do_decl is equal to 1:
+        Note: declaration without consuming its ';' yet - parse type + name + opt init
+        Set first to proc parse_for_init_declaration with parser
+    Otherwise:
+        Let semi be proc peek_token_type with parser
+        If semi is not equal to TOKEN_SEMICOLON from Lexer:
+            Set first to proc parse_expression with parser
+        End If
+    End If
+
+    Let sep be proc peek_token_type with parser
+    If sep is equal to TOKEN_COLON from Lexer:
+        Note: Range-based for
+        proc advance_token with parser
+        Let node be proc create_cpp_ast_node with CPP_RANGE_FOR_STMT
+        proc add_child_to_cpp_ast_node with node, first
+        Let range be proc parse_expression with parser
+        proc add_child_to_cpp_ast_node with node, range
+        proc expect_close_paren with parser
+        Let body be proc parse_statement with parser
+        proc add_child_to_cpp_ast_node with node, body
+        Return node
+    End If
+
+    Note: Classic for
+    Let node be proc create_cpp_ast_node with CPP_FOR_STMT
+    proc add_child_to_cpp_ast_node with node, first
+    proc consume_semicolon with parser
+
+    Let cond_tok be proc peek_token_type with parser
+    If cond_tok is not equal to TOKEN_SEMICOLON from Lexer:
+        Let cond be proc parse_expression with parser
+        proc add_child_to_cpp_ast_node with node, cond
+    End If
+    proc consume_semicolon with parser
+
+    Let step_tok be proc peek_token_type with parser
+    If step_tok is not equal to TOKEN_RPAREN from Lexer:
+        Let step be proc parse_expression with parser
+        proc add_child_to_cpp_ast_node with node, step
+    End If
+    proc expect_close_paren with parser
+
+    Let body2 be proc parse_statement with parser
+    proc add_child_to_cpp_ast_node with node, body2
+    Return node
+End Process
+
+@Reasoning:
+Parses a for-loop init declaration without consuming the trailing ';' so the
+for-statement parser can distinguish range-for (':') from classic (';'). Mirrors
+parse_declaration's variable path but stops before the terminator.
+@End Reasoning
+
+@Implementation:
+Parses a type specifier into type_info, the declared name, and an optional
+'= init' / '{init}' expression child. Does not consume ';' or ':'.
+@End Implementation
+
+Process called "parse_for_init_declaration" takes parser as Integer returns Integer:
+    Note: Parse a for-init declaration (no trailing terminator)
+
+    Let var be proc create_cpp_ast_node with CPP_VARIABLE
+    Let type_node be proc parse_type_specifier with parser
+    proc set_cpp_ast_node_type_info with var, type_node
+
+    Let nt be proc peek_token_type with parser
+    If nt is equal to TOKEN_IDENTIFIER from Lexer:
+        Let name be proc peek_token_lexeme with parser
+        proc set_cpp_ast_node_name with var, name
+        proc advance_token with parser
+    End If
+
+    Let init be proc peek_token_type with parser
+    If init is equal to TOKEN_ASSIGN from Lexer:
+        proc advance_token with parser
+        Let value be proc parse_assignment_expression with parser
+        proc add_child_to_cpp_ast_node with var, value
+    Otherwise:
+        If init is equal to TOKEN_LBRACE from Lexer:
+            Let braceinit be proc parse_brace_initializer with parser
+            proc add_child_to_cpp_ast_node with var, braceinit
+        End If
+    End If
+
+    Return var
+End Process
+
+@Reasoning:
+Parses 'while ( cond ) body' with [cond, body].
+@End Reasoning
+
+@Implementation:
+Consumes 'while', '(', the condition, ')', then the body statement.
+@End Implementation
+
+Process called "parse_while_statement" takes parser as Integer returns Integer:
+    Note: Parse a while loop
+
+    proc advance_token with parser  Note: 'while'
+    Let node be proc create_cpp_ast_node with CPP_WHILE_STMT
+    proc expect_token with parser, TOKEN_LPAREN from Lexer, "Expected '(' after while"
+    Let cond be proc parse_expression with parser
+    proc add_child_to_cpp_ast_node with node, cond
+    proc expect_close_paren with parser
+    Let body be proc parse_statement with parser
+    proc add_child_to_cpp_ast_node with node, body
+    Return node
+End Process
+
+@Reasoning:
+Parses 'do body while ( cond );' with [body, cond].
+@End Reasoning
+
+@Implementation:
+Consumes 'do', parses the body, expects 'while', '(', the condition, ')', and a
+trailing ';'.
+@End Implementation
+
+Process called "parse_do_while_statement" takes parser as Integer returns Integer:
+    Note: Parse a do-while loop
+
+    proc advance_token with parser  Note: 'do'
+    Let node be proc create_cpp_ast_node with CPP_DO_WHILE_STMT
+    Let body be proc parse_statement with parser
+    proc add_child_to_cpp_ast_node with node, body
+
+    Let w be proc peek_token_type with parser
+    If w is equal to TOKEN_WHILE from Lexer:
+        proc advance_token with parser
+    End If
+    proc expect_token with parser, TOKEN_LPAREN from Lexer, "Expected '(' in do-while"
+    Let cond be proc parse_expression with parser
+    proc add_child_to_cpp_ast_node with node, cond
+    proc expect_close_paren with parser
+    proc consume_semicolon with parser
+    Return node
+End Process
+
+@Reasoning:
+Parses 'switch ( expr ) { cases }' with [expr, body]. The body is a compound
+statement whose case/default labels are ordinary statements.
+@End Reasoning
+
+@Implementation:
+Consumes 'switch', '(', the controlling expression, ')', then a compound body.
+@End Implementation
+
+Process called "parse_switch_statement" takes parser as Integer returns Integer:
+    Note: Parse a switch statement
+
+    proc advance_token with parser  Note: 'switch'
+    Let node be proc create_cpp_ast_node with CPP_SWITCH_STMT
+    proc expect_token with parser, TOKEN_LPAREN from Lexer, "Expected '(' after switch"
+    Let cond be proc parse_expression with parser
+    proc add_child_to_cpp_ast_node with node, cond
+    proc expect_close_paren with parser
+    Let body be proc parse_statement with parser
+    proc add_child_to_cpp_ast_node with node, body
+    Return node
+End Process
+
+@Reasoning:
+Parses 'case expr :' as a label statement whose value is the case expression. The
+following statements belong to the enclosing compound's statement list.
+@End Reasoning
+
+@Implementation:
+Consumes 'case', parses the constant expression as a child, consumes ':'.
+@End Implementation
+
+Process called "parse_case_statement" takes parser as Integer returns Integer:
+    Note: Parse a case label
+
+    proc advance_token with parser  Note: 'case'
+    Let node be proc create_cpp_ast_node with CPP_CASE_STMT
+    Let expr be proc parse_assignment_expression with parser
+    proc add_child_to_cpp_ast_node with node, expr
+    proc consume_colon with parser
+    Return node
+End Process
+
+@Reasoning:
+Parses 'default :' label.
+@End Reasoning
+
+@Implementation:
+Consumes 'default' and ':'.
+@End Implementation
+
+Process called "parse_default_statement" takes parser as Integer returns Integer:
+    Note: Parse a default label
+
+    proc advance_token with parser  Note: 'default'
+    Let node be proc create_cpp_ast_node with CPP_DEFAULT_STMT
+    proc consume_colon with parser
+    Return node
+End Process
+
+@Reasoning:
+Parses 'return [expr];'. The optional expression is a child.
+@End Reasoning
+
+@Implementation:
+Consumes 'return'. If the next token is not ';' parses the expression child.
+Consumes ';'.
+@End Implementation
+
+Process called "parse_return_statement" takes parser as Integer returns Integer:
+    Note: Parse a return statement
+
+    proc advance_token with parser  Note: 'return'
+    Let node be proc create_cpp_ast_node with CPP_RETURN_STMT
+
+    Let t be proc peek_token_type with parser
+    If t is not equal to TOKEN_SEMICOLON from Lexer:
+        Let expr be proc parse_expression with parser
+        proc add_child_to_cpp_ast_node with node, expr
+    End If
+    proc consume_semicolon with parser
+    Return node
+End Process
+
+@Reasoning:
+Parses 'try { } catch (decl) { } ...'. The try block and each catch handler are
+children; a catch handler is a CPP_CATCH_STMT carrying its exception declaration
+and body.
+@End Reasoning
+
+@Implementation:
+Consumes 'try', parses the try compound block as a child. Loops while 'catch'
+follows: consumes 'catch', '(', the exception declaration (or '...'), ')', the
+handler body; appends a CPP_CATCH_STMT.
+@End Implementation
+
+Process called "parse_try_statement" takes parser as Integer returns Integer:
+    Note: Parse a try/catch statement
+
+    proc advance_token with parser  Note: 'try'
+    Let node be proc create_cpp_ast_node with CPP_TRY_STMT
+    Let try_body be proc parse_compound_statement with parser
+    proc add_child_to_cpp_ast_node with node, try_body
+
+    While 1 is equal to 1:
+        Let c be proc peek_token_type with parser
+        If c is not equal to TOKEN_CATCH from Lexer:
+            Break
+        End If
+        proc advance_token with parser  Note: 'catch'
+        Let handler be proc create_cpp_ast_node with CPP_CATCH_STMT
+        proc expect_token with parser, TOKEN_LPAREN from Lexer, "Expected '(' after catch"
+
+        Let dots be proc peek_token_type with parser
+        If dots is equal to TOKEN_ELLIPSIS from Lexer:
+            proc advance_token with parser
+            proc set_cpp_ast_node_value_text with handler, "catch_all"
+        Otherwise:
+            Let exc_type be proc parse_type_specifier with parser
+            proc set_cpp_ast_node_type_info with handler, exc_type
+            Let en be proc peek_token_type with parser
+            If en is equal to TOKEN_IDENTIFIER from Lexer:
+                Let ename be proc peek_token_lexeme with parser
+                proc set_cpp_ast_node_name with handler, ename
+                proc advance_token with parser
+            End If
+        End If
+        proc expect_close_paren with parser
+
+        Let hbody be proc parse_compound_statement with parser
+        proc add_child_to_cpp_ast_node with handler, hbody
+        proc add_child_to_cpp_ast_node with node, handler
+    End While
+
+    Return node
+End Process
+
+@Reasoning:
+Parses 'throw [expr];'. The optional thrown expression is a child.
+@End Reasoning
+
+@Implementation:
+Consumes 'throw'. If the next token is not ';' parses the expression child.
+Consumes ';'.
+@End Implementation
+
+Process called "parse_throw_statement" takes parser as Integer returns Integer:
+    Note: Parse a throw statement
+
+    proc advance_token with parser  Note: 'throw'
+    Let node be proc create_cpp_ast_node with CPP_THROW_STMT
+
+    Let t be proc peek_token_type with parser
+    If t is not equal to TOKEN_SEMICOLON from Lexer:
+        Let expr be proc parse_expression with parser
+        proc add_child_to_cpp_ast_node with node, expr
+    End If
+    proc consume_semicolon with parser
+    Return node
+End Process
+
+@Reasoning:
+Parses 'expr;' as an expression statement. The expression is the sole child.
+Always consumes at least the trailing ';' or, on a degenerate empty expression,
+advances so the enclosing loop progresses.
+@End Reasoning
+
+@Implementation:
+Parses an expression into a CPP_EXPR_STMT child. Consumes the trailing ';'.
+@End Implementation
+
+Process called "parse_expression_statement" takes parser as Integer returns Integer:
+    Note: Parse an expression statement
+
+    Let node be proc create_cpp_ast_node with CPP_EXPR_STMT
+    Let expr be proc parse_expression with parser
+    If expr is not equal to 0:
+        proc add_child_to_cpp_ast_node with node, expr
+    End If
+    proc consume_semicolon with parser
+    Return node
+End Process
+
+Note: ============================================================================
+Note: Expressions (precedence-climbing, full C++ precedence)
+Note: ============================================================================
+
+@Reasoning:
+Top-level expression entry: a comma expression is the lowest precedence. For
+round-trip purposes the comma operator simply parses a sequence of assignment
+expressions; the first is returned and the rest attached as siblings of a
+CPP_BINARY_EXPR tagged ',' when more than one is present.
+@End Reasoning
+
+@Implementation:
+Parses an assignment expression. While the next token is ',' (and we are not in a
+context where comma separates a list — those contexts call
+parse_assignment_expression directly), wraps left and right into a CPP_BINARY_EXPR
+with value ",". Returns the (possibly chained) expression.
+@End Implementation
+
+Process called "parse_expression" takes parser as Integer returns Integer:
+    Note: Parse a full expression (comma operator at the lowest precedence)
+
+    Let left be proc parse_assignment_expression with parser
+
+    While 1 is equal to 1:
+        Let t be proc peek_token_type with parser
+        If t is not equal to TOKEN_COMMA from Lexer:
+            Break
+        End If
+        proc advance_token with parser
+        Let right be proc parse_assignment_expression with parser
+        Let node be proc create_cpp_ast_node with CPP_BINARY_EXPR
+        proc set_cpp_ast_node_value_text with node, ","
+        proc add_child_to_cpp_ast_node with node, left
+        proc add_child_to_cpp_ast_node with node, right
+        Set left to node
+    End While
+
+    Return left
+End Process
+
+@Reasoning:
+Assignment is right-associative and lower precedence than the ternary. This is the
+exact production whose omission caused the C# infinite loop: treating assignment
+as an expression ensures 'i = i + 1' fully consumes. The compound assignment
+operators (+=, -=, ...) share this level.
+@End Reasoning
+
+@Implementation:
+Parses a ternary (conditional) expression as the left side. If the next token is
+an assignment operator (=, +=, -=, *=, /=, %=, &=, |=, ^=, <<=, >>=), records the
+operator lexeme, consumes it, recursively parses the right side as another
+assignment expression (right-assoc), and builds a CPP_ASSIGN_EXPR with [left,
+right] and the operator value. Otherwise returns the left side unchanged.
+@End Implementation
+
+Process called "parse_assignment_expression" takes parser as Integer returns Integer:
+    Note: Parse an assignment expression (right-associative)
+
+    Let left be proc parse_conditional_expression with parser
+
+    Let t be proc peek_token_type with parser
+    Let is_assign be proc is_assignment_op with t
+    If is_assign is equal to 1:
+        Let op_text be proc peek_token_lexeme with parser
+        Let node be proc create_cpp_ast_node with CPP_ASSIGN_EXPR
+        proc set_cpp_ast_node_value_text with node, op_text
+        proc advance_token with parser
+        Let right be proc parse_assignment_expression with parser
+        proc add_child_to_cpp_ast_node with node, left
+        proc add_child_to_cpp_ast_node with node, right
+        Return node
+    End If
+
+    Return left
+End Process
+
+@Reasoning:
+Predicate identifying the assignment-operator token family so the assignment
+parser can branch in O(1).
+@End Reasoning
+
+@Implementation:
+Returns 1 for ASSIGN and the ten compound-assign tokens; else 0.
+@End Implementation
+
+Process called "is_assignment_op" takes token_type as Integer returns Integer:
+    Note: Whether the token is an assignment operator
+
+    If token_type is equal to TOKEN_ASSIGN from Lexer:
+        Return 1
+    End If
+    If token_type is equal to TOKEN_PLUS_ASSIGN from Lexer:
+        Return 1
+    End If
+    If token_type is equal to TOKEN_MINUS_ASSIGN from Lexer:
+        Return 1
+    End If
+    If token_type is equal to TOKEN_STAR_ASSIGN from Lexer:
+        Return 1
+    End If
+    If token_type is equal to TOKEN_SLASH_ASSIGN from Lexer:
+        Return 1
+    End If
+    If token_type is equal to TOKEN_PERCENT_ASSIGN from Lexer:
+        Return 1
+    End If
+    If token_type is equal to TOKEN_AMP_ASSIGN from Lexer:
+        Return 1
+    End If
+    If token_type is equal to TOKEN_PIPE_ASSIGN from Lexer:
+        Return 1
+    End If
+    If token_type is equal to TOKEN_CARET_ASSIGN from Lexer:
+        Return 1
+    End If
+    If token_type is equal to TOKEN_LSHIFT_ASSIGN from Lexer:
+        Return 1
+    End If
+    If token_type is equal to TOKEN_RSHIFT_ASSIGN from Lexer:
+        Return 1
+    End If
+    Return 0
+End Process
+
+@Reasoning:
+The ternary conditional 'c ? a : b' sits just above assignment. Right operands are
+assignment expressions so 'c ? a : b = x' parses correctly.
+@End Reasoning
+
+@Implementation:
+Parses a logical-or expression as the condition. If '?' follows, consumes it,
+parses the then-expression (a full expression up to ':'), consumes ':', parses the
+else-expression (an assignment expression), builds CPP_TERNARY_EXPR with [cond,
+then, else].
+@End Implementation
+
+Process called "parse_conditional_expression" takes parser as Integer returns Integer:
+    Note: Parse a ternary conditional expression
+
+    Let cond be proc parse_logical_or_expression with parser
+
+    Let t be proc peek_token_type with parser
+    If t is equal to TOKEN_QUESTION from Lexer:
+        proc advance_token with parser
+        Let node be proc create_cpp_ast_node with CPP_TERNARY_EXPR
+        proc add_child_to_cpp_ast_node with node, cond
+        Let then_expr be proc parse_expression with parser
+        proc add_child_to_cpp_ast_node with node, then_expr
+        proc consume_colon with parser
+        Let else_expr be proc parse_assignment_expression with parser
+        proc add_child_to_cpp_ast_node with node, else_expr
+        Return node
+    End If
+
+    Return cond
+End Process
+
+@Reasoning:
+Left-associative binary level for '||'. Each binary level follows the same
+pattern: parse the next-higher level, then loop while the level's operator(s)
+appear, folding left.
+@End Reasoning
+
+@Implementation:
+Parses logical-and as left. While '||' follows, builds a left-folded
+CPP_BINARY_EXPR with value "||".
+@End Implementation
+
+Process called "parse_logical_or_expression" takes parser as Integer returns Integer:
+    Note: Parse '||' level
+
+    Let left be proc parse_logical_and_expression with parser
+    While 1 is equal to 1:
+        Let t be proc peek_token_type with parser
+        If t is not equal to TOKEN_LOR from Lexer:
+            Break
+        End If
+        proc advance_token with parser
+        Let right be proc parse_logical_and_expression with parser
+        Set left to proc make_binary with left, right, "||"
+    End While
+    Return left
+End Process
+
+@Reasoning:
+Left-associative '&&' level above bitwise-or.
+@End Reasoning
+
+@Implementation:
+Parses bitwise-or as left; folds while '&&' follows with value "&&".
+@End Implementation
+
+Process called "parse_logical_and_expression" takes parser as Integer returns Integer:
+    Note: Parse '&&' level
+
+    Let left be proc parse_bitwise_or_expression with parser
+    While 1 is equal to 1:
+        Let t be proc peek_token_type with parser
+        If t is not equal to TOKEN_LAND from Lexer:
+            Break
+        End If
+        proc advance_token with parser
+        Let right be proc parse_bitwise_or_expression with parser
+        Set left to proc make_binary with left, right, "&&"
+    End While
+    Return left
+End Process
+
+@Reasoning:
+Bitwise '|' level above '^'.
+@End Reasoning
+
+@Implementation:
+Parses bitwise-xor; folds while '|' follows with value "|".
+@End Implementation
+
+Process called "parse_bitwise_or_expression" takes parser as Integer returns Integer:
+    Note: Parse '|' level
+
+    Let left be proc parse_bitwise_xor_expression with parser
+    While 1 is equal to 1:
+        Let t be proc peek_token_type with parser
+        If t is not equal to TOKEN_PIPE from Lexer:
+            Break
+        End If
+        proc advance_token with parser
+        Let right be proc parse_bitwise_xor_expression with parser
+        Set left to proc make_binary with left, right, "|"
+    End While
+    Return left
+End Process
+
+@Reasoning:
+Bitwise '^' level above '&'.
+@End Reasoning
+
+@Implementation:
+Parses bitwise-and; folds while '^' follows with value "^".
+@End Implementation
+
+Process called "parse_bitwise_xor_expression" takes parser as Integer returns Integer:
+    Note: Parse '^' level
+
+    Let left be proc parse_bitwise_and_expression with parser
+    While 1 is equal to 1:
+        Let t be proc peek_token_type with parser
+        If t is not equal to TOKEN_CARET from Lexer:
+            Break
+        End If
+        proc advance_token with parser
+        Let right be proc parse_bitwise_and_expression with parser
+        Set left to proc make_binary with left, right, "^"
+    End While
+    Return left
+End Process
+
+@Reasoning:
+Bitwise '&' level above equality.
+@End Reasoning
+
+@Implementation:
+Parses equality; folds while '&' follows with value "&".
+@End Implementation
+
+Process called "parse_bitwise_and_expression" takes parser as Integer returns Integer:
+    Note: Parse '&' level
+
+    Let left be proc parse_equality_expression with parser
+    While 1 is equal to 1:
+        Let t be proc peek_token_type with parser
+        If t is not equal to TOKEN_AMP from Lexer:
+            Break
+        End If
+        proc advance_token with parser
+        Let right be proc parse_equality_expression with parser
+        Set left to proc make_binary with left, right, "&"
+    End While
+    Return left
+End Process
+
+@Reasoning:
+Equality '==' / '!=' level above relational.
+@End Reasoning
+
+@Implementation:
+Parses relational; folds while '=='/'!=' follows with the matching value.
+@End Implementation
+
+Process called "parse_equality_expression" takes parser as Integer returns Integer:
+    Note: Parse '==' / '!=' level
+
+    Let left be proc parse_relational_expression with parser
+    While 1 is equal to 1:
+        Let t be proc peek_token_type with parser
+        If t is equal to TOKEN_EQ from Lexer:
+            proc advance_token with parser
+            Let r be proc parse_relational_expression with parser
+            Set left to proc make_binary with left, r, "=="
+            Continue
+        End If
+        If t is equal to TOKEN_NE from Lexer:
+            proc advance_token with parser
+            Let r2 be proc parse_relational_expression with parser
+            Set left to proc make_binary with left, r2, "!="
+            Continue
+        End If
+        Break
+    End While
+    Return left
+End Process
+
+@Reasoning:
+Relational '<' '>' '<=' '>=' and the spaceship '<=>' level above shift. Inside a
+template argument list the '<' / '>' are consumed by parse_template_argument_list,
+so here they are genuine relationals.
+@End Reasoning
+
+@Implementation:
+Parses shift; folds while a relational/spaceship operator follows with the
+matching value.
+@End Implementation
+
+Process called "parse_relational_expression" takes parser as Integer returns Integer:
+    Note: Parse '<' '>' '<=' '>=' '<=>' level
+
+    Let left be proc parse_shift_expression with parser
+    While 1 is equal to 1:
+        Let t be proc peek_token_type with parser
+        If t is equal to TOKEN_LESS from Lexer:
+            proc advance_token with parser
+            Let r be proc parse_shift_expression with parser
+            Set left to proc make_binary with left, r, "<"
+            Continue
+        End If
+        If t is equal to TOKEN_GREATER from Lexer:
+            proc advance_token with parser
+            Let r2 be proc parse_shift_expression with parser
+            Set left to proc make_binary with left, r2, ">"
+            Continue
+        End If
+        If t is equal to TOKEN_LE from Lexer:
+            proc advance_token with parser
+            Let r3 be proc parse_shift_expression with parser
+            Set left to proc make_binary with left, r3, "<="
+            Continue
+        End If
+        If t is equal to TOKEN_GE from Lexer:
+            proc advance_token with parser
+            Let r4 be proc parse_shift_expression with parser
+            Set left to proc make_binary with left, r4, ">="
+            Continue
+        End If
+        If t is equal to TOKEN_SPACESHIP from Lexer:
+            proc advance_token with parser
+            Let r5 be proc parse_shift_expression with parser
+            Set left to proc make_binary with left, r5, "<=>"
+            Continue
+        End If
+        Break
+    End While
+    Return left
+End Process
+
+@Reasoning:
+Shift '<<' '>>' level above additive.
+@End Reasoning
+
+@Implementation:
+Parses additive; folds while '<<'/'>>' follows with the matching value.
+@End Implementation
+
+Process called "parse_shift_expression" takes parser as Integer returns Integer:
+    Note: Parse '<<' '>>' level
+
+    Let left be proc parse_additive_expression with parser
+    While 1 is equal to 1:
+        Let t be proc peek_token_type with parser
+        If t is equal to TOKEN_LSHIFT from Lexer:
+            proc advance_token with parser
+            Let r be proc parse_additive_expression with parser
+            Set left to proc make_binary with left, r, "<<"
+            Continue
+        End If
+        If t is equal to TOKEN_RSHIFT from Lexer:
+            proc advance_token with parser
+            Let r2 be proc parse_additive_expression with parser
+            Set left to proc make_binary with left, r2, ">>"
+            Continue
+        End If
+        Break
+    End While
+    Return left
+End Process
+
+@Reasoning:
+Additive '+' '-' level above multiplicative.
+@End Reasoning
+
+@Implementation:
+Parses multiplicative; folds while '+'/'-' follows with the matching value.
+@End Implementation
+
+Process called "parse_additive_expression" takes parser as Integer returns Integer:
+    Note: Parse '+' '-' level
+
+    Let left be proc parse_multiplicative_expression with parser
+    While 1 is equal to 1:
+        Let t be proc peek_token_type with parser
+        If t is equal to TOKEN_PLUS from Lexer:
+            proc advance_token with parser
+            Let r be proc parse_multiplicative_expression with parser
+            Set left to proc make_binary with left, r, "+"
+            Continue
+        End If
+        If t is equal to TOKEN_MINUS from Lexer:
+            proc advance_token with parser
+            Let r2 be proc parse_multiplicative_expression with parser
+            Set left to proc make_binary with left, r2, "-"
+            Continue
+        End If
+        Break
+    End While
+    Return left
+End Process
+
+@Reasoning:
+Multiplicative '*' '/' '%' level above unary. This is the highest binary level.
+@End Reasoning
+
+@Implementation:
+Parses unary; folds while '*'/'/'/'%'  follows with the matching value.
+@End Implementation
+
+Process called "parse_multiplicative_expression" takes parser as Integer returns Integer:
+    Note: Parse '*' '/' '%' level
+
+    Let left be proc parse_unary_expression with parser
+    While 1 is equal to 1:
+        Let t be proc peek_token_type with parser
+        If t is equal to TOKEN_STAR from Lexer:
+            proc advance_token with parser
+            Let r be proc parse_unary_expression with parser
+            Set left to proc make_binary with left, r, "*"
+            Continue
+        End If
+        If t is equal to TOKEN_SLASH from Lexer:
+            proc advance_token with parser
+            Let r2 be proc parse_unary_expression with parser
+            Set left to proc make_binary with left, r2, "/"
+            Continue
+        End If
+        If t is equal to TOKEN_PERCENT from Lexer:
+            proc advance_token with parser
+            Let r3 be proc parse_unary_expression with parser
+            Set left to proc make_binary with left, r3, "%"
+            Continue
+        End If
+        Break
+    End While
+    Return left
+End Process
+
+@Reasoning:
+Builds a left-folded binary node. Centralised so every binary level shares the
+node shape [left, right] + operator value.
+@End Reasoning
+
+@Implementation:
+Creates CPP_BINARY_EXPR, sets the operator value text, appends left then right.
+@End Implementation
+
+Process called "make_binary" takes left as Integer, right as Integer, op as Integer returns Integer:
+    Note: Build a binary expression node
+
+    Let node be proc create_cpp_ast_node with CPP_BINARY_EXPR
+    proc set_cpp_ast_node_value_text with node, op
+    proc add_child_to_cpp_ast_node with node, left
+    proc add_child_to_cpp_ast_node with node, right
+    Return node
+End Process
+
+@Reasoning:
+Unary level: prefix '++ -- + - ! ~ * &', sizeof, new, delete, the named casts
+(static_cast<...>(e), etc.), and C-style casts '(type)e'. Falls through to the
+postfix level. Each prefix consumes its operator and recurses into another unary
+expression (right-assoc).
+@End Reasoning
+
+@Implementation:
+Peeks. INCREMENT/DECREMENT/PLUS/MINUS/NOT/TILDE/STAR/AMP -> consume, build a
+CPP_UNARY_EXPR with the operator value and a recursive unary operand. SIZEOF ->
+CPP_SIZEOF_EXPR over a parenthesised type/expr or a unary operand. NEW ->
+parse_new_expression. DELETE -> parse_delete_expression. The four named casts ->
+'<type>(expr)' into a CPP_CAST_EXPR. Otherwise parse_postfix_expression.
+@End Implementation
+
+Process called "parse_unary_expression" takes parser as Integer returns Integer:
+    Note: Parse a unary / prefix expression
+
+    Let t be proc peek_token_type with parser
+
+    If t is equal to TOKEN_INCREMENT from Lexer:
+        Return proc make_prefix_unary with parser, "++"
+    End If
+    If t is equal to TOKEN_DECREMENT from Lexer:
+        Return proc make_prefix_unary with parser, "--"
+    End If
+    If t is equal to TOKEN_PLUS from Lexer:
+        Return proc make_prefix_unary with parser, "+"
+    End If
+    If t is equal to TOKEN_MINUS from Lexer:
+        Return proc make_prefix_unary with parser, "-"
+    End If
+    If t is equal to TOKEN_NOT from Lexer:
+        Return proc make_prefix_unary with parser, "!"
+    End If
+    If t is equal to TOKEN_TILDE from Lexer:
+        Return proc make_prefix_unary with parser, "~"
+    End If
+    If t is equal to TOKEN_STAR from Lexer:
+        Return proc make_prefix_unary with parser, "*"
+    End If
+    If t is equal to TOKEN_AMP from Lexer:
+        Return proc make_prefix_unary with parser, "&"
+    End If
+    If t is equal to TOKEN_SIZEOF from Lexer:
+        Return proc parse_sizeof_expression with parser
+    End If
+    If t is equal to TOKEN_NEW from Lexer:
+        Return proc parse_new_expression with parser
+    End If
+    If t is equal to TOKEN_DELETE from Lexer:
+        Return proc parse_delete_expression with parser
+    End If
+    If t is equal to TOKEN_STATIC_CAST from Lexer:
+        Return proc parse_named_cast with parser, "static_cast"
+    End If
+    If t is equal to TOKEN_DYNAMIC_CAST from Lexer:
+        Return proc parse_named_cast with parser, "dynamic_cast"
+    End If
+    If t is equal to TOKEN_REINTERPRET_CAST from Lexer:
+        Return proc parse_named_cast with parser, "reinterpret_cast"
+    End If
+    If t is equal to TOKEN_CONST_CAST from Lexer:
+        Return proc parse_named_cast with parser, "const_cast"
+    End If
+
+    Return proc parse_postfix_expression with parser
+End Process
+
+@Reasoning:
+Builds a prefix unary node, consuming the operator and recursing into a unary
+operand (right-associative).
+@End Reasoning
+
+@Implementation:
+Consumes the current operator token, creates CPP_UNARY_EXPR with the operator
+value and value "prefix" semantics implied by node position, appends a recursive
+parse_unary_expression operand.
+@End Implementation
+
+Process called "make_prefix_unary" takes parser as Integer, op as Integer returns Integer:
+    Note: Build a prefix unary expression
+
+    proc advance_token with parser
+    Let node be proc create_cpp_ast_node with CPP_UNARY_EXPR
+    proc set_cpp_ast_node_value_text with node, op
+    Let operand be proc parse_unary_expression with parser
+    proc add_child_to_cpp_ast_node with node, operand
+    Return node
+End Process
+
+@Reasoning:
+Parses 'sizeof expr' or 'sizeof(type)'. Both forms are captured as a
+CPP_SIZEOF_EXPR over the operand.
+@End Reasoning
+
+@Implementation:
+Consumes 'sizeof'. If '(' follows, consumes it, parses a type specifier or an
+expression as the operand (a type if the lead is a type-start, else an
+expression), consumes ')'. Otherwise parses a unary operand.
+@End Implementation
+
+Process called "parse_sizeof_expression" takes parser as Integer returns Integer:
+    Note: Parse a sizeof expression
+
+    proc advance_token with parser  Note: 'sizeof'
+    Let node be proc create_cpp_ast_node with CPP_SIZEOF_EXPR
+
+    Let lp be proc peek_token_type with parser
+    If lp is equal to TOKEN_LPAREN from Lexer:
+        proc advance_token with parser
+        Let lead be proc peek_token_type with parser
+        Let is_ty be proc is_type_start with lead
+        If is_ty is equal to 1:
+            Let ty be proc parse_type_specifier with parser
+            proc set_cpp_ast_node_type_info with node, ty
+        Otherwise:
+            Let e be proc parse_expression with parser
+            proc add_child_to_cpp_ast_node with node, e
+        End If
+        Let rp be proc peek_token_type with parser
+        If rp is equal to TOKEN_RPAREN from Lexer:
+            proc advance_token with parser
+        End If
+    Otherwise:
+        Let operand be proc parse_unary_expression with parser
+        proc add_child_to_cpp_ast_node with node, operand
+    End If
+
+    Return node
+End Process
+
+@Reasoning:
+Parses 'new Type[args]' / 'new Type(args)' allocating a CPP_NEW_EXPR carrying the
+allocated type and any constructor arguments / array size.
+@End Reasoning
+
+@Implementation:
+Consumes 'new'. Parses the type specifier into type_info. If '(' follows parses a
+parenthesised argument list as children. If '[' follows parses the array size as
+a child. Returns the node.
+@End Implementation
+
+Process called "parse_new_expression" takes parser as Integer returns Integer:
+    Note: Parse a new expression
+
+    proc advance_token with parser  Note: 'new'
+    Let node be proc create_cpp_ast_node with CPP_NEW_EXPR
+
+    Let ty be proc parse_type_specifier with parser
+    proc set_cpp_ast_node_type_info with node, ty
+
+    Let nxt be proc peek_token_type with parser
+    If nxt is equal to TOKEN_LBRACKET from Lexer:
+        proc advance_token with parser
+        Let size be proc parse_expression with parser
+        proc add_child_to_cpp_ast_node with node, size
+        Let rb be proc peek_token_type with parser
+        If rb is equal to TOKEN_RBRACKET from Lexer:
+            proc advance_token with parser
+        End If
+    End If
+    If nxt is equal to TOKEN_LPAREN from Lexer:
+        Let args be proc parse_call_arguments with parser
+        proc add_child_to_cpp_ast_node with node, args
+    End If
+
+    Return node
+End Process
+
+@Reasoning:
+Parses 'delete expr' / 'delete[] expr' as CPP_DELETE_EXPR over the operand,
+recording the array form via the value tag.
+@End Reasoning
+
+@Implementation:
+Consumes 'delete'. If '[' ']' follows, consumes the pair and tags "array".
+Parses a unary operand as a child.
+@End Implementation
+
+Process called "parse_delete_expression" takes parser as Integer returns Integer:
+    Note: Parse a delete expression
+
+    proc advance_token with parser  Note: 'delete'
+    Let node be proc create_cpp_ast_node with CPP_DELETE_EXPR
+
+    Let lb be proc peek_token_type with parser
+    If lb is equal to TOKEN_LBRACKET from Lexer:
+        proc advance_token with parser
+        Let rb be proc peek_token_type with parser
+        If rb is equal to TOKEN_RBRACKET from Lexer:
+            proc advance_token with parser
+        End If
+        proc set_cpp_ast_node_value_text with node, "array"
+    End If
+
+    Let operand be proc parse_unary_expression with parser
+    proc add_child_to_cpp_ast_node with node, operand
+    Return node
+End Process
+
+@Reasoning:
+Parses a named cast 'cast<type>(expr)'. The cast kind is the value tag, the
+target type is type_info, the operand is a child.
+@End Reasoning
+
+@Implementation:
+Consumes the cast keyword. Expects '<', parses a type specifier into type_info,
+expects '>'. Expects '(', parses the operand expression child, expects ')'.
+Builds CPP_CAST_EXPR with the cast-kind value.
+@End Implementation
+
+Process called "parse_named_cast" takes parser as Integer, kind as Integer returns Integer:
+    Note: Parse a C++ named cast
+
+    proc advance_token with parser  Note: cast keyword
+    Let node be proc create_cpp_ast_node with CPP_CAST_EXPR
+    proc set_cpp_ast_node_value_text with node, kind
+
+    Let lt be proc peek_token_type with parser
+    If lt is equal to TOKEN_LESS from Lexer:
+        proc advance_token with parser
+    End If
+    Let ty be proc parse_type_specifier with parser
+    proc set_cpp_ast_node_type_info with node, ty
+    Let gt be proc peek_token_type with parser
+    If gt is equal to TOKEN_GREATER from Lexer:
+        proc advance_token with parser
+    End If
+
+    Let lp be proc peek_token_type with parser
+    If lp is equal to TOKEN_LPAREN from Lexer:
+        proc advance_token with parser
+        Let operand be proc parse_expression with parser
+        proc add_child_to_cpp_ast_node with node, operand
+        Let rp be proc peek_token_type with parser
+        If rp is equal to TOKEN_RPAREN from Lexer:
+            proc advance_token with parser
+        End If
+    End If
+
+    Return node
+End Process
+
+@Reasoning:
+Postfix level: a primary expression followed by any run of call '(...)', subscript
+'[...]', member '.x', arrow '->x', scope '::x', and postfix '++'/'--'. Folds
+left so 'a.b()[i]->c' chains correctly. Scope resolution is handled here so
+'Class::method()' and 'std::vector<int>' resolve.
+@End Reasoning
+
+@Implementation:
+Parses a primary. Loops: '(' -> CPP_CALL_EXPR wrapping the callee with an argument
+list child; '[' -> CPP_SUBSCRIPT_EXPR with [object, index]; '.' -> CPP_MEMBER_EXPR
+with the member name; '->' -> CPP_ARROW_EXPR with the member name; '::' ->
+CPP_SCOPE_RESOLUTION with the qualified name; INCREMENT/DECREMENT ->
+CPP_POSTFIX_EXPR. Each iteration consumes tokens, guaranteeing progress; the loop
+breaks when no postfix operator follows.
+@End Implementation
+
+Process called "parse_postfix_expression" takes parser as Integer returns Integer:
+    Note: Parse a postfix expression chain
+
+    Let expr be proc parse_primary_expression with parser
+
+    While 1 is equal to 1:
+        Let t be proc peek_token_type with parser
+
+        If t is equal to TOKEN_LPAREN from Lexer:
+            Let args be proc parse_call_arguments with parser
+            Let call be proc create_cpp_ast_node with CPP_CALL_EXPR
+            proc add_child_to_cpp_ast_node with call, expr
+            proc add_child_to_cpp_ast_node with call, args
+            Set expr to call
+            Continue
+        End If
+        If t is equal to TOKEN_LBRACKET from Lexer:
+            proc advance_token with parser
+            Let index be proc parse_expression with parser
+            Let sub be proc create_cpp_ast_node with CPP_SUBSCRIPT_EXPR
+            proc add_child_to_cpp_ast_node with sub, expr
+            proc add_child_to_cpp_ast_node with sub, index
+            Let rb be proc peek_token_type with parser
+            If rb is equal to TOKEN_RBRACKET from Lexer:
+                proc advance_token with parser
+            End If
+            Set expr to sub
+            Continue
+        End If
+        If t is equal to TOKEN_DOT from Lexer:
+            proc advance_token with parser
+            Let member be proc create_cpp_ast_node with CPP_MEMBER_EXPR
+            proc add_child_to_cpp_ast_node with member, expr
+            Let mname be proc peek_token_lexeme with parser
+            proc set_cpp_ast_node_name with member, mname
+            proc advance_token with parser
+            Set expr to member
+            Continue
+        End If
+        If t is equal to TOKEN_ARROW from Lexer:
+            proc advance_token with parser
+            Let amember be proc create_cpp_ast_node with CPP_ARROW_EXPR
+            proc add_child_to_cpp_ast_node with amember, expr
+            Let aname be proc peek_token_lexeme with parser
+            proc set_cpp_ast_node_name with amember, aname
+            proc advance_token with parser
+            Set expr to amember
+            Continue
+        End If
+        If t is equal to TOKEN_SCOPE from Lexer:
+            proc advance_token with parser
+            Let scope be proc create_cpp_ast_node with CPP_SCOPE_RESOLUTION
+            proc add_child_to_cpp_ast_node with scope, expr
+            Let sname be proc peek_token_lexeme with parser
+            proc set_cpp_ast_node_name with scope, sname
+            Let it be proc peek_token_type with parser
+            If it is equal to TOKEN_IDENTIFIER from Lexer:
+                proc advance_token with parser
+            End If
+            Set expr to scope
+            Continue
+        End If
+        If t is equal to TOKEN_INCREMENT from Lexer:
+            proc advance_token with parser
+            Let post be proc create_cpp_ast_node with CPP_POSTFIX_EXPR
+            proc set_cpp_ast_node_value_text with post, "++"
+            proc add_child_to_cpp_ast_node with post, expr
+            Set expr to post
+            Continue
+        End If
+        If t is equal to TOKEN_DECREMENT from Lexer:
+            proc advance_token with parser
+            Let post2 be proc create_cpp_ast_node with CPP_POSTFIX_EXPR
+            proc set_cpp_ast_node_value_text with post2, "--"
+            proc add_child_to_cpp_ast_node with post2, expr
+            Set expr to post2
+            Continue
+        End If
+
+        Break
+    End While
+
+    Return expr
+End Process
+
+@Reasoning:
+Parses a call argument list '(a, b, ...)' into a CPP_TEMPLATE_ARG_LIST-shaped
+node (reused as a generic argument list). Each argument is an assignment
+expression.
+@End Reasoning
+
+@Implementation:
+Consumes '('. Loops collecting assignment expressions separated by commas until
+')'. Forward-progress guarded. Consumes ')'.
+@End Implementation
+
+Process called "parse_call_arguments" takes parser as Integer returns Integer:
+    Note: Parse a call argument list
+
+    Let node be proc create_cpp_ast_node with CPP_TEMPLATE_ARG_LIST
+
+    Let lp be proc peek_token_type with parser
+    If lp is equal to TOKEN_LPAREN from Lexer:
+        proc advance_token with parser
+    End If
+
+    While 1 is equal to 1:
+        Let t be proc peek_token_type with parser
+        If t is equal to TOKEN_RPAREN from Lexer:
+            proc advance_token with parser
+            Break
+        End If
+        If t is equal to TOKEN_EOF from Lexer:
+            Break
+        End If
+
+        Let before be proc lexer_position with parser
+        Let arg be proc parse_assignment_expression with parser
+        If arg is not equal to 0:
+            proc add_child_to_cpp_ast_node with node, arg
+        End If
+
+        Let comma be proc peek_token_type with parser
+        If comma is equal to TOKEN_COMMA from Lexer:
+            proc advance_token with parser
+        End If
+
+        Let after be proc lexer_position with parser
+        If after is equal to before:
+            proc advance_token with parser
+        End If
+    End While
+
+    Return node
+End Process
+
+@Reasoning:
+Primary expressions: parenthesised expressions, literals (int/float/char/string/
+bool/nullptr), 'this', identifiers (with leading '::' for global scope), and
+lambdas '[capture](params){body}'. Every path consumes at least one token; an
+unrecognised lead consumes one token and yields a fallback identifier node carrying
+that token's lexeme so the postfix/binary loops always progress.
+@End Reasoning
+
+@Implementation:
+Peeks. '(' -> parse a parenthesised expression, ')'. '[' -> lambda. Literal tokens
+-> CPP_LITERAL_EXPR with the lexeme and a kind tag. THIS -> CPP_THIS_EXPR. TRUE/
+FALSE/NULLPTR -> CPP_LITERAL_EXPR. SCOPE '::' lead -> consume and parse the
+following identifier as a global-qualified identifier. IDENTIFIER ->
+CPP_IDENTIFIER_EXPR with the name; a following '<' that begins a template-id is
+left to the postfix/relational layers. Default: consume one token, return an
+identifier node with the lexeme (keeps progress).
+@End Implementation
+
+Process called "parse_primary_expression" takes parser as Integer returns Integer:
+    Note: Parse a primary expression
+
+    Let t be proc peek_token_type with parser
+
+    If t is equal to TOKEN_LPAREN from Lexer:
+        proc advance_token with parser
+        Let inner be proc parse_expression with parser
+        Let rp be proc peek_token_type with parser
+        If rp is equal to TOKEN_RPAREN from Lexer:
+            proc advance_token with parser
+        End If
+        Let paren be proc create_cpp_ast_node with CPP_PAREN_EXPR
+        proc add_child_to_cpp_ast_node with paren, inner
+        Return paren
+    End If
+
+    If t is equal to TOKEN_LBRACKET from Lexer:
+        Return proc parse_lambda_expression with parser
+    End If
+
+    If t is equal to TOKEN_INTEGER from Lexer:
+        Return proc make_literal with parser, "integer"
+    End If
+    If t is equal to TOKEN_FLOAT_LITERAL from Lexer:
+        Return proc make_literal with parser, "float"
+    End If
+    If t is equal to TOKEN_STRING_LITERAL from Lexer:
+        Return proc make_literal with parser, "string"
+    End If
+    If t is equal to TOKEN_CHAR_LITERAL from Lexer:
+        Return proc make_literal with parser, "char"
+    End If
+    If t is equal to TOKEN_TRUE from Lexer:
+        Return proc make_literal with parser, "bool"
+    End If
+    If t is equal to TOKEN_FALSE from Lexer:
+        Return proc make_literal with parser, "bool"
+    End If
+    If t is equal to TOKEN_NULLPTR from Lexer:
+        Return proc make_literal with parser, "nullptr"
+    End If
+    If t is equal to TOKEN_THIS from Lexer:
+        proc advance_token with parser
+        Return proc create_cpp_ast_node with CPP_THIS_EXPR
+    End If
+
+    If t is equal to TOKEN_SCOPE from Lexer:
+        proc advance_token with parser  Note: leading '::'
+        Let gid be proc create_cpp_ast_node with CPP_IDENTIFIER_EXPR
+        Let gname be proc peek_token_lexeme with parser
+        proc set_cpp_ast_node_name with gid, gname
+        Let it be proc peek_token_type with parser
+        If it is equal to TOKEN_IDENTIFIER from Lexer:
+            proc advance_token with parser
+        End If
+        Return gid
+    End If
+
+    If t is equal to TOKEN_IDENTIFIER from Lexer:
+        Let node be proc create_cpp_ast_node with CPP_IDENTIFIER_EXPR
+        Let name be proc peek_token_lexeme with parser
+        proc set_cpp_ast_node_name with node, name
+        proc advance_token with parser
+        Return node
+    End If
+
+    Note: Unrecognised lead - consume one token, emit a fallback identifier carrying
+    Note: its lexeme so the surrounding loops keep making progress.
+    Let fallback be proc create_cpp_ast_node with CPP_IDENTIFIER_EXPR
+    Let flex be proc peek_token_lexeme with parser
+    proc set_cpp_ast_node_name with fallback, flex
+    Let cur be proc peek_token_type with parser
+    If cur is not equal to TOKEN_EOF from Lexer:
+        proc advance_token with parser
+    End If
+    Return fallback
+End Process
+
+@Reasoning:
+Builds a literal node from the current token, capturing its lexeme and a kind tag,
+then consuming the token.
+@End Reasoning
+
+@Implementation:
+Creates CPP_LITERAL_EXPR, copies the current lexeme into the name slot (the
+literal text), sets the value to the kind tag, advances.
+@End Implementation
+
+Process called "make_literal" takes parser as Integer, kind as Integer returns Integer:
+    Note: Build a literal expression node
+
+    Let node be proc create_cpp_ast_node with CPP_LITERAL_EXPR
+    Let lexeme be proc peek_token_lexeme with parser
+    proc set_cpp_ast_node_name with node, lexeme
+    proc set_cpp_ast_node_value_text with node, kind
+    proc advance_token with parser
+    Return node
+End Process
+
+@Reasoning:
+Parses a lambda '[capture](params) [-> ret] { body }'. The capture list, parameter
+list, optional return type, and body are children/slots so HIR can reproduce the
+closure.
+@End Reasoning
+
+@Implementation:
+Consumes '['. Collects capture entries (each an identifier, '&', '=', or 'this')
+into a CPP_CAPTURE_LIST until ']'. If '(' follows parses the parameter list. If
+'->' follows parses the return type into type_info. Parses the '{' body via
+parse_compound_statement. Forward-progress guarded inside the capture loop.
+@End Implementation
+
+Process called "parse_lambda_expression" takes parser as Integer returns Integer:
+    Note: Parse a lambda expression
+
+    proc advance_token with parser  Note: '['
+    Let node be proc create_cpp_ast_node with CPP_LAMBDA
+
+    Let captures be proc create_cpp_ast_node with CPP_CAPTURE_LIST
+    While 1 is equal to 1:
+        Let t be proc peek_token_type with parser
+        If t is equal to TOKEN_RBRACKET from Lexer:
+            proc advance_token with parser
+            Break
+        End If
+        If t is equal to TOKEN_EOF from Lexer:
+            Break
+        End If
+
+        Let before be proc lexer_position with parser
+
+        If t is equal to TOKEN_IDENTIFIER from Lexer:
+            Let cap be proc create_cpp_ast_node with CPP_CAPTURE
+            Let cname be proc peek_token_lexeme with parser
+            proc set_cpp_ast_node_name with cap, cname
+            proc advance_token with parser
+            proc add_child_to_cpp_ast_node with captures, cap
+        Otherwise:
+            If t is equal to TOKEN_AMP from Lexer:
+                proc advance_token with parser
+                Let capr be proc create_cpp_ast_node with CPP_CAPTURE
+                proc set_cpp_ast_node_value_text with capr, "by_reference"
+                proc add_child_to_cpp_ast_node with captures, capr
+            Otherwise:
+                If t is equal to TOKEN_ASSIGN from Lexer:
+                    proc advance_token with parser
+                    Let capc be proc create_cpp_ast_node with CPP_CAPTURE
+                    proc set_cpp_ast_node_value_text with capc, "by_value"
+                    proc add_child_to_cpp_ast_node with captures, capc
+                Otherwise:
+                    If t is equal to TOKEN_THIS from Lexer:
+                        proc advance_token with parser
+                        Let capt be proc create_cpp_ast_node with CPP_CAPTURE
+                        proc set_cpp_ast_node_value_text with capt, "this"
+                        proc add_child_to_cpp_ast_node with captures, capt
+                    End If
+                End If
+            End If
+        End If
+
+        Let comma be proc peek_token_type with parser
+        If comma is equal to TOKEN_COMMA from Lexer:
+            proc advance_token with parser
+        End If
+
+        Let after be proc lexer_position with parser
+        If after is equal to before:
+            proc advance_token with parser
+        End If
+    End While
+    proc add_child_to_cpp_ast_node with node, captures
+
+    Let lp be proc peek_token_type with parser
+    If lp is equal to TOKEN_LPAREN from Lexer:
+        Let params be proc parse_parameter_list with parser
+        proc add_child_to_cpp_ast_node with node, params
+    End If
+
+    Let arrow be proc peek_token_type with parser
+    If arrow is equal to TOKEN_ARROW from Lexer:
+        proc advance_token with parser
+        Let ret be proc parse_type_specifier with parser
+        proc set_cpp_ast_node_type_info with node, ret
+    End If
+
+    Let brace be proc peek_token_type with parser
+    If brace is equal to TOKEN_LBRACE from Lexer:
+        Let body be proc parse_compound_statement with parser
+        proc add_child_to_cpp_ast_node with node, body
+    End If
+
+    Return node
 End Process
