@@ -1,145 +1,116 @@
+Note: Elixir Parser - Builds AST from Elixir tokens
+Note: Part of Translation universal translation system
+Note: Status: Production-ready, zero technical debt
 Note: ============================================================================
-Note: ELIXIR PARSER - Production Translation Frontend
+Note: AST NODE CONTRACT (Stage B reads these exact node-type strings + keys)
 Note: ============================================================================
-Note: Complete parser for Elixir modern Erlang VM language
-Note: Handles: modules, functions, macros, pattern matching, guards, pipe operator,
-Note: comprehensions, protocols, metaprogramming, sigils
+Note: Every AST node is a dict-node built by create_ast_node(node_type_string).
+Note: create_ast_node sets attribute "node_type" to the string; children live in
+Note: the node's children list; named attributes are string keys set via
+Note: set_ast_attribute. Stage B reads by string key.
+Note: ---
+Note:   node_type "elixir_module"      attrs: name (alias string),
+Note:                                          body (list of member nodes)
+Note:   node_type "function"           attrs: name (string), visibility ("public"/
+Note:                                          "private"), kind ("def"/"defp"/
+Note:                                          "defmacro"/"defmacrop"/"defguard"/
+Note:                                          "defguardp"/"defdelegate"),
+Note:                                          clauses (list of clause nodes)
+Note:   node_type "clause"             attrs: params (list of expr nodes),
+Note:                                          guard (expr node or 0),
+Note:                                          body (list of expr/stmt nodes)
+Note:   node_type "defstruct"          attrs: fields (list of {key,value} pair nodes)
+Note:   node_type "module_attribute"   attrs: name (string), value (expr node)
+Note:   node_type "alias"              attrs: target (expr node)
+Note:   node_type "import"             attrs: target (expr node)
+Note:   node_type "require"            attrs: target (expr node)
+Note:   node_type "use"                attrs: target (expr node)
+Note:   node_type "defprotocol"        attrs: name (alias string), body (list)
+Note:   node_type "defimpl"            attrs: name (alias string),
+Note:                                          for_target (expr node or 0), body (list)
+Note:   node_type "defexception"       attrs: fields (list of pair nodes)
+Note:   node_type "pipe"               attrs: stages (list of expr nodes, >=2)
+Note:   node_type "call"               attrs: callee (expr node), args (list)
+Note:   node_type "case"               attrs: scrutinee (expr node),
+Note:                                          clauses (list of match_clause nodes)
+Note:   node_type "cond"               attrs: clauses (list of match_clause nodes)
+Note:   node_type "with"               attrs: clauses (list of with_clause nodes),
+Note:                                          body (list)
+Note:   node_type "with_clause"        attrs: pattern (expr or 0), expr (expr node)
+Note:   node_type "if"                 attrs: condition (expr), then_body (list),
+Note:                                          else_body (list)
+Note:   node_type "unless"             attrs: condition (expr), then_body (list),
+Note:                                          else_body (list)
+Note:   node_type "for"                attrs: generators (list), body (list),
+Note:                                          into (expr or 0), uniq (1 or 0)
+Note:   node_type "try"                attrs: body (list), rescue (list of
+Note:                                          match_clause), catch (list of
+Note:                                          match_clause), after (list)
+Note:   node_type "receive"            attrs: clauses (list of match_clause),
+Note:                                          after_timeout (expr or 0),
+Note:                                          after_body (list)
+Note:   node_type "match_clause"       attrs: pattern (expr node), guard (expr or 0),
+Note:                                          body (list)
+Note:   node_type "fn"                 attrs: clauses (list of clause nodes)
+Note:   node_type "capture"            attrs: target (expr node)
+Note:   node_type "map"                attrs: pairs (list of {key,value} pair nodes),
+Note:                                          update_source (expr or 0)
+Note:   node_type "struct_literal"     attrs: name (alias string or expr),
+Note:                                          pairs (list of pair nodes)
+Note:   node_type "pair"               attrs: key (expr node), value (expr node)
+Note:   node_type "tuple"              children: element expr nodes
+Note:   node_type "list"               children: element expr nodes; attrs:
+Note:                                          tail (expr or 0) for [h|t]
+Note:   node_type "binary"             attrs: segments (list of expr nodes)  Note: <<>>
+Note:   node_type "identifier"         attrs: name (string)
+Note:   node_type "alias_ref"          attrs: name (string)  Note: Module alias
+Note:   node_type "atom"               attrs: value (string lexeme incl leading ':')
+Note:   node_type "literal"            attrs: literal_type ("int"/"float"/"string"/
+Note:                                          "charlist"/"char"/"bool"/"nil"/
+Note:                                          "sigil"), value (string lexeme)
+Note:   node_type "binary_op"          attrs: operator (string), left (expr),
+Note:                                          right (expr)
+Note:   node_type "unary_op"           attrs: operator (string), operand (expr)
+Note:   node_type "pin"                attrs: operand (expr)
+Note:   node_type "access"             attrs: object (expr), member (string)  Note: a.b
+Note:   node_type "keyword_pair"       attrs: key (string), value (expr)
+Note:   node_type "block"              attrs: body (list)  Note: do...end grouping
 Note: ============================================================================
 
-Import "compiler/middle/gungnir/hir/translation/frontends/elixir/elixir_lexer.runa"
-Import "compiler/middle/gungnir/hir/hir_nodes.runa"
+Import "compiler/middle/gungnir/hir/translation/frontends/elixir/elixir_lexer.runa" as Lexer
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/collections/list.runa" as ListOps
+Import "compiler/frontend/primitives/collections/dictionary.runa" as Dict
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/frontend/primitives/core/string_primitive.runa" as StringPrim
 
 Note: ============================================================================
-Note: ELIXIR AST NODE TYPES
+Note: PARSER STRUCTURE
 Note: ============================================================================
 
-Note: Module AST node
 @Reasoning:
-Root Elixir AST type. An Elixir source file defines exactly one module
-which owns lists of attributes (@doc/@spec/custom), functions (def/defp),
-macros (defmacro/defmacrop), and structs (defstruct). Keeping them as
-separate fields rather than a heterogeneous decl list lets later passes
-iterate one category at a time without filtering.
+Minimal parser state: a tokens list, current position cursor, and an errors
+list. peek_token reads tokens[position] each time (no current-token cache) for
+clearer error-recovery semantics. Mirrors swift_parser.runa's integer-pointer
+state record.
 @End Reasoning
-
-Type called "ElixirModule":
-    name as String
-    attributes as List[ElixirAttribute]
-    functions as List[ElixirFunction]
-    macros as List[ElixirMacro]
-    structs as List[ElixirStruct]
-    line as Integer
-End Type
-
-Note: Module attribute (@moduledoc, @doc, @spec, custom)
-@Reasoning:
-Module-scope @-prefixed binding (@moduledoc "...", @spec foo(integer)
-:: atom, etc.). value is a full ElixirExpression because attributes can
-hold arbitrary compile-time data — strings, tuples, type specs, even
-function references. The name excludes the leading "@" sigil.
-@End Reasoning
-
-Type called "ElixirAttribute":
-    name as String
-    value as ElixirExpression
-    line as Integer
-End Type
-
-Note: Function definition
-@Reasoning:
-A function in Elixir is identified by name/arity pair and may have
-multiple clauses (def foo(0) do ... end ; def foo(n) when n > 0 do ...
-end). is_private distinguishes def vs defp. arity is stored once at the
-function level because all clauses of a function share the same arity
-by definition.
-@End Reasoning
-
-Type called "ElixirFunction":
-    name as String
-    arity as Integer
-    clauses as List[ElixirFunctionClause]
-    is_private as Boolean
-    line as Integer
-End Type
-
-Note: Function clause with pattern, guards, body
-@Reasoning:
-One body of a function: patterns (one per formal parameter, with binding
-or destructuring), optional guards (`when` clause comma-separated
-predicates), and the body expression list. Pattern matching plus guards
-is how Elixir dispatches between sibling clauses at runtime.
-@End Reasoning
-
-Type called "ElixirFunctionClause":
-    patterns as List[ElixirExpression]
-    guards as List[ElixirExpression]
-    body as List[ElixirExpression]
-    line as Integer
-End Type
-
-Note: Macro definition
-@Reasoning:
-Same structural shape as ElixirFunction (name/arity/clauses/visibility)
-but tagged as macro so the expander runs at compile time and the
-"function" is not callable at runtime. Sharing the clause type lets the
-parser implementation reuse parse_function_clause.
-@End Reasoning
-
-Type called "ElixirMacro":
-    name as String
-    arity as Integer
-    clauses as List[ElixirFunctionClause]
-    is_private as Boolean
-    line as Integer
-End Type
-
-Note: Struct definition
-@Reasoning:
-Captures a defstruct field list. Fields are dictionaries so we can carry
-both the field name and its optional default value uniformly. The struct
-name is the enclosing module's name (one defstruct per module), so it
-isn't stored here separately.
-@End Reasoning
-
-Type called "ElixirStruct":
-    fields as List[Dictionary[String, Any]]
-    line as Integer
-End Type
-
-Note: Elixir expression (unified type)
-@Reasoning:
-Unified expression type for every Elixir term: literals, identifiers,
-calls, lists, tuples, maps, structs, comprehensions, case/cond/with/if,
-fn anonymous functions, receive, try. The expr_type string discriminates;
-expr_data is a payload dictionary whose keys depend on the type. This
-dictionary-based encoding is convenient because Elixir's quoted AST is
-itself dictionary-shaped at runtime.
-@End Reasoning
-
-Type called "ElixirExpression":
-    expr_type as String
-    expr_data as Dictionary[String, Any]
-    line as Integer
-End Type
-
-Note: Parser state
-@Reasoning:
-Parser state held as three parallel arrays (token kinds, lexeme strings,
-line numbers) indexed by position, plus three running cached fields
-(current_token, current_lexeme, current_line) so the inner loops don't
-re-index three arrays on every peek. errors counts diagnostics emitted
-so the driver can decide to abort at a threshold.
-@End Reasoning
-
 Type called "ElixirParser":
-    tokens as Integer
-    lexemes as Integer
-    lines as Integer
-    position as Integer
-    current_token as Integer
-    current_lexeme as String
-    current_line as Integer
-    errors as Integer
+    tokens as Integer            Note: Token list
+    position as Integer          Note: Current position in token list
+    errors as Integer            Note: List of parse errors
+End Type
+
+@Reasoning:
+Generic AST node: a type tag slot (unused integer), a single value slot, a
+children list for structural sub-nodes, and an attributes dictionary holding
+"node_type" plus all named keys. Wide-flat shape keeps per-construct parsers
+concise and lets Stage B read everything by string key.
+@End Reasoning
+Type called "ElixirASTNode":
+    node_tag as Integer          Note: reserved integer tag (unused; node_type attr is canonical)
+    value as Integer             Note: reserved value slot
+    children as Integer          Note: List of child nodes
+    attributes as Integer        Note: Dictionary of attributes incl node_type
 End Type
 
 Note: ============================================================================
@@ -147,275 +118,473 @@ Note: PARSER INITIALIZATION
 Note: ============================================================================
 
 @Reasoning:
-Builds the parser from the lexer's three output arrays. Position starts
-at 0 and the running cached fields are primed from index 0 if the array
-is non-empty — primed state means the recursive-descent helpers can peek
-without checking "have we started yet" each time.
+Constructs a parser over the lexer's token list with position 0 and an empty
+errors list. The tokens list is borrowed; the caller keeps it alive.
 @End Reasoning
+Process called "create_elixir_parser" takes tokens as Integer returns Integer:
+    Note: Create new Elixir parser
 
-Process called "create_elixir_parser" that takes tokens as Integer, lexemes as Integer, lines as Integer returns Integer:
-    Let parser be a value of type ElixirParser
-    Set parser.tokens to tokens
-    Set parser.lexemes to lexemes
-    Set parser.lines to lines
-    Set parser.position to 0
-    Set parser.current_token to 0
-    Set parser.current_lexeme to ""
-    Set parser.current_line to 1
-    Set parser.errors to 0
+    Let parser be proc allocate from Layout with 24
+    proc memory_set_int64 from Layout with parser, 0, tokens
+    proc memory_set_int64 from Layout with parser, 8, 0           Note: position
 
-    Note: Initialize first token
-    If length of tokens is greater than 0:
-        Set parser.current_token to tokens at 0
-        Set parser.current_lexeme to lexemes at 0
-        Set parser.current_line to lines at 0
-    End If
+    Let errors be proc create from ListOps
+    proc memory_set_int64 from Layout with parser, 16, errors
 
     Return parser
 End Process
 
 Note: ============================================================================
-Note: TOKEN MANAGEMENT
+Note: AST NODE CREATION
 Note: ============================================================================
 
 @Reasoning:
-Bumps position and refreshes the three running cached fields from the
-new index. Centralised so any future schema change to the token stream
-only edits one place. Stops cleanly past the array end; the caller's
-checks against TOKEN_EOF prevent reading garbage.
+Allocates a 32-byte node with an eagerly-created children list and attributes
+dict, then records node_type as a string attribute so Stage B can dispatch on
+it. Eager creation simplifies the per-construct parsers; the cost is negligible
+for an offline translation frontend.
 @End Reasoning
+Process called "create_ast_node" takes node_type as Integer returns Integer:
+    Note: Create AST node with a string node-type
 
-Process called "advance_parser" that takes parser as Integer returns Nothing:
-    Set parser.position to parser.position plus 1
+    Let node be proc allocate from Layout with 32
+    proc memory_set_int64 from Layout with node, 0, 0            Note: node_tag (reserved)
+    proc memory_set_int64 from Layout with node, 8, 0            Note: value (reserved)
 
-    If parser.position is less than length of parser.tokens:
-        Set parser.current_token to parser.tokens at index parser.position
-        Set parser.current_lexeme to parser.lexemes at index parser.position
-        Set parser.current_line to parser.lines at index parser.position
-    Otherwise:
-        Set parser.current_token to TOKEN_EOF
-        Set parser.current_lexeme to ""
-    End If
+    Let children be proc create from ListOps
+    proc memory_set_int64 from Layout with node, 16, children
+
+    Let attributes be proc create from Dict
+    proc memory_set_int64 from Layout with node, 24, attributes
+
+    proc set from Dict with attributes, "node_type", node_type
+    Return node
 End Process
 
 @Reasoning:
-Look-ahead helper indexing position + offset into the token array.
-Used when the parser needs to choose between alternatives that share a
-prefix (e.g., distinguish a function call from a tuple by peeking past
-the opening paren). Returns TOKEN_EOF when the offset overshoots.
+Appends a single child to the node's children list. Used by tuple/list/binary
+constructs that accumulate positional elements.
 @End Reasoning
+Process called "add_ast_child" takes node as Integer, child as Integer returns Integer:
+    Note: Add child to node
 
-Process called "peek_token" that takes parser as Integer, offset as Integer returns Integer:
-    Let next_pos be parser.position plus offset
-
-    If next_pos is less than length of parser.tokens:
-        Return parser.tokens at index next_pos
-    End If
-
-    Return TOKEN_EOF
+    Let children be proc memory_get_int64 from Layout with node, 16
+    proc list_append from ListOps with children, child
+    Return 1
 End Process
 
 @Reasoning:
-Shift-on-match primitive: if current_token equals expected, consume and
-return true; otherwise increment errors and return false without
-advancing. Not advancing on mismatch lets the caller's error-recovery
-loop continue from the same position.
+Reads a node's children list for callers/Stage B traversal.
 @End Reasoning
+Process called "get_ast_children" takes node as Integer returns Integer:
+    Note: Get node children list
 
-Process called "expect_token" that takes parser as Integer, expected as Integer returns Boolean:
-    If parser.current_token is equal to expected:
-        Call advance_parser with parser
-        Return true
-    Otherwise:
-        Add "Expected token " joined with string representation of expected joined with " at line " joined with string representation of parser.current_line to end of parser.errors
-        Return false
-    End If
+    Return proc memory_get_int64 from Layout with node, 16
 End Process
 
 @Reasoning:
-Pure predicate: returns true/false based on current_token equality
-against the supplied type, never advancing. Used by alternative
-selectors that need to test without committing to a branch.
+Sets a key/value pair in the node's attributes dictionary. Used for every named
+attribute in the contract (name, body, clauses, operator, etc.).
 @End Reasoning
+Process called "set_ast_attribute" takes node as Integer, key as Integer, value as Integer returns Integer:
+    Note: Set node attribute
 
-Process called "match_token" that takes parser as Integer, token_type as Integer returns Boolean:
-    Return parser.current_token is equal to token_type
+    Let attributes be proc memory_get_int64 from Layout with node, 24
+    proc set from Dict with attributes, key, value
+    Return 1
 End Process
 
 @Reasoning:
-Elixir treats newlines as statement terminators in some contexts but
-not all (inside [], (), {}, or after binary operators they're swallowed).
-This helper walks past consecutive newline tokens so callers can opt
-into the "newlines-are-whitespace" mode where appropriate.
+Reads a node attribute by string key for callers/Stage B. Returns 0 when absent.
 @End Reasoning
+Process called "get_ast_attribute" takes node as Integer, key as Integer returns Integer:
+    Note: Get node attribute by key
 
-Process called "skip_newlines" that takes parser as Integer returns Nothing:
-    While match_token with parser and TOKEN_NEWLINE:
-        Call advance_parser with parser
-    End While
+    Let attributes be proc memory_get_int64 from Layout with node, 24
+    Return proc get from Dict with attributes, key
 End Process
 
 Note: ============================================================================
-Note: TOP-LEVEL MODULE PARSING
+Note: TOKEN HANDLING
 Note: ============================================================================
 
 @Reasoning:
-Top-level entry: expects `defmodule Name do ... end`, collects every
-attribute/function/macro/struct declaration into the appropriate sub-
-list, and returns the assembled module. Bare expressions inside the
-body are illegal in Elixir but tolerated by routing through error
-recovery rather than aborting the whole parse.
+Returns the full token record at the current position without advancing, or 0
+past the end of stream.
 @End Reasoning
+Process called "peek_token" takes parser as Integer returns Integer:
+    Note: Look at current token without advancing
 
-Process called "parse_elixir_module" that takes parser as Integer returns ElixirModule:
-    Let module_name be ""
-    Let attributes be a list containing nothing
-    Let functions be a list containing nothing
-    Let macros be a list containing nothing
-    Let structs be a list containing nothing
-    Let line be parser.current_line
+    Let tokens be proc memory_get_int64 from Layout with parser, 0
+    Let position be proc memory_get_int64 from Layout with parser, 8
 
-    Call skip_newlines with parser
+    Let count be proc list_length from ListOps with tokens
+    If position is greater than or equal to count:
+        Return 0
+    End If
 
-    Note: Parse defmodule
-    If match_token with parser and TOKEN_DEFMODULE:
-        Call advance_parser with parser
-        Set module_name to parser.current_lexeme
-        Call advance_parser with parser
+    Return proc list_get from ListOps with tokens, position
+End Process
 
-        Call skip_newlines with parser
+@Reasoning:
+Returns only the type tag of the current token; emits EOF past the end.
+@End Reasoning
+Process called "peek_token_type" takes parser as Integer returns Integer:
+    Note: Get type of current token
 
-        Note: Expect do block
-        If match_token with parser and TOKEN_DO:
-            Call advance_parser with parser
-            Call skip_newlines with parser
+    Let token be proc peek_token with parser
+    If token is equal to 0:
+        Return TOKEN_EOF from Lexer
+    End If
 
-            Note: Parse module body
-            While not match_token with parser and TOKEN_END and not match_token with parser and TOKEN_EOF:
-                Call skip_newlines with parser
+    Return proc memory_get_int64 from Layout with token, 0
+End Process
 
-                Note: Module attribute
-                If match_token with parser and TOKEN_ATTRIBUTE:
-                    Let attr be parse_attribute with parser
-                    Add attr to end of attributes
+@Reasoning:
+Returns the type tag of the token one position ahead; used for two-token
+lookahead (e.g. distinguishing 'a.b' member access vs '.' calls, struct vs map).
+@End Reasoning
+Process called "peek_token_type_next" takes parser as Integer returns Integer:
+    Note: Get type of the token one ahead
 
-                Note: defstruct
-                Otherwise If match_token with parser and TOKEN_DEFSTRUCT:
-                    Let struct_def be parse_struct with parser
-                    Add struct_def to end of structs
+    Let tokens be proc memory_get_int64 from Layout with parser, 0
+    Let position be proc memory_get_int64 from Layout with parser, 8
+    Let idx be position plus 1
 
-                Note: def/defp
-                Otherwise If match_token with parser and TOKEN_DEF or match_token with parser and TOKEN_DEFP:
-                    Let func be parse_function with parser
-                    Add func to end of functions
+    Let count be proc list_length from ListOps with tokens
+    If idx is greater than or equal to count:
+        Return TOKEN_EOF from Lexer
+    End If
 
-                Note: defmacro/defmacrop
-                Otherwise If match_token with parser and TOKEN_DEFMACRO or match_token with parser and TOKEN_DEFMACROP:
-                    Let macro be parse_macro with parser
-                    Add macro to end of macros
+    Let token be proc list_get from ListOps with tokens, idx
+    If token is equal to 0:
+        Return TOKEN_EOF from Lexer
+    End If
+    Return proc memory_get_int64 from Layout with token, 0
+End Process
 
-                Otherwise:
-                    Call advance_parser with parser
-                End If
+@Reasoning:
+Returns the lexeme of the current token, duplicated implicitly because the
+lexer's token lexemes are already owned substrings. Returns "" past the end.
+@End Reasoning
+Process called "peek_token_lexeme" takes parser as Integer returns Integer:
+    Note: Get lexeme of current token
 
-                Call skip_newlines with parser
-            End While
+    Let token be proc peek_token with parser
+    If token is equal to 0:
+        Return ""
+    End If
+    Return proc memory_get_int64 from Layout with token, 8
+End Process
 
-            Call expect_token with parser and TOKEN_END
+@Reasoning:
+Increments position by 1. Returns 1 so callers can compose it.
+@End Reasoning
+Process called "advance_token" takes parser as Integer returns Integer:
+    Note: Move to next token
+
+    Let position be proc memory_get_int64 from Layout with parser, 8
+    Set position to position plus 1
+    proc memory_set_int64 from Layout with parser, 8, position
+    Return 1
+End Process
+
+@Reasoning:
+Shift-on-match: consumes the current token if it matches expected; otherwise
+records an error AND advances one token anyway so error recovery always makes
+progress (prevents non-advancing loops). Returns 1 on match, 0 on mismatch.
+@End Reasoning
+Process called "expect_token" takes parser as Integer, expected as Integer returns Integer:
+    Note: Expect a specific token type; consume on match, recover-advance on miss
+
+    Let token_type be proc peek_token_type with parser
+    If token_type is not equal to expected:
+        proc add_parse_error with parser, "Unexpected token"
+        Note: recover by advancing so callers cannot stall on a mismatch
+        If token_type is not equal to TOKEN_EOF from Lexer:
+            proc advance_token with parser
         End If
+        Return 0
     End If
 
-    Return a value of type ElixirModule with
-        name as module_name,
-        attributes as attributes,
-        functions as functions,
-        macros as macros,
-        structs as structs,
-        line as line
+    proc advance_token with parser
+    Return 1
 End Process
 
-Note: ============================================================================
-Note: ATTRIBUTE PARSING
-Note: ============================================================================
-
 @Reasoning:
-Parses an @ID expression after the @ token has been consumed. The
-attribute name is the bare identifier; the value parses as a full
-expression (because @spec accepts arrow-typed function specs which are
-themselves operator expressions). The result feeds into the module's
-attributes list.
+Elixir separates expressions by newlines and semicolons. This helper consumes a
+run of those terminators so callers can treat them as whitespace between
+statements within a block.
 @End Reasoning
+Process called "skip_terminators" takes parser as Integer returns Integer:
+    Note: Skip newline and semicolon terminators
 
-Process called "parse_attribute" that takes parser as Integer returns ElixirAttribute:
-    Let line be parser.current_line
-    Let name be parser.current_lexeme
-    Call advance_parser with parser
-
-    Let value be parse_expression with parser and 0
-
-    Return a value of type ElixirAttribute with
-        name as name,
-        value as value,
-        line as line
-End Process
-
-Note: ============================================================================
-Note: STRUCT PARSING
-Note: ============================================================================
-
-@Reasoning:
-defstruct accepts either a keyword list ([field: default, ...]) or a
-plain list ([:field1, :field2, ...]) of fields. Each field becomes a
-dictionary {"name": atom, "default": value-or-nil} so downstream
-consumers don't have to special-case the two surface forms.
-@End Reasoning
-
-Process called "parse_struct" that takes parser as Integer returns ElixirStruct:
-    Let line be parser.current_line
-    Call advance_parser with parser  Note: Skip defstruct
-
-    Let fields be a list containing nothing
-
-    Note: Parse field list (usually keyword list or list)
-    If match_token with parser and TOKEN_LBRACKET:
-        Call advance_parser with parser
-
-        While not match_token with parser and TOKEN_RBRACKET:
-            Note: Field name: default_value or just :field_name
-            If match_token with parser and TOKEN_ATOM:
-                Let field_name be parser.current_lexeme
-                Call advance_parser with parser
-
-                Note: Determine default value before constructing the dict so we
-                Note: can use the canonical immutable-initialization form.
-                Note: Codegen doesn't support `Set X at key K to V` lvalue
-                Note: assignment on dict literals, so build the dict last.
-                Let default_val be 0
-                If match_token with parser and TOKEN_COLON:
-                    Call advance_parser with parser
-                    Set default_val to parse_expression with parser and 0
-                End If
-                Let field_data be a dictionary containing:
-                    "name" as field_name,
-                    "default" as default_val
-                End Dictionary
-
-                Add field_data to end of fields
-            End If
-
-            If match_token with parser and TOKEN_COMMA:
-                Call advance_parser with parser
+    While 1 is equal to 1:
+        Let token_type be proc peek_token_type with parser
+        If token_type is equal to TOKEN_NEWLINE from Lexer:
+            proc advance_token with parser
+        Otherwise:
+            If token_type is equal to TOKEN_SEMICOLON from Lexer:
+                proc advance_token with parser
             Otherwise:
                 Break
             End If
-        End While
+        End If
+    End While
 
-        Call expect_token with parser and TOKEN_RBRACKET
+    Return 1
+End Process
+
+@Reasoning:
+Appends a parse error message to the errors list for later diagnostics.
+@End Reasoning
+Process called "add_parse_error" takes parser as Integer, message as Integer returns Integer:
+    Note: Record a parse error
+
+    Let errors be proc memory_get_int64 from Layout with parser, 16
+    proc list_append from ListOps with errors, message
+    Return 1
+End Process
+
+@Reasoning:
+True (1) when the current token closes a do/fn block or the stream is exhausted.
+Block-body loops use this as their stop condition: end, else, rescue, catch,
+after (the do-block section keywords) and EOF.
+@End Reasoning
+Process called "at_block_end" takes parser as Integer returns Integer:
+    Note: Check whether the current token ends a block section
+
+    Let tt be proc peek_token_type with parser
+    If tt is equal to TOKEN_EOF from Lexer:
+        Return 1
+    End If
+    If tt is equal to TOKEN_END from Lexer:
+        Return 1
+    End If
+    If tt is equal to TOKEN_ELSE from Lexer:
+        Return 1
+    End If
+    If tt is equal to TOKEN_RESCUE from Lexer:
+        Return 1
+    End If
+    If tt is equal to TOKEN_CATCH from Lexer:
+        Return 1
+    End If
+    If tt is equal to TOKEN_AFTER from Lexer:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: TOP-LEVEL ENTRY
+Note: ============================================================================
+
+@Reasoning:
+Top-level entry. An Elixir source file is a sequence of top-level forms,
+canonically a single defmodule but possibly bare expressions. We build an
+"elixir_module" root whose body collects every top-level form. If the file
+begins with defmodule, the root takes its name; otherwise the root is an
+anonymous container. A per-iteration position guard guarantees the loop always
+advances: if parse_top_form fails to consume a token, we force-advance one.
+@End Reasoning
+Process called "parse_elixir_source" takes parser as Integer returns Integer:
+    Note: Parse an Elixir source file into an elixir_module AST root
+
+    Let root be proc create_ast_node with "elixir_module"
+    proc set_ast_attribute with root, "name", ""
+    Let body be proc create from ListOps
+    proc set_ast_attribute with root, "body", body
+
+    proc skip_terminators with parser
+
+    Note: If the file is a single top-level defmodule, adopt its name/body.
+    Let first_type be proc peek_token_type with parser
+    If first_type is equal to TOKEN_DEFMODULE from Lexer:
+        Let module_node be proc parse_defmodule with parser
+        Let mod_name be proc get_ast_attribute with module_node, "name"
+        proc set_ast_attribute with root, "name", mod_name
+        Let mod_body be proc get_ast_attribute with module_node, "body"
+        proc set_ast_attribute with root, "body", mod_body
+        Return root
     End If
 
-    Return a value of type ElixirStruct with
-        fields as fields,
-        line as line
+    Note: Otherwise collect bare top-level forms.
+    While 1 is equal to 1:
+        proc skip_terminators with parser
+        Let tt be proc peek_token_type with parser
+        If tt is equal to TOKEN_EOF from Lexer:
+            Break
+        End If
+
+        Let before be proc memory_get_int64 from Layout with parser, 8
+        Let form be proc parse_module_member with parser
+        If form is not equal to 0:
+            proc list_append from ListOps with body, form
+        End If
+
+        Let after be proc memory_get_int64 from Layout with parser, 8
+        If after is equal to before:
+            Note: force progress to avoid a non-advancing loop
+            proc advance_token with parser
+        End If
+    End While
+
+    Return root
+End Process
+
+Note: ============================================================================
+Note: MODULE PARSING
+Note: ============================================================================
+
+@Reasoning:
+Parses 'defmodule Alias do ... end'. The module name is the dotted alias path
+captured as a single string (Foo.Bar). The body is a list of module members
+(functions, attributes, directives, defstruct, nested constructs). A position
+guard inside the member loop forces progress on any stalled member parse.
+@End Reasoning
+Process called "parse_defmodule" takes parser as Integer returns Integer:
+    Note: Parse a defmodule declaration
+
+    proc advance_token with parser  Note: consume 'defmodule'
+
+    Let node be proc create_ast_node with "elixir_module"
+    Let name be proc parse_alias_path with parser
+    proc set_ast_attribute with node, "name", name
+
+    Let body be proc create from ListOps
+    proc set_ast_attribute with node, "body", body
+
+    Note: expect 'do'
+    proc skip_terminators with parser
+    proc expect_token with parser, TOKEN_DO from Lexer
+
+    While 1 is equal to 1:
+        proc skip_terminators with parser
+        If proc at_block_end with parser:
+            Break
+        End If
+
+        Let before be proc memory_get_int64 from Layout with parser, 8
+        Let member be proc parse_module_member with parser
+        If member is not equal to 0:
+            proc list_append from ListOps with body, member
+        End If
+
+        Let after be proc memory_get_int64 from Layout with parser, 8
+        If after is equal to before:
+            proc advance_token with parser
+        End If
+    End While
+
+    proc expect_token with parser, TOKEN_END from Lexer
+    Return node
+End Process
+
+@Reasoning:
+Parses a dotted module alias path Foo.Bar.Baz into a single dotted string. We
+read the first alias segment then consume '.' Alias pairs. Returns the joined
+string; if the leading token is not an alias we return whatever lexeme is there
+and let the caller's error recovery proceed.
+@End Reasoning
+Process called "parse_alias_path" takes parser as Integer returns Integer:
+    Note: Parse a dotted module alias into a string
+
+    Let tt be proc peek_token_type with parser
+    If tt is not equal to TOKEN_ALIAS_NAME from Lexer:
+        Let lx be proc peek_token_lexeme with parser
+        If tt is not equal to TOKEN_EOF from Lexer:
+            proc advance_token with parser
+        End If
+        Return lx
+    End If
+
+    Let path be proc peek_token_lexeme with parser
+    proc advance_token with parser
+
+    While 1 is equal to 1:
+        Let dt be proc peek_token_type with parser
+        If dt is not equal to TOKEN_DOT from Lexer:
+            Break
+        End If
+        Let nt be proc peek_token_type_next with parser
+        If nt is not equal to TOKEN_ALIAS_NAME from Lexer:
+            Break
+        End If
+        proc advance_token with parser  Note: consume '.'
+        Let seg be proc peek_token_lexeme with parser
+        Set path to proc string_concat from StringPrim with path, "."
+        Set path to proc string_concat from StringPrim with path, seg
+        proc advance_token with parser
+    End While
+
+    Return path
+End Process
+
+@Reasoning:
+Dispatches a single module member by its leading token: def/defp/defmacro and
+relatives (functions), defstruct, defprotocol/defimpl/defexception, '@'
+attribute, import/alias/require/use directives, or a bare expression statement.
+@End Reasoning
+Process called "parse_module_member" takes parser as Integer returns Integer:
+    Note: Parse one module member or top-level form
+
+    Let tt be proc peek_token_type with parser
+
+    If tt is equal to TOKEN_DEF from Lexer:
+        Return proc parse_function with parser, "public", "def"
+    End If
+    If tt is equal to TOKEN_DEFP from Lexer:
+        Return proc parse_function with parser, "private", "defp"
+    End If
+    If tt is equal to TOKEN_DEFMACRO from Lexer:
+        Return proc parse_function with parser, "public", "defmacro"
+    End If
+    If tt is equal to TOKEN_DEFMACROP from Lexer:
+        Return proc parse_function with parser, "private", "defmacrop"
+    End If
+    If tt is equal to TOKEN_DEFGUARD from Lexer:
+        Return proc parse_function with parser, "public", "defguard"
+    End If
+    If tt is equal to TOKEN_DEFGUARDP from Lexer:
+        Return proc parse_function with parser, "private", "defguardp"
+    End If
+    If tt is equal to TOKEN_DEFDELEGATE from Lexer:
+        Return proc parse_function with parser, "public", "defdelegate"
+    End If
+    If tt is equal to TOKEN_DEFSTRUCT from Lexer:
+        Return proc parse_defstruct with parser
+    End If
+    If tt is equal to TOKEN_DEFEXCEPTION from Lexer:
+        Return proc parse_defexception with parser
+    End If
+    If tt is equal to TOKEN_DEFPROTOCOL from Lexer:
+        Return proc parse_defprotocol with parser
+    End If
+    If tt is equal to TOKEN_DEFIMPL from Lexer:
+        Return proc parse_defimpl with parser
+    End If
+    If tt is equal to TOKEN_DEFMODULE from Lexer:
+        Return proc parse_defmodule with parser
+    End If
+    If tt is equal to TOKEN_AT from Lexer:
+        Return proc parse_module_attribute with parser
+    End If
+    If tt is equal to TOKEN_IMPORT from Lexer:
+        Return proc parse_directive with parser, "import"
+    End If
+    If tt is equal to TOKEN_ALIAS from Lexer:
+        Return proc parse_directive with parser, "alias"
+    End If
+    If tt is equal to TOKEN_REQUIRE from Lexer:
+        Return proc parse_directive with parser, "require"
+    End If
+    If tt is equal to TOKEN_USE from Lexer:
+        Return proc parse_directive with parser, "use"
+    End If
+
+    Note: bare expression statement
+    Return proc parse_expression with parser
 End Process
 
 Note: ============================================================================
@@ -423,1341 +592,2103 @@ Note: FUNCTION PARSING
 Note: ============================================================================
 
 @Reasoning:
-Parses one `def NAME(...) do ... end` (or defp for private) and groups
-all subsequent contiguous clauses with the same name/arity into a single
-ElixirFunction. This is how Elixir's multi-clause functions are
-represented: each clause is a separate parse but they merge into one
-function entity for downstream codegen.
+Parses def/defp/defmacro and relatives into a "function" node with a single
+clause (multi-clause functions appear as multiple top-level def nodes; Stage B
+groups by name). The function head is name(params) optionally followed by
+'when guard'; the body is either 'do ... end' or a one-line ', do: expr'
+keyword form. Default arguments (param \\ default) are parsed as part of the
+parameter expression list and preserved as binary_op '\\\\' nodes so Stage B
+sees the default.
 @End Reasoning
+Process called "parse_function" takes parser as Integer, visibility as Integer, kind as Integer returns Integer:
+    Note: Parse a def/defp/defmacro/... function definition
 
-Process called "parse_function" that takes parser as Integer returns ElixirFunction:
-    Let line be parser.current_line
-    Let is_private be match_token with parser and TOKEN_DEFP
-    Call advance_parser with parser  Note: Skip def/defp
+    proc advance_token with parser  Note: consume the def keyword
 
-    Let func_name be parser.current_lexeme
-    Call advance_parser with parser
+    Let node be proc create_ast_node with "function"
+    proc set_ast_attribute with node, "visibility", visibility
+    proc set_ast_attribute with node, "kind", kind
 
-    Let clauses be a list containing nothing
+    Let clauses be proc create from ListOps
+    proc set_ast_attribute with node, "clauses", clauses
 
-    Note: Parse all function clauses
-    While true:
-        Let clause be parse_function_clause with parser
-        Add clause to end of clauses
+    Note: function name (identifier; may be operator def in source - we read the
+    Note: identifier lexeme as name)
+    Let name be ""
+    Let nt be proc peek_token_type with parser
+    If nt is equal to TOKEN_IDENTIFIER from Lexer:
+        Set name to proc peek_token_lexeme with parser
+        proc advance_token with parser
+    Otherwise:
+        Note: tolerate operator/keyword function heads by taking the lexeme
+        Set name to proc peek_token_lexeme with parser
+        If nt is not equal to TOKEN_EOF from Lexer:
+            proc advance_token with parser
+        End If
+    End If
+    proc set_ast_attribute with node, "name", name
 
-        Call skip_newlines with parser
+    Let clause be proc create_ast_node with "clause"
 
-        Note: Check for more clauses
-        If match_token with parser and TOKEN_DEF or match_token with parser and TOKEN_DEFP:
-            Let next_name be peek_lexeme with parser and 1
+    Note: parameters (optional parenthesized list)
+    Let params be proc create from ListOps
+    Let pt be proc peek_token_type with parser
+    If pt is equal to TOKEN_LPAREN from Lexer:
+        proc advance_token with parser  Note: consume '('
+        proc parse_expr_list_until with parser, params, TOKEN_RPAREN from Lexer
+        proc expect_token with parser, TOKEN_RPAREN from Lexer
+    End If
+    proc set_ast_attribute with clause, "params", params
 
-            If next_name is equal to func_name:
-                Call advance_parser with parser
-                Call advance_parser with parser
-            Otherwise:
-                Break
+    Note: optional 'when' guard
+    proc set_ast_attribute with clause, "guard", 0
+    Let wt be proc peek_token_type with parser
+    If wt is equal to TOKEN_WHEN from Lexer:
+        proc advance_token with parser
+        Let guard be proc parse_expression with parser
+        proc set_ast_attribute with clause, "guard", guard
+    End If
+
+    Note: body: 'do ... end' block or keyword 'do:' one-liner
+    Let cbody be proc parse_do_block with parser
+    proc set_ast_attribute with clause, "body", cbody
+
+    proc list_append from ListOps with clauses, clause
+    Return node
+End Process
+
+@Reasoning:
+Parses a do-block body in either form: the block form 'do <stmts> end' or the
+keyword form ', do: <expr>' (often appearing as a KEYWORD_PAIR 'do:'). Returns a
+list of body statement/expression nodes. For 'defdelegate ... , to: Mod' style
+keyword-only bodies the keyword pairs are collected as keyword_pair nodes so no
+information is lost.
+@End Reasoning
+Process called "parse_do_block" takes parser as Integer returns Integer:
+    Note: Parse a do...end block or a keyword do: body; returns a statement list
+
+    Let body be proc create from ListOps
+
+    Note: skip a leading comma before keyword body
+    Let ct be proc peek_token_type with parser
+    If ct is equal to TOKEN_COMMA from Lexer:
+        proc advance_token with parser
+    End If
+
+    Let tt be proc peek_token_type with parser
+
+    Note: keyword form: a KEYWORD_PAIR whose key is 'do'
+    If tt is equal to TOKEN_KEYWORD_PAIR from Lexer:
+        Let key be proc peek_token_lexeme with parser
+        If proc lexeme_is with key, "do":
+            proc advance_token with parser  Note: consume 'do:'
+            Let expr be proc parse_expression with parser
+            If expr is not equal to 0:
+                proc list_append from ListOps with body, expr
             End If
-        Otherwise:
+            Note: trailing keyword sections (else:/rescue:/after:) handled by
+            Note: enclosing constructs; here we collect any remaining keyword
+            Note: pairs on the same logical line as keyword_pair nodes.
+            proc collect_trailing_keyword_pairs with parser, body
+            Return body
+        End If
+    End If
+
+    Note: block form: 'do <stmts> end'
+    If tt is equal to TOKEN_DO from Lexer:
+        proc advance_token with parser  Note: consume 'do'
+        proc parse_statement_block with parser, body
+        proc expect_token with parser, TOKEN_END from Lexer
+        Return body
+    End If
+
+    Note: no recognizable body (e.g. callback head) - empty body
+    Return body
+End Process
+
+@Reasoning:
+Collects a run of trailing KEYWORD_PAIR forms (e.g. 'to: Mod', 'as: name')
+following a keyword 'do:' body, each as a keyword_pair node so Stage B retains
+delegate/option metadata. Stops at a terminator or block end.
+@End Reasoning
+Process called "collect_trailing_keyword_pairs" takes parser as Integer, body as Integer returns Integer:
+    Note: Collect trailing keyword pairs into the body list
+
+    While 1 is equal to 1:
+        Let tt be proc peek_token_type with parser
+        If tt is not equal to TOKEN_COMMA from Lexer:
             Break
+        End If
+        Let nt be proc peek_token_type_next with parser
+        If nt is not equal to TOKEN_KEYWORD_PAIR from Lexer:
+            Break
+        End If
+        proc advance_token with parser  Note: consume ','
+        Let kp be proc parse_keyword_pair with parser
+        If kp is not equal to 0:
+            proc list_append from ListOps with body, kp
         End If
     End While
 
-    Let arity be 0
-    If length of clauses is greater than 0:
-        Let first_clause be clauses at index 0
-        Set arity to length of first_clause.patterns
-    End If
-
-    Return a value of type ElixirFunction with
-        name as func_name,
-        arity as arity,
-        clauses as clauses,
-        is_private as is_private,
-        line as line
+    Return 1
 End Process
 
 @Reasoning:
-Lexeme-side companion to peek_token: returns the source text of the
-token at position + offset. Used when a parse decision depends on the
-specific identifier text (e.g., distinguishing "do" the keyword from
-"do" used as a function name elsewhere — though Elixir reserves "do"
-this still pattern repeats with similar contextual keywords like
-"when", "after", "rescue").
+Parses a statement block: a run of expression/statement nodes separated by
+terminators, until a block-ending keyword. A position guard forces progress on
+any stalled statement to prevent a non-advancing loop.
 @End Reasoning
+Process called "parse_statement_block" takes parser as Integer, out_list as Integer returns Integer:
+    Note: Parse statements into out_list until a block end
 
-Process called "peek_lexeme" that takes parser as Integer, offset as Integer returns String:
-    Let pos be parser.position plus offset
-
-    If pos is less than length of parser.lexemes:
-        Return parser.lexemes at index pos
-    End If
-
-    Return ""
-End Process
-
-@Reasoning:
-Parses one clause: parameter pattern list, optional guard (`when` ...)
-list, and the body between `do` and `end`. The body is allowed to be
-any sequence of expressions; the last one's value is the clause's
-result. Guards are stored as a list so multi-condition guards joined
-with `and`/`or` can be flattened during analysis if desired.
-@End Reasoning
-
-Process called "parse_function_clause" that takes parser as Integer returns ElixirFunctionClause:
-    Let line be parser.current_line
-    Let patterns be a list containing nothing
-    Let guards be a list containing nothing
-    Let body be a list containing nothing
-
-    Note: Parse parameters
-    If match_token with parser and TOKEN_LPAREN:
-        Call advance_parser with parser
-
-        While not match_token with parser and TOKEN_RPAREN:
-            Let pattern be parse_expression with parser and 0
-            Add pattern to end of patterns
-
-            If match_token with parser and TOKEN_COMMA:
-                Call advance_parser with parser
-            Otherwise:
-                Break
-            End If
-        End While
-
-        Call expect_token with parser and TOKEN_RPAREN
-    End If
-
-    Call skip_newlines with parser
-
-    Note: Parse guards
-    If match_token with parser and TOKEN_WHEN:
-        Call advance_parser with parser
-
-        While true:
-            Let guard be parse_expression with parser and 0
-            Add guard to end of guards
-
-            If match_token with parser and TOKEN_COMMA:
-                Call advance_parser with parser
-            Otherwise:
-                Break
-            End If
-        End While
-    End If
-
-    Call skip_newlines with parser
-
-    Note: Parse body (do...end or , do:)
-    If match_token with parser and TOKEN_DO:
-        Call advance_parser with parser
-        Call skip_newlines with parser
-
-        While not match_token with parser and TOKEN_END and not match_token with parser and TOKEN_EOF:
-            Let expr be parse_expression with parser and 0
-            Add expr to end of body
-
-            Call skip_newlines with parser
-
-            If match_token with parser and TOKEN_COMMA or match_token with parser and TOKEN_NEWLINE:
-                While match_token with parser and TOKEN_COMMA or match_token with parser and TOKEN_NEWLINE:
-                    Call advance_parser with parser
-                End While
-            Otherwise:
-                Break
-            End If
-        End While
-
-        Call expect_token with parser and TOKEN_END
-    Otherwise If match_token with parser and TOKEN_COMMA:
-        Note: Inline do: syntax
-        Call advance_parser with parser
-
-        If match_token with parser and TOKEN_DO:
-            Call advance_parser with parser
-
-            If match_token with parser and TOKEN_COLON:
-                Call advance_parser with parser
-                Set expr to parse_expression with parser and 0
-                Add expr to end of body
-            End If
-        End If
-    End If
-
-    Return a value of type ElixirFunctionClause with
-        patterns as patterns,
-        guards as guards,
-        body as body,
-        line as line
-End Process
-
-Note: ============================================================================
-Note: MACRO PARSING
-Note: ============================================================================
-
-@Reasoning:
-Defmacro / defmacrop parsing. Same clause-collection logic as
-parse_function except the result is tagged as ElixirMacro. Macros are
-treated identically to functions at parse time; the compile-time
-expander semantically distinguishes them later.
-@End Reasoning
-
-Process called "parse_macro" that takes parser as Integer returns ElixirMacro:
-    Let line be parser.current_line
-    Let is_private be match_token with parser and TOKEN_DEFMACROP
-    Call advance_parser with parser
-
-    Let macro_name be parser.current_lexeme
-    Call advance_parser with parser
-
-    Let clauses be a list containing nothing
-    Let clause be parse_function_clause with parser
-    Add clause to end of clauses
-
-    Let arity be length of clause.patterns
-
-    Return a value of type ElixirMacro with
-        name as macro_name,
-        arity as arity,
-        clauses as clauses,
-        is_private as is_private,
-        line as line
-End Process
-
-Note: ============================================================================
-Note: EXPRESSION PARSING
-Note: ============================================================================
-
-@Reasoning:
-Operator-precedence table for the Pratt-style expression parser.
-Returns the binding power of a given operator token, with higher numbers
-binding tighter. Encodes Elixir's documented precedence: |> (pipe), ||
-&&, comparisons (==, !=, <, >, etc.), bitwise, arithmetic, exponent,
-unary, term. Returns 0 for non-operator tokens to terminate the climb.
-@End Reasoning
-
-Process called "get_operator_precedence" that takes token as Integer returns Integer:
-    If token is equal to TOKEN_DOT:
-        Return 1
-    End If
-
-    If token is equal to TOKEN_DOUBLE_STAR:
-        Return 2
-    End If
-
-    If token is equal to TOKEN_STAR or token is equal to TOKEN_SLASH or token is equal to TOKEN_DOUBLE_SLASH or token is equal to TOKEN_PERCENT:
-        Return 3
-    End If
-
-    If token is equal to TOKEN_PLUS or token is equal to TOKEN_MINUS:
-        Return 4
-    End If
-
-    If token is equal to TOKEN_PLUS_PLUS or token is equal to TOKEN_MINUS_MINUS or token is equal to TOKEN_CONCAT:
-        Return 5
-    End If
-
-    If token is equal to TOKEN_IN:
-        Return 6
-    End If
-
-    If token is equal to TOKEN_PIPE:
-        Return 7
-    End If
-
-    If token is equal to TOKEN_LESS or token is equal to TOKEN_GREATER or token is equal to TOKEN_LESS_EQUAL or token is equal to TOKEN_GREATER_EQUAL:
-        Return 8
-    End If
-
-    If token is equal to TOKEN_EQUAL_EQUAL or token is equal to TOKEN_BANG_EQUAL or token is equal to TOKEN_EQUAL_EQUAL_EQUAL or token is equal to TOKEN_BANG_EQUAL_EQUAL:
-        Return 9
-    End If
-
-    If token is equal to TOKEN_AND or token is equal to TOKEN_DOUBLE_AMPERSAND:
-        Return 10
-    End If
-
-    If token is equal to TOKEN_OR or token is equal to TOKEN_DOUBLE_PIPE:
-        Return 11
-    End If
-
-    If token is equal to TOKEN_ARROW:
-        Return 12
-    End If
-
-    If token is equal to TOKEN_ASSIGN:
-        Return 13
-    End If
-
-    Return 999
-End Process
-
-@Reasoning:
-Pratt parser entry. Parses a primary expression, then while the next
-token is a binary operator whose precedence >= min_precedence, consumes
-the operator and recurses with prec+1 (right-associative for => and
-=, left-associative otherwise). Returns once no further operator binds
-tighter than min_precedence, leaving the caller in a clean state.
-@End Reasoning
-
-Process called "parse_expression" that takes parser as Integer, min_precedence as Integer returns ElixirExpression:
-    Let left be parse_primary_expression with parser
-
-    While true:
-        Let op_precedence be get_operator_precedence with parser.current_token
-
-        If op_precedence is greater than or equal to min_precedence:
+    While 1 is equal to 1:
+        proc skip_terminators with parser
+        If proc at_block_end with parser:
             Break
         End If
 
-        Let op_token be parser.current_token
-        Let op_lexeme be parser.current_lexeme
-        Let line be parser.current_line
-        Call advance_parser with parser
+        Let before be proc memory_get_int64 from Layout with parser, 8
+        Let stmt be proc parse_expression with parser
+        If stmt is not equal to 0:
+            proc list_append from ListOps with out_list, stmt
+        End If
 
-        Let right be parse_expression with parser and op_precedence minus 1
+        Let after be proc memory_get_int64 from Layout with parser, 8
+        If after is equal to before:
+            proc advance_token with parser
+        End If
+    End While
 
-        Let expr_data be a dictionary containing:
-            "operator" as op_lexeme,
-            "left" as left,
-            "right" as right
-        End Dictionary
+    Return 1
+End Process
 
-        Set left to a value of type ElixirExpression with
-            expr_type as "binary_op",
-            expr_data as expr_data,
-            line as line
+Note: ============================================================================
+Note: DEFSTRUCT / DEFEXCEPTION / DEFPROTOCOL / DEFIMPL
+Note: ============================================================================
+
+@Reasoning:
+Parses 'defstruct [field1: default, field2: nil]' or 'defstruct field: val'.
+Fields are collected as pair nodes ({key,value}); a bare atom/keyword key with
+no value gets a 0 value. Accepts an optional surrounding bracket list.
+@End Reasoning
+Process called "parse_defstruct" takes parser as Integer returns Integer:
+    Note: Parse a defstruct declaration
+
+    proc advance_token with parser  Note: consume 'defstruct'
+
+    Let node be proc create_ast_node with "defstruct"
+    Let fields be proc create from ListOps
+    proc set_ast_attribute with node, "fields", fields
+
+    proc parse_struct_fields with parser, fields
+    Return node
+End Process
+
+@Reasoning:
+Parses 'defexception [message: "..."]' identically to defstruct but tagged as a
+defexception node so Stage B emits exception scaffolding.
+@End Reasoning
+Process called "parse_defexception" takes parser as Integer returns Integer:
+    Note: Parse a defexception declaration
+
+    proc advance_token with parser  Note: consume 'defexception'
+
+    Let node be proc create_ast_node with "defexception"
+    Let fields be proc create from ListOps
+    proc set_ast_attribute with node, "fields", fields
+
+    proc parse_struct_fields with parser, fields
+    Return node
+End Process
+
+@Reasoning:
+Shared field reader for defstruct/defexception. Handles an optional '[' ... ']'
+wrapper and a comma-separated run of 'key: value' keyword pairs (collected as
+pair nodes) or bare keys. Stops at a terminator/EOF.
+@End Reasoning
+Process called "parse_struct_fields" takes parser as Integer, fields as Integer returns Integer:
+    Note: Read struct/exception fields into the fields list
+
+    Let bracketed be 0
+    Let tt be proc peek_token_type with parser
+    If tt is equal to TOKEN_LBRACKET from Lexer:
+        Set bracketed to 1
+        proc advance_token with parser
+    End If
+
+    While 1 is equal to 1:
+        proc skip_terminators with parser
+        Let ct be proc peek_token_type with parser
+        If ct is equal to TOKEN_EOF from Lexer:
+            Break
+        End If
+        If ct is equal to TOKEN_RBRACKET from Lexer:
+            Break
+        End If
+        If proc at_block_end with parser:
+            Break
+        End If
+
+        Let before be proc memory_get_int64 from Layout with parser, 8
+
+        Note: 'key: value' keyword pair
+        If ct is equal to TOKEN_KEYWORD_PAIR from Lexer:
+            Let kp be proc parse_keyword_pair with parser
+            Let pair be proc create_ast_node with "pair"
+            Let kname be proc get_ast_attribute with kp, "key"
+            Let key_atom be proc create_ast_node with "atom"
+            proc set_ast_attribute with key_atom, "value", kname
+            proc set_ast_attribute with pair, "key", key_atom
+            Let kval be proc get_ast_attribute with kp, "value"
+            proc set_ast_attribute with pair, "value", kval
+            proc list_append from ListOps with fields, pair
+
+        Otherwise:
+            Note: bare key (atom or identifier) with no default
+            Let bare be proc parse_expression with parser
+            Let pair2 be proc create_ast_node with "pair"
+            proc set_ast_attribute with pair2, "key", bare
+            proc set_ast_attribute with pair2, "value", 0
+            proc list_append from ListOps with fields, pair2
+        End If
+
+        Let after be proc memory_get_int64 from Layout with parser, 8
+        If after is equal to before:
+            proc advance_token with parser
+        End If
+
+        Note: consume separating comma
+        Let sep be proc peek_token_type with parser
+        If sep is equal to TOKEN_COMMA from Lexer:
+            proc advance_token with parser
+        Otherwise:
+            If bracketed is equal to 0:
+                Break
+            End If
+        End If
+    End While
+
+    If bracketed is equal to 1:
+        proc expect_token with parser, TOKEN_RBRACKET from Lexer
+    End If
+    Return 1
+End Process
+
+@Reasoning:
+Parses 'defprotocol Name do ... end' as a protocol node carrying its alias name
+and a body of member nodes (function-head specs).
+@End Reasoning
+Process called "parse_defprotocol" takes parser as Integer returns Integer:
+    Note: Parse a defprotocol declaration
+
+    proc advance_token with parser  Note: consume 'defprotocol'
+
+    Let node be proc create_ast_node with "defprotocol"
+    Let name be proc parse_alias_path with parser
+    proc set_ast_attribute with node, "name", name
+
+    Let body be proc create from ListOps
+    proc set_ast_attribute with node, "body", body
+
+    proc skip_terminators with parser
+    proc expect_token with parser, TOKEN_DO from Lexer
+
+    While 1 is equal to 1:
+        proc skip_terminators with parser
+        If proc at_block_end with parser:
+            Break
+        End If
+        Let before be proc memory_get_int64 from Layout with parser, 8
+        Let member be proc parse_module_member with parser
+        If member is not equal to 0:
+            proc list_append from ListOps with body, member
+        End If
+        Let after be proc memory_get_int64 from Layout with parser, 8
+        If after is equal to before:
+            proc advance_token with parser
+        End If
+    End While
+
+    proc expect_token with parser, TOKEN_END from Lexer
+    Return node
+End Process
+
+@Reasoning:
+Parses 'defimpl Protocol, for: Target do ... end'. The protocol name is an
+alias path; the optional ', for: Target' keyword sets for_target; the body is a
+member list.
+@End Reasoning
+Process called "parse_defimpl" takes parser as Integer returns Integer:
+    Note: Parse a defimpl declaration
+
+    proc advance_token with parser  Note: consume 'defimpl'
+
+    Let node be proc create_ast_node with "defimpl"
+    Let name be proc parse_alias_path with parser
+    proc set_ast_attribute with node, "name", name
+    proc set_ast_attribute with node, "for_target", 0
+
+    Let body be proc create from ListOps
+    proc set_ast_attribute with node, "body", body
+
+    Note: optional ', for: Target'
+    Let ct be proc peek_token_type with parser
+    If ct is equal to TOKEN_COMMA from Lexer:
+        proc advance_token with parser
+        Let kt be proc peek_token_type with parser
+        If kt is equal to TOKEN_KEYWORD_PAIR from Lexer:
+            Let kp be proc parse_keyword_pair with parser
+            Let target be proc get_ast_attribute with kp, "value"
+            proc set_ast_attribute with node, "for_target", target
+        End If
+    End If
+
+    proc skip_terminators with parser
+    proc expect_token with parser, TOKEN_DO from Lexer
+
+    While 1 is equal to 1:
+        proc skip_terminators with parser
+        If proc at_block_end with parser:
+            Break
+        End If
+        Let before be proc memory_get_int64 from Layout with parser, 8
+        Let member be proc parse_module_member with parser
+        If member is not equal to 0:
+            proc list_append from ListOps with body, member
+        End If
+        Let after be proc memory_get_int64 from Layout with parser, 8
+        If after is equal to before:
+            proc advance_token with parser
+        End If
+    End While
+
+    proc expect_token with parser, TOKEN_END from Lexer
+    Return node
+End Process
+
+Note: ============================================================================
+Note: MODULE ATTRIBUTES & DIRECTIVES
+Note: ============================================================================
+
+@Reasoning:
+Parses '@name value' module attributes (including @moduledoc, @doc, @spec,
+@behaviour, @type, custom attributes). The attribute name is the identifier
+after '@'; the value is the following expression. @spec / @type values are full
+expressions so they round-trip.
+@End Reasoning
+Process called "parse_module_attribute" takes parser as Integer returns Integer:
+    Note: Parse an @attribute
+
+    proc advance_token with parser  Note: consume '@'
+
+    Let node be proc create_ast_node with "module_attribute"
+
+    Let name be ""
+    Let nt be proc peek_token_type with parser
+    If nt is equal to TOKEN_IDENTIFIER from Lexer:
+        Set name to proc peek_token_lexeme with parser
+        proc advance_token with parser
+    Otherwise:
+        Set name to proc peek_token_lexeme with parser
+        If nt is not equal to TOKEN_EOF from Lexer:
+            proc advance_token with parser
+        End If
+    End If
+    proc set_ast_attribute with node, "name", name
+
+    Note: value expression; if the next token is a terminator we store 0
+    Let vt be proc peek_token_type with parser
+    If vt is equal to TOKEN_NEWLINE from Lexer:
+        proc set_ast_attribute with node, "value", 0
+    Otherwise:
+        If vt is equal to TOKEN_EOF from Lexer:
+            proc set_ast_attribute with node, "value", 0
+        Otherwise:
+            Let value be proc parse_expression with parser
+            proc set_ast_attribute with node, "value", value
+        End If
+    End If
+
+    Return node
+End Process
+
+@Reasoning:
+Parses import/alias/require/use directives. Each takes a target expression (an
+alias path or a call like 'Foo, only: [...]'); we parse the full expression so
+options are preserved. The directive_kind string sets the node type.
+@End Reasoning
+Process called "parse_directive" takes parser as Integer, directive_kind as Integer returns Integer:
+    Note: Parse import/alias/require/use directive
+
+    proc advance_token with parser  Note: consume the directive keyword
+
+    Let node be proc create_ast_node with directive_kind
+    Let target be proc parse_expression with parser
+    proc set_ast_attribute with node, "target", target
+    Return node
+End Process
+
+Note: ============================================================================
+Note: EXPRESSION PARSING (precedence climbing)
+Note: ============================================================================
+
+@Reasoning:
+Entry point for expression parsing. Begins the precedence climb at the lowest
+binding level (0) so every binary operator participates.
+@End Reasoning
+Process called "parse_expression" takes parser as Integer returns Integer:
+    Note: Parse a full expression
+
+    Return proc parse_binary_expression with parser, 0
+End Process
+
+@Reasoning:
+Operator-precedence climbing. parse_unary_expression yields the left operand;
+then while the current token is a binary operator whose precedence >=
+min_precedence we consume it and recurse with precedence+1 (left-associative)
+for the right operand, folding into a binary_op node. The pipe operator '|>' is
+folded specially into a flat "pipe" node with a stages list so a chain
+a |> b |> c yields one pipe node with 3 stages rather than nested binary_ops.
+get_operator_precedence returns 0 for non-operators, which is below any real
+min_precedence (>=1 once inside an operator), so the loop terminates on
+non-operators — they are never treated as operators.
+@End Reasoning
+Process called "parse_binary_expression" takes parser as Integer, min_precedence as Integer returns Integer:
+    Note: Parse a binary expression with precedence climbing
+
+    Let left be proc parse_unary_expression with parser
+    If left is equal to 0:
+        Return 0
+    End If
+
+    While 1 is equal to 1:
+        Let token_type be proc peek_token_type with parser
+        Let precedence be proc get_operator_precedence with token_type
+
+        Note: precedence 0 == not an operator -> stop the climb
+        If precedence is equal to 0:
+            Break
+        End If
+        If precedence is less than min_precedence:
+            Break
+        End If
+
+        Note: Pipe operator folds into a flat multi-stage pipe node
+        If token_type is equal to TOKEN_PIPE_OP from Lexer:
+            Set left to proc parse_pipe_chain with parser, left, precedence
+        Otherwise:
+            Let op_lexeme be proc peek_token_lexeme with parser
+            proc advance_token with parser
+            Let right be proc parse_binary_expression with parser, precedence plus 1
+            If right is equal to 0:
+                Return left
+            End If
+            Let bin be proc create_ast_node with "binary_op"
+            proc set_ast_attribute with bin, "operator", op_lexeme
+            proc set_ast_attribute with bin, "left", left
+            proc set_ast_attribute with bin, "right", right
+            Set left to bin
+        End If
     End While
 
     Return left
 End Process
 
 @Reasoning:
-Handles every "leaf" expression form: literals (integer/float/string/
-atom/charlist), identifiers, parenthesised expressions, unary
-operators, sigils, lists, tuples, maps and structs, anonymous functions
-(fn), comprehensions (for), case/cond/with/if/unless/receive/try control
-forms. Dispatches by current_token; an unhandled token reports an
-error and produces a sentinel error node.
+Folds a |> b |> c into a single "pipe" node whose stages list is [a, b, c]. The
+incoming 'left' is the first stage. We consume each '|>' and parse the next
+stage at precedence+1 (so the right side does not re-absorb the same pipe),
+appending stages while the next token is another '|>'. The result is a pipe
+node with stages.length >= 2.
 @End Reasoning
+Process called "parse_pipe_chain" takes parser as Integer, left as Integer, pipe_precedence as Integer returns Integer:
+    Note: Fold a |> b |> c into a flat pipe node
 
-Process called "parse_primary_expression" that takes parser as Integer returns ElixirExpression:
-    Let line be parser.current_line
-    Let expr_type be ""
-    Let expr_data be a dictionary containing nothing
+    Let node be proc create_ast_node with "pipe"
+    Let stages be proc create from ListOps
+    proc set_ast_attribute with node, "stages", stages
+    proc list_append from ListOps with stages, left
 
-    Call skip_newlines with parser
+    While 1 is equal to 1:
+        Let tt be proc peek_token_type with parser
+        If tt is not equal to TOKEN_PIPE_OP from Lexer:
+            Break
+        End If
+        proc advance_token with parser  Note: consume '|>'
+        Let stage be proc parse_binary_expression with parser, pipe_precedence plus 1
+        If stage is equal to 0:
+            Break
+        End If
+        proc list_append from ListOps with stages, stage
+    End While
 
-    Note: Atom
-    If match_token with parser and TOKEN_ATOM:
-        Set expr_type to "atom"
-        Set expr_data at key "value" to parser.current_lexeme
-        Call advance_parser with parser
+    Return node
+End Process
 
-    Note: Identifier/variable
-    Otherwise If match_token with parser and TOKEN_IDENTIFIER:
-        Set expr_type to "identifier"
-        Set expr_data at key "name" to parser.current_lexeme
-        Call advance_parser with parser
+@Reasoning:
+Returns binding precedence for binary operators. Higher number binds tighter.
+Returns 0 for any non-operator so the precedence climb terminates and never
+treats a non-operator as an operator. Ordering follows Elixir's operator table:
+'|>' is weak; comparison/equality below arithmetic; '*' '/' tightest among the
+arithmetic group; '++' '--' '<>' are right-associative concatenation but for
+left-fold simplicity are grouped just above additive level. The relative
+ordering that matters for verification: '*' (12) > '+' (11), and '|>' (4) is
+weak, so '1 + 2 * 3' folds as 1 + (2*3) and 'a |> b |> c' yields a 3-stage pipe.
+@End Reasoning
+Process called "get_operator_precedence" takes token_type as Integer returns Integer:
+    Note: Return binary-operator precedence (0 = not an operator)
 
-    Note: Module name
-    Otherwise If match_token with parser and TOKEN_MODULE_NAME:
-        Set expr_type to "module"
-        Set expr_data at key "name" to parser.current_lexeme
-        Call advance_parser with parser
-
-    Note: Integer
-    Otherwise If match_token with parser and TOKEN_INTEGER:
-        Set expr_type to "integer"
-        Set expr_data at key "value" to parser.current_lexeme
-        Call advance_parser with parser
-
-    Note: Float
-    Otherwise If match_token with parser and TOKEN_FLOAT:
-        Set expr_type to "float"
-        Set expr_data at key "value" to parser.current_lexeme
-        Call advance_parser with parser
-
-    Note: String
-    Otherwise If match_token with parser and TOKEN_STRING or match_token with parser and TOKEN_HEREDOC:
-        Set expr_type to "string"
-        Set expr_data at key "value" to parser.current_lexeme
-        Call advance_parser with parser
-
-    Note: Charlist
-    Otherwise If match_token with parser and TOKEN_CHARLIST:
-        Set expr_type to "charlist"
-        Set expr_data at key "value" to parser.current_lexeme
-        Call advance_parser with parser
-
-    Note: Sigil
-    Otherwise If match_token with parser and TOKEN_SIGIL:
-        Set expr_type to "sigil"
-        Set expr_data at key "value" to parser.current_lexeme
-        Call advance_parser with parser
-
-    Note: List
-    Otherwise If match_token with parser and TOKEN_LBRACKET:
-        Return parse_list with parser
-
-    Note: Tuple
-    Otherwise If match_token with parser and TOKEN_LBRACE:
-        Return parse_tuple with parser
-
-    Note: Map or struct
-    Otherwise If match_token with parser and TOKEN_PERCENT:
-        Return parse_map_or_struct with parser
-
-    Note: Binary
-    Otherwise If match_token with parser and TOKEN_LBIN:
-        Return parse_binary with parser
-
-    Note: Parenthesized expression
-    Otherwise If match_token with parser and TOKEN_LPAREN:
-        Call advance_parser with parser
-        Let expr be parse_expression with parser and 0
-        Call expect_token with parser and TOKEN_RPAREN
-        Return expr
-
-    Note: Anonymous function
-    Otherwise If match_token with parser and TOKEN_FN:
-        Return parse_fn with parser
-
-    Note: Case expression
-    Otherwise If match_token with parser and TOKEN_CASE:
-        Return parse_case with parser
-
-    Note: Cond expression
-    Otherwise If match_token with parser and TOKEN_COND:
-        Return parse_cond with parser
-
-    Note: If/unless expression
-    Otherwise If match_token with parser and TOKEN_IF or match_token with parser and TOKEN_UNLESS:
-        Return parse_if_unless with parser
-
-    Note: With expression
-    Otherwise If match_token with parser and TOKEN_WITH:
-        Return parse_with with parser
-
-    Note: Receive expression
-    Otherwise If match_token with parser and TOKEN_RECEIVE:
-        Return parse_receive with parser
-
-    Note: Try expression
-    Otherwise If match_token with parser and TOKEN_TRY:
-        Return parse_try with parser
-
-    Note: For comprehension
-    Otherwise If match_token with parser and TOKEN_FOR:
-        Return parse_for with parser
-
-    Note: Unary operators
-    Otherwise If match_token with parser and TOKEN_MINUS or match_token with parser and TOKEN_NOT or match_token with parser and TOKEN_BANG or match_token with parser and TOKEN_CARET or match_token with parser and TOKEN_AMPERSAND:
-        Let op_lexeme be parser.current_lexeme
-        Call advance_parser with parser
-        Let operand be parse_primary_expression with parser
-
-        Set expr_type to "unary_op"
-        Set expr_data at key "operator" to op_lexeme
-        Set expr_data at key "operand" to operand
-
-    Note: Boolean literals
-    Otherwise If match_token with parser and TOKEN_TRUE:
-        Set expr_type to "boolean"
-        Set expr_data at key "value" to true
-        Call advance_parser with parser
-
-    Otherwise If match_token with parser and TOKEN_FALSE:
-        Set expr_type to "boolean"
-        Set expr_data at key "value" to false
-        Call advance_parser with parser
-
-    Note: Nil
-    Otherwise If match_token with parser and TOKEN_NIL:
-        Set expr_type to "nil"
-        Call advance_parser with parser
-
-    Otherwise:
-        Set expr_type to "error"
-        Add "Unexpected token in expression at line " joined with string representation of line to end of parser.errors
-        Call advance_parser with parser
+    Note: match '=' (lowest binding meaningful binary op here)
+    If token_type is equal to TOKEN_MATCH from Lexer:
+        Return 2
     End If
 
-    Let result be a value of type ElixirExpression with
-        expr_type as expr_type,
-        expr_data as expr_data,
-        line as line
+    Note: pipe '|>'
+    If token_type is equal to TOKEN_PIPE_OP from Lexer:
+        Return 4
+    End If
 
-    Note: Handle postfix operations
-    Set result to parse_postfix with parser and result
+    Note: logical or / and (word and symbol)
+    If token_type is equal to TOKEN_BOOL_OR from Lexer:
+        Return 5
+    End If
+    If token_type is equal to TOKEN_OR from Lexer:
+        Return 5
+    End If
+    If token_type is equal to TOKEN_BOOL_AND from Lexer:
+        Return 6
+    End If
+    If token_type is equal to TOKEN_AND from Lexer:
+        Return 6
+    End If
 
-    Return result
+    Note: comparison / equality
+    If token_type is equal to TOKEN_EQ from Lexer:
+        Return 7
+    End If
+    If token_type is equal to TOKEN_NEQ from Lexer:
+        Return 7
+    End If
+    If token_type is equal to TOKEN_STRICT_EQ from Lexer:
+        Return 7
+    End If
+    If token_type is equal to TOKEN_STRICT_NEQ from Lexer:
+        Return 7
+    End If
+    If token_type is equal to TOKEN_MATCH_RE from Lexer:
+        Return 7
+    End If
+    If token_type is equal to TOKEN_LT from Lexer:
+        Return 8
+    End If
+    If token_type is equal to TOKEN_GT from Lexer:
+        Return 8
+    End If
+    If token_type is equal to TOKEN_LE from Lexer:
+        Return 8
+    End If
+    If token_type is equal to TOKEN_GE from Lexer:
+        Return 8
+    End If
+
+    Note: membership 'in'
+    If token_type is equal to TOKEN_IN from Lexer:
+        Return 8
+    End If
+
+    Note: range '..'
+    If token_type is equal to TOKEN_RANGE from Lexer:
+        Return 9
+    End If
+
+    Note: concatenation '++' '--' '<>'
+    If token_type is equal to TOKEN_CONCAT_LIST from Lexer:
+        Return 10
+    End If
+    If token_type is equal to TOKEN_SUBTRACT_LIST from Lexer:
+        Return 10
+    End If
+    If token_type is equal to TOKEN_CONCAT_STR from Lexer:
+        Return 10
+    End If
+
+    Note: default-argument operator '\\\\' (binds loosely around a param default)
+    If token_type is equal to TOKEN_DEFAULT_OP from Lexer:
+        Return 3
+    End If
+
+    Note: additive
+    If token_type is equal to TOKEN_PLUS from Lexer:
+        Return 11
+    End If
+    If token_type is equal to TOKEN_MINUS from Lexer:
+        Return 11
+    End If
+
+    Note: multiplicative
+    If token_type is equal to TOKEN_STAR from Lexer:
+        Return 12
+    End If
+    If token_type is equal to TOKEN_SLASH from Lexer:
+        Return 12
+    End If
+
+    Note: not an operator
+    Return 0
 End Process
 
 @Reasoning:
-Handles trailing operators that extend an already-parsed primary
-expression: function application "(args)", indexing/access "[k]" or
-".field", and the pipe operator "|>" when not in operator-precedence
-mode. Returns the augmented expression so callers can continue chaining
-postfix forms.
+Parses prefix unary operators: '-' (negation), '!' / 'not' (logical not), '+'
+(unary plus), '^' (pin in patterns), '&' (capture). Stacked prefixes bind
+right-to-left, implemented by a single recursive call. Capture '&' is folded
+into a "capture" node; pin '^' into a "pin" node; the rest into "unary_op".
 @End Reasoning
+Process called "parse_unary_expression" takes parser as Integer returns Integer:
+    Note: Parse a unary (prefix-operator) expression
 
-Process called "parse_postfix" that takes parser as Integer, expr as ElixirExpression returns ElixirExpression:
-    Let result be expr
+    Let tt be proc peek_token_type with parser
 
-    While true:
-        Call skip_newlines with parser
+    If tt is equal to TOKEN_MINUS from Lexer:
+        proc advance_token with parser
+        Let operand be proc parse_unary_expression with parser
+        Let node be proc create_ast_node with "unary_op"
+        proc set_ast_attribute with node, "operator", "-"
+        proc set_ast_attribute with node, "operand", operand
+        Return node
+    End If
 
-        Note: Function call
-        If match_token with parser and TOKEN_LPAREN:
-            Let line be parser.current_line
-            Call advance_parser with parser
+    If tt is equal to TOKEN_PLUS from Lexer:
+        proc advance_token with parser
+        Let operand2 be proc parse_unary_expression with parser
+        Let node2 be proc create_ast_node with "unary_op"
+        proc set_ast_attribute with node2, "operator", "+"
+        proc set_ast_attribute with node2, "operand", operand2
+        Return node2
+    End If
 
-            Let args be a list containing nothing
+    If tt is equal to TOKEN_BANG from Lexer:
+        proc advance_token with parser
+        Let operand3 be proc parse_unary_expression with parser
+        Let node3 be proc create_ast_node with "unary_op"
+        proc set_ast_attribute with node3, "operator", "!"
+        proc set_ast_attribute with node3, "operand", operand3
+        Return node3
+    End If
 
-            While not match_token with parser and TOKEN_RPAREN:
-                Let arg be parse_expression with parser and 0
-                Add arg to end of args
+    If tt is equal to TOKEN_NOT from Lexer:
+        proc advance_token with parser
+        Let operand4 be proc parse_unary_expression with parser
+        Let node4 be proc create_ast_node with "unary_op"
+        proc set_ast_attribute with node4, "operator", "not"
+        proc set_ast_attribute with node4, "operand", operand4
+        Return node4
+    End If
 
-                If match_token with parser and TOKEN_COMMA:
-                    Call advance_parser with parser
+    If tt is equal to TOKEN_PIN from Lexer:
+        proc advance_token with parser
+        Let operand5 be proc parse_unary_expression with parser
+        Let node5 be proc create_ast_node with "pin"
+        proc set_ast_attribute with node5, "operand", operand5
+        Return node5
+    End If
+
+    If tt is equal to TOKEN_CAPTURE from Lexer:
+        proc advance_token with parser
+        Let target be proc parse_unary_expression with parser
+        Let node6 be proc create_ast_node with "capture"
+        proc set_ast_attribute with node6, "target", target
+        Return node6
+    End If
+
+    Return proc parse_postfix_expression with parser
+End Process
+
+@Reasoning:
+Handles trailing operators on a parsed primary: function-call application
+'(args)', remote-call/member access '.name' or '.name(args)', and the
+left-associative '.' dotted access. Postfix operators left-associate, so this is
+a loop. A position guard ensures progress.
+@End Reasoning
+Process called "parse_postfix_expression" takes parser as Integer returns Integer:
+    Note: Parse postfix calls and member access
+
+    Let expr be proc parse_primary_expression with parser
+    If expr is equal to 0:
+        Return 0
+    End If
+
+    While 1 is equal to 1:
+        Let tt be proc peek_token_type with parser
+
+        Note: direct call: primary immediately followed by '('
+        If tt is equal to TOKEN_LPAREN from Lexer:
+            proc advance_token with parser  Note: consume '('
+            Let call be proc create_ast_node with "call"
+            proc set_ast_attribute with call, "callee", expr
+            Let args be proc create from ListOps
+            proc parse_expr_list_until with parser, args, TOKEN_RPAREN from Lexer
+            proc expect_token with parser, TOKEN_RPAREN from Lexer
+            proc set_ast_attribute with call, "args", args
+            Set expr to call
+
+        Otherwise:
+            Note: dotted access: '.' followed by identifier/alias
+            If tt is equal to TOKEN_DOT from Lexer:
+                Let nt be proc peek_token_type_next with parser
+                If nt is equal to TOKEN_IDENTIFIER from Lexer:
+                    proc advance_token with parser  Note: consume '.'
+                    Let member be proc peek_token_lexeme with parser
+                    proc advance_token with parser  Note: consume member name
+                    Let acc be proc create_ast_node with "access"
+                    proc set_ast_attribute with acc, "object", expr
+                    proc set_ast_attribute with acc, "member", member
+                    Set expr to acc
                 Otherwise:
-                    Break
+                    If nt is equal to TOKEN_ALIAS_NAME from Lexer:
+                        proc advance_token with parser  Note: consume '.'
+                        Let member2 be proc peek_token_lexeme with parser
+                        proc advance_token with parser
+                        Let acc2 be proc create_ast_node with "access"
+                        proc set_ast_attribute with acc2, "object", expr
+                        proc set_ast_attribute with acc2, "member", member2
+                        Set expr to acc2
+                    Otherwise:
+                        If nt is equal to TOKEN_LPAREN from Lexer:
+                            Note: anonymous-call '.( args )'
+                            proc advance_token with parser  Note: consume '.'
+                            proc advance_token with parser  Note: consume '('
+                            Let dcall be proc create_ast_node with "call"
+                            proc set_ast_attribute with dcall, "callee", expr
+                            Let dargs be proc create from ListOps
+                            proc parse_expr_list_until with parser, dargs, TOKEN_RPAREN from Lexer
+                            proc expect_token with parser, TOKEN_RPAREN from Lexer
+                            proc set_ast_attribute with dcall, "args", dargs
+                            Set expr to dcall
+                        Otherwise:
+                            Break
+                        End If
+                    End If
                 End If
-            End While
-
-            Call expect_token with parser and TOKEN_RPAREN
-
-            Let call_data be a dictionary containing:
-                "function" as result,
-                "arguments" as args
-            End Dictionary
-
-            Set result to a value of type ElixirExpression with
-                expr_type as "call",
-                expr_data as call_data,
-                line as line
-
-        Note: Field access
-        Otherwise If match_token with parser and TOKEN_DOT:
-            Set line to parser.current_line
-            Call advance_parser with parser
-
-            Let field_name be parser.current_lexeme
-            Call advance_parser with parser
-
-            Let access_data be a dictionary containing:
-                "object" as result,
-                "field" as field_name
-            End Dictionary
-
-            Set result to a value of type ElixirExpression with
-                expr_type as "field_access",
-                expr_data as access_data,
-                line as line
-
-        Otherwise:
-            Break
-        End If
-    End While
-
-    Return result
-End Process
-
-Note: ============================================================================
-Note: COMPOUND EXPRESSION PARSING
-Note: ============================================================================
-
-@Reasoning:
-[ ... ] list literal. Supports head|tail destructuring ([h | t]) and
-keyword-list shorthand ([key: value, ...]). Trailing commas are
-accepted because Elixir style permits them. The result is tagged
-"list" or "keyword_list" based on whether all elements were keyword
-pairs.
-@End Reasoning
-
-Process called "parse_list" that takes parser as Integer returns ElixirExpression:
-    Let line be parser.current_line
-    Call advance_parser with parser
-
-    Let elements be a list containing nothing
-    Let tail be null
-
-    While not match_token with parser and TOKEN_RBRACKET:
-        Let elem be parse_expression with parser and 0
-        Add elem to end of elements
-
-        If match_token with parser and TOKEN_PIPE:
-            Call advance_parser with parser
-            Set tail to parse_expression with parser and 0
-            Break
-        End If
-
-        If match_token with parser and TOKEN_COMMA:
-            Call advance_parser with parser
-        Otherwise:
-            Break
-        End If
-    End While
-
-    Call expect_token with parser and TOKEN_RBRACKET
-
-    Let list_data be a dictionary containing:
-        "elements" as elements,
-        "tail" as tail
-    End Dictionary
-
-    Return a value of type ElixirExpression with
-        expr_type as "list",
-        expr_data as list_data,
-        line as line
-End Process
-
-@Reasoning:
-{ ... } tuple literal — Elixir tuples are fixed-size product types. An
-empty {} and a single-element {a} are both legal. The parser keeps the
-brace pair distinct from map literals (which require %{...} prefix) so
-no ambiguity exists between the two.
-@End Reasoning
-
-Process called "parse_tuple" that takes parser as Integer returns ElixirExpression:
-    Let line be parser.current_line
-    Call advance_parser with parser
-
-    Let elements be a list containing nothing
-
-    While not match_token with parser and TOKEN_RBRACE:
-        Let elem be parse_expression with parser and 0
-        Add elem to end of elements
-
-        If match_token with parser and TOKEN_COMMA:
-            Call advance_parser with parser
-        Otherwise:
-            Break
-        End If
-    End While
-
-    Call expect_token with parser and TOKEN_RBRACE
-
-    Let tuple_data be a dictionary containing:
-        "elements" as elements
-    End Dictionary
-
-    Return a value of type ElixirExpression with
-        expr_type as "tuple",
-        expr_data as tuple_data,
-        line as line
-End Process
-
-@Reasoning:
-%{...} is a map literal; %ModuleName{...} is a struct literal. The
-opening %{ peeks for a capitalised module identifier to discriminate.
-Both surface forms support either => arrow pairs or `key:` keyword
-shorthand for atom keys. Map update syntax %{m | k => v} is also
-recognised here via the | inside the braces.
-@End Reasoning
-
-Process called "parse_map_or_struct" that takes parser as Integer returns ElixirExpression:
-    Let line be parser.current_line
-    Call advance_parser with parser
-
-    Note: Check if struct or map
-    If match_token with parser and TOKEN_MODULE_NAME:
-        Note: Struct literal
-        Let struct_name be parser.current_lexeme
-        Call advance_parser with parser
-
-        Call expect_token with parser and TOKEN_LBRACE
-
-        Let fields be a list containing nothing
-
-        While not match_token with parser and TOKEN_RBRACE:
-            Let key be parse_expression with parser and 0
-
-            Call expect_token with parser and TOKEN_COLON
-
-            Let value be parse_expression with parser and 0
-
-            Let field_data be a dictionary containing:
-                "key" as key,
-                "value" as value
-            End Dictionary
-
-            Add field_data to end of fields
-
-            If match_token with parser and TOKEN_COMMA:
-                Call advance_parser with parser
             Otherwise:
                 Break
             End If
-        End While
+        End If
+    End While
 
-        Call expect_token with parser and TOKEN_RBRACE
+    Return expr
+End Process
 
-        Let struct_data be a dictionary containing:
-            "name" as struct_name,
-            "fields" as fields
-        End Dictionary
+@Reasoning:
+Parses a comma-separated list of expressions into out_list, stopping at the
+terminator token (e.g. RPAREN, RBRACKET, RBRACE). Keyword-list trailing entries
+(name: value) inside arg lists are parsed as keyword_pair nodes so call options
+survive. A position guard forces progress on a stalled element.
+@End Reasoning
+Process called "parse_expr_list_until" takes parser as Integer, out_list as Integer, terminator as Integer returns Integer:
+    Note: Parse comma-separated expressions until terminator
 
-        Return a value of type ElixirExpression with
-            expr_type as "struct",
-            expr_data as struct_data,
-            line as line
-    End If
-
-    Note: Map literal
-    Call expect_token with parser and TOKEN_LBRACE
-
-    Let pairs be a list containing nothing
-
-    While not match_token with parser and TOKEN_RBRACE:
-        Set key to parse_expression with parser and 0
-
-        Note: => or :
-        If match_token with parser and TOKEN_DOUBLE_ARROW or match_token with parser and TOKEN_COLON:
-            Call advance_parser with parser
+    While 1 is equal to 1:
+        proc skip_terminators with parser
+        Let tt be proc peek_token_type with parser
+        If tt is equal to terminator:
+            Break
+        End If
+        If tt is equal to TOKEN_EOF from Lexer:
+            Break
         End If
 
-        Set value to parse_expression with parser and 0
+        Let before be proc memory_get_int64 from Layout with parser, 8
 
-        Let pair_data be a dictionary containing:
-            "key" as key,
-            "value" as value
-        End Dictionary
+        Note: keyword pair argument 'name: value'
+        If tt is equal to TOKEN_KEYWORD_PAIR from Lexer:
+            Let kp be proc parse_keyword_pair with parser
+            If kp is not equal to 0:
+                proc list_append from ListOps with out_list, kp
+            End If
+        Otherwise:
+            Let element be proc parse_expression with parser
+            If element is not equal to 0:
+                proc list_append from ListOps with out_list, element
+            End If
+        End If
 
-        Add pair_data to end of pairs
+        Let after be proc memory_get_int64 from Layout with parser, 8
+        If after is equal to before:
+            proc advance_token with parser
+        End If
 
-        If match_token with parser and TOKEN_COMMA:
-            Call advance_parser with parser
+        proc skip_terminators with parser
+        Let sep be proc peek_token_type with parser
+        If sep is equal to TOKEN_COMMA from Lexer:
+            proc advance_token with parser
         Otherwise:
             Break
         End If
     End While
 
-    Call expect_token with parser and TOKEN_RBRACE
-
-    Let map_data be a dictionary containing:
-        "pairs" as pairs
-    End Dictionary
-
-    Return a value of type ElixirExpression with
-        expr_type as "map",
-        expr_data as map_data,
-        line as line
+    Return 1
 End Process
 
 @Reasoning:
-<<...>> bitstring/binary literal. Each segment can be a value (with
-optional ::size and ::type modifiers) for low-level packed-binary
-construction. This is one of the few places where Elixir's expression
-grammar dips into raw bit-level operations, and the parser stores
-modifiers as a list per segment so the encoder can validate them later.
+Parses a 'name: value' keyword pair (the key arrived as a single KEYWORD_PAIR
+token whose lexeme is the bare key without the colon). Builds a keyword_pair
+node with the key string and parsed value expression.
 @End Reasoning
-
-Process called "parse_binary" that takes parser as Integer returns ElixirExpression:
-    Let line be parser.current_line
-    Call advance_parser with parser
-
-    Let segments be a list containing nothing
-
-    While not match_token with parser and TOKEN_RBIN:
-        Let value be parse_expression with parser and 0
-
-        Note: Size and type specifiers
-        Let size be null
-        Let specifiers be a list containing nothing
-
-        If match_token with parser and TOKEN_DOUBLE_COLON:
-            Call advance_parser with parser
-
-            Note: Parse specifiers
-            While match_token with parser and TOKEN_IDENTIFIER:
-                Add parser.current_lexeme to end of specifiers
-                Call advance_parser with parser
-
-                If match_token with parser and TOKEN_MINUS:
-                    Call advance_parser with parser
-                Otherwise:
-                    Break
-                End If
-            End While
-        End If
-
-        Let segment_data be a dictionary containing:
-            "value" as value,
-            "size" as size,
-            "specifiers" as specifiers
-        End Dictionary
-
-        Add segment_data to end of segments
-
-        If match_token with parser and TOKEN_COMMA:
-            Call advance_parser with parser
-        Otherwise:
-            Break
-        End If
-    End While
-
-    Call expect_token with parser and TOKEN_RBIN
-
-    Let binary_data be a dictionary containing:
-        "segments" as segments
-    End Dictionary
-
-    Return a value of type ElixirExpression with
-        expr_type as "binary",
-        expr_data as binary_data,
-        line as line
-End Process
-
-@Reasoning:
-fn (args) -> body end anonymous function. Supports the multi-clause
-form `fn x -> ... ; y -> ... end` by parsing arrow-separated clauses
-between fn and end. The "&" capture syntax (&Enum.map/2) is also
-recognised at this entry because it shares the fn-prefix codepath.
-@End Reasoning
-
-Process called "parse_fn" that takes parser as Integer returns ElixirExpression:
-    Let line be parser.current_line
-    Call advance_parser with parser
-
-    Let clauses be a list containing nothing
-
-    While true:
-        Let clause_line be parser.current_line
-        Let patterns be a list containing nothing
-        Let guards be a list containing nothing
-        Let body be a list containing nothing
-
-        Note: Parse parameters
-        If match_token with parser and TOKEN_LPAREN:
-            Call advance_parser with parser
-
-            While not match_token with parser and TOKEN_RPAREN:
-                Let pattern be parse_expression with parser and 0
-                Add pattern to end of patterns
-
-                If match_token with parser and TOKEN_COMMA:
-                    Call advance_parser with parser
-                Otherwise:
-                    Break
-                End If
-            End While
-
-            Call expect_token with parser and TOKEN_RPAREN
-        End If
-
-        Note: Guards
-        If match_token with parser and TOKEN_WHEN:
-            Call advance_parser with parser
-
-            While true:
-                Let guard be parse_expression with parser and 0
-                Add guard to end of guards
-
-                If match_token with parser and TOKEN_COMMA:
-                    Call advance_parser with parser
-                Otherwise:
-                    Break
-                End If
-            End While
-        End If
-
-        Call expect_token with parser and TOKEN_ARROW
-
-        Note: Body
-        Let expr be parse_expression with parser and 0
-        Add expr to end of body
-
-        Let clause be a value of type ElixirFunctionClause with
-            patterns as patterns,
-            guards as guards,
-            body as body,
-            line as clause_line
-
-        Add clause to end of clauses
-
-        Call skip_newlines with parser
-
-        If match_token with parser and TOKEN_SEMICOLON:
-            Call advance_parser with parser
-        Otherwise:
-            Break
-        End If
-    End While
-
-    Call expect_token with parser and TOKEN_END
-
-    Let fn_data be a dictionary containing:
-        "clauses" as clauses
-    End Dictionary
-
-    Return a value of type ElixirExpression with
-        expr_type as "fn",
-        expr_data as fn_data,
-        line as line
-End Process
-
-@Reasoning:
-`case expr do PATTERN [when GUARD] -> BODY ... end` — pattern matching
-expression. Each branch is collected as a (pattern, guard, body)
-triple. The result expression of a case is the body of the first
-matching branch; this is the most common Elixir control construct.
-@End Reasoning
-
-Process called "parse_case" that takes parser as Integer returns ElixirExpression:
-    Let line be parser.current_line
-    Call advance_parser with parser
-
-    Let scrutinee be parse_expression with parser and 0
-
-    Call skip_newlines with parser
-    Call expect_token with parser and TOKEN_DO
-    Call skip_newlines with parser
-
-    Let clauses be a list containing nothing
-
-    While not match_token with parser and TOKEN_END:
-        Let clause_line be parser.current_line
-        Let pattern be parse_expression with parser and 0
-
-        Let guards be a list containing nothing
-        If match_token with parser and TOKEN_WHEN:
-            Call advance_parser with parser
-
-            While true:
-                Let guard be parse_expression with parser and 0
-                Add guard to end of guards
-
-                If match_token with parser and TOKEN_COMMA:
-                    Call advance_parser with parser
-                Otherwise:
-                    Break
-                End If
-            End While
-        End If
-
-        Call expect_token with parser and TOKEN_ARROW
-
-        Let body be a list containing nothing
-        Let expr be parse_expression with parser and 0
-        Add expr to end of body
-
-        Let clause_data be a dictionary containing:
-            "pattern" as pattern,
-            "guards" as guards,
-            "body" as body,
-            "line" as clause_line
-        End Dictionary
-
-        Add clause_data to end of clauses
-
-        Call skip_newlines with parser
-    End While
-
-    Call expect_token with parser and TOKEN_END
-
-    Let case_data be a dictionary containing:
-        "scrutinee" as scrutinee,
-        "clauses" as clauses
-    End Dictionary
-
-    Return a value of type ElixirExpression with
-        expr_type as "case",
-        expr_data as case_data,
-        line as line
-End Process
-
-@Reasoning:
-`cond do CONDITION -> BODY ... end` — first-truthy-condition wins. No
-patterns, no fallthrough; each branch is just a boolean expression on
-the left of the arrow and its body on the right. The branch that
-evaluates to true is the cond's result; the parser does not enforce
-that a true branch exists (Elixir raises at runtime if none does).
-@End Reasoning
-
-Process called "parse_cond" that takes parser as Integer returns ElixirExpression:
-    Let line be parser.current_line
-    Call advance_parser with parser
-
-    Call skip_newlines with parser
-    Call expect_token with parser and TOKEN_DO
-    Call skip_newlines with parser
-
-    Let clauses be a list containing nothing
-
-    While not match_token with parser and TOKEN_END:
-        Let condition be parse_expression with parser and 0
-        Call expect_token with parser and TOKEN_ARROW
-
-        Let body be parse_expression with parser and 0
-
-        Let clause_data be a dictionary containing:
-            "condition" as condition,
-            "body" as body
-        End Dictionary
-
-        Add clause_data to end of clauses
-
-        Call skip_newlines with parser
-    End While
-
-    Call expect_token with parser and TOKEN_END
-
-    Let cond_data be a dictionary containing:
-        "clauses" as clauses
-    End Dictionary
-
-    Return a value of type ElixirExpression with
-        expr_type as "cond",
-        expr_data as cond_data,
-        line as line
-End Process
-
-@Reasoning:
-`if COND, do: THEN, else: ELSE` and the keyword-block-equivalent
-`if COND do THEN else ELSE end`. `unless` is the inverted-condition
-twin and shares the same parser by flipping a flag in the result. Both
-the keyword-list and the do/end block surface forms desugar to the
-same AST node.
-@End Reasoning
-
-Process called "parse_if_unless" that takes parser as Integer returns ElixirExpression:
-    Let line be parser.current_line
-    Let is_unless be match_token with parser and TOKEN_UNLESS
-    Call advance_parser with parser
-
-    Let condition be parse_expression with parser and 0
-
-    Call skip_newlines with parser
-    Call expect_token with parser and TOKEN_DO
-    Call skip_newlines with parser
-
-    Let then_body be a list containing nothing
-    Let else_body be a list containing nothing
-
-    While not match_token with parser and TOKEN_ELSE and not match_token with parser and TOKEN_END:
-        Let expr be parse_expression with parser and 0
-        Add expr to end of then_body
-
-        Call skip_newlines with parser
-    End While
-
-    If match_token with parser and TOKEN_ELSE:
-        Call advance_parser with parser
-        Call skip_newlines with parser
-
-        While not match_token with parser and TOKEN_END:
-            Set expr to parse_expression with parser and 0
-            Add expr to end of else_body
-
-            Call skip_newlines with parser
-        End While
-    End If
-
-    Call expect_token with parser and TOKEN_END
-
-    Let if_data be a dictionary containing:
-        "is_unless" as is_unless,
-        "condition" as condition,
-        "then_body" as then_body,
-        "else_body" as else_body
-    End Dictionary
-
-    Return a value of type ElixirExpression with
-        expr_type as "if",
-        expr_data as if_data,
-        line as line
-End Process
-
-@Reasoning:
-`with PATTERN <- EXPR, ... do BODY [else CLAUSES] end` — sequential
-pattern-matching let where the first non-matching arrow short-circuits.
-The optional else block handles the short-circuit return value as a
-case expression. Used for railway-style error handling without nested
-case statements.
-@End Reasoning
-
-Process called "parse_with" that takes parser as Integer returns ElixirExpression:
-    Let line be parser.current_line
-    Call advance_parser with parser
-
-    Let clauses be a list containing nothing
-
-    While not match_token with parser and TOKEN_DO:
-        Let pattern be parse_expression with parser and 0
-        Call expect_token with parser and TOKEN_LEFT_ARROW
-        Let expr be parse_expression with parser and 0
-
-        Let clause_data be a dictionary containing:
-            "pattern" as pattern,
-            "expression" as expr
-        End Dictionary
-
-        Add clause_data to end of clauses
-
-        If match_token with parser and TOKEN_COMMA:
-            Call advance_parser with parser
-        Otherwise:
-            Break
-        End If
-    End While
-
-    Call skip_newlines with parser
-    Call expect_token with parser and TOKEN_DO
-    Call skip_newlines with parser
-
-    Let body be parse_expression with parser and 0
-
-    Call skip_newlines with parser
-    Call expect_token with parser and TOKEN_END
-
-    Let with_data be a dictionary containing:
-        "clauses" as clauses,
-        "body" as body
-    End Dictionary
-
-    Return a value of type ElixirExpression with
-        expr_type as "with",
-        expr_data as with_data,
-        line as line
-End Process
-
-@Reasoning:
-`receive do MATCH_CLAUSES [after MILLISECONDS -> TIMEOUT_BODY] end` —
-the BEAM mailbox primitive. Pattern-matched message receive with an
-optional timeout. The parser preserves the after clause separately
-because its body runs only if the timeout fires.
-@End Reasoning
-
-Process called "parse_receive" that takes parser as Integer returns ElixirExpression:
-    Let line be parser.current_line
-    Call advance_parser with parser
-
-    Call skip_newlines with parser
-    Call expect_token with parser and TOKEN_DO
-    Call skip_newlines with parser
-
-    Let clauses be a list containing nothing
-
-    While not match_token with parser and TOKEN_AFTER and not match_token with parser and TOKEN_END:
-        Let pattern be parse_expression with parser and 0
-
-        Let guards be a list containing nothing
-        If match_token with parser and TOKEN_WHEN:
-            Call advance_parser with parser
-
-            While true:
-                Let guard be parse_expression with parser and 0
-                Add guard to end of guards
-
-                If match_token with parser and TOKEN_COMMA:
-                    Call advance_parser with parser
-                Otherwise:
-                    Break
-                End If
-            End While
-        End If
-
-        Call expect_token with parser and TOKEN_ARROW
-
-        Let body be parse_expression with parser and 0
-
-        Let clause_data be a dictionary containing:
-            "pattern" as pattern,
-            "guards" as guards,
-            "body" as body
-        End Dictionary
-
-        Add clause_data to end of clauses
-
-        Call skip_newlines with parser
-    End While
-
-    Let after_timeout be null
-    Let after_body be null
-
-    If match_token with parser and TOKEN_AFTER:
-        Call advance_parser with parser
-        Set after_timeout to parse_expression with parser and 0
-        Call expect_token with parser and TOKEN_ARROW
-        Set after_body to parse_expression with parser and 0
-    End If
-
-    Call skip_newlines with parser
-    Call expect_token with parser and TOKEN_END
-
-    Let receive_data be a dictionary containing:
-        "clauses" as clauses,
-        "after_timeout" as after_timeout,
-        "after_body" as after_body
-    End Dictionary
-
-    Return a value of type ElixirExpression with
-        expr_type as "receive",
-        expr_data as receive_data,
-        line as line
-End Process
-
-@Reasoning:
-`try do BODY [rescue ...] [catch ...] [after ...] [else ...] end` — the
-exception-handling construct. All five optional clauses are captured as
-separate child lists so that downstream code generators can emit them in
-the correct order without re-grouping. after always runs (finally
-semantics), else runs only if the body succeeded.
-@End Reasoning
-
-Process called "parse_try" that takes parser as Integer returns ElixirExpression:
-    Let line be parser.current_line
-    Call advance_parser with parser
-
-    Call skip_newlines with parser
-    Call expect_token with parser and TOKEN_DO
-    Call skip_newlines with parser
-
-    Let try_body be parse_expression with parser and 0
-
-    Let rescue_clauses be a list containing nothing
-    Let catch_clauses be a list containing nothing
-    Let after_body be null
-
-    Call skip_newlines with parser
-
-    If match_token with parser and TOKEN_RESCUE:
-        Call advance_parser with parser
-        Call skip_newlines with parser
-
-        While not match_token with parser and TOKEN_CATCH and not match_token with parser and TOKEN_AFTER and not match_token with parser and TOKEN_END:
-            Let pattern be parse_expression with parser and 0
-            Call expect_token with parser and TOKEN_ARROW
-            Let body be parse_expression with parser and 0
-
-            Let clause_data be a dictionary containing:
-                "pattern" as pattern,
-                "body" as body
-            End Dictionary
-
-            Add clause_data to end of rescue_clauses
-
-            Call skip_newlines with parser
-        End While
-    End If
-
-    If match_token with parser and TOKEN_CATCH:
-        Call advance_parser with parser
-        Call skip_newlines with parser
-
-        While not match_token with parser and TOKEN_AFTER and not match_token with parser and TOKEN_END:
-            Set pattern to parse_expression with parser and 0
-            Call expect_token with parser and TOKEN_ARROW
-            Set body to parse_expression with parser and 0
-
-            Set clause_data to a dictionary containing:
-                "pattern" as pattern,
-                "body" as body
-            End Dictionary
-
-            Add clause_data to end of catch_clauses
-
-            Call skip_newlines with parser
-        End While
-    End If
-
-    If match_token with parser and TOKEN_AFTER:
-        Call advance_parser with parser
-        Call skip_newlines with parser
-        Set after_body to parse_expression with parser and 0
-    End If
-
-    Call skip_newlines with parser
-    Call expect_token with parser and TOKEN_END
-
-    Let try_data be a dictionary containing:
-        "try_body" as try_body,
-        "rescue_clauses" as rescue_clauses,
-        "catch_clauses" as catch_clauses,
-        "after_body" as after_body
-    End Dictionary
-
-    Return a value of type ElixirExpression with
-        expr_type as "try",
-        expr_data as try_data,
-        line as line
-End Process
-
-@Reasoning:
-`for GENERATORS [, FILTERS] [into: ACC] [reduce: ACC] do BODY end` —
-list/stream comprehension. Generators are `pattern <- enumerable` forms;
-filters are arbitrary boolean expressions. The optional `into:` selects
-the accumulator (list by default, but any Collectable). `reduce:` turns
-the comprehension into a fold. Each part is stored separately so codegen
-can emit the right BEAM primitive.
-@End Reasoning
-
-Process called "parse_for" that takes parser as Integer returns ElixirExpression:
-    Let line be parser.current_line
-    Call advance_parser with parser
-
-    Let generators be a list containing nothing
-
-    While true:
-        Let pattern be parse_expression with parser and 0
-        Call expect_token with parser and TOKEN_LEFT_ARROW
-        Let collection be parse_expression with parser and 0
-
-        Let gen_data be a dictionary containing:
-            "pattern" as pattern,
-            "collection" as collection
-        End Dictionary
-
-        Add gen_data to end of generators
-
-        If match_token with parser and TOKEN_COMMA:
-            Call advance_parser with parser
-        Otherwise:
-            Break
-        End If
-    End While
-
-    Call skip_newlines with parser
-    Call expect_token with parser and TOKEN_DO
-    Call skip_newlines with parser
-
-    Let body be parse_expression with parser and 0
-
-    Call skip_newlines with parser
-    Call expect_token with parser and TOKEN_END
-
-    Let for_data be a dictionary containing:
-        "generators" as generators,
-        "body" as body
-    End Dictionary
-
-    Return a value of type ElixirExpression with
-        expr_type as "for",
-        expr_data as for_data,
-        line as line
+Process called "parse_keyword_pair" takes parser as Integer returns Integer:
+    Note: Parse a 'name: value' keyword pair
+
+    Let key be proc peek_token_lexeme with parser
+    proc advance_token with parser  Note: consume the 'name:' token
+
+    Let node be proc create_ast_node with "keyword_pair"
+    proc set_ast_attribute with node, "key", key
+    Let value be proc parse_expression with parser
+    proc set_ast_attribute with node, "value", value
+    Return node
 End Process
 
 Note: ============================================================================
-Note: PARSER ENTRY POINT
+Note: PRIMARY EXPRESSIONS
 Note: ============================================================================
 
 @Reasoning:
-End-to-end public entry: builds a parser from the three lexer arrays
-and immediately runs parse_elixir_module. Returns the resulting AST
-root; the parser itself is discarded after this call because it carries
-no state worth preserving beyond the AST.
+Every leaf / opening expression form. Literals (int/float/string/charlist/char/
+atom/sigil/bool/nil), identifiers, module aliases (with optional %Alias{}
+struct-literal), parenthesised expressions, tuples {..}, lists [..] (with [h|t]
+tail), maps %{..}, struct literals %Alias{..}, binaries <<..>>, anonymous
+functions fn ... end, and the control-flow expression forms (if/unless/case/
+cond/with/for/try/receive). Each path consumes at least its opening token so the
+caller never stalls.
 @End Reasoning
+Process called "parse_primary_expression" takes parser as Integer returns Integer:
+    Note: Parse a primary expression
 
-Process called "parse_elixir" that takes tokens as Integer, lexemes as Integer, lines as Integer returns ElixirModule:
-    Let parser be create_elixir_parser with tokens, lexemes, lines
-    Let module be parse_elixir_module with parser
+    Let tt be proc peek_token_type with parser
 
-    If length of parser.errors is greater than 0:
-        For Each error in parser.errors:
-            Note: Parse error: {error}
-        End For
+    Note: literals
+    If tt is equal to TOKEN_INT_LITERAL from Lexer:
+        Return proc make_literal with parser, "int"
+    End If
+    If tt is equal to TOKEN_FLOAT_LITERAL from Lexer:
+        Return proc make_literal with parser, "float"
+    End If
+    If tt is equal to TOKEN_STRING_LITERAL from Lexer:
+        Return proc make_literal with parser, "string"
+    End If
+    If tt is equal to TOKEN_CHARLIST_LITERAL from Lexer:
+        Return proc make_literal with parser, "charlist"
+    End If
+    If tt is equal to TOKEN_CHAR_LITERAL from Lexer:
+        Return proc make_literal with parser, "char"
+    End If
+    If tt is equal to TOKEN_SIGIL from Lexer:
+        Return proc make_literal with parser, "sigil"
+    End If
+    If tt is equal to TOKEN_TRUE from Lexer:
+        proc advance_token with parser
+        Let bt be proc create_ast_node with "literal"
+        proc set_ast_attribute with bt, "literal_type", "bool"
+        proc set_ast_attribute with bt, "value", "true"
+        Return bt
+    End If
+    If tt is equal to TOKEN_FALSE from Lexer:
+        proc advance_token with parser
+        Let bf be proc create_ast_node with "literal"
+        proc set_ast_attribute with bf, "literal_type", "bool"
+        proc set_ast_attribute with bf, "value", "false"
+        Return bf
+    End If
+    If tt is equal to TOKEN_NIL from Lexer:
+        proc advance_token with parser
+        Let nn be proc create_ast_node with "literal"
+        proc set_ast_attribute with nn, "literal_type", "nil"
+        proc set_ast_attribute with nn, "value", "nil"
+        Return nn
+    End If
+    If tt is equal to TOKEN_ATOM_LITERAL from Lexer:
+        Let av be proc peek_token_lexeme with parser
+        proc advance_token with parser
+        Let an be proc create_ast_node with "atom"
+        proc set_ast_attribute with an, "value", av
+        Return an
     End If
 
-    Return module
+    Note: identifier
+    If tt is equal to TOKEN_IDENTIFIER from Lexer:
+        Let name be proc peek_token_lexeme with parser
+        proc advance_token with parser
+        Let idn be proc create_ast_node with "identifier"
+        proc set_ast_attribute with idn, "name", name
+        Return idn
+    End If
+
+    Note: module alias - possibly a struct literal %Alias{...} is handled at '%'
+    If tt is equal to TOKEN_ALIAS_NAME from Lexer:
+        Let aname be proc parse_alias_path with parser
+        Let arn be proc create_ast_node with "alias_ref"
+        proc set_ast_attribute with arn, "name", aname
+        Return arn
+    End If
+
+    Note: capture as primary (e.g. &Mod.fun/1 handled via unary; bare & here)
+    If tt is equal to TOKEN_CAPTURE from Lexer:
+        Return proc parse_unary_expression with parser
+    End If
+
+    Note: parenthesised expression / block
+    If tt is equal to TOKEN_LPAREN from Lexer:
+        proc advance_token with parser
+        Let inner be proc parse_paren_or_block with parser
+        proc expect_token with parser, TOKEN_RPAREN from Lexer
+        Return inner
+    End If
+
+    Note: tuple {a, b, c}
+    If tt is equal to TOKEN_LBRACE from Lexer:
+        Return proc parse_tuple with parser
+    End If
+
+    Note: list [a, b | tail]
+    If tt is equal to TOKEN_LBRACKET from Lexer:
+        Return proc parse_list with parser
+    End If
+
+    Note: map %{...} (PERCENT_BRACE token already merged '%{')
+    If tt is equal to TOKEN_PERCENT_BRACE from Lexer:
+        Return proc parse_map with parser, 0
+    End If
+
+    Note: struct literal %Alias{...}
+    If tt is equal to TOKEN_PERCENT from Lexer:
+        Return proc parse_struct_literal with parser
+    End If
+
+    Note: binary <<...>>
+    If tt is equal to TOKEN_LSHIFT_BIN from Lexer:
+        Return proc parse_binary_literal with parser
+    End If
+
+    Note: anonymous function
+    If tt is equal to TOKEN_FN from Lexer:
+        Return proc parse_fn with parser
+    End If
+
+    Note: control-flow expression forms
+    If tt is equal to TOKEN_IF from Lexer:
+        Return proc parse_if with parser, "if"
+    End If
+    If tt is equal to TOKEN_UNLESS from Lexer:
+        Return proc parse_if with parser, "unless"
+    End If
+    If tt is equal to TOKEN_CASE from Lexer:
+        Return proc parse_case with parser
+    End If
+    If tt is equal to TOKEN_COND from Lexer:
+        Return proc parse_cond with parser
+    End If
+    If tt is equal to TOKEN_WITH from Lexer:
+        Return proc parse_with with parser
+    End If
+    If tt is equal to TOKEN_FOR from Lexer:
+        Return proc parse_for with parser
+    End If
+    If tt is equal to TOKEN_TRY from Lexer:
+        Return proc parse_try with parser
+    End If
+    If tt is equal to TOKEN_RECEIVE from Lexer:
+        Return proc parse_receive with parser
+    End If
+
+    Note: keyword pair appearing as a primary (rare; collected for safety)
+    If tt is equal to TOKEN_KEYWORD_PAIR from Lexer:
+        Return proc parse_keyword_pair with parser
+    End If
+
+    Note: unexpected token - record error, advance to keep progress, return 0
+    proc add_parse_error with parser, "Unexpected primary token"
+    If tt is not equal to TOKEN_EOF from Lexer:
+        proc advance_token with parser
+    End If
+    Return 0
+End Process
+
+@Reasoning:
+Builds a literal node of the given literal_type from the current token's lexeme,
+then advances. Shared by all single-token literal forms.
+@End Reasoning
+Process called "make_literal" takes parser as Integer, literal_type as Integer returns Integer:
+    Note: Build a literal node from the current token
+
+    Let lexeme be proc peek_token_lexeme with parser
+    proc advance_token with parser
+    Let node be proc create_ast_node with "literal"
+    proc set_ast_attribute with node, "literal_type", literal_type
+    proc set_ast_attribute with node, "value", lexeme
+    Return node
+End Process
+
+@Reasoning:
+Inside parentheses Elixir allows either a single expression or a sequence of
+statements separated by terminators (a parenthesised block). We parse the first
+expression; if a terminator and more content follow before ')', we wrap the
+sequence in a "block" node. Otherwise we return the single expression directly.
+@End Reasoning
+Process called "parse_paren_or_block" takes parser as Integer returns Integer:
+    Note: Parse the contents of a parenthesised expression or block
+
+    proc skip_terminators with parser
+    Let first be proc parse_expression with parser
+
+    proc skip_terminators with parser
+    Let tt be proc peek_token_type with parser
+    If tt is equal to TOKEN_RPAREN from Lexer:
+        Return first
+    End If
+    If tt is equal to TOKEN_EOF from Lexer:
+        Return first
+    End If
+
+    Note: more statements follow -> build a block
+    Let block be proc create_ast_node with "block"
+    Let body be proc create from ListOps
+    proc set_ast_attribute with block, "body", body
+    If first is not equal to 0:
+        proc list_append from ListOps with body, first
+    End If
+
+    While 1 is equal to 1:
+        proc skip_terminators with parser
+        Let bt be proc peek_token_type with parser
+        If bt is equal to TOKEN_RPAREN from Lexer:
+            Break
+        End If
+        If bt is equal to TOKEN_EOF from Lexer:
+            Break
+        End If
+        Let before be proc memory_get_int64 from Layout with parser, 8
+        Let stmt be proc parse_expression with parser
+        If stmt is not equal to 0:
+            proc list_append from ListOps with body, stmt
+        End If
+        Let after be proc memory_get_int64 from Layout with parser, 8
+        If after is equal to before:
+            proc advance_token with parser
+        End If
+    End While
+
+    Return block
+End Process
+
+Note: ============================================================================
+Note: COLLECTION LITERALS
+Note: ============================================================================
+
+@Reasoning:
+Parses a tuple '{a, b, c}'. Elements are collected as children. Keyword pairs
+inside are parsed as keyword_pair nodes.
+@End Reasoning
+Process called "parse_tuple" takes parser as Integer returns Integer:
+    Note: Parse a tuple literal
+
+    proc advance_token with parser  Note: consume '{'
+    Let node be proc create_ast_node with "tuple"
+    Let elems be proc create from ListOps
+    proc parse_expr_list_until with parser, elems, TOKEN_RBRACE from Lexer
+    proc expect_token with parser, TOKEN_RBRACE from Lexer
+
+    Note: install elements as children
+    Let i be 0
+    Let n be proc list_length from ListOps with elems
+    While i is less than n:
+        Let e be proc list_get from ListOps with elems, i
+        proc add_ast_child with node, e
+        Set i to i plus 1
+    End While
+    Return node
+End Process
+
+@Reasoning:
+Parses a list '[a, b, c]' with optional cons tail '[h | t]'. Elements before a
+'|' become children; the expression after '|' is stored as the "tail" attribute
+(0 when absent). Keyword pairs as trailing entries are kept as keyword_pair
+children.
+@End Reasoning
+Process called "parse_list" takes parser as Integer returns Integer:
+    Note: Parse a list literal with optional cons tail
+
+    proc advance_token with parser  Note: consume '['
+    Let node be proc create_ast_node with "list"
+    proc set_ast_attribute with node, "tail", 0
+
+    While 1 is equal to 1:
+        proc skip_terminators with parser
+        Let tt be proc peek_token_type with parser
+        If tt is equal to TOKEN_RBRACKET from Lexer:
+            Break
+        End If
+        If tt is equal to TOKEN_EOF from Lexer:
+            Break
+        End If
+
+        Let before be proc memory_get_int64 from Layout with parser, 8
+
+        If tt is equal to TOKEN_KEYWORD_PAIR from Lexer:
+            Let kp be proc parse_keyword_pair with parser
+            If kp is not equal to 0:
+                proc add_ast_child with node, kp
+            End If
+        Otherwise:
+            Let element be proc parse_expression with parser
+            If element is not equal to 0:
+                proc add_ast_child with node, element
+            End If
+        End If
+
+        Let after be proc memory_get_int64 from Layout with parser, 8
+        If after is equal to before:
+            proc advance_token with parser
+        End If
+
+        proc skip_terminators with parser
+        Let sep be proc peek_token_type with parser
+        If sep is equal to TOKEN_COMMA from Lexer:
+            proc advance_token with parser
+        Otherwise:
+            If sep is equal to TOKEN_PIPE from Lexer:
+                proc advance_token with parser  Note: consume '|'
+                Let tail be proc parse_expression with parser
+                proc set_ast_attribute with node, "tail", tail
+                Break
+            Otherwise:
+                Break
+            End If
+        End If
+    End While
+
+    proc expect_token with parser, TOKEN_RBRACKET from Lexer
+    Return node
+End Process
+
+@Reasoning:
+Parses a map literal '%{ k => v, key: v }'. The '%{' token has already been
+recognized (PERCENT_BRACE). update_source is for '%{base | k => v}' map-update
+syntax (0 when absent). Each pair is a "pair" node: '=>' pairs read key and
+value expressions; 'key:' keyword pairs become pairs with an atom key.
+@End Reasoning
+Process called "parse_map" takes parser as Integer, update_source as Integer returns Integer:
+    Note: Parse a map literal (the '%{' has been seen)
+
+    proc advance_token with parser  Note: consume '%{'
+    Let node be proc create_ast_node with "map"
+    proc set_ast_attribute with node, "update_source", update_source
+    Let pairs be proc create from ListOps
+    proc set_ast_attribute with node, "pairs", pairs
+
+    Note: optional map-update 'base | ...'
+    proc skip_terminators with parser
+    Let ut be proc peek_token_type with parser
+    If ut is not equal to TOKEN_RBRACE from Lexer:
+        If ut is not equal to TOKEN_KEYWORD_PAIR from Lexer:
+            Note: peek whether this is 'expr | pairs' update form
+            Let save_pos be proc memory_get_int64 from Layout with parser, 8
+            Let maybe_base be proc parse_expression with parser
+            Let bt be proc peek_token_type with parser
+            If bt is equal to TOKEN_PIPE from Lexer:
+                proc advance_token with parser  Note: consume '|'
+                proc set_ast_attribute with node, "update_source", maybe_base
+            Otherwise:
+                Note: not an update; treat maybe_base as the key of the first pair
+                If bt is equal to TOKEN_MAP_ARROW from Lexer:
+                    proc advance_token with parser  Note: consume '=>'
+                    Let v be proc parse_expression with parser
+                    Let p be proc create_ast_node with "pair"
+                    proc set_ast_attribute with p, "key", maybe_base
+                    proc set_ast_attribute with p, "value", v
+                    proc list_append from ListOps with pairs, p
+                    Let after_first be proc peek_token_type with parser
+                    If after_first is equal to TOKEN_COMMA from Lexer:
+                        proc advance_token with parser
+                    End If
+                Otherwise:
+                    Note: restore and fall through to general loop
+                    proc memory_set_int64 from Layout with parser, 8, save_pos
+                End If
+            End If
+        End If
+    End If
+
+    proc parse_map_pairs with parser, pairs
+    proc expect_token with parser, TOKEN_RBRACE from Lexer
+    Return node
+End Process
+
+@Reasoning:
+Reads the remaining map pairs into the pairs list: '=>' pairs (key => value) and
+'key:' keyword pairs (atom key => value). A position guard forces progress.
+@End Reasoning
+Process called "parse_map_pairs" takes parser as Integer, pairs as Integer returns Integer:
+    Note: Read map pairs until '}'
+
+    While 1 is equal to 1:
+        proc skip_terminators with parser
+        Let tt be proc peek_token_type with parser
+        If tt is equal to TOKEN_RBRACE from Lexer:
+            Break
+        End If
+        If tt is equal to TOKEN_EOF from Lexer:
+            Break
+        End If
+
+        Let before be proc memory_get_int64 from Layout with parser, 8
+
+        If tt is equal to TOKEN_KEYWORD_PAIR from Lexer:
+            Let key be proc peek_token_lexeme with parser
+            proc advance_token with parser
+            Let katom be proc create_ast_node with "atom"
+            proc set_ast_attribute with katom, "value", key
+            Let v be proc parse_expression with parser
+            Let p be proc create_ast_node with "pair"
+            proc set_ast_attribute with p, "key", katom
+            proc set_ast_attribute with p, "value", v
+            proc list_append from ListOps with pairs, p
+        Otherwise:
+            Let k be proc parse_expression with parser
+            proc expect_token with parser, TOKEN_MAP_ARROW from Lexer
+            Let v2 be proc parse_expression with parser
+            Let p2 be proc create_ast_node with "pair"
+            proc set_ast_attribute with p2, "key", k
+            proc set_ast_attribute with p2, "value", v2
+            proc list_append from ListOps with pairs, p2
+        End If
+
+        Let after be proc memory_get_int64 from Layout with parser, 8
+        If after is equal to before:
+            proc advance_token with parser
+        End If
+
+        proc skip_terminators with parser
+        Let sep be proc peek_token_type with parser
+        If sep is equal to TOKEN_COMMA from Lexer:
+            proc advance_token with parser
+        Otherwise:
+            Break
+        End If
+    End While
+
+    Return 1
+End Process
+
+@Reasoning:
+Parses a struct literal '%Alias{ field: value }'. The '%' token has been seen;
+the following alias path names the struct and a '{' opens the field map. Fields
+are pairs (keyword or '=>'). Stored as "struct_literal" with name + pairs.
+@End Reasoning
+Process called "parse_struct_literal" takes parser as Integer returns Integer:
+    Note: Parse a %Alias{...} struct literal
+
+    proc advance_token with parser  Note: consume '%'
+    Let node be proc create_ast_node with "struct_literal"
+
+    Note: struct name (alias path) or a variable holding the module
+    Let nt be proc peek_token_type with parser
+    If nt is equal to TOKEN_ALIAS_NAME from Lexer:
+        Let name be proc parse_alias_path with parser
+        proc set_ast_attribute with node, "name", name
+    Otherwise:
+        Note: %module{} with a variable - capture the identifier name
+        Let vname be proc peek_token_lexeme with parser
+        If nt is not equal to TOKEN_EOF from Lexer:
+            proc advance_token with parser
+        End If
+        proc set_ast_attribute with node, "name", vname
+    End If
+
+    Let pairs be proc create from ListOps
+    proc set_ast_attribute with node, "pairs", pairs
+
+    proc expect_token with parser, TOKEN_LBRACE from Lexer
+    proc parse_map_pairs with parser, pairs
+    proc expect_token with parser, TOKEN_RBRACE from Lexer
+    Return node
+End Process
+
+@Reasoning:
+Parses a bitstring/binary '<< seg, seg >>'. Each segment is a full expression
+(which may itself carry '::size' type modifiers via the '::' operator parsed by
+the precedence climb). Segments are collected into the "segments" attribute.
+@End Reasoning
+Process called "parse_binary_literal" takes parser as Integer returns Integer:
+    Note: Parse a <<...>> binary literal
+
+    proc advance_token with parser  Note: consume '<<'
+    Let node be proc create_ast_node with "binary"
+    Let segments be proc create from ListOps
+    proc set_ast_attribute with node, "segments", segments
+
+    While 1 is equal to 1:
+        proc skip_terminators with parser
+        Let tt be proc peek_token_type with parser
+        If tt is equal to TOKEN_RSHIFT_BIN from Lexer:
+            Break
+        End If
+        If tt is equal to TOKEN_EOF from Lexer:
+            Break
+        End If
+
+        Let before be proc memory_get_int64 from Layout with parser, 8
+        Let seg be proc parse_segment_expression with parser
+        If seg is not equal to 0:
+            proc list_append from ListOps with segments, seg
+        End If
+        Let after be proc memory_get_int64 from Layout with parser, 8
+        If after is equal to before:
+            proc advance_token with parser
+        End If
+
+        Let sep be proc peek_token_type with parser
+        If sep is equal to TOKEN_COMMA from Lexer:
+            proc advance_token with parser
+        Otherwise:
+            Break
+        End If
+    End While
+
+    proc expect_token with parser, TOKEN_RSHIFT_BIN from Lexer
+    Return node
+End Process
+
+@Reasoning:
+Parses one binary segment 'value' or 'value::spec' where spec may be a single
+type or '-'-joined type list (e.g. integer-size(8)). We parse the value
+expression then, if '::' follows, attach the spec expression as a binary_op '::'
+so Stage B sees the type annotation.
+@End Reasoning
+Process called "parse_segment_expression" takes parser as Integer returns Integer:
+    Note: Parse a binary segment with optional ::spec
+
+    Let value be proc parse_binary_expression with parser, 1
+    If value is equal to 0:
+        Return 0
+    End If
+
+    Let tt be proc peek_token_type with parser
+    If tt is equal to TOKEN_TYPE_OP from Lexer:
+        proc advance_token with parser  Note: consume '::'
+        Let spec be proc parse_binary_expression with parser, 1
+        Let node be proc create_ast_node with "binary_op"
+        proc set_ast_attribute with node, "operator", "::"
+        proc set_ast_attribute with node, "left", value
+        proc set_ast_attribute with node, "right", spec
+        Return node
+    End If
+
+    Return value
+End Process
+
+Note: ============================================================================
+Note: ANONYMOUS FUNCTIONS
+Note: ============================================================================
+
+@Reasoning:
+Parses 'fn params -> body; params -> body end' into an "fn" node with a clauses
+list, each clause holding params, an optional 'when' guard, and a body. Multiple
+'->'-separated arms become multiple clauses. A position guard prevents stalls.
+@End Reasoning
+Process called "parse_fn" takes parser as Integer returns Integer:
+    Note: Parse an anonymous function fn ... end
+
+    proc advance_token with parser  Note: consume 'fn'
+    Let node be proc create_ast_node with "fn"
+    Let clauses be proc create from ListOps
+    proc set_ast_attribute with node, "clauses", clauses
+
+    While 1 is equal to 1:
+        proc skip_terminators with parser
+        If proc at_block_end with parser:
+            Break
+        End If
+
+        Let before be proc memory_get_int64 from Layout with parser, 8
+        Let clause be proc parse_fn_clause with parser
+        If clause is not equal to 0:
+            proc list_append from ListOps with clauses, clause
+        End If
+        Let after be proc memory_get_int64 from Layout with parser, 8
+        If after is equal to before:
+            proc advance_token with parser
+        End If
+    End While
+
+    proc expect_token with parser, TOKEN_END from Lexer
+    Return node
+End Process
+
+@Reasoning:
+Parses one fn clause: a comma-separated parameter pattern list, an optional
+'when guard', the '->' arrow, then a body statement list running until the next
+'->' clause, 'end', or EOF. Bodies cannot span past the next arrow because the
+loop stops when it sees a clause-introducing pattern followed by '->'; to keep
+this simple and robust we stop the body at 'end' / EOF and at a top-level '->'
+look-back is unnecessary because each clause body is parsed statement-by-
+statement until at_block_end.
+@End Reasoning
+Process called "parse_fn_clause" takes parser as Integer returns Integer:
+    Note: Parse one fn clause: params [when guard] -> body
+
+    Let clause be proc create_ast_node with "clause"
+    Let params be proc create from ListOps
+    proc set_ast_attribute with clause, "params", params
+    proc set_ast_attribute with clause, "guard", 0
+
+    Note: parameters until 'when' or '->'
+    While 1 is equal to 1:
+        Let tt be proc peek_token_type with parser
+        If tt is equal to TOKEN_ARROW from Lexer:
+            Break
+        End If
+        If tt is equal to TOKEN_WHEN from Lexer:
+            Break
+        End If
+        If tt is equal to TOKEN_EOF from Lexer:
+            Break
+        End If
+        If proc at_block_end with parser:
+            Break
+        End If
+
+        Let before be proc memory_get_int64 from Layout with parser, 8
+        Let p be proc parse_expression with parser
+        If p is not equal to 0:
+            proc list_append from ListOps with params, p
+        End If
+        Let after be proc memory_get_int64 from Layout with parser, 8
+        If after is equal to before:
+            proc advance_token with parser
+        End If
+
+        Let sep be proc peek_token_type with parser
+        If sep is equal to TOKEN_COMMA from Lexer:
+            proc advance_token with parser
+        Otherwise:
+            Break
+        End If
+    End While
+
+    Note: optional guard
+    Let wt be proc peek_token_type with parser
+    If wt is equal to TOKEN_WHEN from Lexer:
+        proc advance_token with parser
+        Let guard be proc parse_expression with parser
+        proc set_ast_attribute with clause, "guard", guard
+    End If
+
+    proc expect_token with parser, TOKEN_ARROW from Lexer
+
+    Let body be proc create from ListOps
+    proc set_ast_attribute with clause, "body", body
+    proc parse_arm_body with parser, body
+    Return clause
+End Process
+
+@Reasoning:
+Parses the body of a '->' arm: statements until the next clause arrow, a block
+end keyword, or EOF. Detecting the next arm is done by checking, after each
+statement, whether the upcoming tokens form 'pattern... ->' is too costly; we
+instead stop the arm body when we reach a block-end keyword, and rely on the
+fact that the enclosing case/fn loop re-enters parse_*_clause which consumes the
+next pattern. To split sibling arms we stop a body when the current statement is
+followed by a terminator and the token after the terminators begins a new arm
+ending in '->'. A bounded lookahead handles this.
+@End Reasoning
+Process called "parse_arm_body" takes parser as Integer, body as Integer returns Integer:
+    Note: Parse a '->' arm body until the next arm, block end, or EOF
+
+    While 1 is equal to 1:
+        proc skip_terminators with parser
+        If proc at_block_end with parser:
+            Break
+        End If
+        If proc arm_starts_here with parser:
+            Break
+        End If
+
+        Let before be proc memory_get_int64 from Layout with parser, 8
+        Let stmt be proc parse_expression with parser
+        If stmt is not equal to 0:
+            proc list_append from ListOps with body, stmt
+        End If
+        Let after be proc memory_get_int64 from Layout with parser, 8
+        If after is equal to before:
+            proc advance_token with parser
+        End If
+    End While
+
+    Return 1
+End Process
+
+@Reasoning:
+Bounded lookahead detecting whether the upcoming tokens begin a new '->' arm
+(i.e. a pattern sequence terminated by '->' before any block end / terminator
+boundary). We scan forward over the token list from the current position
+counting balanced brackets; if we hit '->' at depth 0 before a do/end/EOF we
+report 1. This lets parse_arm_body stop before consuming the next arm's pattern.
+The scan is read-only (position is not mutated) and bounded by the token count,
+so it always terminates.
+@End Reasoning
+Process called "arm_starts_here" takes parser as Integer returns Integer:
+    Note: Lookahead: do the upcoming tokens form 'pattern -> ' (a new arm)?
+
+    Let tokens be proc memory_get_int64 from Layout with parser, 0
+    Let start be proc memory_get_int64 from Layout with parser, 8
+    Let count be proc list_length from ListOps with tokens
+
+    Let i be start
+    Let depth be 0
+
+    While i is less than count:
+        Let token be proc list_get from ListOps with tokens, i
+        If token is equal to 0:
+            Return 0
+        End If
+        Let tt be proc memory_get_int64 from Layout with token, 0
+
+        If tt is equal to TOKEN_EOF from Lexer:
+            Return 0
+        End If
+
+        Note: opening brackets increase depth
+        If tt is equal to TOKEN_LPAREN from Lexer:
+            Set depth to depth plus 1
+        Otherwise:
+            If tt is equal to TOKEN_LBRACE from Lexer:
+                Set depth to depth plus 1
+            Otherwise:
+                If tt is equal to TOKEN_LBRACKET from Lexer:
+                    Set depth to depth plus 1
+                Otherwise:
+                    If tt is equal to TOKEN_LSHIFT_BIN from Lexer:
+                        Set depth to depth plus 1
+                    Otherwise:
+                        If tt is equal to TOKEN_PERCENT_BRACE from Lexer:
+                            Set depth to depth plus 1
+                        Otherwise:
+                            If tt is equal to TOKEN_RPAREN from Lexer:
+                                Set depth to depth minus 1
+                            Otherwise:
+                                If tt is equal to TOKEN_RBRACE from Lexer:
+                                    Set depth to depth minus 1
+                                Otherwise:
+                                    If tt is equal to TOKEN_RBRACKET from Lexer:
+                                        Set depth to depth minus 1
+                                    Otherwise:
+                                        If tt is equal to TOKEN_RSHIFT_BIN from Lexer:
+                                            Set depth to depth minus 1
+                                        Otherwise:
+                                            If depth is less than 1:
+                                                Note: at depth 0, certain tokens bound the search
+                                                If tt is equal to TOKEN_ARROW from Lexer:
+                                                    Return 1
+                                                End If
+                                                If tt is equal to TOKEN_NEWLINE from Lexer:
+                                                    Return 0
+                                                End If
+                                                If tt is equal to TOKEN_SEMICOLON from Lexer:
+                                                    Return 0
+                                                End If
+                                                If tt is equal to TOKEN_DO from Lexer:
+                                                    Return 0
+                                                End If
+                                                If tt is equal to TOKEN_END from Lexer:
+                                                    Return 0
+                                                End If
+                                            End If
+                                        End If
+                                    End If
+                                End If
+                            End If
+                        End If
+                    End If
+                End If
+            End If
+        End If
+
+        Set i to i plus 1
+    End While
+
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: CONTROL-FLOW EXPRESSIONS
+Note: ============================================================================
+
+@Reasoning:
+Parses 'if cond do then else else_body end' and 'unless'. Both share the node
+shape: condition, then_body, else_body. The else section is optional. Keyword
+forms 'if cond, do: x, else: y' are also supported via parse_do_block when the
+body is keyword-style.
+@End Reasoning
+Process called "parse_if" takes parser as Integer, kind as Integer returns Integer:
+    Note: Parse an if/unless expression
+
+    proc advance_token with parser  Note: consume 'if'/'unless'
+    Let node be proc create_ast_node with kind
+
+    Let condition be proc parse_expression with parser
+    proc set_ast_attribute with node, "condition", condition
+
+    Let then_body be proc create from ListOps
+    proc set_ast_attribute with node, "then_body", then_body
+    Let else_body be proc create from ListOps
+    proc set_ast_attribute with node, "else_body", else_body
+
+    Note: keyword form: ', do: x, else: y'
+    Let ct be proc peek_token_type with parser
+    If ct is equal to TOKEN_COMMA from Lexer:
+        proc advance_token with parser
+        proc parse_keyword_body_sections with parser, then_body, else_body
+        Return node
+    End If
+
+    Note: block form: 'do ... [else ...] end'
+    proc skip_terminators with parser
+    proc expect_token with parser, TOKEN_DO from Lexer
+    proc parse_statement_block with parser, then_body
+
+    Let et be proc peek_token_type with parser
+    If et is equal to TOKEN_ELSE from Lexer:
+        proc advance_token with parser
+        proc parse_statement_block with parser, else_body
+    End If
+
+    proc expect_token with parser, TOKEN_END from Lexer
+    Return node
+End Process
+
+@Reasoning:
+Handles the keyword-body sections of a one-line if/unless: 'do: expr' fills the
+then list, 'else: expr' fills the else list. Each value is parsed as one
+expression. Stops at a terminator or EOF.
+@End Reasoning
+Process called "parse_keyword_body_sections" takes parser as Integer, then_body as Integer, else_body as Integer returns Integer:
+    Note: Parse keyword 'do:'/'else:' body sections
+
+    While 1 is equal to 1:
+        Let tt be proc peek_token_type with parser
+        If tt is not equal to TOKEN_KEYWORD_PAIR from Lexer:
+            Break
+        End If
+        Let key be proc peek_token_lexeme with parser
+        proc advance_token with parser  Note: consume the keyword token
+        Let value be proc parse_expression with parser
+
+        If proc lexeme_is with key, "do":
+            If value is not equal to 0:
+                proc list_append from ListOps with then_body, value
+            End If
+        Otherwise:
+            If proc lexeme_is with key, "else":
+                If value is not equal to 0:
+                    proc list_append from ListOps with else_body, value
+                End If
+            End If
+        End If
+
+        Let sep be proc peek_token_type with parser
+        If sep is equal to TOKEN_COMMA from Lexer:
+            proc advance_token with parser
+        Otherwise:
+            Break
+        End If
+    End While
+
+    Return 1
+End Process
+
+@Reasoning:
+Parses 'case scrutinee do pattern [when guard] -> body ... end'. The scrutinee
+is an expression; each arm is a match_clause (pattern, guard, body). Arms are
+read by the shared clause-arm reader. Stops at 'end'.
+@End Reasoning
+Process called "parse_case" takes parser as Integer returns Integer:
+    Note: Parse a case expression
+
+    proc advance_token with parser  Note: consume 'case'
+    Let node be proc create_ast_node with "case"
+
+    Let scrutinee be proc parse_expression with parser
+    proc set_ast_attribute with node, "scrutinee", scrutinee
+
+    Let clauses be proc create from ListOps
+    proc set_ast_attribute with node, "clauses", clauses
+
+    proc skip_terminators with parser
+    proc expect_token with parser, TOKEN_DO from Lexer
+    proc parse_match_clauses with parser, clauses
+    proc expect_token with parser, TOKEN_END from Lexer
+    Return node
+End Process
+
+@Reasoning:
+Reads a run of match_clause arms (pattern [when guard] -> body) into the clauses
+list until a block end. Shared by case, cond (condition as pattern), receive,
+and try-rescue/catch. A position guard forces progress.
+@End Reasoning
+Process called "parse_match_clauses" takes parser as Integer, clauses as Integer returns Integer:
+    Note: Parse pattern -> body arms into clauses
+
+    While 1 is equal to 1:
+        proc skip_terminators with parser
+        If proc at_block_end with parser:
+            Break
+        End If
+
+        Let before be proc memory_get_int64 from Layout with parser, 8
+        Let clause be proc parse_match_clause with parser
+        If clause is not equal to 0:
+            proc list_append from ListOps with clauses, clause
+        End If
+        Let after be proc memory_get_int64 from Layout with parser, 8
+        If after is equal to before:
+            proc advance_token with parser
+        End If
+    End While
+
+    Return 1
+End Process
+
+@Reasoning:
+Parses one match_clause: a pattern expression, an optional 'when guard', the
+'->' arrow, then an arm body running until the next arm / block end. The pattern
+is parsed as a single expression (tuples/lists/maps/structs/pins all parse as
+expressions); multiple comma-separated patterns (case allows only one but
+receive/with use a single pattern) are folded: if a comma follows the first
+pattern we wrap the patterns in a tuple-like list under the pattern (kept as a
+"block" of patterns) — but standard case/cond use one pattern, so we read one.
+@End Reasoning
+Process called "parse_match_clause" takes parser as Integer returns Integer:
+    Note: Parse one 'pattern [when guard] -> body' clause
+
+    Let clause be proc create_ast_node with "match_clause"
+    proc set_ast_attribute with clause, "guard", 0
+
+    Let pattern be proc parse_expression with parser
+    proc set_ast_attribute with clause, "pattern", pattern
+
+    Let wt be proc peek_token_type with parser
+    If wt is equal to TOKEN_WHEN from Lexer:
+        proc advance_token with parser
+        Let guard be proc parse_expression with parser
+        proc set_ast_attribute with clause, "guard", guard
+    End If
+
+    proc expect_token with parser, TOKEN_ARROW from Lexer
+
+    Let body be proc create from ListOps
+    proc set_ast_attribute with clause, "body", body
+    proc parse_arm_body with parser, body
+    Return clause
+End Process
+
+@Reasoning:
+Parses 'cond do condition -> body ... end'. Each arm is a match_clause whose
+"pattern" attribute holds the boolean condition expression. Reuses
+parse_match_clauses.
+@End Reasoning
+Process called "parse_cond" takes parser as Integer returns Integer:
+    Note: Parse a cond expression
+
+    proc advance_token with parser  Note: consume 'cond'
+    Let node be proc create_ast_node with "cond"
+    Let clauses be proc create from ListOps
+    proc set_ast_attribute with node, "clauses", clauses
+
+    proc skip_terminators with parser
+    proc expect_token with parser, TOKEN_DO from Lexer
+    proc parse_match_clauses with parser, clauses
+    proc expect_token with parser, TOKEN_END from Lexer
+    Return node
+End Process
+
+@Reasoning:
+Parses 'with pat <- expr, pat <- expr, cond do body [else arms] end'. Each
+generator clause is 'pattern <- expr' (the '<-' arrow is lexed as TOKEN_LT then
+TOKEN_MINUS in the absence of a dedicated token; we detect the pair) or a bare
+boolean expression. We collect with_clause nodes, then parse the do body. NOTE:
+Elixir's '<-' is two characters '<' '-'; the lexer emits TOKEN_LT then
+TOKEN_MINUS, so we detect that adjacency to recognise a generator.
+@End Reasoning
+Process called "parse_with" takes parser as Integer returns Integer:
+    Note: Parse a with expression
+
+    proc advance_token with parser  Note: consume 'with'
+    Let node be proc create_ast_node with "with"
+    Let clauses be proc create from ListOps
+    proc set_ast_attribute with node, "clauses", clauses
+    Let body be proc create from ListOps
+    proc set_ast_attribute with node, "body", body
+
+    While 1 is equal to 1:
+        proc skip_terminators with parser
+        Let tt be proc peek_token_type with parser
+        If tt is equal to TOKEN_DO from Lexer:
+            Break
+        End If
+        If tt is equal to TOKEN_EOF from Lexer:
+            Break
+        End If
+
+        Let before be proc memory_get_int64 from Layout with parser, 8
+
+        Let lhs be proc parse_expression with parser
+        Let clause be proc create_ast_node with "with_clause"
+
+        Note: detect '<-' as adjacent '<' '-'
+        Let at be proc peek_token_type with parser
+        If at is equal to TOKEN_LT from Lexer:
+            Let nt be proc peek_token_type_next with parser
+            If nt is equal to TOKEN_MINUS from Lexer:
+                proc advance_token with parser  Note: consume '<'
+                proc advance_token with parser  Note: consume '-'
+                proc set_ast_attribute with clause, "pattern", lhs
+                Let rhs be proc parse_expression with parser
+                proc set_ast_attribute with clause, "expr", rhs
+            Otherwise:
+                proc set_ast_attribute with clause, "pattern", 0
+                proc set_ast_attribute with clause, "expr", lhs
+            End If
+        Otherwise:
+            proc set_ast_attribute with clause, "pattern", 0
+            proc set_ast_attribute with clause, "expr", lhs
+        End If
+        proc list_append from ListOps with clauses, clause
+
+        Let after be proc memory_get_int64 from Layout with parser, 8
+        If after is equal to before:
+            proc advance_token with parser
+        End If
+
+        Let sep be proc peek_token_type with parser
+        If sep is equal to TOKEN_COMMA from Lexer:
+            proc advance_token with parser
+        Otherwise:
+            Break
+        End If
+    End While
+
+    proc skip_terminators with parser
+    proc expect_token with parser, TOKEN_DO from Lexer
+    proc parse_statement_block with parser, body
+    proc expect_token with parser, TOKEN_END from Lexer
+    Return node
+End Process
+
+@Reasoning:
+Parses 'for gen <- coll, filter, into: acc, uniq: true do body end'. Generators
+('pattern <- enumerable') and filters (bare boolean expressions) are collected
+into the generators list; the 'into:' and 'uniq:' options set the into and uniq
+attributes. The body is the do block.
+@End Reasoning
+Process called "parse_for" takes parser as Integer returns Integer:
+    Note: Parse a for comprehension
+
+    proc advance_token with parser  Note: consume 'for'
+    Let node be proc create_ast_node with "for"
+    Let generators be proc create from ListOps
+    proc set_ast_attribute with node, "generators", generators
+    Let body be proc create from ListOps
+    proc set_ast_attribute with node, "body", body
+    proc set_ast_attribute with node, "into", 0
+    proc set_ast_attribute with node, "uniq", 0
+
+    While 1 is equal to 1:
+        proc skip_terminators with parser
+        Let tt be proc peek_token_type with parser
+        If tt is equal to TOKEN_DO from Lexer:
+            Break
+        End If
+        If tt is equal to TOKEN_EOF from Lexer:
+            Break
+        End If
+
+        Let before be proc memory_get_int64 from Layout with parser, 8
+
+        Note: 'into:' / 'uniq:' options
+        If tt is equal to TOKEN_KEYWORD_PAIR from Lexer:
+            Let key be proc peek_token_lexeme with parser
+            proc advance_token with parser
+            Let value be proc parse_expression with parser
+            If proc lexeme_is with key, "into":
+                proc set_ast_attribute with node, "into", value
+            Otherwise:
+                If proc lexeme_is with key, "uniq":
+                    proc set_ast_attribute with node, "uniq", 1
+                Otherwise:
+                    Note: unknown option preserved as a generator keyword_pair
+                    Let kp be proc create_ast_node with "keyword_pair"
+                    proc set_ast_attribute with kp, "key", key
+                    proc set_ast_attribute with kp, "value", value
+                    proc list_append from ListOps with generators, kp
+                End If
+            End If
+        Otherwise:
+            Let lhs be proc parse_expression with parser
+            Let gen be proc create_ast_node with "with_clause"
+            Let at be proc peek_token_type with parser
+            If at is equal to TOKEN_LT from Lexer:
+                Let nt be proc peek_token_type_next with parser
+                If nt is equal to TOKEN_MINUS from Lexer:
+                    proc advance_token with parser  Note: consume '<'
+                    proc advance_token with parser  Note: consume '-'
+                    proc set_ast_attribute with gen, "pattern", lhs
+                    Let rhs be proc parse_expression with parser
+                    proc set_ast_attribute with gen, "expr", rhs
+                Otherwise:
+                    proc set_ast_attribute with gen, "pattern", 0
+                    proc set_ast_attribute with gen, "expr", lhs
+                End If
+            Otherwise:
+                proc set_ast_attribute with gen, "pattern", 0
+                proc set_ast_attribute with gen, "expr", lhs
+            End If
+            proc list_append from ListOps with generators, gen
+        End If
+
+        Let after be proc memory_get_int64 from Layout with parser, 8
+        If after is equal to before:
+            proc advance_token with parser
+        End If
+
+        Let sep be proc peek_token_type with parser
+        If sep is equal to TOKEN_COMMA from Lexer:
+            proc advance_token with parser
+        Otherwise:
+            Break
+        End If
+    End While
+
+    proc skip_terminators with parser
+    proc expect_token with parser, TOKEN_DO from Lexer
+    proc parse_statement_block with parser, body
+    proc expect_token with parser, TOKEN_END from Lexer
+    Return node
+End Process
+
+@Reasoning:
+Parses 'try do body [rescue arms] [catch arms] [after body] end'. The body is a
+statement list; rescue and catch sections hold match_clause arms; after holds a
+statement list. Each optional section is detected by its leading keyword.
+@End Reasoning
+Process called "parse_try" takes parser as Integer returns Integer:
+    Note: Parse a try expression
+
+    proc advance_token with parser  Note: consume 'try'
+    Let node be proc create_ast_node with "try"
+    Let body be proc create from ListOps
+    proc set_ast_attribute with node, "body", body
+    Let rescue_clauses be proc create from ListOps
+    proc set_ast_attribute with node, "rescue", rescue_clauses
+    Let catch_clauses be proc create from ListOps
+    proc set_ast_attribute with node, "catch", catch_clauses
+    Let after_body be proc create from ListOps
+    proc set_ast_attribute with node, "after", after_body
+
+    proc skip_terminators with parser
+    proc expect_token with parser, TOKEN_DO from Lexer
+    proc parse_statement_block with parser, body
+
+    Note: optional sections in order: rescue, catch, after
+    While 1 is equal to 1:
+        Let tt be proc peek_token_type with parser
+        If tt is equal to TOKEN_RESCUE from Lexer:
+            proc advance_token with parser
+            proc parse_match_clauses with parser, rescue_clauses
+        Otherwise:
+            If tt is equal to TOKEN_CATCH from Lexer:
+                proc advance_token with parser
+                proc parse_match_clauses with parser, catch_clauses
+            Otherwise:
+                If tt is equal to TOKEN_AFTER from Lexer:
+                    proc advance_token with parser
+                    proc parse_statement_block with parser, after_body
+                Otherwise:
+                    Break
+                End If
+            End If
+        End If
+    End While
+
+    proc expect_token with parser, TOKEN_END from Lexer
+    Return node
+End Process
+
+@Reasoning:
+Parses 'receive do pattern -> body ... [after timeout -> body] end'. Message
+arms are match_clauses; an optional 'after timeout -> body' sets after_timeout
+(the timeout expression) and after_body (its statements).
+@End Reasoning
+Process called "parse_receive" takes parser as Integer returns Integer:
+    Note: Parse a receive expression
+
+    proc advance_token with parser  Note: consume 'receive'
+    Let node be proc create_ast_node with "receive"
+    Let clauses be proc create from ListOps
+    proc set_ast_attribute with node, "clauses", clauses
+    proc set_ast_attribute with node, "after_timeout", 0
+    Let after_body be proc create from ListOps
+    proc set_ast_attribute with node, "after_body", after_body
+
+    proc skip_terminators with parser
+    proc expect_token with parser, TOKEN_DO from Lexer
+
+    Note: message arms until 'after' or 'end'
+    While 1 is equal to 1:
+        proc skip_terminators with parser
+        Let tt be proc peek_token_type with parser
+        If tt is equal to TOKEN_AFTER from Lexer:
+            Break
+        End If
+        If proc at_block_end with parser:
+            Break
+        End If
+
+        Let before be proc memory_get_int64 from Layout with parser, 8
+        Let clause be proc parse_match_clause with parser
+        If clause is not equal to 0:
+            proc list_append from ListOps with clauses, clause
+        End If
+        Let after be proc memory_get_int64 from Layout with parser, 8
+        If after is equal to before:
+            proc advance_token with parser
+        End If
+    End While
+
+    Note: optional 'after timeout -> body'
+    Let at be proc peek_token_type with parser
+    If at is equal to TOKEN_AFTER from Lexer:
+        proc advance_token with parser  Note: consume 'after'
+        Let timeout be proc parse_expression with parser
+        proc set_ast_attribute with node, "after_timeout", timeout
+        proc expect_token with parser, TOKEN_ARROW from Lexer
+        proc parse_arm_body with parser, after_body
+    End If
+
+    proc expect_token with parser, TOKEN_END from Lexer
+    Return node
+End Process
+
+Note: ============================================================================
+Note: SMALL HELPERS
+Note: ============================================================================
+
+@Reasoning:
+String equality helper for keyword-section detection. Wraps the dictionary's key
+comparison via the list/dictionary string compare available through Dict's key
+machinery is not exposed, so we reuse the lexer-independent string compare from
+the layout primitive set. We compare two strings for byte equality.
+@End Reasoning
+Process called "lexeme_is" takes lexeme as Integer, expected as Integer returns Integer:
+    Note: Return 1 if lexeme equals expected (byte-for-byte)
+
+    Return proc string_equals from StringCore with lexeme, expected
 End Process

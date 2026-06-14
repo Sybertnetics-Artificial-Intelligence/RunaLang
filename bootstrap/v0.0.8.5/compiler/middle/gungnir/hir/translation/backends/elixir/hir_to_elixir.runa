@@ -1,1117 +1,1676 @@
-Note: HIR to Elixir Translator for Translation Translation System
-Note: Converts High-level Intermediate Representation to idiomatic Elixir code
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
 
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+HIR to Elixir Generator - Generate idiomatic Elixir source from HIR.
+
+This file consumes the hir.runa dictionary/list-literal HIR produced by
+elixir_to_hir.runa (the model-3 interchange) and re-emits valid Elixir text. It
+dispatches on the exact "_type" string tags the frontend emits: elixir_module,
+function, clause, defstruct, defexception, module_attribute, alias, import,
+require, use, defprotocol, defimpl, pipe, call, case, cond, with, with_clause,
+if, unless, for, try, receive, match_clause, fn, capture, map, struct_literal,
+pair, tuple, list, binary, identifier, alias_ref, atom, literal, binary_op,
+unary_op, pin, access, keyword_pair, block.
+
+It produces idiomatic Elixir: defmodule Name do ... end; def/defp name(params)
+when guard do ... end; defstruct [a: 1, b: 2]; @attr value; alias/import/require/
+use; a |> b |> c pipes; case expr do pattern -> body end; %{k => v} maps;
+%Name{...} struct literals; fn args -> body end; for gen <- coll do body end.
+
+Dependencies:
+- compiler/middle/gungnir/hir/translation/backends/elixir/elixir_emitter.runa
+- compiler/middle/gungnir/hir/hir.runa
+- compiler/frontend/primitives/memory/layout.runa
+- compiler/frontend/primitives/core/string_core.runa
+- compiler/frontend/primitives/collections/list.runa
+:End Note
+
+Import "compiler/middle/gungnir/hir/translation/backends/elixir/elixir_emitter.runa" as Emitter
+Import "compiler/middle/gungnir/hir/hir.runa" as HIR
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/frontend/primitives/core/string_primitive.runa" as StringPrim
+Import "compiler/frontend/primitives/collections/list.runa" as ListOps
+
+Note: ============================================================================
+Note: Generation Context
+Note: ============================================================================
 
 @Reasoning:
-Translator state for the legacy String-concatenation Elixir backend.
-Tracks output buffer, indent depth, and contextual fields (current
-module, current function, pattern-match scope, actor-model scope, OTP
-behaviour) that downstream emitters need to produce idiomatic Elixir.
+The generator carries the emitter (backing byte buffer) and the current
+indentation level. Elixir blocks are introduced by do ... end with 2-space
+indentation; the level feeds emit_indent so every generator writes a single line.
 @End Reasoning
-
-@Implementation:
-Eight fields covering output, indent, current_module/function name
-context, pattern and actor-model dicts, OTP behaviour name, and
-requires_newline flag for line-break decisions between statements.
-@End Implementation
-
-Type called "HIRToElixirTranslator":
-    output_buffer as String
-    indentation_level as Integer
-    current_module as String
-    current_function as String
-    pattern_context as Integer
-    actor_model_context as Integer
-    otp_behavior_context as String
-    requires_newline as Integer
+Type called "HirToElixirContext":
+    emitter as Integer          Note: Elixir emitter instance
+    indent_level as Integer     Note: Current indentation level
 End Type
 
 @Reasoning:
-Construct a fresh translator with empty buffers and zeroed context.
-Called once per HIR -> Elixir translation.
+Initialises the context at indent level 0 with the supplied emitter. Returns 0 on
+allocation failure.
 @End Reasoning
+Process called "create_hir_to_elixir_context" takes emitter as Integer returns Integer:
+    Let context be proc allocate from Layout with 16
+    If context is equal to 0:
+        Return 0
+    End If
+    proc memory_set_int64 from Layout with context, 0, emitter
+    proc memory_set_int64 from Layout with context, 8, 0
+    Return context
+End Process
 
-@Implementation:
-Builds an HIRToElixirTranslator with output_buffer "", indent 0, empty
-current_module/function, fresh pattern_context and actor_model_context
-dicts, empty otp_behavior_context, requires_newline 0.
-@End Implementation
+@Reasoning:
+Releases the context struct; the emitter is owned by the caller so the output
+buffer survives.
+@End Reasoning
+Process called "destroy_hir_to_elixir_context" takes context as Integer returns Integer:
+    If context is equal to 0:
+        Return 1
+    End If
+    proc deallocate from Layout with context
+    Return 1
+End Process
 
-Process called "create_hir_to_elixir_translator" returns Integer:
-    Note: Create new HIR to Elixir translator instance
+@Reasoning:
+Increases indentation by one level.
+@End Reasoning
+Process called "increase_indent" takes context as Integer returns Integer:
+    If context is equal to 0:
+        Return 0
+    End If
+    Let current be proc memory_get_int64 from Layout with context, 8
+    proc memory_set_int64 from Layout with context, 8, current plus 1
+    Return 1
+End Process
 
-    Let translator be a value of type HIRToElixirTranslator with
-        output_buffer as "",
-        indentation_level as 0,
-        current_module as "",
-        current_function as "",
-        pattern_context as proc create_dict,
-        actor_model_context as proc create_dict,
-        otp_behavior_context as "",
-        requires_newline as 0
+@Reasoning:
+Decreases indentation by one level, guarded against underflow so a malformed HIR
+cannot drive indent_level negative.
+@End Reasoning
+Process called "decrease_indent" takes context as Integer returns Integer:
+    If context is equal to 0:
+        Return 0
+    End If
+    Let current be proc memory_get_int64 from Layout with context, 8
+    If current is greater than 0:
+        proc memory_set_int64 from Layout with context, 8, current minus 1
+    End If
+    Return 1
+End Process
 
-    Return translator
+@Reasoning:
+Emits the current indentation as spaces via the emitter.
+@End Reasoning
+Process called "emit_indent" takes context as Integer returns Integer:
+    If context is equal to 0:
+        Return 0
+    End If
+    Let emitter be proc memory_get_int64 from Layout with context, 0
+    Let level be proc memory_get_int64 from Layout with context, 8
+    proc emit_indent from Emitter with emitter, level
+    Return 1
+End Process
+
+@Reasoning:
+Thin emitter wrappers so the generators read cleanly. Each forwards to the
+emitter held in the context.
+@End Reasoning
+Process called "out_str" takes context as Integer, text as Integer returns Integer:
+    If context is equal to 0:
+        Return 0
+    End If
+    Let emitter be proc memory_get_int64 from Layout with context, 0
+    proc emit_string from Emitter with emitter, text
+    Return 1
+End Process
+
+Process called "out_char" takes context as Integer, ch as Integer returns Integer:
+    If context is equal to 0:
+        Return 0
+    End If
+    Let emitter be proc memory_get_int64 from Layout with context, 0
+    proc emit_char from Emitter with emitter, ch
+    Return 1
+End Process
+
+Process called "out_newline" takes context as Integer returns Integer:
+    If context is equal to 0:
+        Return 0
+    End If
+    Let emitter be proc memory_get_int64 from Layout with context, 0
+    proc emit_newline from Emitter with emitter
+    Return 1
+End Process
+
+Process called "out_space" takes context as Integer returns Integer:
+    If context is equal to 0:
+        Return 0
+    End If
+    Let emitter be proc memory_get_int64 from Layout with context, 0
+    proc emit_space from Emitter with emitter
+    Return 1
 End Process
 
 Note: ============================================================================
-Note: DISPATCHER ENTRY POINT
+Note: HIR Decode Helpers
 Note: ============================================================================
-Note: Single-arg wrapper matching the central dispatcher call shape in
-Note: translation.runa: `Return proc hir_to_elixir from ElixirEmitter with hir_root`.
-Note: Constructs a fresh HIRToElixirTranslator and routes through
-Note: translate_hir_to_elixir which holds the actual translation pipeline.
-Note: Introduced in P2-F Round 2B alongside the demolition of the vestigial
-Note: elixir_emitter.runa shim.
+
 @Reasoning:
-Single-argument dispatcher entry point matching the call shape used in
-the central translation router. Constructs a translator and delegates
-to translate_hir_to_elixir.
+hir.runa exposes dictionary contents only as an entries List of 16-byte
+[key(0), value(8)] blocks via get_dictionary_entries; it has no keyed lookup.
+This accessor performs the linear key scan the frontend's producer surface pairs
+with, returning the matching entry's value node or 0.
 @End Reasoning
+Process called "get_dictionary_value" takes dict_hir as Integer, key as Integer returns Integer:
+    If dict_hir is equal to 0:
+        Return 0
+    End If
+    If key is equal to 0:
+        Return 0
+    End If
 
-@Implementation:
-Null root returns 0. Otherwise creates a translator (returns 0 on
-allocation failure), runs translate_hir_to_elixir, returns the
-accumulated output string.
-@End Implementation
+    Let entries be proc get_dictionary_entries from HIR with dict_hir
+    If entries is equal to 0:
+        Return 0
+    End If
 
-Process called "hir_to_elixir" takes hir_root as Integer returns Integer:
+    Let count be proc size from ListOps with entries
+    Let index be 0
+    While index is less than count:
+        Let entry be proc get_at from ListOps with entries, index
+        If entry is not equal to 0:
+            Let entry_key be proc memory_get_int64 from Layout with entry, 0
+            Let matches be proc string_equals from StringCore with entry_key, key
+            If matches is equal to 1:
+                Return proc memory_get_int64 from Layout with entry, 8
+            End If
+        End If
+        Set index to index plus 1
+    End While
+
+    Return 0
+End Process
+
+@Reasoning:
+Resolves a keyed value that is stored as a HIR string literal and unwraps it to
+its char* payload. Returns 0 when absent.
+@End Reasoning
+Process called "get_dict_string_value" takes dict_hir as Integer, key as Integer returns Integer:
+    If dict_hir is equal to 0:
+        Return 0
+    End If
+    Let value be proc get_dictionary_value with dict_hir, key
+    If value is equal to 0:
+        Return 0
+    End If
+    Return proc get_string_literal_value from HIR with value
+End Process
+
+@Reasoning:
+Returns a keyed subtree (dict or list HIR node) unmodified.
+@End Reasoning
+Process called "get_dict_hir_value" takes dict_hir as Integer, key as Integer returns Integer:
+    If dict_hir is equal to 0:
+        Return 0
+    End If
+    Return proc get_dictionary_value with dict_hir, key
+End Process
+
+@Reasoning:
+Returns the backing element List of a HIR list-literal node so generators iterate
+with size / get_at.
+@End Reasoning
+Process called "list_elements" takes node as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    Return proc get_list_elements from HIR with node
+End Process
+
+@Reasoning:
+True (1) when a node's "_type" string equals tag. Central type test.
+@End Reasoning
+Process called "type_is" takes node as Integer, tag as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    Let nt be proc get_dict_string_value with node, "_type"
+    If nt is equal to 0:
+        Return 0
+    End If
+    Return proc string_equals from StringCore with nt, tag
+End Process
+
+Note: ============================================================================
+Note: Main Entry Point
+Note: ============================================================================
+
+@Reasoning:
+Public entry: pairs an emitter with a fresh context, drives the recursive walker
+from the HIR root, and lifts the output string before destroying the context (the
+emitter buffer outlives both). Returns 0 on null root.
+@End Reasoning
+Process called "generate_elixir_from_hir" takes hir_root as Integer returns Integer:
+    Note: Generate Elixir source text from HIR
+
     If hir_root is equal to 0:
         Return 0
     End If
-    Let translator be proc create_hir_to_elixir_translator
-    If translator is equal to 0:
+
+    Let emitter be proc create_elixir_emitter from Emitter
+    If emitter is equal to 0:
         Return 0
     End If
-    Let elixir_code be proc translate_hir_to_elixir with translator, hir_root
-    Return elixir_code
+
+    Let context be proc create_hir_to_elixir_context with emitter
+    If context is equal to 0:
+        proc destroy_elixir_emitter from Emitter with emitter
+        Return 0
+    End If
+
+    proc generate_node with context, hir_root
+
+    Let output be proc get_output from Emitter with emitter
+
+    proc destroy_hir_to_elixir_context with context
+    proc destroy_elixir_emitter from Emitter with emitter
+
+    Return output
 End Process
 
 @Reasoning:
-Main HIR node dispatcher. Routes based on Elixir-specific node_type
-strings ("module", "function", "actor_receive", "actor_spawn",
-"otp_genserver_call", etc.) to specialised translators. Elixir's actor
-model and OTP behaviours need explicit handling because they map to
-specific module/function patterns rather than generic constructs.
+Central dispatcher. Reads the "_type" tag and routes to the matching generator.
+Module + declarations first, then control-flow expressions, then leaves; unknown
+tags return 0 silently.
 @End Reasoning
+Process called "generate_node" takes context as Integer, node as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
 
-@Implementation:
-Reads node_type via dict lookup. Match statement dispatches across the
-21 known kinds. Unknown nodes emit "# Unknown HIR node: ..." as an
-Elixir comment so callers can spot translation gaps. Returns
-translator.output_buffer.
-@End Implementation
+    Let nt be proc get_dict_string_value with node, "_type"
+    If nt is equal to 0:
+        Return 0
+    End If
 
-Process called "translate_hir_to_elixir" takes translator as Integer, hir as Integer returns String:
-    Note: Translate HIR to idiomatic Elixir code with actor model and OTP support
+    If proc string_equals from StringCore with nt, "elixir_module":
+        Return proc generate_module with context, node
+    End If
+    If proc string_equals from StringCore with nt, "function":
+        Return proc generate_function with context, node
+    End If
+    If proc string_equals from StringCore with nt, "defstruct":
+        Return proc generate_defstruct with context, node, "defstruct"
+    End If
+    If proc string_equals from StringCore with nt, "defexception":
+        Return proc generate_defstruct with context, node, "defexception"
+    End If
+    If proc string_equals from StringCore with nt, "module_attribute":
+        Return proc generate_module_attribute with context, node
+    End If
+    If proc string_equals from StringCore with nt, "alias":
+        Return proc generate_directive with context, node, "alias"
+    End If
+    If proc string_equals from StringCore with nt, "import":
+        Return proc generate_directive with context, node, "import"
+    End If
+    If proc string_equals from StringCore with nt, "require":
+        Return proc generate_directive with context, node, "require"
+    End If
+    If proc string_equals from StringCore with nt, "use":
+        Return proc generate_directive with context, node, "use"
+    End If
+    If proc string_equals from StringCore with nt, "defprotocol":
+        Return proc generate_defprotocol with context, node
+    End If
+    If proc string_equals from StringCore with nt, "defimpl":
+        Return proc generate_defimpl with context, node
+    End If
+    If proc string_equals from StringCore with nt, "pipe":
+        Return proc generate_pipe with context, node
+    End If
+    If proc string_equals from StringCore with nt, "call":
+        Return proc generate_call with context, node
+    End If
+    If proc string_equals from StringCore with nt, "case":
+        Return proc generate_case with context, node
+    End If
+    If proc string_equals from StringCore with nt, "cond":
+        Return proc generate_cond with context, node
+    End If
+    If proc string_equals from StringCore with nt, "with":
+        Return proc generate_with with context, node
+    End If
+    If proc string_equals from StringCore with nt, "with_clause":
+        Return proc generate_with_clause with context, node
+    End If
+    If proc string_equals from StringCore with nt, "if":
+        Return proc generate_if with context, node, "if"
+    End If
+    If proc string_equals from StringCore with nt, "unless":
+        Return proc generate_if with context, node, "unless"
+    End If
+    If proc string_equals from StringCore with nt, "for":
+        Return proc generate_for with context, node
+    End If
+    If proc string_equals from StringCore with nt, "try":
+        Return proc generate_try with context, node
+    End If
+    If proc string_equals from StringCore with nt, "receive":
+        Return proc generate_receive with context, node
+    End If
+    If proc string_equals from StringCore with nt, "match_clause":
+        Return proc generate_match_clause with context, node
+    End If
+    If proc string_equals from StringCore with nt, "fn":
+        Return proc generate_fn with context, node
+    End If
+    If proc string_equals from StringCore with nt, "capture":
+        Return proc generate_capture with context, node
+    End If
+    If proc string_equals from StringCore with nt, "map":
+        Return proc generate_map with context, node
+    End If
+    If proc string_equals from StringCore with nt, "struct_literal":
+        Return proc generate_struct_literal with context, node
+    End If
+    If proc string_equals from StringCore with nt, "pair":
+        Return proc generate_pair with context, node
+    End If
+    If proc string_equals from StringCore with nt, "tuple":
+        Return proc generate_tuple with context, node
+    End If
+    If proc string_equals from StringCore with nt, "list":
+        Return proc generate_list with context, node
+    End If
+    If proc string_equals from StringCore with nt, "binary":
+        Return proc generate_binary with context, node
+    End If
+    If proc string_equals from StringCore with nt, "identifier":
+        Return proc generate_identifier with context, node
+    End If
+    If proc string_equals from StringCore with nt, "alias_ref":
+        Return proc generate_alias_ref with context, node
+    End If
+    If proc string_equals from StringCore with nt, "atom":
+        Return proc generate_atom with context, node
+    End If
+    If proc string_equals from StringCore with nt, "literal":
+        Return proc generate_literal with context, node
+    End If
+    If proc string_equals from StringCore with nt, "binary_op":
+        Return proc generate_binary_op with context, node
+    End If
+    If proc string_equals from StringCore with nt, "unary_op":
+        Return proc generate_unary_op with context, node
+    End If
+    If proc string_equals from StringCore with nt, "pin":
+        Return proc generate_pin with context, node
+    End If
+    If proc string_equals from StringCore with nt, "access":
+        Return proc generate_access with context, node
+    End If
+    If proc string_equals from StringCore with nt, "keyword_pair":
+        Return proc generate_keyword_pair with context, node
+    End If
+    If proc string_equals from StringCore with nt, "block":
+        Return proc generate_block with context, node
+    End If
 
-    Let node_type be proc get_dict_value with hir, "node_type"
-
-    Match node_type:
-        When "module":
-            proc translate_module with translator, hir
-        When "function":
-            proc translate_function with translator, hir
-        When "pattern_match":
-            proc translate_pattern_match with translator, hir
-        When "match_clause":
-            proc translate_match_clause with translator, hir
-        When "actor_receive":
-            proc translate_receive with translator, hir
-        When "actor_spawn":
-            proc translate_spawn with translator, hir
-        When "actor_send":
-            proc translate_send with translator, hir
-        When "otp_genserver_call":
-            proc translate_genserver_call with translator, hir
-        When "otp_genserver_cast":
-            proc translate_genserver_cast with translator, hir
-        When "function_composition":
-            proc translate_pipe with translator, hir
-        When "list_comprehension":
-            proc translate_for_comprehension with translator, hir
-        When "tuple":
-            proc translate_tuple with translator, hir
-        When "map":
-            proc translate_map with translator, hir
-        When "list":
-            proc translate_list with translator, hir
-        When "atom":
-            proc translate_atom with translator, hir
-        When "string_literal":
-            proc translate_string with translator, hir
-        When "number_literal":
-            proc translate_number with translator, hir
-        When "binary_operation":
-            proc translate_binary_operation with translator, hir
-        When "function_call":
-            proc translate_function_call with translator, hir
-        When "variable":
-            proc translate_variable with translator, hir
-        When "assignment":
-            proc translate_assignment with translator, hir
-        When "conditional":
-            proc translate_conditional with translator, hir
-        Otherwise:
-            proc emit with translator, "# Unknown HIR node: "
-            proc emit with translator, node_type
-    End Match
-
-    Return translator.output_buffer
+    Return 0
 End Process
 
-@Reasoning:
-Emit "defmodule Name do ... end". The Elixir module is the primary
-unit of namespacing and code organisation.
-@End Reasoning
-
-@Implementation:
-Reads name, sets current_module on the translator (for nested
-emitters to reference). Emits "defmodule Name do", indents, walks
-declarations, dedents, emits "end".
-@End Implementation
-
-Process called "translate_module" takes translator as Integer, hir as Integer returns Integer:
-    Note: Translate HIR module to Elixir module
-
-    Let module_name be proc get_dict_value with hir, "name"
-    Set translator.current_module to module_name
-
-    proc emit_line with translator, "defmodule "
-    proc emit with translator, module_name
-    proc emit_line with translator, " do"
-    proc indent from translator
-
-    Note: Handle OTP behavior
-    Let otp_behavior be proc get_dict_value with hir, "otp_behavior"
-    If otp_behavior is not equal to 0:
-        Set translator.otp_behavior_context to otp_behavior
-        proc emit_line with translator, "use "
-        proc emit with translator, otp_behavior
-        proc emit_newline from translator
-    End If
-
-    Note: Handle module attributes
-    Let attributes be proc get_dict_value with hir, "attributes"
-    If attributes is not equal to 0:
-        proc translate_module_attributes with translator, attributes
-    End If
-
-    Note: Translate module body
-    Let body be proc get_dict_value with hir, "body"
-    If body is not equal to 0:
-        proc translate_statement_list with translator, body
-    End If
-
-    proc dedent from translator
-    proc emit_line with translator, "end"
-
-    Set translator.current_module to ""
-    Set translator.otp_behavior_context to ""
-
-    Return 1
-End Process
+Note: ============================================================================
+Note: Module + member generation
+Note: ============================================================================
 
 @Reasoning:
-Emit "def name(args) do body end" for a regular function, or
-"defp name(args) do body end" for a private one. Private functions
-are signalled by a flag in the HIR.
+A module emits 'defmodule Name do\n  <members>\nend'. The body members are
+emitted one per logical statement at one indentation level deeper, each on its
+own line via generate_member_line. A blank module name (anonymous top-level
+container) emits its members at top level without the defmodule wrapper.
 @End Reasoning
+Process called "generate_module" takes context as Integer, node as Integer returns Integer:
+    Let name be proc get_dict_string_value with node, "name"
 
-@Implementation:
-Reads name, parameter list, body, and is_private flag. Emits "def "
-(or "defp "), the name, "(" + parameters + ")", " do" + LF, body at
-+1 indent, then "end".
-@End Implementation
-
-Process called "translate_function" takes translator as Integer, hir as Integer returns Integer:
-    Note: Translate HIR function to Elixir def
-
-    Let function_name be proc get_dict_value with hir, "name"
-    Set translator.current_function to function_name
-
-    Note: Check if this is an OTP callback
-    Let otp_callback be proc get_dict_value with hir, "otp_callback"
-    If otp_callback is not equal to 0:
-        proc emit_line with translator, "@impl true"
+    Let has_name be 0
+    If name is not equal to 0:
+        Let name_len be proc string_length from StringCore with name
+        If name_len is greater than 0:
+            Set has_name to 1
+        End If
     End If
 
-    Note: Handle function visibility
-    Let visibility be proc get_dict_value with hir, "visibility"
-    If visibility is equal to "private":
-        proc emit with translator, "defp "
+    Let members be proc get_dict_hir_value with node, "members"
+
+    If has_name is equal to 1:
+        proc emit_indent with context
+        proc out_str with context, "defmodule "
+        proc out_str with context, name
+        proc out_str with context, " do"
+        proc out_newline with context
+        proc increase_indent with context
+        proc generate_member_list with context, members
+        proc decrease_indent with context
+        proc emit_indent with context
+        proc out_str with context, "end"
+        proc out_newline with context
     Otherwise:
-        proc emit with translator, "def "
+        proc generate_member_list with context, members
     End If
-
-    proc emit with translator, function_name
-
-    Note: Handle function clauses (pattern matching)
-    Let clauses be proc get_dict_value with hir, "clauses"
-    If clauses is not equal to 0:
-        proc translate_function_clauses with translator, clauses
-    Otherwise:
-        Note: Single function definition
-        Let parameters be proc get_dict_value with hir, "parameters"
-        If parameters is not equal to 0:
-            proc emit with translator, "("
-            proc translate_parameters with translator, parameters
-            proc emit with translator, ")"
-        End If
-
-        Note: Handle guards
-        Let guards be proc get_dict_value with hir, "guards"
-        If guards is not equal to 0:
-            proc emit with translator, " when "
-            proc translate_guards with translator, guards
-        End If
-
-        proc emit with translator, " do"
-        proc emit_newline from translator
-        proc indent from translator
-
-        Let body be proc get_dict_value with hir, "body"
-        If body is not equal to 0:
-            proc translate_statement_list with translator, body
-        End If
-
-        proc dedent from translator
-        proc emit_line with translator, "end"
-    End If
-
-    Set translator.current_function to ""
 
     Return 1
 End Process
 
 @Reasoning:
-Emit a "case expr do ... end" block for HIR pattern_match nodes.
-Multi-arm patterns are emitted as case clauses.
+Emits every member in a HIR list as its own indented statement line. Each member
+generator emits its own trailing newline, so members are line-separated.
 @End Reasoning
-
-@Implementation:
-Emits "case " + expression + " do" + LF. Walks clauses calling
-translate_match_clause for each. Closes with "end".
-@End Implementation
-
-Process called "translate_pattern_match" takes translator as Integer, hir as Integer returns Integer:
-    Note: Translate HIR pattern match to Elixir case
-
-    proc emit with translator, "case "
-    Let expression be proc get_dict_value with hir, "expression"
-    proc translate_hir_to_elixir with translator, expression
-    proc emit_line with translator, " do"
-
-    proc indent from translator
-
-    Let clauses be proc get_dict_value with hir, "clauses"
-    If clauses is not equal to 0:
-        Let clause_count be proc get_list_size from clauses
-        Let index be 0
-
-        While index is less than clause_count:
-            Let clause be proc get_list_item with clauses, index
-            proc translate_match_clause with translator, clause
-            Set index to index plus 1
-        End While
+Process called "generate_member_list" takes context as Integer, members as Integer returns Integer:
+    If members is equal to 0:
+        Return 1
     End If
-
-    proc dedent from translator
-    proc emit_line with translator, "end"
-
+    Let items be proc list_elements with members
+    If items is equal to 0:
+        Return 1
+    End If
+    Let count be proc size from ListOps with items
+    Let i be 0
+    While i is less than count:
+        Let member be proc get_at from ListOps with items, i
+        If member is not equal to 0:
+            proc generate_member_line with context, member
+        End If
+        Set i to i plus 1
+    End While
     Return 1
 End Process
 
 @Reasoning:
-Emit a single case/receive match clause "pattern -> body".
+Emits one module member. Declaration members (function, defstruct, attributes,
+directives, protocols, impls) already manage their own indentation + newline.
+Bare expression members are emitted as an indented expression line.
 @End Reasoning
+Process called "generate_member_line" takes context as Integer, member as Integer returns Integer:
+    Let nt be proc get_dict_string_value with member, "_type"
+    If nt is equal to 0:
+        Return 1
+    End If
 
-@Implementation:
-Emits indented pattern via translate_pattern, " -> ", then body
-expression. Optional "when" guard between pattern and "->" when
-present.
-@End Implementation
+    Let is_decl be proc is_declaration_tag with nt
+    If is_decl is equal to 1:
+        proc generate_node with context, member
+        Return 1
+    End If
 
-Process called "translate_match_clause" takes translator as Integer, clause as Integer returns Integer:
-    Note: Translate single match clause
+    Note: bare expression statement member
+    proc emit_indent with context
+    proc generate_node with context, member
+    proc out_newline with context
+    Return 1
+End Process
 
-    Let pattern be proc get_dict_value with clause, "pattern"
-    Let guard be proc get_dict_value with clause, "guard"
-    Let body be proc get_dict_value with clause, "body"
+@Reasoning:
+True (1) when the tag is a module-level declaration that self-manages indentation
+and a trailing newline (so generate_member_line does not double-wrap it).
+@End Reasoning
+Process called "is_declaration_tag" takes nt as Integer returns Integer:
+    If proc string_equals from StringCore with nt, "function":
+        Return 1
+    End If
+    If proc string_equals from StringCore with nt, "defstruct":
+        Return 1
+    End If
+    If proc string_equals from StringCore with nt, "defexception":
+        Return 1
+    End If
+    If proc string_equals from StringCore with nt, "module_attribute":
+        Return 1
+    End If
+    If proc string_equals from StringCore with nt, "alias":
+        Return 1
+    End If
+    If proc string_equals from StringCore with nt, "import":
+        Return 1
+    End If
+    If proc string_equals from StringCore with nt, "require":
+        Return 1
+    End If
+    If proc string_equals from StringCore with nt, "use":
+        Return 1
+    End If
+    If proc string_equals from StringCore with nt, "defprotocol":
+        Return 1
+    End If
+    If proc string_equals from StringCore with nt, "defimpl":
+        Return 1
+    End If
+    If proc string_equals from StringCore with nt, "elixir_module":
+        Return 1
+    End If
+    Return 0
+End Process
 
-    proc emit_indent from translator
-    proc translate_pattern with translator, pattern
+@Reasoning:
+A function emits one 'def'/'defp' head per clause: 'def name(params) when guard
+do\n  body\nend'. The keyword (def vs defp) is taken from the "kind" attribute if
+present, else derived from visibility. Every clause is emitted so multi-clause
+functions reconstruct.
+@End Reasoning
+Process called "generate_function" takes context as Integer, node as Integer returns Integer:
+    Let kind be proc get_dict_string_value with node, "kind"
+    Let keyword be proc resolve_def_keyword with node, kind
+    Let name be proc get_dict_string_value with node, "name"
 
+    Let clauses be proc get_dict_hir_value with node, "clauses"
+    If clauses is equal to 0:
+        Return 1
+    End If
+    Let items be proc list_elements with clauses
+    If items is equal to 0:
+        Return 1
+    End If
+    Let count be proc size from ListOps with items
+    Let i be 0
+    While i is less than count:
+        Let clause be proc get_at from ListOps with items, i
+        If clause is not equal to 0:
+            proc generate_function_clause with context, clause, keyword, name
+        End If
+        Set i to i plus 1
+    End While
+    Return 1
+End Process
+
+@Reasoning:
+Resolves the def keyword to emit. Uses the explicit "kind" attribute when it is
+one of the recognised def forms; otherwise falls back to visibility ("private" ->
+defp, anything else -> def).
+@End Reasoning
+Process called "resolve_def_keyword" takes node as Integer, kind as Integer returns Integer:
+    If kind is not equal to 0:
+        If proc string_equals from StringCore with kind, "def":
+            Return "def"
+        End If
+        If proc string_equals from StringCore with kind, "defp":
+            Return "defp"
+        End If
+        If proc string_equals from StringCore with kind, "defmacro":
+            Return "defmacro"
+        End If
+        If proc string_equals from StringCore with kind, "defmacrop":
+            Return "defmacrop"
+        End If
+        If proc string_equals from StringCore with kind, "defguard":
+            Return "defguard"
+        End If
+        If proc string_equals from StringCore with kind, "defguardp":
+            Return "defguardp"
+        End If
+        If proc string_equals from StringCore with kind, "defdelegate":
+            Return "defdelegate"
+        End If
+    End If
+
+    Let visibility be proc get_dict_string_value with node, "visibility"
+    If visibility is not equal to 0:
+        If proc string_equals from StringCore with visibility, "private":
+            Return "defp"
+        End If
+    End If
+    Return "def"
+End Process
+
+@Reasoning:
+Emits one clause head + body. 'keyword name(params)' then, if a guard is present,
+' when guard', then ' do\n  body\nend'. params are comma-separated; the body
+statements are emitted one per indented line.
+@End Reasoning
+Process called "generate_function_clause" takes context as Integer, clause as Integer, keyword as Integer, name as Integer returns Integer:
+    proc emit_indent with context
+    proc out_str with context, keyword
+    proc out_space with context
+    If name is not equal to 0:
+        proc out_str with context, name
+    End If
+    proc out_char with context, 40
+    Let params be proc get_dict_hir_value with clause, "params"
+    proc generate_expr_list with context, params
+    proc out_char with context, 41
+
+    Let guard be proc get_dict_hir_value with clause, "guard"
     If guard is not equal to 0:
-        proc emit with translator, " when "
-        proc translate_hir_to_elixir with translator, guard
+        proc out_str with context, " when "
+        proc generate_node with context, guard
     End If
 
-    proc emit_line with translator, " ->"
-    proc indent from translator
+    proc out_str with context, " do"
+    proc out_newline with context
 
-    proc translate_hir_to_elixir with translator, body
+    proc increase_indent with context
+    Let body be proc get_dict_hir_value with clause, "body"
+    proc generate_statement_list with context, body
+    proc decrease_indent with context
 
-    proc dedent from translator
-    proc emit_newline from translator
-
+    proc emit_indent with context
+    proc out_str with context, "end"
+    proc out_newline with context
     Return 1
 End Process
 
 @Reasoning:
-Translate an HIR pattern to Elixir pattern syntax. Patterns include
-wildcards (_), variables, literals, tuples ({a, b}), maps (%{...}),
-lists ([head | tail]), and binary structures.
+A defstruct/defexception emits 'defstruct [field: default, field2: nil]'. The
+keyword selects defstruct vs defexception. Each field is emitted from its pair.
 @End Reasoning
-
-@Implementation:
-Reads pattern's kind. Wildcard emits "_". Variable emits name.
-Literal recurses through the literal emitters. Tuple emits
-"{p1, p2, ...}". Map emits "%{k => v, ...}". List emits "[p1, p2,
-... | rest]" with optional rest.
-@End Implementation
-
-Process called "translate_pattern" takes translator as Integer, pattern as Integer returns Integer:
-    Note: Translate HIR pattern to Elixir pattern
-
-    Let pattern_type be proc get_dict_value with pattern, "node_type"
-
-    Match pattern_type:
-        When "variable":
-            Let var_name be proc get_dict_value with pattern, "name"
-            proc emit with translator, var_name
-
-        When "tuple_pattern":
-            proc emit with translator, "{"
-            Let elements be proc get_dict_value with pattern, "elements"
-            proc translate_pattern_list with translator, elements, ", "
-            proc emit with translator, "}"
-
-        When "list_pattern":
-            proc translate_list_pattern with translator, pattern
-
-        When "map_pattern":
-            proc translate_map_pattern with translator, pattern
-
-        When "atom":
-            proc emit with translator, ":"
-            Let value be proc get_dict_value with pattern, "value"
-            proc emit with translator, value
-
-        When "string_literal":
-            proc emit with translator, "\""
-            Set value to proc get_dict_value with pattern, "value"
-            proc emit with translator, proc escape_elixir_string from value
-            proc emit with translator, "\""
-
-        When "number_literal":
-            Set value to proc get_dict_value with pattern, "value"
-            proc emit with translator, value
-
-        Otherwise:
-            proc translate_hir_to_elixir with translator, pattern
-    End Match
-
-    Return 1
-End Process
-
-@Reasoning:
-Emit Elixir actor-receive: "receive do clauses end" with optional
-"after timeout -> body" tail. Used in actor processes to wait for
-messages.
-@End Reasoning
-
-@Implementation:
-Emits "receive do" + LF. Walks the receive clauses calling
-translate_match_clause for each pattern -> body pair. If a timeout
-arm exists, emits "after timeout -> body". Closes with "end".
-@End Implementation
-
-Process called "translate_receive" takes translator as Integer, hir as Integer returns Integer:
-    Note: Translate HIR actor receive to Elixir receive
-
-    proc emit_line with translator, "receive do"
-    proc indent from translator
-
-    Let clauses be proc get_dict_value with hir, "clauses"
-    If clauses is not equal to 0:
-        Let clause_count be proc get_list_size from clauses
-        Let index be 0
-
-        While index is less than clause_count:
-            Let clause be proc get_list_item with clauses, index
-            proc translate_receive_clause with translator, clause
-            Set index to index plus 1
-        End While
-    End If
-
-    Note: Handle after clause (timeout)
-    Let after_clause be proc get_dict_value with hir, "after"
-    If after_clause is not equal to 0:
-        Let timeout be proc get_dict_value with after_clause, "timeout"
-        Let timeout_body be proc get_dict_value with after_clause, "body"
-
-        proc emit_indent from translator
-        proc translate_hir_to_elixir with translator, timeout
-        proc emit_line with translator, " ->"
-        proc indent from translator
-        proc translate_hir_to_elixir with translator, timeout_body
-        proc dedent from translator
-    End If
-
-    proc dedent from translator
-    proc emit_line with translator, "end"
-
-    Return 1
-End Process
-
-@Reasoning:
-Emit "spawn(fn -> body end)" or "spawn_link" depending on link flag.
-Spawns a new actor process running the provided body expression.
-@End Reasoning
-
-@Implementation:
-Reads link flag and body expression. Emits "spawn" or "spawn_link",
-then "(fn -> ", body, " end)".
-@End Implementation
-
-Process called "translate_spawn" takes translator as Integer, hir as Integer returns Integer:
-    Note: Translate HIR actor spawn to Elixir spawn
-
-    Let spawn_type be proc get_dict_value with hir, "spawn_type"
-
-    Match spawn_type:
-        When "spawn":
-            proc emit with translator, "spawn("
-        When "spawn_link":
-            proc emit with translator, "spawn_link("
-        When "spawn_monitor":
-            proc emit with translator, "spawn_monitor("
-        When "Task.start":
-            proc emit with translator, "Task.start("
-        Otherwise:
-            proc emit with translator, "spawn("
-    End Match
-
-    Let module_name be proc get_dict_value with hir, "module"
-    Let function_name be proc get_dict_value with hir, "function"
-    Let arguments be proc get_dict_value with hir, "arguments"
-
-    If module_name is not equal to 0:
-        proc emit with translator, module_name
-        proc emit with translator, ", :"
-        proc emit with translator, function_name
-    Otherwise:
-        proc emit with translator, "fn -> "
-        proc emit with translator, function_name
-    End If
-
-    If arguments is not equal to 0:
-        proc emit with translator, ", ["
-        proc translate_argument_list with translator, arguments
-        proc emit with translator, "]"
-    Otherwise:
-        proc emit with translator, ", []"
-    End If
-
-    If module_name is equal to 0:
-        proc emit with translator, " end"
-    End If
-
-    proc emit with translator, ")"
-
-    Return 1
-End Process
-
-@Reasoning:
-Emit "send(pid, message)". Sends a message asynchronously to an
-actor process; no reply is awaited.
-@End Reasoning
-
-@Implementation:
-Reads target_pid and message expressions. Emits "send(", recursively
-translates each, separates with ", ", emits ")".
-@End Implementation
-
-Process called "translate_send" takes translator as Integer, hir as Integer returns Integer:
-    Note: Translate HIR actor send to Elixir send
-
-    proc emit with translator, "send("
-
-    Let target be proc get_dict_value with hir, "target"
-    Let message be proc get_dict_value with hir, "message"
-
-    proc translate_hir_to_elixir with translator, target
-    proc emit with translator, ", "
-    proc translate_hir_to_elixir with translator, message
-
-    proc emit with translator, ")"
-
-    Return 1
-End Process
-
-@Reasoning:
-Emit "GenServer.call(server, message)". Synchronous OTP request-reply
-to a GenServer; the caller blocks until the server responds.
-@End Reasoning
-
-@Implementation:
-Reads server reference and message expressions. Emits
-"GenServer.call(", translates server, ", ", message, ")".
-@End Implementation
-
-Process called "translate_genserver_call" takes translator as Integer, hir as Integer returns Integer:
-    Note: Translate HIR GenServer call to Elixir GenServer.call
-
-    proc emit with translator, "GenServer.call("
-
-    Let server be proc get_dict_value with hir, "server"
-    Let request be proc get_dict_value with hir, "request"
-    Let timeout be proc get_dict_value with hir, "timeout"
-
-    proc translate_hir_to_elixir with translator, server
-    proc emit with translator, ", "
-    proc translate_hir_to_elixir with translator, request
-
-    If timeout is not equal to 0:
-        proc emit with translator, ", "
-        proc translate_hir_to_elixir with translator, timeout
-    End If
-
-    proc emit with translator, ")"
-
-    Return 1
-End Process
-
-@Reasoning:
-Emit "GenServer.cast(server, message)". Asynchronous fire-and-forget
-request to a GenServer; the caller does not wait for a reply.
-@End Reasoning
-
-@Implementation:
-Emits "GenServer.cast(" + server + ", " + message + ")" by recursing
-into the operand expressions.
-@End Implementation
-
-Process called "translate_genserver_cast" takes translator as Integer, hir as Integer returns Integer:
-    Note: Translate HIR GenServer cast to Elixir GenServer.cast
-
-    proc emit with translator, "GenServer.cast("
-
-    Let server be proc get_dict_value with hir, "server"
-    Let request be proc get_dict_value with hir, "request"
-
-    proc translate_hir_to_elixir with translator, server
-    proc emit with translator, ", "
-    proc translate_hir_to_elixir with translator, request
-
-    proc emit with translator, ")"
-
-    Return 1
-End Process
-
-@Reasoning:
-Emit Elixir pipeline operator chain "a |> f |> g". The HIR
-function_composition node carries a list of stages to be chained.
-@End Reasoning
-
-@Implementation:
-Emits the first stage, then for each subsequent stage emits " |> "
-followed by the stage expression. Stages are translated via the main
-dispatcher.
-@End Implementation
-
-Process called "translate_pipe" takes translator as Integer, hir as Integer returns Integer:
-    Note: Translate HIR function composition to Elixir pipe
-
-    Let input be proc get_dict_value with hir, "input"
-    Let transform be proc get_dict_value with hir, "transform"
-
-    proc translate_hir_to_elixir with translator, input
-    proc emit with translator, " |> "
-    proc translate_hir_to_elixir with translator, transform
-
-    Return 1
-End Process
-
-@Reasoning:
-Emit Elixir "for" list comprehension "for x <- xs, filter, do:
-expr". Supports generators, filters, and a body expression.
-@End Reasoning
-
-@Implementation:
-Emits "for ", then comma-separated generators ("var <- source") and
-filters (boolean expressions). Then emits ", do: " followed by the
-body expression.
-@End Implementation
-
-Process called "translate_for_comprehension" takes translator as Integer, hir as Integer returns Integer:
-    Note: Translate HIR list comprehension to Elixir for
-
-    proc emit with translator, "for "
-
-    Let generators be proc get_dict_value with hir, "generators"
-    If generators is not equal to 0:
-        proc translate_generators with translator, generators
-    End If
-
-    Let filters be proc get_dict_value with hir, "filters"
-    If filters is not equal to 0:
-        proc emit with translator, ", "
-        proc translate_filters with translator, filters
-    End If
-
-    Let into_clause be proc get_dict_value with hir, "into"
-    If into_clause is not equal to 0:
-        proc emit with translator, ", into: "
-        proc translate_hir_to_elixir with translator, into_clause
-    End If
-
-    proc emit with translator, ", do: "
-
-    Let transform be proc get_dict_value with hir, "transform"
-    proc translate_hir_to_elixir with translator, transform
-
-    Return 1
-End Process
-
-@Reasoning:
-Emit Elixir tuple "{a, b, c}". Tuples are first-class fixed-size
-ordered values; commonly used for tagged unions ({:ok, value} or
-{:error, reason}).
-@End Reasoning
-
-@Implementation:
-Emits "{", iterates elements with ", " separators recursing into the
-dispatcher, emits "}".
-@End Implementation
-
-Process called "translate_tuple" takes translator as Integer, hir as Integer returns Integer:
-    Note: Translate HIR tuple to Elixir tuple
-
-    proc emit with translator, "{"
-
-    Let elements be proc get_dict_value with hir, "elements"
-    If elements is not equal to 0:
-        proc translate_expression_list with translator, elements, ", "
-    End If
-
-    proc emit with translator, "}"
-
-    Return 1
-End Process
-
-@Reasoning:
-Emit Elixir map "%{key => value, ...}". When keys are atoms can also
-use the short form %{key: value}; this emitter always uses the
-explicit "=>" form.
-@End Reasoning
-
-@Implementation:
-Emits "%{", iterates the entries emitting "key => value" pairs with
-", " separators, emits "}".
-@End Implementation
-
-Process called "translate_map" takes translator as Integer, hir as Integer returns Integer:
-    Note: Translate HIR map to Elixir map
-
-    proc emit with translator, "%{"
-
-    Let pairs be proc get_dict_value with hir, "pairs"
-    If pairs is not equal to 0:
-        Let pair_count be proc get_list_size from pairs
-        Let index be 0
-
-        While index is less than pair_count:
-            If index is greater than 0:
-                proc emit with translator, ", "
-            End If
-
-            Let pair be proc get_list_item with pairs, index
-            Let key be proc get_dict_value with pair, "key"
-            Let value be proc get_dict_value with pair, "value"
-
-            proc translate_hir_to_elixir with translator, key
-            proc emit with translator, " => "
-            proc translate_hir_to_elixir with translator, value
-
-            Set index to index plus 1
-        End While
-    End If
-
-    proc emit with translator, "}"
-
-    Return 1
-End Process
-
-@Reasoning:
-Emit Elixir list "[a, b, c]". Elixir lists are linked-list cons cells;
-the literal syntax is the same as most languages.
-@End Reasoning
-
-@Implementation:
-Emits "[", iterates elements with ", " separators, emits "]".
-@End Implementation
-
-Process called "translate_list" takes translator as Integer, hir as Integer returns Integer:
-    Note: Translate HIR list to Elixir list
-
-    proc emit with translator, "["
-
-    Let elements be proc get_dict_value with hir, "elements"
-    If elements is not equal to 0:
-        proc translate_expression_list with translator, elements, ", "
-    End If
-
-    proc emit with translator, "]"
-
-    Return 1
-End Process
-
-@Reasoning:
-Emit an Elixir atom literal ":name". Atoms are interned symbolic
-constants used for tags, status codes, and module references.
-@End Reasoning
-
-@Implementation:
-Reads the atom name, emits ":" + name.
-@End Implementation
-
-Process called "translate_atom" takes translator as Integer, hir as Integer returns Integer:
-    Note: Translate HIR atom to Elixir atom
-
-    proc emit with translator, ":"
-    Let value be proc get_dict_value with hir, "value"
-    proc emit with translator, value
-
-    Return 1
-End Process
-
-@Reasoning:
-Emit a double-quoted Elixir string literal. Elixir strings are UTF-8
-binaries; special characters must be escaped.
-@End Reasoning
-
-@Implementation:
-Reads the literal value, runs it through escape_elixir_string to
-handle quotes/backslashes/newlines, then emits '"' + escaped + '"'.
-@End Implementation
-
-@Security_Scope:
-Strings are escaped before emission, so user-supplied content cannot
-break out of the literal. Trusts the underlying escape function.
-@End Security_Scope
-
-Process called "translate_string" takes translator as Integer, hir as Integer returns Integer:
-    Note: Translate HIR string to Elixir string
-
-    proc emit with translator, "\""
-    Let value be proc get_dict_value with hir, "value"
-    Let escaped_value be proc escape_elixir_string from value
-    proc emit with translator, escaped_value
-    proc emit with translator, "\""
-
-    Return 1
-End Process
-
-@Reasoning:
-Emit an Elixir number literal. Elixir's numeric literal syntax (plain
-decimal) matches Runa's, so the value is emitted verbatim.
-@End Reasoning
-
-@Implementation:
-Reads the value and emits it as a string.
-@End Implementation
-
-Process called "translate_number" takes translator as Integer, hir as Integer returns Integer:
-    Note: Translate HIR number to Elixir number
-
-    Let value be proc get_dict_value with hir, "value"
-    proc emit with translator, value
-
-    Return 1
-End Process
-
-@Reasoning:
-Emit an Elixir variable reference. Variable names are emitted as-is;
-Elixir uses snake_case by convention so the HIR name should already be
-in the right shape.
-@End Reasoning
-
-@Implementation:
-Reads the variable name from the HIR node and emits it.
-@End Implementation
-
-Process called "translate_variable" takes translator as Integer, hir as Integer returns Integer:
-    Note: Translate HIR variable to Elixir variable
-
-    Let name be proc get_dict_value with hir, "name"
-    proc emit with translator, name
-
-    Return 1
-End Process
-
-@Reasoning:
-Emit an Elixir function call "Module.function(args)" or "function
-(args)". Module-qualified calls require a separate Module prefix.
-@End Reasoning
-
-@Implementation:
-Reads optional module name, function name, and argument list. Emits
-"Module." prefix if present, then the function name, then "(",
-arguments via translate_argument_list, ")".
-@End Implementation
-
-Process called "translate_function_call" takes translator as Integer, hir as Integer returns Integer:
-    Note: Translate HIR function call to Elixir function call
-
-    Let function_name be proc get_dict_value with hir, "function"
-    Let module_name be proc get_dict_value with hir, "module"
-    Let arguments be proc get_dict_value with hir, "arguments"
-
-    If module_name is not equal to 0:
-        proc emit with translator, module_name
-        proc emit with translator, "."
-    End If
-
-    proc emit with translator, function_name
-
-    If arguments is not equal to 0:
-        proc emit with translator, "("
-        proc translate_argument_list with translator, arguments
-        proc emit with translator, ")"
-    End If
-
-    Return 1
-End Process
-
-Note: Helper processes for HIR to Elixir translation
-
-@Reasoning:
-Walk a list of statements emitting each one on its own line. Used
-inside function bodies, case clauses, and do/end blocks.
-@End Reasoning
-
-@Implementation:
-Iterates the statement list, dispatches each via the main
-translate_hir_to_elixir router, emits a newline after each statement.
-@End Implementation
-
-Process called "translate_statement_list" takes translator as Integer, statements as Integer returns Integer:
-    Note: Translate list of HIR statements to Elixir statements
-
-    Let stmt_count be proc get_list_size from statements
-    Let index be 0
-
-    While index is less than stmt_count:
-        Let statement be proc get_list_item with statements, index
-
-        proc emit_indent from translator
-        proc translate_hir_to_elixir with translator, statement
-        proc emit_newline from translator
-
-        Set index to index plus 1
-    End While
-
-    Return 1
-End Process
-
-@Reasoning:
-Emit a comma-separated argument list for function calls.
-@End Reasoning
-
-@Implementation:
-Iterates the args list, recurses each via the main dispatcher, emits
-", " between arguments but not after the last.
-@End Implementation
-
-Process called "translate_argument_list" takes translator as Integer, args as Integer returns Integer:
-    Note: Translate HIR arguments to Elixir argument list
-
-    Let arg_count be proc get_list_size from args
-    Let index be 0
-
-    While index is less than arg_count:
-        If index is greater than 0:
-            proc emit with translator, ", "
+Process called "generate_defstruct" takes context as Integer, node as Integer, keyword as Integer returns Integer:
+    proc emit_indent with context
+    proc out_str with context, keyword
+    proc out_space with context
+    proc out_char with context, 91
+
+    Let fields be proc get_dict_hir_value with node, "fields"
+    If fields is not equal to 0:
+        Let items be proc list_elements with fields
+        If items is not equal to 0:
+            Let count be proc size from ListOps with items
+            Let i be 0
+            While i is less than count:
+                If i is greater than 0:
+                    proc out_str with context, ", "
+                End If
+                Let pair be proc get_at from ListOps with items, i
+                proc generate_struct_field with context, pair
+                Set i to i plus 1
+            End While
         End If
+    End If
 
-        Let argument be proc get_list_item with args, index
-        proc translate_hir_to_elixir with translator, argument
-
-        Set index to index plus 1
-    End While
-
+    proc out_char with context, 93
+    proc out_newline with context
     Return 1
 End Process
 
 @Reasoning:
-Append text to the translator's output buffer. Lowest-level emission
-primitive used by all other emit_* helpers.
+Emits one defstruct field. The key is a pair node whose "key" is an expression
+(usually an atom) and whose "value" may be 0 (bare key) or a default expression.
+A bare atom key 'foo' is emitted as 'foo: nil' (keyword-list form requires a
+value), preserving the field name; a present value emits 'name: value'.
 @End Reasoning
+Process called "generate_struct_field" takes context as Integer, pair as Integer returns Integer:
+    Let key be proc get_dict_hir_value with pair, "key"
+    Let value be proc get_dict_hir_value with pair, "value"
 
-@Implementation:
-Concatenates text onto translator.output_buffer.
-@End Implementation
+    Let field_name be proc field_key_name with key
 
-@Performance_Hints:
-String-concat-based emission is O(n^2) in total output length. Fine
-for typical Elixir module sizes, not for large outputs.
-@End Performance_Hints
-
-Process called "emit" takes translator as Integer, text as String returns Integer:
-    Note: Emit text to output buffer
-    Set translator.output_buffer to proc string_concat with translator.output_buffer, text
-    Return 1
-End Process
-
-@Reasoning:
-Emit text followed by a newline plus the current indent prefix.
-Pairs cleanly with emit-then-emit_line patterns inside translator
-helpers.
-@End Reasoning
-
-@Implementation:
-Emits the text, then a LF, then indent_level * 2 spaces.
-@End Implementation
-
-Process called "emit_line" takes translator as Integer, text as String returns Integer:
-    Note: Emit line with proper indentation
-    proc emit_indent from translator
-    proc emit with translator, text
-    proc emit_newline from translator
-    Return 1
-End Process
-
-@Reasoning:
-Emit a bare newline plus the current indent prefix.
-@End Reasoning
-
-@Implementation:
-Concatenates LF then indent_level * 2 spaces onto output_buffer.
-@End Implementation
-
-Process called "emit_newline" takes translator as Integer returns Integer:
-    Note: Emit newline character
-    proc emit with translator, "\n"
-    Return 1
-End Process
-
-@Reasoning:
-Emit the current indent prefix as standalone whitespace. Used when
-splicing into a line that did not come through emit_line.
-@End Reasoning
-
-@Implementation:
-Loops indent_level times appending two spaces per level (Elixir
-convention).
-@End Implementation
-
-Process called "emit_indent" takes translator as Integer returns Integer:
-    Note: Emit proper indentation
-
-    Let spaces_per_level be 2
-    Let total_spaces be translator.indentation_level multiplied by spaces_per_level
-    Let space_count be 0
-
-    While space_count is less than total_spaces:
-        proc emit with translator, " "
-        Set space_count to space_count plus 1
-    End While
-
-    Return 1
-End Process
-
-@Reasoning:
-Step into a deeper nesting level.
-@End Reasoning
-
-@Implementation:
-Increments translator.indentation_level by 1.
-@End Implementation
-
-Process called "indent" takes translator as Integer returns Integer:
-    Note: Increase indentation level
-    Set translator.indentation_level to translator.indentation_level plus 1
-    Return 1
-End Process
-
-@Reasoning:
-Step out of a nested block. Clamped at zero so unmatched
-indent/dedent calls do not underflow.
-@End Reasoning
-
-@Implementation:
-If indentation_level > 0, decrements by 1.
-@End Implementation
-
-Process called "dedent" takes translator as Integer returns Integer:
-    Note: Decrease indentation level
-    If translator.indentation_level is greater than 0:
-        Set translator.indentation_level to translator.indentation_level minus 1
+    If field_name is not equal to 0:
+        proc out_str with context, field_name
+        proc out_str with context, ": "
+        If value is not equal to 0:
+            proc generate_node with context, value
+        Otherwise:
+            proc out_str with context, "nil"
+        End If
+    Otherwise:
+        proc generate_node with context, key
+        proc out_str with context, " => "
+        If value is not equal to 0:
+            proc generate_node with context, value
+        Otherwise:
+            proc out_str with context, "nil"
+        End If
     End If
     Return 1
 End Process
 
 @Reasoning:
-Escape characters that would break a double-quoted Elixir string
-literal: backslash, double-quote, and common control characters
-(newline, tab, carriage return).
+Extracts the bare field name from a key node. An atom key value ":name" yields
+"name" (the colon stripped); an identifier key yields its name. Returns 0 when the
+key is not a simple name (caller falls back to the map-style form).
 @End Reasoning
+Process called "field_key_name" takes key as Integer returns Integer:
+    If key is equal to 0:
+        Return 0
+    End If
 
-@Implementation:
-Walks each character of the input. Replaces backslash with "\\\\",
-double-quote with "\\\"", newline with "\\n", carriage-return with
-"\\r", tab with "\\t". Other characters pass through unchanged.
-@End Implementation
+    Let is_atom be proc type_is with key, "atom"
+    If is_atom is equal to 1:
+        Let value be proc get_dict_string_value with key, "value"
+        If value is equal to 0:
+            Return 0
+        End If
+        Return proc strip_leading_colon with value
+    End If
 
-@Security_Scope:
-Prevents Elixir string-literal injection. Caller must invoke this
-for any value embedded in a string literal.
-@End Security_Scope
+    Let is_id be proc type_is with key, "identifier"
+    If is_id is equal to 1:
+        Return proc get_dict_string_value with key, "name"
+    End If
 
-Process called "escape_elixir_string" takes text as String returns String:
-    Note: Escape special characters in Elixir string
-
-    Let result be ""
-    Let length be length of text
-    Let index be 0
-
-    While index is less than length:
-        Let char be proc char_at with text, index
-
-        Match char:
-            When "\"":
-                Set result to proc string_concat with result, "\\\""
-            When "\\":
-                Set result to proc string_concat with result, "\\\\"
-            When "\n":
-                Set result to proc string_concat with result, "\\n"
-            When "\t":
-                Set result to proc string_concat with result, "\\t"
-            When "\r":
-                Set result to proc string_concat with result, "\\r"
-            Otherwise:
-                Set result to proc string_concat with result, char
-        End Match
-
-        Set index to index plus 1
-    End While
-
-    Return result
+    Return 0
 End Process
 
 @Reasoning:
-Local helper to construct an empty dictionary for pattern and
-actor-model context tracking inside the translator.
+Strips a single leading ':' from an atom lexeme so ":name" becomes "name". When
+the string has no leading colon it is returned unchanged.
 @End Reasoning
+Process called "strip_leading_colon" takes s as Integer returns Integer:
+    If s is equal to 0:
+        Return 0
+    End If
+    Let len be proc string_length from StringCore with s
+    If len is equal to 0:
+        Return s
+    End If
+    Let first be proc string_char_at from StringCore with s, 0
+    If first is equal to 58:
+        Return proc string_substring from StringPrim with s, 1, len minus 1
+    End If
+    Return s
+End Process
 
-@Implementation:
-Allocates a new dict via the dictionary primitive (or returns a
-shared empty-dict sentinel). Caller is expected to mutate via the
-standard dict API.
-@End Implementation
+@Reasoning:
+A module attribute emits '@name value' on its own line. A 0 value (bare @attr)
+emits just '@name'.
+@End Reasoning
+Process called "generate_module_attribute" takes context as Integer, node as Integer returns Integer:
+    proc emit_indent with context
+    proc out_char with context, 64
+    Let name be proc get_dict_string_value with node, "name"
+    If name is not equal to 0:
+        proc out_str with context, name
+    End If
+    Let value be proc get_dict_hir_value with node, "value"
+    If value is not equal to 0:
+        proc out_space with context
+        proc generate_node with context, value
+    End If
+    proc out_newline with context
+    Return 1
+End Process
 
-Process called "create_dict" returns Integer:
-    Note: Create dictionary for storage
-    Return proc memory_allocate from Layout with 24
+@Reasoning:
+alias/import/require/use emit '<keyword> target' on their own line.
+@End Reasoning
+Process called "generate_directive" takes context as Integer, node as Integer, keyword as Integer returns Integer:
+    proc emit_indent with context
+    proc out_str with context, keyword
+    proc out_space with context
+    Let target be proc get_dict_hir_value with node, "target"
+    If target is not equal to 0:
+        proc generate_node with context, target
+    End If
+    proc out_newline with context
+    Return 1
+End Process
+
+@Reasoning:
+A defprotocol emits 'defprotocol Name do\n  <body>\nend'.
+@End Reasoning
+Process called "generate_defprotocol" takes context as Integer, node as Integer returns Integer:
+    proc emit_indent with context
+    proc out_str with context, "defprotocol "
+    Let name be proc get_dict_string_value with node, "name"
+    If name is not equal to 0:
+        proc out_str with context, name
+    End If
+    proc out_str with context, " do"
+    proc out_newline with context
+    proc increase_indent with context
+    Let body be proc get_dict_hir_value with node, "body"
+    proc generate_member_list with context, body
+    proc decrease_indent with context
+    proc emit_indent with context
+    proc out_str with context, "end"
+    proc out_newline with context
+    Return 1
+End Process
+
+@Reasoning:
+A defimpl emits 'defimpl Name, for: Target do\n  <body>\nend' (the ', for: Target'
+clause is emitted only when for_target is present).
+@End Reasoning
+Process called "generate_defimpl" takes context as Integer, node as Integer returns Integer:
+    proc emit_indent with context
+    proc out_str with context, "defimpl "
+    Let name be proc get_dict_string_value with node, "name"
+    If name is not equal to 0:
+        proc out_str with context, name
+    End If
+    Let for_target be proc get_dict_hir_value with node, "for_target"
+    If for_target is not equal to 0:
+        proc out_str with context, ", for: "
+        proc generate_node with context, for_target
+    End If
+    proc out_str with context, " do"
+    proc out_newline with context
+    proc increase_indent with context
+    Let body be proc get_dict_hir_value with node, "body"
+    proc generate_member_list with context, body
+    proc decrease_indent with context
+    proc emit_indent with context
+    proc out_str with context, "end"
+    proc out_newline with context
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Statement + expression list helpers
+Note: ============================================================================
+
+@Reasoning:
+Emits a body statement list one statement per indented line.
+@End Reasoning
+Process called "generate_statement_list" takes context as Integer, body as Integer returns Integer:
+    If body is equal to 0:
+        Return 1
+    End If
+    Let items be proc list_elements with body
+    If items is equal to 0:
+        Return 1
+    End If
+    Let count be proc size from ListOps with items
+    Let i be 0
+    While i is less than count:
+        Let stmt be proc get_at from ListOps with items, i
+        If stmt is not equal to 0:
+            proc emit_indent with context
+            proc generate_node with context, stmt
+            proc out_newline with context
+        End If
+        Set i to i plus 1
+    End While
+    Return 1
+End Process
+
+@Reasoning:
+Emits a comma-separated inline expression list (call args, clause params, tuple
+elements). No surrounding brackets; the caller emits those.
+@End Reasoning
+Process called "generate_expr_list" takes context as Integer, lst as Integer returns Integer:
+    If lst is equal to 0:
+        Return 1
+    End If
+    Let items be proc list_elements with lst
+    If items is equal to 0:
+        Return 1
+    End If
+    Let count be proc size from ListOps with items
+    Let i be 0
+    While i is less than count:
+        If i is greater than 0:
+            proc out_str with context, ", "
+        End If
+        Let item be proc get_at from ListOps with items, i
+        proc generate_node with context, item
+        Set i to i plus 1
+    End While
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Control-flow generation
+Note: ============================================================================
+
+@Reasoning:
+A pipe emits 'a |> b |> c' inline: each stage separated by ' |> '. Stage count is
+preserved from the stages list.
+@End Reasoning
+Process called "generate_pipe" takes context as Integer, node as Integer returns Integer:
+    Let stages be proc get_dict_hir_value with node, "stages"
+    If stages is equal to 0:
+        Return 1
+    End If
+    Let items be proc list_elements with stages
+    If items is equal to 0:
+        Return 1
+    End If
+    Let count be proc size from ListOps with items
+    Let i be 0
+    While i is less than count:
+        If i is greater than 0:
+            proc out_str with context, " |> "
+        End If
+        Let stage be proc get_at from ListOps with items, i
+        proc generate_node with context, stage
+        Set i to i plus 1
+    End While
+    Return 1
+End Process
+
+@Reasoning:
+A call emits 'callee(args)'.
+@End Reasoning
+Process called "generate_call" takes context as Integer, node as Integer returns Integer:
+    Let callee be proc get_dict_hir_value with node, "callee"
+    If callee is not equal to 0:
+        proc generate_node with context, callee
+    End If
+    proc out_char with context, 40
+    Let args be proc get_dict_hir_value with node, "args"
+    proc generate_expr_list with context, args
+    proc out_char with context, 41
+    Return 1
+End Process
+
+@Reasoning:
+A case emits 'case scrutinee do\n  pattern -> body\n ... end'.
+@End Reasoning
+Process called "generate_case" takes context as Integer, node as Integer returns Integer:
+    proc out_str with context, "case "
+    Let scrutinee be proc get_dict_hir_value with node, "scrutinee"
+    If scrutinee is not equal to 0:
+        proc generate_node with context, scrutinee
+    End If
+    proc out_str with context, " do"
+    proc out_newline with context
+
+    proc increase_indent with context
+    Let clauses be proc get_dict_hir_value with node, "clauses"
+    proc generate_match_clause_list with context, clauses
+    proc decrease_indent with context
+
+    proc emit_indent with context
+    proc out_str with context, "end"
+    Return 1
+End Process
+
+@Reasoning:
+A cond emits 'cond do\n  condition -> body\n ... end'.
+@End Reasoning
+Process called "generate_cond" takes context as Integer, node as Integer returns Integer:
+    proc out_str with context, "cond do"
+    proc out_newline with context
+    proc increase_indent with context
+    Let clauses be proc get_dict_hir_value with node, "clauses"
+    proc generate_match_clause_list with context, clauses
+    proc decrease_indent with context
+    proc emit_indent with context
+    proc out_str with context, "end"
+    Return 1
+End Process
+
+@Reasoning:
+Emits a list of match_clause arms, each on its own indented line as
+'pattern [when guard] -> body'.
+@End Reasoning
+Process called "generate_match_clause_list" takes context as Integer, clauses as Integer returns Integer:
+    If clauses is equal to 0:
+        Return 1
+    End If
+    Let items be proc list_elements with clauses
+    If items is equal to 0:
+        Return 1
+    End If
+    Let count be proc size from ListOps with items
+    Let i be 0
+    While i is less than count:
+        Let clause be proc get_at from ListOps with items, i
+        If clause is not equal to 0:
+            proc emit_indent with context
+            proc generate_match_clause with context, clause
+            proc out_newline with context
+        End If
+        Set i to i plus 1
+    End While
+    Return 1
+End Process
+
+@Reasoning:
+A match_clause emits 'pattern [when guard] -> body'. The body is emitted inline.
+@End Reasoning
+Process called "generate_match_clause" takes context as Integer, node as Integer returns Integer:
+    Let pattern be proc get_dict_hir_value with node, "pattern"
+    If pattern is not equal to 0:
+        proc generate_node with context, pattern
+    End If
+
+    Let guard be proc get_dict_hir_value with node, "guard"
+    If guard is not equal to 0:
+        proc out_str with context, " when "
+        proc generate_node with context, guard
+    End If
+
+    proc out_str with context, " -> "
+    Let body be proc get_dict_hir_value with node, "body"
+    proc generate_inline_body with context, body
+    Return 1
+End Process
+
+@Reasoning:
+Emits an arm body inline: statements joined by '; ' so a multi-statement arm
+stays on one logical line. A single statement emits just that expression.
+@End Reasoning
+Process called "generate_inline_body" takes context as Integer, body as Integer returns Integer:
+    If body is equal to 0:
+        Return 1
+    End If
+    Let items be proc list_elements with body
+    If items is equal to 0:
+        Return 1
+    End If
+    Let count be proc size from ListOps with items
+    Let i be 0
+    While i is less than count:
+        If i is greater than 0:
+            proc out_str with context, "; "
+        End If
+        Let stmt be proc get_at from ListOps with items, i
+        proc generate_node with context, stmt
+        Set i to i plus 1
+    End While
+    Return 1
+End Process
+
+@Reasoning:
+A with emits 'with clause, clause do\n  body\nend'.
+@End Reasoning
+Process called "generate_with" takes context as Integer, node as Integer returns Integer:
+    proc out_str with context, "with "
+    Let clauses be proc get_dict_hir_value with node, "clauses"
+    If clauses is not equal to 0:
+        Let items be proc list_elements with clauses
+        If items is not equal to 0:
+            Let count be proc size from ListOps with items
+            Let i be 0
+            While i is less than count:
+                If i is greater than 0:
+                    proc out_str with context, ", "
+                End If
+                Let clause be proc get_at from ListOps with items, i
+                proc generate_node with context, clause
+                Set i to i plus 1
+            End While
+        End If
+    End If
+    proc out_str with context, " do"
+    proc out_newline with context
+    proc increase_indent with context
+    Let body be proc get_dict_hir_value with node, "body"
+    proc generate_statement_list with context, body
+    proc decrease_indent with context
+    proc emit_indent with context
+    proc out_str with context, "end"
+    Return 1
+End Process
+
+@Reasoning:
+A with_clause / for generator emits 'pattern <- expr' when a pattern is present,
+else just the bare boolean filter expression.
+@End Reasoning
+Process called "generate_with_clause" takes context as Integer, node as Integer returns Integer:
+    Let pattern be proc get_dict_hir_value with node, "pattern"
+    If pattern is not equal to 0:
+        proc generate_node with context, pattern
+        proc out_str with context, " <- "
+    End If
+    Let expr be proc get_dict_hir_value with node, "expr"
+    If expr is not equal to 0:
+        proc generate_node with context, expr
+    End If
+    Return 1
+End Process
+
+@Reasoning:
+if/unless emit '<keyword> condition do\n  then_body\nelse\n  else_body\nend'. The
+else section is emitted only when else_body has statements.
+@End Reasoning
+Process called "generate_if" takes context as Integer, node as Integer, keyword as Integer returns Integer:
+    proc out_str with context, keyword
+    proc out_space with context
+    Let condition be proc get_dict_hir_value with node, "condition"
+    If condition is not equal to 0:
+        proc generate_node with context, condition
+    End If
+    proc out_str with context, " do"
+    proc out_newline with context
+
+    proc increase_indent with context
+    Let then_body be proc get_dict_hir_value with node, "then_body"
+    proc generate_statement_list with context, then_body
+    proc decrease_indent with context
+
+    Let else_body be proc get_dict_hir_value with node, "else_body"
+    Let has_else be proc list_has_items with else_body
+    If has_else is equal to 1:
+        proc emit_indent with context
+        proc out_str with context, "else"
+        proc out_newline with context
+        proc increase_indent with context
+        proc generate_statement_list with context, else_body
+        proc decrease_indent with context
+    End If
+
+    proc emit_indent with context
+    proc out_str with context, "end"
+    Return 1
+End Process
+
+@Reasoning:
+True (1) when a HIR list node has at least one element.
+@End Reasoning
+Process called "list_has_items" takes node as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    Let items be proc list_elements with node
+    If items is equal to 0:
+        Return 0
+    End If
+    Let count be proc size from ListOps with items
+    If count is greater than 0:
+        Return 1
+    End If
+    Return 0
+End Process
+
+@Reasoning:
+A for emits 'for generators[, into: x][, uniq: true] do\n  body\nend'.
+@End Reasoning
+Process called "generate_for" takes context as Integer, node as Integer returns Integer:
+    proc out_str with context, "for "
+    Let generators be proc get_dict_hir_value with node, "generators"
+    If generators is not equal to 0:
+        Let items be proc list_elements with generators
+        If items is not equal to 0:
+            Let count be proc size from ListOps with items
+            Let i be 0
+            While i is less than count:
+                If i is greater than 0:
+                    proc out_str with context, ", "
+                End If
+                Let gen be proc get_at from ListOps with items, i
+                proc generate_node with context, gen
+                Set i to i plus 1
+            End While
+        End If
+    End If
+
+    Let into be proc get_dict_hir_value with node, "into"
+    If into is not equal to 0:
+        proc out_str with context, ", into: "
+        proc generate_node with context, into
+    End If
+
+    Let uniq be proc get_dict_string_value with node, "uniq"
+    If uniq is not equal to 0:
+        Let is_true be proc string_equals from StringCore with uniq, "true"
+        If is_true is equal to 1:
+            proc out_str with context, ", uniq: true"
+        End If
+    End If
+
+    proc out_str with context, " do"
+    proc out_newline with context
+    proc increase_indent with context
+    Let body be proc get_dict_hir_value with node, "body"
+    proc generate_statement_list with context, body
+    proc decrease_indent with context
+    proc emit_indent with context
+    proc out_str with context, "end"
+    Return 1
+End Process
+
+@Reasoning:
+A try emits 'try do\n  body\n[rescue arms][catch arms][after body]\nend'.
+@End Reasoning
+Process called "generate_try" takes context as Integer, node as Integer returns Integer:
+    proc out_str with context, "try do"
+    proc out_newline with context
+    proc increase_indent with context
+    Let body be proc get_dict_hir_value with node, "body"
+    proc generate_statement_list with context, body
+    proc decrease_indent with context
+
+    Let rescue be proc get_dict_hir_value with node, "rescue"
+    Let has_rescue be proc list_has_items with rescue
+    If has_rescue is equal to 1:
+        proc emit_indent with context
+        proc out_str with context, "rescue"
+        proc out_newline with context
+        proc increase_indent with context
+        proc generate_match_clause_list with context, rescue
+        proc decrease_indent with context
+    End If
+
+    Let catch be proc get_dict_hir_value with node, "catch"
+    Let has_catch be proc list_has_items with catch
+    If has_catch is equal to 1:
+        proc emit_indent with context
+        proc out_str with context, "catch"
+        proc out_newline with context
+        proc increase_indent with context
+        proc generate_match_clause_list with context, catch
+        proc decrease_indent with context
+    End If
+
+    Let after be proc get_dict_hir_value with node, "after"
+    Let has_after be proc list_has_items with after
+    If has_after is equal to 1:
+        proc emit_indent with context
+        proc out_str with context, "after"
+        proc out_newline with context
+        proc increase_indent with context
+        proc generate_statement_list with context, after
+        proc decrease_indent with context
+    End If
+
+    proc emit_indent with context
+    proc out_str with context, "end"
+    Return 1
+End Process
+
+@Reasoning:
+A receive emits 'receive do\n  pattern -> body\n[after timeout -> body]\nend'.
+@End Reasoning
+Process called "generate_receive" takes context as Integer, node as Integer returns Integer:
+    proc out_str with context, "receive do"
+    proc out_newline with context
+    proc increase_indent with context
+    Let clauses be proc get_dict_hir_value with node, "clauses"
+    proc generate_match_clause_list with context, clauses
+
+    Let after_timeout be proc get_dict_hir_value with node, "after_timeout"
+    If after_timeout is not equal to 0:
+        proc emit_indent with context
+        proc out_str with context, "after "
+        proc generate_node with context, after_timeout
+        proc out_str with context, " -> "
+        Let after_body be proc get_dict_hir_value with node, "after_body"
+        proc generate_inline_body with context, after_body
+        proc out_newline with context
+    End If
+
+    proc decrease_indent with context
+    proc emit_indent with context
+    proc out_str with context, "end"
+    Return 1
+End Process
+
+@Reasoning:
+An anonymous function emits 'fn params [when guard] -> body[; ...] end'.
+@End Reasoning
+Process called "generate_fn" takes context as Integer, node as Integer returns Integer:
+    proc out_str with context, "fn "
+    Let clauses be proc get_dict_hir_value with node, "clauses"
+    If clauses is not equal to 0:
+        Let items be proc list_elements with clauses
+        If items is not equal to 0:
+            Let count be proc size from ListOps with items
+            Let i be 0
+            While i is less than count:
+                If i is greater than 0:
+                    proc out_str with context, "; "
+                End If
+                Let clause be proc get_at from ListOps with items, i
+                proc generate_fn_clause with context, clause
+                Set i to i plus 1
+            End While
+        End If
+    End If
+    proc out_str with context, " end"
+    Return 1
+End Process
+
+@Reasoning:
+Emits one fn clause inline: 'params [when guard] -> body'.
+@End Reasoning
+Process called "generate_fn_clause" takes context as Integer, clause as Integer returns Integer:
+    Let params be proc get_dict_hir_value with clause, "params"
+    proc generate_expr_list with context, params
+
+    Let guard be proc get_dict_hir_value with clause, "guard"
+    If guard is not equal to 0:
+        proc out_str with context, " when "
+        proc generate_node with context, guard
+    End If
+
+    proc out_str with context, " -> "
+    Let body be proc get_dict_hir_value with clause, "body"
+    proc generate_inline_body with context, body
+    Return 1
+End Process
+
+@Reasoning:
+A capture emits '&target'.
+@End Reasoning
+Process called "generate_capture" takes context as Integer, node as Integer returns Integer:
+    proc out_char with context, 38
+    Let target be proc get_dict_hir_value with node, "target"
+    If target is not equal to 0:
+        proc generate_node with context, target
+    End If
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Collection + leaf generation
+Note: ============================================================================
+
+@Reasoning:
+A map emits '%{k => v, ...}' for arrow pairs, or '%{base | k => v}' when an
+update_source is present.
+@End Reasoning
+Process called "generate_map" takes context as Integer, node as Integer returns Integer:
+    proc out_str with context, "%{"
+    Let update_source be proc get_dict_hir_value with node, "update_source"
+    If update_source is not equal to 0:
+        proc generate_node with context, update_source
+        proc out_str with context, " | "
+    End If
+
+    Let pairs be proc get_dict_hir_value with node, "pairs"
+    If pairs is not equal to 0:
+        Let items be proc list_elements with pairs
+        If items is not equal to 0:
+            Let count be proc size from ListOps with items
+            Let i be 0
+            While i is less than count:
+                If i is greater than 0:
+                    proc out_str with context, ", "
+                End If
+                Let pair be proc get_at from ListOps with items, i
+                proc generate_map_pair with context, pair
+                Set i to i plus 1
+            End While
+        End If
+    End If
+    proc out_char with context, 125
+    Return 1
+End Process
+
+@Reasoning:
+Emits one map pair. An atom key 'name' is emitted in the idiomatic 'name: value'
+keyword form; any other key uses the 'key => value' arrow form. This keeps the
+emitted maps re-parseable and idiomatic while preserving the key set.
+@End Reasoning
+Process called "generate_map_pair" takes context as Integer, pair as Integer returns Integer:
+    Let key be proc get_dict_hir_value with pair, "key"
+    Let value be proc get_dict_hir_value with pair, "value"
+
+    Let field_name be proc field_key_name with key
+    If field_name is not equal to 0:
+        proc out_str with context, field_name
+        proc out_str with context, ": "
+        If value is not equal to 0:
+            proc generate_node with context, value
+        Otherwise:
+            proc out_str with context, "nil"
+        End If
+    Otherwise:
+        If key is not equal to 0:
+            proc generate_node with context, key
+        End If
+        proc out_str with context, " => "
+        If value is not equal to 0:
+            proc generate_node with context, value
+        Otherwise:
+            proc out_str with context, "nil"
+        End If
+    End If
+    Return 1
+End Process
+
+@Reasoning:
+A struct literal emits '%Name{field: value, ...}'.
+@End Reasoning
+Process called "generate_struct_literal" takes context as Integer, node as Integer returns Integer:
+    proc out_char with context, 37
+    Let name be proc get_dict_string_value with node, "name"
+    If name is not equal to 0:
+        proc out_str with context, name
+    End If
+    proc out_char with context, 123
+    Let pairs be proc get_dict_hir_value with node, "pairs"
+    If pairs is not equal to 0:
+        Let items be proc list_elements with pairs
+        If items is not equal to 0:
+            Let count be proc size from ListOps with items
+            Let i be 0
+            While i is less than count:
+                If i is greater than 0:
+                    proc out_str with context, ", "
+                End If
+                Let pair be proc get_at from ListOps with items, i
+                proc generate_map_pair with context, pair
+                Set i to i plus 1
+            End While
+        End If
+    End If
+    proc out_char with context, 125
+    Return 1
+End Process
+
+@Reasoning:
+A standalone pair (rare outside maps/structs) emits 'key => value'.
+@End Reasoning
+Process called "generate_pair" takes context as Integer, node as Integer returns Integer:
+    Let key be proc get_dict_hir_value with node, "key"
+    If key is not equal to 0:
+        proc generate_node with context, key
+    End If
+    proc out_str with context, " => "
+    Let value be proc get_dict_hir_value with node, "value"
+    If value is not equal to 0:
+        proc generate_node with context, value
+    End If
+    Return 1
+End Process
+
+@Reasoning:
+A tuple emits '{a, b, c}' from its elements list.
+@End Reasoning
+Process called "generate_tuple" takes context as Integer, node as Integer returns Integer:
+    proc out_char with context, 123
+    Let elements be proc get_dict_hir_value with node, "elements"
+    proc generate_expr_list with context, elements
+    proc out_char with context, 125
+    Return 1
+End Process
+
+@Reasoning:
+A list emits '[a, b, c]' or '[h | tail]' when a cons tail is present.
+@End Reasoning
+Process called "generate_list" takes context as Integer, node as Integer returns Integer:
+    proc out_char with context, 91
+    Let elements be proc get_dict_hir_value with node, "elements"
+    proc generate_expr_list with context, elements
+    Let tail be proc get_dict_hir_value with node, "tail"
+    If tail is not equal to 0:
+        proc out_str with context, " | "
+        proc generate_node with context, tail
+    End If
+    proc out_char with context, 93
+    Return 1
+End Process
+
+@Reasoning:
+A bitstring emits '<<seg, seg>>' from its segments list.
+@End Reasoning
+Process called "generate_binary" takes context as Integer, node as Integer returns Integer:
+    proc out_str with context, "<<"
+    Let segments be proc get_dict_hir_value with node, "segments"
+    proc generate_expr_list with context, segments
+    proc out_str with context, ">>"
+    Return 1
+End Process
+
+@Reasoning:
+An identifier emits its name verbatim.
+@End Reasoning
+Process called "generate_identifier" takes context as Integer, node as Integer returns Integer:
+    Let name be proc get_dict_string_value with node, "name"
+    If name is not equal to 0:
+        proc out_str with context, name
+    End If
+    Return 1
+End Process
+
+@Reasoning:
+A module alias reference emits its dotted alias name verbatim.
+@End Reasoning
+Process called "generate_alias_ref" takes context as Integer, node as Integer returns Integer:
+    Let name be proc get_dict_string_value with node, "name"
+    If name is not equal to 0:
+        proc out_str with context, name
+    End If
+    Return 1
+End Process
+
+@Reasoning:
+An atom emits its value lexeme verbatim (the lexeme already includes the leading
+':').
+@End Reasoning
+Process called "generate_atom" takes context as Integer, node as Integer returns Integer:
+    Let value be proc get_dict_string_value with node, "value"
+    If value is not equal to 0:
+        proc out_str with context, value
+    End If
+    Return 1
+End Process
+
+@Reasoning:
+A literal emits its value lexeme. String literals are re-wrapped in double quotes
+(the lexeme is the unquoted contents); charlists in single quotes; all other
+literal kinds (int, float, char, bool, nil, sigil) emit the lexeme directly.
+@End Reasoning
+Process called "generate_literal" takes context as Integer, node as Integer returns Integer:
+    Let literal_type be proc get_dict_string_value with node, "literal_type"
+    Let value be proc get_dict_string_value with node, "value"
+    If value is equal to 0:
+        Return 1
+    End If
+
+    If literal_type is not equal to 0:
+        Let is_string be proc string_equals from StringCore with literal_type, "string"
+        If is_string is equal to 1:
+            proc out_char with context, 34
+            proc out_str with context, value
+            proc out_char with context, 34
+            Return 1
+        End If
+        Let is_charlist be proc string_equals from StringCore with literal_type, "charlist"
+        If is_charlist is equal to 1:
+            proc out_char with context, 39
+            proc out_str with context, value
+            proc out_char with context, 39
+            Return 1
+        End If
+    End If
+
+    proc out_str with context, value
+    Return 1
+End Process
+
+@Reasoning:
+A binary operator emits 'left op right' with the canonical operator lexeme and a
+single space on each side. The operator string round-trips verbatim. The producer
+already folded precedence into the tree shape.
+@End Reasoning
+Process called "generate_binary_op" takes context as Integer, node as Integer returns Integer:
+    Let left be proc get_dict_hir_value with node, "left"
+    If left is not equal to 0:
+        proc generate_node with context, left
+    End If
+
+    proc out_space with context
+    Let operator be proc get_dict_string_value with node, "operator"
+    If operator is not equal to 0:
+        proc out_str with context, operator
+    End If
+    proc out_space with context
+
+    Let right be proc get_dict_hir_value with node, "right"
+    If right is not equal to 0:
+        proc generate_node with context, right
+    End If
+    Return 1
+End Process
+
+@Reasoning:
+A unary operator emits 'op operand'. Word operators ('not') get a trailing space;
+symbol operators ('-', '+', '!') bind tight without a space.
+@End Reasoning
+Process called "generate_unary_op" takes context as Integer, node as Integer returns Integer:
+    Let operator be proc get_dict_string_value with node, "operator"
+    If operator is not equal to 0:
+        proc out_str with context, operator
+        Let is_not be proc string_equals from StringCore with operator, "not"
+        If is_not is equal to 1:
+            proc out_space with context
+        End If
+    End If
+    Let operand be proc get_dict_hir_value with node, "operand"
+    If operand is not equal to 0:
+        proc generate_node with context, operand
+    End If
+    Return 1
+End Process
+
+@Reasoning:
+A pin emits '^operand'.
+@End Reasoning
+Process called "generate_pin" takes context as Integer, node as Integer returns Integer:
+    proc out_char with context, 94
+    Let operand be proc get_dict_hir_value with node, "operand"
+    If operand is not equal to 0:
+        proc generate_node with context, operand
+    End If
+    Return 1
+End Process
+
+@Reasoning:
+A dotted access emits 'object.member'.
+@End Reasoning
+Process called "generate_access" takes context as Integer, node as Integer returns Integer:
+    Let object be proc get_dict_hir_value with node, "object"
+    If object is not equal to 0:
+        proc generate_node with context, object
+    End If
+    proc out_char with context, 46
+    Let member be proc get_dict_string_value with node, "member"
+    If member is not equal to 0:
+        proc out_str with context, member
+    End If
+    Return 1
+End Process
+
+@Reasoning:
+A keyword pair emits 'key: value' (the key is the bare keyword name).
+@End Reasoning
+Process called "generate_keyword_pair" takes context as Integer, node as Integer returns Integer:
+    Let key be proc get_dict_string_value with node, "key"
+    If key is not equal to 0:
+        proc out_str with context, key
+    End If
+    proc out_str with context, ": "
+    Let value be proc get_dict_hir_value with node, "value"
+    If value is not equal to 0:
+        proc generate_node with context, value
+    End If
+    Return 1
+End Process
+
+@Reasoning:
+A do/end grouping block emits its statements inline joined by '; ' so it stays a
+single expression.
+@End Reasoning
+Process called "generate_block" takes context as Integer, node as Integer returns Integer:
+    Let body be proc get_dict_hir_value with node, "body"
+    proc generate_inline_body with context, body
+    Return 1
 End Process

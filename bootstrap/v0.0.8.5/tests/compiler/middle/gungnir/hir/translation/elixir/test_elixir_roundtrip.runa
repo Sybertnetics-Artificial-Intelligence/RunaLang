@@ -1,0 +1,601 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+Licensed under Apache 2.0
+:End Note
+
+Note:
+Elixir Translation Round-Trip Probe
+
+End-to-end proof that the Elixir translation pipeline is REAL, not a skeleton:
+
+    Elixir source
+      -> elixir_lexer     (tokenize: defmodule/def/defp/when/case/fn/for, atoms,
+                           keyword pairs, |> pipes, %{} maps, &capture)
+      -> elixir_parser    (build the dict-AST: a defmodule with @moduledoc + alias
+                           + a defstruct of 2 fields, two guarded def clauses + a
+                           defp, a function with a 3-stage |> pipe, a case with 2
+                           pattern-binding clauses, an anonymous fn with &capture,
+                           a map %{a: 1, b: 2}, a for comprehension)
+      -> elixir_semantic  (real scope/name analysis)
+      -> elixir_to_hir    (lower the dict-AST to the hir.runa dictionary/list HIR)
+      -> hir_to_elixir    (emit HIR back to valid Elixir text)
+      -> re-lex / re-parse / re-semantic / re-to_hir of the emitted text
+      -> structural + CONTENT equality on the key constructs
+
+The Elixir HIR node model is hir.runa's dictionary/list literal interchange shared
+by elixir_to_hir (producer) and hir_to_elixir (consumer): a dictionary is a
+HIR_DICTIONARY_LITERAL whose entries List (16-byte [key, value] blocks) hangs at
+the children slot; a list is a HIR_ARRAY_LITERAL whose elements List hangs at the
+children slot; string payloads are HIR string-literal nodes read with
+get_string_literal_value. This probe reads HIR fields through exactly that
+contract (the decoders below mirror the producer/consumer).
+
+DEPTH: the probe does NOT merely check that nodes exist. It asserts on the
+re-parsed HIR2 that the CONTENTS survive: module member function names + count;
+the guarded clause's parameter + guard presence; defstruct field keys (2);
+pipe-chain stage count = 3; case clause count = 2; map key set {a, b}. A
+translator that returned an empty members list (members vanish) makes this probe
+FAIL.
+
+Exit code: number of failed assertions (0 == all passed). No exit_with_code.
+:End Note
+
+Import "compiler/middle/gungnir/hir/translation/frontends/elixir/elixir_lexer.runa" as ElixirLexer
+Import "compiler/middle/gungnir/hir/translation/frontends/elixir/elixir_parser.runa" as ElixirParser
+Import "compiler/middle/gungnir/hir/translation/frontends/elixir/elixir_to_hir.runa" as ElixirFrontend
+Import "compiler/middle/gungnir/hir/translation/backends/elixir/hir_to_elixir.runa" as ElixirBackend
+Import "compiler/middle/gungnir/hir/hir.runa" as HIR
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/collections/list.runa" as List
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/frontend/primitives/core/string_primitive.runa" as StringPrim
+Import "tests/test_utils.runa" as TestUtils
+
+Note: ============================================================================
+Note: hir.runa dict/list literal decoders (mirror the producer/consumer contract)
+Note: ============================================================================
+
+@Reasoning:
+An Elixir HIR dictionary is a HIR_DICTIONARY_LITERAL whose entries List hangs at
+the children slot. Each entry is a 16-byte block: key (raw string handle) at
+offset 0, value (a child HIR node or HIR string literal) at offset 8. This decoder
+linear-scans those entries comparing the raw key with string_equals, returning the
+stored value. It is the exact lookup hir_to_elixir's get_dictionary_value performs,
+so reading HIR through it proves the produced shape is the consumed shape.
+@End Reasoning
+Process called "dict_get" takes node as Integer, key as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+
+    Let entries be proc get_dictionary_entries from HIR with node
+    If entries is equal to 0:
+        Return 0
+    End If
+
+    Let count be proc size from List with entries
+    Let index be 0
+    While index is less than count:
+        Let entry be proc get_at from List with entries, index
+        If entry is not equal to 0:
+            Let entry_key be proc memory_get_int64 from Layout with entry, 0
+            Let matches be proc string_equals from StringCore with entry_key, key
+            If matches is equal to 1:
+                Return proc memory_get_int64 from Layout with entry, 8
+            End If
+        End If
+        Set index to index plus 1
+    End While
+
+    Return 0
+End Process
+
+@Reasoning:
+String fields ("_type", "name", "operator", ...) are stored as HIR string literal
+nodes. This helper resolves the key then unwraps the literal to its char* payload
+via get_string_literal_value, so the probe can compare tags, names, operators.
+@End Reasoning
+Process called "dict_get_string" takes node as Integer, key as Integer returns Integer:
+    Let value_node be proc dict_get with node, key
+    If value_node is equal to 0:
+        Return 0
+    End If
+    Return proc get_string_literal_value from HIR with value_node
+End Process
+
+@Reasoning:
+An Elixir HIR list is a HIR_ARRAY_LITERAL whose backing element List hangs at the
+children slot. Returning that List lets the probe iterate members / clauses /
+params / stages / pairs with List.size and List.get_at.
+@End Reasoning
+Process called "list_elements" takes node as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    Return proc get_list_elements from HIR with node
+End Process
+
+@Reasoning:
+Locates the first element in a HIR list whose "_type" string matches the requested
+kind. A linear scan is robust to the order and count of sibling members.
+@End Reasoning
+Process called "find_in_list" takes list_node as Integer, type_name as Integer returns Integer:
+    If list_node is equal to 0:
+        Return 0
+    End If
+
+    Let items be proc list_elements with list_node
+    If items is equal to 0:
+        Return 0
+    End If
+
+    Let count be proc size from List with items
+    Let index be 0
+    While index is less than count:
+        Let item be proc get_at from List with items, index
+        Let item_type be proc dict_get_string with item, "_type"
+        If item_type is not equal to 0:
+            Let matches be proc string_equals from StringCore with item_type, type_name
+            If matches is equal to 1:
+                Return item
+            End If
+        End If
+        Set index to index plus 1
+    End While
+
+    Return 0
+End Process
+
+@Reasoning:
+Locates a function member by name within a module's members list. Distinguishes
+the guarded functions from the piped function by name.
+@End Reasoning
+Process called "find_function" takes members as Integer, want_name as Integer returns Integer:
+    If members is equal to 0:
+        Return 0
+    End If
+
+    Let items be proc list_elements with members
+    If items is equal to 0:
+        Return 0
+    End If
+
+    Let count be proc size from List with items
+    Let index be 0
+    While index is less than count:
+        Let item be proc get_at from List with items, index
+        Let item_type be proc dict_get_string with item, "_type"
+        If item_type is not equal to 0:
+            Let type_ok be proc string_equals from StringCore with item_type, "function"
+            If type_ok is equal to 1:
+                Let item_name be proc dict_get_string with item, "name"
+                If item_name is not equal to 0:
+                    Let name_ok be proc string_equals from StringCore with item_name, want_name
+                    If name_ok is equal to 1:
+                        Return item
+                    End If
+                End If
+            End If
+        End If
+        Set index to index plus 1
+    End While
+
+    Return 0
+End Process
+
+@Reasoning:
+Counts the number of function members in a module's members list, so the probe can
+assert the function count survives round-trip.
+@End Reasoning
+Process called "count_functions" takes members as Integer returns Integer:
+    If members is equal to 0:
+        Return 0
+    End If
+    Let items be proc list_elements with members
+    If items is equal to 0:
+        Return 0
+    End If
+    Let count be proc size from List with items
+    Let found be 0
+    Let index be 0
+    While index is less than count:
+        Let item be proc get_at from List with items, index
+        Let item_type be proc dict_get_string with item, "_type"
+        If item_type is not equal to 0:
+            Let type_ok be proc string_equals from StringCore with item_type, "function"
+            If type_ok is equal to 1:
+                Set found to found plus 1
+            End If
+        End If
+        Set index to index plus 1
+    End While
+    Return found
+End Process
+
+@Reasoning:
+Returns the element count of a HIR list node (0 when absent). Used to assert pipe
+stage count, case clause count, defstruct field count, etc.
+@End Reasoning
+Process called "list_count" takes node as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    Let items be proc list_elements with node
+    If items is equal to 0:
+        Return 0
+    End If
+    Return proc size from List with items
+End Process
+
+@Reasoning:
+True (1) when a HIR list of pair nodes contains a pair whose key is an atom whose
+value resolves (with the leading ':' stripped) to the target name. Used to assert
+the map key set {a, b} and the defstruct field keys survive. The key may be an
+atom node (":a") or an identifier node ("a").
+@End Reasoning
+Process called "pair_list_has_key" takes pairs_node as Integer, want_key as Integer returns Integer:
+    If pairs_node is equal to 0:
+        Return 0
+    End If
+    Let items be proc list_elements with pairs_node
+    If items is equal to 0:
+        Return 0
+    End If
+
+    Let count be proc size from List with items
+    Let index be 0
+    While index is less than count:
+        Let pair be proc get_at from List with items, index
+        If pair is not equal to 0:
+            Let key be proc dict_get with pair, "key"
+            Let key_name be proc key_simple_name with key
+            If key_name is not equal to 0:
+                Let matches be proc string_equals from StringCore with key_name, want_key
+                If matches is equal to 1:
+                    Return 1
+                End If
+            End If
+        End If
+        Set index to index plus 1
+    End While
+
+    Return 0
+End Process
+
+@Reasoning:
+Extracts a simple key name from a key node. An atom key value ":a" yields "a" (the
+leading colon stripped); an identifier key yields its name. Returns 0 otherwise.
+@End Reasoning
+Process called "key_simple_name" takes key as Integer returns Integer:
+    If key is equal to 0:
+        Return 0
+    End If
+
+    Let nt be proc dict_get_string with key, "_type"
+    If nt is equal to 0:
+        Return 0
+    End If
+
+    Let is_atom be proc string_equals from StringCore with nt, "atom"
+    If is_atom is equal to 1:
+        Let value be proc dict_get_string with key, "value"
+        If value is equal to 0:
+            Return 0
+        End If
+        Let len be proc string_length from StringCore with value
+        If len is equal to 0:
+            Return value
+        End If
+        Let first be proc string_char_at from StringCore with value, 0
+        If first is equal to 58:
+            Return proc string_substring from StringPrim with value, 1, len minus 1
+        End If
+        Return value
+    End If
+
+    Let is_id be proc string_equals from StringCore with nt, "identifier"
+    If is_id is equal to 1:
+        Return proc dict_get_string with key, "name"
+    End If
+
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: Pipeline helper
+Note: ============================================================================
+
+@Reasoning:
+Each round of the probe runs the identical front-of-pipeline (lex -> tokenize ->
+parse -> semantic -> to_hir). Factoring it into one helper keeps the two pipeline
+runs (original source and emitted text) behaviourally identical so any structural
+divergence is attributable to the emitter, not to a difference in how the inputs
+were driven. elixir_to_hir_from_source already runs lex/parse/semantic/lower as a
+unit; this wrapper just guards the source.
+@End Reasoning
+Process called "source_to_hir" takes source as Integer returns Integer:
+    If source is equal to 0:
+        Return 0
+    End If
+    Return proc elixir_to_hir_from_source from ElixirFrontend with source
+End Process
+
+Note: ============================================================================
+Note: Probe entry point
+Note: ============================================================================
+
+Process called "main" returns Integer:
+    Let results be proc create_test_results from TestUtils
+    proc begin_suite from TestUtils with results, "Elixir translation round-trip"
+
+    Note:
+    Representative program exercising the full declaration surface:
+    - defmodule Calc with @moduledoc + alias + a defstruct of 2 fields (total, items)
+    - two guarded def clauses of classify/1 (when x > 0 / when x < 0) and a defp helper
+    - a function pipeline/1 with a 3-stage |> pipe
+    - a function categorize/1 with a case of 2 pattern-binding clauses
+    - a function mapper/1 returning an anonymous fn with an &capture body
+    - a function build_map/0 returning %{a: 1, b: 2}
+    - a function squares/0 with a for comprehension
+    :End Note
+    Let source be "defmodule Calc do\n@moduledoc \"calc\"\nalias Foo.Bar\ndefstruct [total: 0, items: []]\ndef classify(x) when x > 0 do\n:positive\nend\ndef classify(x) when x < 0 do\n:negative\nend\ndefp helper(n) do\nn\nend\ndef pipeline(x) do\nx |> double() |> increment()\nend\ndef categorize(v) do\ncase v do\n{:ok, value} -> value\n{:error, reason} -> reason\nend\nend\ndef mapper(list) do\nfn item -> &process(item) end\nend\ndef build_map() do\n%{a: 1, b: 2}\nend\ndef squares() do\nfor n <- [1, 2, 3] do\nn\nend\nend\nend\n"
+
+    Note: --- Stage 0-2: source -> HIR1 (lex, tokenize, parse, semantic, lower) ---
+    Let lexer be proc create_elixir_lexer from ElixirLexer with source
+    proc assert_not_null from TestUtils with results, "lexer created", lexer
+
+    Let tokens be proc tokenize_elixir from ElixirLexer with lexer
+    proc assert_not_null from TestUtils with results, "tokenizer produced tokens", tokens
+
+    Let parser be proc create_elixir_parser from ElixirParser with tokens
+    proc assert_not_null from TestUtils with results, "parser created", parser
+
+    Let ast be proc parse_elixir_source from ElixirParser with parser
+    proc assert_not_null from TestUtils with results, "parser produced Elixir AST", ast
+
+    Let hir1 be proc elixir_to_hir_from_source from ElixirFrontend with source
+    proc assert_not_null from TestUtils with results, "frontend produced HIR module", hir1
+
+    Note: Root must be a dict node tagged "elixir_module" with members.
+    Let mod_type be proc dict_get_string with hir1, "_type"
+    Let mod_type_ok be proc string_equals from StringCore with mod_type, "elixir_module"
+    proc assert_equal from TestUtils with results, "HIR root is an elixir_module", mod_type_ok, 1
+
+    Let mod_name be proc dict_get_string with hir1, "name"
+    Let mod_name_ok be proc string_equals from StringCore with mod_name, "Calc"
+    proc assert_equal from TestUtils with results, "module name is 'Calc'", mod_name_ok, 1
+
+    Let members be proc dict_get with hir1, "members"
+    proc assert_not_null from TestUtils with results, "module has members", members
+    Let member_elems be proc list_elements with members
+    proc assert_not_null from TestUtils with results, "members is a list", member_elems
+    Let member_count be proc size from List with member_elems
+    proc assert_greater_than_or_equal from TestUtils with results, "module has at least 9 members", member_count, 9
+
+    Note: --- function names + count survive (depth, not just existence) ---
+    Let fn_count be proc count_functions with members
+    proc assert_greater_than_or_equal from TestUtils with results, "module has at least 8 functions", fn_count, 8
+
+    Let classify_fn be proc find_function with members, "classify"
+    proc assert_not_null from TestUtils with results, "function 'classify' present by name", classify_fn
+    Let pipeline_fn be proc find_function with members, "pipeline"
+    proc assert_not_null from TestUtils with results, "function 'pipeline' present by name", pipeline_fn
+    Let categorize_fn be proc find_function with members, "categorize"
+    proc assert_not_null from TestUtils with results, "function 'categorize' present by name", categorize_fn
+    Let helper_fn be proc find_function with members, "helper"
+    proc assert_not_null from TestUtils with results, "private function 'helper' present by name", helper_fn
+
+    Note: --- guarded clause: param + guard presence survive ---
+    Let classify_clauses be proc dict_get with classify_fn, "clauses"
+    Let classify_clause_count be proc list_count with classify_clauses
+    proc assert_greater_than_or_equal from TestUtils with results, "classify has >= 1 clause", classify_clause_count, 1
+    Let classify_clause_items be proc list_elements with classify_clauses
+    Let classify_clause0 be proc get_at from List with classify_clause_items, 0
+    proc assert_not_null from TestUtils with results, "classify clause 0 present", classify_clause0
+    Let classify_params be proc dict_get with classify_clause0, "params"
+    Let classify_param_count be proc list_count with classify_params
+    proc assert_greater_than_or_equal from TestUtils with results, "classify clause has >= 1 param", classify_param_count, 1
+    Let classify_guard be proc dict_get with classify_clause0, "guard"
+    proc assert_not_null from TestUtils with results, "classify clause has a guard", classify_guard
+
+    Note: --- defstruct field keys (2) survive ---
+    Let defstruct_node be proc find_in_list with members, "defstruct"
+    proc assert_not_null from TestUtils with results, "defstruct node present", defstruct_node
+    Let defstruct_fields be proc dict_get with defstruct_node, "fields"
+    Let defstruct_field_count be proc list_count with defstruct_fields
+    proc assert_equal from TestUtils with results, "defstruct has 2 fields", defstruct_field_count, 2
+    Let has_total be proc pair_list_has_key with defstruct_fields, "total"
+    proc assert_equal from TestUtils with results, "defstruct has field 'total'", has_total, 1
+    Let has_items be proc pair_list_has_key with defstruct_fields, "items"
+    proc assert_equal from TestUtils with results, "defstruct has field 'items'", has_items, 1
+
+    Note: --- pipe-chain stage count = 3 survives ---
+    Let pipe_node be proc find_pipe_in_function with pipeline_fn
+    proc assert_not_null from TestUtils with results, "pipe node present in pipeline/1", pipe_node
+    Let pipe_stages be proc dict_get with pipe_node, "stages"
+    Let pipe_stage_count be proc list_count with pipe_stages
+    proc assert_equal from TestUtils with results, "pipe has 3 stages", pipe_stage_count, 3
+
+    Note: --- case clause count = 2 survives ---
+    Let case_node be proc find_case_in_function with categorize_fn
+    proc assert_not_null from TestUtils with results, "case node present in categorize/1", case_node
+    Let case_clauses be proc dict_get with case_node, "clauses"
+    Let case_clause_count be proc list_count with case_clauses
+    proc assert_equal from TestUtils with results, "case has 2 clauses", case_clause_count, 2
+
+    Note: --- map key set {a, b} survives ---
+    Let build_map_fn be proc find_function with members, "build_map"
+    proc assert_not_null from TestUtils with results, "function 'build_map' present", build_map_fn
+    Let map_node be proc find_map_in_function with build_map_fn
+    proc assert_not_null from TestUtils with results, "map node present in build_map/0", map_node
+    Let map_pairs be proc dict_get with map_node, "pairs"
+    Let map_pair_count be proc list_count with map_pairs
+    proc assert_equal from TestUtils with results, "map has 2 pairs", map_pair_count, 2
+    Let map_has_a be proc pair_list_has_key with map_pairs, "a"
+    proc assert_equal from TestUtils with results, "map has key 'a'", map_has_a, 1
+    Let map_has_b be proc pair_list_has_key with map_pairs, "b"
+    proc assert_equal from TestUtils with results, "map has key 'b'", map_has_b, 1
+
+    Note: --- Stage 3: HIR1 -> Elixir text ---
+    Let emitted be proc generate_elixir_from_hir from ElixirBackend with hir1
+    proc assert_not_null from TestUtils with results, "backend produced Elixir text", emitted
+    Let emitted_len be proc string_length from StringCore with emitted
+    proc assert_greater_than from TestUtils with results, "emitted Elixir is non-empty", emitted_len, 0
+
+    Note: --- Stage 4: re-run the pipeline on the emitted text -> HIR2 ---
+    Let hir2 be proc source_to_hir with emitted
+    proc assert_not_null from TestUtils with results, "re-parse of emitted Elixir produced HIR2", hir2
+
+    Let mod2_type be proc dict_get_string with hir2, "_type"
+    Let mod2_type_ok be proc string_equals from StringCore with mod2_type, "elixir_module"
+    proc assert_equal from TestUtils with results, "round-trip root is an elixir_module", mod2_type_ok, 1
+
+    Let mod2_name be proc dict_get_string with hir2, "name"
+    Let mod2_name_ok be proc string_equals from StringCore with mod2_name, "Calc"
+    proc assert_equal from TestUtils with results, "round-trip preserves module name 'Calc'", mod2_name_ok, 1
+
+    Let members2 be proc dict_get with hir2, "members"
+    proc assert_not_null from TestUtils with results, "round-trip module has members", members2
+
+    Note: --- Stage 5: CONTENT equality on the key constructs (HIR2) ---
+
+    Note: function names + count survive round-trip
+    Let fn2_count be proc count_functions with members2
+    proc assert_greater_than_or_equal from TestUtils with results, "round-trip preserves >= 8 functions", fn2_count, 8
+    Let classify2 be proc find_function with members2, "classify"
+    proc assert_not_null from TestUtils with results, "round-trip preserves function 'classify'", classify2
+    Let pipeline2 be proc find_function with members2, "pipeline"
+    proc assert_not_null from TestUtils with results, "round-trip preserves function 'pipeline'", pipeline2
+    Let categorize2 be proc find_function with members2, "categorize"
+    proc assert_not_null from TestUtils with results, "round-trip preserves function 'categorize'", categorize2
+    Let helper2 be proc find_function with members2, "helper"
+    proc assert_not_null from TestUtils with results, "round-trip preserves private function 'helper'", helper2
+
+    Note: guarded clause param + guard survive round-trip
+    Let classify2_clauses be proc dict_get with classify2, "clauses"
+    Let classify2_clause_items be proc list_elements with classify2_clauses
+    Let classify2_clause0 be proc get_at from List with classify2_clause_items, 0
+    proc assert_not_null from TestUtils with results, "round-trip classify clause 0 present", classify2_clause0
+    Let classify2_params be proc dict_get with classify2_clause0, "params"
+    Let classify2_param_count be proc list_count with classify2_params
+    proc assert_greater_than_or_equal from TestUtils with results, "round-trip preserves classify param", classify2_param_count, 1
+    Let classify2_guard be proc dict_get with classify2_clause0, "guard"
+    proc assert_not_null from TestUtils with results, "round-trip preserves classify guard", classify2_guard
+
+    Note: defstruct field keys survive round-trip
+    Let defstruct2 be proc find_in_list with members2, "defstruct"
+    proc assert_not_null from TestUtils with results, "round-trip preserves defstruct node", defstruct2
+    Let defstruct2_fields be proc dict_get with defstruct2, "fields"
+    Let defstruct2_field_count be proc list_count with defstruct2_fields
+    proc assert_equal from TestUtils with results, "round-trip preserves 2 defstruct fields", defstruct2_field_count, 2
+    Let has_total2 be proc pair_list_has_key with defstruct2_fields, "total"
+    proc assert_equal from TestUtils with results, "round-trip preserves defstruct field 'total'", has_total2, 1
+    Let has_items2 be proc pair_list_has_key with defstruct2_fields, "items"
+    proc assert_equal from TestUtils with results, "round-trip preserves defstruct field 'items'", has_items2, 1
+
+    Note: pipe stage count survives round-trip
+    Let pipe2 be proc find_pipe_in_function with pipeline2
+    proc assert_not_null from TestUtils with results, "round-trip preserves pipe node", pipe2
+    Let pipe2_stages be proc dict_get with pipe2, "stages"
+    Let pipe2_stage_count be proc list_count with pipe2_stages
+    proc assert_equal from TestUtils with results, "round-trip preserves 3 pipe stages", pipe2_stage_count, 3
+
+    Note: case clause count survives round-trip
+    Let case2 be proc find_case_in_function with categorize2
+    proc assert_not_null from TestUtils with results, "round-trip preserves case node", case2
+    Let case2_clauses be proc dict_get with case2, "clauses"
+    Let case2_clause_count be proc list_count with case2_clauses
+    proc assert_equal from TestUtils with results, "round-trip preserves 2 case clauses", case2_clause_count, 2
+
+    Note: map key set survives round-trip
+    Let build_map2 be proc find_function with members2, "build_map"
+    proc assert_not_null from TestUtils with results, "round-trip preserves function 'build_map'", build_map2
+    Let map2 be proc find_map_in_function with build_map2
+    proc assert_not_null from TestUtils with results, "round-trip preserves map node", map2
+    Let map2_pairs be proc dict_get with map2, "pairs"
+    Let map2_pair_count be proc list_count with map2_pairs
+    proc assert_equal from TestUtils with results, "round-trip preserves 2 map pairs", map2_pair_count, 2
+    Let map2_has_a be proc pair_list_has_key with map2_pairs, "a"
+    proc assert_equal from TestUtils with results, "round-trip preserves map key 'a'", map2_has_a, 1
+    Let map2_has_b be proc pair_list_has_key with map2_pairs, "b"
+    proc assert_equal from TestUtils with results, "round-trip preserves map key 'b'", map2_has_b, 1
+
+    proc print_summary from TestUtils with results
+    Let failed be proc get_failed from TestUtils with results
+    proc destroy_test_results from TestUtils with results
+
+    Return failed
+End Process
+
+@Reasoning:
+Finds the first pipe node inside a function's clause bodies. Each clause's body is
+a statement list; the first statement of the pipeline function is the pipe
+expression. Scans every clause body for a "pipe"-tagged node.
+@End Reasoning
+Process called "find_pipe_in_function" takes func as Integer returns Integer:
+    Return proc find_tag_in_function_bodies with func, "pipe"
+End Process
+
+@Reasoning:
+Finds the first case node inside a function's clause bodies.
+@End Reasoning
+Process called "find_case_in_function" takes func as Integer returns Integer:
+    Return proc find_tag_in_function_bodies with func, "case"
+End Process
+
+@Reasoning:
+Finds the first map node inside a function's clause bodies.
+@End Reasoning
+Process called "find_map_in_function" takes func as Integer returns Integer:
+    Return proc find_tag_in_function_bodies with func, "map"
+End Process
+
+@Reasoning:
+Scans every clause body statement of a function looking for a node whose "_type"
+matches the requested tag. Returns the first match or 0. Bounded by clause count
+and body length, so it always terminates.
+@End Reasoning
+Process called "find_tag_in_function_bodies" takes func as Integer, tag as Integer returns Integer:
+    If func is equal to 0:
+        Return 0
+    End If
+
+    Let clauses be proc dict_get with func, "clauses"
+    If clauses is equal to 0:
+        Return 0
+    End If
+    Let clause_items be proc list_elements with clauses
+    If clause_items is equal to 0:
+        Return 0
+    End If
+
+    Let clause_count be proc size from List with clause_items
+    Let ci be 0
+    While ci is less than clause_count:
+        Let clause be proc get_at from List with clause_items, ci
+        If clause is not equal to 0:
+            Let body be proc dict_get with clause, "body"
+            If body is not equal to 0:
+                Let body_items be proc list_elements with body
+                If body_items is not equal to 0:
+                    Let body_count be proc size from List with body_items
+                    Let bi be 0
+                    While bi is less than body_count:
+                        Let stmt be proc get_at from List with body_items, bi
+                        Let stmt_type be proc dict_get_string with stmt, "_type"
+                        If stmt_type is not equal to 0:
+                            Let matches be proc string_equals from StringCore with stmt_type, tag
+                            If matches is equal to 1:
+                                Return stmt
+                            End If
+                        End If
+                        Set bi to bi plus 1
+                    End While
+                End If
+            End If
+        End If
+        Set ci to ci plus 1
+    End While
+
+    Return 0
+End Process

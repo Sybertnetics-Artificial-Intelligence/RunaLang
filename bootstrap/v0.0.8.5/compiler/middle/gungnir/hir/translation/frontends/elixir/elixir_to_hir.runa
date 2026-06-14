@@ -1,1585 +1,1267 @@
-Note: ============================================================================
-Note: ELIXIR -> HIR TRANSLATOR
-Note: ============================================================================
-Note: Consumes the native parser output: ElixirModule / ElixirFunction /
-Note: ElixirMacro / ElixirStruct / ElixirFunctionClause / ElixirAttribute /
-Note: ElixirExpression. The previous version of this file targeted a separate
-Note: AST_* tag model that the parser does not produce, leaving the LANG_ELIXIR
-Note: arm of the translation dispatcher non-functional. This rewrite walks the
-Note: parser's native struct fields directly and emits a dictionary-shaped HIR
-Note: tree compatible with the dispatcher's downstream consumers (hir_to_*
-Note: emitters which inspect "node_type" string tags and named child slots).
-Note: ============================================================================
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
 
-Import "compiler/middle/gungnir/hir/translation/frontends/elixir/elixir_parser.runa" as ElixirParser
-Import "compiler/middle/gungnir/hir/translation/frontends/elixir/elixir_lexer.runa" as ElixirLexer
-Import "compiler/frontend/primitives/collections/hashtable.runa" as Dict
-Import "compiler/frontend/primitives/collections/list.runa" as List
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+Elixir to HIR Translator - Translate the Elixir dict-AST to High-level
+Intermediate Representation.
+
+This file lowers the Stage-A Elixir Abstract Syntax Tree (a dictionary/list AST
+produced by elixir_parser.runa) into HIR (High-level Intermediate Representation)
+expressed as hir.runa dictionary-literal and list-literal nodes, the model-3
+interchange shared by every translation frontend.
+
+The AST is read entirely through the Stage-A contract: get_ast_attribute(node,
+key) for named attributes and get_ast_children(node) for positional children;
+every node carries a string "node_type" attribute. The HIR is produced through
+the canonical hir.runa primitives wrapped by the thin builders below.
+
+HIR _type tags emitted (and consumed by hir_to_elixir.runa + the round-trip
+probe): elixir_module, function, clause, defstruct, defexception,
+module_attribute, alias, import, require, use, defprotocol, defimpl, pipe, call,
+case, cond, with, with_clause, if, unless, for, try, receive, match_clause, fn,
+capture, map, struct_literal, pair, tuple, list, binary, identifier, alias_ref,
+atom, literal, binary_op, unary_op, pin, access, keyword_pair, block.
+
+Dependencies:
+- compiler/middle/gungnir/hir/translation/frontends/elixir/elixir_parser.runa
+- compiler/middle/gungnir/hir/translation/frontends/elixir/elixir_lexer.runa
+- compiler/middle/gungnir/hir/translation/frontends/elixir/elixir_semantic.runa
+- compiler/middle/gungnir/hir/hir.runa
+- compiler/frontend/primitives/memory/layout.runa
+- compiler/frontend/primitives/collections/list.runa
+- compiler/frontend/primitives/core/string_core.runa
+:End Note
+
+Import "compiler/middle/gungnir/hir/translation/frontends/elixir/elixir_parser.runa" as Parser
+Import "compiler/middle/gungnir/hir/translation/frontends/elixir/elixir_lexer.runa" as Lexer
+Import "compiler/middle/gungnir/hir/translation/frontends/elixir/elixir_semantic.runa" as Semantic
+Import "compiler/middle/gungnir/hir/hir.runa" as HIR
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/collections/list.runa" as ListOps
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
 
 Note: ============================================================================
-Note: HIR STORAGE PRIMITIVES
+Note: HIR OUTPUT BUILDERS
 Note: ============================================================================
 
 @Reasoning:
-HIR nodes in the dictionary-shaped translation pipeline are untyped hashtables
-keyed by string field names ("node_type", "name", "body", "clauses", ...).
-Wrapping hashtable_create keeps the call sites in this file consistent with
-the same vocabulary used by every other dictionary-shaped frontend
-(bash_to_hir, haskell_to_hir, graphql_to_hir, etc.).
+The Elixir lowering emits its HIR as dictionary-literal and list-literal nodes
+from hir.runa, the same producer surface every other model-3 frontend uses. The
+backend reads these nodes through get_dictionary_entries / get_list_elements, so
+producer and consumer share one representation. These thin wrappers name the
+operations in Elixir-domain terms while delegating to the canonical hir.runa
+primitives; nothing here re-implements dictionary or list storage.
 @End Reasoning
-Process called "create_hir_dict" returns Integer:
-    Return proc hashtable_create from Dict
+Process called "create_dict" returns Integer:
+    Return proc create_hir_dictionary_literal from HIR
+End Process
+
+Process called "create_list" returns Integer:
+    Return proc create_hir_list_literal from HIR
 End Process
 
 @Reasoning:
-HIR list storage uses the production dynamic list primitive. Children,
-clauses, generators, pairs and any other ordered HIR collection allocate
-through this single helper so a future storage swap stays local.
+String-valued attributes are stored wrapped in a HIR string literal so the
+backend's get_string_literal_value resolves them. A null key or dict short-
+circuits to 0.
 @End Reasoning
-Process called "create_hir_list" returns Integer:
-    Return proc list_create from List
-End Process
-
-@Reasoning:
-set_dict_value is a domain alias over hashtable_set. The walker code reads
-naturally with set_dict_value, but the call delegates straight to the
-hashtable implementation so no semantic divergence is introduced.
-@End Reasoning
-Process called "set_dict_value" takes dict as Integer, key as Integer, value as Integer returns Integer:
-    Return proc hashtable_set from Dict with dict, key, value
-End Process
-
-@Reasoning:
-list_append is the corresponding alias for list_push. Walker code reading
-"append child to body" is clearer than "push" semantics inherited from the
-collection module.
-@End Reasoning
-Process called "list_append" takes lst as Integer, item as Integer returns Integer:
-    Return proc list_push from List with lst, item
-End Process
-
-Note: ============================================================================
-Note: TRANSLATOR STATE
-Note: ============================================================================
-
-@Reasoning:
-The translator carries state for OTP-aware translation: a pattern-variable
-binding set, a process-context dictionary keyed by spawn id, an actor-model
-dictionary, a supervision-tree dictionary, and an otp_behaviors dictionary.
-The fan-out matches the previous implementation's intent: Elixir's actor
-model and OTP behaviours cannot be analysed locally and need translator-
-level bookkeeping that survives across nested defmodule/def walks.
-@End Reasoning
-Type called "ElixirToHIRTranslator":
-    pattern_variables as Integer
-    process_context as Integer
-    actor_model_info as Integer
-    supervision_tree as Integer
-    otp_behaviors as Integer
-    current_module as Integer
-    current_function as Integer
-    spawn_id_counter as Integer
-End Type
-
-@Reasoning:
-The constructor pre-builds every tracking dictionary so the walkers never
-test for null subsystem handles. current_module / current_function start
-as 0 because translation begins outside any scope; translate_module and
-translate_function push and restore these pointers across nested walks.
-@End Reasoning
-Process called "create_elixir_to_hir_translator" returns Integer:
-    Let translator be a value of type ElixirToHIRTranslator
-    Set translator.pattern_variables to proc hashtable_create from Dict
-    Set translator.process_context to proc hashtable_create from Dict
-    Set translator.actor_model_info to proc hashtable_create from Dict
-    Set translator.supervision_tree to proc hashtable_create from Dict
-    Set translator.otp_behaviors to proc hashtable_create from Dict
-    Set translator.current_module to 0
-    Set translator.current_function to 0
-    Set translator.spawn_id_counter to 0
-    Return translator
-End Process
-
-Note: ============================================================================
-Note: MODULE TRANSLATION
-Note: ============================================================================
-
-@Reasoning:
-The Elixir parser produces a single ElixirModule per source file as its
-top-level AST. This translator's entry walks that module's attributes,
-structs, macros, and functions in declaration order, lowering each to a
-HIR dict and appending to the module's "body" list. The module HIR node
-carries node_type="module" plus a "name" field; the body list is the
-concatenated ordered statement stream the destination emitter consumes.
-@End Reasoning
-Process called "translate_module" takes translator as Integer, module as ElixirModule returns Integer:
-    Let hir_module be proc create_hir_dict
-    proc set_dict_value with hir_module, "node_type", "module"
-    proc set_dict_value with hir_module, "name", module.name
-    proc set_dict_value with hir_module, "line", module.line
-
-    Let previous_module be translator.current_module
-    Set translator.current_module to hir_module
-
-    Let body be proc create_hir_list
-
-    Note: Lower attributes first; they often carry @moduledoc / @spec the
-    Note: destination emitter wants to render before any defs.
-    For Each attr as ElixirAttribute in module.attributes:
-        Let hir_attr be proc translate_attribute with translator, attr
-        proc list_append with body, hir_attr
-    End For
-
-    Note: Lower struct definitions.
-    For Each s as ElixirStruct in module.structs:
-        Let hir_struct be proc translate_struct with translator, s, module.name
-        proc list_append with body, hir_struct
-    End For
-
-    Note: Lower macros (defmacro / defmacrop). Tagged is_macro=true so the
-    Note: emitter can distinguish them from runtime functions.
-    For Each m as ElixirMacro in module.macros:
-        Let hir_macro be proc translate_macro with translator, m
-        proc list_append with body, hir_macro
-    End For
-
-    Note: Lower function definitions (def / defp).
-    For Each f as ElixirFunction in module.functions:
-        Let hir_func be proc translate_function with translator, f
-        proc list_append with body, hir_func
-    End For
-
-    proc set_dict_value with hir_module, "body", body
-
-    Note: Scan body for "use Behaviour" attributes to tag OTP behaviours.
-    proc extract_otp_behavior_info with translator, hir_module, module
-
-    Set translator.current_module to previous_module
-    Return hir_module
-End Process
-
-@Reasoning:
-The dispatcher's translate_elixir_to_hir entrypoint accepts a Module pointer
-directly; this is the bridge from the wrapper's parse result into the
-walker chain. translate_elixir_to_hir is invoked from the public
-elixir_to_hir_from_source helper after lex+parse.
-@End Reasoning
-Process called "translate_elixir_to_hir" takes translator as Integer, module as ElixirModule returns Integer:
-    Return proc translate_module with translator, module
-End Process
-
-Note: ============================================================================
-Note: ATTRIBUTE TRANSLATION
-Note: ============================================================================
-
-@Reasoning:
-@-prefixed module-scope attributes lower to HIR "module_attribute" dicts
-carrying the attribute name (without the @ sigil) and the lowered value
-expression. The destination emitter decides whether to render as a docstring
-(@moduledoc, @doc), a type spec (@spec), or a custom binding.
-@End Reasoning
-Process called "translate_attribute" takes translator as Integer, attr as ElixirAttribute returns Integer:
-    Let hir_attr be proc create_hir_dict
-    proc set_dict_value with hir_attr, "node_type", "module_attribute"
-    proc set_dict_value with hir_attr, "name", attr.name
-    proc set_dict_value with hir_attr, "line", attr.line
-    Let hir_value be proc translate_expression with translator, attr.value
-    proc set_dict_value with hir_attr, "value", hir_value
-    Return hir_attr
-End Process
-
-Note: ============================================================================
-Note: STRUCT TRANSLATION
-Note: ============================================================================
-
-@Reasoning:
-defstruct lowers to a HIR "struct" dict whose name is the enclosing module's
-name (Elixir tightly couples one defstruct per module). Each field is a
-dictionary with "name" and "default" keys; we emit them as HIR field dicts
-into a "fields" list so destination emitters can reproduce both the field
-order and the per-field defaults.
-@End Reasoning
-Process called "translate_struct" takes translator as Integer, s as ElixirStruct, module_name as String returns Integer:
-    Let hir_struct be proc create_hir_dict
-    proc set_dict_value with hir_struct, "node_type", "struct_definition"
-    proc set_dict_value with hir_struct, "name", module_name
-    proc set_dict_value with hir_struct, "line", s.line
-
-    Let fields_hir be proc create_hir_list
-    For Each field in s.fields:
-        Let hir_field be proc create_hir_dict
-        proc set_dict_value with hir_field, "node_type", "struct_field"
-        proc set_dict_value with hir_field, "name", field at key "name"
-        Let default_val be field at key "default"
-        If default_val is not equal to 0:
-            Let hir_default be proc translate_expression with translator, default_val
-            proc set_dict_value with hir_field, "default", hir_default
-        End If
-        proc list_append with fields_hir, hir_field
-    End For
-
-    proc set_dict_value with hir_struct, "fields", fields_hir
-    Return hir_struct
-End Process
-
-Note: ============================================================================
-Note: FUNCTION / MACRO TRANSLATION
-Note: ============================================================================
-
-@Reasoning:
-def / defp lower to a HIR "function" dict carrying name, arity, visibility
-(is_private), and a "clauses" list. Each clause is its own HIR dict with
-patterns, optional guards, and a body statement list. OTP callback
-detection runs after the clauses are translated: standard GenServer /
-Supervisor callbacks tag the HIR function with "otp_callback" so the
-target emitter can synthesise the matching trait/interface implementation.
-@End Reasoning
-Process called "translate_function" takes translator as Integer, func as ElixirFunction returns Integer:
-    Let hir_func be proc create_hir_dict
-    proc set_dict_value with hir_func, "node_type", "function"
-    proc set_dict_value with hir_func, "name", func.name
-    proc set_dict_value with hir_func, "arity", func.arity
-    proc set_dict_value with hir_func, "line", func.line
-    If func.is_private:
-        proc set_dict_value with hir_func, "is_private", "true"
-    Otherwise:
-        proc set_dict_value with hir_func, "is_private", "false"
+Process called "set_dict_string" takes dict_hir as Integer, key as Integer, value as Integer returns Integer:
+    If dict_hir is equal to 0:
+        Return 0
     End If
-
-    Let previous_function be translator.current_function
-    Set translator.current_function to hir_func
-
-    Let hir_clauses be proc create_hir_list
-    For Each clause as ElixirFunctionClause in func.clauses:
-        Let hir_clause be proc translate_function_clause with translator, clause
-        proc list_append with hir_clauses, hir_clause
-    End For
-    proc set_dict_value with hir_func, "clauses", hir_clauses
-
-    proc check_otp_callback with translator, hir_func, func.name, func.arity
-
-    Set translator.current_function to previous_function
-    Return hir_func
-End Process
-
-@Reasoning:
-defmacro / defmacrop share the structural layout of def: name, arity,
-clauses, visibility. The is_macro=true tag distinguishes them from runtime
-functions so the destination emitter can route them to its macro/template
-expander where one exists, or fall back to function emission with a comment
-warning otherwise.
-@End Reasoning
-Process called "translate_macro" takes translator as Integer, mac as ElixirMacro returns Integer:
-    Let hir_macro be proc create_hir_dict
-    proc set_dict_value with hir_macro, "node_type", "macro"
-    proc set_dict_value with hir_macro, "name", mac.name
-    proc set_dict_value with hir_macro, "arity", mac.arity
-    proc set_dict_value with hir_macro, "line", mac.line
-    proc set_dict_value with hir_macro, "is_macro", "true"
-    If mac.is_private:
-        proc set_dict_value with hir_macro, "is_private", "true"
-    Otherwise:
-        proc set_dict_value with hir_macro, "is_private", "false"
-    End If
-
-    Let hir_clauses be proc create_hir_list
-    For Each clause as ElixirFunctionClause in mac.clauses:
-        Let hir_clause be proc translate_function_clause with translator, clause
-        proc list_append with hir_clauses, hir_clause
-    End For
-    proc set_dict_value with hir_macro, "clauses", hir_clauses
-    Return hir_macro
-End Process
-
-@Reasoning:
-A function clause is parameters + optional guards + body. Patterns lower
-via translate_pattern (which records bound variable names in the
-translator's pattern_variables set). Guards lower as ordinary expressions
-because the guard sub-grammar is a syntactic restriction, not a different
-expression layer. Each body element is a statement-position expression;
-the last body element's value is the clause's result.
-@End Reasoning
-Process called "translate_function_clause" takes translator as Integer, clause as ElixirFunctionClause returns Integer:
-    Let hir_clause be proc create_hir_dict
-    proc set_dict_value with hir_clause, "node_type", "function_clause"
-    proc set_dict_value with hir_clause, "line", clause.line
-
-    Let hir_patterns be proc create_hir_list
-    For Each pat as ElixirExpression in clause.patterns:
-        Let hir_pat be proc translate_pattern with translator, pat
-        proc list_append with hir_patterns, hir_pat
-    End For
-    proc set_dict_value with hir_clause, "patterns", hir_patterns
-
-    Let hir_guards be proc create_hir_list
-    For Each g as ElixirExpression in clause.guards:
-        Let hir_g be proc translate_expression with translator, g
-        proc list_append with hir_guards, hir_g
-    End For
-    proc set_dict_value with hir_clause, "guards", hir_guards
-
-    Let hir_body be proc create_hir_list
-    For Each expr as ElixirExpression in clause.body:
-        Let hir_expr be proc translate_expression with translator, expr
-        proc list_append with hir_body, hir_expr
-    End For
-    proc set_dict_value with hir_clause, "body", hir_body
-
-    Return hir_clause
-End Process
-
-Note: ============================================================================
-Note: EXPRESSION TRANSLATION
-Note: ============================================================================
-
-@Reasoning:
-The parser produces a unified ElixirExpression carrying an expr_type
-string and a per-form expr_data dictionary. This dispatcher routes each
-expr_type to a specialised lowering helper; unknown types fall back to a
-sentinel "unknown_expression" HIR node tagged with the source expr_type so
-downstream tooling can report which form was unrecognised rather than
-silently dropping a subtree.
-@End Reasoning
-Process called "translate_expression" takes translator as Integer, expr as ElixirExpression returns Integer:
-    If expr is equal to 0:
+    If key is equal to 0:
         Return 0
     End If
 
-    Let kind be expr.expr_type
-
-    If kind is equal to "integer":
-        Return proc translate_integer_literal with expr
-    End If
-    If kind is equal to "float":
-        Return proc translate_float_literal with expr
-    End If
-    If kind is equal to "string":
-        Return proc translate_string_literal with expr
-    End If
-    If kind is equal to "charlist":
-        Return proc translate_charlist_literal with expr
-    End If
-    If kind is equal to "atom":
-        Return proc translate_atom_literal with expr
-    End If
-    If kind is equal to "boolean":
-        Return proc translate_boolean_literal with expr
-    End If
-    If kind is equal to "nil":
-        Return proc translate_nil_literal with expr
-    End If
-    If kind is equal to "sigil":
-        Return proc translate_sigil_literal with expr
-    End If
-    If kind is equal to "identifier":
-        Return proc translate_identifier with expr
-    End If
-    If kind is equal to "module":
-        Return proc translate_module_reference with expr
-    End If
-    If kind is equal to "binary_op":
-        Return proc translate_binary_op with translator, expr
-    End If
-    If kind is equal to "unary_op":
-        Return proc translate_unary_op with translator, expr
-    End If
-    If kind is equal to "call":
-        Return proc translate_call with translator, expr
-    End If
-    If kind is equal to "field_access":
-        Return proc translate_field_access with translator, expr
-    End If
-    If kind is equal to "list":
-        Return proc translate_list_expr with translator, expr
-    End If
-    If kind is equal to "tuple":
-        Return proc translate_tuple_expr with translator, expr
-    End If
-    If kind is equal to "map":
-        Return proc translate_map_expr with translator, expr
-    End If
-    If kind is equal to "struct":
-        Return proc translate_struct_expr with translator, expr
-    End If
-    If kind is equal to "binary":
-        Return proc translate_binary_expr with translator, expr
-    End If
-    If kind is equal to "fn":
-        Return proc translate_fn_expr with translator, expr
-    End If
-    If kind is equal to "case":
-        Return proc translate_case_expr with translator, expr
-    End If
-    If kind is equal to "cond":
-        Return proc translate_cond_expr with translator, expr
-    End If
-    If kind is equal to "if":
-        Return proc translate_if_expr with translator, expr
-    End If
-    If kind is equal to "with":
-        Return proc translate_with_expr with translator, expr
-    End If
-    If kind is equal to "receive":
-        Return proc translate_receive_expr with translator, expr
-    End If
-    If kind is equal to "try":
-        Return proc translate_try_expr with translator, expr
-    End If
-    If kind is equal to "for":
-        Return proc translate_for_expr with translator, expr
-    End If
-    If kind is equal to "error":
-        Let hir_err be proc create_hir_dict
-        proc set_dict_value with hir_err, "node_type", "error"
-        proc set_dict_value with hir_err, "line", expr.line
-        Return hir_err
-    End If
-
-    Let hir_unknown be proc create_hir_dict
-    proc set_dict_value with hir_unknown, "node_type", "unknown_expression"
-    proc set_dict_value with hir_unknown, "kind", kind
-    proc set_dict_value with hir_unknown, "line", expr.line
-    Return hir_unknown
-End Process
-
-Note: ============================================================================
-Note: LITERAL TRANSLATORS
-Note: ============================================================================
-
-@Reasoning:
-Each Elixir literal lowers to a HIR "literal" dict carrying the source
-literal_kind tag and the raw value. Distinct kinds (integer / float /
-string / charlist / atom / boolean / nil / sigil) let downstream backends
-re-emit the literal in the destination language's syntax without needing
-to re-parse the value string.
-@End Reasoning
-Process called "translate_integer_literal" takes expr as ElixirExpression returns Integer:
-    Let hir be proc create_hir_dict
-    proc set_dict_value with hir, "node_type", "literal"
-    proc set_dict_value with hir, "literal_kind", "integer"
-    proc set_dict_value with hir, "value", expr.expr_data at key "value"
-    proc set_dict_value with hir, "line", expr.line
-    Return hir
-End Process
-
-Process called "translate_float_literal" takes expr as ElixirExpression returns Integer:
-    Let hir be proc create_hir_dict
-    proc set_dict_value with hir, "node_type", "literal"
-    proc set_dict_value with hir, "literal_kind", "float"
-    proc set_dict_value with hir, "value", expr.expr_data at key "value"
-    proc set_dict_value with hir, "line", expr.line
-    Return hir
-End Process
-
-Process called "translate_string_literal" takes expr as ElixirExpression returns Integer:
-    Let hir be proc create_hir_dict
-    proc set_dict_value with hir, "node_type", "literal"
-    proc set_dict_value with hir, "literal_kind", "string"
-    proc set_dict_value with hir, "value", expr.expr_data at key "value"
-    proc set_dict_value with hir, "line", expr.line
-    Return hir
-End Process
-
-Process called "translate_charlist_literal" takes expr as ElixirExpression returns Integer:
-    Let hir be proc create_hir_dict
-    proc set_dict_value with hir, "node_type", "literal"
-    proc set_dict_value with hir, "literal_kind", "charlist"
-    proc set_dict_value with hir, "value", expr.expr_data at key "value"
-    proc set_dict_value with hir, "line", expr.line
-    Return hir
-End Process
-
-Process called "translate_atom_literal" takes expr as ElixirExpression returns Integer:
-    Let hir be proc create_hir_dict
-    proc set_dict_value with hir, "node_type", "literal"
-    proc set_dict_value with hir, "literal_kind", "atom"
-    proc set_dict_value with hir, "value", expr.expr_data at key "value"
-    proc set_dict_value with hir, "line", expr.line
-    Return hir
-End Process
-
-Process called "translate_boolean_literal" takes expr as ElixirExpression returns Integer:
-    Let hir be proc create_hir_dict
-    proc set_dict_value with hir, "node_type", "literal"
-    proc set_dict_value with hir, "literal_kind", "boolean"
-    proc set_dict_value with hir, "value", expr.expr_data at key "value"
-    proc set_dict_value with hir, "line", expr.line
-    Return hir
-End Process
-
-Process called "translate_nil_literal" takes expr as ElixirExpression returns Integer:
-    Let hir be proc create_hir_dict
-    proc set_dict_value with hir, "node_type", "literal"
-    proc set_dict_value with hir, "literal_kind", "nil"
-    proc set_dict_value with hir, "line", expr.line
-    Return hir
-End Process
-
-Process called "translate_sigil_literal" takes expr as ElixirExpression returns Integer:
-    Let hir be proc create_hir_dict
-    proc set_dict_value with hir, "node_type", "literal"
-    proc set_dict_value with hir, "literal_kind", "sigil"
-    proc set_dict_value with hir, "value", expr.expr_data at key "value"
-    proc set_dict_value with hir, "line", expr.line
-    Return hir
-End Process
-
-Process called "translate_identifier" takes expr as ElixirExpression returns Integer:
-    Let hir be proc create_hir_dict
-    proc set_dict_value with hir, "node_type", "identifier"
-    proc set_dict_value with hir, "name", expr.expr_data at key "name"
-    proc set_dict_value with hir, "line", expr.line
-    Return hir
-End Process
-
-Process called "translate_module_reference" takes expr as ElixirExpression returns Integer:
-    Let hir be proc create_hir_dict
-    proc set_dict_value with hir, "node_type", "module_reference"
-    proc set_dict_value with hir, "name", expr.expr_data at key "name"
-    proc set_dict_value with hir, "line", expr.line
-    Return hir
-End Process
-
-Note: ============================================================================
-Note: BINARY / UNARY OPERATORS
-Note: ============================================================================
-
-@Reasoning:
-Elixir's binary-op parser stores the operator string (e.g., "+", "|>",
-"==", "++"), the left expression, and the right expression. The pipe
-operator "|>" passes its left value as the first argument to the right
-call, which is a distinct semantic from a generic binary op; we tag those
-with node_type="pipe" so the destination emitter can route pipes into
-its native pipeline construct (Elm pipe, F# pipe, Java streams) or rewrite
-them as nested calls. All other binary ops produce node_type="binary_op".
-@End Reasoning
-Process called "translate_binary_op" takes translator as Integer, expr as ElixirExpression returns Integer:
-    Let op be expr.expr_data at key "operator"
-    Let left be expr.expr_data at key "left"
-    Let right be expr.expr_data at key "right"
-
-    Let hir be proc create_hir_dict
-    If op is equal to "|>":
-        proc set_dict_value with hir, "node_type", "pipe"
-    Otherwise:
-        proc set_dict_value with hir, "node_type", "binary_op"
-    End If
-    proc set_dict_value with hir, "operator", op
-    proc set_dict_value with hir, "line", expr.line
-
-    Let hir_left be proc translate_expression with translator, left
-    Let hir_right be proc translate_expression with translator, right
-    proc set_dict_value with hir, "left", hir_left
-    proc set_dict_value with hir, "right", hir_right
-    Return hir
+    Let value_literal be proc create_hir_string_literal from HIR with value
+    Return proc add_dictionary_entry from HIR with dict_hir, key, value_literal
 End Process
 
 @Reasoning:
-Unary operators (-, !, not, ^, &) lower to a HIR "unary_op" dict with the
-operator string preserved verbatim so the emitter can re-render in the
-destination language's syntax. The pin operator "^" carries pattern-match
-semantics in Elixir but at the expression layer it is shaped identically
-to other unary ops; the pattern-matching translator handles its semantic
-meaning when ^x appears in pattern position.
+Subtree-valued attributes (child HIR nodes and HIR lists) are stored verbatim so
+the backend reads them back as nodes/lists rather than strings.
 @End Reasoning
-Process called "translate_unary_op" takes translator as Integer, expr as ElixirExpression returns Integer:
-    Let hir be proc create_hir_dict
-    proc set_dict_value with hir, "node_type", "unary_op"
-    proc set_dict_value with hir, "operator", expr.expr_data at key "operator"
-    proc set_dict_value with hir, "line", expr.line
-    Let operand be expr.expr_data at key "operand"
-    Let hir_operand be proc translate_expression with translator, operand
-    proc set_dict_value with hir, "operand", hir_operand
-    Return hir
-End Process
-
-Note: ============================================================================
-Note: CALL / FIELD ACCESS
-Note: ============================================================================
-
-@Reasoning:
-A "call" expression has a callee expression (which may itself be a field
-access for Module.function calls) and a list of argument expressions. We
-emit a HIR "call" dict and additionally recognise three Elixir-specific
-call patterns that need OTP-aware tagging:
-  - spawn / spawn_link / spawn_monitor / Task.start -> "actor_spawn"
-  - send -> "actor_send"
-  - GenServer.call / GenServer.cast / Supervisor.start_link -> tagged
-    "otp_genserver_call" / "otp_genserver_cast" / "otp_supervisor_start".
-The detection happens after the generic translation so the emitted call
-dict always has a complete "callee" + "arguments" payload; the OTP-flavour
-tags simply re-classify the node_type and add extra fields.
-@End Reasoning
-Process called "translate_call" takes translator as Integer, expr as ElixirExpression returns Integer:
-    Let callee_expr be expr.expr_data at key "function"
-    Let arg_list be expr.expr_data at key "arguments"
-
-    Let hir be proc create_hir_dict
-    proc set_dict_value with hir, "node_type", "call"
-    proc set_dict_value with hir, "line", expr.line
-
-    Let hir_callee be proc translate_expression with translator, callee_expr
-    proc set_dict_value with hir, "callee", hir_callee
-
-    Let hir_args be proc create_hir_list
-    Let count be length of arg_list
-    Let i be 0
-    While i is less than count:
-        Let arg be arg_list at index i
-        Let hir_arg be proc translate_expression with translator, arg
-        proc list_append with hir_args, hir_arg
-        Set i to i plus 1
-    End While
-    proc set_dict_value with hir, "arguments", hir_args
-
-    Note: Detect OTP / actor model call patterns and re-classify.
-    Let callee_name be proc resolve_callee_name with callee_expr
-    If callee_name is equal to "spawn":
-        proc set_dict_value with hir, "node_type", "actor_spawn"
-        proc set_dict_value with hir, "spawn_type", "spawn"
-        proc track_process_spawn with translator, hir
+Process called "set_dict_value" takes dict_hir as Integer, key as Integer, value as Integer returns Integer:
+    If dict_hir is equal to 0:
+        Return 0
     End If
-    If callee_name is equal to "spawn_link":
-        proc set_dict_value with hir, "node_type", "actor_spawn"
-        proc set_dict_value with hir, "spawn_type", "spawn_link"
-        proc set_dict_value with hir, "linked", "true"
-        proc track_process_spawn with translator, hir
-    End If
-    If callee_name is equal to "spawn_monitor":
-        proc set_dict_value with hir, "node_type", "actor_spawn"
-        proc set_dict_value with hir, "spawn_type", "spawn_monitor"
-        proc set_dict_value with hir, "monitored", "true"
-        proc track_process_spawn with translator, hir
-    End If
-    If callee_name is equal to "send":
-        proc set_dict_value with hir, "node_type", "actor_send"
-        proc set_dict_value with hir, "actor_model", "true"
-    End If
-    If callee_name is equal to "GenServer.call":
-        proc set_dict_value with hir, "node_type", "otp_genserver_call"
-        proc set_dict_value with hir, "otp_behavior", "genserver"
-    End If
-    If callee_name is equal to "GenServer.cast":
-        proc set_dict_value with hir, "node_type", "otp_genserver_cast"
-        proc set_dict_value with hir, "otp_behavior", "genserver"
-    End If
-    If callee_name is equal to "Supervisor.start_link":
-        proc set_dict_value with hir, "node_type", "otp_supervisor_start"
-        proc set_dict_value with hir, "otp_behavior", "supervisor"
-    End If
-    If callee_name is equal to "Task.start":
-        proc set_dict_value with hir, "node_type", "actor_spawn"
-        proc set_dict_value with hir, "spawn_type", "task_start"
-        proc set_dict_value with hir, "otp_task", "true"
-        proc track_process_spawn with translator, hir
-    End If
-
-    Return hir
-End Process
-
-@Reasoning:
-Resolves a callee expression to a flat dotted-name string. Pure identifier
-callees yield their name; "Module.function" field accesses yield the
-dotted form. Anything more complex (computed callee, anonymous lambda
-invocation, etc.) yields "" so the OTP-pattern detector simply skips
-re-classification.
-@End Reasoning
-Process called "resolve_callee_name" takes callee_expr as ElixirExpression returns String:
-    If callee_expr is equal to 0:
-        Return ""
-    End If
-    If callee_expr.expr_type is equal to "identifier":
-        Return callee_expr.expr_data at key "name"
-    End If
-    If callee_expr.expr_type is equal to "module":
-        Return callee_expr.expr_data at key "name"
-    End If
-    If callee_expr.expr_type is equal to "field_access":
-        Let obj be callee_expr.expr_data at key "object"
-        Let field be callee_expr.expr_data at key "field"
-        Let obj_name be proc resolve_callee_name with obj
-        If obj_name is equal to "":
-            Return field
-        End If
-        Return obj_name joined with "." joined with field
-    End If
-    Return ""
-End Process
-
-@Reasoning:
-"object.field" lowers to HIR "field_access" with translated object and
-literal field name. This carries the same node shape that hir_to_*
-emitters expect for record/struct field reads in their destination
-languages.
-@End Reasoning
-Process called "translate_field_access" takes translator as Integer, expr as ElixirExpression returns Integer:
-    Let hir be proc create_hir_dict
-    proc set_dict_value with hir, "node_type", "field_access"
-    proc set_dict_value with hir, "line", expr.line
-    Let obj be expr.expr_data at key "object"
-    Let hir_obj be proc translate_expression with translator, obj
-    proc set_dict_value with hir, "object", hir_obj
-    proc set_dict_value with hir, "field", expr.expr_data at key "field"
-    Return hir
-End Process
-
-Note: ============================================================================
-Note: COMPOUND LITERALS
-Note: ============================================================================
-
-@Reasoning:
-List literals carry an "elements" list plus an optional "tail" (for head|
-tail destructuring [h | t]). We lower elements one by one; the tail, if
-present, becomes a sibling HIR node under "tail". When tail is nil the
-list HIR omits the key so destination emitters can branch on its presence
-to choose between proper-list and cons-pair forms.
-@End Reasoning
-Process called "translate_list_expr" takes translator as Integer, expr as ElixirExpression returns Integer:
-    Let hir be proc create_hir_dict
-    proc set_dict_value with hir, "node_type", "list"
-    proc set_dict_value with hir, "line", expr.line
-
-    Let elements be expr.expr_data at key "elements"
-    Let tail be expr.expr_data at key "tail"
-
-    Let hir_elements be proc create_hir_list
-    Let count be length of elements
-    Let i be 0
-    While i is less than count:
-        Let elem be elements at index i
-        Let hir_elem be proc translate_expression with translator, elem
-        proc list_append with hir_elements, hir_elem
-        Set i to i plus 1
-    End While
-    proc set_dict_value with hir, "elements", hir_elements
-
-    If tail is not equal to 0:
-        Let hir_tail be proc translate_expression with translator, tail
-        proc set_dict_value with hir, "tail", hir_tail
-    End If
-    Return hir
-End Process
-
-@Reasoning:
-Tuples are heterogeneous fixed-size collections; Elixir uses them for
-tagged returns ({:ok, value}) and pattern matching. We lower to HIR
-"tuple" with elements in declaration order; the destination emitter
-chooses between a real tuple (Rust, Python), a record (Java), or a
-positional list depending on language capability.
-@End Reasoning
-Process called "translate_tuple_expr" takes translator as Integer, expr as ElixirExpression returns Integer:
-    Let hir be proc create_hir_dict
-    proc set_dict_value with hir, "node_type", "tuple"
-    proc set_dict_value with hir, "line", expr.line
-
-    Let elements be expr.expr_data at key "elements"
-    Let hir_elements be proc create_hir_list
-    Let count be length of elements
-    Let i be 0
-    While i is less than count:
-        Let elem be elements at index i
-        Let hir_elem be proc translate_expression with translator, elem
-        proc list_append with hir_elements, hir_elem
-        Set i to i plus 1
-    End While
-    proc set_dict_value with hir, "elements", hir_elements
-    Return hir
-End Process
-
-@Reasoning:
-Maps lower to HIR "map" with a "pairs" list where each pair carries
-"key" and "value" sub-HIR. Preserving insertion order matches Elixir's
-%{} literal semantics and aligns with destination emitters that target
-ordered maps (JavaScript object, Java LinkedHashMap, Rust IndexMap).
-@End Reasoning
-Process called "translate_map_expr" takes translator as Integer, expr as ElixirExpression returns Integer:
-    Let hir be proc create_hir_dict
-    proc set_dict_value with hir, "node_type", "map"
-    proc set_dict_value with hir, "line", expr.line
-
-    Let pairs be expr.expr_data at key "pairs"
-    Let hir_pairs be proc create_hir_list
-    Let count be length of pairs
-    Let i be 0
-    While i is less than count:
-        Let pair be pairs at index i
-        Let k be pair at key "key"
-        Let v be pair at key "value"
-        Let hir_pair be proc create_hir_dict
-        proc set_dict_value with hir_pair, "node_type", "map_pair"
-        Let hir_k be proc translate_expression with translator, k
-        Let hir_v be proc translate_expression with translator, v
-        proc set_dict_value with hir_pair, "key", hir_k
-        proc set_dict_value with hir_pair, "value", hir_v
-        proc list_append with hir_pairs, hir_pair
-        Set i to i plus 1
-    End While
-    proc set_dict_value with hir, "pairs", hir_pairs
-    Return hir
-End Process
-
-@Reasoning:
-%Mod{key: value, ...} lowers to HIR "struct_literal" with a "type"
-identifier (the module name) and a "pairs" list of field bindings. The
-emitter routes this to the destination language's named-struct constructor
-or, if absent, to a tagged map.
-@End Reasoning
-Process called "translate_struct_expr" takes translator as Integer, expr as ElixirExpression returns Integer:
-    Let hir be proc create_hir_dict
-    proc set_dict_value with hir, "node_type", "struct_literal"
-    proc set_dict_value with hir, "line", expr.line
-    proc set_dict_value with hir, "type", expr.expr_data at key "name"
-
-    Let pairs be expr.expr_data at key "pairs"
-    Let hir_pairs be proc create_hir_list
-    If pairs is not equal to 0:
-        Let count be length of pairs
-        Let i be 0
-        While i is less than count:
-            Let pair be pairs at index i
-            Let k be pair at key "key"
-            Let v be pair at key "value"
-            Let hir_pair be proc create_hir_dict
-            proc set_dict_value with hir_pair, "node_type", "struct_field_init"
-            Let hir_k be proc translate_expression with translator, k
-            Let hir_v be proc translate_expression with translator, v
-            proc set_dict_value with hir_pair, "key", hir_k
-            proc set_dict_value with hir_pair, "value", hir_v
-            proc list_append with hir_pairs, hir_pair
-            Set i to i plus 1
-        End While
-    End If
-    proc set_dict_value with hir, "pairs", hir_pairs
-    Return hir
-End Process
-
-@Reasoning:
-Bitstring / binary literals <<...>> lower to HIR "binary_literal" with
-elements list. Elixir uses bitstrings for protocol buffers, serialised
-formats, and pattern-matching against wire data; preserving the segments
-lets a destination emitter regenerate the bit-precise representation.
-@End Reasoning
-Process called "translate_binary_expr" takes translator as Integer, expr as ElixirExpression returns Integer:
-    Let hir be proc create_hir_dict
-    proc set_dict_value with hir, "node_type", "binary_literal"
-    proc set_dict_value with hir, "line", expr.line
-
-    Let elements be expr.expr_data at key "elements"
-    Let hir_elements be proc create_hir_list
-    If elements is not equal to 0:
-        Let count be length of elements
-        Let i be 0
-        While i is less than count:
-            Let elem be elements at index i
-            Let hir_elem be proc translate_expression with translator, elem
-            proc list_append with hir_elements, hir_elem
-            Set i to i plus 1
-        End While
-    End If
-    proc set_dict_value with hir, "elements", hir_elements
-    Return hir
-End Process
-
-Note: ============================================================================
-Note: CONTROL FLOW
-Note: ============================================================================
-
-@Reasoning:
-fn -> ... end is the anonymous function form. The parser stores a list
-of clauses (a multi-clause fn dispatches by pattern). We lower each
-clause and emit a HIR "lambda" dict with clauses list, mirroring the
-function/macro shape.
-@End Reasoning
-Process called "translate_fn_expr" takes translator as Integer, expr as ElixirExpression returns Integer:
-    Let hir be proc create_hir_dict
-    proc set_dict_value with hir, "node_type", "lambda"
-    proc set_dict_value with hir, "line", expr.line
-
-    Let clauses be expr.expr_data at key "clauses"
-    Let hir_clauses be proc create_hir_list
-    If clauses is not equal to 0:
-        Let count be length of clauses
-        Let i be 0
-        While i is less than count:
-            Let clause be clauses at index i
-            Let hir_clause be proc translate_function_clause with translator, clause
-            proc list_append with hir_clauses, hir_clause
-            Set i to i plus 1
-        End While
-    End If
-    proc set_dict_value with hir, "clauses", hir_clauses
-    Return hir
-End Process
-
-@Reasoning:
-case e do pattern -> body ; ... end lowers to HIR "pattern_match" with
-the scrutinee under "expression" and a "clauses" list of pattern + guard
-+ body trios. The HIR node_type distinguishes Elixir-source-level case
-from desugared matches so the gungnir lowering can choose its target
-syntax.
-@End Reasoning
-Process called "translate_case_expr" takes translator as Integer, expr as ElixirExpression returns Integer:
-    Let hir be proc create_hir_dict
-    proc set_dict_value with hir, "node_type", "pattern_match"
-    proc set_dict_value with hir, "line", expr.line
-
-    Let scrutinee be expr.expr_data at key "expression"
-    Let hir_scrut be proc translate_expression with translator, scrutinee
-    proc set_dict_value with hir, "expression", hir_scrut
-
-    Let clauses be expr.expr_data at key "clauses"
-    Let hir_clauses be proc create_hir_list
-    If clauses is not equal to 0:
-        Let count be length of clauses
-        Let i be 0
-        While i is less than count:
-            Let clause be clauses at index i
-            Let hir_clause be proc translate_match_clause with translator, clause
-            proc list_append with hir_clauses, hir_clause
-            Set i to i plus 1
-        End While
-    End If
-    proc set_dict_value with hir, "clauses", hir_clauses
-    Return hir
-End Process
-
-@Reasoning:
-A match clause (case arm) is a pattern + optional guard + body. We
-delegate to translate_pattern (which records bound variable names in the
-translator's pattern_variables) and translate_expression for the guard
-and body. The HIR shape is identical to a function clause, but tagged
-"match_clause" so destination emitters can decide whether to emit a
-language-native match or unfold into a chained-if equivalent.
-@End Reasoning
-Process called "translate_match_clause" takes translator as Integer, clause as ElixirFunctionClause returns Integer:
-    Let hir be proc create_hir_dict
-    proc set_dict_value with hir, "node_type", "match_clause"
-    proc set_dict_value with hir, "line", clause.line
-
-    Let hir_patterns be proc create_hir_list
-    For Each p as ElixirExpression in clause.patterns:
-        Let hir_p be proc translate_pattern with translator, p
-        proc list_append with hir_patterns, hir_p
-    End For
-    proc set_dict_value with hir, "patterns", hir_patterns
-
-    Let hir_guards be proc create_hir_list
-    For Each g as ElixirExpression in clause.guards:
-        Let hir_g be proc translate_expression with translator, g
-        proc list_append with hir_guards, hir_g
-    End For
-    proc set_dict_value with hir, "guards", hir_guards
-
-    Let hir_body be proc create_hir_list
-    For Each e as ElixirExpression in clause.body:
-        Let hir_e be proc translate_expression with translator, e
-        proc list_append with hir_body, hir_e
-    End For
-    proc set_dict_value with hir, "body", hir_body
-    Return hir
-End Process
-
-@Reasoning:
-cond do guard -> body ; ... end is multi-branch dispatch on boolean
-guards. We lower to HIR "cond" with a "clauses" list where each clause
-carries a single guard and a body. Destination emitters typically render
-this as an else-if chain.
-@End Reasoning
-Process called "translate_cond_expr" takes translator as Integer, expr as ElixirExpression returns Integer:
-    Let hir be proc create_hir_dict
-    proc set_dict_value with hir, "node_type", "cond"
-    proc set_dict_value with hir, "line", expr.line
-
-    Let clauses be expr.expr_data at key "clauses"
-    Let hir_clauses be proc create_hir_list
-    If clauses is not equal to 0:
-        Let count be length of clauses
-        Let i be 0
-        While i is less than count:
-            Let clause be clauses at index i
-            Let cond_expr be clause at key "condition"
-            Let body_list be clause at key "body"
-            Let hir_clause be proc create_hir_dict
-            proc set_dict_value with hir_clause, "node_type", "cond_clause"
-            Let hir_cond be proc translate_expression with translator, cond_expr
-            proc set_dict_value with hir_clause, "condition", hir_cond
-            Let hir_body be proc translate_body_list with translator, body_list
-            proc set_dict_value with hir_clause, "body", hir_body
-            proc list_append with hir_clauses, hir_clause
-            Set i to i plus 1
-        End While
-    End If
-    proc set_dict_value with hir, "clauses", hir_clauses
-    Return hir
-End Process
-
-@Reasoning:
-if condition do A else B end lowers to HIR "if_statement" with condition,
-then_block, and optional else_block. The parser stores then-body and
-else-body as separate ElixirExpression lists.
-@End Reasoning
-Process called "translate_if_expr" takes translator as Integer, expr as ElixirExpression returns Integer:
-    Let hir be proc create_hir_dict
-    proc set_dict_value with hir, "node_type", "if_statement"
-    proc set_dict_value with hir, "line", expr.line
-
-    Let cond be expr.expr_data at key "condition"
-    Let hir_cond be proc translate_expression with translator, cond
-    proc set_dict_value with hir, "condition", hir_cond
-
-    Let then_body be expr.expr_data at key "then"
-    Let hir_then be proc translate_body_list with translator, then_body
-    proc set_dict_value with hir, "then_block", hir_then
-
-    Let else_body be expr.expr_data at key "else"
-    If else_body is not equal to 0:
-        Let hir_else be proc translate_body_list with translator, else_body
-        proc set_dict_value with hir, "else_block", hir_else
-    End If
-    Return hir
-End Process
-
-@Reasoning:
-with <- chains lower to HIR "with_chain". Each step has a pattern and
-an expression (pattern <- expr). On any pattern-match failure the with
-falls through to the optional else clause. We preserve the step list
-plus optional else; destination emitters can either render with as a
-flat-map / monadic bind or as nested case statements.
-@End Reasoning
-Process called "translate_with_expr" takes translator as Integer, expr as ElixirExpression returns Integer:
-    Let hir be proc create_hir_dict
-    proc set_dict_value with hir, "node_type", "with_chain"
-    proc set_dict_value with hir, "line", expr.line
-
-    Let steps be expr.expr_data at key "steps"
-    Let hir_steps be proc create_hir_list
-    If steps is not equal to 0:
-        Let count be length of steps
-        Let i be 0
-        While i is less than count:
-            Let step be steps at index i
-            Let pat be step at key "pattern"
-            Let val be step at key "expression"
-            Let hir_step be proc create_hir_dict
-            proc set_dict_value with hir_step, "node_type", "with_step"
-            Let hir_pat be proc translate_pattern with translator, pat
-            proc set_dict_value with hir_step, "pattern", hir_pat
-            Let hir_val be proc translate_expression with translator, val
-            proc set_dict_value with hir_step, "value", hir_val
-            proc list_append with hir_steps, hir_step
-            Set i to i plus 1
-        End While
-    End If
-    proc set_dict_value with hir, "steps", hir_steps
-
-    Let do_body be expr.expr_data at key "do"
-    If do_body is not equal to 0:
-        Let hir_do be proc translate_body_list with translator, do_body
-        proc set_dict_value with hir, "body", hir_do
-    End If
-
-    Let else_clauses be expr.expr_data at key "else"
-    If else_clauses is not equal to 0:
-        Let hir_else be proc create_hir_list
-        Let count be length of else_clauses
-        Let i be 0
-        While i is less than count:
-            Let clause be else_clauses at index i
-            Let hir_clause be proc translate_match_clause with translator, clause
-            proc list_append with hir_else, hir_clause
-            Set i to i plus 1
-        End While
-        proc set_dict_value with hir, "else", hir_else
-    End If
-    Return hir
-End Process
-
-@Reasoning:
-receive selects messages from the process mailbox by pattern. We tag
-node_type="actor_receive" so destination emitters can lower to their
-native concurrency primitive (Go channel select, Java BlockingQueue.poll,
-Erlang receive). The optional after clause for timeout is preserved as
-a "timeout" sub-node.
-@End Reasoning
-Process called "translate_receive_expr" takes translator as Integer, expr as ElixirExpression returns Integer:
-    Let hir be proc create_hir_dict
-    proc set_dict_value with hir, "node_type", "actor_receive"
-    proc set_dict_value with hir, "line", expr.line
-    proc set_dict_value with hir, "actor_model", "true"
-
-    Let clauses be expr.expr_data at key "clauses"
-    Let hir_clauses be proc create_hir_list
-    If clauses is not equal to 0:
-        Let count be length of clauses
-        Let i be 0
-        While i is less than count:
-            Let clause be clauses at index i
-            Let hir_clause be proc translate_match_clause with translator, clause
-            proc list_append with hir_clauses, hir_clause
-            Set i to i plus 1
-        End While
-    End If
-    proc set_dict_value with hir, "clauses", hir_clauses
-
-    Let after_clause be expr.expr_data at key "after"
-    If after_clause is not equal to 0:
-        Let timeout_expr be after_clause at key "timeout"
-        Let timeout_body be after_clause at key "body"
-        Let hir_after be proc create_hir_dict
-        proc set_dict_value with hir_after, "node_type", "timeout_clause"
-        Let hir_timeout be proc translate_expression with translator, timeout_expr
-        proc set_dict_value with hir_after, "timeout", hir_timeout
-        Let hir_tbody be proc translate_body_list with translator, timeout_body
-        proc set_dict_value with hir_after, "body", hir_tbody
-        proc set_dict_value with hir, "after", hir_after
-    End If
-    Return hir
-End Process
-
-@Reasoning:
-try / rescue / catch / after lowers to HIR "try_statement". rescue
-clauses match on exception structs, catch clauses match on throw values
-(:throw / :exit / :error pairs), the after clause unconditionally runs.
-We preserve all four sub-blocks so destination emitters can route to
-language-appropriate exception handling.
-@End Reasoning
-Process called "translate_try_expr" takes translator as Integer, expr as ElixirExpression returns Integer:
-    Let hir be proc create_hir_dict
-    proc set_dict_value with hir, "node_type", "try_statement"
-    proc set_dict_value with hir, "line", expr.line
-
-    Let do_body be expr.expr_data at key "do"
-    If do_body is not equal to 0:
-        Let hir_do be proc translate_body_list with translator, do_body
-        proc set_dict_value with hir, "body", hir_do
-    End If
-
-    Let rescue_clauses be expr.expr_data at key "rescue"
-    If rescue_clauses is not equal to 0:
-        Let hir_rescue be proc create_hir_list
-        Let count be length of rescue_clauses
-        Let i be 0
-        While i is less than count:
-            Let c be rescue_clauses at index i
-            Let hir_c be proc translate_match_clause with translator, c
-            proc list_append with hir_rescue, hir_c
-            Set i to i plus 1
-        End While
-        proc set_dict_value with hir, "rescue", hir_rescue
-    End If
-
-    Let catch_clauses be expr.expr_data at key "catch"
-    If catch_clauses is not equal to 0:
-        Let hir_catch be proc create_hir_list
-        Let count be length of catch_clauses
-        Let i be 0
-        While i is less than count:
-            Let c be catch_clauses at index i
-            Let hir_c be proc translate_match_clause with translator, c
-            proc list_append with hir_catch, hir_c
-            Set i to i plus 1
-        End While
-        proc set_dict_value with hir, "catch", hir_catch
-    End If
-
-    Let after_body be expr.expr_data at key "after"
-    If after_body is not equal to 0:
-        Let hir_after be proc translate_body_list with translator, after_body
-        proc set_dict_value with hir, "after", hir_after
-    End If
-    Return hir
-End Process
-
-@Reasoning:
-for-comprehensions fuse generators (pattern <- enumerable), filters
-(boolean predicates), and a transform body into one expression. We lower
-to HIR "list_comprehension" with generators / filters / transform as
-named child slots. Generators carry their pattern + source-enumerable;
-filters are plain expressions.
-@End Reasoning
-Process called "translate_for_expr" takes translator as Integer, expr as ElixirExpression returns Integer:
-    Let hir be proc create_hir_dict
-    proc set_dict_value with hir, "node_type", "list_comprehension"
-    proc set_dict_value with hir, "line", expr.line
-
-    Let generators be expr.expr_data at key "generators"
-    Let hir_generators be proc create_hir_list
-    If generators is not equal to 0:
-        Let count be length of generators
-        Let i be 0
-        While i is less than count:
-            Let gen be generators at index i
-            Let pat be gen at key "pattern"
-            Let src be gen at key "source"
-            Let hir_gen be proc create_hir_dict
-            proc set_dict_value with hir_gen, "node_type", "generator"
-            Let hir_pat be proc translate_pattern with translator, pat
-            proc set_dict_value with hir_gen, "pattern", hir_pat
-            Let hir_src be proc translate_expression with translator, src
-            proc set_dict_value with hir_gen, "source", hir_src
-            proc list_append with hir_generators, hir_gen
-            Set i to i plus 1
-        End While
-    End If
-    proc set_dict_value with hir, "generators", hir_generators
-
-    Let filters be expr.expr_data at key "filters"
-    If filters is not equal to 0:
-        Let hir_filters be proc create_hir_list
-        Let count be length of filters
-        Let i be 0
-        While i is less than count:
-            Let f be filters at index i
-            Let hir_f be proc translate_expression with translator, f
-            proc list_append with hir_filters, hir_f
-            Set i to i plus 1
-        End While
-        proc set_dict_value with hir, "filters", hir_filters
-    End If
-
-    Let do_body be expr.expr_data at key "do"
-    If do_body is not equal to 0:
-        Let hir_transform be proc translate_body_list with translator, do_body
-        proc set_dict_value with hir, "transform", hir_transform
-    End If
-
-    Let into_target be expr.expr_data at key "into"
-    If into_target is not equal to 0:
-        Let hir_into be proc translate_expression with translator, into_target
-        proc set_dict_value with hir, "into", hir_into
-    End If
-    Return hir
-End Process
-
-Note: ============================================================================
-Note: PATTERN TRANSLATION
-Note: ============================================================================
-
-@Reasoning:
-Patterns in Elixir reuse the ElixirExpression type; the parser stores
-patterns in clause.patterns and tuple-element / list-element positions
-inside other expressions. translate_pattern walks an expression in
-pattern mode, binding variable names in translator.pattern_variables
-on first encounter and recursing into composite patterns (tuple, list,
-map, struct, binary). Literals lower identically to expressions because
-matching a literal is structurally the same operation as evaluating it.
-@End Reasoning
-Process called "translate_pattern" takes translator as Integer, pat as ElixirExpression returns Integer:
-    If pat is equal to 0:
+    If key is equal to 0:
         Return 0
     End If
 
-    Let kind be pat.expr_type
+    Return proc add_dictionary_entry from HIR with dict_hir, key, value
+End Process
 
-    If kind is equal to "identifier":
-        Let name be pat.expr_data at key "name"
-        proc bind_pattern_variable with translator, name
-        Let hir be proc create_hir_dict
-        proc set_dict_value with hir, "node_type", "pattern_variable"
-        proc set_dict_value with hir, "name", name
-        proc set_dict_value with hir, "line", pat.line
-        Return hir
+@Reasoning:
+Appends a translated node to a HIR list literal; null-guards both operands.
+@End Reasoning
+Process called "add_to_hir_list" takes list_hir as Integer, element as Integer returns Integer:
+    If list_hir is equal to 0:
+        Return 0
+    End If
+    If element is equal to 0:
+        Return 0
     End If
 
-    If kind is equal to "tuple":
-        Let hir be proc create_hir_dict
-        proc set_dict_value with hir, "node_type", "tuple_pattern"
-        proc set_dict_value with hir, "line", pat.line
-        Let elements be pat.expr_data at key "elements"
-        Let hir_elements be proc create_hir_list
-        Let count be length of elements
-        Let i be 0
-        While i is less than count:
-            Let e be elements at index i
-            Let hir_e be proc translate_pattern with translator, e
-            proc list_append with hir_elements, hir_e
-            Set i to i plus 1
-        End While
-        proc set_dict_value with hir, "elements", hir_elements
-        Return hir
-    End If
-
-    If kind is equal to "list":
-        Let hir be proc create_hir_dict
-        proc set_dict_value with hir, "node_type", "list_pattern"
-        proc set_dict_value with hir, "line", pat.line
-        Let elements be pat.expr_data at key "elements"
-        Let tail be pat.expr_data at key "tail"
-        Let hir_elements be proc create_hir_list
-        Let count be length of elements
-        Let i be 0
-        While i is less than count:
-            Let e be elements at index i
-            Let hir_e be proc translate_pattern with translator, e
-            proc list_append with hir_elements, hir_e
-            Set i to i plus 1
-        End While
-        proc set_dict_value with hir, "elements", hir_elements
-        If tail is not equal to 0:
-            Let hir_tail be proc translate_pattern with translator, tail
-            proc set_dict_value with hir, "tail", hir_tail
-        End If
-        Return hir
-    End If
-
-    If kind is equal to "map":
-        Let hir be proc create_hir_dict
-        proc set_dict_value with hir, "node_type", "map_pattern"
-        proc set_dict_value with hir, "line", pat.line
-        Let pairs be pat.expr_data at key "pairs"
-        Let hir_pairs be proc create_hir_list
-        If pairs is not equal to 0:
-            Let count be length of pairs
-            Let i be 0
-            While i is less than count:
-                Let p be pairs at index i
-                Let k be p at key "key"
-                Let v be p at key "value"
-                Let hir_p be proc create_hir_dict
-                proc set_dict_value with hir_p, "node_type", "map_pattern_pair"
-                Let hir_k be proc translate_expression with translator, k
-                Let hir_v be proc translate_pattern with translator, v
-                proc set_dict_value with hir_p, "key", hir_k
-                proc set_dict_value with hir_p, "value", hir_v
-                proc list_append with hir_pairs, hir_p
-                Set i to i plus 1
-            End While
-        End If
-        proc set_dict_value with hir, "pairs", hir_pairs
-        Return hir
-    End If
-
-    If kind is equal to "struct":
-        Let hir be proc create_hir_dict
-        proc set_dict_value with hir, "node_type", "struct_pattern"
-        proc set_dict_value with hir, "line", pat.line
-        proc set_dict_value with hir, "type", pat.expr_data at key "name"
-        Let pairs be pat.expr_data at key "pairs"
-        Let hir_pairs be proc create_hir_list
-        If pairs is not equal to 0:
-            Let count be length of pairs
-            Let i be 0
-            While i is less than count:
-                Let p be pairs at index i
-                Let k be p at key "key"
-                Let v be p at key "value"
-                Let hir_p be proc create_hir_dict
-                proc set_dict_value with hir_p, "node_type", "struct_pattern_field"
-                Let hir_k be proc translate_expression with translator, k
-                Let hir_v be proc translate_pattern with translator, v
-                proc set_dict_value with hir_p, "key", hir_k
-                proc set_dict_value with hir_p, "value", hir_v
-                proc list_append with hir_pairs, hir_p
-                Set i to i plus 1
-            End While
-        End If
-        proc set_dict_value with hir, "pairs", hir_pairs
-        Return hir
-    End If
-
-    If kind is equal to "binary":
-        Let hir be proc create_hir_dict
-        proc set_dict_value with hir, "node_type", "binary_pattern"
-        proc set_dict_value with hir, "line", pat.line
-        Let elements be pat.expr_data at key "elements"
-        Let hir_elements be proc create_hir_list
-        If elements is not equal to 0:
-            Let count be length of elements
-            Let i be 0
-            While i is less than count:
-                Let e be elements at index i
-                Let hir_e be proc translate_pattern with translator, e
-                proc list_append with hir_elements, hir_e
-                Set i to i plus 1
-            End While
-        End If
-        proc set_dict_value with hir, "elements", hir_elements
-        Return hir
-    End If
-
-    Note: Literals and operator patterns (pin ^x, |  cons) reuse the
-    Note: expression translator since their HIR shape matches.
-    Return proc translate_expression with translator, pat
+    Return proc add_list_element from HIR with list_hir, element
 End Process
 
 Note: ============================================================================
-Note: HELPERS
+Note: AST READ HELPERS
 Note: ============================================================================
 
 @Reasoning:
-translate_body_list lowers a List[ElixirExpression] body block into a
-HIR list of translated statements. Used by case clauses, if/else blocks,
-with do/else, try do/rescue/catch/after, receive after, for comprehension
-transforms. Centralised so the body-list lowering remains uniform across
-every consumer.
+Reads a node's string "node_type" attribute through the Stage-A accessor so the
+dispatcher can branch on it. Returns 0 when the node is null.
 @End Reasoning
-Process called "translate_body_list" takes translator as Integer, body as Integer returns Integer:
-    Let hir_body be proc create_hir_list
-    If body is equal to 0:
-        Return hir_body
+Process called "node_type_of" takes node as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
     End If
-    Let count be length of body
+    Return proc get_ast_attribute from Parser with node, "node_type"
+End Process
+
+@Reasoning:
+Reads a named AST attribute through the Stage-A accessor; null-guards the node.
+@End Reasoning
+Process called "attr" takes node as Integer, key as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    Return proc get_ast_attribute from Parser with node, key
+End Process
+
+@Reasoning:
+Compares the node_type string against a tag; thin wrapper over StringCore so the
+dispatcher reads cleanly.
+@End Reasoning
+Process called "type_is" takes nt as Integer, tag as Integer returns Integer:
+    Return proc string_equals from StringCore with nt, tag
+End Process
+
+@Reasoning:
+Lowers an AST list of expression/member nodes into a HIR list literal by
+dispatching each element through translate_node. Skips null elements. Returns an
+(possibly empty) HIR list literal; the caller decides whether emptiness is
+acceptable. Used for every member, clause, param, stage, pair, and arm list so
+every list is fully populated from its AST source.
+@End Reasoning
+Process called "translate_node_list" takes ast_list as Integer returns Integer:
+    Let list_hir be proc create_list
+    If ast_list is equal to 0:
+        Return list_hir
+    End If
+
+    Let count be proc list_length from ListOps with ast_list
     Let i be 0
     While i is less than count:
-        Let e be body at index i
-        Let hir_e be proc translate_expression with translator, e
-        proc list_append with hir_body, hir_e
+        Let item be proc list_get from ListOps with ast_list, i
+        If item is not equal to 0:
+            Let item_hir be proc translate_node with item
+            If item_hir is not equal to 0:
+                proc add_to_hir_list with list_hir, item_hir
+            End If
+        End If
         Set i to i plus 1
     End While
-    Return hir_body
+
+    Return list_hir
 End Process
 
 @Reasoning:
-Records a pattern-bound variable name in translator.pattern_variables.
-Guard expression lowering can later consult this set to distinguish
-bound names (legal in guards) from free identifiers (which would resolve
-to module-level lookup). The value side stores the marker "bound" so the
-set behaves as a presence test under hashtable semantics.
+Lowers an AST list of node children read from get_ast_children. Identical to
+translate_node_list but sourced from the children list rather than an attribute.
 @End Reasoning
-Process called "bind_pattern_variable" takes translator as Integer, var_name as String returns Integer:
-    Return proc hashtable_set from Dict with translator.pattern_variables, var_name, "bound"
-End Process
+Process called "translate_children" takes node as Integer returns Integer:
+    Let list_hir be proc create_list
+    If node is equal to 0:
+        Return list_hir
+    End If
 
-@Reasoning:
-Records a process-spawning call site under a unique id in process_context.
-The spawn_id_counter is bumped per call so each spawn has a distinct key
-even for repeated identical call shapes. Downstream actor-graph analysis
-walks this dictionary to build a process topology.
-@End Reasoning
-Process called "track_process_spawn" takes translator as Integer, spawn_hir as Integer returns Integer:
-    Set translator.spawn_id_counter to translator.spawn_id_counter plus 1
-    Let id_str be "spawn_" joined with string representation of translator.spawn_id_counter
-    Return proc hashtable_set from Dict with translator.process_context, id_str, spawn_hir
-End Process
+    Let children be proc get_ast_children from Parser with node
+    If children is equal to 0:
+        Return list_hir
+    End If
 
-@Reasoning:
-OTP behaviours (GenServer, Supervisor, Application, GenStage, Agent, etc.)
-are declared inside a module body via `use Behaviour`. The parser stores
-these as ordinary call expressions; here we walk the module's function
-clauses looking for top-level `use ...` calls and record the behaviour
-name in translator.otp_behaviors plus tag the HIR module dict with
-otp_behavior=<name>. Multiple use statements yield multiple entries.
-@End Reasoning
-Process called "extract_otp_behavior_info" takes translator as Integer, hir_module as Integer, module as ElixirModule returns Integer:
-    Note: Elixir's `use Behaviour` syntax appears as bare expressions in the
-    Note: module body, but the parser routes those into the functions list
-    Note: only if they look like def/defp; ordinary `use` calls go through
-    Note: the bare-expression error-recovery path so we cannot recover them
-    Note: from the structured module fields. We instead scan each function's
-    Note: first body element for `use Behaviour` markers, which is how
-    Note: behaviour declarations appear when they follow a def line.
-    For Each f as ElixirFunction in module.functions:
-        For Each clause as ElixirFunctionClause in f.clauses:
-            For Each e as ElixirExpression in clause.body:
-                If e.expr_type is equal to "call":
-                    Let callee be e.expr_data at key "function"
-                    Let name be proc resolve_callee_name with callee
-                    If name is equal to "use":
-                        Let args be e.expr_data at key "arguments"
-                        If length of args is greater than 0:
-                            Let first_arg be args at index 0
-                            Let behaviour_name be proc resolve_callee_name with first_arg
-                            If behaviour_name is not equal to "":
-                                proc hashtable_set from Dict with translator.otp_behaviors, behaviour_name, hir_module
-                                proc set_dict_value with hir_module, "otp_behavior", behaviour_name
-                            End If
-                        End If
-                    End If
-                End If
-            End For
-        End For
-    End For
-    Return 1
-End Process
-
-@Reasoning:
-Standard OTP callback functions are identified by both name and arity:
-GenServer: init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2,
-code_change/3. Supervisor: init/1 (disambiguated by checking the module's
-otp_behavior tag — if set to "Supervisor", init/1 is a supervisor init;
-otherwise we tag it as genserver_init by default since GenServer is the
-overwhelmingly more common case). Application: start/2, stop/1. Agent:
-init/1. Tagging the HIR function with its canonical callback role lets
-target emitters generate the right framework hooks in destination languages
-that have explicit actor/service interfaces (Akka actor methods,
-Java Spring lifecycle annotations, etc.).
-@End Reasoning
-Process called "check_otp_callback" takes translator as Integer, hir_func as Integer, name as String, arity as Integer returns Integer:
-    If name is equal to "init" and arity is equal to 1:
-        Let supervisor_tag be proc hashtable_get from Dict with translator.current_module, "otp_behavior"
-        If supervisor_tag is equal to "Supervisor":
-            proc set_dict_value with hir_func, "otp_callback", "supervisor_init"
-        Otherwise:
-            proc set_dict_value with hir_func, "otp_callback", "genserver_init"
+    Let count be proc list_length from ListOps with children
+    Let i be 0
+    While i is less than count:
+        Let child be proc list_get from ListOps with children, i
+        If child is not equal to 0:
+            Let child_hir be proc translate_node with child
+            If child_hir is not equal to 0:
+                proc add_to_hir_list with list_hir, child_hir
+            End If
         End If
-        Return 1
+        Set i to i plus 1
+    End While
+
+    Return list_hir
+End Process
+
+Note: ============================================================================
+Note: Main Translation Entry Points
+Note: ============================================================================
+
+@Reasoning:
+Top-level AST entry point. The parser's parse_elixir_source returns an
+"elixir_module" root carrying a "name" (alias string) and a "body" list of every
+top-level member. This builds an "elixir_module" HIR dict with the module name as
+a string and a "members" list lowered from the body, so the backend walks a
+uniform module -> members shape. Returns 0 on a null AST.
+@End Reasoning
+Process called "translate_elixir_ast_to_hir" takes ast_root as Integer returns Integer:
+    Note: Translate Elixir AST to HIR
+
+    If ast_root is equal to 0:
+        Return 0
     End If
-    If name is equal to "handle_call" and arity is equal to 3:
-        proc set_dict_value with hir_func, "otp_callback", "genserver_handle_call"
-        Return 1
+
+    Let module_hir be proc create_dict
+    proc set_dict_string with module_hir, "_type", "elixir_module"
+
+    Let name be proc attr with ast_root, "name"
+    If name is not equal to 0:
+        proc set_dict_string with module_hir, "name", name
+    Otherwise:
+        proc set_dict_string with module_hir, "name", ""
     End If
-    If name is equal to "handle_cast" and arity is equal to 2:
-        proc set_dict_value with hir_func, "otp_callback", "genserver_handle_cast"
-        Return 1
+
+    Let body be proc attr with ast_root, "body"
+    Let members_hir be proc translate_node_list with body
+    proc set_dict_value with module_hir, "members", members_hir
+
+    Return module_hir
+End Process
+
+@Reasoning:
+Convenience entry point that drives the whole front of the pipeline from raw
+source: lex, tokenize, parse, run semantic analysis (real scope/name checking),
+then lower the AST to HIR. Returns 0 if any stage yields 0. Semantic analysis is
+run for its name/scope diagnostics; the produced AST is lowered regardless so the
+caller can inspect diagnostics via the semantic analyzer when needed.
+@End Reasoning
+Process called "elixir_to_hir_from_source" takes source as Integer returns Integer:
+    Note: Lex -> parse -> semantic -> lower an Elixir source string to HIR
+
+    If source is equal to 0:
+        Return 0
     End If
-    If name is equal to "handle_info" and arity is equal to 2:
-        proc set_dict_value with hir_func, "otp_callback", "genserver_handle_info"
-        Return 1
+
+    Let lexer be proc create_elixir_lexer from Lexer with source
+    If lexer is equal to 0:
+        Return 0
     End If
-    If name is equal to "terminate" and arity is equal to 2:
-        proc set_dict_value with hir_func, "otp_callback", "genserver_terminate"
-        Return 1
+
+    Let tokens be proc tokenize_elixir from Lexer with lexer
+    If tokens is equal to 0:
+        Return 0
     End If
-    If name is equal to "code_change" and arity is equal to 3:
-        proc set_dict_value with hir_func, "otp_callback", "genserver_code_change"
-        Return 1
+
+    Let parser be proc create_elixir_parser from Parser with tokens
+    If parser is equal to 0:
+        Return 0
     End If
-    If name is equal to "start" and arity is equal to 2:
-        proc set_dict_value with hir_func, "otp_callback", "application_start"
-        Return 1
+
+    Let ast be proc parse_elixir_source from Parser with parser
+    If ast is equal to 0:
+        Return 0
     End If
-    If name is equal to "stop" and arity is equal to 1:
-        proc set_dict_value with hir_func, "otp_callback", "application_stop"
-        Return 1
+
+    Note: Real semantic analysis (scope + name resolution). Diagnostics are
+    Note: collected on the analyzer; lowering proceeds on the validated AST.
+    Let analyzer be proc create_elixir_semantic_analyzer from Semantic
+    If analyzer is not equal to 0:
+        proc analyze_elixir_ast from Semantic with analyzer, ast
     End If
+
+    Return proc translate_elixir_ast_to_hir with ast
+End Process
+
+@Reasoning:
+Single dispatcher for the entire Elixir AST. Reads the node's string node_type
+and routes to the matching translator. Declarations, control-flow expressions,
+collections, and leaf expressions are all funnelled through here so recursive
+sub-translators bottom out without per-kind plumbing. Returns 0 on an
+unrecognised node_type rather than crashing.
+@End Reasoning
+Process called "translate_node" takes node as Integer returns Integer:
+    Note: Translate one Elixir AST node to HIR based on its node_type
+
+    If node is equal to 0:
+        Return 0
+    End If
+
+    Let nt be proc node_type_of with node
+    If nt is equal to 0:
+        Return 0
+    End If
+
+    Note: --- module + members ---
+    If proc type_is with nt, "elixir_module":
+        Return proc translate_elixir_ast_to_hir with node
+    End If
+    If proc type_is with nt, "function":
+        Return proc translate_function with node
+    End If
+    If proc type_is with nt, "clause":
+        Return proc translate_clause with node
+    End If
+    If proc type_is with nt, "defstruct":
+        Return proc translate_defstruct with node, "defstruct"
+    End If
+    If proc type_is with nt, "defexception":
+        Return proc translate_defstruct with node, "defexception"
+    End If
+    If proc type_is with nt, "module_attribute":
+        Return proc translate_module_attribute with node
+    End If
+    If proc type_is with nt, "alias":
+        Return proc translate_directive with node, "alias"
+    End If
+    If proc type_is with nt, "import":
+        Return proc translate_directive with node, "import"
+    End If
+    If proc type_is with nt, "require":
+        Return proc translate_directive with node, "require"
+    End If
+    If proc type_is with nt, "use":
+        Return proc translate_directive with node, "use"
+    End If
+    If proc type_is with nt, "defprotocol":
+        Return proc translate_defprotocol with node
+    End If
+    If proc type_is with nt, "defimpl":
+        Return proc translate_defimpl with node
+    End If
+
+    Note: --- control-flow expressions ---
+    If proc type_is with nt, "pipe":
+        Return proc translate_pipe with node
+    End If
+    If proc type_is with nt, "call":
+        Return proc translate_call with node
+    End If
+    If proc type_is with nt, "case":
+        Return proc translate_case with node
+    End If
+    If proc type_is with nt, "cond":
+        Return proc translate_cond with node
+    End If
+    If proc type_is with nt, "with":
+        Return proc translate_with with node
+    End If
+    If proc type_is with nt, "with_clause":
+        Return proc translate_with_clause with node
+    End If
+    If proc type_is with nt, "if":
+        Return proc translate_if with node, "if"
+    End If
+    If proc type_is with nt, "unless":
+        Return proc translate_if with node, "unless"
+    End If
+    If proc type_is with nt, "for":
+        Return proc translate_for with node
+    End If
+    If proc type_is with nt, "try":
+        Return proc translate_try with node
+    End If
+    If proc type_is with nt, "receive":
+        Return proc translate_receive with node
+    End If
+    If proc type_is with nt, "match_clause":
+        Return proc translate_match_clause with node
+    End If
+    If proc type_is with nt, "fn":
+        Return proc translate_fn with node
+    End If
+    If proc type_is with nt, "capture":
+        Return proc translate_capture with node
+    End If
+
+    Note: --- collections + literals ---
+    If proc type_is with nt, "map":
+        Return proc translate_map with node
+    End If
+    If proc type_is with nt, "struct_literal":
+        Return proc translate_struct_literal with node
+    End If
+    If proc type_is with nt, "pair":
+        Return proc translate_pair with node
+    End If
+    If proc type_is with nt, "tuple":
+        Return proc translate_tuple with node
+    End If
+    If proc type_is with nt, "list":
+        Return proc translate_list with node
+    End If
+    If proc type_is with nt, "binary":
+        Return proc translate_binary with node
+    End If
+    If proc type_is with nt, "identifier":
+        Return proc translate_identifier with node
+    End If
+    If proc type_is with nt, "alias_ref":
+        Return proc translate_alias_ref with node
+    End If
+    If proc type_is with nt, "atom":
+        Return proc translate_atom with node
+    End If
+    If proc type_is with nt, "literal":
+        Return proc translate_literal with node
+    End If
+    If proc type_is with nt, "binary_op":
+        Return proc translate_binary_op with node
+    End If
+    If proc type_is with nt, "unary_op":
+        Return proc translate_unary_op with node
+    End If
+    If proc type_is with nt, "pin":
+        Return proc translate_pin with node
+    End If
+    If proc type_is with nt, "access":
+        Return proc translate_access with node
+    End If
+    If proc type_is with nt, "keyword_pair":
+        Return proc translate_keyword_pair with node
+    End If
+    If proc type_is with nt, "block":
+        Return proc translate_block with node
+    End If
+
+    Note: unknown node type
     Return 0
 End Process
 
 Note: ============================================================================
-Note: PUBLIC ENTRY POINT
+Note: DECLARATION TRANSLATORS
 Note: ============================================================================
 
 @Reasoning:
-Public single-arg facade invoked by the translation dispatcher's
-LANG_ELIXIR arm. Wires the full source -> HIR pipeline: create_lexer
-builds the lexer state from the source string, lex tokenises into the
-three parallel arrays (tokens/lexemes/lines), parse_elixir wraps those
-arrays into an ElixirParser and parses out an ElixirModule, and
-translate_elixir_to_hir lowers the module into HIR.
+A function declaration carries name, visibility, kind, and a clauses list. Each
+clause is lowered through translate_clause into a real list (never empty when the
+parser produced clauses), so the depth probe sees the guarded clause's params and
+guard survive.
 @End Reasoning
-@Implementation:
-lexer = create_lexer(source); lex(lexer); module = parse_elixir(lexer.tokens,
-lexer.lexemes, lexer.lines); translator = create_elixir_to_hir_translator();
-return translate_elixir_to_hir(translator, module). The pipeline returns 0
-only if the lexer fails to allocate; the parser produces a partial module
-on syntax errors but downstream translation still consumes it (matching
-the error-recovery posture every other frontend uses).
-@End Implementation
-Process called "elixir_to_hir_from_source" takes source_code as Integer returns Integer:
-    Let lexer be proc create_lexer from ElixirLexer with source_code
-    Call lex from ElixirLexer with lexer
+Process called "translate_function" takes node as Integer returns Integer:
+    Let func_hir be proc create_dict
+    proc set_dict_string with func_hir, "_type", "function"
 
-    Let module be proc parse_elixir from ElixirParser with lexer.tokens, lexer.lexemes, lexer.lines
-    Let translator be proc create_elixir_to_hir_translator
-    Return proc translate_elixir_to_hir with translator, module
+    Let name be proc attr with node, "name"
+    If name is not equal to 0:
+        proc set_dict_string with func_hir, "name", name
+    End If
+
+    Let visibility be proc attr with node, "visibility"
+    If visibility is not equal to 0:
+        proc set_dict_string with func_hir, "visibility", visibility
+    End If
+
+    Let kind be proc attr with node, "kind"
+    If kind is not equal to 0:
+        proc set_dict_string with func_hir, "kind", kind
+    End If
+
+    Let clauses be proc attr with node, "clauses"
+    Let clauses_hir be proc translate_node_list with clauses
+    proc set_dict_value with func_hir, "clauses", clauses_hir
+
+    Return func_hir
 End Process
 
 @Reasoning:
-Dispatcher-facing entry used by the LANG_ELIXIR arm of translation.runa
-when the dispatcher imports this module as ElixirParser/ElixirEmitter. The
-single-arg form takes the source string and runs the full pipeline; the
-dispatcher conventionally calls this as `elixir_to_hir(source)`.
+A function/fn clause carries a params list, an optional guard expression, and a
+body statement list. params and body are lowered into real lists; the guard is
+lowered when present (the probe asserts the guarded clause has a guard and at
+least one param).
 @End Reasoning
-Process called "elixir_to_hir" takes source_code as Integer returns Integer:
-    Return proc elixir_to_hir_from_source with source_code
+Process called "translate_clause" takes node as Integer returns Integer:
+    Let clause_hir be proc create_dict
+    proc set_dict_string with clause_hir, "_type", "clause"
+
+    Let params be proc attr with node, "params"
+    Let params_hir be proc translate_node_list with params
+    proc set_dict_value with clause_hir, "params", params_hir
+
+    Let guard be proc attr with node, "guard"
+    If guard is not equal to 0:
+        Let guard_hir be proc translate_node with guard
+        If guard_hir is not equal to 0:
+            proc set_dict_value with clause_hir, "guard", guard_hir
+        End If
+    End If
+
+    Let body be proc attr with node, "body"
+    Let body_hir be proc translate_node_list with body
+    proc set_dict_value with clause_hir, "body", body_hir
+
+    Return clause_hir
+End Process
+
+@Reasoning:
+defstruct and defexception both carry a fields list of pair nodes. The tag passed
+in selects which HIR _type to emit. Fields are lowered into a real list so the
+probe sees both field keys survive.
+@End Reasoning
+Process called "translate_defstruct" takes node as Integer, tag as Integer returns Integer:
+    Let struct_hir be proc create_dict
+    proc set_dict_string with struct_hir, "_type", tag
+
+    Let fields be proc attr with node, "fields"
+    Let fields_hir be proc translate_node_list with fields
+    proc set_dict_value with struct_hir, "fields", fields_hir
+
+    Return struct_hir
+End Process
+
+@Reasoning:
+A module attribute (@name value) carries a name string and an optional value
+expression. Both survive: the name as a string, the value as a lowered subtree
+when present.
+@End Reasoning
+Process called "translate_module_attribute" takes node as Integer returns Integer:
+    Let mattr_hir be proc create_dict
+    proc set_dict_string with mattr_hir, "_type", "module_attribute"
+
+    Let name be proc attr with node, "name"
+    If name is not equal to 0:
+        proc set_dict_string with mattr_hir, "name", name
+    End If
+
+    Let value be proc attr with node, "value"
+    If value is not equal to 0:
+        Let value_hir be proc translate_node with value
+        If value_hir is not equal to 0:
+            proc set_dict_value with mattr_hir, "value", value_hir
+        End If
+    End If
+
+    Return mattr_hir
+End Process
+
+@Reasoning:
+alias/import/require/use directives each carry a target expression. The tag
+selects the HIR _type; the target is lowered into a subtree so the directive's
+module reference survives.
+@End Reasoning
+Process called "translate_directive" takes node as Integer, tag as Integer returns Integer:
+    Let dir_hir be proc create_dict
+    proc set_dict_string with dir_hir, "_type", tag
+
+    Let target be proc attr with node, "target"
+    If target is not equal to 0:
+        Let target_hir be proc translate_node with target
+        If target_hir is not equal to 0:
+            proc set_dict_value with dir_hir, "target", target_hir
+        End If
+    End If
+
+    Return dir_hir
+End Process
+
+@Reasoning:
+A defprotocol carries an alias name and a body of member nodes (function heads).
+Both survive: the name as a string, the body as a real lowered list.
+@End Reasoning
+Process called "translate_defprotocol" takes node as Integer returns Integer:
+    Let proto_hir be proc create_dict
+    proc set_dict_string with proto_hir, "_type", "defprotocol"
+
+    Let name be proc attr with node, "name"
+    If name is not equal to 0:
+        proc set_dict_string with proto_hir, "name", name
+    End If
+
+    Let body be proc attr with node, "body"
+    Let body_hir be proc translate_node_list with body
+    proc set_dict_value with proto_hir, "body", body_hir
+
+    Return proto_hir
+End Process
+
+@Reasoning:
+A defimpl carries an alias name, an optional for_target expression, and a body of
+members. All three survive.
+@End Reasoning
+Process called "translate_defimpl" takes node as Integer returns Integer:
+    Let impl_hir be proc create_dict
+    proc set_dict_string with impl_hir, "_type", "defimpl"
+
+    Let name be proc attr with node, "name"
+    If name is not equal to 0:
+        proc set_dict_string with impl_hir, "name", name
+    End If
+
+    Let for_target be proc attr with node, "for_target"
+    If for_target is not equal to 0:
+        Let for_hir be proc translate_node with for_target
+        If for_hir is not equal to 0:
+            proc set_dict_value with impl_hir, "for_target", for_hir
+        End If
+    End If
+
+    Let body be proc attr with node, "body"
+    Let body_hir be proc translate_node_list with body
+    proc set_dict_value with impl_hir, "body", body_hir
+
+    Return impl_hir
+End Process
+
+Note: ============================================================================
+Note: CONTROL-FLOW + EXPRESSION TRANSLATORS
+Note: ============================================================================
+
+@Reasoning:
+A pipe folds a |> b |> c into a single node whose stages list holds every stage
+in order. The stages list is lowered into a real list so the probe asserts the
+3-stage pipe survives with stage count = 3.
+@End Reasoning
+Process called "translate_pipe" takes node as Integer returns Integer:
+    Let pipe_hir be proc create_dict
+    proc set_dict_string with pipe_hir, "_type", "pipe"
+
+    Let stages be proc attr with node, "stages"
+    Let stages_hir be proc translate_node_list with stages
+    proc set_dict_value with pipe_hir, "stages", stages_hir
+
+    Return pipe_hir
+End Process
+
+@Reasoning:
+A call carries a callee expression and an args list. The callee is lowered as a
+subtree, the args as a real list, so call sites reconstruct accurately.
+@End Reasoning
+Process called "translate_call" takes node as Integer returns Integer:
+    Let call_hir be proc create_dict
+    proc set_dict_string with call_hir, "_type", "call"
+
+    Let callee be proc attr with node, "callee"
+    If callee is not equal to 0:
+        Let callee_hir be proc translate_node with callee
+        If callee_hir is not equal to 0:
+            proc set_dict_value with call_hir, "callee", callee_hir
+        End If
+    End If
+
+    Let args be proc attr with node, "args"
+    Let args_hir be proc translate_node_list with args
+    proc set_dict_value with call_hir, "args", args_hir
+
+    Return call_hir
+End Process
+
+@Reasoning:
+A case carries a scrutinee and a clauses list of match_clause nodes. Both
+survive; the clauses list is lowered into a real list so the probe asserts the
+2-clause case survives with clause count = 2.
+@End Reasoning
+Process called "translate_case" takes node as Integer returns Integer:
+    Let case_hir be proc create_dict
+    proc set_dict_string with case_hir, "_type", "case"
+
+    Let scrutinee be proc attr with node, "scrutinee"
+    If scrutinee is not equal to 0:
+        Let scrutinee_hir be proc translate_node with scrutinee
+        If scrutinee_hir is not equal to 0:
+            proc set_dict_value with case_hir, "scrutinee", scrutinee_hir
+        End If
+    End If
+
+    Let clauses be proc attr with node, "clauses"
+    Let clauses_hir be proc translate_node_list with clauses
+    proc set_dict_value with case_hir, "clauses", clauses_hir
+
+    Return case_hir
+End Process
+
+@Reasoning:
+A cond carries a clauses list of match_clause nodes (each clause's pattern is the
+boolean condition). The clauses list is lowered into a real list.
+@End Reasoning
+Process called "translate_cond" takes node as Integer returns Integer:
+    Let cond_hir be proc create_dict
+    proc set_dict_string with cond_hir, "_type", "cond"
+
+    Let clauses be proc attr with node, "clauses"
+    Let clauses_hir be proc translate_node_list with clauses
+    proc set_dict_value with cond_hir, "clauses", clauses_hir
+
+    Return cond_hir
+End Process
+
+@Reasoning:
+A with carries a generator clauses list (with_clause nodes) and a do body. Both
+survive as real lists.
+@End Reasoning
+Process called "translate_with" takes node as Integer returns Integer:
+    Let with_hir be proc create_dict
+    proc set_dict_string with with_hir, "_type", "with"
+
+    Let clauses be proc attr with node, "clauses"
+    Let clauses_hir be proc translate_node_list with clauses
+    proc set_dict_value with with_hir, "clauses", clauses_hir
+
+    Let body be proc attr with node, "body"
+    Let body_hir be proc translate_node_list with body
+    proc set_dict_value with with_hir, "body", body_hir
+
+    Return with_hir
+End Process
+
+@Reasoning:
+A with_clause / generator carries an optional pattern and a required expr. The
+pattern is lowered when present, the expr always.
+@End Reasoning
+Process called "translate_with_clause" takes node as Integer returns Integer:
+    Let wc_hir be proc create_dict
+    proc set_dict_string with wc_hir, "_type", "with_clause"
+
+    Let pattern be proc attr with node, "pattern"
+    If pattern is not equal to 0:
+        Let pattern_hir be proc translate_node with pattern
+        If pattern_hir is not equal to 0:
+            proc set_dict_value with wc_hir, "pattern", pattern_hir
+        End If
+    End If
+
+    Let expr be proc attr with node, "expr"
+    If expr is not equal to 0:
+        Let expr_hir be proc translate_node with expr
+        If expr_hir is not equal to 0:
+            proc set_dict_value with wc_hir, "expr", expr_hir
+        End If
+    End If
+
+    Return wc_hir
+End Process
+
+@Reasoning:
+if / unless carry a condition, a then_body list, and an else_body list. The tag
+selects the HIR _type; condition is lowered as a subtree, the bodies as real
+lists.
+@End Reasoning
+Process called "translate_if" takes node as Integer, tag as Integer returns Integer:
+    Let if_hir be proc create_dict
+    proc set_dict_string with if_hir, "_type", tag
+
+    Let condition be proc attr with node, "condition"
+    If condition is not equal to 0:
+        Let cond_hir be proc translate_node with condition
+        If cond_hir is not equal to 0:
+            proc set_dict_value with if_hir, "condition", cond_hir
+        End If
+    End If
+
+    Let then_body be proc attr with node, "then_body"
+    Let then_hir be proc translate_node_list with then_body
+    proc set_dict_value with if_hir, "then_body", then_hir
+
+    Let else_body be proc attr with node, "else_body"
+    Let else_hir be proc translate_node_list with else_body
+    proc set_dict_value with if_hir, "else_body", else_hir
+
+    Return if_hir
+End Process
+
+@Reasoning:
+A for comprehension carries generators, a body, an optional into expression, and
+a uniq flag. Generators and body are real lists; into is lowered when present;
+uniq is preserved as a "true"/"false" string.
+@End Reasoning
+Process called "translate_for" takes node as Integer returns Integer:
+    Let for_hir be proc create_dict
+    proc set_dict_string with for_hir, "_type", "for"
+
+    Let generators be proc attr with node, "generators"
+    Let generators_hir be proc translate_node_list with generators
+    proc set_dict_value with for_hir, "generators", generators_hir
+
+    Let body be proc attr with node, "body"
+    Let body_hir be proc translate_node_list with body
+    proc set_dict_value with for_hir, "body", body_hir
+
+    Let into be proc attr with node, "into"
+    If into is not equal to 0:
+        Let into_hir be proc translate_node with into
+        If into_hir is not equal to 0:
+            proc set_dict_value with for_hir, "into", into_hir
+        End If
+    End If
+
+    Let uniq be proc attr with node, "uniq"
+    If uniq is equal to 1:
+        proc set_dict_string with for_hir, "uniq", "true"
+    Otherwise:
+        proc set_dict_string with for_hir, "uniq", "false"
+    End If
+
+    Return for_hir
+End Process
+
+@Reasoning:
+A try carries a body, rescue clauses, catch clauses, and an after body. All four
+survive as real lists.
+@End Reasoning
+Process called "translate_try" takes node as Integer returns Integer:
+    Let try_hir be proc create_dict
+    proc set_dict_string with try_hir, "_type", "try"
+
+    Let try_body be proc attr with node, "body"
+    Let try_body_hir be proc translate_node_list with try_body
+    proc set_dict_value with try_hir, "body", try_body_hir
+
+    Let rescue be proc attr with node, "rescue"
+    Let rescue_hir be proc translate_node_list with rescue
+    proc set_dict_value with try_hir, "rescue", rescue_hir
+
+    Let catch be proc attr with node, "catch"
+    Let catch_hir be proc translate_node_list with catch
+    proc set_dict_value with try_hir, "catch", catch_hir
+
+    Let after be proc attr with node, "after"
+    Let after_hir be proc translate_node_list with after
+    proc set_dict_value with try_hir, "after", after_hir
+
+    Return try_hir
+End Process
+
+@Reasoning:
+A receive carries message clauses, an optional after_timeout expression, and an
+after_body list. The clauses and after_body are real lists; timeout is lowered
+when present.
+@End Reasoning
+Process called "translate_receive" takes node as Integer returns Integer:
+    Let recv_hir be proc create_dict
+    proc set_dict_string with recv_hir, "_type", "receive"
+
+    Let clauses be proc attr with node, "clauses"
+    Let clauses_hir be proc translate_node_list with clauses
+    proc set_dict_value with recv_hir, "clauses", clauses_hir
+
+    Let after_timeout be proc attr with node, "after_timeout"
+    If after_timeout is not equal to 0:
+        Let timeout_hir be proc translate_node with after_timeout
+        If timeout_hir is not equal to 0:
+            proc set_dict_value with recv_hir, "after_timeout", timeout_hir
+        End If
+    End If
+
+    Let after_body be proc attr with node, "after_body"
+    Let after_hir be proc translate_node_list with after_body
+    proc set_dict_value with recv_hir, "after_body", after_hir
+
+    Return recv_hir
+End Process
+
+@Reasoning:
+A match_clause carries a pattern, an optional guard, and a body. Pattern and body
+survive; guard is lowered when present.
+@End Reasoning
+Process called "translate_match_clause" takes node as Integer returns Integer:
+    Let mc_hir be proc create_dict
+    proc set_dict_string with mc_hir, "_type", "match_clause"
+
+    Let pattern be proc attr with node, "pattern"
+    If pattern is not equal to 0:
+        Let pattern_hir be proc translate_node with pattern
+        If pattern_hir is not equal to 0:
+            proc set_dict_value with mc_hir, "pattern", pattern_hir
+        End If
+    End If
+
+    Let guard be proc attr with node, "guard"
+    If guard is not equal to 0:
+        Let guard_hir be proc translate_node with guard
+        If guard_hir is not equal to 0:
+            proc set_dict_value with mc_hir, "guard", guard_hir
+        End If
+    End If
+
+    Let body be proc attr with node, "body"
+    Let body_hir be proc translate_node_list with body
+    proc set_dict_value with mc_hir, "body", body_hir
+
+    Return mc_hir
+End Process
+
+@Reasoning:
+An anonymous function carries a clauses list of clause nodes. The clauses list is
+lowered into a real list.
+@End Reasoning
+Process called "translate_fn" takes node as Integer returns Integer:
+    Let fn_hir be proc create_dict
+    proc set_dict_string with fn_hir, "_type", "fn"
+
+    Let clauses be proc attr with node, "clauses"
+    Let clauses_hir be proc translate_node_list with clauses
+    proc set_dict_value with fn_hir, "clauses", clauses_hir
+
+    Return fn_hir
+End Process
+
+@Reasoning:
+A capture (&target) carries a target expression. The target is lowered as a
+subtree.
+@End Reasoning
+Process called "translate_capture" takes node as Integer returns Integer:
+    Let cap_hir be proc create_dict
+    proc set_dict_string with cap_hir, "_type", "capture"
+
+    Let target be proc attr with node, "target"
+    If target is not equal to 0:
+        Let target_hir be proc translate_node with target
+        If target_hir is not equal to 0:
+            proc set_dict_value with cap_hir, "target", target_hir
+        End If
+    End If
+
+    Return cap_hir
+End Process
+
+Note: ============================================================================
+Note: COLLECTION + LEAF TRANSLATORS
+Note: ============================================================================
+
+@Reasoning:
+A map carries a pairs list of pair nodes and an optional update_source. The pairs
+list is lowered into a real list so the probe asserts the map's key set survives;
+update_source is lowered when present.
+@End Reasoning
+Process called "translate_map" takes node as Integer returns Integer:
+    Let map_hir be proc create_dict
+    proc set_dict_string with map_hir, "_type", "map"
+
+    Let pairs be proc attr with node, "pairs"
+    Let pairs_hir be proc translate_node_list with pairs
+    proc set_dict_value with map_hir, "pairs", pairs_hir
+
+    Let update_source be proc attr with node, "update_source"
+    If update_source is not equal to 0:
+        Let update_hir be proc translate_node with update_source
+        If update_hir is not equal to 0:
+            proc set_dict_value with map_hir, "update_source", update_hir
+        End If
+    End If
+
+    Return map_hir
+End Process
+
+@Reasoning:
+A struct literal carries a name (alias string) and a pairs list. The name is
+stored as a string; the pairs are lowered into a real list.
+@End Reasoning
+Process called "translate_struct_literal" takes node as Integer returns Integer:
+    Let sl_hir be proc create_dict
+    proc set_dict_string with sl_hir, "_type", "struct_literal"
+
+    Let name be proc attr with node, "name"
+    If name is not equal to 0:
+        proc set_dict_string with sl_hir, "name", name
+    End If
+
+    Let pairs be proc attr with node, "pairs"
+    Let pairs_hir be proc translate_node_list with pairs
+    proc set_dict_value with sl_hir, "pairs", pairs_hir
+
+    Return sl_hir
+End Process
+
+@Reasoning:
+A pair carries a key expression and a value expression. Both are lowered as
+subtrees (value may be 0 for a bare struct-field key).
+@End Reasoning
+Process called "translate_pair" takes node as Integer returns Integer:
+    Let pair_hir be proc create_dict
+    proc set_dict_string with pair_hir, "_type", "pair"
+
+    Let key be proc attr with node, "key"
+    If key is not equal to 0:
+        Let key_hir be proc translate_node with key
+        If key_hir is not equal to 0:
+            proc set_dict_value with pair_hir, "key", key_hir
+        End If
+    End If
+
+    Let value be proc attr with node, "value"
+    If value is not equal to 0:
+        Let value_hir be proc translate_node with value
+        If value_hir is not equal to 0:
+            proc set_dict_value with pair_hir, "value", value_hir
+        End If
+    End If
+
+    Return pair_hir
+End Process
+
+@Reasoning:
+A tuple stores its elements as AST children. They are lowered into a real
+"elements" list.
+@End Reasoning
+Process called "translate_tuple" takes node as Integer returns Integer:
+    Let tuple_hir be proc create_dict
+    proc set_dict_string with tuple_hir, "_type", "tuple"
+
+    Let elements_hir be proc translate_children with node
+    proc set_dict_value with tuple_hir, "elements", elements_hir
+
+    Return tuple_hir
+End Process
+
+@Reasoning:
+A list stores its elements as AST children and an optional cons tail attribute.
+Elements are lowered into a real "elements" list; the tail is lowered when
+present.
+@End Reasoning
+Process called "translate_list" takes node as Integer returns Integer:
+    Let list_hir be proc create_dict
+    proc set_dict_string with list_hir, "_type", "list"
+
+    Let elements_hir be proc translate_children with node
+    proc set_dict_value with list_hir, "elements", elements_hir
+
+    Let tail be proc attr with node, "tail"
+    If tail is not equal to 0:
+        Let tail_hir be proc translate_node with tail
+        If tail_hir is not equal to 0:
+            proc set_dict_value with list_hir, "tail", tail_hir
+        End If
+    End If
+
+    Return list_hir
+End Process
+
+@Reasoning:
+A bitstring/binary carries a segments list. Lowered into a real "segments" list.
+@End Reasoning
+Process called "translate_binary" takes node as Integer returns Integer:
+    Let bin_hir be proc create_dict
+    proc set_dict_string with bin_hir, "_type", "binary"
+
+    Let segments be proc attr with node, "segments"
+    Let segments_hir be proc translate_node_list with segments
+    proc set_dict_value with bin_hir, "segments", segments_hir
+
+    Return bin_hir
+End Process
+
+@Reasoning:
+An identifier carries a name string.
+@End Reasoning
+Process called "translate_identifier" takes node as Integer returns Integer:
+    Let id_hir be proc create_dict
+    proc set_dict_string with id_hir, "_type", "identifier"
+
+    Let name be proc attr with node, "name"
+    If name is not equal to 0:
+        proc set_dict_string with id_hir, "name", name
+    End If
+
+    Return id_hir
+End Process
+
+@Reasoning:
+A module alias reference carries a name string.
+@End Reasoning
+Process called "translate_alias_ref" takes node as Integer returns Integer:
+    Let ar_hir be proc create_dict
+    proc set_dict_string with ar_hir, "_type", "alias_ref"
+
+    Let name be proc attr with node, "name"
+    If name is not equal to 0:
+        proc set_dict_string with ar_hir, "name", name
+    End If
+
+    Return ar_hir
+End Process
+
+@Reasoning:
+An atom carries its value lexeme (including the leading ':').
+@End Reasoning
+Process called "translate_atom" takes node as Integer returns Integer:
+    Let atom_hir be proc create_dict
+    proc set_dict_string with atom_hir, "_type", "atom"
+
+    Let value be proc attr with node, "value"
+    If value is not equal to 0:
+        proc set_dict_string with atom_hir, "value", value
+    End If
+
+    Return atom_hir
+End Process
+
+@Reasoning:
+A literal carries a literal_type discriminator and a value lexeme. Both are
+preserved as strings.
+@End Reasoning
+Process called "translate_literal" takes node as Integer returns Integer:
+    Let lit_hir be proc create_dict
+    proc set_dict_string with lit_hir, "_type", "literal"
+
+    Let literal_type be proc attr with node, "literal_type"
+    If literal_type is not equal to 0:
+        proc set_dict_string with lit_hir, "literal_type", literal_type
+    End If
+
+    Let value be proc attr with node, "value"
+    If value is not equal to 0:
+        proc set_dict_string with lit_hir, "value", value
+    End If
+
+    Return lit_hir
+End Process
+
+@Reasoning:
+A binary operator carries an operator string and left/right operands. Elixir's
+operator surface has no per-op HIR_OP_* token in this dict-literal model, so the
+operator lexeme itself is preserved as the canonical "operator" string and also
+recorded under "elixir_operator" metadata so a HIR_OP-consuming backend can map
+it. Both operands are lowered as subtrees.
+@End Reasoning
+Process called "translate_binary_op" takes node as Integer returns Integer:
+    Let bop_hir be proc create_dict
+    proc set_dict_string with bop_hir, "_type", "binary_op"
+
+    Let operator be proc attr with node, "operator"
+    If operator is not equal to 0:
+        proc set_dict_string with bop_hir, "operator", operator
+        proc set_dict_string with bop_hir, "elixir_operator", operator
+    End If
+
+    Let left be proc attr with node, "left"
+    If left is not equal to 0:
+        Let left_hir be proc translate_node with left
+        If left_hir is not equal to 0:
+            proc set_dict_value with bop_hir, "left", left_hir
+        End If
+    End If
+
+    Let right be proc attr with node, "right"
+    If right is not equal to 0:
+        Let right_hir be proc translate_node with right
+        If right_hir is not equal to 0:
+            proc set_dict_value with bop_hir, "right", right_hir
+        End If
+    End If
+
+    Return bop_hir
+End Process
+
+@Reasoning:
+A unary operator carries an operator string and a single operand. The operator
+is preserved as the canonical "operator" string plus "elixir_operator" metadata;
+the operand is lowered as a subtree.
+@End Reasoning
+Process called "translate_unary_op" takes node as Integer returns Integer:
+    Let uop_hir be proc create_dict
+    proc set_dict_string with uop_hir, "_type", "unary_op"
+
+    Let operator be proc attr with node, "operator"
+    If operator is not equal to 0:
+        proc set_dict_string with uop_hir, "operator", operator
+        proc set_dict_string with uop_hir, "elixir_operator", operator
+    End If
+
+    Let operand be proc attr with node, "operand"
+    If operand is not equal to 0:
+        Let operand_hir be proc translate_node with operand
+        If operand_hir is not equal to 0:
+            proc set_dict_value with uop_hir, "operand", operand_hir
+        End If
+    End If
+
+    Return uop_hir
+End Process
+
+@Reasoning:
+A pin (^operand) in a pattern carries a single operand expression.
+@End Reasoning
+Process called "translate_pin" takes node as Integer returns Integer:
+    Let pin_hir be proc create_dict
+    proc set_dict_string with pin_hir, "_type", "pin"
+
+    Let operand be proc attr with node, "operand"
+    If operand is not equal to 0:
+        Let operand_hir be proc translate_node with operand
+        If operand_hir is not equal to 0:
+            proc set_dict_value with pin_hir, "operand", operand_hir
+        End If
+    End If
+
+    Return pin_hir
+End Process
+
+@Reasoning:
+A dotted access (object.member) carries an object expression and a member name
+string. The object is lowered as a subtree; the member is preserved as a string.
+@End Reasoning
+Process called "translate_access" takes node as Integer returns Integer:
+    Let acc_hir be proc create_dict
+    proc set_dict_string with acc_hir, "_type", "access"
+
+    Let object be proc attr with node, "object"
+    If object is not equal to 0:
+        Let object_hir be proc translate_node with object
+        If object_hir is not equal to 0:
+            proc set_dict_value with acc_hir, "object", object_hir
+        End If
+    End If
+
+    Let member be proc attr with node, "member"
+    If member is not equal to 0:
+        proc set_dict_string with acc_hir, "member", member
+    End If
+
+    Return acc_hir
+End Process
+
+@Reasoning:
+A keyword pair (name: value) carries a key string and a value expression. The key
+is preserved as a string; the value is lowered as a subtree.
+@End Reasoning
+Process called "translate_keyword_pair" takes node as Integer returns Integer:
+    Let kp_hir be proc create_dict
+    proc set_dict_string with kp_hir, "_type", "keyword_pair"
+
+    Let key be proc attr with node, "key"
+    If key is not equal to 0:
+        proc set_dict_string with kp_hir, "key", key
+    End If
+
+    Let value be proc attr with node, "value"
+    If value is not equal to 0:
+        Let value_hir be proc translate_node with value
+        If value_hir is not equal to 0:
+            proc set_dict_value with kp_hir, "value", value_hir
+        End If
+    End If
+
+    Return kp_hir
+End Process
+
+@Reasoning:
+A do/end grouping block carries a body statement list. Lowered into a real
+"body" list.
+@End Reasoning
+Process called "translate_block" takes node as Integer returns Integer:
+    Let block_hir be proc create_dict
+    proc set_dict_string with block_hir, "_type", "block"
+
+    Let body be proc attr with node, "body"
+    Let body_hir be proc translate_node_list with body
+    proc set_dict_value with block_hir, "body", body_hir
+
+    Return block_hir
 End Process

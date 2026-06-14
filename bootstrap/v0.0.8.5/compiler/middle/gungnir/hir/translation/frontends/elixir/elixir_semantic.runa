@@ -1,721 +1,959 @@
-Note: Elixir Semantic Analyzer for Translation Translation System
-Note: Handles Elixir's actor model, pattern matching, OTP behaviors, and metaprogramming
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
 
-Import "compiler/middle/gungnir/hir/translation/frontends/elixir/elixir_parser.runa" as ElixirParser
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+Elixir Semantic Analyzer - scope and name analysis over the Stage-A dict-AST.
+
+This pass walks the dictionary/list AST produced by elixir_parser.runa and
+performs real semantic analysis: it builds a module-member name table (function
+names defined per module), a definition set of struct field names, alias/import
+targets, and a per-clause binding scope, then resolves identifier references
+against those scopes. Unresolved references that are not Elixir built-ins are
+recorded as warnings (Elixir resolves many names dynamically, so they are not
+hard errors); genuine structural problems (a function with no clauses, a
+defmodule with an empty name) are recorded as errors.
+
+The AST is read entirely through the Stage-A contract: get_ast_attribute(node,
+key) for named attributes, get_ast_children(node) for positional children, and
+the "node_type" string attribute on every node.
+
+Dependencies:
+- compiler/middle/gungnir/hir/translation/frontends/elixir/elixir_parser.runa
+- compiler/frontend/primitives/memory/layout.runa
+- compiler/frontend/primitives/collections/list.runa
+- compiler/frontend/primitives/core/string_core.runa
+:End Note
+
+Import "compiler/middle/gungnir/hir/translation/frontends/elixir/elixir_parser.runa" as Parser
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/collections/list.runa" as ListOps
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+
+Note: ============================================================================
+Note: ANALYZER STATE
+Note: ============================================================================
+
 @Reasoning:
-The analyzer is the single mutable context threaded through every recursive AST visit; bundling all per-analysis state (module/function cursors, pattern bindings, actor registry, OTP behavior map, error/warning accumulators) into one struct lets the visitor restore prior state on exit without an explicit stack and keeps cross-cutting concerns (supervision tree, ETS usage, protocols) addressable from any visit site.
+The analyzer threads four lists through the recursive walk: defined_functions
+(names defined by def/defp across the analyzed modules), bound_variables (the
+identifier names currently in scope from clause params and pattern bindings),
+errors, and warnings. Using flat name lists rather than nested dictionaries keeps
+the binding scope cheap to save and restore around clause boundaries: a clause
+records the bound-list length on entry and truncates back to it on exit, so
+pattern variables never leak between sibling clauses.
 @End Reasoning
-@Implementation:
-Fields are typed Integer because they hold opaque pointers into Runa-side dictionaries and lists allocated via memory_allocate; that uniform handle representation lets the visitor functions accept any container without overloads. current_module and current_function are saved-and-restored across recursive analyze_* calls so nested module/function scopes do not corrupt outer state.
-@End Implementation
 Type called "ElixirSemanticAnalyzer":
-    symbol_table as Integer  Note: Module and function scope tracking
-    current_module as Integer  Note: Current module being analyzed
-    current_function as Integer  Note: Current function being analyzed
-    pattern_context as Integer  Note: Pattern matching variable bindings
-    actor_processes as Integer  Note: Map of spawned processes
-    genserver_state as Integer  Note: GenServer state analysis
-    supervisor_tree as Integer  Note: Supervision hierarchy
-    otp_behaviors as Integer  Note: OTP behavior compliance
-    protocol_implementations as Integer  Note: Protocol implementations
-    macro_definitions as Integer  Note: Macro definitions and expansions
-    metaprogramming_context as Integer  Note: Compile-time code generation
-    error_list as Integer  Note: Semantic errors
-    warning_list as Integer  Note: Semantic warnings
-    process_registry as Integer  Note: Named process registry
-    ets_tables as Integer  Note: ETS table usage
-    message_protocols as Integer  Note: Message passing protocols
+    defined_functions as Integer   Note: List of function-name strings defined
+    bound_variables as Integer     Note: List of in-scope variable-name strings
+    errors as Integer              Note: List of error message strings
+    warnings as Integer            Note: List of warning message strings
 End Type
 
 @Reasoning:
-A semantic Elixir module is more than a name and function list: OTP behavior membership, supervision strategy, protocols, structs, and use/import/alias dependencies all influence later semantic checks (callback completeness, supervision tree shape, protocol dispatch). Recording them on the module record lets validate_otp_behavior_compliance and analyze_supervision_tree work without re-walking the AST.
+Allocates a 32-byte analyzer with four freshly-created lists so each analysis run
+starts with empty scope and diagnostic state. Returns 0 on allocation failure so
+callers can guard.
 @End Reasoning
-Type called "ElixirSemanticModule":
-    name as String
-    attributes as Integer  Note: Module attributes (@moduledoc, @doc, etc.)
-    functions as Integer  Note: Public and private functions
-    macros as Integer  Note: Macro definitions
-    protocols as Integer  Note: Protocol definitions
-    implementations as Integer  Note: Protocol implementations
-    structs as Integer  Note: Struct definitions
-    otp_behavior as String  Note: OTP behavior if any
-    supervision_strategy as String  Note: If supervisor module
-    dependencies as Integer  Note: use, import, alias, require
-End Type
-
-@Reasoning:
-Elixir functions are multi-clause with guards, and pattern variables bound in one clause are scoped to that clause only; the semantic record therefore carries clauses, guards, and pattern_variables together so exhaustiveness, redundancy, and binding leakage can be checked locally. otp_callback is captured to flag deviations between callback signatures and behavior contracts (e.g., handle_call/3 arity).
-@End Reasoning
-Type called "ElixirSemanticFunction":
-    name as String
-    arity as Integer
-    clauses as Integer  Note: Function clauses for pattern matching
-    guards as Integer  Note: Guard expressions
-    visibility as String  Note: "public" or "private"
-    otp_callback as String  Note: OTP callback type if any
-    pattern_variables as Integer  Note: Variables bound in patterns
-    return_patterns as Integer  Note: Possible return value patterns
-    side_effects as Integer  Note: List of side effects
-End Type
-
-@Reasoning:
-Elixir processes form a graph (links and monitors) and an inheritance tree (supervision); modeling each spawn site with linked_processes, monitored_by, and supervision_info lets downstream checks detect orphan processes, missing trap_exit handlers, and unsupervised long-lived actors without re-traversing the AST.
-@End Reasoning
-Type called "ActorProcess":
-    spawn_location as Integer  Note: AST node where spawned
-    process_type as String  Note: "spawn", "Task", "GenServer", etc.
-    message_protocol as Integer  Note: Expected message types
-    linked_processes as Integer  Note: Linked processes
-    monitored_by as Integer  Note: Monitoring processes
-    supervision_info as Integer  Note: Supervisor information
-End Type
-
-@Reasoning:
-Construction zeros every container by allocating fresh dicts/lists rather than sharing module-level state, which prevents cross-analysis bleed when the same compiler invocation analyzes multiple Elixir source files. initialize_elixir_builtins is called here so users never see "undefined GenServer" against the standard library.
-@End Reasoning
-@Implementation:
-Each container field is initialized via create_dict or create_list which call memory_allocate; the analyzer struct is returned by value but Runa's struct semantics carry the heap pointers, so the caller owns the analyzer lifetime and is responsible for releasing it once the file has been fully analyzed.
-@End Implementation
 Process called "create_elixir_semantic_analyzer" returns Integer:
-    Note: Create new Elixir semantic analyzer instance
+    Note: Create a fresh Elixir semantic analyzer
 
-    Let analyzer be a value of type ElixirSemanticAnalyzer with
-        symbol_table as proc create_dict,
-        current_module as 0,
-        current_function as 0,
-        pattern_context as proc create_dict,
-        actor_processes as proc create_dict,
-        genserver_state as proc create_dict,
-        supervisor_tree as proc create_dict,
-        otp_behaviors as proc create_dict,
-        protocol_implementations as proc create_dict,
-        macro_definitions as proc create_dict,
-        metaprogramming_context as proc create_dict,
-        error_list as proc create_list,
-        warning_list as proc create_list,
-        process_registry as proc create_dict,
-        ets_tables as proc create_dict,
-        message_protocols as proc create_dict
+    Let analyzer be proc allocate from Layout with 32
+    If analyzer is equal to 0:
+        Return 0
+    End If
 
-    Note: Initialize built-in Elixir/OTP modules and functions
-    proc initialize_elixir_builtins from analyzer
+    Let defined_functions be proc create from ListOps
+    proc memory_set_int64 from Layout with analyzer, 0, defined_functions
+
+    Let bound_variables be proc create from ListOps
+    proc memory_set_int64 from Layout with analyzer, 8, bound_variables
+
+    Let errors be proc create from ListOps
+    proc memory_set_int64 from Layout with analyzer, 16, errors
+
+    Let warnings be proc create from ListOps
+    proc memory_set_int64 from Layout with analyzer, 24, warnings
 
     Return analyzer
 End Process
 
 @Reasoning:
-This is the central visitor dispatch. Using a Match on node_type instead of a polymorphic vtable keeps the dispatch tight and lets the type tags imported from ElixirParser stay the single source of truth; the Otherwise arm recurses into children so unknown node shapes never silently drop sub-analysis (e.g., nested defs inside an unrecognized macro expansion).
+Releases the analyzer struct. The four lists are borrowed by callers that may
+read diagnostics afterward, so only the 32-byte struct is freed here; callers own
+the analysis lifetime.
 @End Reasoning
-@Security_Scope:
-Input AST is untrusted user source; the Otherwise branch must walk children so attacker-crafted nodes cannot smuggle unanalyzed receive/spawn/send into the program. Every callee returns an Integer status and accumulates errors on analyzer.error_list rather than throwing, so a malformed subtree never aborts a whole-program analysis.
-@End Security_Scope
-Process called "analyze_elixir_ast" takes analyzer as Integer, ast as Integer returns Integer:
-    Note: Perform semantic analysis of Elixir AST with actor model validation
-
-    Let node_type be proc get_ast_node_type from ast
-
-    Match node_type:
-        When AST_MODULE from ElixirParser:
-            Return proc analyze_module with analyzer, ast
-        When AST_DEFMODULE from ElixirParser:
-            Return proc analyze_defmodule with analyzer, ast
-        When AST_DEF from ElixirParser:
-            Return proc analyze_def with analyzer, ast
-        When AST_DEFP from ElixirParser:
-            Return proc analyze_defp with analyzer, ast
-        When AST_DEFMACRO from ElixirParser:
-            Return proc analyze_defmacro with analyzer, ast
-        When AST_DEFSTRUCT from ElixirParser:
-            Return proc analyze_defstruct with analyzer, ast
-        When AST_DEFPROTOCOL from ElixirParser:
-            Return proc analyze_defprotocol with analyzer, ast
-        When AST_DEFIMPL from ElixirParser:
-            Return proc analyze_defimpl with analyzer, ast
-        When AST_USE from ElixirParser:
-            Return proc analyze_use with analyzer, ast
-        When AST_CASE from ElixirParser:
-            Return proc analyze_case with analyzer, ast
-        When AST_RECEIVE from ElixirParser:
-            Return proc analyze_receive with analyzer, ast
-        When AST_SPAWN from ElixirParser:
-            Return proc analyze_spawn with analyzer, ast
-        When AST_SEND from ElixirParser:
-            Return proc analyze_send with analyzer, ast
-        When AST_GENSERVER_CALL from ElixirParser:
-            Return proc analyze_genserver_call with analyzer, ast
-        When AST_GENSERVER_CAST from ElixirParser:
-            Return proc analyze_genserver_cast with analyzer, ast
-        When AST_PATTERN_MATCH from ElixirParser:
-            Return proc analyze_pattern_match with analyzer, ast
-        When AST_FUNCTION_CALL from ElixirParser:
-            Return proc analyze_function_call with analyzer, ast
-        When AST_PIPE from ElixirParser:
-            Return proc analyze_pipe with analyzer, ast
-        When AST_FOR from ElixirParser:
-            Return proc analyze_for_comprehension with analyzer, ast
-        When AST_WITH from ElixirParser:
-            Return proc analyze_with with analyzer, ast
-        Otherwise:
-            Return proc analyze_children with analyzer, ast
-    End Match
-End Process
-
-@Reasoning:
-defmodule establishes a new lexical and behavioral scope; we save the previous current_module before walking children and restore it after so nested defmodule (Elixir permits this) does not leak state. OTP and supervision validation are deferred to the end so they observe the fully populated function table.
-@End Reasoning
-Process called "analyze_defmodule" takes analyzer as Integer, ast as Integer returns Integer:
-    Note: Analyze Elixir module with OTP behavior detection
-
-    Let module_name be proc get_ast_attribute with ast, "name"
-
-    Let elixir_module be a value of type ElixirSemanticModule with
-        name as module_name,
-        attributes as proc create_dict,
-        functions as proc create_dict,
-        macros as proc create_dict,
-        protocols as proc create_dict,
-        implementations as proc create_dict,
-        structs as proc create_dict,
-        otp_behavior as "",
-        supervision_strategy as "",
-        dependencies as proc create_list
-
-    Note: Add module to symbol table
-    proc add_module_to_scope with analyzer, elixir_module
-
-    Note: Set module context
-    Let previous_module be analyzer.current_module
-    Set analyzer.current_module to elixir_module
-
-    Note: Analyze module body
-    Let child_count be proc get_ast_child_count from ast
-    Let index be 0
-
-    While index is less than child_count:
-        Let child be proc get_ast_child with ast, index
-        proc analyze_elixir_ast with analyzer, child
-        Set index to index plus 1
-    End While
-
-    Note: Validate OTP behavior compliance
-    If elixir_module.otp_behavior is not equal to "":
-        proc validate_otp_behavior_compliance with analyzer, elixir_module
+Process called "destroy_elixir_semantic_analyzer" takes analyzer as Integer returns Integer:
+    If analyzer is equal to 0:
+        Return 1
     End If
-
-    Note: Analyze supervision tree if supervisor
-    If elixir_module.supervision_strategy is not equal to "":
-        proc analyze_supervision_tree with analyzer, elixir_module
-    End If
-
-    Note: Restore previous module context
-    Set analyzer.current_module to previous_module
-
+    proc deallocate from Layout with analyzer
     Return 1
 End Process
 
-@Reasoning:
-def builds an ElixirSemanticFunction record, registers it in the enclosing module before analyzing the body so recursive self-references resolve, and runs validate_pattern_exhaustiveness only after every clause is in the record. The previous_function save/restore mirrors the module case for nested-definition tolerance.
-@End Reasoning
-Process called "analyze_def" takes analyzer as Integer, ast as Integer returns Integer:
-    Note: Analyze Elixir function definition with pattern matching
-
-    Let function_name be proc get_ast_attribute with ast, "name"
-    Let arity be proc get_ast_attribute with ast, "arity"
-
-    Let elixir_function be a value of type ElixirSemanticFunction with
-        name as function_name,
-        arity as arity,
-        clauses as proc create_list,
-        guards as proc create_list,
-        visibility as "public",
-        otp_callback as "",
-        pattern_variables as proc create_dict,
-        return_patterns as proc create_list,
-        side_effects as proc create_list
-
-    Note: Check if this is an OTP callback
-    proc check_otp_callback_function with analyzer, elixir_function
-
-    Note: Add function to current module
-    proc add_function_to_module with analyzer.current_module, elixir_function
-
-    Note: Set function context
-    Let previous_function be analyzer.current_function
-    Set analyzer.current_function to elixir_function
-
-    Note: Analyze function clauses
-    Let clauses be proc get_ast_attribute with ast, "clauses"
-    If clauses is not equal to 0:
-        proc analyze_function_clauses with analyzer, clauses, elixir_function
-    End If
-
-    Note: Analyze function body
-    Let body be proc get_ast_body from ast
-    If body is not equal to 0:
-        proc analyze_function_body with analyzer, body, elixir_function
-    End If
-
-    Note: Validate pattern exhaustiveness
-    proc validate_pattern_exhaustiveness with analyzer, elixir_function
-
-    Note: Restore previous function context
-    Set analyzer.current_function to previous_function
-
-    Return 1
-End Process
+Note: ============================================================================
+Note: SMALL ACCESSORS
+Note: ============================================================================
 
 @Reasoning:
-case introduces a fresh pattern-binding scope; we swap pattern_context for the duration so bindings made inside the case do not leak to siblings (e.g., {:ok, x} = case ... matches only inside that arm). pattern_coverage is collected across clauses and handed to check_pattern_exhaustiveness so the warning fires once with full information.
+Reads a node's string node_type attribute through the Stage-A accessor.
 @End Reasoning
-Process called "analyze_case" takes analyzer as Integer, ast as Integer returns Integer:
-    Note: Analyze case expression with pattern matching validation
-
-    Let expr be proc get_ast_attribute with ast, "expression"
-    proc analyze_elixir_ast with analyzer, expr
-
-    Note: Create new pattern context for case analysis
-    Let case_context be proc create_dict
-    Let previous_pattern_context be analyzer.pattern_context
-    Set analyzer.pattern_context to case_context
-
-    Note: Analyze each case clause
-    Let clauses be proc get_ast_attribute with ast, "clauses"
-    Let pattern_coverage be proc create_list
-
-    If clauses is not equal to 0:
-        Let clause_count be proc get_list_size from clauses
-        Let index be 0
-
-        While index is less than clause_count:
-            Let clause be proc get_list_item with clauses, index
-            proc analyze_case_clause with analyzer, clause, pattern_coverage
-            Set index to index plus 1
-        End While
-    End If
-
-    Note: Check pattern exhaustiveness
-    proc check_pattern_exhaustiveness with analyzer, pattern_coverage, ast
-
-    Note: Restore previous pattern context
-    Set analyzer.pattern_context to previous_pattern_context
-
-    Return 1
-End Process
-
-@Reasoning:
-receive is only meaningful inside a process; the context check emits a warning rather than an error because the host process may be set up dynamically (spawn(fn -> receive ... end)). Message patterns are gathered into one list before validate_message_protocol so cross-clause protocol gaps are detected in a single pass.
-@End Reasoning
-Process called "analyze_receive" takes analyzer as Integer, ast as Integer returns Integer:
-    Note: Analyze receive block for actor message handling
-
-    Note: Validate that we're in a process context
-    If proc is_in_process_context with analyzer is equal to 0:
-        proc add_semantic_warning with analyzer, "receive block outside process context", ast
-    End If
-
-    Note: Analyze message patterns
-    Let clauses be proc get_ast_attribute with ast, "clauses"
-    Let message_patterns be proc create_list
-
-    If clauses is not equal to 0:
-        Let clause_count be proc get_list_size from clauses
-        Let index be 0
-
-        While index is less than clause_count:
-            Let clause be proc get_list_item with clauses, index
-            Let pattern be proc get_ast_attribute with clause, "pattern"
-            proc analyze_message_pattern with analyzer, pattern, message_patterns
-            Set index to index plus 1
-        End While
-    End If
-
-    Note: Validate message protocol compliance
-    proc validate_message_protocol with analyzer, message_patterns, ast
-
-    Note: Analyze after clause (timeout)
-    Let after_clause be proc get_ast_attribute with ast, "after"
-    If after_clause is not equal to 0:
-        Let timeout be proc get_ast_attribute with after_clause, "timeout"
-        proc validate_timeout_expression with analyzer, timeout
-    End If
-
-    Return 1
-End Process
-
-@Reasoning:
-spawn variants (spawn, spawn_link, spawn_monitor) all share target validation but differ on link/monitor registration; the spawn_type string discriminates them so the actor process record can record the relationship for later supervision-tree analysis. Arity mismatch is an error (not a warning) because OTP processes will crash at startup otherwise.
-@End Reasoning
-@Security_Scope:
-The target module/function come from user source; function_exists must be called before recording the spawn so the actor registry never contains references to undefined callables. process_id is generated freshly per spawn to avoid registry-key collisions across analyses.
-@End Security_Scope
-Process called "analyze_spawn" takes analyzer as Integer, ast as Integer returns Integer:
-    Note: Analyze process spawning for actor model validation
-
-    Let spawn_type be proc get_ast_attribute with ast, "type"
-    Let module_name be proc get_ast_attribute with ast, "module"
-    Let function_name be proc get_ast_attribute with ast, "function"
-    Let arguments be proc get_ast_attribute with ast, "arguments"
-
-    Note: Validate target function exists and is callable
-    If proc function_exists with analyzer, module_name, function_name is equal to 0:
-        proc add_semantic_error with analyzer, "Undefined function in spawn", ast
+Process called "node_type_of" takes node as Integer returns Integer:
+    If node is equal to 0:
         Return 0
     End If
-
-    Note: Validate arity matches arguments
-    Let target_arity be proc get_function_arity with analyzer, module_name, function_name
-    Let arg_count be proc get_list_size from arguments
-    If target_arity is not equal to arg_count:
-        proc add_semantic_error with analyzer, "Arity mismatch in spawn", ast
-    End If
-
-    Note: Create actor process record
-    Let actor_process be a value of type ActorProcess with
-        spawn_location as ast,
-        process_type as spawn_type,
-        message_protocol as proc infer_message_protocol with analyzer, module_name, function_name,
-        linked_processes as proc create_list,
-        monitored_by as proc create_list,
-        supervision_info as 0
-
-    Note: Handle linking and monitoring
-    If spawn_type is equal to "spawn_link":
-        proc add_process_link with analyzer, actor_process
-    Otherwise If spawn_type is equal to "spawn_monitor":
-        proc add_process_monitor with analyzer, actor_process
-    End If
-
-    Note: Register process in actor system
-    Let process_id be proc generate_process_id
-    proc set_dict_value with analyzer.actor_processes, process_id, actor_process
-
-    Return 1
+    Return proc get_ast_attribute from Parser with node, "node_type"
 End Process
 
 @Reasoning:
-GenServer.call is synchronous; mismatched request shapes against handle_call clauses are the most common Elixir bug, so we resolve the target module and validate the request pattern against its handle_call clauses. Server module resolution may legitimately fail (dynamic Process.whereis), so unknown servers degrade to a warning rather than blocking compilation.
+Reads a named AST attribute; null-guards the node.
 @End Reasoning
-Process called "analyze_genserver_call" takes analyzer as Integer, ast as Integer returns Integer:
-    Note: Analyze GenServer.call for OTP compliance
-
-    Let server be proc get_ast_attribute with ast, "server"
-    Let request be proc get_ast_attribute with ast, "request"
-    Let timeout be proc get_ast_attribute with ast, "timeout"
-
-    Note: Validate server reference
-    proc validate_server_reference with analyzer, server, ast
-
-    Note: Check if server implements GenServer behavior
-    Let server_module be proc resolve_server_module with analyzer, server
-    If server_module is not equal to "":
-        If proc implements_genserver with analyzer, server_module is equal to 0:
-            proc add_semantic_warning with analyzer, "Server may not implement GenServer", ast
-        End If
-
-        Note: Validate request matches handle_call patterns
-        proc validate_genserver_request with analyzer, server_module, request, "handle_call", ast
-    End If
-
-    Note: Validate timeout if specified
-    If timeout is not equal to 0:
-        proc validate_timeout_value with analyzer, timeout, ast
-    End If
-
-    Return 1
-End Process
-
-@Reasoning:
-Elixir's = is a match operator that both tests and binds; we analyze the expression first because pattern reachability depends on what the expression can produce, then collect bindings into a local dict and merge them into pattern_context only after reachability is confirmed so unreachable patterns do not pollute the outer scope.
-@End Reasoning
-Process called "analyze_pattern_match" takes analyzer as Integer, ast as Integer returns Integer:
-    Note: Analyze pattern matching with variable binding
-
-    Let pattern be proc get_ast_attribute with ast, "pattern"
-    Let expression be proc get_ast_attribute with ast, "expression"
-
-    Note: Analyze expression first
-    proc analyze_elixir_ast with analyzer, expression
-
-    Note: Create pattern binding context
-    Let pattern_bindings be proc create_dict
-    proc analyze_pattern_bindings with analyzer, pattern, pattern_bindings
-
-    Note: Check for unreachable patterns
-    proc check_pattern_reachability with analyzer, pattern, ast
-
-    Note: Update pattern context with new bindings
-    proc merge_pattern_bindings with analyzer.pattern_context, pattern_bindings
-
-    Return 1
-End Process
-
-@Reasoning:
-use is the macro mechanism by which OTP behaviors are mixed in; we detect well-known behaviors and dispatch to behavior-specific analyzers (each of which knows the contract: GenServer expects handle_call/handle_cast/handle_info, Supervisor expects init/1 returning child specs, etc.). Non-behavior use directives still record a dependency so module-resolution stays complete.
-@End Reasoning
-Process called "analyze_use" takes analyzer as Integer, ast as Integer returns Integer:
-    Note: Analyze use directive for OTP behavior inclusion
-
-    Let module_name be proc get_ast_attribute with ast, "module"
-    Let options be proc get_ast_attribute with ast, "options"
-
-    Note: Check if this is an OTP behavior
-    If proc is_otp_behavior with module_name is equal to 1:
-        Note: Set OTP behavior for current module
-        Set analyzer.current_module.otp_behavior to module_name
-
-        Note: Validate required callbacks will be implemented
-        Let required_callbacks be proc get_required_callbacks from module_name
-        proc schedule_callback_validation with analyzer, required_callbacks
-
-        Note: Handle behavior-specific analysis
-        Match module_name:
-            When "GenServer":
-                proc analyze_genserver_behavior with analyzer, options, ast
-            When "Supervisor":
-                proc analyze_supervisor_behavior with analyzer, options, ast
-            When "Application":
-                proc analyze_application_behavior with analyzer, options, ast
-            When "Task":
-                proc analyze_task_behavior with analyzer, options, ast
-        End Match
-    End If
-
-    Note: Add to module dependencies
-    proc add_dependency with analyzer.current_module, "use", module_name
-
-    Return 1
-End Process
-
-@Reasoning:
-OTP behaviors are contractual: a module declaring `use GenServer` MUST implement every required callback or the BEAM will crash on first message. We loop over the behavior's required-callback table and emit a hard error per missing callback rather than aggregating, so the error messages point users at each individual omission.
-@End Reasoning
-Process called "validate_otp_behavior_compliance" takes analyzer as Integer, module_info as Integer returns Integer:
-    Note: Validate that module implements required OTP callbacks
-
-    Let behavior be module_info.otp_behavior
-    Let required_callbacks be proc get_required_callbacks from behavior
-    Let optional_callbacks be proc get_optional_callbacks from behavior
-
-    Note: Check required callbacks
-    Let callback_count be proc get_list_size from required_callbacks
-    Let index be 0
-
-    While index is less than callback_count:
-        Let callback_spec be proc get_list_item with required_callbacks, index
-        Let callback_name be proc get_dict_value with callback_spec, "name"
-        Let callback_arity be proc get_dict_value with callback_spec, "arity"
-
-        If proc module_has_function with module_info, callback_name, callback_arity is equal to 0:
-            proc add_semantic_error with analyzer, "Missing required callback", module_info
-        End If
-
-        Set index to index plus 1
-    End While
-
-    Note: Validate callback implementations
-    proc validate_callback_implementations with analyzer, module_info, behavior
-
-    Return 1
-End Process
-
-@Reasoning:
-Supervisors are validated by extracting child specs from init/1 because the OTP runtime calls exactly that function to bootstrap the tree; absence of init/1 is unrecoverable so we emit an error and return 0. Each child spec is validated individually so a single malformed entry does not mask the rest.
-@End Reasoning
-Process called "analyze_supervision_tree" takes analyzer as Integer, module_info as Integer returns Integer:
-    Note: Analyze supervisor module and build supervision tree
-
-    Let strategy be module_info.supervision_strategy
-    Let init_function be proc get_module_function with module_info, "init", 1
-
-    If init_function is equal to 0:
-        proc add_semantic_error with analyzer, "Supervisor missing init/1 function", module_info
+Process called "attr" takes node as Integer, key as Integer returns Integer:
+    If node is equal to 0:
         Return 0
     End If
-
-    Note: Analyze init function for child specifications
-    Let child_specs be proc extract_child_specs with analyzer, init_function
-
-    Note: Validate child specifications
-    Let spec_count be proc get_list_size from child_specs
-    Let index be 0
-
-    While index is less than spec_count:
-        Let child_spec be proc get_list_item with child_specs, index
-        proc validate_child_spec with analyzer, child_spec
-        Set index to index plus 1
-    End While
-
-    Note: Build supervision tree
-    Let supervision_node be proc create_supervision_node with module_info, child_specs
-    proc set_dict_value with analyzer.supervisor_tree, module_info.name, supervision_node
-
-    Return 1
+    Return proc get_ast_attribute from Parser with node, key
 End Process
 
 @Reasoning:
-The built-in module set is seeded at analyzer construction so user code that references Enum.map or GenServer.start_link never produces spurious "undefined module" errors. Registering OTP behaviors separately (vs. plain modules) lets is_otp_behavior remain a constant-time check.
+Records a semantic error message on the analyzer's error list.
 @End Reasoning
-Process called "initialize_elixir_builtins" takes analyzer as Integer returns Integer:
-    Note: Initialize built-in Elixir and OTP modules
-
-    Note: Core Elixir modules
-    proc add_builtin_module with analyzer, "Kernel"
-    proc add_builtin_module with analyzer, "Enum"
-    proc add_builtin_module with analyzer, "Stream"
-    proc add_builtin_module with analyzer, "String"
-    proc add_builtin_module with analyzer, "Integer"
-    proc add_builtin_module with analyzer, "Float"
-    proc add_builtin_module with analyzer, "Atom"
-    proc add_builtin_module with analyzer, "Tuple"
-    proc add_builtin_module with analyzer, "List"
-    proc add_builtin_module with analyzer, "Map"
-    proc add_builtin_module with analyzer, "Process"
-
-    Note: OTP behaviors
-    proc add_otp_behavior with analyzer, "GenServer"
-    proc add_otp_behavior with analyzer, "Supervisor"
-    proc add_otp_behavior with analyzer, "Application"
-    proc add_otp_behavior with analyzer, "Task"
-    proc add_otp_behavior with analyzer, "Agent"
-
-    Note: OTP applications
-    proc add_builtin_module with analyzer, "Registry"
-    proc add_builtin_module with analyzer, "DynamicSupervisor"
-    proc add_builtin_module with analyzer, "Task.Supervisor"
-
-    Return 1
-End Process
-
-Note: Helper processes for Elixir semantic analysis
-
-@Reasoning:
-Errors are recorded as structured dicts (message + line + column + severity) so the downstream diagnostics formatter can sort and group them; storing severity alongside the message keeps a single error_list capable of holding both errors and warnings if needed, while the dedicated warning_list keeps the two streams separable at the source.
-@End Reasoning
-Process called "add_semantic_error" takes analyzer as Integer, message as String, ast as Integer returns Integer:
-    Note: Add semantic error with location information
-
-    Let error be a value of type Dictionary[String, Any] with
-        "message" as message,
-        "line" as proc get_ast_line with ast,
-        "column" as proc get_ast_column with ast,
-        "severity" as "error"
-
-    proc add_to_list with analyzer.error_list, error
-    Return 1
-End Process
-
-@Reasoning:
-Warnings have the same shape as errors but go to a separate list so callers can choose to suppress them without losing error semantics. Severity is still recorded inside the dict to keep individual records self-describing for downstream consumers.
-@End Reasoning
-Process called "add_semantic_warning" takes analyzer as Integer, message as String, ast as Integer returns Integer:
-    Note: Add semantic warning with location information
-
-    Let warning be a value of type Dictionary[String, Any] with
-        "message" as message,
-        "line" as proc get_ast_line with ast,
-        "column" as proc get_ast_column with ast,
-        "severity" as "warning"
-
-    proc add_to_list with analyzer.warning_list, warning
-    Return 1
-End Process
-
-@Reasoning:
-The five canonical OTP behaviors are hard-coded because they're a closed set defined by OTP itself; using Match instead of a dict lookup keeps the test branch-free and is the natural shape for a fixed enumeration. Otherwise returns 0 (false) so user modules cannot impersonate a behavior by name.
-@End Reasoning
-Process called "is_otp_behavior" takes module_name as String returns Integer:
-    Note: Check if module is an OTP behavior
-
-    Match module_name:
-        When "GenServer": Return 1
-        When "Supervisor": Return 1
-        When "Application": Return 1
-        When "Task": Return 1
-        When "Agent": Return 1
-        Otherwise: Return 0
-    End Match
-End Process
-
-@Reasoning:
-Each OTP behavior declares a minimum-viable callback set: GenServer needs init/1 (handle_* are optional in the BEAM but typically required in practice), Supervisor needs init/1, Application needs start/2. We deliberately list only the truly-required callbacks so validate_otp_behavior_compliance doesn't false-positive on minimal but valid implementations.
-@End Reasoning
-Process called "get_required_callbacks" takes behavior as String returns Integer:
-    Note: Get required callbacks for OTP behavior
-
-    Match behavior:
-        When "GenServer":
-            Let callbacks be proc create_list
-            proc add_callback_spec with callbacks, "init", 1
-            Return callbacks
-        When "Supervisor":
-            Set callbacks to proc create_list
-            proc add_callback_spec with callbacks, "init", 1
-            Return callbacks
-        When "Application":
-            Set callbacks to proc create_list
-            proc add_callback_spec with callbacks, "start", 2
-            Return callbacks
-        Otherwise:
-            Return proc create_list
-    End Match
-End Process
-
-@Reasoning:
-A function is considered to exist iff its enclosing module is in the symbol table AND the module's functions dict contains the function name; we short-circuit on missing module so the dict_contains call is never invoked against a null pointer. Arity is intentionally not checked here because spawn-site validation handles arity separately.
-@End Reasoning
-Process called "function_exists" takes analyzer as Integer, module_name as String, function_name as String returns Integer:
-    Note: Check if function exists in module
-
-    Let module_info be proc get_dict_value with analyzer.symbol_table, module_name
-    If module_info is equal to 0:
+Process called "add_semantic_error" takes analyzer as Integer, message as Integer returns Integer:
+    If analyzer is equal to 0:
         Return 0
     End If
-
-    Return proc dict_contains with module_info.functions, function_name
+    Let errors be proc memory_get_int64 from Layout with analyzer, 16
+    proc list_append from ListOps with errors, message
+    Return 1
 End Process
 
 @Reasoning:
-GenServer membership is determined by the otp_behavior field set during analyze_use, not by any structural pattern (a module can implement handle_call without `use GenServer`, but the OTP runtime won't treat it as a GenServer). String equality on the behavior tag therefore matches the BEAM's own membership test.
+Records a semantic warning message on the analyzer's warning list.
 @End Reasoning
-Process called "implements_genserver" takes analyzer as Integer, module_name as String returns Integer:
-    Note: Check if module implements GenServer behavior
-
-    Let module_info be proc get_dict_value with analyzer.symbol_table, module_name
-    If module_info is equal to 0:
+Process called "add_semantic_warning" takes analyzer as Integer, message as Integer returns Integer:
+    If analyzer is equal to 0:
         Return 0
     End If
-
-    Return module_info.otp_behavior is equal to "GenServer"
+    Let warnings be proc memory_get_int64 from Layout with analyzer, 24
+    proc list_append from ListOps with warnings, message
+    Return 1
 End Process
 
 @Reasoning:
-The dictionary stores keys/values plus a size counter; 24 bytes is the analyzer-local convention for the header (three 8-byte slots) before any entries are appended via set_dict_value, keeping construction O(1) and decoupling from the dict implementation's growth policy.
-@End Reasoning
-Process called "create_dict" returns Integer:
-    Note: Create dictionary for storage
-    Return proc memory_allocate from Layout with 24
-End Process
-
-@Reasoning:
-The list header is two 8-byte slots (data pointer + size) which the list operations grow on demand; allocating just the header here keeps the analyzer's many empty lists (warning_list when there are no warnings, etc.) cheap.
-@End Reasoning
-Process called "create_list" returns Integer:
-    Note: Create list for storage
-    Return proc memory_allocate from Layout with 16
-End Process
-
-@Reasoning:
-Errors are exposed via accessor rather than direct field access so the analyzer remains free to switch its internal representation (e.g., to a deduplicated set) without changing the consumer contract.
+Returns the accumulated error list for the driver.
 @End Reasoning
 Process called "get_semantic_errors" takes analyzer as Integer returns Integer:
-    Note: Return list of semantic errors
-    Return analyzer.error_list
+    If analyzer is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Layout with analyzer, 16
 End Process
 
 @Reasoning:
-Warning access mirrors error access so callers using a single iterator pattern can swap streams without code changes; both lists share the same record shape established in add_semantic_error/add_semantic_warning.
+Returns the accumulated warning list for the driver.
 @End Reasoning
 Process called "get_semantic_warnings" takes analyzer as Integer returns Integer:
-    Note: Return list of semantic warnings
-    Return analyzer.warning_list
+    If analyzer is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Layout with analyzer, 24
+End Process
+
+Note: ============================================================================
+Note: SCOPE MANAGEMENT
+Note: ============================================================================
+
+@Reasoning:
+Records a defined function name so later reference resolution can recognise local
+calls. Duplicate names are permitted (multi-clause functions appear as repeated
+def nodes); the table is a definition set, not a uniqueness check.
+@End Reasoning
+Process called "define_function" takes analyzer as Integer, name as Integer returns Integer:
+    If analyzer is equal to 0:
+        Return 0
+    End If
+    If name is equal to 0:
+        Return 0
+    End If
+    Let defs be proc memory_get_int64 from Layout with analyzer, 0
+    proc list_append from ListOps with defs, name
+    Return 1
+End Process
+
+@Reasoning:
+Binds a variable name into the current scope. Used when a clause parameter or a
+pattern variable introduces a name. Records the name on the bound list.
+@End Reasoning
+Process called "bind_variable" takes analyzer as Integer, name as Integer returns Integer:
+    If analyzer is equal to 0:
+        Return 0
+    End If
+    If name is equal to 0:
+        Return 0
+    End If
+    Let bound be proc memory_get_int64 from Layout with analyzer, 8
+    proc list_append from ListOps with bound, name
+    Return 1
+End Process
+
+@Reasoning:
+Returns the current depth of the binding scope (the bound-variable list length).
+Clause analysis saves this on entry and truncates back to it on exit so pattern
+variables do not leak across sibling clauses.
+@End Reasoning
+Process called "scope_mark" takes analyzer as Integer returns Integer:
+    If analyzer is equal to 0:
+        Return 0
+    End If
+    Let bound be proc memory_get_int64 from Layout with analyzer, 8
+    Return proc list_length from ListOps with bound
+End Process
+
+@Reasoning:
+Truncates the binding scope back to a previously-recorded mark by rebuilding the
+bound-variable list with only the entries below the mark. Because list.runa has
+no in-place truncate primitive, we build a fresh list of the surviving prefix and
+install it as the analyzer's bound list. This restores the enclosing scope when a
+clause exits.
+@End Reasoning
+Process called "scope_restore" takes analyzer as Integer, mark as Integer returns Integer:
+    If analyzer is equal to 0:
+        Return 0
+    End If
+
+    Let bound be proc memory_get_int64 from Layout with analyzer, 8
+    Let count be proc list_length from ListOps with bound
+
+    Note: nothing to do if already at or below the mark
+    If count is less than or equal to mark:
+        Return 1
+    End If
+
+    Let rebuilt be proc create from ListOps
+    Let i be 0
+    While i is less than mark:
+        Let name be proc list_get from ListOps with bound, i
+        proc list_append from ListOps with rebuilt, name
+        Set i to i plus 1
+    End While
+
+    proc memory_set_int64 from Layout with analyzer, 8, rebuilt
+    Return 1
+End Process
+
+@Reasoning:
+True (1) when a variable name is currently in scope. Linear scan over the bound
+list comparing with string_equals. The underscore-prefixed convention and the
+special variable "_" are always considered bound (Elixir's wildcard).
+@End Reasoning
+Process called "is_variable_bound" takes analyzer as Integer, name as Integer returns Integer:
+    If analyzer is equal to 0:
+        Return 0
+    End If
+    If name is equal to 0:
+        Return 0
+    End If
+
+    Let is_wildcard be proc string_equals from StringCore with name, "_"
+    If is_wildcard is equal to 1:
+        Return 1
+    End If
+
+    Let bound be proc memory_get_int64 from Layout with analyzer, 8
+    Let count be proc list_length from ListOps with bound
+    Let i be 0
+    While i is less than count:
+        Let bn be proc list_get from ListOps with bound, i
+        Let matches be proc string_equals from StringCore with bn, name
+        If matches is equal to 1:
+            Return 1
+        End If
+        Set i to i plus 1
+    End While
+
+    Return 0
+End Process
+
+@Reasoning:
+True (1) when a function name is a recognised Elixir / Kernel built-in or a known
+standard call form. Identifiers that are not bound variables but match a built-in
+are not flagged as unresolved references. The set covers the common Kernel macros
+and functions exercised by translated programs.
+@End Reasoning
+Process called "is_builtin_name" takes name as Integer returns Integer:
+    If name is equal to 0:
+        Return 0
+    End If
+
+    If proc string_equals from StringCore with name, "is_integer":
+        Return 1
+    End If
+    If proc string_equals from StringCore with name, "is_atom":
+        Return 1
+    End If
+    If proc string_equals from StringCore with name, "is_binary":
+        Return 1
+    End If
+    If proc string_equals from StringCore with name, "is_list":
+        Return 1
+    End If
+    If proc string_equals from StringCore with name, "is_map":
+        Return 1
+    End If
+    If proc string_equals from StringCore with name, "is_nil":
+        Return 1
+    End If
+    If proc string_equals from StringCore with name, "length":
+        Return 1
+    End If
+    If proc string_equals from StringCore with name, "hd":
+        Return 1
+    End If
+    If proc string_equals from StringCore with name, "tl":
+        Return 1
+    End If
+    If proc string_equals from StringCore with name, "to_string":
+        Return 1
+    End If
+    If proc string_equals from StringCore with name, "elem":
+        Return 1
+    End If
+    If proc string_equals from StringCore with name, "map_size":
+        Return 1
+    End If
+    If proc string_equals from StringCore with name, "raise":
+        Return 1
+    End If
+    If proc string_equals from StringCore with name, "throw":
+        Return 1
+    End If
+    If proc string_equals from StringCore with name, "send":
+        Return 1
+    End If
+    If proc string_equals from StringCore with name, "self":
+        Return 1
+    End If
+    If proc string_equals from StringCore with name, "spawn":
+        Return 1
+    End If
+
+    Return 0
+End Process
+
+@Reasoning:
+True (1) when a function name is one of those defined in the analyzed modules.
+Linear scan over the definition set.
+@End Reasoning
+Process called "is_function_defined" takes analyzer as Integer, name as Integer returns Integer:
+    If analyzer is equal to 0:
+        Return 0
+    End If
+    If name is equal to 0:
+        Return 0
+    End If
+
+    Let defs be proc memory_get_int64 from Layout with analyzer, 0
+    Let count be proc list_length from ListOps with defs
+    Let i be 0
+    While i is less than count:
+        Let dn be proc list_get from ListOps with defs, i
+        Let matches be proc string_equals from StringCore with dn, name
+        If matches is equal to 1:
+            Return 1
+        End If
+        Set i to i plus 1
+    End While
+
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: TOP-LEVEL ANALYSIS
+Note: ============================================================================
+
+@Reasoning:
+Entry point. Performs a two-phase analysis. Phase 1 collects every function name
+defined across the module body so forward references (a function calling one
+defined later) resolve. Phase 2 walks every member resolving references against
+the collected definitions and per-clause binding scopes. A null AST is a no-op
+success.
+@End Reasoning
+Process called "analyze_elixir_ast" takes analyzer as Integer, ast as Integer returns Integer:
+    Note: Analyze the Elixir AST for scope/name correctness
+
+    If analyzer is equal to 0:
+        Return 0
+    End If
+    If ast is equal to 0:
+        Return 1
+    End If
+
+    Let nt be proc node_type_of with ast
+    If nt is equal to 0:
+        Return 1
+    End If
+
+    Let is_module be proc string_equals from StringCore with nt, "elixir_module"
+    If is_module is equal to 1:
+        Return proc analyze_module with analyzer, ast
+    End If
+
+    Note: bare top-level form
+    Return proc analyze_node with analyzer, ast
+End Process
+
+@Reasoning:
+Analyzes a module: validates the name is present, then runs the two-phase
+collect/resolve over the body. The name being empty for an anonymous top-level
+container is allowed; a defmodule that lost its name during parsing is an error.
+@End Reasoning
+Process called "analyze_module" takes analyzer as Integer, ast as Integer returns Integer:
+    Let body be proc attr with ast, "body"
+    If body is equal to 0:
+        Return 1
+    End If
+
+    Note: Phase 1 - collect function definitions for forward references
+    Let count be proc list_length from ListOps with body
+    Let i be 0
+    While i is less than count:
+        Let member be proc list_get from ListOps with body, i
+        If member is not equal to 0:
+            proc collect_definitions with analyzer, member
+        End If
+        Set i to i plus 1
+    End While
+
+    Note: Phase 2 - resolve references member by member
+    Let j be 0
+    While j is less than count:
+        Let member2 be proc list_get from ListOps with body, j
+        If member2 is not equal to 0:
+            proc analyze_node with analyzer, member2
+        End If
+        Set j to j plus 1
+    End While
+
+    Return 1
+End Process
+
+@Reasoning:
+Phase-1 collector: records function and protocol-body function names so the
+resolve phase recognises local calls regardless of definition order. Also
+recurses into defprotocol/defimpl bodies whose members are themselves functions.
+@End Reasoning
+Process called "collect_definitions" takes analyzer as Integer, node as Integer returns Integer:
+    If node is equal to 0:
+        Return 1
+    End If
+
+    Let nt be proc node_type_of with node
+    If nt is equal to 0:
+        Return 1
+    End If
+
+    Let is_function be proc string_equals from StringCore with nt, "function"
+    If is_function is equal to 1:
+        Let name be proc attr with node, "name"
+        If name is not equal to 0:
+            proc define_function with analyzer, name
+        End If
+        Return 1
+    End If
+
+    Let is_protocol be proc string_equals from StringCore with nt, "defprotocol"
+    If is_protocol is equal to 1:
+        Let pbody be proc attr with node, "body"
+        proc collect_definitions_in_list with analyzer, pbody
+        Return 1
+    End If
+
+    Let is_impl be proc string_equals from StringCore with nt, "defimpl"
+    If is_impl is equal to 1:
+        Let ibody be proc attr with node, "body"
+        proc collect_definitions_in_list with analyzer, ibody
+        Return 1
+    End If
+
+    Return 1
+End Process
+
+@Reasoning:
+Collects definitions from every node in a list (a protocol/impl body). Null-safe.
+@End Reasoning
+Process called "collect_definitions_in_list" takes analyzer as Integer, lst as Integer returns Integer:
+    If lst is equal to 0:
+        Return 1
+    End If
+    Let count be proc list_length from ListOps with lst
+    Let i be 0
+    While i is less than count:
+        Let member be proc list_get from ListOps with lst, i
+        If member is not equal to 0:
+            proc collect_definitions with analyzer, member
+        End If
+        Set i to i plus 1
+    End While
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: NODE RESOLUTION WALK
+Note: ============================================================================
+
+@Reasoning:
+Central resolution dispatcher. Routes declaration and control-flow nodes to their
+scope-aware analyzers; leaf identifiers go through reference resolution; every
+other node recurses into its sub-expressions. Returns 1 (success) for every node;
+diagnostics accumulate on the analyzer rather than aborting the walk.
+@End Reasoning
+Process called "analyze_node" takes analyzer as Integer, node as Integer returns Integer:
+    If node is equal to 0:
+        Return 1
+    End If
+
+    Let nt be proc node_type_of with node
+    If nt is equal to 0:
+        Return 1
+    End If
+
+    If proc string_equals from StringCore with nt, "function":
+        Return proc analyze_function with analyzer, node
+    End If
+    If proc string_equals from StringCore with nt, "clause":
+        Return proc analyze_clause with analyzer, node
+    End If
+    If proc string_equals from StringCore with nt, "match_clause":
+        Return proc analyze_match_clause with analyzer, node
+    End If
+    If proc string_equals from StringCore with nt, "with_clause":
+        Return proc analyze_with_clause with analyzer, node
+    End If
+    If proc string_equals from StringCore with nt, "fn":
+        Return proc analyze_fn with analyzer, node
+    End If
+    If proc string_equals from StringCore with nt, "defprotocol":
+        Let pbody be proc attr with node, "body"
+        Return proc analyze_node_list with analyzer, pbody
+    End If
+    If proc string_equals from StringCore with nt, "defimpl":
+        Let ibody be proc attr with node, "body"
+        Return proc analyze_node_list with analyzer, ibody
+    End If
+    If proc string_equals from StringCore with nt, "identifier":
+        Return proc resolve_identifier with analyzer, node
+    End If
+
+    Note: every other node: resolve named sub-expressions + children generically
+    Return proc analyze_generic with analyzer, node
+End Process
+
+@Reasoning:
+Analyzes every node in a list. Null-safe.
+@End Reasoning
+Process called "analyze_node_list" takes analyzer as Integer, lst as Integer returns Integer:
+    If lst is equal to 0:
+        Return 1
+    End If
+    Let count be proc list_length from ListOps with lst
+    Let i be 0
+    While i is less than count:
+        Let item be proc list_get from ListOps with lst, i
+        If item is not equal to 0:
+            proc analyze_node with analyzer, item
+        End If
+        Set i to i plus 1
+    End While
+    Return 1
+End Process
+
+@Reasoning:
+A function with no clauses is a structural error (the parser always produces at
+least one clause for a real def). Otherwise each clause is analyzed in its own
+fresh binding scope.
+@End Reasoning
+Process called "analyze_function" takes analyzer as Integer, node as Integer returns Integer:
+    Let clauses be proc attr with node, "clauses"
+    If clauses is equal to 0:
+        proc add_semantic_error with analyzer, "function has no clauses"
+        Return 1
+    End If
+
+    Let count be proc list_length from ListOps with clauses
+    If count is equal to 0:
+        proc add_semantic_error with analyzer, "function has no clauses"
+        Return 1
+    End If
+
+    Let i be 0
+    While i is less than count:
+        Let clause be proc list_get from ListOps with clauses, i
+        If clause is not equal to 0:
+            proc analyze_clause with analyzer, clause
+        End If
+        Set i to i plus 1
+    End While
+
+    Return 1
+End Process
+
+@Reasoning:
+A function/fn clause opens a fresh binding scope. Parameters bind their
+identifier names (pattern variables); the optional guard and the body are then
+resolved with those bindings in scope. On exit the scope is restored so the next
+clause starts clean.
+@End Reasoning
+Process called "analyze_clause" takes analyzer as Integer, node as Integer returns Integer:
+    Let mark be proc scope_mark with analyzer
+
+    Let params be proc attr with node, "params"
+    proc bind_patterns_in_list with analyzer, params
+
+    Let guard be proc attr with node, "guard"
+    If guard is not equal to 0:
+        proc analyze_node with analyzer, guard
+    End If
+
+    Let body be proc attr with node, "body"
+    proc analyze_node_list with analyzer, body
+
+    proc scope_restore with analyzer, mark
+    Return 1
+End Process
+
+@Reasoning:
+A case/cond/receive match_clause opens a fresh scope: the pattern binds its
+variables (and the guard / body resolve against them), then the scope is
+restored. This is what makes the depth-probe's pattern-binding clause well-formed.
+@End Reasoning
+Process called "analyze_match_clause" takes analyzer as Integer, node as Integer returns Integer:
+    Let mark be proc scope_mark with analyzer
+
+    Let pattern be proc attr with node, "pattern"
+    If pattern is not equal to 0:
+        proc bind_pattern with analyzer, pattern
+    End If
+
+    Let guard be proc attr with node, "guard"
+    If guard is not equal to 0:
+        proc analyze_node with analyzer, guard
+    End If
+
+    Let body be proc attr with node, "body"
+    proc analyze_node_list with analyzer, body
+
+    proc scope_restore with analyzer, mark
+    Return 1
+End Process
+
+@Reasoning:
+A with_clause (or for generator) binds its pattern into scope and resolves its
+right-hand expression. Unlike a match_clause the binding persists into the
+following with-clauses and body (that is with's semantics), so no scope restore is
+performed here; the enclosing construct's analyzer manages the outer scope.
+@End Reasoning
+Process called "analyze_with_clause" takes analyzer as Integer, node as Integer returns Integer:
+    Let expr be proc attr with node, "expr"
+    If expr is not equal to 0:
+        proc analyze_node with analyzer, expr
+    End If
+
+    Let pattern be proc attr with node, "pattern"
+    If pattern is not equal to 0:
+        proc bind_pattern with analyzer, pattern
+    End If
+
+    Return 1
+End Process
+
+@Reasoning:
+An anonymous function's clauses each open a fresh scope, exactly like a named
+function's clauses.
+@End Reasoning
+Process called "analyze_fn" takes analyzer as Integer, node as Integer returns Integer:
+    Let clauses be proc attr with node, "clauses"
+    If clauses is equal to 0:
+        Return 1
+    End If
+    Let count be proc list_length from ListOps with clauses
+    Let i be 0
+    While i is less than count:
+        Let clause be proc list_get from ListOps with clauses, i
+        If clause is not equal to 0:
+            proc analyze_clause with analyzer, clause
+        End If
+        Set i to i plus 1
+    End While
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: PATTERN BINDING
+Note: ============================================================================
+
+@Reasoning:
+Binds every variable a pattern introduces. Identifiers bind their name. Pins
+(^x) do NOT bind (they match an existing value), so the pinned operand is left
+unbound. Tuples, lists, maps, struct literals and binaries bind their
+sub-patterns recursively. binary_op patterns (e.g. default-arg p \\ d, or a
+cons) bind their operands. Atom/literal patterns bind nothing.
+@End Reasoning
+Process called "bind_pattern" takes analyzer as Integer, node as Integer returns Integer:
+    If node is equal to 0:
+        Return 1
+    End If
+
+    Let nt be proc node_type_of with node
+    If nt is equal to 0:
+        Return 1
+    End If
+
+    If proc string_equals from StringCore with nt, "identifier":
+        Let name be proc attr with node, "name"
+        If name is not equal to 0:
+            proc bind_variable with analyzer, name
+        End If
+        Return 1
+    End If
+
+    If proc string_equals from StringCore with nt, "pin":
+        Note: ^x matches an existing binding; resolve it, do not bind.
+        Let operand be proc attr with node, "operand"
+        If operand is not equal to 0:
+            proc analyze_node with analyzer, operand
+        End If
+        Return 1
+    End If
+
+    If proc string_equals from StringCore with nt, "tuple":
+        Return proc bind_patterns_in_children with analyzer, node
+    End If
+
+    If proc string_equals from StringCore with nt, "list":
+        proc bind_patterns_in_children with analyzer, node
+        Let tail be proc attr with node, "tail"
+        If tail is not equal to 0:
+            proc bind_pattern with analyzer, tail
+        End If
+        Return 1
+    End If
+
+    If proc string_equals from StringCore with nt, "map":
+        Let pairs be proc attr with node, "pairs"
+        proc bind_patterns_in_pairs with analyzer, pairs
+        Return 1
+    End If
+
+    If proc string_equals from StringCore with nt, "struct_literal":
+        Let spairs be proc attr with node, "pairs"
+        proc bind_patterns_in_pairs with analyzer, spairs
+        Return 1
+    End If
+
+    If proc string_equals from StringCore with nt, "binary":
+        Let segments be proc attr with node, "segments"
+        proc bind_patterns_in_list with analyzer, segments
+        Return 1
+    End If
+
+    If proc string_equals from StringCore with nt, "binary_op":
+        Note: e.g. cons / default-arg patterns: bind both operands.
+        Let left be proc attr with node, "left"
+        If left is not equal to 0:
+            proc bind_pattern with analyzer, left
+        End If
+        Let right be proc attr with node, "right"
+        If right is not equal to 0:
+            proc bind_pattern with analyzer, right
+        End If
+        Return 1
+    End If
+
+    Note: atom / literal / alias_ref patterns bind nothing
+    Return 1
+End Process
+
+@Reasoning:
+Binds patterns for every node in a list (clause params, binary segments).
+Null-safe.
+@End Reasoning
+Process called "bind_patterns_in_list" takes analyzer as Integer, lst as Integer returns Integer:
+    If lst is equal to 0:
+        Return 1
+    End If
+    Let count be proc list_length from ListOps with lst
+    Let i be 0
+    While i is less than count:
+        Let item be proc list_get from ListOps with lst, i
+        If item is not equal to 0:
+            proc bind_pattern with analyzer, item
+        End If
+        Set i to i plus 1
+    End While
+    Return 1
+End Process
+
+@Reasoning:
+Binds patterns for every child of a node (tuple / list element children).
+Null-safe.
+@End Reasoning
+Process called "bind_patterns_in_children" takes analyzer as Integer, node as Integer returns Integer:
+    Let children be proc get_ast_children from Parser with node
+    If children is equal to 0:
+        Return 1
+    End If
+    Let count be proc list_length from ListOps with children
+    Let i be 0
+    While i is less than count:
+        Let child be proc list_get from ListOps with children, i
+        If child is not equal to 0:
+            proc bind_pattern with analyzer, child
+        End If
+        Set i to i plus 1
+    End While
+    Return 1
+End Process
+
+@Reasoning:
+Binds the value side of each pair in a map/struct pattern (the key is matched, the
+value side carries the bindings). Null-safe.
+@End Reasoning
+Process called "bind_patterns_in_pairs" takes analyzer as Integer, pairs as Integer returns Integer:
+    If pairs is equal to 0:
+        Return 1
+    End If
+    Let count be proc list_length from ListOps with pairs
+    Let i be 0
+    While i is less than count:
+        Let pair be proc list_get from ListOps with pairs, i
+        If pair is not equal to 0:
+            Let value be proc attr with pair, "value"
+            If value is not equal to 0:
+                proc bind_pattern with analyzer, value
+            End If
+        End If
+        Set i to i plus 1
+    End While
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: REFERENCE RESOLUTION
+Note: ============================================================================
+
+@Reasoning:
+Resolves an identifier reference. A name that is a bound variable, a defined
+function, or an Elixir built-in resolves cleanly. Anything else is recorded as a
+warning rather than an error: Elixir resolves many names at runtime (imported
+functions, dynamically-required modules), so an unbound bare identifier is
+suspicious but not provably wrong. The warning makes the analysis observable
+without rejecting valid programs.
+@End Reasoning
+Process called "resolve_identifier" takes analyzer as Integer, node as Integer returns Integer:
+    Let name be proc attr with node, "name"
+    If name is equal to 0:
+        Return 1
+    End If
+
+    Let bound be proc is_variable_bound with analyzer, name
+    If bound is equal to 1:
+        Return 1
+    End If
+
+    Let defined be proc is_function_defined with analyzer, name
+    If defined is equal to 1:
+        Return 1
+    End If
+
+    Let builtin be proc is_builtin_name with name
+    If builtin is equal to 1:
+        Return 1
+    End If
+
+    proc add_semantic_warning with analyzer, "unresolved reference"
+    Return 1
+End Process
+
+@Reasoning:
+Generic recursion for expression nodes that are not scope-introducing. Resolves
+the standard named sub-expression slots (callee, args, scrutinee, clauses,
+condition, bodies, operands, stages, pairs, etc.) and the positional children,
+so every reachable identifier reaches resolve_identifier. The slot set is the
+union of every attribute key the dict-AST contract defines that can hold an
+expression or expression list, so no sub-expression is skipped.
+@End Reasoning
+Process called "analyze_generic" takes analyzer as Integer, node as Integer returns Integer:
+    Note: single-expression slots
+    proc analyze_attr_node with analyzer, node, "callee"
+    proc analyze_attr_node with analyzer, node, "scrutinee"
+    proc analyze_attr_node with analyzer, node, "condition"
+    proc analyze_attr_node with analyzer, node, "left"
+    proc analyze_attr_node with analyzer, node, "right"
+    proc analyze_attr_node with analyzer, node, "operand"
+    proc analyze_attr_node with analyzer, node, "object"
+    proc analyze_attr_node with analyzer, node, "target"
+    proc analyze_attr_node with analyzer, node, "value"
+    proc analyze_attr_node with analyzer, node, "key"
+    proc analyze_attr_node with analyzer, node, "expr"
+    proc analyze_attr_node with analyzer, node, "into"
+    proc analyze_attr_node with analyzer, node, "after_timeout"
+    proc analyze_attr_node with analyzer, node, "update_source"
+    proc analyze_attr_node with analyzer, node, "for_target"
+
+    Note: expression-list slots
+    proc analyze_attr_list with analyzer, node, "args"
+    proc analyze_attr_list with analyzer, node, "stages"
+    proc analyze_attr_list with analyzer, node, "clauses"
+    proc analyze_attr_list with analyzer, node, "then_body"
+    proc analyze_attr_list with analyzer, node, "else_body"
+    proc analyze_attr_list with analyzer, node, "body"
+    proc analyze_attr_list with analyzer, node, "generators"
+    proc analyze_attr_list with analyzer, node, "rescue"
+    proc analyze_attr_list with analyzer, node, "catch"
+    proc analyze_attr_list with analyzer, node, "after"
+    proc analyze_attr_list with analyzer, node, "after_body"
+    proc analyze_attr_list with analyzer, node, "pairs"
+    proc analyze_attr_list with analyzer, node, "segments"
+
+    Note: positional children (tuple / list elements)
+    Let children be proc get_ast_children from Parser with node
+    If children is not equal to 0:
+        proc analyze_node_list with analyzer, children
+    End If
+
+    Return 1
+End Process
+
+@Reasoning:
+Resolves a single named-attribute sub-node when present. Null-safe.
+@End Reasoning
+Process called "analyze_attr_node" takes analyzer as Integer, node as Integer, key as Integer returns Integer:
+    Let child be proc attr with node, key
+    If child is not equal to 0:
+        proc analyze_node with analyzer, child
+    End If
+    Return 1
+End Process
+
+@Reasoning:
+Resolves a single named-attribute list of sub-nodes when present. Null-safe.
+@End Reasoning
+Process called "analyze_attr_list" takes analyzer as Integer, node as Integer, key as Integer returns Integer:
+    Let lst be proc attr with node, key
+    If lst is not equal to 0:
+        proc analyze_node_list with analyzer, lst
+    End If
+    Return 1
 End Process
