@@ -323,7 +323,17 @@ Process called "skip_to_recovery" takes parser as Integer:
         proc advance_token with parser
     End While
 
-    If parser_obj.current_token is equal to TOKEN_SEMICOLON or parser_obj.current_token is equal to TOKEN_NEWLINE:
+    Note:
+    Consume the synchronisation token itself so the caller resumes at the token
+    AFTER it. Critically, a right-brace must also be consumed here: leaving it in
+    place let the top-level declaration loop re-enter skip_to_recovery on the same
+    "}" forever (its loop condition is already false on a right-brace, so it never
+    advanced) - a non-advancing parser loop that exhausted memory. Consuming the
+    brace guarantees forward progress on every recovery.
+    :End Note
+    If parser_obj.current_token is equal to TOKEN_SEMICOLON or
+       parser_obj.current_token is equal to TOKEN_NEWLINE or
+       parser_obj.current_token is equal to TOKEN_RIGHT_BRACE:
         proc advance_token with parser
     End If
 End Process
@@ -365,11 +375,26 @@ Process called "parse_scala_compilation_unit" takes parser as Integer returns In
             Break
         End If
 
+        Note:
+        Snapshot the byte cursor before sub-parsing. If a failed declaration plus
+        recovery leaves the cursor exactly where it started, no token was
+        consumed and re-entering would spin forever (a non-advancing parser loop
+        that exhausts memory). The guard force-advances one token in that case so
+        progress is always made.
+        :End Note
+        Let pos_before be parser_obj.position
+
         Let decl be proc parse_top_level_declaration with parser
         If decl is not equal to 0:
             proc add_child with program, decl
         Otherwise:
             proc skip_to_recovery with parser
+        End If
+
+        If parser_obj.current_token is not equal to TOKEN_EOF:
+            If parser_obj.position is equal to pos_before:
+                proc advance_token with parser
+            End If
         End If
     End While
 
@@ -481,13 +506,29 @@ Process called "parse_qualified_identifier" takes parser as Integer returns Inte
     proc list_append from List with name_parts, parser_obj.current_token_value
     proc advance_token with parser
 
-    While proc consume_token with parser, TOKEN_DOT:
-        If proc match_token with parser, TOKEN_IDENTIFIER:
-            proc list_append from List with name_parts, parser_obj.current_token_value
-            proc advance_token with parser
+    Note:
+    Consume successive ".identifier" segments. A dot that precedes a brace
+    (".{ selectors }") or an underscore (".  _" wildcard) must NOT be consumed
+    here: those forms belong to the import-path / wildcard handlers, and eating
+    the dot then erroring on the brace/underscore left the cursor parked on a
+    token the top-level recovery loop could not advance past (a non-advancing
+    parser loop that exhausted memory). We therefore peek past the dot and stop
+    the qualified identifier at the boundary, leaving the dot for the caller.
+    :End Note
+    Let scanning be 1
+    While scanning is equal to 1:
+        If not proc match_token with parser, TOKEN_DOT:
+            Set scanning to 0
         Otherwise:
-            proc add_parser_error with parser, "Expected identifier after '.'"
-            Return 0
+            Let after_dot be proc peek_token with parser
+            If after_dot is equal to TOKEN_IDENTIFIER:
+                proc advance_token with parser
+                proc list_append from List with name_parts, parser_obj.current_token_value
+                proc advance_token with parser
+            Otherwise:
+                Note: ".{" or "._" - leave the dot for the import-path handler.
+                Set scanning to 0
+            End If
         End If
     End While
 
@@ -534,8 +575,25 @@ Process called "parse_import_path" takes parser as Integer returns Integer:
         Return 0
     End If
 
-    Note: Handle import selectors {x, y, z}
+    Note:
+    Handle import selectors ".{x, y => z, _}". The qualified-identifier parser
+    stops at the dot that precedes the brace, so we consume that dot here before
+    the opening brace. Both the dotted form ("path.{...}") and a bare brace
+    immediately following the path are accepted.
+    :End Note
+    Let has_selector be 0
     If proc match_token with parser, TOKEN_LEFT_BRACE:
+        Set has_selector to 1
+    Otherwise:
+        If proc match_token with parser, TOKEN_DOT:
+            If proc peek_token with parser is equal to TOKEN_LEFT_BRACE:
+                proc advance_token with parser
+                Set has_selector to 1
+            End If
+        End If
+    End If
+
+    If has_selector is equal to 1:
         proc advance_token with parser
 
         Let selector_list be proc create_ast_node with AST_LIST_LITERAL, "selectors"

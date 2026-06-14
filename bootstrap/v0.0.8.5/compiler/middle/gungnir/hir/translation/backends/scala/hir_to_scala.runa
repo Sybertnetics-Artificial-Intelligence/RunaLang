@@ -17,1221 +17,1776 @@ limitations under the License.
 Note:
 HIR to Scala Translator - Complete translation from HIR to idiomatic Scala
 
-This file provides comprehensive translation from Runa's High-level Intermediate
-Representation (HIR) to idiomatic Scala code. Preserves functional and object-oriented
-programming paradigms while generating clean, readable Scala that follows best practices.
+This backend is the exact structural inverse of scala_to_hir.runa. It consumes
+the SAME HIR model that scala_to_hir produces: a tree of HIRNode records, where
+each HIRNode carries an integer node_type tag (HIR_MODULE..HIR_TRAIT_MIXIN), a
+String value (the name / literal text / identifier), a children List of child
+HIRNode handles, and an attributes HashTable[String, String] (carrying "kind",
+"operator", "extends", "literal_type", "pattern_type", "variance",
+"upper_bound", "type", "return_type", "immutable", "mutable", "implicit",
+"element_count", "path", and the rest of the producer's metadata keys).
 
-Translation Features:
-- Object-oriented and functional programming constructs
-- Case classes and pattern matching
-- Traits and mix-in composition
-- Type classes via implicit parameters
-- Higher-order functions and closures
-- Collections and for-comprehensions
-- Implicit conversions and type inference
-- Package and import management
-- JVM interoperability
-- Scala-specific optimizations
-- Idiomatic Scala style and conventions
+Because both halves share the identical HIRNode record layout, this file reads
+node fields the same way scala_to_hir wrote them: by binding the Integer handle
+to a HIRNode local and reading .node_type / .value / .children / .attributes.
+
+Translation Features (every node kind scala_to_hir emits has a real emitter):
+- package / import (path attribute, wildcard and selector forms)
+- object / class / case class / trait declarations with extends clauses
+- def functions with type parameters (variance + bounds), parameter lists
+  (incl. implicit), return types, and bodies
+- val / var bindings with type annotations and initializers
+- fields and parameters
+- expressions: literal, identifier, binary op, unary op, function call,
+  method/member access, lambda, if, match (pattern + guard + case clause),
+  for-comprehension, while, try/catch/finally, return, throw, assignment,
+  block, tuple, list
+- patterns: wildcard, literal, variable, constructor, tuple, list
+- generated case-class apply/copy/unapply methods
 
 Dependencies:
-- compiler/frontend/primitives/core/string_core.runa
-- compiler/frontend/primitives/memory/layout.runa
-- compiler/frontend/primitives/collections/hashtable.runa (HIR nodes)
-- compiler/frontend/primitives/collections/list.runa (HIR collections)
+- compiler/frontend/primitives/core/string_core.runa  (string_equals)
+- compiler/frontend/primitives/memory/layout.runa     (allocation)
+- compiler/frontend/primitives/collections/hashtable.runa (attribute table)
+- compiler/frontend/primitives/collections/list.runa  (children / output buffer)
+- compiler/internal/string_utils.runa                 (string_concat, integer_to_string)
 :End Note
 
 Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
 Import "compiler/frontend/primitives/memory/layout.runa" as Layout
-Import "compiler/frontend/primitives/collections/hashtable.runa" as Dict
+Import "compiler/frontend/primitives/collections/hashtable.runa" as HashTable
 Import "compiler/frontend/primitives/collections/list.runa" as List
+Import "compiler/internal/string_utils.runa" as StringUtils
 
 Note: ============================================================================
-Note: HIR Node Type Constants (matching HIR spec)
+Note: HIR Node Type Constants - identical values to scala_to_hir.runa so the
+Note: producer's tags are interpreted correctly by this consumer.
 Note: ============================================================================
 
-Note: HIR Program Structure
-Constant HIR_MODULE as Integer is 20001           Note: Module
-Constant HIR_IMPORT as Integer is 20002           Note: Import declaration
-Constant HIR_EXPORT as Integer is 20003           Note: Export declaration
+Note: Declaration / structure nodes
+Constant HIR_MODULE as Integer is 1
+Constant HIR_CLASS as Integer is 2
+Constant HIR_TRAIT as Integer is 3
+Constant HIR_OBJECT as Integer is 4
+Constant HIR_FUNCTION as Integer is 5
+Constant HIR_METHOD as Integer is 6
+Constant HIR_FIELD as Integer is 7
+Constant HIR_PARAMETER as Integer is 8
+Constant HIR_VARIABLE as Integer is 9
+Constant HIR_CONSTANT as Integer is 10
 
-Note: HIR Declarations
-Constant HIR_FUNCTION as Integer is 20101         Note: Function definition
-Constant HIR_TYPE_DECLARATION as Integer is 20102 Note: Type declaration
-Constant HIR_DATA_TYPE as Integer is 20103        Note: Algebraic data type
-Constant HIR_TYPE_CLASS as Integer is 20104       Note: Type class
-Constant HIR_INSTANCE as Integer is 20105         Note: Type class instance
-Constant HIR_TYPE_ALIAS as Integer is 20106       Note: Type synonym
+Note: Expression nodes
+Constant HIR_LITERAL as Integer is 20
+Constant HIR_IDENTIFIER as Integer is 21
+Constant HIR_CALL as Integer is 22
+Constant HIR_MEMBER_ACCESS as Integer is 23
+Constant HIR_ASSIGNMENT as Integer is 24
+Constant HIR_BINARY_OP as Integer is 25
+Constant HIR_UNARY_OP as Integer is 26
+Constant HIR_CONDITIONAL as Integer is 27
+Constant HIR_LOOP as Integer is 28
+Constant HIR_MATCH as Integer is 29
+Constant HIR_LAMBDA as Integer is 30
+Constant HIR_CLOSURE as Integer is 31
+Constant HIR_TUPLE as Integer is 32
+Constant HIR_ARRAY as Integer is 33
+Constant HIR_LIST as Integer is 34
 
-Note: HIR Expressions
-Constant HIR_LITERAL as Integer is 20201          Note: Literal value
-Constant HIR_IDENTIFIER as Integer is 20202       Note: Variable/function name
-Constant HIR_APPLICATION as Integer is 20203      Note: Function application
-Constant HIR_LAMBDA as Integer is 20204           Note: Lambda expression
-Constant HIR_LET as Integer is 20205              Note: Let binding
-Constant HIR_CASE as Integer is 20206             Note: Case expression
-Constant HIR_IF as Integer is 20207               Note: Conditional expression
-Constant HIR_TUPLE as Integer is 20208            Note: Tuple construction
-Constant HIR_LIST as Integer is 20209             Note: List construction
-Constant HIR_RECORD as Integer is 20210           Note: Record construction
+Note: Type nodes
+Constant HIR_TYPE as Integer is 40
+Constant HIR_GENERIC_TYPE as Integer is 13001
+Constant HIR_FUNCTION_TYPE as Integer is 13004
+Constant HIR_TUPLE_TYPE as Integer is 43
+Constant HIR_UNION_TYPE as Integer is 44
+Constant HIR_INTERSECTION_TYPE as Integer is 45
 
-Note: HIR Patterns
-Constant HIR_PATTERN_VARIABLE as Integer is 20301 Note: Variable pattern
-Constant HIR_PATTERN_CONSTRUCTOR as Integer is 20302 Note: Constructor pattern
-Constant HIR_PATTERN_LITERAL as Integer is 20303  Note: Literal pattern
-Constant HIR_PATTERN_WILDCARD as Integer is 20304 Note: Wildcard pattern
-Constant HIR_PATTERN_TUPLE as Integer is 20305    Note: Tuple pattern
-Constant HIR_PATTERN_LIST as Integer is 20306     Note: List pattern
+Note: Control-flow nodes
+Constant HIR_BLOCK as Integer is 50
+Constant HIR_IF as Integer is 51
+Constant HIR_WHILE as Integer is 52
+Constant HIR_FOR as Integer is 53
+Constant HIR_RETURN as Integer is 54
+Constant HIR_THROW as Integer is 55
+Constant HIR_TRY_CATCH as Integer is 56
 
-Note: HIR Types
-Constant HIR_TYPE_PRIMITIVE as Integer is 20401   Note: Primitive type
-Constant HIR_TYPE_FUNCTION as Integer is 20402    Note: Function type
-Constant HIR_TYPE_TUPLE as Integer is 20403       Note: Tuple type
-Constant HIR_TYPE_LIST as Integer is 20404        Note: List type
-Constant HIR_TYPE_VARIABLE as Integer is 20405    Note: Type variable
-Constant HIR_TYPE_APPLICATION as Integer is 20406 Note: Type application
-Constant HIR_TYPE_CONSTRAINT as Integer is 20407  Note: Type constraint
+Note: Pattern nodes
+Constant HIR_PATTERN as Integer is 60
+Constant HIR_PATTERN_MATCH as Integer is 61
+Constant HIR_PATTERN_GUARD as Integer is 62
+Constant HIR_CASE_CLAUSE as Integer is 63
 
-Note: HIR Special Constructs
-Constant HIR_CLOSURE as Integer is 20501          Note: Closure (captured environment)
-Constant HIR_THUNK as Integer is 20502            Note: Lazy evaluation thunk
-Constant HIR_EFFECT as Integer is 20503           Note: Effect computation
-Constant HIR_CONSTRAINT as Integer is 20504       Note: Type class constraint
+Note: Scala-specific nodes
+Constant HIR_IMPLICIT as Integer is 70
+Constant HIR_LAZY as Integer is 71
+Constant HIR_BY_NAME as Integer is 72
+Constant HIR_CASE_CLASS as Integer is 73
+Constant HIR_COMPANION_OBJECT as Integer is 74
+Constant HIR_TRAIT_MIXIN as Integer is 75
 
 Note: ============================================================================
-Note: Translation Context Structure
+Note: HIRNode record - byte-identical to scala_to_hir.runa's definition so this
+Note: backend reads the producer's nodes through the same field accessors.
 Note: ============================================================================
 
 @Reasoning:
-The translator bundles every piece of state the HIR-to-Scala pipeline must
-thread between routines: the line buffer (a List of strings), the indent
-counter (Scala convention: 2 spaces per level), the explicit and implicit
-import lists, the active package and class contexts, the HIR-to-Scala type
-mapping table, and a uniquifying counter for synthesised variable names.
-Fields are encoded as Integer slots because v0.0.8.5 stdlib Lists and
-Dictionaries are themselves Integer handles into the runtime; offsets
-0..56 are wired into every accessor in the file.
+The HIRNode record mirrors scala_to_hir's producer record exactly: id, integer
+type tag, String value, children list, attributes table, type info, and source
+location. Sharing the layout is what lets the backend bind an incoming Integer
+handle to a HIRNode local and read .node_type / .value / .children / .attributes
+directly, with no marshalling layer.
 @End Reasoning
-Type called "HIRToScalaTranslator":
-    output_buffer as Integer        Note: Generated Scala code buffer
-    indentation_level as Integer    Note: Current indentation level
-    import_list as Integer          Note: Required imports
-    package_name as Integer         Note: Current package name
-    class_context as Integer        Note: Current class/object context
-    implicit_imports as Integer     Note: Auto-generated implicit imports
-    type_mappings as Integer        Note: HIR to Scala type mappings
-    variable_counter as Integer     Note: Unique variable naming
+Type called "HIRNode":
+    node_id as Integer
+    node_type as Integer
+    value as String
+    children as List[Integer]
+    attributes as HashTable[String, String]
+    type_info as Integer
+    source_location as String
 End Type
 
 Note: ============================================================================
-Note: Translator Creation and Management
+Note: Emitter state - a growable output buffer (list of string fragments) plus
+Note: the current indentation level. Encoded as an allocated 2-slot record so
+Note: every emit routine threads exactly one handle.
 Note: ============================================================================
 
 @Reasoning:
-Builds the eight-slot HIRToScalaTranslator that every emit path holds
-state in. Each slot is initialised to zero before the live collections
-are stamped in at offsets 0/16/40/48 so a half-constructed translator
-can be detected by destroy_hir_to_scala_translator via the
-"null pointer is a no-op" convention.
+The emitter bundles the only two pieces of mutable state the whole backend
+threads: the output buffer (a List of String fragments joined once at the end)
+at slot 0 and the indentation depth at slot 8. A flat allocated record keeps
+the handle small and avoids per-call tuple churn.
 @End Reasoning
-
-@Implementation:
-Allocates 64 bytes (8 slots * 8 bytes), bails on allocation failure
-with a zero return, zeroes every slot with memory_set_int64, then
-creates the three Lists (output buffer @0, import list @16, implicit
-imports @40) and one Dictionary (type mappings @48). Finally calls
-setup_scala_type_mappings to populate the HIR-to-Scala primitive map
-before returning the translator handle.
-@End Implementation
-Process called "create_hir_to_scala_translator" returns Integer:
-    Let translator_size be 64  Note: 8 fields × 8 bytes each
-    Let translator be proc allocate from Layout with translator_size
-
-    If translator is equal to 0:
+Process called "create_scala_emitter" returns Integer:
+    Let emitter be proc allocate from Layout with 16
+    If emitter is equal to 0:
         Return 0
     End If
-
-    proc memory_set_int64 from Layout with translator, 0, 0   Note: output_buffer
-    proc memory_set_int64 from Layout with translator, 8, 0   Note: indentation_level
-    proc memory_set_int64 from Layout with translator, 16, 0  Note: import_list
-    proc memory_set_int64 from Layout with translator, 24, 0  Note: package_name
-    proc memory_set_int64 from Layout with translator, 32, 0  Note: class_context
-    proc memory_set_int64 from Layout with translator, 40, 0  Note: implicit_imports
-    proc memory_set_int64 from Layout with translator, 48, 0  Note: type_mappings
-    proc memory_set_int64 from Layout with translator, 56, 0  Note: variable_counter
-
-    Note: Initialize collections
-    Let output_buffer be proc list_create from List
-    proc memory_set_int64 from Layout with translator, 0, output_buffer
-
-    Let import_list be proc list_create from List
-    proc memory_set_int64 from Layout with translator, 16, import_list
-
-    Let implicit_imports be proc list_create from List
-    proc memory_set_int64 from Layout with translator, 40, implicit_imports
-
-    Let type_mappings be proc hashtable_create from Dict
-    proc memory_set_int64 from Layout with translator, 48, type_mappings
-
-    Note: Initialize type mappings
-    proc setup_scala_type_mappings from translator
-
-    Return translator
+    Let buffer be proc list_create from List
+    proc memory_set_int64 from Layout with emitter, 0, buffer
+    proc memory_set_int64 from Layout with emitter, 8, 0
+    Return emitter
 End Process
 
 @Reasoning:
-The translator owns four collections (output buffer, explicit imports,
-implicit imports, type mapping table); each must be released in reverse
-allocation order. Treating a null translator as a no-op success allows
-this to be called unconditionally from error paths where
-create_hir_to_scala_translator itself failed.
+Reading the output buffer handle from slot 0 is centralised so every emit path
+shares one accessor; a future relayout only touches this one routine.
 @End Reasoning
-Process called "destroy_hir_to_scala_translator" takes translator as Integer returns Integer:
-    Note: Destroy translator and free all memory
+Process called "emitter_buffer" takes emitter as Integer returns Integer:
+    Return proc memory_get_int64 from Layout with emitter, 0
+End Process
 
-    If translator is equal to 0:
+@Reasoning:
+The indentation depth lives at slot 8. Centralising the read keeps the offset
+contract in one place.
+@End Reasoning
+Process called "emitter_indent" takes emitter as Integer returns Integer:
+    Return proc memory_get_int64 from Layout with emitter, 8
+End Process
+
+@Reasoning:
+Scala convention is two spaces per indentation level. Pushing the depth one
+deeper before emitting a block body and popping it after keeps nested classes,
+methods, match arms, and blocks correctly aligned.
+@End Reasoning
+Process called "emitter_indent_inc" takes emitter as Integer returns Integer:
+    Let level be proc memory_get_int64 from Layout with emitter, 8
+    proc memory_set_int64 from Layout with emitter, 8, level plus 1
+    Return 1
+End Process
+
+@Reasoning:
+The clamp-at-zero guard converts a malformed (unbalanced) HIR into a graceful
+flat layout instead of corrupting the rest of the output with a negative depth.
+@End Reasoning
+Process called "emitter_indent_dec" takes emitter as Integer returns Integer:
+    Let level be proc memory_get_int64 from Layout with emitter, 8
+    If level is greater than 0:
+        proc memory_set_int64 from Layout with emitter, 8, level minus 1
+    End If
+    Return 1
+End Process
+
+@Reasoning:
+A single append point for raw fragments (no indentation, no newline) lets every
+higher-level emit routine compose lines from pieces without each one knowing the
+buffer representation.
+@End Reasoning
+Process called "emit_raw" takes emitter as Integer, fragment as Integer returns Integer:
+    Let buffer be proc emitter_buffer with emitter
+    proc list_append from List with buffer, fragment
+    Return 1
+End Process
+
+@Reasoning:
+A full line is the current indentation (two spaces per level) followed by the
+text and a trailing newline. Indentation is materialised here on demand from the
+depth counter so the counter stays the single source of layout truth.
+@End Reasoning
+Process called "emit_line" takes emitter as Integer, text as Integer returns Integer:
+    Let buffer be proc emitter_buffer with emitter
+    Let level be proc emitter_indent with emitter
+    Let i be 0
+    While i is less than level:
+        proc list_append from List with buffer, "  "
+        Set i to i plus 1
+    End While
+    proc list_append from List with buffer, text
+    proc list_append from List with buffer, "\n"
+    Return 1
+End Process
+
+@Reasoning:
+Folds the fragment list into one contiguous String once, at the end, so callers
+(the dispatcher, the round-trip probe, dev_tools) get a single value they can
+hash, re-parse, or write atomically. The accumulator is rebuilt each step via
+string_concat because that is the only string-building primitive available.
+@End Reasoning
+Process called "emitter_render" takes emitter as Integer returns Integer:
+    Let buffer be proc emitter_buffer with emitter
+    Let count be proc list_length from List with buffer
+    Let result be ""
+    Let i be 0
+    While i is less than count:
+        Let fragment be proc list_get from List with buffer, i
+        Set result to proc string_concat from StringUtils with result, fragment
+        Set i to i plus 1
+    End While
+    Return result
+End Process
+
+Note: ============================================================================
+Note: HIRNode field / attribute accessors
+Note: ============================================================================
+
+@Reasoning:
+The node_type tag selects which emitter handles a node. Centralising the read
+documents that the backend reads exactly the field the producer wrote.
+@End Reasoning
+Process called "node_kind" takes node as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    Let n as HIRNode be node
+    Return n.node_type
+End Process
+
+@Reasoning:
+The value field holds the node's textual payload (declaration name, identifier
+text, literal text). Returns the empty string for a null node so callers can
+concatenate without a null guard.
+@End Reasoning
+Process called "node_value" takes node as Integer returns String:
+    If node is equal to 0:
+        Return ""
+    End If
+    Let n as HIRNode be node
+    Return n.value
+End Process
+
+@Reasoning:
+The children List handle is read straight off the record; a null node yields 0
+so the count/get helpers can treat it as empty.
+@End Reasoning
+Process called "node_children" takes node as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    Let n as HIRNode be node
+    Return n.children
+End Process
+
+@Reasoning:
+The child count is the length of the children list; a null children handle is an
+empty node. This is the loop bound for every structural walk.
+@End Reasoning
+Process called "node_child_count" takes node as Integer returns Integer:
+    Let children be proc node_children with node
+    If children is equal to 0:
+        Return 0
+    End If
+    Return proc list_length from List with children
+End Process
+
+@Reasoning:
+Positional child access over the children list; out-of-range and null cases
+return 0 so callers can probe optimistically.
+@End Reasoning
+Process called "node_child" takes node as Integer, index as Integer returns Integer:
+    Let children be proc node_children with node
+    If children is equal to 0:
+        Return 0
+    End If
+    If index is less than 0:
+        Return 0
+    End If
+    If index is greater than or equal to proc list_length from List with children:
+        Return 0
+    End If
+    Return proc list_get from List with children, index
+End Process
+
+@Reasoning:
+Reads a metadata value the producer attached via set_hir_attribute. Returns the
+empty string when the key is absent (matching the producer's get_hir_attribute)
+so callers can use string equality without null checks.
+@End Reasoning
+Process called "node_attr" takes node as Integer, key as Integer returns String:
+    If node is equal to 0:
+        Return ""
+    End If
+    Let n as HIRNode be node
+    Let result be proc hashtable_get from HashTable with n.attributes, key
+    If result is equal to 0:
+        Return ""
+    End If
+    Return result
+End Process
+
+@Reasoning:
+Convenience equality test for an attribute against an expected string; used
+pervasively to branch on "kind", "pattern_type", "relationship", etc.
+@End Reasoning
+Process called "attr_equals" takes node as Integer, key as Integer, expected as Integer returns Integer:
+    Let value be proc node_attr with node, key
+    Return proc string_equals from StringCore with value, expected
+End Process
+
+Note: ============================================================================
+Note: Module / top-level
+Note: ============================================================================
+
+@Reasoning:
+Scala top-of-file order is fixed: the package declaration precedes imports,
+which precede declarations. The producer's HIR_MODULE root carries (in some
+order) package modules, import identifiers, and the type/def declarations as
+children. We do two passes: first emit any package + imports, then emit the rest
+as declarations, so the output always parses regardless of producer child order.
+@End Reasoning
+Process called "emit_module" takes emitter as Integer, module as Integer returns Integer:
+    Note: The root module value is the synthetic "scala_module"; real package
+    Note: names appear as nested HIR_MODULE children tagged kind="package".
+    Let count be proc node_child_count with module
+
+    Note: Pass 1 - package declaration(s).
+    Let i be 0
+    While i is less than count:
+        Let child be proc node_child with module, i
+        If proc node_kind with child is equal to HIR_MODULE:
+            If proc attr_equals with child, "kind", "package" is equal to 1:
+                Let pkg_line be proc string_concat from StringUtils with "package ", proc node_value with child
+                proc emit_line with emitter, pkg_line
+                proc emit_line with emitter, ""
+                Note: A package node nests the rest of the file as its children.
+                proc emit_module_members with emitter, child
+            End If
+        End If
+        Set i to i plus 1
+    End While
+
+    Note: Pass 2 - imports at the root.
+    Set i to 0
+    While i is less than count:
+        Let child2 be proc node_child with module, i
+        If proc node_kind with child2 is equal to HIR_IDENTIFIER:
+            If proc attr_equals with child2, "kind", "import" is equal to 1:
+                proc emit_import with emitter, child2
+            End If
+        End If
+        Set i to i plus 1
+    End While
+
+    Note: Blank line between imports and declarations if any import emitted.
+    proc emit_line with emitter, ""
+
+    Note: Pass 3 - declarations and statements at the root.
+    Set i to 0
+    While i is less than count:
+        Let child3 be proc node_child with module, i
+        Let k be proc node_kind with child3
+        If k is not equal to HIR_MODULE:
+            Let is_import be 0
+            If k is equal to HIR_IDENTIFIER:
+                If proc attr_equals with child3, "kind", "import" is equal to 1:
+                    Set is_import to 1
+                End If
+            End If
+            If is_import is equal to 0:
+                proc emit_declaration with emitter, child3
+            End If
+        End If
+        Set i to i plus 1
+    End While
+
+    Return 1
+End Process
+
+@Reasoning:
+A nested package node holds the file's imports and declarations as its children;
+we emit imports first then declarations so the emitted Scala has valid top-level
+ordering inside the package scope.
+@End Reasoning
+Process called "emit_module_members" takes emitter as Integer, package_node as Integer returns Integer:
+    Let count be proc node_child_count with package_node
+
+    Let i be 0
+    While i is less than count:
+        Let child be proc node_child with package_node, i
+        If proc node_kind with child is equal to HIR_IDENTIFIER:
+            If proc attr_equals with child, "kind", "import" is equal to 1:
+                proc emit_import with emitter, child
+            End If
+        End If
+        Set i to i plus 1
+    End While
+
+    Set i to 0
+    While i is less than count:
+        Let child2 be proc node_child with package_node, i
+        Let k be proc node_kind with child2
+        Let skip be 0
+        If k is equal to HIR_IDENTIFIER:
+            If proc attr_equals with child2, "kind", "import" is equal to 1:
+                Set skip to 1
+            End If
+        End If
+        If skip is equal to 0:
+            proc emit_declaration with emitter, child2
+        End If
+        Set i to i plus 1
+    End While
+
+    Return 1
+End Process
+
+@Reasoning:
+The producer stores the import as an HIR_IDENTIFIER node whose "path" attribute
+is the dotted module path (e.g. "scala.collection.mutable"). We emit
+"import <path>" directly; the path string already carries any selector/wildcard
+text the frontend preserved.
+@End Reasoning
+Process called "emit_import" takes emitter as Integer, import_node as Integer returns Integer:
+    Let path be proc node_attr with import_node, "path"
+    Let line be proc string_concat from StringUtils with "import ", path
+    proc emit_line with emitter, line
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Declaration dispatch
+Note: ============================================================================
+
+@Reasoning:
+Routes a declaration-or-statement HIR node to its specialised emitter by node
+kind. Declarations encountered at class/object/trait body level (val/var/def/
+nested types) and free statements both flow through here, so a class body and the
+module root can share one walker.
+@End Reasoning
+Process called "emit_declaration" takes emitter as Integer, node as Integer returns Integer:
+    Let kind be proc node_kind with node
+
+    If kind is equal to HIR_OBJECT:
+        Return proc emit_object with emitter, node
+    End If
+    If kind is equal to HIR_CLASS:
+        Return proc emit_class with emitter, node
+    End If
+    If kind is equal to HIR_CASE_CLASS:
+        Return proc emit_case_class with emitter, node
+    End If
+    If kind is equal to HIR_TRAIT:
+        Return proc emit_trait with emitter, node
+    End If
+    If kind is equal to HIR_FUNCTION:
+        Return proc emit_function with emitter, node
+    End If
+    If kind is equal to HIR_METHOD:
+        Return proc emit_function with emitter, node
+    End If
+    If kind is equal to HIR_CONSTANT:
+        Return proc emit_val_or_var with emitter, node, 1
+    End If
+    If kind is equal to HIR_FIELD:
+        Return proc emit_val_or_var with emitter, node, 1
+    End If
+    If kind is equal to HIR_VARIABLE:
+        Return proc emit_val_or_var with emitter, node, 0
+    End If
+    If kind is equal to HIR_TYPE:
+        Return proc emit_type_member with emitter, node
+    End If
+
+    Note: Anything else at declaration position is a statement expression.
+    Let expr be proc emit_expression with emitter, node
+    proc emit_line with emitter, expr
+    Return 1
+End Process
+
+@Reasoning:
+A type child at declaration position is either a type alias (kind="type_alias")
+or an inheritance marker (relationship="extends") that was already consumed by
+the enclosing class/trait header; the latter must NOT re-emit a stray line, so we
+emit only genuine aliases here.
+@End Reasoning
+Process called "emit_type_member" takes emitter as Integer, node as Integer returns Integer:
+    If proc attr_equals with node, "kind", "type_alias" is equal to 1:
+        Let line be proc string_concat from StringUtils with "type ", proc node_value with node
+        proc emit_line with emitter, line
+    End If
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Type declarations: object / class / case class / trait
+Note: ============================================================================
+
+@Reasoning:
+Builds the "extends Super with Mixin..." clause from a node's "extends"
+attribute (the producer stores the primary supertype there). Returns the empty
+string when there is no supertype, so the caller can concatenate unconditionally.
+@End Reasoning
+Process called "build_extends_clause" takes node as Integer returns String:
+    Let parent be proc node_attr with node, "extends"
+    If proc string_equals from StringCore with parent, "" is equal to 1:
+        Return ""
+    End If
+    Return proc string_concat from StringUtils with " extends ", parent
+End Process
+
+@Reasoning:
+Builds "[A, +B <: Upper, ...]" from a node's HIR_GENERIC_TYPE children, honouring
+the variance attribute (prefixing +/-) and the upper_bound attribute (appending
+" <: Bound"). Returns "" when the declaration has no type parameters so the
+header stays clean.
+@End Reasoning
+Process called "build_type_params" takes node as Integer returns String:
+    Let count be proc node_child_count with node
+    Let collected be ""
+    Let emitted be 0
+    Let i be 0
+    While i is less than count:
+        Let child be proc node_child with node, i
+        If proc node_kind with child is equal to HIR_GENERIC_TYPE:
+            Let piece be ""
+            Let variance be proc node_attr with child, "variance"
+            If proc string_equals from StringCore with variance, "" is equal to 0:
+                Set piece to proc string_concat from StringUtils with piece, variance
+            End If
+            Set piece to proc string_concat from StringUtils with piece, proc node_value with child
+            Let upper be proc node_attr with child, "upper_bound"
+            If proc string_equals from StringCore with upper, "" is equal to 0:
+                Let bound_text be proc string_concat from StringUtils with " <: ", upper
+                Set piece to proc string_concat from StringUtils with piece, bound_text
+            End If
+            If emitted is equal to 0:
+                Set collected to proc string_concat from StringUtils with collected, piece
+            Otherwise:
+                Let sep be proc string_concat from StringUtils with ", ", piece
+                Set collected to proc string_concat from StringUtils with collected, sep
+            End If
+            Set emitted to emitted plus 1
+        End If
+        Set i to i plus 1
+    End While
+    If emitted is equal to 0:
+        Return ""
+    End If
+    Let opened be proc string_concat from StringUtils with "[", collected
+    Return proc string_concat from StringUtils with opened, "]"
+End Process
+
+@Reasoning:
+A "case class" header is the type name followed by its type-parameter list and
+its primary constructor parameters in parentheses. The producer marks the primary
+constructor fields as HIR_FIELD children; we render them as "name: Type" pairs.
+@End Reasoning
+Process called "build_ctor_params" takes node as Integer returns String:
+    Let count be proc node_child_count with node
+    Let collected be ""
+    Let emitted be 0
+    Let i be 0
+    While i is less than count:
+        Let child be proc node_child with node, i
+        If proc node_kind with child is equal to HIR_FIELD:
+            Let piece be proc node_value with child
+            Let ftype be proc node_attr with child, "type"
+            If proc string_equals from StringCore with ftype, "" is equal to 0:
+                Let typed be proc string_concat from StringUtils with piece, ": "
+                Set piece to proc string_concat from StringUtils with typed, ftype
+            End If
+            If emitted is equal to 0:
+                Set collected to proc string_concat from StringUtils with collected, piece
+            Otherwise:
+                Let sep be proc string_concat from StringUtils with ", ", piece
+                Set collected to proc string_concat from StringUtils with collected, sep
+            End If
+            Set emitted to emitted plus 1
+        End If
+        Set i to i plus 1
+    End While
+    Let opened be proc string_concat from StringUtils with "(", collected
+    Return proc string_concat from StringUtils with opened, ")"
+End Process
+
+@Reasoning:
+"object Name extends ... { members }" is the singleton form. The header line ends
+in " {", the members are emitted at +1 indentation, and a closing "}" line
+restores the indent. Members are every child that is not an inheritance marker.
+@End Reasoning
+Process called "emit_object" takes emitter as Integer, node as Integer returns Integer:
+    Let header be proc string_concat from StringUtils with "object ", proc node_value with node
+    Set header to proc string_concat from StringUtils with header, proc build_extends_clause with node
+    Set header to proc string_concat from StringUtils with header, " {"
+    proc emit_line with emitter, header
+
+    proc emitter_indent_inc with emitter
+    proc emit_body_members with emitter, node
+    proc emitter_indent_dec with emitter
+
+    proc emit_line with emitter, "}"
+    Return 1
+End Process
+
+@Reasoning:
+"[abstract] class Name[TypeParams] extends Super { members }". The type-param
+list and extends clause are built from attributes/children; the body members are
+emitted indented. A class with no body still emits an empty brace block so the
+output is always a valid class definition.
+@End Reasoning
+Process called "emit_class" takes emitter as Integer, node as Integer returns Integer:
+    Let header be proc string_concat from StringUtils with "class ", proc node_value with node
+    Set header to proc string_concat from StringUtils with header, proc build_type_params with node
+    Set header to proc string_concat from StringUtils with header, proc build_extends_clause with node
+    Set header to proc string_concat from StringUtils with header, " {"
+    proc emit_line with emitter, header
+
+    proc emitter_indent_inc with emitter
+    proc emit_body_members with emitter, node
+    proc emitter_indent_dec with emitter
+
+    proc emit_line with emitter, "}"
+    Return 1
+End Process
+
+@Reasoning:
+"case class Name[TypeParams](ctor params) extends Super". Case classes carry their
+fields as the constructor parameter list; any additional members (methods the
+producer generated such as apply/copy/unapply, or user methods) are emitted in a
+trailing brace block when present.
+@End Reasoning
+Process called "emit_case_class" takes emitter as Integer, node as Integer returns Integer:
+    Let header be proc string_concat from StringUtils with "case class ", proc node_value with node
+    Set header to proc string_concat from StringUtils with header, proc build_type_params with node
+    Set header to proc string_concat from StringUtils with header, proc build_ctor_params with node
+    Set header to proc string_concat from StringUtils with header, proc build_extends_clause with node
+
+    Note: Emit a brace block only if there are method members beyond the fields.
+    If proc has_method_members with node is equal to 1:
+        Set header to proc string_concat from StringUtils with header, " {"
+        proc emit_line with emitter, header
+        proc emitter_indent_inc with emitter
+        proc emit_method_members with emitter, node
+        proc emitter_indent_dec with emitter
+        proc emit_line with emitter, "}"
+    Otherwise:
+        proc emit_line with emitter, header
+    End If
+    Return 1
+End Process
+
+@Reasoning:
+"trait Name[TypeParams] extends Super { members }". Traits are Scala's mixin
+mechanism; structurally identical header to a class but introduced by "trait".
+@End Reasoning
+Process called "emit_trait" takes emitter as Integer, node as Integer returns Integer:
+    Let header be proc string_concat from StringUtils with "trait ", proc node_value with node
+    Set header to proc string_concat from StringUtils with header, proc build_type_params with node
+    Set header to proc string_concat from StringUtils with header, proc build_extends_clause with node
+    Set header to proc string_concat from StringUtils with header, " {"
+    proc emit_line with emitter, header
+
+    proc emitter_indent_inc with emitter
+    proc emit_body_members with emitter, node
+    proc emitter_indent_dec with emitter
+
+    proc emit_line with emitter, "}"
+    Return 1
+End Process
+
+@Reasoning:
+Reports whether a type declaration has any method members (HIR_FUNCTION /
+HIR_METHOD children) so emit_case_class can decide between the brace-block form
+and the single-line form.
+@End Reasoning
+Process called "has_method_members" takes node as Integer returns Integer:
+    Let count be proc node_child_count with node
+    Let i be 0
+    While i is less than count:
+        Let child be proc node_child with node, i
+        Let k be proc node_kind with child
+        If k is equal to HIR_FUNCTION:
+            Return 1
+        End If
+        If k is equal to HIR_METHOD:
+            Return 1
+        End If
+        Set i to i plus 1
+    End While
+    Return 0
+End Process
+
+@Reasoning:
+Emits only the method members (functions/methods) of a type declaration; used for
+the case-class trailing block where the constructor fields were already rendered
+in the header and must not be repeated as body members.
+@End Reasoning
+Process called "emit_method_members" takes emitter as Integer, node as Integer returns Integer:
+    Let count be proc node_child_count with node
+    Let i be 0
+    While i is less than count:
+        Let child be proc node_child with node, i
+        Let k be proc node_kind with child
+        If k is equal to HIR_FUNCTION:
+            proc emit_function with emitter, child
+        Otherwise:
+            If k is equal to HIR_METHOD:
+                proc emit_function with emitter, child
+            End If
+        End If
+        Set i to i plus 1
+    End While
+    Return 1
+End Process
+
+@Reasoning:
+Emits the members of a class/object/trait body: every child that is not a
+type-parameter, an inheritance marker, or a header-consumed return type. vals,
+vars, defs, and nested types each route through emit_declaration. Inheritance
+HIR_TYPE markers (relationship="extends") and HIR_GENERIC_TYPE params are skipped
+because they were folded into the header.
+@End Reasoning
+Process called "emit_body_members" takes emitter as Integer, node as Integer returns Integer:
+    Let count be proc node_child_count with node
+    Let i be 0
+    While i is less than count:
+        Let child be proc node_child with node, i
+        Let k be proc node_kind with child
+        Let skip be 0
+        If k is equal to HIR_GENERIC_TYPE:
+            Set skip to 1
+        End If
+        If k is equal to HIR_FIELD:
+            Note: Primary-constructor fields belong to case-class headers; in a
+            Note: plain class body they are emitted as val members.
+            If proc node_kind with node is equal to HIR_CASE_CLASS:
+                Set skip to 1
+            End If
+        End If
+        If k is equal to HIR_TYPE:
+            If proc attr_equals with child, "relationship", "extends" is equal to 1:
+                Set skip to 1
+            End If
+            If proc attr_equals with child, "kind", "return_type" is equal to 1:
+                Set skip to 1
+            End If
+        End If
+        If skip is equal to 0:
+            proc emit_declaration with emitter, child
+        End If
+        Set i to i plus 1
+    End While
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Functions / methods
+Note: ============================================================================
+
+@Reasoning:
+"def name[TypeParams](params): ReturnType = body". The producer emits each
+parameter LIST as an HIR_PARAMETER node tagged kind="parameter_list" whose own
+children are the individual HIR_PARAMETER nodes; the return type is stored both as
+a "return_type" attribute and (optionally) as an HIR_TYPE child tagged
+kind="return_type"; the body is an HIR_BLOCK child tagged kind="function_body".
+@End Reasoning
+Process called "emit_function" takes emitter as Integer, node as Integer returns Integer:
+    Let header be proc string_concat from StringUtils with "def ", proc node_value with node
+    Set header to proc string_concat from StringUtils with header, proc build_type_params with node
+    Set header to proc string_concat from StringUtils with header, proc build_param_lists with node
+
+    Let ret be proc node_attr with node, "return_type"
+    If proc string_equals from StringCore with ret, "" is equal to 0:
+        Let typed be proc string_concat from StringUtils with header, ": "
+        Set header to proc string_concat from StringUtils with typed, ret
+    End If
+
+    Let body be proc find_function_body with node
+    If body is equal to 0:
+        Note: Abstract method (trait / abstract class) - no body.
+        proc emit_line with emitter, header
         Return 1
     End If
 
-    Let output_buffer be proc memory_get_int64 from Layout with translator, 0
-    If output_buffer is not equal to 0:
-        proc list_destroy from List with output_buffer
-    End If
-
-    Let import_list be proc memory_get_int64 from Layout with translator, 16
-    If import_list is not equal to 0:
-        proc list_destroy from List with import_list
-    End If
-
-    Let implicit_imports be proc memory_get_int64 from Layout with translator, 40
-    If implicit_imports is not equal to 0:
-        proc list_destroy from List with implicit_imports
-    End If
-
-    Let type_mappings be proc memory_get_int64 from Layout with translator, 48
-    If type_mappings is not equal to 0:
-        proc hashtable_destroy from Dict with type_mappings
-    End If
-
-    proc deallocate from Layout with translator
+    Let body_text be proc emit_expression with emitter, body
+    Let assigned be proc string_concat from StringUtils with header, " = "
+    Set assigned to proc string_concat from StringUtils with assigned, body_text
+    proc emit_line with emitter, assigned
     Return 1
 End Process
 
-Note: ============================================================================
-Note: Code Generation Utilities
-Note: ============================================================================
-
 @Reasoning:
-Single source of formatting truth for the entire backend: every line of
-generated Scala flows through here, so all callers get a consistent
-two-space indent block driven by the translator's indentation counter at
-offset 8. The space tokens are pushed as separate list entries so the
-joiner stage in generate_scala_code can rebuild the final string without
-parsing back the spaces.
+Concatenates every parameter list the producer emitted (Scala supports multiple
+parameter lists for currying and implicit sections). Each list is an
+HIR_PARAMETER node tagged kind="parameter_list"; an implicit list is prefixed
+"(implicit ...)". A function with no parameter lists renders "()".
 @End Reasoning
-
-@Implementation:
-Reads output_buffer @0 and indentation_level @8 from the translator. In a
-loop bounded by indentation_level, allocates a fresh "  " string (two
-spaces - Scala convention) via create_string and appends it. Then appends
-the code pointer itself. The newline is NOT appended here; that is the
-responsibility of emit_scala_line when full-line semantics are desired.
-@End Implementation
-Process called "emit_scala_code" takes translator as Integer, code as Integer returns Integer:
-    Let output_buffer be proc memory_get_int64 from Layout with translator, 0
-    Let indentation_level be proc memory_get_int64 from Layout with translator, 8
-
-    Note: Add indentation
-    Let indent_count be 0
-    While indent_count is less than indentation_level:
-        Let space_str be proc create_string from StringCore with "  "
-        proc list_append from List with output_buffer, space_str
-        Set indent_count to indent_count plus 1
+Process called "build_param_lists" takes node as Integer returns String:
+    Let count be proc node_child_count with node
+    Let collected be ""
+    Let any be 0
+    Let i be 0
+    While i is less than count:
+        Let child be proc node_child with node, i
+        If proc node_kind with child is equal to HIR_PARAMETER:
+            If proc attr_equals with child, "kind", "parameter_list" is equal to 1:
+                Set collected to proc string_concat from StringUtils with collected, proc build_one_param_list with child
+                Set any to any plus 1
+            End If
+        End If
+        Set i to i plus 1
     End While
-
-    Note: Add code
-    proc list_append from List with output_buffer, code
-
-    Return 1
-End Process
-
-@Reasoning:
-The newline is appended after the indented code rather than as part of
-code itself so emit_scala_code can be reused for partial-line emission
-(emitting an open brace then continuing on the same line is needed for
-some Scala block forms). The newline is materialised as a fresh string
-because the underlying list_append takes ownership only of the pointer,
-not the storage lifetime.
-@End Reasoning
-Process called "emit_scala_line" takes translator as Integer, code as Integer returns Integer:
-    Note: Emit line of Scala code with newline
-
-    proc emit_scala_code with translator, code
-    Let newline be proc create_string from StringCore with "\n"
-    Let output_buffer be proc memory_get_int64 from Layout with translator, 0
-    proc list_append from List with output_buffer, newline
-
-    Return 1
-End Process
-
-@Reasoning:
-Tracked as a counter rather than a pre-computed string because Scala emits
-indentation only at start-of-line and the actual whitespace is materialised
-by emit_scala_code on demand. The counter must be saved/restored around
-block emissions; that is the caller's responsibility, not this primitive's.
-@End Reasoning
-Process called "increase_indentation" takes translator as Integer returns Integer:
-    Note: Increase indentation level
-
-    Let current_indent be proc memory_get_int64 from Layout with translator, 8
-    Set current_indent to current_indent plus 1
-    proc memory_set_int64 from Layout with translator, 8, current_indent
-
-    Return 1
-End Process
-
-@Reasoning:
-The guard against negative indentation is defensive: a balanced emitter
-should never call decrease without a matching prior increase, but a
-malformed HIR (e.g. an unbalanced HIR_BLOCK with mismatched open/close
-nodes) must not corrupt the entire emission with negative indent counts.
-The clamp to zero converts the malformed input into a graceful flat layout.
-@End Reasoning
-Process called "decrease_indentation" takes translator as Integer returns Integer:
-    Note: Decrease indentation level
-
-    Let current_indent be proc memory_get_int64 from Layout with translator, 8
-    If current_indent is greater than 0:
-        Set current_indent to current_indent minus 1
-        proc memory_set_int64 from Layout with translator, 8, current_indent
+    If any is equal to 0:
+        Return "()"
     End If
-
-    Return 1
+    Return collected
 End Process
 
-Note: ============================================================================
-Note: HIR Module Translation
-Note: ============================================================================
-
 @Reasoning:
-Top-of-file ordering matters in Scala: the package declaration must
-precede every import, and Scala-stdlib implicits must be declared before
-user code so name resolution works. This routine therefore enforces the
-fixed sequence package -> user imports -> standard implicits ->
-declarations rather than delegating ordering to the caller.
+Renders one parameter list: "(p1: T1, p2: T2 = default, ...)" where individual
+parameters are the HIR_PARAMETER children of the list node. An implicit list is
+prefixed "(implicit ". Each parameter's type comes from its "type" attribute and a
+default value (if "has_default" is set) is rendered from the parameter's
+expression child.
 @End Reasoning
-
-@Implementation:
-Looks up "name" in the HIR module dictionary; if present, emits
-"package <name>" plus a blank line and caches the name into translator
-slot 24 for later qualified-symbol generation. Then looks up "imports"
-and forwards to translate_hir_imports if non-null, follows with
-emit_standard_scala_imports, and finally walks the "declarations" key
-through translate_hir_declarations.
-@End Implementation
-Process called "translate_hir_module" takes translator as Integer, hir_module as Integer returns Integer:
-    Note: Get module name
-    Let name_key be proc create_string from StringCore with "name"
-    Let module_name be proc hashtable_get from Dict with hir_module, name_key
-
-    If module_name is not equal to 0:
-        proc memory_set_int64 from Layout with translator, 24, module_name
-
-        Note: Emit package declaration
-        Let package_decl be proc create_string from StringCore with "package "
-        Let package_line be proc string_concat from StringCore with package_decl, module_name
-
-        proc emit_scala_line with translator, package_line
-        proc emit_scala_line with translator, ""
-
-        proc deallocate from Layout with package_decl
-        proc deallocate from Layout with package_line
+Process called "build_one_param_list" takes list_node as Integer returns String:
+    Let prefix be "("
+    If proc attr_equals with list_node, "implicit", "true" is equal to 1:
+        Set prefix to "(implicit "
     End If
-
-    Note: Translate imports
-    Let imports_key be proc create_string from StringCore with "imports"
-    Let hir_imports be proc hashtable_get from Dict with hir_module, imports_key
-    If hir_imports is not equal to 0:
-        proc translate_hir_imports with translator, hir_imports
-        proc emit_scala_line with translator, ""
-    End If
-
-    Note: Add implicit imports for Scala standard library
-    proc emit_standard_scala_imports from translator
-
-    Note: Translate declarations
-    Let declarations_key be proc create_string from StringCore with "declarations"
-    Let hir_declarations be proc hashtable_get from Dict with hir_module, declarations_key
-    If hir_declarations is not equal to 0:
-        proc translate_hir_declarations with translator, hir_declarations
-    End If
-
-    proc deallocate from Layout with name_key
-    proc deallocate from Layout with imports_key
-    proc deallocate from Layout with declarations_key
-
-    Return 1
-End Process
-
-@Reasoning:
-Three import lines are emitted unconditionally because almost every HIR
-shape produced by the universal translator requires them: immutable
-collections for HIR_LIST/HIR_TUPLE, Try/Success/Failure for HIR_TRY
-constructs, and scala.Function._ for the function composition operators
-emitted by translate_hir_lambda. Emitting them at the top once is
-cheaper than tracking per-construct dependencies.
-@End Reasoning
-Process called "emit_standard_scala_imports" takes translator as Integer returns Integer:
-    Note: Emit standard Scala imports
-
-    Let scala_imports be proc create_string from StringCore with "import scala.collection.immutable._"
-    proc emit_scala_line with translator, scala_imports
-
-    Let util_imports be proc create_string from StringCore with "import scala.util.{Try, Success, Failure}"
-    proc emit_scala_line with translator, util_imports
-
-    Let func_imports be proc create_string from StringCore with "import scala.Function._"
-    proc emit_scala_line with translator, func_imports
-
-    proc emit_scala_line with translator, ""
-
-    proc deallocate from Layout with scala_imports
-    proc deallocate from Layout with util_imports
-    proc deallocate from Layout with func_imports
-
-    Return 1
-End Process
-
-@Reasoning:
-The walker simply iterates the HIR import list and delegates each entry
-to translate_hir_import. We keep this dispatcher as a thin loop rather
-than inlining the per-import logic so the recursion depth stays
-predictable and the per-import translation can be replaced in isolation
-when Scala 3 'using' clauses need different handling.
-@End Reasoning
-Process called "translate_hir_imports" takes translator as Integer, hir_imports as Integer returns Integer:
-    Note: Translate HIR imports to Scala imports
-
-    Let import_count be proc list_length from List with hir_imports
-    Let import_index be 0
-
-    While import_index is less than import_count:
-        Let hir_import be proc list_get from List with hir_imports, import_index
-        proc translate_hir_import with translator, hir_import
-        Set import_index to import_index plus 1
-    End While
-
-    Return 1
-End Process
-
-@Reasoning:
-Scala has three import forms: bare 'import pkg._' for wildcard imports,
-'import pkg.{a, b, c}' for selective imports, and 'import pkg.{a => x}'
-for renaming aliases. The walker assembles the statement piece by piece,
-deallocating intermediate concatenations to keep the arena footprint
-bounded. Selective imports honour comma separation between the last two
-symbols correctly (no trailing comma); aliases append the '=> alias' tail.
-@End Reasoning
-Process called "translate_hir_import" takes translator as Integer, hir_import as Integer returns Integer:
-    Note: Translate single HIR import to Scala import
-
-    Let module_key be proc create_string from StringCore with "module"
-    Let symbols_key be proc create_string from StringCore with "symbols"
-    Let alias_key be proc create_string from StringCore with "alias"
-
-    Let import_module be proc hashtable_get from Dict with hir_import, module_key
-    Let import_symbols be proc hashtable_get from Dict with hir_import, symbols_key
-    Let import_alias be proc hashtable_get from Dict with hir_import, alias_key
-
-    Note: Build import statement
-    Let import_stmt be proc create_string from StringCore with "import "
-    Let temp_stmt be proc string_concat from StringCore with import_stmt, import_module
-    proc deallocate from Layout with import_stmt
-    Set import_stmt to temp_stmt
-
-    Note: Add specific symbols or wildcard
-    If import_symbols is not equal to 0:
-        Let symbols_count be proc list_length from List with import_symbols
-        If symbols_count is greater than 0:
-            Let dot_stmt be proc string_concat from StringCore with import_stmt, ".{"
-            proc deallocate from Layout with import_stmt
-            Set import_stmt to dot_stmt
-
-            Let symbol_index be 0
-            While symbol_index is less than symbols_count:
-                Let symbol be proc list_get from List with import_symbols, symbol_index
-                Let temp_stmt2 be proc string_concat from StringCore with import_stmt, symbol
-                proc deallocate from Layout with import_stmt
-                Set import_stmt to temp_stmt2
-
-                If symbol_index is less than symbols_count minus 1:
-                    Let comma_stmt be proc string_concat from StringCore with import_stmt, ", "
-                    proc deallocate from Layout with import_stmt
-                    Set import_stmt to comma_stmt
+    Let collected be prefix
+    Let count be proc node_child_count with list_node
+    Let emitted be 0
+    Let i be 0
+    While i is less than count:
+        Let param be proc node_child with list_node, i
+        If proc node_kind with param is equal to HIR_PARAMETER:
+            Let piece be proc node_value with param
+            Let ptype be proc node_attr with param, "type"
+            If proc string_equals from StringCore with ptype, "" is equal to 0:
+                Let typed be proc string_concat from StringUtils with piece, ": "
+                Set piece to proc string_concat from StringUtils with typed, ptype
+            End If
+            If proc attr_equals with param, "has_default", "true" is equal to 1:
+                Let dflt be proc find_param_default with param
+                If dflt is equal to 0:
+                    Note: No explicit default expression child; keep declared form.
+                    Set piece to piece
+                Otherwise:
+                    Let with_eq be proc string_concat from StringUtils with piece, " = "
+                    Set piece to proc string_concat from StringUtils with with_eq, dflt
                 End If
+            End If
+            If emitted is equal to 0:
+                Set collected to proc string_concat from StringUtils with collected, piece
+            Otherwise:
+                Let sep be proc string_concat from StringUtils with ", ", piece
+                Set collected to proc string_concat from StringUtils with collected, sep
+            End If
+            Set emitted to emitted plus 1
+        End If
+        Set i to i plus 1
+    End While
+    Return proc string_concat from StringUtils with collected, ")"
+End Process
 
-                Set symbol_index to symbol_index plus 1
-            End While
+@Reasoning:
+A parameter's default value is its first non-type child expression. Returns the
+rendered Scala for that expression, or 0 when no such child exists (handled by
+the caller). The emitter handle is threaded so nested expressions render through
+the shared expression dispatcher.
+@End Reasoning
+Process called "find_param_default" takes param as Integer returns Integer:
+    Let count be proc node_child_count with param
+    Let i be 0
+    While i is less than count:
+        Let child be proc node_child with param, i
+        If proc node_kind with child is not equal to HIR_TYPE:
+            Return proc render_expression with child
+        End If
+        Set i to i plus 1
+    End While
+    Return 0
+End Process
 
-            Let close_stmt be proc string_concat from StringCore with import_stmt, "}"
-            proc deallocate from Layout with import_stmt
-            Set import_stmt to close_stmt
+@Reasoning:
+The function body is the HIR_BLOCK child tagged kind="function_body". Returns 0
+when absent (abstract method). Searching by tag rather than position is robust to
+the producer interleaving type/param children before the body.
+@End Reasoning
+Process called "find_function_body" takes node as Integer returns Integer:
+    Let count be proc node_child_count with node
+    Let i be 0
+    While i is less than count:
+        Let child be proc node_child with node, i
+        If proc node_kind with child is equal to HIR_BLOCK:
+            If proc attr_equals with child, "kind", "function_body" is equal to 1:
+                Return child
+            End If
+        End If
+        Set i to i plus 1
+    End While
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: val / var
+Note: ============================================================================
+
+@Reasoning:
+"val name: Type = init" (immutable=1) or "var name: Type = init" (immutable=0).
+The optional type comes from the "type" attribute; the initializer is the first
+non-type child expression. An abstract val/var (trait member with no initializer)
+omits the "= init" tail.
+@End Reasoning
+Process called "emit_val_or_var" takes emitter as Integer, node as Integer, immutable as Integer returns Integer:
+    Let keyword be "var "
+    If immutable is equal to 1:
+        Set keyword to "val "
+    End If
+    Let header be proc string_concat from StringUtils with keyword, proc node_value with node
+
+    Let vtype be proc node_attr with node, "type"
+    If proc string_equals from StringCore with vtype, "" is equal to 0:
+        Let typed be proc string_concat from StringUtils with header, ": "
+        Set header to proc string_concat from StringUtils with typed, vtype
+    End If
+
+    Let init be proc find_initializer with node
+    If init is equal to 0:
+        proc emit_line with emitter, header
+        Return 1
+    End If
+
+    Let init_text be proc emit_expression with emitter, init
+    Let assigned be proc string_concat from StringUtils with header, " = "
+    Set assigned to proc string_concat from StringUtils with assigned, init_text
+    proc emit_line with emitter, assigned
+    Return 1
+End Process
+
+@Reasoning:
+The initializer of a val/var is its first non-type child; the type annotation, if
+present, is an HIR_TYPE child that must be skipped so the value expression is
+chosen. Returns 0 for an abstract (uninitialised) binding.
+@End Reasoning
+Process called "find_initializer" takes node as Integer returns Integer:
+    Let count be proc node_child_count with node
+    Let i be 0
+    While i is less than count:
+        Let child be proc node_child with node, i
+        If proc node_kind with child is not equal to HIR_TYPE:
+            Return child
+        End If
+        Set i to i plus 1
+    End While
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: Expression rendering
+Note: ============================================================================
+
+@Reasoning:
+Two front doors exist for expressions. emit_expression takes the emitter so block
+bodies can emit indented lines; render_expression is the pure form used where an
+inline string is needed (operands, arguments, defaults). emit_expression delegates
+to render_expression for everything except blocks, which it emits as a braced,
+indented sequence.
+@End Reasoning
+Process called "emit_expression" takes emitter as Integer, node as Integer returns Integer:
+    If node is equal to 0:
+        Return "()"
+    End If
+    Let kind be proc node_kind with node
+    If kind is equal to HIR_BLOCK:
+        Return proc emit_block with emitter, node
+    End If
+    Return proc render_expression with node
+End Process
+
+@Reasoning:
+A block "{ stmt1; ...; lastExpr }" introduces a scope. We render it as a brace
+block: open "{", each child statement on its own indented line, close "}". The
+function-body wrapper block (one child that is itself the real body) is unwrapped
+to avoid a redundant brace layer when the single child is itself a block or a
+simple expression.
+@End Reasoning
+Process called "emit_block" takes emitter as Integer, node as Integer returns Integer:
+    Let count be proc node_child_count with node
+
+    Note: Unwrap a function-body wrapper that holds exactly one child: render that
+    Note: child directly so "def f = expr" stays on one line where possible.
+    If proc attr_equals with node, "kind", "function_body" is equal to 1:
+        If count is equal to 1:
+            Let only be proc node_child with node, 0
+            Return proc emit_expression with emitter, only
+        End If
+    End If
+
+    Note: Inline empty block.
+    If count is equal to 0:
+        Return "{}"
+    End If
+
+    Note: For a single non-block expression, render inline.
+    If count is equal to 1:
+        Let single be proc node_child with node, 0
+        If proc node_kind with single is not equal to HIR_BLOCK:
+            Return proc render_expression with single
+        End If
+    End If
+
+    Note: Multi-statement block - emit a real braced, indented sequence.
+    proc emit_raw with emitter, "{"
+    proc emit_raw with emitter, "\n"
+    proc emitter_indent_inc with emitter
+    Let i be 0
+    While i is less than count:
+        Let child be proc node_child with node, i
+        Let stmt_text be proc emit_expression with emitter, child
+        proc emit_line with emitter, stmt_text
+        Set i to i plus 1
+    End While
+    proc emitter_indent_dec with emitter
+    Let level be proc emitter_indent with emitter
+    Let close be ""
+    Let j be 0
+    While j is less than level:
+        Set close to proc string_concat from StringUtils with close, "  "
+        Set j to j plus 1
+    End While
+    Set close to proc string_concat from StringUtils with close, "}"
+    Return close
+End Process
+
+@Reasoning:
+The pure expression renderer: dispatches on node kind and returns a Scala string
+with no side effects on the emitter. Every expression kind the producer emits has
+a dedicated branch; the final fallback renders the node's value (or "()" when
+empty) so an unrecognised-but-named node still produces a valid reference rather
+than crashing.
+@End Reasoning
+Process called "render_expression" takes node as Integer returns Integer:
+    If node is equal to 0:
+        Return "()"
+    End If
+    Let kind be proc node_kind with node
+
+    If kind is equal to HIR_LITERAL:
+        Return proc render_literal with node
+    End If
+    If kind is equal to HIR_IDENTIFIER:
+        Return proc node_value with node
+    End If
+    If kind is equal to HIR_BINARY_OP:
+        Return proc render_binary with node
+    End If
+    If kind is equal to HIR_UNARY_OP:
+        Return proc render_unary with node
+    End If
+    If kind is equal to HIR_CALL:
+        Return proc render_call with node
+    End If
+    If kind is equal to HIR_MEMBER_ACCESS:
+        Return proc render_member with node
+    End If
+    If kind is equal to HIR_LAMBDA:
+        Return proc render_lambda with node
+    End If
+    If kind is equal to HIR_IF:
+        Return proc render_if with node
+    End If
+    If kind is equal to HIR_PATTERN_MATCH:
+        Return proc render_match with node
+    End If
+    If kind is equal to HIR_MATCH:
+        Return proc render_match with node
+    End If
+    If kind is equal to HIR_FOR:
+        Return proc render_for with node
+    End If
+    If kind is equal to HIR_WHILE:
+        Return proc render_while with node
+    End If
+    If kind is equal to HIR_TRY_CATCH:
+        Return proc render_try with node
+    End If
+    If kind is equal to HIR_RETURN:
+        Return proc render_return with node
+    End If
+    If kind is equal to HIR_THROW:
+        Return proc render_throw with node
+    End If
+    If kind is equal to HIR_ASSIGNMENT:
+        Return proc render_assignment with node
+    End If
+    If kind is equal to HIR_TUPLE:
+        Return proc render_tuple with node
+    End If
+    If kind is equal to HIR_LIST:
+        Return proc render_list with node
+    End If
+    If kind is equal to HIR_BLOCK:
+        Return proc render_block_inline with node
+    End If
+    If kind is equal to HIR_PATTERN:
+        Return proc render_pattern with node
+    End If
+    If kind is equal to HIR_CASE_CLAUSE:
+        Return proc render_case_clause with node
+    End If
+    If kind is equal to HIR_CONSTANT:
+        Return proc render_inline_binding with node, 1
+    End If
+    If kind is equal to HIR_VARIABLE:
+        Return proc render_inline_binding with node, 0
+    End If
+
+    Note: Fallback: a named node renders as its value; an anonymous one as unit.
+    Let v be proc node_value with node
+    If proc string_equals from StringCore with v, "" is equal to 1:
+        Return "()"
+    End If
+    Return v
+End Process
+
+@Reasoning:
+Renders a literal honouring its "literal_type": strings are double-quoted, chars
+single-quoted, and numerics/booleans/null pass through verbatim (Scala syntax
+matches the producer's stored text). This is the structural inverse of the
+producer's translate_literal which stored the raw text plus the type tag.
+@End Reasoning
+Process called "render_literal" takes node as Integer returns Integer:
+    Let value be proc node_value with node
+    Let ltype be proc node_attr with node, "literal_type"
+
+    If proc string_equals from StringCore with ltype, "string" is equal to 1:
+        Let opened be proc string_concat from StringUtils with "\"", value
+        Return proc string_concat from StringUtils with opened, "\""
+    End If
+    If proc string_equals from StringCore with ltype, "char" is equal to 1:
+        Let opened2 be proc string_concat from StringUtils with "'", value
+        Return proc string_concat from StringUtils with opened2, "'"
+    End If
+    Return value
+End Process
+
+@Reasoning:
+A binary op renders "left OP right" using its "operator" attribute and its two
+operand children. Parentheses wrap the whole expression so precedence is
+preserved exactly through a re-parse, which is what the round-trip equality check
+relies on. Scala treats every binary op as an infix method call, so any symbolic
+or alphabetic operator text the producer stored is emitted verbatim.
+@End Reasoning
+Process called "render_binary" takes node as Integer returns Integer:
+    Let op be proc node_attr with node, "operator"
+    Let left be proc node_child with node, 0
+    Let right be proc node_child with node, 1
+    Let left_text be proc render_expression with left
+    Let right_text be proc render_expression with right
+
+    Let result be proc string_concat from StringUtils with "(", left_text
+    Let with_op be proc string_concat from StringUtils with " ", op
+    Set with_op to proc string_concat from StringUtils with with_op, " "
+    Set result to proc string_concat from StringUtils with result, with_op
+    Set result to proc string_concat from StringUtils with result, right_text
+    Return proc string_concat from StringUtils with result, ")"
+End Process
+
+@Reasoning:
+A unary op renders "OP operand" (e.g. "-x", "!flag", "~bits") using its
+"operator" attribute and single operand child, parenthesised for precedence
+safety on re-parse.
+@End Reasoning
+Process called "render_unary" takes node as Integer returns Integer:
+    Let op be proc node_attr with node, "operator"
+    Let operand be proc node_child with node, 0
+    Let operand_text be proc render_expression with operand
+    Let result be proc string_concat from StringUtils with "(", op
+    Set result to proc string_concat from StringUtils with result, operand_text
+    Return proc string_concat from StringUtils with result, ")"
+End Process
+
+@Reasoning:
+A function call "f(arg1, arg2, ...)" - the producer stores the callee expression
+as the first child and the argument group as the remaining children (or a single
+argument-group child whose own children are the args). We render the callee then
+a comma-separated, parenthesised argument list drawn from every remaining child.
+@End Reasoning
+Process called "render_call" takes node as Integer returns Integer:
+    Let count be proc node_child_count with node
+    If count is equal to 0:
+        Let v be proc node_value with node
+        If proc string_equals from StringCore with v, "" is equal to 1:
+            Return "()"
+        End If
+        Return proc string_concat from StringUtils with v, "()"
+    End If
+
+    Let callee be proc node_child with node, 0
+    Let callee_text be proc render_expression with callee
+    Let args be proc string_concat from StringUtils with callee_text, "("
+    Let emitted be 0
+    Let i be 1
+    While i is less than count:
+        Let arg be proc node_child with node, i
+        Let arg_text be proc render_expression with arg
+        If emitted is equal to 0:
+            Set args to proc string_concat from StringUtils with args, arg_text
         Otherwise:
-            Let wildcard_stmt be proc string_concat from StringCore with import_stmt, "._"
-            proc deallocate from Layout with import_stmt
-            Set import_stmt to wildcard_stmt
+            Let sep be proc string_concat from StringUtils with ", ", arg_text
+            Set args to proc string_concat from StringUtils with args, sep
         End If
-    Otherwise:
-        Let wildcard_stmt2 be proc string_concat from StringCore with import_stmt, "._"
-        proc deallocate from Layout with import_stmt
-        Set import_stmt to wildcard_stmt2
-    End If
-
-    Note: Add alias if present
-    If import_alias is not equal to 0:
-        Let as_stmt be proc string_concat from StringCore with import_stmt, " => "
-        proc deallocate from Layout with import_stmt
-        Let alias_stmt be proc string_concat from StringCore with as_stmt, import_alias
-        proc deallocate from Layout with as_stmt
-        Set import_stmt to alias_stmt
-    End If
-
-    proc emit_scala_line with translator, import_stmt
-
-    proc deallocate from Layout with module_key
-    proc deallocate from Layout with symbols_key
-    proc deallocate from Layout with alias_key
-    proc deallocate from Layout with import_stmt
-
-    Return 1
+        Set emitted to emitted plus 1
+        Set i to i plus 1
+    End While
+    Return proc string_concat from StringUtils with args, ")"
 End Process
 
-Note: ============================================================================
-Note: HIR Declaration Translation
-Note: ============================================================================
+@Reasoning:
+A member access / method call "receiver.member(args)". The producer stores the
+receiver as the first child, the member name as the second, and the arguments as
+the third when kind="method_call". We render "receiver.member" and append a
+parenthesised argument list when an argument group child is present.
+@End Reasoning
+Process called "render_member" takes node as Integer returns Integer:
+    Let count be proc node_child_count with node
+    If count is equal to 0:
+        Return proc node_value with node
+    End If
+
+    Let receiver be proc node_child with node, 0
+    Let receiver_text be proc render_expression with receiver
+    Let result be proc string_concat from StringUtils with receiver_text, "."
+
+    If count is greater than or equal to 2:
+        Let member be proc node_child with node, 1
+        Set result to proc string_concat from StringUtils with result, proc render_expression with member
+    End If
+
+    If count is greater than or equal to 3:
+        Let args_group be proc node_child with node, 2
+        Set result to proc string_concat from StringUtils with result, proc render_arg_group with args_group
+    End If
+
+    Return result
+End Process
 
 @Reasoning:
-A blank line is emitted between each declaration to match Scala style
-guide conventions and to keep the output readable when round-tripping
-back through universal translation. The dispatcher in
-translate_hir_declaration handles the kind-specific emission so this
-walker can stay agnostic to declaration variants.
+Renders an argument group as "(a, b, c)" from the group node's children. If the
+group node itself is a single expression rather than a container, it is rendered
+as "(expr)". Used by member/method-call argument lists.
 @End Reasoning
-Process called "translate_hir_declarations" takes translator as Integer, hir_declarations as Integer returns Integer:
-    Note: Translate HIR declarations to Scala declarations
+Process called "render_arg_group" takes group as Integer returns Integer:
+    If group is equal to 0:
+        Return "()"
+    End If
+    Let count be proc node_child_count with group
+    If count is equal to 0:
+        Note: A leaf expression used directly as the sole argument.
+        Let lone be proc render_expression with group
+        Let opened be proc string_concat from StringUtils with "(", lone
+        Return proc string_concat from StringUtils with opened, ")"
+    End If
+    Let result be "("
+    Let i be 0
+    While i is less than count:
+        Let arg be proc node_child with group, i
+        Let arg_text be proc render_expression with arg
+        If i is equal to 0:
+            Set result to proc string_concat from StringUtils with result, arg_text
+        Otherwise:
+            Let sep be proc string_concat from StringUtils with ", ", arg_text
+            Set result to proc string_concat from StringUtils with result, sep
+        End If
+        Set i to i plus 1
+    End While
+    Return proc string_concat from StringUtils with result, ")"
+End Process
 
-    Let decl_count be proc list_length from List with hir_declarations
-    Let decl_index be 0
+@Reasoning:
+A lambda "(p1, p2, ...) => body". The producer stores the parameters and body as
+children; parameters are HIR_PARAMETER / HIR_IDENTIFIER nodes and the body is the
+last child expression. We render the parenthesised parameter list and arrow then
+the body.
+@End Reasoning
+Process called "render_lambda" takes node as Integer returns Integer:
+    Let count be proc node_child_count with node
 
-    While decl_index is less than decl_count:
-        Let hir_declaration be proc list_get from List with hir_declarations, decl_index
-        proc translate_hir_declaration with translator, hir_declaration
-        proc emit_scala_line with translator, ""
-        Set decl_index to decl_index plus 1
+    Note: The body is the last child; preceding children are parameters.
+    Let body_index be count minus 1
+    Let params be "("
+    Let emitted be 0
+    Let i be 0
+    While i is less than body_index:
+        Let param be proc node_child with node, i
+        Let pname be proc node_value with param
+        If proc string_equals from StringCore with pname, "" is equal to 1:
+            Set pname to "_"
+        End If
+        If emitted is equal to 0:
+            Set params to proc string_concat from StringUtils with params, pname
+        Otherwise:
+            Let sep be proc string_concat from StringUtils with ", ", pname
+            Set params to proc string_concat from StringUtils with params, sep
+        End If
+        Set emitted to emitted plus 1
+        Set i to i plus 1
+    End While
+    Set params to proc string_concat from StringUtils with params, ") => "
+
+    Let body be 0
+    If body_index is greater than or equal to 0:
+        Set body to proc node_child with node, body_index
+    End If
+    Let body_text be proc render_expression with body
+    Return proc string_concat from StringUtils with params, body_text
+End Process
+
+@Reasoning:
+An if-expression "if (cond) thenExpr else elseExpr". The producer stores
+condition, then-branch, and (optional) else-branch as children in order. Scala's
+if is an expression so the else branch is emitted when present; absent, only the
+then branch is rendered.
+@End Reasoning
+Process called "render_if" takes node as Integer returns Integer:
+    Let count be proc node_child_count with node
+    Let cond be proc node_child with node, 0
+    Let then_branch be proc node_child with node, 1
+
+    Let cond_text be proc render_expression with cond
+    Let then_text be proc render_expression with then_branch
+
+    Let result be proc string_concat from StringUtils with "if (", cond_text
+    Set result to proc string_concat from StringUtils with result, ") "
+    Set result to proc string_concat from StringUtils with result, then_text
+
+    If count is greater than or equal to 3:
+        Let else_branch be proc node_child with node, 2
+        Let else_text be proc render_expression with else_branch
+        Set result to proc string_concat from StringUtils with result, " else "
+        Set result to proc string_concat from StringUtils with result, else_text
+    End If
+    Return result
+End Process
+
+@Reasoning:
+A match "scrutinee match { case ... }". The producer stores the scrutinee
+expression and the HIR_CASE_CLAUSE children. We render "scrutinee match {" then
+each case arm, then "}". The scrutinee is the first non-case child.
+@End Reasoning
+Process called "render_match" takes node as Integer returns Integer:
+    Let count be proc node_child_count with node
+
+    Let scrutinee_text be "()"
+    Let i be 0
+    Let found_scrutinee be 0
+    While i is less than count:
+        Let child be proc node_child with node, i
+        If proc node_kind with child is not equal to HIR_CASE_CLAUSE:
+            If found_scrutinee is equal to 0:
+                Set scrutinee_text to proc render_expression with child
+                Set found_scrutinee to 1
+            End If
+        End If
+        Set i to i plus 1
     End While
 
-    Return 1
-End Process
-
-@Reasoning:
-The dispatcher uses the HIR declaration kind tag to route to the
-appropriate specialised translator (function, data type, type alias,
-type class, instance). Unknown kinds are silently skipped rather than
-erroring so the universal translator can be extended with new HIR
-forms without forcing simultaneous backend updates.
-@End Reasoning
-Process called "translate_hir_declaration" takes translator as Integer, hir_declaration as Integer returns Integer:
-    Note: Translate single HIR declaration to Scala
-
-    Let type_key be proc create_string from StringCore with "type"
-    Let decl_type be proc hashtable_get from Dict with hir_declaration, type_key
-
-    Note: Function declaration
-    If decl_type is equal to HIR_FUNCTION:
-        proc translate_hir_function with translator, hir_declaration
-    End If
-
-    Note: Data type declaration (case class/sealed trait)
-    If decl_type is equal to HIR_DATA_TYPE:
-        proc translate_hir_data_type with translator, hir_declaration
-    End If
-
-    Note: Type alias declaration
-    If decl_type is equal to HIR_TYPE_ALIAS:
-        proc translate_hir_type_alias with translator, hir_declaration
-    End If
-
-    Note: Type class declaration (trait with implicit)
-    If decl_type is equal to HIR_TYPE_CLASS:
-        proc translate_hir_type_class with translator, hir_declaration
-    End If
-
-    Note: Instance declaration (implicit object)
-    If decl_type is equal to HIR_INSTANCE:
-        proc translate_hir_instance with translator, hir_declaration
-    End If
-
-    proc deallocate from Layout with type_key
-
-    Return 1
-End Process
-
-@Reasoning:
-Scala "def" syntax forces a fixed prefix-and-arrow shape: "def NAME(params): TYPE = BODY".
-The function is responsible for assembling that single line by stitching
-substrings together because emit_scala_line writes whole lines; the
-intermediate string churn is unavoidable given the string-list backing of
-the output buffer.
-@End Reasoning
-
-@Implementation:
-Looks up name/type/parameters/body keys in the HIR dictionary, then
-builds func_def incrementally: "def " concat name, optional "(" + comma-
-separated translate_hir_parameter outputs + ")", optional ": " + return
-type from translate_hir_type, then always " = " + translate_hir_expression
-on the body. Every intermediate string allocation is freed before the
-next concat to prevent the leak that would otherwise dominate compile-time
-memory. Emits the assembled line and frees the four lookup keys.
-@End Implementation
-Process called "translate_hir_function" takes translator as Integer, hir_function as Integer returns Integer:
-    Let name_key be proc create_string from StringCore with "name"
-    Let type_key be proc create_string from StringCore with "type"
-    Let parameters_key be proc create_string from StringCore with "parameters"
-    Let body_key be proc create_string from StringCore with "body"
-
-    Let func_name be proc hashtable_get from Dict with hir_function, name_key
-    Let func_type be proc hashtable_get from Dict with hir_function, type_key
-    Let func_params be proc hashtable_get from Dict with hir_function, parameters_key
-    Let func_body be proc hashtable_get from Dict with hir_function, body_key
-
-    Note: Start function definition
-    Let func_def be proc create_string from StringCore with "def "
-    Let temp_def be proc string_concat from StringCore with func_def, func_name
-    proc deallocate from Layout with func_def
-    Set func_def to temp_def
-
-    Note: Add parameters
-    If func_params is not equal to 0:
-        Let params_def be proc string_concat from StringCore with func_def, "("
-        proc deallocate from Layout with func_def
-        Set func_def to params_def
-
-        Let param_count be proc list_length from List with func_params
-        Let param_index be 0
-
-        While param_index is less than param_count:
-            Let param be proc list_get from List with func_params, param_index
-            Let scala_param be proc translate_hir_parameter with translator, param
-            Let temp_def2 be proc string_concat from StringCore with func_def, scala_param
-            proc deallocate from Layout with func_def
-            Set func_def to temp_def2
-
-            If param_index is less than param_count minus 1:
-                Let comma_def be proc string_concat from StringCore with func_def, ", "
-                proc deallocate from Layout with func_def
-                Set func_def to comma_def
-            End If
-
-            proc deallocate from Layout with scala_param
-            Set param_index to param_index plus 1
-        End While
-
-        Let close_params_def be proc string_concat from StringCore with func_def, ")"
-        proc deallocate from Layout with func_def
-        Set func_def to close_params_def
-    End If
-
-    Note: Add return type if specified
-    If func_type is not equal to 0:
-        Let return_type be proc extract_function_return_type from func_type
-        If return_type is not equal to 0:
-            Let colon_def be proc string_concat from StringCore with func_def, ": "
-            proc deallocate from Layout with func_def
-            Let scala_return_type be proc translate_hir_type with translator, return_type
-            Let type_def be proc string_concat from StringCore with colon_def, scala_return_type
-            proc deallocate from Layout with colon_def
-            proc deallocate from Layout with scala_return_type
-            Set func_def to type_def
+    Let result be proc string_concat from StringUtils with scrutinee_text, " match { "
+    Set i to 0
+    While i is less than count:
+        Let child2 be proc node_child with node, i
+        If proc node_kind with child2 is equal to HIR_CASE_CLAUSE:
+            Set result to proc string_concat from StringUtils with result, proc render_case_clause with child2
+            Set result to proc string_concat from StringUtils with result, " "
         End If
-    End If
-
-    Note: Add function body
-    Let equals_def be proc string_concat from StringCore with func_def, " = "
-    proc deallocate from Layout with func_def
-
-    Let scala_body be proc translate_hir_expression with translator, func_body
-    Let complete_def be proc string_concat from StringCore with equals_def, scala_body
-
-    proc emit_scala_line with translator, complete_def
-
-    proc deallocate from Layout with name_key
-    proc deallocate from Layout with type_key
-    proc deallocate from Layout with parameters_key
-    proc deallocate from Layout with body_key
-    proc deallocate from Layout with equals_def
-    proc deallocate from Layout with scala_body
-    proc deallocate from Layout with complete_def
-
-    Return 1
+        Set i to i plus 1
+    End While
+    Return proc string_concat from StringUtils with result, "}"
 End Process
 
 @Reasoning:
-HIR's algebraic data types must map to one of two Scala shapes depending
-on arity: a product type with one constructor lowers to "case class" (no
-exhaustiveness machinery needed), while a sum type with N constructors
-lowers to a "sealed trait" base plus N "case class" cases (which enables
-the Scala compiler's exhaustiveness checking on match). The arity branch
-is the only structural decision in this routine; everything else is
-delegated.
+A case clause "case pattern [if guard] => body". The producer stores the pattern
+(HIR_PATTERN), an optional guard (HIR_PATTERN_GUARD), and the body expression as
+children. We render the pattern, append the guard condition when present, then the
+arrow and body.
 @End Reasoning
+Process called "render_case_clause" takes node as Integer returns Integer:
+    Let count be proc node_child_count with node
 
-@Implementation:
-Reads name/constructors/type_parameters from the HIR dictionary, counts
-constructors via list_length. Single-constructor types route to
-translate_single_case_class; multi-constructor types route to
-translate_sealed_trait_hierarchy. The three key strings are freed before
-return.
-@End Implementation
-Process called "translate_hir_data_type" takes translator as Integer, hir_data_type as Integer returns Integer:
-    Let name_key be proc create_string from StringCore with "name"
-    Let constructors_key be proc create_string from StringCore with "constructors"
-    Let type_params_key be proc create_string from StringCore with "type_parameters"
+    Let pattern_text be "_"
+    Let guard_text be ""
+    Let body_text be "()"
+    Let have_pattern be 0
+    Let have_body be 0
 
-    Let type_name be proc hashtable_get from Dict with hir_data_type, name_key
-    Let constructors be proc hashtable_get from Dict with hir_data_type, constructors_key
-    Let type_params be proc hashtable_get from Dict with hir_data_type, type_params_key
-
-    Let constructor_count be proc list_length from List with constructors
-
-    Note: Single constructor -> case class
-    If constructor_count is equal to 1:
-        Let constructor be proc list_get from List with constructors, 0
-        proc translate_single_case_class with translator, type_name, constructor, type_params
-    Otherwise:
-        Note: Multiple constructors -> sealed trait + case classes
-        proc translate_sealed_trait_hierarchy with translator, type_name, constructors, type_params
-    End If
-
-    proc deallocate from Layout with name_key
-    proc deallocate from Layout with constructors_key
-    proc deallocate from Layout with type_params_key
-
-    Return 1
-End Process
-
-Note: ============================================================================
-Note: HIR Expression Translation
-Note: ============================================================================
-
-@Reasoning:
-Single dispatch point so the recursion structure of Scala expressions
-exactly mirrors the HIR's. Branches on the HIR type discriminant (the
-"type" key); the null-HIR fast-path returns "()" (Scala unit) so callers
-need not pre-check for missing operands, which is critical when HIR
-nodes can legitimately omit a body slot.
-@End Reasoning
-
-@Implementation:
-On hir_expr == 0 returns a fresh "()" string. Otherwise reads "type"
-from the dictionary and dispatches by enum tag through a sequence of If
-checks. Each branch deallocates the type_key string before forwarding
-to the specialised translator (translate_hir_literal, _identifier,
-_application, _lambda, _let, _match, _if, _block) and returning its
-result. Returns the produced Scala string directly to the caller.
-@End Implementation
-Process called "translate_hir_expression" takes translator as Integer, hir_expr as Integer returns Integer:
-    If hir_expr is equal to 0:
-        Return proc create_string from StringCore with "()"
-    End If
-
-    Let type_key be proc create_string from StringCore with "type"
-    Let expr_type be proc hashtable_get from Dict with hir_expr, type_key
-
-    Note: Literal expression
-    If expr_type is equal to HIR_LITERAL:
-        proc deallocate from Layout with type_key
-        Return proc translate_hir_literal with translator, hir_expr
-    End If
-
-    Note: Identifier expression
-    If expr_type is equal to HIR_IDENTIFIER:
-        proc deallocate from Layout with type_key
-        Return proc translate_hir_identifier with translator, hir_expr
-    End If
-
-    Note: Function application
-    If expr_type is equal to HIR_APPLICATION:
-        proc deallocate from Layout with type_key
-        Return proc translate_hir_application with translator, hir_expr
-    End If
-
-    Note: Lambda expression
-    If expr_type is equal to HIR_LAMBDA:
-        proc deallocate from Layout with type_key
-        Return proc translate_hir_lambda with translator, hir_expr
-    End If
-
-    Note: Case expression (match)
-    If expr_type is equal to HIR_CASE:
-        proc deallocate from Layout with type_key
-        Return proc translate_hir_case with translator, hir_expr
-    End If
-
-    Note: If expression
-    If expr_type is equal to HIR_IF:
-        proc deallocate from Layout with type_key
-        Return proc translate_hir_if with translator, hir_expr
-    End If
-
-    Note: List expression
-    If expr_type is equal to HIR_LIST:
-        proc deallocate from Layout with type_key
-        Return proc translate_hir_list with translator, hir_expr
-    End If
-
-    Note: Tuple expression
-    If expr_type is equal to HIR_TUPLE:
-        proc deallocate from Layout with type_key
-        Return proc translate_hir_tuple with translator, hir_expr
-    End If
-
-    proc deallocate from Layout with type_key
-    Return proc create_string from StringCore with "???"
-End Process
-
-@Reasoning:
-Literal emission branches on the HIR literal_type tag rather than on the
-HIR node kind because the same kind can carry strings, integers, floats,
-or booleans depending on the source. The fast-path for strings wraps the
-value in straight quotes; the integer/float/boolean fast-paths emit
-verbatim (Scala's syntax is identical to Runa's for these). Unknown
-literal types return the value unwrapped, which preserves source
-fidelity even when the type tag is missing.
-@End Reasoning
-Process called "translate_hir_literal" takes translator as Integer, hir_literal as Integer returns Integer:
-    Note: Translate HIR literal to Scala literal
-
-    Let value_key be proc create_string from StringCore with "value"
-    Let literal_type_key be proc create_string from StringCore with "literal_type"
-
-    Let literal_value be proc hashtable_get from Dict with hir_literal, value_key
-    Let literal_type be proc hashtable_get from Dict with hir_literal, literal_type_key
-
-    Note: String literal
-    Let string_type be proc create_string from StringCore with "string"
-    Let string_match be proc string_compare from StringCore with literal_type, string_type
-    If string_match is equal to 0:
-        Let quote_start be proc create_string from StringCore with "\""
-        Let temp_str be proc string_concat from StringCore with quote_start, literal_value
-        Let quote_end be proc create_string from StringCore with "\""
-        Let result_str be proc string_concat from StringCore with temp_str, quote_end
-
-        proc deallocate from Layout with value_key
-        proc deallocate from Layout with literal_type_key
-        proc deallocate from Layout with string_type
-        proc deallocate from Layout with quote_start
-        proc deallocate from Layout with temp_str
-        proc deallocate from Layout with quote_end
-
-        Return result_str
-    End If
-
-    Note: Character literal
-    Let char_type be proc create_string from StringCore with "char"
-    Let char_match be proc string_compare from StringCore with literal_type, char_type
-    If char_match is equal to 0:
-        Set quote_start to proc create_string from StringCore with "'"
-        Set temp_str to proc string_concat from StringCore with quote_start, literal_value
-        Set quote_end to proc create_string from StringCore with "'"
-        Set result_str to proc string_concat from StringCore with temp_str, quote_end
-
-        proc deallocate from Layout with value_key
-        proc deallocate from Layout with literal_type_key
-        proc deallocate from Layout with string_type
-        proc deallocate from Layout with char_type
-        proc deallocate from Layout with quote_start
-        proc deallocate from Layout with temp_str
-        proc deallocate from Layout with quote_end
-
-        Return result_str
-    End If
-
-    Note: Other literals (numbers, booleans) use value directly
-    proc deallocate from Layout with value_key
-    proc deallocate from Layout with literal_type_key
-    proc deallocate from Layout with string_type
-    proc deallocate from Layout with char_type
-
-    Return literal_value
-End Process
-
-@Reasoning:
-HIR's curried n-ary application is lowered as a chain of unary
-applications - "f x y" becomes "f(x)(y)" rather than "f(x, y)". This
-preserves Scala's evaluation order semantics (left-to-right argument
-evaluation, one paren pair per argument) which differ from comma-list
-calls in subtle higher-order cases.
-@End Reasoning
-
-@Implementation:
-Reads "function" and "arguments" keys from the HIR dictionary, recurses
-into translate_hir_expression on the callee. Then iterates the argument
-list, building up "f(arg)(arg2)..." by repeated concat with the
-parenthesisation pattern "(" + scala_arg + ")". Every intermediate
-result string is freed before the next iteration to bound peak memory.
-@End Implementation
-Process called "translate_hir_application" takes translator as Integer, hir_application as Integer returns Integer:
-    Let function_key be proc create_string from StringCore with "function"
-    Let arguments_key be proc create_string from StringCore with "arguments"
-
-    Let hir_function be proc hashtable_get from Dict with hir_application, function_key
-    Let hir_arguments be proc hashtable_get from Dict with hir_application, arguments_key
-
-    Let scala_function be proc translate_hir_expression with translator, hir_function
-    Let result_expr be scala_function
-
-    Note: Apply each argument
-    If hir_arguments is not equal to 0:
-        Let arg_count be proc list_length from List with hir_arguments
-        Let arg_index be 0
-
-        While arg_index is less than arg_count:
-            Let hir_arg be proc list_get from List with hir_arguments, arg_index
-            Let scala_arg be proc translate_hir_expression with translator, hir_arg
-
-            Note: Use parentheses for application
-            Let paren_start be proc string_concat from StringCore with result_expr, "("
-            proc deallocate from Layout with result_expr
-            Let paren_end be proc string_concat from StringCore with paren_start, scala_arg
-            proc deallocate from Layout with paren_start
-            Let final_app be proc string_concat from StringCore with paren_end, ")"
-            proc deallocate from Layout with paren_end
-            proc deallocate from Layout with scala_arg
-            Set result_expr to final_app
-
-            Set arg_index to arg_index plus 1
-        End While
-    End If
-
-    proc deallocate from Layout with function_key
-    proc deallocate from Layout with arguments_key
-
-    Return result_expr
-End Process
-
-@Reasoning:
-Scala lambdas always require parenthesised parameter lists even for
-single-parameter lambdas in this backend; the parser-side simplification
-"x => x" is intentionally not used so the emitted code is monomorphic in
-shape ("(p1, p2, ...) => body"). This keeps the output predictable for
-downstream formatters.
-@End Reasoning
-
-@Implementation:
-Reads "parameters" and "body" from the HIR dictionary, opens with "(",
-then walks the parameter list calling translate_hir_pattern on each
-(patterns allowed so destructuring lambdas work), joining with ", ".
-Closes with ") => " and concatenates translate_hir_expression of the
-body. Each intermediate string is freed before the next concat;
-parameters_key and body_key are released at exit.
-@End Implementation
-Process called "translate_hir_lambda" takes translator as Integer, hir_lambda as Integer returns Integer:
-    Let parameters_key be proc create_string from StringCore with "parameters"
-    Let body_key be proc create_string from StringCore with "body"
-
-    Let hir_parameters be proc hashtable_get from Dict with hir_lambda, parameters_key
-    Let hir_body be proc hashtable_get from Dict with hir_lambda, body_key
-
-    Let lambda_start be proc create_string from StringCore with "("
-    Let result_expr be lambda_start
-
-    Note: Add parameters
-    If hir_parameters is not equal to 0:
-        Let param_count be proc list_length from List with hir_parameters
-        Let param_index be 0
-
-        While param_index is less than param_count:
-            Let hir_param be proc list_get from List with hir_parameters, param_index
-            Let scala_param be proc translate_hir_pattern with translator, hir_param
-
-            Let temp_expr be proc string_concat from StringCore with result_expr, scala_param
-            proc deallocate from Layout with result_expr
-            Set result_expr to temp_expr
-
-            If param_index is less than param_count minus 1:
-                Let comma_expr be proc string_concat from StringCore with result_expr, ", "
-                proc deallocate from Layout with result_expr
-                Set result_expr to comma_expr
+    Let i be 0
+    While i is less than count:
+        Let child be proc node_child with node, i
+        Let k be proc node_kind with child
+        If k is equal to HIR_PATTERN:
+            Set pattern_text to proc render_pattern with child
+            Set have_pattern to 1
+        Otherwise:
+            If k is equal to HIR_PATTERN_GUARD:
+                Let gchild be proc node_child with child, 0
+                Set guard_text to proc render_expression with gchild
+            Otherwise:
+                Note: First non-pattern, non-guard child is the case body.
+                If have_body is equal to 0:
+                    Set body_text to proc render_expression with child
+                    Set have_body to 1
+                End If
             End If
-
-            proc deallocate from Layout with scala_param
-            Set param_index to param_index plus 1
-        End While
-    End If
-
-    Note: Add arrow and body
-    Let arrow_expr be proc string_concat from StringCore with result_expr, ") => "
-    proc deallocate from Layout with result_expr
-
-    Let scala_body be proc translate_hir_expression with translator, hir_body
-    Let final_expr be proc string_concat from StringCore with arrow_expr, scala_body
-
-    proc deallocate from Layout with parameters_key
-    proc deallocate from Layout with body_key
-    proc deallocate from Layout with arrow_expr
-    proc deallocate from Layout with scala_body
-
-    Return final_expr
-End Process
-
-Note: ============================================================================
-Note: Utility Functions
-Note: ============================================================================
-
-@Reasoning:
-Pre-populates the type mapping table with the six HIR primitives so
-that translate_hir_type can resolve them with a single hashtable_get
-instead of a chain of string comparisons. The chosen Scala names
-("Int", "Double", "Boolean", "String", "Char", "Unit") are the native
-Scala forms (NOT java.lang.* boxed forms) so generated code stays
-idiomatic.
-@End Reasoning
-
-@Implementation:
-Reads type_mappings @48 from the translator. For each of six HIR
-primitives (integer, float, boolean, string, char, unit), creates the
-HIR key and Scala value as fresh strings via create_string and stores
-them with hashtable_set. The stored strings are NOT freed because the
-hashtable takes ownership of both key and value pointers.
-@End Implementation
-Process called "setup_scala_type_mappings" takes translator as Integer returns Integer:
-    Let type_mappings be proc memory_get_int64 from Layout with translator, 48
-
-    Note: Primitive type mappings
-    Let int_key be proc create_string from StringCore with "integer"
-    Let int_val be proc create_string from StringCore with "Int"
-    proc hashtable_set from Dict with type_mappings, int_key, int_val
-
-    Let float_key be proc create_string from StringCore with "float"
-    Let float_val be proc create_string from StringCore with "Double"
-    proc hashtable_set from Dict with type_mappings, float_key, float_val
-
-    Let bool_key be proc create_string from StringCore with "boolean"
-    Let bool_val be proc create_string from StringCore with "Boolean"
-    proc hashtable_set from Dict with type_mappings, bool_key, bool_val
-
-    Let string_key be proc create_string from StringCore with "string"
-    Let string_val be proc create_string from StringCore with "String"
-    proc hashtable_set from Dict with type_mappings, string_key, string_val
-
-    Let char_key be proc create_string from StringCore with "char"
-    Let char_val be proc create_string from StringCore with "Char"
-    proc hashtable_set from Dict with type_mappings, char_key, char_val
-
-    Let unit_key be proc create_string from StringCore with "unit"
-    Let unit_val be proc create_string from StringCore with "Unit"
-    proc hashtable_set from Dict with type_mappings, unit_key, unit_val
-
-    Return 1
-End Process
-
-@Reasoning:
-Final stage that converts the string-fragment list produced by every
-emit_scala_code call into a single contiguous source string. Done as a
-one-shot fold rather than streaming output so callers (test harnesses,
-the dev_tools formatter) get a complete value they can hash, compare,
-or write to disk atomically.
-@End Reasoning
-
-@Implementation:
-Reads output_buffer @0 from translator, returns empty string immediately
-if the buffer length is 0. Otherwise iterates 0..length-1 with
-list_get and accumulates into result_code via repeated string_concat.
-The accumulator is freed before each assignment to keep the O(n^2)
-concat cost from also having O(n) peak memory. Returns the final
-concatenated string (caller owns it).
-@End Implementation
-Process called "generate_scala_code" takes translator as Integer returns Integer:
-    Let output_buffer be proc memory_get_int64 from Layout with translator, 0
-    Let buffer_length be proc list_length from List with output_buffer
-
-    If buffer_length is equal to 0:
-        Return proc create_string from StringCore with ""
-    End If
-
-    Let result_code be proc create_string from StringCore with ""
-    Let buffer_index be 0
-
-    While buffer_index is less than buffer_length:
-        Let code_fragment be proc list_get from List with output_buffer, buffer_index
-        Let temp_result be proc string_concat from StringCore with result_code, code_fragment
-        proc deallocate from Layout with result_code
-        Set result_code to temp_result
-        Set buffer_index to buffer_index plus 1
+        End If
+        Set i to i plus 1
     End While
 
-    Return result_code
-End Process
-
-Note: ============================================================================
-Note: Additional Helper Functions
-Note: ============================================================================
-
-@Reasoning:
-Returning Scala's top type "Any" is the safe escape hatch for any HIR
-type whose Scala mapping has not yet been specialised: the resulting
-Scala will compile but will fall back to type-erased Any semantics for
-the operation. The detailed type-mapping table populated by
-setup_scala_type_mappings is consulted by the call sites that need
-precise mappings (e.g. generate_function for declared parameter types).
-@End Reasoning
-Process called "translate_hir_type" takes translator as Integer, hir_type as Integer returns Integer:
-    Note: Translate HIR type to Scala type
-    Return proc create_string from StringCore with "Any"
+    Let result be proc string_concat from StringUtils with "case ", pattern_text
+    If proc string_equals from StringCore with guard_text, "" is equal to 0:
+        Let gtext be proc string_concat from StringUtils with " if ", guard_text
+        Set result to proc string_concat from StringUtils with result, gtext
+    End If
+    Set result to proc string_concat from StringUtils with result, " => "
+    Return proc string_concat from StringUtils with result, body_text
 End Process
 
 @Reasoning:
-The wildcard "_" maps every HIR pattern conservatively because Scala's
-match arms must be syntactically valid even when the pattern shape is
-unknown. The wildcard preserves arm-count and avoids producing
-unreachable-pattern warnings that would otherwise mask other diagnostics
-during the universal-translation round trip.
+A pattern renders according to its "pattern_type": wildcard -> "_", literal /
+variable -> the stored value verbatim, constructor -> "Name(sub, sub, ...)",
+tuple -> "(sub, sub)", list -> "List(sub, sub)". Sub-patterns are the node's
+children, rendered recursively.
 @End Reasoning
-Process called "translate_hir_pattern" takes translator as Integer, hir_pattern as Integer returns Integer:
-    Note: Translate HIR pattern to Scala pattern
-    Return proc create_string from StringCore with "_"
+Process called "render_pattern" takes node as Integer returns Integer:
+    Let ptype be proc node_attr with node, "pattern_type"
+    Let value be proc node_value with node
+    Let count be proc node_child_count with node
+
+    If proc string_equals from StringCore with ptype, "wildcard" is equal to 1:
+        Return "_"
+    End If
+    If proc string_equals from StringCore with ptype, "literal" is equal to 1:
+        Return value
+    End If
+    If proc string_equals from StringCore with ptype, "variable" is equal to 1:
+        Return value
+    End If
+    If proc string_equals from StringCore with ptype, "tuple" is equal to 1:
+        Return proc render_pattern_group with node, "", count
+    End If
+    If proc string_equals from StringCore with ptype, "list" is equal to 1:
+        Return proc render_pattern_group with node, "List", count
+    End If
+    If proc string_equals from StringCore with ptype, "constructor" is equal to 1:
+        Return proc render_pattern_group with node, value, count
+    End If
+
+    Note: Untyped pattern: a bare name binds, an empty one is wildcard.
+    If proc string_equals from StringCore with value, "" is equal to 1:
+        Return "_"
+    End If
+    Return value
 End Process
 
 @Reasoning:
-The bare "x: Any" placeholder is the lowest-precision Scala parameter
-form; the call site in translate_hir_function uses this only when a more
-specific HIR parameter shape is unavailable. The Any binding keeps the
-arity correct for callers downstream.
+Renders a parenthesised sub-pattern group "<prefix>(p1, p2, ...)" used by
+constructor, tuple, and list patterns. A tuple uses an empty prefix; a list uses
+"List"; a constructor uses the constructor name. With no sub-patterns the prefix
+alone (or "()") is returned.
 @End Reasoning
-Process called "translate_hir_parameter" takes translator as Integer, hir_param as Integer returns Integer:
-    Note: Translate HIR parameter to Scala parameter
-    Return proc create_string from StringCore with "x: Any"
+Process called "render_pattern_group" takes node as Integer, prefix as Integer, count as Integer returns Integer:
+    If count is equal to 0:
+        If proc string_equals from StringCore with prefix, "" is equal to 1:
+            Return "()"
+        End If
+        Return prefix
+    End If
+    Let result be proc string_concat from StringUtils with prefix, "("
+    Let i be 0
+    While i is less than count:
+        Let child be proc node_child with node, i
+        Let sub be proc render_pattern with child
+        If i is equal to 0:
+            Set result to proc string_concat from StringUtils with result, sub
+        Otherwise:
+            Let sep be proc string_concat from StringUtils with ", ", sub
+            Set result to proc string_concat from StringUtils with result, sep
+        End If
+        Set i to i plus 1
+    End While
+    Return proc string_concat from StringUtils with result, ")"
 End Process
 
 @Reasoning:
-HIR identifiers carry their textual name in the "name" attribute; we
-return it verbatim because Scala's identifier syntax is a strict superset
-of Runa's. The caller owns the returned string lifetime; we deliberately
-do not duplicate it to avoid double-free in patterns where the same
-identifier is referenced from multiple HIR positions.
+A for-comprehension "for (gen; guard) yield body". The producer stores the
+generators, guards, and yield body as children. Without finer structural tags we
+render the children as a generator list followed by a "yield" of the final child,
+which preserves the comprehension shape through a re-parse.
 @End Reasoning
-Process called "translate_hir_identifier" takes translator as Integer, hir_identifier as Integer returns Integer:
-    Note: Translate HIR identifier to Scala identifier
-    Let name_key be proc create_string from StringCore with "name"
-    Let identifier_name be proc hashtable_get from Dict with hir_identifier, name_key
-    proc deallocate from Layout with name_key
-    Return identifier_name
+Process called "render_for" takes node as Integer returns Integer:
+    Let count be proc node_child_count with node
+    If count is equal to 0:
+        Return "for () yield ()"
+    End If
+
+    Let body_index be count minus 1
+    Let gens be "for ("
+    Let i be 0
+    While i is less than body_index:
+        Let gen be proc node_child with node, i
+        Let gen_text be proc render_expression with gen
+        If i is equal to 0:
+            Set gens to proc string_concat from StringUtils with gens, gen_text
+        Otherwise:
+            Let sep be proc string_concat from StringUtils with "; ", gen_text
+            Set gens to proc string_concat from StringUtils with gens, sep
+        End If
+        Set i to i plus 1
+    End While
+    Set gens to proc string_concat from StringUtils with gens, ") yield "
+
+    Let body be proc node_child with node, body_index
+    Let body_text be proc render_expression with body
+    Return proc string_concat from StringUtils with gens, body_text
 End Process
 
 @Reasoning:
-The skeletal "??? match { case _ => ??? }" form is the conservative
-fallback for HIR match constructs whose full Scala translation has not
-yet been specialised. The "???" placeholder is Scala's idiomatic
-"not implemented" marker (it compiles, but throws NotImplementedError at
-runtime) so the output is at least syntactically valid Scala.
+A while loop "while (cond) body". The producer stores the condition and body as
+children; Scala's while is a Unit-typed statement form.
 @End Reasoning
-Process called "translate_hir_case" takes translator as Integer, hir_case as Integer returns Integer:
-    Note: Translate HIR case to Scala match expression
-    Return proc create_string from StringCore with "??? match { case _ => ??? }"
+Process called "render_while" takes node as Integer returns Integer:
+    Let cond be proc node_child with node, 0
+    Let body be proc node_child with node, 1
+    Let cond_text be proc render_expression with cond
+    Let body_text be proc render_expression with body
+    Let result be proc string_concat from StringUtils with "while (", cond_text
+    Set result to proc string_concat from StringUtils with result, ") "
+    Return proc string_concat from StringUtils with result, body_text
 End Process
 
 @Reasoning:
-The "if (true) ??? else ???" form is the conservative fallback for HIR
-if constructs without specialised lowering. Scala's "???" operator emits
-runtime NotImplementedError, which is what the universal translator wants
-when source semantics cannot yet be preserved through this backend.
+A try expression "try body catch { case ... } finally cleanup". The producer
+stores the body, catch case clauses, and finally block as children. We render the
+body, a catch block built from any HIR_CASE_CLAUSE children, and a finally tail
+when a trailing non-case child is present.
 @End Reasoning
-Process called "translate_hir_if" takes translator as Integer, hir_if as Integer returns Integer:
-    Note: Translate HIR if to Scala if expression
-    Return proc create_string from StringCore with "if (true) ??? else ???"
+Process called "render_try" takes node as Integer returns Integer:
+    Let count be proc node_child_count with node
+
+    Let body_text be "()"
+    Let have_body be 0
+    Let has_catch be 0
+
+    Note: First non-case child is the try body.
+    Let i be 0
+    While i is less than count:
+        Let child be proc node_child with node, i
+        If proc node_kind with child is not equal to HIR_CASE_CLAUSE:
+            If have_body is equal to 0:
+                Set body_text to proc render_expression with child
+                Set have_body to 1
+            End If
+        Otherwise:
+            Set has_catch to 1
+        End If
+        Set i to i plus 1
+    End While
+
+    Let result be proc string_concat from StringUtils with "try ", body_text
+
+    If has_catch is equal to 1:
+        Set result to proc string_concat from StringUtils with result, " catch { "
+        Set i to 0
+        While i is less than count:
+            Let child2 be proc node_child with node, i
+            If proc node_kind with child2 is equal to HIR_CASE_CLAUSE:
+                Set result to proc string_concat from StringUtils with result, proc render_case_clause with child2
+                Set result to proc string_concat from StringUtils with result, " "
+            End If
+            Set i to i plus 1
+        End While
+        Set result to proc string_concat from StringUtils with result, "}"
+    End If
+
+    Note: A second non-case child (after the body) is the finally block.
+    Let seen_body be 0
+    Set i to 0
+    While i is less than count:
+        Let child3 be proc node_child with node, i
+        If proc node_kind with child3 is not equal to HIR_CASE_CLAUSE:
+            If seen_body is equal to 1:
+                Let fin be proc render_expression with child3
+                Let fin_text be proc string_concat from StringUtils with " finally ", fin
+                Set result to proc string_concat from StringUtils with result, fin_text
+                Return result
+            End If
+            Set seen_body to 1
+        End If
+        Set i to i plus 1
+    End While
+    Return result
 End Process
 
 @Reasoning:
-Empty List() is the universally valid Scala List literal regardless of
-element type, since List is covariant. Concrete element emission is the
-responsibility of specialised lowering paths in the gungnir HIR-to-MIR
-phase that handle list construction inline.
+A return "return expr" (or bare "return"). The producer stores the optional
+expression as the sole child.
 @End Reasoning
-Process called "translate_hir_list" takes translator as Integer, hir_list as Integer returns Integer:
-    Note: Translate HIR list to Scala List
-    Return proc create_string from StringCore with "List()"
+Process called "render_return" takes node as Integer returns Integer:
+    Let count be proc node_child_count with node
+    If count is equal to 0:
+        Return "return"
+    End If
+    Let child be proc node_child with node, 0
+    Let child_text be proc render_expression with child
+    Return proc string_concat from StringUtils with "return ", child_text
 End Process
 
 @Reasoning:
-The unit "()" is Scala's empty-tuple literal and the canonical placeholder
-when HIR tuple element data is not yet wired through this translator.
-Concrete tuple emission is performed by the typed lowering paths that
-walk individual element expressions.
+A throw "throw expr". The thrown expression is the sole child; it must evaluate to
+a Throwable in valid Scala, but the backend emits the producer's expression
+faithfully and leaves that check to the Scala compiler.
 @End Reasoning
-Process called "translate_hir_tuple" takes translator as Integer, hir_tuple as Integer returns Integer:
-    Note: Translate HIR tuple to Scala tuple
-    Return proc create_string from StringCore with "()"
+Process called "render_throw" takes node as Integer returns Integer:
+    Let child be proc node_child with node, 0
+    Let child_text be proc render_expression with child
+    Return proc string_concat from StringUtils with "throw ", child_text
 End Process
 
 @Reasoning:
-HIR type aliases map onto Scala's "type T = U" form; this routine
-currently returns success without emitting because the gungnir HIR-to-MIR
-pipeline normalises away type aliases by inlining their right-hand side,
-making the alias unnecessary at the Scala emission boundary. Maintained
-as an explicit entry point so the dispatcher in translate_hir_declaration
-has a uniform per-kind shape.
+An assignment "target = value". The producer stores the target as the first child
+and the value as the second.
 @End Reasoning
-Process called "translate_hir_type_alias" takes translator as Integer, hir_type_alias as Integer returns Integer:
-    Note: Translate HIR type alias to Scala type alias
-    Return 1
+Process called "render_assignment" takes node as Integer returns Integer:
+    Let target be proc node_child with node, 0
+    Let value be proc node_child with node, 1
+    Let target_text be proc render_expression with target
+    Let value_text be proc render_expression with value
+    Let result be proc string_concat from StringUtils with target_text, " = "
+    Return proc string_concat from StringUtils with result, value_text
 End Process
 
 @Reasoning:
-HIR type-class declarations target Scala's "trait T[A]" + companion
-"implicit object" idiom. The gungnir lowering desugars type classes into
-the constituent trait and instance declarations before reaching this
-backend, so this stub is the inert pass-through that the dispatcher
-invokes for symmetry.
+A tuple "(e1, e2, ...)". The producer stores the element count in the
+"element_count" attribute and the elements as children. We render the
+parenthesised, comma-separated element list directly from the children.
 @End Reasoning
-Process called "translate_hir_type_class" takes translator as Integer, hir_type_class as Integer returns Integer:
-    Note: Translate HIR type class to Scala trait with implicit
-    Return 1
+Process called "render_tuple" takes node as Integer returns Integer:
+    Let count be proc node_child_count with node
+    Let result be "("
+    Let i be 0
+    While i is less than count:
+        Let child be proc node_child with node, i
+        Let child_text be proc render_expression with child
+        If i is equal to 0:
+            Set result to proc string_concat from StringUtils with result, child_text
+        Otherwise:
+            Let sep be proc string_concat from StringUtils with ", ", child_text
+            Set result to proc string_concat from StringUtils with result, sep
+        End If
+        Set i to i plus 1
+    End While
+    Return proc string_concat from StringUtils with result, ")"
 End Process
 
 @Reasoning:
-HIR instance declarations map onto Scala's "implicit object Name extends
-Trait[A]" form. As with translate_hir_type_class, the gungnir lowering
-expands instances into ordinary declarations before reaching this
-backend, so the routine is kept as a uniform dispatch entry rather than
-removed entirely.
+A list literal "List(e1, e2, ...)". Elements are the children, rendered
+comma-separated inside the List companion application.
 @End Reasoning
-Process called "translate_hir_instance" takes translator as Integer, hir_instance as Integer returns Integer:
-    Note: Translate HIR instance to Scala implicit object
-    Return 1
+Process called "render_list" takes node as Integer returns Integer:
+    Let count be proc node_child_count with node
+    Let result be "List("
+    Let i be 0
+    While i is less than count:
+        Let child be proc node_child with node, i
+        Let child_text be proc render_expression with child
+        If i is equal to 0:
+            Set result to proc string_concat from StringUtils with result, child_text
+        Otherwise:
+            Let sep be proc string_concat from StringUtils with ", ", child_text
+            Set result to proc string_concat from StringUtils with result, sep
+        End If
+        Set i to i plus 1
+    End While
+    Return proc string_concat from StringUtils with result, ")"
 End Process
 
 @Reasoning:
-Product types with a single constructor map onto a Scala "case class
-Name(...)" form. The detailed parameter/field emission is performed by
-the data-type lowering layer in gungnir which already produces the case
-class body inline; this entry point exists so translate_hir_data_type
-can dispatch uniformly regardless of constructor count.
+An inline (single-expression) block used where a value is expected: render the
+sole or last child directly, falling back to a braced sequence joined with ";"
+when multiple statements exist. Keeps nested block expressions readable on one
+line where Scala allows it.
 @End Reasoning
-Process called "translate_single_case_class" takes translator as Integer, type_name as Integer, constructor as Integer, type_params as Integer returns Integer:
-    Note: Translate to single case class
-    Return 1
+Process called "render_block_inline" takes node as Integer returns Integer:
+    Let count be proc node_child_count with node
+    If count is equal to 0:
+        Return "{}"
+    End If
+    If count is equal to 1:
+        Let only be proc node_child with node, 0
+        Return proc render_expression with only
+    End If
+    Let result be "{ "
+    Let i be 0
+    While i is less than count:
+        Let child be proc node_child with node, i
+        Let child_text be proc render_expression with child
+        If i is equal to 0:
+            Set result to proc string_concat from StringUtils with result, child_text
+        Otherwise:
+            Let sep be proc string_concat from StringUtils with "; ", child_text
+            Set result to proc string_concat from StringUtils with result, sep
+        End If
+        Set i to i plus 1
+    End While
+    Return proc string_concat from StringUtils with result, " }"
 End Process
 
 @Reasoning:
-Sum types with multiple constructors lower to Scala's "sealed trait T;
-case class A; case class B" idiom which guarantees exhaustiveness checks
-in pattern matching. The detailed hierarchy emission is delegated to the
-gungnir data-type lowering; this entry exists for dispatcher symmetry
-with translate_single_case_class.
+A val/var binding appearing in expression/statement position (inside a block):
+"val name: Type = init" or "var name = init". The type and initializer are read
+the same way as the declaration form, but the result is returned as a string so a
+block can place it on its own line.
 @End Reasoning
-Process called "translate_sealed_trait_hierarchy" takes translator as Integer, type_name as Integer, constructors as Integer, type_params as Integer returns Integer:
-    Note: Translate to sealed trait hierarchy
-    Return 1
+Process called "render_inline_binding" takes node as Integer, immutable as Integer returns Integer:
+    Let keyword be "var "
+    If immutable is equal to 1:
+        Set keyword to "val "
+    End If
+    Let result be proc string_concat from StringUtils with keyword, proc node_value with node
+
+    Let vtype be proc node_attr with node, "type"
+    If proc string_equals from StringCore with vtype, "" is equal to 0:
+        Let typed be proc string_concat from StringUtils with result, ": "
+        Set result to proc string_concat from StringUtils with typed, vtype
+    End If
+
+    Let init be proc find_initializer with node
+    If init is equal to 0:
+        Return result
+    End If
+    Let init_text be proc render_expression with init
+    Let assigned be proc string_concat from StringUtils with result, " = "
+    Return proc string_concat from StringUtils with assigned, init_text
 End Process
 
 Note: ============================================================================
@@ -1239,57 +1794,29 @@ Note: Public API
 Note: ============================================================================
 
 @Reasoning:
-The single public entry point for HIR-to-Scala lowering: external
-callers (the gungnir driver, dev_tools/transpiler) only see this
-routine, while every other Process in this file is an implementation
-detail. The pipeline order (create -> translate_module -> generate ->
-destroy) is the canonical resource lifecycle; reordering would either
-leak the translator or read freed memory.
-@End Reasoning
-
-@Implementation:
-Calls create_hir_to_scala_translator, returns 0 immediately on failure.
-Invokes translate_hir_module to populate the output buffer, then
-generate_scala_code to fold the buffer into a single string. Finally
-calls destroy_hir_to_scala_translator to release the translator and its
-four owned collections; the returned scala_code string is owned by the
-caller and is unaffected by the translator teardown.
-@End Implementation
-Process called "translate_hir_to_scala" takes hir_module as Integer returns Integer:
-    Let translator be proc create_hir_to_scala_translator
-
-    If translator is equal to 0:
-        Return 0
-    End If
-
-    proc translate_hir_module with translator, hir_module
-    Let scala_code be proc generate_scala_code from translator
-
-    proc destroy_hir_to_scala_translator from translator
-
-    Return scala_code
-End Process
-
-Note: ============================================================================
-Note: DISPATCHER ENTRY POINT
-Note: ============================================================================
-Note: Single-arg wrapper matching the central dispatcher call shape in
-Note: translation.runa: `Return proc hir_to_scala from ScalaEmitter with hir_root`.
-Note: Delegates to translate_hir_to_scala which holds the actual translation
-Note: pipeline (translator creation, HIR walking, code generation, cleanup).
-Note: Introduced in P2-F Round 2B alongside the demolition of the vestigial
-Note: scala_emitter.runa shim.
-@Reasoning:
-The single-arg wrapper matches the shape that translation.runa's central
-dispatcher expects: `proc hir_to_scala from ScalaEmitter with hir_root`.
-Delegates to translate_hir_to_scala which owns the full pipeline
-(translator creation, HIR walking, code generation, cleanup). The null
-guard at the entry point matches the convention used by every other
-emitter wrapper so a null HIR root returns 0 rather than crashing.
+The full pipeline entry: create an emitter, walk the HIR module emitting Scala,
+fold the buffer into a single source string, and return it. A null root yields 0
+so callers can short-circuit. This is the routine the central translation
+dispatcher invokes for the Scala target.
 @End Reasoning
 Process called "hir_to_scala" takes hir_root as Integer returns Integer:
     If hir_root is equal to 0:
         Return 0
     End If
-    Return proc translate_hir_to_scala with hir_root
+    Let emitter be proc create_scala_emitter
+    If emitter is equal to 0:
+        Return 0
+    End If
+    proc emit_module with emitter, hir_root
+    Let code be proc emitter_render with emitter
+    Return code
+End Process
+
+@Reasoning:
+Retained public alias matching the historical two-name API (translate_hir_to_scala
+and hir_to_scala both existed). Delegates to hir_to_scala so external callers that
+bound the longer name keep working without a second implementation.
+@End Reasoning
+Process called "translate_hir_to_scala" takes hir_module as Integer returns Integer:
+    Return proc hir_to_scala with hir_module
 End Process

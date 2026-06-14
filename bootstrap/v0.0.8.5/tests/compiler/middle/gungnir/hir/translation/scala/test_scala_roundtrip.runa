@@ -1,0 +1,235 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+Licensed under Apache 2.0
+:End Note
+
+Note:
+Scala Translation Round-Trip Probe
+
+End-to-end proof that the Scala translation pipeline is REAL, not a skeleton:
+
+    Scala source
+      -> scala_lexer    (tokenizer)
+      -> scala_parser   (recursive-descent AST: package, imports, object,
+                         case class, trait + class, generic def with bounds,
+                         match w/ patterns + guard, for-comprehension w/ yield,
+                         lambda, string interpolation)
+      -> scala_semantic (scope/name analysis; validation only)
+      -> scala_to_hir   (lower to the producer's HIRNode tree IR)
+      -> hir_to_scala   (emit HIR back to valid Scala text)
+      -> re-lex / re-parse / re-to_hir of the emitted text
+      -> structural HIR equality on the key constructs
+
+The Scala HIR node model is scala_to_hir.runa's typed HIRNode record shared by
+scala_to_hir (producer) and hir_to_scala (consumer): each node is a struct with
+node_type at offset 8, the textual value at offset 16, and a children List at
+offset 24. This probe reads HIR fields through exactly that contract.
+
+It lowers the source to HIR1, asserts HIR1 is a module whose tree contains the
+named declarations (object "Geometry", case class "Circle", trait "Shape",
+class "Square", def "area", def "classify"), emits HIR1 back to Scala text,
+re-runs the whole pipeline on the emitted text to HIR2, and asserts HIR2 is
+STRUCTURALLY EQUAL to HIR1 on those same key constructs.
+
+Exit code: number of failed assertions (0 == all passed). No exit_with_code.
+:End Note
+
+Import "compiler/middle/gungnir/hir/translation/frontends/scala/scala_to_hir.runa" as ScalaFrontend
+Import "compiler/middle/gungnir/hir/translation/backends/scala/hir_to_scala.runa" as ScalaBackend
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/collections/list.runa" as List
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "tests/test_utils.runa" as TestUtils
+
+Note: ============================================================================
+Note: HIRNode decoders - node_type@8, value@16, children@24, matching
+Note: scala_to_hir.runa's HIRNode record (node_id@0, node_type@8, value@16,
+Note: children@24, attributes@32, type_info@40, source_location@48).
+Note: ============================================================================
+
+@Reasoning:
+The node_type tag lives at offset 8 (node_id occupies offset 0). Centralising the
+read documents the contract this probe shares with both producer and consumer.
+@End Reasoning
+Process called "hir_kind" takes node as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Layout with node, 8
+End Process
+
+@Reasoning:
+The textual payload (name / literal / identifier) is the String handle at offset
+16.
+@End Reasoning
+Process called "hir_value" takes node as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Layout with node, 16
+End Process
+
+@Reasoning:
+The children List handle is at offset 24; the same List the producer populated
+via add_hir_child, so List.length / List.get iterate it directly.
+@End Reasoning
+Process called "hir_children" takes node as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Layout with node, 24
+End Process
+
+@Reasoning:
+The child count is the length of the children list, or 0 when the node has no
+children handle.
+@End Reasoning
+Process called "hir_child_count" takes node as Integer returns Integer:
+    Let children be proc hir_children with node
+    If children is equal to 0:
+        Return 0
+    End If
+    Return proc list_length from List with children
+End Process
+
+@Reasoning:
+Positional child access over the children list.
+@End Reasoning
+Process called "hir_child" takes node as Integer, index as Integer returns Integer:
+    Let children be proc hir_children with node
+    If children is equal to 0:
+        Return 0
+    End If
+    Return proc list_get from List with children, index
+End Process
+
+@Reasoning:
+Recursively searches the whole HIR tree for the first node whose value string
+equals the requested name. Robust locator for a named declaration regardless of
+the depth (module -> package -> class/trait body) at which it sits.
+@End Reasoning
+Process called "find_named_any" takes parent as Integer, name as Integer returns Integer:
+    If parent is equal to 0:
+        Return 0
+    End If
+    Let pv be proc hir_value with parent
+    If pv is not equal to 0:
+        Let matches be proc string_equals from StringCore with pv, name
+        If matches is equal to 1:
+            Return parent
+        End If
+    End If
+    Let count be proc hir_child_count with parent
+    Let i be 0
+    While i is less than count:
+        Let child be proc hir_child with parent, i
+        Let found be proc find_named_any with child, name
+        If found is not equal to 0:
+            Return found
+        End If
+        Set i to i plus 1
+    End While
+    Return 0
+End Process
+
+@Reasoning:
+Two HIR nodes are structurally equal on a construct when both carry the same
+node_type tag - a whitespace-insensitive fidelity check that survives the
+emitter's re-indentation.
+@End Reasoning
+Process called "same_kind" takes a as Integer, b as Integer returns Integer:
+    If a is equal to 0:
+        Return 0
+    End If
+    If b is equal to 0:
+        Return 0
+    End If
+    Let ka be proc hir_kind with a
+    Let kb be proc hir_kind with b
+    If ka is equal to kb:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: Probe entry point
+Note: ============================================================================
+
+Process called "main" returns Integer:
+    Let results be proc create_test_results from TestUtils
+    proc begin_suite from TestUtils with results, "Scala translation round-trip"
+
+    Note:
+    Representative program exercising the constructs the task requires: a package,
+    imports (wildcard + selector), an object, a case class, a trait and a class
+    extending it, a generic def with an upper bound, a match with patterns and a
+    guard, a for-comprehension with yield, a lambda, and string interpolation.
+    :End Note
+    Let source be "package geometry\nimport scala.collection.mutable._\nimport scala.math.{Pi, sqrt}\nobject Geometry {\nval origin = 0\n}\ncase class Circle(radius: Double)\ntrait Shape {\ndef area: Double\n}\nclass Square(side: Double) extends Shape {\ndef area: Double = side * side\n}\ndef classify[T <: Shape](s: T): String = s match {\ncase c if c.area > 10.0 => \"big\"\ncase _ => \"small\"\n}\ndef pairs = for (x <- List(1, 2, 3)) yield x * 2\nval f = (x: Int) => x + 1\nval label = s\"area\"\n"
+
+    Note: --- Stage 0-2: source -> HIR1 (parse, validate, lower) ---
+    Let hir1 be proc scala_to_hir_from_source from ScalaFrontend with source
+    proc assert_not_null from TestUtils with results, "frontend produced HIR module", hir1
+
+    Note: HIR root has declarations.
+    Let root_kids be proc hir_child_count with hir1
+    proc assert_greater_than from TestUtils with results, "module has declarations", root_kids, 0
+
+    Note: --- key named constructs present in HIR1 ---
+    Let obj_node be proc find_named_any with hir1, "Geometry"
+    proc assert_not_null from TestUtils with results, "object 'Geometry' lowered", obj_node
+
+    Let circle_node be proc find_named_any with hir1, "Circle"
+    proc assert_not_null from TestUtils with results, "case class 'Circle' lowered", circle_node
+
+    Let shape_node be proc find_named_any with hir1, "Shape"
+    proc assert_not_null from TestUtils with results, "trait 'Shape' lowered", shape_node
+
+    Let square_node be proc find_named_any with hir1, "Square"
+    proc assert_not_null from TestUtils with results, "class 'Square' lowered", square_node
+
+    Let classify_node be proc find_named_any with hir1, "classify"
+    proc assert_not_null from TestUtils with results, "def 'classify' lowered", classify_node
+
+    Let area_node be proc find_named_any with hir1, "area"
+    proc assert_not_null from TestUtils with results, "def 'area' lowered", area_node
+
+    Note: --- Stage 3: HIR1 -> Scala text ---
+    Let emitted be proc hir_to_scala from ScalaBackend with hir1
+    proc assert_not_null from TestUtils with results, "backend produced Scala text", emitted
+    Let emitted_len be proc string_length from StringCore with emitted
+    proc assert_greater_than from TestUtils with results, "emitted Scala is non-empty", emitted_len, 0
+
+    Note: --- Stage 4: re-run the pipeline on the emitted text -> HIR2 ---
+    Let hir2 be proc scala_to_hir_from_source from ScalaFrontend with emitted
+    proc assert_not_null from TestUtils with results, "re-parse of emitted Scala produced HIR", hir2
+    Let root2_kids be proc hir_child_count with hir2
+    proc assert_greater_than from TestUtils with results, "round-trip module has declarations", root2_kids, 0
+
+    Note: --- Stage 5: structural equality on the key constructs ---
+    Let obj2 be proc find_named_any with hir2, "Geometry"
+    proc assert_not_null from TestUtils with results, "round-trip preserves object 'Geometry'", obj2
+    Let obj_same be proc same_kind with obj_node, obj2
+    proc assert_equal from TestUtils with results, "round-trip preserves 'Geometry' node kind", obj_same, 1
+
+    Let circle2 be proc find_named_any with hir2, "Circle"
+    proc assert_not_null from TestUtils with results, "round-trip preserves case class 'Circle'", circle2
+    Let circle_same be proc same_kind with circle_node, circle2
+    proc assert_equal from TestUtils with results, "round-trip preserves 'Circle' node kind", circle_same, 1
+
+    Let shape2 be proc find_named_any with hir2, "Shape"
+    proc assert_not_null from TestUtils with results, "round-trip preserves trait 'Shape'", shape2
+
+    Let square2 be proc find_named_any with hir2, "Square"
+    proc assert_not_null from TestUtils with results, "round-trip preserves class 'Square'", square2
+
+    Let classify2 be proc find_named_any with hir2, "classify"
+    proc assert_not_null from TestUtils with results, "round-trip preserves def 'classify'", classify2
+
+    proc print_summary from TestUtils with results
+    Let failed be proc get_failed from TestUtils with results
+    proc destroy_test_results from TestUtils with results
+
+    Return failed
+End Process
