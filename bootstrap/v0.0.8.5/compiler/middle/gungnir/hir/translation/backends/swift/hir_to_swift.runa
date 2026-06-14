@@ -213,6 +213,52 @@ Returns 0 if dict_hir is 0. Otherwise reads HIR.get_dict_value(dict, key)
 and returns it (also 0 when the key is absent, which is the expected
 "missing" sentinel).
 @End Implementation
+@Reasoning:
+hir.runa exposes dictionary contents only as an entries List of 16-byte
+[key(0), value(8)] blocks via get_dictionary_entries; it has no keyed
+lookup. This local accessor performs the linear key scan the frontend's
+producer surface (csharp/kotlin/go model) pairs with, returning the
+matching entry's value node or 0. Linear scan is the right cost model:
+translation dictionaries are small fixed property sets.
+@End Reasoning
+@Implementation:
+Null-guard dict_hir and key. Read the entries List via get_dictionary_entries.
+Iterate, comparing each entry's key (offset 0) to the requested key with
+string_equals; on match return the entry's value (offset 8). Return 0 when
+absent.
+@End Implementation
+Process called "get_dictionary_value" takes dict_hir as Integer, key as Integer returns Integer:
+    Note: Look up a value node by key in a HIR dictionary literal
+
+    If dict_hir is equal to 0:
+        Return 0
+    End If
+    If key is equal to 0:
+        Return 0
+    End If
+
+    Let entries be proc get_dictionary_entries from HIR with dict_hir
+    If entries is equal to 0:
+        Return 0
+    End If
+
+    Let count be proc size from ListOps with entries
+    Let index be 0
+    While index is less than count:
+        Let entry be proc get_at from ListOps with entries, index
+        If entry is not equal to 0:
+            Let entry_key be proc memory_get_int64 from Layout with entry, 0
+            Let matches be proc string_equals from StringCore with entry_key, key
+            If matches is equal to 1:
+                Return proc memory_get_int64 from Layout with entry, 8
+            End If
+        End If
+        Set index to index plus 1
+    End While
+
+    Return 0
+End Process
+
 Process called "get_dict_string_value" takes dict_hir as Integer, key as Integer returns Integer:
     Note: Get string value from HIR dictionary
 
@@ -220,13 +266,14 @@ Process called "get_dict_string_value" takes dict_hir as Integer, key as Integer
         Return 0
     End If
 
-    Let value be proc get_dict_value from HIR with dict_hir, key
+    Let value be proc get_dictionary_value with dict_hir, key
 
     If value is equal to 0:
         Return 0
     End If
 
-    Return value
+    Note: String-valued fields are stored as HIR string literals; unwrap.
+    Return proc get_string_literal_value from HIR with value
 End Process
 
 @Reasoning:
@@ -247,21 +294,22 @@ Process called "get_dict_hir_value" takes dict_hir as Integer, key as Integer re
         Return 0
     End If
 
-    Let value be proc get_dict_value from HIR with dict_hir, key
+    Let value be proc get_dictionary_value with dict_hir, key
     Return value
 End Process
 
 @Reasoning:
-HIR carries boolean fields as wrapped string nodes (e.g. `{ "value": "true" }`)
-so the caller would otherwise have to fetch the child then string-compare.
-This helper collapses both steps and normalizes the result to a clean
-1/0 integer so callers can use it as a plain conditional.
+Boolean fields are stored by the frontend through set_dict_string as a
+plain HIR string literal carrying "true" or "false" (e.g. the "mutable"
+field). This helper resolves that string literal and normalizes it to a
+clean 1/0 integer so callers can use it directly as a conditional.
 @End Reasoning
 
 @Implementation:
-Null-guards dict_hir. Reads the keyed sub-node; if non-null reads its
-nested "value" string and returns 1 when that string equals "true" via
-StringCore.strings_equal, else 0. Any missing layer collapses to 0.
+Null-guard dict_hir. Read the keyed value as a string via
+get_dict_string_value (which unwraps the string literal). Return 1 when
+the string equals "true" via StringCore.string_equals, else 0. A missing
+key or non-"true" value collapses to 0.
 @End Implementation
 Process called "get_dict_bool_value" takes dict_hir as Integer, key as Integer returns Integer:
     Note: Get boolean value from HIR dictionary (1=true, 0=false)
@@ -270,15 +318,9 @@ Process called "get_dict_bool_value" takes dict_hir as Integer, key as Integer r
         Return 0
     End If
 
-    Let value be proc get_dict_value from HIR with dict_hir, key
-
-    If value is equal to 0:
-        Return 0
-    End If
-
-    Let str_value be proc get_dict_string_value with value, "value"
+    Let str_value be proc get_dict_string_value with dict_hir, key
     If str_value is not equal to 0:
-        Let is_true be proc strings_equal from StringCore with str_value, "true"
+        Let is_true be proc string_equals from StringCore with str_value, "true"
         If is_true is equal to 1:
             Return 1
         End If
@@ -318,7 +360,7 @@ Process called "generate_swift_from_hir" takes hir_root as Integer returns Integ
         Return 0
     End If
 
-    Let context be proc create_hir_to_swift_context from emitter
+    Let context be proc create_hir_to_swift_context with emitter
 
     If context is equal to 0:
         proc destroy_swift_emitter from Emitter with emitter
@@ -329,7 +371,7 @@ Process called "generate_swift_from_hir" takes hir_root as Integer returns Integ
 
     Let output be proc get_output from Emitter with emitter
 
-    proc destroy_hir_to_swift_context from context
+    proc destroy_hir_to_swift_context with context
     proc destroy_swift_emitter from Emitter with emitter
 
     Return output
@@ -346,6 +388,49 @@ binding inside a switch case. Unknown tags return 0 silently because the HIR
 pipeline guarantees frontends only emit recognised tag strings; encountering an
 unknown tag at runtime indicates a translator bug rather than malformed source.
 @End Reasoning
+@Reasoning:
+The program root carries every top-level declaration in a "members" list.
+Emitting them through generate_node and separating each with a newline
+reproduces a Swift source file: top-level imports, types, functions in
+order. A blank line is not forced between members because individual
+declaration generators already emit their own trailing newline.
+@End Reasoning
+@Implementation:
+Null-guard. Read the "members" list node via get_dict_hir_value. If a
+HIR list, iterate it with get_list_elements / ListOps.size and dispatch
+each element through generate_node, emitting a newline after each so the
+top-level declarations are line-separated. Returns 1.
+@End Implementation
+Process called "generate_program" takes context as Integer, program_hir as Integer returns Integer:
+    Note: Generate a full Swift source file from a swift_program HIR node
+
+    If program_hir is equal to 0:
+        Return 0
+    End If
+
+    Let emitter be proc memory_get_int64 from Layout with context, 0
+
+    Let members be proc get_dict_hir_value with program_hir, "members"
+    If members is not equal to 0:
+        Let is_list be proc is_list_literal from HIR with members
+        If is_list is equal to 1:
+            Let items be proc get_list_elements from HIR with members
+            Let count be proc size from ListOps with items
+            Let index be 0
+            While index is less than count:
+                Let member_hir be proc get_at from ListOps with items, index
+                If member_hir is not equal to 0:
+                    proc generate_node with context, member_hir
+                    proc emit_newline from Emitter with emitter
+                End If
+                Set index to index plus 1
+            End While
+        End If
+    End If
+
+    Return 1
+End Process
+
 Process called "generate_node" takes context as Integer, node_hir as Integer returns Integer:
     Note: Generate Swift code from HIR node based on type
 
@@ -359,158 +444,164 @@ Process called "generate_node" takes context as Integer, node_hir as Integer ret
         Return 0
     End If
 
+    Note: Program root - emit each top-level member, separated by newlines
+    Let is_program be proc string_equals from StringCore with node_type, "swift_program"
+    If is_program is equal to 1:
+        Return proc generate_program with context, node_hir
+    End If
+
     Note: Import declarations
-    Let is_import be proc strings_equal from StringCore with node_type, "swift_import"
+    Let is_import be proc string_equals from StringCore with node_type, "swift_import"
     If is_import is equal to 1:
         Return proc generate_import_decl with context, node_hir
     End If
 
     Note: Function declarations
-    Let is_function be proc strings_equal from StringCore with node_type, "swift_function"
+    Let is_function be proc string_equals from StringCore with node_type, "swift_function"
     If is_function is equal to 1:
         Return proc generate_function_decl with context, node_hir
     End If
 
     Note: Type declarations
-    Let is_class be proc strings_equal from StringCore with node_type, "swift_class"
+    Let is_class be proc string_equals from StringCore with node_type, "swift_class"
     If is_class is equal to 1:
         Return proc generate_class_decl with context, node_hir
     End If
 
-    Let is_struct be proc strings_equal from StringCore with node_type, "swift_struct"
+    Let is_struct be proc string_equals from StringCore with node_type, "swift_struct"
     If is_struct is equal to 1:
         Return proc generate_struct_decl with context, node_hir
     End If
 
-    Let is_enum be proc strings_equal from StringCore with node_type, "swift_enum"
+    Let is_enum be proc string_equals from StringCore with node_type, "swift_enum"
     If is_enum is equal to 1:
         Return proc generate_enum_decl with context, node_hir
     End If
 
-    Let is_protocol be proc strings_equal from StringCore with node_type, "swift_protocol"
+    Let is_protocol be proc string_equals from StringCore with node_type, "swift_protocol"
     If is_protocol is equal to 1:
         Return proc generate_protocol_decl with context, node_hir
     End If
 
-    Let is_extension be proc strings_equal from StringCore with node_type, "swift_extension"
+    Let is_extension be proc string_equals from StringCore with node_type, "swift_extension"
     If is_extension is equal to 1:
         Return proc generate_extension_decl with context, node_hir
     End If
 
-    Let is_typealias be proc strings_equal from StringCore with node_type, "swift_typealias"
+    Let is_typealias be proc string_equals from StringCore with node_type, "swift_typealias"
     If is_typealias is equal to 1:
         Return proc generate_typealias_decl with context, node_hir
     End If
 
     Note: Variable declarations
-    Let is_var be proc strings_equal from StringCore with node_type, "swift_var"
+    Let is_var be proc string_equals from StringCore with node_type, "swift_var"
     If is_var is equal to 1:
         Return proc generate_var_decl with context, node_hir
     End If
 
-    Let is_let be proc strings_equal from StringCore with node_type, "swift_let"
+    Let is_let be proc string_equals from StringCore with node_type, "swift_let"
     If is_let is equal to 1:
         Return proc generate_let_decl with context, node_hir
     End If
 
     Note: Statements
-    Let is_if be proc strings_equal from StringCore with node_type, "swift_if"
+    Let is_if be proc string_equals from StringCore with node_type, "swift_if"
     If is_if is equal to 1:
         Return proc generate_if_stmt with context, node_hir
     End If
 
-    Let is_guard be proc strings_equal from StringCore with node_type, "swift_guard"
+    Let is_guard be proc string_equals from StringCore with node_type, "swift_guard"
     If is_guard is equal to 1:
         Return proc generate_guard_stmt with context, node_hir
     End If
 
-    Let is_switch be proc strings_equal from StringCore with node_type, "swift_switch"
+    Let is_switch be proc string_equals from StringCore with node_type, "swift_switch"
     If is_switch is equal to 1:
         Return proc generate_switch_stmt with context, node_hir
     End If
 
-    Let is_for_in be proc strings_equal from StringCore with node_type, "swift_for_in"
+    Let is_for_in be proc string_equals from StringCore with node_type, "swift_for_in"
     If is_for_in is equal to 1:
         Return proc generate_for_in_stmt with context, node_hir
     End If
 
-    Let is_while be proc strings_equal from StringCore with node_type, "swift_while"
+    Let is_while be proc string_equals from StringCore with node_type, "swift_while"
     If is_while is equal to 1:
         Return proc generate_while_stmt with context, node_hir
     End If
 
-    Let is_defer be proc strings_equal from StringCore with node_type, "swift_defer"
+    Let is_defer be proc string_equals from StringCore with node_type, "swift_defer"
     If is_defer is equal to 1:
         Return proc generate_defer_stmt with context, node_hir
     End If
 
-    Let is_do_catch be proc strings_equal from StringCore with node_type, "swift_do_catch"
+    Let is_do_catch be proc string_equals from StringCore with node_type, "swift_do_catch"
     If is_do_catch is equal to 1:
         Return proc generate_do_catch_stmt with context, node_hir
     End If
 
-    Let is_return be proc strings_equal from StringCore with node_type, "swift_return"
+    Let is_return be proc string_equals from StringCore with node_type, "swift_return"
     If is_return is equal to 1:
         Return proc generate_return_stmt with context, node_hir
     End If
 
-    Let is_break be proc strings_equal from StringCore with node_type, "swift_break"
+    Let is_break be proc string_equals from StringCore with node_type, "swift_break"
     If is_break is equal to 1:
         Return proc generate_break_stmt with context, node_hir
     End If
 
-    Let is_continue be proc strings_equal from StringCore with node_type, "swift_continue"
+    Let is_continue be proc string_equals from StringCore with node_type, "swift_continue"
     If is_continue is equal to 1:
         Return proc generate_continue_stmt with context, node_hir
     End If
 
     Note: Expressions
-    Let is_binary be proc strings_equal from StringCore with node_type, "swift_binary_op"
+    Let is_binary be proc string_equals from StringCore with node_type, "swift_binary_op"
     If is_binary is equal to 1:
         Return proc generate_binary_expr with context, node_hir
     End If
 
-    Let is_unary be proc strings_equal from StringCore with node_type, "swift_unary_op"
+    Let is_unary be proc string_equals from StringCore with node_type, "swift_unary_op"
     If is_unary is equal to 1:
         Return proc generate_unary_expr with context, node_hir
     End If
 
-    Let is_call be proc strings_equal from StringCore with node_type, "swift_call"
+    Let is_call be proc string_equals from StringCore with node_type, "swift_call"
     If is_call is equal to 1:
         Return proc generate_call_expr with context, node_hir
     End If
 
-    Let is_member be proc strings_equal from StringCore with node_type, "swift_member_access"
+    Let is_member be proc string_equals from StringCore with node_type, "swift_member_access"
     If is_member is equal to 1:
         Return proc generate_member_expr with context, node_hir
     End If
 
-    Let is_subscript be proc strings_equal from StringCore with node_type, "swift_subscript"
+    Let is_subscript be proc string_equals from StringCore with node_type, "swift_subscript"
     If is_subscript is equal to 1:
         Return proc generate_subscript_expr with context, node_hir
     End If
 
-    Let is_optional_chain be proc strings_equal from StringCore with node_type, "swift_optional_chain"
+    Let is_optional_chain be proc string_equals from StringCore with node_type, "swift_optional_chain"
     If is_optional_chain is equal to 1:
         Return proc generate_optional_chain_expr with context, node_hir
     End If
 
-    Let is_force_unwrap be proc strings_equal from StringCore with node_type, "swift_force_unwrap"
+    Let is_force_unwrap be proc string_equals from StringCore with node_type, "swift_force_unwrap"
     If is_force_unwrap is equal to 1:
         Return proc generate_force_unwrap_expr with context, node_hir
     End If
 
-    Let is_closure be proc strings_equal from StringCore with node_type, "swift_closure"
+    Let is_closure be proc string_equals from StringCore with node_type, "swift_closure"
     If is_closure is equal to 1:
         Return proc generate_closure_expr with context, node_hir
     End If
 
-    Let is_literal be proc strings_equal from StringCore with node_type, "swift_literal"
+    Let is_literal be proc string_equals from StringCore with node_type, "swift_literal"
     If is_literal is equal to 1:
         Return proc generate_literal_expr with context, node_hir
     End If
 
-    Let is_identifier be proc strings_equal from StringCore with node_type, "swift_identifier"
+    Let is_identifier be proc string_equals from StringCore with node_type, "swift_identifier"
     If is_identifier is equal to 1:
         Return proc generate_identifier_expr with context, node_hir
     End If
@@ -578,7 +669,7 @@ Process called "generate_function_decl" takes context as Integer, func_hir as In
 
     Let emitter be proc memory_get_int64 from Layout with context, 0
 
-    proc emit_indent from context
+    proc emit_indent with context
 
     Note: Access control (public, private, etc.)
     Let access be proc get_dict_string_value with func_hir, "access_control"
@@ -644,10 +735,10 @@ Process called "generate_function_decl" takes context as Integer, func_hir as In
     If body is not equal to 0:
         proc emit_string from Emitter with emitter, " {"
         proc emit_newline from Emitter with emitter
-        proc increase_indent from context
+        proc increase_indent with context
         proc generate_statement_list with context, body
-        proc decrease_indent from context
-        proc emit_indent from context
+        proc decrease_indent with context
+        proc emit_indent with context
         proc emit_char from Emitter with emitter, 125  Note: }
     Otherwise:
         proc emit_string from Emitter with emitter, " {}"
@@ -682,7 +773,7 @@ Process called "generate_modifiers" takes context as Integer, modifiers_hir as I
 
     Let emitter be proc memory_get_int64 from Layout with context, 0
 
-    Let is_list be proc is_list_hir from HIR with modifiers_hir
+    Let is_list be proc is_list_literal from HIR with modifiers_hir
 
     If is_list is equal to 1:
         Let items be proc get_list_elements from HIR with modifiers_hir
@@ -732,7 +823,7 @@ Process called "generate_parameter_list" takes context as Integer, params_hir as
 
     Let emitter be proc memory_get_int64 from Layout with context, 0
 
-    Let is_list be proc is_list_hir from HIR with params_hir
+    Let is_list be proc is_list_literal from HIR with params_hir
 
     If is_list is equal to 1:
         Let items be proc get_list_elements from HIR with params_hir
@@ -843,7 +934,7 @@ Process called "generate_class_decl" takes context as Integer, class_hir as Inte
 
     Let emitter be proc memory_get_int64 from Layout with context, 0
 
-    proc emit_indent from context
+    proc emit_indent with context
 
     Note: Access control
     Let access be proc get_dict_string_value with class_hir, "access_control"
@@ -887,12 +978,12 @@ Process called "generate_class_decl" takes context as Integer, class_hir as Inte
     Note: Members
     Let members be proc get_dict_hir_value with class_hir, "members"
     If members is not equal to 0:
-        proc increase_indent from context
+        proc increase_indent with context
         proc generate_member_list with context, members
-        proc decrease_indent from context
+        proc decrease_indent with context
     End If
 
-    proc emit_indent from context
+    proc emit_indent with context
     proc emit_char from Emitter with emitter, 125  Note: }
     proc emit_newline from Emitter with emitter
     proc emit_newline from Emitter with emitter
@@ -918,7 +1009,7 @@ Process called "generate_struct_decl" takes context as Integer, struct_hir as In
 
     Let emitter be proc memory_get_int64 from Layout with context, 0
 
-    proc emit_indent from context
+    proc emit_indent with context
 
     Let access be proc get_dict_string_value with struct_hir, "access_control"
     If access is not equal to 0:
@@ -956,12 +1047,12 @@ Process called "generate_struct_decl" takes context as Integer, struct_hir as In
 
     Let members be proc get_dict_hir_value with struct_hir, "members"
     If members is not equal to 0:
-        proc increase_indent from context
+        proc increase_indent with context
         proc generate_member_list with context, members
-        proc decrease_indent from context
+        proc decrease_indent with context
     End If
 
-    proc emit_indent from context
+    proc emit_indent with context
     proc emit_char from Emitter with emitter, 125  Note: }
     proc emit_newline from Emitter with emitter
     proc emit_newline from Emitter with emitter
@@ -986,7 +1077,7 @@ Process called "generate_enum_decl" takes context as Integer, enum_hir as Intege
 
     Let emitter be proc memory_get_int64 from Layout with context, 0
 
-    proc emit_indent from context
+    proc emit_indent with context
 
     Let access be proc get_dict_string_value with enum_hir, "access_control"
     If access is not equal to 0:
@@ -1019,12 +1110,12 @@ Process called "generate_enum_decl" takes context as Integer, enum_hir as Intege
     Note: Cases
     Let cases be proc get_dict_hir_value with enum_hir, "cases"
     If cases is not equal to 0:
-        proc increase_indent from context
+        proc increase_indent with context
         proc generate_enum_cases with context, cases
-        proc decrease_indent from context
+        proc decrease_indent with context
     End If
 
-    proc emit_indent from context
+    proc emit_indent with context
     proc emit_char from Emitter with emitter, 125  Note: }
     proc emit_newline from Emitter with emitter
     proc emit_newline from Emitter with emitter
@@ -1054,7 +1145,7 @@ Process called "generate_enum_cases" takes context as Integer, cases_hir as Inte
 
     Let emitter be proc memory_get_int64 from Layout with context, 0
 
-    Let is_list be proc is_list_hir from HIR with cases_hir
+    Let is_list be proc is_list_literal from HIR with cases_hir
 
     If is_list is equal to 1:
         Let items be proc get_list_elements from HIR with cases_hir
@@ -1065,7 +1156,7 @@ Process called "generate_enum_cases" takes context as Integer, cases_hir as Inte
             Let case_hir be proc get_at from ListOps with items, index
 
             If case_hir is not equal to 0:
-                proc emit_indent from context
+                proc emit_indent with context
                 proc emit_string from Emitter with emitter, "case "
 
                 Let case_name be proc get_dict_string_value with case_hir, "name"
@@ -1119,7 +1210,7 @@ Process called "generate_associated_values" takes context as Integer, values_hir
 
     Let emitter be proc memory_get_int64 from Layout with context, 0
 
-    Let is_list be proc is_list_hir from HIR with values_hir
+    Let is_list be proc is_list_literal from HIR with values_hir
 
     If is_list is equal to 1:
         Let items be proc get_list_elements from HIR with values_hir
@@ -1162,7 +1253,7 @@ Process called "generate_protocol_decl" takes context as Integer, protocol_hir a
 
     Let emitter be proc memory_get_int64 from Layout with context, 0
 
-    proc emit_indent from context
+    proc emit_indent with context
 
     Let access be proc get_dict_string_value with protocol_hir, "access_control"
     If access is not equal to 0:
@@ -1190,12 +1281,12 @@ Process called "generate_protocol_decl" takes context as Integer, protocol_hir a
     Note: Requirements
     Let requirements be proc get_dict_hir_value with protocol_hir, "requirements"
     If requirements is not equal to 0:
-        proc increase_indent from context
+        proc increase_indent with context
         proc generate_protocol_requirements with context, requirements
-        proc decrease_indent from context
+        proc decrease_indent with context
     End If
 
-    proc emit_indent from context
+    proc emit_indent with context
     proc emit_char from Emitter with emitter, 125  Note: }
     proc emit_newline from Emitter with emitter
     proc emit_newline from Emitter with emitter
@@ -1223,7 +1314,7 @@ Process called "generate_protocol_requirements" takes context as Integer, requir
         Return 0
     End If
 
-    Let is_list be proc is_list_hir from HIR with requirements_hir
+    Let is_list be proc is_list_literal from HIR with requirements_hir
 
     If is_list is equal to 1:
         Let items be proc get_list_elements from HIR with requirements_hir
@@ -1263,7 +1354,7 @@ Process called "generate_extension_decl" takes context as Integer, ext_hir as In
 
     Let emitter be proc memory_get_int64 from Layout with context, 0
 
-    proc emit_indent from context
+    proc emit_indent with context
     proc emit_string from Emitter with emitter, "extension "
 
     Let extended_type be proc get_dict_string_value with ext_hir, "extended_type"
@@ -1291,12 +1382,12 @@ Process called "generate_extension_decl" takes context as Integer, ext_hir as In
     Note: Members
     Let members be proc get_dict_hir_value with ext_hir, "members"
     If members is not equal to 0:
-        proc increase_indent from context
+        proc increase_indent with context
         proc generate_member_list with context, members
-        proc decrease_indent from context
+        proc decrease_indent with context
     End If
 
-    proc emit_indent from context
+    proc emit_indent with context
     proc emit_char from Emitter with emitter, 125  Note: }
     proc emit_newline from Emitter with emitter
     proc emit_newline from Emitter with emitter
@@ -1325,7 +1416,7 @@ Process called "generate_typealias_decl" takes context as Integer, alias_hir as 
 
     Let emitter be proc memory_get_int64 from Layout with context, 0
 
-    proc emit_indent from context
+    proc emit_indent with context
 
     Let access be proc get_dict_string_value with alias_hir, "access_control"
     If access is not equal to 0:
@@ -1371,7 +1462,7 @@ Process called "generate_var_decl" takes context as Integer, var_hir as Integer 
 
     Let emitter be proc memory_get_int64 from Layout with context, 0
 
-    proc emit_indent from context
+    proc emit_indent with context
 
     Let access be proc get_dict_string_value with var_hir, "access_control"
     If access is not equal to 0:
@@ -1427,7 +1518,7 @@ Process called "generate_let_decl" takes context as Integer, let_hir as Integer 
 
     Let emitter be proc memory_get_int64 from Layout with context, 0
 
-    proc emit_indent from context
+    proc emit_indent with context
 
     Let access be proc get_dict_string_value with let_hir, "access_control"
     If access is not equal to 0:
@@ -1483,7 +1574,7 @@ Process called "generate_member_list" takes context as Integer, members_hir as I
         Return 0
     End If
 
-    Let is_list be proc is_list_hir from HIR with members_hir
+    Let is_list be proc is_list_literal from HIR with members_hir
 
     If is_list is equal to 1:
         Let items be proc get_list_elements from HIR with members_hir
@@ -1526,7 +1617,7 @@ Process called "generate_generic_parameters" takes context as Integer, generic_p
 
     Let emitter be proc memory_get_int64 from Layout with context, 0
 
-    Let is_list be proc is_list_hir from HIR with generic_params_hir
+    Let is_list be proc is_list_literal from HIR with generic_params_hir
 
     If is_list is equal to 1:
         Let items be proc get_list_elements from HIR with generic_params_hir
@@ -1572,7 +1663,7 @@ Process called "generate_inheritance_list" takes context as Integer, inheritance
 
     Let emitter be proc memory_get_int64 from Layout with context, 0
 
-    Let is_list be proc is_list_hir from HIR with inheritance_hir
+    Let is_list be proc is_list_literal from HIR with inheritance_hir
 
     If is_list is equal to 1:
         Let items be proc get_list_elements from HIR with inheritance_hir
@@ -1619,7 +1710,7 @@ Process called "generate_where_clause" takes context as Integer, where_hir as In
 
     Let emitter be proc memory_get_int64 from Layout with context, 0
 
-    Let is_list be proc is_list_hir from HIR with where_hir
+    Let is_list be proc is_list_literal from HIR with where_hir
 
     If is_list is equal to 1:
         Let items be proc get_list_elements from HIR with where_hir
@@ -1668,7 +1759,7 @@ Process called "generate_statement_list" takes context as Integer, stmts_hir as 
         Return 0
     End If
 
-    Let is_list be proc is_list_hir from HIR with stmts_hir
+    Let is_list be proc is_list_literal from HIR with stmts_hir
 
     If is_list is equal to 1:
         Let items be proc get_list_elements from HIR with stmts_hir
@@ -1708,7 +1799,7 @@ Process called "generate_if_stmt" takes context as Integer, if_hir as Integer re
 
     Let emitter be proc memory_get_int64 from Layout with context, 0
 
-    proc emit_indent from context
+    proc emit_indent with context
     proc emit_string from Emitter with emitter, "if "
 
     Note: Condition
@@ -1723,12 +1814,12 @@ Process called "generate_if_stmt" takes context as Integer, if_hir as Integer re
     Note: Then block
     Let then_block be proc get_dict_hir_value with if_hir, "then_block"
     If then_block is not equal to 0:
-        proc increase_indent from context
+        proc increase_indent with context
         proc generate_statement_list with context, then_block
-        proc decrease_indent from context
+        proc decrease_indent with context
     End If
 
-    proc emit_indent from context
+    proc emit_indent with context
     proc emit_char from Emitter with emitter, 125  Note: }
 
     Note: Else block
@@ -1736,10 +1827,10 @@ Process called "generate_if_stmt" takes context as Integer, if_hir as Integer re
     If else_block is not equal to 0:
         proc emit_string from Emitter with emitter, " else {"
         proc emit_newline from Emitter with emitter
-        proc increase_indent from context
+        proc increase_indent with context
         proc generate_statement_list with context, else_block
-        proc decrease_indent from context
-        proc emit_indent from context
+        proc decrease_indent with context
+        proc emit_indent with context
         proc emit_char from Emitter with emitter, 125  Note: }
     End If
 
@@ -1766,7 +1857,7 @@ Process called "generate_guard_stmt" takes context as Integer, guard_hir as Inte
 
     Let emitter be proc memory_get_int64 from Layout with context, 0
 
-    proc emit_indent from context
+    proc emit_indent with context
     proc emit_string from Emitter with emitter, "guard "
 
     Let condition be proc get_dict_hir_value with guard_hir, "condition"
@@ -1779,12 +1870,12 @@ Process called "generate_guard_stmt" takes context as Integer, guard_hir as Inte
 
     Let else_block be proc get_dict_hir_value with guard_hir, "else_block"
     If else_block is not equal to 0:
-        proc increase_indent from context
+        proc increase_indent with context
         proc generate_statement_list with context, else_block
-        proc decrease_indent from context
+        proc decrease_indent with context
     End If
 
-    proc emit_indent from context
+    proc emit_indent with context
     proc emit_char from Emitter with emitter, 125  Note: }
     proc emit_newline from Emitter with emitter
 
@@ -1809,7 +1900,7 @@ Process called "generate_switch_stmt" takes context as Integer, switch_hir as In
 
     Let emitter be proc memory_get_int64 from Layout with context, 0
 
-    proc emit_indent from context
+    proc emit_indent with context
     proc emit_string from Emitter with emitter, "switch "
 
     Let expression be proc get_dict_hir_value with switch_hir, "expression"
@@ -1825,7 +1916,7 @@ Process called "generate_switch_stmt" takes context as Integer, switch_hir as In
         proc generate_switch_cases with context, cases
     End If
 
-    proc emit_indent from context
+    proc emit_indent with context
     proc emit_char from Emitter with emitter, 125  Note: }
     proc emit_newline from Emitter with emitter
 
@@ -1855,7 +1946,7 @@ Process called "generate_switch_cases" takes context as Integer, cases_hir as In
 
     Let emitter be proc memory_get_int64 from Layout with context, 0
 
-    Let is_list be proc is_list_hir from HIR with cases_hir
+    Let is_list be proc is_list_literal from HIR with cases_hir
 
     If is_list is equal to 1:
         Let items be proc get_list_elements from HIR with cases_hir
@@ -1866,7 +1957,7 @@ Process called "generate_switch_cases" takes context as Integer, cases_hir as In
             Let case_hir be proc get_at from ListOps with items, index
 
             If case_hir is not equal to 0:
-                proc emit_indent from context
+                proc emit_indent with context
                 proc emit_string from Emitter with emitter, "case "
 
                 Let pattern be proc get_dict_hir_value with case_hir, "pattern"
@@ -1885,9 +1976,9 @@ Process called "generate_switch_cases" takes context as Integer, cases_hir as In
 
                 Let body be proc get_dict_hir_value with case_hir, "body"
                 If body is not equal to 0:
-                    proc increase_indent from context
+                    proc increase_indent with context
                     proc generate_statement_list with context, body
-                    proc decrease_indent from context
+                    proc decrease_indent with context
                 End If
             End If
 
@@ -1919,7 +2010,7 @@ Process called "generate_for_in_stmt" takes context as Integer, for_hir as Integ
 
     Let emitter be proc memory_get_int64 from Layout with context, 0
 
-    proc emit_indent from context
+    proc emit_indent with context
     proc emit_string from Emitter with emitter, "for "
 
     Let pattern be proc get_dict_string_value with for_hir, "pattern"
@@ -1939,12 +2030,12 @@ Process called "generate_for_in_stmt" takes context as Integer, for_hir as Integ
 
     Let body be proc get_dict_hir_value with for_hir, "body"
     If body is not equal to 0:
-        proc increase_indent from context
+        proc increase_indent with context
         proc generate_statement_list with context, body
-        proc decrease_indent from context
+        proc decrease_indent with context
     End If
 
-    proc emit_indent from context
+    proc emit_indent with context
     proc emit_char from Emitter with emitter, 125  Note: }
     proc emit_newline from Emitter with emitter
 
@@ -1971,7 +2062,7 @@ Process called "generate_while_stmt" takes context as Integer, while_hir as Inte
 
     Let emitter be proc memory_get_int64 from Layout with context, 0
 
-    proc emit_indent from context
+    proc emit_indent with context
     proc emit_string from Emitter with emitter, "while "
 
     Let condition be proc get_dict_hir_value with while_hir, "condition"
@@ -1984,12 +2075,12 @@ Process called "generate_while_stmt" takes context as Integer, while_hir as Inte
 
     Let body be proc get_dict_hir_value with while_hir, "body"
     If body is not equal to 0:
-        proc increase_indent from context
+        proc increase_indent with context
         proc generate_statement_list with context, body
-        proc decrease_indent from context
+        proc decrease_indent with context
     End If
 
-    proc emit_indent from context
+    proc emit_indent with context
     proc emit_char from Emitter with emitter, 125  Note: }
     proc emit_newline from Emitter with emitter
 
@@ -2014,18 +2105,18 @@ Process called "generate_defer_stmt" takes context as Integer, defer_hir as Inte
 
     Let emitter be proc memory_get_int64 from Layout with context, 0
 
-    proc emit_indent from context
+    proc emit_indent with context
     proc emit_string from Emitter with emitter, "defer {"
     proc emit_newline from Emitter with emitter
 
     Let body be proc get_dict_hir_value with defer_hir, "body"
     If body is not equal to 0:
-        proc increase_indent from context
+        proc increase_indent with context
         proc generate_statement_list with context, body
-        proc decrease_indent from context
+        proc decrease_indent with context
     End If
 
-    proc emit_indent from context
+    proc emit_indent with context
     proc emit_char from Emitter with emitter, 125  Note: }
     proc emit_newline from Emitter with emitter
 
@@ -2050,18 +2141,18 @@ Process called "generate_do_catch_stmt" takes context as Integer, do_catch_hir a
 
     Let emitter be proc memory_get_int64 from Layout with context, 0
 
-    proc emit_indent from context
+    proc emit_indent with context
     proc emit_string from Emitter with emitter, "do {"
     proc emit_newline from Emitter with emitter
 
     Let do_block be proc get_dict_hir_value with do_catch_hir, "do_block"
     If do_block is not equal to 0:
-        proc increase_indent from context
+        proc increase_indent with context
         proc generate_statement_list with context, do_block
-        proc decrease_indent from context
+        proc decrease_indent with context
     End If
 
-    proc emit_indent from context
+    proc emit_indent with context
     proc emit_char from Emitter with emitter, 125  Note: }
 
     Let catch_clauses be proc get_dict_hir_value with do_catch_hir, "catch_clauses"
@@ -2097,7 +2188,7 @@ Process called "generate_catch_clauses" takes context as Integer, catches_hir as
 
     Let emitter be proc memory_get_int64 from Layout with context, 0
 
-    Let is_list be proc is_list_hir from HIR with catches_hir
+    Let is_list be proc is_list_literal from HIR with catches_hir
 
     If is_list is equal to 1:
         Let items be proc get_list_elements from HIR with catches_hir
@@ -2126,12 +2217,12 @@ Process called "generate_catch_clauses" takes context as Integer, catches_hir as
 
                 Let body be proc get_dict_hir_value with catch_hir, "body"
                 If body is not equal to 0:
-                    proc increase_indent from context
+                    proc increase_indent with context
                     proc generate_statement_list with context, body
-                    proc decrease_indent from context
+                    proc decrease_indent with context
                 End If
 
-                proc emit_indent from context
+                proc emit_indent with context
                 proc emit_char from Emitter with emitter, 125  Note: }
             End If
 
@@ -2162,7 +2253,7 @@ Process called "generate_return_stmt" takes context as Integer, return_hir as In
 
     Let emitter be proc memory_get_int64 from Layout with context, 0
 
-    proc emit_indent from context
+    proc emit_indent with context
     proc emit_string from Emitter with emitter, "return"
 
     Let value be proc get_dict_hir_value with return_hir, "value"
@@ -2194,7 +2285,7 @@ Process called "generate_break_stmt" takes context as Integer, break_hir as Inte
 
     Let emitter be proc memory_get_int64 from Layout with context, 0
 
-    proc emit_indent from context
+    proc emit_indent with context
     proc emit_string from Emitter with emitter, "break"
 
     Let label be proc get_dict_string_value with break_hir, "label"
@@ -2226,7 +2317,7 @@ Process called "generate_continue_stmt" takes context as Integer, continue_hir a
 
     Let emitter be proc memory_get_int64 from Layout with context, 0
 
-    proc emit_indent from context
+    proc emit_indent with context
     proc emit_string from Emitter with emitter, "continue"
 
     Let label be proc get_dict_string_value with continue_hir, "label"
@@ -2395,7 +2486,7 @@ Process called "generate_argument_list" takes context as Integer, args_hir as In
 
     Let emitter be proc memory_get_int64 from Layout with context, 0
 
-    Let is_list be proc is_list_hir from HIR with args_hir
+    Let is_list be proc is_list_literal from HIR with args_hir
 
     If is_list is equal to 1:
         Let items be proc get_list_elements from HIR with args_hir
@@ -2605,12 +2696,12 @@ Process called "generate_closure_expr" takes context as Integer, closure_hir as 
     Note: Body
     Let body be proc get_dict_hir_value with closure_hir, "body"
     If body is not equal to 0:
-        proc increase_indent from context
+        proc increase_indent with context
         proc generate_statement_list with context, body
-        proc decrease_indent from context
+        proc decrease_indent with context
     End If
 
-    proc emit_indent from context
+    proc emit_indent with context
     proc emit_char from Emitter with emitter, 125  Note: }
 
     Return 1
@@ -2637,7 +2728,7 @@ Process called "generate_capture_list" takes context as Integer, captures_hir as
 
     Let emitter be proc memory_get_int64 from Layout with context, 0
 
-    Let is_list be proc is_list_hir from HIR with captures_hir
+    Let is_list be proc is_list_literal from HIR with captures_hir
 
     If is_list is equal to 1:
         Let items be proc get_list_elements from HIR with captures_hir
@@ -2681,7 +2772,7 @@ Process called "generate_closure_parameters" takes context as Integer, params_hi
 
     Let emitter be proc memory_get_int64 from Layout with context, 0
 
-    Let is_list be proc is_list_hir from HIR with params_hir
+    Let is_list be proc is_list_literal from HIR with params_hir
 
     If is_list is equal to 1:
         Let items be proc get_list_elements from HIR with params_hir
@@ -2827,7 +2918,7 @@ Process called "generate_generic_arguments" takes context as Integer, args_hir a
 
     Let emitter be proc memory_get_int64 from Layout with context, 0
 
-    Let is_list be proc is_list_hir from HIR with args_hir
+    Let is_list be proc is_list_literal from HIR with args_hir
 
     If is_list is equal to 1:
         Let items be proc get_list_elements from HIR with args_hir

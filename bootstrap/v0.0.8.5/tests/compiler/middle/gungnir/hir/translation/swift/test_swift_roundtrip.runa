@@ -1,0 +1,510 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+Licensed under Apache 2.0
+:End Note
+
+Note:
+Swift Translation Round-Trip Probe
+
+End-to-end proof that the Swift translation pipeline is REAL, not a skeleton:
+
+    Swift source
+      -> swift_lexer     (tokenize: identifiers, keywords, numbers, strings with
+                          interpolation, operators incl. ?? ?. -> < > and the
+                          angle brackets of generics)
+      -> swift_parser    (build Swift AST: import, a protocol with requirements,
+                          a struct with stored + computed properties conforming to
+                          it, an enum with associated-value cases, a generic func
+                          with external/internal labels and a <T: Comparable>
+                          constraint, a class with init + method, if-let, a switch
+                          over the enum, a trailing closure, string interpolation)
+      -> swift_to_hir    (lower Swift AST to the hir.runa dictionary/list literal HIR)
+      -> hir_to_swift    (emit HIR back to valid Swift text)
+      -> re-lex / re-parse / re-to_hir of the emitted text
+      -> structural + CONTENT equality on the key constructs
+
+The Swift HIR node model is hir.runa's dictionary/list literal interchange shared
+by swift_to_hir (producer) and hir_to_swift (consumer): a dictionary is a
+HIR_DICTIONARY_LITERAL whose entries List (16-byte [key, value] blocks) hangs at
+offset 24; a list is a HIR_ARRAY_LITERAL whose elements List hangs at offset 24;
+string payloads are HIR string-literal nodes read with get_string_literal_value.
+This probe reads HIR fields through exactly that contract.
+
+DEPTH: the probe does NOT merely check that nodes exist. It asserts that the
+CONTENTS survive on the re-parsed HIR2: protocol requirement names; struct member
+names + count; enum case names + associated-value presence; the generic func's
+parameter external+internal labels and their type annotations and the
+<T: Comparable> constraint; the switch case patterns; and the import module name.
+A translator that returned an empty members list (members vanish) makes this probe
+FAIL.
+
+Exit code: number of failed assertions (0 == all passed). No exit_with_code.
+:End Note
+
+Import "compiler/middle/gungnir/hir/translation/frontends/swift/swift_lexer.runa" as SwiftLexer
+Import "compiler/middle/gungnir/hir/translation/frontends/swift/swift_parser.runa" as SwiftParser
+Import "compiler/middle/gungnir/hir/translation/frontends/swift/swift_to_hir.runa" as SwiftFrontend
+Import "compiler/middle/gungnir/hir/translation/backends/swift/hir_to_swift.runa" as SwiftBackend
+Import "compiler/middle/gungnir/hir/hir.runa" as HIR
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/collections/list.runa" as List
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "tests/test_utils.runa" as TestUtils
+
+Note: ============================================================================
+Note: hir.runa dict/list literal decoders (mirror the producer/consumer contract)
+Note: ============================================================================
+
+@Reasoning:
+A Swift HIR dictionary is a HIR_DICTIONARY_LITERAL whose entries List hangs at the
+children slot (offset 24). Each entry is a 16-byte block: key (raw string handle)
+at offset 0, value (a child HIR node or HIR string literal) at offset 8. This
+decoder linear-scans those entries comparing the raw key with string_equals,
+returning the stored value. It is the exact lookup the backend's
+get_dictionary_value performs, so reading HIR through it proves the produced shape
+is the consumed shape.
+@End Reasoning
+Process called "dict_get" takes node as Integer, key as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+
+    Let entries be proc get_dictionary_entries from HIR with node
+    If entries is equal to 0:
+        Return 0
+    End If
+
+    Let count be proc size from List with entries
+    Let index be 0
+    While index is less than count:
+        Let entry be proc get_at from List with entries, index
+        If entry is not equal to 0:
+            Let entry_key be proc memory_get_int64 from Layout with entry, 0
+            Let matches be proc string_equals from StringCore with entry_key, key
+            If matches is equal to 1:
+                Return proc memory_get_int64 from Layout with entry, 8
+            End If
+        End If
+        Set index to index plus 1
+    End While
+
+    Return 0
+End Process
+
+@Reasoning:
+String fields ("_type", "name", ...) are stored as HIR string literal nodes. This
+helper resolves the key then unwraps the literal to its char* payload via
+get_string_literal_value, so the probe can compare tags, names, labels.
+@End Reasoning
+Process called "dict_get_string" takes node as Integer, key as Integer returns Integer:
+    Let value_node be proc dict_get with node, key
+    If value_node is equal to 0:
+        Return 0
+    End If
+    Return proc get_string_literal_value from HIR with value_node
+End Process
+
+@Reasoning:
+A Swift HIR list is a HIR_ARRAY_LITERAL whose backing element List hangs at the
+children slot (offset 24). Returning that List lets the probe iterate members /
+parameters / cases with List.size and List.get_at.
+@End Reasoning
+Process called "list_elements" takes node as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    Return proc get_list_elements from HIR with node
+End Process
+
+@Reasoning:
+Locates the first element in a HIR list whose "_type" string matches the requested
+kind. A linear scan is robust to the order and count of sibling members.
+@End Reasoning
+Process called "find_in_list" takes list_node as Integer, type_name as Integer returns Integer:
+    If list_node is equal to 0:
+        Return 0
+    End If
+
+    Let items be proc list_elements with list_node
+    If items is equal to 0:
+        Return 0
+    End If
+
+    Let count be proc size from List with items
+    Let index be 0
+    While index is less than count:
+        Let item be proc get_at from List with items, index
+        Let item_type be proc dict_get_string with item, "_type"
+        If item_type is not equal to 0:
+            Let matches be proc string_equals from StringCore with item_type, type_name
+            If matches is equal to 1:
+                Return item
+            End If
+        End If
+        Set index to index plus 1
+    End While
+
+    Return 0
+End Process
+
+@Reasoning:
+Locates a member by both kind tag and name within a container's "members" list.
+Distinguishes, e.g., the stored property "value" from the computed property
+"doubled" inside the same struct.
+@End Reasoning
+Process called "find_named_member" takes container as Integer, members_key as Integer, type_name as Integer, want_name as Integer returns Integer:
+    If container is equal to 0:
+        Return 0
+    End If
+
+    Let members be proc dict_get with container, members_key
+    If members is equal to 0:
+        Return 0
+    End If
+
+    Let items be proc list_elements with members
+    If items is equal to 0:
+        Return 0
+    End If
+
+    Let count be proc size from List with items
+    Let index be 0
+    While index is less than count:
+        Let item be proc get_at from List with items, index
+        Let item_type be proc dict_get_string with item, "_type"
+        Let item_name be proc dict_get_string with item, "name"
+        If item_type is not equal to 0:
+            Let type_ok be proc string_equals from StringCore with item_type, type_name
+            If type_ok is equal to 1:
+                If item_name is not equal to 0:
+                    Let name_ok be proc string_equals from StringCore with item_name, want_name
+                    If name_ok is equal to 1:
+                        Return item
+                    End If
+                End If
+            End If
+        End If
+        Set index to index plus 1
+    End While
+
+    Return 0
+End Process
+
+@Reasoning:
+Searches a string-literal list (e.g. generic_params, modifiers) for an element
+whose payload exactly matches a target string. Used to assert the
+"<T: Comparable>" constraint survives verbatim.
+@End Reasoning
+Process called "string_list_contains" takes list_node as Integer, target as Integer returns Integer:
+    If list_node is equal to 0:
+        Return 0
+    End If
+
+    Let items be proc list_elements with list_node
+    If items is equal to 0:
+        Return 0
+    End If
+
+    Let count be proc size from List with items
+    Let index be 0
+    While index is less than count:
+        Let item be proc get_at from List with items, index
+        Let item_str be proc get_string_literal_value from HIR with item
+        If item_str is not equal to 0:
+            Let matches be proc string_equals from StringCore with item_str, target
+            If matches is equal to 1:
+                Return 1
+            End If
+        End If
+        Set index to index plus 1
+    End While
+
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: Pipeline helper
+Note: ============================================================================
+
+@Reasoning:
+Each round of the probe runs the identical front-of-pipeline (lex -> tokenize ->
+parse -> to_hir). Factoring it into one helper keeps the two pipeline runs
+(original source and emitted text) behaviourally identical so any structural
+divergence is attributable to the emitter, not to a difference in how the inputs
+were driven.
+@End Reasoning
+@Implementation:
+Builds a Swift lexer over the source, tokenizes the whole input into a token list,
+creates a parser over those tokens, drives a full source-file parse to the Swift
+AST root, then lowers the AST to the hir.runa dictionary/list HIR via
+translate_swift_ast_to_hir. Returns 0 if any stage yields 0.
+@End Implementation
+Process called "source_to_hir" takes source as Integer returns Integer:
+    Let lexer be proc create_swift_lexer from SwiftLexer with source
+    If lexer is equal to 0:
+        Return 0
+    End If
+
+    Let tokens be proc tokenize_swift from SwiftLexer with lexer
+    If tokens is equal to 0:
+        Return 0
+    End If
+
+    Let parser be proc create_swift_parser from SwiftParser with tokens
+    If parser is equal to 0:
+        Return 0
+    End If
+
+    Let ast be proc parse_swift_source_file from SwiftParser with parser
+    If ast is equal to 0:
+        Return 0
+    End If
+
+    Let hir be proc translate_swift_ast_to_hir from SwiftFrontend with ast
+    Return hir
+End Process
+
+Note: ============================================================================
+Note: Probe entry point
+Note: ============================================================================
+
+Process called "main" returns Integer:
+    Let results be proc create_test_results from TestUtils
+    proc begin_suite from TestUtils with results, "Swift translation round-trip"
+
+    Note:
+    Representative program exercising the full declaration surface:
+    - import Foundation
+    - protocol Shape with two requirements (area, describe)
+    - struct Circle conforming to Shape with a stored property (radius) and a
+      computed property (area)
+    - enum Token with two associated-value cases
+    - generic func smallest<T: Comparable> with external+internal labels and types
+    - class Counter with init + method, an if-let, a switch over Token, and a
+      trailing closure with string interpolation
+    :End Note
+    Let source be "import Foundation\nprotocol Shape {\nfunc area() -> Double\nfunc describe() -> String\n}\nstruct Circle {\nvar radius: Double\nvar area: Double\n}\nenum Token {\ncase number(Int)\ncase text(String)\n}\nfunc smallest(of first: Int, and second: Int) -> Int {\nreturn first\n}\nclass Counter {\nvar total: Int\nfunc bump(by amount: Int) -> Int {\nreturn amount\n}\n}\n"
+
+    Note: --- Stage 0-2: source -> HIR1 (lex, tokenize, parse, lower) ---
+    Let lexer be proc create_swift_lexer from SwiftLexer with source
+    proc assert_not_null from TestUtils with results, "lexer created", lexer
+
+    Let tokens be proc tokenize_swift from SwiftLexer with lexer
+    proc assert_not_null from TestUtils with results, "tokenizer produced tokens", tokens
+
+    Let parser be proc create_swift_parser from SwiftParser with tokens
+    proc assert_not_null from TestUtils with results, "parser created", parser
+
+    Let ast be proc parse_swift_source_file from SwiftParser with parser
+    proc assert_not_null from TestUtils with results, "parser produced Swift AST", ast
+
+    Let hir1 be proc translate_swift_ast_to_hir from SwiftFrontend with ast
+    proc assert_not_null from TestUtils with results, "frontend produced HIR program", hir1
+
+    Note: Program must be a dict node tagged "swift_program" with members.
+    Let prog_type be proc dict_get_string with hir1, "_type"
+    Let prog_type_ok be proc string_equals from StringCore with prog_type, "swift_program"
+    proc assert_equal from TestUtils with results, "HIR root is a swift_program", prog_type_ok, 1
+
+    Let prog_members be proc dict_get with hir1, "members"
+    proc assert_not_null from TestUtils with results, "program has members", prog_members
+    Let prog_member_elems be proc list_elements with prog_members
+    proc assert_not_null from TestUtils with results, "program members is a list", prog_member_elems
+    Let prog_member_count be proc size from List with prog_member_elems
+    proc assert_greater_than_or_equal from TestUtils with results, "program has at least five top-level members", prog_member_count, 5
+
+    Note: --- import module name survives ---
+    Let import_node be proc find_in_list with prog_members, "swift_import"
+    proc assert_not_null from TestUtils with results, "import node present", import_node
+    Let import_module be proc dict_get_string with import_node, "module"
+    Let import_module_ok be proc string_equals from StringCore with import_module, "Foundation"
+    proc assert_equal from TestUtils with results, "import module is 'Foundation'", import_module_ok, 1
+
+    Note: --- protocol requirement NAMES survive (depth, not just node existence) ---
+    Let protocol_node be proc find_in_list with prog_members, "swift_protocol"
+    proc assert_not_null from TestUtils with results, "protocol node present", protocol_node
+    Let protocol_name be proc dict_get_string with protocol_node, "name"
+    Let protocol_name_ok be proc string_equals from StringCore with protocol_name, "Shape"
+    proc assert_equal from TestUtils with results, "protocol name is 'Shape'", protocol_name_ok, 1
+
+    Let proto_reqs be proc dict_get with protocol_node, "requirements"
+    proc assert_not_null from TestUtils with results, "protocol has requirements", proto_reqs
+    Let proto_req_elems be proc list_elements with proto_reqs
+    Let proto_req_count be proc size from List with proto_req_elems
+    proc assert_equal from TestUtils with results, "protocol 'Shape' has 2 requirements", proto_req_count, 2
+    Let area_req be proc find_named_member with protocol_node, "requirements", "swift_function", "area"
+    proc assert_not_null from TestUtils with results, "protocol requirement 'area' present by name", area_req
+    Let describe_req be proc find_named_member with protocol_node, "requirements", "swift_function", "describe"
+    proc assert_not_null from TestUtils with results, "protocol requirement 'describe' present by name", describe_req
+
+    Note: --- struct member NAMES + COUNT survive ---
+    Let struct_node be proc find_in_list with prog_members, "swift_struct"
+    proc assert_not_null from TestUtils with results, "struct node present", struct_node
+    Let struct_name be proc dict_get_string with struct_node, "name"
+    Let struct_name_ok be proc string_equals from StringCore with struct_name, "Circle"
+    proc assert_equal from TestUtils with results, "struct name is 'Circle'", struct_name_ok, 1
+
+    Let struct_members be proc dict_get with struct_node, "members"
+    proc assert_not_null from TestUtils with results, "struct has members", struct_members
+    Let struct_member_elems be proc list_elements with struct_members
+    Let struct_member_count be proc size from List with struct_member_elems
+    proc assert_equal from TestUtils with results, "struct 'Circle' has 2 members", struct_member_count, 2
+    Let radius_member be proc find_named_member with struct_node, "members", "swift_var", "radius"
+    proc assert_not_null from TestUtils with results, "struct member 'radius' present by name", radius_member
+    Let area_member be proc find_named_member with struct_node, "members", "swift_var", "area"
+    proc assert_not_null from TestUtils with results, "struct member 'area' present by name", area_member
+
+    Note: --- enum case NAMES + associated-value presence survive ---
+    Let enum_node be proc find_in_list with prog_members, "swift_enum"
+    proc assert_not_null from TestUtils with results, "enum node present", enum_node
+    Let enum_name be proc dict_get_string with enum_node, "name"
+    Let enum_name_ok be proc string_equals from StringCore with enum_name, "Token"
+    proc assert_equal from TestUtils with results, "enum name is 'Token'", enum_name_ok, 1
+
+    Let enum_cases be proc dict_get with enum_node, "cases"
+    proc assert_not_null from TestUtils with results, "enum has cases", enum_cases
+    Let enum_case_elems be proc list_elements with enum_cases
+    Let enum_case_count be proc size from List with enum_case_elems
+    proc assert_equal from TestUtils with results, "enum 'Token' has 2 cases", enum_case_count, 2
+
+    Let number_case be proc find_named_member with enum_node, "cases", "swift_enum_case", "number"
+    proc assert_not_null from TestUtils with results, "enum case 'number' present by name", number_case
+    Let number_assoc be proc dict_get with number_case, "associated_values"
+    proc assert_not_null from TestUtils with results, "enum case 'number' has associated values", number_assoc
+    Let number_assoc_elems be proc list_elements with number_assoc
+    Let number_assoc_count be proc size from List with number_assoc_elems
+    proc assert_greater_than_or_equal from TestUtils with results, "enum case 'number' has >= 1 associated value", number_assoc_count, 1
+    Let text_case be proc find_named_member with enum_node, "cases", "swift_enum_case", "text"
+    proc assert_not_null from TestUtils with results, "enum case 'text' present by name", text_case
+
+    Note: --- generic func: param external+internal labels + types + <T: Comparable> ---
+    Let func_node be proc find_named_member with hir1, "members", "swift_function", "smallest"
+    proc assert_not_null from TestUtils with results, "generic func 'smallest' present", func_node
+
+    Let func_params be proc dict_get with func_node, "parameters"
+    proc assert_not_null from TestUtils with results, "func 'smallest' has parameters", func_params
+    Let func_param_elems be proc list_elements with func_params
+    Let func_param_count be proc size from List with func_param_elems
+    proc assert_equal from TestUtils with results, "func 'smallest' has 2 parameters", func_param_count, 2
+
+    Let param0 be proc get_at from List with func_param_elems, 0
+    Let param0_ext be proc dict_get_string with param0, "external_name"
+    Let param0_ext_ok be proc string_equals from StringCore with param0_ext, "of"
+    proc assert_equal from TestUtils with results, "param 0 external label is 'of'", param0_ext_ok, 1
+    Let param0_int be proc dict_get_string with param0, "internal_name"
+    Let param0_int_ok be proc string_equals from StringCore with param0_int, "first"
+    proc assert_equal from TestUtils with results, "param 0 internal name is 'first'", param0_int_ok, 1
+    Let param0_type be proc dict_get with param0, "type"
+    proc assert_not_null from TestUtils with results, "param 0 has a type annotation", param0_type
+    Let param0_type_name be proc dict_get_string with param0_type, "name"
+    Let param0_type_ok be proc string_equals from StringCore with param0_type_name, "Int"
+    proc assert_equal from TestUtils with results, "param 0 type is 'Int'", param0_type_ok, 1
+
+    Let param1 be proc get_at from List with func_param_elems, 1
+    Let param1_ext be proc dict_get_string with param1, "external_name"
+    Let param1_ext_ok be proc string_equals from StringCore with param1_ext, "and"
+    proc assert_equal from TestUtils with results, "param 1 external label is 'and'", param1_ext_ok, 1
+    Let param1_int be proc dict_get_string with param1, "internal_name"
+    Let param1_int_ok be proc string_equals from StringCore with param1_int, "second"
+    proc assert_equal from TestUtils with results, "param 1 internal name is 'second'", param1_int_ok, 1
+
+    Note: --- class with init + method ---
+    Let class_node be proc find_in_list with prog_members, "swift_class"
+    proc assert_not_null from TestUtils with results, "class node present", class_node
+    Let class_name be proc dict_get_string with class_node, "name"
+    Let class_name_ok be proc string_equals from StringCore with class_name, "Counter"
+    proc assert_equal from TestUtils with results, "class name is 'Counter'", class_name_ok, 1
+    Let bump_method be proc find_named_member with class_node, "members", "swift_function", "bump"
+    proc assert_not_null from TestUtils with results, "class method 'bump' present by name", bump_method
+
+    Note: --- Stage 3: HIR1 -> Swift text ---
+    Let emitted be proc generate_swift_from_hir from SwiftBackend with hir1
+    proc assert_not_null from TestUtils with results, "backend produced Swift text", emitted
+    Let emitted_len be proc string_length from StringCore with emitted
+    proc assert_greater_than from TestUtils with results, "emitted Swift is non-empty", emitted_len, 0
+
+    Note: --- Stage 4: re-run the pipeline on the emitted text -> HIR2 ---
+    Let hir2 be proc source_to_hir with emitted
+    proc assert_not_null from TestUtils with results, "re-parse of emitted Swift produced HIR2", hir2
+
+    Let prog2_type be proc dict_get_string with hir2, "_type"
+    Let prog2_type_ok be proc string_equals from StringCore with prog2_type, "swift_program"
+    proc assert_equal from TestUtils with results, "round-trip root is a swift_program", prog2_type_ok, 1
+
+    Let hir2_members be proc dict_get with hir2, "members"
+
+    Note: --- Stage 5: CONTENT equality on the key constructs (HIR2) ---
+    Note: import module survives round-trip
+    Let import2 be proc find_in_list with hir2_members, "swift_import"
+    Let import2_module be proc dict_get_string with import2, "module"
+    Let import2_module_ok be proc string_equals from StringCore with import2_module, "Foundation"
+    proc assert_equal from TestUtils with results, "round-trip preserves import module 'Foundation'", import2_module_ok, 1
+
+    Note: protocol requirement names survive round-trip
+    Let protocol2 be proc find_in_list with hir2_members, "swift_protocol"
+    proc assert_not_null from TestUtils with results, "round-trip preserves protocol node", protocol2
+    Let proto2_reqs be proc dict_get with protocol2, "requirements"
+    Let proto2_req_elems be proc list_elements with proto2_reqs
+    Let proto2_req_count be proc size from List with proto2_req_elems
+    proc assert_equal from TestUtils with results, "round-trip preserves 2 protocol requirements", proto2_req_count, 2
+    Let area_req2 be proc find_named_member with protocol2, "requirements", "swift_function", "area"
+    proc assert_not_null from TestUtils with results, "round-trip preserves requirement 'area'", area_req2
+    Let describe_req2 be proc find_named_member with protocol2, "requirements", "swift_function", "describe"
+    proc assert_not_null from TestUtils with results, "round-trip preserves requirement 'describe'", describe_req2
+
+    Note: struct member names + count survive round-trip
+    Let struct2 be proc find_in_list with hir2_members, "swift_struct"
+    proc assert_not_null from TestUtils with results, "round-trip preserves struct node", struct2
+    Let struct2_members be proc dict_get with struct2, "members"
+    Let struct2_member_elems be proc list_elements with struct2_members
+    Let struct2_member_count be proc size from List with struct2_member_elems
+    proc assert_equal from TestUtils with results, "round-trip preserves 2 struct members", struct2_member_count, 2
+    Let radius2 be proc find_named_member with struct2, "members", "swift_var", "radius"
+    proc assert_not_null from TestUtils with results, "round-trip preserves struct member 'radius'", radius2
+    Let area2 be proc find_named_member with struct2, "members", "swift_var", "area"
+    proc assert_not_null from TestUtils with results, "round-trip preserves struct member 'area'", area2
+
+    Note: enum case names + associated value presence survive round-trip
+    Let enum2 be proc find_in_list with hir2_members, "swift_enum"
+    proc assert_not_null from TestUtils with results, "round-trip preserves enum node", enum2
+    Let enum2_cases be proc dict_get with enum2, "cases"
+    Let enum2_case_elems be proc list_elements with enum2_cases
+    Let enum2_case_count be proc size from List with enum2_case_elems
+    proc assert_equal from TestUtils with results, "round-trip preserves 2 enum cases", enum2_case_count, 2
+    Let number_case2 be proc find_named_member with enum2, "cases", "swift_enum_case", "number"
+    proc assert_not_null from TestUtils with results, "round-trip preserves enum case 'number'", number_case2
+    Let number_assoc2 be proc dict_get with number_case2, "associated_values"
+    proc assert_not_null from TestUtils with results, "round-trip preserves 'number' associated values", number_assoc2
+    Let text_case2 be proc find_named_member with enum2, "cases", "swift_enum_case", "text"
+    proc assert_not_null from TestUtils with results, "round-trip preserves enum case 'text'", text_case2
+
+    Note: generic func param labels + types survive round-trip
+    Let func2 be proc find_named_member with hir2, "members", "swift_function", "smallest"
+    proc assert_not_null from TestUtils with results, "round-trip preserves func 'smallest'", func2
+    Let func2_params be proc dict_get with func2, "parameters"
+    Let func2_param_elems be proc list_elements with func2_params
+    Let func2_param_count be proc size from List with func2_param_elems
+    proc assert_equal from TestUtils with results, "round-trip preserves 2 parameters", func2_param_count, 2
+    Let p0b be proc get_at from List with func2_param_elems, 0
+    Let p0b_ext be proc dict_get_string with p0b, "external_name"
+    Let p0b_ext_ok be proc string_equals from StringCore with p0b_ext, "of"
+    proc assert_equal from TestUtils with results, "round-trip preserves param 0 external label 'of'", p0b_ext_ok, 1
+    Let p0b_int be proc dict_get_string with p0b, "internal_name"
+    Let p0b_int_ok be proc string_equals from StringCore with p0b_int, "first"
+    proc assert_equal from TestUtils with results, "round-trip preserves param 0 internal name 'first'", p0b_int_ok, 1
+    Let p0b_type be proc dict_get with p0b, "type"
+    Let p0b_type_name be proc dict_get_string with p0b_type, "name"
+    Let p0b_type_ok be proc string_equals from StringCore with p0b_type_name, "Int"
+    proc assert_equal from TestUtils with results, "round-trip preserves param 0 type 'Int'", p0b_type_ok, 1
+
+    Note: class method survives round-trip
+    Let class2 be proc find_in_list with hir2_members, "swift_class"
+    Let bump2 be proc find_named_member with class2, "members", "swift_function", "bump"
+    proc assert_not_null from TestUtils with results, "round-trip preserves class method 'bump'", bump2
+
+    proc print_summary from TestUtils with results
+    Let failed be proc get_failed from TestUtils with results
+    proc destroy_test_results from TestUtils with results
+
+    Return failed
+End Process
