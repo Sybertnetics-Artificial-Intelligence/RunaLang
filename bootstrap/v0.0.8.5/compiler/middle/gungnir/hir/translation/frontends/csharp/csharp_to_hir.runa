@@ -42,10 +42,10 @@ Dependencies:
 :End Note
 
 Import "compiler/middle/gungnir/hir/translation/frontends/csharp/csharp_parser.runa" as Parser
+Import "compiler/middle/gungnir/hir/hir.runa" as HIR
 Import "compiler/frontend/primitives/memory/layout.runa" as Layout
 Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
-Import "compiler/frontend/primitives/collections/dictionary.runa" as Dict
-Import "compiler/frontend/primitives/collections/list.runa" as ListOps
+Import "compiler/frontend/primitives/collections/list.runa" as List
 
 Note: ============================================================================
 Note: C# to HIR Translation Context
@@ -77,6 +77,149 @@ End Type
 
 Constant CONTEXT_SIZE as Integer is 32
 
+Note: ============================================================================
+Note: HIR Construction Helpers
+Note: ============================================================================
+
+@Reasoning:
+The C# frontend models every translated construct as a string-keyed HIR
+dictionary literal whose values are either HIR string literals (scalar fields)
+or nested HIR nodes (sub-trees and lists). These thin wrappers adapt that
+intent onto the canonical hir.runa producer API (create_hir_dictionary_literal,
+add_dictionary_entry, create_hir_string_literal, create_hir_list_literal,
+add_list_element) so the rest of the translator reads as declarative dict/list
+building. The backend (hir_to_csharp) decodes exactly this shape.
+@End Reasoning
+
+@Implementation:
+create_dictionary -> create_hir_dictionary_literal (a HIR dict node with an
+eager entries list). Returns 0 on allocation failure.
+@End Implementation
+Process called "create_dictionary" returns Integer:
+    Note: Create a HIR dictionary literal node
+
+    Return proc create_hir_dictionary_literal from HIR
+End Process
+
+@Reasoning:
+Scalar fields carry string payloads (type tags, names, modifier flags). The
+value is wrapped in a HIR string literal so the dictionary entry value is a
+proper HIR node, matching what the backend's get_dict_string_value expects.
+@End Reasoning
+@Implementation:
+Null-guard hir and key. Wrap value in create_hir_string_literal, then
+add_dictionary_entry(hir, key, value_literal). A 0 value yields an empty-string
+literal so the key is still recorded.
+@End Implementation
+Process called "set_dict_string_value" takes hir as Integer, key as Integer, value as Integer returns Integer:
+    Note: Add a string-valued entry to a HIR dictionary
+
+    If hir is equal to 0:
+        Return 0
+    End If
+    If key is equal to 0:
+        Return 0
+    End If
+
+    Let value_literal be proc create_hir_string_literal from HIR with value
+    Return proc add_dictionary_entry from HIR with hir, key, value_literal
+End Process
+
+@Reasoning:
+Structured fields carry a nested HIR node (a sub-dictionary, list, or
+expression). The value node is stored verbatim so the backend can recurse into
+it.
+@End Reasoning
+@Implementation:
+Null-guard hir and key. add_dictionary_entry(hir, key, value) with the value
+node passed through unchanged (0 is a legal explicit-null payload).
+@End Implementation
+Process called "set_dict_hir_value" takes hir as Integer, key as Integer, value as Integer returns Integer:
+    Note: Add a HIR-node-valued entry to a HIR dictionary
+
+    If hir is equal to 0:
+        Return 0
+    End If
+    If key is equal to 0:
+        Return 0
+    End If
+
+    Return proc add_dictionary_entry from HIR with hir, key, value
+End Process
+
+@Reasoning:
+Ordered collections (members, parameters, statements, arguments) are modelled
+as HIR list literals so the backend can iterate them with get_list_elements.
+@End Reasoning
+@Implementation:
+create_list -> create_hir_list_literal (a HIR array-literal node with an eager
+elements list). Returns 0 on allocation failure.
+@End Implementation
+Process called "create_list" returns Integer:
+    Note: Create a HIR list literal node
+
+    Return proc create_hir_list_literal from HIR
+End Process
+
+@Reasoning:
+Append a translated node to a HIR list literal, preserving source order.
+@End Reasoning
+@Implementation:
+Null-guard list and element. add_list_element(list, element). Returns 1 on
+success, 0 on null input.
+@End Implementation
+Process called "add_to_list" takes list as Integer, element as Integer returns Integer:
+    Note: Append an element to a HIR list literal
+
+    If list is equal to 0:
+        Return 0
+    End If
+    If element is equal to 0:
+        Return 0
+    End If
+
+    Return proc add_list_element from HIR with list, element
+End Process
+
+@Reasoning:
+Some translators query a list's length to decide whether to emit an optional
+field (e.g. skip the "interfaces" key when there are none). The length is the
+element count of the underlying List.
+@End Reasoning
+@Implementation:
+Null-guard returns 0. Read the elements List via get_list_elements; return 0 if
+absent, otherwise List.size.
+@End Implementation
+Process called "get_list_length" takes list as Integer returns Integer:
+    Note: Number of elements in a HIR list literal
+
+    If list is equal to 0:
+        Return 0
+    End If
+
+    Let elements be proc get_list_elements from HIR with list
+    If elements is equal to 0:
+        Return 0
+    End If
+
+    Return proc size from List with elements
+End Process
+
+@Reasoning:
+Error-accumulation lists are transient scratch structures. HIR nodes are owned
+by the arena and reclaimed in bulk when the arena is freed, so an explicit
+per-list destroy is a no-op that exists only so call sites that release a
+scratch list read symmetrically.
+@End Reasoning
+@Implementation:
+No action; arena reclamation owns the storage. Returns 1.
+@End Implementation
+Process called "destroy_list" takes list as Integer returns Integer:
+    Note: Release a transient HIR list (arena-owned, no-op)
+
+    Return 1
+End Process
+
 @Reasoning:
 Constructor establishes the four-field context invariants: arena set,
 namespace and class zero (no enclosing declaration yet), errors list
@@ -104,7 +247,7 @@ Process called "create_csharp_to_hir_context" takes arena as Integer returns Int
     proc memory_set_int64 from Layout with context, 8, 0   Note: current_namespace
     proc memory_set_int64 from Layout with context, 16, 0  Note: current_class
 
-    Let errors be proc create_list from ListOps
+    Let errors be proc create_list
     proc memory_set_int64 from Layout with context, 24, errors
 
     Return context
@@ -132,7 +275,7 @@ Process called "destroy_csharp_to_hir_context" takes context as Integer returns 
 
     Let errors be proc memory_get_int64 from Layout with context, 24
     If errors is not equal to 0:
-        proc destroy_list from ListOps with errors
+        proc destroy_list with errors
     End If
 
     proc deallocate from Layout with context
@@ -341,12 +484,16 @@ Process called "translate_node" takes context as Integer, node as Integer return
         Return proc translate_lock_statement with context, node
     End If
 
-    If node_type is equal to CSHARP_EXPRESSION_STMT from Parser:
+    If node_type is equal to CSHARP_EXPR_STMT from Parser:
         Return proc translate_expression_statement with context, node
     End If
 
     If node_type is equal to CSHARP_VAR_DECL from Parser:
         Return proc translate_var_declaration with context, node
+    End If
+
+    If node_type is equal to CSHARP_PARAMETER from Parser:
+        Return proc translate_parameter with context, node
     End If
 
     Note: Expressions
@@ -358,7 +505,11 @@ Process called "translate_node" takes context as Integer, node as Integer return
         Return proc translate_unary_expression with context, node
     End If
 
-    If node_type is equal to CSHARP_ASSIGNMENT_EXPR from Parser:
+    If node_type is equal to CSHARP_ASSIGN_STMT from Parser:
+        Return proc translate_assignment_expression with context, node
+    End If
+
+    If node_type is equal to CSHARP_ASSIGN_EXPR from Parser:
         Return proc translate_assignment_expression with context, node
     End If
 
@@ -366,7 +517,7 @@ Process called "translate_node" takes context as Integer, node as Integer return
         Return proc translate_call_expression with context, node
     End If
 
-    If node_type is equal to CSHARP_MEMBER_ACCESS_EXPR from Parser:
+    If node_type is equal to CSHARP_MEMBER_EXPR from Parser:
         Return proc translate_member_access_expression with context, node
     End If
 
@@ -422,10 +573,10 @@ Stores members at HIR key "members". Returns the dict.
 Process called "translate_program" takes context as Integer, node as Integer returns Integer:
     Note: Translate C# program node to HIR
 
-    Let hir be proc create_dictionary from Dict
-    proc set_dict_string_value from Dict with hir, "_type", "csharp_program"
+    Let hir be proc create_dictionary
+    proc set_dict_string_value with hir, "_type", "csharp_program"
 
-    Let members be proc create_list from ListOps
+    Let members be proc create_list
 
     Let child_count be proc get_child_count from Parser with node
     Let index be 0
@@ -435,13 +586,13 @@ Process called "translate_program" takes context as Integer, node as Integer ret
         Let child_hir be proc translate_node with context, child
 
         If child_hir is not equal to 0:
-            proc add_to_list from ListOps with members, child_hir
+            proc add_to_list with members, child_hir
         End If
 
         Set index to index plus 1
     End While
 
-    proc set_dict_hir_value from Dict with hir, "members", members
+    proc set_dict_hir_value with hir, "members", members
 
     Return hir
 End Process
@@ -464,16 +615,16 @@ list stored under "members".
 Process called "translate_namespace" takes context as Integer, node as Integer returns Integer:
     Note: Translate namespace declaration to HIR
 
-    Let hir be proc create_dictionary from Dict
-    proc set_dict_string_value from Dict with hir, "_type", "csharp_namespace"
+    Let hir be proc create_dictionary
+    proc set_dict_string_value with hir, "_type", "csharp_namespace"
 
     Let name be proc get_node_name from Parser with node
     If name is not equal to 0:
-        proc set_dict_string_value from Dict with hir, "name", name
+        proc set_dict_string_value with hir, "name", name
         proc memory_set_int64 from Layout with context, 8, name  Note: Update current_namespace
     End If
 
-    Let members be proc create_list from ListOps
+    Let members be proc create_list
 
     Let child_count be proc get_child_count from Parser with node
     Let index be 0
@@ -483,13 +634,13 @@ Process called "translate_namespace" takes context as Integer, node as Integer r
         Let child_hir be proc translate_node with context, child
 
         If child_hir is not equal to 0:
-            proc add_to_list from ListOps with members, child_hir
+            proc add_to_list with members, child_hir
         End If
 
         Set index to index plus 1
     End While
 
-    proc set_dict_hir_value from Dict with hir, "members", members
+    proc set_dict_hir_value with hir, "members", members
 
     Return hir
 End Process
@@ -511,17 +662,17 @@ Returns the dict.
 Process called "translate_using" takes context as Integer, node as Integer returns Integer:
     Note: Translate using directive to HIR
 
-    Let hir be proc create_dictionary from Dict
-    proc set_dict_string_value from Dict with hir, "_type", "csharp_using"
+    Let hir be proc create_dictionary
+    proc set_dict_string_value with hir, "_type", "csharp_using"
 
     Let name be proc get_node_name from Parser with node
     If name is not equal to 0:
-        proc set_dict_string_value from Dict with hir, "namespace", name
+        proc set_dict_string_value with hir, "namespace", name
     End If
 
     Let alias be proc get_node_attribute from Parser with node, "alias"
     If alias is not equal to 0:
-        proc set_dict_string_value from Dict with hir, "alias", alias
+        proc set_dict_string_value with hir, "alias", alias
     End If
 
     Return hir
@@ -556,50 +707,52 @@ appended to the members list stored at "members". Returns the dict.
 Process called "translate_class" takes context as Integer, node as Integer returns Integer:
     Note: Translate class declaration to HIR
 
-    Let hir be proc create_dictionary from Dict
-    proc set_dict_string_value from Dict with hir, "_type", "csharp_class"
+    Let hir be proc create_dictionary
+    proc set_dict_string_value with hir, "_type", "csharp_class"
 
     Let name be proc get_node_name from Parser with node
     If name is not equal to 0:
-        proc set_dict_string_value from Dict with hir, "name", name
+        proc set_dict_string_value with hir, "name", name
         proc memory_set_int64 from Layout with context, 16, name  Note: Update current_class
     End If
 
     Note: Access modifiers
     Let access be proc get_node_attribute from Parser with node, "access"
     If access is not equal to 0:
-        proc set_dict_string_value from Dict with hir, "access", access
+        proc set_dict_string_value with hir, "access", access
     End If
 
     Note: Modifiers (static, abstract, sealed, partial)
     Let is_static be proc get_node_attribute from Parser with node, "static"
     If is_static is not equal to 0:
-        proc set_dict_string_value from Dict with hir, "static", "true"
+        proc set_dict_string_value with hir, "static", "true"
     End If
 
     Let is_abstract be proc get_node_attribute from Parser with node, "abstract"
     If is_abstract is not equal to 0:
-        proc set_dict_string_value from Dict with hir, "abstract", "true"
+        proc set_dict_string_value with hir, "abstract", "true"
     End If
 
     Let is_sealed be proc get_node_attribute from Parser with node, "sealed"
     If is_sealed is not equal to 0:
-        proc set_dict_string_value from Dict with hir, "sealed", "true"
+        proc set_dict_string_value with hir, "sealed", "true"
     End If
 
     Let is_partial be proc get_node_attribute from Parser with node, "partial"
     If is_partial is not equal to 0:
-        proc set_dict_string_value from Dict with hir, "partial", "true"
+        proc set_dict_string_value with hir, "partial", "true"
     End If
 
-    Note: Generic type parameters
+    Note: Generic type parameters. The parser stores these as a comma-joined
+    Note: string attribute, so the HIR field is a string value (the backend
+    Note: reads it back with get_dict_string_value).
     Let type_params be proc get_node_attribute from Parser with node, "type_parameters"
     If type_params is not equal to 0:
-        proc set_dict_hir_value from Dict with hir, "type_parameters", type_params
+        proc set_dict_string_value with hir, "type_parameters", type_params
     End If
 
     Note: Base class and interfaces
-    Let base_types be proc create_list from ListOps
+    Let base_types be proc create_list
     Let child_count be proc get_child_count from Parser with node
     Let index be 0
     Let found_base be 0
@@ -611,23 +764,23 @@ Process called "translate_class" takes context as Integer, node as Integer retur
         If child_type is equal to CSHARP_TYPE from Parser:
             If found_base is equal to 0:
                 Let base_hir be proc translate_node with context, child
-                proc set_dict_hir_value from Dict with hir, "base_class", base_hir
+                proc set_dict_hir_value with hir, "base_class", base_hir
                 Set found_base to 1
             Otherwise:
                 Let interface_hir be proc translate_node with context, child
-                proc add_to_list from ListOps with base_types, interface_hir
+                proc add_to_list with base_types, interface_hir
             End If
         End If
 
         Set index to index plus 1
     End While
 
-    If proc get_list_length from ListOps with base_types is greater than 0:
-        proc set_dict_hir_value from Dict with hir, "interfaces", base_types
+    If proc get_list_length with base_types is greater than 0:
+        proc set_dict_hir_value with hir, "interfaces", base_types
     End If
 
     Note: Members (methods, fields, properties, events)
-    Let members be proc create_list from ListOps
+    Let members be proc create_list
     Set index to 0
 
     While index is less than child_count:
@@ -638,14 +791,14 @@ Process called "translate_class" takes context as Integer, node as Integer retur
             Let member_hir be proc translate_node with context, child
 
             If member_hir is not equal to 0:
-                proc add_to_list from ListOps with members, member_hir
+                proc add_to_list with members, member_hir
             End If
         End If
 
         Set index to index plus 1
     End While
 
-    proc set_dict_hir_value from Dict with hir, "members", members
+    proc set_dict_hir_value with hir, "members", members
 
     Return hir
 End Process
@@ -670,7 +823,7 @@ Process called "translate_struct" takes context as Integer, node as Integer retu
     Let hir be proc translate_class with context, node
 
     If hir is not equal to 0:
-        proc set_dict_string_value from Dict with hir, "_type", "csharp_struct"
+        proc set_dict_string_value with hir, "_type", "csharp_struct"
     End If
 
     Return hir
@@ -695,28 +848,30 @@ signatures, properties) and appends to members. Returns the dict.
 Process called "translate_interface" takes context as Integer, node as Integer returns Integer:
     Note: Translate interface declaration to HIR
 
-    Let hir be proc create_dictionary from Dict
-    proc set_dict_string_value from Dict with hir, "_type", "csharp_interface"
+    Let hir be proc create_dictionary
+    proc set_dict_string_value with hir, "_type", "csharp_interface"
 
     Let name be proc get_node_name from Parser with node
     If name is not equal to 0:
-        proc set_dict_string_value from Dict with hir, "name", name
+        proc set_dict_string_value with hir, "name", name
     End If
 
     Note: Access modifiers
     Let access be proc get_node_attribute from Parser with node, "access"
     If access is not equal to 0:
-        proc set_dict_string_value from Dict with hir, "access", access
+        proc set_dict_string_value with hir, "access", access
     End If
 
-    Note: Generic type parameters
+    Note: Generic type parameters. The parser stores these as a comma-joined
+    Note: string attribute, so the HIR field is a string value (the backend
+    Note: reads it back with get_dict_string_value).
     Let type_params be proc get_node_attribute from Parser with node, "type_parameters"
     If type_params is not equal to 0:
-        proc set_dict_hir_value from Dict with hir, "type_parameters", type_params
+        proc set_dict_string_value with hir, "type_parameters", type_params
     End If
 
     Note: Base interfaces
-    Let base_interfaces be proc create_list from ListOps
+    Let base_interfaces be proc create_list
     Let child_count be proc get_child_count from Parser with node
     Let index be 0
 
@@ -726,18 +881,18 @@ Process called "translate_interface" takes context as Integer, node as Integer r
 
         If child_type is equal to CSHARP_TYPE from Parser:
             Let interface_hir be proc translate_node with context, child
-            proc add_to_list from ListOps with base_interfaces, interface_hir
+            proc add_to_list with base_interfaces, interface_hir
         End If
 
         Set index to index plus 1
     End While
 
-    If proc get_list_length from ListOps with base_interfaces is greater than 0:
-        proc set_dict_hir_value from Dict with hir, "base_interfaces", base_interfaces
+    If proc get_list_length with base_interfaces is greater than 0:
+        proc set_dict_hir_value with hir, "base_interfaces", base_interfaces
     End If
 
     Note: Members (method signatures, properties)
-    Let members be proc create_list from ListOps
+    Let members be proc create_list
     Set index to 0
 
     While index is less than child_count:
@@ -748,14 +903,14 @@ Process called "translate_interface" takes context as Integer, node as Integer r
             Let member_hir be proc translate_node with context, child
 
             If member_hir is not equal to 0:
-                proc add_to_list from ListOps with members, member_hir
+                proc add_to_list with members, member_hir
             End If
         End If
 
         Set index to index plus 1
     End While
 
-    proc set_dict_hir_value from Dict with hir, "members", members
+    proc set_dict_hir_value with hir, "members", members
 
     Return hir
 End Process
@@ -776,22 +931,22 @@ which is stored at HIR key "values". Returns the dict.
 Process called "translate_enum" takes context as Integer, node as Integer returns Integer:
     Note: Translate enum declaration to HIR
 
-    Let hir be proc create_dictionary from Dict
-    proc set_dict_string_value from Dict with hir, "_type", "csharp_enum"
+    Let hir be proc create_dictionary
+    proc set_dict_string_value with hir, "_type", "csharp_enum"
 
     Let name be proc get_node_name from Parser with node
     If name is not equal to 0:
-        proc set_dict_string_value from Dict with hir, "name", name
+        proc set_dict_string_value with hir, "name", name
     End If
 
     Note: Access modifiers
     Let access be proc get_node_attribute from Parser with node, "access"
     If access is not equal to 0:
-        proc set_dict_string_value from Dict with hir, "access", access
+        proc set_dict_string_value with hir, "access", access
     End If
 
     Note: Enum values
-    Let values be proc create_list from ListOps
+    Let values be proc create_list
     Let child_count be proc get_child_count from Parser with node
     Let index be 0
 
@@ -800,13 +955,13 @@ Process called "translate_enum" takes context as Integer, node as Integer return
         Let value_hir be proc translate_node with context, child
 
         If value_hir is not equal to 0:
-            proc add_to_list from ListOps with values, value_hir
+            proc add_to_list with values, value_hir
         End If
 
         Set index to index plus 1
     End While
 
-    proc set_dict_hir_value from Dict with hir, "values", values
+    proc set_dict_hir_value with hir, "values", values
 
     Return hir
 End Process
@@ -828,18 +983,18 @@ list stored at "parameters". Returns the dict.
 Process called "translate_delegate" takes context as Integer, node as Integer returns Integer:
     Note: Translate delegate declaration to HIR
 
-    Let hir be proc create_dictionary from Dict
-    proc set_dict_string_value from Dict with hir, "_type", "csharp_delegate"
+    Let hir be proc create_dictionary
+    proc set_dict_string_value with hir, "_type", "csharp_delegate"
 
     Let name be proc get_node_name from Parser with node
     If name is not equal to 0:
-        proc set_dict_string_value from Dict with hir, "name", name
+        proc set_dict_string_value with hir, "name", name
     End If
 
     Note: Access modifiers
     Let access be proc get_node_attribute from Parser with node, "access"
     If access is not equal to 0:
-        proc set_dict_string_value from Dict with hir, "access", access
+        proc set_dict_string_value with hir, "access", access
     End If
 
     Note: Return type
@@ -847,11 +1002,11 @@ Process called "translate_delegate" takes context as Integer, node as Integer re
     If child_count is greater than 0:
         Let return_type_node be proc get_child from Parser with node, 0
         Let return_type be proc translate_node with context, return_type_node
-        proc set_dict_hir_value from Dict with hir, "return_type", return_type
+        proc set_dict_hir_value with hir, "return_type", return_type
     End If
 
     Note: Parameters
-    Let parameters be proc create_list from ListOps
+    Let parameters be proc create_list
     Let index be 1
 
     While index is less than child_count:
@@ -859,13 +1014,13 @@ Process called "translate_delegate" takes context as Integer, node as Integer re
         Let param_hir be proc translate_node with context, param_node
 
         If param_hir is not equal to 0:
-            proc add_to_list from ListOps with parameters, param_hir
+            proc add_to_list with parameters, param_hir
         End If
 
         Set index to index plus 1
     End While
 
-    proc set_dict_hir_value from Dict with hir, "parameters", parameters
+    proc set_dict_hir_value with hir, "parameters", parameters
 
     Return hir
 End Process
@@ -895,44 +1050,44 @@ translates the last child as "body". Returns the dict.
 Process called "translate_method" takes context as Integer, node as Integer returns Integer:
     Note: Translate method declaration to HIR
 
-    Let hir be proc create_dictionary from Dict
-    proc set_dict_string_value from Dict with hir, "_type", "csharp_method"
+    Let hir be proc create_dictionary
+    proc set_dict_string_value with hir, "_type", "csharp_method"
 
     Let name be proc get_node_name from Parser with node
     If name is not equal to 0:
-        proc set_dict_string_value from Dict with hir, "name", name
+        proc set_dict_string_value with hir, "name", name
     End If
 
     Note: Access modifiers
     Let access be proc get_node_attribute from Parser with node, "access"
     If access is not equal to 0:
-        proc set_dict_string_value from Dict with hir, "access", access
+        proc set_dict_string_value with hir, "access", access
     End If
 
     Note: Modifiers
     Let is_static be proc get_node_attribute from Parser with node, "static"
     If is_static is not equal to 0:
-        proc set_dict_string_value from Dict with hir, "static", "true"
+        proc set_dict_string_value with hir, "static", "true"
     End If
 
     Let is_virtual be proc get_node_attribute from Parser with node, "virtual"
     If is_virtual is not equal to 0:
-        proc set_dict_string_value from Dict with hir, "virtual", "true"
+        proc set_dict_string_value with hir, "virtual", "true"
     End If
 
     Let is_override be proc get_node_attribute from Parser with node, "override"
     If is_override is not equal to 0:
-        proc set_dict_string_value from Dict with hir, "override", "true"
+        proc set_dict_string_value with hir, "override", "true"
     End If
 
     Let is_abstract be proc get_node_attribute from Parser with node, "abstract"
     If is_abstract is not equal to 0:
-        proc set_dict_string_value from Dict with hir, "abstract", "true"
+        proc set_dict_string_value with hir, "abstract", "true"
     End If
 
     Let is_async be proc get_node_attribute from Parser with node, "async"
     If is_async is not equal to 0:
-        proc set_dict_string_value from Dict with hir, "async", "true"
+        proc set_dict_string_value with hir, "async", "true"
     End If
 
     Note: Return type, parameters, and body
@@ -941,10 +1096,10 @@ Process called "translate_method" takes context as Integer, node as Integer retu
     If child_count is greater than 0:
         Let return_type_node be proc get_child from Parser with node, 0
         Let return_type be proc translate_node with context, return_type_node
-        proc set_dict_hir_value from Dict with hir, "return_type", return_type
+        proc set_dict_hir_value with hir, "return_type", return_type
     End If
 
-    Let parameters be proc create_list from ListOps
+    Let parameters be proc create_list
     Let index be 1
     Let body_index be child_count minus 1
 
@@ -953,18 +1108,18 @@ Process called "translate_method" takes context as Integer, node as Integer retu
         Let param_hir be proc translate_node with context, param_node
 
         If param_hir is not equal to 0:
-            proc add_to_list from ListOps with parameters, param_hir
+            proc add_to_list with parameters, param_hir
         End If
 
         Set index to index plus 1
     End While
 
-    proc set_dict_hir_value from Dict with hir, "parameters", parameters
+    proc set_dict_hir_value with hir, "parameters", parameters
 
     If child_count is greater than 1:
         Let body_node be proc get_child from Parser with node, body_index
         Let body be proc translate_node with context, body_node
-        proc set_dict_hir_value from Dict with hir, "body", body
+        proc set_dict_hir_value with hir, "body", body
     End If
 
     Return hir
@@ -987,34 +1142,34 @@ translates to "initializer". Returns the dict.
 Process called "translate_field" takes context as Integer, node as Integer returns Integer:
     Note: Translate field declaration to HIR
 
-    Let hir be proc create_dictionary from Dict
-    proc set_dict_string_value from Dict with hir, "_type", "csharp_field"
+    Let hir be proc create_dictionary
+    proc set_dict_string_value with hir, "_type", "csharp_field"
 
     Let name be proc get_node_name from Parser with node
     If name is not equal to 0:
-        proc set_dict_string_value from Dict with hir, "name", name
+        proc set_dict_string_value with hir, "name", name
     End If
 
     Note: Access modifiers
     Let access be proc get_node_attribute from Parser with node, "access"
     If access is not equal to 0:
-        proc set_dict_string_value from Dict with hir, "access", access
+        proc set_dict_string_value with hir, "access", access
     End If
 
     Note: Modifiers
     Let is_static be proc get_node_attribute from Parser with node, "static"
     If is_static is not equal to 0:
-        proc set_dict_string_value from Dict with hir, "static", "true"
+        proc set_dict_string_value with hir, "static", "true"
     End If
 
     Let is_readonly be proc get_node_attribute from Parser with node, "readonly"
     If is_readonly is not equal to 0:
-        proc set_dict_string_value from Dict with hir, "readonly", "true"
+        proc set_dict_string_value with hir, "readonly", "true"
     End If
 
     Let is_const be proc get_node_attribute from Parser with node, "const"
     If is_const is not equal to 0:
-        proc set_dict_string_value from Dict with hir, "const", "true"
+        proc set_dict_string_value with hir, "const", "true"
     End If
 
     Note: Type and initializer
@@ -1023,13 +1178,13 @@ Process called "translate_field" takes context as Integer, node as Integer retur
     If child_count is greater than 0:
         Let type_node be proc get_child from Parser with node, 0
         Let field_type be proc translate_node with context, type_node
-        proc set_dict_hir_value from Dict with hir, "type", field_type
+        proc set_dict_hir_value with hir, "type", field_type
     End If
 
     If child_count is greater than 1:
         Let init_node be proc get_child from Parser with node, 1
         Let initializer be proc translate_node with context, init_node
-        proc set_dict_hir_value from Dict with hir, "initializer", initializer
+        proc set_dict_hir_value with hir, "initializer", initializer
     End If
 
     Return hir
@@ -1068,34 +1223,34 @@ Process called "translate_property" takes context as Integer, node as Integer re
     accessor information for proper round-trip translation.
     @End Reasoning
 
-    Let hir be proc create_dictionary from Dict
-    proc set_dict_string_value from Dict with hir, "_type", "csharp_property"
+    Let hir be proc create_dictionary
+    proc set_dict_string_value with hir, "_type", "csharp_property"
 
     Let name be proc get_node_name from Parser with node
     If name is not equal to 0:
-        proc set_dict_string_value from Dict with hir, "name", name
+        proc set_dict_string_value with hir, "name", name
     End If
 
     Note: Access modifiers
     Let access be proc get_node_attribute from Parser with node, "access"
     If access is not equal to 0:
-        proc set_dict_string_value from Dict with hir, "access", access
+        proc set_dict_string_value with hir, "access", access
     End If
 
     Note: Modifiers
     Let is_static be proc get_node_attribute from Parser with node, "static"
     If is_static is not equal to 0:
-        proc set_dict_string_value from Dict with hir, "static", "true"
+        proc set_dict_string_value with hir, "static", "true"
     End If
 
     Let is_virtual be proc get_node_attribute from Parser with node, "virtual"
     If is_virtual is not equal to 0:
-        proc set_dict_string_value from Dict with hir, "virtual", "true"
+        proc set_dict_string_value with hir, "virtual", "true"
     End If
 
     Let is_override be proc get_node_attribute from Parser with node, "override"
     If is_override is not equal to 0:
-        proc set_dict_string_value from Dict with hir, "override", "true"
+        proc set_dict_string_value with hir, "override", "true"
     End If
 
     Note: Type
@@ -1104,28 +1259,28 @@ Process called "translate_property" takes context as Integer, node as Integer re
     If child_count is greater than 0:
         Let type_node be proc get_child from Parser with node, 0
         Let prop_type be proc translate_node with context, type_node
-        proc set_dict_hir_value from Dict with hir, "type", prop_type
+        proc set_dict_hir_value with hir, "type", prop_type
     End If
 
     Note: Get accessor
     Let get_accessor be proc get_node_attribute from Parser with node, "get"
     If get_accessor is not equal to 0:
         Let get_hir be proc translate_node with context, get_accessor
-        proc set_dict_hir_value from Dict with hir, "get", get_hir
+        proc set_dict_hir_value with hir, "get", get_hir
     End If
 
     Note: Set accessor
     Let set_accessor be proc get_node_attribute from Parser with node, "set"
     If set_accessor is not equal to 0:
         Let set_hir be proc translate_node with context, set_accessor
-        proc set_dict_hir_value from Dict with hir, "set", set_hir
+        proc set_dict_hir_value with hir, "set", set_hir
     End If
 
     Note: Auto-property initializer
     If child_count is greater than 1:
         Let init_node be proc get_child from Parser with node, 1
         Let initializer be proc translate_node with context, init_node
-        proc set_dict_hir_value from Dict with hir, "initializer", initializer
+        proc set_dict_hir_value with hir, "initializer", initializer
     End If
 
     Return hir
@@ -1147,24 +1302,24 @@ child 0 as the delegate type into HIR key "type". Returns the dict.
 Process called "translate_event" takes context as Integer, node as Integer returns Integer:
     Note: Translate event declaration to HIR
 
-    Let hir be proc create_dictionary from Dict
-    proc set_dict_string_value from Dict with hir, "_type", "csharp_event"
+    Let hir be proc create_dictionary
+    proc set_dict_string_value with hir, "_type", "csharp_event"
 
     Let name be proc get_node_name from Parser with node
     If name is not equal to 0:
-        proc set_dict_string_value from Dict with hir, "name", name
+        proc set_dict_string_value with hir, "name", name
     End If
 
     Note: Access modifiers
     Let access be proc get_node_attribute from Parser with node, "access"
     If access is not equal to 0:
-        proc set_dict_string_value from Dict with hir, "access", access
+        proc set_dict_string_value with hir, "access", access
     End If
 
     Note: Modifiers
     Let is_static be proc get_node_attribute from Parser with node, "static"
     If is_static is not equal to 0:
-        proc set_dict_string_value from Dict with hir, "static", "true"
+        proc set_dict_string_value with hir, "static", "true"
     End If
 
     Note: Delegate type
@@ -1173,7 +1328,7 @@ Process called "translate_event" takes context as Integer, node as Integer retur
     If child_count is greater than 0:
         Let type_node be proc get_child from Parser with node, 0
         Let event_type be proc translate_node with context, type_node
-        proc set_dict_hir_value from Dict with hir, "type", event_type
+        proc set_dict_hir_value with hir, "type", event_type
     End If
 
     Return hir
@@ -1196,12 +1351,12 @@ key "name". Returns the dict.
 Process called "translate_type" takes context as Integer, node as Integer returns Integer:
     Note: Translate basic type to HIR
 
-    Let hir be proc create_dictionary from Dict
-    proc set_dict_string_value from Dict with hir, "_type", "csharp_type"
+    Let hir be proc create_dictionary
+    proc set_dict_string_value with hir, "_type", "csharp_type"
 
     Let name be proc get_node_name from Parser with node
     If name is not equal to 0:
-        proc set_dict_string_value from Dict with hir, "name", name
+        proc set_dict_string_value with hir, "name", name
     End If
 
     Return hir
@@ -1222,16 +1377,16 @@ type_args list, stored at HIR key "type_arguments". Returns the dict.
 Process called "translate_generic_type" takes context as Integer, node as Integer returns Integer:
     Note: Translate generic type to HIR
 
-    Let hir be proc create_dictionary from Dict
-    proc set_dict_string_value from Dict with hir, "_type", "csharp_generic_type"
+    Let hir be proc create_dictionary
+    proc set_dict_string_value with hir, "_type", "csharp_generic_type"
 
     Let name be proc get_node_name from Parser with node
     If name is not equal to 0:
-        proc set_dict_string_value from Dict with hir, "name", name
+        proc set_dict_string_value with hir, "name", name
     End If
 
     Note: Type arguments
-    Let type_args be proc create_list from ListOps
+    Let type_args be proc create_list
     Let child_count be proc get_child_count from Parser with node
     Let index be 0
 
@@ -1240,13 +1395,13 @@ Process called "translate_generic_type" takes context as Integer, node as Intege
         Let arg_hir be proc translate_node with context, child
 
         If arg_hir is not equal to 0:
-            proc add_to_list from ListOps with type_args, arg_hir
+            proc add_to_list with type_args, arg_hir
         End If
 
         Set index to index plus 1
     End While
 
-    proc set_dict_hir_value from Dict with hir, "type_arguments", type_args
+    proc set_dict_hir_value with hir, "type_arguments", type_args
 
     Return hir
 End Process
@@ -1266,8 +1421,8 @@ non-zero stores it as HIR string "rank". Returns the dict.
 Process called "translate_array_type" takes context as Integer, node as Integer returns Integer:
     Note: Translate array type to HIR
 
-    Let hir be proc create_dictionary from Dict
-    proc set_dict_string_value from Dict with hir, "_type", "csharp_array_type"
+    Let hir be proc create_dictionary
+    proc set_dict_string_value with hir, "_type", "csharp_array_type"
 
     Note: Element type
     Let child_count be proc get_child_count from Parser with node
@@ -1275,13 +1430,13 @@ Process called "translate_array_type" takes context as Integer, node as Integer 
     If child_count is greater than 0:
         Let element_node be proc get_child from Parser with node, 0
         Let element_type be proc translate_node with context, element_node
-        proc set_dict_hir_value from Dict with hir, "element_type", element_type
+        proc set_dict_hir_value with hir, "element_type", element_type
     End If
 
     Note: Rank (number of dimensions)
     Let rank be proc get_node_attribute from Parser with node, "rank"
     If rank is not equal to 0:
-        proc set_dict_string_value from Dict with hir, "rank", rank
+        proc set_dict_string_value with hir, "rank", rank
     End If
 
     Return hir
@@ -1301,8 +1456,8 @@ Dict tagged "csharp_nullable_type". Child 0 translates to HIR key
 Process called "translate_nullable_type" takes context as Integer, node as Integer returns Integer:
     Note: Translate nullable type to HIR
 
-    Let hir be proc create_dictionary from Dict
-    proc set_dict_string_value from Dict with hir, "_type", "csharp_nullable_type"
+    Let hir be proc create_dictionary
+    proc set_dict_string_value with hir, "_type", "csharp_nullable_type"
 
     Note: Underlying type
     Let child_count be proc get_child_count from Parser with node
@@ -1310,7 +1465,7 @@ Process called "translate_nullable_type" takes context as Integer, node as Integ
     If child_count is greater than 0:
         Let type_node be proc get_child from Parser with node, 0
         Let underlying_type be proc translate_node with context, type_node
-        proc set_dict_hir_value from Dict with hir, "underlying_type", underlying_type
+        proc set_dict_hir_value with hir, "underlying_type", underlying_type
     End If
 
     Return hir
@@ -1336,10 +1491,10 @@ appends non-null translations to a statements list stored at HIR key
 Process called "translate_block" takes context as Integer, node as Integer returns Integer:
     Note: Translate block statement to HIR
 
-    Let hir be proc create_dictionary from Dict
-    proc set_dict_string_value from Dict with hir, "_type", "csharp_block"
+    Let hir be proc create_dictionary
+    proc set_dict_string_value with hir, "_type", "csharp_block"
 
-    Let statements be proc create_list from ListOps
+    Let statements be proc create_list
     Let child_count be proc get_child_count from Parser with node
     Let index be 0
 
@@ -1348,13 +1503,13 @@ Process called "translate_block" takes context as Integer, node as Integer retur
         Let stmt_hir be proc translate_node with context, child
 
         If stmt_hir is not equal to 0:
-            proc add_to_list from ListOps with statements, stmt_hir
+            proc add_to_list with statements, stmt_hir
         End If
 
         Set index to index plus 1
     End While
 
-    proc set_dict_hir_value from Dict with hir, "statements", statements
+    proc set_dict_hir_value with hir, "statements", statements
 
     Return hir
 End Process
@@ -1374,27 +1529,27 @@ into "then_branch", and (when child_count > 2) child 2 into
 Process called "translate_if_statement" takes context as Integer, node as Integer returns Integer:
     Note: Translate if statement to HIR
 
-    Let hir be proc create_dictionary from Dict
-    proc set_dict_string_value from Dict with hir, "_type", "csharp_if"
+    Let hir be proc create_dictionary
+    proc set_dict_string_value with hir, "_type", "csharp_if"
 
     Let child_count be proc get_child_count from Parser with node
 
     If child_count is greater than 0:
         Let condition_node be proc get_child from Parser with node, 0
         Let condition be proc translate_node with context, condition_node
-        proc set_dict_hir_value from Dict with hir, "condition", condition
+        proc set_dict_hir_value with hir, "condition", condition
     End If
 
     If child_count is greater than 1:
         Let then_node be proc get_child from Parser with node, 1
         Let then_branch be proc translate_node with context, then_node
-        proc set_dict_hir_value from Dict with hir, "then_branch", then_branch
+        proc set_dict_hir_value with hir, "then_branch", then_branch
     End If
 
     If child_count is greater than 2:
         Let else_node be proc get_child from Parser with node, 2
         Let else_branch be proc translate_node with context, else_node
-        proc set_dict_hir_value from Dict with hir, "else_branch", else_branch
+        proc set_dict_hir_value with hir, "else_branch", else_branch
     End If
 
     Return hir
@@ -1416,33 +1571,33 @@ the dict.
 Process called "translate_for_statement" takes context as Integer, node as Integer returns Integer:
     Note: Translate for statement to HIR
 
-    Let hir be proc create_dictionary from Dict
-    proc set_dict_string_value from Dict with hir, "_type", "csharp_for"
+    Let hir be proc create_dictionary
+    proc set_dict_string_value with hir, "_type", "csharp_for"
 
     Let child_count be proc get_child_count from Parser with node
 
     If child_count is greater than 0:
         Let init_node be proc get_child from Parser with node, 0
         Let initializer be proc translate_node with context, init_node
-        proc set_dict_hir_value from Dict with hir, "initializer", initializer
+        proc set_dict_hir_value with hir, "initializer", initializer
     End If
 
     If child_count is greater than 1:
         Let condition_node be proc get_child from Parser with node, 1
         Let condition be proc translate_node with context, condition_node
-        proc set_dict_hir_value from Dict with hir, "condition", condition
+        proc set_dict_hir_value with hir, "condition", condition
     End If
 
     If child_count is greater than 2:
         Let increment_node be proc get_child from Parser with node, 2
         Let increment be proc translate_node with context, increment_node
-        proc set_dict_hir_value from Dict with hir, "increment", increment
+        proc set_dict_hir_value with hir, "increment", increment
     End If
 
     If child_count is greater than 3:
         Let body_node be proc get_child from Parser with node, 3
         Let body be proc translate_node with context, body_node
-        proc set_dict_hir_value from Dict with hir, "body", body
+        proc set_dict_hir_value with hir, "body", body
     End If
 
     Return hir
@@ -1464,12 +1619,12 @@ into "body" when each exists. Returns the dict.
 Process called "translate_foreach_statement" takes context as Integer, node as Integer returns Integer:
     Note: Translate foreach statement to HIR
 
-    Let hir be proc create_dictionary from Dict
-    proc set_dict_string_value from Dict with hir, "_type", "csharp_foreach"
+    Let hir be proc create_dictionary
+    proc set_dict_string_value with hir, "_type", "csharp_foreach"
 
     Let var_name be proc get_node_name from Parser with node
     If var_name is not equal to 0:
-        proc set_dict_string_value from Dict with hir, "variable", var_name
+        proc set_dict_string_value with hir, "variable", var_name
     End If
 
     Let child_count be proc get_child_count from Parser with node
@@ -1477,19 +1632,19 @@ Process called "translate_foreach_statement" takes context as Integer, node as I
     If child_count is greater than 0:
         Let type_node be proc get_child from Parser with node, 0
         Let var_type be proc translate_node with context, type_node
-        proc set_dict_hir_value from Dict with hir, "type", var_type
+        proc set_dict_hir_value with hir, "type", var_type
     End If
 
     If child_count is greater than 1:
         Let collection_node be proc get_child from Parser with node, 1
         Let collection be proc translate_node with context, collection_node
-        proc set_dict_hir_value from Dict with hir, "collection", collection
+        proc set_dict_hir_value with hir, "collection", collection
     End If
 
     If child_count is greater than 2:
         Let body_node be proc get_child from Parser with node, 2
         Let body be proc translate_node with context, body_node
-        proc set_dict_hir_value from Dict with hir, "body", body
+        proc set_dict_hir_value with hir, "body", body
     End If
 
     Return hir
@@ -1508,21 +1663,21 @@ if child_count > 1, child 1 into "body". Returns the dict.
 Process called "translate_while_statement" takes context as Integer, node as Integer returns Integer:
     Note: Translate while statement to HIR
 
-    Let hir be proc create_dictionary from Dict
-    proc set_dict_string_value from Dict with hir, "_type", "csharp_while"
+    Let hir be proc create_dictionary
+    proc set_dict_string_value with hir, "_type", "csharp_while"
 
     Let child_count be proc get_child_count from Parser with node
 
     If child_count is greater than 0:
         Let condition_node be proc get_child from Parser with node, 0
         Let condition be proc translate_node with context, condition_node
-        proc set_dict_hir_value from Dict with hir, "condition", condition
+        proc set_dict_hir_value with hir, "condition", condition
     End If
 
     If child_count is greater than 1:
         Let body_node be proc get_child from Parser with node, 1
         Let body be proc translate_node with context, body_node
-        proc set_dict_hir_value from Dict with hir, "body", body
+        proc set_dict_hir_value with hir, "body", body
     End If
 
     Return hir
@@ -1542,21 +1697,21 @@ child_count > 1, child 1 into "condition". Returns the dict.
 Process called "translate_do_while_statement" takes context as Integer, node as Integer returns Integer:
     Note: Translate do-while statement to HIR
 
-    Let hir be proc create_dictionary from Dict
-    proc set_dict_string_value from Dict with hir, "_type", "csharp_do_while"
+    Let hir be proc create_dictionary
+    proc set_dict_string_value with hir, "_type", "csharp_do_while"
 
     Let child_count be proc get_child_count from Parser with node
 
     If child_count is greater than 0:
         Let body_node be proc get_child from Parser with node, 0
         Let body be proc translate_node with context, body_node
-        proc set_dict_hir_value from Dict with hir, "body", body
+        proc set_dict_hir_value with hir, "body", body
     End If
 
     If child_count is greater than 1:
         Let condition_node be proc get_child from Parser with node, 1
         Let condition be proc translate_node with context, condition_node
-        proc set_dict_hir_value from Dict with hir, "condition", condition
+        proc set_dict_hir_value with hir, "condition", condition
     End If
 
     Return hir
@@ -1578,18 +1733,18 @@ translates and appends non-null results to a cases list, stored at HIR
 Process called "translate_switch_statement" takes context as Integer, node as Integer returns Integer:
     Note: Translate switch statement to HIR
 
-    Let hir be proc create_dictionary from Dict
-    proc set_dict_string_value from Dict with hir, "_type", "csharp_switch"
+    Let hir be proc create_dictionary
+    proc set_dict_string_value with hir, "_type", "csharp_switch"
 
     Let child_count be proc get_child_count from Parser with node
 
     If child_count is greater than 0:
         Let expr_node be proc get_child from Parser with node, 0
         Let expression be proc translate_node with context, expr_node
-        proc set_dict_hir_value from Dict with hir, "expression", expression
+        proc set_dict_hir_value with hir, "expression", expression
     End If
 
-    Let cases be proc create_list from ListOps
+    Let cases be proc create_list
     Let index be 1
 
     While index is less than child_count:
@@ -1597,13 +1752,13 @@ Process called "translate_switch_statement" takes context as Integer, node as In
         Let case_hir be proc translate_node with context, case_node
 
         If case_hir is not equal to 0:
-            proc add_to_list from ListOps with cases, case_hir
+            proc add_to_list with cases, case_hir
         End If
 
         Set index to index plus 1
     End While
 
-    proc set_dict_hir_value from Dict with hir, "cases", cases
+    proc set_dict_hir_value with hir, "cases", cases
 
     Return hir
 End Process
@@ -1629,19 +1784,19 @@ whose type equals CSHARP_FINALLY_CLAUSE is translated, stored at
 Process called "translate_try_statement" takes context as Integer, node as Integer returns Integer:
     Note: Translate try-catch-finally statement to HIR
 
-    Let hir be proc create_dictionary from Dict
-    proc set_dict_string_value from Dict with hir, "_type", "csharp_try"
+    Let hir be proc create_dictionary
+    proc set_dict_string_value with hir, "_type", "csharp_try"
 
     Let child_count be proc get_child_count from Parser with node
 
     If child_count is greater than 0:
         Let try_node be proc get_child from Parser with node, 0
         Let try_block be proc translate_node with context, try_node
-        proc set_dict_hir_value from Dict with hir, "try_block", try_block
+        proc set_dict_hir_value with hir, "try_block", try_block
     End If
 
     Note: Catch clauses
-    Let catches be proc create_list from ListOps
+    Let catches be proc create_list
     Let index be 1
 
     While index is less than child_count:
@@ -1652,15 +1807,15 @@ Process called "translate_try_statement" takes context as Integer, node as Integ
             Let catch_hir be proc translate_node with context, child
 
             If catch_hir is not equal to 0:
-                proc add_to_list from ListOps with catches, catch_hir
+                proc add_to_list with catches, catch_hir
             End If
         End If
 
         Set index to index plus 1
     End While
 
-    If proc get_list_length from ListOps with catches is greater than 0:
-        proc set_dict_hir_value from Dict with hir, "catch_clauses", catches
+    If proc get_list_length with catches is greater than 0:
+        proc set_dict_hir_value with hir, "catch_clauses", catches
     End If
 
     Note: Finally block
@@ -1672,7 +1827,7 @@ Process called "translate_try_statement" takes context as Integer, node as Integ
 
         If child_type is equal to CSHARP_FINALLY_CLAUSE from Parser:
             Let finally_hir be proc translate_node with context, child
-            proc set_dict_hir_value from Dict with hir, "finally_block", finally_hir
+            proc set_dict_hir_value with hir, "finally_block", finally_hir
             Break
         End If
 
@@ -1696,15 +1851,15 @@ into HIR "expression". Returns the dict.
 Process called "translate_return_statement" takes context as Integer, node as Integer returns Integer:
     Note: Translate return statement to HIR
 
-    Let hir be proc create_dictionary from Dict
-    proc set_dict_string_value from Dict with hir, "_type", "csharp_return"
+    Let hir be proc create_dictionary
+    proc set_dict_string_value with hir, "_type", "csharp_return"
 
     Let child_count be proc get_child_count from Parser with node
 
     If child_count is greater than 0:
         Let expr_node be proc get_child from Parser with node, 0
         Let expression be proc translate_node with context, expr_node
-        proc set_dict_hir_value from Dict with hir, "expression", expression
+        proc set_dict_hir_value with hir, "expression", expression
     End If
 
     Return hir
@@ -1722,8 +1877,8 @@ Returns a dict whose only field is _type = "csharp_break".
 Process called "translate_break_statement" takes context as Integer, node as Integer returns Integer:
     Note: Translate break statement to HIR
 
-    Let hir be proc create_dictionary from Dict
-    proc set_dict_string_value from Dict with hir, "_type", "csharp_break"
+    Let hir be proc create_dictionary
+    proc set_dict_string_value with hir, "_type", "csharp_break"
 
     Return hir
 End Process
@@ -1739,8 +1894,8 @@ Returns a dict whose only field is _type = "csharp_continue".
 Process called "translate_continue_statement" takes context as Integer, node as Integer returns Integer:
     Note: Translate continue statement to HIR
 
-    Let hir be proc create_dictionary from Dict
-    proc set_dict_string_value from Dict with hir, "_type", "csharp_continue"
+    Let hir be proc create_dictionary
+    proc set_dict_string_value with hir, "_type", "csharp_continue"
 
     Return hir
 End Process
@@ -1759,15 +1914,15 @@ into HIR "expression". Returns the dict.
 Process called "translate_throw_statement" takes context as Integer, node as Integer returns Integer:
     Note: Translate throw statement to HIR
 
-    Let hir be proc create_dictionary from Dict
-    proc set_dict_string_value from Dict with hir, "_type", "csharp_throw"
+    Let hir be proc create_dictionary
+    proc set_dict_string_value with hir, "_type", "csharp_throw"
 
     Let child_count be proc get_child_count from Parser with node
 
     If child_count is greater than 0:
         Let expr_node be proc get_child from Parser with node, 0
         Let expression be proc translate_node with context, expr_node
-        proc set_dict_hir_value from Dict with hir, "expression", expression
+        proc set_dict_hir_value with hir, "expression", expression
     End If
 
     Return hir
@@ -1794,21 +1949,21 @@ this translator does not add a runtime check.
 Process called "translate_lock_statement" takes context as Integer, node as Integer returns Integer:
     Note: Translate lock statement to HIR
 
-    Let hir be proc create_dictionary from Dict
-    proc set_dict_string_value from Dict with hir, "_type", "csharp_lock"
+    Let hir be proc create_dictionary
+    proc set_dict_string_value with hir, "_type", "csharp_lock"
 
     Let child_count be proc get_child_count from Parser with node
 
     If child_count is greater than 0:
         Let expr_node be proc get_child from Parser with node, 0
         Let expression be proc translate_node with context, expr_node
-        proc set_dict_hir_value from Dict with hir, "expression", expression
+        proc set_dict_hir_value with hir, "expression", expression
     End If
 
     If child_count is greater than 1:
         Let body_node be proc get_child from Parser with node, 1
         Let body be proc translate_node with context, body_node
-        proc set_dict_hir_value from Dict with hir, "body", body
+        proc set_dict_hir_value with hir, "body", body
     End If
 
     Return hir
@@ -1829,15 +1984,15 @@ translates child 0 into HIR "expression". Returns the dict.
 Process called "translate_expression_statement" takes context as Integer, node as Integer returns Integer:
     Note: Translate expression statement to HIR
 
-    Let hir be proc create_dictionary from Dict
-    proc set_dict_string_value from Dict with hir, "_type", "csharp_expression_statement"
+    Let hir be proc create_dictionary
+    proc set_dict_string_value with hir, "_type", "csharp_expression_statement"
 
     Let child_count be proc get_child_count from Parser with node
 
     If child_count is greater than 0:
         Let expr_node be proc get_child from Parser with node, 0
         Let expression be proc translate_node with context, expr_node
-        proc set_dict_hir_value from Dict with hir, "expression", expression
+        proc set_dict_hir_value with hir, "expression", expression
     End If
 
     Return hir
@@ -1859,12 +2014,12 @@ child 1 into "initializer". Returns the dict.
 Process called "translate_var_declaration" takes context as Integer, node as Integer returns Integer:
     Note: Translate variable declaration to HIR
 
-    Let hir be proc create_dictionary from Dict
-    proc set_dict_string_value from Dict with hir, "_type", "csharp_var_declaration"
+    Let hir be proc create_dictionary
+    proc set_dict_string_value with hir, "_type", "csharp_var_declaration"
 
     Let name be proc get_node_name from Parser with node
     If name is not equal to 0:
-        proc set_dict_string_value from Dict with hir, "name", name
+        proc set_dict_string_value with hir, "name", name
     End If
 
     Let child_count be proc get_child_count from Parser with node
@@ -1872,13 +2027,68 @@ Process called "translate_var_declaration" takes context as Integer, node as Int
     If child_count is greater than 0:
         Let type_node be proc get_child from Parser with node, 0
         Let var_type be proc translate_node with context, type_node
-        proc set_dict_hir_value from Dict with hir, "type", var_type
+        proc set_dict_hir_value with hir, "type", var_type
     End If
 
     If child_count is greater than 1:
         Let init_node be proc get_child from Parser with node, 1
         Let initializer be proc translate_node with context, init_node
-        proc set_dict_hir_value from Dict with hir, "initializer", initializer
+        proc set_dict_hir_value with hir, "initializer", initializer
+    End If
+
+    Return hir
+End Process
+
+@Reasoning:
+A method/constructor parameter carries a name (the parser stores it on the node
+name) and a declared type (child 0). The parameter-passing modifiers (ref, out,
+in, params) are recorded by the parser as node attributes, so they are carried
+through to HIR here so the backend can re-emit them and the round-trip preserves
+the full parameter signature. Without a parameter translator, translate_node
+returned 0 for CSHARP_PARAMETER and the method's parameter list silently
+collapsed to empty — the parameter-count round-trip failure.
+@End Reasoning
+@Implementation:
+Dict tagged "csharp_parameter". Stores the node name at HIR "name". Translates
+child 0 (the type) into HIR "type" when present. Copies the ref/out/in/params
+modifier attributes when set. Returns the dict.
+@End Implementation
+Process called "translate_parameter" takes context as Integer, node as Integer returns Integer:
+    Note: Translate method/constructor parameter to HIR
+
+    Let hir be proc create_dictionary
+    proc set_dict_string_value with hir, "_type", "csharp_parameter"
+
+    Let name be proc get_node_name from Parser with node
+    If name is not equal to 0:
+        proc set_dict_string_value with hir, "name", name
+    End If
+
+    Let child_count be proc get_child_count from Parser with node
+    If child_count is greater than 0:
+        Let type_node be proc get_child from Parser with node, 0
+        Let param_type be proc translate_node with context, type_node
+        proc set_dict_hir_value with hir, "type", param_type
+    End If
+
+    Let is_ref be proc get_node_attribute from Parser with node, "ref"
+    If is_ref is not equal to 0:
+        proc set_dict_string_value with hir, "ref", "true"
+    End If
+
+    Let is_out be proc get_node_attribute from Parser with node, "out"
+    If is_out is not equal to 0:
+        proc set_dict_string_value with hir, "out", "true"
+    End If
+
+    Let is_in be proc get_node_attribute from Parser with node, "in"
+    If is_in is not equal to 0:
+        proc set_dict_string_value with hir, "in", "true"
+    End If
+
+    Let is_params be proc get_node_attribute from Parser with node, "params"
+    If is_params is not equal to 0:
+        proc set_dict_string_value with hir, "params", "true"
     End If
 
     Return hir
@@ -1904,12 +2114,12 @@ at HIR "operator". Translates child 0 into "left", child 1 into
 Process called "translate_binary_expression" takes context as Integer, node as Integer returns Integer:
     Note: Translate binary expression to HIR
 
-    Let hir be proc create_dictionary from Dict
-    proc set_dict_string_value from Dict with hir, "_type", "csharp_binary_expr"
+    Let hir be proc create_dictionary
+    proc set_dict_string_value with hir, "_type", "csharp_binary_expr"
 
     Let operator be proc get_node_attribute from Parser with node, "operator"
     If operator is not equal to 0:
-        proc set_dict_string_value from Dict with hir, "operator", operator
+        proc set_dict_string_value with hir, "operator", operator
     End If
 
     Let child_count be proc get_child_count from Parser with node
@@ -1917,13 +2127,13 @@ Process called "translate_binary_expression" takes context as Integer, node as I
     If child_count is greater than 0:
         Let left_node be proc get_child from Parser with node, 0
         Let left_expr be proc translate_node with context, left_node
-        proc set_dict_hir_value from Dict with hir, "left", left_expr
+        proc set_dict_hir_value with hir, "left", left_expr
     End If
 
     If child_count is greater than 1:
         Let right_node be proc get_child from Parser with node, 1
         Let right_expr be proc translate_node with context, right_node
-        proc set_dict_hir_value from Dict with hir, "right", right_expr
+        proc set_dict_hir_value with hir, "right", right_expr
     End If
 
     Return hir
@@ -1944,12 +2154,12 @@ Returns the dict.
 Process called "translate_unary_expression" takes context as Integer, node as Integer returns Integer:
     Note: Translate unary expression to HIR
 
-    Let hir be proc create_dictionary from Dict
-    proc set_dict_string_value from Dict with hir, "_type", "csharp_unary_expr"
+    Let hir be proc create_dictionary
+    proc set_dict_string_value with hir, "_type", "csharp_unary_expr"
 
     Let operator be proc get_node_attribute from Parser with node, "operator"
     If operator is not equal to 0:
-        proc set_dict_string_value from Dict with hir, "operator", operator
+        proc set_dict_string_value with hir, "operator", operator
     End If
 
     Let child_count be proc get_child_count from Parser with node
@@ -1957,7 +2167,7 @@ Process called "translate_unary_expression" takes context as Integer, node as In
     If child_count is greater than 0:
         Let operand_node be proc get_child from Parser with node, 0
         Let operand be proc translate_node with context, operand_node
-        proc set_dict_hir_value from Dict with hir, "operand", operand
+        proc set_dict_hir_value with hir, "operand", operand
     End If
 
     Return hir
@@ -1980,12 +2190,21 @@ dict.
 Process called "translate_assignment_expression" takes context as Integer, node as Integer returns Integer:
     Note: Translate assignment expression to HIR
 
-    Let hir be proc create_dictionary from Dict
-    proc set_dict_string_value from Dict with hir, "_type", "csharp_assignment"
+    Let hir be proc create_dictionary
+    proc set_dict_string_value with hir, "_type", "csharp_assignment"
 
+    Note: CSHARP_ASSIGN_EXPR records the operator spelling as the node name;
+    Note: the legacy CSHARP_ASSIGN_STMT path used an "operator" attribute. Prefer
+    Note: the attribute, fall back to the node name, so both node shapes carry
+    Note: the correct operator into HIR (and default to "=" when neither is set).
     Let operator be proc get_node_attribute from Parser with node, "operator"
+    If operator is equal to 0:
+        Set operator to proc get_node_name from Parser with node
+    End If
     If operator is not equal to 0:
-        proc set_dict_string_value from Dict with hir, "operator", operator
+        proc set_dict_string_value with hir, "operator", operator
+    Otherwise:
+        proc set_dict_string_value with hir, "operator", "="
     End If
 
     Let child_count be proc get_child_count from Parser with node
@@ -1993,13 +2212,13 @@ Process called "translate_assignment_expression" takes context as Integer, node 
     If child_count is greater than 0:
         Let target_node be proc get_child from Parser with node, 0
         Let target be proc translate_node with context, target_node
-        proc set_dict_hir_value from Dict with hir, "target", target
+        proc set_dict_hir_value with hir, "target", target
     End If
 
     If child_count is greater than 1:
         Let value_node be proc get_child from Parser with node, 1
         Let value be proc translate_node with context, value_node
-        proc set_dict_hir_value from Dict with hir, "value", value
+        proc set_dict_hir_value with hir, "value", value
     End If
 
     Return hir
@@ -2020,18 +2239,18 @@ dict.
 Process called "translate_call_expression" takes context as Integer, node as Integer returns Integer:
     Note: Translate call expression to HIR
 
-    Let hir be proc create_dictionary from Dict
-    proc set_dict_string_value from Dict with hir, "_type", "csharp_call"
+    Let hir be proc create_dictionary
+    proc set_dict_string_value with hir, "_type", "csharp_call"
 
     Let child_count be proc get_child_count from Parser with node
 
     If child_count is greater than 0:
         Let callee_node be proc get_child from Parser with node, 0
         Let callee be proc translate_node with context, callee_node
-        proc set_dict_hir_value from Dict with hir, "callee", callee
+        proc set_dict_hir_value with hir, "callee", callee
     End If
 
-    Let arguments be proc create_list from ListOps
+    Let arguments be proc create_list
     Let index be 1
 
     While index is less than child_count:
@@ -2039,13 +2258,13 @@ Process called "translate_call_expression" takes context as Integer, node as Int
         Let arg_hir be proc translate_node with context, arg_node
 
         If arg_hir is not equal to 0:
-            proc add_to_list from ListOps with arguments, arg_hir
+            proc add_to_list with arguments, arg_hir
         End If
 
         Set index to index plus 1
     End While
 
-    proc set_dict_hir_value from Dict with hir, "arguments", arguments
+    proc set_dict_hir_value with hir, "arguments", arguments
 
     Return hir
 End Process
@@ -2065,12 +2284,12 @@ Returns the dict.
 Process called "translate_member_access_expression" takes context as Integer, node as Integer returns Integer:
     Note: Translate member access expression to HIR
 
-    Let hir be proc create_dictionary from Dict
-    proc set_dict_string_value from Dict with hir, "_type", "csharp_member_access"
+    Let hir be proc create_dictionary
+    proc set_dict_string_value with hir, "_type", "csharp_member_access"
 
     Let member be proc get_node_name from Parser with node
     If member is not equal to 0:
-        proc set_dict_string_value from Dict with hir, "member", member
+        proc set_dict_string_value with hir, "member", member
     End If
 
     Let child_count be proc get_child_count from Parser with node
@@ -2078,7 +2297,7 @@ Process called "translate_member_access_expression" takes context as Integer, no
     If child_count is greater than 0:
         Let object_node be proc get_child from Parser with node, 0
         Let object_expr be proc translate_node with context, object_node
-        proc set_dict_hir_value from Dict with hir, "object", object_expr
+        proc set_dict_hir_value with hir, "object", object_expr
     End If
 
     Return hir
@@ -2097,21 +2316,21 @@ child 1 into HIR "index" when present. Returns the dict.
 Process called "translate_index_expression" takes context as Integer, node as Integer returns Integer:
     Note: Translate index expression to HIR
 
-    Let hir be proc create_dictionary from Dict
-    proc set_dict_string_value from Dict with hir, "_type", "csharp_index"
+    Let hir be proc create_dictionary
+    proc set_dict_string_value with hir, "_type", "csharp_index"
 
     Let child_count be proc get_child_count from Parser with node
 
     If child_count is greater than 0:
         Let object_node be proc get_child from Parser with node, 0
         Let object_expr be proc translate_node with context, object_node
-        proc set_dict_hir_value from Dict with hir, "object", object_expr
+        proc set_dict_hir_value with hir, "object", object_expr
     End If
 
     If child_count is greater than 1:
         Let index_node be proc get_child from Parser with node, 1
         Let index_expr be proc translate_node with context, index_node
-        proc set_dict_hir_value from Dict with hir, "index", index_expr
+        proc set_dict_hir_value with hir, "index", index_expr
     End If
 
     Return hir
@@ -2134,18 +2353,18 @@ arguments list, stored at HIR "arguments". Returns the dict.
 Process called "translate_new_expression" takes context as Integer, node as Integer returns Integer:
     Note: Translate new expression to HIR
 
-    Let hir be proc create_dictionary from Dict
-    proc set_dict_string_value from Dict with hir, "_type", "csharp_new"
+    Let hir be proc create_dictionary
+    proc set_dict_string_value with hir, "_type", "csharp_new"
 
     Let child_count be proc get_child_count from Parser with node
 
     If child_count is greater than 0:
         Let type_node be proc get_child from Parser with node, 0
         Let type_expr be proc translate_node with context, type_node
-        proc set_dict_hir_value from Dict with hir, "type", type_expr
+        proc set_dict_hir_value with hir, "type", type_expr
     End If
 
-    Let arguments be proc create_list from ListOps
+    Let arguments be proc create_list
     Let index be 1
 
     While index is less than child_count:
@@ -2153,13 +2372,13 @@ Process called "translate_new_expression" takes context as Integer, node as Inte
         Let arg_hir be proc translate_node with context, arg_node
 
         If arg_hir is not equal to 0:
-            proc add_to_list from ListOps with arguments, arg_hir
+            proc add_to_list with arguments, arg_hir
         End If
 
         Set index to index plus 1
     End While
 
-    proc set_dict_hir_value from Dict with hir, "arguments", arguments
+    proc set_dict_hir_value with hir, "arguments", arguments
 
     Return hir
 End Process
@@ -2180,10 +2399,10 @@ at HIR "parameters"). When child_count > 0 translates child
 Process called "translate_lambda_expression" takes context as Integer, node as Integer returns Integer:
     Note: Translate lambda expression to HIR
 
-    Let hir be proc create_dictionary from Dict
-    proc set_dict_string_value from Dict with hir, "_type", "csharp_lambda"
+    Let hir be proc create_dictionary
+    proc set_dict_string_value with hir, "_type", "csharp_lambda"
 
-    Let parameters be proc create_list from ListOps
+    Let parameters be proc create_list
     Let child_count be proc get_child_count from Parser with node
     Let body_index be child_count minus 1
     Let index be 0
@@ -2193,18 +2412,18 @@ Process called "translate_lambda_expression" takes context as Integer, node as I
         Let param_hir be proc translate_node with context, param_node
 
         If param_hir is not equal to 0:
-            proc add_to_list from ListOps with parameters, param_hir
+            proc add_to_list with parameters, param_hir
         End If
 
         Set index to index plus 1
     End While
 
-    proc set_dict_hir_value from Dict with hir, "parameters", parameters
+    proc set_dict_hir_value with hir, "parameters", parameters
 
     If child_count is greater than 0:
         Let body_node be proc get_child from Parser with node, body_index
         Let body be proc translate_node with context, body_node
-        proc set_dict_hir_value from Dict with hir, "body", body
+        proc set_dict_hir_value with hir, "body", body
     End If
 
     Return hir
@@ -2225,27 +2444,27 @@ each is present. Returns the dict.
 Process called "translate_conditional_expression" takes context as Integer, node as Integer returns Integer:
     Note: Translate conditional (ternary) expression to HIR
 
-    Let hir be proc create_dictionary from Dict
-    proc set_dict_string_value from Dict with hir, "_type", "csharp_conditional"
+    Let hir be proc create_dictionary
+    proc set_dict_string_value with hir, "_type", "csharp_conditional"
 
     Let child_count be proc get_child_count from Parser with node
 
     If child_count is greater than 0:
         Let condition_node be proc get_child from Parser with node, 0
         Let condition be proc translate_node with context, condition_node
-        proc set_dict_hir_value from Dict with hir, "condition", condition
+        proc set_dict_hir_value with hir, "condition", condition
     End If
 
     If child_count is greater than 1:
         Let true_node be proc get_child from Parser with node, 1
         Let true_expr be proc translate_node with context, true_node
-        proc set_dict_hir_value from Dict with hir, "true_expression", true_expr
+        proc set_dict_hir_value with hir, "true_expression", true_expr
     End If
 
     If child_count is greater than 2:
         Let false_node be proc get_child from Parser with node, 2
         Let false_expr be proc translate_node with context, false_node
-        proc set_dict_hir_value from Dict with hir, "false_expression", false_expr
+        proc set_dict_hir_value with hir, "false_expression", false_expr
     End If
 
     Return hir
@@ -2265,15 +2484,15 @@ into HIR "expression". Returns the dict.
 Process called "translate_await_expression" takes context as Integer, node as Integer returns Integer:
     Note: Translate await expression to HIR
 
-    Let hir be proc create_dictionary from Dict
-    proc set_dict_string_value from Dict with hir, "_type", "csharp_await"
+    Let hir be proc create_dictionary
+    proc set_dict_string_value with hir, "_type", "csharp_await"
 
     Let child_count be proc get_child_count from Parser with node
 
     If child_count is greater than 0:
         Let expr_node be proc get_child from Parser with node, 0
         Let expression be proc translate_node with context, expr_node
-        proc set_dict_hir_value from Dict with hir, "expression", expression
+        proc set_dict_hir_value with hir, "expression", expression
     End If
 
     Return hir
@@ -2292,12 +2511,12 @@ Dict tagged "csharp_identifier" with the node's name stored at HIR
 Process called "translate_identifier" takes context as Integer, node as Integer returns Integer:
     Note: Translate identifier to HIR
 
-    Let hir be proc create_dictionary from Dict
-    proc set_dict_string_value from Dict with hir, "_type", "csharp_identifier"
+    Let hir be proc create_dictionary
+    proc set_dict_string_value with hir, "_type", "csharp_identifier"
 
     Let name be proc get_node_name from Parser with node
     If name is not equal to 0:
-        proc set_dict_string_value from Dict with hir, "name", name
+        proc set_dict_string_value with hir, "name", name
     End If
 
     Return hir
@@ -2319,17 +2538,17 @@ at HIR "literal_type". Returns the dict.
 Process called "translate_literal" takes context as Integer, node as Integer returns Integer:
     Note: Translate literal to HIR
 
-    Let hir be proc create_dictionary from Dict
-    proc set_dict_string_value from Dict with hir, "_type", "csharp_literal"
+    Let hir be proc create_dictionary
+    proc set_dict_string_value with hir, "_type", "csharp_literal"
 
     Let value be proc get_node_name from Parser with node
     If value is not equal to 0:
-        proc set_dict_string_value from Dict with hir, "value", value
+        proc set_dict_string_value with hir, "value", value
     End If
 
     Let literal_type be proc get_node_attribute from Parser with node, "literal_type"
     If literal_type is not equal to 0:
-        proc set_dict_string_value from Dict with hir, "literal_type", literal_type
+        proc set_dict_string_value with hir, "literal_type", literal_type
     End If
 
     Return hir

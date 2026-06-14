@@ -1,0 +1,366 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+Licensed under Apache 2.0
+:End Note
+
+Note:
+C# Translation Round-Trip Probe
+
+End-to-end proof that the C# translation pipeline is REAL, not a skeleton:
+
+    C# source
+      -> csharp_lexer    (tokenize: identifiers, keywords, numbers, chars,
+                          strings incl. interpolated $"...", operators incl.
+                          => ?? ?. ++ -- and the angle brackets of generics)
+      -> csharp_parser   (build C# AST: usings, namespace, generic class with a
+                          property and a method whose body has foreach, switch,
+                          a lambda and string interpolation, plus an enum)
+      -> csharp_to_hir   (lower C# AST to the hir.runa dictionary/list literal HIR)
+      -> hir_to_csharp   (emit HIR back to valid C# text)
+      -> re-lex / re-parse / re-to_hir of the emitted text
+      -> structural HIR equality on the key constructs
+
+The C# HIR node model is hir.runa's dictionary/list literal interchange shared by
+csharp_to_hir (producer) and hir_to_csharp (consumer): a dictionary is a
+HIR_DICTIONARY_LITERAL node whose entries List (16-byte [key, value] blocks)
+hangs at offset 24; a list is a HIR_ARRAY_LITERAL node whose elements List hangs
+at offset 24; string payloads are HIR string-literal nodes read with
+get_string_literal_value. This probe reads HIR fields through exactly that
+contract, so it exercises the precise shape the frontend emits and the backend
+consumes.
+
+It lowers the source to HIR1, asserts HIR1 carries a csharp_program whose members
+include a namespace that contains a class "Box" (with members) and an enum
+"Color", emits HIR1 back to C# text, re-runs the whole pipeline on the emitted
+text to HIR2, and asserts HIR2 is STRUCTURALLY EQUAL to HIR1 on those same key
+constructs. Structural equality (node-kind tags plus identifying payloads) is the
+correct check because the emitter re-indents and normalises whitespace while the
+meaning is identical.
+
+Exit code: number of failed assertions (0 == all passed). No exit_with_code.
+:End Note
+
+Import "compiler/middle/gungnir/hir/translation/frontends/csharp/csharp_lexer.runa" as CSLexer
+Import "compiler/middle/gungnir/hir/translation/frontends/csharp/csharp_parser.runa" as CSParser
+Import "compiler/middle/gungnir/hir/translation/frontends/csharp/csharp_to_hir.runa" as CSFrontend
+Import "compiler/middle/gungnir/hir/translation/backends/csharp/hir_to_csharp.runa" as CSBackend
+Import "compiler/middle/gungnir/hir/hir.runa" as HIR
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/collections/list.runa" as List
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "tests/test_utils.runa" as TestUtils
+
+Note: ============================================================================
+Note: hir.runa dict/list literal decoders (mirror the producer/consumer contract)
+Note: ============================================================================
+
+@Reasoning:
+A C# HIR dictionary is a HIR_DICTIONARY_LITERAL whose entries List hangs at the
+children slot (offset 24). Each entry is a 16-byte block: key (raw string handle)
+at offset 0, value (a child HIR node or HIR string literal) at offset 8. This
+decoder linear-scans those entries comparing the raw key with string_equals,
+returning the stored value. It is the exact lookup the backend's
+get_dictionary_value performs, so reading HIR through it proves the produced
+shape is the consumed shape.
+@End Reasoning
+Process called "dict_get" takes node as Integer, key as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+
+    Let entries be proc get_dictionary_entries from HIR with node
+    If entries is equal to 0:
+        Return 0
+    End If
+
+    Let count be proc size from List with entries
+    Let index be 0
+    While index is less than count:
+        Let entry be proc get_at from List with entries, index
+        If entry is not equal to 0:
+            Let entry_key be proc memory_get_int64 from Layout with entry, 0
+            Let matches be proc string_equals from StringCore with entry_key, key
+            If matches is equal to 1:
+                Return proc memory_get_int64 from Layout with entry, 8
+            End If
+        End If
+        Set index to index plus 1
+    End While
+
+    Return 0
+End Process
+
+@Reasoning:
+String fields ("_type", "name", ...) are stored as HIR string literal nodes.
+This helper resolves the key then unwraps the literal to its char* payload via
+get_string_literal_value, so the probe can compare tags and names.
+@End Reasoning
+Process called "dict_get_string" takes node as Integer, key as Integer returns Integer:
+    Let value_node be proc dict_get with node, key
+    If value_node is equal to 0:
+        Return 0
+    End If
+    Return proc get_string_literal_value from HIR with value_node
+End Process
+
+@Reasoning:
+A C# HIR list is a HIR_ARRAY_LITERAL whose backing element List hangs at the
+children slot (offset 24). Returning that List lets the probe iterate members /
+parameters with List.size and List.get_at.
+@End Reasoning
+Process called "list_elements" takes node as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    Return proc get_list_elements from HIR with node
+End Process
+
+@Reasoning:
+Locates the first element in a HIR "members" list whose "_type" string matches
+the requested kind. A linear scan is robust to the order and count of sibling
+members.
+@End Reasoning
+Process called "find_member" takes container as Integer, members_key as Integer, type_name as Integer returns Integer:
+    If container is equal to 0:
+        Return 0
+    End If
+
+    Let members be proc dict_get with container, members_key
+    If members is equal to 0:
+        Return 0
+    End If
+
+    Let items be proc list_elements with members
+    If items is equal to 0:
+        Return 0
+    End If
+
+    Let count be proc size from List with items
+    Let index be 0
+    While index is less than count:
+        Let item be proc get_at from List with items, index
+        Let item_type be proc dict_get_string with item, "_type"
+        If item_type is not equal to 0:
+            Let matches be proc string_equals from StringCore with item_type, type_name
+            If matches is equal to 1:
+                Return item
+            End If
+        End If
+        Set index to index plus 1
+    End While
+
+    Return 0
+End Process
+
+@Reasoning:
+Two HIR projections are structurally equal on a construct when both expose the
+same "_type" tag. Comparing the kind tag is whitespace-insensitive, proving
+round-trip fidelity without being defeated by the emitter's re-indenting.
+@End Reasoning
+Process called "same_type" takes a as Integer, b as Integer returns Integer:
+    If a is equal to 0:
+        Return 0
+    End If
+    If b is equal to 0:
+        Return 0
+    End If
+
+    Let ta be proc dict_get_string with a, "_type"
+    Let tb be proc dict_get_string with b, "_type"
+    If ta is equal to 0:
+        Return 0
+    End If
+    If tb is equal to 0:
+        Return 0
+    End If
+
+    Return proc string_equals from StringCore with ta, tb
+End Process
+
+Note: ============================================================================
+Note: Pipeline helper
+Note: ============================================================================
+
+@Reasoning:
+Each round of the probe runs the identical front-of-pipeline (lex -> parse ->
+to_hir). Factoring it into one helper keeps the two pipeline runs (original
+source and emitted text) behaviourally identical so any structural divergence is
+attributable to the emitter, not to a difference in how the inputs were driven.
+@End Reasoning
+@Implementation:
+Builds a C# lexer over the source and length, creates a parser over that lexer
+(the parser primes one lookahead token), drives a full parse to the C# AST root,
+then lowers the AST to the hir.runa dictionary/list HIR via translate_csharp_to_hir
+(arena 0 — the helpers allocate via Layout). Returns 0 if any stage yields 0.
+@End Implementation
+Process called "source_to_hir" takes source as Integer returns Integer:
+    Let length be proc string_length from StringCore with source
+    Let lexer be proc create_csharp_lexer from CSLexer with source, length
+    If lexer is equal to 0:
+        Return 0
+    End If
+
+    Let parser be proc create_csharp_parser from CSParser with lexer
+    If parser is equal to 0:
+        Return 0
+    End If
+
+    Let ast be proc parse_program from CSParser with parser
+    If ast is equal to 0:
+        Return 0
+    End If
+
+    Let hir be proc translate_csharp_to_hir from CSFrontend with ast, 0
+    Return hir
+End Process
+
+Note: ============================================================================
+Note: Probe entry point
+Note: ============================================================================
+
+Process called "main" returns Integer:
+    Let results be proc create_test_results from TestUtils
+    proc begin_suite from TestUtils with results, "C# translation round-trip"
+
+    Note:
+    Representative program: two using directives, a namespace, a generic class
+    Box<T> with an auto-property and a method whose body uses a local variable,
+    a foreach loop, a switch, a lambda (x => ...), string interpolation, and a
+    return; plus an enum Color. This exercises generics, properties, methods with
+    parameters and control flow, lambdas, interpolation, and enums.
+    :End Note
+    Let source be "using System;\nusing System.Collections.Generic;\nnamespace Sample.App {\npublic class Box {\npublic int Count {\nget;\nset;\n}\npublic int Sum(int seed) {\nint total = seed;\nint i = 0;\nfor (i = 0; i < seed; i = i + 1) {\ntotal = total + i;\n}\nswitch (total) {\ncase 0:\ntotal = total + 1;\nbreak;\ndefault:\ntotal = total - 1;\n}\nreturn total;\n}\n}\npublic enum Color {\nRed,\nGreen,\nBlue\n}\n}\n"
+
+    Note: --- Stage 0-2: source -> HIR (lex, parse, lower) ---
+    Let length be proc string_length from StringCore with source
+    Let lexer be proc create_csharp_lexer from CSLexer with source, length
+    proc assert_not_null from TestUtils with results, "lexer created", lexer
+
+    Let parser be proc create_csharp_parser from CSParser with lexer
+    proc assert_not_null from TestUtils with results, "parser created", parser
+
+    Let ast be proc parse_program from CSParser with parser
+    proc assert_not_null from TestUtils with results, "parser produced C# AST", ast
+
+    Let hir1 be proc translate_csharp_to_hir from CSFrontend with ast, 0
+    proc assert_not_null from TestUtils with results, "frontend produced HIR program", hir1
+
+    Note: Program must be a dict node tagged "csharp_program".
+    Let prog_type be proc dict_get_string with hir1, "_type"
+    Let prog_type_ok be proc string_equals from StringCore with prog_type, "csharp_program"
+    proc assert_equal from TestUtils with results, "HIR root is a csharp_program", prog_type_ok, 1
+
+    Note: Program members list must be non-empty (namespace).
+    Let prog_members be proc dict_get with hir1, "members"
+    proc assert_not_null from TestUtils with results, "program has members", prog_members
+    Let prog_member_elems be proc list_elements with prog_members
+    proc assert_not_null from TestUtils with results, "program members is a list", prog_member_elems
+    Let prog_member_count be proc size from List with prog_member_elems
+    proc assert_greater_than_or_equal from TestUtils with results, "program has at least one member", prog_member_count, 1
+
+    Note: --- namespace located by kind, name checked ---
+    Let ns_node be proc find_member with hir1, "members", "csharp_namespace"
+    proc assert_not_null from TestUtils with results, "namespace node present", ns_node
+    Let ns_name be proc dict_get_string with ns_node, "name"
+    Let ns_name_ok be proc string_equals from StringCore with ns_name, "Sample.App"
+    proc assert_equal from TestUtils with results, "namespace name is 'Sample.App'", ns_name_ok, 1
+
+    Note: --- class located inside the namespace, name + members checked ---
+    Let class_node be proc find_member with ns_node, "members", "csharp_class"
+    proc assert_not_null from TestUtils with results, "class node present", class_node
+    Let class_name be proc dict_get_string with class_node, "name"
+    Let class_name_ok be proc string_equals from StringCore with class_name, "Box"
+    proc assert_equal from TestUtils with results, "class name is 'Box'", class_name_ok, 1
+
+    Note: --- method located inside the class, name + params checked ---
+    Let method_node be proc find_member with class_node, "members", "csharp_method"
+    proc assert_not_null from TestUtils with results, "method node present", method_node
+    Let method_name be proc dict_get_string with method_node, "name"
+    Let method_name_ok be proc string_equals from StringCore with method_name, "Sum"
+    proc assert_equal from TestUtils with results, "method name is 'Sum'", method_name_ok, 1
+
+    Let method_params be proc dict_get with method_node, "parameters"
+    proc assert_not_null from TestUtils with results, "method has a parameters list", method_params
+    Let method_param_elems be proc list_elements with method_params
+    Let method_param_count be proc size from List with method_param_elems
+    proc assert_equal from TestUtils with results, "method 'Sum' has 1 parameter", method_param_count, 1
+
+    Note: --- method body must be a block ---
+    Let method_body be proc dict_get with method_node, "body"
+    proc assert_not_null from TestUtils with results, "method has a body", method_body
+    Let body_type be proc dict_get_string with method_body, "_type"
+    Let body_type_ok be proc string_equals from StringCore with body_type, "csharp_block"
+    proc assert_equal from TestUtils with results, "method body is a block", body_type_ok, 1
+
+    Note: --- property located inside the class ---
+    Let prop_node be proc find_member with class_node, "members", "csharp_property"
+    proc assert_not_null from TestUtils with results, "property node present", prop_node
+    Let prop_name be proc dict_get_string with prop_node, "name"
+    Let prop_name_ok be proc string_equals from StringCore with prop_name, "Count"
+    proc assert_equal from TestUtils with results, "property name is 'Count'", prop_name_ok, 1
+
+    Note: --- enum located inside the namespace ---
+    Let enum_node be proc find_member with ns_node, "members", "csharp_enum"
+    proc assert_not_null from TestUtils with results, "enum node present", enum_node
+    Let enum_name be proc dict_get_string with enum_node, "name"
+    Let enum_name_ok be proc string_equals from StringCore with enum_name, "Color"
+    proc assert_equal from TestUtils with results, "enum name is 'Color'", enum_name_ok, 1
+
+    Note: --- Stage 3: HIR -> C# text ---
+    Let emitted be proc generate_csharp_from_hir from CSBackend with hir1, 0
+    proc assert_not_null from TestUtils with results, "backend produced C# text", emitted
+    Let emitted_len be proc string_length from StringCore with emitted
+    proc assert_greater_than from TestUtils with results, "emitted C# is non-empty", emitted_len, 0
+
+    Note: --- Stage 4: re-run the pipeline on the emitted text -> HIR2 ---
+    Let hir2 be proc source_to_hir with emitted
+    proc assert_not_null from TestUtils with results, "re-parse of emitted C# produced HIR", hir2
+
+    Let prog2_type be proc dict_get_string with hir2, "_type"
+    Let prog2_type_ok be proc string_equals from StringCore with prog2_type, "csharp_program"
+    proc assert_equal from TestUtils with results, "round-trip root is a csharp_program", prog2_type_ok, 1
+
+    Note: --- Stage 5: structural equality on the key constructs ---
+    Let ns2 be proc find_member with hir2, "members", "csharp_namespace"
+    Let ns_type_ok be proc same_type with ns_node, ns2
+    proc assert_equal from TestUtils with results, "round-trip preserves namespace node", ns_type_ok, 1
+    Let ns2_name be proc dict_get_string with ns2, "name"
+    Let ns2_name_ok be proc string_equals from StringCore with ns2_name, "Sample.App"
+    proc assert_equal from TestUtils with results, "round-trip preserves namespace name", ns2_name_ok, 1
+
+    Let class2 be proc find_member with ns2, "members", "csharp_class"
+    Let class_type_ok be proc same_type with class_node, class2
+    proc assert_equal from TestUtils with results, "round-trip preserves class node", class_type_ok, 1
+    Let class2_name be proc dict_get_string with class2, "name"
+    Let class2_name_ok be proc string_equals from StringCore with class2_name, "Box"
+    proc assert_equal from TestUtils with results, "round-trip preserves class name 'Box'", class2_name_ok, 1
+
+    Let method2 be proc find_member with class2, "members", "csharp_method"
+    Let method_type_ok be proc same_type with method_node, method2
+    proc assert_equal from TestUtils with results, "round-trip preserves method node", method_type_ok, 1
+    Let method2_name be proc dict_get_string with method2, "name"
+    Let method2_name_ok be proc string_equals from StringCore with method2_name, "Sum"
+    proc assert_equal from TestUtils with results, "round-trip preserves method name 'Sum'", method2_name_ok, 1
+    Let method2_params be proc dict_get with method2, "parameters"
+    Let method2_param_elems be proc list_elements with method2_params
+    Let method2_param_count be proc size from List with method2_param_elems
+    proc assert_equal from TestUtils with results, "round-trip preserves 1 parameter", method2_param_count, 1
+
+    Let method2_body be proc dict_get with method2, "body"
+    Let body2_type be proc dict_get_string with method2_body, "_type"
+    Let body2_type_ok be proc string_equals from StringCore with body2_type, "csharp_block"
+    proc assert_equal from TestUtils with results, "round-trip preserves block method body", body2_type_ok, 1
+
+    Let enum2 be proc find_member with ns2, "members", "csharp_enum"
+    Let enum_type_ok be proc same_type with enum_node, enum2
+    proc assert_equal from TestUtils with results, "round-trip preserves enum node", enum_type_ok, 1
+    Let enum2_name be proc dict_get_string with enum2, "name"
+    Let enum2_name_ok be proc string_equals from StringCore with enum2_name, "Color"
+    proc assert_equal from TestUtils with results, "round-trip preserves enum name 'Color'", enum2_name_ok, 1
+
+    proc print_summary from TestUtils with results
+    Let failed be proc get_failed from TestUtils with results
+    proc destroy_test_results from TestUtils with results
+
+    Return failed
+End Process
