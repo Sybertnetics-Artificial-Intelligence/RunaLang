@@ -1,0 +1,638 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+Licensed under Apache 2.0
+:End Note
+
+Note:
+Makefile Translation Round-Trip Probe
+
+End-to-end proof that the Makefile translation pipeline is REAL, not a skeleton:
+
+    Makefile source
+      -> makefile_lexer    (tokenize: identifiers, assignment ops =/:=/?=/+=,
+                            colons, recipe tabs, $-references, conditional and
+                            directive keywords)
+      -> makefile_parser   (build the rule / assignment / conditional / include
+                            AST)
+      -> makefile_to_hir   (lower assignments to HIR_MAKEFILE_VARIABLE, rules to
+                            HIR_MAKEFILE_TARGET / PATTERN_RULE / SPECIAL_TARGET,
+                            recipe lines to HIR_MAKEFILE_RECIPE, conditionals to
+                            HIR_MAKEFILE_CONDITIONAL, includes to
+                            HIR_MAKEFILE_INCLUDE)
+      -> hir_to_makefile   (emit the HIR module back to Makefile text)
+
+The probe feeds a representative Makefile containing:
+  - CC = gcc                         (simple assignment ->  HIR variable)
+  - CFLAGS := -O2 -Wall              (immediate assignment)
+  - LDFLAGS ?= -lm                   (conditional assignment)
+  - SRC = main.c util.c              (simple assignment, referenced later)
+  - OBJ = main.o util.o              (simple assignment)
+  - .PHONY: all clean                (special target / phony directive)
+  - all: app                         (target with a prerequisite)
+  - app: $(OBJ)                      (target with $(VAR) prerequisite + recipe
+        $(CC) $(LDFLAGS) -o $@ $(OBJ)   using automatic variable $@)
+  - %.o: %.c                         (pattern rule with %)
+        $(CC) $(CFLAGS) -c $< -o $@     (automatic vars $< and $@)
+  - include config.mk                (include directive)
+  - ifeq ($(DEBUG),1) ... endif      (conditional block)
+
+It then:
+
+  1. Drives the source through lexer -> parser -> to_hir and asserts the HIR
+     root is an HIR_MAKEFILE_MODULE carrying a member list of lowered nodes.
+  2. Walks the first-stage HIR members and asserts the variable names and
+     assignment operators, the target names, the prerequisite list, the recipe
+     command text, and the node kinds survived.
+  3. Emits the HIR back to Makefile text and asserts the text is non-empty.
+  4. Re-parses the emitted Makefile text back into HIR (the SECOND emission) and
+     asserts the two HIR member streams are STRUCTURALLY EQUAL via a recursive
+     comparator: same member count, same node kind at each position, and the
+     same identifying payload (variable name + assign type, target names +
+     prerequisite names + recipe command text) at each position, compared by
+     content rather than byte identity. Structural equality is the correct
+     semantic-equivalence check: the backend canonicalises whitespace so the
+     byte stream differs while the meaning is identical.
+
+Exit code: number of failed assertions (0 == all passed). No exit_with_code.
+:End Note
+
+Import "compiler/middle/gungnir/hir/translation/frontends/makefile/makefile_lexer.runa" as MakefileLexer
+Import "compiler/middle/gungnir/hir/translation/frontends/makefile/makefile_parser.runa" as MakefileParser
+Import "compiler/middle/gungnir/hir/translation/frontends/makefile/makefile_to_hir.runa" as MakefileFrontend
+Import "compiler/middle/gungnir/hir/translation/backends/makefile/hir_to_makefile.runa" as MakefileBackend
+Import "compiler/frontend/primitives/collections/list.runa" as List
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "tests/test_utils.runa" as TestUtils
+
+Note: ============================================================================
+Note: HIR node kind constants (mirror makefile_to_hir.runa)
+Note: ============================================================================
+
+Constant HIR_MAKEFILE_MODULE as Integer is 10000
+Constant HIR_MAKEFILE_TARGET as Integer is 10001
+Constant HIR_MAKEFILE_VARIABLE as Integer is 10002
+Constant HIR_MAKEFILE_RECIPE as Integer is 10003
+Constant HIR_MAKEFILE_CONDITIONAL as Integer is 10004
+Constant HIR_MAKEFILE_INCLUDE as Integer is 10005
+Constant HIR_MAKEFILE_PATTERN_RULE as Integer is 10006
+Constant HIR_MAKEFILE_SPECIAL_TARGET as Integer is 10007
+
+Constant ASSIGN_SIMPLE as Integer is 1
+Constant ASSIGN_IMMEDIATE as Integer is 2
+Constant ASSIGN_APPEND as Integer is 3
+Constant ASSIGN_CONDITIONAL as Integer is 4
+
+Note: ============================================================================
+Note: Pipeline driver: Makefile source -> HIR module
+Note: ============================================================================
+
+@Reasoning:
+The Makefile pipeline exposes the stages individually: create_lexer takes the
+source string, tokenize produces the token list, create_parser consumes the
+token list, parse_makefile builds the rule/assignment AST, and the frontend
+translate lowers the AST root to an HIR module node holding a member list.
+Returning the module pointer (or 0 on any stage failure) lets the caller assert
+on a single value.
+@End Reasoning
+Process called "makefile_source_to_hir" takes source as Integer returns Integer:
+    Let lexer be proc create_lexer from MakefileLexer with source
+    If lexer is equal to 0:
+        Return 0
+    End If
+
+    Let tokens be proc tokenize from MakefileLexer with lexer
+    If tokens is equal to 0:
+        Return 0
+    End If
+
+    Let parser be proc create_parser from MakefileParser with tokens
+    If parser is equal to 0:
+        Return 0
+    End If
+
+    Let ast be proc parse_makefile from MakefileParser with parser
+    If ast is equal to 0:
+        Return 0
+    End If
+
+    Let hir_module be proc translate from MakefileFrontend with ast
+    Return hir_module
+End Process
+
+Note: ============================================================================
+Note: HIR accessors (mirror the backend's read contract)
+Note: ============================================================================
+
+@Reasoning:
+Every HIR node stamps its kind constant at offset 0. Returns the kind so the
+comparator and assertions can dispatch on variable vs target vs recipe vs
+conditional vs include nodes.
+@End Reasoning
+Process called "node_kind" takes node as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_integer from Memory with node, 0
+End Process
+
+@Reasoning:
+The HIR module carries its member list (the lowered top-level statements) at
+offset 16. Returns the member-list pointer so the count and per-member
+accessors can walk it.
+@End Reasoning
+Process called "module_members" takes module as Integer returns Integer:
+    If module is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_integer from Memory with module, 16
+End Process
+
+@Reasoning:
+Returns the number of members in a module's member list so assertions and the
+comparator know how many statements to walk.
+@End Reasoning
+Process called "member_count" takes module as Integer returns Integer:
+    Let members be proc module_members with module
+    If members is equal to 0:
+        Return 0
+    End If
+    Return proc list_length from List with members
+End Process
+
+@Reasoning:
+Returns member i of a module as a raw node pointer so callers can read its node
+kind (offset 0) and per-kind fields.
+@End Reasoning
+Process called "member_at" takes module as Integer, index as Integer returns Integer:
+    Let members be proc module_members with module
+    If members is equal to 0:
+        Return 0
+    End If
+    Return proc list_get from List with members, index
+End Process
+
+@Reasoning:
+A lowered assignment is an HIR_MAKEFILE_VARIABLE node whose variable-name string
+sits at offset 8. Returns the name string pointer so the probe can assert which
+variable each member represents.
+@End Reasoning
+Process called "var_name" takes node as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    Let kind be proc memory_get_integer from Memory with node, 0
+    If kind is not equal to HIR_MAKEFILE_VARIABLE:
+        Return 0
+    End If
+    Return proc memory_get_pointer from Memory with node, 8
+End Process
+
+@Reasoning:
+An HIR_MAKEFILE_VARIABLE node carries its assignment-operator discriminator
+(=/:=/+=/?=) as an integer at offset 16. Returns it so the probe can assert the
+assignment kind survived.
+@End Reasoning
+Process called "var_assign_type" takes node as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    Let kind be proc memory_get_integer from Memory with node, 0
+    If kind is not equal to HIR_MAKEFILE_VARIABLE:
+        Return 0
+    End If
+    Return proc memory_get_integer from Memory with node, 16
+End Process
+
+@Reasoning:
+A target / pattern-rule / special-target node keeps its target-name list at
+offset 8. Returns the first target name string for the survival assertion.
+@End Reasoning
+Process called "target_first_name" takes node as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    Let targets be proc memory_get_integer from Memory with node, 8
+    If targets is equal to 0:
+        Return 0
+    End If
+    Let count be proc list_length from List with targets
+    If count is equal to 0:
+        Return 0
+    End If
+    Return proc list_get from List with targets, 0
+End Process
+
+@Reasoning:
+A target node keeps its prerequisite (dependency) list at offset 16. Returns
+the count so the comparator can verify the prerequisite arity survived.
+@End Reasoning
+Process called "target_dep_count" takes node as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    Let deps be proc memory_get_integer from Memory with node, 16
+    If deps is equal to 0:
+        Return 0
+    End If
+    Return proc list_length from List with deps
+End Process
+
+@Reasoning:
+Returns prerequisite i (dependency list at offset 16) as a string so the
+content comparator can verify prerequisite names survived.
+@End Reasoning
+Process called "target_dep_at" takes node as Integer, index as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    Let deps be proc memory_get_integer from Memory with node, 16
+    If deps is equal to 0:
+        Return 0
+    End If
+    Return proc list_get from List with deps, index
+End Process
+
+@Reasoning:
+A target node keeps its lowered recipe list (HIR_MAKEFILE_RECIPE nodes) at
+offset 32. Returns the recipe count so the comparator can verify recipe arity.
+@End Reasoning
+Process called "target_recipe_count" takes node as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    Let recipes be proc memory_get_integer from Memory with node, 32
+    If recipes is equal to 0:
+        Return 0
+    End If
+    Return proc list_length from List with recipes
+End Process
+
+@Reasoning:
+Returns recipe i of a target (recipe list at offset 32) as a raw recipe node so
+the comparator can read its original command text.
+@End Reasoning
+Process called "target_recipe_at" takes node as Integer, index as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    Let recipes be proc memory_get_integer from Memory with node, 32
+    If recipes is equal to 0:
+        Return 0
+    End If
+    Return proc list_get from List with recipes, index
+End Process
+
+@Reasoning:
+An HIR_MAKEFILE_RECIPE node preserves the original command string at offset 32
+(the verbatim recipe text captured at lowering time). Returns it for the recipe
+content survival assertion.
+@End Reasoning
+Process called "recipe_command" takes node as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    Let kind be proc memory_get_integer from Memory with node, 0
+    If kind is not equal to HIR_MAKEFILE_RECIPE:
+        Return 0
+    End If
+    Return proc memory_get_pointer from Memory with node, 32
+End Process
+
+Note: ============================================================================
+Note: Structural equality of two Makefile HIR member streams
+Note: ============================================================================
+
+@Reasoning:
+Compares two target-like nodes for structural equality: same first target name,
+same prerequisite arity and prerequisite names, same recipe arity and recipe
+command text at each position. Whitespace- and indentation-insensitive because
+it compares the lowered string payloads, not the source bytes.
+@End Reasoning
+Process called "targets_equal" takes a as Integer, b as Integer returns Integer:
+    Let name_a be proc target_first_name with a
+    Let name_b be proc target_first_name with b
+    Let names_match be proc string_equals from StringCore with name_a, name_b
+    If names_match is not equal to 1:
+        Return 0
+    End If
+
+    Let dep_a be proc target_dep_count with a
+    Let dep_b be proc target_dep_count with b
+    If dep_a is not equal to dep_b:
+        Return 0
+    End If
+
+    Let i be 0
+    While i is less than dep_a:
+        Let da be proc target_dep_at with a, i
+        Let db be proc target_dep_at with b, i
+        Let deps_match be proc string_equals from StringCore with da, db
+        If deps_match is not equal to 1:
+            Return 0
+        End If
+        Set i to i plus 1
+    End While
+
+    Let rec_a be proc target_recipe_count with a
+    Let rec_b be proc target_recipe_count with b
+    If rec_a is not equal to rec_b:
+        Return 0
+    End If
+
+    Let j be 0
+    While j is less than rec_a:
+        Let ra be proc target_recipe_at with a, j
+        Let rb be proc target_recipe_at with b, j
+        Let cmd_a be proc recipe_command with ra
+        Let cmd_b be proc recipe_command with rb
+        Let cmds_match be proc string_equals from StringCore with cmd_a, cmd_b
+        If cmds_match is not equal to 1:
+            Return 0
+        End If
+        Set j to j plus 1
+    End While
+
+    Return 1
+End Process
+
+@Reasoning:
+Two Makefiles are semantically equal when their lowered HIR member streams match
+position-for-position: same member count, same node kind at each position, and
+-- for the kinds the round trip must preserve -- the same identifying payload
+(variable name + assignment operator for variables; target names, prerequisite
+names, and recipe command text for targets / pattern rules / special targets).
+This is whitespace-insensitive, so it proves round-trip fidelity without being
+fooled by the backend's canonical re-rendering.
+@End Reasoning
+Process called "hir_modules_equal" takes a as Integer, b as Integer returns Integer:
+    If a is equal to 0:
+        Return 0
+    End If
+    If b is equal to 0:
+        Return 0
+    End If
+
+    Let count_a be proc member_count with a
+    Let count_b be proc member_count with b
+    If count_a is not equal to count_b:
+        Return 0
+    End If
+
+    Let i be 0
+    While i is less than count_a:
+        Let member_a be proc member_at with a, i
+        Let member_b be proc member_at with b, i
+
+        Let kind_a be proc node_kind with member_a
+        Let kind_b be proc node_kind with member_b
+        If kind_a is not equal to kind_b:
+            Return 0
+        End If
+
+        Note: Variables: compare name and assignment operator.
+        If kind_a is equal to HIR_MAKEFILE_VARIABLE:
+            Let var_a be proc var_name with member_a
+            Let var_b be proc var_name with member_b
+            Let vars_match be proc string_equals from StringCore with var_a, var_b
+            If vars_match is not equal to 1:
+                Return 0
+            End If
+            Let at_a be proc var_assign_type with member_a
+            Let at_b be proc var_assign_type with member_b
+            If at_a is not equal to at_b:
+                Return 0
+            End If
+        End If
+
+        Note: Regular targets: compare names, prerequisites, recipes.
+        If kind_a is equal to HIR_MAKEFILE_TARGET:
+            Let teq be proc targets_equal with member_a, member_b
+            If teq is not equal to 1:
+                Return 0
+            End If
+        End If
+
+        Note: Pattern rules: same target-like comparison.
+        If kind_a is equal to HIR_MAKEFILE_PATTERN_RULE:
+            Let peq be proc targets_equal with member_a, member_b
+            If peq is not equal to 1:
+                Return 0
+            End If
+        End If
+
+        Note: Special targets (.PHONY etc.): same target-like comparison.
+        If kind_a is equal to HIR_MAKEFILE_SPECIAL_TARGET:
+            Let seq be proc targets_equal with member_a, member_b
+            If seq is not equal to 1:
+                Return 0
+            End If
+        End If
+
+        Set i to i plus 1
+    End While
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Find a member of a given kind whose first target name matches a string.
+Note: ============================================================================
+
+@Reasoning:
+The emitted Makefile re-parses into the same member set, but the backend may
+reorder nothing -- still, to assert second-emission survival robustly we locate
+a target by its name rather than by position. Returns the member pointer or 0
+if no target-like member has the given first name.
+@End Reasoning
+Process called "find_target_by_name" takes module as Integer, name as Integer returns Integer:
+    Let count be proc member_count with module
+    Let i be 0
+    While i is less than count:
+        Let member be proc member_at with module, i
+        Let kind be proc node_kind with member
+        Let is_target_like be 0
+        If kind is equal to HIR_MAKEFILE_TARGET:
+            Set is_target_like to 1
+        End If
+        If kind is equal to HIR_MAKEFILE_PATTERN_RULE:
+            Set is_target_like to 1
+        End If
+        If kind is equal to HIR_MAKEFILE_SPECIAL_TARGET:
+            Set is_target_like to 1
+        End If
+
+        If is_target_like is equal to 1:
+            Let first be proc target_first_name with member
+            If first is not equal to 0:
+                Let matches be proc string_equals from StringCore with first, name
+                If matches is equal to 1:
+                    Return member
+                End If
+            End If
+        End If
+
+        Set i to i plus 1
+    End While
+
+    Return 0
+End Process
+
+@Reasoning:
+Locates an HIR_MAKEFILE_VARIABLE member by its variable name so second-emission
+variable survival can be asserted by content rather than position. Returns the
+member pointer or 0 when no such variable exists.
+@End Reasoning
+Process called "find_variable_by_name" takes module as Integer, name as Integer returns Integer:
+    Let count be proc member_count with module
+    Let i be 0
+    While i is less than count:
+        Let member be proc member_at with module, i
+        Let kind be proc node_kind with member
+        If kind is equal to HIR_MAKEFILE_VARIABLE:
+            Let vn be proc var_name with member
+            If vn is not equal to 0:
+                Let matches be proc string_equals from StringCore with vn, name
+                If matches is equal to 1:
+                    Return member
+                End If
+            End If
+        End If
+        Set i to i plus 1
+    End While
+
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: Probe entry point
+Note: ============================================================================
+
+Process called "main" returns Integer:
+    Let results be proc create_test_results from TestUtils
+    proc begin_suite from TestUtils with results, "Makefile translation round-trip"
+
+    Note:
+    Representative Makefile. Member order after lowering (0-indexed):
+      0  CC = gcc                       -> HIR variable (ASSIGN_SIMPLE)
+      1  CFLAGS := -O2 -Wall            -> HIR variable (ASSIGN_IMMEDIATE)
+      2  LDFLAGS ?= -lm                 -> HIR variable (ASSIGN_CONDITIONAL)
+      3  SRC = main.c util.c            -> HIR variable (ASSIGN_SIMPLE)
+      4  OBJ = main.o util.o            -> HIR variable (ASSIGN_SIMPLE)
+      5  .PHONY: all clean              -> HIR special target
+      6  all: app                       -> HIR target
+      7  app: $(OBJ) + recipe           -> HIR target with recipe
+      8  %.o: %.c + recipe              -> HIR pattern rule with recipe
+      9  include config.mk              -> HIR include
+     10  ifeq ($(DEBUG),1) ... endif    -> HIR conditional
+    Newlines are explicit \n; recipe lines begin with a literal tab \t.
+    :End Note
+    Let source be "CC = gcc\nCFLAGS := -O2 -Wall\nLDFLAGS ?= -lm\nSRC = main.c util.c\nOBJ = main.o util.o\n.PHONY: all clean\nall: app\napp: $(OBJ)\n\t$(CC) $(LDFLAGS) -o $@ $(OBJ)\n%.o: %.c\n\t$(CC) $(CFLAGS) -c $< -o $@\ninclude config.mk\nifeq ($(DEBUG),1)\nCFLAGS += -g\nendif"
+
+    Note: --- Stage 1: source -> HIR ---
+    Let hir1 be proc makefile_source_to_hir with source
+    proc assert_not_null from TestUtils with results, "pipeline produced HIR module", hir1
+
+    Let mod_kind be proc node_kind with hir1
+    proc assert_equal from TestUtils with results, "HIR root is a makefile module", mod_kind, HIR_MAKEFILE_MODULE
+
+    Let count1 be proc member_count with hir1
+    proc assert_greater_than from TestUtils with results, "HIR module has members", count1, 0
+
+    Note: --- Variable survival: CC = gcc (simple) ---
+    Let cc_var be proc find_variable_by_name with hir1, "CC"
+    proc assert_not_null from TestUtils with results, "CC variable lowered", cc_var
+    Let cc_assign be proc var_assign_type with cc_var
+    proc assert_equal from TestUtils with results, "CC uses simple assignment", cc_assign, ASSIGN_SIMPLE
+
+    Note: --- CFLAGS := -O2 -Wall (immediate) ---
+    Let cflags_var be proc find_variable_by_name with hir1, "CFLAGS"
+    proc assert_not_null from TestUtils with results, "CFLAGS variable lowered", cflags_var
+    Let cflags_assign be proc var_assign_type with cflags_var
+    proc assert_equal from TestUtils with results, "CFLAGS uses immediate assignment", cflags_assign, ASSIGN_IMMEDIATE
+
+    Note: --- LDFLAGS ?= -lm (conditional) ---
+    Let ldflags_var be proc find_variable_by_name with hir1, "LDFLAGS"
+    proc assert_not_null from TestUtils with results, "LDFLAGS variable lowered", ldflags_var
+    Let ldflags_assign be proc var_assign_type with ldflags_var
+    proc assert_equal from TestUtils with results, "LDFLAGS uses conditional assignment", ldflags_assign, ASSIGN_CONDITIONAL
+
+    Note: --- Target survival: app: $(OBJ) with recipe ---
+    Let app_target be proc find_target_by_name with hir1, "app"
+    proc assert_not_null from TestUtils with results, "app target lowered", app_target
+    Let app_kind be proc node_kind with app_target
+    proc assert_equal from TestUtils with results, "app is a regular target", app_kind, HIR_MAKEFILE_TARGET
+    Let app_deps be proc target_dep_count with app_target
+    proc assert_equal from TestUtils with results, "app has one prerequisite", app_deps, 1
+    Let app_recipes be proc target_recipe_count with app_target
+    proc assert_equal from TestUtils with results, "app has one recipe line", app_recipes, 1
+    Let app_recipe be proc target_recipe_at with app_target, 0
+    Let app_cmd be proc recipe_command with app_recipe
+    proc assert_string_equal from TestUtils with results, "app recipe command survives", app_cmd, "$(CC) $(LDFLAGS) -o $@ $(OBJ)"
+
+    Note: --- Pattern rule survival: %.o: %.c ---
+    Let pat_target be proc find_target_by_name with hir1, "%.o"
+    proc assert_not_null from TestUtils with results, "pattern rule lowered", pat_target
+    Let pat_kind be proc node_kind with pat_target
+    proc assert_equal from TestUtils with results, "%.o is a pattern rule", pat_kind, HIR_MAKEFILE_PATTERN_RULE
+    Let pat_recipe be proc target_recipe_at with pat_target, 0
+    Let pat_cmd be proc recipe_command with pat_recipe
+    proc assert_string_equal from TestUtils with results, "pattern recipe command survives", pat_cmd, "$(CC) $(CFLAGS) -c $< -o $@"
+
+    Note: --- .PHONY special target survival ---
+    Let phony_target be proc find_target_by_name with hir1, ".PHONY"
+    proc assert_not_null from TestUtils with results, ".PHONY special target lowered", phony_target
+    Let phony_kind be proc node_kind with phony_target
+    proc assert_equal from TestUtils with results, ".PHONY is a special target", phony_kind, HIR_MAKEFILE_SPECIAL_TARGET
+
+    Note: --- Stage 2: HIR -> Makefile text ---
+    Let emitted be proc translate from MakefileBackend with hir1
+    proc assert_not_null from TestUtils with results, "backend produced Makefile text", emitted
+    Let emitted_len be proc string_length from StringCore with emitted
+    proc assert_greater_than from TestUtils with results, "emitted Makefile is non-empty", emitted_len, 0
+
+    Note: --- Stage 3: re-parse the emitted Makefile text -> HIR (the SECOND
+    Note: emission), then assert the two member streams are structurally equal.
+    Note: This is the load-bearing round-trip assertion. ---
+    Let hir2 be proc makefile_source_to_hir with emitted
+    proc assert_not_null from TestUtils with results, "re-parse of emitted Makefile produced HIR", hir2
+
+    Let mod2_kind be proc node_kind with hir2
+    proc assert_equal from TestUtils with results, "re-parsed root is a makefile module", mod2_kind, HIR_MAKEFILE_MODULE
+
+    Let count2 be proc member_count with hir2
+    proc assert_equal from TestUtils with results, "re-parsed module preserves member count", count2, count1
+
+    Note: --- Second-emission content survival, located by name ---
+    Let r_cc be proc find_variable_by_name with hir2, "CC"
+    proc assert_not_null from TestUtils with results, "round-trip CC variable survives", r_cc
+    Let r_cc_assign be proc var_assign_type with r_cc
+    proc assert_equal from TestUtils with results, "round-trip CC assignment operator survives", r_cc_assign, ASSIGN_SIMPLE
+
+    Let r_cflags be proc find_variable_by_name with hir2, "CFLAGS"
+    proc assert_not_null from TestUtils with results, "round-trip CFLAGS variable survives", r_cflags
+    Let r_cflags_assign be proc var_assign_type with r_cflags
+    proc assert_equal from TestUtils with results, "round-trip CFLAGS assignment operator survives", r_cflags_assign, ASSIGN_IMMEDIATE
+
+    Let r_app be proc find_target_by_name with hir2, "app"
+    proc assert_not_null from TestUtils with results, "round-trip app target survives", r_app
+    Let r_app_recipe be proc target_recipe_at with r_app, 0
+    Let r_app_cmd be proc recipe_command with r_app_recipe
+    proc assert_string_equal from TestUtils with results, "round-trip app recipe command survives", r_app_cmd, "$(CC) $(LDFLAGS) -o $@ $(OBJ)"
+
+    Let r_pat be proc find_target_by_name with hir2, "%.o"
+    proc assert_not_null from TestUtils with results, "round-trip pattern rule survives", r_pat
+    Let r_pat_recipe be proc target_recipe_at with r_pat, 0
+    Let r_pat_cmd be proc recipe_command with r_pat_recipe
+    proc assert_string_equal from TestUtils with results, "round-trip pattern recipe command survives", r_pat_cmd, "$(CC) $(CFLAGS) -c $< -o $@"
+
+    Note: --- Full structural equality of the two member streams ---
+    Let structurally_equal be proc hir_modules_equal with hir1, hir2
+    proc assert_equal from TestUtils with results, "round-trip HIR is structurally equal", structurally_equal, 1
+
+    proc print_summary from TestUtils with results
+    Let failed be proc get_failed from TestUtils with results
+    proc destroy_test_results from TestUtils with results
+
+    Return failed
+End Process

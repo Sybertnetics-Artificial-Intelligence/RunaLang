@@ -1,1692 +1,1012 @@
-Note: ===================================================================
-Note: MAKEFILE SEMANTIC ANALYZER
-Note: ===================================================================
-Note: Semantic analysis for GNU Makefile build system definitions. Handles
-Note: target validation, dependency analysis, variable resolution, pattern
-Note: rule analysis, and build system best practices enforcement.
-
-Note: Part of the Translation System
-Note: Location: compiler/middle/gungnir/hir/translation/frontends/makefile/makefile_semantic.runa
-Note: ===================================================================
+Note: Makefile Semantic Analyzer - Static analysis of GNU Make build files
+Note: Part of the Translation universal language translation system
+Note: -
+Note: Performs a real two-phase static analysis over the parser AST produced by
+Note: makefile_parser.runa:
+Note:   Phase 1 (collect): walk every top-level statement and record every
+Note:     target name, every defined variable name (assignments + define blocks),
+Note:     every .PHONY declaration, and every include file.
+Note:   Phase 2 (validate): re-walk the statements and check that prerequisite
+Note:     references resolve to a known target or an on-disk source convention,
+Note:     that $(VAR)/${VAR} references resolve to a defined or built-in make
+Note:     variable, that recipe lines are well-formed, that no target is defined
+Note:     twice with single-colon rules, and that .PHONY entries name real
+Note:     targets.
+Note: -
+Note: The AST node layout consumed here is fixed by makefile_parser.runa and is
+Note: documented inline at each accessor. All nodes are raw heap structs whose
+Note: first 8-byte word is the NODE_* kind tag.
 
 Import "compiler/middle/gungnir/hir/translation/frontends/makefile/makefile_parser.runa" as Parser
 Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
 Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/frontend/primitives/core/string_primitive.runa" as StringPrimitive
 Import "compiler/frontend/primitives/collections/list.runa" as List
-Import "compiler/frontend/primitives/collections/dictionary.runa" as Dict
 
-Note: ===================================================================
-Note: SEMANTIC ANALYZER STRUCTURE
-Note: ===================================================================
+Note: ============================================================================
+Note: AST Node Kind Constants (mirror makefile_parser.runa)
+Note: ============================================================================
+
+Constant NODE_MAKEFILE as Integer is 1000
+Constant NODE_VARIABLE_ASSIGNMENT as Integer is 1001
+Constant NODE_TARGET_RULE as Integer is 1002
+Constant NODE_RECIPE_LINE as Integer is 1003
+Constant NODE_CONDITIONAL as Integer is 1004
+Constant NODE_INCLUDE_DIRECTIVE as Integer is 1005
+Constant NODE_EXPORT_DIRECTIVE as Integer is 1006
+Constant NODE_DEFINE_BLOCK as Integer is 1007
+Constant NODE_SPECIAL_TARGET as Integer is 1008
+Constant NODE_FUNCTION_CALL as Integer is 1009
+Constant NODE_VARIABLE_REFERENCE as Integer is 1010
+Constant NODE_TEXT as Integer is 1011
+
+Note: ============================================================================
+Note: ANALYZER STATE
+Note: ============================================================================
 
 @Reasoning:
-Eighteen-slot analyzer state covering all Makefile semantic registries:
-- targets/variables/dependencies are Dict-typed for O(1) name lookup during
-  reference resolution and cycle detection;
-- pattern_rules / implicit_rules / phony_targets / include_files /
-  conditional_blocks / function_calls / variable_references are List-typed
-  since they are iterated linearly during validation passes;
-- circular_dependencies / undefined_targets / unused_variables /
-  validation_errors / validation_warnings collect diagnostic output;
-- default_target / error_message / has_error provide single-value scalar
-  state for the first explicit target and any fatal error.
+The analyzer threads six lists through the two-phase walk: target_names (every
+target string declared by a rule), variable_names (every variable name defined
+by an assignment or define block), phony_targets (every name listed under
+.PHONY), errors and warnings (diagnostic message strings), and
+undefined_targets (prerequisite names that resolved to no target). Flat string
+lists keep membership tests cheap and let the driver read diagnostics directly
+after analysis without any internal-layout knowledge. The struct is six 8-byte
+slots = 48 bytes.
 @End Reasoning
 Type called "MakefileSemanticAnalyzer":
-    targets as Integer
-    variables as Integer
-    dependencies as Integer
-    pattern_rules as Integer
-    implicit_rules as Integer
-    phony_targets as Integer
-    default_target as Integer
-    include_files as Integer
-    conditional_blocks as Integer
-    function_calls as Integer
-    variable_references as Integer
-    circular_dependencies as Integer
-    undefined_targets as Integer
-    unused_variables as Integer
-    validation_errors as Integer
-    validation_warnings as Integer
-    error_message as Integer
-    has_error as Integer
+    target_names as Integer        Note: List of declared target-name strings
+    variable_names as Integer      Note: List of defined variable-name strings
+    phony_targets as Integer       Note: List of names declared under .PHONY
+    errors as Integer              Note: List of error message strings
+    warnings as Integer            Note: List of warning message strings
+    undefined_targets as Integer   Note: List of unresolved prerequisite names
 End Type
 
-Note: ===================================================================
-Note: ANALYZER CREATION
-Note: ===================================================================
-
 @Reasoning:
-Constructor eagerly allocates every registry so the analysis passes
-do not have to lazy-init them on first use. The 18-slot struct holds
-three Dict-typed registries (targets, variables, dependencies) for
-O(1) name lookup during cycle detection, ten List-typed registries
-that are iterated linearly during validation, plus three scalar
-slots (default_target, error_message, has_error). One eager allocation
-batch is cheaper than per-phase init because the analyse pass runs
-exactly once per Makefile.
+Allocates a 48-byte analyzer with six freshly-created lists so every analysis
+run starts with empty collection and diagnostic state. Returns 0 on allocation
+failure so callers can guard.
 @End Reasoning
-
-@Implementation:
-Allocates 144 bytes (18 fields x 8 bytes) via Layout.allocate. Returns
-0 on allocation failure. Creates three Dicts (targets, variables,
-dependencies) and twelve Lists for the iterable registries plus the
-two diagnostics lists. Writes each into its offset (0..120 in 8-byte
-strides) per the field layout in the Type declaration above. Offsets
-48, 128, and 136 (default_target, error_message, has_error) are
-zeroed because they are scalar slots that start empty.
-@End Implementation
 Process called "create_makefile_semantic_analyzer" returns Integer:
-    Note: Create Makefile semantic analyzer for build system validation
-
-    @Reasoning:
-    Initialize comprehensive semantic analyzer for Makefile including
-    target validation, dependency analysis, variable resolution, pattern
-    rule validation, and Make-specific semantic rules enforcement.
-    @End Reasoning
-
-    @Implementation:
-    Allocate analyzer structure with registries for targets, variables,
-    dependencies, rules, and validation tracking. Initialize all registries
-    for comprehensive GNU Make build system analysis and validation.
-    @End Implementation
-
-    Let analyzer_size be 144
-    Let analyzer be proc allocate from Layout with analyzer_size
-
+    Let analyzer be proc allocate from Layout with 48
     If analyzer is equal to 0:
         Return 0
     End If
 
-    Let targets be proc create from Dict
-    Let variables be proc create from Dict
-    Let dependencies be proc create from Dict
-    Let pattern_rules be proc create from List
-    Let implicit_rules be proc create from List
-    Let phony_targets be proc create from List
-    Let include_files be proc create from List
-    Let conditional_blocks be proc create from List
-    Let function_calls be proc create from List
-    Let variable_references be proc create from List
-    Let circular_dependencies be proc create from List
-    Let undefined_targets be proc create from List
-    Let unused_variables be proc create from List
-    Let validation_errors be proc create from List
-    Let validation_warnings be proc create from List
+    Let target_names be proc list_create from List
+    proc memory_set_integer from Memory with analyzer, 0, target_names
 
-    proc memory_set_int64 from Layout with analyzer, 0, targets
-    proc memory_set_int64 from Layout with analyzer, 8, variables
-    proc memory_set_int64 from Layout with analyzer, 16, dependencies
-    proc memory_set_int64 from Layout with analyzer, 24, pattern_rules
-    proc memory_set_int64 from Layout with analyzer, 32, implicit_rules
-    proc memory_set_int64 from Layout with analyzer, 40, phony_targets
-    proc memory_set_int64 from Layout with analyzer, 48, 0  Note: default_target
-    proc memory_set_int64 from Layout with analyzer, 56, include_files
-    proc memory_set_int64 from Layout with analyzer, 64, conditional_blocks
-    proc memory_set_int64 from Layout with analyzer, 72, function_calls
-    proc memory_set_int64 from Layout with analyzer, 80, variable_references
-    proc memory_set_int64 from Layout with analyzer, 88, circular_dependencies
-    proc memory_set_int64 from Layout with analyzer, 96, undefined_targets
-    proc memory_set_int64 from Layout with analyzer, 104, unused_variables
-    proc memory_set_int64 from Layout with analyzer, 112, validation_errors
-    proc memory_set_int64 from Layout with analyzer, 120, validation_warnings
-    proc memory_set_int64 from Layout with analyzer, 128, 0  Note: error_message
-    proc memory_set_int64 from Layout with analyzer, 136, 0  Note: has_error
+    Let variable_names be proc list_create from List
+    proc memory_set_integer from Memory with analyzer, 8, variable_names
+
+    Let phony_targets be proc list_create from List
+    proc memory_set_integer from Memory with analyzer, 16, phony_targets
+
+    Let errors be proc list_create from List
+    proc memory_set_integer from Memory with analyzer, 24, errors
+
+    Let warnings be proc list_create from List
+    proc memory_set_integer from Memory with analyzer, 32, warnings
+
+    Let undefined_targets be proc list_create from List
+    proc memory_set_integer from Memory with analyzer, 40, undefined_targets
 
     Return analyzer
 End Process
 
-Note: ===================================================================
-Note: MAIN ANALYSIS ENTRY POINT
-Note: ===================================================================
+@Reasoning:
+Releases the analyzer struct. The six lists are borrowed by callers that read
+diagnostics after analysis, so only the 48-byte struct is freed here; callers
+own the analysis lifetime.
+@End Reasoning
+Process called "destroy_makefile_semantic_analyzer" takes analyzer as Integer returns Integer:
+    If analyzer is equal to 0:
+        Return 1
+    End If
+    proc deallocate from Layout with analyzer
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: SMALL ACCESSORS
+Note: ============================================================================
 
 @Reasoning:
-The six analysis phases run in fixed order because each later phase
-consumes registries that earlier phases populate. Declarations come
-first because every subsequent phase queries the targets/variables
-dicts. Dependency resolution must precede target validation because
-the validator checks that prerequisites are themselves declared.
-Variable analysis follows because dependency expansion in recipes
-references variables. Pattern validation runs late because it relies
-on the fully populated rule registries. Circular dependency detection
-runs last so it sees the complete dependency graph including
-implicit and pattern-rule edges.
+Reads a node's NODE_* kind tag from offset 0. Null-guards the node so callers
+can dispatch on the result without a separate null check.
 @End Reasoning
+Process called "node_kind_of" takes node as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_integer from Memory with node, 0
+End Process
 
-@Implementation:
-Returns 0 immediately on null analyzer. On null makefile_ast, records
-"Null Makefile AST" via set_makefile_semantic_error and returns 0.
-Otherwise calls the six phase functions in order:
-collect_makefile_declarations, resolve_makefile_dependencies,
-validate_makefile_targets, analyze_makefile_variables,
-validate_makefile_patterns, detect_makefile_circular_dependencies.
-Reads has_error at offset 136 after all phases run; returns 0 if any
-phase set it, otherwise 1. Diagnostics persist on the analyzer's
-validation_errors / validation_warnings lists for caller retrieval.
-@End Implementation
-Process called "analyze_makefile" takes analyzer as Integer, makefile_ast as Integer returns Integer:
-    Note: Perform complete semantic analysis on Makefile
-
-    @Reasoning:
-    Comprehensive analysis including target validation, dependency resolution,
-    variable usage analysis, pattern rule validation, circular dependency
-    detection, and GNU Make best practices enforcement.
-    @End Reasoning
-
-    @Implementation:
-    Multi-phase analysis: collect declarations, resolve dependencies, validate
-    targets, analyze variables, check patterns, and enforce Make conventions
-    for robust and maintainable build systems.
-    @End Implementation
-
+@Reasoning:
+Records a semantic error message on the analyzer's error list (offset 24).
+@End Reasoning
+Process called "add_makefile_validation_error" takes analyzer as Integer, error_message as Integer returns Integer:
     If analyzer is equal to 0:
         Return 0
     End If
-
-    If makefile_ast is equal to 0:
-        proc set_makefile_semantic_error with analyzer, "Null Makefile AST"
-        Return 0
-    End If
-
-    Note: Phase 1: Collect targets, variables, and rules
-    proc collect_makefile_declarations with analyzer, makefile_ast
-
-    Note: Phase 2: Resolve dependencies and references
-    proc resolve_makefile_dependencies from analyzer
-
-    Note: Phase 3: Validate targets and rules
-    proc validate_makefile_targets from analyzer
-
-    Note: Phase 4: Analyze variables and functions
-    proc analyze_makefile_variables from analyzer
-
-    Note: Phase 5: Check patterns and implicit rules
-    proc validate_makefile_patterns from analyzer
-
-    Note: Phase 6: Detect circular dependencies
-    proc detect_makefile_circular_dependencies from analyzer
-
-    Let has_error be proc memory_get_int64 from Layout with analyzer, 136
-    If has_error is equal to 1:
-        Return 0
-    End If
-
-    Return 1
-End Process
-
-Note: ===================================================================
-Note: DECLARATION COLLECTION
-Note: ===================================================================
-
-@Reasoning:
-GNU Make designates the first explicit target as the "default goal"
-that runs when `make` is invoked without arguments. The first_target_set
-flag threads through the iteration so collect_makefile_target can
-distinguish the first encountered target rule from subsequent ones
-and assign it to the default_target slot. Five statement kinds are
-recognised here (target_rule, variable_assignment, include_directive,
-conditional_block, pattern_rule); other statement types fall through
-to later phases where their specialised handling lives.
-@End Reasoning
-
-@Implementation:
-Reads the AST's flat statement list via get_makefile_statements.
-Initialises first_target_set to 0 and iterates. For each statement,
-reads stmt_type and Match-dispatches to the appropriate collector.
-For target_rule, sets first_target_set to 1 after the first call so
-subsequent targets do not overwrite default_target. The Otherwise arm
-silently skips statement kinds that other phases handle (e.g.
-function calls, which are gathered during dependency resolution).
-@End Implementation
-Process called "collect_makefile_declarations" takes analyzer as Integer, makefile_ast as Integer:
-    Note: Collect all Makefile declarations for reference resolution
-
-    @Reasoning:
-    First phase collects all targets, variables, pattern rules, implicit
-    rules, include directives, and conditional blocks to build comprehensive
-    registries for cross-reference validation and dependency analysis.
-    @End Reasoning
-
-    Let statements be proc get_makefile_statements from makefile_ast
-    Let stmt_count be proc size from List with statements
-    Let first_target_set be 0
-    Let i be 0
-
-    While i is less than stmt_count:
-        Let statement be proc get from List with statements, i
-        Let stmt_type be proc get_makefile_statement_type from statement
-
-        Match stmt_type:
-            When "target_rule":
-                proc collect_makefile_target with analyzer, statement, first_target_set
-                If first_target_set is equal to 0:
-                    Set first_target_set to 1
-                End If
-            When "variable_assignment":
-                proc collect_makefile_variable with analyzer, statement
-            When "include_directive":
-                proc collect_makefile_include with analyzer, statement
-            When "conditional_block":
-                proc collect_makefile_conditional with analyzer, statement
-            When "pattern_rule":
-                proc collect_makefile_pattern_rule with analyzer, statement
-            Otherwise:
-                Note: Other statements analyzed in later phases
-        End Match
-
-        Set i to i plus 1
-    End While
-End Process
-
-@Reasoning:
-A single target_rule can declare multiple targets (e.g. `a b c: deps`)
-so the registration loop iterates the target_names list. The first
-target seen in the whole Makefile (first_target_set == 0 AND first
-name in this rule) becomes the default goal - tracked at offset 48.
-Duplicate target detection is a warning rather than an error because
-GNU Make legitimately supports overriding rules via `::` and explicit
-re-declarations; the warning surfaces accidental shadowing.
-@End Reasoning
-
-@Implementation:
-Reads target_names via get_makefile_target_names. Reads the targets
-registry (offset 0) and dependencies registry (offset 16). Loops
-i = 0..target_count - 1:
-- If first_target_set is 0 AND i is 0, writes target_name to offset 48
-  (default_target).
-- Calls Dict.contains on targets_registry; if 1, concatenates
-  "Duplicate target definition: " with target_name and records via
-  add_makefile_validation_warning.
-- Inserts target_name -> target_rule into targets_registry.
-- Calls get_makefile_target_prerequisites to register dependency edges
-  into dependencies_registry (continues outside the shown excerpt).
-@End Implementation
-Process called "collect_makefile_target" takes analyzer as Integer, target_rule as Integer, first_target_set as Integer:
-    Note: Collect target rule for registry
-
-    @Reasoning:
-    Register target with dependencies, prerequisites, and recipe commands
-    for dependency analysis and validation. Track first target as default
-    target following GNU Make conventions.
-    @End Reasoning
-
-    Let target_names be proc get_makefile_target_names from target_rule
-    Let target_count be proc size from List with target_names
-    Let targets_registry be proc memory_get_int64 from Layout with analyzer, 0
-    Let dependencies_registry be proc memory_get_int64 from Layout with analyzer, 16
-    Let i be 0
-
-    While i is less than target_count:
-        Let target_name be proc get from List with target_names, i
-
-        Note: Set first target as default
-        If first_target_set is equal to 0 and i is equal to 0:
-            proc memory_set_int64 from Layout with analyzer, 48, target_name
-        End If
-
-        Note: Check for duplicate target
-        Let exists be proc contains from Dict with targets_registry, target_name
-        If exists is equal to 1:
-            Let warning be proc string_concat from StringCore with "Duplicate target definition: ", target_name
-            proc add_makefile_validation_warning with analyzer, warning
-        End If
-
-        proc set from Dict with targets_registry, target_name, target_rule
-
-        Note: Register target dependencies
-        Let prerequisites be proc get_makefile_target_prerequisites from target_rule
-        proc set from Dict with dependencies_registry, target_name, prerequisites
-
-        Set i to i plus 1
-    End While
-
-    Note: Check for special targets
-    proc check_special_targets with analyzer, target_names
-End Process
-
-@Reasoning:
-GNU Make has four assignment flavours: recursive (=), simple (:=),
-conditional (?=), append (+=). The flavour matters at expansion time
-because recursive variables re-expand their values on each reference
-while simple variables snapshot the value at assignment time. Storing
-the value and assignment_type together in a variable_info record lets
-the later variable-resolution pass apply the correct expansion
-strategy without re-querying the AST node.
-@End Reasoning
-
-@Implementation:
-Reads variable_name, variable_value, and assignment_type from the
-variable_assignment AST node via the corresponding getters. Reads the
-variables registry at offset 8. Constructs a variable_info via
-create_variable_info, then inserts variable_name -> var_info into the
-variables registry via Dict.set. The variables registry overwrites
-on duplicate keys, matching GNU Make's late-binding semantics where
-a later assignment supersedes earlier ones.
-@End Implementation
-Process called "collect_makefile_variable" takes analyzer as Integer, variable_assignment as Integer:
-    Note: Collect variable assignment for registry
-
-    @Reasoning:
-    Register variable with assignment type (recursive, simple, conditional,
-    append), value, and scope for proper variable resolution and validation
-    following GNU Make variable semantics.
-    @End Reasoning
-
-    Let variable_name be proc get_makefile_variable_name from variable_assignment
-    Let variable_value be proc get_makefile_variable_value from variable_assignment
-    Let assignment_type be proc get_makefile_assignment_type from variable_assignment
-
-    Let variables_registry be proc memory_get_int64 from Layout with analyzer, 8
-    Let var_info be proc create_variable_info with variable_value, assignment_type
-
-    proc set from Dict with variables_registry, variable_name, var_info
-End Process
-
-@Reasoning:
-`include` directives may name multiple files in a single statement
-(e.g. `include $(wildcard *.d)`), so each one is registered
-individually onto the include_files list at offset 56. Per-file
-existence validation runs at collection time rather than during the
-later validation phase so a missing include can fail fast with a
-precise pointer to the offending file path.
-@End Reasoning
-
-@Implementation:
-Reads include_files registry handle from offset 56 and the list of
-filenames from the include_directive via get_makefile_include_files.
-Iterates i = 0..file_count - 1: reads include_file, appends to the
-analyzer's include_files list, then calls validate_include_file_existence
-which performs access(F_OK)/access(R_OK) syscalls to verify presence
-and readability and records errors/warnings as appropriate.
-@End Implementation
-Process called "collect_makefile_include" takes analyzer as Integer, include_directive as Integer:
-    Note: Collect include directive for dependency tracking
-
-    @Reasoning:
-    Register include files for dependency analysis and validation. Include
-    files affect variable scope and can introduce additional targets and
-    rules that must be considered in semantic analysis.
-    @End Reasoning
-
-    Let include_files be proc memory_get_int64 from Layout with analyzer, 56
-    Let included_files be proc get_makefile_include_files from include_directive
-    Let file_count be proc size from List with included_files
-    Let i be 0
-
-    While i is less than file_count:
-        Let include_file be proc get from List with included_files, i
-        proc add from List with include_files, include_file
-
-        Note: Validate include file exists using filesystem access
-        proc validate_include_file_existence with analyzer, include_file
-
-        Set i to i plus 1
-    End While
-End Process
-
-@Reasoning:
-Validates an "include" / "sinclude" / "-include" filename by probing the
-filesystem with access(F_OK=0) for existence and access(R_OK=4) for read
-permission. Missing files emit an error (because plain "include" is fatal in
-Make); existing-but-unreadable files emit a warning so the user is notified
-without aborting the analysis pipeline. Silent-include forms (sinclude /
--include) are not distinguished here — the parser layer is expected to handle
-suppression by passing through the silent flag.
-@End Reasoning
-
-@Security_Scope:
-Performs a filesystem access() syscall on the user-supplied include_file
-path. The string is taken at face value with no normalization; symlink and
-TOCTOU concerns are deferred to the build executor downstream.
-@End Security_Scope
-Process called "validate_include_file_existence" takes analyzer as Integer, include_file as Integer returns Integer:
-    Note: Check if include file exists on filesystem using stat syscall
-
-    Note: Try to stat the file to check existence
-    Note: stat syscall returns 0 on success, -1 on error
-    Let stat_result be External "access" from include_file, 0
-    Note: F_OK = 0 checks for file existence
-
-    If stat_result is less than 0:
-        Note: File does not exist or is not accessible
-        Let error_msg be proc string_concat from StringCore with "Include file not found: ", include_file
-        proc add_makefile_error with analyzer, error_msg
-        Return 0
-    End If
-
-    Note: Additionally check if file is readable
-    Let read_result be External "access" from include_file, 4
-    Note: R_OK = 4 checks for read permission
-
-    If read_result is less than 0:
-        Note: File exists but is not readable
-        Let warning_msg be proc string_concat from StringCore with "Include file not readable: ", include_file
-        proc add_makefile_warning with analyzer, warning_msg
-        Return 0
-    End If
-
+    Let errors be proc memory_get_integer from Memory with analyzer, 24
+    proc list_append from List with errors, error_message
     Return 1
 End Process
 
 @Reasoning:
-Conditional blocks (`ifdef`, `ifndef`, `ifeq`, `ifneq`, `else`,
-`endif`) parameterise which targets and rules become visible during a
-particular Make invocation, but for static analysis we record every
-conditional block so the variable-usage analysis can warn about
-variables that appear only inside conditional bodies. Analyzing the
-condition expression eagerly catches references to undefined variables
-in the condition itself.
+Records a semantic warning message on the analyzer's warning list (offset 32).
 @End Reasoning
-
-@Implementation:
-Reads the conditional_blocks registry handle from offset 64 and
-appends conditional_block via List.add. Reads the condition expression
-via get_makefile_condition_expression and passes it to
-analyze_condition_variables, which records every variable name
-referenced in the condition into the analyzer's variable_references
-list for cross-check during analyze_makefile_variables.
-@End Implementation
-Process called "collect_makefile_conditional" takes analyzer as Integer, conditional_block as Integer:
-    Note: Collect conditional block for analysis
-
-    @Reasoning:
-    Register conditional blocks (ifdef, ifndef, ifeq, ifneq) for variable
-    dependency tracking and conditional logic validation following GNU Make
-    conditional processing semantics.
-    @End Reasoning
-
-    Let conditional_blocks be proc memory_get_int64 from Layout with analyzer, 64
-    proc add from List with conditional_blocks, conditional_block
-
-    Note: Analyze condition expression
-    Let condition_expr be proc get_makefile_condition_expression from conditional_block
-    proc analyze_condition_variables with analyzer, condition_expr
+Process called "add_makefile_validation_warning" takes analyzer as Integer, warning_message as Integer returns Integer:
+    If analyzer is equal to 0:
+        Return 0
+    End If
+    Let warnings be proc memory_get_integer from Memory with analyzer, 32
+    proc list_append from List with warnings, warning_message
+    Return 1
 End Process
 
 @Reasoning:
-Pattern rules like `%.o: %.c` define how to build any target matching
-the `%.o` pattern from a prerequisite matching the corresponding `%.c`
-pattern. Registering them on the pattern_rules list at offset 24 lets
-the validate_makefile_patterns phase later iterate every pattern rule
-to verify the stem placeholder appears in both target and prerequisite
-sides and that the recipe is non-empty.
+Linear membership test over a list of string pointers. Returns 1 when needle is
+string-equal to any element, 0 otherwise. Used for target / variable / phony
+lookups during validation.
 @End Reasoning
-
-@Implementation:
-Reads the pattern_rules registry handle from offset 24 and appends
-the pattern_rule via List.add. Calls validate_pattern_rule_syntax to
-perform the immediate syntactic checks (single %, balanced stem
-usage, recipe present); deeper semantic checks (no overlap with more
-specific rules, no impossible patterns) happen in
-validate_makefile_patterns once all rules are collected.
-@End Implementation
-Process called "collect_makefile_pattern_rule" takes analyzer as Integer, pattern_rule as Integer:
-    Note: Collect pattern rule for validation
-
-    @Reasoning:
-    Register pattern rules (%.o: %.c) for implicit rule analysis and
-    target matching validation. Pattern rules define how to build targets
-    matching specific patterns following GNU Make pattern rule semantics.
-    @End Reasoning
-
-    Let pattern_rules be proc memory_get_int64 from Layout with analyzer, 24
-    proc add from List with pattern_rules, pattern_rule
-
-    Note: Validate pattern syntax
-    proc validate_pattern_rule_syntax with analyzer, pattern_rule
-End Process
-
-@Reasoning:
-GNU Make's special targets begin with a dot (.PHONY, .DEFAULT,
-.SUFFIXES, .PRECIOUS, .INTERMEDIATE, etc.) and instruct Make to treat
-their prerequisites specially. The most consequential for static
-analysis is .PHONY because phony targets are exempt from "this
-target's name exists as a file" checks - missing the .PHONY
-registration would produce false positives during validation.
-@End Reasoning
-
-@Implementation:
-Reads the phony_targets list handle from offset 40. Iterates the
-target_names list. For each target_name, compares against ".PHONY"
-via StringCore.string_equals; if matched, calls
-mark_phony_prerequisites which walks the prerequisites of the .PHONY
-rule and adds each one to phony_targets. The other special targets
-(.DEFAULT, etc.) are recognised by their own branches inside this
-function (continued outside the shown excerpt).
-@End Implementation
-Process called "check_special_targets" takes analyzer as Integer, target_names as Integer:
-    Note: Check for special Make targets
-
-    @Reasoning:
-    Identify special targets like .PHONY, .DEFAULT, .SUFFIXES, .PRECIOUS
-    that have special semantics in GNU Make. Register phony targets for
-    dependency analysis exclusion.
-    @End Reasoning
-
-    Let target_count be proc size from List with target_names
-    Let phony_targets be proc memory_get_int64 from Layout with analyzer, 40
-    Let i be 0
-
-    While i is less than target_count:
-        Let target_name be proc get from List with target_names, i
-
-        Let is_phony be proc string_equals from StringCore with target_name, ".PHONY"
-        If is_phony is equal to 1:
-            Note: .PHONY target - next prerequisites are phony
-            proc mark_phony_prerequisites with analyzer, target_names
-        End If
-
-        Let is_default be proc string_equals from StringCore with target_name, ".DEFAULT"
-        If is_default is equal to 1:
-            proc handle_default_target with analyzer, target_names
-        End If
-
-        Let starts_with_dot be proc string_char_at from StringCore with target_name, 0
-        If starts_with_dot is equal to 46:  Note: Dot character
-            proc add from List with phony_targets, target_name
-        End If
-
-        Set i to i plus 1
-    End While
-End Process
-
-Note: ===================================================================
-Note: DEPENDENCY RESOLUTION
-Note: ===================================================================
-
-@Reasoning:
-Phase 2 entry point. The four sub-steps (target dependency resolution,
-variable reference resolution, function-call resolution, dependency
-graph construction) are sequenced so each can rely on its predecessors:
-target dependencies must be resolved before variable references can be
-checked in prerequisite lists, function calls are resolved after
-because they can appear in any string position, and the final graph
-build assembles the edges all three prior steps discovered.
-@End Reasoning
-
-@Implementation:
-Calls four phase-internal functions in fixed order:
-resolve_target_dependencies, resolve_variable_references,
-resolve_function_calls, build_dependency_graph. Each operates on
-registries the analyzer's collection phase populated and writes its
-own outputs into the analyzer (variable_references, function_calls,
-dependencies graph). No explicit error propagation here - each
-sub-step records errors directly into the analyzer's diagnostic lists.
-@End Implementation
-Process called "resolve_makefile_dependencies" takes analyzer as Integer:
-    Note: Resolve all target dependencies and references
-
-    @Reasoning:
-    Second phase resolves all target dependencies, variable references,
-    function calls, and include file dependencies to build complete
-    dependency graph for circular dependency detection.
-    @End Reasoning
-
-    proc resolve_target_dependencies from analyzer
-    proc resolve_variable_references from analyzer
-    proc resolve_function_calls from analyzer
-    proc build_dependency_graph from analyzer
-End Process
-
-@Reasoning:
-For each registered target, every prerequisite must resolve to one of
-three things: another declared target, a pattern rule match, or an
-on-disk file. Items that match none of these are added to
-undefined_targets - this is not an error in Make (the build may still
-succeed if the prereq is generated at runtime) but the analyzer
-records it for the user's review. Pattern-rule fallback is checked
-before declaring something undefined to avoid false positives on
-common patterns like %.o being implied by a %.o:%.c rule.
-@End Reasoning
-
-@Implementation:
-Reads the dependencies registry (offset 16), targets registry
-(offset 0), and undefined_targets list (offset 96). Iterates every
-key in dependencies_registry, reading the prerequisite list for each.
-For each prerequisite: queries targets_registry; if absent, calls
-check_pattern_rule_match against the registered pattern_rules. If
-neither matches, appends the prereq_name to undefined_targets. Both
-loops are O(N) over their respective lists; total work is O(T * P)
-for T targets and P average prerequisites per target.
-@End Implementation
-Process called "resolve_target_dependencies" takes analyzer as Integer:
-    Note: Resolve target dependency references
-
-    @Reasoning:
-    Validate all target prerequisites exist as defined targets, files,
-    or pattern rules. Check for undefined targets and build complete
-    dependency chains for topological sorting and cycle detection.
-    @End Reasoning
-
-    Let dependencies_registry be proc memory_get_int64 from Layout with analyzer, 16
-    Let targets_registry be proc memory_get_int64 from Layout with analyzer, 0
-    Let undefined_targets be proc memory_get_int64 from Layout with analyzer, 96
-
-    Let target_names be proc keys from Dict with dependencies_registry
-    Let target_count be proc size from List with target_names
-    Let i be 0
-
-    While i is less than target_count:
-        Let target_name be proc get from List with target_names, i
-        Let prerequisites be proc get from Dict with dependencies_registry, target_name
-
-        If prerequisites is not equal to 0:
-            Let prereq_count be proc size from List with prerequisites
-            Let j be 0
-
-            While j is less than prereq_count:
-                Let prereq_name be proc get from List with prerequisites, j
-
-                Note: Check if prerequisite exists as target
-                Let prereq_exists be proc contains from Dict with targets_registry, prereq_name
-
-                If prereq_exists is equal to 0:
-                    Note: Check if it matches a pattern rule
-                    Let matches_pattern be proc check_pattern_rule_match with analyzer, prereq_name
-
-                    If matches_pattern is equal to 0:
-                        Note: Undefined target - could be a file
-                        proc add from List with undefined_targets, prereq_name
-                    End If
-                End If
-
-                Set j to j plus 1
-            End While
-        End If
-
-        Set i to i plus 1
-    End While
-End Process
-
-@Reasoning:
-Variable references can appear in three positions: target names
-(`$(SUFFIX): ...`), prerequisite lists (`obj: $(DEPS)`), and recipe
-command lines (`@echo $(MSG)`). Each must be scanned so the
-analyzer's variable_references list accumulates every name used,
-making it possible for analyze_makefile_variables to cross-check
-against the variables registry and report undefined-variable usage.
-@End Reasoning
-
-@Implementation:
-Reads targets_registry (offset 0), variables_registry (offset 8),
-and variable_references list (offset 80). Reads every target_rule
-from targets_registry via Dict.values. For each rule, calls
-check_variable_references_in_list three times with the target names,
-prerequisites, and recipe lines respectively, accumulating into
-variable_references. The same list is reused for all three positions
-because downstream analysis works off the full reference set rather
-than separating by position.
-@End Implementation
-Process called "resolve_variable_references" takes analyzer as Integer:
-    Note: Resolve all variable references in targets and recipes
-
-    @Reasoning:
-    Analyze variable references in target names, prerequisites, and recipe
-    commands to validate all referenced variables are defined and detect
-    undefined variable usage according to GNU Make variable semantics.
-    @End Reasoning
-
-    Let targets_registry be proc memory_get_int64 from Layout with analyzer, 0
-    Let variables_registry be proc memory_get_int64 from Layout with analyzer, 8
-    Let variable_references be proc memory_get_int64 from Layout with analyzer, 80
-
-    Let target_rules be proc values from Dict with targets_registry
-    Let rule_count be proc size from List with target_rules
-    Let i be 0
-
-    While i is less than rule_count:
-        Let target_rule be proc get from List with target_rules, i
-
-        Note: Check variable references in target names
-        Let target_names be proc get_makefile_target_names from target_rule
-        proc check_variable_references_in_list with analyzer, target_names, variable_references
-
-        Note: Check variable references in prerequisites
-        Let prerequisites be proc get_makefile_target_prerequisites from target_rule
-        proc check_variable_references_in_list with analyzer, prerequisites, variable_references
-
-        Note: Check variable references in recipe
-        Let recipe_commands be proc get_makefile_target_recipe from target_rule
-        proc check_variable_references_in_list with analyzer, recipe_commands, variable_references
-
-        Set i to i plus 1
-    End While
-End Process
-
-@Reasoning:
-Per-list driver for variable-reference extraction. Used by
-resolve_variable_references to walk target names, prerequisites, and recipe
-command lines, dispatching each string into extract_variable_references which
-does the actual "$..." parsing. Null list is a no-op so callers do not need
-to guard.
-@End Reasoning
-Process called "check_variable_references_in_list" takes analyzer as Integer, string_list as Integer, references as Integer:
-    Note: Check for variable references in list of strings
-
+Process called "string_list_contains" takes string_list as Integer, needle as Integer returns Integer:
     If string_list is equal to 0:
-        Return
+        Return 0
+    End If
+    If needle is equal to 0:
+        Return 0
     End If
 
-    Let string_count be proc size from List with string_list
-    Let i be 0
-
-    While i is less than string_count:
-        Let string_value be proc get from List with string_list, i
-        proc extract_variable_references with analyzer, string_value, references
-        Set i to i plus 1
+    Let count be proc list_length from List with string_list
+    Let index be 0
+    While index is less than count:
+        Let element be proc list_get from List with string_list, index
+        If element is not equal to 0:
+            Let matches be proc string_equals from StringCore with element, needle
+            If matches is equal to 1:
+                Return 1
+            End If
+        End If
+        Set index to index plus 1
     End While
+
+    Return 0
 End Process
 
+Note: ============================================================================
+Note: BUILT-IN MAKE VARIABLES
+Note: ============================================================================
+
 @Reasoning:
-Parses a free-form Make text fragment (recipe line or variable value)
-and appends every embedded variable reference to the caller's
-references list. Make recognizes three reference forms: $(VAR),
-${VAR}, and bare $VAR for single-character names. The single ASCII
-char-code 36 ('$') is the only sentinel we scan for; the actual
-bracket parsing happens in parse_variable_reference.
+GNU Make predefines a set of variables (compiler/tool names, default flags,
+automatic variables) that are always available without an explicit assignment.
+A reference to one of these must not be reported as undefined. The set checked
+here is the standard implicit-rule variable family plus the automatic
+variables; an unknown variable that is not in this set and not assigned in the
+makefile is the signal for an undefined-variable warning.
 @End Reasoning
-@Implementation:
-Linear pass over the text by character index. On encountering '$' we
-delegate to parse_variable_reference to extract the variable name and,
-on success, append it and advance past `name + 2` (the 2 accounts for
-the `$` and the opening bracket; for bare `$X` references parse_*
-returns the single-char form and the +2 is still safe because the
-loop will skip the trailing non-`$` characters).
-@End Implementation
-Process called "extract_variable_references" takes analyzer as Integer, text as Integer, references as Integer:
-    Note: Extract variable references from text string
+Process called "is_builtin_make_variable" takes variable_name as Integer returns Integer:
+    If variable_name is equal to 0:
+        Return 0
+    End If
+
+    Note: Tool / program name variables
+    If proc string_equals from StringCore with variable_name, "CC" is equal to 1:
+        Return 1
+    End If
+    If proc string_equals from StringCore with variable_name, "CXX" is equal to 1:
+        Return 1
+    End If
+    If proc string_equals from StringCore with variable_name, "AR" is equal to 1:
+        Return 1
+    End If
+    If proc string_equals from StringCore with variable_name, "AS" is equal to 1:
+        Return 1
+    End If
+    If proc string_equals from StringCore with variable_name, "LD" is equal to 1:
+        Return 1
+    End If
+    If proc string_equals from StringCore with variable_name, "RM" is equal to 1:
+        Return 1
+    End If
+    If proc string_equals from StringCore with variable_name, "MAKE" is equal to 1:
+        Return 1
+    End If
+    If proc string_equals from StringCore with variable_name, "SHELL" is equal to 1:
+        Return 1
+    End If
+
+    Note: Standard flag variables
+    If proc string_equals from StringCore with variable_name, "CFLAGS" is equal to 1:
+        Return 1
+    End If
+    If proc string_equals from StringCore with variable_name, "CXXFLAGS" is equal to 1:
+        Return 1
+    End If
+    If proc string_equals from StringCore with variable_name, "CPPFLAGS" is equal to 1:
+        Return 1
+    End If
+    If proc string_equals from StringCore with variable_name, "LDFLAGS" is equal to 1:
+        Return 1
+    End If
+    If proc string_equals from StringCore with variable_name, "ARFLAGS" is equal to 1:
+        Return 1
+    End If
+    If proc string_equals from StringCore with variable_name, "LDLIBS" is equal to 1:
+        Return 1
+    End If
+
+    Note: Automatic variables (the one-byte names recorded by reference scanning)
+    If proc string_equals from StringCore with variable_name, "@" is equal to 1:
+        Return 1
+    End If
+    If proc string_equals from StringCore with variable_name, "<" is equal to 1:
+        Return 1
+    End If
+    If proc string_equals from StringCore with variable_name, "^" is equal to 1:
+        Return 1
+    End If
+    If proc string_equals from StringCore with variable_name, "?" is equal to 1:
+        Return 1
+    End If
+    If proc string_equals from StringCore with variable_name, "*" is equal to 1:
+        Return 1
+    End If
+    If proc string_equals from StringCore with variable_name, "+" is equal to 1:
+        Return 1
+    End If
+    If proc string_equals from StringCore with variable_name, "|" is equal to 1:
+        Return 1
+    End If
+    If proc string_equals from StringCore with variable_name, "%" is equal to 1:
+        Return 1
+    End If
+
+    Note: Make special variables
+    If proc string_equals from StringCore with variable_name, "MAKEFLAGS" is equal to 1:
+        Return 1
+    End If
+    If proc string_equals from StringCore with variable_name, "MAKEFILE_LIST" is equal to 1:
+        Return 1
+    End If
+    If proc string_equals from StringCore with variable_name, "CURDIR" is equal to 1:
+        Return 1
+    End If
+    If proc string_equals from StringCore with variable_name, "VPATH" is equal to 1:
+        Return 1
+    End If
+
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: CHARACTER UTILITY
+Note: ============================================================================
+
+@Reasoning:
+Returns 1 when text contains the byte target_char at least once, 0 otherwise.
+Used for prerequisite shape checks ('.' extension, '/' path, '$' reference)
+without allocating a substring.
+@End Reasoning
+Process called "contains_char" takes text as Integer, target_char as Integer returns Integer:
+    If text is equal to 0:
+        Return 0
+    End If
 
     Let length be proc string_length from StringCore with text
-    Let i be 0
+    Let index be 0
+    While index is less than length:
+        Let ch be proc string_char_at from StringCore with text, index
+        If ch is equal to target_char:
+            Return 1
+        End If
+        Set index to index plus 1
+    End While
 
-    While i is less than length:
-        Let char be proc string_char_at from StringCore with text, i
+    Return 0
+End Process
 
-        If char is equal to 36:  Note: Dollar sign
-            Let var_ref be proc parse_variable_reference with text, i
-            If var_ref is not equal to 0:
-                proc add from List with references, var_ref
-                Let var_length be proc string_length from StringCore with var_ref
-                Set i to i plus var_length plus 2
-            Otherwise:
-                Set i to i plus 1
-            End If
+Note: ============================================================================
+Note: VARIABLE-REFERENCE EXTRACTION
+Note: ============================================================================
+
+@Reasoning:
+Extracts the variable / function name from inside a $( ) or ${ } reference.
+Scanning begins just past the opening delimiter and stops at the matching
+closing delimiter (tracking nesting depth so an inner reference's closer is not
+mistaken for the outer's) or at the first whitespace (which separates a make
+function name from its arguments). Returns the leading name token; the empty
+string when the reference is malformed (no content before a closer).
+@End Reasoning
+Process called "extract_delimited_name" takes text as Integer, start_pos as Integer, close_char as Integer returns Integer:
+    Let length be proc string_length from StringCore with text
+    Let index be start_pos
+    Let name be ""
+    Let depth be 1
+
+    Let open_char be 40
+    If close_char is equal to 125:
+        Set open_char to 123
+    End If
+
+    Let scanning be 1
+    While scanning is equal to 1:
+        If index is greater than or equal to length:
+            Set scanning to 0
         Otherwise:
-            Set i to i plus 1
-        End If
-    End While
-End Process
-
-Note: ===================================================================
-Note: TARGET VALIDATION
-Note: ===================================================================
-
-@Reasoning:
-Phase 3 wraps four orthogonal validation tasks: syntactic checks on
-target names and prerequisite lists, recipe-command syntax checks,
-.PHONY-specific validation (phony targets must have no on-disk file
-of the same name to avoid Make's "up-to-date" optimisation), and a
-missing-recipe sweep that catches non-phony targets without any
-commands. Splitting them into four sub-functions keeps the
-responsibilities cleanly partitioned and lets each evolve
-independently.
-@End Reasoning
-
-@Implementation:
-Calls four phase-internal functions in fixed order:
-validate_target_syntax, validate_recipe_commands,
-validate_phony_targets, check_missing_recipes. Each operates on the
-targets registry and writes errors/warnings into the analyzer's
-validation_errors / validation_warnings lists. No explicit return
-value; the per-error has_error flag flip in add_makefile_error makes
-the eventual `has_error` check in analyze_makefile authoritative.
-@End Implementation
-Process called "validate_makefile_targets" takes analyzer as Integer:
-    Note: Validate target rules and recipes
-
-    @Reasoning:
-    Third phase validates target rule syntax, recipe command syntax, and
-    target-specific semantics including phony target handling, default
-    target validation, and recipe command validation.
-    @End Reasoning
-
-    proc validate_target_syntax from analyzer
-    proc validate_recipe_commands from analyzer
-    proc validate_phony_targets from analyzer
-    proc check_missing_recipes from analyzer
-End Process
-
-@Reasoning:
-Iterates every target rule registered in the targets Dict and dispatches the
-target-name list and prerequisite list through their respective name
-validators (validate_target_names checks for empty, invalid-character, or
-duplicate target names; validate_prerequisite_names performs similar checks
-on dependency strings).
-@End Reasoning
-Process called "validate_target_syntax" takes analyzer as Integer:
-    Note: Validate target rule syntax
-
-    Let targets_registry be proc memory_get_int64 from Layout with analyzer, 0
-    Let target_rules be proc values from Dict with targets_registry
-    Let rule_count be proc size from List with target_rules
-    Let i be 0
-
-    While i is less than rule_count:
-        Let target_rule be proc get from List with target_rules, i
-
-        Note: Validate target names
-        Let target_names be proc get_makefile_target_names from target_rule
-        proc validate_target_names with analyzer, target_names
-
-        Note: Validate prerequisites
-        Let prerequisites be proc get_makefile_target_prerequisites from target_rule
-        proc validate_prerequisite_names with analyzer, prerequisites
-
-        Set i to i plus 1
-    End While
-End Process
-
-@Reasoning:
-Dispatcher over the targets registry that delegates per-command
-validation to validate_recipe_command. Each Makefile target carries a
-recipe (a list of shell commands); flattening the iteration here
-avoids duplicating the registry walk in every per-command check and
-keeps line_number computation linear with the command index.
-@End Reasoning
-@Implementation:
-Outer loop over target_rules from the targets registry (offset 0).
-For each rule, get_makefile_target_recipe yields its command list,
-which inner loop walks. line_number passed to validate_recipe_command
-is the command's index within its recipe, not the absolute file line;
-the per-target relative index is sufficient for diagnostic anchoring
-because the recipe is already namespaced by target name in the error
-message.
-@End Implementation
-Process called "validate_recipe_commands" takes analyzer as Integer:
-    Note: Validate recipe command syntax
-
-    Let targets_registry be proc memory_get_int64 from Layout with analyzer, 0
-    Let target_rules be proc values from Dict with targets_registry
-    Let rule_count be proc size from List with target_rules
-    Let i be 0
-
-    While i is less than rule_count:
-        Let target_rule be proc get from List with target_rules, i
-        Let recipe_commands be proc get_makefile_target_recipe from target_rule
-
-        If recipe_commands is not equal to 0:
-            Let command_count be proc size from List with recipe_commands
-            Let j be 0
-
-            While j is less than command_count:
-                Let command be proc get from List with recipe_commands, j
-                proc validate_recipe_command with analyzer, command, j
-                Set j to j plus 1
-            End While
-        End If
-
-        Set i to i plus 1
-    End While
-End Process
-
-@Reasoning:
-A Make recipe command may carry up to three prefix modifiers that
-must be skipped before the actual shell command is parsed: `@`
-suppresses echo, `-` ignores errors, `+` forces execution even under
-`make -n`. The validator must understand the prefix layer to avoid
-flagging a leading prefix as a syntax error and to expose the bare
-command for further inspection.
-@End Reasoning
-
-@Implementation:
-Reads the command's length; returns immediately on empty command.
-Reads the first character; if 64 ('@'), advances command_start to 1
-to skip the silent prefix. If 45 ('-'), advances similarly for the
-ignore-errors prefix. If 43 ('+'), advances for the force-execute
-prefix (continued outside the shown excerpt). The actual command
-syntax check then runs against command_start..length-1. line_number
-is threaded through so any error message can pinpoint the offending
-line within the recipe.
-@End Implementation
-
-@Security_Scope:
-Recipe commands are shell scripts under user control. This routine
-only inspects the first character for known Make prefixes; it does
-not interpret the command body. Downstream callers that emit the
-command into a shell remain responsible for quoting and escaping.
-@End Security_Scope
-Process called "validate_recipe_command" takes analyzer as Integer, command as Integer, line_number as Integer:
-    Note: Validate individual recipe command
-
-    @Reasoning:
-    Check recipe command for proper syntax, valid command prefixes,
-    potential security issues, and common Make recipe patterns.
-    Handle @ (silent), - (ignore errors), + (always execute) prefixes.
-    @End Reasoning
-
-    Let length be proc string_length from StringCore with command
-    If length is equal to 0:
-        Return
-    End If
-
-    Let first_char be proc string_char_at from StringCore with command, 0
-    Let command_start be 0
-
-    Note: Handle command prefixes
-    If first_char is equal to 64:  Note: @ prefix (silent)
-        Set command_start to 1
-    End If
-    If first_char is equal to 45:  Note: minus prefix (ignore errors)
-        Set command_start to 1
-    End If
-    If first_char is equal to 43:  Note: plus prefix (always execute)
-        Set command_start to 1
-    End If
-
-    Let actual_command be proc string_substring from StringCore with command, command_start, length minus command_start
-
-    Note: Check for common issues
-    proc check_recipe_security_patterns with analyzer, actual_command, line_number
-    proc check_recipe_best_practices with analyzer, actual_command, line_number
-End Process
-
-@Reasoning:
-A name declared phony via `.PHONY: name` is expected to also have a
-corresponding rule definition - otherwise the phony declaration has no
-effect. Walking phony_targets and cross-checking against the targets
-registry surfaces accidental .PHONY entries for typo'd target names.
-Phony targets that DO have prerequisites need extra scrutiny because
-declaring a file-backed prerequisite of a phony target makes the file
-always re-build.
-@End Reasoning
-
-@Implementation:
-Reads phony_targets list (offset 40), targets registry (offset 0),
-and dependencies registry (offset 16). Iterates phony_targets. For
-each phony_target name: queries targets_registry; if absent, records
-"Phony target not defined: <name>" via add_makefile_validation_warning.
-Reads the prerequisite list for the phony target from
-dependencies_registry; if non-empty, delegates to
-validate_phony_dependencies which checks each prereq for file-vs-
-phony conflicts.
-@End Implementation
-Process called "validate_phony_targets" takes analyzer as Integer:
-    Note: Validate phony target declarations
-
-    @Reasoning:
-    Validate phony targets are properly declared, used correctly, and
-    don't conflict with file targets. Check .PHONY target usage and
-    ensure phony targets don't have file dependencies.
-    @End Reasoning
-
-    Let phony_targets be proc memory_get_int64 from Layout with analyzer, 40
-    Let targets_registry be proc memory_get_int64 from Layout with analyzer, 0
-    Let dependencies_registry be proc memory_get_int64 from Layout with analyzer, 16
-
-    Let phony_count be proc size from List with phony_targets
-    Let i be 0
-
-    While i is less than phony_count:
-        Let phony_target be proc get from List with phony_targets, i
-
-        Note: Check if phony target is defined
-        Let is_defined be proc contains from Dict with targets_registry, phony_target
-        If is_defined is equal to 0:
-            Let warning be proc string_concat from StringCore with "Phony target not defined: ", phony_target
-            proc add_makefile_validation_warning with analyzer, warning
-        End If
-
-        Note: Check phony target dependencies
-        Let phony_deps be proc get from Dict with dependencies_registry, phony_target
-        If phony_deps is not equal to 0:
-            proc validate_phony_dependencies with analyzer, phony_target, phony_deps
-        End If
-
-        Set i to i plus 1
-    End While
-End Process
-
-Note: ===================================================================
-Note: VARIABLE ANALYSIS
-Note: ===================================================================
-
-@Reasoning:
-Phase 4 entry point. Four orthogonal variable-analysis tasks:
-naming-convention and assignment-type analysis (analyze_variable_-
-definitions), undefined-variable detection via cross-reference
-against the registry (check_undefined_variable_usage), scope
-analysis for target-local variables (analyze_variable_scope), and
-unused-variable detection (check_unused_variables).
-@End Reasoning
-
-@Implementation:
-Calls four phase-internal functions in fixed order:
-analyze_variable_definitions, check_undefined_variable_usage,
-analyze_variable_scope, check_unused_variables. Each operates on the
-variables registry (offset 8) and variable_references list (offset
-80) and records its findings into the analyzer's diagnostic lists.
-@End Implementation
-Process called "analyze_makefile_variables" takes analyzer as Integer:
-    Note: Analyze variable usage and definitions
-
-    @Reasoning:
-    Fourth phase analyzes variable definitions, usage patterns, scope,
-    assignment types, and variable expansion according to GNU Make
-    variable semantics including recursive and simple assignment.
-    @End Reasoning
-
-    proc analyze_variable_definitions from analyzer
-    proc check_undefined_variable_usage from analyzer
-    proc analyze_variable_scope from analyzer
-    proc check_unused_variables from analyzer
-End Process
-
-@Reasoning:
-Each variable's definition needs two checks: that its name follows
-Make conventions (uppercase by convention for user variables, no
-spaces, no embedded $ signs) and that its assignment type is used
-consistently (e.g. mixing := and += against the same variable in
-ways that surprise the user). Walking the keys of variables_registry
-is the natural iteration because each entry corresponds to exactly
-one final definition.
-@End Reasoning
-
-@Implementation:
-Reads the variables registry handle from offset 8. Reads the key
-list via Dict.keys. Iterates: for each variable_name, reads the
-var_info record, calls check_variable_naming (which inspects the
-name string for convention violations) and
-check_variable_assignment_consistency (which inspects var_info's
-assignment_type against historical uses tracked elsewhere). Both
-delegates record their findings into the analyzer's diagnostics.
-@End Implementation
-Process called "analyze_variable_definitions" takes analyzer as Integer:
-    Note: Analyze variable definition patterns
-
-    @Reasoning:
-    Analyze variable assignment types (=, :=, ?=, +=) for proper usage,
-    variable naming conventions, and potential conflicts between
-    assignment types that might cause unexpected behavior.
-    @End Reasoning
-
-    Let variables_registry be proc memory_get_int64 from Layout with analyzer, 8
-    Let variable_names be proc keys from Dict with variables_registry
-    Let var_count be proc size from List with variable_names
-    Let i be 0
-
-    While i is less than var_count:
-        Let variable_name be proc get from List with variable_names, i
-        Let var_info be proc get from Dict with variables_registry, variable_name
-
-        Note: Check variable naming conventions
-        proc check_variable_naming with analyzer, variable_name
-
-        Note: Check assignment type consistency
-        proc check_variable_assignment_consistency with analyzer, variable_name, var_info
-
-        Set i to i plus 1
-    End While
-End Process
-
-@Reasoning:
-GNU Make tolerates undefined variable references at runtime
-(expanding them to empty strings), so undefined-variable usage is a
-warning rather than an error - it is almost always a defect but may
-be intentional in some setups. The check must consult the builtin
-list because variables like `$(CC)`, `$(CFLAGS)`, `$(MAKE)` are
-defined by Make itself and never appear in the user's variable
-declarations.
-@End Reasoning
-
-@Implementation:
-Reads the variable_references list (offset 80) and variables registry
-(offset 8). Iterates the references list. For each var_ref: queries
-Dict.contains on variables_registry; if 0, calls
-is_builtin_make_variable to fall back to the prelude list. If neither
-matches, builds "Undefined variable used: <name>" via string_concat
-and records via add_makefile_validation_warning. References that are
-declared or builtin pass through silently.
-@End Implementation
-Process called "check_undefined_variable_usage" takes analyzer as Integer:
-    Note: Check for usage of undefined variables
-
-    @Reasoning:
-    Cross-reference variable references with defined variables to identify
-    undefined variable usage. Consider built-in Make variables and
-    environment variables in the analysis.
-    @End Reasoning
-
-    Let variable_references be proc memory_get_int64 from Layout with analyzer, 80
-    Let variables_registry be proc memory_get_int64 from Layout with analyzer, 8
-
-    Let ref_count be proc size from List with variable_references
-    Let i be 0
-
-    While i is less than ref_count:
-        Let var_ref be proc get from List with variable_references, i
-
-        Note: Check if variable is defined
-        Let is_defined be proc contains from Dict with variables_registry, var_ref
-
-        If is_defined is equal to 0:
-            Note: Check if it's a built-in variable
-            Let is_builtin be proc is_builtin_make_variable from var_ref
-
-            If is_builtin is equal to 0:
-                Let warning be proc string_concat from StringCore with "Undefined variable used: ", var_ref
-                proc add_makefile_validation_warning with analyzer, warning
-            End If
-        End If
-
-        Set i to i plus 1
-    End While
-End Process
-
-Note: ===================================================================
-Note: PATTERN RULE VALIDATION
-Note: ===================================================================
-
-@Reasoning:
-Phase 5 entry point. Pattern-rule validation needs three sub-steps:
-syntactic validation of every registered pattern rule
-(validate_pattern_rule_syntax_all), conflict detection between rules
-that could match the same target (check_pattern_conflicts), and
-suffix-rule legacy checks (validate_suffix_rules - old-style .c.o
-rules need different handling than %.o:%.c pattern rules).
-@End Reasoning
-
-@Implementation:
-Calls three phase-internal functions in fixed order:
-validate_pattern_rule_syntax_all, check_pattern_conflicts,
-validate_suffix_rules. Each iterates the pattern_rules list at
-offset 24 and writes errors/warnings into the analyzer's diagnostic
-lists. No explicit return value.
-@End Implementation
-Process called "validate_makefile_patterns" takes analyzer as Integer:
-    Note: Validate pattern rules and implicit rules
-
-    @Reasoning:
-    Fifth phase validates pattern rule syntax, implicit rule usage,
-    suffix rules, and pattern matching semantics according to GNU Make
-    pattern rule and implicit rule specifications.
-    @End Reasoning
-
-    proc validate_pattern_rule_syntax_all from analyzer
-    proc check_pattern_conflicts from analyzer
-    proc validate_suffix_rules from analyzer
-End Process
-
-@Reasoning:
-Top-level driver for pattern-rule validation. Walks the analyzer's
-pattern_rules List and delegates each rule to validate_individual_pattern_rule
-for the per-rule "%" wildcard checks.
-@End Reasoning
-Process called "validate_pattern_rule_syntax_all" takes analyzer as Integer:
-    Note: Validate syntax of all pattern rules
-
-    Let pattern_rules be proc memory_get_int64 from Layout with analyzer, 24
-    Let rule_count be proc size from List with pattern_rules
-    Let i be 0
-
-    While i is less than rule_count:
-        Let pattern_rule be proc get from List with pattern_rules, i
-        proc validate_individual_pattern_rule with analyzer, pattern_rule
-        Set i to i plus 1
-    End While
-End Process
-
-@Reasoning:
-A Make pattern rule encodes a build template using a single `%` stem
-in the target; the same `%` is implicit-bound in prerequisites and
-expands to whatever portion of a concrete target name matched the
-literal flanks of the pattern. Three invariants must therefore hold:
-(1) the target carries exactly one `%`, (2) prerequisites carry
-patterns whose stem alignment is consistent with the target, and (3)
-the recipe references automatic variables (`$<`, `$@`, etc.) rather
-than a hardcoded filename, since the rule applies to many targets.
-@End Reasoning
-@Implementation:
-Counts `%` in target_pattern (char 37) via count_character_occurrences
-and emits an error on any count other than exactly one. Delegates
-prerequisite alignment to validate_pattern_prerequisites and recipe
-automatic-variable checks to check_automatic_variable_usage. Both
-delegations skip on null inputs because absent prerequisites and an
-empty recipe are both legal for a forward declaration.
-@End Implementation
-Process called "validate_individual_pattern_rule" takes analyzer as Integer, pattern_rule as Integer:
-    Note: Validate individual pattern rule
-
-    Let target_pattern be proc get_pattern_rule_target from pattern_rule
-    Let prerequisites be proc get_pattern_rule_prerequisites from pattern_rule
-
-    Note: Validate target pattern has exactly one %
-    Let percent_count be proc count_character_occurrences with target_pattern, 37  Note: modulo by character
-    If percent_count is not equal to 1:
-        Let error be proc string_concat from StringCore with "Pattern rule target must have exactly one %: ", target_pattern
-        proc add_makefile_validation_error with analyzer, error
-    End If
-
-    Note: Validate prerequisite patterns
-    If prerequisites is not equal to 0:
-        proc validate_pattern_prerequisites with analyzer, prerequisites, target_pattern
-    End If
-
-    Note: Check recipe uses automatic variables appropriately
-    Let recipe_commands be proc get_pattern_rule_recipe from pattern_rule
-    If recipe_commands is not equal to 0:
-        proc check_automatic_variable_usage with analyzer, recipe_commands
-    End If
-End Process
-
-Note: ===================================================================
-Note: CIRCULAR DEPENDENCY DETECTION
-Note: ===================================================================
-
-@Reasoning:
-Phase 6 entry point. Cycle detection on the dependency graph uses
-the classic three-color DFS - 'visiting' marks nodes on the current
-recursion stack, 'visited' marks completely processed subtrees. The
-outer loop iterates every target so unreachable cycles (cycles not
-reachable from the default target) are still found.
-@End Reasoning
-
-@Implementation:
-Reads the dependencies registry (offset 16) and circular_dependencies
-list (offset 88). Allocates two scratch Dicts (visited and visiting)
-that live only for the duration of this phase. Iterates every key in
-dependencies_registry: if not yet visited, calls
-detect_cycle_from_target which performs the recursive DFS marking
-visiting on entry and moving the node to visited on exit. Cycles
-are recorded into circular_dependencies and as errors on the
-analyzer's diagnostic list.
-@End Implementation
-
-@Performance_Hints:
-O(V + E) total over the dependency graph: each target is processed
-exactly once thanks to the visited check; each dependency edge is
-walked once during its target's DFS. Memory is O(V) for the visited
-and visiting scratch dicts plus O(D) for recursion depth.
-@End Performance_Hints
-Process called "detect_makefile_circular_dependencies" takes analyzer as Integer:
-    Note: Detect circular dependencies in target graph
-
-    @Reasoning:
-    Sixth phase uses depth-first search to detect circular dependencies
-    in the target dependency graph. Circular dependencies prevent proper
-    build ordering and cause Make to fail with infinite recursion.
-    @End Reasoning
-
-    Let dependencies_registry be proc memory_get_int64 from Layout with analyzer, 16
-    Let visited be proc create from Dict
-    Let visiting be proc create from Dict
-    Let circular_dependencies be proc memory_get_int64 from Layout with analyzer, 88
-
-    Let target_names be proc keys from Dict with dependencies_registry
-    Let target_count be proc size from List with target_names
-    Let i be 0
-
-    While i is less than target_count:
-        Let target_name be proc get from List with target_names, i
-        Let is_visited be proc contains from Dict with visited, target_name
-
-        If is_visited is equal to 0:
-            proc detect_cycle_from_target with analyzer, target_name, visited, visiting, circular_dependencies
-        End If
-
-        Set i to i plus 1
-    End While
-End Process
-
-@Reasoning:
-DFS visit with three-color tracking: 'visiting' marks the recursion stack
-(WHITE/GRAY in classic terms) and 'visited' marks completed subtrees (BLACK).
-A back-edge (dependency name already in 'visiting') is exactly a cycle and is
-recorded as "target -> dep" in circular_deps plus a validation error.
-On exit, the node is removed from 'visiting' and added to 'visited' so
-ancestors can complete their own DFS without re-flagging this subtree.
-@End Reasoning
-
-@Performance_Hints:
-O(V + E) total across all targets when amortized through the visited set:
-each node is processed at most once because the 'visited' check at the
-caller prevents re-entry. Memory: O(V) for the two tracking dicts plus the
-recursion stack.
-@End Performance_Hints
-Process called "detect_cycle_from_target" takes analyzer as Integer, target_name as Integer, visited as Integer, visiting as Integer, circular_deps as Integer:
-    Note: Detect cycles starting from specific target
-
-    proc set from Dict with visiting, target_name, 1
-
-    Let dependencies_registry be proc memory_get_int64 from Layout with analyzer, 16
-    Let target_deps be proc get from Dict with dependencies_registry, target_name
-
-    If target_deps is not equal to 0:
-        Let dep_count be proc size from List with target_deps
-        Let i be 0
-
-        While i is less than dep_count:
-            Let dep_name be proc get from List with target_deps, i
-            Let is_visiting be proc contains from Dict with visiting, dep_name
-
-            If is_visiting is equal to 1:
-                Note: Cycle detected
-                Let cycle_info be proc string_concat from StringCore with target_name, " -> "
-                Set cycle_info to proc string_concat from StringCore with cycle_info, dep_name
-                proc add from List with circular_deps, cycle_info
-
-                Let error be proc string_concat from StringCore with "Circular dependency detected: ", cycle_info
-                proc add_makefile_validation_error with analyzer, error
+            Let ch be proc string_char_at from StringCore with text, index
+
+            If ch is equal to open_char:
+                Set depth to depth plus 1
+                Set name to proc string_concat from StringPrimitive with name, proc char_to_string from StringCore with ch
+                Set index to index plus 1
             Otherwise:
-                Let is_visited be proc contains from Dict with visited, dep_name
-                If is_visited is equal to 0:
-                    proc detect_cycle_from_target with analyzer, dep_name, visited, visiting, circular_deps
+                If ch is equal to close_char:
+                    Set depth to depth minus 1
+                    If depth is equal to 0:
+                        Set scanning to 0
+                    Otherwise:
+                        Set name to proc string_concat from StringPrimitive with name, proc char_to_string from StringCore with ch
+                        Set index to index plus 1
+                    End If
+                Otherwise:
+                    If ch is equal to 32:
+                        Note: Space ends the function/variable name token
+                        Set scanning to 0
+                    Otherwise:
+                        Set name to proc string_concat from StringPrimitive with name, proc char_to_string from StringCore with ch
+                        Set index to index plus 1
+                    End If
                 End If
             End If
+        End If
+    End While
 
-            Set i to i plus 1
+    Return name
+End Process
+
+@Reasoning:
+Scans a value/recipe string for $(NAME), ${NAME}, and $X references and appends
+each referenced variable name to references_out. Balanced-delimiter tracking
+lets nested references such as $(dir $(SRC)) record the outer name; the inner
+reference is recorded on its own iteration because scanning continues past the
+opening delimiter. Single-character references ($X, $@) record the one-byte
+name. A function call like $(wildcard *.c) records "wildcard" as the leading
+token, which is harmless because function names are validated against the
+builtin set and never flagged. This mirrors makefile_to_hir's value parser so
+the variable universe seen by analysis matches what translation produces.
+@End Reasoning
+Process called "extract_variable_references" takes text as Integer, references_out as Integer returns Integer:
+    If text is equal to 0:
+        Return 0
+    End If
+    If references_out is equal to 0:
+        Return 0
+    End If
+
+    Let length be proc string_length from StringCore with text
+    Let index be 0
+
+    While index is less than length:
+        Let ch be proc string_char_at from StringCore with text, index
+
+        If ch is equal to 36:
+            Note: '$' begins a reference
+            Let next_index be index plus 1
+            If next_index is less than length:
+                Let next_ch be proc string_char_at from StringCore with text, next_index
+
+                If next_ch is equal to 40:
+                    Note: $( ... )
+                    Let name be proc extract_delimited_name with text, next_index plus 1, 41
+                    If proc string_length from StringCore with name is greater than 0:
+                        proc list_append from List with references_out, name
+                    End If
+                    Set index to index plus 2
+                Otherwise:
+                    If next_ch is equal to 123:
+                        Note: ${ ... }
+                        Let braced_name be proc extract_delimited_name with text, next_index plus 1, 125
+                        If proc string_length from StringCore with braced_name is greater than 0:
+                            proc list_append from List with references_out, braced_name
+                        End If
+                        Set index to index plus 2
+                    Otherwise:
+                        Note: Single-character reference $X / $@ / $<
+                        Let single be proc char_to_string from StringCore with next_ch
+                        proc list_append from List with references_out, single
+                        Set index to index plus 2
+                    End If
+                End If
+            Otherwise:
+                Note: Trailing lone '$'
+                Set index to index plus 1
+            End If
+        Otherwise:
+            Set index to index plus 1
+        End If
+    End While
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: PHASE 1: DECLARATION COLLECTION
+Note: ============================================================================
+
+@Reasoning:
+Records each target name from a rule's target list. When the target is ".PHONY"
+its prerequisite list names targets that the user has declared phony; those
+prerequisite names are added to the phony list (not the target list) because
+they describe other rules rather than introducing a buildable target. All other
+targets (including ordinary special targets like .SUFFIXES) record their names
+in the target list so prerequisite resolution can find them.
+@End Reasoning
+Process called "collect_target_rule" takes analyzer as Integer, target_rule as Integer returns Integer:
+    Let targets_list be proc memory_get_integer from Memory with target_rule, 8
+    If targets_list is equal to 0:
+        Return 0
+    End If
+
+    Let target_count be proc list_length from List with targets_list
+    If target_count is equal to 0:
+        Return 0
+    End If
+
+    Let first_target be proc list_get from List with targets_list, 0
+    Let is_phony_directive be 0
+    If first_target is not equal to 0:
+        Set is_phony_directive to proc string_equals from StringCore with first_target, ".PHONY"
+    End If
+
+    If is_phony_directive is equal to 1:
+        Note: Prerequisites of .PHONY are the phony target names
+        Let phony_list be proc memory_get_integer from Memory with analyzer, 16
+        Let prereqs be proc memory_get_integer from Memory with target_rule, 16
+        If prereqs is not equal to 0:
+            Let prereq_count be proc list_length from List with prereqs
+            Let p_index be 0
+            While p_index is less than prereq_count:
+                Let phony_name be proc list_get from List with prereqs, p_index
+                If phony_name is not equal to 0:
+                    proc list_append from List with phony_list, phony_name
+                End If
+                Set p_index to p_index plus 1
+            End While
+        End If
+        Return 1
+    End If
+
+    Note: Ordinary rule: record every target name
+    Let target_list be proc memory_get_integer from Memory with analyzer, 0
+    Let index be 0
+    While index is less than target_count:
+        Let target_name be proc list_get from List with targets_list, index
+        If target_name is not equal to 0:
+            proc list_append from List with target_list, target_name
+        End If
+        Set index to index plus 1
+    End While
+
+    Return 1
+End Process
+
+@Reasoning:
+Dispatches a single statement to the appropriate collector based on its NODE_*
+kind. Target rules contribute target names (and, when the rule is .PHONY, the
+prerequisites become phony entries); assignments and define blocks contribute
+variable names; conditionals recurse into both branches.
+@End Reasoning
+Process called "collect_statement" takes analyzer as Integer, stmt as Integer returns Integer:
+    Let kind be proc node_kind_of with stmt
+    If kind is equal to 0:
+        Return 0
+    End If
+
+    If kind is equal to NODE_TARGET_RULE:
+        proc collect_target_rule with analyzer, stmt
+        Return 1
+    End If
+
+    If kind is equal to NODE_SPECIAL_TARGET:
+        proc collect_target_rule with analyzer, stmt
+        Return 1
+    End If
+
+    If kind is equal to NODE_VARIABLE_ASSIGNMENT:
+        Let var_name be proc memory_get_pointer from Memory with stmt, 8
+        If var_name is not equal to 0:
+            Let var_list be proc memory_get_integer from Memory with analyzer, 8
+            proc list_append from List with var_list, var_name
+        End If
+        Return 1
+    End If
+
+    If kind is equal to NODE_DEFINE_BLOCK:
+        Let define_name be proc memory_get_pointer from Memory with stmt, 8
+        If define_name is not equal to 0:
+            Let define_list be proc memory_get_integer from Memory with analyzer, 8
+            proc list_append from List with define_list, define_name
+        End If
+        Return 1
+    End If
+
+    If kind is equal to NODE_CONDITIONAL:
+        Let then_list be proc memory_get_integer from Memory with stmt, 32
+        proc collect_makefile_declarations with analyzer, then_list
+        Let else_list be proc memory_get_integer from Memory with stmt, 40
+        If else_list is not equal to 0:
+            proc collect_makefile_declarations with analyzer, else_list
+        End If
+        Return 1
+    End If
+
+    Return 1
+End Process
+
+@Reasoning:
+Walks the top-level statement list once and records every declared target,
+variable, and .PHONY entry into the analyzer's collection lists. Conditionals
+are descended into (both branches) so names defined inside ifeq/ifdef blocks are
+visible to phase-2 validation. This pass performs no validation; it only builds
+the symbol universe.
+@End Reasoning
+Process called "collect_makefile_declarations" takes analyzer as Integer, statements_list as Integer returns Integer:
+    If statements_list is equal to 0:
+        Return 0
+    End If
+
+    Let count be proc list_length from List with statements_list
+    Let index be 0
+    While index is less than count:
+        Let stmt be proc list_get from List with statements_list, index
+        proc collect_statement with analyzer, stmt
+        Set index to index plus 1
+    End While
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: PHASE 2: VALIDATION
+Note: ============================================================================
+
+@Reasoning:
+Extracts every variable reference from a value/command/operand string and warns
+on any name that is neither defined in the makefile nor a built-in make
+variable. A null or empty value short-circuits. The temporary reference list is
+created per call so references from one value never leak into another.
+@End Reasoning
+Process called "validate_value_references" takes analyzer as Integer, value as Integer returns Integer:
+    If value is equal to 0:
+        Return 0
+    End If
+
+    Let value_len be proc string_length from StringCore with value
+    If value_len is equal to 0:
+        Return 0
+    End If
+
+    Let references be proc list_create from List
+    proc extract_variable_references with value, references
+
+    Let variable_list be proc memory_get_integer from Memory with analyzer, 8
+
+    Let ref_count be proc list_length from List with references
+    Let index be 0
+    While index is less than ref_count:
+        Let ref_name be proc list_get from List with references, index
+        If ref_name is not equal to 0:
+            Let is_defined be proc string_list_contains with variable_list, ref_name
+            If is_defined is equal to 0:
+                Let is_builtin be proc is_builtin_make_variable with ref_name
+                If is_builtin is equal to 0:
+                    Let msg be proc string_concat from StringPrimitive with "Reference to undefined variable '", ref_name
+                    Set msg to proc string_concat from StringPrimitive with msg, "'"
+                    proc add_makefile_validation_warning with analyzer, msg
+                End If
+            End If
+        End If
+        Set index to index plus 1
+    End While
+
+    Return 1
+End Process
+
+@Reasoning:
+Resolves one prerequisite name. It is satisfied when it names a known target
+(an explicit rule) or has the shape of a source file (contains a '.' extension
+or a '/' path separator, which make builds via implicit/pattern rules). A bare
+name that is neither a known target nor file-shaped is recorded on the
+undefined-targets list and warned, because make would fail with "No rule to
+make target" at build time. Names containing '$' are skipped because they are
+variable references resolved at expansion time, not literal prerequisites.
+@End Reasoning
+Process called "validate_prerequisite" takes analyzer as Integer, prereq as Integer returns Integer:
+    If prereq is equal to 0:
+        Return 0
+    End If
+
+    Let prereq_len be proc string_length from StringCore with prereq
+    If prereq_len is equal to 0:
+        Return 0
+    End If
+
+    Note: Skip variable-reference prerequisites; resolved at expansion time
+    Let has_dollar be proc contains_char with prereq, 36
+    If has_dollar is equal to 1:
+        Return 1
+    End If
+
+    Let target_list be proc memory_get_integer from Memory with analyzer, 0
+    Let is_known_target be proc string_list_contains with target_list, prereq
+    If is_known_target is equal to 1:
+        Return 1
+    End If
+
+    Note: File-shaped prerequisites are buildable via implicit rules
+    Let has_dot be proc contains_char with prereq, 46
+    If has_dot is equal to 1:
+        Return 1
+    End If
+    Let has_slash be proc contains_char with prereq, 47
+    If has_slash is equal to 1:
+        Return 1
+    End If
+
+    Note: Unresolved: neither a known target nor file-shaped
+    Let undefined_list be proc memory_get_integer from Memory with analyzer, 40
+    Let already_recorded be proc string_list_contains with undefined_list, prereq
+    If already_recorded is equal to 0:
+        proc list_append from List with undefined_list, prereq
+        Let msg be proc string_concat from StringPrimitive with "Prerequisite '", prereq
+        Set msg to proc string_concat from StringPrimitive with msg, "' names no known target and is not a file"
+        proc add_makefile_validation_warning with analyzer, msg
+    End If
+
+    Return 1
+End Process
+
+@Reasoning:
+Validates one recipe line. A recipe whose command is empty (after the tab) is a
+warning because make treats a blank recipe line as a no-op that usually signals
+a copy/paste error. The command's $(VAR) references are validated against the
+variable universe. The silent (@) and ignore-errors (-) flags need no check;
+they are always syntactically valid prefixes.
+@End Reasoning
+Process called "validate_recipe_line" takes analyzer as Integer, recipe as Integer returns Integer:
+    If recipe is equal to 0:
+        Return 0
+    End If
+
+    Let command be proc memory_get_pointer from Memory with recipe, 8
+    If command is equal to 0:
+        proc add_makefile_validation_warning with analyzer, "Empty recipe line"
+        Return 1
+    End If
+
+    Let command_len be proc string_length from StringCore with command
+    If command_len is equal to 0:
+        proc add_makefile_validation_warning with analyzer, "Empty recipe line"
+        Return 1
+    End If
+
+    proc validate_value_references with analyzer, command
+    Return 1
+End Process
+
+@Reasoning:
+Validates one target rule. The checks: (1) prerequisite resolution — each
+non-pattern prerequisite must name a known target or a plausible source file,
+otherwise it is recorded as an unresolved reference and warned; (2) recipe
+validity for each recipe line; (3) an empty single-colon, non-pattern target
+with neither prerequisites nor a recipe is warned because it is almost always a
+mistake. .PHONY directive lines are skipped here and validated by
+validate_phony_targets.
+@End Reasoning
+Process called "validate_target_rule" takes analyzer as Integer, target_rule as Integer returns Integer:
+    Let targets_list be proc memory_get_integer from Memory with target_rule, 8
+    If targets_list is equal to 0:
+        Return 0
+    End If
+
+    Let first_target be proc list_get from List with targets_list, 0
+    Let is_phony_directive be 0
+    If first_target is not equal to 0:
+        Set is_phony_directive to proc string_equals from StringCore with first_target, ".PHONY"
+    End If
+
+    If is_phony_directive is equal to 1:
+        Return 1
+    End If
+
+    Let is_pattern be proc memory_get_integer from Memory with target_rule, 40
+    Let is_double_colon be proc memory_get_integer from Memory with target_rule, 48
+
+    Note: Prerequisite resolution (skip for pattern rules whose prereqs use %)
+    If is_pattern is equal to 0:
+        Let prereqs be proc memory_get_integer from Memory with target_rule, 16
+        If prereqs is not equal to 0:
+            Let prereq_count be proc list_length from List with prereqs
+            Let p_index be 0
+            While p_index is less than prereq_count:
+                Let prereq be proc list_get from List with prereqs, p_index
+                proc validate_prerequisite with analyzer, prereq
+                Set p_index to p_index plus 1
+            End While
+        End If
+    End If
+
+    Note: Recipe-line validity
+    Let recipes_list be proc memory_get_integer from Memory with target_rule, 32
+    If recipes_list is not equal to 0:
+        Let recipe_count be proc list_length from List with recipes_list
+        Let r_index be 0
+        While r_index is less than recipe_count:
+            Let recipe be proc list_get from List with recipes_list, r_index
+            proc validate_recipe_line with analyzer, recipe
+            Set r_index to r_index plus 1
         End While
     End If
 
-    proc remove from Dict with visiting, target_name
-    proc set from Dict with visited, target_name, 1
-End Process
-
-Note: ===================================================================
-Note: UTILITY FUNCTIONS
-Note: ===================================================================
-
-@Reasoning:
-The undefined-variable check would generate noise on every Make-
-provided builtin if it did not have an authoritative recognition
-function. The set is two-tiered: a fixed name list for the named
-builtins (CC, CFLAGS, etc.) and a single-character check for the
-automatic variables ($@, $<, $^, $?) which use punctuation as the
-variable name. Splitting the two recognition styles keeps the lookup
-simple while covering both surfaces.
-@End Reasoning
-
-@Implementation:
-Builds an 11-entry list of named builtins (CC, CXX, CFLAGS, CXXFLAGS,
-LDFLAGS, MAKE, MAKEFILE_LIST, SHELL, PWD, USER, HOME). Iterates the
-list comparing against variable_name via StringCore.string_equals;
-any match returns 1. If no named match, reads the first character of
-variable_name and returns 1 for '@' (64), '<' (60), '^' (94), or '?'
-(63). All other names return 0. Building the list each call is a
-deliberate trade against keeping a module-level static dict because
-this function is on the cold path and the list construction is
-cheaper than the alternative module-init bookkeeping.
-@End Implementation
-Process called "is_builtin_make_variable" takes variable_name as Integer returns Integer:
-    Note: Check if variable is a built-in Make variable
-
-    @Reasoning:
-    GNU Make provides numerous built-in variables like CC, CFLAGS, MAKE,
-    MAKEFILE_LIST, etc. These don't need to be explicitly defined and
-    should not be flagged as undefined variables.
-    @End Reasoning
-
-    Note: Check common built-in variables
-    Let builtin_vars be proc create from List
-    proc add from List with builtin_vars, "CC"
-    proc add from List with builtin_vars, "CXX"
-    proc add from List with builtin_vars, "CFLAGS"
-    proc add from List with builtin_vars, "CXXFLAGS"
-    proc add from List with builtin_vars, "LDFLAGS"
-    proc add from List with builtin_vars, "MAKE"
-    proc add from List with builtin_vars, "MAKEFILE_LIST"
-    proc add from List with builtin_vars, "SHELL"
-    proc add from List with builtin_vars, "PWD"
-    proc add from List with builtin_vars, "USER"
-    proc add from List with builtin_vars, "HOME"
-
-    Let var_count be proc size from List with builtin_vars
-    Let i be 0
-
-    While i is less than var_count:
-        Let builtin_var be proc get from List with builtin_vars, i
-        Let matches be proc string_equals from StringCore with variable_name, builtin_var
-        If matches is equal to 1:
-            Return 1
+    Note: Empty single-colon, non-pattern target with no prereqs and no recipe
+    If is_pattern is equal to 0:
+        If is_double_colon is equal to 0:
+            Let prereqs_check be proc memory_get_integer from Memory with target_rule, 16
+            Let recipes_check be proc memory_get_integer from Memory with target_rule, 32
+            Let prereq_n be 0
+            If prereqs_check is not equal to 0:
+                Set prereq_n to proc list_length from List with prereqs_check
+            End If
+            Let recipe_n be 0
+            If recipes_check is not equal to 0:
+                Set recipe_n to proc list_length from List with recipes_check
+            End If
+            If prereq_n is equal to 0:
+                If recipe_n is equal to 0:
+                    If first_target is not equal to 0:
+                        Let empty_msg be proc string_concat from StringPrimitive with "Target '", first_target
+                        Set empty_msg to proc string_concat from StringPrimitive with empty_msg, "' has no prerequisites and no recipe"
+                        proc add_makefile_validation_warning with analyzer, empty_msg
+                    End If
+                End If
+            End If
         End If
-        Set i to i plus 1
-    End While
-
-    Note: Check automatic variables ($@, $<, $^, $?, etc.)
-    Let first_char be proc string_char_at from StringCore with variable_name, 0
-    If first_char is equal to 64:  Note: @ character
-        Return 1
-    End If
-    If first_char is equal to 60:  Note: is less than character
-        Return 1
-    End If
-    If first_char is equal to 94:  Note: bitwise xor character
-        Return 1
-    End If
-    If first_char is equal to 63:  Note: ? character
-        Return 1
     End If
 
-    Return 0
+    Return 1
 End Process
 
 @Reasoning:
-Make accepts three variable-reference syntaxes: `$(VAR)`, `${VAR}`,
-and the single-character form `$X` where X is any character. The
-parser must pick the right closing delimiter for the bracketed forms
-and the right one-character extract for the bare form. Returning 0
-for malformed references (unclosed bracket, end-of-text right after
-the $) lets the caller skip past the offending character without
-hard-erroring.
+Dispatches a statement to the matching validator. Target rules check
+prerequisite resolution and recipe validity; assignments and define blocks
+check their value for undefined-variable references; conditionals validate both
+branches and their operand expressions. Include / export statements need no
+per-statement check beyond what phase 1 collected.
 @End Reasoning
-
-@Implementation:
-Reads the text length. Returns 0 if there is no character after the
-dollar (start_pos + 1 >= length). Reads the character at start_pos+1:
-- 40 ('('): finds the matching ')' via string_find_from starting at
-  start_pos+2; if found, returns the substring between the brackets.
-- 123 ('{'): same logic with '}' as the closer.
-- otherwise: treats it as a single-character variable reference and
-  returns that character as a 1-byte string via char_to_string.
-Returns 0 if a bracketed form has no closing bracket within the
-remaining text.
-@End Implementation
-Process called "parse_variable_reference" takes text as Integer, start_pos as Integer returns Integer:
-    Note: Parse variable reference from text starting at position
-
-    @Reasoning:
-    Parse Make variable references in forms $(VAR), ${VAR}, and $VAR.
-    Handle nested variable references and return the variable name
-    for validation against defined variables.
-    @End Reasoning
-
-    Let length be proc string_length from StringCore with text
-    If start_pos plus 1 is greater than or equal to length:
+Process called "validate_statement" takes analyzer as Integer, stmt as Integer returns Integer:
+    Let kind be proc node_kind_of with stmt
+    If kind is equal to 0:
         Return 0
     End If
 
-    Let next_char be proc string_char_at from StringCore with text, start_pos plus 1
+    If kind is equal to NODE_TARGET_RULE:
+        proc validate_target_rule with analyzer, stmt
+        Return 1
+    End If
 
-    If next_char is equal to 40:  Note: Opening parenthesis $(VAR)
-        Let end_pos be proc string_find_from from StringCore with text, ")", start_pos plus 2
-        If end_pos is not equal to -1:
-            Return proc string_substring from StringCore with text, start_pos plus 2, end_pos minus start_pos minus 2
+    If kind is equal to NODE_SPECIAL_TARGET:
+        proc validate_target_rule with analyzer, stmt
+        Return 1
+    End If
+
+    If kind is equal to NODE_VARIABLE_ASSIGNMENT:
+        Let value be proc memory_get_pointer from Memory with stmt, 24
+        proc validate_value_references with analyzer, value
+        Return 1
+    End If
+
+    If kind is equal to NODE_DEFINE_BLOCK:
+        Let content be proc memory_get_pointer from Memory with stmt, 16
+        proc validate_value_references with analyzer, content
+        Return 1
+    End If
+
+    If kind is equal to NODE_CONDITIONAL:
+        Let operand1 be proc memory_get_pointer from Memory with stmt, 16
+        proc validate_value_references with analyzer, operand1
+        Let operand2 be proc memory_get_pointer from Memory with stmt, 24
+        proc validate_value_references with analyzer, operand2
+
+        Let then_list be proc memory_get_integer from Memory with stmt, 32
+        proc validate_makefile_statements with analyzer, then_list
+        Let else_list be proc memory_get_integer from Memory with stmt, 40
+        If else_list is not equal to 0:
+            proc validate_makefile_statements with analyzer, else_list
         End If
+        Return 1
     End If
 
-    If next_char is equal to 123:  Note: Opening brace ${VAR}
-        Set end_pos to proc string_find_from from StringCore with text, "}", start_pos plus 2
-        If end_pos is not equal to -1:
-            Return proc string_substring from StringCore with text, start_pos plus 2, end_pos minus start_pos minus 2
-        End If
-    End If
-
-    Note: Single character variable $X
-    If start_pos plus 1 is less than length:
-        Let var_char be proc char_to_string from StringCore with next_char
-        Return var_char
-    End If
-
-    Return 0
+    Return 1
 End Process
 
 @Reasoning:
-Single-pass count of how many times a given byte appears in a string. Used
-by pattern-rule validation to enforce "exactly one %" in pattern targets.
-Returns 0 for empty strings without error.
+Re-walks the top-level statement list and validates each statement against the
+symbol universe built in phase 1. Conditionals recurse into both branches so
+statements inside conditional blocks are validated identically to top-level
+ones.
 @End Reasoning
-Process called "count_character_occurrences" takes text as Integer, target_char as Integer returns Integer:
-    Note: Count occurrences of character in text
+Process called "validate_makefile_statements" takes analyzer as Integer, statements_list as Integer returns Integer:
+    If statements_list is equal to 0:
+        Return 0
+    End If
 
-    Let count be 0
-    Let length be proc string_length from StringCore with text
-    Let i be 0
-
-    While i is less than length:
-        Let char be proc string_char_at from StringCore with text, i
-        If char is equal to target_char:
-            Set count to count plus 1
-        End If
-        Set i to i plus 1
+    Let count be proc list_length from List with statements_list
+    Let index be 0
+    While index is less than count:
+        Let stmt be proc list_get from List with statements_list, index
+        proc validate_statement with analyzer, stmt
+        Set index to index plus 1
     End While
 
-    Return count
-End Process
-
-Note: ===================================================================
-Note: ERROR HANDLING
-Note: ===================================================================
-
-@Reasoning:
-Records a fatal semantic error in the analyzer's error_message slot and
-sets has_error to 1. Distinct from add_makefile_validation_error: this is
-for analyzer-internal failures (e.g. memory allocation errors), while
-validation errors collect user-visible Makefile defects.
-@End Reasoning
-Process called "set_makefile_semantic_error" takes analyzer as Integer, error_message as Integer:
-    Note: Set semantic analysis error
-
-    proc memory_set_int64 from Layout with analyzer, 128, error_message
-    proc memory_set_int64 from Layout with analyzer, 136, 1
+    Return 1
 End Process
 
 @Reasoning:
-Appends a user-visible validation error (e.g. undefined target, circular
-dependency, bad pattern rule) to the analyzer's validation_errors list.
-Multiple errors accumulate; the caller queries them via
-makefile_semantic_get_errors after analysis completes.
+Validates the .PHONY directive contents collected in phase 1: each name listed
+under .PHONY should correspond to a target that actually has a rule, otherwise
+the .PHONY entry is dead (it marks a non-existent target as phony). A missing
+target for a phony name is a warning, not an error, because a .PHONY entry for a
+not-yet-written target is a legitimate (if premature) pattern.
 @End Reasoning
-Process called "add_makefile_validation_error" takes analyzer as Integer, error_message as Integer:
-    Note: Add validation error to error list
+Process called "validate_phony_targets" takes analyzer as Integer returns Integer:
+    Let phony_list be proc memory_get_integer from Memory with analyzer, 16
+    If phony_list is equal to 0:
+        Return 0
+    End If
 
-    Let errors be proc memory_get_int64 from Layout with analyzer, 112
-    proc add from List with errors, error_message
+    Let target_list be proc memory_get_integer from Memory with analyzer, 0
+
+    Let count be proc list_length from List with phony_list
+    Let index be 0
+    While index is less than count:
+        Let phony_name be proc list_get from List with phony_list, index
+        If phony_name is not equal to 0:
+            Let has_target be proc string_list_contains with target_list, phony_name
+            If has_target is equal to 0:
+                Let msg be proc string_concat from StringPrimitive with ".PHONY names target '", phony_name
+                Set msg to proc string_concat from StringPrimitive with msg, "' which has no rule"
+                proc add_makefile_validation_warning with analyzer, msg
+            End If
+        End If
+        Set index to index plus 1
+    End While
+
+    Return 1
 End Process
+
+Note: ============================================================================
+Note: TOP-LEVEL ANALYSIS DRIVER
+Note: ============================================================================
 
 @Reasoning:
-Appends a non-fatal warning (e.g. unused variable, undefined-but-builtin
-variable reference, unreadable include file) to validation_warnings. Warnings
-do not affect has_error or analysis success; they are advisory only.
+Runs the full two-phase analysis on a parsed makefile AST using a pre-created
+analyzer. Phase 1 collects every declaration; phase 2 validates references and
+.PHONY consistency. Returns 1 when analysis completed with zero errors, 0 when
+the AST is missing/ill-formed or any error was recorded. The makefile_ast is
+the NODE_MAKEFILE root whose statement list lives at offset 8.
 @End Reasoning
-Process called "add_makefile_validation_warning" takes analyzer as Integer, warning_message as Integer:
-    Note: Add validation warning to warning list
+Process called "analyze_makefile" takes analyzer as Integer, makefile_ast as Integer returns Integer:
+    If analyzer is equal to 0:
+        Return 0
+    End If
+    If makefile_ast is equal to 0:
+        proc add_makefile_validation_error with analyzer, "Null makefile AST"
+        Return 0
+    End If
 
-    Let warnings be proc memory_get_int64 from Layout with analyzer, 120
-    proc add from List with warnings, warning_message
+    Let kind be proc node_kind_of with makefile_ast
+    If kind is not equal to NODE_MAKEFILE:
+        proc add_makefile_validation_error with analyzer, "AST root is not a makefile node"
+        Return 0
+    End If
+
+    Let statements_list be proc memory_get_integer from Memory with makefile_ast, 8
+
+    Note: Phase 1: collect declarations
+    proc collect_makefile_declarations with analyzer, statements_list
+
+    Note: Phase 2: validate references, recipes, and .PHONY consistency
+    proc validate_makefile_statements with analyzer, statements_list
+    proc validate_phony_targets with analyzer
+
+    Let error_list be proc memory_get_integer from Memory with analyzer, 24
+    Let error_count be proc list_length from List with error_list
+    If error_count is greater than 0:
+        Return 0
+    End If
+
+    Return 1
 End Process
 
-Note: ===================================================================
+Note: ============================================================================
 Note: PUBLIC API
-Note: ===================================================================
+Note: ============================================================================
 
 @Reasoning:
-Public one-shot entry point: constructs an analyzer, runs the full analysis
-pipeline (collection -> resolution -> validation -> cycle detection) against
-the provided AST, and returns the populated analyzer for the caller to query
-via the accessor procs below. Analyzer allocation failure returns 0.
+One-shot convenience entry: creates an analyzer, runs the full analysis, and
+returns the analyzer pointer so the caller can read errors/warnings via the
+accessors below. Returns 0 only on allocation failure; a makefile with errors
+still returns a valid analyzer carrying the diagnostics.
 @End Reasoning
 Process called "makefile_semantic_analyze" takes makefile_ast as Integer returns Integer:
-    Note: Perform semantic analysis on Makefile AST
-
     Let analyzer be proc create_makefile_semantic_analyzer
     If analyzer is equal to 0:
         Return 0
     End If
-
-    Let result be proc analyze_makefile with analyzer, makefile_ast
+    proc analyze_makefile with analyzer, makefile_ast
     Return analyzer
 End Process
 
 @Reasoning:
-Accessor for the validation_errors list at offset 112. Null analyzer returns
-0 so callers can chain after a potentially-failed analyze call without an
-explicit null check.
+Returns the accumulated error list (offset 24) for the driver / IDE.
 @End Reasoning
 Process called "makefile_semantic_get_errors" takes analyzer as Integer returns Integer:
-    Note: Get validation errors from semantic analysis
-
     If analyzer is equal to 0:
         Return 0
     End If
-
-    Return proc memory_get_int64 from Layout with analyzer, 112
+    Return proc memory_get_integer from Memory with analyzer, 24
 End Process
 
 @Reasoning:
-Accessor for the validation_warnings list at offset 120. Null-safe like the
-errors accessor.
+Returns the accumulated warning list (offset 32) for the driver / IDE.
 @End Reasoning
 Process called "makefile_semantic_get_warnings" takes analyzer as Integer returns Integer:
-    Note: Get validation warnings from semantic analysis
-
     If analyzer is equal to 0:
         Return 0
     End If
-
-    Return proc memory_get_int64 from Layout with analyzer, 120
+    Return proc memory_get_integer from Memory with analyzer, 32
 End Process
 
 @Reasoning:
-Accessor for the circular_dependencies list at offset 88 — each entry is a
-"target -> dependency" string produced by the DFS cycle detector. Null-safe.
-@End Reasoning
-Process called "makefile_semantic_get_circular_dependencies" takes analyzer as Integer returns Integer:
-    Note: Get circular dependencies found during analysis
-
-    If analyzer is equal to 0:
-        Return 0
-    End If
-
-    Return proc memory_get_int64 from Layout with analyzer, 88
-End Process
-
-@Reasoning:
-Accessor for the undefined_targets list at offset 96 — names referenced as
-prerequisites that have no matching target rule and no implicit-rule match.
-Null-safe.
+Returns the list of unresolved prerequisite names (offset 40) so tooling can
+report "No rule to make target" candidates ahead of an actual build.
 @End Reasoning
 Process called "makefile_semantic_get_undefined_targets" takes analyzer as Integer returns Integer:
-    Note: Get undefined targets found during analysis
-
     If analyzer is equal to 0:
         Return 0
     End If
-
-    Return proc memory_get_int64 from Layout with analyzer, 96
+    Return proc memory_get_integer from Memory with analyzer, 40
 End Process
 
 @Reasoning:
-Returns the count of validation errors (or 1 for a null analyzer, which is
-itself a failure state). Callers typically treat any non-zero value as a
-build-blocking failure.
+Boolean wrapper over the error list so callers expressing "did analysis fail?"
+do not need to compare a count. Returns 1 when any error was recorded, 0
+otherwise.
 @End Reasoning
 Process called "makefile_semantic_has_errors" takes analyzer as Integer returns Integer:
-    Note: Check if semantic analysis found any errors
-
     If analyzer is equal to 0:
         Return 1
     End If
+    Let error_list be proc memory_get_integer from Memory with analyzer, 24
+    Let count be proc list_length from List with error_list
+    If count is greater than 0:
+        Return 1
+    End If
+    Return 0
+End Process
 
-    Let errors be proc memory_get_int64 from Layout with analyzer, 112
-    Let error_count be proc size from List with errors
-    Return error_count
+@Reasoning:
+Returns the count of warnings recorded, for summary reporting.
+@End Reasoning
+Process called "makefile_semantic_warning_count" takes analyzer as Integer returns Integer:
+    If analyzer is equal to 0:
+        Return 0
+    End If
+    Let warning_list be proc memory_get_integer from Memory with analyzer, 32
+    Return proc list_length from List with warning_list
 End Process
