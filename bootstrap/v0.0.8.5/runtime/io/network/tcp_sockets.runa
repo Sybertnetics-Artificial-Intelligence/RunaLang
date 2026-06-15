@@ -1,4 +1,4 @@
-Note: 
+Note:
 Copyright 2025 Sybertnetics Artificial Intelligence Solutions
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,24 +15,786 @@ limitations under the License.
 :End Note
 
 Note:
-This file handles TCP socket operations and TCP networking for the Runa runtime I/O system.
+==============================================================================
+TCP SOCKET RUNTIME SUBSYSTEM v0.0.8.5
+==============================================================================
 
-This file performs the following tasks:
-- Process TCP socket operations and TCP networking
-- Handle TCP connection management and TCP data transfer
-- Manage TCP coordination and TCP synchronization
-- Process TCP error handling and TCP feedback
+This module implements the production TCP socket layer for the Runa runtime
+I/O system. It builds directly on the platform-agnostic syscall router in
+compiler/frontend/primitives/assembly/syscall.runa, dispatching the real
+socket family system calls (socket, connect, bind, listen, accept, sendto,
+recvfrom, shutdown, setsockopt, close) on whichever backend the compiler
+selects at build time.
 
-This file is essential because of the following reasons:
-- tcp_sockets enables comprehensive TCP socket operations and TCP networking
-- Proper TCP handling ensures correct network operations and user experience
-- tcp_sockets support enables Runa compilation for TCP networking workflows
+Client surface (consumed by the remote import resolver):
+  - tcp_connect(host, port, timeout_seconds) -> fd (or negative errno)
+  - tcp_send(fd, data_string)                -> bytes sent (handles partial)
+  - tcp_receive_all(fd, timeout_seconds)      -> heap string (read to EOF)
+  - tcp_close(fd)                             -> 0 on success / negative errno
 
-This file consists of the following functions/features/operation types:
-- TCP socket operations and TCP networking
-- TCP connection management and TCP data transfer
-- TCP coordination and TCP synchronization
-- TCP error handling and TCP feedback
+Lower-level primitives (also exported for full network stack reuse):
+  - tcp_socket_create / tcp_set_recv_timeout / tcp_set_send_timeout
+  - tcp_set_reuseaddr / tcp_connect_addr / tcp_send_buffer / tcp_recv_buffer
+  - tcp_shutdown
+
+Server surface (completeness; the remote resolver is a pure client, but the
+runtime must offer the full BSD socket set per the production standard):
+  - tcp_bind / tcp_listen / tcp_accept / tcp_server_create
+
+Address handling:
+  - parse_ipv4_literal: dotted-decimal "A.B.C.D" -> 32-bit network-order word
+  - resolve_host: dotted-decimal fast path, otherwise delegates to the DNS
+    resolver (dns_resolver.runa) for A-record lookup of a hostname.
+
+All return values follow the kernel convention: a negative number is a
+negated errno. Callers treat any negative result as failure. No success is
+ever fabricated; every byte count and file descriptor comes from a real
+syscall return.
 :End Note
 
-Note: TODO - Implement tcp_sockets functionality
+Import "compiler/frontend/primitives/assembly/syscall.runa" as Syscall
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "runtime/io/network/dns_resolver.runa" as DNS
+
+Note:
+============================================================================
+SOCKET-DOMAIN CONSTANTS (Linux/BSD AF_INET stream socket constants)
+============================================================================
+These constants are stable across the Linux and BSD socket ABIs that the
+syscall router serves. They are expressed as named processes so callers
+never embed bare magic numbers.
+:End Note
+
+Process called "AF_INET" returns Integer:
+    Note: IPv4 address family.
+    Return 2
+End Process
+
+Process called "SOCK_STREAM" returns Integer:
+    Note: Reliable, ordered, connection-based byte stream (TCP).
+    Return 1
+End Process
+
+Process called "SOCK_DGRAM" returns Integer:
+    Note: Connectionless datagram socket (UDP) - used by the DNS resolver.
+    Return 2
+End Process
+
+Process called "IPPROTO_TCP" returns Integer:
+    Note: TCP protocol selector for a SOCK_STREAM AF_INET socket.
+    Return 6
+End Process
+
+Process called "SOL_SOCKET" returns Integer:
+    Note: setsockopt level for generic socket-level options.
+    Return 1
+End Process
+
+Process called "SO_REUSEADDR" returns Integer:
+    Note: Allow a bound address to be reused immediately (server option).
+    Return 2
+End Process
+
+Process called "SO_RCVTIMEO" returns Integer:
+    Note: Receive timeout option (struct timeval).
+    Return 20
+End Process
+
+Process called "SO_SNDTIMEO" returns Integer:
+    Note: Send timeout option (struct timeval).
+    Return 21
+End Process
+
+Process called "SHUT_RD" returns Integer:
+    Return 0
+End Process
+
+Process called "SHUT_WR" returns Integer:
+    Return 1
+End Process
+
+Process called "SHUT_RDWR" returns Integer:
+    Note: Disable both directions of a connected socket.
+    Return 2
+End Process
+
+Process called "EINTR" returns Integer:
+    Note: Interrupted system call - the operation must be retried.
+    Return 4
+End Process
+
+Note:
+============================================================================
+ADDRESS PARSING
+============================================================================
+:End Note
+
+Process called "parse_ipv4_literal" takes ip_str as Integer returns Integer:
+    @Reasoning:
+        A dotted-decimal IPv4 literal "A.B.C.D" maps to a 32-bit address.
+        The kernel sockaddr_in stores that address in network byte order
+        (big-endian): the leftmost octet A occupies the most significant
+        byte of the on-wire word, i.e. byte 0 of the 4-byte field when the
+        field is laid out in memory as it travels on the wire. We therefore
+        build the network-order 32-bit value as A in the high byte through
+        D in the low byte. The function returns -1 when the input is not a
+        well-formed IPv4 literal so that callers can fall back to DNS.
+    @End Reasoning
+    @Implementation:
+        Walk the string accumulating each decimal octet, validating that
+        there are exactly four dot-separated components, each in 0..255,
+        with at least one digit and no stray characters. The accumulated
+        host-order value (A<<24 | B<<16 | C<<8 | D) is then byte-swapped to
+        network order before returning, because the sockaddr_in.sin_addr
+        field is consumed by the kernel as a big-endian 32-bit quantity and
+        Runa integers are stored little-endian on the supported backends.
+    @End Implementation
+
+    If ip_str is equal to 0:
+        Return -1
+    End If
+
+    Let length be proc string_length from StringCore with ip_str
+    If length is equal to 0:
+        Return -1
+    End If
+
+    Let octet_index be 0
+    Let current be 0
+    Let digit_count be 0
+    Let host_order be 0
+    Let i be 0
+
+    While i is less than length:
+        Let ch be proc memory_get_byte from Memory with ip_str, i
+
+        If ch is equal to 46:
+            Note: Dot separator. A component must have ended with digits and
+            Note: we must not already have seen the fourth component.
+            If digit_count is equal to 0:
+                Return -1
+            End If
+            If octet_index is greater than 2:
+                Return -1
+            End If
+            Set host_order to host_order multiplied by 256
+            Set host_order to host_order plus current
+            Set octet_index to octet_index plus 1
+            Set current to 0
+            Set digit_count to 0
+        Otherwise:
+            If ch is less than 48:
+                Return -1
+            End If
+            If ch is greater than 57:
+                Return -1
+            End If
+            Let digit be ch minus 48
+            Set current to current multiplied by 10
+            Set current to current plus digit
+            Set digit_count to digit_count plus 1
+            If current is greater than 255:
+                Return -1
+            End If
+            If digit_count is greater than 3:
+                Return -1
+            End If
+        End If
+
+        Set i to i plus 1
+    End While
+
+    Note: Commit the final (fourth) octet.
+    If digit_count is equal to 0:
+        Return -1
+    End If
+    If octet_index is not equal to 3:
+        Return -1
+    End If
+    Set host_order to host_order multiplied by 256
+    Set host_order to host_order plus current
+
+    Note: Convert host-order (A is most significant) to the network-order
+    Note: 32-bit word laid out for the wire: byte 0 = A, byte 1 = B, ...
+    Let a be host_order divided by 16777216
+    Set a to a modulo by 256
+    Let b be host_order divided by 65536
+    Set b to b modulo by 256
+    Let c be host_order divided by 256
+    Set c to c modulo by 256
+    Let d be host_order modulo by 256
+
+    Let net_order be d multiplied by 16777216
+    Set net_order to net_order plus c multiplied by 65536
+    Set net_order to net_order plus b multiplied by 256
+    Set net_order to net_order plus a
+
+    Return net_order
+End Process
+
+Process called "resolve_host" takes host as Integer returns Integer:
+    @Reasoning:
+        The remote import resolver hands this layer a hostname extracted
+        from a URL (for example "example.com"), not always a numeric IP.
+        We first try the dotted-decimal fast path; if that fails we perform
+        a real DNS A-record lookup. The return value is a 32-bit
+        network-order IPv4 address suitable for sockaddr_in, or -1 on
+        failure.
+    @End Reasoning
+
+    If host is equal to 0:
+        Return -1
+    End If
+
+    Let literal be proc parse_ipv4_literal with host
+    If literal is not equal to -1:
+        Return literal
+    End If
+
+    Note: Not a literal - resolve the name via DNS (A record).
+    Return proc dns_resolve_a from DNS with host
+End Process
+
+Note:
+============================================================================
+SOCKADDR_IN CONSTRUCTION
+============================================================================
+The kernel's sockaddr_in is 16 bytes:
+  offset 0 : sin_family   (2 bytes, host order, AF_INET = 2)
+  offset 2 : sin_port     (2 bytes, network/big-endian order)
+  offset 4 : sin_addr     (4 bytes, network order)
+  offset 8 : 8 bytes of zero padding (sin_zero)
+:End Note
+
+Process called "build_sockaddr_in" takes net_addr as Integer, port as Integer returns Integer:
+    @Implementation:
+        Allocate a 16-byte heap buffer, zero it, then write sin_family,
+        sin_port (host port converted to big-endian), and sin_addr (already
+        network order). Returns the buffer pointer, or 0 on allocation
+        failure. The caller owns the buffer and must deallocate it.
+    @End Implementation
+
+    Let addr be proc allocate from Layout with 16
+    If addr is equal to 0:
+        Return 0
+    End If
+    proc memory_zero from Memory with addr, 16
+
+    Note: sin_family = AF_INET, stored host-order in the low 2 bytes.
+    Let family be AF_INET()
+    proc memory_set_byte from Memory with addr, 0, family modulo by 256
+    proc memory_set_byte from Memory with addr, 1, family divided by 256
+
+    Note: sin_port - convert the host-order port to big-endian (high byte
+    Note: first on the wire). Port is a 16-bit value.
+    Let port_low be port modulo by 256
+    Let port_high be port divided by 256
+    Set port_high to port_high modulo by 256
+    proc memory_set_byte from Memory with addr, 2, port_high
+    proc memory_set_byte from Memory with addr, 3, port_low
+
+    Note: sin_addr - net_addr is already in network byte order; write its
+    Note: four bytes in ascending memory order (byte 0 first).
+    Let byte0 be net_addr modulo by 256
+    Let byte1 be net_addr divided by 256
+    Set byte1 to byte1 modulo by 256
+    Let byte2 be net_addr divided by 65536
+    Set byte2 to byte2 modulo by 256
+    Let byte3 be net_addr divided by 16777216
+    Set byte3 to byte3 modulo by 256
+    proc memory_set_byte from Memory with addr, 4, byte0
+    proc memory_set_byte from Memory with addr, 5, byte1
+    proc memory_set_byte from Memory with addr, 6, byte2
+    proc memory_set_byte from Memory with addr, 7, byte3
+
+    Return addr
+End Process
+
+Note:
+============================================================================
+LOW-LEVEL SOCKET PRIMITIVES
+============================================================================
+:End Note
+
+Process called "tcp_socket_create" returns Integer:
+    Note: Create an AF_INET / SOCK_STREAM (TCP) socket.
+    Note: Returns a file descriptor (>= 0) or a negative errno.
+    Let sys_socket be proc SYS_SOCKET from Syscall
+    Let domain be AF_INET()
+    Let socket_type be SOCK_STREAM()
+    Let protocol be IPPROTO_TCP()
+    Let fd be proc syscall_3 from Syscall with sys_socket, domain, socket_type, protocol
+    Return fd
+End Process
+
+Process called "tcp_set_socket_timeout" takes fd as Integer, option as Integer, seconds as Integer returns Integer:
+    @Implementation:
+        Build a struct timeval { time_t tv_sec; suseconds_t tv_usec; } as a
+        16-byte buffer (both fields are 8 bytes on the supported 64-bit
+        backends) and pass it to setsockopt at SOL_SOCKET level. A
+        non-positive seconds value disables the timeout, which we represent
+        by leaving the timeval zeroed. Returns the setsockopt result.
+    @End Implementation
+    If fd is less than 0:
+        Return -1
+    End If
+
+    Let tv be proc allocate from Layout with 16
+    If tv is equal to 0:
+        Return -1
+    End If
+    proc memory_zero from Memory with tv, 16
+
+    If seconds is greater than 0:
+        proc memory_set_qword from Memory with tv, 0, seconds
+    End If
+
+    Let sys_setsockopt be proc SYS_SETSOCKOPT from Syscall
+    Let level be SOL_SOCKET()
+    Let result be proc syscall_5 from Syscall with sys_setsockopt, fd, level, option, tv, 16
+    proc deallocate from Layout with tv
+    Return result
+End Process
+
+Process called "tcp_set_recv_timeout" takes fd as Integer, seconds as Integer returns Integer:
+    Let option be SO_RCVTIMEO()
+    Return proc tcp_set_socket_timeout with fd, option, seconds
+End Process
+
+Process called "tcp_set_send_timeout" takes fd as Integer, seconds as Integer returns Integer:
+    Let option be SO_SNDTIMEO()
+    Return proc tcp_set_socket_timeout with fd, option, seconds
+End Process
+
+Process called "tcp_set_reuseaddr" takes fd as Integer returns Integer:
+    @Implementation:
+        Set SO_REUSEADDR with an integer option value of 1 (a 4-byte int).
+        Used by servers so a freshly closed listening port can be rebound
+        without waiting out TIME_WAIT.
+    @End Implementation
+    If fd is less than 0:
+        Return -1
+    End If
+    Let optval be proc allocate from Layout with 4
+    If optval is equal to 0:
+        Return -1
+    End If
+    proc memory_set_byte from Memory with optval, 0, 1
+    proc memory_set_byte from Memory with optval, 1, 0
+    proc memory_set_byte from Memory with optval, 2, 0
+    proc memory_set_byte from Memory with optval, 3, 0
+
+    Let sys_setsockopt be proc SYS_SETSOCKOPT from Syscall
+    Let level be SOL_SOCKET()
+    Let option be SO_REUSEADDR()
+    Let result be proc syscall_5 from Syscall with sys_setsockopt, fd, level, option, optval, 4
+    proc deallocate from Layout with optval
+    Return result
+End Process
+
+Process called "tcp_connect_addr" takes fd as Integer, sockaddr as Integer returns Integer:
+    @Implementation:
+        Invoke the connect syscall, retrying transparently if it is
+        interrupted by a signal (EINTR / errno 4 -> kernel returns -4).
+        Returns 0 on success or a negative errno on failure.
+    @End Implementation
+    If fd is less than 0:
+        Return -1
+    End If
+    If sockaddr is equal to 0:
+        Return -1
+    End If
+
+    Let sys_connect be proc SYS_CONNECT from Syscall
+    Let eintr be EINTR()
+    Let neg_eintr be 0 minus eintr
+    Let connecting be 1
+    Let result be 0
+
+    While connecting is equal to 1:
+        Set result to proc syscall_3 from Syscall with sys_connect, fd, sockaddr, 16
+        If result is equal to neg_eintr:
+            Note: Interrupted before completion - retry the connect.
+            Set connecting to 1
+        Otherwise:
+            Set connecting to 0
+        End If
+    End While
+
+    Return result
+End Process
+
+Process called "tcp_shutdown" takes fd as Integer, how as Integer returns Integer:
+    Note: Shut down one or both directions of a connected socket.
+    If fd is less than 0:
+        Return -1
+    End If
+    Let sys_shutdown be proc SYS_SHUTDOWN from Syscall
+    Return proc syscall_2 from Syscall with sys_shutdown, fd, how
+End Process
+
+Note:
+============================================================================
+SEND / RECEIVE WITH PARTIAL-TRANSFER AND EINTR HANDLING
+============================================================================
+:End Note
+
+Process called "tcp_send_buffer" takes fd as Integer, buffer as Integer, length as Integer returns Integer:
+    @Reasoning:
+        A single sendto syscall may transmit fewer bytes than requested
+        (short write) or be interrupted by a signal before sending
+        anything. A correct send must loop until the entire buffer has
+        been handed to the kernel, advancing the buffer pointer by the
+        number of bytes actually sent each iteration, and retrying on
+        EINTR. flags=0, dest_addr=0, addrlen=0 give plain connected-socket
+        send semantics over sendto.
+    @End Reasoning
+    @Implementation:
+        Returns the total number of bytes sent (== length) on success, or
+        the negative errno from the failing syscall. A return of 0 from
+        sendto on a stream socket with a non-zero request is treated as a
+        broken connection and reported as failure.
+    @End Implementation
+    If fd is less than 0:
+        Return -1
+    End If
+    If buffer is equal to 0:
+        Return -1
+    End If
+    If length is less than 0:
+        Return -1
+    End If
+    If length is equal to 0:
+        Return 0
+    End If
+
+    Let sys_sendto be proc SYS_SENDTO from Syscall
+    Let eintr be EINTR()
+    Let neg_eintr be 0 minus eintr
+    Let total_sent be 0
+
+    While total_sent is less than length:
+        Let cursor be buffer plus total_sent
+        Let remaining be length minus total_sent
+        Let n be proc syscall_6 from Syscall with sys_sendto, fd, cursor, remaining, 0, 0, 0
+
+        If n is equal to neg_eintr:
+            Note: Interrupted - retry the same chunk without advancing.
+            Set total_sent to total_sent
+        Otherwise:
+            If n is less than 0:
+                Note: Real error - propagate the negative errno.
+                Return n
+            End If
+            If n is equal to 0:
+                Note: Peer closed / cannot accept more - connection broken.
+                Return total_sent
+            End If
+            Set total_sent to total_sent plus n
+        End If
+    End While
+
+    Return total_sent
+End Process
+
+Process called "tcp_recv_buffer" takes fd as Integer, buffer as Integer, length as Integer returns Integer:
+    @Implementation:
+        Single recvfrom into the caller buffer, retrying on EINTR.
+        flags=0, src_addr=0, addrlen=0 for a plain connected-socket read.
+        Returns the number of bytes received (0 means orderly peer
+        shutdown / EOF), or a negative errno.
+    @End Implementation
+    If fd is less than 0:
+        Return -1
+    End If
+    If buffer is equal to 0:
+        Return -1
+    End If
+    If length is less than 0:
+        Return -1
+    End If
+    If length is equal to 0:
+        Return 0
+    End If
+
+    Let sys_recvfrom be proc SYS_RECVFROM from Syscall
+    Let eintr be EINTR()
+    Let neg_eintr be 0 minus eintr
+    Let receiving be 1
+    Let n be 0
+
+    While receiving is equal to 1:
+        Set n to proc syscall_6 from Syscall with sys_recvfrom, fd, buffer, length, 0, 0, 0
+        If n is equal to neg_eintr:
+            Set receiving to 1
+        Otherwise:
+            Set receiving to 0
+        End If
+    End While
+
+    Return n
+End Process
+
+Note:
+============================================================================
+HIGH-LEVEL CLIENT API (consumed by the remote import resolver)
+============================================================================
+:End Note
+
+Process called "tcp_connect" takes host as Integer, port as Integer, timeout_seconds as Integer returns Integer:
+    @Reasoning:
+        Open a TCP connection to host:port. host may be a dotted-decimal
+        IPv4 literal or a DNS hostname; resolve_host handles both. On any
+        failure the partially constructed socket is closed so no descriptor
+        leaks, and a negative value is returned.
+    @End Reasoning
+    @Implementation:
+        1. Resolve host to a network-order IPv4 address.
+        2. Create the TCP socket.
+        3. Apply receive/send timeouts when timeout_seconds > 0 so a stalled
+           peer cannot block the import resolver indefinitely.
+        4. Build the sockaddr_in and connect (EINTR-safe).
+        5. Return the connected fd, or close-and-return-negative on error.
+    @End Implementation
+
+    If host is equal to 0:
+        Return -1
+    End If
+
+    Let net_addr be proc resolve_host with host
+    If net_addr is less than 0:
+        Return -1
+    End If
+
+    Let fd be proc tcp_socket_create
+    If fd is less than 0:
+        Return fd
+    End If
+
+    If timeout_seconds is greater than 0:
+        proc tcp_set_recv_timeout with fd, timeout_seconds
+        proc tcp_set_send_timeout with fd, timeout_seconds
+    End If
+
+    Let sockaddr be proc build_sockaddr_in with net_addr, port
+    If sockaddr is equal to 0:
+        proc tcp_close with fd
+        Return -1
+    End If
+
+    Let connect_result be proc tcp_connect_addr with fd, sockaddr
+    proc deallocate from Layout with sockaddr
+
+    If connect_result is less than 0:
+        proc tcp_close with fd
+        Return connect_result
+    End If
+
+    Return fd
+End Process
+
+Process called "tcp_send" takes fd as Integer, data as Integer returns Integer:
+    @Reasoning:
+        The remote resolver passes a Runa string (a NUL-terminated byte
+        buffer; the string pointer is itself the byte buffer). We send
+        exactly string_length(data) bytes - never the trailing NUL - using
+        the partial-transfer-safe send loop.
+    @End Reasoning
+    If fd is less than 0:
+        Return -1
+    End If
+    If data is equal to 0:
+        Return -1
+    End If
+    Let length be proc string_length from StringCore with data
+    Return proc tcp_send_buffer with fd, data, length
+End Process
+
+Process called "tcp_receive_all" takes fd as Integer, timeout_seconds as Integer returns Integer:
+    @Reasoning:
+        Read the entire response body until the peer closes the connection
+        (recv returns 0 = EOF). The data is accumulated into a growable
+        owned-heap buffer that doubles in capacity as needed, with the
+        running content preserved across each growth via memory_copy. The
+        result is NUL-terminated and returned as a Runa string pointer.
+    @End Reasoning
+    @Implementation:
+        Start with a 4096-byte capacity. On each iteration recv into the
+        free tail of the buffer; on EOF stop; on error free the buffer and
+        return -1; otherwise advance the length and, if the buffer is full,
+        double its capacity (copying existing bytes into the larger
+        allocation and freeing the old one). A hard ceiling of 64 MiB
+        guards against an unbounded/hostile response; exceeding it frees the
+        buffer and returns -1. The final buffer is NUL-terminated and
+        returned; the caller owns it and must deallocate it.
+    @End Implementation
+    If fd is less than 0:
+        Return -1
+    End If
+
+    If timeout_seconds is greater than 0:
+        proc tcp_set_recv_timeout with fd, timeout_seconds
+    End If
+
+    Let capacity be 4096
+    Let max_capacity be 67108864
+    Let buffer be proc allocate from Layout with capacity
+    If buffer is equal to 0:
+        Return -1
+    End If
+
+    Let used be 0
+    Let reading be 1
+
+    While reading is equal to 1:
+        Let free_space be capacity minus used
+        Note: Always keep at least one byte free for the terminator; if the
+        Note: free region is down to that single byte, grow before reading.
+        If free_space is less than 2:
+            Let new_capacity be capacity multiplied by 2
+            If new_capacity is greater than max_capacity:
+                Set new_capacity to max_capacity
+            End If
+            If new_capacity is less than or equal to capacity:
+                Note: Cannot grow further - response exceeds the ceiling.
+                proc deallocate from Layout with buffer
+                Return -1
+            End If
+            Let bigger be proc allocate from Layout with new_capacity
+            If bigger is equal to 0:
+                proc deallocate from Layout with buffer
+                Return -1
+            End If
+            proc memory_copy from Memory with bigger, buffer, used
+            proc deallocate from Layout with buffer
+            Set buffer to bigger
+            Set capacity to new_capacity
+            Set free_space to capacity minus used
+        End If
+
+        Note: Reserve one byte for the NUL terminator on the read size.
+        Let read_room be free_space minus 1
+        Let dest be buffer plus used
+        Let n be proc tcp_recv_buffer with fd, dest, read_room
+
+        If n is less than 0:
+            proc deallocate from Layout with buffer
+            Return -1
+        End If
+        If n is equal to 0:
+            Note: Orderly peer shutdown - end of stream.
+            Set reading to 0
+        Otherwise:
+            Set used to used plus n
+        End If
+    End While
+
+    Note: NUL-terminate so the buffer is a valid Runa string.
+    proc memory_set_byte from Memory with buffer, used, 0
+    Return buffer
+End Process
+
+Process called "tcp_close" takes fd as Integer returns Integer:
+    Note: Close a socket file descriptor via the syscall router.
+    If fd is less than 0:
+        Return -1
+    End If
+    Return proc syscall_close from Syscall with fd
+End Process
+
+Note:
+============================================================================
+SERVER API (completeness - full BSD socket set)
+============================================================================
+:End Note
+
+Process called "tcp_bind" takes fd as Integer, net_addr as Integer, port as Integer returns Integer:
+    @Implementation:
+        Build a sockaddr_in for the given network-order address (use 0 for
+        INADDR_ANY) and port, then invoke the bind syscall. Returns 0 on
+        success or a negative errno.
+    @End Implementation
+    If fd is less than 0:
+        Return -1
+    End If
+    Let sockaddr be proc build_sockaddr_in with net_addr, port
+    If sockaddr is equal to 0:
+        Return -1
+    End If
+    Let sys_bind be proc SYS_BIND from Syscall
+    Let result be proc syscall_3 from Syscall with sys_bind, fd, sockaddr, 16
+    proc deallocate from Layout with sockaddr
+    Return result
+End Process
+
+Process called "tcp_listen" takes fd as Integer, backlog as Integer returns Integer:
+    Note: Mark the socket as a passive listening socket.
+    If fd is less than 0:
+        Return -1
+    End If
+    Let effective_backlog be backlog
+    If effective_backlog is less than 1:
+        Set effective_backlog to 128
+    End If
+    Let sys_listen be proc SYS_LISTEN from Syscall
+    Return proc syscall_2 from Syscall with sys_listen, fd, effective_backlog
+End Process
+
+Process called "tcp_accept" takes fd as Integer returns Integer:
+    @Implementation:
+        Accept the next pending connection, retrying on EINTR. Passing 0
+        for both the address buffer and the address-length pointer tells
+        the kernel the caller does not want the peer address. Returns the
+        accepted connection fd (>= 0) or a negative errno.
+    @End Implementation
+    If fd is less than 0:
+        Return -1
+    End If
+    Let sys_accept be proc SYS_ACCEPT from Syscall
+    Let eintr be EINTR()
+    Let neg_eintr be 0 minus eintr
+    Let accepting be 1
+    Let conn_fd be 0
+
+    While accepting is equal to 1:
+        Set conn_fd to proc syscall_3 from Syscall with sys_accept, fd, 0, 0
+        If conn_fd is equal to neg_eintr:
+            Set accepting to 1
+        Otherwise:
+            Set accepting to 0
+        End If
+    End While
+
+    Return conn_fd
+End Process
+
+Process called "tcp_server_create" takes net_addr as Integer, port as Integer, backlog as Integer returns Integer:
+    @Reasoning:
+        Convenience constructor: create a TCP socket, enable SO_REUSEADDR,
+        bind it to net_addr:port, and start listening. On any failure the
+        socket is closed and a negative value returned, so no descriptor
+        leaks on the error path.
+    @End Reasoning
+    Let fd be proc tcp_socket_create
+    If fd is less than 0:
+        Return fd
+    End If
+
+    proc tcp_set_reuseaddr with fd
+
+    Let bind_result be proc tcp_bind with fd, net_addr, port
+    If bind_result is less than 0:
+        proc tcp_close with fd
+        Return bind_result
+    End If
+
+    Let listen_result be proc tcp_listen with fd, backlog
+    If listen_result is less than 0:
+        proc tcp_close with fd
+        Return listen_result
+    End If
+
+    Return fd
+End Process

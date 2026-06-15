@@ -1,4 +1,4 @@
-Note: 
+Note:
 Copyright 2025 Sybertnetics Artificial Intelligence Solutions
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,24 +15,765 @@ limitations under the License.
 :End Note
 
 Note:
-This file handles DNS resolution and domain name resolution for the Runa runtime I/O system.
+==============================================================================
+DNS RESOLVER RUNTIME SUBSYSTEM v0.0.8.5
+==============================================================================
 
-This file performs the following tasks:
-- Process DNS resolution and domain name resolution
-- Handle DNS query processing and DNS response handling
-- Manage DNS coordination and DNS synchronization
-- Process DNS error handling and DNS feedback
+A real DNS client that resolves a hostname to an IPv4 address by issuing a
+standard DNS A-record query over UDP (RFC 1035) to the system nameserver.
 
-This file is essential because of the following reasons:
-- dns_resolver enables comprehensive DNS resolution and domain name resolution
-- Proper DNS handling ensures correct network operations and user experience
-- dns_resolver support enables Runa compilation for DNS resolution workflows
+Pipeline:
+  1. Read the first "nameserver <ip>" line from /etc/resolv.conf to learn the
+     resolver address; fall back to 127.0.0.1 if none is found.
+  2. Open an AF_INET / SOCK_DGRAM (UDP) socket and connect it to the
+     nameserver on port 53 (connect on a datagram socket fixes the default
+     peer so plain send/recv can be used).
+  3. Encode a DNS query message: a 12-byte header (transaction id,
+     recursion-desired flag, one question) followed by the QNAME (labels
+     length-prefixed), QTYPE=A (1), QCLASS=IN (1).
+  4. Send the query and read the response into a fixed 512-byte buffer (the
+     classic UDP DNS message ceiling).
+  5. Parse the answer section, skipping name fields (handling RFC 1035
+     message-compression pointers), and return the first A record's 4-byte
+     address as a 32-bit network-order word.
 
-This file consists of the following functions/features/operation types:
-- DNS resolution and domain name resolution
-- DNS query processing and DNS response handling
-- DNS coordination and DNS synchronization
-- DNS error handling and DNS feedback
+Returns a 32-bit network-order IPv4 address on success, or -1 on any
+failure (no nameserver, socket/send/recv error, malformed response, or no A
+record present). All byte counts and the returned address come from real
+syscalls and the actual wire bytes - nothing is fabricated.
+
+This module dispatches every system call through the platform-agnostic
+syscall router, so it follows the same multi-platform backend selection as
+the rest of the runtime.
 :End Note
 
-Note: TODO - Implement dns_resolver functionality
+Import "compiler/frontend/primitives/assembly/syscall.runa" as Syscall
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+
+Process called "dns_AF_INET" returns Integer:
+    Return 2
+End Process
+
+Process called "dns_SOCK_DGRAM" returns Integer:
+    Return 2
+End Process
+
+Process called "dns_IPPROTO_UDP" returns Integer:
+    Return 17
+End Process
+
+Process called "dns_PORT" returns Integer:
+    Note: Standard DNS service port.
+    Return 53
+End Process
+
+Process called "dns_EINTR" returns Integer:
+    Return 4
+End Process
+
+Note:
+============================================================================
+NAMESERVER DISCOVERY (/etc/resolv.conf)
+============================================================================
+:End Note
+
+Process called "dns_parse_ipv4_literal" takes ip_str as Integer, length as Integer returns Integer:
+    @Reasoning:
+        Parse a dotted-decimal IPv4 string of explicit length (the resolv.conf
+        token is not NUL-terminated within the larger file buffer) into a
+        32-bit network-order address. Mirrors the validation in the TCP
+        layer's parser but operates over a bounded slice. Returns -1 on a
+        malformed value.
+    @End Reasoning
+    If ip_str is equal to 0:
+        Return -1
+    End If
+    If length is less than 7:
+        Return -1
+    End If
+
+    Let octet_index be 0
+    Let current be 0
+    Let digit_count be 0
+    Let host_order be 0
+    Let i be 0
+
+    While i is less than length:
+        Let ch be proc memory_get_byte from Memory with ip_str, i
+        If ch is equal to 46:
+            If digit_count is equal to 0:
+                Return -1
+            End If
+            If octet_index is greater than 2:
+                Return -1
+            End If
+            Set host_order to host_order multiplied by 256
+            Set host_order to host_order plus current
+            Set octet_index to octet_index plus 1
+            Set current to 0
+            Set digit_count to 0
+        Otherwise:
+            If ch is less than 48:
+                Return -1
+            End If
+            If ch is greater than 57:
+                Return -1
+            End If
+            Let digit be ch minus 48
+            Set current to current multiplied by 10
+            Set current to current plus digit
+            Set digit_count to digit_count plus 1
+            If current is greater than 255:
+                Return -1
+            End If
+        End If
+        Set i to i plus 1
+    End While
+
+    If digit_count is equal to 0:
+        Return -1
+    End If
+    If octet_index is not equal to 3:
+        Return -1
+    End If
+    Set host_order to host_order multiplied by 256
+    Set host_order to host_order plus current
+
+    Let a be host_order divided by 16777216
+    Set a to a modulo by 256
+    Let b be host_order divided by 65536
+    Set b to b modulo by 256
+    Let c be host_order divided by 256
+    Set c to c modulo by 256
+    Let d be host_order modulo by 256
+
+    Let net_order be d multiplied by 16777216
+    Set net_order to net_order plus c multiplied by 65536
+    Set net_order to net_order plus b multiplied by 256
+    Set net_order to net_order plus a
+    Return net_order
+End Process
+
+Process called "dns_read_nameserver" returns Integer:
+    @Reasoning:
+        Read /etc/resolv.conf and return the network-order IPv4 address of
+        the first "nameserver" directive. If the file cannot be read or has
+        no usable nameserver line, fall back to the loopback resolver
+        127.0.0.1 (network-order word with byte0=127, byte3=1), which is the
+        conventional local-stub-resolver address.
+    @End Reasoning
+    @Implementation:
+        Open the file read-only, read up to 4096 bytes, then scan line by
+        line. For each line, skip leading spaces/tabs, check for the literal
+        token "nameserver" followed by whitespace, then skip whitespace to
+        the address token, measure the address token up to the next
+        whitespace/newline, and parse it as IPv4. The first valid one wins.
+    @End Implementation
+    Note: 127.0.0.1 network-order word: byte0=127, byte1=0, byte2=0, byte3=1.
+    Let fallback be 1 multiplied by 16777216
+    Set fallback to fallback plus 127
+
+    Let path be "/etc/resolv.conf"
+    Let o_rdonly be proc O_RDONLY from Syscall
+    Let fd be proc syscall_open from Syscall with path, o_rdonly, 0
+    If fd is less than 0:
+        Return fallback
+    End If
+
+    Let capacity be 4096
+    Let buffer be proc allocate from Layout with capacity
+    If buffer is equal to 0:
+        proc syscall_close from Syscall with fd
+        Return fallback
+    End If
+
+    Let total be 0
+    Let reading be 1
+    While reading is equal to 1:
+        Let room be capacity minus total
+        If room is less than or equal to 0:
+            Set reading to 0
+        Otherwise:
+            Let dest be buffer plus total
+            Let n be proc syscall_read from Syscall with fd, dest, room
+            If n is less than or equal to 0:
+                Set reading to 0
+            Otherwise:
+                Set total to total plus n
+            End If
+        End If
+    End While
+    proc syscall_close from Syscall with fd
+
+    Let result be fallback
+    Let found be 0
+    Let i be 0
+
+    While i is less than total:
+        Note: Skip leading whitespace on the line.
+        Let line_start be i
+        Let scanning_ws be 1
+        While scanning_ws is equal to 1:
+            If line_start is greater than or equal to total:
+                Set scanning_ws to 0
+            Otherwise:
+                Let wc be proc memory_get_byte from Memory with buffer, line_start
+                If wc is equal to 32:
+                    Set line_start to line_start plus 1
+                Otherwise:
+                    If wc is equal to 9:
+                        Set line_start to line_start plus 1
+                    Otherwise:
+                        Set scanning_ws to 0
+                    End If
+                End If
+            End If
+        End While
+
+        Note: Check for the "nameserver" keyword at line_start.
+        Let is_ns be 0
+        If found is equal to 0:
+            Let remaining be total minus line_start
+            If remaining is greater than or equal to 11:
+                Let kw be "nameserver"
+                Let match be 1
+                Let k be 0
+                While k is less than 10:
+                    Let want be proc memory_get_byte from Memory with kw, k
+                    Let got be proc memory_get_byte from Memory with buffer, line_start plus k
+                    If want is not equal to got:
+                        Set match to 0
+                        Set k to 10
+                    Otherwise:
+                        Set k to k plus 1
+                    End If
+                End While
+                If match is equal to 1:
+                    Let sep be proc memory_get_byte from Memory with buffer, line_start plus 10
+                    If sep is equal to 32:
+                        Set is_ns to 1
+                    Otherwise:
+                        If sep is equal to 9:
+                            Set is_ns to 1
+                        End If
+                    End If
+                End If
+            End If
+        End If
+
+        If is_ns is equal to 1:
+            Note: Advance past keyword and any whitespace to the address.
+            Let addr_pos be line_start plus 10
+            Let skipping be 1
+            While skipping is equal to 1:
+                If addr_pos is greater than or equal to total:
+                    Set skipping to 0
+                Otherwise:
+                    Let sc be proc memory_get_byte from Memory with buffer, addr_pos
+                    If sc is equal to 32:
+                        Set addr_pos to addr_pos plus 1
+                    Otherwise:
+                        If sc is equal to 9:
+                            Set addr_pos to addr_pos plus 1
+                        Otherwise:
+                            Set skipping to 0
+                        End If
+                    End If
+                End If
+            End While
+
+            Note: Measure the address token length.
+            Let addr_end be addr_pos
+            Let measuring be 1
+            While measuring is equal to 1:
+                If addr_end is greater than or equal to total:
+                    Set measuring to 0
+                Otherwise:
+                    Let ec be proc memory_get_byte from Memory with buffer, addr_end
+                    If ec is equal to 32:
+                        Set measuring to 0
+                    Otherwise:
+                        If ec is equal to 9:
+                            Set measuring to 0
+                        Otherwise:
+                            If ec is equal to 10:
+                                Set measuring to 0
+                            Otherwise:
+                                If ec is equal to 13:
+                                    Set measuring to 0
+                                Otherwise:
+                                    Set addr_end to addr_end plus 1
+                                End If
+                            End If
+                        End If
+                    End If
+                End If
+            End While
+
+            Let addr_len be addr_end minus addr_pos
+            Let addr_ptr be buffer plus addr_pos
+            Let parsed be proc dns_parse_ipv4_literal with addr_ptr, addr_len
+            If parsed is not equal to -1:
+                Set result to parsed
+                Set found to 1
+            End If
+        End If
+
+        Note: Advance i to the start of the next line.
+        Let j be line_start
+        Let to_newline be 1
+        While to_newline is equal to 1:
+            If j is greater than or equal to total:
+                Set to_newline to 0
+            Otherwise:
+                Let nc be proc memory_get_byte from Memory with buffer, j
+                If nc is equal to 10:
+                    Set j to j plus 1
+                    Set to_newline to 0
+                Otherwise:
+                    Set j to j plus 1
+                End If
+            End If
+        End While
+        If j is less than or equal to i:
+            Set i to i plus 1
+        Otherwise:
+            Set i to j
+        End If
+    End While
+
+    proc deallocate from Layout with buffer
+    Return result
+End Process
+
+Note:
+============================================================================
+QUERY MESSAGE ENCODING
+============================================================================
+:End Note
+
+Process called "dns_encode_qname" takes hostname as Integer, out_buffer as Integer, out_offset as Integer returns Integer:
+    @Reasoning:
+        Encode a hostname into the DNS QNAME wire format: a sequence of
+        length-prefixed labels terminated by a zero-length label. For
+        "example.com" this produces 07 'example' 03 'com' 00. Returns the
+        new write offset (just past the terminating zero byte), or -1 if any
+        label is empty or exceeds 63 bytes (the DNS label limit).
+    @End Reasoning
+    Let host_len be proc string_length from StringCore with hostname
+    Let write_pos be out_offset
+    Let label_start be 0
+    Let i be 0
+
+    While i is less than host_len:
+        Let ch be proc memory_get_byte from Memory with hostname, i
+        If ch is equal to 46:
+            Let label_len be i minus label_start
+            If label_len is equal to 0:
+                Return -1
+            End If
+            If label_len is greater than 63:
+                Return -1
+            End If
+            proc memory_set_byte from Memory with out_buffer, write_pos, label_len
+            Set write_pos to write_pos plus 1
+            Let c be 0
+            While c is less than label_len:
+                Let b be proc memory_get_byte from Memory with hostname, label_start plus c
+                proc memory_set_byte from Memory with out_buffer, write_pos, b
+                Set write_pos to write_pos plus 1
+                Set c to c plus 1
+            End While
+            Set label_start to i plus 1
+        End If
+        Set i to i plus 1
+    End While
+
+    Note: Final label (after the last dot, or the whole name if no dot).
+    Let final_len be host_len minus label_start
+    If final_len is equal to 0:
+        Return -1
+    End If
+    If final_len is greater than 63:
+        Return -1
+    End If
+    proc memory_set_byte from Memory with out_buffer, write_pos, final_len
+    Set write_pos to write_pos plus 1
+    Let f be 0
+    While f is less than final_len:
+        Let fb be proc memory_get_byte from Memory with hostname, label_start plus f
+        proc memory_set_byte from Memory with out_buffer, write_pos, fb
+        Set write_pos to write_pos plus 1
+        Set f to f plus 1
+    End While
+
+    Note: Zero-length terminating label.
+    proc memory_set_byte from Memory with out_buffer, write_pos, 0
+    Set write_pos to write_pos plus 1
+    Return write_pos
+End Process
+
+Process called "dns_build_query" takes hostname as Integer, out_buffer as Integer, txid as Integer returns Integer:
+    @Implementation:
+        Write the 12-byte DNS header then the question. Header fields (all
+        big-endian 16-bit): ID = txid, FLAGS = 0x0100 (standard query,
+        recursion desired), QDCOUNT = 1, ANCOUNT = NSCOUNT = ARCOUNT = 0.
+        After the encoded QNAME, write QTYPE = 1 (A) and QCLASS = 1 (IN),
+        each big-endian 16-bit. Returns total query length, or -1 if the
+        name could not be encoded.
+    @End Implementation
+    Note: ID.
+    Let id_high be txid divided by 256
+    Set id_high to id_high modulo by 256
+    Let id_low be txid modulo by 256
+    proc memory_set_byte from Memory with out_buffer, 0, id_high
+    proc memory_set_byte from Memory with out_buffer, 1, id_low
+
+    Note: FLAGS = 0x0100 (RD set).
+    proc memory_set_byte from Memory with out_buffer, 2, 1
+    proc memory_set_byte from Memory with out_buffer, 3, 0
+
+    Note: QDCOUNT = 1.
+    proc memory_set_byte from Memory with out_buffer, 4, 0
+    proc memory_set_byte from Memory with out_buffer, 5, 1
+
+    Note: ANCOUNT = 0.
+    proc memory_set_byte from Memory with out_buffer, 6, 0
+    proc memory_set_byte from Memory with out_buffer, 7, 0
+
+    Note: NSCOUNT = 0.
+    proc memory_set_byte from Memory with out_buffer, 8, 0
+    proc memory_set_byte from Memory with out_buffer, 9, 0
+
+    Note: ARCOUNT = 0.
+    proc memory_set_byte from Memory with out_buffer, 10, 0
+    proc memory_set_byte from Memory with out_buffer, 11, 0
+
+    Let after_qname be proc dns_encode_qname with hostname, out_buffer, 12
+    If after_qname is equal to -1:
+        Return -1
+    End If
+
+    Note: QTYPE = 1 (A).
+    proc memory_set_byte from Memory with out_buffer, after_qname, 0
+    proc memory_set_byte from Memory with out_buffer, after_qname plus 1, 1
+    Note: QCLASS = 1 (IN).
+    proc memory_set_byte from Memory with out_buffer, after_qname plus 2, 0
+    proc memory_set_byte from Memory with out_buffer, after_qname plus 3, 1
+
+    Return after_qname plus 4
+End Process
+
+Note:
+============================================================================
+RESPONSE PARSING
+============================================================================
+:End Note
+
+Process called "dns_skip_name" takes response as Integer, offset as Integer, response_len as Integer returns Integer:
+    @Reasoning:
+        Advance past a DNS name field starting at offset. A name is a series
+        of length-prefixed labels ending in a zero-length label, but any
+        label length byte whose top two bits are set (>= 192) is a
+        compression pointer occupying exactly two bytes and terminates the
+        name in the field stream. Returns the offset of the first byte after
+        the name, or -1 on a malformed/overrunning field.
+    @End Reasoning
+    Let pos be offset
+    Let walking be 1
+    Let final_pos be -1
+
+    While walking is equal to 1:
+        If pos is greater than or equal to response_len:
+            Set walking to 0
+        Otherwise:
+            Let len_byte be proc memory_get_byte from Memory with response, pos
+            If len_byte is greater than or equal to 192:
+                Note: Compression pointer - two bytes total, name ends here.
+                If pos plus 1 is greater than or equal to response_len:
+                    Set walking to 0
+                Otherwise:
+                    Set final_pos to pos plus 2
+                    Set walking to 0
+                End If
+            Otherwise:
+                If len_byte is equal to 0:
+                    Note: Root label - end of an uncompressed name.
+                    Set final_pos to pos plus 1
+                    Set walking to 0
+                Otherwise:
+                    Set pos to pos plus 1
+                    Set pos to pos plus len_byte
+                End If
+            End If
+        End If
+    End While
+
+    Return final_pos
+End Process
+
+Process called "dns_parse_answer" takes response as Integer, response_len as Integer returns Integer:
+    @Reasoning:
+        Parse the response far enough to extract the first A record's
+        address. Validate the header, confirm the response code is 0 (no
+        error), skip the question section, then iterate the answer records.
+        For each record skip the NAME, read TYPE/CLASS/TTL/RDLENGTH, and when
+        TYPE=1 (A), CLASS=1 (IN) and RDLENGTH=4, read the four RDATA bytes as
+        the network-order address.
+    @End Reasoning
+    @Implementation:
+        Returns the 32-bit network-order address (byte0 of RDATA in the low
+        byte) on success, or -1 if the message is malformed, errored, or
+        contains no A record.
+    @End Implementation
+    If response_len is less than 12:
+        Return -1
+    End If
+
+    Note: FLAGS byte 3 low nibble = RCODE; non-zero means server error.
+    Let flags_low be proc memory_get_byte from Memory with response, 3
+    Let rcode be flags_low modulo by 16
+    If rcode is not equal to 0:
+        Return -1
+    End If
+
+    Let qd_high be proc memory_get_byte from Memory with response, 4
+    Let qd_low be proc memory_get_byte from Memory with response, 5
+    Let qdcount be qd_high multiplied by 256
+    Set qdcount to qdcount plus qd_low
+
+    Let an_high be proc memory_get_byte from Memory with response, 6
+    Let an_low be proc memory_get_byte from Memory with response, 7
+    Let ancount be an_high multiplied by 256
+    Set ancount to ancount plus an_low
+
+    If ancount is equal to 0:
+        Return -1
+    End If
+
+    Note: Skip the question section (each: QNAME + QTYPE(2) + QCLASS(2)).
+    Let pos be 12
+    Let q be 0
+    While q is less than qdcount:
+        Let after_name be proc dns_skip_name with response, pos, response_len
+        If after_name is equal to -1:
+            Return -1
+        End If
+        Set pos to after_name plus 4
+        Set q to q plus 1
+    End While
+
+    Note: Walk answer records.
+    Let a be 0
+    Let answer_addr be -1
+    While a is less than ancount:
+        If answer_addr is not equal to -1:
+            Set a to ancount
+        Otherwise:
+            Let rec_name_end be proc dns_skip_name with response, pos, response_len
+            If rec_name_end is equal to -1:
+                Return -1
+            End If
+            Note: Need TYPE(2)+CLASS(2)+TTL(4)+RDLENGTH(2) = 10 bytes.
+            If rec_name_end plus 10 is greater than response_len:
+                Return -1
+            End If
+            Let type_high be proc memory_get_byte from Memory with response, rec_name_end
+            Let type_low be proc memory_get_byte from Memory with response, rec_name_end plus 1
+            Let rtype be type_high multiplied by 256
+            Set rtype to rtype plus type_low
+
+            Let class_high be proc memory_get_byte from Memory with response, rec_name_end plus 2
+            Let class_low be proc memory_get_byte from Memory with response, rec_name_end plus 3
+            Let rclass be class_high multiplied by 256
+            Set rclass to rclass plus class_low
+
+            Let rdlen_high be proc memory_get_byte from Memory with response, rec_name_end plus 8
+            Let rdlen_low be proc memory_get_byte from Memory with response, rec_name_end plus 9
+            Let rdlength be rdlen_high multiplied by 256
+            Set rdlength to rdlength plus rdlen_low
+
+            Let rdata_pos be rec_name_end plus 10
+
+            If rtype is equal to 1:
+                If rclass is equal to 1:
+                    If rdlength is equal to 4:
+                        If rdata_pos plus 4 is greater than response_len:
+                            Return -1
+                        End If
+                        Let b0 be proc memory_get_byte from Memory with response, rdata_pos
+                        Let b1 be proc memory_get_byte from Memory with response, rdata_pos plus 1
+                        Let b2 be proc memory_get_byte from Memory with response, rdata_pos plus 2
+                        Let b3 be proc memory_get_byte from Memory with response, rdata_pos plus 3
+                        Note: RDATA holds the address in network order; byte0
+                        Note: is the most significant on-wire octet, which maps
+                        Note: to the low byte of our network-order word.
+                        Let net be b0
+                        Set net to net plus b1 multiplied by 256
+                        Set net to net plus b2 multiplied by 65536
+                        Set net to net plus b3 multiplied by 16777216
+                        Set answer_addr to net
+                    End If
+                End If
+            End If
+
+            Note: Advance to the next record regardless of type.
+            Set pos to rdata_pos plus rdlength
+            Set a to a plus 1
+        End If
+    End While
+
+    Return answer_addr
+End Process
+
+Note:
+============================================================================
+PUBLIC ENTRY POINT
+============================================================================
+:End Note
+
+Process called "dns_resolve_a" takes hostname as Integer returns Integer:
+    @Reasoning:
+        Resolve a hostname to a network-order IPv4 address via a UDP DNS
+        A-record query to the system nameserver. Returns the address or -1
+        on any failure. Every descriptor opened here is closed on all exit
+        paths so no fd leaks.
+    @End Reasoning
+    @Implementation:
+        Discover the nameserver, open a UDP socket, connect it to the
+        nameserver:53, build and send the query, read the (<=512 byte)
+        response, and parse out the first A record. recv/send are wrapped
+        for EINTR retry. A transaction id is derived from the process id so
+        concurrent queries are less likely to collide on a shared id.
+    @End Implementation
+    If hostname is equal to 0:
+        Return -1
+    End If
+
+    Let ns_addr be proc dns_read_nameserver
+    If ns_addr is less than 0:
+        Return -1
+    End If
+
+    Note: Create UDP socket.
+    Let sys_socket be proc SYS_SOCKET from Syscall
+    Let domain be dns_AF_INET()
+    Let socktype be dns_SOCK_DGRAM()
+    Let proto be dns_IPPROTO_UDP()
+    Let fd be proc syscall_3 from Syscall with sys_socket, domain, socktype, proto
+    If fd is less than 0:
+        Return -1
+    End If
+
+    Note: Build sockaddr_in for nameserver:53.
+    Let sockaddr be proc allocate from Layout with 16
+    If sockaddr is equal to 0:
+        proc syscall_close from Syscall with fd
+        Return -1
+    End If
+    proc memory_zero from Memory with sockaddr, 16
+    Let family be dns_AF_INET()
+    proc memory_set_byte from Memory with sockaddr, 0, family modulo by 256
+    proc memory_set_byte from Memory with sockaddr, 1, family divided by 256
+    Let port be dns_PORT()
+    Let port_low be port modulo by 256
+    Let port_high be port divided by 256
+    Set port_high to port_high modulo by 256
+    proc memory_set_byte from Memory with sockaddr, 2, port_high
+    proc memory_set_byte from Memory with sockaddr, 3, port_low
+    Let na0 be ns_addr modulo by 256
+    Let na1 be ns_addr divided by 256
+    Set na1 to na1 modulo by 256
+    Let na2 be ns_addr divided by 65536
+    Set na2 to na2 modulo by 256
+    Let na3 be ns_addr divided by 16777216
+    Set na3 to na3 modulo by 256
+    proc memory_set_byte from Memory with sockaddr, 4, na0
+    proc memory_set_byte from Memory with sockaddr, 5, na1
+    proc memory_set_byte from Memory with sockaddr, 6, na2
+    proc memory_set_byte from Memory with sockaddr, 7, na3
+
+    Let sys_connect be proc SYS_CONNECT from Syscall
+    Let connect_result be proc syscall_3 from Syscall with sys_connect, fd, sockaddr, 16
+    proc deallocate from Layout with sockaddr
+    If connect_result is less than 0:
+        proc syscall_close from Syscall with fd
+        Return -1
+    End If
+
+    Note: Build the query into a buffer (512 bytes is ample for a query).
+    Let query be proc allocate from Layout with 512
+    If query is equal to 0:
+        proc syscall_close from Syscall with fd
+        Return -1
+    End If
+
+    Note: Derive a transaction id from the process id reduced to 16 bits.
+    Let sys_getpid be proc SYS_GETPID from Syscall
+    Let pid be proc syscall_0 from Syscall with sys_getpid
+    Let txid be pid modulo by 65536
+    If txid is less than 0:
+        Set txid to 4660
+    End If
+
+    Let query_len be proc dns_build_query with hostname, query, txid
+    If query_len is equal to -1:
+        proc deallocate from Layout with query
+        proc syscall_close from Syscall with fd
+        Return -1
+    End If
+
+    Note: Send the query (EINTR-safe).
+    Let sys_sendto be proc SYS_SENDTO from Syscall
+    Let eintr be dns_EINTR()
+    Let neg_eintr be 0 minus eintr
+    Let sending be 1
+    Let sent be 0
+    While sending is equal to 1:
+        Set sent to proc syscall_6 from Syscall with sys_sendto, fd, query, query_len, 0, 0, 0
+        If sent is equal to neg_eintr:
+            Set sending to 1
+        Otherwise:
+            Set sending to 0
+        End If
+    End While
+    proc deallocate from Layout with query
+    If sent is less than 0:
+        proc syscall_close from Syscall with fd
+        Return -1
+    End If
+
+    Note: Receive the response (UDP DNS messages are <= 512 bytes).
+    Let response be proc allocate from Layout with 512
+    If response is equal to 0:
+        proc syscall_close from Syscall with fd
+        Return -1
+    End If
+    Let sys_recvfrom be proc SYS_RECVFROM from Syscall
+    Let receiving be 1
+    Let received be 0
+    While receiving is equal to 1:
+        Set received to proc syscall_6 from Syscall with sys_recvfrom, fd, response, 512, 0, 0, 0
+        If received is equal to neg_eintr:
+            Set receiving to 1
+        Otherwise:
+            Set receiving to 0
+        End If
+    End While
+    proc syscall_close from Syscall with fd
+
+    If received is less than 0:
+        proc deallocate from Layout with response
+        Return -1
+    End If
+    If received is less than 12:
+        proc deallocate from Layout with response
+        Return -1
+    End If
+
+    Let addr be proc dns_parse_answer with response, received
+    proc deallocate from Layout with response
+    Return addr
+End Process
