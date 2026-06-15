@@ -1,0 +1,195 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+Licensed under Apache 2.0
+:End Note
+
+Note:
+PowerShell Content-Preserving Round-Trip Test (Stage B)
+
+Proves that the PowerShell translation pipeline is CONTENT-PRESERVING, not
+merely structure-preserving. The pipeline under test is:
+
+    PowerShell source
+      -> parse                      (powershell_parser: token stream -> AST,
+                                      every content node now carries its
+                                      source lexeme in the node value slot)
+      -> translate_powershell_to_hir (powershell_to_hir: AST -> HIR dicts,
+                                      reading lexeme from value@32 and the
+                                      parser node layout children@16/count@24)
+      -> hir_to_powershell           (backend: HIR -> PowerShell source string)
+
+The round-trip runs the pipeline TWICE:
+    src  --parse--> AST1 --to_hir--> HIR1 --emit--> emitted1
+    emitted1 --parse--> AST2 --to_hir--> HIR2 --emit--> emitted2
+
+A purely structural pipeline that discards names/literals would emit empty
+shells on the first pass, so emitted1 would already be missing the content.
+A content-preserving pipeline carries the exact source text through, so both
+emitted1 AND emitted2 contain the names, literals, and operators. We assert
+the SECOND emission (which has survived a full parse -> HIR -> emit -> parse
+-> HIR -> emit loop) still contains each piece of content. Asserting the
+second emission rather than the first is the stronger test: it proves the
+information survives re-ingestion of the generated code, not just a single
+forward pass.
+
+Content survival is checked with string_index_of (returns the byte offset of
+a substring, or a negative value when absent), so each assertion proves the
+actual name / literal / operator text is present in the regenerated source.
+
+The probe exits with the number of failed assertions (0 == all passed) and
+runs under the harness CPU/address caps so a non-terminating parse or emit
+would be killed before reaching print_summary.
+:End Note
+
+Import "compiler/middle/gungnir/hir/translation/frontends/powershell/powershell_parser.runa" as Parser
+Import "compiler/middle/gungnir/hir/translation/frontends/powershell/powershell_to_hir.runa" as ToHir
+Import "compiler/middle/gungnir/hir/translation/backends/powershell/hir_to_powershell.runa" as Backend
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/frontend/primitives/core/string_primitive.runa" as StringPrim
+Import "tests/test_utils.runa" as TestUtils
+
+@Reasoning:
+Runs one full forward pass of the pipeline: parse the supplied PowerShell
+source into an AST, translate the AST to HIR, and emit HIR back to a
+PowerShell source string. Returns the emitted source pointer (or 0 if any
+stage produced nothing). Centralising the pass lets the round-trip invoke it
+twice over its own output without duplicating the wiring.
+@End Reasoning
+Process called "pipeline_pass" takes source as Integer returns Integer:
+    Let src_len be proc string_length from StringCore with source
+    Let ast be proc parse from Parser with source, src_len
+    If ast is equal to 0:
+        Return 0
+    End If
+    Let hir be proc translate_powershell_to_hir from ToHir with ast
+    If hir is equal to 0:
+        Return 0
+    End If
+    Return proc hir_to_powershell from Backend with hir
+End Process
+
+@Reasoning:
+Returns 1 when needle occurs in haystack, 0 otherwise. string_index_of
+returns the 0-based byte offset of the first match or a negative sentinel
+when absent, so a non-negative result means present. Both arguments are
+NUL-terminated strings.
+@End Reasoning
+Process called "contains" takes haystack as Integer, needle as Integer returns Integer:
+    If haystack is equal to 0:
+        Return 0
+    End If
+    Let idx be proc string_index_of from StringPrim with haystack, needle
+    If idx is greater than or equal to 0:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Process called "main" returns Integer:
+    Let results be proc create_test_results from TestUtils
+    proc begin_suite from TestUtils with results, "PowerShell content round-trip"
+
+    Note:
+    A focused PowerShell program that exercises every content category the
+    brief requires to survive the round-trip:
+    - a function definition (Get-Greeting) with a param() block, a typed
+      parameter [string]$Name and its default value "World"
+    - a cmdlet invocation (Write-Output) with a named parameter -InputObject
+    - a two-stage pipeline (Get-ChildItem | Where-Object { $_ })
+    - if / elseif / else
+    - a foreach with its loop variable ($item)
+    - a hashtable @{} with two keys (host, port)
+    - a try / catch
+    - a -match comparison operator
+    - a string interpolation literal "$($Name)"
+    :End Note
+    Let source be "function Get-Greeting {\nparam(\n[string]$Name = \"World\"\n)\n$total = 0\n}\nWrite-Output -InputObject $Name\nGet-ChildItem | Where-Object { $_ }\nif ($Count -eq 1) {\n$x = 1\n} elseif ($Count -eq 2) {\n$y = 2\n} else {\n$z = 3\n}\nforeach ($item in $list) {\n$item\n}\n$config = @{ host = \"localhost\"; port = 8080 }\ntry {\n$a = 1\n} catch {\n$b = 2\n}\nif ($Name -match \"or\") {\n$c = 1\n}\n$msg = \"$($Name)\"\n"
+
+    Let src_len be proc string_length from StringCore with source
+    proc assert_greater_than from TestUtils with results, "source is non-empty", src_len, 0
+
+    Note: --- First forward pass: src -> AST -> HIR -> emitted1 ---
+    Let emitted1 be proc pipeline_pass with source
+    proc assert_not_null from TestUtils with results, "first pass emitted PowerShell", emitted1
+
+    Let emitted1_len be proc string_length from StringCore with emitted1
+    proc assert_greater_than from TestUtils with results, "first emission is non-empty", emitted1_len, 0
+
+    Note: --- Second forward pass over the generated code: emitted1 -> emitted2 ---
+    Let emitted2 be proc pipeline_pass with emitted1
+    proc assert_not_null from TestUtils with results, "second pass emitted PowerShell", emitted2
+
+    Let emitted2_len be proc string_length from StringCore with emitted2
+    proc assert_greater_than from TestUtils with results, "second emission is non-empty", emitted2_len, 0
+
+    Note:
+    Content-survival assertions against the SECOND emission (the source that
+    has survived a complete parse -> HIR -> emit -> parse -> HIR -> emit
+    loop). Each checks that the literal name / value / operator text is still
+    present. If the frontend discarded lexemes these would all be absent.
+    :End Note
+
+    Note: function name
+    Let has_func_name be proc contains with emitted2, "Get-Greeting"
+    proc assert_true from TestUtils with results, "function name Get-Greeting survives", has_func_name
+
+    Note: typed parameter name
+    Let has_param_name be proc contains with emitted2, "Name"
+    proc assert_true from TestUtils with results, "typed param name Name survives", has_param_name
+
+    Note: parameter default value literal
+    Let has_default be proc contains with emitted2, "World"
+    proc assert_true from TestUtils with results, "param default value \"World\" survives", has_default
+
+    Note: cmdlet name
+    Let has_cmdlet be proc contains with emitted2, "Write-Output"
+    proc assert_true from TestUtils with results, "cmdlet name Write-Output survives", has_cmdlet
+
+    Note: named-parameter NAME on the cmdlet
+    Let has_named_param be proc contains with emitted2, "InputObject"
+    proc assert_true from TestUtils with results, "named-parameter name InputObject survives", has_named_param
+
+    Note: two-stage pipeline (both stage cmdlet names present)
+    Let has_stage1 be proc contains with emitted2, "Get-ChildItem"
+    proc assert_true from TestUtils with results, "pipeline stage Get-ChildItem survives", has_stage1
+    Let has_stage2 be proc contains with emitted2, "Where-Object"
+    proc assert_true from TestUtils with results, "pipeline stage Where-Object survives", has_stage2
+
+    Note: if / elseif / else assignment targets survive (proves all three branches kept their content)
+    Let has_if_x be proc contains with emitted2, "$x"
+    proc assert_true from TestUtils with results, "if branch assignment $x survives", has_if_x
+    Let has_elseif_y be proc contains with emitted2, "$y"
+    proc assert_true from TestUtils with results, "elseif branch assignment $y survives", has_elseif_y
+    Let has_else_z be proc contains with emitted2, "$z"
+    proc assert_true from TestUtils with results, "else branch assignment $z survives", has_else_z
+
+    Note: foreach loop variable
+    Let has_foreach_var be proc contains with emitted2, "$item"
+    proc assert_true from TestUtils with results, "foreach loop variable $item survives", has_foreach_var
+
+    Note: hashtable with two keys
+    Let has_key1 be proc contains with emitted2, "host"
+    proc assert_true from TestUtils with results, "hashtable key host survives", has_key1
+    Let has_key2 be proc contains with emitted2, "port"
+    proc assert_true from TestUtils with results, "hashtable key port survives", has_key2
+
+    Note: try/catch assignment targets survive
+    Let has_try_a be proc contains with emitted2, "$a"
+    proc assert_true from TestUtils with results, "try body assignment $a survives", has_try_a
+    Let has_catch_b be proc contains with emitted2, "$b"
+    proc assert_true from TestUtils with results, "catch body assignment $b survives", has_catch_b
+
+    Note: -match operator
+    Let has_match be proc contains with emitted2, "-match"
+    proc assert_true from TestUtils with results, "comparison operator -match survives", has_match
+
+    Note: string interpolation literal "$($Name)"
+    Let has_interp be proc contains with emitted2, "$($Name)"
+    proc assert_true from TestUtils with results, "string interpolation \"$($Name)\" survives", has_interp
+
+    proc print_summary from TestUtils with results
+    Let failed be proc get_failed from TestUtils with results
+    proc destroy_test_results from TestUtils with results
+
+    Return failed
+End Process

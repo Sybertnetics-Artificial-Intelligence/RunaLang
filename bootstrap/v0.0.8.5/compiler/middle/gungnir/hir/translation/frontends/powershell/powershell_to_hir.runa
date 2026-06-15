@@ -207,34 +207,42 @@ Process called "translate_literal" takes ast as Integer returns Integer:
     End If
 
     Let node_type be proc memory_get_int64 from Layout with ast, 0
-    Let value be proc memory_get_int64 from Layout with ast, 8
+    Let value be proc memory_get_int64 from Layout with ast, 32
 
     Let hir_node be proc create_hir_dict
 
-    Note: AST_STRING_LITERAL (80)
-    If node_type is equal to 80:
+    Note: AST_STRING_LITERAL (72)
+    If node_type is equal to 72:
         proc set_dict_value with hir_node, "node_type", "string_literal"
         proc set_dict_value with hir_node, "value", value
         Return hir_node
     End If
 
-    Note: AST_NUMBER_LITERAL (81)
-    If node_type is equal to 81:
+    Note: AST_NUMBER_LITERAL (73)
+    If node_type is equal to 73:
         proc set_dict_value with hir_node, "node_type", "number_literal"
         proc set_dict_value with hir_node, "value", value
         Return hir_node
     End If
 
-    Note: AST_BOOLEAN_LITERAL (82)
-    If node_type is equal to 82:
+    Note: AST_BOOLEAN_LITERAL (74)
+    If node_type is equal to 74:
         proc set_dict_value with hir_node, "node_type", "boolean_literal"
         proc set_dict_value with hir_node, "value", value
         Return hir_node
     End If
 
-    Note: AST_NULL_LITERAL (83)
-    If node_type is equal to 83:
+    Note: AST_NULL_LITERAL (75)
+    If node_type is equal to 75:
         proc set_dict_value with hir_node, "node_type", "null_literal"
+        proc set_dict_value with hir_node, "value", value
+        Return hir_node
+    End If
+
+    Note: AST_IDENTIFIER (70) — used for member/method/type/parameter names,
+    Note: which the literal-style consumers in the backend read under "value".
+    If node_type is equal to 70:
+        proc set_dict_value with hir_node, "node_type", "identifier"
         proc set_dict_value with hir_node, "value", value
         Return hir_node
     End If
@@ -262,7 +270,7 @@ Process called "translate_variable" takes ast as Integer returns Integer:
         Return 0
     End If
 
-    Let value be proc memory_get_int64 from Layout with ast, 8
+    Let value be proc memory_get_int64 from Layout with ast, 32
 
     Let hir_var be proc create_hir_dict
     proc set_dict_value with hir_var, "node_type", "variable_reference"
@@ -293,24 +301,84 @@ Process called "translate_parameter" takes ast as Integer returns Integer:
         Return 0
     End If
 
-    Let children be proc memory_get_int64 from Layout with ast, 32
-    Let child_count be proc memory_get_int64 from Layout with ast, 40
+    Note:
+    The parser emits AST_PARAMETER in two shapes:
+      1. Cmdlet named argument `-Name value`: the name lexeme (without the
+         leading dash) is in the value slot (offset 32) and the optional
+         value expression is the first child.
+      2. Declaration `[Type]$name = default`: the value slot is empty; the
+         children are an optional type expression (AST_TYPE_EXPRESSION = 46),
+         the variable (AST_VARIABLE = 32) carrying the name in its own value
+         slot, and an optional default value (any other node).
+    Both shapes resolve to a name node (read by the backend as name ->
+    "value") plus an optional value subtree.
+    :End Note
+    Let name_value be proc memory_get_int64 from Layout with ast, 32
+    Let children be proc memory_get_int64 from Layout with ast, 16
+    Let child_count be proc memory_get_int64 from Layout with ast, 24
 
     Let hir_param be proc create_hir_dict
     proc set_dict_value with hir_param, "node_type", "parameter"
 
-    Note: Parameter name (first child)
-    If child_count is greater than 0:
-        Let name_ast be proc memory_get_int64 from Layout with children, 0
-        Let name_hir be proc translate_literal from name_ast
-        proc set_dict_value with hir_param, "name", name_hir
+    Note: Determine whether the value slot carries a usable name.
+    Let has_name_value be 0
+    If name_value is not equal to 0:
+        Let name_len be proc string_length from StringCore with name_value
+        If name_len is greater than 0:
+            Set has_name_value to 1
+        End If
     End If
 
-    Note: Parameter value (second child, optional)
-    If child_count is greater than 1:
-        Let value_ast be proc memory_get_int64 from Layout with children, 8
-        Let value_hir be proc translate_node from value_ast
-        proc set_dict_value with hir_param, "value", value_hir
+    If has_name_value is equal to 1:
+        Note: Shape 1: cmdlet named argument.
+        Let name_hir be proc create_hir_dict
+        proc set_dict_value with name_hir, "node_type", "identifier"
+        proc set_dict_value with name_hir, "value", name_value
+        proc set_dict_value with hir_param, "name", name_hir
+
+        If child_count is greater than 0:
+            Let value_ast be proc memory_get_int64 from Layout with children, 0
+            Let value_hir be proc translate_node with value_ast
+            proc set_dict_value with hir_param, "value", value_hir
+        End If
+
+        Return hir_param
+    End If
+
+    Note: Shape 2: declaration. Walk the children once, classifying each by
+    Note: its AST tag, to extract the variable name and the default value.
+    Let var_name be ""
+    Let default_ast be 0
+    Let j be 0
+    While j is less than child_count:
+        Let child_ast be proc memory_get_int64 from Layout with children, j multiplied by 8
+        Let child_type be proc memory_get_int64 from Layout with child_ast, 0
+
+        If child_type is equal to 32:
+            Note: AST_VARIABLE — the parameter name (stripped of its $).
+            Set var_name to proc memory_get_int64 from Layout with child_ast, 32
+        Otherwise:
+            If child_type is equal to 46:
+                Note: AST_TYPE_EXPRESSION — type annotation; not needed for the
+                Note: name/value the backend emits, so skipped here.
+                Set j to j
+            Otherwise:
+                Note: Any other node is the default value expression.
+                Set default_ast to child_ast
+            End If
+        End If
+
+        Set j to j plus 1
+    End While
+
+    Let decl_name_hir be proc create_hir_dict
+    proc set_dict_value with decl_name_hir, "node_type", "identifier"
+    proc set_dict_value with decl_name_hir, "value", var_name
+    proc set_dict_value with hir_param, "name", decl_name_hir
+
+    If default_ast is not equal to 0:
+        Let default_hir be proc translate_node with default_ast
+        proc set_dict_value with hir_param, "value", default_hir
     End If
 
     Return hir_param
@@ -336,7 +404,7 @@ Process called "translate_cmdlet" takes ast as Integer returns Integer:
         Return 0
     End If
 
-    Let value be proc memory_get_int64 from Layout with ast, 8
+    Let value be proc memory_get_int64 from Layout with ast, 32
 
     Let hir_cmdlet be proc create_hir_dict
     proc set_dict_value with hir_cmdlet, "node_type", "cmdlet"
@@ -371,34 +439,38 @@ Process called "translate_cmdlet_invocation" takes ast as Integer returns Intege
         Return 0
     End If
 
-    Let children be proc memory_get_int64 from Layout with ast, 32
-    Let child_count be proc memory_get_int64 from Layout with ast, 40
+    Note: The parser models a cmdlet invocation as a single AST_CMDLET node:
+    Note: the Verb-Noun name is stored in the node value slot (offset 32) and
+    Note: every argument / named parameter follows as a child (offset 16).
+    Let name_value be proc memory_get_int64 from Layout with ast, 32
+    Let children be proc memory_get_int64 from Layout with ast, 16
+    Let child_count be proc memory_get_int64 from Layout with ast, 24
 
     Let hir_invocation be proc create_hir_dict
     proc set_dict_value with hir_invocation, "node_type", "cmdlet_invocation"
 
-    Note: Cmdlet name (first child)
-    If child_count is greater than 0:
-        Let cmdlet_ast be proc memory_get_int64 from Layout with children, 0
-        Let cmdlet_hir be proc translate_cmdlet from cmdlet_ast
-        proc set_dict_value with hir_invocation, "cmdlet", cmdlet_hir
-    End If
+    Note: Build the cmdlet name node (the backend reads "cmdlet" -> "name").
+    Let cmdlet_hir be proc create_hir_dict
+    proc set_dict_value with cmdlet_hir, "node_type", "cmdlet"
+    proc set_dict_value with cmdlet_hir, "name", name_value
+    proc set_dict_value with hir_invocation, "cmdlet", cmdlet_hir
 
     Note: Parameters and arguments
     Let parameters be proc create_hir_list
     Let arguments be proc create_hir_list
 
-    Let i be 1  Note: Skip first child (cmdlet name)
+    Let i be 0
     While i is less than child_count:
         Let child_ast be proc memory_get_int64 from Layout with children, i multiplied by 8
         Let child_type be proc memory_get_int64 from Layout with child_ast, 0
 
-        Note: Check if parameter (AST_PARAMETER = 72)
-        If child_type is equal to 72:
-            Let param_hir be proc translate_parameter from child_ast
+        Note: AST_PARAMETER (31) is a named parameter; everything else is a
+        Note: positional argument.
+        If child_type is equal to 31:
+            Let param_hir be proc translate_parameter with child_ast
             proc list_append with parameters, param_hir
         Otherwise:
-            Let arg_hir be proc translate_node from child_ast
+            Let arg_hir be proc translate_node with child_ast
             proc list_append with arguments, arg_hir
         End If
 
@@ -430,8 +502,8 @@ Process called "translate_pipeline" takes ast as Integer returns Integer:
         Return 0
     End If
 
-    Let children be proc memory_get_int64 from Layout with ast, 32
-    Let child_count be proc memory_get_int64 from Layout with ast, 40
+    Let children be proc memory_get_int64 from Layout with ast, 16
+    Let child_count be proc memory_get_int64 from Layout with ast, 24
 
     Let hir_pipeline be proc create_hir_dict
     proc set_dict_value with hir_pipeline, "node_type", "pipeline"
@@ -441,7 +513,7 @@ Process called "translate_pipeline" takes ast as Integer returns Integer:
     Let i be 0
     While i is less than child_count:
         Let cmd_ast be proc memory_get_int64 from Layout with children, i multiplied by 8
-        Let cmd_hir be proc translate_node from cmd_ast
+        Let cmd_hir be proc translate_node with cmd_ast
         proc list_append with commands, cmd_hir
         Set i to i plus 1
     End While
@@ -470,8 +542,8 @@ Process called "translate_array_literal" takes ast as Integer returns Integer:
         Return 0
     End If
 
-    Let children be proc memory_get_int64 from Layout with ast, 32
-    Let child_count be proc memory_get_int64 from Layout with ast, 40
+    Let children be proc memory_get_int64 from Layout with ast, 16
+    Let child_count be proc memory_get_int64 from Layout with ast, 24
 
     Let hir_array be proc create_hir_dict
     proc set_dict_value with hir_array, "node_type", "array_literal"
@@ -481,7 +553,7 @@ Process called "translate_array_literal" takes ast as Integer returns Integer:
     Let i be 0
     While i is less than child_count:
         Let element_ast be proc memory_get_int64 from Layout with children, i multiplied by 8
-        Let element_hir be proc translate_node from element_ast
+        Let element_hir be proc translate_node with element_ast
         proc list_append with elements, element_hir
         Set i to i plus 1
     End While
@@ -511,20 +583,35 @@ Process called "translate_hashtable_literal" takes ast as Integer returns Intege
         Return 0
     End If
 
-    Let children be proc memory_get_int64 from Layout with ast, 32
-    Let child_count be proc memory_get_int64 from Layout with ast, 40
+    Let children be proc memory_get_int64 from Layout with ast, 16
+    Let child_count be proc memory_get_int64 from Layout with ast, 24
 
     Let hir_hashtable be proc create_hir_dict
     proc set_dict_value with hir_hashtable, "node_type", "hashtable_literal"
 
+    Note: The parser stores hashtable entries as flat alternating children
+    Note: (key0, value0, key1, value1, ...). Pair them up into key_value_pair
+    Note: HIR nodes so the backend can emit each `key = value` entry.
     Let pairs be proc create_hir_list
 
     Let i be 0
     While i is less than child_count:
-        Let pair_ast be proc memory_get_int64 from Layout with children, i multiplied by 8
-        Let pair_hir be proc translate_node from pair_ast
+        Let key_ast be proc memory_get_int64 from Layout with children, i multiplied by 8
+        Let key_hir be proc translate_node with key_ast
+
+        Let pair_hir be proc create_hir_dict
+        proc set_dict_value with pair_hir, "node_type", "key_value_pair"
+        proc set_dict_value with pair_hir, "key", key_hir
+
+        Let value_index be i plus 1
+        If value_index is less than child_count:
+            Let value_ast be proc memory_get_int64 from Layout with children, value_index multiplied by 8
+            Let value_hir be proc translate_node with value_ast
+            proc set_dict_value with pair_hir, "value", value_hir
+        End If
+
         proc list_append with pairs, pair_hir
-        Set i to i plus 1
+        Set i to i plus 2
     End While
 
     proc set_dict_value with hir_hashtable, "pairs", pairs
@@ -551,8 +638,8 @@ Process called "translate_key_value_pair" takes ast as Integer returns Integer:
         Return 0
     End If
 
-    Let children be proc memory_get_int64 from Layout with ast, 32
-    Let child_count be proc memory_get_int64 from Layout with ast, 40
+    Let children be proc memory_get_int64 from Layout with ast, 16
+    Let child_count be proc memory_get_int64 from Layout with ast, 24
 
     Let hir_pair be proc create_hir_dict
     proc set_dict_value with hir_pair, "node_type", "key_value_pair"
@@ -560,14 +647,14 @@ Process called "translate_key_value_pair" takes ast as Integer returns Integer:
     Note: Key (first child)
     If child_count is greater than 0:
         Let key_ast be proc memory_get_int64 from Layout with children, 0
-        Let key_hir be proc translate_node from key_ast
+        Let key_hir be proc translate_node with key_ast
         proc set_dict_value with hir_pair, "key", key_hir
     End If
 
     Note: Value (second child)
     If child_count is greater than 1:
         Let value_ast be proc memory_get_int64 from Layout with children, 8
-        Let value_hir be proc translate_node from value_ast
+        Let value_hir be proc translate_node with value_ast
         proc set_dict_value with hir_pair, "value", value_hir
     End If
 
@@ -593,8 +680,8 @@ Process called "translate_subexpression" takes ast as Integer returns Integer:
         Return 0
     End If
 
-    Let children be proc memory_get_int64 from Layout with ast, 32
-    Let child_count be proc memory_get_int64 from Layout with ast, 40
+    Let children be proc memory_get_int64 from Layout with ast, 16
+    Let child_count be proc memory_get_int64 from Layout with ast, 24
 
     Let hir_subexpr be proc create_hir_dict
     proc set_dict_value with hir_subexpr, "node_type", "subexpression"
@@ -602,11 +689,46 @@ Process called "translate_subexpression" takes ast as Integer returns Integer:
     Note: Expression body
     If child_count is greater than 0:
         Let body_ast be proc memory_get_int64 from Layout with children, 0
-        Let body_hir be proc translate_node from body_ast
+        Let body_hir be proc translate_node with body_ast
         proc set_dict_value with hir_subexpr, "body", body_hir
     End If
 
     Return hir_subexpr
+End Process
+
+@Reasoning:
+A PowerShell type expression `[TypeName]` (used for casts `[int]$x`,
+type checks, and parameter annotations) carries the type name as its
+single AST_IDENTIFIER child. The HIR records the bracketed name under
+"type_name" so the backend can re-emit `[TypeName]` verbatim and the
+round-trip preserves the exact type token.
+@End Reasoning
+@Implementation:
+Returns 0 for null ast. Reads children and child_count. Builds an HIR
+dict tagged "type_expression". If child_count > 0 reads children[0]'s
+value slot (offset 32) as the type-name lexeme and stores it under
+"type_name".
+@End Implementation
+Process called "translate_type_expression" takes ast as Integer returns Integer:
+    Note: Translate PowerShell type expression [TypeName] to HIR
+
+    If ast is equal to 0:
+        Return 0
+    End If
+
+    Let children be proc memory_get_int64 from Layout with ast, 16
+    Let child_count be proc memory_get_int64 from Layout with ast, 24
+
+    Let hir_type be proc create_hir_dict
+    proc set_dict_value with hir_type, "node_type", "type_expression"
+
+    If child_count is greater than 0:
+        Let name_ast be proc memory_get_int64 from Layout with children, 0
+        Let name_value be proc memory_get_int64 from Layout with name_ast, 32
+        proc set_dict_value with hir_type, "type_name", name_value
+    End If
+
+    Return hir_type
 End Process
 
 @Reasoning:
@@ -629,9 +751,9 @@ Process called "translate_binary_operation" takes ast as Integer returns Integer
         Return 0
     End If
 
-    Let value be proc memory_get_int64 from Layout with ast, 8
-    Let children be proc memory_get_int64 from Layout with ast, 32
-    Let child_count be proc memory_get_int64 from Layout with ast, 40
+    Let value be proc memory_get_int64 from Layout with ast, 32
+    Let children be proc memory_get_int64 from Layout with ast, 16
+    Let child_count be proc memory_get_int64 from Layout with ast, 24
 
     Let hir_binop be proc create_hir_dict
     proc set_dict_value with hir_binop, "node_type", "binary_operation"
@@ -640,14 +762,14 @@ Process called "translate_binary_operation" takes ast as Integer returns Integer
     Note: Left operand (first child)
     If child_count is greater than 0:
         Let left_ast be proc memory_get_int64 from Layout with children, 0
-        Let left_hir be proc translate_node from left_ast
+        Let left_hir be proc translate_node with left_ast
         proc set_dict_value with hir_binop, "left", left_hir
     End If
 
     Note: Right operand (second child)
     If child_count is greater than 1:
         Let right_ast be proc memory_get_int64 from Layout with children, 8
-        Let right_hir be proc translate_node from right_ast
+        Let right_hir be proc translate_node with right_ast
         proc set_dict_value with hir_binop, "right", right_hir
     End If
 
@@ -674,9 +796,9 @@ Process called "translate_unary_operation" takes ast as Integer returns Integer:
         Return 0
     End If
 
-    Let value be proc memory_get_int64 from Layout with ast, 8
-    Let children be proc memory_get_int64 from Layout with ast, 32
-    Let child_count be proc memory_get_int64 from Layout with ast, 40
+    Let value be proc memory_get_int64 from Layout with ast, 32
+    Let children be proc memory_get_int64 from Layout with ast, 16
+    Let child_count be proc memory_get_int64 from Layout with ast, 24
 
     Let hir_unary be proc create_hir_dict
     proc set_dict_value with hir_unary, "node_type", "unary_operation"
@@ -685,7 +807,7 @@ Process called "translate_unary_operation" takes ast as Integer returns Integer:
     Note: Operand (first child)
     If child_count is greater than 0:
         Let operand_ast be proc memory_get_int64 from Layout with children, 0
-        Let operand_hir be proc translate_node from operand_ast
+        Let operand_hir be proc translate_node with operand_ast
         proc set_dict_value with hir_unary, "operand", operand_hir
     End If
 
@@ -714,8 +836,8 @@ Process called "translate_member_access" takes ast as Integer returns Integer:
         Return 0
     End If
 
-    Let children be proc memory_get_int64 from Layout with ast, 32
-    Let child_count be proc memory_get_int64 from Layout with ast, 40
+    Let children be proc memory_get_int64 from Layout with ast, 16
+    Let child_count be proc memory_get_int64 from Layout with ast, 24
 
     Let hir_member be proc create_hir_dict
     proc set_dict_value with hir_member, "node_type", "member_access"
@@ -723,14 +845,14 @@ Process called "translate_member_access" takes ast as Integer returns Integer:
     Note: Object (first child)
     If child_count is greater than 0:
         Let object_ast be proc memory_get_int64 from Layout with children, 0
-        Let object_hir be proc translate_node from object_ast
+        Let object_hir be proc translate_node with object_ast
         proc set_dict_value with hir_member, "object", object_hir
     End If
 
     Note: Member name (second child)
     If child_count is greater than 1:
         Let member_ast be proc memory_get_int64 from Layout with children, 8
-        Let member_hir be proc translate_literal from member_ast
+        Let member_hir be proc translate_literal with member_ast
         proc set_dict_value with hir_member, "member", member_hir
     End If
 
@@ -756,8 +878,8 @@ Process called "translate_index_access" takes ast as Integer returns Integer:
         Return 0
     End If
 
-    Let children be proc memory_get_int64 from Layout with ast, 32
-    Let child_count be proc memory_get_int64 from Layout with ast, 40
+    Let children be proc memory_get_int64 from Layout with ast, 16
+    Let child_count be proc memory_get_int64 from Layout with ast, 24
 
     Let hir_index be proc create_hir_dict
     proc set_dict_value with hir_index, "node_type", "index_access"
@@ -765,14 +887,14 @@ Process called "translate_index_access" takes ast as Integer returns Integer:
     Note: Object (first child)
     If child_count is greater than 0:
         Let object_ast be proc memory_get_int64 from Layout with children, 0
-        Let object_hir be proc translate_node from object_ast
+        Let object_hir be proc translate_node with object_ast
         proc set_dict_value with hir_index, "object", object_hir
     End If
 
     Note: Index (second child)
     If child_count is greater than 1:
         Let index_ast be proc memory_get_int64 from Layout with children, 8
-        Let index_hir be proc translate_node from index_ast
+        Let index_hir be proc translate_node with index_ast
         proc set_dict_value with hir_index, "index", index_hir
     End If
 
@@ -802,8 +924,8 @@ Process called "translate_method_call" takes ast as Integer returns Integer:
         Return 0
     End If
 
-    Let children be proc memory_get_int64 from Layout with ast, 32
-    Let child_count be proc memory_get_int64 from Layout with ast, 40
+    Let children be proc memory_get_int64 from Layout with ast, 16
+    Let child_count be proc memory_get_int64 from Layout with ast, 24
 
     Let hir_method be proc create_hir_dict
     proc set_dict_value with hir_method, "node_type", "method_call"
@@ -811,14 +933,14 @@ Process called "translate_method_call" takes ast as Integer returns Integer:
     Note: Object (first child)
     If child_count is greater than 0:
         Let object_ast be proc memory_get_int64 from Layout with children, 0
-        Let object_hir be proc translate_node from object_ast
+        Let object_hir be proc translate_node with object_ast
         proc set_dict_value with hir_method, "object", object_hir
     End If
 
     Note: Method name (second child)
     If child_count is greater than 1:
         Let method_ast be proc memory_get_int64 from Layout with children, 8
-        Let method_hir be proc translate_literal from method_ast
+        Let method_hir be proc translate_literal with method_ast
         proc set_dict_value with hir_method, "method", method_hir
     End If
 
@@ -828,7 +950,7 @@ Process called "translate_method_call" takes ast as Integer returns Integer:
     Let i be 2
     While i is less than child_count:
         Let arg_ast be proc memory_get_int64 from Layout with children, i multiplied by 8
-        Let arg_hir be proc translate_node from arg_ast
+        Let arg_hir be proc translate_node with arg_ast
         proc list_append with arguments, arg_hir
         Set i to i plus 1
     End While
@@ -861,8 +983,8 @@ Process called "translate_if_statement" takes ast as Integer returns Integer:
         Return 0
     End If
 
-    Let children be proc memory_get_int64 from Layout with ast, 32
-    Let child_count be proc memory_get_int64 from Layout with ast, 40
+    Let children be proc memory_get_int64 from Layout with ast, 16
+    Let child_count be proc memory_get_int64 from Layout with ast, 24
 
     Let hir_if be proc create_hir_dict
     proc set_dict_value with hir_if, "node_type", "if_statement"
@@ -870,14 +992,14 @@ Process called "translate_if_statement" takes ast as Integer returns Integer:
     Note: Condition (first child)
     If child_count is greater than 0:
         Let cond_ast be proc memory_get_int64 from Layout with children, 0
-        Let cond_hir be proc translate_node from cond_ast
+        Let cond_hir be proc translate_node with cond_ast
         proc set_dict_value with hir_if, "condition", cond_hir
     End If
 
     Note: Then body (second child)
     If child_count is greater than 1:
         Let then_ast be proc memory_get_int64 from Layout with children, 8
-        Let then_hir be proc translate_node from then_ast
+        Let then_hir be proc translate_node with then_ast
         proc set_dict_value with hir_if, "then_body", then_hir
     End If
 
@@ -888,7 +1010,7 @@ Process called "translate_if_statement" takes ast as Integer returns Integer:
         Let i be 2
         While i is less than child_count:
             Let branch_ast be proc memory_get_int64 from Layout with children, i multiplied by 8
-            Let branch_hir be proc translate_node from branch_ast
+            Let branch_hir be proc translate_node with branch_ast
             proc list_append with branches, branch_hir
             Set i to i plus 1
         End While
@@ -916,8 +1038,8 @@ Process called "translate_while_statement" takes ast as Integer returns Integer:
         Return 0
     End If
 
-    Let children be proc memory_get_int64 from Layout with ast, 32
-    Let child_count be proc memory_get_int64 from Layout with ast, 40
+    Let children be proc memory_get_int64 from Layout with ast, 16
+    Let child_count be proc memory_get_int64 from Layout with ast, 24
 
     Let hir_while be proc create_hir_dict
     proc set_dict_value with hir_while, "node_type", "while_loop"
@@ -925,14 +1047,14 @@ Process called "translate_while_statement" takes ast as Integer returns Integer:
     Note: Condition (first child)
     If child_count is greater than 0:
         Let cond_ast be proc memory_get_int64 from Layout with children, 0
-        Let cond_hir be proc translate_node from cond_ast
+        Let cond_hir be proc translate_node with cond_ast
         proc set_dict_value with hir_while, "condition", cond_hir
     End If
 
     Note: Body (second child)
     If child_count is greater than 1:
         Let body_ast be proc memory_get_int64 from Layout with children, 8
-        Let body_hir be proc translate_node from body_ast
+        Let body_hir be proc translate_node with body_ast
         proc set_dict_value with hir_while, "body", body_hir
     End If
 
@@ -940,9 +1062,10 @@ Process called "translate_while_statement" takes ast as Integer returns Integer:
 End Process
 
 @Reasoning:
-PowerShell C-style `for (init; cond; update) {body}` has four
-positional children. Each piece is optional in syntax but the
-parser emits placeholder nulls when missing.
+PowerShell C-style `for (init; cond; update) {body}` has up to four
+positional children. Each clause is optional in syntax; when a clause
+is absent the parser omits its child, so child_count reflects exactly
+the clauses that were present and each branch is guarded on count.
 @End Reasoning
 
 @Implementation:
@@ -958,8 +1081,8 @@ Process called "translate_for_statement" takes ast as Integer returns Integer:
         Return 0
     End If
 
-    Let children be proc memory_get_int64 from Layout with ast, 32
-    Let child_count be proc memory_get_int64 from Layout with ast, 40
+    Let children be proc memory_get_int64 from Layout with ast, 16
+    Let child_count be proc memory_get_int64 from Layout with ast, 24
 
     Let hir_for be proc create_hir_dict
     proc set_dict_value with hir_for, "node_type", "for_loop"
@@ -967,28 +1090,28 @@ Process called "translate_for_statement" takes ast as Integer returns Integer:
     Note: Initialization (first child)
     If child_count is greater than 0:
         Let init_ast be proc memory_get_int64 from Layout with children, 0
-        Let init_hir be proc translate_node from init_ast
+        Let init_hir be proc translate_node with init_ast
         proc set_dict_value with hir_for, "initialization", init_hir
     End If
 
     Note: Condition (second child)
     If child_count is greater than 1:
         Let cond_ast be proc memory_get_int64 from Layout with children, 8
-        Let cond_hir be proc translate_node from cond_ast
+        Let cond_hir be proc translate_node with cond_ast
         proc set_dict_value with hir_for, "condition", cond_hir
     End If
 
     Note: Update (third child)
     If child_count is greater than 2:
         Let update_ast be proc memory_get_int64 from Layout with children, 16
-        Let update_hir be proc translate_node from update_ast
+        Let update_hir be proc translate_node with update_ast
         proc set_dict_value with hir_for, "update", update_hir
     End If
 
     Note: Body (fourth child)
     If child_count is greater than 3:
         Let body_ast be proc memory_get_int64 from Layout with children, 24
-        Let body_hir be proc translate_node from body_ast
+        Let body_hir be proc translate_node with body_ast
         proc set_dict_value with hir_for, "body", body_hir
     End If
 
@@ -1016,25 +1139,33 @@ Process called "translate_foreach_statement" takes ast as Integer returns Intege
         Return 0
     End If
 
-    Let value be proc memory_get_int64 from Layout with ast, 8
-    Let children be proc memory_get_int64 from Layout with ast, 32
-    Let child_count be proc memory_get_int64 from Layout with ast, 40
+    Note: The parser emits foreach children in source order:
+    Note: [0] = loop variable (AST_VARIABLE with its $name in value@32),
+    Note: [1] = collection expression, [2] = body block.
+    Let children be proc memory_get_int64 from Layout with ast, 16
+    Let child_count be proc memory_get_int64 from Layout with ast, 24
 
     Let hir_foreach be proc create_hir_dict
     proc set_dict_value with hir_foreach, "node_type", "foreach_loop"
-    proc set_dict_value with hir_foreach, "variable", value
 
-    Note: Collection (first child)
+    Note: Loop variable name (first child's lexeme value).
     If child_count is greater than 0:
-        Let collection_ast be proc memory_get_int64 from Layout with children, 0
-        Let collection_hir be proc translate_node from collection_ast
+        Let var_ast be proc memory_get_int64 from Layout with children, 0
+        Let var_value be proc memory_get_int64 from Layout with var_ast, 32
+        proc set_dict_value with hir_foreach, "variable", var_value
+    End If
+
+    Note: Collection (second child).
+    If child_count is greater than 1:
+        Let collection_ast be proc memory_get_int64 from Layout with children, 8
+        Let collection_hir be proc translate_node with collection_ast
         proc set_dict_value with hir_foreach, "collection", collection_hir
     End If
 
-    Note: Body (second child)
-    If child_count is greater than 1:
-        Let body_ast be proc memory_get_int64 from Layout with children, 8
-        Let body_hir be proc translate_node from body_ast
+    Note: Body (third child).
+    If child_count is greater than 2:
+        Let body_ast be proc memory_get_int64 from Layout with children, 16
+        Let body_hir be proc translate_node with body_ast
         proc set_dict_value with hir_foreach, "body", body_hir
     End If
 
@@ -1062,8 +1193,8 @@ Process called "translate_switch_statement" takes ast as Integer returns Integer
         Return 0
     End If
 
-    Let children be proc memory_get_int64 from Layout with ast, 32
-    Let child_count be proc memory_get_int64 from Layout with ast, 40
+    Let children be proc memory_get_int64 from Layout with ast, 16
+    Let child_count be proc memory_get_int64 from Layout with ast, 24
 
     Let hir_switch be proc create_hir_dict
     proc set_dict_value with hir_switch, "node_type", "switch_statement"
@@ -1071,7 +1202,7 @@ Process called "translate_switch_statement" takes ast as Integer returns Integer
     Note: Expression (first child)
     If child_count is greater than 0:
         Let expr_ast be proc memory_get_int64 from Layout with children, 0
-        Let expr_hir be proc translate_node from expr_ast
+        Let expr_hir be proc translate_node with expr_ast
         proc set_dict_value with hir_switch, "expression", expr_hir
     End If
 
@@ -1081,7 +1212,7 @@ Process called "translate_switch_statement" takes ast as Integer returns Integer
     Let i be 1
     While i is less than child_count:
         Let case_ast be proc memory_get_int64 from Layout with children, i multiplied by 8
-        Let case_hir be proc translate_switch_case from case_ast
+        Let case_hir be proc translate_switch_case with case_ast
         proc list_append with cases, case_hir
         Set i to i plus 1
     End While
@@ -1108,8 +1239,8 @@ Process called "translate_switch_case" takes ast as Integer returns Integer:
         Return 0
     End If
 
-    Let children be proc memory_get_int64 from Layout with ast, 32
-    Let child_count be proc memory_get_int64 from Layout with ast, 40
+    Let children be proc memory_get_int64 from Layout with ast, 16
+    Let child_count be proc memory_get_int64 from Layout with ast, 24
 
     Let hir_case be proc create_hir_dict
     proc set_dict_value with hir_case, "node_type", "switch_case"
@@ -1117,14 +1248,14 @@ Process called "translate_switch_case" takes ast as Integer returns Integer:
     Note: Pattern (first child)
     If child_count is greater than 0:
         Let pattern_ast be proc memory_get_int64 from Layout with children, 0
-        Let pattern_hir be proc translate_node from pattern_ast
+        Let pattern_hir be proc translate_node with pattern_ast
         proc set_dict_value with hir_case, "pattern", pattern_hir
     End If
 
     Note: Body (second child)
     If child_count is greater than 1:
         Let body_ast be proc memory_get_int64 from Layout with children, 8
-        Let body_hir be proc translate_node from body_ast
+        Let body_hir be proc translate_node with body_ast
         proc set_dict_value with hir_case, "body", body_hir
     End If
 
@@ -1153,33 +1284,42 @@ Process called "translate_function_definition" takes ast as Integer returns Inte
         Return 0
     End If
 
-    Let value be proc memory_get_int64 from Layout with ast, 8
-    Let children be proc memory_get_int64 from Layout with ast, 32
-    Let child_count be proc memory_get_int64 from Layout with ast, 40
+    Let children be proc memory_get_int64 from Layout with ast, 16
+    Let child_count be proc memory_get_int64 from Layout with ast, 24
 
     Let hir_func be proc create_hir_dict
     proc set_dict_value with hir_func, "node_type", "function_definition"
-    proc set_dict_value with hir_func, "name", value
 
-    Note: Parameters (all children except last)
+    Note: The parser emits the function name as the first child (an
+    Note: AST_IDENTIFIER whose value slot holds the name lexeme), then an
+    Note: optional parameter list, with the body block always last.
+    If child_count is greater than 0:
+        Let name_ast be proc memory_get_int64 from Layout with children, 0
+        Let name_value be proc memory_get_int64 from Layout with name_ast, 32
+        proc set_dict_value with hir_func, "name", name_value
+    End If
+
+    Note: Parameters: every child between the name (index 0) and the body
+    Note: (last index). For functions with only a name and body there are
+    Note: none.
     Let parameters be proc create_hir_list
 
-    Let i be 0
     Let body_index be child_count minus 1
+    Let i be 1
 
     While i is less than body_index:
         Let param_ast be proc memory_get_int64 from Layout with children, i multiplied by 8
-        Let param_hir be proc translate_node from param_ast
+        Let param_hir be proc translate_node with param_ast
         proc list_append with parameters, param_hir
         Set i to i plus 1
     End While
 
     proc set_dict_value with hir_func, "parameters", parameters
 
-    Note: Body (last child)
-    If child_count is greater than 0:
+    Note: Body (last child).
+    If child_count is greater than 1:
         Let body_ast be proc memory_get_int64 from Layout with children, body_index multiplied by 8
-        Let body_hir be proc translate_node from body_ast
+        Let body_hir be proc translate_node with body_ast
         proc set_dict_value with hir_func, "body", body_hir
     End If
 
@@ -1206,21 +1346,28 @@ Process called "translate_class_definition" takes ast as Integer returns Integer
         Return 0
     End If
 
-    Let value be proc memory_get_int64 from Layout with ast, 8
-    Let children be proc memory_get_int64 from Layout with ast, 32
-    Let child_count be proc memory_get_int64 from Layout with ast, 40
+    Let children be proc memory_get_int64 from Layout with ast, 16
+    Let child_count be proc memory_get_int64 from Layout with ast, 24
 
     Let hir_class be proc create_hir_dict
     proc set_dict_value with hir_class, "node_type", "class_definition"
-    proc set_dict_value with hir_class, "name", value
 
-    Note: Members (all children)
+    Note: The parser emits the class/enum name as the first child (an
+    Note: AST_IDENTIFIER whose value slot holds the name lexeme); members
+    Note: follow as the remaining children.
+    If child_count is greater than 0:
+        Let name_ast be proc memory_get_int64 from Layout with children, 0
+        Let name_value be proc memory_get_int64 from Layout with name_ast, 32
+        proc set_dict_value with hir_class, "name", name_value
+    End If
+
+    Note: Members (children after the name).
     Let members be proc create_hir_list
 
-    Let i be 0
+    Let i be 1
     While i is less than child_count:
         Let member_ast be proc memory_get_int64 from Layout with children, i multiplied by 8
-        Let member_hir be proc translate_node from member_ast
+        Let member_hir be proc translate_node with member_ast
         proc list_append with members, member_hir
         Set i to i plus 1
     End While
@@ -1251,9 +1398,9 @@ Process called "translate_property_definition" takes ast as Integer returns Inte
         Return 0
     End If
 
-    Let value be proc memory_get_int64 from Layout with ast, 8
-    Let children be proc memory_get_int64 from Layout with ast, 32
-    Let child_count be proc memory_get_int64 from Layout with ast, 40
+    Let value be proc memory_get_int64 from Layout with ast, 32
+    Let children be proc memory_get_int64 from Layout with ast, 16
+    Let child_count be proc memory_get_int64 from Layout with ast, 24
 
     Let hir_prop be proc create_hir_dict
     proc set_dict_value with hir_prop, "node_type", "property_definition"
@@ -1262,14 +1409,14 @@ Process called "translate_property_definition" takes ast as Integer returns Inte
     Note: Type (first child, optional)
     If child_count is greater than 0:
         Let type_ast be proc memory_get_int64 from Layout with children, 0
-        Let type_hir be proc translate_node from type_ast
+        Let type_hir be proc translate_node with type_ast
         proc set_dict_value with hir_prop, "type", type_hir
     End If
 
     Note: Initial value (second child, optional)
     If child_count is greater than 1:
         Let value_ast be proc memory_get_int64 from Layout with children, 8
-        Let value_hir be proc translate_node from value_ast
+        Let value_hir be proc translate_node with value_ast
         proc set_dict_value with hir_prop, "initial_value", value_hir
     End If
 
@@ -1296,8 +1443,8 @@ Process called "translate_constructor_definition" takes ast as Integer returns I
         Return 0
     End If
 
-    Let children be proc memory_get_int64 from Layout with ast, 32
-    Let child_count be proc memory_get_int64 from Layout with ast, 40
+    Let children be proc memory_get_int64 from Layout with ast, 16
+    Let child_count be proc memory_get_int64 from Layout with ast, 24
 
     Let hir_constructor be proc create_hir_dict
     proc set_dict_value with hir_constructor, "node_type", "constructor_definition"
@@ -1310,7 +1457,7 @@ Process called "translate_constructor_definition" takes ast as Integer returns I
 
     While i is less than body_index:
         Let param_ast be proc memory_get_int64 from Layout with children, i multiplied by 8
-        Let param_hir be proc translate_node from param_ast
+        Let param_hir be proc translate_node with param_ast
         proc list_append with parameters, param_hir
         Set i to i plus 1
     End While
@@ -1320,7 +1467,7 @@ Process called "translate_constructor_definition" takes ast as Integer returns I
     Note: Body (last child)
     If child_count is greater than 0:
         Let body_ast be proc memory_get_int64 from Layout with children, body_index multiplied by 8
-        Let body_hir be proc translate_node from body_ast
+        Let body_hir be proc translate_node with body_ast
         proc set_dict_value with hir_constructor, "body", body_hir
     End If
 
@@ -1349,9 +1496,9 @@ Process called "translate_method_definition" takes ast as Integer returns Intege
         Return 0
     End If
 
-    Let value be proc memory_get_int64 from Layout with ast, 8
-    Let children be proc memory_get_int64 from Layout with ast, 32
-    Let child_count be proc memory_get_int64 from Layout with ast, 40
+    Let value be proc memory_get_int64 from Layout with ast, 32
+    Let children be proc memory_get_int64 from Layout with ast, 16
+    Let child_count be proc memory_get_int64 from Layout with ast, 24
 
     Let hir_method be proc create_hir_dict
     proc set_dict_value with hir_method, "node_type", "method_definition"
@@ -1365,7 +1512,7 @@ Process called "translate_method_definition" takes ast as Integer returns Intege
 
     While i is less than body_index:
         Let param_ast be proc memory_get_int64 from Layout with children, i multiplied by 8
-        Let param_hir be proc translate_node from param_ast
+        Let param_hir be proc translate_node with param_ast
         proc list_append with parameters, param_hir
         Set i to i plus 1
     End While
@@ -1375,7 +1522,7 @@ Process called "translate_method_definition" takes ast as Integer returns Intege
     Note: Body (last child)
     If child_count is greater than 0:
         Let body_ast be proc memory_get_int64 from Layout with children, body_index multiplied by 8
-        Let body_hir be proc translate_node from body_ast
+        Let body_hir be proc translate_node with body_ast
         proc set_dict_value with hir_method, "body", body_hir
     End If
 
@@ -1407,8 +1554,8 @@ Process called "translate_try_statement" takes ast as Integer returns Integer:
         Return 0
     End If
 
-    Let children be proc memory_get_int64 from Layout with ast, 32
-    Let child_count be proc memory_get_int64 from Layout with ast, 40
+    Let children be proc memory_get_int64 from Layout with ast, 16
+    Let child_count be proc memory_get_int64 from Layout with ast, 24
 
     Let hir_try be proc create_hir_dict
     proc set_dict_value with hir_try, "node_type", "try_statement"
@@ -1416,7 +1563,7 @@ Process called "translate_try_statement" takes ast as Integer returns Integer:
     Note: Try body (first child)
     If child_count is greater than 0:
         Let try_ast be proc memory_get_int64 from Layout with children, 0
-        Let try_hir be proc translate_node from try_ast
+        Let try_hir be proc translate_node with try_ast
         proc set_dict_value with hir_try, "try_body", try_hir
     End If
 
@@ -1428,7 +1575,7 @@ Process called "translate_try_statement" takes ast as Integer returns Integer:
 
     While i is less than finally_index:
         Let catch_ast be proc memory_get_int64 from Layout with children, i multiplied by 8
-        Let catch_hir be proc translate_catch_clause from catch_ast
+        Let catch_hir be proc translate_catch_clause with catch_ast
         proc list_append with catch_clauses, catch_hir
         Set i to i plus 1
     End While
@@ -1438,7 +1585,7 @@ Process called "translate_try_statement" takes ast as Integer returns Integer:
     Note: Finally block (last child, optional)
     If child_count is greater than 1:
         Let finally_ast be proc memory_get_int64 from Layout with children, finally_index multiplied by 8
-        Let finally_hir be proc translate_node from finally_ast
+        Let finally_hir be proc translate_node with finally_ast
         proc set_dict_value with hir_try, "finally_body", finally_hir
     End If
 
@@ -1469,8 +1616,8 @@ Process called "translate_catch_clause" takes ast as Integer returns Integer:
         Return 0
     End If
 
-    Let children be proc memory_get_int64 from Layout with ast, 32
-    Let child_count be proc memory_get_int64 from Layout with ast, 40
+    Let children be proc memory_get_int64 from Layout with ast, 16
+    Let child_count be proc memory_get_int64 from Layout with ast, 24
 
     Let hir_catch be proc create_hir_dict
     proc set_dict_value with hir_catch, "node_type", "catch_clause"
@@ -1478,14 +1625,14 @@ Process called "translate_catch_clause" takes ast as Integer returns Integer:
     Note: Exception type (first child, optional)
     If child_count is greater than 0:
         Let type_ast be proc memory_get_int64 from Layout with children, 0
-        Let type_hir be proc translate_node from type_ast
+        Let type_hir be proc translate_node with type_ast
         proc set_dict_value with hir_catch, "exception_type", type_hir
     End If
 
     Note: Variable name (second child, optional)
     If child_count is greater than 1:
         Let var_ast be proc memory_get_int64 from Layout with children, 8
-        Let var_hir be proc translate_literal from var_ast
+        Let var_hir be proc translate_literal with var_ast
         proc set_dict_value with hir_catch, "variable", var_hir
     End If
 
@@ -1493,7 +1640,7 @@ Process called "translate_catch_clause" takes ast as Integer returns Integer:
     Let body_index be child_count minus 1
     If child_count is greater than 0:
         Let body_ast be proc memory_get_int64 from Layout with children, body_index multiplied by 8
-        Let body_hir be proc translate_node from body_ast
+        Let body_hir be proc translate_node with body_ast
         proc set_dict_value with hir_catch, "body", body_hir
     End If
 
@@ -1518,8 +1665,8 @@ Process called "translate_throw_statement" takes ast as Integer returns Integer:
         Return 0
     End If
 
-    Let children be proc memory_get_int64 from Layout with ast, 32
-    Let child_count be proc memory_get_int64 from Layout with ast, 40
+    Let children be proc memory_get_int64 from Layout with ast, 16
+    Let child_count be proc memory_get_int64 from Layout with ast, 24
 
     Let hir_throw be proc create_hir_dict
     proc set_dict_value with hir_throw, "node_type", "throw_statement"
@@ -1527,7 +1674,7 @@ Process called "translate_throw_statement" takes ast as Integer returns Integer:
     Note: Exception expression (first child, optional)
     If child_count is greater than 0:
         Let expr_ast be proc memory_get_int64 from Layout with children, 0
-        Let expr_hir be proc translate_node from expr_ast
+        Let expr_hir be proc translate_node with expr_ast
         proc set_dict_value with hir_throw, "expression", expr_hir
     End If
 
@@ -1552,8 +1699,8 @@ Process called "translate_return_statement" takes ast as Integer returns Integer
         Return 0
     End If
 
-    Let children be proc memory_get_int64 from Layout with ast, 32
-    Let child_count be proc memory_get_int64 from Layout with ast, 40
+    Let children be proc memory_get_int64 from Layout with ast, 16
+    Let child_count be proc memory_get_int64 from Layout with ast, 24
 
     Let hir_return be proc create_hir_dict
     proc set_dict_value with hir_return, "node_type", "return_statement"
@@ -1561,7 +1708,7 @@ Process called "translate_return_statement" takes ast as Integer returns Integer
     Note: Return value (first child, optional)
     If child_count is greater than 0:
         Let value_ast be proc memory_get_int64 from Layout with children, 0
-        Let value_hir be proc translate_node from value_ast
+        Let value_hir be proc translate_node with value_ast
         proc set_dict_value with hir_return, "value", value_hir
     End If
 
@@ -1634,8 +1781,8 @@ Process called "translate_assignment" takes ast as Integer returns Integer:
         Return 0
     End If
 
-    Let children be proc memory_get_int64 from Layout with ast, 32
-    Let child_count be proc memory_get_int64 from Layout with ast, 40
+    Let children be proc memory_get_int64 from Layout with ast, 16
+    Let child_count be proc memory_get_int64 from Layout with ast, 24
 
     Let hir_assign be proc create_hir_dict
     proc set_dict_value with hir_assign, "node_type", "assignment"
@@ -1643,14 +1790,14 @@ Process called "translate_assignment" takes ast as Integer returns Integer:
     Note: Variable (first child)
     If child_count is greater than 0:
         Let var_ast be proc memory_get_int64 from Layout with children, 0
-        Let var_hir be proc translate_variable from var_ast
+        Let var_hir be proc translate_variable with var_ast
         proc set_dict_value with hir_assign, "variable", var_hir
     End If
 
     Note: Value (second child)
     If child_count is greater than 1:
         Let value_ast be proc memory_get_int64 from Layout with children, 8
-        Let value_hir be proc translate_node from value_ast
+        Let value_hir be proc translate_node with value_ast
         proc set_dict_value with hir_assign, "value", value_hir
     End If
 
@@ -1677,8 +1824,8 @@ Process called "translate_block" takes ast as Integer returns Integer:
         Return 0
     End If
 
-    Let children be proc memory_get_int64 from Layout with ast, 32
-    Let child_count be proc memory_get_int64 from Layout with ast, 40
+    Let children be proc memory_get_int64 from Layout with ast, 16
+    Let child_count be proc memory_get_int64 from Layout with ast, 24
 
     Let hir_block be proc create_hir_dict
     proc set_dict_value with hir_block, "node_type", "script_block"
@@ -1688,7 +1835,7 @@ Process called "translate_block" takes ast as Integer returns Integer:
     Let i be 0
     While i is less than child_count:
         Let stmt_ast be proc memory_get_int64 from Layout with children, i multiplied by 8
-        Let stmt_hir be proc translate_node from stmt_ast
+        Let stmt_hir be proc translate_node with stmt_ast
         proc list_append with statements, stmt_hir
         Set i to i plus 1
     End While
@@ -1734,177 +1881,226 @@ Process called "translate_node" takes ast as Integer returns Integer:
 
     Let node_type be proc memory_get_int64 from Layout with ast, 0
 
+    Note: Dispatch is keyed on the parser's AST node constants
+    Note: (powershell_parser.runa). Structural nodes route to their
+    Note: dedicated translators; literals and identifiers route to
+    Note: translate_literal which reads the lexeme from the node value slot.
+
     Note: AST_SCRIPT (1)
     If node_type is equal to 1:
-        Return proc translate_script from ast
+        Return proc translate_script with ast
     End If
 
     Note: AST_PIPELINE (3)
     If node_type is equal to 3:
-        Return proc translate_pipeline from ast
+        Return proc translate_pipeline with ast
+    End If
+
+    Note: AST_BLOCK (5)
+    If node_type is equal to 5:
+        Return proc translate_block with ast
     End If
 
     Note: AST_IF_STATEMENT (10)
     If node_type is equal to 10:
-        Return proc translate_if_statement from ast
+        Return proc translate_if_statement with ast
     End If
 
     Note: AST_WHILE_STATEMENT (11)
     If node_type is equal to 11:
-        Return proc translate_while_statement from ast
+        Return proc translate_while_statement with ast
     End If
 
     Note: AST_FOR_STATEMENT (12)
     If node_type is equal to 12:
-        Return proc translate_for_statement from ast
+        Return proc translate_for_statement with ast
     End If
 
     Note: AST_FOREACH_STATEMENT (13)
     If node_type is equal to 13:
-        Return proc translate_foreach_statement from ast
+        Return proc translate_foreach_statement with ast
     End If
 
     Note: AST_SWITCH_STATEMENT (14)
     If node_type is equal to 14:
-        Return proc translate_switch_statement from ast
+        Return proc translate_switch_statement with ast
     End If
 
-    Note: AST_FUNCTION_DEFINITION (20)
+    Note: AST_DO_WHILE (15) and AST_DO_UNTIL (16) share the while shape
+    Note: (condition + body) at the HIR level.
+    If node_type is equal to 15:
+        Return proc translate_while_statement with ast
+    End If
+    If node_type is equal to 16:
+        Return proc translate_while_statement with ast
+    End If
+
+    Note: AST_FUNCTION_DEFINITION (20), AST_FILTER_DEFINITION (21),
+    Note: AST_WORKFLOW_DEFINITION (22) share the function shape.
     If node_type is equal to 20:
-        Return proc translate_function_definition from ast
+        Return proc translate_function_definition with ast
     End If
-
-    Note: AST_ASSIGNMENT (21)
     If node_type is equal to 21:
-        Return proc translate_assignment from ast
+        Return proc translate_function_definition with ast
     End If
-
-    Note: AST_VARIABLE (22)
     If node_type is equal to 22:
-        Return proc translate_variable from ast
+        Return proc translate_function_definition with ast
     End If
 
-    Note: AST_CLASS_DEFINITION (23)
+    Note: AST_CLASS_DEFINITION (23) and AST_ENUM_DEFINITION (24) both carry
+    Note: a name child followed by member children.
     If node_type is equal to 23:
-        Return proc translate_class_definition from ast
+        Return proc translate_class_definition with ast
     End If
-
-    Note: AST_PROPERTY_DEFINITION (24)
     If node_type is equal to 24:
-        Return proc translate_property_definition from ast
+        Return proc translate_class_definition with ast
     End If
 
-    Note: AST_CONSTRUCTOR_DEFINITION (25)
+    Note: AST_METHOD_DEFINITION (25)
     If node_type is equal to 25:
-        Return proc translate_constructor_definition from ast
+        Return proc translate_method_definition with ast
     End If
 
-    Note: AST_METHOD_DEFINITION (26)
+    Note: AST_PROPERTY_DEFINITION (26)
     If node_type is equal to 26:
-        Return proc translate_method_definition from ast
+        Return proc translate_property_definition with ast
     End If
 
-    Note: AST_TRY_STATEMENT (30)
+    Note: AST_PARAM_BLOCK (30) — a list of AST_PARAMETER children.
     If node_type is equal to 30:
-        Return proc translate_try_statement from ast
+        Return proc translate_block with ast
     End If
 
-    Note: AST_CATCH_CLAUSE (31)
+    Note: AST_PARAMETER (31)
     If node_type is equal to 31:
-        Return proc translate_catch_clause from ast
+        Return proc translate_parameter with ast
     End If
 
-    Note: AST_THROW_STATEMENT (32)
+    Note: AST_VARIABLE (32)
     If node_type is equal to 32:
-        Return proc translate_throw_statement from ast
+        Return proc translate_variable with ast
     End If
 
-    Note: AST_RETURN_STATEMENT (33)
+    Note: AST_VARIABLE_ASSIGNMENT (33)
     If node_type is equal to 33:
-        Return proc translate_return_statement from ast
+        Return proc translate_assignment with ast
     End If
 
-    Note: AST_BREAK_STATEMENT (34)
+    Note: AST_PROPERTY_ACCESS (34)
     If node_type is equal to 34:
-        Return proc translate_break_statement from ast
+        Return proc translate_member_access with ast
     End If
 
-    Note: AST_CONTINUE_STATEMENT (35)
+    Note: AST_METHOD_CALL (35)
     If node_type is equal to 35:
-        Return proc translate_continue_statement from ast
+        Return proc translate_method_call with ast
     End If
 
-    Note: AST_BINARY_OPERATION (40)
+    Note: AST_ARRAY_ACCESS (36)
+    If node_type is equal to 36:
+        Return proc translate_index_access with ast
+    End If
+
+    Note: AST_BINARY_EXPRESSION (40)
     If node_type is equal to 40:
-        Return proc translate_binary_operation from ast
+        Return proc translate_binary_operation with ast
     End If
 
-    Note: AST_UNARY_OPERATION (41)
+    Note: AST_UNARY_EXPRESSION (41)
     If node_type is equal to 41:
-        Return proc translate_unary_operation from ast
+        Return proc translate_unary_operation with ast
     End If
 
-    Note: AST_MEMBER_ACCESS (42)
+    Note: AST_SUBEXPRESSION (42)
     If node_type is equal to 42:
-        Return proc translate_member_access from ast
+        Return proc translate_subexpression with ast
     End If
 
-    Note: AST_INDEX_ACCESS (43)
+    Note: AST_ARRAY_SUBEXPRESSION (43)
     If node_type is equal to 43:
-        Return proc translate_index_access from ast
+        Return proc translate_array_literal with ast
     End If
 
-    Note: AST_METHOD_CALL (44)
+    Note: AST_HASHTABLE (44)
     If node_type is equal to 44:
-        Return proc translate_method_call from ast
+        Return proc translate_hashtable_literal with ast
     End If
 
-    Note: AST_CMDLET_INVOCATION (70)
+    Note: AST_ARRAY_LITERAL (45)
+    If node_type is equal to 45:
+        Return proc translate_array_literal with ast
+    End If
+
+    Note: AST_TYPE_EXPRESSION (46) — translates as the bracketed type name.
+    If node_type is equal to 46:
+        Return proc translate_type_expression with ast
+    End If
+
+    Note: AST_TRY_STATEMENT (50)
+    If node_type is equal to 50:
+        Return proc translate_try_statement with ast
+    End If
+
+    Note: AST_CATCH_STATEMENT (51)
+    If node_type is equal to 51:
+        Return proc translate_catch_clause with ast
+    End If
+
+    Note: AST_FINALLY_STATEMENT (52) — body-only clause.
+    If node_type is equal to 52:
+        Return proc translate_catch_clause with ast
+    End If
+
+    Note: AST_THROW_STATEMENT (53)
+    If node_type is equal to 53:
+        Return proc translate_throw_statement with ast
+    End If
+
+    Note: AST_RETURN_STATEMENT (60)
+    If node_type is equal to 60:
+        Return proc translate_return_statement with ast
+    End If
+
+    Note: AST_BREAK_STATEMENT (61)
+    If node_type is equal to 61:
+        Return proc translate_break_statement with ast
+    End If
+
+    Note: AST_CONTINUE_STATEMENT (62)
+    If node_type is equal to 62:
+        Return proc translate_continue_statement with ast
+    End If
+
+    Note: AST_EXIT_STATEMENT (63) — modelled as a return with optional value.
+    If node_type is equal to 63:
+        Return proc translate_return_statement with ast
+    End If
+
+    Note: AST_IDENTIFIER (70) — name-carrying leaf; lexeme under "value".
     If node_type is equal to 70:
-        Return proc translate_cmdlet_invocation from ast
+        Return proc translate_literal with ast
     End If
 
-    Note: AST_CMDLET (71)
+    Note: AST_CMDLET (71) — cmdlet invocation: name in the value slot, args
+    Note: and named parameters as children.
     If node_type is equal to 71:
-        Return proc translate_cmdlet from ast
+        Return proc translate_cmdlet_invocation with ast
     End If
 
-    Note: AST_PARAMETER (72)
-    If node_type is equal to 72:
-        Return proc translate_parameter from ast
-    End If
-
-    Note: AST_ARRAY_LITERAL (73)
-    If node_type is equal to 73:
-        Return proc translate_array_literal from ast
-    End If
-
-    Note: AST_HASHTABLE_LITERAL (74)
-    If node_type is equal to 74:
-        Return proc translate_hashtable_literal from ast
-    End If
-
-    Note: AST_KEY_VALUE_PAIR (75)
-    If node_type is equal to 75:
-        Return proc translate_key_value_pair from ast
-    End If
-
-    Note: AST_SUBEXPRESSION (76)
-    If node_type is equal to 76:
-        Return proc translate_subexpression from ast
-    End If
-
-    Note: AST_SCRIPT_BLOCK (77)
-    If node_type is equal to 77:
-        Return proc translate_block from ast
-    End If
-
-    Note: Literal types: AST_STRING_LITERAL (80), AST_NUMBER_LITERAL (81),
-    Note: AST_BOOLEAN_LITERAL (82), AST_NULL_LITERAL (83)
-    If node_type is greater than or equal to 80:
-        If node_type is less than or equal to 83:
-            Return proc translate_literal from ast
+    Note: Literal leaves: AST_STRING_LITERAL (72), AST_NUMBER_LITERAL (73),
+    Note: AST_BOOLEAN_LITERAL (74), AST_NULL_LITERAL (75).
+    If node_type is greater than or equal to 72:
+        If node_type is less than or equal to 75:
+            Return proc translate_literal with ast
         End If
+    End If
+
+    Note: AST_SWITCH_CLAUSE (80) and AST_DEFAULT_CLAUSE (82)
+    If node_type is equal to 80:
+        Return proc translate_switch_case with ast
+    End If
+    If node_type is equal to 82:
+        Return proc translate_switch_case with ast
     End If
 
     Return 0
@@ -1930,8 +2126,8 @@ Process called "translate_script" takes ast as Integer returns Integer:
         Return 0
     End If
 
-    Let children be proc memory_get_int64 from Layout with ast, 32
-    Let child_count be proc memory_get_int64 from Layout with ast, 40
+    Let children be proc memory_get_int64 from Layout with ast, 16
+    Let child_count be proc memory_get_int64 from Layout with ast, 24
 
     Let hir_script be proc create_hir_dict
     proc set_dict_value with hir_script, "node_type", "script"
@@ -1941,7 +2137,7 @@ Process called "translate_script" takes ast as Integer returns Integer:
     Let i be 0
     While i is less than child_count:
         Let stmt_ast be proc memory_get_int64 from Layout with children, i multiplied by 8
-        Let stmt_hir be proc translate_node from stmt_ast
+        Let stmt_hir be proc translate_node with stmt_ast
         proc list_append with statements, stmt_hir
         Set i to i plus 1
     End While
@@ -1964,7 +2160,7 @@ node kinds without ever touching this function.
 Process called "translate_powershell_to_hir" takes ast as Integer returns Integer:
     Note: Main translation entry point for PowerShell AST to HIR
 
-    Return proc translate_node from ast
+    Return proc translate_node with ast
 End Process
 
 Note: End of PowerShell→HIR Translator

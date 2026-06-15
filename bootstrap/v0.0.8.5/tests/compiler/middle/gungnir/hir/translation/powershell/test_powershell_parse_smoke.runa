@@ -1,0 +1,122 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+Licensed under Apache 2.0
+:End Note
+
+Note:
+PowerShell Lex + Parse Smoke Probe (Stage A)
+
+Bounded proof that the PowerShell front-of-pipeline (lexer + parser) is REAL
+and TERMINATES on a broad slice of real PowerShell:
+
+    PowerShell source
+      -> tokenize        (powershell_lexer: param() blocks, typed params,
+                          $variables + $script:/$env: scopes, Verb-Noun cmdlets
+                          with -Named/positional/switch params, pipelines |,
+                          if/elseif/else, foreach/for/while/do, switch,
+                          try/catch/finally, hashtables @{}, arrays @(),
+                          script blocks { }, "$($x)" interpolation,
+                          -eq/-ne/-gt/-match/-like operators, # and <# #> comments)
+      -> create_parser   (wire the token stream into the parser state)
+      -> parse_script    (walk the token stream into the AST)
+
+This probe deliberately does NOT assert content round-trip: the PowerShell
+parser productions do not yet populate node value/name payloads and the
+lexer does not retain per-token lexeme text, so HIR content survival is the
+subject of a separate from-scratch frontend build (see report). What this
+probe DOES prove is that the lex + parse layer:
+  - produces a non-empty token stream,
+  - terminates (the harness runs under a hard CPU cap; an infinite parse
+    loop would be killed and the probe would never reach print_summary), and
+  - produces a non-empty AST (the top-level SCRIPT node accrues children).
+
+The probe exits with the number of failed assertions (0 == all passed).
+:End Note
+
+Import "compiler/middle/gungnir/hir/translation/frontends/powershell/powershell_lexer.runa" as Lexer
+Import "compiler/middle/gungnir/hir/translation/frontends/powershell/powershell_parser.runa" as Parser
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "tests/test_utils.runa" as TestUtils
+
+@Reasoning:
+Reads the cached child_count field (offset 24) of an AST node. The parser's
+create_ast_node lays out nodes as type@0, parent@8, children@16,
+child_count@24, data@32, capacity@48; add_child increments child_count, so
+this is the authoritative count of accrued top-level statements.
+@End Reasoning
+Process called "ast_child_count" takes node as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Layout with node, 24
+End Process
+
+@Reasoning:
+Reads the node_type tag (offset 0) so the probe can confirm the root really
+is the AST_SCRIPT node the parser is documented to return.
+@End Reasoning
+Process called "ast_node_type" takes node as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Layout with node, 0
+End Process
+
+Process called "main" returns Integer:
+    Let results be proc create_test_results from TestUtils
+    proc begin_suite from TestUtils with results, "PowerShell lex+parse smoke"
+
+    Note:
+    Representative PowerShell program exercising the full lexer/parser surface
+    the brief enumerates:
+    - comment-based help / # and <# #> comments
+    - function with param() block, typed param [string]$Name, default value,
+      and a [Parameter()] attribute
+    - $variables, $script: and $env: scopes
+    - cmdlet invocation (Verb-Noun) with named, positional and switch params
+    - a multi-stage pipeline with $_
+    - if / elseif / else
+    - foreach, for, while, do-while
+    - switch with -regex
+    - try / catch / finally + throw
+    - hashtable @{} and array @()
+    - script block { }
+    - "$($x)" string interpolation
+    - comparison operators -eq / -ne / -gt / -match / -like
+    :End Note
+    Let source be "<#\nComment-based help block\n#>\nfunction Get-Greeting {\nparam(\n[Parameter(Mandatory=$true)]\n[string]$Name = \"World\",\n[int]$Count\n)\n$script:total = 0\n$env:PATH\nWrite-Output -InputObject $Name -NoNewline\nGet-ChildItem $env:HOME | Where-Object { $_.Length -gt 0 } | Sort-Object Name\nif ($Count -eq 0) {\n$result = @{ name = $Name; count = $Count }\n} elseif ($Count -gt 10) {\n$result = @(1, 2, 3)\n} else {\nthrow \"bad count\"\n}\nforeach ($item in $result) {\nWrite-Output \"$($item)\"\n}\nfor ($i = 0; $i -lt $Count; $i = $i + 1) {\n$total = $total + $i\n}\nwhile ($total -ne 0) {\n$total = $total - 1\n}\ndo {\n$total = $total + 1\n} while ($total -lt 5)\nswitch -regex ($Name) {\n\"^W\" { Write-Output \"starts with W\" }\ndefault { Write-Output \"other\" }\n}\ntry {\n$x = Get-Item -Path $Name\n} catch {\nWrite-Error $_\n} finally {\nWrite-Output \"done\"\n}\nif ($Name -match \"or\" -and $Name -like \"*ld\") {\nWrite-Output \"matched\"\n}\nreturn $result\n}\n# trailing comment\n"
+
+    Let src_len be proc string_length from StringCore with source
+    proc assert_greater_than from TestUtils with results, "source is non-empty", src_len, 0
+
+    Note: --- Stage A.1: tokenize ---
+    Let lexer be proc tokenize from Lexer with source, src_len
+    proc assert_not_null from TestUtils with results, "lexer produced a token stream", lexer
+
+    Let token_count be proc memory_get_int64 from Layout with lexer, 48
+    proc assert_greater_than from TestUtils with results, "lexer produced tokens", token_count, 0
+
+    Note: --- Stage A.2: parser construction ---
+    Let parser be proc create_parser from Parser with lexer
+    proc assert_not_null from TestUtils with results, "parser created", parser
+
+    Let parser_token_count be proc memory_get_int64 from Layout with parser, 24
+    proc assert_equal from TestUtils with results, "parser sees the lexer token count", parser_token_count, token_count
+
+    Note: --- Stage A.3: parse (must terminate under the CPU cap) ---
+    Let script be proc parse_script from Parser with parser
+    proc assert_not_null from TestUtils with results, "parser produced an AST", script
+
+    Let root_type be proc ast_node_type with script
+    proc assert_equal from TestUtils with results, "AST root is AST_SCRIPT", root_type, 1
+
+    Let child_count be proc ast_child_count with script
+    proc assert_greater_than from TestUtils with results, "AST root has top-level statements", child_count, 0
+
+    proc print_summary from TestUtils with results
+    Let failed be proc get_failed from TestUtils with results
+    proc destroy_test_results from TestUtils with results
+
+    Return failed
+End Process
