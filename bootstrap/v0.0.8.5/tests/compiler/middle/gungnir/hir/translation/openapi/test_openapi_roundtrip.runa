@@ -43,9 +43,12 @@ Exit code: number of failed assertions (0 == all passed). No exit_with_code.
 Import "compiler/middle/gungnir/hir/translation/frontends/openapi/openapi_parser.runa" as Parser
 Import "compiler/middle/gungnir/hir/translation/frontends/openapi/openapi_to_hir.runa" as Frontend
 Import "compiler/middle/gungnir/hir/translation/backends/openapi/hir_to_openapi.runa" as Backend
+Import "compiler/middle/gungnir/hir/translation/frontends/yaml/yaml_to_hir.runa" as YamlFrontend
+Import "compiler/middle/gungnir/hir/hir.runa" as HIR
 Import "compiler/frontend/primitives/collections/dictionary.runa" as Dict
 Import "compiler/frontend/primitives/collections/list.runa" as List
 Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
 Import "tests/test_utils.runa" as TestUtils
 
 Note: Value-cell kind tags (must match openapi_parser.runa)
@@ -122,15 +125,20 @@ Process called "main" returns Integer:
     second parse must consume.
     :End Note
     Note:
-    The path is "/users" (a flow-indicator-free template). OpenAPI path
-    templating with brace parameters (e.g. "/users/{id}") is exercised at the
-    operation-parameter level below (name=id, in=path); the brace path key
-    itself is omitted because the shared YAML lexer terminates a plain scalar
-    on a bare "{" in block context (a pre-existing lexer limitation unrelated
-    to the OpenAPI translation layer), which would break the SECOND parse of
-    the emitted block YAML.
+    The path is "/users/{id}" - a real OpenAPI path template carrying a brace
+    parameter. This is the load-bearing case for bug #513: the shared YAML
+    lexer must keep the braces as literal scalar bytes when the path key is
+    re-emitted as a BLOCK-context plain scalar on the SECOND parse. The braces
+    here in the FIRST (flow-style) parse appear inside a quoted scalar so they
+    were never the problem; the failure was that the emitter writes the key
+    UNQUOTED as a block-mapping key ("/users/{id}:"), which previously caused
+    the lexer to truncate the plain scalar at the "{". The flow-context map
+    cells throughout this document (e.g. {"type": "integer"}) still rely on
+    flow indicators terminating scalars correctly, so this single document
+    exercises BOTH contexts. A dedicated pure-block-context probe follows the
+    round-trip below.
     :End Note
-    Let source be "{\"openapi\": \"3.0.3\", \"info\": {\"title\": \"User API\", \"version\": \"1.2.0\", \"description\": \"Manages users\"}, \"paths\": {\"/users\": {\"get\": {\"summary\": \"Get a user\", \"parameters\": [{\"name\": \"id\", \"in\": \"path\"}], \"responses\": {\"200\": {\"description\": \"OK\"}}}}}, \"components\": {\"schemas\": {\"User\": {\"type\": \"object\", \"properties\": {\"id\": {\"type\": \"integer\"}, \"name\": {\"type\": \"string\"}}}}}}"
+    Let source be "{\"openapi\": \"3.0.3\", \"info\": {\"title\": \"User API\", \"version\": \"1.2.0\", \"description\": \"Manages users\"}, \"paths\": {\"/users/{id}\": {\"get\": {\"summary\": \"Get a user\", \"parameters\": [{\"name\": \"id\", \"in\": \"path\"}], \"responses\": {\"200\": {\"description\": \"OK\"}}}}}, \"components\": {\"schemas\": {\"User\": {\"type\": \"object\", \"properties\": {\"id\": {\"type\": \"integer\"}, \"name\": {\"type\": \"string\"}}}}}}"
 
     Note: --- Stage 0: parse source -> AST cell ---
     Let ast1 be proc parse_openapi from Parser with source
@@ -198,9 +206,9 @@ Process called "main" returns Integer:
     Let paths2_cell be proc dict_lookup with hir2, paths_key
     proc assert_not_null from TestUtils with results, "hir2 has paths section", paths2_cell
 
-    Let path_key be proc create_from_literal from StringCore with "/users"
+    Let path_key be proc create_from_literal from StringCore with "/users/{id}"
     Let path_item2_cell be proc dict_lookup with paths2_cell, path_key
-    proc assert_not_null from TestUtils with results, "hir2 path /users survives", path_item2_cell
+    proc assert_not_null from TestUtils with results, "hir2 path /users/{id} survives round-trip (bug #513)", path_item2_cell
 
     Let get_key be proc create_from_literal from StringCore with "get"
     Let op2_cell be proc dict_lookup with path_item2_cell, get_key
@@ -276,6 +284,72 @@ Process called "main" returns Integer:
     Let nametype_cell be proc dict_lookup with nameprop_cell, type_key
     Let nametype_str be proc scalar_text with nametype_cell
     proc assert_string_equal from TestUtils with results, "hir2 property name type survives (string)", nametype_str, "string"
+
+    Note: ================= BUG #513: PURE BLOCK-CONTEXT BRACE PROBE =================
+    Note:
+    Direct, isolated proof of the lexer fix for bug #513: a plain scalar
+    containing flow indicators ({ } [ ] ,) must survive in BLOCK context,
+    where per the YAML spec those characters are ordinary scalar bytes (they
+    only terminate a plain scalar inside flow collections). This probe feeds a
+    BLOCK-style YAML document whose mapping key AND value are the BARE,
+    UNQUOTED scalar "/users/{id}" - exactly the shape the OpenAPI emitter
+    produces for a templated path key. The probe drives the YAML frontend
+    (yaml_to_hir) directly, which is the layer the shared lexer feeds; this
+    keeps the proof scoped to the lexer behaviour and independent of the
+    OpenAPI shape-gate. Before the fix the lexer truncated the scalar at "{",
+    so the key/value were malformed; after the fix the literal "/users/{id}"
+    appears verbatim as both the mapping key and the scalar value.
+    :End Note
+    Let block_source be "/users/{id}: /users/{id}\n"
+    Let block_hir be proc yaml_to_hir_from_source from YamlFrontend with block_source
+    proc assert_not_null from TestUtils with results, "block-context YAML lowers to HIR (bug #513)", block_hir
+
+    Let block_kind be proc get_hir_node_type from HIR with block_hir
+    proc assert_equal from TestUtils with results, "block-context root is dictionary literal", block_kind, HIR_DICTIONARY_LITERAL from HIR
+
+    Let block_entries be proc get_dictionary_entries from HIR with block_hir
+    proc assert_not_null from TestUtils with results, "block-context dictionary has entries", block_entries
+    Let block_count be proc size from List with block_entries
+    proc assert_equal from TestUtils with results, "block-context mapping has exactly 1 entry (scalar not split on braces)", block_count, 1
+
+    Let block_e0 be proc get_at from List with block_entries, 0
+    Let block_k0 be proc memory_get_int64 from Layout with block_e0, 0
+    proc assert_string_equal from TestUtils with results, "block-context key '/users/{id}' survives literally (bug #513)", block_k0, "/users/{id}"
+
+    Let block_v0 be proc memory_get_int64 from Layout with block_e0, 8
+    Let block_v0_str be proc get_string_literal_value from HIR with block_v0
+    proc assert_string_equal from TestUtils with results, "block-context value '/users/{id}' survives literally (bug #513)", block_v0_str, "/users/{id}"
+
+    Note: ================= FLOW-CONTEXT REGRESSION GUARD =================
+    Note:
+    Confirm flow indicators STILL terminate plain scalars in FLOW context. A
+    valid OpenAPI doc carries the User schema written as a FLOW map whose
+    properties is a flow map of two entries: {id: {type: integer}, name:
+    {type: string}}. Each inner flow value must tokenize as a distinct entry
+    with its own scalar - if the flow_depth guard were wrong (never tracked),
+    the value of "id" would swallow ", name: ...}" and the property map would
+    collapse to a single malformed entry. We assert both inner scalars survive
+    with their exact text, proving flow indicators are still honored as
+    terminators inside flow collections.
+    :End Note
+    Let flow_source be "{\"openapi\": \"3.0.3\", \"info\": {\"title\": \"T\", \"version\": \"1\"}, \"paths\": {}, \"components\": {\"schemas\": {\"User\": {\"type\": \"object\", \"properties\": {\"id\": {\"type\": \"integer\"}, \"name\": {\"type\": \"string\"}}}}}}"
+    Let flow_ast be proc parse_openapi from Parser with flow_source
+    proc assert_not_null from TestUtils with results, "flow-context doc parses", flow_ast
+    Let flow_hir be proc translate_openapi_to_hir from Frontend with flow_ast
+    proc assert_not_null from TestUtils with results, "flow-context doc lowers to HIR", flow_hir
+    Let flow_comp_cell be proc dict_lookup with flow_hir, components_key
+    Let flow_schemas_cell be proc dict_lookup with flow_comp_cell, schemas_key
+    Let flow_user_cell be proc dict_lookup with flow_schemas_cell, user_key
+    Let flow_props_cell be proc dict_lookup with flow_user_cell, properties_key
+    proc assert_not_null from TestUtils with results, "flow-context properties map present", flow_props_cell
+    Let flow_id_cell be proc dict_lookup with flow_props_cell, id_key
+    Let flow_id_type_cell be proc dict_lookup with flow_id_cell, type_key
+    Let flow_id_type_str be proc scalar_text with flow_id_type_cell
+    proc assert_string_equal from TestUtils with results, "flow-context id type is exactly 'integer' (flow indicators still terminate)", flow_id_type_str, "integer"
+    Let flow_name_cell be proc dict_lookup with flow_props_cell, name_key
+    Let flow_name_type_cell be proc dict_lookup with flow_name_cell, type_key
+    Let flow_name_type_str be proc scalar_text with flow_name_type_cell
+    proc assert_string_equal from TestUtils with results, "flow-context name type is exactly 'string' (flow indicators still terminate)", flow_name_type_str, "string"
 
     proc print_summary from TestUtils with results
     Let failed be proc get_failed from TestUtils with results

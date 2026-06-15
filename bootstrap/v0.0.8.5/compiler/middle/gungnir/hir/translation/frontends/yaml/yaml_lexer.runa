@@ -136,7 +136,7 @@ just continue lexing tokens.
 @End Reasoning
 
 @Implementation:
-88-byte record (11 fields × 8 bytes):
+96-byte record (12 fields × 8 bytes):
 - source @0 - source string pointer
 - source_length @8 - precomputed length so EOF check is fast
 - position @16 - byte offset
@@ -150,6 +150,12 @@ just continue lexing tokens.
 - at_line_start @72 - 0/1 flag set by advance_char when consuming
   a newline so the dispatcher knows to scan indent
 - error_message @80 - pointer to first error message (or 0)
+- flow_depth @88 - nesting depth of flow collections; incremented
+  when a flow-collection open token ([ or {) is emitted and
+  decremented (clamped at 0) on a close token (] or }). Plain
+  scalars only treat flow indicators ([ ] { } ,) as terminators
+  when flow_depth > 0 (FLOW context); in BLOCK context those
+  characters are ordinary scalar bytes.
 @End Implementation
 Type called "YAMLLexer":
     source as Integer           Note: Source code string
@@ -163,6 +169,7 @@ Type called "YAMLLexer":
     indent_stack_capacity as Integer Note: Capacity of indent stack
     at_line_start as Integer    Note: Boolean: 1 if at start of line
     error_message as Integer    Note: Error message if TOKEN_ERROR
+    flow_depth as Integer       Note: Flow-collection nesting depth (0 = block context)
 End Type
 
 Note: ============================================================================
@@ -183,12 +190,12 @@ Source ownership stays with the caller - we only retain a pointer.
 @End Reasoning
 
 @Implementation:
-Allocates an 88-byte lexer record (11 slots * 8 bytes) via Layout.allocate;
+Allocates a 96-byte lexer record (12 slots * 8 bytes) via Layout.allocate;
 returns 0 if it fails. Computes source_length via StringCore.string_length.
-Writes the 11 slots at fixed offsets: 0=source ptr, 8=source_length,
+Writes the 12 slots at fixed offsets: 0=source ptr, 8=source_length,
 16=position=0, 24=line=1, 32=column=1, 40=current_indent=0,
 48=indent_stack=0 (filled below), 56=indent_stack_size=0, 64=capacity=0,
-72=at_line_start=1, 80=error_message=0. Then allocates the indent stack
+72=at_line_start=1, 80=error_message=0, 88=flow_depth=0. Then allocates the indent stack
 at capacity 32 (32 * 8 = 256 bytes). If allocation succeeds: writes 0 at
 indent_stack[0] (base level), then overwrites lexer offsets 48, 56, 64
 with the stack pointer, size=1, capacity=32. If indent-stack allocation
@@ -199,7 +206,7 @@ indent tracking. Returns the lexer handle.
 Process called "create_yaml_lexer" takes source as Integer returns Integer:
     Note: Create YAML lexer for source code
 
-    Let lexer_size be 88  Note: YAMLLexer: 11 fields × 8 bytes
+    Let lexer_size be 96  Note: YAMLLexer: 12 fields × 8 bytes
     Let lexer be proc allocate from Layout with lexer_size
 
     If lexer is equal to 0:
@@ -220,6 +227,7 @@ Process called "create_yaml_lexer" takes source as Integer returns Integer:
     proc memory_set_int64 from Layout with lexer, 64, 0   Note: indent_stack_capacity = 0
     proc memory_set_int64 from Layout with lexer, 72, 1   Note: at_line_start = true
     proc memory_set_int64 from Layout with lexer, 80, 0   Note: error_message = null
+    proc memory_set_int64 from Layout with lexer, 88, 0   Note: flow_depth = 0 (block context)
 
     Note: Initialize indent stack with base level 0 and capacity 32
     Let initial_capacity be 32
@@ -822,14 +830,18 @@ but grows on overflow so arbitrarily-long scalars work.
 
 @Implementation:
 Captures line (offset 24), column (offset 32), current_indent. Records
-start_pos (offset 16) and source (offset 0). Allocates a 1024-byte
-buffer for the scalar value. Loops reading characters via peek_char:
-breaks on EOF (0), newline (10), colon-followed-by-space-or-EOF
-(45 then 32/9/10/0), hash-followed-by-space, and any flow indicator.
-Appends each retained byte to buffer, growing buffer when full. On
-loop exit calls create_token with the assembled value and the
-(line, column) captured at entry. Always frees the local buffer
-before returning - the token holds its own copy.
+start_pos (offset 16) and source (offset 0). Reads flow_depth (offset
+88) to decide context. Allocates a 1024-byte buffer for the scalar
+value. Loops reading characters via peek_char: breaks on EOF (0),
+newline (10), colon-followed-by-space-or-EOF (45 then 32/9/10/0),
+hash-followed-by-space. The flow indicators (, [ ] { }) only terminate
+the scalar when flow_depth is greater than 0 (FLOW context); in BLOCK
+context (flow_depth == 0) they are ordinary scalar bytes appended to
+the buffer, so block-mapping keys/values such as an OpenAPI path
+`/users/{id}` round-trip correctly. Appends each retained byte to
+buffer, growing buffer when full. On loop exit calls create_token with
+the assembled value and the (line, column) captured at entry. Always
+frees the local buffer before returning - the token holds its own copy.
 @End Implementation
 
 Process called "scan_plain_scalar" takes lexer as Integer returns Integer:
@@ -841,6 +853,7 @@ Process called "scan_plain_scalar" takes lexer as Integer returns Integer:
 
     Let start_pos be proc memory_get_int64 from Layout with lexer, 16
     Let source be proc memory_get_int64 from Layout with lexer, 0
+    Let flow_depth be proc memory_get_int64 from Layout with lexer, 88
 
     Let buffer_size be 1024
     Let buffer be proc allocate from Layout with buffer_size
@@ -893,25 +906,31 @@ Process called "scan_plain_scalar" takes lexer as Integer returns Integer:
             Continue
         End If
 
-        Note: Check for flow indicators
-        If char is equal to 44:  Note: ,
-            Break
-        End If
+        Note: Check for flow indicators.
+        Note: Per the YAML spec these only terminate a plain scalar in
+        Note: FLOW context (inside [ ... ] / { ... }). In BLOCK context
+        Note: (flow_depth == 0) they are ordinary scalar characters, so a
+        Note: block value like /users/{id} is preserved literally.
+        If flow_depth is greater than 0:
+            If char is equal to 44:  Note: ,
+                Break
+            End If
 
-        If char is equal to 91:  Note: [
-            Break
-        End If
+            If char is equal to 91:  Note: [
+                Break
+            End If
 
-        If char is equal to 93:  Note: ]
-            Break
-        End If
+            If char is equal to 93:  Note: ]
+                Break
+            End If
 
-        If char is equal to 123:  Note: {
-            Break
-        End If
+            If char is equal to 123:  Note: {
+                Break
+            End If
 
-        If char is equal to 125:  Note: }
-            Break
+            If char is equal to 125:  Note: }
+                Break
+            End If
         End If
 
         Note: Add character to buffer
@@ -1851,21 +1870,37 @@ Process called "next_token" takes lexer as Integer returns Integer:
     Note: Flow collection tokens
     If char is equal to 91:  Note: [
         proc advance_char with lexer
+        Let flow_depth_open_seq be proc memory_get_int64 from Layout with lexer, 88
+        Set flow_depth_open_seq to flow_depth_open_seq plus 1
+        proc memory_set_int64 from Layout with lexer, 88, flow_depth_open_seq
         Return proc create_token with TOKEN_LEFT_BRACKET, 0, 0, line, column, indent
     End If
 
     If char is equal to 93:  Note: ]
         proc advance_char with lexer
+        Let flow_depth_close_seq be proc memory_get_int64 from Layout with lexer, 88
+        If flow_depth_close_seq is greater than 0:
+            Set flow_depth_close_seq to flow_depth_close_seq minus 1
+            proc memory_set_int64 from Layout with lexer, 88, flow_depth_close_seq
+        End If
         Return proc create_token with TOKEN_RIGHT_BRACKET, 0, 0, line, column, indent
     End If
 
     If char is equal to 123:  Note: {
         proc advance_char with lexer
+        Let flow_depth_open_map be proc memory_get_int64 from Layout with lexer, 88
+        Set flow_depth_open_map to flow_depth_open_map plus 1
+        proc memory_set_int64 from Layout with lexer, 88, flow_depth_open_map
         Return proc create_token with TOKEN_LEFT_BRACE, 0, 0, line, column, indent
     End If
 
     If char is equal to 125:  Note: }
         proc advance_char with lexer
+        Let flow_depth_close_map be proc memory_get_int64 from Layout with lexer, 88
+        If flow_depth_close_map is greater than 0:
+            Set flow_depth_close_map to flow_depth_close_map minus 1
+            proc memory_set_int64 from Layout with lexer, 88, flow_depth_close_map
+        End If
         Return proc create_token with TOKEN_RIGHT_BRACE, 0, 0, line, column, indent
     End If
 
