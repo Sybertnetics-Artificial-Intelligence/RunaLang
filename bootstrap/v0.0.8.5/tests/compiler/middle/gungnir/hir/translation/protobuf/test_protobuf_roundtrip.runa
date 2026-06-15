@@ -1,0 +1,436 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+Licensed under Apache 2.0
+:End Note
+
+Note:
+Protocol Buffers Translation Round-Trip Probe
+
+End-to-end proof that the Protocol Buffers translation pipeline is REAL, not a
+skeleton:
+
+    .proto source
+      -> protobuf_lexer    (tokenize: keywords, types, identifiers, literals,
+                            punctuation, // and /* */ comments)
+      -> protobuf_parser   (build proto AST: syntax/package/import/message/
+                            field/map/oneof/nested enum/enum/service/rpc)
+      -> protobuf_to_hir   (lower proto AST to the canonical HIR literal model)
+      -> hir_to_protobuf   (emit HIR back to .proto text)
+
+The probe feeds a representative proto3 document containing a syntax
+declaration, a package, an import, a message with scalar fields
+(int32/string/bool) each with a field number, a repeated field, a map field, a
+nested enum, a oneof, a top-level enum, and a service with a unary rpc plus a
+server-streaming rpc. It then:
+
+  1. Parses to HIR and asserts the HIR root is a dictionary literal whose
+     "syntax" is "proto3", whose "package" is the declared name, and whose
+     "messages"/"enums"/"services" lists carry the expected shapes.
+  2. Asserts depth: a message name, three scalar fields (type+name+number
+     each), a repeated field, a map field, a nested enum, a oneof, and a
+     service rpc with request/response types.
+  3. Emits the HIR back to .proto text and asserts the text is non-empty.
+  4. Re-parses the emitted .proto back into HIR and asserts the two HIR trees
+     are STRUCTURALLY EQUAL via a recursive comparator. Structural equality
+     (rather than byte equality) is the correct semantic-equivalence check
+     because the emitter reformats whitespace while the meaning is identical.
+
+Exit code: number of failed assertions (0 == all passed). No exit_with_code.
+:End Note
+
+Import "compiler/middle/gungnir/hir/translation/frontends/protobuf/protobuf_to_hir.runa" as ProtoFrontend
+Import "compiler/middle/gungnir/hir/translation/frontends/protobuf/protobuf_parser.runa" as ProtoParser
+Import "compiler/middle/gungnir/hir/translation/backends/protobuf/hir_to_protobuf.runa" as ProtoBackend
+Import "compiler/middle/gungnir/hir/hir.runa" as HIR
+Import "compiler/frontend/primitives/collections/list.runa" as List
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "tests/test_utils.runa" as TestUtils
+
+Note: ============================================================================
+Note: HIR dictionary lookup by string key (content comparison)
+Note: ============================================================================
+
+@Reasoning:
+The proto HIR dictionaries store keys ("type", "name", "field_type",
+"field_number", "messages", etc.) in lowering order. Looking up by
+content-compared key rather than positional index makes the probe robust to
+that order, exactly as the backend's get_dict_string_value does.
+@End Reasoning
+
+Process called "dict_lookup" takes hir_dict as Integer, key as Integer returns Integer:
+    Let entries be proc get_dictionary_entries from HIR with hir_dict
+
+    If entries is equal to 0:
+        Return 0
+    End If
+
+    Let count be proc size from List with entries
+    Let index be 0
+
+    While index is less than count:
+        Let entry be proc get_at from List with entries, index
+        Let entry_key be proc memory_get_int64 from Layout with entry, 0
+        Let entry_value be proc memory_get_int64 from Layout with entry, 8
+
+        Let matches be proc string_equals from StringCore with entry_key, key
+
+        If matches is equal to 1:
+            Return entry_value
+        End If
+
+        Set index to index plus 1
+    End While
+
+    Return 0
+End Process
+
+@Reasoning:
+Convenience projection: look up a string-literal value by key and return its
+raw byte pointer for assert_string_equal.
+@End Reasoning
+
+Process called "dict_lookup_string" takes hir_dict as Integer, key as Integer returns Integer:
+    Let value_node be proc dict_lookup with hir_dict, key
+
+    If value_node is equal to 0:
+        Return 0
+    End If
+
+    Return proc get_string_literal_value from HIR with value_node
+End Process
+
+Note: ============================================================================
+Note: Structural HIR equality (semantic equivalence of two proto-derived trees)
+Note: ============================================================================
+
+@Reasoning:
+Two .proto documents are semantically equal when their HIR projections are
+structurally equal: same node kind at every position, same scalar payloads,
+same key/value pairing for dictionaries (order-preserving, which the lowering
+guarantees), and same element ordering for the arrays. Comparing the HIR trees
+rather than the raw text is whitespace- and formatting-insensitive, so it
+proves round-trip fidelity without being fooled by the emitter's formatting.
+@End Reasoning
+
+Process called "hir_equal" takes a as Integer, b as Integer returns Integer:
+    If a is equal to 0:
+        If b is equal to 0:
+            Return 1
+        End If
+        Return 0
+    End If
+
+    If b is equal to 0:
+        Return 0
+    End If
+
+    Let kind_a be proc get_hir_node_type from HIR with a
+    Let kind_b be proc get_hir_node_type from HIR with b
+
+    If kind_a is not equal to kind_b:
+        Return 0
+    End If
+
+    Note: Dictionary literals: compare entry count, then key+value pairwise
+    If kind_a is equal to HIR_DICTIONARY_LITERAL from HIR:
+        Let entries_a be proc get_dictionary_entries from HIR with a
+        Let entries_b be proc get_dictionary_entries from HIR with b
+
+        If entries_a is equal to 0:
+            If entries_b is equal to 0:
+                Return 1
+            End If
+            Return 0
+        End If
+
+        If entries_b is equal to 0:
+            Return 0
+        End If
+
+        Let count_a be proc size from List with entries_a
+        Let count_b be proc size from List with entries_b
+
+        If count_a is not equal to count_b:
+            Return 0
+        End If
+
+        Let i be 0
+        While i is less than count_a:
+            Let entry_a be proc get_at from List with entries_a, i
+            Let entry_b be proc get_at from List with entries_b, i
+
+            Let key_a be proc memory_get_int64 from Layout with entry_a, 0
+            Let key_b be proc memory_get_int64 from Layout with entry_b, 0
+            Let keys_match be proc string_equals from StringCore with key_a, key_b
+
+            If keys_match is not equal to 1:
+                Return 0
+            End If
+
+            Let val_a be proc memory_get_int64 from Layout with entry_a, 8
+            Let val_b be proc memory_get_int64 from Layout with entry_b, 8
+            Let vals_match be proc hir_equal with val_a, val_b
+
+            If vals_match is not equal to 1:
+                Return 0
+            End If
+
+            Set i to i plus 1
+        End While
+
+        Return 1
+    End If
+
+    Note: Array literals: compare element count, then elements pairwise
+    If kind_a is equal to HIR_ARRAY_LITERAL from HIR:
+        Let elems_a be proc get_list_elements from HIR with a
+        Let elems_b be proc get_list_elements from HIR with b
+
+        If elems_a is equal to 0:
+            If elems_b is equal to 0:
+                Return 1
+            End If
+            Return 0
+        End If
+
+        If elems_b is equal to 0:
+            Return 0
+        End If
+
+        Let ecount_a be proc size from List with elems_a
+        Let ecount_b be proc size from List with elems_b
+
+        If ecount_a is not equal to ecount_b:
+            Return 0
+        End If
+
+        Let j be 0
+        While j is less than ecount_a:
+            Let el_a be proc get_at from List with elems_a, j
+            Let el_b be proc get_at from List with elems_b, j
+            Let el_match be proc hir_equal with el_a, el_b
+
+            If el_match is not equal to 1:
+                Return 0
+            End If
+
+            Set j to j plus 1
+        End While
+
+        Return 1
+    End If
+
+    Note: Scalar literals (HIR_LITERAL): compare value_type tag, then payload
+    If kind_a is equal to HIR_LITERAL from HIR:
+        Let tag_a be proc memory_get_int64 from Layout with a, 48
+        Let tag_b be proc memory_get_int64 from Layout with b, 48
+
+        If tag_a is not equal to tag_b:
+            Return 0
+        End If
+
+        Let payload_a be proc memory_get_int64 from Layout with a, 40
+        Let payload_b be proc memory_get_int64 from Layout with b, 40
+
+        Note: String payloads are byte pointers; compare by content
+        If tag_a is equal to HIR_LITERAL_KIND_STRING from HIR:
+            Return proc string_equals from StringCore with payload_a, payload_b
+        End If
+
+        Note: Integer/boolean payloads are compared by raw value
+        If payload_a is equal to payload_b:
+            Return 1
+        End If
+        Return 0
+    End If
+
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: Probe entry point
+Note: ============================================================================
+
+Process called "main" returns Integer:
+    Let results be proc create_test_results from TestUtils
+    proc begin_suite from TestUtils with results, "Protocol Buffers translation round-trip"
+
+    Note:
+    Representative proto3 document covering: syntax, package, import, a message
+    with scalar fields (int32/string/bool) carrying field numbers, a repeated
+    field, a map field, a nested enum, a oneof, a top-level enum, a service
+    with a unary rpc and a server-streaming rpc, and both comment styles.
+    :End Note
+    Let source be "syntax = \"proto3\";\npackage example.api;\nimport \"common.proto\";\n\n// A user record\nmessage User {\n  int32 id = 1;\n  string name = 2;\n  bool active = 3;\n  repeated string tags = 4;\n  map<string, int32> scores = 5;\n  enum Role {\n    ROLE_NONE = 0;\n    ROLE_ADMIN = 1;\n  }\n  oneof contact {\n    string email = 6;\n    string phone = 7;\n  }\n}\n\n/* status codes */\nenum Status {\n  STATUS_OK = 0;\n  STATUS_ERR = 1;\n}\n\nservice UserService {\n  rpc GetUser (User) returns (User);\n  rpc StreamUsers (User) returns (stream User);\n}\n"
+
+    Note: --- Stage 0: parse the source (proves the parser advances and terminates) ---
+    Let ast be proc parse_protobuf from ProtoParser with source
+    proc assert_not_null from TestUtils with results, "parser produced proto AST", ast
+
+    Note: --- Stage 1: source -> HIR ---
+    Let hir1 be proc translate_protobuf_to_hir from ProtoFrontend with source, 0
+    proc assert_not_null from TestUtils with results, "frontend produced HIR root", hir1
+
+    Let root_kind be proc get_hir_node_type from HIR with hir1
+    proc assert_equal from TestUtils with results, "HIR root is dictionary literal", root_kind, HIR_DICTIONARY_LITERAL from HIR
+
+    Note: syntax + package survive lowering
+    Let syntax_str be proc dict_lookup_string with hir1, "syntax"
+    proc assert_string_equal from TestUtils with results, "syntax is 'proto3'", syntax_str, "proto3"
+
+    Let package_str be proc dict_lookup_string with hir1, "package"
+    proc assert_string_equal from TestUtils with results, "package is 'example.api'", package_str, "example.api"
+
+    Note: imports list carries the imported path
+    Let imports_val be proc dict_lookup with hir1, "imports"
+    Let imports_elems be proc get_list_elements from HIR with imports_val
+    Let imports_count be proc size from List with imports_elems
+    proc assert_equal from TestUtils with results, "one import present", imports_count, 1
+    Let import_node be proc get_at from List with imports_elems, 0
+    Let import_str be proc get_string_literal_value from HIR with import_node
+    proc assert_string_equal from TestUtils with results, "import path is 'common.proto'", import_str, "common.proto"
+
+    Note: --- Stage 1 depth: the message and its fields ---
+    Let messages_val be proc dict_lookup with hir1, "messages"
+    Let messages_elems be proc get_list_elements from HIR with messages_val
+    Let messages_count be proc size from List with messages_elems
+    proc assert_equal from TestUtils with results, "one top-level message present", messages_count, 1
+
+    Let user_msg be proc get_at from List with messages_elems, 0
+    Let user_name be proc dict_lookup_string with user_msg, "name"
+    proc assert_string_equal from TestUtils with results, "message name is 'User'", user_name, "User"
+
+    Let user_fields_val be proc dict_lookup with user_msg, "fields"
+    Let user_fields be proc get_list_elements from HIR with user_fields_val
+    Let user_fields_count be proc size from List with user_fields
+
+    Note:
+    The User body lowers to: int32 id, string name, bool active, repeated tags,
+    map scores, nested enum Role, oneof contact => seven field-position members.
+    :End Note
+    proc assert_equal from TestUtils with results, "message has 7 body members", user_fields_count, 7
+
+    Note: Field 0: int32 id = 1  (type + name + number)
+    Let f0 be proc get_at from List with user_fields, 0
+    Let f0_name be proc dict_lookup_string with f0, "name"
+    proc assert_string_equal from TestUtils with results, "field 0 name is 'id'", f0_name, "id"
+    Let f0_type be proc dict_lookup_string with f0, "field_type"
+    proc assert_string_equal from TestUtils with results, "field 0 type is 'int32'", f0_type, "int32"
+    Let f0_num_node be proc dict_lookup with f0, "field_number"
+    Let f0_num be proc get_integer_literal_value from HIR with f0_num_node
+    proc assert_equal from TestUtils with results, "field 0 number is 1", f0_num, 1
+
+    Note: Field 1: string name = 2
+    Let f1 be proc get_at from List with user_fields, 1
+    Let f1_name be proc dict_lookup_string with f1, "name"
+    proc assert_string_equal from TestUtils with results, "field 1 name is 'name'", f1_name, "name"
+    Let f1_type be proc dict_lookup_string with f1, "field_type"
+    proc assert_string_equal from TestUtils with results, "field 1 type is 'string'", f1_type, "string"
+    Let f1_num_node be proc dict_lookup with f1, "field_number"
+    Let f1_num be proc get_integer_literal_value from HIR with f1_num_node
+    proc assert_equal from TestUtils with results, "field 1 number is 2", f1_num, 2
+
+    Note: Field 2: bool active = 3
+    Let f2 be proc get_at from List with user_fields, 2
+    Let f2_type be proc dict_lookup_string with f2, "field_type"
+    proc assert_string_equal from TestUtils with results, "field 2 type is 'bool'", f2_type, "bool"
+    Let f2_num_node be proc dict_lookup with f2, "field_number"
+    Let f2_num be proc get_integer_literal_value from HIR with f2_num_node
+    proc assert_equal from TestUtils with results, "field 2 number is 3", f2_num, 3
+
+    Note: Field 3: repeated string tags = 4  (repeated flag survives)
+    Let f3 be proc get_at from List with user_fields, 3
+    Let f3_name be proc dict_lookup_string with f3, "name"
+    proc assert_string_equal from TestUtils with results, "field 3 name is 'tags'", f3_name, "tags"
+    Let f3_rep_node be proc dict_lookup with f3, "repeated"
+    Let f3_rep be proc get_boolean_literal_value from HIR with f3_rep_node
+    proc assert_equal from TestUtils with results, "field 3 is repeated", f3_rep, 1
+
+    Note: Field 4: map<string, int32> scores = 5  (map type tag + key/value types)
+    Let f4 be proc get_at from List with user_fields, 4
+    Let f4_type be proc dict_lookup_string with f4, "type"
+    proc assert_string_equal from TestUtils with results, "field 4 is a map_field", f4_type, "map_field"
+    Let f4_key be proc dict_lookup_string with f4, "key_type"
+    proc assert_string_equal from TestUtils with results, "map key type is 'string'", f4_key, "string"
+    Let f4_val be proc dict_lookup_string with f4, "value_type"
+    proc assert_string_equal from TestUtils with results, "map value type is 'int32'", f4_val, "int32"
+
+    Note: Field 5: nested enum Role with two values
+    Let f5 be proc get_at from List with user_fields, 5
+    Let f5_type be proc dict_lookup_string with f5, "type"
+    proc assert_string_equal from TestUtils with results, "field 5 is a nested enum", f5_type, "enum"
+    Let f5_name be proc dict_lookup_string with f5, "name"
+    proc assert_string_equal from TestUtils with results, "nested enum name is 'Role'", f5_name, "Role"
+    Let f5_values_val be proc dict_lookup with f5, "values"
+    Let f5_values be proc get_list_elements from HIR with f5_values_val
+    Let f5_values_count be proc size from List with f5_values
+    proc assert_equal from TestUtils with results, "nested enum has 2 values", f5_values_count, 2
+
+    Note: Field 6: oneof contact with two member fields
+    Let f6 be proc get_at from List with user_fields, 6
+    Let f6_type be proc dict_lookup_string with f6, "type"
+    proc assert_string_equal from TestUtils with results, "field 6 is a oneof", f6_type, "oneof"
+    Let f6_name be proc dict_lookup_string with f6, "name"
+    proc assert_string_equal from TestUtils with results, "oneof name is 'contact'", f6_name, "contact"
+    Let f6_fields_val be proc dict_lookup with f6, "fields"
+    Let f6_fields be proc get_list_elements from HIR with f6_fields_val
+    Let f6_fields_count be proc size from List with f6_fields
+    proc assert_equal from TestUtils with results, "oneof has 2 member fields", f6_fields_count, 2
+
+    Note: Top-level enum Status
+    Let enums_val be proc dict_lookup with hir1, "enums"
+    Let enums_elems be proc get_list_elements from HIR with enums_val
+    Let enums_count be proc size from List with enums_elems
+    proc assert_equal from TestUtils with results, "one top-level enum present", enums_count, 1
+    Let status_enum be proc get_at from List with enums_elems, 0
+    Let status_name be proc dict_lookup_string with status_enum, "name"
+    proc assert_string_equal from TestUtils with results, "top-level enum name is 'Status'", status_name, "Status"
+
+    Note: Service with two rpcs (unary + server-streaming)
+    Let services_val be proc dict_lookup with hir1, "services"
+    Let services_elems be proc get_list_elements from HIR with services_val
+    Let services_count be proc size from List with services_elems
+    proc assert_equal from TestUtils with results, "one service present", services_count, 1
+    Let svc be proc get_at from List with services_elems, 0
+    Let svc_name be proc dict_lookup_string with svc, "name"
+    proc assert_string_equal from TestUtils with results, "service name is 'UserService'", svc_name, "UserService"
+
+    Let rpcs_val be proc dict_lookup with svc, "rpcs"
+    Let rpcs_elems be proc get_list_elements from HIR with rpcs_val
+    Let rpcs_count be proc size from List with rpcs_elems
+    proc assert_equal from TestUtils with results, "service has 2 rpcs", rpcs_count, 2
+
+    Let rpc0 be proc get_at from List with rpcs_elems, 0
+    Let rpc0_name be proc dict_lookup_string with rpc0, "name"
+    proc assert_string_equal from TestUtils with results, "rpc 0 name is 'GetUser'", rpc0_name, "GetUser"
+    Let rpc0_req be proc dict_lookup_string with rpc0, "request_type"
+    proc assert_string_equal from TestUtils with results, "rpc 0 request type is 'User'", rpc0_req, "User"
+    Let rpc0_resp be proc dict_lookup_string with rpc0, "response_type"
+    proc assert_string_equal from TestUtils with results, "rpc 0 response type is 'User'", rpc0_resp, "User"
+
+    Let rpc1 be proc get_at from List with rpcs_elems, 1
+    Let rpc1_stream_node be proc dict_lookup with rpc1, "response_stream"
+    Let rpc1_stream be proc get_boolean_literal_value from HIR with rpc1_stream_node
+    proc assert_equal from TestUtils with results, "rpc 1 response is streaming", rpc1_stream, 1
+
+    Note: --- Stage 2: HIR -> .proto text ---
+    Let emitted be proc hir_to_protobuf from ProtoBackend with hir1
+    proc assert_not_null from TestUtils with results, "backend produced proto text", emitted
+
+    Let emitted_len be proc string_length from StringCore with emitted
+    proc assert_greater_than from TestUtils with results, "emitted proto is non-empty", emitted_len, 0
+
+    Note: --- Stage 3: re-parse emitted .proto -> HIR, assert structurally equal ---
+    Let hir2 be proc translate_protobuf_to_hir from ProtoFrontend with emitted, 0
+    proc assert_not_null from TestUtils with results, "re-parse of emitted proto produced HIR", hir2
+
+    Let structurally_equal be proc hir_equal with hir1, hir2
+    proc assert_equal from TestUtils with results, "round-trip HIR is structurally equal", structurally_equal, 1
+
+    proc print_summary from TestUtils with results
+    Let failed be proc get_failed from TestUtils with results
+    proc destroy_test_results from TestUtils with results
+
+    Return failed
+End Process
