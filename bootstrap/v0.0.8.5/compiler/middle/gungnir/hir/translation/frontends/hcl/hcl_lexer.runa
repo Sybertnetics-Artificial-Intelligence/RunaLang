@@ -128,6 +128,7 @@ Type called "HCLToken":
     value as Integer
     line as Integer
     column as Integer
+    has_interpolation as Integer
 End Type
 
 Note: ===================================================================
@@ -242,8 +243,37 @@ Process called "create_token" takes token_type as Integer, value as Integer, lin
         token_type as token_type,
         value as value,
         line as line,
-        column as column
+        column as column,
+        has_interpolation as 0
     Return token
+End Process
+
+@Reasoning:
+Records a boolean attribute on a token. Currently the only flag is
+"has_interpolation", set by the string scanner when a quoted string
+contains one or more ${...} interpolations. Routing the write through a
+named setter keeps the token struct layout private to the lexer and gives
+downstream consumers (a future interpolation-aware parser pass) a stable
+accessor surface.
+@End Reasoning
+Process called "set_token_flag" takes token as HCLToken, flag_name as Integer, flag_value as Integer:
+    Let is_interp be proc string_equals from StringCore with flag_name, "has_interpolation"
+    If is_interp is equal to 1:
+        Set token.has_interpolation to flag_value
+    End If
+End Process
+
+@Reasoning:
+Reads a boolean attribute previously recorded by set_token_flag. Returns 0
+for any unrecognised flag name so callers can probe optimistically without
+guarding each call.
+@End Reasoning
+Process called "get_token_flag" takes token as HCLToken, flag_name as Integer returns Integer:
+    Let is_interp be proc string_equals from StringCore with flag_name, "has_interpolation"
+    If is_interp is equal to 1:
+        Return token.has_interpolation
+    End If
+    Return 0
 End Process
 
 @Reasoning:
@@ -274,46 +304,44 @@ Process called "lex_identifier" takes lexer as Integer returns Integer:
     Let start_pos be lexer.position
     Let start_col be lexer.column
 
-    Note: Identifier: [a-zA-Z_][a-zA-Z0-9_-]*
-    While lexer.current_char is not equal to 0:
-        Let is_alpha be proc is_alphabetic with lexer.current_char
-        Let is_digit be proc is_digit_char with lexer.current_char
-        Let is_underscore be lexer.current_char is equal to 95
-        Let is_hyphen be lexer.current_char is equal to 45
-
-        If is_alpha is equal to 0:
-            If is_digit is equal to 0:
-                If is_underscore is equal to 0:
-                    If is_hyphen is equal to 0:
-                        Note: Not part of identifier
-                        Let i be 0
-                    Otherwise:
-                        proc advance with lexer
-                    End If
-                Otherwise:
-                    proc advance with lexer
-                End If
-            Otherwise:
-                proc advance with lexer
-            End If
+    Note: Identifier: [a-zA-Z_][a-zA-Z0-9_-]*. The loop consumes one identifier character per
+    Note: iteration and terminates as soon as the current character is not part of an identifier,
+    Note: guaranteeing forward progress (no advance => loop condition flips off).
+    Let scanning be 1
+    While scanning is equal to 1:
+        If lexer.current_char is equal to 0:
+            Set scanning to 0
         Otherwise:
-            proc advance with lexer
-        End If
-
-        If is_alpha is equal to 0:
-            If is_digit is equal to 0:
-                If is_underscore is equal to 0:
-                    If is_hyphen is equal to 0:
-                        Note: Break
-                        Set i to 999999
-                    End If
-                End If
+            Let is_alpha be proc is_alphabetic with lexer.current_char
+            Let is_digit be proc is_digit_char with lexer.current_char
+            Let is_underscore be 0
+            If lexer.current_char is equal to 95:
+                Set is_underscore to 1
             End If
-        End If
+            Let is_hyphen be 0
+            If lexer.current_char is equal to 45:
+                Set is_hyphen to 1
+            End If
 
-        If i is equal to 999999:
-            Note: Break loop
-            Set i to 0
+            Let is_ident_char be 0
+            If is_alpha is equal to 1:
+                Set is_ident_char to 1
+            End If
+            If is_digit is equal to 1:
+                Set is_ident_char to 1
+            End If
+            If is_underscore is equal to 1:
+                Set is_ident_char to 1
+            End If
+            If is_hyphen is equal to 1:
+                Set is_ident_char to 1
+            End If
+
+            If is_ident_char is equal to 1:
+                proc advance with lexer
+            Otherwise:
+                Set scanning to 0
+            End If
         End If
     End While
 
@@ -490,63 +518,74 @@ Process called "lex_string" takes lexer as Integer returns Integer:
     Let has_interpolation be 0
     Let interpolation_depth be 0
 
-    While lexer.current_char is not equal to 0:
-        If lexer.current_char is equal to quote_char and interpolation_depth is equal to 0:
-            Note: End of string (only if not inside interpolation)
-            proc advance with lexer
-
-            Note: Create string token with interpolation marker if needed
-            Let token be proc create_token with TOKEN_STRING, value, lexer.line, start_col
-
-            If has_interpolation is equal to 1:
-                Note: Mark token as containing interpolations for parser processing
-                proc set_token_flag with token, "has_interpolation", 1
-            End If
-
-            Return token
+    Let scanning be 1
+    While scanning is equal to 1:
+        If lexer.current_char is equal to 0:
+            Note: Unterminated string
+            Return proc create_token with TOKEN_ERROR, "Unterminated string", lexer.line, start_col
         End If
 
-        If lexer.current_char is equal to 92:
-            Note: Backslash - escape sequence
+        Let is_terminator be 0
+        If lexer.current_char is equal to quote_char:
+            If interpolation_depth is equal to 0:
+                Set is_terminator to 1
+            End If
+        End If
+
+        If is_terminator is equal to 1:
+            Note: End of string (only when not inside an interpolation)
             proc advance with lexer
-            If lexer.current_char is not equal to 0:
-                Set value to proc string_concat from StringPrimitive with value, proc char_to_string with lexer.current_char
+            Let token be proc create_token with TOKEN_STRING, value, lexer.line, start_col
+            If has_interpolation is equal to 1:
+                proc set_token_flag with token, "has_interpolation", 1
+            End If
+            Return token
+        Otherwise:
+            If lexer.current_char is equal to 92:
+                Note: Backslash escape: append the escaped character verbatim
                 proc advance with lexer
-            Otherwise:
-            If lexer.current_char is equal to 36:
-                Note: Check for interpolation ${
-                Let next_char be proc peek with lexer, 1
-                If next_char is equal to 123:
-                    Note: Start of interpolation - include marker in string for parser
-                    Set has_interpolation to 1
-                    Set value to proc string_concat from StringPrimitive with value, "${"
-                    Set interpolation_depth to interpolation_depth plus 1
-                    proc advance with lexer
-                    proc advance with lexer
-                Otherwise:
-                    Note: Just a dollar sign, not interpolation
+                If lexer.current_char is not equal to 0:
                     Set value to proc string_concat from StringPrimitive with value, proc char_to_string with lexer.current_char
                     proc advance with lexer
                 End If
-            Otherwise If lexer.current_char is equal to 123 and interpolation_depth is greater than 0:
-                Note: Nested brace inside interpolation
-                Set value to proc string_concat from StringPrimitive with value, proc char_to_string with lexer.current_char
-                Set interpolation_depth to interpolation_depth plus 1
-                proc advance with lexer
-            Otherwise If lexer.current_char is equal to 125 and interpolation_depth is greater than 0:
-                Note: Closing brace for interpolation
-                Set value to proc string_concat from StringPrimitive with value, proc char_to_string with lexer.current_char
-                Set interpolation_depth to interpolation_depth minus 1
-                proc advance with lexer
             Otherwise:
-                Set value to proc string_concat from StringPrimitive with value, proc char_to_string with lexer.current_char
-                proc advance with lexer
-            End If
+                If lexer.current_char is equal to 36:
+                    Note: "$" - check for interpolation opener "${"
+                    Let next_char be proc peek with lexer, 1
+                    If next_char is equal to 123:
+                        Set has_interpolation to 1
+                        Set value to proc string_concat from StringPrimitive with value, "${"
+                        Set interpolation_depth to interpolation_depth plus 1
+                        proc advance with lexer
+                        proc advance with lexer
+                    Otherwise:
+                        Set value to proc string_concat from StringPrimitive with value, proc char_to_string with lexer.current_char
+                        proc advance with lexer
+                    End If
+                Otherwise:
+                    If lexer.current_char is equal to 123 and interpolation_depth is greater than 0:
+                        Note: Nested opening brace inside an interpolation
+                        Set value to proc string_concat from StringPrimitive with value, proc char_to_string with lexer.current_char
+                        Set interpolation_depth to interpolation_depth plus 1
+                        proc advance with lexer
+                    Otherwise:
+                        If lexer.current_char is equal to 125 and interpolation_depth is greater than 0:
+                            Note: Closing brace ending an interpolation level
+                            Set value to proc string_concat from StringPrimitive with value, proc char_to_string with lexer.current_char
+                            Set interpolation_depth to interpolation_depth minus 1
+                            proc advance with lexer
+                        Otherwise:
+                            Note: Ordinary string character
+                            Set value to proc string_concat from StringPrimitive with value, proc char_to_string with lexer.current_char
+                            proc advance with lexer
+                        End If
+                    End If
+                End If
             End If
         End If
     End While
 
-    Note: Unterminated string
+    Note: Unterminated string (loop exited without an explicit terminator)
     Return proc create_token with TOKEN_ERROR, "Unterminated string", lexer.line, start_col
 End Process
 
@@ -579,30 +618,29 @@ Process called "lex_number" takes lexer as Integer returns Integer:
     Let start_col be lexer.column
     Let has_decimal be 0
 
-    While lexer.current_char is not equal to 0:
-        Let is_digit be proc is_digit_char with lexer.current_char
-
-        If is_digit is equal to 1:
-            proc advance with lexer
+    Let scanning be 1
+    While scanning is equal to 1:
+        If lexer.current_char is equal to 0:
+            Set scanning to 0
         Otherwise:
-            If lexer.current_char is equal to 46:
-                Note: Decimal point
-                If has_decimal is equal to 0:
-                    Set has_decimal to 1
-                    proc advance with lexer
-                Otherwise:
-                    Note: Break - second decimal point
-                    Let i be 999999
-                End If
+            Let is_digit be proc is_digit_char with lexer.current_char
+            If is_digit is equal to 1:
+                proc advance with lexer
             Otherwise:
-                Note: Break - not a number character
-                Set i to 999999
+                If lexer.current_char is equal to 46:
+                    Note: Decimal point: accept the first one only
+                    If has_decimal is equal to 0:
+                        Set has_decimal to 1
+                        proc advance with lexer
+                    Otherwise:
+                        Note: A second decimal point ends the number
+                        Set scanning to 0
+                    End If
+                Otherwise:
+                    Note: Not a number character: number ends here
+                    Set scanning to 0
+                End If
             End If
-        End If
-
-        If i is equal to 999999:
-            Note: Break loop
-            Set i to 0
         End If
     End While
 
@@ -630,19 +668,19 @@ Process called "lex_comment" takes lexer as Integer returns Integer:
 
     Note: Check comment type
     If lexer.current_char is equal to 35:
-        Note: # comment
+        Note: # comment: consume to end of line, leaving the LF for the tokenizer to emit
         proc advance with lexer
-        While lexer.current_char is not equal to 0:
-            If lexer.current_char is equal to 10:
-                Note: Newline - end of comment
-                Let i be 999999
+        Let scanning be 1
+        While scanning is equal to 1:
+            If lexer.current_char is equal to 0:
+                Set scanning to 0
             Otherwise:
-                Set value to proc string_concat from StringPrimitive with value, proc char_to_string with lexer.current_char
-                proc advance with lexer
-            End If
-
-            If i is equal to 999999:
-                Set i to 0
+                If lexer.current_char is equal to 10:
+                    Set scanning to 0
+                Otherwise:
+                    Set value to proc string_concat from StringPrimitive with value, proc char_to_string with lexer.current_char
+                    proc advance with lexer
+                End If
             End If
         End While
     Otherwise:
@@ -650,46 +688,47 @@ Process called "lex_comment" takes lexer as Integer returns Integer:
             Let next_char be proc peek with lexer, 1
 
             If next_char is equal to 47:
-                Note: // comment
+                Note: // comment: consume to end of line, leaving the LF for the tokenizer
                 proc advance with lexer
                 proc advance with lexer
-                While lexer.current_char is not equal to 0:
-                    If lexer.current_char is equal to 10:
-                        Note: Newline
-                        Set i to 999999
+                Let line_scanning be 1
+                While line_scanning is equal to 1:
+                    If lexer.current_char is equal to 0:
+                        Set line_scanning to 0
                     Otherwise:
-                        Set value to proc string_concat from StringPrimitive with value, proc char_to_string with lexer.current_char
-                        proc advance with lexer
-                    End If
-
-                    If i is equal to 999999:
-                        Set i to 0
-                    End If
-                End While
-            Otherwise:
-                If next_char is equal to 42:
-                    Note: /* */ comment
-                    proc advance with lexer
-                    proc advance with lexer
-                    While lexer.current_char is not equal to 0:
-                        If lexer.current_char is equal to 42:
-                            Let peek_char be proc peek with lexer, 1
-                            If peek_char is equal to 47:
-                                Note: End of comment
-                                proc advance with lexer
-                                proc advance with lexer
-                                Set i to 999999
-                            Otherwise:
-                                Set value to proc string_concat from StringPrimitive with value, proc char_to_string with lexer.current_char
-                                proc advance with lexer
-                            End If
+                        If lexer.current_char is equal to 10:
+                            Set line_scanning to 0
                         Otherwise:
                             Set value to proc string_concat from StringPrimitive with value, proc char_to_string with lexer.current_char
                             proc advance with lexer
                         End If
-
-                        If i is equal to 999999:
-                            Set i to 0
+                    End If
+                End While
+            Otherwise:
+                If next_char is equal to 42:
+                    Note: /* */ comment: consume through the closing */ then stop
+                    proc advance with lexer
+                    proc advance with lexer
+                    Let block_scanning be 1
+                    While block_scanning is equal to 1:
+                        If lexer.current_char is equal to 0:
+                            Set block_scanning to 0
+                        Otherwise:
+                            If lexer.current_char is equal to 42:
+                                Let peek_char be proc peek with lexer, 1
+                                If peek_char is equal to 47:
+                                    Note: End of comment: consume the closing */ and stop
+                                    proc advance with lexer
+                                    proc advance with lexer
+                                    Set block_scanning to 0
+                                Otherwise:
+                                    Set value to proc string_concat from StringPrimitive with value, proc char_to_string with lexer.current_char
+                                    proc advance with lexer
+                                End If
+                            Otherwise:
+                                Set value to proc string_concat from StringPrimitive with value, proc char_to_string with lexer.current_char
+                                proc advance with lexer
+                            End If
                         End If
                     End While
                 End If
@@ -726,22 +765,23 @@ Process called "lex_heredoc" takes lexer as Integer returns Integer:
         proc advance with lexer
     End If
 
-    Note: Read delimiter
+    Note: Read delimiter up to (and consuming) the terminating newline
     Let delimiter be ""
-    While lexer.current_char is not equal to 0:
-        If lexer.current_char is equal to 10:
-            Note: Newline - end of delimiter
-            proc advance with lexer
-            Set lexer.line to lexer.line plus 1
-            Set lexer.column to 1
-            Let i be 999999
+    Let reading_delimiter be 1
+    While reading_delimiter is equal to 1:
+        If lexer.current_char is equal to 0:
+            Set reading_delimiter to 0
         Otherwise:
-            Set delimiter to proc string_concat from StringPrimitive with delimiter, proc char_to_string with lexer.current_char
-            proc advance with lexer
-        End If
-
-        If i is equal to 999999:
-            Set i to 0
+            If lexer.current_char is equal to 10:
+                Note: Newline ends the delimiter
+                proc advance with lexer
+                Set lexer.line to lexer.line plus 1
+                Set lexer.column to 1
+                Set reading_delimiter to 0
+            Otherwise:
+                Set delimiter to proc string_concat from StringPrimitive with delimiter, proc char_to_string with lexer.current_char
+                proc advance with lexer
+            End If
         End If
     End While
 
