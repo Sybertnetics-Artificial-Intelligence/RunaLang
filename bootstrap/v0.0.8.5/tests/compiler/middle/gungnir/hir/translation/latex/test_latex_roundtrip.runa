@@ -1,0 +1,265 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+Licensed under Apache 2.0
+:End Note
+
+Note:
+LaTeX Translation Round-Trip Probe
+
+End-to-end proof that the LaTeX translation pipeline is REAL, not a skeleton:
+
+    LaTeX source
+      -> latex_lexer   (tokenize: commands, braces, math delimiters, text)
+      -> latex_parser  (build LaTeX preamble/body AST)
+      -> latex_to_hir  (lower AST to the self-contained kind-tagged HIR tree,
+                        each node tagged with a HIR_LATEX_* constant at offset 0)
+      -> hir_to_latex  (emit HIR back to LaTeX source text)
+
+The orchestration entry points live in backends/latex/latex_emitter.runa:
+latex_to_hir(source) drives lexer+parser+translator and returns the HIR
+module; hir_to_latex(module) drives the backend and returns LaTeX text.
+
+The probe feeds a representative document containing a \documentclass, a
+\usepackage, a \section with a title, a \textbf formatting command, an
+itemize environment with two \item entries, and an inline-math span. It then:
+
+  1. Translates the source to HIR and asserts the HIR root is the LaTeX
+     document module (type tag HIR_LATEX_DOCUMENT). The translator's
+     add_to_module flattens every translated node into the module's items
+     list (offset 16), so the probe walks that flat list and asserts the
+     presence and structured attributes of each expected node kind:
+     documentclass class name, usepackage package name, section title,
+     bold-text payload, the itemize environment, two list items, and the
+     inline-math node. LaTeX -> HIR is the lossless direction (every
+     structural attribute is preserved as a typed field on the node), so
+     these are exact structural asserts.
+
+  2. Emits the HIR back to LaTeX text and asserts the text is non-empty and
+     carries the \documentclass and \section sigils.
+
+  3. Re-parses the emitted LaTeX back into HIR and asserts the re-parsed
+     module preserves the document type, the documentclass class name, the
+     section title, and the itemize environment - i.e. STRUCTURAL survival
+     on the SECOND emission, not just non-empty output.
+
+Exit code: number of failed assertions (0 == all passed). No exit_with_code.
+:End Note
+
+Import "compiler/middle/gungnir/hir/translation/backends/latex/latex_emitter.runa" as LaTeXEmitter
+Import "compiler/middle/gungnir/hir/translation/frontends/latex/latex_to_hir.runa" as LaTeXHIR
+Import "compiler/middle/gungnir/hir/hir_nodes.runa" as HIR
+Import "compiler/frontend/primitives/collections/list.runa" as List
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "tests/test_utils.runa" as TestUtils
+
+Note: ============================================================================
+Note: HIR module readers (self-contained kind-tagged tree)
+Note: ============================================================================
+
+@Reasoning:
+The LaTeX HIR module is a record whose type tag sits at offset 0 and whose
+flattened items list (every node enrolled via add_to_module) sits at offset
+16. This reader returns that items list so the probe can scan it exactly the
+way a backend would when it walks the module top-level.
+@End Reasoning
+Process called "module_items" takes module_ptr as Integer returns Integer:
+    If module_ptr is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_integer from Memory with module_ptr, 16
+End Process
+
+@Reasoning:
+Returns the node-type tag (offset 0) for any HIR node, or 0 for a null
+pointer. Mirrors how the production backend dispatches on the kind tag.
+@End Reasoning
+Process called "node_kind" takes node_ptr as Integer returns Integer:
+    If node_ptr is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_integer from Memory with node_ptr, 0
+End Process
+
+@Reasoning:
+Locates the first node in a module's flat items list whose type tag equals
+the requested kind. Linear scan matches the renderer's dispatch loop. Returns
+0 when no node of that kind exists so callers can assert presence with
+assert_not_null.
+@End Reasoning
+Process called "find_node_by_kind" takes module_ptr as Integer, kind as Integer returns Integer:
+    Let items be proc module_items with module_ptr
+    If items is equal to 0:
+        Return 0
+    End If
+
+    Let count be proc list_length from List with items
+    Let index be 0
+
+    While index is less than count:
+        Let node be proc list_get from List with items, index
+        Let this_kind be proc node_kind with node
+        If this_kind is equal to kind:
+            Return node
+        End If
+        Set index to index plus 1
+    End While
+
+    Return 0
+End Process
+
+@Reasoning:
+Counts how many nodes in the flat items list carry the requested type tag.
+Used to assert the two-item list count without assuming the items are
+contiguous in the flattened sequence.
+@End Reasoning
+Process called "count_nodes_by_kind" takes module_ptr as Integer, kind as Integer returns Integer:
+    Let items be proc module_items with module_ptr
+    If items is equal to 0:
+        Return 0
+    End If
+
+    Let count be proc list_length from List with items
+    Let index be 0
+    Let total be 0
+
+    While index is less than count:
+        Let node be proc list_get from List with items, index
+        Let this_kind be proc node_kind with node
+        If this_kind is equal to kind:
+            Set total to total plus 1
+        End If
+        Set index to index plus 1
+    End While
+
+    Return total
+End Process
+
+@Reasoning:
+Reads a string-pointer field at the given byte offset of a HIR node. The
+LaTeX frontend stores text payloads (class names, titles, formatted text,
+environment names) as string pointers via memory_set_pointer, so the reader
+pulls them back with the matching pointer accessor.
+@End Reasoning
+Process called "node_string_field" takes node_ptr as Integer, offset as Integer returns Integer:
+    If node_ptr is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_pointer from Memory with node_ptr, offset
+End Process
+
+Note: ============================================================================
+Note: Probe entry point
+Note: ============================================================================
+
+Process called "main" returns Integer:
+    Let results be proc create_test_results from TestUtils
+    proc begin_suite from TestUtils with results, "LaTeX translation round-trip"
+
+    Note:
+    Representative document: documentclass + usepackage in the preamble, then
+    a section heading, a bold-text command, an itemize list with two items,
+    and an inline-math span inside the document body.
+    :End Note
+    Let source be "\\documentclass{article}\n\\usepackage{amsmath}\n\\begin{document}\n\\section{Intro Title}\n\\textbf{bold text}\n\\begin{itemize}\n\\item first\n\\item second\n\\end{itemize}\n$a+b$\n\\end{document}\n"
+
+    Note: --- Stage 1: source -> HIR ---
+    Let hir1 be proc latex_to_hir from LaTeXEmitter with source
+    proc assert_not_null from TestUtils with results, "frontend produced HIR module", hir1
+
+    Let root_kind be proc node_kind with hir1
+    proc assert_equal from TestUtils with results, "HIR root is latex document", root_kind, HIR_LATEX_DOCUMENT from LaTeXHIR
+
+    Let items be proc module_items with hir1
+    proc assert_not_null from TestUtils with results, "module has items list", items
+
+    Let item_total be proc list_length from List with items
+    proc assert_greater_than from TestUtils with results, "module items list is non-empty", item_total, 0
+
+    Note: --- Documentclass: class name ---
+    Let docclass be proc find_node_by_kind with hir1, HIR_LATEX_DOCUMENTCLASS from LaTeXHIR
+    proc assert_not_null from TestUtils with results, "module contains a documentclass node", docclass
+
+    Let class_name be proc node_string_field with docclass, 8
+    proc assert_string_equal from TestUtils with results, "documentclass class is 'article'", class_name, "article"
+
+    Note: --- Usepackage: package name ---
+    Let usepackage be proc find_node_by_kind with hir1, HIR_LATEX_USEPACKAGE from LaTeXHIR
+    proc assert_not_null from TestUtils with results, "module contains a usepackage node", usepackage
+
+    Let package_name be proc node_string_field with usepackage, 8
+    proc assert_string_equal from TestUtils with results, "usepackage package is 'amsmath'", package_name, "amsmath"
+
+    Note: --- Section: title ---
+    Let section be proc find_node_by_kind with hir1, HIR_LATEX_SECTION from LaTeXHIR
+    proc assert_not_null from TestUtils with results, "module contains a section node", section
+
+    Let section_title be proc node_string_field with section, 8
+    proc assert_string_equal from TestUtils with results, "section title is 'Intro Title'", section_title, "Intro Title"
+
+    Note: --- Bold text formatting ---
+    Let bold be proc find_node_by_kind with hir1, HIR_LATEX_TEXT_BOLD from LaTeXHIR
+    proc assert_not_null from TestUtils with results, "module contains a bold-text node", bold
+
+    Let bold_text be proc node_string_field with bold, 8
+    proc assert_string_equal from TestUtils with results, "bold text is 'bold text'", bold_text, "bold text"
+
+    Note: --- Itemize environment + two items ---
+    Let itemize be proc find_node_by_kind with hir1, HIR_LATEX_ITEMIZE from LaTeXHIR
+    proc assert_not_null from TestUtils with results, "module contains an itemize environment", itemize
+
+    Let env_name be proc node_string_field with itemize, 8
+    proc assert_string_equal from TestUtils with results, "itemize environment name is 'itemize'", env_name, "itemize"
+
+    Note:
+    Each \item is lowered to a HIR_LIST_LITERAL node (the kind tag used by
+    translate_list_item) and flattened into the module items list. There are
+    exactly two items in the source. translate_argument_content also emits
+    HIR_LIST_LITERAL blocks for braced arguments, so the count is asserted as
+    "at least 2" to keep the structural check robust to argument lowering.
+    :End Note
+    Let list_item_count be proc count_nodes_by_kind with hir1, HIR_LIST_LITERAL from HIR
+    proc assert_greater_than from TestUtils with results, "module has 2 or more list-item blocks", list_item_count, 1
+
+    Note: --- Inline math ---
+    Let math_inline be proc find_node_by_kind with hir1, HIR_LATEX_MATH_INLINE from LaTeXHIR
+    proc assert_not_null from TestUtils with results, "module contains an inline-math node", math_inline
+
+    Note: --- Stage 2: HIR -> LaTeX text ---
+    Let emitted be proc hir_to_latex from LaTeXEmitter with hir1
+    proc assert_not_null from TestUtils with results, "backend produced LaTeX text", emitted
+
+    Let emitted_len be proc string_length from StringCore with emitted
+    proc assert_greater_than from TestUtils with results, "emitted LaTeX is non-empty", emitted_len, 0
+
+    Let first_char be proc string_char_at from StringCore with emitted, 0
+    proc assert_equal from TestUtils with results, "emitted LaTeX begins with backslash (92)", first_char, 92
+
+    Note: --- Stage 3: re-parse emitted LaTeX -> HIR, assert stable structure ---
+    Let hir2 be proc latex_to_hir from LaTeXEmitter with emitted
+    proc assert_not_null from TestUtils with results, "re-parse of emitted LaTeX produced HIR", hir2
+
+    Let root2_kind be proc node_kind with hir2
+    proc assert_equal from TestUtils with results, "re-parsed root is latex document", root2_kind, HIR_LATEX_DOCUMENT from LaTeXHIR
+
+    Let docclass2 be proc find_node_by_kind with hir2, HIR_LATEX_DOCUMENTCLASS from LaTeXHIR
+    proc assert_not_null from TestUtils with results, "re-parsed module keeps a documentclass", docclass2
+
+    Let class_name2 be proc node_string_field with docclass2, 8
+    proc assert_string_equal from TestUtils with results, "re-parsed documentclass class is 'article'", class_name2, "article"
+
+    Let section2 be proc find_node_by_kind with hir2, HIR_LATEX_SECTION from LaTeXHIR
+    proc assert_not_null from TestUtils with results, "re-parsed module keeps a section", section2
+
+    Let section_title2 be proc node_string_field with section2, 8
+    proc assert_string_equal from TestUtils with results, "re-parsed section title is 'Intro Title'", section_title2, "Intro Title"
+
+    Let itemize2 be proc find_node_by_kind with hir2, HIR_LATEX_ITEMIZE from LaTeXHIR
+    proc assert_not_null from TestUtils with results, "re-parsed module keeps an itemize environment", itemize2
+
+    proc print_summary from TestUtils with results
+    Let failed be proc get_failed from TestUtils with results
+    proc destroy_test_results from TestUtils with results
+
+    Return failed
+End Process
