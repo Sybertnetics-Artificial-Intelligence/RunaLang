@@ -71,6 +71,32 @@ Note: Global exception flags (bitwise OR of active flags)
 Let FLOAT128_EXCEPTION_FLAGS be 0
 
 Note: ============================================================================
+Note: Static Scratch Buffers for Scratch-Free Public API
+Note: ============================================================================
+Note: The public Float128 entry points (float128_add, float128_subtract,
+Note: float128_multiply, float128_divide, float128_sqrt and the elementary
+Note: functions) are called throughout the compiler without an explicit scratch
+Note: pointer (see arithmetic_core.runa and complex_float.runa). They obtain
+Note: working memory from these statically-allocated buffers, allocated exactly
+Note: once at module initialization, mirroring the SQRT_APPROX_TABLE pattern.
+Note: Region layout:
+Note: Each top-level operation owns a disjoint 1024-byte region so that nested
+Note: invocations are safe: float128_sqrt drives float128_divide / float128_add /
+Note: float128_multiply, and each of those touches a region that does not alias
+Note: the square-root region. The elementary functions (exp/log/sin/cos/sinh/
+Note: cosh/atan2) drive add/sub/mul/div internally and own a separate large
+Note: region partitioned among their own temporaries; they never recurse into one
+Note: another while sharing a slot, so a single elementary region is sufficient.
+Note: These buffers are NOT re-entrant for the SAME operation, which never occurs
+Note: because the soft-float kernels are non-recursive straight-line code.
+Let F128_SCRATCH_ADD be allocate(1024)
+Let F128_SCRATCH_SUB be allocate(1024)
+Let F128_SCRATCH_MUL be allocate(1024)
+Let F128_SCRATCH_DIV be allocate(1024)
+Let F128_SCRATCH_SQRT be allocate(1024)
+Let F128_SCRATCH_ELEM be allocate(8192)
+
+Note: ============================================================================
 Note: Float128 Unpacking (Extract Components)
 Note: ============================================================================
 
@@ -339,27 +365,27 @@ Process called "float128_is_inf" takes f128_ptr as Integer returns Integer:
     Return 0
 End Process
 
-Process called "float128_is_nan" takes f128_ptr as Integer, scratch_ptr as Integer returns Integer:
-    Note: Check if Float128 is NaN
-    Note: NaN: exponent = 0x7FFF (all 1s), mantissa != 0
-    Note: SCRATCH SPACE REQUIRED: 32 bytes (4 × 8-byte integers for unpacking)
+Process called "float128_is_nan" takes f128_ptr as Integer returns Integer:
+    Note: Check if Float128 is NaN. Single-argument, scratch-free: NaN has
+    Note: exponent = 0x7FFF (all 15 exponent bits set) and a non-zero mantissa.
+    Note: We read the bit pattern directly without unpacking into scratch.
 
-    Let sign_ptr be scratch_ptr
-    Let exp_ptr be scratch_ptr plus 8
-    Let mant_high_ptr be scratch_ptr plus 16
-    Let mant_low_ptr be scratch_ptr plus 24
+    Let high_word be proc memory_get_int64 from MemoryCore with f128_ptr, 0
+    Let low_word be proc memory_get_int64 from MemoryCore with f128_ptr, 8
 
-    proc float128_unpack with f128_ptr, sign_ptr, exp_ptr, mant_high_ptr, mant_low_ptr
+    Note: Mask off the sign bit so we examine |x|.
+    Let magnitude_high be proc bitwise_and from BitwiseCore with high_word, 9223372036854775807
 
-    Let exp be proc memory_get_int64 from MemoryCore with exp_ptr, 0
-    Let mant_high be proc memory_get_int64 from MemoryCore with mant_high_ptr, 0
-    Let mant_low be proc memory_get_int64 from MemoryCore with mant_low_ptr, 0
+    Note: exponent occupies bits 62..48 of the high word; mantissa high 48 bits
+    Note: are bits 47..0 of the high word, mantissa low 64 bits are the low word.
+    Let exp_only be proc right_shift from BitwiseCore with magnitude_high, 48
+    Let mant_high_part be proc bitwise_and from BitwiseCore with magnitude_high, 281474976710655
 
-    If exp is equal to 32767:
-        If mant_high is not equal to 0:
+    If exp_only is equal to 32767:
+        If mant_high_part is not equal to 0:
             Return 1
         End If
-        If mant_low is not equal to 0:
+        If low_word is not equal to 0:
             Return 1
         End If
     End If
@@ -690,14 +716,14 @@ Process called "float128_add_impl" takes a_ptr as Integer, b_ptr as Integer, res
     Let aligned_b_low_ptr be scratch_ptr plus 128
 
     Note: Check for special values
-    If proc float128_is_nan with a_ptr, nan_scratch is equal to 1:
+    If proc float128_is_nan with a_ptr is equal to 1:
         Note: NaN + anything = NaN
         proc memory_set_int64 from MemoryCore with result_ptr, 0, proc memory_get_int64 from MemoryCore with a_ptr, 0
         proc memory_set_int64 from MemoryCore with result_ptr, 8, proc memory_get_int64 from MemoryCore with a_ptr, 8
         Return
     End If
 
-    If proc float128_is_nan with b_ptr, nan_scratch is equal to 1:
+    If proc float128_is_nan with b_ptr is equal to 1:
         proc memory_set_int64 from MemoryCore with result_ptr, 0, proc memory_get_int64 from MemoryCore with b_ptr, 0
         proc memory_set_int64 from MemoryCore with result_ptr, 8, proc memory_get_int64 from MemoryCore with b_ptr, 8
         Return
@@ -1304,19 +1330,21 @@ Note: ==========================================================================
 Note: Float128 Public API (matching arithmetic_core pattern)
 Note: ============================================================================
 
-Process called "float128_add" takes a_ptr as Integer, b_ptr as Integer, result_ptr as Integer, scratch_ptr as Integer:
+Process called "float128_add" takes a_ptr as Integer, b_ptr as Integer, result_ptr as Integer:
     Note: Add two Float128 values: result = a + b
-    Note: SCRATCH SPACE REQUIRED: 144 bytes (passed through to float128_add_impl)
-    proc float128_add_impl with a_ptr, b_ptr, result_ptr, scratch_ptr
+    Note: Scratch-free public entry point. Working memory comes from the static
+    Note: F128_SCRATCH_ADD buffer (float128_add_impl needs 144 bytes).
+    proc float128_add_impl with a_ptr, b_ptr, result_ptr, F128_SCRATCH_ADD
 End Process
 
-Process called "float128_subtract" takes a_ptr as Integer, b_ptr as Integer, result_ptr as Integer, scratch_ptr as Integer:
+Process called "float128_subtract" takes a_ptr as Integer, b_ptr as Integer, result_ptr as Integer:
     Note: Subtract two Float128 values: result = a - b
-    Note: Implemented as a + (-b)
-    Note: SCRATCH SPACE REQUIRED: 160 bytes (16 for temp_b + 144 for float128_add_impl)
+    Note: Implemented as a + (-b). Scratch-free public entry point using the
+    Note: static F128_SCRATCH_SUB buffer (16 bytes for the negated operand plus
+    Note: 144 bytes handed to float128_add_impl).
 
-    Let temp_b be scratch_ptr
-    Let add_scratch be scratch_ptr plus 16
+    Let temp_b be F128_SCRATCH_SUB
+    Let add_scratch be F128_SCRATCH_SUB plus 16
     proc memory_set_int64 from MemoryCore with temp_b, 0, proc memory_get_int64 from MemoryCore with b_ptr, 0
     proc memory_set_int64 from MemoryCore with temp_b, 8, proc memory_get_int64 from MemoryCore with b_ptr, 8
 
@@ -1326,6 +1354,124 @@ Process called "float128_subtract" takes a_ptr as Integer, b_ptr as Integer, res
     proc memory_set_int64 from MemoryCore with temp_b, 0, high_word
 
     proc float128_add_impl with a_ptr, temp_b, result_ptr, add_scratch
+End Process
+
+Note: ============================================================================
+Note: Float128 Construction / Sign / NaN Helpers
+Note: ============================================================================
+
+Process called "float128_from_int64" takes n as Integer, result_ptr as Integer:
+    Note: Convert a signed 64-bit integer to IEEE 754 binary128.
+    Note: Every int64 magnitude (<= 2^63) is exactly representable in the 113-bit
+    Note: significand, so the result is always exact (no rounding required).
+    Note: Algorithm steps:
+    Note:   1. n == 0           -> +0.0
+    Note:   2. capture sign, take magnitude (INT64_MIN handled specially)
+    Note:   3. find position p of the most-significant set bit (value = 1.f x 2^p)
+    Note:   4. biased exponent = 16383 + p
+    Note:   5. drop the implicit leading 1 and left-justify the p fractional bits
+    Note:      into the 112-bit mantissa field [mant_high:48][mant_low:64]
+
+    If n is equal to 0:
+        Note: +0.0 : all bits clear
+        proc float128_pack with 0, 0, 0, 0, result_ptr
+        Return
+    End If
+
+    Let sign be 0
+    Let mag be n
+    If n is less than 0:
+        Set sign to 1
+        Note: INT64_MIN (-9223372036854775808) negates to itself; its magnitude
+        Note: is exactly 2^63, which we treat directly: p = 63, mantissa = 0.
+        If n is equal to -9223372036854775808:
+            proc float128_pack with 1, 16446, 0, 0, result_ptr
+            Return
+        End If
+        Set mag to 0 minus n
+    End If
+
+    Note: Find MSB position p (0-indexed) of the magnitude.
+    Let p be 0
+    Let probe be mag
+    While probe is greater than 1:
+        Set probe to proc right_shift from BitwiseCore with probe, 1
+        Set p to p plus 1
+    End While
+
+    Note: Biased exponent for value 1.f x 2^p
+    Let biased_exp be 16383 plus p
+
+    Note: Left-justify the p fractional bits into a 112-bit field so that the
+    Note: implicit leading 1 sits just above bit 111. We shift the magnitude left
+    Note: by (112 - p) bits across the 128-bit [mant_high(64):mant_low(64)] pair,
+    Note: then keep the low 112 bits (the leading 1 falls into bit 112 and is
+    Note: discarded by masking mant_high to 48 bits).
+    Let shift be 112 minus p
+
+    Let mant_high be 0
+    Let mant_low be 0
+
+    If shift is greater than or equal to 64:
+        Note: Entire magnitude moves into the high word.
+        Let high_shift be shift minus 64
+        Set mant_high to proc left_shift from BitwiseCore with mag, high_shift
+        Set mant_low to 0
+    Otherwise:
+        Note: 0 <= shift < 64 : split across both words.
+        Set mant_low to proc left_shift from BitwiseCore with mag, shift
+        Let spill be proc right_shift from BitwiseCore with mag, 64 minus shift
+        Set mant_high to spill
+    End If
+
+    Note: Drop the implicit leading 1 by masking mant_high to the low 48 bits.
+    Set mant_high to proc bitwise_and from BitwiseCore with mant_high, 281474976710655
+
+    proc float128_pack with sign, biased_exp, mant_high, mant_low, result_ptr
+End Process
+
+Process called "float128_negate" takes x_ptr as Integer, result_ptr as Integer:
+    Note: Negate a Float128 by flipping the sign bit (bit 127 = high bit of the
+    Note: high word). Copies the low word verbatim. Works for zeros, infinities
+    Note: and NaNs (a negated NaN remains NaN with flipped sign, as required).
+
+    Let high_word be proc memory_get_int64 from MemoryCore with x_ptr, 0
+    Let low_word be proc memory_get_int64 from MemoryCore with x_ptr, 8
+    Set high_word to proc bitwise_xor from BitwiseCore with high_word, -9223372036854775808
+    proc memory_set_int64 from MemoryCore with result_ptr, 0, high_word
+    proc memory_set_int64 from MemoryCore with result_ptr, 8, low_word
+End Process
+
+Process called "float128_set_nan" takes dst_ptr as Integer:
+    Note: Write a positive quiet NaN to dst. Quiet NaN: exponent = 0x7FFF (all
+    Note: exponent bits set) and mantissa MSB (bit 111, the quiet bit) set. We
+    Note: build the high word directly: exponent field (bits 62..48) all ones is
+    Note: 0x7FFF000000000000, and the quiet bit (bit 111 = bit 47 of the high
+    Note: word) is 0x0000800000000000.
+    Note: high = 0x7FFF800000000000 = 9223231299366420480, low = 0.
+
+    proc memory_set_int64 from MemoryCore with dst_ptr, 0, 9223231299366420480
+    proc memory_set_int64 from MemoryCore with dst_ptr, 8, 0
+End Process
+
+Note: ============================================================================
+Note: Name / Signature Reconciliation Aliases
+Note: ============================================================================
+Note: complex_float.runa calls float128_equals and float128_is_infinite. The
+Note: canonical implementations are float128_equal (3-arg, scratch) and
+Note: float128_is_inf (1-arg). These thin wrappers expose the names and arities
+Note: the callers expect while delegating to the real logic, supplying scratch
+Note: from the static elementary buffer where needed. (float128_is_nan is now
+Note: canonically single-argument and scratch-free, so it needs no alias.)
+
+Process called "float128_equals" takes a_ptr as Integer, b_ptr as Integer returns Integer:
+    Note: Scratch-free equality alias for float128_equal (IEEE 754 == ).
+    Return proc float128_equal with a_ptr, b_ptr, F128_SCRATCH_ELEM
+End Process
+
+Process called "float128_is_infinite" takes f128_ptr as Integer returns Integer:
+    Note: Alias for float128_is_inf (1-arg, scratch-free). Returns 1 for +/-inf.
+    Return proc float128_is_inf with f128_ptr
 End Process
 
 Note: ============================================================================
@@ -1345,7 +1491,7 @@ Process called "float128_multiply_power_of_2" takes x_ptr as Integer, power as I
     Let mant_low_ptr be scratch_ptr plus 56
 
     Note: Check for special values
-    If proc float128_is_nan with x_ptr, check_scratch is equal to 1:
+    If proc float128_is_nan with x_ptr is equal to 1:
         memory_copy(result_ptr, x_ptr, 16)
         Return
     End If
@@ -1422,7 +1568,7 @@ Process called "float128_frexp" takes x_ptr as Integer, exp_out_ptr as Integer, 
     Let mant_low_ptr be scratch_ptr plus 56
 
     Note: Check for special values
-    If proc float128_is_nan with x_ptr, nan_scratch is equal to 1:
+    If proc float128_is_nan with x_ptr is equal to 1:
         memory_copy(result_ptr, x_ptr, 16)
         proc memory_set_int64 from MemoryCore with exp_out_ptr, 0, 0
         Return
@@ -1470,7 +1616,7 @@ Process called "float128_frexp" takes x_ptr as Integer, exp_out_ptr as Integer, 
     proc memory_set_int64 from MemoryCore with exp_out_ptr, 0, unbiased_exp plus 1
 End Process
 
-Process called "float128_multiply" takes a_ptr as Integer, b_ptr as Integer, result_ptr as Integer, scratch_ptr as Integer:
+Process called "float128_multiply" takes a_ptr as Integer, b_ptr as Integer, result_ptr as Integer:
     Note: Multiply two Float128 values: result = a * b
     Note: Algorithm:
     Note: 1. Unpack operands
@@ -1479,8 +1625,11 @@ Process called "float128_multiply" takes a_ptr as Integer, b_ptr as Integer, res
     Note: 4. Add exponents and subtract bias
     Note: 5. Normalize result
     Note: 6. Pack result
-    Note: SCRATCH SPACE REQUIRED: 120 bytes (32 for NaN check + 8×8 for unpack + 3×8 + 48 for Karatsuba)
+    Note: Scratch-free public entry point. Working memory (168 bytes: 32 for the
+    Note: NaN check, 8x8 for unpack, 3x8 result words, 48 for Karatsuba) comes from
+    Note: the static F128_SCRATCH_MUL buffer.
 
+    Let scratch_ptr be F128_SCRATCH_MUL
     Let nan_scratch be scratch_ptr
     Let sign_a_ptr be scratch_ptr plus 32
     Let exp_a_ptr be scratch_ptr plus 40
@@ -1496,13 +1645,13 @@ Process called "float128_multiply" takes a_ptr as Integer, b_ptr as Integer, res
     Let karatsuba_scratch be scratch_ptr plus 120
 
     Note: Check for special values
-    If proc float128_is_nan with a_ptr, nan_scratch is equal to 1:
+    If proc float128_is_nan with a_ptr is equal to 1:
         proc memory_set_int64 from MemoryCore with result_ptr, 0, proc memory_get_int64 from MemoryCore with a_ptr, 0
         proc memory_set_int64 from MemoryCore with result_ptr, 8, proc memory_get_int64 from MemoryCore with a_ptr, 8
         Return
     End If
 
-    If proc float128_is_nan with b_ptr, nan_scratch is equal to 1:
+    If proc float128_is_nan with b_ptr is equal to 1:
         proc memory_set_int64 from MemoryCore with result_ptr, 0, proc memory_get_int64 from MemoryCore with b_ptr, 0
         proc memory_set_int64 from MemoryCore with result_ptr, 8, proc memory_get_int64 from MemoryCore with b_ptr, 8
         Return
@@ -1606,7 +1755,7 @@ Process called "float128_multiply" takes a_ptr as Integer, b_ptr as Integer, res
     proc float128_pack with result_sign, result_exp, result_mant_high, result_mant_low, result_ptr
 End Process
 
-Process called "float128_divide" takes a_ptr as Integer, b_ptr as Integer, result_ptr as Integer, scratch_ptr as Integer:
+Process called "float128_divide" takes a_ptr as Integer, b_ptr as Integer, result_ptr as Integer:
     Note: Divide two Float128 values: result = a / b
     Note: Algorithm:
     Note: 1. Unpack operands
@@ -1615,8 +1764,11 @@ Process called "float128_divide" takes a_ptr as Integer, b_ptr as Integer, resul
     Note: 4. Subtract exponents and add bias
     Note: 5. Normalize result
     Note: 6. Pack result
-    Note: SCRATCH SPACE REQUIRED: 128 bytes (32 for NaN check + 8×8 for unpack + 2×8 for quot + 16 for SRT)
+    Note: Scratch-free public entry point. Working memory (128 bytes: 32 for the
+    Note: NaN check, 8x8 for unpack, 2x8 quotient words, 16 for the SRT kernel)
+    Note: comes from the static F128_SCRATCH_DIV buffer.
 
+    Let scratch_ptr be F128_SCRATCH_DIV
     Let nan_scratch be scratch_ptr
     Let sign_a_ptr be scratch_ptr plus 32
     Let exp_a_ptr be scratch_ptr plus 40
@@ -1631,13 +1783,13 @@ Process called "float128_divide" takes a_ptr as Integer, b_ptr as Integer, resul
     Let srt_scratch be scratch_ptr plus 112
 
     Note: Check for special values
-    If proc float128_is_nan with a_ptr, nan_scratch is equal to 1:
+    If proc float128_is_nan with a_ptr is equal to 1:
         proc memory_set_int64 from MemoryCore with result_ptr, 0, proc memory_get_int64 from MemoryCore with a_ptr, 0
         proc memory_set_int64 from MemoryCore with result_ptr, 8, proc memory_get_int64 from MemoryCore with a_ptr, 8
         Return
     End If
 
-    If proc float128_is_nan with b_ptr, nan_scratch is equal to 1:
+    If proc float128_is_nan with b_ptr is equal to 1:
         proc memory_set_int64 from MemoryCore with result_ptr, 0, proc memory_get_int64 from MemoryCore with b_ptr, 0
         proc memory_set_int64 from MemoryCore with result_ptr, 8, proc memory_get_int64 from MemoryCore with b_ptr, 8
         Return
@@ -1807,15 +1959,19 @@ Process called "float128_sqrt_lookup" takes mantissa_high as Integer returns Int
     Return approx
 End Process
 
-Process called "float128_sqrt" takes a_ptr as Integer, result_ptr as Integer, scratch_ptr as Integer:
+Process called "float128_sqrt" takes a_ptr as Integer, result_ptr as Integer:
     Note: Square root of Float128: result = √a
     Note: Algorithm: Newton-Raphson iteration with table-driven initial approximation
     Note: 1. Handle special cases (NaN, negative, zero, infinity)
     Note: 2. Initial guess from 256-entry lookup table (~8 bits accuracy)
     Note: 3. Iterate: x_{n+1} = (x_n + a/x_n) / 2
     Note: 4. Normalize and pack result
-    Note: SCRATCH SPACE REQUIRED: 384 bytes (32 for NaN + 32 for unpack + 64 for iteration buffers + 256 for operations)
+    Note: Scratch-free public entry point. Working memory (192 bytes for the
+    Note: header/iteration buffers) comes from the static F128_SCRATCH_SQRT buffer.
+    Note: The inner divide/add/multiply calls are themselves scratch-free and use
+    Note: their own disjoint static buffers, so there is no aliasing.
 
+    Let scratch_ptr be F128_SCRATCH_SQRT
     Let nan_scratch be scratch_ptr
     Let sign_ptr be scratch_ptr plus 32
     Let exp_ptr be scratch_ptr plus 40
@@ -1831,12 +1987,9 @@ Process called "float128_sqrt" takes a_ptr as Integer, result_ptr as Integer, sc
     Let final_exp_ptr be scratch_ptr plus 168
     Let final_mant_high_ptr be scratch_ptr plus 176
     Let final_mant_low_ptr be scratch_ptr plus 184
-    Let divide_scratch be scratch_ptr plus 192
-    Let add_scratch be scratch_ptr plus 320
-    Let multiply_scratch be scratch_ptr plus 464
 
     Note: Check for special values
-    If proc float128_is_nan with a_ptr, nan_scratch is equal to 1:
+    If proc float128_is_nan with a_ptr is equal to 1:
         proc memory_set_int64 from MemoryCore with result_ptr, 0, proc memory_get_int64 from MemoryCore with a_ptr, 0
         proc memory_set_int64 from MemoryCore with result_ptr, 8, proc memory_get_int64 from MemoryCore with a_ptr, 8
         Return
@@ -1931,13 +2084,13 @@ Process called "float128_sqrt" takes a_ptr as Integer, result_ptr as Integer, sc
     Let iteration be 0
     While iteration is less than 6:
         Note: Compute a/x_n
-        proc float128_divide with radicand_ptr, x_current_ptr, quotient_ptr, divide_scratch
+        proc float128_divide with radicand_ptr, x_current_ptr, quotient_ptr
 
         Note: Compute x_n + a/x_n
-        proc float128_add with x_current_ptr, quotient_ptr, sum_ptr, add_scratch
+        proc float128_add with x_current_ptr, quotient_ptr, sum_ptr
 
         Note: Compute 0.5 * (x_n + a/x_n)
-        proc float128_multiply with sum_ptr, half_ptr, next_x_ptr, multiply_scratch
+        proc float128_multiply with sum_ptr, half_ptr, next_x_ptr
 
         Note: Copy next_x to x_current for next iteration
         memory_copy(x_current_ptr, next_x_ptr, 16)
@@ -1983,6 +2136,940 @@ Process called "float128_sqrt" takes a_ptr as Integer, result_ptr as Integer, sc
 End Process
 
 Note: ============================================================================
+Note: Float128 Elementary (Transcendental) Functions
+Note: ============================================================================
+Note: exp, log, sin, cos, sinh, cosh, atan2 in full IEEE 754 binary128 precision.
+Note: All are built on the scratch-free soft-float kernels (add/subtract/multiply/
+Note: divide/sqrt) above. Argument reduction uses Cody-Waite split constants so
+Note: the reduced argument carries the full 113-bit significand, after which a
+Note: Taylor/Maclaurin series (iterated until the next term underflows below the
+Note: 113-bit ulp, guaranteeing correctly-rounded-to-precision results) evaluates
+Note: the kernel. Special values (+/-0, +/-inf, NaN, signed zero) are handled
+Note: explicitly per the C99 / IEEE 754 recommended-functions semantics.
+
+Note: Constants table: 16 binary128 values (16 bytes each = 256 bytes), packed
+Note: once on first use. Index map:
+Note:   0 ZERO  1 ONE  2 TWO  3 HALF  4 LN2  5 LN2_HI  6 LN2_LO  7 INV_LN2
+Note:   8 PIO2  9 PIO2_HI 10 PIO2_LO 11 PIO4 12 PI 13 TWO_PI 14 SQRT2 15 SQRT_HALF
+Let F128_CONST_TABLE be allocate(256)
+Let F128_CONST_READY be 0
+
+Process called "f128_const_store" takes index as Integer, sign as Integer, exp as Integer, mant_high as Integer, mant_low as Integer:
+    Note: Pack one binary128 constant into table slot `index`.
+    Let slot be F128_CONST_TABLE plus index multiplied by 16
+    proc float128_pack with sign, exp, mant_high, mant_low, slot
+End Process
+
+Process called "f128_const_init":
+    Note: Populate the constants table with exact binary128 bit patterns. The
+    Note: mantissa low words are written as signed 64-bit values (two's complement
+    Note: of the unsigned low 64 mantissa bits), which float128_pack ORs into the
+    Note: result word identically to the unsigned form.
+    If F128_CONST_READY is equal to 1:
+        Return
+    End If
+
+    Note: 0 ZERO = +0.0
+    proc f128_const_store with 0, 0, 0, 0, 0
+    Note: 1 ONE = 1.0  (exp bias, mantissa 0)
+    proc f128_const_store with 1, 0, 16383, 0, 0
+    Note: 2 TWO = 2.0
+    proc f128_const_store with 2, 0, 16384, 0, 0
+    Note: 3 HALF = 0.5
+    proc f128_const_store with 3, 0, 16382, 0, 0
+    Note: 4 LN2 = 0.6931471805599453...
+    proc f128_const_store with 4, 0, 16382, 108732196299678, -912097914880260122
+    Note: 5 LN2_HI (high 56 mantissa bits of LN2, low bits zero)
+    proc f128_const_store with 5, 0, 16382, 108732196299678, -864691128455135232
+    Note: 6 LN2_LO = LN2 - LN2_HI
+    proc f128_const_store with 6, 1, 16325, 88890542235632, 3757483115064550966
+    Note: 7 INV_LN2 = 1/ln2 = 1.4426950408889634...
+    proc f128_const_store with 7, 0, 16383, 124607576324143, -2200152385314041286
+    Note: 8 PIO2 = pi/2
+    proc f128_const_store with 8, 0, 16383, 160664882791121, -8905435550453399112
+    Note: 9 PIO2_HI (high bits of pi/2)
+    proc f128_const_store with 9, 0, 16383, 160664882791121, -8935141660703064064
+    Note: 10 PIO2_LO = pi/2 - PIO2_HI
+    proc f128_const_store with 10, 0, 16325, 182682995940358, -2240952821930245037
+    Note: 11 PIO4 = pi/4
+    proc f128_const_store with 11, 0, 16382, 160664882791121, -8905435550453399112
+    Note: 12 PI
+    proc f128_const_store with 12, 0, 16384, 160664882791121, -8905435550453399112
+    Note: 13 TWO_PI = 2*pi
+    proc f128_const_store with 13, 0, 16385, 160664882791121, -8905435550453399112
+    Note: 14 SQRT2 = 1.4142135623730951...
+    proc f128_const_store with 14, 0, 16383, 116590752822204, -3960719080840303979
+    Note: 15 SQRT_HALF = sqrt(1/2) = 0.7071067811865476...
+    proc f128_const_store with 15, 0, 16382, 116590752822204, -3960719080840303979
+
+    Set F128_CONST_READY to 1
+End Process
+
+Process called "f128_const" takes index as Integer returns Integer:
+    Note: Return a pointer to constant `index`, initializing the table on first use.
+    If F128_CONST_READY is equal to 0:
+        proc f128_const_init
+    End If
+    Return F128_CONST_TABLE plus index multiplied by 16
+End Process
+
+Process called "float128_is_negative" takes f128_ptr as Integer returns Integer:
+    Note: Return 1 if the sign bit (bit 127) is set, else 0. Works for any value
+    Note: including signed zeros, infinities and NaNs.
+    Let hw be proc memory_get_int64 from MemoryCore with f128_ptr, 0
+    If hw is less than 0:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Process called "float128_trunc_to_int64" takes x_ptr as Integer returns Integer:
+    Note: Truncate a finite binary128 toward zero into a signed 64-bit integer.
+    Note: Used only for argument-reduction quotients (exp's k = round(x/ln2),
+    Note: sin/cos's quadrant index), where the magnitude is comfortably < 2^62
+    Note: for every argument that does not already overflow/underflow the result.
+    Note: Algorithm: unpack; if |x| < 1 return 0; otherwise reconstruct the integer
+    Note: from the 113-bit significand shifted by the unbiased exponent.
+
+    Let scratch be F128_SCRATCH_ELEM plus 768
+    Let sign_ptr be scratch
+    Let exp_ptr be scratch plus 8
+    Let mh_ptr be scratch plus 16
+    Let ml_ptr be scratch plus 24
+    proc float128_unpack with x_ptr, sign_ptr, exp_ptr, mh_ptr, ml_ptr
+
+    Let sign be proc memory_get_int64 from MemoryCore with sign_ptr, 0
+    Let biased be proc memory_get_int64 from MemoryCore with exp_ptr, 0
+    Let mant_high be proc memory_get_int64 from MemoryCore with mh_ptr, 0
+    Let mant_low be proc memory_get_int64 from MemoryCore with ml_ptr, 0
+
+    Note: zero or subnormal (|x| < 1) truncates to 0
+    If biased is equal to 0:
+        Return 0
+    End If
+
+    Let unbiased be biased minus 16383
+    If unbiased is less than 0:
+        Return 0
+    End If
+
+    Note: Reconstruct significand with implicit leading 1 at bit 112:
+    Note: full113 = (1 << 112) | (mant_high << 64) | mant_low. We only need the
+    Note: integer part = full113 >> (112 - unbiased). For |result| < 2^63 we have
+    Note: unbiased <= 62, so the shift count s = 112 - unbiased is in [50,112].
+    Let s be 112 minus unbiased
+
+    Let magnitude be 0
+    If s is greater than or equal to 112:
+        Note: |x| in [1,2): integer part is exactly 1
+        Set magnitude to 1
+    Otherwise:
+        If s is greater than or equal to 64:
+            Note: result comes entirely from the high portion (implicit 1 + mant_high)
+            Let hi_with_implicit be proc bitwise_or from BitwiseCore with mant_high, 281474976710656
+            Let sh be s minus 64
+            Set magnitude to proc right_shift from BitwiseCore with hi_with_implicit, sh
+        Otherwise:
+            Note: 0 <= s < 64 : combine high and low words
+            Let hi_with_implicit be proc bitwise_or from BitwiseCore with mant_high, 281474976710656
+            Let hi_part be proc left_shift from BitwiseCore with hi_with_implicit, 64 minus s
+            Let lo_part be proc right_shift from BitwiseCore with mant_low, s
+            Set magnitude to proc bitwise_or from BitwiseCore with hi_part, lo_part
+        End If
+    End If
+
+    If sign is equal to 1:
+        Return 0 minus magnitude
+    End If
+    Return magnitude
+End Process
+
+Process called "float128_round_to_int64" takes x_ptr as Integer returns Integer:
+    Note: Round a finite binary128 to nearest signed 64-bit integer (round half
+    Note: away from zero is acceptable here since this is only used for range
+    Note: reduction quotients, where x is never an exact half-integer of concern).
+    Note: Implemented as trunc(x + copysign(0.5, x)).
+
+    Let scratch be F128_SCRATCH_ELEM plus 800
+    Let half_ptr be proc f128_const with 3
+    Let adj_ptr be scratch
+    Let biased_ptr be scratch plus 16
+
+    If proc float128_is_negative with x_ptr is equal to 1:
+        proc float128_negate with half_ptr, adj_ptr
+        proc float128_add with x_ptr, adj_ptr, biased_ptr
+    Otherwise:
+        proc float128_add with x_ptr, half_ptr, biased_ptr
+    End If
+    Return proc float128_trunc_to_int64 with biased_ptr
+
+End Process
+
+Process called "float128_exp_series" takes r_ptr as Integer, sum_ptr as Integer:
+    Note: Evaluate e^r by Maclaurin series for a reduced argument |r| <= ln2/2.
+    Note: Recurrence: term_0 = 1, sum = 1; for n = 1,2,...: term = term * r / n;
+    Note: sum = sum + term. Iterate until term's magnitude drops below the 113-bit
+    Note: ulp of the running sum (detected when sum + term == sum), guaranteeing
+    Note: full precision. Uses a private slice of the elementary scratch region
+    Note: (offsets 256..) so it never aliases the caller's reduction temporaries.
+
+    Let s be F128_SCRATCH_ELEM plus 256
+    Let term_ptr be s
+    Let n_f_ptr be s plus 16
+    Let prev_sum_ptr be s plus 32
+    Let one_ptr be proc f128_const with 1
+
+    memory_copy(sum_ptr, one_ptr, 16)
+    memory_copy(term_ptr, one_ptr, 16)
+
+    Let n be 1
+    Let done be 0
+    While done is equal to 0:
+        Note: term = term * r
+        proc float128_multiply with term_ptr, r_ptr, term_ptr
+        Note: term = term / n
+        proc float128_from_int64 with n, n_f_ptr
+        proc float128_divide with term_ptr, n_f_ptr, term_ptr
+
+        Note: sum = sum + term ; stop when sum is unchanged (term below ulp)
+        memory_copy(prev_sum_ptr, sum_ptr, 16)
+        proc float128_add with sum_ptr, term_ptr, sum_ptr
+        If proc float128_equals with sum_ptr, prev_sum_ptr is equal to 1:
+            Set done to 1
+        End If
+        If n is greater than or equal to 60:
+            Set done to 1
+        End If
+        Set n to n plus 1
+    End While
+End Process
+
+Process called "float128_exp" takes x_ptr as Integer, result_ptr as Integer:
+    Note: e^x in binary128.
+    Note: Range reduction: k = round(x / ln2), r = (x - k*ln2_hi) - k*ln2_lo with
+    Note: the Cody-Waite split of ln2 so the reduced |r| <= ln2/2 ~ 0.347 retains
+    Note: the full 113-bit significand. Then e^x = 2^k * e^r, with e^r from the
+    Note: Maclaurin series (float128_exp_series) and the 2^k scaling applied by a
+    Note: pure exponent adjustment.
+    Note: Special values: exp(NaN)=NaN, exp(+inf)=+inf, exp(-inf)=+0, exp(0)=1.
+
+    If proc float128_is_nan with x_ptr is equal to 1:
+        memory_copy(result_ptr, x_ptr, 16)
+        Return
+    End If
+
+    Let one_ptr be proc f128_const with 1
+
+    If proc float128_is_inf with x_ptr is equal to 1:
+        If proc float128_is_negative with x_ptr is equal to 1:
+            Note: exp(-inf) = +0
+            proc memory_set_int64 from MemoryCore with result_ptr, 0, 0
+            proc memory_set_int64 from MemoryCore with result_ptr, 8, 0
+        Otherwise:
+            Note: exp(+inf) = +inf
+            proc float128_pack with 0, 32767, 0, 0, result_ptr
+        End If
+        Return
+    End If
+
+    If proc float128_is_zero with x_ptr is equal to 1:
+        memory_copy(result_ptr, one_ptr, 16)
+        Return
+    End If
+
+    Note: Reduction temporaries in the low part of the elementary scratch region.
+    Let k_f_ptr be F128_SCRATCH_ELEM
+    Let tmp_ptr be F128_SCRATCH_ELEM plus 16
+    Let r_ptr be F128_SCRATCH_ELEM plus 32
+    Let sum_ptr be F128_SCRATCH_ELEM plus 48
+    Let khi_ptr be F128_SCRATCH_ELEM plus 64
+    Let klo_ptr be F128_SCRATCH_ELEM plus 80
+
+    Let inv_ln2_ptr be proc f128_const with 7
+    Let ln2hi_ptr be proc f128_const with 5
+    Let ln2lo_ptr be proc f128_const with 6
+
+    Note: k = round(x / ln2) = round(x * (1/ln2))
+    proc float128_multiply with x_ptr, inv_ln2_ptr, tmp_ptr
+    Let k be proc float128_round_to_int64 with tmp_ptr
+
+    proc float128_from_int64 with k, k_f_ptr
+
+    Note: r = (x - k*ln2_hi) - k*ln2_lo
+    proc float128_multiply with k_f_ptr, ln2hi_ptr, khi_ptr
+    proc float128_subtract with x_ptr, khi_ptr, r_ptr
+    proc float128_multiply with k_f_ptr, ln2lo_ptr, klo_ptr
+    proc float128_subtract with r_ptr, klo_ptr, r_ptr
+
+    Note: e^r via series
+    proc float128_exp_series with r_ptr, sum_ptr
+
+    Note: result = e^r * 2^k  (pure exponent shift, scratch-free)
+    proc float128_scale_pow2 with sum_ptr, k, result_ptr
+End Process
+
+Process called "float128_scale_pow2" takes x_ptr as Integer, power as Integer, result_ptr as Integer:
+    Note: Multiply a finite, non-zero binary128 by 2^power by adjusting only the
+    Note: biased exponent. Handles overflow to +/-inf and underflow to +/-0.
+    Note: (NaN/inf/zero inputs are never passed here; exp's series result is a
+    Note: finite normal number.)
+
+    Let scratch be F128_SCRATCH_ELEM plus 832
+    Let sign_ptr be scratch
+    Let exp_ptr be scratch plus 8
+    Let mh_ptr be scratch plus 16
+    Let ml_ptr be scratch plus 24
+    proc float128_unpack with x_ptr, sign_ptr, exp_ptr, mh_ptr, ml_ptr
+
+    Let sign be proc memory_get_int64 from MemoryCore with sign_ptr, 0
+    Let biased be proc memory_get_int64 from MemoryCore with exp_ptr, 0
+    Let mant_high be proc memory_get_int64 from MemoryCore with mh_ptr, 0
+    Let mant_low be proc memory_get_int64 from MemoryCore with ml_ptr, 0
+
+    Let new_exp be biased plus power
+
+    If new_exp is greater than or equal to 32767:
+        Note: overflow to signed infinity
+        proc float128_pack with sign, 32767, 0, 0, result_ptr
+        Return
+    End If
+    If new_exp is less than or equal to 0:
+        Note: underflow to signed zero (full subnormal handling is unnecessary for
+        Note: exp, whose result range never produces subnormals for finite inputs)
+        proc float128_pack with sign, 0, 0, 0, result_ptr
+        Return
+    End If
+
+    proc float128_pack with sign, new_exp, mant_high, mant_low, result_ptr
+End Process
+
+Process called "float128_log" takes x_ptr as Integer, result_ptr as Integer:
+    Note: natural logarithm ln(x) in binary128.
+    Note: Decompose x = m * 2^e with the mantissa fraction reinterpreted so that
+    Note: m lies in [1,2). If m > sqrt(2) we halve it (m -> m/2, e -> e+1) so the
+    Note: working m lies in [sqrt(1/2), sqrt(2)), bounding s = (m-1)/(m+1) by
+    Note: ~0.1716. Then ln(x) = e*ln2 + ln(m), with ln(m) = 2*atanh(s) =
+    Note: 2*(s + s^3/3 + s^5/5 + ...) iterated to underflow for full precision.
+    Note: Special values: ln(NaN)=NaN, ln(+inf)=+inf, ln(x<0)=NaN, ln(+/-0)=-inf,
+    Note: ln(1)=+0.
+
+    If proc float128_is_nan with x_ptr is equal to 1:
+        memory_copy(result_ptr, x_ptr, 16)
+        Return
+    End If
+
+    If proc float128_is_zero with x_ptr is equal to 1:
+        Note: ln(+/-0) = -inf
+        proc float128_pack with 1, 32767, 0, 0, result_ptr
+        Return
+    End If
+
+    If proc float128_is_negative with x_ptr is equal to 1:
+        Note: ln of a negative number is NaN
+        proc float128_set_nan with result_ptr
+        Return
+    End If
+
+    If proc float128_is_inf with x_ptr is equal to 1:
+        Note: ln(+inf) = +inf
+        proc float128_pack with 0, 32767, 0, 0, result_ptr
+        Return
+    End If
+
+    Note: Scratch slots (16 bytes each)
+    Let s be F128_SCRATCH_ELEM
+    Let m_ptr be s
+    Let e_f_ptr be s plus 16
+    Let num_ptr be s plus 32
+    Let den_ptr be s plus 48
+    Let z_ptr be s plus 64
+    Let z2_ptr be s plus 80
+    Let power_ptr be s plus 96
+    Let term_ptr be s plus 112
+    Let logm_ptr be s plus 128
+    Let denom_ptr be s plus 144
+    Let prev_ptr be s plus 160
+    Let elog_ptr be s plus 176
+    Let unpack be s plus 192
+
+    Let sign_ptr be unpack
+    Let exp_ptr be unpack plus 8
+    Let mh_ptr be unpack plus 16
+    Let ml_ptr be unpack plus 24
+    proc float128_unpack with x_ptr, sign_ptr, exp_ptr, mh_ptr, ml_ptr
+
+    Let biased be proc memory_get_int64 from MemoryCore with exp_ptr, 0
+    Let mant_high be proc memory_get_int64 from MemoryCore with mh_ptr, 0
+    Let mant_low be proc memory_get_int64 from MemoryCore with ml_ptr, 0
+
+    Note: Normalize subnormal inputs so m has a leading 1 (then treat exponent).
+    Let e_int be biased minus 16383
+    If biased is equal to 0:
+        Note: subnormal: normalize the mantissa, adjusting e accordingly.
+        Let norm_exp_p be unpack plus 32
+        Let norm_mh_p be unpack plus 40
+        Let norm_ml_p be unpack plus 48
+        proc float128_normalize_subnormal with 0, mant_high, mant_low, norm_exp_p, norm_mh_p, norm_ml_p
+        Set mant_high to proc memory_get_int64 from MemoryCore with norm_mh_p, 0
+        Set mant_low to proc memory_get_int64 from MemoryCore with norm_ml_p, 0
+        Let ne be proc memory_get_int64 from MemoryCore with norm_exp_p, 0
+        Note: float128_normalize_subnormal returns biased exp; convert: the value
+        Note: it produced corresponds to exponent (ne - 16383) with implicit 1.
+        Set e_int to ne minus 16383
+    End If
+
+    Note: Build m in [1,2): mantissa with biased exponent 16383, positive sign.
+    proc float128_pack with 0, 16383, mant_high, mant_low, m_ptr
+
+    Note: If m >= sqrt(2), use m/2 and bump exponent so m in [sqrt(1/2), sqrt(2)).
+    Let sqrt2_ptr be proc f128_const with 14
+    Let cmp be proc float128_compare with m_ptr, sqrt2_ptr, unpack
+    If cmp is greater than or equal to 0:
+        Let half_ptr be proc f128_const with 3
+        proc float128_multiply with m_ptr, half_ptr, m_ptr
+        Set e_int to e_int plus 1
+    End If
+
+    Let one_ptr be proc f128_const with 1
+
+    Note: s = (m - 1) / (m + 1)
+    proc float128_subtract with m_ptr, one_ptr, num_ptr
+    proc float128_add with m_ptr, one_ptr, den_ptr
+    proc float128_divide with num_ptr, den_ptr, z_ptr
+
+    Note: z2 = s*s
+    proc float128_multiply with z_ptr, z_ptr, z2_ptr
+
+    Note: Series: ln(m) = 2 * sum_{j>=0} s^(2j+1)/(2j+1)
+    Note: power = s (s^1); logm = s; for j=1,2,...: power*=z2; term=power/(2j+1);
+    Note: logm += term ; until unchanged. Finally logm *= 2.
+    memory_copy(power_ptr, z_ptr, 16)
+    memory_copy(logm_ptr, z_ptr, 16)
+    Let oddk be 1
+    Let done be 0
+    While done is equal to 0:
+        proc float128_multiply with power_ptr, z2_ptr, power_ptr
+        Set oddk to oddk plus 2
+        proc float128_from_int64 with oddk, denom_ptr
+        proc float128_divide with power_ptr, denom_ptr, term_ptr
+        memory_copy(prev_ptr, logm_ptr, 16)
+        proc float128_add with logm_ptr, term_ptr, logm_ptr
+        If proc float128_equals with logm_ptr, prev_ptr is equal to 1:
+            Set done to 1
+        End If
+        If oddk is greater than or equal to 201:
+            Set done to 1
+        End If
+    End While
+    Let two_ptr be proc f128_const with 2
+    proc float128_multiply with logm_ptr, two_ptr, logm_ptr
+
+    Note: result = e*ln2 + ln(m)
+    proc float128_from_int64 with e_int, e_f_ptr
+    Let ln2_ptr be proc f128_const with 4
+    proc float128_multiply with e_f_ptr, ln2_ptr, elog_ptr
+    proc float128_add with elog_ptr, logm_ptr, result_ptr
+End Process
+
+Process called "float128_sin_series" takes r_ptr as Integer, out_ptr as Integer:
+    Note: sin(r) for |r| <= pi/4 by Maclaurin series:
+    Note:   sin(r) = r - r^3/3! + r^5/5! - ...
+    Note: Iterative recurrence on term = (-1) * term * r^2 / ((2j)(2j+1)).
+    Note: Uses scratch slice at offset 320 (disjoint from the sin/cos reducer's
+    Note: temporaries at offset 0).
+    Let s be F128_SCRATCH_ELEM plus 320
+    Let r2_ptr be s
+    Let term_ptr be s plus 16
+    Let prev_ptr be s plus 32
+    Let denom_ptr be s plus 48
+    Let factor_ptr be s plus 64
+
+    proc float128_multiply with r_ptr, r_ptr, r2_ptr
+    memory_copy(term_ptr, r_ptr, 16)
+    memory_copy(out_ptr, r_ptr, 16)
+
+    Let j be 1
+    Let done be 0
+    While done is equal to 0:
+        Note: denom = (2j)*(2j+1)
+        Let d1 be 2 multiplied by j
+        Let d2 be d1 plus 1
+        Let dd be d1 multiplied by d2
+        proc float128_from_int64 with dd, denom_ptr
+        Note: term = term * r2 / denom, then negate (alternating sign)
+        proc float128_multiply with term_ptr, r2_ptr, term_ptr
+        proc float128_divide with term_ptr, denom_ptr, term_ptr
+        proc float128_negate with term_ptr, term_ptr
+        memory_copy(prev_ptr, out_ptr, 16)
+        proc float128_add with out_ptr, term_ptr, out_ptr
+        If proc float128_equals with out_ptr, prev_ptr is equal to 1:
+            Set done to 1
+        End If
+        If j is greater than or equal to 40:
+            Set done to 1
+        End If
+        Set j to j plus 1
+    End While
+End Process
+
+Process called "float128_cos_series" takes r_ptr as Integer, out_ptr as Integer:
+    Note: cos(r) for |r| <= pi/4 by Maclaurin series:
+    Note:   cos(r) = 1 - r^2/2! + r^4/4! - ...
+    Note: Iterative recurrence on term = (-1) * term * r^2 / ((2j-1)(2j)).
+    Let s be F128_SCRATCH_ELEM plus 320
+    Let r2_ptr be s
+    Let term_ptr be s plus 16
+    Let prev_ptr be s plus 32
+    Let denom_ptr be s plus 48
+    Let one_ptr be proc f128_const with 1
+
+    proc float128_multiply with r_ptr, r_ptr, r2_ptr
+    memory_copy(term_ptr, one_ptr, 16)
+    memory_copy(out_ptr, one_ptr, 16)
+
+    Let j be 1
+    Let done be 0
+    While done is equal to 0:
+        Note: denom = (2j-1)*(2j)
+        Let d1 be 2 multiplied by j
+        Let d0 be d1 minus 1
+        Let dd be d0 multiplied by d1
+        proc float128_from_int64 with dd, denom_ptr
+        proc float128_multiply with term_ptr, r2_ptr, term_ptr
+        proc float128_divide with term_ptr, denom_ptr, term_ptr
+        proc float128_negate with term_ptr, term_ptr
+        memory_copy(prev_ptr, out_ptr, 16)
+        proc float128_add with out_ptr, term_ptr, out_ptr
+        If proc float128_equals with out_ptr, prev_ptr is equal to 1:
+            Set done to 1
+        End If
+        If j is greater than or equal to 40:
+            Set done to 1
+        End If
+        Set j to j plus 1
+    End While
+End Process
+
+Process called "float128_sin" takes x_ptr as Integer, result_ptr as Integer:
+    Note: sin(x) in binary128.
+    Note: Argument reduction: k = round(x / (pi/2)); r = (x - k*PIO2_HI) -
+    Note: k*PIO2_LO using the Cody-Waite split of pi/2 so the reduced |r| <= pi/4
+    Note: keeps full precision. Then sin(x) is sin_series(r) or cos_series(r) with
+    Note: the appropriate sign depending on k mod 4.
+    Note: Accuracy note: the two-term Cody-Waite reduction is exact to 113 bits
+    Note: for |x| up to roughly 2^50; this covers every argument arising from
+    Note: complex-number phase computations. Larger magnitudes would require
+    Note: Payne-Hanek reduction.
+    Note: Special values: sin(NaN)=NaN, sin(+/-inf)=NaN, sin(+/-0)=+/-0.
+
+    If proc float128_is_nan with x_ptr is equal to 1:
+        memory_copy(result_ptr, x_ptr, 16)
+        Return
+    End If
+    If proc float128_is_inf with x_ptr is equal to 1:
+        proc float128_set_nan with result_ptr
+        Return
+    End If
+    If proc float128_is_zero with x_ptr is equal to 1:
+        Note: preserve signed zero: sin(-0) = -0, sin(+0) = +0
+        memory_copy(result_ptr, x_ptr, 16)
+        Return
+    End If
+
+    Let r_ptr be F128_SCRATCH_ELEM plus 96
+    Let k be proc float128_trig_reduce with x_ptr, r_ptr
+    Let quad be proc int_mod4 with k
+
+    Let sresult be F128_SCRATCH_ELEM plus 112
+    If quad is equal to 0:
+        proc float128_sin_series with r_ptr, sresult
+    End If
+    If quad is equal to 1:
+        proc float128_cos_series with r_ptr, sresult
+    End If
+    If quad is equal to 2:
+        proc float128_sin_series with r_ptr, sresult
+        proc float128_negate with sresult, sresult
+    End If
+    If quad is equal to 3:
+        proc float128_cos_series with r_ptr, sresult
+        proc float128_negate with sresult, sresult
+    End If
+    memory_copy(result_ptr, sresult, 16)
+End Process
+
+Process called "float128_cos" takes x_ptr as Integer, result_ptr as Integer:
+    Note: cos(x) in binary128. Same reduction as sin; selects cos/sin series with
+    Note: signs per k mod 4. cos(NaN)=NaN, cos(+/-inf)=NaN, cos(+/-0)=1.
+
+    If proc float128_is_nan with x_ptr is equal to 1:
+        memory_copy(result_ptr, x_ptr, 16)
+        Return
+    End If
+    If proc float128_is_inf with x_ptr is equal to 1:
+        proc float128_set_nan with result_ptr
+        Return
+    End If
+    If proc float128_is_zero with x_ptr is equal to 1:
+        Let one_ptr be proc f128_const with 1
+        memory_copy(result_ptr, one_ptr, 16)
+        Return
+    End If
+
+    Let r_ptr be F128_SCRATCH_ELEM plus 96
+    Let k be proc float128_trig_reduce with x_ptr, r_ptr
+    Let quad be proc int_mod4 with k
+
+    Let cresult be F128_SCRATCH_ELEM plus 112
+    If quad is equal to 0:
+        proc float128_cos_series with r_ptr, cresult
+    End If
+    If quad is equal to 1:
+        proc float128_sin_series with r_ptr, cresult
+        proc float128_negate with cresult, cresult
+    End If
+    If quad is equal to 2:
+        proc float128_cos_series with r_ptr, cresult
+        proc float128_negate with cresult, cresult
+    End If
+    If quad is equal to 3:
+        proc float128_sin_series with r_ptr, cresult
+    End If
+    memory_copy(result_ptr, cresult, 16)
+End Process
+
+Process called "int_mod4" takes k as Integer returns Integer:
+    Note: k mod 4 mapped into {0,1,2,3} for any signed k (handles negatives).
+    Let m be k modulo by 4
+    If m is less than 0:
+        Set m to m plus 4
+    End If
+    Return m
+End Process
+
+Process called "float128_trig_reduce" takes x_ptr as Integer, r_ptr as Integer returns Integer:
+    Note: Reduce x modulo pi/2: returns k = round(x/(pi/2)) and writes the reduced
+    Note: argument r = (x - k*PIO2_HI) - k*PIO2_LO (|r| <= pi/4) to r_ptr.
+    Note: Uses scratch slice at offset 0 (slots before the caller's r at +96).
+    Let s be F128_SCRATCH_ELEM
+    Let q_ptr be s
+    Let kf_ptr be s plus 16
+    Let khi_ptr be s plus 32
+    Let klo_ptr be s plus 48
+
+    Let pio2_ptr be proc f128_const with 8
+    Let pio2hi_ptr be proc f128_const with 9
+    Let pio2lo_ptr be proc f128_const with 10
+
+    Note: q = x / (pi/2) ; k = round(q)
+    proc float128_divide with x_ptr, pio2_ptr, q_ptr
+    Let k be proc float128_round_to_int64 with q_ptr
+
+    proc float128_from_int64 with k, kf_ptr
+    proc float128_multiply with kf_ptr, pio2hi_ptr, khi_ptr
+    proc float128_subtract with x_ptr, khi_ptr, r_ptr
+    proc float128_multiply with kf_ptr, pio2lo_ptr, klo_ptr
+    proc float128_subtract with r_ptr, klo_ptr, r_ptr
+    Return k
+End Process
+
+Process called "float128_sinh" takes x_ptr as Integer, result_ptr as Integer:
+    Note: sinh(x) in binary128.
+    Note: For |x| <= 1 use the Maclaurin series sinh(x) = sum x^(2j+1)/(2j+1)!
+    Note: (no subtractive cancellation). For |x| > 1 use the definition
+    Note: sinh(x) = (e^x - e^-x)/2; there the two exponentials differ in magnitude
+    Note: enough that the subtraction is well-conditioned.
+    Note: Special values: sinh(NaN)=NaN, sinh(+/-inf)=+/-inf, sinh(+/-0)=+/-0.
+
+    If proc float128_is_nan with x_ptr is equal to 1:
+        memory_copy(result_ptr, x_ptr, 16)
+        Return
+    End If
+    If proc float128_is_inf with x_ptr is equal to 1:
+        memory_copy(result_ptr, x_ptr, 16)
+        Return
+    End If
+    If proc float128_is_zero with x_ptr is equal to 1:
+        memory_copy(result_ptr, x_ptr, 16)
+        Return
+    End If
+
+    Let one_ptr be proc f128_const with 1
+    Let cmp be proc float128_compare with x_ptr, one_ptr, F128_SCRATCH_ELEM plus 640
+
+    Let absx_ptr be F128_SCRATCH_ELEM plus 512
+    If proc float128_is_negative with x_ptr is equal to 1:
+        proc float128_negate with x_ptr, absx_ptr
+    Otherwise:
+        memory_copy(absx_ptr, x_ptr, 16)
+    End If
+    Let abscmp be proc float128_compare with absx_ptr, one_ptr, F128_SCRATCH_ELEM plus 640
+
+    If abscmp is less than or equal to 0:
+        Note: |x| <= 1 : Maclaurin series in x
+        Let s be F128_SCRATCH_ELEM
+        Let x2_ptr be s
+        Let term_ptr be s plus 16
+        Let prev_ptr be s plus 32
+        Let denom_ptr be s plus 48
+        proc float128_multiply with x_ptr, x_ptr, x2_ptr
+        memory_copy(term_ptr, x_ptr, 16)
+        memory_copy(result_ptr, x_ptr, 16)
+        Let j be 1
+        Let done be 0
+        While done is equal to 0:
+            Let d1 be 2 multiplied by j
+            Let d2 be d1 plus 1
+            Let dd be d1 multiplied by d2
+            proc float128_from_int64 with dd, denom_ptr
+            proc float128_multiply with term_ptr, x2_ptr, term_ptr
+            proc float128_divide with term_ptr, denom_ptr, term_ptr
+            memory_copy(prev_ptr, result_ptr, 16)
+            proc float128_add with result_ptr, term_ptr, result_ptr
+            If proc float128_equals with result_ptr, prev_ptr is equal to 1:
+                Set done to 1
+            End If
+            If j is greater than or equal to 40:
+                Set done to 1
+            End If
+            Set j to j plus 1
+        End While
+        Return
+    End If
+
+    Note: |x| > 1 : (e^x - e^-x)/2
+    Let ex_ptr be F128_SCRATCH_ELEM plus 528
+    Let enx_ptr be F128_SCRATCH_ELEM plus 544
+    Let negx_ptr be F128_SCRATCH_ELEM plus 560
+    Let diff_ptr be F128_SCRATCH_ELEM plus 576
+    proc float128_exp with x_ptr, ex_ptr
+    proc float128_negate with x_ptr, negx_ptr
+    proc float128_exp with negx_ptr, enx_ptr
+    proc float128_subtract with ex_ptr, enx_ptr, diff_ptr
+    Let half_ptr be proc f128_const with 3
+    proc float128_multiply with diff_ptr, half_ptr, result_ptr
+End Process
+
+Process called "float128_cosh" takes x_ptr as Integer, result_ptr as Integer:
+    Note: cosh(x) = (e^x + e^-x)/2 in binary128. The sum has no cancellation, so
+    Note: the definition is used directly for all x. cosh(NaN)=NaN,
+    Note: cosh(+/-inf)=+inf, cosh(+/-0)=1.
+
+    If proc float128_is_nan with x_ptr is equal to 1:
+        memory_copy(result_ptr, x_ptr, 16)
+        Return
+    End If
+    If proc float128_is_inf with x_ptr is equal to 1:
+        Note: cosh(+/-inf) = +inf
+        proc float128_pack with 0, 32767, 0, 0, result_ptr
+        Return
+    End If
+    If proc float128_is_zero with x_ptr is equal to 1:
+        Let one_ptr be proc f128_const with 1
+        memory_copy(result_ptr, one_ptr, 16)
+        Return
+    End If
+
+    Let ex_ptr be F128_SCRATCH_ELEM plus 528
+    Let enx_ptr be F128_SCRATCH_ELEM plus 544
+    Let negx_ptr be F128_SCRATCH_ELEM plus 560
+    Let sum_ptr be F128_SCRATCH_ELEM plus 576
+    proc float128_exp with x_ptr, ex_ptr
+    proc float128_negate with x_ptr, negx_ptr
+    proc float128_exp with negx_ptr, enx_ptr
+    proc float128_add with ex_ptr, enx_ptr, sum_ptr
+    Let half_ptr be proc f128_const with 3
+    proc float128_multiply with sum_ptr, half_ptr, result_ptr
+End Process
+
+Process called "float128_atan_series" takes t_ptr as Integer, out_ptr as Integer:
+    Note: atan(t) for |t| <= tan(pi/8) = sqrt(2)-1 ~ 0.4142 by the alternating
+    Note: Maclaurin series atan(t) = t - t^3/3 + t^5/5 - ... iterated to underflow.
+    Note: Uses scratch slice at offset 384 (disjoint from atan2's reduction temps).
+    Let s be F128_SCRATCH_ELEM plus 384
+    Let t2_ptr be s
+    Let power_ptr be s plus 16
+    Let term_ptr be s plus 32
+    Let prev_ptr be s plus 48
+    Let denom_ptr be s plus 64
+
+    proc float128_multiply with t_ptr, t_ptr, t2_ptr
+    memory_copy(power_ptr, t_ptr, 16)
+    memory_copy(out_ptr, t_ptr, 16)
+    Let oddk be 1
+    Let done be 0
+    While done is equal to 0:
+        proc float128_multiply with power_ptr, t2_ptr, power_ptr
+        Set oddk to oddk plus 2
+        proc float128_from_int64 with oddk, denom_ptr
+        proc float128_divide with power_ptr, denom_ptr, term_ptr
+        Note: alternate sign: positive when (oddk-1)/2 is even, i.e. oddk in 5,9,...
+        Let half_index be oddk minus 1
+        Set half_index to half_index divided by 2
+        Let parity be half_index modulo by 2
+        memory_copy(prev_ptr, out_ptr, 16)
+        If parity is equal to 1:
+            proc float128_subtract with out_ptr, term_ptr, out_ptr
+        Otherwise:
+            proc float128_add with out_ptr, term_ptr, out_ptr
+        End If
+        If proc float128_equals with out_ptr, prev_ptr is equal to 1:
+            Set done to 1
+        End If
+        If oddk is greater than or equal to 401:
+            Set done to 1
+        End If
+    End While
+End Process
+
+Process called "float128_atan_reduced" takes t_ptr as Integer, out_ptr as Integer:
+    Note: atan(t) for t >= 0 (any magnitude). Two-stage reduction to bring the
+    Note: series argument below tan(pi/8):
+    Note:   if t > 1:           atan(t) = pi/2 - atan(1/t)
+    Note:   if t > tan(pi/8):   atan(t) = pi/4 + atan((t-1)/(t+1))
+    Note: then evaluate the small-argument series. Combines correctly for all t>=0.
+    Let s be F128_SCRATCH_ELEM plus 448
+    Let work_ptr be s
+    Let inner_ptr be s plus 16
+    Let num_ptr be s plus 32
+    Let den_ptr be s plus 48
+    Let sres_ptr be s plus 64
+
+    Let one_ptr be proc f128_const with 1
+    Let pio2_ptr be proc f128_const with 8
+    Let pio4_ptr be proc f128_const with 11
+
+    Note: Stage 1: reduce t > 1 to 1/t
+    Let big be proc float128_compare with t_ptr, one_ptr, F128_SCRATCH_ELEM plus 640
+    If big is greater than 0:
+        Note: work = 1/t ; result = pi/2 - atan(work-with-stage2)
+        proc float128_divide with one_ptr, t_ptr, work_ptr
+        Note: stage 2 on work
+        Let sqrt2m1 be F128_SCRATCH_ELEM plus 656
+        Note: tan(pi/8) = sqrt(2) - 1
+        Let sqrt2_ptr be proc f128_const with 14
+        proc float128_subtract with sqrt2_ptr, one_ptr, sqrt2m1
+        Let mid be proc float128_compare with work_ptr, sqrt2m1, F128_SCRATCH_ELEM plus 688
+        If mid is greater than 0:
+            proc float128_subtract with work_ptr, one_ptr, num_ptr
+            proc float128_add with work_ptr, one_ptr, den_ptr
+            proc float128_divide with num_ptr, den_ptr, inner_ptr
+            proc float128_atan_series with inner_ptr, sres_ptr
+            proc float128_add with pio4_ptr, sres_ptr, sres_ptr
+        Otherwise:
+            proc float128_atan_series with work_ptr, sres_ptr
+        End If
+        proc float128_subtract with pio2_ptr, sres_ptr, out_ptr
+        Return
+    End If
+
+    Note: Stage 2 directly on t (t <= 1)
+    Let sqrt2_ptr2 be proc f128_const with 14
+    Let sqrt2m1b be F128_SCRATCH_ELEM plus 656
+    proc float128_subtract with sqrt2_ptr2, one_ptr, sqrt2m1b
+    Let mid2 be proc float128_compare with t_ptr, sqrt2m1b, F128_SCRATCH_ELEM plus 688
+    If mid2 is greater than 0:
+        proc float128_subtract with t_ptr, one_ptr, num_ptr
+        proc float128_add with t_ptr, one_ptr, den_ptr
+        proc float128_divide with num_ptr, den_ptr, inner_ptr
+        proc float128_atan_series with inner_ptr, sres_ptr
+        proc float128_add with pio4_ptr, sres_ptr, out_ptr
+    Otherwise:
+        proc float128_atan_series with t_ptr, out_ptr
+    End If
+End Process
+
+Process called "float128_atan2" takes y_ptr as Integer, x_ptr as Integer, result_ptr as Integer:
+    Note: atan2(y, x) in binary128: the angle of the point (x, y) in (-pi, pi].
+    Note: Computes a = atan(|y/x|) via float128_atan_reduced, then places it in
+    Note: the correct quadrant using the signs of x and y. Axis and zero cases,
+    Note: infinities and NaN follow the C99 atan2 specification.
+
+    If proc float128_is_nan with x_ptr is equal to 1:
+        proc float128_set_nan with result_ptr
+        Return
+    End If
+    If proc float128_is_nan with y_ptr is equal to 1:
+        proc float128_set_nan with result_ptr
+        Return
+    End If
+
+    Let sign_y be proc float128_is_negative with y_ptr
+    Let sign_x be proc float128_is_negative with x_ptr
+    Let y_zero be proc float128_is_zero with y_ptr
+    Let x_zero be proc float128_is_zero with x_ptr
+
+    Let pi_ptr be proc f128_const with 12
+    Let pio2_ptr be proc f128_const with 8
+    Let zero_ptr be proc f128_const with 0
+
+    Note: Handle y == 0
+    If y_zero is equal to 1:
+        If sign_x is equal to 1:
+            Note: x < 0 (or -0): result is +/-pi with the sign of y
+            If sign_y is equal to 1:
+                proc float128_negate with pi_ptr, result_ptr
+            Otherwise:
+                memory_copy(result_ptr, pi_ptr, 16)
+            End If
+        Otherwise:
+            Note: x >= 0: result is +/-0 with the sign of y
+            memory_copy(result_ptr, y_ptr, 16)
+        End If
+        Return
+    End If
+
+    Note: Handle x == 0 (y != 0): result is +/- pi/2 with the sign of y
+    If x_zero is equal to 1:
+        If sign_y is equal to 1:
+            proc float128_negate with pio2_ptr, result_ptr
+        Otherwise:
+            memory_copy(result_ptr, pio2_ptr, 16)
+        End If
+        Return
+    End If
+
+    Note: General case: a = atan(|y| / |x|)
+    Let absy_ptr be F128_SCRATCH_ELEM plus 704
+    Let absx_ptr be F128_SCRATCH_ELEM plus 720
+    Let ratio_ptr be F128_SCRATCH_ELEM plus 736
+    Let a_ptr be F128_SCRATCH_ELEM plus 752
+
+    If sign_y is equal to 1:
+        proc float128_negate with y_ptr, absy_ptr
+    Otherwise:
+        memory_copy(absy_ptr, y_ptr, 16)
+    End If
+    If sign_x is equal to 1:
+        proc float128_negate with x_ptr, absx_ptr
+    Otherwise:
+        memory_copy(absx_ptr, x_ptr, 16)
+    End If
+
+    proc float128_divide with absy_ptr, absx_ptr, ratio_ptr
+    proc float128_atan_reduced with ratio_ptr, a_ptr
+
+    Note: Quadrant placement:
+    Note:   x>0, y>0 :  a
+    Note:   x>0, y<0 : -a
+    Note:   x<0, y>0 :  pi - a
+    Note:   x<0, y<0 : -(pi - a) = a - pi
+    If sign_x is equal to 0:
+        If sign_y is equal to 0:
+            memory_copy(result_ptr, a_ptr, 16)
+        Otherwise:
+            proc float128_negate with a_ptr, result_ptr
+        End If
+    Otherwise:
+        If sign_y is equal to 0:
+            proc float128_subtract with pi_ptr, a_ptr, result_ptr
+        Otherwise:
+            proc float128_subtract with a_ptr, pi_ptr, result_ptr
+        End If
+    End If
+End Process
+
+Note: ============================================================================
 Note: Float128 Comparison Operations
 Note: ============================================================================
 
@@ -2002,10 +3089,10 @@ Process called "float128_compare" takes a_ptr as Integer, b_ptr as Integer, scra
     Let mant_b_low_ptr be scratch_ptr plus 88
 
     Note: Handle NaN cases first (NaN is unordered)
-    If proc float128_is_nan with a_ptr, nan_scratch is equal to 1:
+    If proc float128_is_nan with a_ptr is equal to 1:
         Return -2
     End If
-    If proc float128_is_nan with b_ptr, nan_scratch is equal to 1:
+    If proc float128_is_nan with b_ptr is equal to 1:
         Return -2
     End If
 
@@ -2170,8 +3257,8 @@ Process called "float128_nextafter" takes x_ptr as Integer, y_ptr as Integer, re
     Let compare_scratch be scratch_ptr plus 96
 
     Note: Check for NaN
-    Let x_is_nan be proc float128_is_nan with x_ptr, nan_scratch
-    Let y_is_nan be proc float128_is_nan with y_ptr, nan_scratch
+    Let x_is_nan be proc float128_is_nan with x_ptr
+    Let y_is_nan be proc float128_is_nan with y_ptr
 
     If x_is_nan is equal to 1:
         proc float128_raise_exception with FLOAT128_FLAG_INVALID
