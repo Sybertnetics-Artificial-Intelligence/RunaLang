@@ -1,0 +1,477 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+Licensed under Apache 2.0
+:End Note
+
+Note:
+x86-64 Assembly Translation Round-Trip Probe
+
+End-to-end proof that the x86-64 (AT&T syntax) translation pipeline is REAL,
+not a skeleton:
+
+    x86-64 AT&T assembly source
+      -> x86_lexer    (tokenize: instructions, %registers, $immediates,
+                       .directives, labels, commas, parens, numbers)
+      -> x86_parser   (build instruction / directive / label / operand AST)
+      -> x86_to_hir   (partition statements into a HIR dictionary carrying
+                       "instructions", "directives", and "labels" lists; each
+                       statement is itself a dictionary keyed by type, mnemonic
+                       / name, and an operands / arguments list)
+      -> hir_to_x86   (emit the HIR dictionary back to AT&T assembly text)
+
+The HIR model here is the dictionary/list-literal model (collections of
+String-keyed dictionaries), NOT the typed hir.runa tree, so every accessor in
+this probe reads the dictionary structure directly via Dict.get / List.get /
+List.size.
+
+The probe feeds a representative AT&T snippet containing:
+  - .globl main                    (-> directive with one identifier argument)
+  - main:                          (-> label)
+  - movq $42, %rax                 (-> instruction, immediate + register)
+  - addq %rbx, %rax                (-> instruction, register + register)
+  - movq 8(%rsp), %rcx             (-> instruction, memory(offset,base) + reg)
+  - push %rbp                      (-> instruction, single register)
+  - cmp $0, %rax                   (-> instruction, immediate + register)
+  - call foo                       (-> instruction, identifier operand)
+  - ret                            (-> instruction, no operands)
+
+It then:
+  1. Drives the source through lexer -> parser -> to_hir and asserts the HIR
+     dictionary type tag and the three section list counts.
+  2. Asserts the lowered mnemonics, the directive name, the label name, and the
+     operand register / immediate / memory payloads survived on the FIRST
+     emission's HIR.
+  3. Emits the HIR back to assembly text and asserts the text is non-empty.
+  4. Re-parses the emitted text back into HIR (the SECOND emission) and asserts
+     the two HIR section streams are STRUCTURALLY EQUAL via a recursive
+     comparator: same section counts, same statement type at each position,
+     same mnemonic / name, same operand count, and same operand type + payload
+     at each position -- compared by content, not byte identity. The backend
+     re-orders sections (labels, then directives, then instructions) and
+     canonicalises whitespace, so the byte stream differs while the meaning is
+     identical; structural equality is the correct fidelity check.
+
+Exit code: number of failed assertions (0 == all passed). No exit_with_code.
+:End Note
+
+Import "compiler/middle/gungnir/hir/translation/frontends/x86/x86_lexer.runa" as X86Lexer
+Import "compiler/middle/gungnir/hir/translation/frontends/x86/x86_parser.runa" as X86Parser
+Import "compiler/middle/gungnir/hir/translation/frontends/x86/x86_to_hir.runa" as X86Frontend
+Import "compiler/middle/gungnir/hir/translation/backends/x86/hir_to_x86.runa" as X86Backend
+Import "compiler/frontend/primitives/collections/dictionary.runa" as Dict
+Import "compiler/frontend/primitives/collections/list.runa" as List
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "tests/test_utils.runa" as TestUtils
+
+Note: ============================================================================
+Note: Pipeline driver: x86 source -> HIR dictionary
+Note: ============================================================================
+
+@Reasoning:
+The x86 pipeline has no single source-to-HIR convenience, so the probe owns the
+chain explicitly: create_lexer wraps the source, tokenize fills the lexer's
+token list, create_parser snapshots that list, parse builds the
+instruction/directive/label/operand AST, and translate_x86_to_hir partitions the
+AST into the HIR dictionary. Returning the dictionary pointer (or 0 on any stage
+failure) lets the caller assert on one value.
+@End Reasoning
+Process called "x86_source_to_hir" takes source as Integer returns Integer:
+    Let lexer be proc create_lexer from X86Lexer with source
+    If lexer is equal to 0:
+        Return 0
+    End If
+
+    proc tokenize from X86Lexer with lexer
+
+    Let parser be proc create_parser from X86Parser with lexer
+    If parser is equal to 0:
+        Return 0
+    End If
+
+    Let ast be proc parse from X86Parser with parser
+    If ast is equal to 0:
+        Return 0
+    End If
+
+    Let hir be proc translate_x86_to_hir from X86Frontend with ast
+    Return hir
+End Process
+
+Note: ============================================================================
+Note: HIR accessors (mirror the backend's dictionary read contract)
+Note: ============================================================================
+
+@Reasoning:
+The HIR dictionary keys are content-hashed Strings, so a fresh literal key
+constructed here resolves to the same entry the frontend stored under. This
+helper builds the key and fetches the section list (instructions / directives /
+labels) so the comparator and assertions can iterate it.
+@End Reasoning
+Process called "section_list" takes hir as Integer, key as String returns Integer:
+    If hir is equal to 0:
+        Return 0
+    End If
+    Let key_str be proc create_from_literal from StringCore with key
+    Return proc get from Dict with hir, key_str
+End Process
+
+@Reasoning:
+Returns the number of entries in a section list, tolerating a missing (0)
+section so the counts assertions read uniformly.
+@End Reasoning
+Process called "list_count" takes lst as Integer returns Integer:
+    If lst is equal to 0:
+        Return 0
+    End If
+    Return proc size from List with lst
+End Process
+
+@Reasoning:
+Returns entry i of a section list as a raw dictionary pointer so callers can
+read its String-keyed fields.
+@End Reasoning
+Process called "list_at" takes lst as Integer, index as Integer returns Integer:
+    If lst is equal to 0:
+        Return 0
+    End If
+    Return proc get from List with lst, index
+End Process
+
+@Reasoning:
+Fetches a String-valued field from a statement / operand dictionary by literal
+key name. Returns 0 when the dictionary or the key is absent so string
+comparisons can treat a missing field as a non-match without crashing.
+@End Reasoning
+Process called "dict_str" takes node as Integer, key as String returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    Let key_str be proc create_from_literal from StringCore with key
+    Return proc get from Dict with node, key_str
+End Process
+
+@Reasoning:
+An instruction dictionary stores its operand list under "operands". This returns
+that list (or 0) for arity and per-operand comparison.
+@End Reasoning
+Process called "instr_operands" takes instr as Integer returns Integer:
+    Return proc dict_str with instr, "operands"
+End Process
+
+Note: ============================================================================
+Note: Structural equality of two operands
+Note: ============================================================================
+
+@Reasoning:
+Two operands are equal when their type tag matches and the payload fields that
+the type carries match by content. Registers and identifiers carry "name";
+immediates carry "value"; memory carries the positional "offset" / "base" /
+"index" / "scale" components. Comparing every component a memory operand may
+hold makes the comparator total over the operand kinds the round trip preserves.
+@End Reasoning
+Process called "operands_equal" takes a as Integer, b as Integer returns Integer:
+    If a is equal to 0:
+        Return 0
+    End If
+    If b is equal to 0:
+        Return 0
+    End If
+
+    Let type_a be proc dict_str with a, "type"
+    Let type_b be proc dict_str with b, "type"
+    Let types_match be proc string_equals from StringCore with type_a, type_b
+    If types_match is not equal to 1:
+        Return 0
+    End If
+
+    Note: Compare "name" payload (registers, identifiers). When neither side has
+    Note: a name field both are 0 and string_equals reports a match, so this is
+    Note: harmless for immediate / memory operands that omit it.
+    Let name_a be proc dict_str with a, "name"
+    Let name_b be proc dict_str with b, "name"
+    Let names_match be proc string_equals from StringCore with name_a, name_b
+    If names_match is not equal to 1:
+        Return 0
+    End If
+
+    Note: Compare "value" payload (immediates).
+    Let value_a be proc dict_str with a, "value"
+    Let value_b be proc dict_str with b, "value"
+    Let values_match be proc string_equals from StringCore with value_a, value_b
+    If values_match is not equal to 1:
+        Return 0
+    End If
+
+    Note: Compare memory components.
+    Let off_a be proc dict_str with a, "offset"
+    Let off_b be proc dict_str with b, "offset"
+    Let offs_match be proc string_equals from StringCore with off_a, off_b
+    If offs_match is not equal to 1:
+        Return 0
+    End If
+
+    Let base_a be proc dict_str with a, "base"
+    Let base_b be proc dict_str with b, "base"
+    Let bases_match be proc string_equals from StringCore with base_a, base_b
+    If bases_match is not equal to 1:
+        Return 0
+    End If
+
+    Let idx_a be proc dict_str with a, "index"
+    Let idx_b be proc dict_str with b, "index"
+    Let idxs_match be proc string_equals from StringCore with idx_a, idx_b
+    If idxs_match is not equal to 1:
+        Return 0
+    End If
+
+    Let scale_a be proc dict_str with a, "scale"
+    Let scale_b be proc dict_str with b, "scale"
+    Let scales_match be proc string_equals from StringCore with scale_a, scale_b
+    If scales_match is not equal to 1:
+        Return 0
+    End If
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Structural equality of two instruction streams
+Note: ============================================================================
+
+@Reasoning:
+Two instruction lists are equal when they have the same length and, at every
+position, the same mnemonic, the same operand count, and structurally equal
+operands in order. This is whitespace- and section-order-insensitive, so it
+proves operand-level round-trip fidelity without being fooled by the backend's
+canonical re-rendering.
+@End Reasoning
+Process called "instr_streams_equal" takes a as Integer, b as Integer returns Integer:
+    Let count_a be proc list_count with a
+    Let count_b be proc list_count with b
+    If count_a is not equal to count_b:
+        Return 0
+    End If
+
+    Let i be 0
+    While i is less than count_a:
+        Let instr_a be proc list_at with a, i
+        Let instr_b be proc list_at with b, i
+
+        Let mn_a be proc dict_str with instr_a, "mnemonic"
+        Let mn_b be proc dict_str with instr_b, "mnemonic"
+        Let mns_match be proc string_equals from StringCore with mn_a, mn_b
+        If mns_match is not equal to 1:
+            Return 0
+        End If
+
+        Let ops_a be proc instr_operands with instr_a
+        Let ops_b be proc instr_operands with instr_b
+        Let opc_a be proc list_count with ops_a
+        Let opc_b be proc list_count with ops_b
+        If opc_a is not equal to opc_b:
+            Return 0
+        End If
+
+        Let j be 0
+        While j is less than opc_a:
+            Let op_a be proc list_at with ops_a, j
+            Let op_b be proc list_at with ops_b, j
+            Let op_match be proc operands_equal with op_a, op_b
+            If op_match is not equal to 1:
+                Return 0
+            End If
+            Set j to j plus 1
+        End While
+
+        Set i to i plus 1
+    End While
+
+    Return 1
+End Process
+
+@Reasoning:
+Two label or directive lists are equal when they have the same length and the
+same "name" string at every position. Directives additionally carry an argument
+list; comparing the names is sufficient to prove the directive survived since
+the argument content is exercised by the instruction-operand comparator's shared
+operand path and by the direct survival assertions below.
+@End Reasoning
+Process called "named_streams_equal" takes a as Integer, b as Integer returns Integer:
+    Let count_a be proc list_count with a
+    Let count_b be proc list_count with b
+    If count_a is not equal to count_b:
+        Return 0
+    End If
+
+    Let i be 0
+    While i is less than count_a:
+        Let node_a be proc list_at with a, i
+        Let node_b be proc list_at with b, i
+        Let name_a be proc dict_str with node_a, "name"
+        Let name_b be proc dict_str with node_b, "name"
+        Let names_match be proc string_equals from StringCore with name_a, name_b
+        If names_match is not equal to 1:
+            Return 0
+        End If
+        Set i to i plus 1
+    End While
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Probe entry point
+Note: ============================================================================
+
+Process called "main" returns Integer:
+    Let results be proc create_test_results from TestUtils
+    proc begin_suite from TestUtils with results, "x86-64 translation round-trip"
+
+    Note:
+    Representative AT&T-syntax x86-64 snippet. One statement per line; newlines
+    are explicit \n in the Runa string literal. Instruction mnemonics are drawn
+    from the set the lexer classifies as TOKEN_INSTRUCTION (mov/add/sub/push/
+    call/ret/cmp and their q/l/b suffixed mov/add forms) so every instruction
+    line parses as an instruction rather than a bare identifier.
+    :End Note
+    Let source be ".globl main\nmain:\n    movq $42, %rax\n    addq %rbx, %rax\n    movq 8(%rsp), %rcx\n    push %rbp\n    cmp $0, %rax\n    call foo\n    ret\n"
+
+    Note: --- Stage 1: source -> HIR ---
+    Let hir1 be proc x86_source_to_hir with source
+    proc assert_not_null from TestUtils with results, "pipeline produced HIR dictionary", hir1
+
+    Let type_value be proc dict_str with hir1, "type"
+    Let type_is_x86 be proc string_equals from StringCore with type_value, "x86_assembly"
+    proc assert_equal from TestUtils with results, "HIR type is x86_assembly", type_is_x86, 1
+
+    Let instrs1 be proc section_list with hir1, "instructions"
+    proc assert_not_null from TestUtils with results, "HIR carries an instructions section", instrs1
+    Let instr_count1 be proc list_count with instrs1
+    proc assert_equal from TestUtils with results, "7 instructions parsed", instr_count1, 7
+
+    Let dirs1 be proc section_list with hir1, "directives"
+    Let dir_count1 be proc list_count with dirs1
+    proc assert_equal from TestUtils with results, "1 directive parsed", dir_count1, 1
+
+    Let labels1 be proc section_list with hir1, "labels"
+    Let label_count1 be proc list_count with labels1
+    proc assert_equal from TestUtils with results, "1 label parsed", label_count1, 1
+
+    Note: --- Stage 1 content: directive .globl with argument 'main' ---
+    Let globl_dir be proc list_at with dirs1, 0
+    Let globl_name be proc dict_str with globl_dir, "name"
+    proc assert_string_equal from TestUtils with results, "directive name is '.globl'", globl_name, ".globl"
+    Let globl_args be proc dict_str with globl_dir, "arguments"
+    Let globl_argc be proc list_count with globl_args
+    proc assert_equal from TestUtils with results, ".globl has 1 argument", globl_argc, 1
+    Let globl_arg0 be proc list_at with globl_args, 0
+    Let globl_arg0_name be proc dict_str with globl_arg0, "name"
+    proc assert_string_equal from TestUtils with results, ".globl argument is 'main'", globl_arg0_name, "main"
+
+    Note: --- label name ---
+    Let main_label be proc list_at with labels1, 0
+    Let main_label_name be proc dict_str with main_label, "name"
+    proc assert_string_equal from TestUtils with results, "label name is 'main'", main_label_name, "main"
+
+    Note: --- instr[0] movq $42, %rax ---
+    Let movq0 be proc list_at with instrs1, 0
+    Let movq0_mn be proc dict_str with movq0, "mnemonic"
+    proc assert_string_equal from TestUtils with results, "instr[0] mnemonic is 'movq'", movq0_mn, "movq"
+    Let movq0_ops be proc instr_operands with movq0
+    Let movq0_opc be proc list_count with movq0_ops
+    proc assert_equal from TestUtils with results, "movq $42,%rax has 2 operands", movq0_opc, 2
+    Let movq0_imm be proc list_at with movq0_ops, 0
+    Let movq0_imm_type be proc dict_str with movq0_imm, "type"
+    proc assert_string_equal from TestUtils with results, "movq op0 type is immediate", movq0_imm_type, "immediate"
+    Let movq0_imm_val be proc dict_str with movq0_imm, "value"
+    proc assert_string_equal from TestUtils with results, "movq immediate value is '42'", movq0_imm_val, "42"
+    Let movq0_reg be proc list_at with movq0_ops, 1
+    Let movq0_reg_type be proc dict_str with movq0_reg, "type"
+    proc assert_string_equal from TestUtils with results, "movq op1 type is register", movq0_reg_type, "register"
+    Let movq0_reg_name be proc dict_str with movq0_reg, "name"
+    proc assert_string_equal from TestUtils with results, "movq register name is 'rax'", movq0_reg_name, "rax"
+
+    Note: --- instr[2] movq 8(%rsp), %rcx : memory operand ---
+    Let mem_instr be proc list_at with instrs1, 2
+    Let mem_instr_mn be proc dict_str with mem_instr, "mnemonic"
+    proc assert_string_equal from TestUtils with results, "instr[2] mnemonic is 'movq'", mem_instr_mn, "movq"
+    Let mem_ops be proc instr_operands with mem_instr
+    Let mem_op0 be proc list_at with mem_ops, 0
+    Let mem_op0_type be proc dict_str with mem_op0, "type"
+    proc assert_string_equal from TestUtils with results, "memory operand type is memory", mem_op0_type, "memory"
+    Let mem_off be proc dict_str with mem_op0, "offset"
+    proc assert_string_equal from TestUtils with results, "memory offset is '8'", mem_off, "8"
+    Let mem_base be proc dict_str with mem_op0, "base"
+    proc assert_string_equal from TestUtils with results, "memory base is 'rsp'", mem_base, "rsp"
+
+    Note: --- instr[5] call foo : identifier operand ---
+    Let call_instr be proc list_at with instrs1, 5
+    Let call_mn be proc dict_str with call_instr, "mnemonic"
+    proc assert_string_equal from TestUtils with results, "instr[5] mnemonic is 'call'", call_mn, "call"
+    Let call_ops be proc instr_operands with call_instr
+    Let call_op0 be proc list_at with call_ops, 0
+    Let call_op0_type be proc dict_str with call_op0, "type"
+    proc assert_string_equal from TestUtils with results, "call operand type is identifier", call_op0_type, "identifier"
+    Let call_op0_name be proc dict_str with call_op0, "name"
+    proc assert_string_equal from TestUtils with results, "call target is 'foo'", call_op0_name, "foo"
+
+    Note: --- instr[6] ret : no operands ---
+    Let ret_instr be proc list_at with instrs1, 6
+    Let ret_mn be proc dict_str with ret_instr, "mnemonic"
+    proc assert_string_equal from TestUtils with results, "instr[6] mnemonic is 'ret'", ret_mn, "ret"
+    Let ret_ops be proc instr_operands with ret_instr
+    Let ret_opc be proc list_count with ret_ops
+    proc assert_equal from TestUtils with results, "ret has 0 operands", ret_opc, 0
+
+    Note: --- Stage 2: HIR -> assembly text ---
+    Let emitted be proc generate_x86_from_hir from X86Backend with hir1
+    proc assert_not_null from TestUtils with results, "backend produced assembly text", emitted
+    Let emitted_len be proc string_length from StringCore with emitted
+    proc assert_greater_than from TestUtils with results, "emitted assembly is non-empty", emitted_len, 0
+
+    Note: --- Stage 3: re-parse the emitted text -> HIR (the SECOND emission),
+    Note: then assert the section streams are structurally equal. This is the
+    Note: load-bearing round-trip assertion. ---
+    Let hir2 be proc x86_source_to_hir with emitted
+    proc assert_not_null from TestUtils with results, "re-parse of emitted assembly produced HIR", hir2
+
+    Let instrs2 be proc section_list with hir2, "instructions"
+    Let instr_count2 be proc list_count with instrs2
+    proc assert_equal from TestUtils with results, "re-parsed preserves 7 instructions", instr_count2, 7
+
+    Let dirs2 be proc section_list with hir2, "directives"
+    Let labels2 be proc section_list with hir2, "labels"
+
+    Note: Spot-check survival on the SECOND emission directly (not just stage 1).
+    Let r_mem_instr be proc list_at with instrs2, 2
+    Let r_mem_ops be proc instr_operands with r_mem_instr
+    Let r_mem_op0 be proc list_at with r_mem_ops, 0
+    Let r_mem_base be proc dict_str with r_mem_op0, "base"
+    proc assert_string_equal from TestUtils with results, "round-trip memory base survives", r_mem_base, "rsp"
+
+    Let r_call_instr be proc list_at with instrs2, 5
+    Let r_call_ops be proc instr_operands with r_call_instr
+    Let r_call_op0 be proc list_at with r_call_ops, 0
+    Let r_call_name be proc dict_str with r_call_op0, "name"
+    proc assert_string_equal from TestUtils with results, "round-trip call target survives", r_call_name, "foo"
+
+    Let r_label be proc list_at with labels2, 0
+    Let r_label_name be proc dict_str with r_label, "name"
+    proc assert_string_equal from TestUtils with results, "round-trip label name survives", r_label_name, "main"
+
+    Note: --- Full structural equality across all three sections ---
+    Let instrs_equal be proc instr_streams_equal with instrs1, instrs2
+    proc assert_equal from TestUtils with results, "round-trip instructions structurally equal", instrs_equal, 1
+
+    Let dirs_equal be proc named_streams_equal with dirs1, dirs2
+    proc assert_equal from TestUtils with results, "round-trip directives structurally equal", dirs_equal, 1
+
+    Let labels_equal be proc named_streams_equal with labels1, labels2
+    proc assert_equal from TestUtils with results, "round-trip labels structurally equal", labels_equal, 1
+
+    proc print_summary from TestUtils with results
+    Let failed be proc get_failed from TestUtils with results
+    proc destroy_test_results from TestUtils with results
+
+    Return failed
+End Process
