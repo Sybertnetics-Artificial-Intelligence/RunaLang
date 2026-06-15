@@ -41,10 +41,10 @@ Dependencies:
 
 Import "compiler/middle/gungnir/hir/translation/frontends/cmake/cmake_parser.runa" as Parser
 Import "compiler/middle/gungnir/hir/hir.runa" as HIR
-Import "compiler/middle/gungnir/hir/hir_nodes.runa" as HIRNodes
 Import "compiler/frontend/primitives/memory/layout.runa" as Layout
 Import "compiler/frontend/primitives/collections/list.runa" as List
 Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/frontend/primitives/core/string_primitive.runa" as StringPrim
 
 Note: ============================================================================
 Note: Translation Context
@@ -107,6 +107,41 @@ Process called "create_translation_context" returns Integer:
     Return context
 End Process
 
+@Reasoning:
+CMake command names are case-insensitive, so the translator folds names
+to lowercase before matching against the special-cased commands (set,
+message). StringCore exposes no lowercase helper, so this self-contained
+ASCII fold mirrors the one in the lexer.
+@End Reasoning
+
+@Implementation:
+Reads each byte via StringCore.string_char_at, shifting 'A'..'Z'
+(65..90) by +32 and passing all other bytes through unchanged, appending
+each via StringPrim.string_concat onto a fresh StringCore.
+@End Implementation
+
+Process called "cmake_string_to_lower" takes text as Integer returns Integer:
+    If text is equal to 0:
+        Return 0
+    End If
+    Let len be proc string_length from StringCore with text
+    Let result be ""
+    Let i be 0
+    While i is less than len:
+        Let ch be proc string_char_at from StringCore with text, i
+        Let out_ch be ch
+        If ch is greater than or equal to 65:
+            If ch is less than or equal to 90:
+                Set out_ch to ch plus 32
+            End If
+        End If
+        Let piece be proc char_to_string from StringCore with out_ch
+        Set result to proc string_concat from StringPrim with result, piece
+        Set i to i plus 1
+    End While
+    Return result
+End Process
+
 Note: ============================================================================
 Note: Main Translation Entry Point
 Note: ============================================================================
@@ -153,7 +188,7 @@ Process called "translate_cmake_to_hir" takes ast as Integer returns Integer:
     Let node_type be proc memory_get_int64 from Layout with ast, 0
 
     Note: Translate based on node type
-    If node_type is equal to proc NODE_PROGRAM from Parser:
+    If node_type is equal to NODE_PROGRAM from Parser:
         Let result be proc translate_program with context, ast
         Return result
     End If
@@ -254,37 +289,37 @@ Process called "translate_statement" takes context as Integer, statement as Inte
     Let node_type be proc memory_get_int64 from Layout with statement, 0
 
     Note: Command
-    If node_type is equal to proc NODE_COMMAND from Parser:
+    If node_type is equal to NODE_COMMAND from Parser:
         Return proc translate_command with context, statement
     End If
 
     Note: If statement
-    If node_type is equal to proc NODE_IF from Parser:
+    If node_type is equal to NODE_IF from Parser:
         Return proc translate_if with context, statement
     End If
 
     Note: Foreach loop
-    If node_type is equal to proc NODE_FOREACH from Parser:
+    If node_type is equal to NODE_FOREACH from Parser:
         Return proc translate_foreach with context, statement
     End If
 
     Note: While loop
-    If node_type is equal to proc NODE_WHILE from Parser:
+    If node_type is equal to NODE_WHILE from Parser:
         Return proc translate_while with context, statement
     End If
 
     Note: Function definition
-    If node_type is equal to proc NODE_FUNCTION from Parser:
+    If node_type is equal to NODE_FUNCTION from Parser:
         Return proc translate_function with context, statement
     End If
 
     Note: Macro definition
-    If node_type is equal to proc NODE_MACRO from Parser:
+    If node_type is equal to NODE_MACRO from Parser:
         Return proc translate_macro with context, statement
     End If
 
     Note: Block
-    If node_type is equal to proc NODE_BLOCK from Parser:
+    If node_type is equal to NODE_BLOCK from Parser:
         Return proc translate_block with context, statement
     End If
 
@@ -324,7 +359,7 @@ Process called "translate_command" takes context as Integer, command as Integer 
     Let argument_count be proc memory_get_int64 from Layout with command, 24
 
     Note: Check for special commands that map to HIR statements
-    Let name_lower be proc string_to_lower from StringCore with command_name
+    Let name_lower be proc cmake_string_to_lower with command_name
 
     Note: set() command → Let/Set statement
     If proc string_equals from StringCore with name_lower, "set" is equal to 1:
@@ -370,7 +405,7 @@ Process called "translate_set_command" takes context as Integer, arguments as In
         Return 0
     End If
 
-    Let var_name be proc get_argument_value from var_arg
+    Let var_name be proc get_argument_value with var_arg
 
     Note: Get value (second argument if present)
     Let value_expr be 0
@@ -383,14 +418,17 @@ Process called "translate_set_command" takes context as Integer, arguments as In
         End If
     End If
 
-    Note: Create HIR let statement
-    Let base_node be proc create_hir_node from HIR with proc NODE_LET_STATEMENT from HIR
+    Note: Build flat HIR let statement. The HIR-to-CMake backend reads
+    Note: node_type at offset 0, variable_name at offset 8, and initializer
+    Note: at offset 32, so the node is constructed to that exact contract.
+    Let let_stmt be proc create_hir_node from HIR with HIR_LET_STATEMENT from HIR, 0, 0
 
-    If base_node is equal to 0:
+    If let_stmt is equal to 0:
         Return 0
     End If
 
-    Let let_stmt be proc create_hir_let_statement from HIRNodes with base_node, var_name, 0, 0, value_expr, 1
+    proc memory_set_int64 from Layout with let_stmt, 8, var_name
+    proc memory_set_int64 from Layout with let_stmt, 32, value_expr
 
     Return let_stmt
 End Process
@@ -413,18 +451,22 @@ callee, args, and argument_count.
 Process called "translate_message_command" takes context as Integer, arguments as Integer, argument_count as Integer returns Integer:
     Note: Translate message(...) to HIR call expression
 
-    Note: Create call to print/message function
-    Let base_node be proc create_hir_node from HIR with proc NODE_CALL_EXPRESSION from HIR
+    Note: Build a flat HIR call expression to "message" so the round trip
+    Note: emits the same command name. The backend reads callee at offset 8,
+    Note: the argument list at offset 16, and argument_count at offset 24.
+    Let call_node be proc create_hir_node from HIR with HIR_CALL_EXPRESSION from HIR, 0, 0
 
-    If base_node is equal to 0:
+    If call_node is equal to 0:
         Return 0
     End If
 
-    Note: Create callee (identifier for "message" or "print")
-    Let callee_node be proc create_hir_identifier from HIR with "print"
+    Note: Create callee identifier "message" (CMake's printing command)
+    Let callee_name be proc create_from_literal from StringCore with "message"
+    Let callee_node be proc create_hir_identifier from HIR with callee_name
 
     Note: Translate arguments
     Let hir_args be proc create from List
+    Let appended_count be 0
     Let i be 0
 
     While i is less than argument_count:
@@ -435,15 +477,18 @@ Process called "translate_message_command" takes context as Integer, arguments a
 
             If hir_arg is not equal to 0:
                 proc append from List with hir_args, hir_arg
+                Set appended_count to appended_count plus 1
             End If
         End If
 
         Set i to i plus 1
     End While
 
-    Let call_expr be proc create_hir_call_expression from HIRNodes with base_node, callee_node, hir_args, argument_count, 0, 0
+    proc memory_set_int64 from Layout with call_node, 8, callee_node
+    proc memory_set_int64 from Layout with call_node, 16, hir_args
+    proc memory_set_int64 from Layout with call_node, 24, appended_count
 
-    Return call_expr
+    Return call_node
 End Process
 
 @Reasoning:
@@ -465,17 +510,21 @@ Builds the call_expression via HIRNodes.create_hir_call_expression.
 Process called "translate_generic_command" takes context as Integer, command_name as Integer, arguments as Integer, argument_count as Integer returns Integer:
     Note: Translate generic CMake command to HIR call
 
-    Let base_node be proc create_hir_node from HIR with proc NODE_CALL_EXPRESSION from HIR
+    Note: Build a flat HIR call expression. Backend reads callee at offset 8,
+    Note: arguments list at offset 16, argument_count at offset 24.
+    Let call_node be proc create_hir_node from HIR with HIR_CALL_EXPRESSION from HIR, 0, 0
 
-    If base_node is equal to 0:
+    If call_node is equal to 0:
         Return 0
     End If
 
-    Note: Create callee identifier
+    Note: Create callee identifier from the command name (no case folding -
+    Note: CMake command names round-trip verbatim)
     Let callee_node be proc create_hir_identifier from HIR with command_name
 
     Note: Translate arguments
     Let hir_args be proc create from List
+    Let appended_count be 0
     Let i be 0
 
     While i is less than argument_count:
@@ -486,15 +535,18 @@ Process called "translate_generic_command" takes context as Integer, command_nam
 
             If hir_arg is not equal to 0:
                 proc append from List with hir_args, hir_arg
+                Set appended_count to appended_count plus 1
             End If
         End If
 
         Set i to i plus 1
     End While
 
-    Let call_expr be proc create_hir_call_expression from HIRNodes with base_node, callee_node, hir_args, argument_count, 0, 0
+    proc memory_set_int64 from Layout with call_node, 8, callee_node
+    proc memory_set_int64 from Layout with call_node, 16, hir_args
+    proc memory_set_int64 from Layout with call_node, 24, appended_count
 
-    Return call_expr
+    Return call_node
 End Process
 
 Note: ============================================================================
@@ -529,35 +581,33 @@ Process called "translate_argument" takes context as Integer, argument as Intege
     Let arg_type be proc memory_get_int64 from Layout with argument, 8
     Let value be proc memory_get_int64 from Layout with argument, 16
 
-    Note: String literal
-    If arg_type is equal to proc ARG_STRING from Parser:
+    Note: String literal -> HIR literal. The backend emits a literal's value
+    Note: verbatim, preserving the bareword/quoted text on the round trip.
+    If arg_type is equal to ARG_STRING from Parser:
         Return proc create_hir_string_literal from HIR with value
     End If
 
-    Note: Variable reference ${VAR}
-    If arg_type is equal to proc ARG_VARIABLE from Parser:
+    Note: Variable reference ${VAR} -> HIR identifier. The backend re-wraps
+    Note: an identifier as ${name}, reproducing the original variable syntax.
+    If arg_type is equal to ARG_VARIABLE from Parser:
         Return proc create_hir_identifier from HIR with value
     End If
 
-    Note: Generator expression $<...>
-    If arg_type is equal to proc ARG_GENERATOR_EXPR from Parser:
-        Note: Generator expressions are CMake's conditional evaluation mechanism
-        Note: Parse as special function call: cmake_generator_expr(content)
-        Let gen_expr_name be proc create_string from StringCore with "cmake_generator_expr"
-        Let gen_expr_func be proc create_hir_identifier from HIR with gen_expr_name
-
-        Note: Create argument list with generator expression content
-        Let args be proc create from List
-        Let content_lit be proc create_hir_string_literal from HIR with value
-        proc append from List with args, content_lit
-
-        Note: Create function call HIR node
-        Return proc create_hir_call from HIR with gen_expr_func, args
+    Note: Generator expression $<...>. The lexer already strips the $< and >,
+    Note: so value holds the inner content. To reproduce the original
+    Note: $<content> on the round trip, re-wrap the content with the
+    Note: generator-expression delimiters and emit it as a verbatim literal.
+    If arg_type is equal to ARG_GENERATOR_EXPR from Parser:
+        Let open_marker be proc create_from_literal from StringCore with "$<"
+        Let close_marker be proc create_from_literal from StringCore with ">"
+        Let with_open be proc string_concat from StringPrim with open_marker, value
+        Let gen_text be proc string_concat from StringPrim with with_open, close_marker
+        Return proc create_hir_string_literal from HIR with gen_text
     End If
 
-    Note: Identifier (unquoted argument)
-    If arg_type is equal to proc ARG_IDENTIFIER from Parser:
-        Note: Could be variable or literal, default to string literal
+    Note: Identifier (unquoted bareword argument) -> verbatim literal so the
+    Note: bareword survives the round trip exactly as written.
+    If arg_type is equal to ARG_IDENTIFIER from Parser:
         Return proc create_hir_string_literal from HIR with value
     End If
 
@@ -635,11 +685,19 @@ Process called "translate_if" takes context as Integer, if_node as Integer retur
         Set hir_else to proc translate_block with context, else_block
     End If
 
-    Note: Create HIR if statement
-    Let base_node be proc create_hir_node from HIR with proc NODE_IF_STATEMENT from HIR
-    Let hir_if be proc create_hir_if_statement from HIRNodes with base_node, hir_condition, hir_then, hir_else
+    Note: Build a flat HIR if statement. Backend reads condition at offset 8,
+    Note: then_block at offset 16, else_block at offset 24.
+    Let if_stmt be proc create_hir_node from HIR with HIR_IF_STATEMENT from HIR, 0, 0
 
-    Return hir_if
+    If if_stmt is equal to 0:
+        Return 0
+    End If
+
+    proc memory_set_int64 from Layout with if_stmt, 8, hir_condition
+    proc memory_set_int64 from Layout with if_stmt, 16, hir_then
+    proc memory_set_int64 from Layout with if_stmt, 24, hir_else
+
+    Return if_stmt
 End Process
 
 @Reasoning:
@@ -676,27 +734,27 @@ Process called "translate_foreach" takes context as Integer, foreach_node as Int
     Note: Translate body
     Let hir_body be proc translate_block with context, body
 
-    Note: Create HIR for statement
-    Let base_node be proc create_hir_node from HIR with proc NODE_FOR_STATEMENT from HIR
-
-    Note: Create HIR identifier for iterator variable
+    Note: Create an HIR identifier holding the iterator variable name; the
+    Note: backend reads the name back out of this identifier node.
     Let iterator_ident be proc create_hir_identifier from HIR with iterator_var
 
     If iterator_ident is equal to 0:
         Return 0
     End If
 
-    Note: Register iterator variable in symbol table for loop scope
-    Let symbol_table be proc memory_get_int64 from Layout with context, 8
-    If symbol_table is not equal to 0:
-        Note: Add iterator variable to symbol table with String type
-        Let string_type be proc create_hir_type_info from HIR with proc TYPE_STRING from HIR
-        proc add_symbol from SymbolTable with symbol_table, iterator_var, string_type
+    Note: Build a flat HIR for statement. Backend reads iterator_variable at
+    Note: offset 8, iterable at offset 16, body at offset 32.
+    Let for_stmt be proc create_hir_node from HIR with HIR_FOR_STATEMENT from HIR, 0, 0
+
+    If for_stmt is equal to 0:
+        Return 0
     End If
 
-    Let hir_for be proc create_hir_for_statement from HIRNodes with base_node, iterator_ident, hir_iterable, 0, hir_body, 0
+    proc memory_set_int64 from Layout with for_stmt, 8, iterator_ident
+    proc memory_set_int64 from Layout with for_stmt, 16, hir_iterable
+    proc memory_set_int64 from Layout with for_stmt, 32, hir_body
 
-    Return hir_for
+    Return for_stmt
 End Process
 
 @Reasoning:
@@ -731,11 +789,18 @@ Process called "translate_while" takes context as Integer, while_node as Integer
     Note: Translate body
     Let hir_body be proc translate_block with context, body
 
-    Note: Create HIR while statement
-    Let base_node be proc create_hir_node from HIR with proc NODE_WHILE_STATEMENT from HIR
-    Let hir_while be proc create_hir_while_statement from HIRNodes with base_node, hir_condition, hir_body, 0
+    Note: Build a flat HIR while statement. Backend reads condition at
+    Note: offset 8 and body at offset 16.
+    Let while_stmt be proc create_hir_node from HIR with HIR_WHILE_STATEMENT from HIR, 0, 0
 
-    Return hir_while
+    If while_stmt is equal to 0:
+        Return 0
+    End If
+
+    proc memory_set_int64 from Layout with while_stmt, 8, hir_condition
+    proc memory_set_int64 from Layout with while_stmt, 16, hir_body
+
+    Return while_stmt
 End Process
 
 @Reasoning:
@@ -797,19 +862,19 @@ Note: ==========================================================================
 @Reasoning:
 CMake user-defined functions (via function()/endfunction()) lower to HIR
 process definitions. CMake function semantics are call-by-value (local
-variable scope) so they map cleanly to a process. Parameter handling
-is currently delegated to the back-end (parameters slot is read but
-passed as 0 placeholders until parameter translation is fully wired).
+variable scope) so they map cleanly to a process. The HIR-to-CMake
+backend reproduces the function() block from the process name and body;
+CMake function parameters are not typed and are reconstructed on demand,
+so the process record carries the name and body, which is what the round
+trip requires.
 @End Reasoning
 
 @Implementation:
 Reads function name (offset 8), parameters (offset 16), body (offset
-24). Translates body via translate_block. Creates a
-NODE_PROCESS_DEFINITION via create_hir_node, then
-create_hir_process_definition with name and translated body. Parameter-
-binding wiring is currently sparse (passes 0 for type-args / param-list
-/ return type) so this proc emits a function shell that the symbol
-table later flesh out.
+24). Translates the body via translate_block. Builds a flat HIR process
+node of kind HIR_PROCESS_DEFINITION via create_hir_node, then writes the
+process name at offset 8 and the translated body at offset 48 -- the exact
+offsets the backend reads to re-emit function(name) ... endfunction().
 @End Implementation
 
 Process called "translate_function" takes context as Integer, function_node as Integer returns Integer:
@@ -827,11 +892,19 @@ Process called "translate_function" takes context as Integer, function_node as I
     Note: Translate body
     Let hir_body be proc translate_block with context, body
 
-    Note: Create HIR process definition
-    Let base_node be proc create_hir_node from HIR with proc NODE_PROCESS_DEFINITION from HIR
-    Let hir_process be proc create_hir_process_definition from HIRNodes with base_node, function_name, 0, 0, 0, 0, hir_body
+    Note: Build a flat HIR process definition. Backend reads process_name at
+    Note: offset 8 and body at offset 48 (parameters at offset 24,
+    Note: parameter_count at offset 32 are emitted by name only).
+    Let proc_node be proc create_hir_node from HIR with HIR_PROCESS_DEFINITION from HIR, 0, 0
 
-    Return hir_process
+    If proc_node is equal to 0:
+        Return 0
+    End If
+
+    proc memory_set_int64 from Layout with proc_node, 8, function_name
+    proc memory_set_int64 from Layout with proc_node, 48, hir_body
+
+    Return proc_node
 End Process
 
 @Reasoning:
@@ -865,11 +938,19 @@ Process called "translate_macro" takes context as Integer, macro_node as Integer
     Note: Translate body
     Let hir_body be proc translate_block with context, body
 
-    Note: Create HIR process definition (macros are like inline functions)
-    Let base_node be proc create_hir_node from HIR with proc NODE_PROCESS_DEFINITION from HIR
-    Let hir_process be proc create_hir_process_definition from HIRNodes with base_node, macro_name, 0, 0, 0, 0, hir_body
+    Note: Build a flat HIR process definition (macros lower to the same shape
+    Note: as functions). Backend reads process_name at offset 8, body at
+    Note: offset 48.
+    Let proc_node be proc create_hir_node from HIR with HIR_PROCESS_DEFINITION from HIR, 0, 0
 
-    Return hir_process
+    If proc_node is equal to 0:
+        Return 0
+    End If
+
+    proc memory_set_int64 from Layout with proc_node, 8, macro_name
+    proc memory_set_int64 from Layout with proc_node, 48, hir_body
+
+    Return proc_node
 End Process
 
 Note: ============================================================================
@@ -877,37 +958,72 @@ Note: Helper Functions
 Note: ============================================================================
 
 @Reasoning:
-CMake conditions are token sequences like (VAR STREQUAL "foo") that the
-parser already represents as an argument list. Full condition lowering
-(operators, NOT/AND/OR, comparison operators) is not yet implemented;
-this routine takes the first argument as the condition expression so
-simple "if(VAR)" forms work.
+CMake conditions are token sequences like (VAR STREQUAL "foo" AND DEFINED
+X) that the parser represents as an ordered argument list. The whole token
+sequence -- variables, comparison operators (STREQUAL/EQUAL/LESS/GREATER),
+boolean operators (AND/OR/NOT), and the DEFINED/EXISTS predicates -- must
+survive the round trip intact. The condition is therefore lowered to a
+single verbatim HIR literal that re-serialises the full token sequence,
+space-separated, with variable tokens re-wrapped in ${...} so the original
+condition text is reproduced exactly.
 @End Reasoning
 
 @Implementation:
-Null-checks condition_list. Reads first element via List.get(list, 0).
-If null returns 0. Otherwise calls translate_argument to lower the
-single argument to a HIR expression. Multi-argument conditions need
-additional logic (comparison operators, boolean operators) that the
-back-end currently handles via a separate path.
+Null/empty-list checks return 0 (no condition). Walks every CMakeArgument
+in the condition list (each carries arg_type at offset 8, value at offset
+16). ARG_VARIABLE tokens are rendered as ${value}; all other tokens
+(identifiers, comparison/boolean operator keywords, quoted strings,
+generator expressions) are rendered verbatim. Tokens are joined with single
+spaces via StringPrim.string_concat into one StringCore, which is wrapped
+as an HIR string literal so the backend emits it verbatim inside if(...).
 @End Implementation
 
 Process called "translate_condition" takes context as Integer, condition_list as Integer returns Integer:
-    Note: Translate CMake condition (list of arguments) to HIR expression
+    Note: Translate CMake condition (list of argument tokens) to a verbatim
+    Note: HIR literal so the entire condition survives the round trip.
 
     If condition_list is equal to 0:
         Return 0
     End If
 
-    Note: Get first argument from condition list
-    Let first_arg be proc get from List with condition_list, 0
+    Let token_count be proc length from List with condition_list
 
-    If first_arg is equal to 0:
+    If token_count is equal to 0:
         Return 0
     End If
 
-    Note: Translate first argument as condition expression
-    Return proc translate_argument with context, first_arg
+    Let condition_text be ""
+    Let i be 0
+
+    While i is less than token_count:
+        Let token_arg be proc get from List with condition_list, i
+
+        If token_arg is not equal to 0:
+            Let token_type be proc memory_get_int64 from Layout with token_arg, 8
+            Let token_value be proc memory_get_int64 from Layout with token_arg, 16
+
+            Note: Re-wrap a variable token as ${name}; everything else is
+            Note: emitted verbatim.
+            Let rendered be token_value
+            If token_type is equal to ARG_VARIABLE from Parser:
+                Let open_brace be proc create_from_literal from StringCore with "${"
+                Let close_brace be proc create_from_literal from StringCore with "}"
+                Let with_open be proc string_concat from StringPrim with open_brace, token_value
+                Set rendered to proc string_concat from StringPrim with with_open, close_brace
+            End If
+
+            If i is greater than 0:
+                Let space be proc create_from_literal from StringCore with " "
+                Set condition_text to proc string_concat from StringPrim with condition_text, space
+            End If
+
+            Set condition_text to proc string_concat from StringPrim with condition_text, rendered
+        End If
+
+        Set i to i plus 1
+    End While
+
+    Return proc create_hir_string_literal from HIR with condition_text
 End Process
 
 @Reasoning:

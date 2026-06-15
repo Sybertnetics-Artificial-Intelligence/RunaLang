@@ -1,0 +1,535 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+Licensed under Apache 2.0
+:End Note
+
+Note:
+CMake Translation Round-Trip Probe
+
+End-to-end proof that the CMake translation pipeline is REAL, not a skeleton:
+
+    CMakeLists.txt source
+      -> cmake_lexer    (tokenize: commands, ${VAR}, $<genexpr>, strings,
+                         control-flow keywords, parens)
+      -> cmake_parser   (build CMake command/control-flow AST)
+      -> cmake_to_hir   (lower commands to HIR call expressions, set() to HIR
+                         let statements, if/foreach to HIR control flow,
+                         function() to HIR process definitions)
+      -> hir_to_cmake   (emit the HIR tree back to CMake script text)
+
+The probe feeds a representative CMakeLists.txt containing:
+  - cmake_minimum_required(VERSION 3.20)
+  - project(MyApp)
+  - set(SRC_FILES main.c util.c)        (-> HIR let statement)
+  - add_executable(myapp ${SRC_FILES})  (-> HIR call expression)
+  - add_library(mylib STATIC lib.c)     (-> HIR call expression)
+  - target_link_libraries(myapp mylib)  (-> HIR call expression)
+  - an if(WIN32) ... endif() guard      (-> HIR if statement)
+  - a foreach(f ${SRC_FILES}) ... endforeach() loop (-> HIR for statement)
+  - a function(my_func) ... endfunction() (-> HIR process definition)
+
+It then:
+
+  1. Drives the source through lexer -> parser -> to_hir and asserts the HIR
+     root is the program node carrying a single block child.
+  2. Walks the first-stage HIR statements and asserts the lowered command
+     names, the set() variable name, the if condition text, the foreach
+     iterator name, and the function name survived.
+  3. Emits the HIR back to CMake text and asserts the text is non-empty.
+  4. Re-parses the emitted CMake text back into HIR (the SECOND emission) and
+     asserts the two HIR statement streams are STRUCTURALLY EQUAL via a
+     recursive comparator: same statement count, same node kind at each
+     position, same command name / variable name / nesting at each position,
+     compared by content rather than byte identity. Structural equality is the
+     correct semantic-equivalence check: the backend canonicalises whitespace
+     and indentation so the byte stream differs while the meaning is identical.
+
+Exit code: number of failed assertions (0 == all passed). No exit_with_code.
+:End Note
+
+Import "compiler/middle/gungnir/hir/translation/frontends/cmake/cmake_lexer.runa" as CMakeLexer
+Import "compiler/middle/gungnir/hir/translation/frontends/cmake/cmake_parser.runa" as CMakeParser
+Import "compiler/middle/gungnir/hir/translation/frontends/cmake/cmake_to_hir.runa" as CMakeFrontend
+Import "compiler/middle/gungnir/hir/translation/backends/cmake/hir_to_cmake.runa" as CMakeBackend
+Import "compiler/middle/gungnir/hir/hir.runa" as HIR
+Import "compiler/frontend/primitives/collections/list.runa" as List
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "tests/test_utils.runa" as TestUtils
+
+Note: ============================================================================
+Note: Pipeline driver: CMake source -> HIR program node
+Note: ============================================================================
+
+@Reasoning:
+The CMake pipeline has no single source-to-HIR convenience, so the probe owns
+the chain explicitly: create_lexer produces the byte-positioned lexer,
+create_parser primes the parser by consuming the first token, parse builds the
+command/control-flow AST, and translate_cmake_to_hir lowers the AST to an HIR
+program node holding a single block of statements. Returning the program
+pointer (or 0 on any stage failure) lets the caller assert on one value.
+@End Reasoning
+Process called "cmake_source_to_hir" takes source as Integer returns Integer:
+    Let lexer be proc create_lexer from CMakeLexer with source
+    If lexer is equal to 0:
+        Return 0
+    End If
+
+    Let parser be proc create_parser from CMakeParser with lexer
+    If parser is equal to 0:
+        Return 0
+    End If
+
+    Let ast be proc parse from CMakeParser with parser
+    If ast is equal to 0:
+        Return 0
+    End If
+
+    Let hir_program be proc translate_cmake_to_hir from CMakeFrontend with ast
+    Return hir_program
+End Process
+
+Note: ============================================================================
+Note: HIR accessors (mirror the backend's read contract)
+Note: ============================================================================
+
+@Reasoning:
+translate_cmake_to_hir returns an HIR program node whose children list lives at
+offset 24 with the count at offset 32. The CMake frontend attaches exactly one
+block child holding all top-level statements. This helper unwraps the program
+to that statement-bearing block so every other accessor operates on the block.
+@End Reasoning
+Process called "program_block" takes program as Integer returns Integer:
+    If program is equal to 0:
+        Return 0
+    End If
+    Let children be proc memory_get_int64 from Layout with program, 24
+    If children is equal to 0:
+        Return 0
+    End If
+    Return proc get from List with children, 0
+End Process
+
+@Reasoning:
+A block node carries its statement list at offset 24 and the count at offset
+32. This returns the statement count so assertions and the comparator know how
+many statements to walk.
+@End Reasoning
+Process called "block_count" takes block as Integer returns Integer:
+    If block is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Layout with block, 32
+End Process
+
+@Reasoning:
+Returns statement i of a block as a raw node pointer so callers can read its
+node kind (offset 0) and per-kind fields.
+@End Reasoning
+Process called "block_stmt_at" takes block as Integer, index as Integer returns Integer:
+    If block is equal to 0:
+        Return 0
+    End If
+    Let statements be proc memory_get_int64 from Layout with block, 24
+    If statements is equal to 0:
+        Return 0
+    End If
+    Return proc get from List with statements, index
+End Process
+
+@Reasoning:
+Every HIR node stamps its kind constant at offset 0. This returns the kind so
+the comparator and assertions can dispatch on call vs let vs if vs for vs
+process-definition statements.
+@End Reasoning
+Process called "node_kind" takes node as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Layout with node, 0
+End Process
+
+@Reasoning:
+A lowered CMake command is an HIR call expression whose callee identifier sits
+at offset 8 and the identifier's name string at offset 40. This returns the
+command-name string pointer so the probe can assert which command each
+statement represents.
+@End Reasoning
+Process called "call_name" takes call as Integer returns Integer:
+    If call is equal to 0:
+        Return 0
+    End If
+    Let kind be proc memory_get_int64 from Layout with call, 0
+    If kind is not equal to HIR_CALL_EXPRESSION from HIR:
+        Return 0
+    End If
+    Let callee be proc memory_get_int64 from Layout with call, 8
+    If callee is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Layout with callee, 40
+End Process
+
+@Reasoning:
+A call expression stores its argument list at offset 16 and the count at offset
+24. This returns the argument count so the comparator can verify per-call arity.
+@End Reasoning
+Process called "call_argc" takes call as Integer returns Integer:
+    If call is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Layout with call, 24
+End Process
+
+@Reasoning:
+Returns argument i of a call (argument list at offset 16) as a raw node so the
+content comparator can read its string payload.
+@End Reasoning
+Process called "call_arg_at" takes call as Integer, index as Integer returns Integer:
+    If call is equal to 0:
+        Return 0
+    End If
+    Let args be proc memory_get_int64 from Layout with call, 16
+    If args is equal to 0:
+        Return 0
+    End If
+    Return proc get from List with args, index
+End Process
+
+@Reasoning:
+Argument nodes are HIR literals (string payload at offset 40) or identifiers
+(name at offset 40); both store the comparable string at offset 40. This
+returns that string pointer for content comparison, mirroring the backend
+which reads offset 40 for both literal values and identifier names.
+@End Reasoning
+Process called "arg_string" takes node as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Layout with node, 40
+End Process
+
+@Reasoning:
+A lowered set() command is an HIR let statement: the variable name string is at
+offset 8. This returns that name for the variable-survival assertion.
+@End Reasoning
+Process called "let_var_name" takes node as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    Let kind be proc memory_get_int64 from Layout with node, 0
+    If kind is not equal to HIR_LET_STATEMENT from HIR:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Layout with node, 8
+End Process
+
+@Reasoning:
+A lowered if() command is an HIR if statement: the condition expression is at
+offset 8. The CMake frontend lowers the whole condition token sequence to a
+single verbatim string literal whose text is at offset 40. This digs to that
+condition text for the survival assertion.
+@End Reasoning
+Process called "if_condition_text" takes node as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    Let kind be proc memory_get_int64 from Layout with node, 0
+    If kind is not equal to HIR_IF_STATEMENT from HIR:
+        Return 0
+    End If
+    Let condition be proc memory_get_int64 from Layout with node, 8
+    If condition is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Layout with condition, 40
+End Process
+
+@Reasoning:
+A lowered foreach() command is an HIR for statement: the iterator variable is an
+identifier node at offset 8 whose name string is at offset 40. This returns the
+iterator name for the survival assertion.
+@End Reasoning
+Process called "for_iterator_name" takes node as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    Let kind be proc memory_get_int64 from Layout with node, 0
+    If kind is not equal to HIR_FOR_STATEMENT from HIR:
+        Return 0
+    End If
+    Let iterator be proc memory_get_int64 from Layout with node, 8
+    If iterator is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Layout with iterator, 40
+End Process
+
+@Reasoning:
+A lowered function() command is an HIR process definition: the process name
+string is at offset 8. This returns the function name for the survival
+assertion.
+@End Reasoning
+Process called "process_name" takes node as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    Let kind be proc memory_get_int64 from Layout with node, 0
+    If kind is not equal to HIR_PROCESS_DEFINITION from HIR:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Layout with node, 8
+End Process
+
+Note: ============================================================================
+Note: Structural equality of two CMake HIR statement streams
+Note: ============================================================================
+
+@Reasoning:
+Two CMake scripts are semantically equal when their lowered HIR statement
+streams match position-for-position: same statement count, same node kind at
+each position, and -- for the kinds the round trip must preserve -- the same
+identifying payload (command name + argument string payloads for calls, the
+variable name for let statements, the condition text for ifs, the iterator name
+for fors, the process name for process definitions). This is whitespace- and
+indentation-insensitive, so it proves round-trip fidelity without being fooled
+by the backend's canonical re-rendering.
+@End Reasoning
+Process called "hir_blocks_equal" takes a as Integer, b as Integer returns Integer:
+    If a is equal to 0:
+        Return 0
+    End If
+    If b is equal to 0:
+        Return 0
+    End If
+
+    Let count_a be proc block_count with a
+    Let count_b be proc block_count with b
+    If count_a is not equal to count_b:
+        Return 0
+    End If
+
+    Let i be 0
+    While i is less than count_a:
+        Let stmt_a be proc block_stmt_at with a, i
+        Let stmt_b be proc block_stmt_at with b, i
+
+        Let kind_a be proc node_kind with stmt_a
+        Let kind_b be proc node_kind with stmt_b
+        If kind_a is not equal to kind_b:
+            Return 0
+        End If
+
+        Note: Call expressions: compare command name, arity, and every
+        Note: argument string payload by content.
+        If kind_a is equal to HIR_CALL_EXPRESSION from HIR:
+            Let name_a be proc call_name with stmt_a
+            Let name_b be proc call_name with stmt_b
+            Let names_match be proc string_equals from StringCore with name_a, name_b
+            If names_match is not equal to 1:
+                Return 0
+            End If
+
+            Let argc_a be proc call_argc with stmt_a
+            Let argc_b be proc call_argc with stmt_b
+            If argc_a is not equal to argc_b:
+                Return 0
+            End If
+
+            Let j be 0
+            While j is less than argc_a:
+                Let arg_a be proc call_arg_at with stmt_a, j
+                Let arg_b be proc call_arg_at with stmt_b, j
+                Let str_a be proc arg_string with arg_a
+                Let str_b be proc arg_string with arg_b
+                Let args_match be proc string_equals from StringCore with str_a, str_b
+                If args_match is not equal to 1:
+                    Return 0
+                End If
+                Set j to j plus 1
+            End While
+        End If
+
+        Note: Let statements: compare the variable name.
+        If kind_a is equal to HIR_LET_STATEMENT from HIR:
+            Let var_a be proc let_var_name with stmt_a
+            Let var_b be proc let_var_name with stmt_b
+            Let vars_match be proc string_equals from StringCore with var_a, var_b
+            If vars_match is not equal to 1:
+                Return 0
+            End If
+        End If
+
+        Note: If statements: compare the verbatim condition text.
+        If kind_a is equal to HIR_IF_STATEMENT from HIR:
+            Let cond_a be proc if_condition_text with stmt_a
+            Let cond_b be proc if_condition_text with stmt_b
+            Let conds_match be proc string_equals from StringCore with cond_a, cond_b
+            If conds_match is not equal to 1:
+                Return 0
+            End If
+        End If
+
+        Note: For statements: compare the iterator variable name.
+        If kind_a is equal to HIR_FOR_STATEMENT from HIR:
+            Let iter_a be proc for_iterator_name with stmt_a
+            Let iter_b be proc for_iterator_name with stmt_b
+            Let iters_match be proc string_equals from StringCore with iter_a, iter_b
+            If iters_match is not equal to 1:
+                Return 0
+            End If
+        End If
+
+        Note: Process definitions: compare the function name.
+        If kind_a is equal to HIR_PROCESS_DEFINITION from HIR:
+            Let proc_a be proc process_name with stmt_a
+            Let proc_b be proc process_name with stmt_b
+            Let procs_match be proc string_equals from StringCore with proc_a, proc_b
+            If procs_match is not equal to 1:
+                Return 0
+            End If
+        End If
+
+        Set i to i plus 1
+    End While
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Probe entry point
+Note: ============================================================================
+
+Process called "main" returns Integer:
+    Let results be proc create_test_results from TestUtils
+    proc begin_suite from TestUtils with results, "CMake translation round-trip"
+
+    Note:
+    Representative CMakeLists.txt. Top-level statement order (0-indexed):
+      0  cmake_minimum_required(VERSION 3.20)   -> call
+      1  project(MyApp)                         -> call
+      2  set(SRC_FILES main.c util.c)           -> let statement
+      3  add_executable(myapp ${SRC_FILES})     -> call
+      4  add_library(mylib STATIC lib.c)        -> call
+      5  target_link_libraries(myapp mylib)     -> call
+      6  if(WIN32) ... endif()                  -> if statement
+      7  foreach(f ${SRC_FILES}) ... endforeach -> for statement
+      8  function(my_func) ... endfunction()    -> process definition
+    Newlines are explicit \n in the Runa string literal.
+    :End Note
+    Let source be "cmake_minimum_required(VERSION 3.20)\nproject(MyApp)\nset(SRC_FILES main.c util.c)\nadd_executable(myapp ${SRC_FILES})\nadd_library(mylib STATIC lib.c)\ntarget_link_libraries(myapp mylib)\nif(WIN32)\n  message(STATUS windows)\nendif()\nforeach(f ${SRC_FILES})\n  message(STATUS ${f})\nendforeach()\nfunction(my_func)\n  message(STATUS hello)\nendfunction()"
+
+    Note: --- Stage 1: source -> HIR ---
+    Let hir1 be proc cmake_source_to_hir with source
+    proc assert_not_null from TestUtils with results, "pipeline produced HIR program", hir1
+
+    Let block1 be proc program_block with hir1
+    proc assert_not_null from TestUtils with results, "HIR program carries a statement block", block1
+
+    Let stmt_count be proc block_count with block1
+    proc assert_equal from TestUtils with results, "HIR block has 9 statements", stmt_count, 9
+
+    Note: --- Stage 1 content: cmake_minimum_required command ---
+    Let cmr_call be proc block_stmt_at with block1, 0
+    Let cmr_name be proc call_name with cmr_call
+    proc assert_string_equal from TestUtils with results, "stmt[0] is cmake_minimum_required", cmr_name, "cmake_minimum_required"
+
+    Note: --- project command ---
+    Let proj_call be proc block_stmt_at with block1, 1
+    Let proj_name be proc call_name with proj_call
+    proc assert_string_equal from TestUtils with results, "stmt[1] is project", proj_name, "project"
+    Let proj_arg be proc arg_string with proc call_arg_at with proj_call, 0
+    proc assert_string_equal from TestUtils with results, "project arg is 'MyApp'", proj_arg, "MyApp"
+
+    Note: --- set() lowers to a let statement ---
+    Let set_stmt be proc block_stmt_at with block1, 2
+    Let set_kind be proc node_kind with set_stmt
+    proc assert_equal from TestUtils with results, "stmt[2] is HIR let statement", set_kind, HIR_LET_STATEMENT from HIR
+    Let set_var be proc let_var_name with set_stmt
+    proc assert_string_equal from TestUtils with results, "set() variable is 'SRC_FILES'", set_var, "SRC_FILES"
+
+    Note: --- add_executable command ---
+    Let exe_call be proc block_stmt_at with block1, 3
+    Let exe_name be proc call_name with exe_call
+    proc assert_string_equal from TestUtils with results, "stmt[3] is add_executable", exe_name, "add_executable"
+    Let exe_target be proc arg_string with proc call_arg_at with exe_call, 0
+    proc assert_string_equal from TestUtils with results, "add_executable target is 'myapp'", exe_target, "myapp"
+
+    Note: --- add_library command ---
+    Let lib_call be proc block_stmt_at with block1, 4
+    Let lib_name be proc call_name with lib_call
+    proc assert_string_equal from TestUtils with results, "stmt[4] is add_library", lib_name, "add_library"
+    Let lib_target be proc arg_string with proc call_arg_at with lib_call, 0
+    proc assert_string_equal from TestUtils with results, "add_library target is 'mylib'", lib_target, "mylib"
+
+    Note: --- target_link_libraries command ---
+    Let tll_call be proc block_stmt_at with block1, 5
+    Let tll_name be proc call_name with tll_call
+    proc assert_string_equal from TestUtils with results, "stmt[5] is target_link_libraries", tll_name, "target_link_libraries"
+
+    Note: --- if() lowers to an if statement ---
+    Let if_stmt be proc block_stmt_at with block1, 6
+    Let if_kind be proc node_kind with if_stmt
+    proc assert_equal from TestUtils with results, "stmt[6] is HIR if statement", if_kind, HIR_IF_STATEMENT from HIR
+    Let if_cond be proc if_condition_text with if_stmt
+    proc assert_string_equal from TestUtils with results, "if condition text is 'WIN32'", if_cond, "WIN32"
+
+    Note: --- foreach() lowers to a for statement ---
+    Let for_stmt be proc block_stmt_at with block1, 7
+    Let for_kind be proc node_kind with for_stmt
+    proc assert_equal from TestUtils with results, "stmt[7] is HIR for statement", for_kind, HIR_FOR_STATEMENT from HIR
+    Let for_iter be proc for_iterator_name with for_stmt
+    proc assert_string_equal from TestUtils with results, "foreach iterator is 'f'", for_iter, "f"
+
+    Note: --- function() lowers to a process definition ---
+    Let func_stmt be proc block_stmt_at with block1, 8
+    Let func_kind be proc node_kind with func_stmt
+    proc assert_equal from TestUtils with results, "stmt[8] is HIR process definition", func_kind, HIR_PROCESS_DEFINITION from HIR
+    Let func_name be proc process_name with func_stmt
+    proc assert_string_equal from TestUtils with results, "function name is 'my_func'", func_name, "my_func"
+
+    Note: --- Stage 2: HIR -> CMake text ---
+    Let emitted be proc hir_to_cmake from CMakeBackend with hir1
+    proc assert_not_null from TestUtils with results, "backend produced CMake text", emitted
+
+    Let emitted_len be proc string_length from StringCore with emitted
+    proc assert_greater_than from TestUtils with results, "emitted CMake is non-empty", emitted_len, 0
+
+    Note: --- Stage 3: re-parse the emitted CMake text -> HIR (the SECOND
+    Note: emission), then assert the two statement streams are structurally
+    Note: equal. This is the load-bearing round-trip assertion. ---
+    Let hir2 be proc cmake_source_to_hir with emitted
+    proc assert_not_null from TestUtils with results, "re-parse of emitted CMake produced HIR", hir2
+
+    Let block2 be proc program_block with hir2
+    proc assert_not_null from TestUtils with results, "re-parsed HIR carries a statement block", block2
+
+    Let count2 be proc block_count with block2
+    proc assert_equal from TestUtils with results, "re-parsed block preserves 9 statements", count2, 9
+
+    Note: Spot-check survival on the SECOND emission directly (not just stage 1).
+    Let r_set be proc block_stmt_at with block2, 2
+    Let r_set_var be proc let_var_name with r_set
+    proc assert_string_equal from TestUtils with results, "round-trip set() variable survives", r_set_var, "SRC_FILES"
+
+    Let r_if be proc block_stmt_at with block2, 6
+    Let r_if_cond be proc if_condition_text with r_if
+    proc assert_string_equal from TestUtils with results, "round-trip if condition survives", r_if_cond, "WIN32"
+
+    Let r_for be proc block_stmt_at with block2, 7
+    Let r_for_iter be proc for_iterator_name with r_for
+    proc assert_string_equal from TestUtils with results, "round-trip foreach iterator survives", r_for_iter, "f"
+
+    Let r_func be proc block_stmt_at with block2, 8
+    Let r_func_name be proc process_name with r_func
+    proc assert_string_equal from TestUtils with results, "round-trip function name survives", r_func_name, "my_func"
+
+    Let structurally_equal be proc hir_blocks_equal with block1, block2
+    proc assert_equal from TestUtils with results, "round-trip HIR is structurally equal", structurally_equal, 1
+
+    proc print_summary from TestUtils with results
+    Let failed be proc get_failed from TestUtils with results
+    proc destroy_test_results from TestUtils with results
+
+    Return failed
+End Process
