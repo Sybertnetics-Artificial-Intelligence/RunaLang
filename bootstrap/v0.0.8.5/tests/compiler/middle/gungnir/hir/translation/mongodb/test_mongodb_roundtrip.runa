@@ -1,0 +1,597 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+Licensed under Apache 2.0
+:End Note
+
+Note:
+MongoDB Translation Round-Trip Probe
+
+End-to-end proof that the MongoDB translation pipeline is REAL, not a skeleton:
+
+    MongoDB shell query
+      -> mongodb_lexer    (tokenize: identifiers, $-operators, strings, numbers,
+                           braces/brackets/parens, colon, comma)
+      -> mongodb_parser   (build MongoDB operation/document/array AST)
+      -> mongodb_to_hir   (lower the AST to a kind-tagged HIR value tree:
+                           1=dictionary, 2=list, 3=literal)
+      -> hir_to_mongodb   (emit the HIR value tree back to MongoDB shell text)
+
+The probe drives two representative inputs:
+
+  A) A find() query with a nested $gt operator, a string value, an $-and-free
+     compound document, and a projection document:
+        find({age: {$gt: 5}, name: "Alice"}, {age: 1})
+  B) An aggregation pipeline with ordered $match / $group / $sort stages, each a
+     document carrying nested operator expressions ($sum):
+        aggregate([{$match: {status: "A"}}, {$group: {total: {$sum: 1}}}, {$sort: {total: 1}}])
+
+For each input it:
+  1. Drives source -> HIR1 and asserts the kind-tagged root is a dictionary
+     (kind 1) whose "type" / "operation" attributes survived.
+  2. Walks HIR1 and asserts deep content survived: for the find() case the query
+     document's first member key ("age"), its nested operator key ("$gt") and
+     operand ("5"), the second member key ("name") and its string value, and the
+     projection's first member key; for the aggregate case the pipeline is a
+     list (kind 2) of the correct stage count whose stage keys ("$match",
+     "$group", "$sort") survived in order.
+  3. Emits HIR1 -> text1 and asserts the text is non-empty.
+  4. Re-parses text1 -> HIR2, re-emits HIR2 -> text2, and asserts (a) the two
+     emissions are byte-identical (the backend is a fixed point: a second
+     emission accumulates no extra quoting or reordering) and (b) HIR1 and HIR2
+     are STRUCTURALLY EQUAL via a recursive, kind-aware comparator that compares
+     dictionary member keys and values by content, list length and element order,
+     and literal payloads by content. Structural equality is the correct
+     semantic-equivalence check: a $-operator member is re-parsed as a quoted
+     field, so the node kind differs while the member key and value are identical.
+
+Exit code: number of failed assertions (0 == all passed). No exit_with_code.
+:End Note
+
+Import "compiler/middle/gungnir/hir/translation/frontends/mongodb/mongodb_to_hir.runa" as Frontend
+Import "compiler/middle/gungnir/hir/translation/backends/mongodb/hir_to_mongodb.runa" as Backend
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "tests/test_utils.runa" as TestUtils
+
+Note: ============================================================================
+Note: HIR value-tree accessors (mirror the backend's read contract)
+Note: ============================================================================
+
+@Reasoning:
+Every node the translator emits carries a kind tag in its first slot
+(1=dictionary, 2=list, 3=literal). Reading the tag the same way the backend
+does lets the probe assert on node shape directly.
+@End Reasoning
+Process called "node_kind" takes node as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Layout with node, 0
+End Process
+
+@Reasoning:
+A kind=1 dictionary stores size at offset 8 and parallel key/value pointer
+arrays at offsets 24 and 32. This linear scan compares each stored key against
+the query key by content (the keys are NUL-terminated byte slices) and returns
+the matching value pointer, or 0 when no key matches -- exactly the backend's
+dict_get contract.
+@End Reasoning
+Process called "dict_lookup" takes dict as Integer, key as Integer returns Integer:
+    If dict is equal to 0:
+        Return 0
+    End If
+    Let size be proc memory_get_int64 from Layout with dict, 8
+    Let keys_ptr be proc memory_get_int64 from Layout with dict, 24
+    Let values_ptr be proc memory_get_int64 from Layout with dict, 32
+
+    Let index be 0
+    While index is less than size:
+        Let current_key be proc memory_get_int64 from Layout with keys_ptr, index multiplied by 8
+        Let matched be proc string_equals from StringCore with current_key, key
+        If matched is equal to 1:
+            Return proc memory_get_int64 from Layout with values_ptr, index multiplied by 8
+        End If
+        Set index to index plus 1
+    End While
+    Return 0
+End Process
+
+@Reasoning:
+A kind=2 list stores its element count at offset 8 and the item pointer array
+at offset 24. These two accessors mirror the backend's list_size / list_get so
+the probe walks lists exactly as emission does.
+@End Reasoning
+Process called "list_count" takes list as Integer returns Integer:
+    If list is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Layout with list, 8
+End Process
+
+Process called "list_item" takes list as Integer, index as Integer returns Integer:
+    If list is equal to 0:
+        Return 0
+    End If
+    Let items be proc memory_get_int64 from Layout with list, 24
+    Return proc memory_get_int64 from Layout with items, index multiplied by 8
+End Process
+
+@Reasoning:
+A kind=3 literal stores its raw byte-slice pointer at offset 8. Unwrapping it
+yields the underlying string for content comparison.
+@End Reasoning
+Process called "literal_value" takes node as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Layout with node, 8
+End Process
+
+@Reasoning:
+A document is a kind=1 dictionary whose "fields" attribute is a kind=2 list of
+member dictionaries (each a {name,value} field or an {operator,value} operator).
+This returns member i so the probe can assert per-member content.
+@End Reasoning
+Process called "doc_member_at" takes doc as Integer, index as Integer returns Integer:
+    Let fields_key be proc create_from_literal from StringCore with "fields"
+    Let fields be proc dict_lookup with doc, fields_key
+    If fields is equal to 0:
+        Return 0
+    End If
+    Return proc list_item with fields, index
+End Process
+
+@Reasoning:
+A document member is keyed either by "name" (a plain field) or by "operator"
+(a $-operator). After a round trip the $-operator is re-parsed as a quoted
+field, so the member key may live under either attribute. This returns whichever
+is present so callers compare members by their observable key regardless of the
+node kind that produced them.
+@End Reasoning
+Process called "member_key" takes member as Integer returns Integer:
+    Let operator_key be proc create_from_literal from StringCore with "operator"
+    Let op_name be proc dict_lookup with member, operator_key
+    If op_name is not equal to 0:
+        Return op_name
+    End If
+    Let name_key be proc create_from_literal from StringCore with "name"
+    Return proc dict_lookup with member, name_key
+End Process
+
+@Reasoning:
+The operand of a document member is always stored under "value" by both the
+field and operator translators, so a single accessor serves both.
+@End Reasoning
+Process called "member_value" takes member as Integer returns Integer:
+    Let value_key be proc create_from_literal from StringCore with "value"
+    Return proc dict_lookup with member, value_key
+End Process
+
+@Reasoning:
+A document member key arrives unquoted when written as a bare identifier or
+$-operator and quote-inclusive when the lexer captured it from a prior emission
+(the backend quotes every key, and the lexer's string token spans the quotes).
+Structural equality must therefore compare keys modulo a single surrounding
+double-quote pair. This helper compares two NUL-terminated keys after skipping a
+leading double quote and ignoring a trailing double quote on either operand, so
+"age" and age compare equal while preserving full interior content.
+@End Reasoning
+Process called "keys_equal_normalized" takes ka as Integer, kb as Integer returns Integer:
+    If ka is equal to 0:
+        If kb is equal to 0:
+            Return 1
+        End If
+        Return 0
+    End If
+    If kb is equal to 0:
+        Return 0
+    End If
+
+    Let ia be 0
+    Let la be proc string_length from StringCore with ka
+    Let first_a be proc memory_get_byte from Layout with ka, 0
+    If first_a is equal to 34:
+        Set ia to 1
+        Let last_a be proc memory_get_byte from Layout with ka, la minus 1
+        If last_a is equal to 34:
+            Set la to la minus 1
+        End If
+    End If
+
+    Let ib be 0
+    Let lb be proc string_length from StringCore with kb
+    Let first_b be proc memory_get_byte from Layout with kb, 0
+    If first_b is equal to 34:
+        Set ib to 1
+        Let last_b be proc memory_get_byte from Layout with kb, lb minus 1
+        If last_b is equal to 34:
+            Set lb to lb minus 1
+        End If
+    End If
+
+    Let len_a be la minus ia
+    Let len_b be lb minus ib
+    If len_a is not equal to len_b:
+        Return 0
+    End If
+
+    Let offset be 0
+    While offset is less than len_a:
+        Let byte_a be proc memory_get_byte from Layout with ka, ia plus offset
+        Let byte_b be proc memory_get_byte from Layout with kb, ib plus offset
+        If byte_a is not equal to byte_b:
+            Return 0
+        End If
+        Set offset to offset plus 1
+    End While
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Recursive kind-aware structural comparator
+Note: ============================================================================
+
+@Reasoning:
+Two MongoDB HIR value trees are semantically equal when, structurally, they
+carry the same operation/document/array/literal shape with the same key and
+value content. The comparator is kind-aware but member-kind-agnostic: a
+$-operator member ({operator,value}) and the quoted field it re-parses into
+({name,value}) compare equal because member_key and member_value extract the
+same observable key and operand from both. Documents are compared by member
+count then member-by-member key+value; the pipeline list by length then element
+order; operation dictionaries by their "type"/"operation" tags plus their
+payload children; literals by byte content. This is the correct round-trip
+fidelity check: it ignores how the backend re-renders form while proving meaning
+survives.
+@End Reasoning
+Process called "hir_equal" takes a as Integer, b as Integer returns Integer:
+    If a is equal to 0:
+        If b is equal to 0:
+            Return 1
+        End If
+        Return 0
+    End If
+    If b is equal to 0:
+        Return 0
+    End If
+
+    Let kind_a be proc node_kind with a
+    Let kind_b be proc node_kind with b
+
+    Note: Literal vs literal -> compare byte content
+    If kind_a is equal to 3:
+        If kind_b is not equal to 3:
+            Return 0
+        End If
+        Let str_a be proc literal_value with a
+        Let str_b be proc literal_value with b
+        If str_a is equal to 0:
+            If str_b is equal to 0:
+                Return 1
+            End If
+            Return 0
+        End If
+        If str_b is equal to 0:
+            Return 0
+        End If
+        Return proc string_equals from StringCore with str_a, str_b
+    End If
+
+    Note: List vs list -> length then element order
+    If kind_a is equal to 2:
+        If kind_b is not equal to 2:
+            Return 0
+        End If
+        Let count_a be proc list_count with a
+        Let count_b be proc list_count with b
+        If count_a is not equal to count_b:
+            Return 0
+        End If
+        Let i be 0
+        While i is less than count_a:
+            Let elem_a be proc list_item with a, i
+            Let elem_b be proc list_item with b, i
+            Let elem_eq be proc hir_equal with elem_a, elem_b
+            If elem_eq is not equal to 1:
+                Return 0
+            End If
+            Set i to i plus 1
+        End While
+        Return 1
+    End If
+
+    Note: Dictionary vs dictionary
+    If kind_b is not equal to 1:
+        Return 0
+    End If
+
+    Note: An operation/document dictionary carries a "type" attribute. If either
+    Note: side has it, compare as a typed dictionary on its shared attributes.
+    Let type_key be proc create_from_literal from StringCore with "type"
+    Let type_a be proc dict_lookup with a, type_key
+    Let type_b be proc dict_lookup with b, type_key
+
+    If type_a is not equal to 0:
+        If type_b is equal to 0:
+            Return 0
+        End If
+        Let types_match be proc string_equals from StringCore with type_a, type_b
+        If types_match is not equal to 1:
+            Return 0
+        End If
+        Return proc typed_dict_equal with a, b, type_a
+    End If
+    If type_b is not equal to 0:
+        Return 0
+    End If
+
+    Note: Untyped dictionary == a document member ({name|operator, value}).
+    Let key_a be proc member_key with a
+    Let key_b be proc member_key with b
+    If key_a is equal to 0:
+        Return 0
+    End If
+    If key_b is equal to 0:
+        Return 0
+    End If
+    Let keys_match be proc keys_equal_normalized with key_a, key_b
+    If keys_match is not equal to 1:
+        Return 0
+    End If
+    Let val_a be proc member_value with a
+    Let val_b be proc member_value with b
+    Return proc hir_equal with val_a, val_b
+End Process
+
+@Reasoning:
+Documents and the operation kinds share a tagged shape, so equality reduces to:
+documents compare their "fields" member lists position-for-position via the
+generic member comparator; query/aggregate/update/insert/delete dictionaries
+compare their "operation" name plus each payload child (query/projection,
+pipeline, filter/update/options, documents, filter) recursively. The dispatch
+is on the "type" string so a single helper covers every operation family.
+@End Reasoning
+Process called "typed_dict_equal" takes a as Integer, b as Integer, type_str as Integer returns Integer:
+    Note: --- document: compare the "fields" member list ---
+    Let is_document be proc string_equals from StringCore with type_str, "document"
+    If is_document is equal to 1:
+        Let fields_key be proc create_from_literal from StringCore with "fields"
+        Let fields_a be proc dict_lookup with a, fields_key
+        Let fields_b be proc dict_lookup with b, fields_key
+        Return proc hir_equal with fields_a, fields_b
+    End If
+
+    Note: --- every operation shares an "operation" name ---
+    Let op_key be proc create_from_literal from StringCore with "operation"
+    Let op_a be proc dict_lookup with a, op_key
+    Let op_b be proc dict_lookup with b, op_key
+    If op_a is equal to 0:
+        Return 0
+    End If
+    If op_b is equal to 0:
+        Return 0
+    End If
+    Let ops_match be proc string_equals from StringCore with op_a, op_b
+    If ops_match is not equal to 1:
+        Return 0
+    End If
+
+    Note: --- query: query + projection ---
+    Let is_query be proc string_equals from StringCore with type_str, "query"
+    If is_query is equal to 1:
+        Let query_key be proc create_from_literal from StringCore with "query"
+        Let query_a be proc dict_lookup with a, query_key
+        Let query_b be proc dict_lookup with b, query_key
+        Let q_eq be proc hir_equal with query_a, query_b
+        If q_eq is not equal to 1:
+            Return 0
+        End If
+        Let proj_key be proc create_from_literal from StringCore with "projection"
+        Let proj_a be proc dict_lookup with a, proj_key
+        Let proj_b be proc dict_lookup with b, proj_key
+        Return proc hir_equal with proj_a, proj_b
+    End If
+
+    Note: --- aggregate: pipeline ---
+    Let is_aggregate be proc string_equals from StringCore with type_str, "aggregate"
+    If is_aggregate is equal to 1:
+        Let pipeline_key be proc create_from_literal from StringCore with "pipeline"
+        Let pipeline_a be proc dict_lookup with a, pipeline_key
+        Let pipeline_b be proc dict_lookup with b, pipeline_key
+        Return proc hir_equal with pipeline_a, pipeline_b
+    End If
+
+    Note: --- update: filter + update + options ---
+    Let is_update be proc string_equals from StringCore with type_str, "update"
+    If is_update is equal to 1:
+        Let filter_key be proc create_from_literal from StringCore with "filter"
+        Let filter_a be proc dict_lookup with a, filter_key
+        Let filter_b be proc dict_lookup with b, filter_key
+        Let f_eq be proc hir_equal with filter_a, filter_b
+        If f_eq is not equal to 1:
+            Return 0
+        End If
+        Let update_key be proc create_from_literal from StringCore with "update"
+        Let update_a be proc dict_lookup with a, update_key
+        Let update_b be proc dict_lookup with b, update_key
+        Let u_eq be proc hir_equal with update_a, update_b
+        If u_eq is not equal to 1:
+            Return 0
+        End If
+        Let options_key be proc create_from_literal from StringCore with "options"
+        Let options_a be proc dict_lookup with a, options_key
+        Let options_b be proc dict_lookup with b, options_key
+        Return proc hir_equal with options_a, options_b
+    End If
+
+    Note: --- insert: documents ---
+    Let is_insert be proc string_equals from StringCore with type_str, "insert"
+    If is_insert is equal to 1:
+        Let docs_key be proc create_from_literal from StringCore with "documents"
+        Let docs_a be proc dict_lookup with a, docs_key
+        Let docs_b be proc dict_lookup with b, docs_key
+        Return proc hir_equal with docs_a, docs_b
+    End If
+
+    Note: --- delete: filter ---
+    Let is_delete be proc string_equals from StringCore with type_str, "delete"
+    If is_delete is equal to 1:
+        Let del_filter_key be proc create_from_literal from StringCore with "filter"
+        Let del_filter_a be proc dict_lookup with a, del_filter_key
+        Let del_filter_b be proc dict_lookup with b, del_filter_key
+        Return proc hir_equal with del_filter_a, del_filter_b
+    End If
+
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: Probe entry point
+Note: ============================================================================
+
+Process called "main" returns Integer:
+    Let results be proc create_test_results from TestUtils
+    proc begin_suite from TestUtils with results, "MongoDB translation round-trip"
+
+    Note: ========================================================================
+    Note: Case A: find() with nested $gt operator + string value + projection
+    Note: ========================================================================
+    Let source_a be "find({age: {$gt: 5}, name: \"Alice\"}, {age: 1})"
+
+    Let hir_a be proc mongodb_to_hir_from_source from Frontend with source_a
+    proc assert_not_null from TestUtils with results, "find: pipeline produced HIR", hir_a
+
+    Let kind_a be proc node_kind with hir_a
+    proc assert_equal from TestUtils with results, "find: HIR root is a dictionary", kind_a, 1
+
+    Let type_key be proc create_from_literal from StringCore with "type"
+    Let type_a be proc dict_lookup with hir_a, type_key
+    proc assert_string_equal from TestUtils with results, "find: root type is 'query'", type_a, "query"
+
+    Let op_key be proc create_from_literal from StringCore with "operation"
+    Let op_a be proc dict_lookup with hir_a, op_key
+    proc assert_string_equal from TestUtils with results, "find: operation is 'find'", op_a, "find"
+
+    Note: --- query document: members survived ---
+    Let query_key be proc create_from_literal from StringCore with "query"
+    Let query_doc be proc dict_lookup with hir_a, query_key
+    proc assert_not_null from TestUtils with results, "find: query document present", query_doc
+
+    Let member0 be proc doc_member_at with query_doc, 0
+    Let member0_key be proc member_key with member0
+    proc assert_string_equal from TestUtils with results, "find: query member[0] key is 'age'", member0_key, "age"
+
+    Note: member[0] value is the nested {$gt: 5} document
+    Let member0_value be proc member_value with member0
+    Let nested_member be proc doc_member_at with member0_value, 0
+    Let nested_key be proc member_key with nested_member
+    proc assert_string_equal from TestUtils with results, "find: nested operator key is '$gt'", nested_key, "$gt"
+
+    Let nested_value be proc member_value with nested_member
+    Let nested_literal be proc literal_value with nested_value
+    proc assert_string_equal from TestUtils with results, "find: nested operator operand is '5'", nested_literal, "5"
+
+    Let member1 be proc doc_member_at with query_doc, 1
+    Let member1_key be proc member_key with member1
+    proc assert_string_equal from TestUtils with results, "find: query member[1] key is 'name'", member1_key, "name"
+
+    Let member1_value be proc member_value with member1
+    Let member1_literal be proc literal_value with member1_value
+    proc assert_string_equal from TestUtils with results, "find: query member[1] value is '\"Alice\"'", member1_literal, "\"Alice\""
+
+    Note: --- projection document present with member 'age' ---
+    Let proj_key be proc create_from_literal from StringCore with "projection"
+    Let proj_doc be proc dict_lookup with hir_a, proj_key
+    proc assert_not_null from TestUtils with results, "find: projection document present", proj_doc
+    Let proj_member be proc doc_member_at with proj_doc, 0
+    Let proj_member_key be proc member_key with proj_member
+    proc assert_string_equal from TestUtils with results, "find: projection member[0] key is 'age'", proj_member_key, "age"
+
+    Note: --- emit, re-parse, re-emit; assert idempotent + structurally equal ---
+    Let text_a1 be proc generate_mongodb from Backend with hir_a
+    proc assert_not_null from TestUtils with results, "find: backend produced text", text_a1
+    Let len_a1 be proc string_length from StringCore with text_a1
+    proc assert_greater_than from TestUtils with results, "find: emitted text is non-empty", len_a1, 0
+
+    Let hir_a2 be proc mongodb_to_hir_from_source from Frontend with text_a1
+    proc assert_not_null from TestUtils with results, "find: re-parse produced HIR", hir_a2
+    Let text_a2 be proc generate_mongodb from Backend with hir_a2
+
+    Let idem_a be proc string_equals from StringCore with text_a1, text_a2
+    proc assert_equal from TestUtils with results, "find: second emission is byte-identical", idem_a, 1
+
+    Let struct_a be proc hir_equal with hir_a, hir_a2
+    proc assert_equal from TestUtils with results, "find: round-trip HIR is structurally equal", struct_a, 1
+
+    Note: ========================================================================
+    Note: Case B: aggregation pipeline with ordered $match / $group / $sort
+    Note: ========================================================================
+    Let source_b be "aggregate([{$match: {status: \"A\"}}, {$group: {total: {$sum: 1}}}, {$sort: {total: 1}}])"
+
+    Let hir_b be proc mongodb_to_hir_from_source from Frontend with source_b
+    proc assert_not_null from TestUtils with results, "aggregate: pipeline produced HIR", hir_b
+
+    Let type_b be proc dict_lookup with hir_b, type_key
+    proc assert_string_equal from TestUtils with results, "aggregate: root type is 'aggregate'", type_b, "aggregate"
+
+    Let pipeline_key be proc create_from_literal from StringCore with "pipeline"
+    Let pipeline be proc dict_lookup with hir_b, pipeline_key
+    proc assert_not_null from TestUtils with results, "aggregate: pipeline present", pipeline
+
+    Let pkind be proc node_kind with pipeline
+    proc assert_equal from TestUtils with results, "aggregate: pipeline is a list", pkind, 2
+
+    Let stage_count be proc list_count with pipeline
+    proc assert_equal from TestUtils with results, "aggregate: pipeline has 3 stages", stage_count, 3
+
+    Note: --- stage[0] is a {$match: ...} document ---
+    Let stage0 be proc list_item with pipeline, 0
+    Let stage0_member be proc doc_member_at with stage0, 0
+    Let stage0_key be proc member_key with stage0_member
+    proc assert_string_equal from TestUtils with results, "aggregate: stage[0] key is '$match'", stage0_key, "$match"
+
+    Note: --- stage[1] is a {$group: ...} document ---
+    Let stage1 be proc list_item with pipeline, 1
+    Let stage1_member be proc doc_member_at with stage1, 0
+    Let stage1_key be proc member_key with stage1_member
+    proc assert_string_equal from TestUtils with results, "aggregate: stage[1] key is '$group'", stage1_key, "$group"
+
+    Note: --- stage[2] is a {$sort: ...} document ---
+    Let stage2 be proc list_item with pipeline, 2
+    Let stage2_member be proc doc_member_at with stage2, 0
+    Let stage2_key be proc member_key with stage2_member
+    proc assert_string_equal from TestUtils with results, "aggregate: stage[2] key is '$sort'", stage2_key, "$sort"
+
+    Note: --- nested $sum operand inside $group survived ---
+    Let group_body be proc member_value with stage1_member
+    Let total_member be proc doc_member_at with group_body, 0
+    Let total_key be proc member_key with total_member
+    proc assert_string_equal from TestUtils with results, "aggregate: $group member key is 'total'", total_key, "total"
+    Let total_value be proc member_value with total_member
+    Let sum_member be proc doc_member_at with total_value, 0
+    Let sum_key be proc member_key with sum_member
+    proc assert_string_equal from TestUtils with results, "aggregate: nested operator key is '$sum'", sum_key, "$sum"
+
+    Note: --- emit, re-parse, re-emit; assert idempotent + structurally equal ---
+    Let text_b1 be proc generate_mongodb from Backend with hir_b
+    proc assert_not_null from TestUtils with results, "aggregate: backend produced text", text_b1
+    Let len_b1 be proc string_length from StringCore with text_b1
+    proc assert_greater_than from TestUtils with results, "aggregate: emitted text is non-empty", len_b1, 0
+
+    Let hir_b2 be proc mongodb_to_hir_from_source from Frontend with text_b1
+    proc assert_not_null from TestUtils with results, "aggregate: re-parse produced HIR", hir_b2
+    Let text_b2 be proc generate_mongodb from Backend with hir_b2
+
+    Let idem_b be proc string_equals from StringCore with text_b1, text_b2
+    proc assert_equal from TestUtils with results, "aggregate: second emission is byte-identical", idem_b, 1
+
+    Let struct_b be proc hir_equal with hir_b, hir_b2
+    proc assert_equal from TestUtils with results, "aggregate: round-trip HIR is structurally equal", struct_b, 1
+
+    proc print_summary from TestUtils with results
+    Let failed be proc get_failed from TestUtils with results
+    proc destroy_test_results from TestUtils with results
+
+    Return failed
+End Process

@@ -59,10 +59,13 @@ sub-types and literals. Null inputs map to the MongoDB null literal.
 @End Reasoning
 
 @Implementation:
-Looks up the "type" attribute on the HIR node. Documents recurse into
-generate_document; operation kinds (query/aggregate/update/insert/delete)
-route to their respective emitters; lists fall through to generate_array;
-anything else is treated as a string literal and emitted verbatim.
+Reads the kind tag at offset 0 of the HIR value node (1=dictionary,
+2=list, 3=literal). Lists route to generate_array; literals emit the raw
+byte slice at offset 8 verbatim. Dictionaries look up the "type" attribute:
+"document" recurses into generate_document; the operation kinds
+(query/aggregate/update/insert/delete) route to their respective emitters;
+an untyped dictionary (e.g. an operator {operator,value}) is emitted as a
+plain document.
 @End Implementation
 
 Process called "generate_value" takes value as Integer, emitter as Integer, indent_level as Integer returns Integer:
@@ -73,10 +76,27 @@ Process called "generate_value" takes value as Integer, emitter as Integer, inde
         Return 1
     End If
 
-    Note: Check if value is a dictionary
-    Let type_key be proc create_string from StringCore with "type"
+    Let kind be proc memory_get_int64 from Layout with value, 0
+
+    Note: kind = 3 -> literal byte slice at offset 8
+    If kind is equal to 3:
+        Let literal be proc memory_get_int64 from Layout with value, 8
+        If literal is equal to 0:
+            proc emitter_raw_emit_string from EmitterCommon with emitter, "null"
+        Otherwise:
+            proc emitter_raw_emit_string from EmitterCommon with emitter, literal
+        End If
+        Return 1
+    End If
+
+    Note: kind = 2 -> list
+    If kind is equal to 2:
+        Return proc generate_array with value, emitter, indent_level
+    End If
+
+    Note: kind = 1 -> dictionary; route on its "type" attribute
+    Let type_key be proc create_from_literal from StringCore with "type"
     Let type_value be proc dict_get with value, type_key
-    proc deallocate from Layout with type_key
 
     If type_value is not equal to 0:
         Let is_document be proc string_equals from StringCore with type_value, "document"
@@ -111,16 +131,8 @@ Process called "generate_value" takes value as Integer, emitter as Integer, inde
         End If
     End If
 
-    Note: Check if value is a list
-    Let is_list be proc is_list from value
-    If is_list is equal to 1:
-        Return proc generate_array with value, emitter, indent_level
-    End If
-
-    Note: Otherwise, it's a literal string
-    proc emitter_raw_emit_string from EmitterCommon with emitter, value
-
-    Return 1
+    Note: Untyped dictionary (a MongoDB $-operator map) -> emit as {"$op": value}
+    Return proc generate_operator with value, emitter, indent_level
 End Process
 
 @Reasoning:
@@ -139,12 +151,11 @@ Process called "generate_document" takes doc as Integer, emitter as Integer, ind
 
     proc emitter_raw_emit_byte from EmitterCommon with emitter, 123  Note: {
 
-    Let fields_key be proc create_string from StringCore with "fields"
+    Let fields_key be proc create_from_literal from StringCore with "fields"
     Let fields be proc dict_get with doc, fields_key
-    proc deallocate from Layout with fields_key
 
     If fields is not equal to 0:
-        Let field_count be proc list_size from fields
+        Let field_count be proc list_size with fields
         Let index be 0
 
         While index is less than field_count:
@@ -166,32 +177,122 @@ Process called "generate_document" takes doc as Integer, emitter as Integer, ind
 End Process
 
 @Reasoning:
-Fields are name-value pairs inside a MongoDB document. The name is quoted
-to match BSON serialization conventions accepted by the shell.
+A document member is either a plain field (name: value) or a MongoDB
+$-operator member ($op: value). The translator emits a {name,value}
+dictionary for the former and an {operator,value} dictionary for the
+latter, and both flavours land in the parent document's fields list. This
+routine probes for the "operator" key first so $-operators rendered as a
+document member keep their $-name; otherwise it falls back to the plain
+field shape. The member key is quoted to match BSON serialization
+conventions accepted by the shell.
 @End Reasoning
 
 @Implementation:
-Reads the "name" and "value" attributes off the HIR field node. Emits the
-quoted name, ": ", then recurses through generate_value on the value child.
+Reads the "operator" attribute; if present it is the member key, otherwise
+the "name" attribute is. The key is emitted via emit_key, which is
+idempotent: an unquoted identifier/operator key is wrapped in double
+quotes, while a key whose first byte is already a double quote (produced by
+a prior emission that the lexer then captured quote-inclusive) is emitted
+verbatim so re-emission never accumulates extra quote pairs. The key is
+followed by ": " and the "value" child recursed through generate_value.
 @End Implementation
 
 Process called "generate_field" takes field as Integer, emitter as Integer, indent_level as Integer returns Integer:
-    Note: Generate field: "name": value
+    Note: Generate document member: "key": value
 
-    Let name_key be proc create_string from StringCore with "name"
-    Let name be proc dict_get with field, name_key
-    proc deallocate from Layout with name_key
+    Let operator_key be proc create_from_literal from StringCore with "operator"
+    Let operator_name be proc dict_get with field, operator_key
 
-    proc emitter_raw_emit_byte from EmitterCommon with emitter, 34  Note: "
-    proc emitter_raw_emit_string from EmitterCommon with emitter, name
-    proc emitter_raw_emit_byte from EmitterCommon with emitter, 34  Note: "
+    Let member_key be 0
+    If operator_name is not equal to 0:
+        Set member_key to operator_name
+    Otherwise:
+        Let name_key be proc create_from_literal from StringCore with "name"
+        Set member_key to proc dict_get with field, name_key
+    End If
+
+    proc emit_key with member_key, emitter
     proc emitter_raw_emit_string from EmitterCommon with emitter, ": "
 
-    Let value_key be proc create_string from StringCore with "value"
+    Let value_key be proc create_from_literal from StringCore with "value"
     Let value be proc dict_get with field, value_key
-    proc deallocate from Layout with value_key
 
     proc generate_value with value, emitter, indent_level
+
+    Return 1
+End Process
+
+@Reasoning:
+Document member keys must be emitted with exactly one surrounding pair of
+double quotes regardless of how the key string was produced. MongoDB shell
+keys arrive at the translator either as bare identifiers/operators (no
+quotes) or, after a prior emission round, as quote-inclusive string slices
+captured by the lexer. Adding quotes unconditionally would double them on
+re-emission and break round-trip idempotency; this helper makes emission a
+fixed point.
+@End Reasoning
+
+@Implementation:
+If the key pointer is 0, emit an empty quoted key. Otherwise read its first
+byte: if it is already a double quote (34), the key carries its own quotes
+so emit it verbatim; otherwise wrap the key in a double-quote pair. Returns
+1.
+@End Implementation
+
+Process called "emit_key" takes key as Integer, emitter as Integer returns Integer:
+    Note: Emit a document member key with exactly one pair of double quotes
+
+    If key is equal to 0:
+        proc emitter_raw_emit_byte from EmitterCommon with emitter, 34  Note: "
+        proc emitter_raw_emit_byte from EmitterCommon with emitter, 34  Note: "
+        Return 1
+    End If
+
+    Let first_char be proc memory_get_byte from Layout with key, 0
+
+    If first_char is equal to 34:  Note: already starts with "
+        proc emitter_raw_emit_string from EmitterCommon with emitter, key
+        Return 1
+    End If
+
+    proc emitter_raw_emit_byte from EmitterCommon with emitter, 34  Note: "
+    proc emitter_raw_emit_string from EmitterCommon with emitter, key
+    proc emitter_raw_emit_byte from EmitterCommon with emitter, 34  Note: "
+
+    Return 1
+End Process
+
+@Reasoning:
+A MongoDB $-operator node carries an operator name (e.g. "$gt") plus a
+single operand value. In shell/JSON syntax it renders as a one-field
+object: {"$gt": <value>}. Emitting it through this dedicated routine keeps
+the operator name quoted and its operand recursed through generate_value
+so nested operators ($and: [ ... ]) survive.
+@End Reasoning
+
+@Implementation:
+Emits "{". Reads the "operator" attribute (a raw byte slice) and emits it
+quoted, then ": ". Reads the "value" attribute and recurses through
+generate_value. Closes with "}". Returns 1.
+@End Implementation
+
+Process called "generate_operator" takes operator_node as Integer, emitter as Integer, indent_level as Integer returns Integer:
+    Note: Generate operator object: {"$op": value}
+
+    proc emitter_raw_emit_byte from EmitterCommon with emitter, 123  Note: {
+
+    Let op_key be proc create_from_literal from StringCore with "operator"
+    Let op_name be proc dict_get with operator_node, op_key
+
+    proc emit_key with op_name, emitter
+    proc emitter_raw_emit_string from EmitterCommon with emitter, ": "
+
+    Let value_key be proc create_from_literal from StringCore with "value"
+    Let value be proc dict_get with operator_node, value_key
+
+    proc generate_value with value, emitter, indent_level
+
+    proc emitter_raw_emit_byte from EmitterCommon with emitter, 125  Note: }
 
     Return 1
 End Process
@@ -211,7 +312,7 @@ Process called "generate_array" takes array as Integer, emitter as Integer, inde
 
     proc emitter_raw_emit_byte from EmitterCommon with emitter, 91  Note: [
 
-    Let size be proc list_size from array
+    Let size be proc list_size with array
     Let index be 0
 
     While index is less than size:
@@ -252,18 +353,16 @@ Process called "generate_query_operation" takes operation as Integer, emitter as
     Note: Format: db.collection.find({query}) or db.collection.find({query}, {projection})
 
     Note: Get operation name
-    Let op_key be proc create_string from StringCore with "operation"
+    Let op_key be proc create_from_literal from StringCore with "operation"
     Let op_name be proc dict_get with operation, op_key
-    proc deallocate from Layout with op_key
 
     Note: Emit operation name
     proc emitter_raw_emit_string from EmitterCommon with emitter, op_name
     proc emitter_raw_emit_byte from EmitterCommon with emitter, 40  Note: (
 
     Note: Get and generate query document
-    Let query_key be proc create_string from StringCore with "query"
+    Let query_key be proc create_from_literal from StringCore with "query"
     Let query be proc dict_get with operation, query_key
-    proc deallocate from Layout with query_key
 
     If query is not equal to 0:
         proc generate_value with query, emitter, indent_level
@@ -272,9 +371,8 @@ Process called "generate_query_operation" takes operation as Integer, emitter as
     End If
 
     Note: Check for optional projection
-    Let proj_key be proc create_string from StringCore with "projection"
+    Let proj_key be proc create_from_literal from StringCore with "projection"
     Let projection be proc dict_get with operation, proj_key
-    proc deallocate from Layout with proj_key
 
     If projection is not equal to 0:
         proc emitter_raw_emit_string from EmitterCommon with emitter, ", "
@@ -302,18 +400,16 @@ Process called "generate_aggregate_operation" takes operation as Integer, emitte
     Note: Format: db.collection.aggregate([{$stage1}, {$stage2}, ...])
 
     Note: Get operation name
-    Let op_key be proc create_string from StringCore with "operation"
+    Let op_key be proc create_from_literal from StringCore with "operation"
     Let op_name be proc dict_get with operation, op_key
-    proc deallocate from Layout with op_key
 
     Note: Emit operation name
     proc emitter_raw_emit_string from EmitterCommon with emitter, op_name
     proc emitter_raw_emit_byte from EmitterCommon with emitter, 40  Note: (
 
     Note: Get and generate pipeline array
-    Let pipeline_key be proc create_string from StringCore with "pipeline"
+    Let pipeline_key be proc create_from_literal from StringCore with "pipeline"
     Let pipeline be proc dict_get with operation, pipeline_key
-    proc deallocate from Layout with pipeline_key
 
     If pipeline is not equal to 0:
         proc generate_value with pipeline, emitter, indent_level
@@ -341,18 +437,16 @@ Process called "generate_update_operation" takes operation as Integer, emitter a
     Note: Format: db.collection.updateOne({filter}, {update}, {options})
 
     Note: Get operation name
-    Let op_key be proc create_string from StringCore with "operation"
+    Let op_key be proc create_from_literal from StringCore with "operation"
     Let op_name be proc dict_get with operation, op_key
-    proc deallocate from Layout with op_key
 
     Note: Emit operation name
     proc emitter_raw_emit_string from EmitterCommon with emitter, op_name
     proc emitter_raw_emit_byte from EmitterCommon with emitter, 40  Note: (
 
     Note: Get and generate filter document
-    Let filter_key be proc create_string from StringCore with "filter"
+    Let filter_key be proc create_from_literal from StringCore with "filter"
     Let filter be proc dict_get with operation, filter_key
-    proc deallocate from Layout with filter_key
 
     If filter is not equal to 0:
         proc generate_value with filter, emitter, indent_level
@@ -361,9 +455,8 @@ Process called "generate_update_operation" takes operation as Integer, emitter a
     End If
 
     Note: Get and generate update document
-    Let update_key be proc create_string from StringCore with "update"
+    Let update_key be proc create_from_literal from StringCore with "update"
     Let update be proc dict_get with operation, update_key
-    proc deallocate from Layout with update_key
 
     If update is not equal to 0:
         proc emitter_raw_emit_string from EmitterCommon with emitter, ", "
@@ -371,9 +464,8 @@ Process called "generate_update_operation" takes operation as Integer, emitter a
     End If
 
     Note: Check for optional options
-    Let options_key be proc create_string from StringCore with "options"
+    Let options_key be proc create_from_literal from StringCore with "options"
     Let options be proc dict_get with operation, options_key
-    proc deallocate from Layout with options_key
 
     If options is not equal to 0:
         proc emitter_raw_emit_string from EmitterCommon with emitter, ", "
@@ -401,18 +493,16 @@ Process called "generate_insert_operation" takes operation as Integer, emitter a
     Note: Format: db.collection.insertOne({document}) or db.collection.insertMany([{doc1}, {doc2}])
 
     Note: Get operation name
-    Let op_key be proc create_string from StringCore with "operation"
+    Let op_key be proc create_from_literal from StringCore with "operation"
     Let op_name be proc dict_get with operation, op_key
-    proc deallocate from Layout with op_key
 
     Note: Emit operation name
     proc emitter_raw_emit_string from EmitterCommon with emitter, op_name
     proc emitter_raw_emit_byte from EmitterCommon with emitter, 40  Note: (
 
     Note: Get and generate documents
-    Let docs_key be proc create_string from StringCore with "documents"
+    Let docs_key be proc create_from_literal from StringCore with "documents"
     Let documents be proc dict_get with operation, docs_key
-    proc deallocate from Layout with docs_key
 
     If documents is not equal to 0:
         proc generate_value with documents, emitter, indent_level
@@ -440,18 +530,16 @@ Process called "generate_delete_operation" takes operation as Integer, emitter a
     Note: Format: db.collection.deleteOne({filter}) or db.collection.deleteMany({filter})
 
     Note: Get operation name
-    Let op_key be proc create_string from StringCore with "operation"
+    Let op_key be proc create_from_literal from StringCore with "operation"
     Let op_name be proc dict_get with operation, op_key
-    proc deallocate from Layout with op_key
 
     Note: Emit operation name
     proc emitter_raw_emit_string from EmitterCommon with emitter, op_name
     proc emitter_raw_emit_byte from EmitterCommon with emitter, 40  Note: (
 
     Note: Get and generate filter document
-    Let filter_key be proc create_string from StringCore with "filter"
+    Let filter_key be proc create_from_literal from StringCore with "filter"
     Let filter be proc dict_get with operation, filter_key
-    proc deallocate from Layout with filter_key
 
     If filter is not equal to 0:
         proc generate_value with filter, emitter, indent_level
@@ -469,23 +557,24 @@ Note: Dictionary and List Utilities
 Note: ============================================================================
 
 @Reasoning:
-The backend stores HIR attribute lookups through a flat parallel-array
-dictionary (keys at offset 16, values at offset 24, size at offset 0).
-A local helper avoids dragging the full Dict module into the import list.
+The backend reads HIR attribute lookups from the kind-tagged parallel-array
+dictionary emitted by the translator (kind at offset 0, size at offset 8,
+keys at offset 24, values at offset 32). A local helper avoids dragging the
+full Dict module into the import list.
 @End Reasoning
 
 @Implementation:
-Reads size, keys_ptr and values_ptr from the dict header at offsets 0/16/24,
-then linearly scans the keys array calling string_equals against the query
-key. Returns the matching value pointer or 0 when no key matches.
+Reads size, keys_ptr and values_ptr from the dict header at offsets
+8/24/32, then linearly scans the keys array calling string_equals against
+the query key. Returns the matching value pointer or 0 when no key matches.
 @End Implementation
 
 Process called "dict_get" takes dict as Integer, key as Integer returns Integer:
     Note: Get value from dictionary by key
 
-    Let size be proc memory_get_int64 from Layout with dict, 0
-    Let keys_ptr be proc memory_get_int64 from Layout with dict, 16
-    Let values_ptr be proc memory_get_int64 from Layout with dict, 24
+    Let size be proc memory_get_int64 from Layout with dict, 8
+    Let keys_ptr be proc memory_get_int64 from Layout with dict, 24
+    Let values_ptr be proc memory_get_int64 from Layout with dict, 32
 
     Let index be 0
     While index is less than size:
@@ -504,61 +593,36 @@ Process called "dict_get" takes dict as Integer, key as Integer returns Integer:
 End Process
 
 @Reasoning:
-generate_value needs to discriminate between dictionaries and lists. The
-heuristic relies on the layout difference: a backend list header carries a
-non-zero capacity slot whereas the parallel-array dictionary header does
-not, giving a cheap shape-based test.
+Trivial accessor that reads the list-length field directly from the
+kind-tagged list header (kind at offset 0, size at offset 8). Kept local
+because the imported list module is not depended on here.
 @End Reasoning
 
 @Implementation:
-Reads size at offset 0 and capacity at offset 8. Returns 1 when capacity is
-greater than 0 (i.e. the value has a list-style header), else 0.
-@End Implementation
-
-Process called "is_list" takes value as Integer returns Integer:
-    Note: Check if value is a list structure
-
-    Note: Simple heuristic: lists have size, capacity, items fields
-    Let size be proc memory_get_int64 from Layout with value, 0
-    Let capacity be proc memory_get_int64 from Layout with value, 8
-
-    If capacity is greater than 0:
-        Return 1
-    End If
-
-    Return 0
-End Process
-
-@Reasoning:
-Trivial accessor that reads the list-length field directly from the header.
-Kept local because the imported list module is not depended on here.
-@End Reasoning
-
-@Implementation:
-Reads the int64 at offset 0 of the list header.
+Reads the int64 at offset 8 of the list header.
 @End Implementation
 
 Process called "list_size" takes list as Integer returns Integer:
     Note: Get list size
 
-    Let size be proc memory_get_int64 from Layout with list, 0
+    Let size be proc memory_get_int64 from Layout with list, 8
     Return size
 End Process
 
 @Reasoning:
 Trivial random-access reader; lists store their item pointer array at
-offset 16 of the header and items are int64-sized.
+offset 24 of the kind-tagged header and items are int64-sized.
 @End Reasoning
 
 @Implementation:
-Reads the items pointer from offset 16, then reads index * 8 bytes into
+Reads the items pointer from offset 24, then reads index * 8 bytes into
 that array to fetch the requested entry.
 @End Implementation
 
 Process called "list_get" takes list as Integer, index as Integer returns Integer:
     Note: Get item from list by index
 
-    Let items be proc memory_get_int64 from Layout with list, 16
+    Let items be proc memory_get_int64 from Layout with list, 24
     Let item be proc memory_get_int64 from Layout with items, index multiplied by 8
     Return item
 End Process
