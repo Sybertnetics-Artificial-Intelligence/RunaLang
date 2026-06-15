@@ -1,796 +1,1047 @@
-Note: COBOL Semantic Analyzer for Translation Translation System
-Note: Handles COBOL-85 semantic analysis, data structure validation, and business logic verification
+Note:
+COBOL Semantic Analyzer - structure and reference analysis over the parser AST.
+
+This pass walks the binary AST produced by cobol_parser.runa and performs real
+two-phase COBOL-85 semantic analysis:
+
+Phase 1 (collection) records every data-item name declared in the DATA DIVISION
+and every paragraph / section name declared in the PROCEDURE DIVISION, so that a
+PERFORM or GO TO that targets a paragraph defined later in the program still
+resolves, and so a MOVE / COMPUTE can be checked against the full data dictionary
+regardless of definition order.
+
+Phase 2 (validation) walks the program checking real COBOL conditions:
+- IDENTIFICATION DIVISION must be present and must carry a PROGRAM-ID.
+- PROCEDURE DIVISION must be present.
+- Every data item's level number must be a legal COBOL level (01-49 for the
+  regular hierarchy, or 66 / 77 / 88 for the special forms).
+- Every data item's PICTURE clause, when present, must be well formed (no mixed
+  numeric/alphabetic classes, S only in the leading position, at most one implied
+  decimal point, and only valid PICTURE symbols).
+- Every PERFORM and GO TO target paragraph must exist in the procedure name set.
+- Every MOVE source / target and every COMPUTE target identifier must resolve to
+  a declared data item.
+
+The AST is read entirely through the contract documented in cobol_parser.runa: a
+node is a 48-byte record [type @0][name @8][value @16][children @24]
+[child_count @32][metadata @40]; node type is an integer COBOL_* constant; the
+name / value slots hold StringCore lexeme handles; children is a flat array of
+node pointers; keyed attributes ("level", "picture", "operator", ...) are read
+with get_node_attribute. Diagnostics accumulate as message strings on the
+analyzer's error and warning lists rather than aborting the walk, so a single
+malformed construct never suppresses reporting on the rest of the program.
+
+Dependencies:
+- compiler/middle/gungnir/hir/translation/frontends/cobol/cobol_parser.runa
+- compiler/frontend/primitives/memory/layout.runa
+- compiler/frontend/primitives/collections/list.runa
+- compiler/frontend/primitives/core/string_core.runa
+:End Note
 
 Import "compiler/middle/gungnir/hir/translation/frontends/cobol/cobol_parser.runa" as CobolParser
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/collections/list.runa" as ListOps
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+
+Note: ============================================================================
+Note: ANALYZER STATE
+Note: ============================================================================
+
 @Reasoning:
-COBOL's four-division structure (IDENTIFICATION, ENVIRONMENT, DATA, PROCEDURE) and its nested sections (FILE, WORKING-STORAGE, LINKAGE) make per-scope state mandatory; current_division/current_section act as the cursor so cross-cutting validations (e.g., a procedure referencing a working-storage item it can't see) work without re-walking. Separating the three section dictionaries lets symbol resolution honor COBOL's visibility rules.
+The analyzer threads four flat string-handle lists through the two-phase walk:
+data_names (every data item declared in the DATA DIVISION), procedure_names
+(every paragraph and section declared in the PROCEDURE DIVISION), errors, and
+warnings. COBOL has no block scope for data names — WORKING-STORAGE / FILE /
+LINKAGE items and all paragraph labels share one program-wide namespace — so flat
+definition sets exactly model COBOL visibility and keep reference resolution a
+single linear membership test.
 @End Reasoning
 Type called "CobolSemanticAnalyzer":
-    symbol_table as Integer  Note: Map of data items and procedure names
-    current_division as String  Note: Current division being analyzed
-    current_section as String  Note: Current section being analyzed
-    file_descriptions as Integer  Note: Map of file control entries
-    data_definitions as Integer  Note: Map of data item definitions
-    procedure_definitions as Integer  Note: Map of paragraph and section definitions
-    program_structure as Integer  Note: Map tracking program structure
-    error_list as Integer  Note: List of semantic errors
-    warning_list as Integer  Note: List of semantic warnings
-    level_numbers as Integer  Note: Stack of level numbers for data validation
-    working_storage as Integer  Note: Map of working storage items
-    linkage_section as Integer  Note: Map of linkage section items
-    file_section as Integer  Note: Map of file section items
-    copy_books as Integer  Note: Map of included copybooks
+    data_names as Integer        Note: List of declared data-item name handles
+    procedure_names as Integer   Note: List of declared paragraph/section name handles
+    errors as Integer            Note: List of error message strings
+    warnings as Integer          Note: List of warning message strings
 End Type
 
 @Reasoning:
-A COBOL symbol carries far more semantic weight than in modern languages: PICTURE, USAGE, level number, REDEFINES, and OCCURS all participate in compatibility checks. Tracking division/section on the symbol itself is what allows scope-aware validation in deeply nested PROCEDURE DIVISION code.
-@End Reasoning
-Type called "CobolSymbol":
-    name as String
-    symbol_type as String  Note: "data-item", "file", "paragraph", "section", "program"
-    data_type as String  Note: "numeric", "alphabetic", "alphanumeric", "group"
-    level_number as Integer  Note: 01-49, 66, 77, 88 for COBOL data items
-    picture_clause as String  Note: PICTURE specification
-    usage_clause as String  Note: DISPLAY, COMPUTATIONAL, PACKED-DECIMAL, etc.
-    value_clause as String  Note: Initial value if specified
-    occurs_clause as Integer  Note: Number of occurrences (arrays)
-    redefines_item as String  Note: Item being redefined
-    division as String  Note: Division where symbol is defined
-    section as String  Note: Section where symbol is defined
-    line_number as Integer
-    column_number as Integer
-End Type
-
-@Reasoning:
-A data item record captures everything needed for both layout (byte_length, decimal_positions, is_signed) and hierarchy (parent_item, child_items, is_group_item). The level_number drives the hierarchy reconstruction COBOL is famous for: items with higher numbers nest under lower-numbered ancestors until another lower-numbered sibling appears.
-@End Reasoning
-Type called "CobolDataItem":
-    name as String
-    level_number as Integer
-    picture_clause as String
-    usage_clause as String
-    value_clause as String
-    occurs_count as Integer
-    parent_item as String
-    child_items as Integer  Note: List of subordinate items
-    byte_length as Integer  Note: Computed storage size
-    decimal_positions as Integer  Note: Number of decimal places
-    is_signed as Integer  Note: 1 if signed, 0 if unsigned
-    is_group_item as Integer  Note: 1 if group item, 0 if elementary
-End Type
-
-@Reasoning:
-COBOL files are richer than POSIX files: organization (SEQUENTIAL/INDEXED/RELATIVE) and access mode (SEQUENTIAL/RANDOM/DYNAMIC) interact (e.g., RANDOM on a SEQUENTIAL file is illegal), and INDEXED files require a record_key. Storing the SELECT clause text alongside lets the validator point at the user's original wording in error messages.
-@End Reasoning
-Type called "CobolFileDescription":
-    name as String
-    organization as String  Note: SEQUENTIAL, INDEXED, RELATIVE
-    access_mode as String  Note: SEQUENTIAL, RANDOM, DYNAMIC
-    record_key as String  Note: Primary key for indexed files
-    file_status as String  Note: Status field name
-    block_contains as Integer  Note: Block size
-    record_contains as Integer  Note: Record size
-    select_clause as String  Note: Original SELECT statement
-End Type
-
-@Reasoning:
-Fresh per-analysis containers avoid cross-file bleed; we also create a level_numbers stack here (not a dict) because COBOL group-item nesting is intrinsically last-in-first-out as the parser walks 01 -> 02 -> 03 -> ... and pops back when a sibling level appears.
+Allocates a 32-byte analyzer with four freshly-created lists so each analysis run
+starts with empty definition and diagnostic state. Returns 0 on allocation
+failure so callers can guard.
 @End Reasoning
 Process called "create_cobol_semantic_analyzer" returns Integer:
-    Note: Create new COBOL semantic analyzer instance
+    Note: Create a fresh COBOL semantic analyzer
 
-    Let analyzer be a value of type CobolSemanticAnalyzer with
-        symbol_table as proc create_dict,
-        current_division as "",
-        current_section as "",
-        file_descriptions as proc create_dict,
-        data_definitions as proc create_dict,
-        procedure_definitions as proc create_dict,
-        program_structure as proc create_dict,
-        error_list as proc create_list,
-        warning_list as proc create_list,
-        level_numbers as proc create_stack,
-        working_storage as proc create_dict,
-        linkage_section as proc create_dict,
-        file_section as proc create_dict,
-        copy_books as proc create_dict
+    Let analyzer be proc allocate from Layout with 32
+    If analyzer is equal to 0:
+        Return 0
+    End If
 
-    Note: Initialize COBOL built-in features
-    proc initialize_cobol_builtins from analyzer
+    Let data_names be proc create from ListOps
+    proc memory_set_int64 from Layout with analyzer, 0, data_names
+
+    Let procedure_names be proc create from ListOps
+    proc memory_set_int64 from Layout with analyzer, 8, procedure_names
+
+    Let errors be proc create from ListOps
+    proc memory_set_int64 from Layout with analyzer, 16, errors
+
+    Let warnings be proc create from ListOps
+    proc memory_set_int64 from Layout with analyzer, 24, warnings
 
     Return analyzer
 End Process
 
 @Reasoning:
-The dispatch table covers all 25+ COBOL statement and section nodes; the size of the Match reflects COBOL's verbosity (each verb has its own statement form) and the importance of validating each in its own context (MOVE has different rules from COMPUTE which has different rules from PERFORM). Otherwise -> analyze_children ensures unknown nodes never skip sub-analysis.
+Releases the analyzer struct. The four lists are borrowed by callers that may read
+diagnostics afterward, so only the 32-byte struct is freed here; callers own the
+analysis lifetime.
 @End Reasoning
-@Security_Scope:
-Input AST is untrusted; per-statement validators emit errors via add_semantic_error without aborting the analyzer, so a single malformed statement cannot prevent error reporting on the rest of the program.
-@End Security_Scope
-Process called "analyze_cobol_ast" takes analyzer as Integer, ast as Integer returns Integer:
-    Note: Perform complete semantic analysis of COBOL AST
-
-    Let node_type be proc get_ast_node_type from ast
-
-    Match node_type:
-        When AST_PROGRAM from CobolParser:
-            Return proc analyze_program with analyzer, ast
-        When AST_IDENTIFICATION_DIVISION from CobolParser:
-            Return proc analyze_identification_division with analyzer, ast
-        When AST_ENVIRONMENT_DIVISION from CobolParser:
-            Return proc analyze_environment_division with analyzer, ast
-        When AST_DATA_DIVISION from CobolParser:
-            Return proc analyze_data_division with analyzer, ast
-        When AST_PROCEDURE_DIVISION from CobolParser:
-            Return proc analyze_procedure_division with analyzer, ast
-        When AST_FILE_SECTION from CobolParser:
-            Return proc analyze_file_section with analyzer, ast
-        When AST_WORKING_STORAGE_SECTION from CobolParser:
-            Return proc analyze_working_storage_section with analyzer, ast
-        When AST_LINKAGE_SECTION from CobolParser:
-            Return proc analyze_linkage_section with analyzer, ast
-        When AST_DATA_ITEM from CobolParser:
-            Return proc analyze_data_item with analyzer, ast
-        When AST_MOVE_STATEMENT from CobolParser:
-            Return proc analyze_move_statement with analyzer, ast
-        When AST_ADD_STATEMENT from CobolParser:
-            Return proc analyze_add_statement with analyzer, ast
-        When AST_SUBTRACT_STATEMENT from CobolParser:
-            Return proc analyze_subtract_statement with analyzer, ast
-        When AST_MULTIPLY_STATEMENT from CobolParser:
-            Return proc analyze_multiply_statement with analyzer, ast
-        When AST_DIVIDE_STATEMENT from CobolParser:
-            Return proc analyze_divide_statement with analyzer, ast
-        When AST_COMPUTE_STATEMENT from CobolParser:
-            Return proc analyze_compute_statement with analyzer, ast
-        When AST_IF_STATEMENT from CobolParser:
-            Return proc analyze_if_statement with analyzer, ast
-        When AST_PERFORM_STATEMENT from CobolParser:
-            Return proc analyze_perform_statement with analyzer, ast
-        When AST_CALL_STATEMENT from CobolParser:
-            Return proc analyze_call_statement with analyzer, ast
-        When AST_DISPLAY_STATEMENT from CobolParser:
-            Return proc analyze_display_statement with analyzer, ast
-        When AST_ACCEPT_STATEMENT from CobolParser:
-            Return proc analyze_accept_statement with analyzer, ast
-        When AST_OPEN_STATEMENT from CobolParser:
-            Return proc analyze_open_statement with analyzer, ast
-        When AST_CLOSE_STATEMENT from CobolParser:
-            Return proc analyze_close_statement with analyzer, ast
-        When AST_READ_STATEMENT from CobolParser:
-            Return proc analyze_read_statement with analyzer, ast
-        When AST_WRITE_STATEMENT from CobolParser:
-            Return proc analyze_write_statement with analyzer, ast
-        When AST_EVALUATE_STATEMENT from CobolParser:
-            Return proc analyze_evaluate_statement with analyzer, ast
-        When AST_GO_TO_STATEMENT from CobolParser:
-            Return proc analyze_go_to_statement with analyzer, ast
-        When AST_STOP_STATEMENT from CobolParser:
-            Return proc analyze_stop_statement with analyzer, ast
-        When AST_EXIT_STATEMENT from CobolParser:
-            Return proc analyze_exit_statement with analyzer, ast
-        Otherwise:
-            Return proc analyze_children with analyzer, ast
-    End Match
-End Process
-
-@Reasoning:
-COBOL-85 mandates IDENTIFICATION DIVISION and PROCEDURE DIVISION (others are optional). We track presence flags during the single child-walk so the post-walk validation reports each missing division individually with one error each. ENVIRONMENT/DATA are not flagged because their absence is legal for trivial programs.
-@End Reasoning
-Process called "analyze_program" takes analyzer as Integer, ast as Integer returns Integer:
-    Note: Analyze complete COBOL program structure
-
-    Note: COBOL programs must have all four divisions
-    Let has_identification be 0
-    Let has_environment be 0
-    Let has_data be 0
-    Let has_procedure be 0
-
-    Note: Analyze each division
-    Let child_count be proc get_ast_child_count from ast
-    Let index be 0
-
-    While index is less than child_count:
-        Let child be proc get_ast_child with ast, index
-        Let child_type be proc get_ast_node_type from child
-
-        Match child_type:
-            When AST_IDENTIFICATION_DIVISION from CobolParser:
-                Set has_identification to 1
-                proc analyze_cobol_ast with analyzer, child
-            When AST_ENVIRONMENT_DIVISION from CobolParser:
-                Set has_environment to 1
-                proc analyze_cobol_ast with analyzer, child
-            When AST_DATA_DIVISION from CobolParser:
-                Set has_data to 1
-                proc analyze_cobol_ast with analyzer, child
-            When AST_PROCEDURE_DIVISION from CobolParser:
-                Set has_procedure to 1
-                proc analyze_cobol_ast with analyzer, child
-            Otherwise:
-                proc analyze_cobol_ast with analyzer, child
-        End Match
-
-        Set index to index plus 1
-    End While
-
-    Note: Validate program structure
-    If has_identification is equal to 0:
-        proc add_semantic_error with analyzer, "Missing IDENTIFICATION DIVISION", ast
+Process called "destroy_cobol_semantic_analyzer" takes analyzer as Integer returns Integer:
+    If analyzer is equal to 0:
+        Return 1
     End If
-
-    If has_procedure is equal to 0:
-        proc add_semantic_error with analyzer, "Missing PROCEDURE DIVISION", ast
-    End If
-
-    Note: Perform cross-division validation
-    proc validate_program_consistency from analyzer
-
+    proc deallocate from Layout with analyzer
     Return 1
 End Process
 
-@Reasoning:
-The DATA division sets analyzer.current_division so child validators (analyze_data_item, file-section validators) can tag every symbol with its division of origin. validate_data_structure_consistency runs once after all sections are absorbed so inter-section checks (e.g., REDEFINES targeting the wrong section) see the complete picture.
-@End Reasoning
-Process called "analyze_data_division" takes analyzer as Integer, ast as Integer returns Integer:
-    Note: Analyze DATA DIVISION with complete data structure validation
-
-    Set analyzer.current_division to "DATA"
-
-    Note: Process each section in DATA DIVISION
-    Let child_count be proc get_ast_child_count from ast
-    Let index be 0
-
-    While index is less than child_count:
-        Let child be proc get_ast_child with ast, index
-        proc analyze_cobol_ast with analyzer, child
-        Set index to index plus 1
-    End While
-
-    Note: Validate data structure consistency
-    proc validate_data_structure_consistency from analyzer
-
-    Return 1
-End Process
+Note: ============================================================================
+Note: NODE ACCESSORS
+Note: ============================================================================
 
 @Reasoning:
-Level numbers are constrained by the COBOL-85 spec to 01-49 (regular hierarchy), 66 (RENAMES), 77 (independent elementary), or 88 (condition name). The dual-condition check (range OR special) reflects exactly that disjunction; rejecting out-of-range values catches the most common COBOL parse-tolerance error. PICTURE/USAGE/VALUE/OCCURS each go to dedicated validators because their syntaxes are independent.
+Reads a node's integer type constant from offset 0; null-guards the node so a
+missing child never dereferences a null pointer.
 @End Reasoning
-Process called "analyze_data_item" takes analyzer as Integer, ast as Integer returns Integer:
-    Note: Analyze COBOL data item with complete validation
-
-    Let data_item be a value of type CobolDataItem with
-        name as proc get_ast_attribute with ast, "name",
-        level_number as proc get_ast_attribute with ast, "level",
-        picture_clause as proc get_ast_attribute with ast, "picture",
-        usage_clause as proc get_ast_attribute with ast, "usage",
-        value_clause as proc get_ast_attribute with ast, "value",
-        occurs_count as proc get_ast_attribute with ast, "occurs",
-        parent_item as "",
-        child_items as proc create_list,
-        byte_length as 0,
-        decimal_positions as 0,
-        is_signed as 0,
-        is_group_item as 0
-
-    Note: Validate level number
-    If data_item.level_number is less than 1 or data_item.level_number is greater than 49:
-        If data_item.level_number is not equal to 66 and data_item.level_number is not equal to 77 and data_item.level_number is not equal to 88:
-            proc add_semantic_error with analyzer, "Invalid level number", ast
-        End If
-    End If
-
-    Note: Validate PICTURE clause
-    If data_item.picture_clause is not equal to "":
-        proc validate_picture_clause with analyzer, data_item.picture_clause, ast
-        proc compute_data_item_size with analyzer, data_item
-    End If
-
-    Note: Validate USAGE clause
-    If data_item.usage_clause is not equal to "":
-        proc validate_usage_clause with analyzer, data_item.usage_clause, ast
-    End If
-
-    Note: Validate VALUE clause
-    If data_item.value_clause is not equal to "":
-        proc validate_value_clause with analyzer, data_item, ast
-    End If
-
-    Note: Handle OCCURS clause (arrays)
-    If data_item.occurs_count is greater than 0:
-        proc validate_occurs_clause with analyzer, data_item, ast
-    End If
-
-    Note: Determine if group or elementary item
-    proc determine_item_type with analyzer, data_item, ast
-
-    Note: Add to appropriate section
-    proc add_data_item_to_section with analyzer, data_item
-
-    Note: Validate level number hierarchy
-    proc validate_level_hierarchy with analyzer, data_item, ast
-
-    Return 1
-End Process
-
-@Reasoning:
-MOVE supports multiple targets ("MOVE A TO B C D"); each target gets its own compatibility check because COBOL's MOVE rules vary with both source AND each target type. The source-existence check short-circuits because all targets share the same source, so reporting once is correct.
-@End Reasoning
-Process called "analyze_move_statement" takes analyzer as Integer, ast as Integer returns Integer:
-    Note: Analyze MOVE statement with type compatibility checking
-
-    Let source_field be proc get_ast_attribute with ast, "source"
-    Let target_fields be proc get_ast_attribute with ast, "targets"
-
-    Note: Validate source field exists
-    If proc symbol_exists with analyzer, source_field is equal to 0:
-        proc add_semantic_error with analyzer, "Undefined source field in MOVE", ast
+Process called "node_type_of" takes node as Integer returns Integer:
+    If node is equal to 0:
         Return 0
     End If
-
-    Note: Get source field information
-    Let source_info be proc get_symbol_info with analyzer, source_field
-
-    Note: Validate each target field
-    Let target_count be proc get_list_size from target_fields
-    Let index be 0
-
-    While index is less than target_count:
-        Let target_field be proc get_list_item with target_fields, index
-
-        If proc symbol_exists with analyzer, target_field is equal to 0:
-            proc add_semantic_error with analyzer, "Undefined target field in MOVE", ast
-        Otherwise:
-            Let target_info be proc get_symbol_info with analyzer, target_field
-            proc validate_move_compatibility with analyzer, source_info, target_info, ast
-        End If
-
-        Set index to index plus 1
-    End While
-
-    Return 1
+    Return proc memory_get_int64 from Layout with node, 0
 End Process
 
 @Reasoning:
-COMPUTE requires a numeric target (you cannot COMPUTE into an alphabetic field). We check existence before type so an undefined target yields the more useful "undefined" error rather than a type error against a stale handle.
+Reads a node's name lexeme handle from offset 8 (the identifier for paragraphs,
+sections, data items, PROGRAM-ID, and PERFORM targets).
 @End Reasoning
-Process called "analyze_compute_statement" takes analyzer as Integer, ast as Integer returns Integer:
-    Note: Analyze COMPUTE statement with arithmetic expression validation
-
-    Let target_field be proc get_ast_attribute with ast, "target"
-    Let expression be proc get_ast_attribute with ast, "expression"
-
-    Note: Validate target field exists and is numeric
-    If proc symbol_exists with analyzer, target_field is equal to 0:
-        proc add_semantic_error with analyzer, "Undefined target field in COMPUTE", ast
+Process called "node_name" takes node as Integer returns Integer:
+    If node is equal to 0:
         Return 0
     End If
-
-    Let target_info be proc get_symbol_info with analyzer, target_field
-    If proc is_numeric_field with target_info is equal to 0:
-        proc add_semantic_error with analyzer, "Non-numeric target in COMPUTE", ast
-    End If
-
-    Note: Validate arithmetic expression
-    proc validate_arithmetic_expression with analyzer, expression, ast
-
-    Return 1
+    Return proc memory_get_int64 from Layout with node, 8
 End Process
 
 @Reasoning:
-COBOL IF blocks have separate THEN and ELSE statement lists with no terminator inside the AST (the parser already handles END-IF); we therefore analyze each list as an independent unit. validate_conditional_expression handles the condition shape (class-conditions, relation-conditions, complex-conditions).
+Reads a node's children array pointer from offset 24.
 @End Reasoning
-Process called "analyze_if_statement" takes analyzer as Integer, ast as Integer returns Integer:
-    Note: Analyze IF statement with condition validation
-
-    Let condition be proc get_ast_attribute with ast, "condition"
-    Let then_statements be proc get_ast_attribute with ast, "then_statements"
-    Let else_statements be proc get_ast_attribute with ast, "else_statements"
-
-    Note: Validate condition expression
-    proc validate_conditional_expression with analyzer, condition, ast
-
-    Note: Analyze then statements
-    If then_statements is not equal to 0:
-        proc analyze_statement_list with analyzer, then_statements
-    End If
-
-    Note: Analyze else statements
-    If else_statements is not equal to 0:
-        proc analyze_statement_list with analyzer, else_statements
-    End If
-
-    Return 1
-End Process
-
-@Reasoning:
-PERFORM has four forms (simple, TIMES, UNTIL, VARYING) sharing a common target-procedure attribute; we validate the procedure reference once and then conditionally validate the form-specific clauses (numeric for TIMES, conditional for UNTIL) only when present, so a simple PERFORM never triggers a numeric/conditional validation against an absent expression.
-@End Reasoning
-Process called "analyze_perform_statement" takes analyzer as Integer, ast as Integer returns Integer:
-    Note: Analyze PERFORM statement with procedure reference validation
-
-    Let target_procedure be proc get_ast_attribute with ast, "target"
-    Let perform_type be proc get_ast_attribute with ast, "type"
-    Let times_expression be proc get_ast_attribute with ast, "times"
-    Let until_condition be proc get_ast_attribute with ast, "until"
-
-    Note: Validate target procedure exists
-    If target_procedure is not equal to "":
-        If proc procedure_exists with analyzer, target_procedure is equal to 0:
-            proc add_semantic_error with analyzer, "Undefined procedure in PERFORM", ast
-        End If
-    End If
-
-    Note: Validate PERFORM TIMES expression
-    If times_expression is not equal to "":
-        proc validate_numeric_expression with analyzer, times_expression, ast
-    End If
-
-    Note: Validate PERFORM UNTIL condition
-    If until_condition is not equal to "":
-        proc validate_conditional_expression with analyzer, until_condition, ast
-    End If
-
-    Return 1
-End Process
-
-@Reasoning:
-The FILE SECTION holds FD entries, but file names must also appear in ENVIRONMENT DIVISION's SELECT clause; we cross-check during FD analysis rather than later because the file name is available here without re-traversing. has_select_statement returning false is a warning (not error) because some preprocessors emit FD entries with the SELECT in a separate copybook.
-@End Reasoning
-Process called "analyze_file_section" takes analyzer as Integer, ast as Integer returns Integer:
-    Note: Analyze FILE SECTION with file description validation
-
-    Set analyzer.current_section to "FILE"
-
-    Note: Process each file description
-    Let child_count be proc get_ast_child_count from ast
-    Let index be 0
-
-    While index is less than child_count:
-        Let child be proc get_ast_child with ast, index
-        proc analyze_cobol_ast with analyzer, child
-
-        Note: Validate file has corresponding SELECT statement
-        Let file_name be proc get_ast_attribute with child, "name"
-        If proc has_select_statement with analyzer, file_name is equal to 0:
-            proc add_semantic_warning with analyzer, "File without SELECT statement", child
-        End If
-
-        Set index to index plus 1
-    End While
-
-    Return 1
-End Process
-
-@Reasoning:
-PICTURE syntax has specific invariants: S must be the first character, V may appear at most once, and 9 (numeric) cannot mix with X/A (alpha). We walk the string character-by-character so the error messages point at the exact violation rather than a generic "bad PICTURE". The repetition factor "9(5)" branches to a sub-validator because nested parens require their own parser.
-@End Reasoning
-@Performance_Hints:
-PICTURE strings are typically short (<32 chars); a linear walk is appropriate. Branching on Match is faster than a dispatch table for this small character set.
-@End Performance_Hints
-Process called "validate_picture_clause" takes analyzer as Integer, picture as String, ast as Integer returns Integer:
-    Note: Validate COBOL PICTURE clause syntax and semantics
-
-    If picture is equal to "":
-        proc add_semantic_error with analyzer, "Empty PICTURE clause", ast
+Process called "node_children" takes node as Integer returns Integer:
+    If node is equal to 0:
         Return 0
     End If
+    Return proc memory_get_int64 from Layout with node, 24
+End Process
 
-    Let picture_length be length of picture
-    Let index be 0
-    Let has_digits be 0
-    Let has_alpha be 0
-    Let has_decimal be 0
-
-    Note: Parse PICTURE clause character by character
-    While index is less than picture_length:
-        Let char be proc char_at with picture, index
-
-        Match char:
-            When "9":
-                Set has_digits to 1
-            When "X":
-                Set has_alpha to 1
-            When "A":
-                Set has_alpha to 1
-            When "V":
-                If has_decimal is equal to 1:
-                    proc add_semantic_error with analyzer, "Multiple decimal points in PICTURE", ast
-                End If
-                Set has_decimal to 1
-            When "S":
-                If index is not equal to 0:
-                    proc add_semantic_error with analyzer, "S must be first character in PICTURE", ast
-                End If
-            When "(":
-                Note: Handle repetition factor (e.g., 9(5))
-                proc validate_repetition_factor with analyzer, picture, index, ast
-            Otherwise:
-                Note: Check for other valid PICTURE characters
-                If proc is_valid_picture_char with char is equal to 0:
-                    proc add_semantic_error with analyzer, "Invalid character in PICTURE clause", ast
-                End If
-        End Match
-
-        Set index to index plus 1
-    End While
-
-    Note: Validate PICTURE consistency
-    If has_digits is equal to 1 and has_alpha is equal to 1:
-        proc add_semantic_error with analyzer, "Mixed numeric and alphabetic in PICTURE", ast
+@Reasoning:
+Reads a node's child count from offset 32.
+@End Reasoning
+Process called "node_child_count" takes node as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
     End If
-
-    Return 1
+    Return proc memory_get_int64 from Layout with node, 32
 End Process
 
 @Reasoning:
-COBOL's MOVE compatibility matrix is asymmetric: numeric->alphabetic is forbidden, but numeric->alphanumeric is permitted with formatting (de-edit -> edit). Each combination is handled in a dedicated branch rather than a 2D matrix so the diagnostics name the actual source/target types in user-facing terms. Group moves take a separate path because they're byte-copy operations not subject to type checks.
+Returns the i-th child node pointer, or 0 when the index is out of range or the
+node has no children array. Children are stored as a flat int64 array, so element
+i lives at byte offset i * 8.
 @End Reasoning
-Process called "validate_move_compatibility" takes analyzer as Integer, source as Integer, target as Integer, ast as Integer returns Integer:
-    Note: Validate COBOL MOVE statement type compatibility
-
-    Let source_type be proc get_data_type from source
-    Let target_type be proc get_data_type from target
-    Let source_picture be proc get_picture_clause from source
-    Let target_picture be proc get_picture_clause from target
-
-    Note: COBOL MOVE rules are complex and depend on data types
-    Match source_type:
-        When "numeric":
-            If target_type is equal to "alphabetic":
-                proc add_semantic_error with analyzer, "Cannot move numeric to alphabetic", ast
-            Otherwise If target_type is equal to "alphanumeric":
-                Note: Numeric to alphanumeric is allowed with formatting
-                proc check_numeric_to_alphanumeric_move with analyzer, source, target, ast
-            End If
-        When "alphabetic":
-            If target_type is equal to "numeric":
-                proc add_semantic_error with analyzer, "Cannot move alphabetic to numeric", ast
-            End If
-        When "alphanumeric":
-            If target_type is equal to "numeric":
-                proc check_alphanumeric_to_numeric_move with analyzer, source, target, ast
-            End If
-        When "group":
-            Note: Group moves are always allowed (elementary moves)
-            proc validate_group_move with analyzer, source, target, ast
-    End Match
-
-    Note: Check size compatibility
-    proc check_move_size_compatibility with analyzer, source, target, ast
-
-    Return 1
+Process called "node_child" takes node as Integer, index as Integer returns Integer:
+    Let children be proc node_children with node
+    If children is equal to 0:
+        Return 0
+    End If
+    Let count be proc node_child_count with node
+    If index is less than 0:
+        Return 0
+    End If
+    If index is greater than or equal to count:
+        Return 0
+    End If
+    Let offset be index multiplied by 8
+    Return proc memory_get_int64 from Layout with children, offset
 End Process
 
 @Reasoning:
-Arithmetic validation recurses down a binary tree (left, right, operator) so deeply nested COMPUTE expressions are checked structurally rather than via string parsing. Identifiers must resolve to numeric fields; non-numeric refs short-circuit with a precise error. Literal nodes terminate the recursion without further checks because all numeric literals are arithmetically valid.
+Reads a keyed node attribute ("level", "picture", "operator", ...) through the
+parser's metadata accessor, returning 0 when absent.
 @End Reasoning
-Process called "validate_arithmetic_expression" takes analyzer as Integer, expression as Integer, ast as Integer returns Integer:
-    Note: Validate COBOL arithmetic expression
-
-    Let expr_type be proc get_ast_node_type from expression
-
-    Match expr_type:
-        When AST_BINARY_OPERATION from CobolParser:
-            Let left_operand be proc get_ast_child with expression, 0
-            Let right_operand be proc get_ast_child with expression, 1
-            Let operator be proc get_ast_attribute with expression, "operator"
-
-            proc validate_arithmetic_expression with analyzer, left_operand, ast
-            proc validate_arithmetic_expression with analyzer, right_operand, ast
-
-            Note: Validate operator is arithmetic
-            proc validate_arithmetic_operator with analyzer, operator, ast
-
-        When AST_IDENTIFIER from CobolParser:
-            Let field_name be proc get_ast_attribute with expression, "name"
-            If proc symbol_exists with analyzer, field_name is equal to 0:
-                proc add_semantic_error with analyzer, "Undefined field in expression", ast
-            Otherwise:
-                Let field_info be proc get_symbol_info with analyzer, field_name
-                If proc is_numeric_field with field_info is equal to 0:
-                    proc add_semantic_error with analyzer, "Non-numeric field in arithmetic expression", ast
-                End If
-            End If
-
-        When AST_NUMERIC_LITERAL from CobolParser:
-            Note: Numeric literals are always valid in arithmetic expressions
-            Return 1
-
-        Otherwise:
-            proc add_semantic_error with analyzer, "Invalid expression in arithmetic context", ast
-    End Match
-
-    Return 1
+Process called "node_attr" takes node as Integer, key as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    Return proc get_node_attribute from CobolParser with node, key
 End Process
 
+Note: ============================================================================
+Note: DIAGNOSTICS
+Note: ============================================================================
+
 @Reasoning:
-COBOL's figurative constants (ZERO/SPACE/HIGH-VALUE/etc.) and intrinsic functions (CURRENT-DATE/LENGTH/NUMVAL/etc.) are pre-registered so user code references resolve without "undefined" errors. Singular and plural forms (ZERO/ZEROS/ZEROES) are registered separately because COBOL treats them as distinct identifiers, though they denote the same value.
+Records a semantic error message on the analyzer's error list. Messages are plain
+strings so the downstream driver can present them without knowing the analyzer's
+internal layout.
 @End Reasoning
-Process called "initialize_cobol_builtins" takes analyzer as Integer returns Integer:
-    Note: Initialize built-in COBOL features and functions
-
-    Note: Add figurative constants
-    proc add_figurative_constant with analyzer, "ZERO", "numeric"
-    proc add_figurative_constant with analyzer, "ZEROS", "numeric"
-    proc add_figurative_constant with analyzer, "ZEROES", "numeric"
-    proc add_figurative_constant with analyzer, "SPACE", "alphanumeric"
-    proc add_figurative_constant with analyzer, "SPACES", "alphanumeric"
-    proc add_figurative_constant with analyzer, "HIGH-VALUE", "alphanumeric"
-    proc add_figurative_constant with analyzer, "HIGH-VALUES", "alphanumeric"
-    proc add_figurative_constant with analyzer, "LOW-VALUE", "alphanumeric"
-    proc add_figurative_constant with analyzer, "LOW-VALUES", "alphanumeric"
-    proc add_figurative_constant with analyzer, "QUOTE", "alphanumeric"
-    proc add_figurative_constant with analyzer, "QUOTES", "alphanumeric"
-    proc add_figurative_constant with analyzer, "ALL", "alphanumeric"
-
-    Note: Add intrinsic functions
-    proc add_intrinsic_function with analyzer, "CURRENT-DATE"
-    proc add_intrinsic_function with analyzer, "LENGTH"
-    proc add_intrinsic_function with analyzer, "NUMVAL"
-    proc add_intrinsic_function with analyzer, "NUMVAL-C"
-    proc add_intrinsic_function with analyzer, "UPPER-CASE"
-    proc add_intrinsic_function with analyzer, "LOWER-CASE"
-    proc add_intrinsic_function with analyzer, "REVERSE"
-    proc add_intrinsic_function with analyzer, "MAX"
-    proc add_intrinsic_function with analyzer, "MIN"
-    proc add_intrinsic_function with analyzer, "SUM"
-
+Process called "add_semantic_error" takes analyzer as Integer, message as Integer returns Integer:
+    If analyzer is equal to 0:
+        Return 0
+    End If
+    Let errors be proc memory_get_int64 from Layout with analyzer, 16
+    proc list_append from ListOps with errors, message
     Return 1
 End Process
 
-Note: Helper processes for COBOL semantic analysis
-
 @Reasoning:
-Errors are structured dicts so the downstream diagnostics formatter can sort by line/column and group by severity; the line/column come from the AST node so the user sees a precise pointer into their source.
+Records a semantic warning message on the analyzer's warning list.
 @End Reasoning
-Process called "add_semantic_error" takes analyzer as Integer, message as String, ast as Integer returns Integer:
-    Note: Add semantic error with location information
-
-    Let error be a value of type Dictionary[String, Any] with
-        "message" as message,
-        "line" as proc get_ast_line with ast,
-        "column" as proc get_ast_column with ast,
-        "severity" as "error"
-
-    proc add_to_list with analyzer.error_list, error
+Process called "add_semantic_warning" takes analyzer as Integer, message as Integer returns Integer:
+    If analyzer is equal to 0:
+        Return 0
+    End If
+    Let warnings be proc memory_get_int64 from Layout with analyzer, 24
+    proc list_append from ListOps with warnings, message
     Return 1
 End Process
 
 @Reasoning:
-Warnings share the error record shape but route to a separate list so callers can suppress warnings without losing error semantics; both records carry severity so a future merge into a single diagnostic stream is trivial.
-@End Reasoning
-Process called "add_semantic_warning" takes analyzer as Integer, message as String, ast as Integer returns Integer:
-    Note: Add semantic warning with location information
-
-    Let warning be a value of type Dictionary[String, Any] with
-        "message" as message,
-        "line" as proc get_ast_line with ast,
-        "column" as proc get_ast_column with ast,
-        "severity" as "warning"
-
-    proc add_to_list with analyzer.warning_list, warning
-    Return 1
-End Process
-
-@Reasoning:
-Accessor exposes the error list rather than the analyzer field directly so the underlying representation can later change (e.g., to a deduped set) without breaking callers.
+Returns the accumulated error list for the driver.
 @End Reasoning
 Process called "get_semantic_errors" takes analyzer as Integer returns Integer:
-    Note: Return list of semantic errors
-    Return analyzer.error_list
+    If analyzer is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Layout with analyzer, 16
 End Process
 
 @Reasoning:
-Warning accessor mirrors the error accessor so a single consumer pattern handles both streams.
+Returns the accumulated warning list for the driver.
 @End Reasoning
 Process called "get_semantic_warnings" takes analyzer as Integer returns Integer:
-    Note: Return list of semantic warnings
-    Return analyzer.warning_list
+    If analyzer is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Layout with analyzer, 24
+End Process
+
+Note: ============================================================================
+Note: NAME TABLES
+Note: ============================================================================
+
+@Reasoning:
+Records a declared data-item name into the program-wide data dictionary so a
+later MOVE / COMPUTE reference resolves regardless of definition order. A null or
+empty handle is ignored; duplicate names are tolerated because COBOL permits
+qualified duplicates (the resolver only needs membership, not uniqueness).
+@End Reasoning
+Process called "define_data_name" takes analyzer as Integer, name as Integer returns Integer:
+    If analyzer is equal to 0:
+        Return 0
+    End If
+    If name is equal to 0:
+        Return 0
+    End If
+    Let names be proc memory_get_int64 from Layout with analyzer, 0
+    proc list_append from ListOps with names, name
+    Return 1
 End Process
 
 @Reasoning:
-Symbol resolution walks the four COBOL visibility scopes in order (working-storage, file-section, linkage-section, procedure-names); the order matters for the human-perceived "nearest definition" but here every dict is independent so any order would resolve correctly. We short-circuit on first hit to keep average lookup at O(1) for typical programs where most refs are in working-storage.
+Records a declared paragraph or section name into the procedure name set so a
+PERFORM / GO TO that targets it resolves regardless of definition order.
 @End Reasoning
-Process called "symbol_exists" takes analyzer as Integer, symbol_name as String returns Integer:
-    Note: Check if symbol exists in any scope
+Process called "define_procedure_name" takes analyzer as Integer, name as Integer returns Integer:
+    If analyzer is equal to 0:
+        Return 0
+    End If
+    If name is equal to 0:
+        Return 0
+    End If
+    Let names be proc memory_get_int64 from Layout with analyzer, 8
+    proc list_append from ListOps with names, name
+    Return 1
+End Process
 
-    Note: Check working storage
-    If proc dict_contains with analyzer.working_storage, symbol_name is equal to 1:
+@Reasoning:
+True (1) when a data-item name is present in the program-wide data dictionary.
+Linear scan comparing each declared name with string_equals. COBOL's figurative
+constants (ZERO, SPACE(S), HIGH-VALUE(S), LOW-VALUE(S), QUOTE(S), ALL) are
+always-available literals, so a reference to one resolves without an explicit
+declaration.
+@End Reasoning
+Process called "data_name_defined" takes analyzer as Integer, name as Integer returns Integer:
+    If analyzer is equal to 0:
+        Return 0
+    End If
+    If name is equal to 0:
+        Return 0
+    End If
+
+    If proc is_figurative_constant with name is equal to 1:
         Return 1
     End If
 
-    Note: Check file section
-    If proc dict_contains with analyzer.file_section, symbol_name is equal to 1:
-        Return 1
-    End If
-
-    Note: Check linkage section
-    If proc dict_contains with analyzer.linkage_section, symbol_name is equal to 1:
-        Return 1
-    End If
-
-    Note: Check procedure names
-    If proc dict_contains with analyzer.procedure_definitions, symbol_name is equal to 1:
-        Return 1
-    End If
+    Let names be proc memory_get_int64 from Layout with analyzer, 0
+    Let count be proc list_length from ListOps with names
+    Let i be 0
+    While i is less than count:
+        Let dn be proc list_get from ListOps with names, i
+        Let matches be proc string_equals from StringCore with dn, name
+        If matches is equal to 1:
+            Return 1
+        End If
+        Set i to i plus 1
+    End While
 
     Return 0
 End Process
 
 @Reasoning:
-A field is numeric if its PICTURE contains 9 OR its USAGE is one of the explicit numeric clauses (COMP/COMPUTATIONAL/PACKED-DECIMAL/BINARY). We check PICTURE first because that's the more common case in business code, but both checks must be performed because a field can be USAGE COMP with no PICTURE (BINARY items in some dialects).
+True (1) when a paragraph / section name is present in the procedure name set.
+Linear membership test mirroring data_name_defined.
 @End Reasoning
-Process called "is_numeric_field" takes field_info as Integer returns Integer:
-    Note: Check if field is numeric based on PICTURE clause
-
-    Let picture be proc get_dict_value with field_info, "picture_clause"
-    Let usage be proc get_dict_value with field_info, "usage_clause"
-
-    Note: Check for numeric PICTURE patterns
-    If proc contains with picture, "9" is equal to 1:
-        Return 1
+Process called "procedure_name_defined" takes analyzer as Integer, name as Integer returns Integer:
+    If analyzer is equal to 0:
+        Return 0
+    End If
+    If name is equal to 0:
+        Return 0
     End If
 
-    Note: Check for numeric USAGE clauses
-    If usage is equal to "COMPUTATIONAL" or usage is equal to "COMP" or
-       usage is equal to "PACKED-DECIMAL" or usage is equal to "BINARY":
-        Return 1
-    End If
+    Let names be proc memory_get_int64 from Layout with analyzer, 8
+    Let count be proc list_length from ListOps with names
+    Let i be 0
+    While i is less than count:
+        Let pn be proc list_get from ListOps with names, i
+        Let matches be proc string_equals from StringCore with pn, name
+        If matches is equal to 1:
+            Return 1
+        End If
+        Set i to i plus 1
+    End While
 
     Return 0
 End Process
 
 @Reasoning:
-Storage size depends on USAGE: DISPLAY is one byte per PICTURE character, COMP is platform-dependent binary, PACKED-DECIMAL is half-byte per digit plus sign nibble, BINARY follows the BIN field width. Each computation is a separate function because the rules don't reuse machinery. OCCURS multiplies the result at the end because OCCURS applies to the item's own size, not its constituents.
+True (1) when a name is one of COBOL's figurative constants. These denote
+implicit literal values (all-zeros, all-spaces, the highest/lowest collating
+value, the quote character) and are valid operands anywhere a data item may
+appear, so the resolver must never flag them as undefined. Singular and plural
+spellings are listed separately because COBOL accepts both forms as distinct
+spellings of the same value.
 @End Reasoning
-Process called "compute_data_item_size" takes analyzer as Integer, data_item as Integer returns Integer:
-    Note: Compute storage size of COBOL data item
+Process called "is_figurative_constant" takes name as Integer returns Integer:
+    If name is equal to 0:
+        Return 0
+    End If
+    If proc string_equals from StringCore with name, "ZERO" is equal to 1:
+        Return 1
+    End If
+    If proc string_equals from StringCore with name, "ZEROS" is equal to 1:
+        Return 1
+    End If
+    If proc string_equals from StringCore with name, "ZEROES" is equal to 1:
+        Return 1
+    End If
+    If proc string_equals from StringCore with name, "SPACE" is equal to 1:
+        Return 1
+    End If
+    If proc string_equals from StringCore with name, "SPACES" is equal to 1:
+        Return 1
+    End If
+    If proc string_equals from StringCore with name, "HIGH-VALUE" is equal to 1:
+        Return 1
+    End If
+    If proc string_equals from StringCore with name, "HIGH-VALUES" is equal to 1:
+        Return 1
+    End If
+    If proc string_equals from StringCore with name, "LOW-VALUE" is equal to 1:
+        Return 1
+    End If
+    If proc string_equals from StringCore with name, "LOW-VALUES" is equal to 1:
+        Return 1
+    End If
+    If proc string_equals from StringCore with name, "QUOTE" is equal to 1:
+        Return 1
+    End If
+    If proc string_equals from StringCore with name, "QUOTES" is equal to 1:
+        Return 1
+    End If
+    If proc string_equals from StringCore with name, "ALL" is equal to 1:
+        Return 1
+    End If
+    Return 0
+End Process
 
-    Let picture be data_item.picture_clause
-    Let usage be data_item.usage_clause
-    Let size be 0
+Note: ============================================================================
+Note: NUMERIC LEXEME PARSING
+Note: ============================================================================
 
-    Note: Parse PICTURE clause to determine size
-    If usage is equal to "DISPLAY" or usage is equal to "":
-        Set size to proc compute_display_size from picture
-    Otherwise If usage is equal to "COMPUTATIONAL" or usage is equal to "COMP":
-        Set size to proc compute_computational_size from picture
-    Otherwise If usage is equal to "PACKED-DECIMAL":
-        Set size to proc compute_packed_decimal_size from picture
-    Otherwise If usage is equal to "BINARY":
-        Set size to proc compute_binary_size from picture
+@Reasoning:
+A data item's level number reaches the analyzer as the raw lexeme handle the
+lexer captured (e.g. the two bytes "01"), not as a parsed integer, because the
+parser stores it verbatim under the "level" attribute. Validation needs the
+numeric value, so this converts the leading run of ASCII digits in a
+NUL-terminated lexeme to an integer. A handle of 0 or a lexeme with no leading
+digit yields -1 so the caller can distinguish "absent / malformed" from any legal
+level. Bytes are read with string_char_at; ASCII '0'..'9' are codes 48..57.
+@End Reasoning
+Process called "lexeme_to_int" takes lexeme as Integer returns Integer:
+    If lexeme is equal to 0:
+        Return -1
     End If
 
-    Note: Apply OCCURS clause
-    If data_item.occurs_count is greater than 0:
-        Set size to size multiplied by data_item.occurs_count
+    Let first be proc string_char_at from StringCore with lexeme, 0
+    If first is less than 48:
+        Return -1
+    End If
+    If first is greater than 57:
+        Return -1
     End If
 
-    Set data_item.byte_length to size
-    Return size
+    Let value be 0
+    Let index be 0
+    While 1 is equal to 1:
+        Let ch be proc string_char_at from StringCore with lexeme, index
+        If ch is less than 48:
+            Return value
+        End If
+        If ch is greater than 57:
+            Return value
+        End If
+        Let digit be ch minus 48
+        Set value to value multiplied by 10
+        Set value to value plus digit
+        Set index to index plus 1
+    End While
+
+    Return value
+End Process
+
+Note: ============================================================================
+Note: TOP-LEVEL ANALYSIS
+Note: ============================================================================
+
+@Reasoning:
+Entry point. Performs a two-phase analysis over the COBOL_PROGRAM root and its
+division children. Phase 1 collects every data-item and procedure name so forward
+references (a PERFORM of a paragraph defined later, a MOVE into a field declared
+after the procedure body) resolve. Phase 2 validates division presence and then
+walks every division checking the structural and reference conditions. A null AST
+is a no-op success so the driver can call unconditionally.
+@End Reasoning
+@Security_Scope:
+The input AST is untrusted; every validator records diagnostics via
+add_semantic_error / add_semantic_warning and returns rather than aborting, so a
+malformed subtree cannot prevent analysis of its siblings.
+@End Security_Scope
+Process called "analyze_cobol_ast" takes analyzer as Integer, ast as Integer returns Integer:
+    Note: Two-phase semantic analysis of a parsed COBOL program
+
+    If analyzer is equal to 0:
+        Return 0
+    End If
+    If ast is equal to 0:
+        Return 1
+    End If
+
+    Note: Phase 1 - collect data-item and procedure names for forward references
+    proc collect_definitions with analyzer, ast
+
+    Note: Phase 2 - validate program structure and resolve references
+    proc validate_program with analyzer, ast
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: PHASE 1 - DEFINITION COLLECTION
+Note: ============================================================================
+
+@Reasoning:
+Walks the program root's division children. DATA DIVISION contributes data-item
+names; PROCEDURE DIVISION contributes paragraph and section names. Other
+divisions declare no referenceable names. Recursing per-division keeps the
+collector aligned with COBOL's structure rather than blindly flattening the tree.
+@End Reasoning
+Process called "collect_definitions" takes analyzer as Integer, ast as Integer returns Integer:
+    If ast is equal to 0:
+        Return 1
+    End If
+
+    Let count be proc node_child_count with ast
+    Let i be 0
+    While i is less than count:
+        Let child be proc node_child with ast, i
+        Let child_type be proc node_type_of with child
+
+        If child_type is equal to COBOL_DATA_DIV from CobolParser:
+            proc collect_data_names with analyzer, child
+        End If
+        If child_type is equal to COBOL_PROCEDURE_DIV from CobolParser:
+            proc collect_procedure_names with analyzer, child
+        End If
+
+        Set i to i plus 1
+    End While
+
+    Return 1
 End Process
 
 @Reasoning:
-The 24-byte dictionary header reserves three 8-byte slots (data, size, capacity); entries are appended via set_dict_value which grows the data pointer separately, keeping create_dict O(1) and decoupled from the dict implementation's growth policy.
+Recursively gathers every COBOL_DATA_ITEM name beneath the DATA DIVISION. Data
+items nest (group items contain elementary items as children, and sections wrap
+items), so the walk descends through every node and records the name of each
+data-item node it meets. Non-item nodes (sections, file descriptions) contribute
+no name but are still descended into to reach the items they contain.
 @End Reasoning
-Process called "create_dict" returns Integer:
-    Note: Create dictionary for storage
-    Return proc memory_allocate from Layout with 24
+Process called "collect_data_names" takes analyzer as Integer, node as Integer returns Integer:
+    If node is equal to 0:
+        Return 1
+    End If
+
+    Let nt be proc node_type_of with node
+    If nt is equal to COBOL_DATA_ITEM from CobolParser:
+        Let name be proc node_name with node
+        If name is not equal to 0:
+            proc define_data_name with analyzer, name
+        End If
+    End If
+
+    Let count be proc node_child_count with node
+    Let i be 0
+    While i is less than count:
+        Let child be proc node_child with node, i
+        proc collect_data_names with analyzer, child
+        Set i to i plus 1
+    End While
+
+    Return 1
 End Process
 
 @Reasoning:
-The 16-byte list header (data pointer + size) suffices for an empty list; growing it is deferred to add_to_list which resizes lazily. Most COBOL analyzers create many small lists that stay empty (e.g., child_items on elementary data), so cheap construction matters.
+Recursively gathers every paragraph and section label beneath the PROCEDURE
+DIVISION. A section node contains paragraph children, so recording both the
+section's own name and descending into it captures the full set of PERFORM / GO TO
+targets.
 @End Reasoning
-Process called "create_list" returns Integer:
-    Note: Create list for storage
-    Return proc memory_allocate from Layout with 16
+Process called "collect_procedure_names" takes analyzer as Integer, node as Integer returns Integer:
+    If node is equal to 0:
+        Return 1
+    End If
+
+    Let nt be proc node_type_of with node
+    If nt is equal to COBOL_PARAGRAPH from CobolParser:
+        Let pname be proc node_name with node
+        If pname is not equal to 0:
+            proc define_procedure_name with analyzer, pname
+        End If
+    End If
+    If nt is equal to COBOL_SECTION from CobolParser:
+        Let sname be proc node_name with node
+        If sname is not equal to 0:
+            proc define_procedure_name with analyzer, sname
+        End If
+    End If
+
+    Let count be proc node_child_count with node
+    Let i be 0
+    While i is less than count:
+        Let child be proc node_child with node, i
+        proc collect_procedure_names with analyzer, child
+        Set i to i plus 1
+    End While
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: PHASE 2 - VALIDATION
+Note: ============================================================================
+
+@Reasoning:
+COBOL-85 mandates IDENTIFICATION DIVISION (carrying a PROGRAM-ID) and PROCEDURE
+DIVISION; ENVIRONMENT and DATA are optional. A single scan over the division
+children records which mandatory divisions are present and validates the
+IDENTIFICATION division's PROGRAM-ID, then descends into DATA (level/PICTURE
+checks) and PROCEDURE (reference checks). Missing mandatory divisions are reported
+individually so the user sees each omission.
+@End Reasoning
+Process called "validate_program" takes analyzer as Integer, ast as Integer returns Integer:
+    If ast is equal to 0:
+        Return 1
+    End If
+
+    Let has_identification be 0
+    Let has_procedure be 0
+
+    Let count be proc node_child_count with ast
+    Let i be 0
+    While i is less than count:
+        Let child be proc node_child with ast, i
+        Let child_type be proc node_type_of with child
+
+        If child_type is equal to COBOL_IDENTIFICATION_DIV from CobolParser:
+            Set has_identification to 1
+            proc validate_identification_division with analyzer, child
+        End If
+        If child_type is equal to COBOL_DATA_DIV from CobolParser:
+            proc validate_data_division with analyzer, child
+        End If
+        If child_type is equal to COBOL_PROCEDURE_DIV from CobolParser:
+            Set has_procedure to 1
+            proc validate_procedure_division with analyzer, child
+        End If
+
+        Set i to i plus 1
+    End While
+
+    If has_identification is equal to 0:
+        proc add_semantic_error with analyzer, "Missing IDENTIFICATION DIVISION"
+    End If
+    If has_procedure is equal to 0:
+        proc add_semantic_error with analyzer, "Missing PROCEDURE DIVISION"
+    End If
+
+    Return 1
 End Process
 
 @Reasoning:
-The level_numbers stack tracks COBOL's hierarchy as the parser descends and ascends data items; 16 bytes (top pointer + size) mirrors the list header because the stack is implemented as a list with push/pop semantics. A dedicated constructor signals intent at call sites.
+The parser stores PROGRAM-ID under the IDENTIFICATION division node's name slot.
+COBOL-85 requires PROGRAM-ID, so a division with no name handle is a structural
+error. This is the one IDENTIFICATION-division check with semantic weight; the
+optional AUTHOR / DATE-WRITTEN paragraphs are documentation and carry no
+constraint.
 @End Reasoning
-Process called "create_stack" returns Integer:
-    Note: Create stack for context management
-    Return proc memory_allocate from Layout with 16
+Process called "validate_identification_division" takes analyzer as Integer, node as Integer returns Integer:
+    If node is equal to 0:
+        Return 1
+    End If
+
+    Let program_id be proc node_name with node
+    If program_id is equal to 0:
+        proc add_semantic_error with analyzer, "IDENTIFICATION DIVISION missing PROGRAM-ID"
+    End If
+
+    Return 1
+End Process
+
+@Reasoning:
+Descends the DATA DIVISION validating every data item it contains. The recursion
+mirrors the collector: every COBOL_DATA_ITEM is validated (level number then
+PICTURE) and every node is descended into so nested group / section structure is
+reached.
+@End Reasoning
+Process called "validate_data_division" takes analyzer as Integer, node as Integer returns Integer:
+    If node is equal to 0:
+        Return 1
+    End If
+
+    Let nt be proc node_type_of with node
+    If nt is equal to COBOL_DATA_ITEM from CobolParser:
+        proc validate_data_item with analyzer, node
+    End If
+
+    Let count be proc node_child_count with node
+    Let i be 0
+    While i is less than count:
+        Let child be proc node_child with node, i
+        proc validate_data_division with analyzer, child
+        Set i to i plus 1
+    End While
+
+    Return 1
+End Process
+
+@Reasoning:
+A data item carries a level number (mandatory) and an optional PICTURE clause.
+The level number must be a legal COBOL level: 01-49 for the regular hierarchy, or
+the special independent / renaming / condition forms 66, 77, 88. lexeme_to_int
+returns -1 for a missing or non-numeric level, which is itself an error. When a
+PICTURE is present it is validated for class consistency and symbol legality.
+@End Reasoning
+Process called "validate_data_item" takes analyzer as Integer, node as Integer returns Integer:
+    Let level_lexeme be proc node_attr with node, "level"
+    Let level be proc lexeme_to_int with level_lexeme
+
+    If level is less than 1:
+        proc add_semantic_error with analyzer, "Data item missing or non-numeric level number"
+    Otherwise:
+        If level is greater than 49:
+            If level is not equal to 66:
+                If level is not equal to 77:
+                    If level is not equal to 88:
+                        proc add_semantic_error with analyzer, "Invalid COBOL level number (must be 01-49, 66, 77, or 88)"
+                    End If
+                End If
+            End If
+        End If
+    End If
+
+    Let picture be proc node_attr with node, "picture"
+    If picture is not equal to 0:
+        proc validate_picture_clause with analyzer, picture
+    End If
+
+    Return 1
+End Process
+
+@Reasoning:
+COBOL PICTURE syntax has hard invariants enforced here by a single linear pass
+over the symbol bytes (a PICTURE string is short and NUL-terminated): the sign
+symbol S may appear only as the first character; the implied-decimal symbol V may
+appear at most once; numeric symbols (9) may not be combined with alphabetic
+symbols (A); and only recognised PICTURE symbols may appear. Each violation is
+reported against the offending property so the user sees the precise fault rather
+than a generic rejection. An empty PICTURE handle (a present but zero-length
+clause) is itself invalid.
+@End Reasoning
+@Performance_Hints:
+PICTURE strings are short (typically under 16 symbols); a single byte scan with
+running class flags is optimal and avoids any allocation.
+@End Performance_Hints
+Process called "validate_picture_clause" takes analyzer as Integer, picture as Integer returns Integer:
+    If picture is equal to 0:
+        Return 1
+    End If
+
+    Let pic_length be proc string_length from StringCore with picture
+    If pic_length is equal to 0:
+        proc add_semantic_error with analyzer, "Empty PICTURE clause"
+        Return 1
+    End If
+
+    Let has_numeric be 0
+    Let has_alpha be 0
+    Let decimal_count be 0
+    Let index be 0
+
+    While index is less than pic_length:
+        Let ch be proc string_char_at from StringCore with picture, index
+
+        If ch is equal to 57:
+            Note: '9' numeric digit position
+            Set has_numeric to 1
+        Otherwise:
+            If ch is equal to 88:
+                Note: 'X' alphanumeric position
+                Set has_alpha to 1
+            Otherwise:
+                If ch is equal to 65:
+                    Note: 'A' alphabetic position
+                    Set has_alpha to 1
+                Otherwise:
+                    If ch is equal to 86:
+                        Note: 'V' implied decimal point
+                        Set decimal_count to decimal_count plus 1
+                    Otherwise:
+                        If ch is equal to 83:
+                            Note: 'S' operational sign - legal only first
+                            If index is not equal to 0:
+                                proc add_semantic_error with analyzer, "PICTURE sign S must be the first symbol"
+                            End If
+                        Otherwise:
+                            If proc is_valid_picture_symbol with ch is equal to 0:
+                                proc add_semantic_error with analyzer, "Invalid symbol in PICTURE clause"
+                            End If
+                        End If
+                    End If
+                End If
+            End If
+        End If
+
+        Set index to index plus 1
+    End While
+
+    If decimal_count is greater than 1:
+        proc add_semantic_error with analyzer, "PICTURE clause has more than one implied decimal point (V)"
+    End If
+
+    If has_numeric is equal to 1:
+        If has_alpha is equal to 1:
+            proc add_semantic_error with analyzer, "PICTURE clause mixes numeric and alphabetic classes"
+        End If
+    End If
+
+    Return 1
+End Process
+
+@Reasoning:
+Recognises the remaining legal COBOL PICTURE symbols beyond the class symbols
+(9 / X / A), the sign (S), and the implied decimal (V) handled directly by the
+caller: editing and structural symbols P (decimal scaling), Z (zero suppression),
+the actual decimal point (.), the parenthesised repeat-count delimiters ( and ),
+the digits 0-9 that form a repeat count, the insertion characters comma, slash,
+space (B), and the currency / sign editing symbols $ + - * and CR/DB initials
+C D R. Anything else is rejected by the caller. Comparisons are on ASCII byte
+codes so no per-character string allocation is needed.
+@End Reasoning
+Process called "is_valid_picture_symbol" takes ch as Integer returns Integer:
+    Note: P
+    If ch is equal to 80:
+        Return 1
+    End If
+    Note: Z
+    If ch is equal to 90:
+        Return 1
+    End If
+    Note: B (blank insertion)
+    If ch is equal to 66:
+        Return 1
+    End If
+    Note: . decimal point
+    If ch is equal to 46:
+        Return 1
+    End If
+    Note: , comma insertion
+    If ch is equal to 44:
+        Return 1
+    End If
+    Note: / slash insertion
+    If ch is equal to 47:
+        Return 1
+    End If
+    Note: ( open repeat count
+    If ch is equal to 40:
+        Return 1
+    End If
+    Note: ) close repeat count
+    If ch is equal to 41:
+        Return 1
+    End If
+    Note: $ currency
+    If ch is equal to 36:
+        Return 1
+    End If
+    Note: + plus sign editing
+    If ch is equal to 43:
+        Return 1
+    End If
+    Note: - minus sign editing
+    If ch is equal to 45:
+        Return 1
+    End If
+    Note: * check-protect
+    If ch is equal to 42:
+        Return 1
+    End If
+    Note: C (CR credit symbol)
+    If ch is equal to 67:
+        Return 1
+    End If
+    Note: D (DB debit symbol)
+    If ch is equal to 68:
+        Return 1
+    End If
+    Note: R (second letter of CR)
+    If ch is equal to 82:
+        Return 1
+    End If
+
+    Note: Digits 0-9 forming repeat counts inside parentheses
+    If ch is greater than or equal to 48:
+        If ch is less than or equal to 57:
+            Return 1
+        End If
+    End If
+
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: PROCEDURE DIVISION VALIDATION
+Note: ============================================================================
+
+@Reasoning:
+Walks the PROCEDURE DIVISION recursively dispatching each statement to its
+reference validator. PERFORM and GO TO targets must be declared paragraphs; MOVE
+and COMPUTE operands must be declared data items (or figurative constants). Every
+other node is descended into so statements nested inside paragraphs, sections,
+IF / ELSE bodies, and EVALUATE WHEN clauses are all reached.
+@End Reasoning
+Process called "validate_procedure_division" takes analyzer as Integer, node as Integer returns Integer:
+    If node is equal to 0:
+        Return 1
+    End If
+
+    Let nt be proc node_type_of with node
+
+    If nt is equal to COBOL_PERFORM_STMT from CobolParser:
+        proc validate_perform with analyzer, node
+    End If
+    If nt is equal to COBOL_GO_STMT from CobolParser:
+        proc validate_go_to with analyzer, node
+    End If
+    If nt is equal to COBOL_MOVE_STMT from CobolParser:
+        proc validate_move with analyzer, node
+    End If
+    If nt is equal to COBOL_COMPUTE_STMT from CobolParser:
+        proc validate_compute with analyzer, node
+    End If
+
+    Let count be proc node_child_count with node
+    Let i be 0
+    While i is less than count:
+        Let child be proc node_child with node, i
+        proc validate_procedure_division with analyzer, child
+        Set i to i plus 1
+    End While
+
+    Return 1
+End Process
+
+@Reasoning:
+A PERFORM that names a target paragraph stores that name in the node's name slot
+(the conditional PERFORM UNTIL / VARYING forms carry a condition child instead and
+no name). When a name is present it must resolve to a declared paragraph or
+section; an unresolved target is a genuine control-flow error because the runtime
+would have nowhere to transfer to.
+@End Reasoning
+Process called "validate_perform" takes analyzer as Integer, node as Integer returns Integer:
+    Let target be proc node_name with node
+    If target is equal to 0:
+        Return 1
+    End If
+
+    If proc procedure_name_defined with analyzer, target is equal to 0:
+        proc add_semantic_error with analyzer, "PERFORM targets undefined paragraph"
+    End If
+
+    Return 1
+End Process
+
+@Reasoning:
+GO TO transfers control to a paragraph; its target is parsed into an identifier
+child. The first identifier child names the destination paragraph, which must
+exist in the procedure name set.
+@End Reasoning
+Process called "validate_go_to" takes analyzer as Integer, node as Integer returns Integer:
+    Let target be proc node_name with node
+    If target is equal to 0:
+        Note: The parser may attach the destination as the first identifier child
+        Note: rather than the name slot; resolve it from there when present.
+        Let first_child be proc node_child with node, 0
+        If first_child is equal to 0:
+            Return 1
+        End If
+        Let child_type be proc node_type_of with first_child
+        If child_type is not equal to COBOL_IDENTIFIER from CobolParser:
+            Return 1
+        End If
+        Set target to proc node_name with first_child
+        If target is equal to 0:
+            Return 1
+        End If
+    End If
+
+    If proc procedure_name_defined with analyzer, target is equal to 0:
+        proc add_semantic_error with analyzer, "GO TO targets undefined paragraph"
+    End If
+
+    Return 1
+End Process
+
+@Reasoning:
+MOVE stores its source as the first child and each destination as a subsequent
+child, all parsed as COBOL_IDENTIFIER (or literal / figurative) expression nodes.
+Every identifier operand must resolve to a declared data item; literals and
+figurative constants carry their value in the value slot (no name) and need no
+declaration, so only name-bearing identifier children are checked.
+@End Reasoning
+Process called "validate_move" takes analyzer as Integer, node as Integer returns Integer:
+    Let count be proc node_child_count with node
+    Let i be 0
+    While i is less than count:
+        Let operand be proc node_child with node, i
+        proc validate_identifier_reference with analyzer, operand
+        Set i to i plus 1
+    End While
+
+    Return 1
+End Process
+
+@Reasoning:
+COMPUTE stores its result variable as the first child and the arithmetic
+expression tree as the second. The result identifier must resolve to a declared
+data item; the expression is walked recursively so every identifier leaf inside
+it is also checked. Validating the whole subtree catches references in deeply
+nested arithmetic, not just the top-level result.
+@End Reasoning
+Process called "validate_compute" takes analyzer as Integer, node as Integer returns Integer:
+    Let count be proc node_child_count with node
+    Let i be 0
+    While i is less than count:
+        Let child be proc node_child with node, i
+        proc validate_expression_references with analyzer, child
+        Set i to i plus 1
+    End While
+
+    Return 1
+End Process
+
+@Reasoning:
+Recursively checks every identifier leaf in an arithmetic expression subtree. A
+COBOL_IDENTIFIER must resolve to a declared data item; a COBOL_ARITHMETIC_EXPR
+holds operand children that are recursed into; literals terminate the recursion
+because every literal is a valid operand. This lets COMPUTE validation cover the
+entire right-hand side rather than only its root.
+@End Reasoning
+Process called "validate_expression_references" takes analyzer as Integer, node as Integer returns Integer:
+    If node is equal to 0:
+        Return 1
+    End If
+
+    Let nt be proc node_type_of with node
+    If nt is equal to COBOL_IDENTIFIER from CobolParser:
+        proc validate_identifier_reference with analyzer, node
+        Return 1
+    End If
+
+    Let count be proc node_child_count with node
+    Let i be 0
+    While i is less than count:
+        Let child be proc node_child with node, i
+        proc validate_expression_references with analyzer, child
+        Set i to i plus 1
+    End While
+
+    Return 1
+End Process
+
+@Reasoning:
+Checks a single operand node: only COBOL_IDENTIFIER nodes name data items that
+must be declared. Literal and figurative-constant nodes carry no name slot (their
+content is in the value slot) and require no declaration, so they pass silently.
+An identifier whose name does not resolve to a declared data item or figurative
+constant is reported as an undefined-reference error.
+@End Reasoning
+Process called "validate_identifier_reference" takes analyzer as Integer, node as Integer returns Integer:
+    If node is equal to 0:
+        Return 1
+    End If
+
+    Let nt be proc node_type_of with node
+    If nt is not equal to COBOL_IDENTIFIER from CobolParser:
+        Return 1
+    End If
+
+    Let name be proc node_name with node
+    If name is equal to 0:
+        Return 1
+    End If
+
+    If proc data_name_defined with analyzer, name is equal to 0:
+        proc add_semantic_error with analyzer, "Reference to undefined data item"
+    End If
+
+    Return 1
 End Process

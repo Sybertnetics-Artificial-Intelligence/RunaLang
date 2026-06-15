@@ -104,6 +104,12 @@ Constant COBOL_RELATIONAL_EXPR as Integer is 6073
 Constant COBOL_LOGICAL_EXPR as Integer is 6074
 Constant COBOL_FIGURATIVE_CONST as Integer is 6075
 
+Note: Arithmetic Statement Clauses
+Constant COBOL_ROUNDED_CLAUSE as Integer is 6080
+Constant COBOL_ON_SIZE_ERROR as Integer is 6081
+Constant COBOL_REMAINDER_CLAUSE as Integer is 6082
+Constant COBOL_OTHER_CLAUSE as Integer is 6083
+
 Note: ============================================================================
 Note: Parser Structure
 Note: ============================================================================
@@ -152,7 +158,7 @@ Process called "create_cobol_parser" takes source as Integer, arena as Integer r
     so we'll track current division context during parsing.
     @End Reasoning
 
-    Let parser_size be 40  Note: 5 fields × 8 bytes
+    Let parser_size be 48  Note: 6 fields × 8 bytes
     Let parser be proc allocate from Layout with parser_size
 
     If parser is equal to 0:
@@ -171,6 +177,7 @@ Process called "create_cobol_parser" takes source as Integer, arena as Integer r
     proc memory_set_int64 from Layout with parser, 16, 0   Note: previous_token
     proc memory_set_int64 from Layout with parser, 24, 0   Note: error_count
     proc memory_set_int64 from Layout with parser, 32, arena
+    proc memory_set_int64 from Layout with parser, 40, 0   Note: error_list
 
     Let first_token be proc next_token from Lexer with lexer
     proc memory_set_int64 from Layout with parser, 8, first_token
@@ -296,10 +303,133 @@ Reads current token type via peek_token_type, returns 1 on match and 0
 otherwise. Constant time, no allocation.
 @End Implementation
 
+@Reasoning:
+Bounded backtracking support. A parser position captures everything needed to
+resume scanning from the current point: a snapshot of the underlying lexer scan
+state plus the parser's current_token and previous_token pointers. The COBOL
+grammar needs this to disambiguate a paragraph header (identifier immediately
+followed by a period) from an ordinary statement and to detect multi-word
+clauses like ON SIZE ERROR without committing to a parse.
+@End Reasoning
+@Implementation:
+The position record is a 24-byte block: lexer snapshot pointer (offset 0),
+saved current_token (offset 8), saved previous_token (offset 16). It is freed
+by set_parser_position, which restores the lexer and both token slots.
+@End Implementation
+Process called "get_parser_position" takes parser as Integer returns Integer:
+    Note: Capture the current parse position into a caller-owned record
+
+    If parser is equal to 0:
+        Return 0
+    End If
+
+    Let record be proc allocate from Layout with 24
+    If record is equal to 0:
+        Return 0
+    End If
+
+    Let lexer be proc memory_get_int64 from Layout with parser, 0
+    Let lexer_snapshot be proc save_lexer_state from Lexer with lexer
+    Let current_token be proc memory_get_int64 from Layout with parser, 8
+    Let previous_token be proc memory_get_int64 from Layout with parser, 16
+
+    proc memory_set_int64 from Layout with record, 0, lexer_snapshot
+    proc memory_set_int64 from Layout with record, 8, current_token
+    proc memory_set_int64 from Layout with record, 16, previous_token
+
+    Return record
+End Process
+
+@Reasoning:
+Rewind the parser to a saved position and release the position record. After
+this call the parser observes exactly the token it observed when the position
+was captured, and subsequent advance_token calls re-scan from that point.
+@End Reasoning
+Process called "set_parser_position" takes parser as Integer, record as Integer returns Integer:
+    Note: Restore a saved parse position and free the position record
+
+    If parser is equal to 0:
+        Return 0
+    End If
+
+    If record is equal to 0:
+        Return 0
+    End If
+
+    Let lexer_snapshot be proc memory_get_int64 from Layout with record, 0
+    Let current_token be proc memory_get_int64 from Layout with record, 8
+    Let previous_token be proc memory_get_int64 from Layout with record, 16
+
+    Let lexer be proc memory_get_int64 from Layout with parser, 0
+    proc restore_lexer_state from Lexer with lexer, lexer_snapshot
+
+    proc memory_set_int64 from Layout with parser, 8, current_token
+    proc memory_set_int64 from Layout with parser, 16, previous_token
+
+    proc deallocate from Layout with record
+
+    Return 1
+End Process
+
+@Reasoning:
+Single-token look-ahead: report the type of the token that follows the current
+one without consuming either. Implemented by snapshotting, advancing once,
+reading the type, and restoring — the streaming lexer is rewound so the parse
+is left exactly where it began.
+@End Reasoning
+Process called "peek_next_token_type" takes parser as Integer returns Integer:
+    Note: Get the type of the next token without consuming the current one
+
+    If parser is equal to 0:
+        Return TOKEN_EOF from Lexer
+    End If
+
+    Let saved be proc get_parser_position with parser
+    proc advance_token with parser
+    Let next_type be proc peek_token_type with parser
+    proc set_parser_position with parser, saved
+
+    Return next_type
+End Process
+
+@Reasoning:
+Single-token look-ahead that returns the next token record itself (not just its
+type) so callers can inspect its fields. Used to detect ON SIZE ERROR: when the
+current token is ON, the parser checks whether the following token is SIZE
+before committing to the clause. The position argument is accepted for call-site
+symmetry; this streaming parser supports one token of look-ahead, so the
+returned token is always the one immediately after the current token.
+@End Reasoning
+@Implementation:
+Snapshots the parser position, advances once, reads the current_token pointer
+(which the next-token pull made the look-ahead token), then restores the
+position. The returned token pointer is arena-allocated and outlives the
+rewind, so the caller may safely read its type at offset 0.
+@End Implementation
+Process called "get_token_at" takes parser as Integer, position as Integer returns Integer:
+    Note: Return the token immediately following the current token
+
+    If parser is equal to 0:
+        Return 0
+    End If
+
+    Let saved be proc get_parser_position with parser
+    proc advance_token with parser
+    Let lookahead_token be proc memory_get_int64 from Layout with parser, 8
+    proc set_parser_position with parser, saved
+
+    Return lookahead_token
+End Process
+
+@Reasoning:
+Predicate form of peek_token_type. Returning a clean 0/1 boolean lets
+recursive-descent predicates compose without comparing to a token constant
+inline.
+@End Reasoning
 Process called "check_token_type" takes parser as Integer, expected as Integer returns Integer:
     Note: Check if current token matches expected type
 
-    Let token_type be proc peek_token_type from parser
+    Let token_type be proc peek_token_type with parser
 
     If token_type is equal to expected:
         Return 1
@@ -324,14 +454,14 @@ Process called "expect_token" takes parser as Integer, expected as Integer, erro
     report error if mismatch. Essential for predictable parsing.
     @End Reasoning
 
-    Let token_type be proc peek_token_type from parser
+    Let token_type be proc peek_token_type with parser
 
     If token_type is not equal to expected:
         proc report_parse_error with parser, error_msg
         Return 0
     End If
 
-    proc advance_token from parser
+    proc advance_token with parser
 
     Return 1
 End Process
@@ -340,7 +470,8 @@ End Process
 Records a structured error: increments error_count (offset 24), captures
 the current token's line/column for position reporting, builds a 32-byte
 error_record (message, line, col, raw token), and appends to the parser's
-errors list (allocated lazily on first error at offset 32 of the parser).
+errors list (allocated lazily on first error at offset 40 of the parser;
+offset 32 holds the arena handle).
 Lazy list allocation matters because most parses run with no errors at
 all and a never-allocated list saves both memory and startup time.
 @End Reasoning
@@ -368,17 +499,72 @@ Process called "report_parse_error" takes parser as Integer, message as Integer 
     proc memory_set_int64 from Layout with error_record, 16, column_number
     proc memory_set_int64 from Layout with error_record, 24, current_token
 
-    Note: Add to parser's error list
-    Let errors_list be proc memory_get_int64 from Layout with parser, 32
+    Note: Add to parser's error list (offset 40; offset 32 holds the arena)
+    Let errors_list be proc memory_get_int64 from Layout with parser, 40
     If errors_list is equal to 0:
-        Set errors_list to proc allocate from Layout with 16
-        proc memory_set_int64 from Layout with errors_list, 0, 0  Note: count
-        proc memory_set_int64 from Layout with errors_list, 8, 0  Note: capacity
-        proc memory_set_int64 from Layout with parser, 32, errors_list
+        Set errors_list to proc allocate from Layout with 24
+        proc memory_set_int64 from Layout with errors_list, 0, 0   Note: count
+        proc memory_set_int64 from Layout with errors_list, 8, 0   Note: capacity
+        proc memory_set_int64 from Layout with errors_list, 16, 0  Note: items pointer
+        proc memory_set_int64 from Layout with parser, 40, errors_list
     End If
 
     Note: Add error to list
     proc add_to_error_list with errors_list, error_record
+
+    Return 1
+End Process
+
+@Reasoning:
+Appends a parse-error record to the parser's diagnostic list, growing the
+backing item array on demand. The list header is a 24-byte block: count
+(offset 0), capacity (offset 8), and a pointer to an int64 array of error
+record pointers (offset 16). Errors accumulate so the driver can report every
+diagnostic from a single parse rather than aborting on the first.
+@End Reasoning
+@Implementation:
+Capacity starts at 4 and doubles when full; growth allocates a fresh array,
+copies the populated prefix with memory_copy (dest, src, byte_length), frees
+the old array, and updates the header. The new record pointer is stored at the
+next free slot and the count is incremented.
+@End Implementation
+Process called "add_to_error_list" takes errors_list as Integer, error_record as Integer returns Integer:
+    Note: Append an error record to the diagnostic list, growing as needed
+
+    If errors_list is equal to 0:
+        Return 0
+    End If
+
+    Let count be proc memory_get_int64 from Layout with errors_list, 0
+    Let capacity be proc memory_get_int64 from Layout with errors_list, 8
+    Let items be proc memory_get_int64 from Layout with errors_list, 16
+
+    If count is greater than or equal to capacity:
+        Let new_capacity be 4
+        If capacity is greater than 0:
+            Set new_capacity to capacity multiplied by 2
+        End If
+
+        Let new_bytes be new_capacity multiplied by 8
+        Let new_items be proc allocate from Layout with new_bytes
+        If new_items is equal to 0:
+            Return 0
+        End If
+
+        If items is not equal to 0:
+            Let old_bytes be count multiplied by 8
+            proc memory_copy from Layout with new_items, items, old_bytes
+            proc deallocate from Layout with items
+        End If
+
+        Set items to new_items
+        proc memory_set_int64 from Layout with errors_list, 8, new_capacity
+        proc memory_set_int64 from Layout with errors_list, 16, items
+    End If
+
+    Let slot_offset be count multiplied by 8
+    proc memory_set_int64 from Layout with items, slot_offset, error_record
+    proc memory_set_int64 from Layout with errors_list, 0, count plus 1
 
     Return 1
 End Process
@@ -524,12 +710,21 @@ from per-statement parsers.
 @End Reasoning
 
 Process called "set_node_attribute" takes node as Integer, key as Integer, value as Integer returns Integer:
-    Note: Set node attribute (metadata)
+    Note: Set node attribute (keyed metadata)
 
     @Reasoning:
-    Store metadata as key-value pair for additional node information
-    (e.g., "async" flag, "static" flag, line numbers).
+    A node carries an arbitrary number of named attributes (e.g. a data item's
+    "level" and "picture", or future "usage"/"occurs" flags). The metadata slot
+    (node offset 40) holds a growing keyed store rather than a single pair so
+    that multiple attributes coexist instead of the second write being dropped.
     @End Reasoning
+    @Implementation:
+    The store is a 24-byte header — count (offset 0), capacity (offset 8), and a
+    pointer to an array of 16-byte [key, value] entries (offset 16). Capacity
+    starts at 4 and doubles when full; growth copies the populated prefix with
+    memory_copy (in bytes), frees the old entry array, and rewires the header.
+    Setting an existing key overwrites its value in place.
+    @End Implementation
 
     If node is equal to 0:
         Return 0
@@ -538,14 +733,107 @@ Process called "set_node_attribute" takes node as Integer, key as Integer, value
     Let metadata be proc memory_get_int64 from Layout with node, 40
 
     If metadata is equal to 0:
-        Let new_metadata be proc allocate from Layout with 16
-        proc memory_set_int64 from Layout with new_metadata, 0, key
-        proc memory_set_int64 from Layout with new_metadata, 8, value
-        proc memory_set_int64 from Layout with node, 40, new_metadata
-        Return 1
+        Set metadata to proc allocate from Layout with 24
+        If metadata is equal to 0:
+            Return 0
+        End If
+        proc memory_set_int64 from Layout with metadata, 0, 0   Note: count
+        proc memory_set_int64 from Layout with metadata, 8, 0   Note: capacity
+        proc memory_set_int64 from Layout with metadata, 16, 0  Note: entries pointer
+        proc memory_set_int64 from Layout with node, 40, metadata
     End If
 
+    Let count be proc memory_get_int64 from Layout with metadata, 0
+    Let capacity be proc memory_get_int64 from Layout with metadata, 8
+    Let entries be proc memory_get_int64 from Layout with metadata, 16
+
+    Note: Overwrite the value if the key already exists
+    Let scan be 0
+    While scan is less than count:
+        Let entry_offset be scan multiplied by 16
+        Let existing_key be proc memory_get_int64 from Layout with entries, entry_offset
+        If existing_key is not equal to 0:
+            Let same be proc string_equals from StringCore with existing_key, key
+            If same is equal to 1:
+                Let value_offset be entry_offset plus 8
+                proc memory_set_int64 from Layout with entries, value_offset, value
+                Return 1
+            End If
+        End If
+        Set scan to scan plus 1
+    End While
+
+    If count is greater than or equal to capacity:
+        Let new_capacity be 4
+        If capacity is greater than 0:
+            Set new_capacity to capacity multiplied by 2
+        End If
+
+        Let new_bytes be new_capacity multiplied by 16
+        Let new_entries be proc allocate from Layout with new_bytes
+        If new_entries is equal to 0:
+            Return 0
+        End If
+
+        If entries is not equal to 0:
+            Let old_bytes be count multiplied by 16
+            proc memory_copy from Layout with new_entries, entries, old_bytes
+            proc deallocate from Layout with entries
+        End If
+
+        Set entries to new_entries
+        proc memory_set_int64 from Layout with metadata, 8, new_capacity
+        proc memory_set_int64 from Layout with metadata, 16, entries
+    End If
+
+    Let slot_offset be count multiplied by 16
+    proc memory_set_int64 from Layout with entries, slot_offset, key
+    Let slot_value_offset be slot_offset plus 8
+    proc memory_set_int64 from Layout with entries, slot_value_offset, value
+    proc memory_set_int64 from Layout with metadata, 0, count plus 1
+
     Return 1
+End Process
+
+@Reasoning:
+Reader counterpart to set_node_attribute: returns the value stored under a
+named attribute, or 0 when the node has no metadata or the key is absent.
+Used by the HIR lowering to recover a data item's level and picture without
+relying on a fixed slot offset.
+@End Reasoning
+Process called "get_node_attribute" takes node as Integer, key as Integer returns Integer:
+    Note: Look up a keyed node attribute, or 0 if absent
+
+    If node is equal to 0:
+        Return 0
+    End If
+
+    Let metadata be proc memory_get_int64 from Layout with node, 40
+    If metadata is equal to 0:
+        Return 0
+    End If
+
+    Let count be proc memory_get_int64 from Layout with metadata, 0
+    Let entries be proc memory_get_int64 from Layout with metadata, 16
+    If entries is equal to 0:
+        Return 0
+    End If
+
+    Let scan be 0
+    While scan is less than count:
+        Let entry_offset be scan multiplied by 16
+        Let existing_key be proc memory_get_int64 from Layout with entries, entry_offset
+        If existing_key is not equal to 0:
+            Let same be proc string_equals from StringCore with existing_key, key
+            If same is equal to 1:
+                Let value_offset be entry_offset plus 8
+                Return proc memory_get_int64 from Layout with entries, value_offset
+            End If
+        End If
+        Set scan to scan plus 1
+    End While
+
+    Return 0
 End Process
 
 Note: ============================================================================
@@ -576,42 +864,45 @@ Process called "parse_cobol" takes source as Integer returns Integer:
         Return 0
     End If
 
-    Let program be proc create_ast_node from COBOL_PROGRAM
+    Let program be proc create_ast_node with COBOL_PROGRAM
 
     Note: Parse IDENTIFICATION DIVISION (required)
-    Let id_div be proc parse_identification_division from parser
+    Let id_div be proc parse_identification_division with parser
     If id_div is not equal to 0:
         proc add_node_child with program, id_div
     End If
 
     Note: Parse ENVIRONMENT DIVISION (optional)
-    Let token_type be proc peek_token_type from parser
+    Let token_type be proc peek_token_type with parser
     If token_type is equal to TOKEN_ENVIRONMENT from Lexer:
-        Let env_div be proc parse_environment_division from parser
+        Let env_div be proc parse_environment_division with parser
         If env_div is not equal to 0:
             proc add_node_child with program, env_div
         End If
     End If
 
     Note: Parse DATA DIVISION (optional but common)
-    Set token_type to proc peek_token_type from parser
+    Set token_type to proc peek_token_type with parser
     If token_type is equal to TOKEN_DATA from Lexer:
-        Let data_div be proc parse_data_division from parser
+        Let data_div be proc parse_data_division with parser
         If data_div is not equal to 0:
             proc add_node_child with program, data_div
         End If
     End If
 
     Note: Parse PROCEDURE DIVISION (required)
-    Set token_type to proc peek_token_type from parser
+    Set token_type to proc peek_token_type with parser
     If token_type is equal to TOKEN_PROCEDURE from Lexer:
-        Let proc_div be proc parse_procedure_division from parser
+        Let proc_div be proc parse_procedure_division with parser
         If proc_div is not equal to 0:
             proc add_node_child with program, proc_div
         End If
     End If
 
-    proc destroy_cobol_parser from parser
+    Note: The lexer and parser record are released, but the AST nodes and their
+    Note: name/lexeme string handles were heap-allocated independently and remain
+    Note: owned by the returned program tree, which outlives this parser instance.
+    proc destroy_cobol_parser with parser
 
     Return program
 End Process
@@ -639,63 +930,71 @@ Process called "parse_identification_division" takes parser as Integer returns I
     DATE-WRITTEN. date. (optional)
     @End Reasoning
 
-    Let token_type be proc peek_token_type from parser
+    Let token_type be proc peek_token_type with parser
 
     If token_type is not equal to TOKEN_IDENTIFICATION from Lexer:
         proc report_parse_error with parser, "Expected IDENTIFICATION DIVISION"
         Return 0
     End If
 
-    proc advance_token from parser  Note: consume IDENTIFICATION
+    proc advance_token with parser  Note: consume IDENTIFICATION
 
-    Let div_node be proc create_ast_node from COBOL_IDENTIFICATION_DIV
+    Let div_node be proc create_ast_node with COBOL_IDENTIFICATION_DIV
 
     Note: Expect DIVISION keyword
-    Set token_type to proc peek_token_type from parser
+    Set token_type to proc peek_token_type with parser
     If token_type is equal to TOKEN_DIVISION from Lexer:
-        proc advance_token from parser
+        proc advance_token with parser
     End If
 
     Note: Expect period
-    Set token_type to proc peek_token_type from parser
+    Set token_type to proc peek_token_type with parser
     If token_type is equal to TOKEN_PERIOD from Lexer:
-        proc advance_token from parser
+        proc advance_token with parser
     End If
 
     Note: Parse PROGRAM-ID (required)
-    Set token_type to proc peek_token_type from parser
+    Set token_type to proc peek_token_type with parser
     If token_type is equal to TOKEN_PROGRAM_ID from Lexer:
-        proc advance_token from parser
+        proc advance_token with parser
 
-        Let program_id be proc peek_token_lexeme from parser
-        proc set_node_name with div_node, program_id
-        proc advance_token from parser
-
-        Note: Expect period
-        Set token_type to proc peek_token_type from parser
+        Note: COBOL writes "PROGRAM-ID. program-name." with a period separating
+        Note: the paragraph header from the program name, so consume that period
+        Note: before reading the name lexeme.
+        Set token_type to proc peek_token_type with parser
         If token_type is equal to TOKEN_PERIOD from Lexer:
-            proc advance_token from parser
+            proc advance_token with parser
+        End If
+
+        Let program_id be proc peek_token_lexeme with parser
+        proc set_node_name with div_node, program_id
+        proc advance_token with parser
+
+        Note: Expect trailing period after the program name
+        Set token_type to proc peek_token_type with parser
+        If token_type is equal to TOKEN_PERIOD from Lexer:
+            proc advance_token with parser
         End If
     End If
 
     Note: Parse optional paragraphs (AUTHOR, DATE-WRITTEN, etc.)
     While 1 is equal to 1:
-        Set token_type to proc peek_token_type from parser
+        Set token_type to proc peek_token_type with parser
 
         If token_type is equal to TOKEN_AUTHOR from Lexer:
-            proc advance_token from parser
+            proc advance_token with parser
             Note: Skip to period
-            proc skip_to_period from parser
+            proc skip_to_period with parser
 
         Otherwise:
         If token_type is equal to TOKEN_DATE_WRITTEN from Lexer:
-            proc advance_token from parser
-            proc skip_to_period from parser
+            proc advance_token with parser
+            proc skip_to_period with parser
 
         Otherwise:
         If token_type is equal to TOKEN_DATE_COMPILED from Lexer:
-            proc advance_token from parser
-            proc skip_to_period from parser
+            proc advance_token with parser
+            proc skip_to_period with parser
 
         Otherwise:
             Note: Not an ID division paragraph, break
@@ -731,41 +1030,41 @@ Process called "parse_environment_division" takes parser as Integer returns Inte
     INPUT-OUTPUT SECTION. (file declarations)
     @End Reasoning
 
-    Let token_type be proc peek_token_type from parser
+    Let token_type be proc peek_token_type with parser
 
     If token_type is not equal to TOKEN_ENVIRONMENT from Lexer:
         Return 0
     End If
 
-    proc advance_token from parser
+    proc advance_token with parser
 
-    Let div_node be proc create_ast_node from COBOL_ENVIRONMENT_DIV
+    Let div_node be proc create_ast_node with COBOL_ENVIRONMENT_DIV
 
     Note: Expect DIVISION keyword
-    Set token_type to proc peek_token_type from parser
+    Set token_type to proc peek_token_type with parser
     If token_type is equal to TOKEN_DIVISION from Lexer:
-        proc advance_token from parser
+        proc advance_token with parser
     End If
 
     Note: Expect period
-    Set token_type to proc peek_token_type from parser
+    Set token_type to proc peek_token_type with parser
     If token_type is equal to TOKEN_PERIOD from Lexer:
-        proc advance_token from parser
+        proc advance_token with parser
     End If
 
     Note: Parse CONFIGURATION SECTION (optional)
-    Set token_type to proc peek_token_type from parser
+    Set token_type to proc peek_token_type with parser
     If token_type is equal to TOKEN_CONFIGURATION from Lexer:
-        Let config be proc parse_configuration_section from parser
+        Let config be proc parse_configuration_section with parser
         If config is not equal to 0:
             proc add_node_child with div_node, config
         End If
     End If
 
     Note: Parse INPUT-OUTPUT SECTION (file control)
-    Set token_type to proc peek_token_type from parser
+    Set token_type to proc peek_token_type with parser
     If token_type is equal to TOKEN_INPUT_OUTPUT from Lexer:
-        Let io_section be proc parse_input_output_section from parser
+        Let io_section be proc parse_input_output_section with parser
         If io_section is not equal to 0:
             proc add_node_child with div_node, io_section
         End If
@@ -781,6 +1080,113 @@ attributes the formatter / code generator must respect — e.g., COMMA as
 decimal point changes how arithmetic literals are emitted.
 @End Reasoning
 
+Process called "parse_source_computer_paragraph" takes parser as Integer returns Integer:
+    Note: Parse SOURCE-COMPUTER paragraph
+
+    @Reasoning:
+    SOURCE-COMPUTER. computer-name [WITH DEBUGGING MODE].
+    The paragraph names the machine the program is compiled on. The
+    computer-name is captured onto the paragraph node so the formatter
+    can re-emit it verbatim; remaining clauses are consumed to the period.
+    @End Reasoning
+
+    Let token_type be proc peek_token_type with parser
+    If token_type is not equal to TOKEN_SOURCE from Lexer:
+        Return 0
+    End If
+
+    proc advance_token with parser
+
+    Let para_node be proc create_ast_node with COBOL_PARAGRAPH
+
+    Note: Expect period after the paragraph header keyword
+    Set token_type to proc peek_token_type with parser
+    If token_type is equal to TOKEN_PERIOD from Lexer:
+        proc advance_token with parser
+    End If
+
+    Note: Capture the computer-name if present
+    Set token_type to proc peek_token_type with parser
+    If token_type is equal to TOKEN_IDENTIFIER from Lexer:
+        Let computer_name be proc peek_token_lexeme with parser
+        proc set_node_name with para_node, computer_name
+        proc advance_token with parser
+    End If
+
+    Note: Consume any trailing clauses through the terminating period
+    proc skip_to_period with parser
+
+    Return para_node
+End Process
+
+@Reasoning:
+OBJECT-COMPUTER names the machine the program is intended to execute
+on, optionally with MEMORY SIZE / PROGRAM COLLATING SEQUENCE clauses.
+The computer-name is preserved on the node; the remainder is consumed
+to the period.
+@End Reasoning
+
+Process called "parse_object_computer_paragraph" takes parser as Integer returns Integer:
+    Note: Parse OBJECT-COMPUTER paragraph
+
+    Let token_type be proc peek_token_type with parser
+    If token_type is not equal to TOKEN_OBJECT from Lexer:
+        Return 0
+    End If
+
+    proc advance_token with parser
+
+    Let para_node be proc create_ast_node with COBOL_PARAGRAPH
+
+    Note: Expect period after the paragraph header keyword
+    Set token_type to proc peek_token_type with parser
+    If token_type is equal to TOKEN_PERIOD from Lexer:
+        proc advance_token with parser
+    End If
+
+    Note: Capture the computer-name if present
+    Set token_type to proc peek_token_type with parser
+    If token_type is equal to TOKEN_IDENTIFIER from Lexer:
+        Let computer_name be proc peek_token_lexeme with parser
+        proc set_node_name with para_node, computer_name
+        proc advance_token with parser
+    End If
+
+    Note: Consume any trailing clauses through the terminating period
+    proc skip_to_period with parser
+
+    Return para_node
+End Process
+
+@Reasoning:
+SPECIAL-NAMES associates implementor names with mnemonic names and
+defines DECIMAL-POINT / CURRENCY / class conditions. The full clause
+body runs until the terminating period; the node records the paragraph
+so downstream stages preserve the configuration block.
+@End Reasoning
+
+Process called "parse_special_names_paragraph" takes parser as Integer returns Integer:
+    Note: Parse SPECIAL-NAMES paragraph
+
+    Let token_type be proc peek_token_type with parser
+    If token_type is not equal to TOKEN_SPECIAL from Lexer:
+        Return 0
+    End If
+
+    proc advance_token with parser
+
+    Let para_node be proc create_ast_node with COBOL_PARAGRAPH
+
+    Note: SPECIAL-NAMES clauses span to the terminating period
+    proc skip_to_period with parser
+
+    Return para_node
+End Process
+
+@Reasoning:
+CONFIGURATION SECTION describes target machine and special-name aliases.
+@End Reasoning
+
 Process called "parse_configuration_section" takes parser as Integer returns Integer:
     Note: Parse CONFIGURATION SECTION
 
@@ -789,25 +1195,25 @@ Process called "parse_configuration_section" takes parser as Integer returns Int
     These paragraphs define the computing environment and system-specific configurations.
     @End Reasoning
 
-    proc advance_token from parser
+    proc advance_token with parser
 
-    Let section_node be proc create_ast_node from COBOL_CONFIG_SECTION
+    Let section_node be proc create_ast_node with COBOL_CONFIG_SECTION
 
     Note: Expect SECTION keyword
-    Let token_type be proc peek_token_type from parser
+    Let token_type be proc peek_token_type with parser
     If token_type is equal to TOKEN_SECTION from Lexer:
-        proc advance_token from parser
+        proc advance_token with parser
     End If
 
     Note: Expect period
-    Set token_type to proc peek_token_type from parser
+    Set token_type to proc peek_token_type with parser
     If token_type is equal to TOKEN_PERIOD from Lexer:
-        proc advance_token from parser
+        proc advance_token with parser
     End If
 
     Note: Parse configuration paragraphs until next section
     While 1 is equal to 1:
-        Set token_type to proc peek_token_type from parser
+        Set token_type to proc peek_token_type with parser
 
         Note: Check for next section
         If token_type is equal to TOKEN_DATA from Lexer:
@@ -822,21 +1228,21 @@ Process called "parse_configuration_section" takes parser as Integer returns Int
 
         Note: Parse SOURCE-COMPUTER paragraph
         If token_type is equal to TOKEN_SOURCE from Lexer:
-            Let source_para be proc parse_source_computer_paragraph from parser
-            proc add_child with section_node, source_para
+            Let source_para be proc parse_source_computer_paragraph with parser
+            proc add_node_child with section_node, source_para
         Otherwise:
             Note: Parse OBJECT-COMPUTER paragraph
             If token_type is equal to TOKEN_OBJECT from Lexer:
-                Let object_para be proc parse_object_computer_paragraph from parser
-                proc add_child with section_node, object_para
+                Let object_para be proc parse_object_computer_paragraph with parser
+                proc add_node_child with section_node, object_para
             Otherwise:
                 Note: Parse SPECIAL-NAMES paragraph
                 If token_type is equal to TOKEN_SPECIAL from Lexer:
-                    Let special_para be proc parse_special_names_paragraph from parser
-                    proc add_child with section_node, special_para
+                    Let special_para be proc parse_special_names_paragraph with parser
+                    proc add_node_child with section_node, special_para
                 Otherwise:
                     Note: Unknown paragraph - skip to period
-                    proc skip_to_period from parser
+                    proc skip_to_period with parser
                 End If
             End If
         End If
@@ -861,38 +1267,38 @@ Process called "parse_input_output_section" takes parser as Integer returns Inte
     defining file assignments.
     @End Reasoning
 
-    proc advance_token from parser
+    proc advance_token with parser
 
-    Let section_node be proc create_ast_node from COBOL_INPUT_OUTPUT
+    Let section_node be proc create_ast_node with COBOL_INPUT_OUTPUT
 
     Note: Expect SECTION keyword
-    Let token_type be proc peek_token_type from parser
+    Let token_type be proc peek_token_type with parser
     If token_type is equal to TOKEN_SECTION from Lexer:
-        proc advance_token from parser
+        proc advance_token with parser
     End If
 
     Note: Expect period
-    Set token_type to proc peek_token_type from parser
+    Set token_type to proc peek_token_type with parser
     If token_type is equal to TOKEN_PERIOD from Lexer:
-        proc advance_token from parser
+        proc advance_token with parser
     End If
 
     Note: Parse FILE-CONTROL
-    Set token_type to proc peek_token_type from parser
+    Set token_type to proc peek_token_type with parser
     If token_type is equal to TOKEN_FILE from Lexer:
-        Let next_type be proc peek_next_token_type from parser
+        Let next_type be proc peek_next_token_type with parser
         Note: We don't have peek_next, so advance and check
-        proc advance_token from parser
-        Set token_type to proc peek_token_type from parser
+        proc advance_token with parser
+        Set token_type to proc peek_token_type with parser
 
         Note: Parse SELECT statements
         While token_type is equal to TOKEN_SELECT from Lexer:
-            Let select_stmt be proc parse_select_statement from parser
+            Let select_stmt be proc parse_select_statement with parser
             If select_stmt is not equal to 0:
                 proc add_node_child with section_node, select_stmt
             End If
 
-            Set token_type to proc peek_token_type from parser
+            Set token_type to proc peek_token_type with parser
         End While
     End If
 
@@ -917,26 +1323,53 @@ Process called "parse_select_statement" takes parser as Integer returns Integer:
     FILE STATUS IS status-field.
     @End Reasoning
 
-    Let token_type be proc peek_token_type from parser
+    Let token_type be proc peek_token_type with parser
 
     If token_type is not equal to TOKEN_SELECT from Lexer:
         Return 0
     End If
 
-    proc advance_token from parser
+    proc advance_token with parser
 
-    Let select_node be proc create_ast_node from COBOL_SELECT_STMT
+    Let select_node be proc create_ast_node with COBOL_SELECT_STMT
 
     Note: Get file name
-    Set token_type to proc peek_token_type from parser
+    Set token_type to proc peek_token_type with parser
     If token_type is equal to TOKEN_IDENTIFIER from Lexer:
-        Let file_name be proc peek_token_lexeme from parser
+        Let file_name be proc peek_token_lexeme with parser
         proc set_node_name with select_node, file_name
-        proc advance_token from parser
+        proc advance_token with parser
     End If
 
-    Note: Skip to period (parse ASSIGN, ORGANIZATION, etc. in full implementation)
-    proc skip_to_period from parser
+    Note: Parse ASSIGN [TO] external-name clause when present
+    Set token_type to proc peek_token_type with parser
+    If token_type is equal to TOKEN_ASSIGN from Lexer:
+        proc advance_token with parser
+
+        Note: Optional TO connective
+        Set token_type to proc peek_token_type with parser
+        If token_type is equal to TOKEN_TO from Lexer:
+            proc advance_token with parser
+        End If
+
+        Note: Capture the external assignment target (identifier or literal)
+        Set token_type to proc peek_token_type with parser
+        If token_type is equal to TOKEN_IDENTIFIER from Lexer:
+            Let assign_target be proc peek_token_lexeme with parser
+            proc set_node_value with select_node, assign_target
+            proc advance_token with parser
+        Otherwise:
+            If token_type is equal to TOKEN_STRING from Lexer:
+                Let assign_literal be proc peek_token_lexeme with parser
+                proc set_node_value with select_node, assign_literal
+                proc advance_token with parser
+            End If
+        End If
+    End If
+
+    Note: Consume remaining SELECT clauses (ORGANIZATION, ACCESS, FILE STATUS)
+    Note: through the terminating period
+    proc skip_to_period with parser
 
     Return select_node
 End Process
@@ -964,50 +1397,50 @@ Process called "parse_data_division" takes parser as Integer returns Integer:
     LINKAGE SECTION. (parameters from calling programs)
     @End Reasoning
 
-    Let token_type be proc peek_token_type from parser
+    Let token_type be proc peek_token_type with parser
 
     If token_type is not equal to TOKEN_DATA from Lexer:
         Return 0
     End If
 
-    proc advance_token from parser
+    proc advance_token with parser
 
-    Let div_node be proc create_ast_node from COBOL_DATA_DIV
+    Let div_node be proc create_ast_node with COBOL_DATA_DIV
 
     Note: Expect DIVISION keyword
-    Set token_type to proc peek_token_type from parser
+    Set token_type to proc peek_token_type with parser
     If token_type is equal to TOKEN_DIVISION from Lexer:
-        proc advance_token from parser
+        proc advance_token with parser
     End If
 
     Note: Expect period
-    Set token_type to proc peek_token_type from parser
+    Set token_type to proc peek_token_type with parser
     If token_type is equal to TOKEN_PERIOD from Lexer:
-        proc advance_token from parser
+        proc advance_token with parser
     End If
 
     Note: Parse FILE SECTION (optional)
-    Set token_type to proc peek_token_type from parser
+    Set token_type to proc peek_token_type with parser
     If token_type is equal to TOKEN_FILE_SECTION from Lexer:
-        Let file_section be proc parse_file_section from parser
+        Let file_section be proc parse_file_section with parser
         If file_section is not equal to 0:
             proc add_node_child with div_node, file_section
         End If
     End If
 
     Note: Parse WORKING-STORAGE SECTION
-    Set token_type to proc peek_token_type from parser
+    Set token_type to proc peek_token_type with parser
     If token_type is equal to TOKEN_WORKING_STORAGE from Lexer:
-        Let ws_section be proc parse_working_storage_section from parser
+        Let ws_section be proc parse_working_storage_section with parser
         If ws_section is not equal to 0:
             proc add_node_child with div_node, ws_section
         End If
     End If
 
     Note: Parse LINKAGE SECTION (optional)
-    Set token_type to proc peek_token_type from parser
+    Set token_type to proc peek_token_type with parser
     If token_type is equal to TOKEN_LINKAGE from Lexer:
-        Let linkage_section be proc parse_linkage_section from parser
+        Let linkage_section be proc parse_linkage_section with parser
         If linkage_section is not equal to 0:
             proc add_node_child with div_node, linkage_section
         End If
@@ -1027,24 +1460,24 @@ data items.
 Process called "parse_file_section" takes parser as Integer returns Integer:
     Note: Parse FILE SECTION
 
-    proc advance_token from parser
+    proc advance_token with parser
 
-    Let section_node be proc create_ast_node from COBOL_FILE_SECTION
+    Let section_node be proc create_ast_node with COBOL_FILE_SECTION
 
     Note: Expect SECTION keyword
-    Let token_type be proc peek_token_type from parser
+    Let token_type be proc peek_token_type with parser
     If token_type is equal to TOKEN_SECTION from Lexer:
-        proc advance_token from parser
+        proc advance_token with parser
     End If
 
     Note: Expect period
-    Set token_type to proc peek_token_type from parser
+    Set token_type to proc peek_token_type with parser
     If token_type is equal to TOKEN_PERIOD from Lexer:
-        proc advance_token from parser
+        proc advance_token with parser
     End If
 
     Note: Parse FD (File Description) entries
-    Set token_type to proc peek_token_type from parser
+    Set token_type to proc peek_token_type with parser
     While token_type is not equal to TOKEN_EOF from Lexer:
         Note: Break on next section
         If token_type is equal to TOKEN_WORKING_STORAGE from Lexer:
@@ -1058,12 +1491,12 @@ Process called "parse_file_section" takes parser as Integer returns Integer:
         End If
 
         Note: Parse data item (level number + PICTURE)
-        Let data_item be proc parse_data_item from parser
+        Let data_item be proc parse_data_item with parser
         If data_item is not equal to 0:
             proc add_node_child with section_node, data_item
         End If
 
-        Set token_type to proc peek_token_type from parser
+        Set token_type to proc peek_token_type with parser
     End While
 
     Return section_node
@@ -1087,24 +1520,24 @@ Process called "parse_working_storage_section" takes parser as Integer returns I
     Level 88 is condition name.
     @End Reasoning
 
-    proc advance_token from parser
+    proc advance_token with parser
 
-    Let section_node be proc create_ast_node from COBOL_WORKING_STORAGE
+    Let section_node be proc create_ast_node with COBOL_WORKING_STORAGE
 
     Note: Expect SECTION keyword
-    Let token_type be proc peek_token_type from parser
+    Let token_type be proc peek_token_type with parser
     If token_type is equal to TOKEN_SECTION from Lexer:
-        proc advance_token from parser
+        proc advance_token with parser
     End If
 
     Note: Expect period
-    Set token_type to proc peek_token_type from parser
+    Set token_type to proc peek_token_type with parser
     If token_type is equal to TOKEN_PERIOD from Lexer:
-        proc advance_token from parser
+        proc advance_token with parser
     End If
 
     Note: Parse data items
-    Set token_type to proc peek_token_type from parser
+    Set token_type to proc peek_token_type with parser
     While token_type is not equal to TOKEN_EOF from Lexer:
         Note: Break on next section or division
         If token_type is equal to TOKEN_LINKAGE from Lexer:
@@ -1119,16 +1552,16 @@ Process called "parse_working_storage_section" takes parser as Integer returns I
 
         Note: Check for level number (numeric literal 01-88)
         If token_type is equal to TOKEN_NUMBER from Lexer:
-            Let data_item be proc parse_data_item from parser
+            Let data_item be proc parse_data_item with parser
             If data_item is not equal to 0:
                 proc add_node_child with section_node, data_item
             End If
 
         Otherwise:
-            proc advance_token from parser
+            proc advance_token with parser
         End If
 
-        Set token_type to proc peek_token_type from parser
+        Set token_type to proc peek_token_type with parser
     End While
 
     Return section_node
@@ -1145,43 +1578,75 @@ clauses — we record the items and let the validator enforce that rule.
 Process called "parse_linkage_section" takes parser as Integer returns Integer:
     Note: Parse LINKAGE SECTION
 
-    proc advance_token from parser
+    proc advance_token with parser
 
-    Let section_node be proc create_ast_node from COBOL_LINKAGE_SECTION
+    Let section_node be proc create_ast_node with COBOL_LINKAGE_SECTION
 
     Note: Expect SECTION keyword
-    Let token_type be proc peek_token_type from parser
+    Let token_type be proc peek_token_type with parser
     If token_type is equal to TOKEN_SECTION from Lexer:
-        proc advance_token from parser
+        proc advance_token with parser
     End If
 
     Note: Expect period
-    Set token_type to proc peek_token_type from parser
+    Set token_type to proc peek_token_type with parser
     If token_type is equal to TOKEN_PERIOD from Lexer:
-        proc advance_token from parser
+        proc advance_token with parser
     End If
 
     Note: Parse data items (same as working-storage)
-    Set token_type to proc peek_token_type from parser
+    Set token_type to proc peek_token_type with parser
     While token_type is not equal to TOKEN_EOF from Lexer:
         If token_type is equal to TOKEN_PROCEDURE from Lexer:
             Return section_node
         End If
 
         If token_type is equal to TOKEN_NUMBER from Lexer:
-            Let data_item be proc parse_data_item from parser
+            Let data_item be proc parse_data_item with parser
             If data_item is not equal to 0:
                 proc add_node_child with section_node, data_item
             End If
 
         Otherwise:
-            proc advance_token from parser
+            proc advance_token with parser
         End If
 
-        Set token_type to proc peek_token_type from parser
+        Set token_type to proc peek_token_type with parser
     End While
 
     Return section_node
+End Process
+
+@Reasoning:
+A COBOL PICTURE clause may carry a parenthesised repeat count — PIC 9(4),
+PIC X(30), PIC S9(7)V99 — where "(n)" means "repeat the preceding symbol n
+times". The streaming lexer tokenises "9(4)" as the separate tokens 9, (, 4,
+and ), so after the base picture symbol is captured the parser must absorb a
+trailing "( count )" group to stay aligned with the following clause. Only a
+single immediately-following parenthesised group is consumed; anything else
+(a space-separated VALUE/USAGE keyword, a period) is left for the caller.
+@End Reasoning
+Process called "consume_picture_count" takes parser as Integer returns Integer:
+    Note: Consume an optional "( count )" repeat group after a PICTURE symbol
+
+    Let token_type be proc peek_token_type with parser
+    If token_type is not equal to TOKEN_LPAREN from Lexer:
+        Return 0
+    End If
+
+    proc advance_token with parser  Note: consume '('
+
+    Set token_type to proc peek_token_type with parser
+    If token_type is equal to TOKEN_NUMBER from Lexer:
+        proc advance_token with parser  Note: consume the count
+    End If
+
+    Set token_type to proc peek_token_type with parser
+    If token_type is equal to TOKEN_RPAREN from Lexer:
+        proc advance_token with parser  Note: consume ')'
+    End If
+
+    Return 1
 End Process
 
 @Reasoning:
@@ -1214,64 +1679,73 @@ Process called "parse_data_item" takes parser as Integer returns Integer:
     77 TOTAL-AMOUNT PIC 9(7)V99 VALUE 0.
     @End Reasoning
 
-    Let token_type be proc peek_token_type from parser
+    Let token_type be proc peek_token_type with parser
 
     If token_type is not equal to TOKEN_NUMBER from Lexer:
         Return 0
     End If
 
-    Let data_item be proc create_ast_node from COBOL_DATA_ITEM
+    Let data_item be proc create_ast_node with COBOL_DATA_ITEM
 
     Note: Get level number
-    Let level_lexeme be proc peek_token_lexeme from parser
+    Let level_lexeme be proc peek_token_lexeme with parser
     proc set_node_attribute with data_item, "level", level_lexeme
-    proc advance_token from parser
+    proc advance_token with parser
 
     Note: Get data name
-    Set token_type to proc peek_token_type from parser
+    Set token_type to proc peek_token_type with parser
     If token_type is equal to TOKEN_IDENTIFIER from Lexer:
-        Let data_name be proc peek_token_lexeme from parser
+        Let data_name be proc peek_token_lexeme with parser
         proc set_node_name with data_item, data_name
-        proc advance_token from parser
+        proc advance_token with parser
     End If
 
     Note: Parse PICTURE clause (optional for group items)
-    Set token_type to proc peek_token_type from parser
+    Set token_type to proc peek_token_type with parser
     If token_type is equal to TOKEN_PIC from Lexer:
-        proc advance_token from parser
+        proc advance_token with parser
 
         Note: Get picture string
-        Set token_type to proc peek_token_type from parser
-        Let picture_str be proc peek_token_lexeme from parser
+        Set token_type to proc peek_token_type with parser
+        Let picture_str be proc peek_token_lexeme with parser
         proc set_node_attribute with data_item, "picture", picture_str
-        proc advance_token from parser
+        proc advance_token with parser
+
+        Note: Consume the parenthesised repeat count, e.g. 9(4) or X(30). The
+        Note: lexer splits "9(4)" into separate 9 / ( / 4 / ) tokens, so absorb
+        Note: the "( count )" tail here to leave the parser positioned at the
+        Note: next clause (VALUE, USAGE) rather than stranded inside the count.
+        proc consume_picture_count with parser
     End If
 
     If token_type is equal to TOKEN_PICTURE from Lexer:
-        proc advance_token from parser
+        proc advance_token with parser
 
-        Set token_type to proc peek_token_type from parser
-        Set picture_str to proc peek_token_lexeme from parser
+        Set token_type to proc peek_token_type with parser
+        Set picture_str to proc peek_token_lexeme with parser
         proc set_node_attribute with data_item, "picture", picture_str
-        proc advance_token from parser
+        proc advance_token with parser
+
+        Note: Same parenthesised repeat-count handling as the PIC form above.
+        proc consume_picture_count with parser
     End If
 
     Note: Parse VALUE clause (optional)
-    Set token_type to proc peek_token_type from parser
+    Set token_type to proc peek_token_type with parser
     If token_type is equal to TOKEN_VALUE from Lexer:
-        proc advance_token from parser
+        proc advance_token with parser
 
         Note: Get value (can be literal or figurative constant)
-        Set token_type to proc peek_token_type from parser
-        Let value_lexeme be proc peek_token_lexeme from parser
+        Set token_type to proc peek_token_type with parser
+        Let value_lexeme be proc peek_token_lexeme with parser
         proc set_node_value with data_item, value_lexeme
-        proc advance_token from parser
+        proc advance_token with parser
     End If
 
     Note: Expect period
-    Set token_type to proc peek_token_type from parser
+    Set token_type to proc peek_token_type with parser
     If token_type is equal to TOKEN_PERIOD from Lexer:
-        proc advance_token from parser
+        proc advance_token with parser
     End If
 
     Return data_item
@@ -1298,31 +1772,31 @@ Process called "parse_procedure_division" takes parser as Integer returns Intege
     sections and paragraphs. Statements end with period.
     @End Reasoning
 
-    Let token_type be proc peek_token_type from parser
+    Let token_type be proc peek_token_type with parser
 
     If token_type is not equal to TOKEN_PROCEDURE from Lexer:
         Return 0
     End If
 
-    proc advance_token from parser
+    proc advance_token with parser
 
-    Let div_node be proc create_ast_node from COBOL_PROCEDURE_DIV
+    Let div_node be proc create_ast_node with COBOL_PROCEDURE_DIV
 
     Note: Expect DIVISION keyword
-    Set token_type to proc peek_token_type from parser
+    Set token_type to proc peek_token_type with parser
     If token_type is equal to TOKEN_DIVISION from Lexer:
-        proc advance_token from parser
+        proc advance_token with parser
     End If
 
     Note: Expect period
-    Set token_type to proc peek_token_type from parser
+    Set token_type to proc peek_token_type with parser
     If token_type is equal to TOKEN_PERIOD from Lexer:
-        proc advance_token from parser
+        proc advance_token with parser
     End If
 
     Note: Parse sections and paragraphs
     While 1 is equal to 1:
-        Set token_type to proc peek_token_type from parser
+        Set token_type to proc peek_token_type with parser
 
         If token_type is equal to TOKEN_EOF from Lexer:
             Return div_node
@@ -1330,19 +1804,19 @@ Process called "parse_procedure_division" takes parser as Integer returns Intege
 
         Note: Check for section (identifier followed by SECTION)
         If token_type is equal to TOKEN_IDENTIFIER from Lexer:
-            Let para_or_section be proc parse_paragraph_or_section from parser
+            Let para_or_section be proc parse_paragraph_or_section with parser
             If para_or_section is not equal to 0:
                 proc add_node_child with div_node, para_or_section
             End If
 
         Otherwise:
             Note: Parse statement
-            Let stmt be proc parse_statement from parser
+            Let stmt be proc parse_statement with parser
             If stmt is not equal to 0:
                 proc add_node_child with div_node, stmt
 
             Otherwise:
-                proc advance_token from parser
+                proc advance_token with parser
             End If
         End If
     End While
@@ -1366,39 +1840,39 @@ Process called "parse_paragraph_or_section" takes parser as Integer returns Inte
     Section: section-name SECTION. paragraphs.
     @End Reasoning
 
-    Let token_type be proc peek_token_type from parser
+    Let token_type be proc peek_token_type with parser
 
     If token_type is not equal to TOKEN_IDENTIFIER from Lexer:
         Return 0
     End If
 
-    Let name be proc peek_token_lexeme from parser
-    proc advance_token from parser
+    Let name be proc peek_token_lexeme with parser
+    proc advance_token with parser
 
     Note: Check if SECTION keyword follows
-    Set token_type to proc peek_token_type from parser
+    Set token_type to proc peek_token_type with parser
     If token_type is equal to TOKEN_SECTION from Lexer:
-        proc advance_token from parser
+        proc advance_token with parser
 
-        Let section_node be proc create_ast_node from COBOL_SECTION
+        Let section_node be proc create_ast_node with COBOL_SECTION
         proc set_node_name with section_node, name
 
         Note: Expect period
-        Set token_type to proc peek_token_type from parser
+        Set token_type to proc peek_token_type with parser
         If token_type is equal to TOKEN_PERIOD from Lexer:
-            proc advance_token from parser
+            proc advance_token with parser
         End If
 
         Note: Parse paragraphs within section
         While 1 is equal to 1:
-            Set token_type to proc peek_token_type from parser
+            Set token_type to proc peek_token_type with parser
 
             If token_type is equal to TOKEN_EOF from Lexer:
                 Return section_node
             End If
 
             If token_type is equal to TOKEN_IDENTIFIER from Lexer:
-                Let para be proc parse_paragraph from parser
+                Let para be proc parse_paragraph with parser
                 If para is not equal to 0:
                     proc add_node_child with section_node, para
 
@@ -1415,18 +1889,18 @@ Process called "parse_paragraph_or_section" takes parser as Integer returns Inte
 
     Otherwise:
         Note: It's a paragraph
-        Let para_node be proc create_ast_node from COBOL_PARAGRAPH
+        Let para_node be proc create_ast_node with COBOL_PARAGRAPH
         proc set_node_name with para_node, name
 
         Note: Expect period
-        Set token_type to proc peek_token_type from parser
+        Set token_type to proc peek_token_type with parser
         If token_type is equal to TOKEN_PERIOD from Lexer:
-            proc advance_token from parser
+            proc advance_token with parser
         End If
 
         Note: Parse statements until next paragraph or EOF
         While 1 is equal to 1:
-            Set token_type to proc peek_token_type from parser
+            Set token_type to proc peek_token_type with parser
 
             If token_type is equal to TOKEN_EOF from Lexer:
                 Return para_node
@@ -1435,9 +1909,9 @@ Process called "parse_paragraph_or_section" takes parser as Integer returns Inte
             Note: Check for next paragraph (identifier followed by period at statement level)
             If token_type is equal to TOKEN_IDENTIFIER from Lexer:
                 Note: Look ahead to determine if this is a new paragraph or statement
-                Let current_pos be proc get_parser_position from parser
-                proc advance_token from parser
-                Let next_type be proc peek_token_type from parser
+                Let current_pos be proc get_parser_position with parser
+                proc advance_token with parser
+                Let next_type be proc peek_token_type with parser
 
                 Note: Reset to saved position
                 proc set_parser_position with parser, current_pos
@@ -1449,7 +1923,7 @@ Process called "parse_paragraph_or_section" takes parser as Integer returns Inte
                 End If
 
                 Note: Otherwise it's a statement within this paragraph
-                Let stmt be proc parse_statement from parser
+                Let stmt be proc parse_statement with parser
                 If stmt is not equal to 0:
                     proc add_node_child with para_node, stmt
 
@@ -1458,7 +1932,7 @@ Process called "parse_paragraph_or_section" takes parser as Integer returns Inte
                 End If
 
             Otherwise:
-                Set stmt to proc parse_statement from parser
+                Set stmt to proc parse_statement with parser
                 If stmt is not equal to 0:
                     proc add_node_child with para_node, stmt
 
@@ -1483,27 +1957,27 @@ boundaries are preserved only as metadata, not structural nesting.
 Process called "parse_paragraph" takes parser as Integer returns Integer:
     Note: Parse paragraph
 
-    Let token_type be proc peek_token_type from parser
+    Let token_type be proc peek_token_type with parser
 
     If token_type is not equal to TOKEN_IDENTIFIER from Lexer:
         Return 0
     End If
 
-    Let name be proc peek_token_lexeme from parser
-    proc advance_token from parser
+    Let name be proc peek_token_lexeme with parser
+    proc advance_token with parser
 
-    Let para_node be proc create_ast_node from COBOL_PARAGRAPH
+    Let para_node be proc create_ast_node with COBOL_PARAGRAPH
     proc set_node_name with para_node, name
 
     Note: Expect period
-    Set token_type to proc peek_token_type from parser
+    Set token_type to proc peek_token_type with parser
     If token_type is equal to TOKEN_PERIOD from Lexer:
-        proc advance_token from parser
+        proc advance_token with parser
     End If
 
     Note: Parse statements
     While 1 is equal to 1:
-        Set token_type to proc peek_token_type from parser
+        Set token_type to proc peek_token_type with parser
 
         If token_type is equal to TOKEN_EOF from Lexer:
             Return para_node
@@ -1513,7 +1987,7 @@ Process called "parse_paragraph" takes parser as Integer returns Integer:
             Return para_node  Note: Next paragraph
         End If
 
-        Let stmt be proc parse_statement from parser
+        Let stmt be proc parse_statement with parser
         If stmt is not equal to 0:
             proc add_node_child with para_node, stmt
 
@@ -1548,90 +2022,90 @@ Process called "parse_statement" takes parser as Integer returns Integer:
     IF, EVALUATE, PERFORM, DISPLAY, ACCEPT, OPEN, CLOSE, READ, WRITE, etc.
     @End Reasoning
 
-    Let token_type be proc peek_token_type from parser
+    Let token_type be proc peek_token_type with parser
 
     If token_type is equal to TOKEN_MOVE from Lexer:
-        Return proc parse_move_statement from parser
+        Return proc parse_move_statement with parser
     End If
 
     If token_type is equal to TOKEN_ADD from Lexer:
-        Return proc parse_add_statement from parser
+        Return proc parse_add_statement with parser
     End If
 
     If token_type is equal to TOKEN_SUBTRACT from Lexer:
-        Return proc parse_subtract_statement from parser
+        Return proc parse_subtract_statement with parser
     End If
 
     If token_type is equal to TOKEN_MULTIPLY from Lexer:
-        Return proc parse_multiply_statement from parser
+        Return proc parse_multiply_statement with parser
     End If
 
     If token_type is equal to TOKEN_DIVIDE from Lexer:
-        Return proc parse_divide_statement from parser
+        Return proc parse_divide_statement with parser
     End If
 
     If token_type is equal to TOKEN_COMPUTE from Lexer:
-        Return proc parse_compute_statement from parser
+        Return proc parse_compute_statement with parser
     End If
 
     If token_type is equal to TOKEN_IF from Lexer:
-        Return proc parse_if_statement from parser
+        Return proc parse_if_statement with parser
     End If
 
     If token_type is equal to TOKEN_EVALUATE from Lexer:
-        Return proc parse_evaluate_statement from parser
+        Return proc parse_evaluate_statement with parser
     End If
 
     If token_type is equal to TOKEN_PERFORM from Lexer:
-        Return proc parse_perform_statement from parser
+        Return proc parse_perform_statement with parser
     End If
 
     If token_type is equal to TOKEN_DISPLAY from Lexer:
-        Return proc parse_display_statement from parser
+        Return proc parse_display_statement with parser
     End If
 
     If token_type is equal to TOKEN_ACCEPT from Lexer:
-        Return proc parse_accept_statement from parser
+        Return proc parse_accept_statement with parser
     End If
 
     If token_type is equal to TOKEN_OPEN from Lexer:
-        Return proc parse_open_statement from parser
+        Return proc parse_open_statement with parser
     End If
 
     If token_type is equal to TOKEN_CLOSE from Lexer:
-        Return proc parse_close_statement from parser
+        Return proc parse_close_statement with parser
     End If
 
     If token_type is equal to TOKEN_READ from Lexer:
-        Return proc parse_read_statement from parser
+        Return proc parse_read_statement with parser
     End If
 
     If token_type is equal to TOKEN_WRITE from Lexer:
-        Return proc parse_write_statement from parser
+        Return proc parse_write_statement with parser
     End If
 
     If token_type is equal to TOKEN_GO from Lexer:
-        Return proc parse_go_statement from parser
+        Return proc parse_go_statement with parser
     End If
 
     If token_type is equal to TOKEN_GOTO from Lexer:
-        Return proc parse_go_statement from parser
+        Return proc parse_go_statement with parser
     End If
 
     If token_type is equal to TOKEN_STOP from Lexer:
-        Return proc parse_stop_statement from parser
+        Return proc parse_stop_statement with parser
     End If
 
     If token_type is equal to TOKEN_EXIT from Lexer:
-        Return proc parse_exit_statement from parser
+        Return proc parse_exit_statement with parser
     End If
 
     If token_type is equal to TOKEN_GOBACK from Lexer:
-        Return proc parse_goback_statement from parser
+        Return proc parse_goback_statement with parser
     End If
 
     If token_type is equal to TOKEN_CALL from Lexer:
-        Return proc parse_call_statement from parser
+        Return proc parse_call_statement with parser
     End If
 
     Return 0
@@ -1648,25 +2122,25 @@ assignment idiom in COBOL.
 Process called "parse_move_statement" takes parser as Integer returns Integer:
     Note: Parse MOVE statement (MOVE source TO destination)
 
-    proc advance_token from parser
+    proc advance_token with parser
 
-    Let stmt be proc create_ast_node from COBOL_MOVE_STMT
+    Let stmt be proc create_ast_node with COBOL_MOVE_STMT
 
     Note: Parse source expression
-    Let source be proc parse_expression from parser
+    Let source be proc parse_expression with parser
     If source is not equal to 0:
         proc add_node_child with stmt, source
     End If
 
     Note: Expect TO keyword
-    Let token_type be proc peek_token_type from parser
+    Let token_type be proc peek_token_type with parser
     If token_type is equal to TOKEN_TO from Lexer:
-        proc advance_token from parser
+        proc advance_token with parser
     End If
 
     Note: Parse destination (can be multiple)
     While 1 is equal to 1:
-        Let dest be proc parse_expression from parser
+        Let dest be proc parse_expression with parser
         If dest is not equal to 0:
             proc add_node_child with stmt, dest
 
@@ -1677,14 +2151,14 @@ Process called "parse_move_statement" takes parser as Integer returns Integer:
             End If
         End If
 
-        Set token_type to proc peek_token_type from parser
+        Set token_type to proc peek_token_type with parser
         If token_type is equal to TOKEN_PERIOD from Lexer:
-            proc advance_token from parser
+            proc advance_token with parser
             Return stmt
         End If
     End While
 
-    proc skip_to_period from parser
+    proc skip_to_period with parser
     Return stmt
 End Process
 
@@ -1707,37 +2181,37 @@ recovery fallback.
 Process called "parse_add_statement" takes parser as Integer returns Integer:
     Note: Parse ADD statement (ADD operands TO destination GIVING result)
 
-    proc advance_token from parser
+    proc advance_token with parser
 
-    Let stmt be proc create_ast_node from COBOL_ADD_STMT
+    Let stmt be proc create_ast_node with COBOL_ADD_STMT
 
     Note: Parse operands
     While 1 is equal to 1:
-        Let token_type be proc peek_token_type from parser
+        Let token_type be proc peek_token_type with parser
 
         If token_type is equal to TOKEN_TO from Lexer:
-            proc advance_token from parser
+            proc advance_token with parser
             Note: Parse destination
-            Let dest be proc parse_expression from parser
+            Let dest be proc parse_expression with parser
             If dest is not equal to 0:
                 proc add_node_child with stmt, dest
             End If
         End If
 
         If token_type is equal to TOKEN_GIVING from Lexer:
-            proc advance_token from parser
-            Let result be proc parse_expression from parser
+            proc advance_token with parser
+            Let result be proc parse_expression with parser
             If result is not equal to 0:
                 proc add_node_child with stmt, result
             End If
         End If
 
         If token_type is equal to TOKEN_PERIOD from Lexer:
-            proc advance_token from parser
+            proc advance_token with parser
             Return stmt
         End If
 
-        Let operand be proc parse_expression from parser
+        Let operand be proc parse_expression with parser
         If operand is not equal to 0:
             proc add_node_child with stmt, operand
 
@@ -1749,7 +2223,7 @@ Process called "parse_add_statement" takes parser as Integer returns Integer:
         End If
     End While
 
-    proc skip_to_period from parser
+    proc skip_to_period with parser
     Return stmt
 End Process
 
@@ -1771,18 +2245,18 @@ Process called "parse_subtract_statement" takes parser as Integer returns Intege
     We parse all operands, FROM keyword, target, optional GIVING clause, and ROUNDED.
     @End Reasoning
 
-    proc advance_token from parser
+    proc advance_token with parser
 
-    Let stmt be proc create_ast_node from COBOL_SUBTRACT_STMT
+    Let stmt be proc create_ast_node with COBOL_SUBTRACT_STMT
 
     Note: Parse subtrahends (operands to subtract)
     While 1 is equal to 1:
-        Let token_type be proc peek_token_type from parser
+        Let token_type be proc peek_token_type with parser
 
         If token_type is equal to TOKEN_FROM from Lexer:
             Note: FROM keyword marks end of subtrahends
             If 1 is equal to 1:
-                proc advance_token from parser
+                proc advance_token with parser
                 Note: Break out of loop
                 If 1 is equal to 1:
                     Note: Continue to parse FROM operand
@@ -1800,14 +2274,14 @@ Process called "parse_subtract_statement" takes parser as Integer returns Intege
             Return stmt
         End If
 
-        Let operand be proc parse_expression from parser
+        Let operand be proc parse_expression with parser
         If operand is not equal to 0:
             proc add_node_child with stmt, operand
 
         Otherwise:
             Note: Break if no valid operand
             If token_type is equal to TOKEN_FROM from Lexer:
-                proc advance_token from parser
+                proc advance_token with parser
             End If
             If 1 is equal to 1:
                 Note: Exit loop
@@ -1819,31 +2293,31 @@ Process called "parse_subtract_statement" takes parser as Integer returns Intege
     End While
 
     Note: Parse FROM operand (minuend)
-    Let from_operand be proc parse_expression from parser
+    Let from_operand be proc parse_expression with parser
     If from_operand is not equal to 0:
         proc add_node_child with stmt, from_operand
     End If
 
     Note: Check for GIVING clause
-    Set token_type to proc peek_token_type from parser
+    Set token_type to proc peek_token_type with parser
     If token_type is equal to TOKEN_GIVING from Lexer:
-        proc advance_token from parser
-        Let giving_target be proc parse_expression from parser
+        proc advance_token with parser
+        Let giving_target be proc parse_expression with parser
         If giving_target is not equal to 0:
             proc add_node_child with stmt, giving_target
         End If
     End If
 
     Note: Check for ROUNDED clause
-    Set token_type to proc peek_token_type from parser
+    Set token_type to proc peek_token_type with parser
     If token_type is equal to TOKEN_ROUNDED from Lexer:
-        proc advance_token from parser
-        Let rounded_node be proc create_ast_node from COBOL_ROUNDED_CLAUSE
+        proc advance_token with parser
+        Let rounded_node be proc create_ast_node with COBOL_ROUNDED_CLAUSE
         proc add_node_child with stmt, rounded_node
     End If
 
     Note: Check for ON SIZE ERROR clause
-    Set token_type to proc peek_token_type from parser
+    Set token_type to proc peek_token_type with parser
     If token_type is equal to TOKEN_ON from Lexer:
         Let next_pos be proc memory_get_int64 from Layout with parser, 16
         Set next_pos to next_pos plus 1
@@ -1851,16 +2325,16 @@ Process called "parse_subtract_statement" takes parser as Integer returns Intege
         Let lookahead_type be proc memory_get_int64 from Layout with lookahead, 0
 
         If lookahead_type is equal to TOKEN_SIZE from Lexer:
-            proc advance_token from parser
-            proc advance_token from parser
+            proc advance_token with parser
+            proc advance_token with parser
 
-            Set token_type to proc peek_token_type from parser
+            Set token_type to proc peek_token_type with parser
             If token_type is equal to TOKEN_ERROR from Lexer:
-                proc advance_token from parser
+                proc advance_token with parser
 
-                Let error_clause be proc create_ast_node from COBOL_ON_SIZE_ERROR
+                Let error_clause be proc create_ast_node with COBOL_ON_SIZE_ERROR
                 While 1 is equal to 1:
-                    Set token_type to proc peek_token_type from parser
+                    Set token_type to proc peek_token_type with parser
 
                     If token_type is equal to TOKEN_PERIOD from Lexer:
                         proc add_node_child with stmt, error_clause
@@ -1872,7 +2346,7 @@ Process called "parse_subtract_statement" takes parser as Integer returns Intege
                         End If
                     End If
 
-                    Let error_stmt be proc parse_statement from parser
+                    Let error_stmt be proc parse_statement with parser
                     If error_stmt is not equal to 0:
                         proc add_node_child with error_clause, error_stmt
 
@@ -1890,7 +2364,7 @@ Process called "parse_subtract_statement" takes parser as Integer returns Intege
         End If
     End If
 
-    proc skip_to_period from parser
+    proc skip_to_period with parser
 
     Return stmt
 End Process
@@ -1911,48 +2385,48 @@ Process called "parse_multiply_statement" takes parser as Integer returns Intege
     We parse the multiplicand, BY keyword, multiplier, optional GIVING clause, and ROUNDED.
     @End Reasoning
 
-    proc advance_token from parser
+    proc advance_token with parser
 
-    Let stmt be proc create_ast_node from COBOL_MULTIPLY_STMT
+    Let stmt be proc create_ast_node with COBOL_MULTIPLY_STMT
 
     Note: Parse multiplicand (first operand)
-    Let multiplicand be proc parse_expression from parser
+    Let multiplicand be proc parse_expression with parser
     If multiplicand is not equal to 0:
         proc add_node_child with stmt, multiplicand
     End If
 
     Note: Expect BY keyword
-    Let token_type be proc peek_token_type from parser
+    Let token_type be proc peek_token_type with parser
     If token_type is equal to TOKEN_BY from Lexer:
-        proc advance_token from parser
+        proc advance_token with parser
     End If
 
     Note: Parse multiplier (second operand)
-    Let multiplier be proc parse_expression from parser
+    Let multiplier be proc parse_expression with parser
     If multiplier is not equal to 0:
         proc add_node_child with stmt, multiplier
     End If
 
     Note: Check for GIVING clause
-    Set token_type to proc peek_token_type from parser
+    Set token_type to proc peek_token_type with parser
     If token_type is equal to TOKEN_GIVING from Lexer:
-        proc advance_token from parser
-        Let giving_target be proc parse_expression from parser
+        proc advance_token with parser
+        Let giving_target be proc parse_expression with parser
         If giving_target is not equal to 0:
             proc add_node_child with stmt, giving_target
         End If
     End If
 
     Note: Check for ROUNDED clause
-    Set token_type to proc peek_token_type from parser
+    Set token_type to proc peek_token_type with parser
     If token_type is equal to TOKEN_ROUNDED from Lexer:
-        proc advance_token from parser
-        Let rounded_node be proc create_ast_node from COBOL_ROUNDED_CLAUSE
+        proc advance_token with parser
+        Let rounded_node be proc create_ast_node with COBOL_ROUNDED_CLAUSE
         proc add_node_child with stmt, rounded_node
     End If
 
     Note: Check for ON SIZE ERROR clause
-    Set token_type to proc peek_token_type from parser
+    Set token_type to proc peek_token_type with parser
     If token_type is equal to TOKEN_ON from Lexer:
         Let next_pos be proc memory_get_int64 from Layout with parser, 16
         Set next_pos to next_pos plus 1
@@ -1960,16 +2434,16 @@ Process called "parse_multiply_statement" takes parser as Integer returns Intege
         Let lookahead_type be proc memory_get_int64 from Layout with lookahead, 0
 
         If lookahead_type is equal to TOKEN_SIZE from Lexer:
-            proc advance_token from parser
-            proc advance_token from parser
+            proc advance_token with parser
+            proc advance_token with parser
 
-            Set token_type to proc peek_token_type from parser
+            Set token_type to proc peek_token_type with parser
             If token_type is equal to TOKEN_ERROR from Lexer:
-                proc advance_token from parser
+                proc advance_token with parser
 
-                Let error_clause be proc create_ast_node from COBOL_ON_SIZE_ERROR
+                Let error_clause be proc create_ast_node with COBOL_ON_SIZE_ERROR
                 While 1 is equal to 1:
-                    Set token_type to proc peek_token_type from parser
+                    Set token_type to proc peek_token_type with parser
 
                     If token_type is equal to TOKEN_PERIOD from Lexer:
                         proc add_node_child with stmt, error_clause
@@ -1981,7 +2455,7 @@ Process called "parse_multiply_statement" takes parser as Integer returns Intege
                         End If
                     End If
 
-                    Let error_stmt be proc parse_statement from parser
+                    Let error_stmt be proc parse_statement with parser
                     If error_stmt is not equal to 0:
                         proc add_node_child with error_clause, error_stmt
 
@@ -1999,7 +2473,7 @@ Process called "parse_multiply_statement" takes parser as Integer returns Intege
         End If
     End If
 
-    proc skip_to_period from parser
+    proc skip_to_period with parser
 
     Return stmt
 End Process
@@ -2022,67 +2496,67 @@ Process called "parse_divide_statement" takes parser as Integer returns Integer:
     We parse the dividend, INTO/BY keyword, divisor, optional GIVING, REMAINDER, and ROUNDED clauses.
     @End Reasoning
 
-    proc advance_token from parser
+    proc advance_token with parser
 
-    Let stmt be proc create_ast_node from COBOL_DIVIDE_STMT
+    Let stmt be proc create_ast_node with COBOL_DIVIDE_STMT
 
     Note: Parse dividend (first operand)
-    Let dividend be proc parse_expression from parser
+    Let dividend be proc parse_expression with parser
     If dividend is not equal to 0:
         proc add_node_child with stmt, dividend
     End If
 
     Note: Check for INTO or BY keyword
-    Let token_type be proc peek_token_type from parser
+    Let token_type be proc peek_token_type with parser
     Let is_into be 0
 
     If token_type is equal to TOKEN_INTO from Lexer:
         Set is_into to 1
-        proc advance_token from parser
+        proc advance_token with parser
     End If
 
     If token_type is equal to TOKEN_BY from Lexer:
-        proc advance_token from parser
+        proc advance_token with parser
     End If
 
     Note: Parse divisor (second operand)
-    Let divisor be proc parse_expression from parser
+    Let divisor be proc parse_expression with parser
     If divisor is not equal to 0:
         proc add_node_child with stmt, divisor
     End If
 
     Note: Check for GIVING clause
-    Set token_type to proc peek_token_type from parser
+    Set token_type to proc peek_token_type with parser
     If token_type is equal to TOKEN_GIVING from Lexer:
-        proc advance_token from parser
-        Let giving_target be proc parse_expression from parser
+        proc advance_token with parser
+        Let giving_target be proc parse_expression with parser
         If giving_target is not equal to 0:
             proc add_node_child with stmt, giving_target
         End If
     End If
 
     Note: Check for REMAINDER clause
-    Set token_type to proc peek_token_type from parser
+    Set token_type to proc peek_token_type with parser
     If token_type is equal to TOKEN_REMAINDER from Lexer:
-        proc advance_token from parser
-        Let remainder_target be proc parse_expression from parser
+        proc advance_token with parser
+        Let remainder_target be proc parse_expression with parser
         If remainder_target is not equal to 0:
-            Let remainder_node be proc create_ast_node from COBOL_REMAINDER_CLAUSE
+            Let remainder_node be proc create_ast_node with COBOL_REMAINDER_CLAUSE
             proc add_node_child with remainder_node, remainder_target
             proc add_node_child with stmt, remainder_node
         End If
     End If
 
     Note: Check for ROUNDED clause
-    Set token_type to proc peek_token_type from parser
+    Set token_type to proc peek_token_type with parser
     If token_type is equal to TOKEN_ROUNDED from Lexer:
-        proc advance_token from parser
-        Let rounded_node be proc create_ast_node from COBOL_ROUNDED_CLAUSE
+        proc advance_token with parser
+        Let rounded_node be proc create_ast_node with COBOL_ROUNDED_CLAUSE
         proc add_node_child with stmt, rounded_node
     End If
 
     Note: Check for ON SIZE ERROR clause
-    Set token_type to proc peek_token_type from parser
+    Set token_type to proc peek_token_type with parser
     If token_type is equal to TOKEN_ON from Lexer:
         Let next_pos be proc memory_get_int64 from Layout with parser, 16
         Set next_pos to next_pos plus 1
@@ -2090,16 +2564,16 @@ Process called "parse_divide_statement" takes parser as Integer returns Integer:
         Let lookahead_type be proc memory_get_int64 from Layout with lookahead, 0
 
         If lookahead_type is equal to TOKEN_SIZE from Lexer:
-            proc advance_token from parser
-            proc advance_token from parser
+            proc advance_token with parser
+            proc advance_token with parser
 
-            Set token_type to proc peek_token_type from parser
+            Set token_type to proc peek_token_type with parser
             If token_type is equal to TOKEN_ERROR from Lexer:
-                proc advance_token from parser
+                proc advance_token with parser
 
-                Let error_clause be proc create_ast_node from COBOL_ON_SIZE_ERROR
+                Let error_clause be proc create_ast_node with COBOL_ON_SIZE_ERROR
                 While 1 is equal to 1:
-                    Set token_type to proc peek_token_type from parser
+                    Set token_type to proc peek_token_type with parser
 
                     If token_type is equal to TOKEN_PERIOD from Lexer:
                         proc add_node_child with stmt, error_clause
@@ -2111,7 +2585,7 @@ Process called "parse_divide_statement" takes parser as Integer returns Integer:
                         End If
                     End If
 
-                    Let error_stmt be proc parse_statement from parser
+                    Let error_stmt be proc parse_statement with parser
                     If error_stmt is not equal to 0:
                         proc add_node_child with error_clause, error_stmt
 
@@ -2129,7 +2603,7 @@ Process called "parse_divide_statement" takes parser as Integer returns Integer:
         End If
     End If
 
-    proc skip_to_period from parser
+    proc skip_to_period with parser
 
     Return stmt
 End Process
@@ -2145,29 +2619,29 @@ clearer than a chain of ADD/SUBTRACT/MULTIPLY/DIVIDE.
 Process called "parse_compute_statement" takes parser as Integer returns Integer:
     Note: Parse COMPUTE statement (COMPUTE result = expression)
 
-    proc advance_token from parser
+    proc advance_token with parser
 
-    Let stmt be proc create_ast_node from COBOL_COMPUTE_STMT
+    Let stmt be proc create_ast_node with COBOL_COMPUTE_STMT
 
     Note: Parse result variable
-    Let result be proc parse_expression from parser
+    Let result be proc parse_expression with parser
     If result is not equal to 0:
         proc add_node_child with stmt, result
     End If
 
     Note: Expect = (EQUAL_SIGN)
-    Let token_type be proc peek_token_type from parser
+    Let token_type be proc peek_token_type with parser
     If token_type is equal to TOKEN_EQUAL_SIGN from Lexer:
-        proc advance_token from parser
+        proc advance_token with parser
     End If
 
     Note: Parse arithmetic expression
-    Let expr be proc parse_arithmetic_expression from parser
+    Let expr be proc parse_arithmetic_expression with parser
     If expr is not equal to 0:
         proc add_node_child with stmt, expr
     End If
 
-    proc skip_to_period from parser
+    proc skip_to_period with parser
 
     Return stmt
 End Process
@@ -2191,36 +2665,36 @@ Process called "parse_if_statement" takes parser as Integer returns Integer:
     END-IF.
     @End Reasoning
 
-    proc advance_token from parser
+    proc advance_token with parser
 
-    Let stmt be proc create_ast_node from COBOL_IF_STMT
+    Let stmt be proc create_ast_node with COBOL_IF_STMT
 
     Note: Parse condition
-    Let condition be proc parse_condition from parser
+    Let condition be proc parse_condition with parser
     If condition is not equal to 0:
         proc add_node_child with stmt, condition
     End If
 
     Note: Parse THEN statements
     While 1 is equal to 1:
-        Let token_type be proc peek_token_type from parser
+        Let token_type be proc peek_token_type with parser
 
         If token_type is equal to TOKEN_ELSE from Lexer:
             Note: Parse ELSE clause
-            proc advance_token from parser
-            Let else_clause be proc create_ast_node from COBOL_ELSE_CLAUSE
+            proc advance_token with parser
+            Let else_clause be proc create_ast_node with COBOL_ELSE_CLAUSE
 
             While 1 is equal to 1:
-                Set token_type to proc peek_token_type from parser
+                Set token_type to proc peek_token_type with parser
 
                 If token_type is equal to TOKEN_END_IF from Lexer:
-                    proc advance_token from parser
+                    proc advance_token with parser
                     proc add_node_child with stmt, else_clause
-                    proc skip_to_period from parser
+                    proc skip_to_period with parser
                     Return stmt
                 End If
 
-                Let else_stmt be proc parse_statement from parser
+                Let else_stmt be proc parse_statement with parser
                 If else_stmt is not equal to 0:
                     proc add_node_child with else_clause, else_stmt
 
@@ -2235,17 +2709,17 @@ Process called "parse_if_statement" takes parser as Integer returns Integer:
         End If
 
         If token_type is equal to TOKEN_END_IF from Lexer:
-            proc advance_token from parser
-            proc skip_to_period from parser
+            proc advance_token with parser
+            proc skip_to_period with parser
             Return stmt
         End If
 
         If token_type is equal to TOKEN_PERIOD from Lexer:
-            proc advance_token from parser
+            proc advance_token with parser
             Return stmt
         End If
 
-        Let then_stmt be proc parse_statement from parser
+        Let then_stmt be proc parse_statement with parser
         If then_stmt is not equal to 0:
             proc add_node_child with stmt, then_stmt
 
@@ -2293,36 +2767,36 @@ Process called "parse_evaluate_statement" takes parser as Integer returns Intege
     and the optional WHEN OTHER (default) clause.
     @End Reasoning
 
-    proc advance_token from parser
+    proc advance_token with parser
 
-    Let stmt be proc create_ast_node from COBOL_EVALUATE_STMT
+    Let stmt be proc create_ast_node with COBOL_EVALUATE_STMT
 
     Note: Parse test expression
-    Let test_expr be proc parse_expression from parser
+    Let test_expr be proc parse_expression with parser
     If test_expr is not equal to 0:
         proc add_node_child with stmt, test_expr
     End If
 
     Note: Parse WHEN clauses
     While 1 is equal to 1:
-        Let token_type be proc peek_token_type from parser
+        Let token_type be proc peek_token_type with parser
 
         If token_type is equal to TOKEN_WHEN from Lexer:
-            proc advance_token from parser
+            proc advance_token with parser
 
-            Let when_clause be proc create_ast_node from COBOL_WHEN_CLAUSE
+            Let when_clause be proc create_ast_node with COBOL_WHEN_CLAUSE
 
             Note: Check for WHEN OTHER (default case)
-            Set token_type to proc peek_token_type from parser
+            Set token_type to proc peek_token_type with parser
             If token_type is equal to TOKEN_OTHER from Lexer:
-                proc advance_token from parser
-                Let other_node be proc create_ast_node from COBOL_OTHER_CLAUSE
+                proc advance_token with parser
+                Let other_node be proc create_ast_node with COBOL_OTHER_CLAUSE
                 proc add_node_child with when_clause, other_node
 
             Otherwise:
                 Note: Parse WHEN value(s)
                 While 1 is equal to 1:
-                    Set token_type to proc peek_token_type from parser
+                    Set token_type to proc peek_token_type with parser
 
                     If token_type is equal to TOKEN_WHEN from Lexer:
                         Note: Next WHEN clause
@@ -2381,7 +2855,7 @@ Process called "parse_evaluate_statement" takes parser as Integer returns Intege
                         End If
                     End If
 
-                    Let when_value be proc parse_expression from parser
+                    Let when_value be proc parse_expression with parser
                     If when_value is not equal to 0:
                         proc add_node_child with when_clause, when_value
 
@@ -2399,7 +2873,7 @@ Process called "parse_evaluate_statement" takes parser as Integer returns Intege
 
             Note: Parse statements for this WHEN clause
             While 1 is equal to 1:
-                Set token_type to proc peek_token_type from parser
+                Set token_type to proc peek_token_type with parser
 
                 If token_type is equal to TOKEN_WHEN from Lexer:
                     Note: Next WHEN clause
@@ -2415,8 +2889,8 @@ Process called "parse_evaluate_statement" takes parser as Integer returns Intege
                 If token_type is equal to TOKEN_END_EVALUATE from Lexer:
                     Note: End of EVALUATE
                     proc add_node_child with stmt, when_clause
-                    proc advance_token from parser
-                    proc skip_to_period from parser
+                    proc advance_token with parser
+                    proc skip_to_period with parser
                     Return stmt
                 End If
 
@@ -2426,7 +2900,7 @@ Process called "parse_evaluate_statement" takes parser as Integer returns Intege
                     Return stmt
                 End If
 
-                Let when_stmt be proc parse_statement from parser
+                Let when_stmt be proc parse_statement with parser
                 If when_stmt is not equal to 0:
                     proc add_node_child with when_clause, when_stmt
 
@@ -2444,8 +2918,8 @@ Process called "parse_evaluate_statement" takes parser as Integer returns Intege
         End If
 
         If token_type is equal to TOKEN_END_EVALUATE from Lexer:
-            proc advance_token from parser
-            proc skip_to_period from parser
+            proc advance_token with parser
+            proc skip_to_period with parser
             Return stmt
         End If
 
@@ -2481,29 +2955,29 @@ Process called "parse_perform_statement" takes parser as Integer returns Integer
     PERFORM VARYING counter FROM start BY increment UNTIL condition
     @End Reasoning
 
-    proc advance_token from parser
+    proc advance_token with parser
 
-    Let stmt be proc create_ast_node from COBOL_PERFORM_STMT
+    Let stmt be proc create_ast_node with COBOL_PERFORM_STMT
 
     Note: Parse target paragraph or UNTIL/VARYING
-    Let token_type be proc peek_token_type from parser
+    Let token_type be proc peek_token_type with parser
 
     If token_type is equal to TOKEN_UNTIL from Lexer:
-        proc advance_token from parser
-        Let condition be proc parse_condition from parser
+        proc advance_token with parser
+        Let condition be proc parse_condition with parser
         If condition is not equal to 0:
             proc add_node_child with stmt, condition
         End If
 
     Otherwise:
     If token_type is equal to TOKEN_IDENTIFIER from Lexer:
-        Let target be proc peek_token_lexeme from parser
+        Let target be proc peek_token_lexeme with parser
         proc set_node_name with stmt, target
-        proc advance_token from parser
+        proc advance_token with parser
     End If
     End If
 
-    proc skip_to_period from parser
+    proc skip_to_period with parser
 
     Return stmt
 End Process
@@ -2519,29 +2993,30 @@ attributes for the emitter.
 Process called "parse_display_statement" takes parser as Integer returns Integer:
     Note: Parse DISPLAY statement
 
-    proc advance_token from parser
+    proc advance_token with parser
 
-    Let stmt be proc create_ast_node from COBOL_DISPLAY_STMT
+    Let stmt be proc create_ast_node with COBOL_DISPLAY_STMT
 
     Note: Parse items to display
     While 1 is equal to 1:
-        Let token_type be proc peek_token_type from parser
+        Let token_type be proc peek_token_type with parser
 
         If token_type is equal to TOKEN_PERIOD from Lexer:
-            proc advance_token from parser
+            proc advance_token with parser
             Return stmt
         End If
 
-        Let item be proc parse_expression from parser
+        Let item be proc parse_expression with parser
         If item is not equal to 0:
             proc add_node_child with stmt, item
 
         Otherwise:
-            Note: Break
-            If 1 is equal to 1:
-                proc skip_to_period from parser
-                Return stmt
-            End If
+            Note: A token that cannot start a display item (ELSE, END-IF, the
+            Note: next verb, EOF) marks the end of this statement. Leave that
+            Note: boundary token for the caller (e.g. the enclosing IF) rather
+            Note: than running skip_to_period, which would swallow the ELSE /
+            Note: END-IF and dissolve the surrounding control structure.
+            Return stmt
         End If
     End While
 
@@ -2565,17 +3040,17 @@ the period terminator.
 Process called "parse_accept_statement" takes parser as Integer returns Integer:
     Note: Parse ACCEPT statement
 
-    proc advance_token from parser
+    proc advance_token with parser
 
-    Let stmt be proc create_ast_node from COBOL_ACCEPT_STMT
+    Let stmt be proc create_ast_node with COBOL_ACCEPT_STMT
 
     Note: Parse destination variable
-    Let dest be proc parse_expression from parser
+    Let dest be proc parse_expression with parser
     If dest is not equal to 0:
         proc add_node_child with stmt, dest
     End If
 
-    proc skip_to_period from parser
+    proc skip_to_period with parser
 
     Return stmt
 End Process
@@ -2596,11 +3071,11 @@ the back-end which re-walks the lexer's token sequence per statement.
 Process called "parse_open_statement" takes parser as Integer returns Integer:
     Note: Parse OPEN statement
 
-    proc advance_token from parser
+    proc advance_token with parser
 
-    Let stmt be proc create_ast_node from COBOL_OPEN_STMT
+    Let stmt be proc create_ast_node with COBOL_OPEN_STMT
 
-    proc skip_to_period from parser
+    proc skip_to_period with parser
 
     Return stmt
 End Process
@@ -2619,11 +3094,11 @@ file list and any WITH NO REWIND / WITH LOCK clauses up to the period.
 Process called "parse_close_statement" takes parser as Integer returns Integer:
     Note: Parse CLOSE statement
 
-    proc advance_token from parser
+    proc advance_token with parser
 
-    Let stmt be proc create_ast_node from COBOL_CLOSE_STMT
+    Let stmt be proc create_ast_node with COBOL_CLOSE_STMT
 
-    proc skip_to_period from parser
+    proc skip_to_period with parser
 
     Return stmt
 End Process
@@ -2643,11 +3118,11 @@ INTO target and conditional clauses.
 Process called "parse_read_statement" takes parser as Integer returns Integer:
     Note: Parse READ statement
 
-    proc advance_token from parser
+    proc advance_token with parser
 
-    Let stmt be proc create_ast_node from COBOL_READ_STMT
+    Let stmt be proc create_ast_node with COBOL_READ_STMT
 
-    proc skip_to_period from parser
+    proc skip_to_period with parser
 
     Return stmt
 End Process
@@ -2666,11 +3141,11 @@ ADVANCING, AT END-OF-PAGE clauses through the period.
 Process called "parse_write_statement" takes parser as Integer returns Integer:
     Note: Parse WRITE statement
 
-    proc advance_token from parser
+    proc advance_token with parser
 
-    Let stmt be proc create_ast_node from COBOL_WRITE_STMT
+    Let stmt be proc create_ast_node with COBOL_WRITE_STMT
 
-    proc skip_to_period from parser
+    proc skip_to_period with parser
 
     Return stmt
 End Process
@@ -2692,25 +3167,25 @@ trailing DEPENDING ON expression and the period.
 Process called "parse_go_statement" takes parser as Integer returns Integer:
     Note: Parse GO TO statement
 
-    proc advance_token from parser
+    proc advance_token with parser
 
-    Let stmt be proc create_ast_node from COBOL_GO_STMT
+    Let stmt be proc create_ast_node with COBOL_GO_STMT
 
     Note: Expect TO keyword (optional in GO TO)
-    Let token_type be proc peek_token_type from parser
+    Let token_type be proc peek_token_type with parser
     If token_type is equal to TOKEN_TO from Lexer:
-        proc advance_token from parser
+        proc advance_token with parser
     End If
 
     Note: Parse target paragraph
-    Set token_type to proc peek_token_type from parser
+    Set token_type to proc peek_token_type with parser
     If token_type is equal to TOKEN_IDENTIFIER from Lexer:
-        Let target be proc peek_token_lexeme from parser
+        Let target be proc peek_token_lexeme with parser
         proc set_node_name with stmt, target
-        proc advance_token from parser
+        proc advance_token with parser
     End If
 
-    proc skip_to_period from parser
+    proc skip_to_period with parser
 
     Return stmt
 End Process
@@ -2730,11 +3205,11 @@ keyword or literal operand through the period.
 Process called "parse_stop_statement" takes parser as Integer returns Integer:
     Note: Parse STOP statement
 
-    proc advance_token from parser
+    proc advance_token with parser
 
-    Let stmt be proc create_ast_node from COBOL_STOP_STMT
+    Let stmt be proc create_ast_node with COBOL_STOP_STMT
 
-    proc skip_to_period from parser
+    proc skip_to_period with parser
 
     Return stmt
 End Process
@@ -2754,11 +3229,11 @@ optional qualifier keyword and period.
 Process called "parse_exit_statement" takes parser as Integer returns Integer:
     Note: Parse EXIT statement
 
-    proc advance_token from parser
+    proc advance_token with parser
 
-    Let stmt be proc create_ast_node from COBOL_EXIT_STMT
+    Let stmt be proc create_ast_node with COBOL_EXIT_STMT
 
-    proc skip_to_period from parser
+    proc skip_to_period with parser
 
     Return stmt
 End Process
@@ -2778,11 +3253,11 @@ period terminator.
 Process called "parse_goback_statement" takes parser as Integer returns Integer:
     Note: Parse GOBACK statement
 
-    proc advance_token from parser
+    proc advance_token with parser
 
-    Let stmt be proc create_ast_node from COBOL_GOBACK_STMT
+    Let stmt be proc create_ast_node with COBOL_GOBACK_STMT
 
-    proc skip_to_period from parser
+    proc skip_to_period with parser
 
     Return stmt
 End Process
@@ -2802,11 +3277,11 @@ program name, USING list, and any exception clauses through the period.
 Process called "parse_call_statement" takes parser as Integer returns Integer:
     Note: Parse CALL statement
 
-    proc advance_token from parser
+    proc advance_token with parser
 
-    Let stmt be proc create_ast_node from COBOL_CALL_STMT
+    Let stmt be proc create_ast_node with COBOL_CALL_STMT
 
-    proc skip_to_period from parser
+    proc skip_to_period with parser
 
     Return stmt
 End Process
@@ -2834,44 +3309,44 @@ caller can react (typically by recovering via skip_to_period).
 Process called "parse_expression" takes parser as Integer returns Integer:
     Note: Parse expression (identifier, literal, or figurative constant)
 
-    Let token_type be proc peek_token_type from parser
+    Let token_type be proc peek_token_type with parser
 
     If token_type is equal to TOKEN_IDENTIFIER from Lexer:
-        Let expr be proc create_ast_node from COBOL_IDENTIFIER
-        Let name be proc peek_token_lexeme from parser
+        Let expr be proc create_ast_node with COBOL_IDENTIFIER
+        Let name be proc peek_token_lexeme with parser
         proc set_node_name with expr, name
-        proc advance_token from parser
+        proc advance_token with parser
         Return expr
     End If
 
     If token_type is equal to TOKEN_NUMBER from Lexer:
-        Set expr to proc create_ast_node from COBOL_LITERAL
-        Let value be proc peek_token_lexeme from parser
+        Set expr to proc create_ast_node with COBOL_LITERAL
+        Let value be proc peek_token_lexeme with parser
         proc set_node_value with expr, value
-        proc advance_token from parser
+        proc advance_token with parser
         Return expr
     End If
 
     If token_type is equal to TOKEN_STRING from Lexer:
-        Set expr to proc create_ast_node from COBOL_LITERAL
-        Set value to proc peek_token_lexeme from parser
+        Set expr to proc create_ast_node with COBOL_LITERAL
+        Set value to proc peek_token_lexeme with parser
         proc set_node_value with expr, value
-        proc advance_token from parser
+        proc advance_token with parser
         Return expr
     End If
 
     Note: Figurative constants
     If token_type is equal to TOKEN_ZERO from Lexer:
-        Set expr to proc create_ast_node from COBOL_FIGURATIVE_CONST
+        Set expr to proc create_ast_node with COBOL_FIGURATIVE_CONST
         proc set_node_name with expr, "ZERO"
-        proc advance_token from parser
+        proc advance_token with parser
         Return expr
     End If
 
     If token_type is equal to TOKEN_SPACES from Lexer:
-        Set expr to proc create_ast_node from COBOL_FIGURATIVE_CONST
+        Set expr to proc create_ast_node with COBOL_FIGURATIVE_CONST
         proc set_node_name with expr, "SPACES"
-        proc advance_token from parser
+        proc advance_token with parser
         Return expr
     End If
 
@@ -2894,46 +3369,46 @@ Process called "parse_arithmetic_expression" takes parser as Integer returns Int
     Operators: +, -, *, /
     @End Reasoning
 
-    Let left be proc parse_expression from parser
+    Let left be proc parse_expression with parser
 
-    Let token_type be proc peek_token_type from parser
+    Let token_type be proc peek_token_type with parser
 
     If token_type is equal to TOKEN_PLUS from Lexer:
-        proc advance_token from parser
-        Let expr be proc create_ast_node from COBOL_ARITHMETIC_EXPR
+        proc advance_token with parser
+        Let expr be proc create_ast_node with COBOL_ARITHMETIC_EXPR
         proc set_node_attribute with expr, "operator", "+"
         proc add_node_child with expr, left
-        Let right be proc parse_arithmetic_expression from parser
+        Let right be proc parse_arithmetic_expression with parser
         proc add_node_child with expr, right
         Return expr
     End If
 
     If token_type is equal to TOKEN_MINUS from Lexer:
-        proc advance_token from parser
-        Set expr to proc create_ast_node from COBOL_ARITHMETIC_EXPR
+        proc advance_token with parser
+        Set expr to proc create_ast_node with COBOL_ARITHMETIC_EXPR
         proc set_node_attribute with expr, "operator", "-"
         proc add_node_child with expr, left
-        Set right to proc parse_arithmetic_expression from parser
+        Set right to proc parse_arithmetic_expression with parser
         proc add_node_child with expr, right
         Return expr
     End If
 
     If token_type is equal to TOKEN_STAR from Lexer:
-        proc advance_token from parser
-        Set expr to proc create_ast_node from COBOL_ARITHMETIC_EXPR
+        proc advance_token with parser
+        Set expr to proc create_ast_node with COBOL_ARITHMETIC_EXPR
         proc set_node_attribute with expr, "operator", "*"
         proc add_node_child with expr, left
-        Set right to proc parse_arithmetic_expression from parser
+        Set right to proc parse_arithmetic_expression with parser
         proc add_node_child with expr, right
         Return expr
     End If
 
     If token_type is equal to TOKEN_SLASH from Lexer:
-        proc advance_token from parser
-        Set expr to proc create_ast_node from COBOL_ARITHMETIC_EXPR
+        proc advance_token with parser
+        Set expr to proc create_ast_node with COBOL_ARITHMETIC_EXPR
         proc set_node_attribute with expr, "operator", "/"
         proc add_node_child with expr, left
-        Set right to proc parse_arithmetic_expression from parser
+        Set right to proc parse_arithmetic_expression with parser
         proc add_node_child with expr, right
         Return expr
     End If
@@ -2958,36 +3433,70 @@ Process called "parse_condition" takes parser as Integer returns Integer:
     Logical operators: AND, OR, NOT
     @End Reasoning
 
-    Let left be proc parse_expression from parser
+    Let left be proc parse_expression with parser
 
-    Let token_type be proc peek_token_type from parser
+    Let token_type be proc peek_token_type with parser
 
+    Note: COBOL relational operators come in two lexical forms that are
+    Note: semantically identical: the reserved-word forms (EQUAL / GREATER /
+    Note: LESS) and the symbolic forms (= / > / <). Accept both so conditions
+    Note: written with either spelling parse to the same relational tree.
     If token_type is equal to TOKEN_EQUAL from Lexer:
-        proc advance_token from parser
-        Let expr be proc create_ast_node from COBOL_RELATIONAL_EXPR
+        proc advance_token with parser
+        Let expr be proc create_ast_node with COBOL_RELATIONAL_EXPR
         proc set_node_attribute with expr, "operator", "="
         proc add_node_child with expr, left
-        Let right be proc parse_expression from parser
+        Let right be proc parse_expression with parser
+        proc add_node_child with expr, right
+        Return expr
+    End If
+
+    If token_type is equal to TOKEN_EQUAL_SIGN from Lexer:
+        proc advance_token with parser
+        Set expr to proc create_ast_node with COBOL_RELATIONAL_EXPR
+        proc set_node_attribute with expr, "operator", "="
+        proc add_node_child with expr, left
+        Set right to proc parse_expression with parser
         proc add_node_child with expr, right
         Return expr
     End If
 
     If token_type is equal to TOKEN_GREATER from Lexer:
-        proc advance_token from parser
-        Set expr to proc create_ast_node from COBOL_RELATIONAL_EXPR
+        proc advance_token with parser
+        Set expr to proc create_ast_node with COBOL_RELATIONAL_EXPR
         proc set_node_attribute with expr, "operator", ">"
         proc add_node_child with expr, left
-        Set right to proc parse_expression from parser
+        Set right to proc parse_expression with parser
+        proc add_node_child with expr, right
+        Return expr
+    End If
+
+    If token_type is equal to TOKEN_GREATER_THAN from Lexer:
+        proc advance_token with parser
+        Set expr to proc create_ast_node with COBOL_RELATIONAL_EXPR
+        proc set_node_attribute with expr, "operator", ">"
+        proc add_node_child with expr, left
+        Set right to proc parse_expression with parser
         proc add_node_child with expr, right
         Return expr
     End If
 
     If token_type is equal to TOKEN_LESS from Lexer:
-        proc advance_token from parser
-        Set expr to proc create_ast_node from COBOL_RELATIONAL_EXPR
+        proc advance_token with parser
+        Set expr to proc create_ast_node with COBOL_RELATIONAL_EXPR
         proc set_node_attribute with expr, "operator", "<"
         proc add_node_child with expr, left
-        Set right to proc parse_expression from parser
+        Set right to proc parse_expression with parser
+        proc add_node_child with expr, right
+        Return expr
+    End If
+
+    If token_type is equal to TOKEN_LESS_THAN from Lexer:
+        proc advance_token with parser
+        Set expr to proc create_ast_node with COBOL_RELATIONAL_EXPR
+        proc set_node_attribute with expr, "operator", "<"
+        proc add_node_child with expr, left
+        Set right to proc parse_expression with parser
         proc add_node_child with expr, right
         Return expr
     End If
@@ -3015,10 +3524,10 @@ Process called "skip_to_period" takes parser as Integer returns Integer:
     @End Reasoning
 
     While 1 is equal to 1:
-        Let token_type be proc peek_token_type from parser
+        Let token_type be proc peek_token_type with parser
 
         If token_type is equal to TOKEN_PERIOD from Lexer:
-            proc advance_token from parser
+            proc advance_token with parser
             Return 1
         End If
 
@@ -3026,7 +3535,7 @@ Process called "skip_to_period" takes parser as Integer returns Integer:
             Return 1
         End If
 
-        proc advance_token from parser
+        proc advance_token with parser
     End While
 
     Return 1
@@ -3044,7 +3553,7 @@ Process called "skip_to_next_section" takes parser as Integer returns Integer:
     Note: Skip tokens until next section keyword
 
     While 1 is equal to 1:
-        Let token_type be proc peek_token_type from parser
+        Let token_type be proc peek_token_type with parser
 
         If token_type is equal to TOKEN_EOF from Lexer:
             Return 1
@@ -3058,7 +3567,7 @@ Process called "skip_to_next_section" takes parser as Integer returns Integer:
             Return 1
         End If
 
-        proc advance_token from parser
+        proc advance_token with parser
     End While
 
     Return 1

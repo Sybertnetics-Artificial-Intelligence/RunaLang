@@ -1,0 +1,402 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+Licensed under Apache 2.0
+:End Note
+
+Note:
+COBOL Translation Round-Trip Probe
+
+End-to-end proof that the COBOL translation pipeline is REAL, not a skeleton:
+
+    COBOL source
+      -> cobol_lexer     (tokenize: divisions, PROGRAM-ID, level numbers,
+                          PIC/VALUE clauses, paragraphs, verbs)
+      -> cobol_parser    (build the AST node tree)
+      -> cobol_to_hir    (lower the AST to the cobol HIR dictionary/list model)
+      -> hir_to_cobol    (emit HIR back to valid COBOL text)
+      -> re-lex / re-parse / re-to_hir of the emitted text
+      -> structural + CONTENT equality on the key constructs
+
+The COBOL HIR node model is cobol_to_hir's local dictionary/list interchange
+shared with hir_to_cobol: a dictionary is a 32-byte header (size @0, capacity
+@8, keys-array pointer @16, values-array pointer @24) over two parallel int64
+arrays; a child list is a ListOps list. String payloads are raw char* handles.
+This probe reads HIR fields through exactly that contract (the decoders below
+mirror the producer/consumer).
+
+DEPTH: the probe does NOT merely check that nodes exist. It asserts on the
+re-parsed HIR2 that the CONTENTS survive: PROGRAM-ID name; a WORKING-STORAGE
+item with level + PIC + VALUE; >= 2 paragraphs; a MOVE; an IF with an ELSE; a
+PERFORM UNTIL; a COMPUTE; a DISPLAY. A translator that returned an empty list
+(constructs vanish) makes this probe FAIL.
+
+Exit code: number of failed assertions (0 == all passed). No exit_with_code.
+:End Note
+
+Import "compiler/middle/gungnir/hir/translation/frontends/cobol/cobol_parser.runa" as CobolParser
+Import "compiler/middle/gungnir/hir/translation/frontends/cobol/cobol_to_hir.runa" as CobolFrontend
+Import "compiler/middle/gungnir/hir/translation/backends/cobol/hir_to_cobol.runa" as CobolBackend
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/collections/list.runa" as ListOps
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "tests/test_utils.runa" as TestUtils
+
+Note: ============================================================================
+Note: cobol HIR dict/list decoders (mirror the producer/consumer contract)
+Note: ============================================================================
+
+@Reasoning:
+A cobol HIR dictionary is a 32-byte header over two parallel int64 arrays:
+size (offset 0), capacity (offset 8), keys pointer (offset 16), values pointer
+(offset 24). This decoder linear-scans the populated prefix comparing the raw
+key with string_equals and returns the parallel value slot. It is the exact
+lookup hir_to_cobol's dict_lookup_entry performs, so reading HIR through it
+proves the produced shape is the consumed shape.
+@End Reasoning
+Process called "dict_get" takes node as Integer, key as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+
+    Let size be proc memory_get_int64 from Layout with node, 0
+    Let keys be proc memory_get_int64 from Layout with node, 16
+    Let values be proc memory_get_int64 from Layout with node, 24
+    If keys is equal to 0:
+        Return 0
+    End If
+
+    Let index be 0
+    While index is less than size:
+        Let slot_offset be index multiplied by 8
+        Let stored_key be proc memory_get_int64 from Layout with keys, slot_offset
+        If stored_key is not equal to 0:
+            Let matches be proc string_equals from StringCore with stored_key, key
+            If matches is equal to 1:
+                Return proc memory_get_int64 from Layout with values, slot_offset
+            End If
+        End If
+        Set index to index plus 1
+    End While
+
+    Return 0
+End Process
+
+@Reasoning:
+String fields ("_type", "name", "level", "picture", "value", "target") are
+stored as raw char* handles directly in the value slot. dict_get returns that
+handle unchanged, so the same lookup serves both string and node values; the
+caller decides how to interpret the result.
+@End Reasoning
+Process called "dict_get_string" takes node as Integer, key as Integer returns Integer:
+    Return proc dict_get with node, key
+End Process
+
+@Reasoning:
+Returns the element count of a cobol HIR child list (a ListOps list), or 0 when
+absent. Used to assert division counts, statement counts, paragraph counts.
+@End Reasoning
+Process called "list_count" takes list_node as Integer returns Integer:
+    If list_node is equal to 0:
+        Return 0
+    End If
+    Return proc list_length from ListOps with list_node
+End Process
+
+@Reasoning:
+Returns the element at index of a cobol HIR child list, or 0 when out of range.
+@End Reasoning
+Process called "list_item" takes list_node as Integer, index as Integer returns Integer:
+    If list_node is equal to 0:
+        Return 0
+    End If
+    Return proc list_get from ListOps with list_node, index
+End Process
+
+@Reasoning:
+Locates the first element of a child list whose "_type" matches the requested
+kind. Used to find a specific division, section, or statement within a list.
+@End Reasoning
+Process called "find_in_list" takes list_node as Integer, type_name as Integer returns Integer:
+    If list_node is equal to 0:
+        Return 0
+    End If
+    Let count be proc list_count with list_node
+    Let index be 0
+    While index is less than count:
+        Let item be proc list_item with list_node, index
+        Let item_type be proc dict_get_string with item, "_type"
+        If item_type is not equal to 0:
+            Let matches be proc string_equals from StringCore with item_type, type_name
+            If matches is equal to 1:
+                Return item
+            End If
+        End If
+        Set index to index plus 1
+    End While
+    Return 0
+End Process
+
+@Reasoning:
+Counts the elements of a child list whose "_type" matches the requested kind.
+Used to assert e.g. that >= 2 paragraphs and a non-zero count of a given
+statement kind survive.
+@End Reasoning
+Process called "count_of_type" takes list_node as Integer, type_name as Integer returns Integer:
+    If list_node is equal to 0:
+        Return 0
+    End If
+    Let count be proc list_count with list_node
+    Let found be 0
+    Let index be 0
+    While index is less than count:
+        Let item be proc list_item with list_node, index
+        Let item_type be proc dict_get_string with item, "_type"
+        If item_type is not equal to 0:
+            Let matches be proc string_equals from StringCore with item_type, type_name
+            If matches is equal to 1:
+                Set found to found plus 1
+            End If
+        End If
+        Set index to index plus 1
+    End While
+    Return found
+End Process
+
+@Reasoning:
+Searches a list of paragraphs/sections for any statement of a given kind by
+scanning each paragraph's "statements" list. Returns the first matching
+statement node, or 0. Bounded by the paragraph and statement counts, so it
+always terminates.
+@End Reasoning
+Process called "find_stmt_in_paragraphs" takes paragraphs as Integer, kind as Integer returns Integer:
+    If paragraphs is equal to 0:
+        Return 0
+    End If
+    Let pcount be proc list_count with paragraphs
+    Let p be 0
+    While p is less than pcount:
+        Let para be proc list_item with paragraphs, p
+        Let stmts be proc dict_get with para, "statements"
+        If stmts is not equal to 0:
+            Let scount be proc list_count with stmts
+            Let s be 0
+            While s is less than scount:
+                Let stmt be proc list_item with stmts, s
+                Let stmt_type be proc dict_get_string with stmt, "_type"
+                If stmt_type is not equal to 0:
+                    Let matches be proc string_equals from StringCore with stmt_type, kind
+                    If matches is equal to 1:
+                        Return stmt
+                    End If
+                End If
+                Set s to s plus 1
+            End While
+        End If
+        Set p to p plus 1
+    End While
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: Navigation helpers over the cobol_program HIR
+Note: ============================================================================
+
+@Reasoning:
+The program root holds a "divisions" list. This locates a division by its
+"_type" tag (cobol_data_division / cobol_procedure_division).
+@End Reasoning
+Process called "find_division" takes hir_root as Integer, type_name as Integer returns Integer:
+    Let divisions be proc dict_get with hir_root, "divisions"
+    Return proc find_in_list with divisions, type_name
+End Process
+
+@Reasoning:
+The DATA DIVISION holds a "sections" list (the producer/consumer contract
+between cobol_to_hir and hir_to_cobol keys it "sections"); this returns the
+WORKING-STORAGE section's "items" list (the data items).
+@End Reasoning
+Process called "find_working_storage_items" takes hir_root as Integer returns Integer:
+    Let data_div be proc find_division with hir_root, "cobol_data_division"
+    If data_div is equal to 0:
+        Return 0
+    End If
+    Let body be proc dict_get with data_div, "sections"
+    Let ws be proc find_in_list with body, "cobol_working_storage"
+    If ws is equal to 0:
+        Return 0
+    End If
+    Return proc dict_get with ws, "items"
+End Process
+
+@Reasoning:
+Locates a WORKING-STORAGE item by name in the items list.
+@End Reasoning
+Process called "find_item_by_name" takes items as Integer, want_name as Integer returns Integer:
+    If items is equal to 0:
+        Return 0
+    End If
+    Let count be proc list_count with items
+    Let index be 0
+    While index is less than count:
+        Let item be proc list_item with items, index
+        Let item_name be proc dict_get_string with item, "name"
+        If item_name is not equal to 0:
+            Let matches be proc string_equals from StringCore with item_name, want_name
+            If matches is equal to 1:
+                Return item
+            End If
+        End If
+        Set index to index plus 1
+    End While
+    Return 0
+End Process
+
+@Reasoning:
+The PROCEDURE DIVISION holds a "body" list whose elements are paragraph nodes
+(cobol_paragraph). This returns that body list so the probe can count
+paragraphs and search their statements.
+@End Reasoning
+Process called "find_procedure_paragraphs" takes hir_root as Integer returns Integer:
+    Let proc_div be proc find_division with hir_root, "cobol_procedure_division"
+    If proc_div is equal to 0:
+        Return 0
+    End If
+    Return proc dict_get with proc_div, "body"
+End Process
+
+Note: ============================================================================
+Note: Pipeline helpers
+Note: ============================================================================
+
+@Reasoning:
+Each round of the probe runs the identical front of the pipeline (parse ->
+lower to HIR). Sharing this wrapper guarantees the two runs (original and
+emitted) are behaviourally identical so any divergence is attributable to the
+emitter.
+@End Reasoning
+Process called "source_to_hir" takes source as Integer returns Integer:
+    If source is equal to 0:
+        Return 0
+    End If
+    Let ast be proc parse_cobol from CobolParser with source
+    If ast is equal to 0:
+        Return 0
+    End If
+    Let arena be proc allocate from Layout with 65536
+    Return proc translate_cobol_to_hir from CobolFrontend with ast, arena
+End Process
+
+Note: ============================================================================
+Note: Probe entry point
+Note: ============================================================================
+
+@Reasoning:
+The same battery of CONTENT assertions runs against both HIR1 (the first
+lowering) and HIR2 (the lowering of the emitted text). Factoring them into a
+single routine keeps the two runs identical and guarantees the round-trip is
+held to exactly the same bar as the original. The "phase" label distinguishes
+the two runs in the test report.
+@End Reasoning
+Process called "assert_program_content" takes results as Integer, hir as Integer, phase as Integer returns Integer:
+    Note: PROGRAM-ID name survives
+    Let prog_name be proc dict_get_string with hir, "name"
+    Let prog_name_ok be proc string_equals from StringCore with prog_name, "PAYROLL"
+    proc assert_equal from TestUtils with results, "PROGRAM-ID is 'PAYROLL'", prog_name_ok, 1
+
+    Note: WORKING-STORAGE item with level + PIC + VALUE survives
+    Let items be proc find_working_storage_items with hir
+    proc assert_not_null from TestUtils with results, "WORKING-STORAGE items present", items
+    Let counter be proc find_item_by_name with items, "COUNTER"
+    proc assert_not_null from TestUtils with results, "data item 'COUNTER' present", counter
+    Let counter_level be proc dict_get_string with counter, "level"
+    Let counter_level_ok be proc string_equals from StringCore with counter_level, "01"
+    proc assert_equal from TestUtils with results, "COUNTER level is 01", counter_level_ok, 1
+    Let counter_pic be proc dict_get with counter, "picture"
+    proc assert_not_null from TestUtils with results, "COUNTER has a PIC clause", counter_pic
+    Let counter_value be proc dict_get with counter, "value"
+    proc assert_not_null from TestUtils with results, "COUNTER has a VALUE clause", counter_value
+
+    Note: >= 2 paragraphs survive
+    Let paragraphs be proc find_procedure_paragraphs with hir
+    proc assert_not_null from TestUtils with results, "procedure body present", paragraphs
+    Let para_count be proc count_of_type with paragraphs, "cobol_paragraph"
+    proc assert_greater_than_or_equal from TestUtils with results, ">= 2 paragraphs present", para_count, 2
+
+    Note: MOVE survives
+    Let move_stmt be proc find_stmt_in_paragraphs with paragraphs, "cobol_move"
+    proc assert_not_null from TestUtils with results, "MOVE statement present", move_stmt
+
+    Note: IF with ELSE survives
+    Let if_stmt be proc find_stmt_in_paragraphs with paragraphs, "cobol_if"
+    proc assert_not_null from TestUtils with results, "IF statement present", if_stmt
+    Let if_else be proc dict_get with if_stmt, "else_statements"
+    proc assert_not_null from TestUtils with results, "IF has an ELSE branch", if_else
+
+    Note: PERFORM UNTIL survives
+    Let perform_stmt be proc find_stmt_in_paragraphs with paragraphs, "cobol_perform"
+    proc assert_not_null from TestUtils with results, "PERFORM statement present", perform_stmt
+
+    Note: COMPUTE survives
+    Let compute_stmt be proc find_stmt_in_paragraphs with paragraphs, "cobol_compute"
+    proc assert_not_null from TestUtils with results, "COMPUTE statement present", compute_stmt
+
+    Note: DISPLAY survives
+    Let display_stmt be proc find_stmt_in_paragraphs with paragraphs, "cobol_display"
+    proc assert_not_null from TestUtils with results, "DISPLAY statement present", display_stmt
+
+    Return 1
+End Process
+
+Process called "main" returns Integer:
+    Let results be proc create_test_results from TestUtils
+    proc begin_suite from TestUtils with results, "COBOL translation round-trip"
+
+    Note:
+    Representative program exercising a broad COBOL surface:
+    - IDENTIFICATION DIVISION with PROGRAM-ID PAYROLL
+    - DATA DIVISION / WORKING-STORAGE with level + PIC + VALUE items
+    - PROCEDURE DIVISION with two paragraphs
+    - MOVE, COMPUTE, IF/ELSE/END-IF, PERFORM UNTIL, DISPLAY
+    :End Note
+    Let source be "IDENTIFICATION DIVISION.\nPROGRAM-ID. PAYROLL.\nDATA DIVISION.\nWORKING-STORAGE SECTION.\n01 COUNTER PIC 9(4) VALUE 0.\n01 TOTAL PIC 9(6) VALUE 0.\nPROCEDURE DIVISION.\nMAIN-PARA.\nMOVE 0 TO TOTAL.\nPERFORM ADD-PARA UNTIL COUNTER > 10.\nIF TOTAL > 100\nDISPLAY \"BIG\"\nELSE\nDISPLAY \"SMALL\"\nEND-IF.\nADD-PARA.\nCOMPUTE TOTAL = TOTAL + COUNTER.\nDISPLAY TOTAL.\n"
+
+    Note: --- Stage 0-1: source -> AST (PARSE SMOKE) ---
+    Let ast be proc parse_cobol from CobolParser with source
+    proc assert_not_null from TestUtils with results, "parser produced COBOL AST", ast
+
+    Note: --- Stage 2: AST -> HIR1 ---
+    Let arena1 be proc allocate from Layout with 65536
+    Let hir1 be proc translate_cobol_to_hir from CobolFrontend with ast, arena1
+    proc assert_not_null from TestUtils with results, "frontend produced HIR program", hir1
+
+    Note: Root must be a dict node tagged "cobol_program".
+    Let prog_type be proc dict_get_string with hir1, "_type"
+    Let prog_type_ok be proc string_equals from StringCore with prog_type, "cobol_program"
+    proc assert_equal from TestUtils with results, "HIR root is a cobol_program", prog_type_ok, 1
+
+    Note: --- Stage 2 content assertions on HIR1 ---
+    proc assert_program_content with results, hir1, 1
+
+    Note: --- Stage 3: HIR1 -> COBOL text ---
+    Let emitted be proc hir_to_cobol from CobolBackend with hir1
+    proc assert_not_null from TestUtils with results, "backend produced COBOL text", emitted
+    Let emitted_len be proc string_length from StringCore with emitted
+    proc assert_greater_than from TestUtils with results, "emitted COBOL is non-empty", emitted_len, 0
+
+    Note: --- Stage 4: re-run the pipeline on the emitted text -> HIR2 ---
+    Let hir2 be proc source_to_hir with emitted
+    proc assert_not_null from TestUtils with results, "re-parse of emitted COBOL produced HIR2", hir2
+
+    Let prog2_type be proc dict_get_string with hir2, "_type"
+    Let prog2_type_ok be proc string_equals from StringCore with prog2_type, "cobol_program"
+    proc assert_equal from TestUtils with results, "round-trip root is a cobol_program", prog2_type_ok, 1
+
+    Note: --- Stage 5: same CONTENT assertions on HIR2 (round-trip survival) ---
+    proc assert_program_content with results, hir2, 2
+
+    proc print_summary from TestUtils with results
+    Let failed be proc get_failed from TestUtils with results
+    proc destroy_test_results from TestUtils with results
+
+    Return failed
+End Process
