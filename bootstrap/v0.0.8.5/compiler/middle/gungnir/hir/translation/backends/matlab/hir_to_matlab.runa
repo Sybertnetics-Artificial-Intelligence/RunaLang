@@ -1,17 +1,18 @@
 Note: ===================================================================
 Note: HIR TO MATLAB GENERATOR
 Note: ===================================================================
-Note: Translates HIR (High-level Intermediate Representation) into
-Note: MATLAB source code for the Translation universal translation system.
+Note: Reconstructs MATLAB source code from the canonical typed HIR
+Note: (hir_nodes.runa) produced by matlab_to_hir.runa, for the Translation
+Note: universal translation system.
 
-Note: This module handles:
-Note: - HIR module to MATLAB script/function file generation
-Note: - HIR types to MATLAB classdef generation
-Note: - HIR functions to MATLAB functions with multiple return values
-Note: - HIR operations to MATLAB expressions (matrix vs element-wise)
-Note: - HIR control flow to MATLAB statements
-Note: - MATLAB-specific feature reconstruction (parfor, spmd, function handles)
-Note: - Type mapping (HIR → MATLAB types)
+Note: This backend is the consumer half of the model-1 typed-HIR contract:
+Note: it reads real HIR_* nodes via hir_get_* accessors and re-emits MATLAB.
+Note: MATLAB-specific details that have no HIR node kind (matrix vs
+Note: element-wise operators, the power operator, transpose, ranges, cell
+Note: arrays, function handles, anonymous functions, parfor/spmd, switch,
+Note: try/catch, global/persistent, multiple return values) are carried as
+Note: metadata that matlab_to_hir attached; the two files agree on those
+Note: exact keys.
 
 Note: Part of the Translation Translation System
 Note: Location: compiler/middle/gungnir/hir/translation/backends/matlab/hir_to_matlab.runa
@@ -19,187 +20,125 @@ Note: ===================================================================
 
 Import "compiler/middle/gungnir/hir/hir_nodes.runa" as HIR
 Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/frontend/primitives/core/string_primitive.runa" as StringPrim
 Import "compiler/frontend/primitives/collections/list.runa" as ListCore
-Import "compiler/frontend/primitives/collections/dictionary.runa" as DictCore
 
 Note: ===================================================================
 Note: GENERATION CONTEXT
 Note: ===================================================================
-Note: Maintains state during HIR→MATLAB generation including type mappings,
-Note: indentation tracking, and generated code buffers.
 
 @Reasoning:
-The context carries every piece of state the MATLAB emitter must thread
-between calls: the HIR-to-MATLAB type-name dictionary, the active indent
-level and indent string (MATLAB's de-facto 4-space convention), the line
-buffer that accumulates the script, the surrounding class/function nodes
-for context-sensitive emission (e.g. method vs free function), and the
-matrix-context table that records which expressions need element-wise vs
-matrix-mode operators. The context is mutated in place across the entire
-emission, so identity not copying is what threads it through recursion.
+The context threads the indentation level and the line buffer through the
+recursive emission. Identity (not copying) carries the mutation across the
+recursion: every emitter appends to the same code_buffer and adjusts the
+same indent_level.
 @End Reasoning
 Type called "MatlabGenerationContext":
-    Note: Type mapping table (HIR types → MATLAB types)
-    type_map as Integer
-
-    Note: Current indentation level
     indent_level as Integer
-
-    Note: Indentation string (typically 4 spaces for MATLAB)
-    indent_string as Integer
-
-    Note: Generated code buffer
     code_buffer as Integer
-
-    Note: Current class context (0 if not in a class)
-    current_class as Integer
-
-    Note: Current function context (0 if not in a function)
-    current_function as Integer
-
-    Note: Matrix operation context (element-wise vs matrix)
-    matrix_context as Integer
 End Type
 
-Note: ===================================================================
-Note: CONTEXT MANAGEMENT
-Note: ===================================================================
-
 @Reasoning:
-The factory installs MATLAB's idiomatic 4-space indent and zero-initialises
-the class/function context fields so the first generate_module call cannot
-inherit stale references from a previous compilation. The type map and
-matrix-context map are constructed eagerly (rather than lazily) so the
-emission loop never has to test for null dictionaries on the hot path.
+The factory zero-initialises the indent level and allocates the line buffer
+so the first emit cannot inherit stale state from a previous translation.
 @End Reasoning
 Process called "create_generation_context" returns Integer:
     Let ctx be a value of type MatlabGenerationContext with
-        type_map as proc dict_create from DictCore,
         indent_level as 0,
-        indent_string as "    ",
-        code_buffer as proc list_create from ListCore,
-        current_class as 0,
-        current_function as 0,
-        matrix_context as proc dict_create from DictCore
-
-    Note: Initialize standard type mappings (HIR → MATLAB)
-    proc register_standard_type_mappings from ctx
+        code_buffer as proc list_create from ListCore
 
     Return ctx
 End Process
 
 @Reasoning:
-MATLAB has no static types, but the emitter still emits documentation
-comments that mention the source HIR type. Mapping integers and floats to
-"double" reflects MATLAB's numeric defaults (every literal is a double
-unless cast), while strings become "char" because pre-2017 MATLAB used
-char arrays and the string class is still optional. Collections map to
-"array" and "struct" because that is how MATLAB represents lists and
-dictionaries respectively.
-@End Reasoning
-Process called "register_standard_type_mappings" takes ctx as MatlabGenerationContext:
-    Note: Map HIR primitive types to MATLAB types
-    proc dict_set from DictCore with ctx.type_map, proc int_to_string from StringCore with HIR.HIR_TYPE_INTEGER, "double"
-    proc dict_set from DictCore with ctx.type_map, proc int_to_string from StringCore with HIR.HIR_TYPE_FLOAT, "double"
-    proc dict_set from DictCore with ctx.type_map, proc int_to_string from StringCore with HIR.HIR_TYPE_STRING, "char"
-    proc dict_set from DictCore with ctx.type_map, proc int_to_string from StringCore with HIR.HIR_TYPE_BOOLEAN, "logical"
-
-    Note: MATLAB doesn't have explicit type annotations, these are for comments/documentation
-    proc dict_set from DictCore with ctx.type_map, proc int_to_string from StringCore with HIR.HIR_TYPE_ANY, "any"
-    proc dict_set from DictCore with ctx.type_map, proc int_to_string from StringCore with HIR.HIR_TYPE_VOID, "void"
-
-    Note: Map HIR collection types
-    proc dict_set from DictCore with ctx.type_map, proc int_to_string from StringCore with HIR.HIR_TYPE_ARRAY, "array"
-    proc dict_set from DictCore with ctx.type_map, proc int_to_string from StringCore with HIR.HIR_TYPE_DICTIONARY, "struct"
-End Process
-
-@Reasoning:
-Indentation is tracked as a simple integer counter rather than maintaining
-a pre-computed string because the emitter occasionally walks back through
-the same depth multiple times. The actual whitespace is materialised in
-get_current_indent only when a line is emitted.
+Indentation is a counter; the whitespace is materialised only when a line is
+emitted. Increase/decrease are symmetric and every block open has a matching
+close in the same routine.
 @End Reasoning
 Process called "increase_indent" takes ctx as Integer:
     Set ctx.indent_level to ctx.indent_level plus 1
 End Process
 
-@Reasoning:
-Symmetric counterpart to increase_indent; every emission of a block-closing
-'end' must be preceded by a decrease so that the closing keyword aligns
-with the opening one. The emitter never decreases past zero because every
-increase has a matching decrease in the same generation routine.
-@End Reasoning
 Process called "decrease_indent" takes ctx as Integer:
     Set ctx.indent_level to ctx.indent_level minus 1
 End Process
 
 @Reasoning:
-Constructing the indentation as a fresh string per line is the canonical
-v0.0.8.5 approach: the indent string is small (typically 4 chars) and the
-arena allocator amortises the cost. Caching a single indent string per
-level was considered but rejected because the buffer would have to be
-invalidated whenever the indent string itself was changed by tooling.
+Builds the current indent string by repeating MATLAB's 4-space unit
+indent_level times. Constructed per line because the indent is small and the
+arena allocator amortises the cost.
 @End Reasoning
 Process called "get_current_indent" takes ctx as Integer returns Integer:
     Let indent be ""
     Let i be 0
     While i is less than ctx.indent_level:
-        Set indent to proc string_concat from StringCore with indent, ctx.indent_string
+        Set indent to proc string_concat from StringPrim with indent, "    "
         Set i to i plus 1
     End While
     Return indent
 End Process
 
 @Reasoning:
-emit_line is the single point through which all MATLAB lines reach the
-buffer; centralising indentation here guarantees no Process can forget to
-prefix the whitespace. The line content is the caller's responsibility -
-the emitter never inspects it, which is what allows emit_line to handle
-classdef, function, keywords, and expression statements identically.
+Single point through which all MATLAB lines reach the buffer so no emitter
+forgets the indent prefix.
 @End Reasoning
 Process called "emit_line" takes ctx as Integer, line as Integer:
-    Let indent be proc get_current_indent from ctx
-    Let full_line be proc string_concat from StringCore with indent, line
+    Let indent be proc get_current_indent with ctx
+    Let full_line be proc string_concat from StringPrim with indent, line
     proc list_append from ListCore with ctx.code_buffer, full_line
 End Process
 
 @Reasoning:
-Blank lines bypass the indentation pipeline because MATLAB style guides
-require blank lines to be truly empty rather than indented whitespace.
-Appending the empty string directly avoids paying for the indent allocation
-that emit_line would otherwise produce.
+Blank lines bypass indentation so they are truly empty per MATLAB style.
 @End Reasoning
 Process called "emit_blank_line" takes ctx as Integer:
     proc list_append from ListCore with ctx.code_buffer, ""
 End Process
 
 @Reasoning:
-Joining is done with explicit newline separators rather than appending a
-trailing newline to every line because MATLAB script files do not require
-a trailing newline and adding one would alter the byte-identity of the
-output during golden-file regression tests. The single-pass left-fold is
-O(N^2) in string length theoretically but in practice the buffer growth
-is dominated by the underlying allocator's geometric expansion.
+Joins the buffered lines with newline separators (no trailing newline) so
+the output is byte-stable for golden comparisons.
 @End Reasoning
 Process called "get_generated_code" takes ctx as Integer returns Integer:
-    Note: Join all code lines with newlines
     Let result be ""
     Let count be proc list_length from ListCore with ctx.code_buffer
     Let i be 0
-
     While i is less than count:
         Let line be proc list_get from ListCore with ctx.code_buffer, i
-        Set result to proc string_concat from StringCore with result, line
-
-        Note: Add newline except for last line
-        If i is less than count minus 1:
-            Set result to proc string_concat from StringCore with result, "\n"
+        Set result to proc string_concat from StringPrim with result, line
+        Let last_index be count minus 1
+        If i is less than last_index:
+            Set result to proc string_concat from StringPrim with result, "\n"
         End If
-
         Set i to i plus 1
     End While
-
     Return result
+End Process
+
+Note: ===================================================================
+Note: METADATA HELPERS
+Note: ===================================================================
+
+@Reasoning:
+A flag is present when hir_get_metadata returns a non-zero handle whose
+string value equals "1". Centralising the test keeps every emitter's flag
+check identical.
+@End Reasoning
+Process called "metadata_flag" takes node as Integer, key as Integer returns Integer:
+    Let value be proc hir_get_metadata from HIR with node, key
+    If value is equal to 0:
+        Return 0
+    End If
+    Let is_set be proc string_equals from StringCore with value, "1"
+    Return is_set
+End Process
+
+@Reasoning:
+Returns the raw string value stored under a metadata key, or 0 when absent.
+Used for non-flag metadata (operator spellings, joined name lists).
+@End Reasoning
+Process called "metadata_value" takes node as Integer, key as Integer returns Integer:
+    Return proc hir_get_metadata from HIR with node, key
 End Process
 
 Note: ===================================================================
@@ -207,20 +146,14 @@ Note: MAIN GENERATION ENTRY POINT
 Note: ===================================================================
 
 @Reasoning:
-The top-level entry point owns the context lifecycle: it creates a fresh
-generation context per invocation so concurrent translations of multiple
-HIR modules never share mutable state. The two-step (generate, then
-collect) pattern lets the caller treat the result as a pure string while
-all stateful emission happens against the local ctx.
+Owns the context lifecycle: a fresh context per call so concurrent
+translations never share mutable state. The module is walked, then the
+buffered lines are joined into the final source string.
 @End Reasoning
 Process called "generate_matlab_from_hir" takes hir_module as Integer returns Integer:
     Let ctx be proc create_generation_context
-
-    Note: Generate the MATLAB program from HIR module
     proc generate_module with ctx, hir_module
-
-    Note: Get the final generated code
-    Let matlab_code be proc get_generated_code from ctx
+    Let matlab_code be proc get_generated_code with ctx
     Return matlab_code
 End Process
 
@@ -229,47 +162,53 @@ Note: MODULE GENERATION
 Note: ===================================================================
 
 @Reasoning:
-MATLAB has no notion of modules, packages, or imports: each file declares
-either a top-level script or exactly one class/function. The emitter
-preserves the module name as a comment for round-tripping back through
-universal translation; the body iterates declarations and dispatches
-between classdef and function emission, ignoring HIR node kinds that have
-no MATLAB representation (e.g. enums - those would be lowered earlier).
+MATLAB has no modules. Each top-level declaration is emitted in order:
+classes via generate_class, functions via generate_function (the synthetic
+matlab_script_main function's body holds hoisted script statements and is
+emitted as an ordinary function). A blank line separates declarations.
 @End Reasoning
 Process called "generate_module" takes ctx as Integer, hir_module as Integer:
-    Note: MATLAB doesn't have module-level imports/exports like modern languages
-    Note: Generate file-level comments for documentation
-    Let module_name be proc hir_get_module_name from HIR with hir_module
-    Let has_name be proc string_length from StringCore with module_name
-    If has_name is greater than 0:
-        Let comment_line be proc string_concat from StringCore with "% Module: ", module_name
-        proc emit_line with ctx, comment_line
-        proc emit_blank_line from ctx
+    If hir_module is equal to 0:
+        Return
     End If
 
-    Note: Generate declarations
     Let declarations be proc hir_get_declarations from HIR with hir_module
     Let decl_count be proc list_length from ListCore with declarations
     Let i be 0
-
     While i is less than decl_count:
         Let decl be proc list_get from ListCore with declarations, i
         Let decl_type be proc hir_node_type from HIR with decl
 
-        Note: Generate class
         If decl_type is equal to HIR.HIR_CLASS:
             proc generate_class with ctx, decl
-            proc emit_blank_line from ctx
+            proc emit_blank_line with ctx
         End If
 
-        Note: Generate function
         If decl_type is equal to HIR.HIR_FUNCTION:
-            proc generate_function with ctx, decl
-            proc emit_blank_line from ctx
+            Let func_name be proc hir_get_function_name from HIR with decl
+            Let is_script_main be proc string_equals from StringCore with func_name, "matlab_script_main"
+            If is_script_main is equal to 1:
+                proc generate_script_body with ctx, decl
+            Otherwise:
+                proc generate_function with ctx, decl
+            End If
+            proc emit_blank_line with ctx
         End If
 
         Set i to i plus 1
     End While
+End Process
+
+@Reasoning:
+The synthetic script wrapper has no MATLAB syntactic form; its body
+statements are emitted directly at top level, reproducing a MATLAB script
+file.
+@End Reasoning
+Process called "generate_script_body" takes ctx as Integer, func_node as Integer:
+    Let body be proc hir_get_function_body from HIR with func_node
+    If body is not equal to 0:
+        proc generate_block_inner with ctx, body
+    End If
 End Process
 
 Note: ===================================================================
@@ -277,150 +216,127 @@ Note: CLASS GENERATION
 Note: ===================================================================
 
 @Reasoning:
-MATLAB classdef syntax is rigid: members must be partitioned into separate
-properties/methods/events blocks, each with its own end. The walker first
-buckets members by HIR kind so each block emits contiguously, mirroring
-the language requirement. The current_class field is saved/restored across
-nested classes (which MATLAB allows in package directories) so the inner
-class does not corrupt the outer class context.
+MATLAB classdef requires members partitioned into properties / methods
+blocks each with their own end. Members are bucketed by HIR kind (field vs
+method) and emitted contiguously. Base class, events and the enumeration
+flag are reconstructed from the class metadata the frontend attached.
 @End Reasoning
 Process called "generate_class" takes ctx as Integer, class_node as Integer:
-    Note: Save previous class context
-    Let prev_class be ctx.current_class
-    Set ctx.current_class to class_node
-
-    Note: Build classdef declaration
     Let class_name be proc hir_get_class_name from HIR with class_node
-    Let class_line be proc string_concat from StringCore with "classdef ", class_name
+    Let class_line be proc string_concat from StringPrim with "classdef ", class_name
 
-    Note: Add base class if present (< BaseClass syntax)
-    Let base_class be proc hir_get_base_class from HIR with class_node
+    Let base_class be proc metadata_value with class_node, "matlab_base_class"
     If base_class is not equal to 0:
-        Let base_type be proc generate_type with ctx, base_class
-        Set class_line to proc string_concat from StringCore with class_line, " < "
-        Set class_line to proc string_concat from StringCore with class_line, base_type
+        Set class_line to proc string_concat from StringPrim with class_line, " < "
+        Set class_line to proc string_concat from StringPrim with class_line, base_class
     End If
 
     proc emit_line with ctx, class_line
-    proc increase_indent from ctx
+    proc increase_indent with ctx
 
-    Note: Check for properties, methods, events, enumeration
     Let members be proc hir_get_class_members from HIR with class_node
-
-    Note: Separate members by type
-    Let properties be proc list_create from ListCore
-    Let methods be proc list_create from ListCore
-    Let i be 0
     Let member_count be proc list_length from ListCore with members
 
-    While i is less than member_count:
-        Let member be proc list_get from ListCore with members, i
-        Let member_type be proc hir_node_type from HIR with member
+    Let is_enum be proc metadata_flag with class_node, "matlab_enumeration"
 
-        If member_type is equal to HIR.HIR_FIELD:
-            proc list_append from ListCore with properties, member
+    Note: Properties / enumeration values
+    Let field_count be 0
+    Let k be 0
+    While k is less than member_count:
+        Let m be proc list_get from ListCore with members, k
+        Let mt be proc hir_node_type from HIR with m
+        If mt is equal to HIR.HIR_FIELD:
+            Set field_count to field_count plus 1
         End If
-
-        If member_type is equal to HIR.HIR_METHOD:
-            proc list_append from ListCore with methods, member
-        End If
-
-        Set i to i plus 1
+        Set k to k plus 1
     End While
 
-    Note: Generate properties block
-    Let prop_count be proc list_length from ListCore with properties
-    If prop_count is greater than 0:
-        proc emit_blank_line from ctx
-        proc emit_line with ctx, "properties"
-        proc increase_indent from ctx
-
-        Set i to 0
-        While i is less than prop_count:
-            Let property be proc list_get from ListCore with properties, i
-            Let prop_name be proc hir_get_field_name from HIR with property
-
-            Note: Check for initializer
-            Let initializer be proc hir_get_field_initializer from HIR with property
-            If initializer is not equal to 0:
-                Let init_expr be proc generate_expression with ctx, initializer
-                Let prop_line be proc string_concat from StringCore with prop_name, " = "
-                Set prop_line to proc string_concat from StringCore with prop_line, init_expr
-                proc emit_line with ctx, prop_line
-            Otherwise:
-                proc emit_line with ctx, prop_name
+    If field_count is greater than 0:
+        proc emit_blank_line with ctx
+        If is_enum is equal to 1:
+            proc emit_line with ctx, "enumeration"
+        Otherwise:
+            proc emit_line with ctx, "properties"
+        End If
+        proc increase_indent with ctx
+        Let i be 0
+        While i is less than member_count:
+            Let member be proc list_get from ListCore with members, i
+            Let member_type be proc hir_node_type from HIR with member
+            If member_type is equal to HIR.HIR_FIELD:
+                Let field_name be proc hir_get_field_name from HIR with member
+                proc emit_line with ctx, field_name
             End If
-
             Set i to i plus 1
         End While
-
-        proc decrease_indent from ctx
+        proc decrease_indent with ctx
         proc emit_line with ctx, "end"
     End If
 
-    Note: Generate methods block
-    Let method_count be proc list_length from ListCore with methods
-    If method_count is greater than 0:
-        proc emit_blank_line from ctx
+    Note: Methods
+    Let method_present be 0
+    Let p be 0
+    While p is less than member_count:
+        Let mm be proc list_get from ListCore with members, p
+        Let mmt be proc hir_node_type from HIR with mm
+        Let is_func be 0
+        If mmt is equal to HIR.HIR_FUNCTION:
+            Set is_func to 1
+        End If
+        If mmt is equal to HIR.HIR_METHOD:
+            Set is_func to 1
+        End If
+        If is_func is equal to 1:
+            Set method_present to 1
+        End If
+        Set p to p plus 1
+    End While
+
+    If method_present is equal to 1:
+        proc emit_blank_line with ctx
         proc emit_line with ctx, "methods"
-        proc increase_indent from ctx
-
-        Set i to 0
-        While i is less than method_count:
-            Let method be proc list_get from ListCore with methods, i
-            proc emit_blank_line from ctx
-            proc generate_method with ctx, method
-            Set i to i plus 1
+        proc increase_indent with ctx
+        Let j be 0
+        While j is less than member_count:
+            Let mem be proc list_get from ListCore with members, j
+            Let memt be proc hir_node_type from HIR with mem
+            Let emit_it be 0
+            If memt is equal to HIR.HIR_FUNCTION:
+                Set emit_it to 1
+            End If
+            If memt is equal to HIR.HIR_METHOD:
+                Set emit_it to 1
+            End If
+            If emit_it is equal to 1:
+                proc emit_blank_line with ctx
+                proc generate_function with ctx, mem
+            End If
+            Set j to j plus 1
         End While
-
-        proc decrease_indent from ctx
+        proc decrease_indent with ctx
         proc emit_line with ctx, "end"
     End If
 
-    Note: Check for MATLAB events metadata
-    Let events be proc hir_get_metadata from HIR with class_node, "matlab_events"
+    Note: Events
+    Let events be proc metadata_value with class_node, "matlab_events"
     If events is not equal to 0:
-        proc emit_blank_line from ctx
+        proc emit_blank_line with ctx
         proc emit_line with ctx, "events"
-        proc increase_indent from ctx
-
-        Let event_count be proc list_length from ListCore with events
-        Set i to 0
-        While i is less than event_count:
-            Let event_name be proc list_get from ListCore with events, i
-            proc emit_line with ctx, event_name
-            Set i to i plus 1
+        proc increase_indent with ctx
+        Let event_names be proc split_on_comma_space with events
+        Let ev_count be proc list_length from ListCore with event_names
+        Let e be 0
+        While e is less than ev_count:
+            Let ev be proc list_get from ListCore with event_names, e
+            proc emit_line with ctx, ev
+            Set e to e plus 1
         End While
-
-        proc decrease_indent from ctx
+        proc decrease_indent with ctx
         proc emit_line with ctx, "end"
     End If
 
-    Note: Check for enumeration metadata
-    Let is_enum be proc hir_get_metadata from HIR with class_node, "matlab_enumeration"
-    If is_enum is equal to 1:
-        proc emit_blank_line from ctx
-        proc emit_line with ctx, "enumeration"
-        proc increase_indent from ctx
-
-        Note: Enumeration values are in properties
-        Set i to 0
-        While i is less than prop_count:
-            Set property to proc list_get from ListCore with properties, i
-            Let enum_val be proc hir_get_field_name from HIR with property
-            proc emit_line with ctx, enum_val
-            Set i to i plus 1
-        End While
-
-        proc decrease_indent from ctx
-        proc emit_line with ctx, "end"
-    End If
-
-    proc decrease_indent from ctx
+    proc decrease_indent with ctx
     proc emit_line with ctx, "end"
-
-    Note: Restore previous class context
-    Set ctx.current_class to prev_class
 End Process
 
 Note: ===================================================================
@@ -428,185 +344,58 @@ Note: FUNCTION GENERATION
 Note: ===================================================================
 
 @Reasoning:
-MATLAB functions support multiple named return values via the
-'[a, b] = func(...)' syntax, which is preserved by reading the
-"matlab_output_params" metadata bag the frontend stuffed onto the HIR
-node. Without that metadata we fall back to single-output emission keyed
-on the HIR return type; void returns omit the assignment entirely. The
-current_function context is saved/restored so nested anonymous functions
-do not lose the enclosing scope.
+Reconstructs the MATLAB function header. Multiple outputs are read from the
+"matlab_output_params" metadata to rebuild "[a, b] = name(...)"; a single
+output uses "matlab_single_output" for "y = name(...)"; absent both yields a
+no-output "name(...)". Input parameters come from the real HIR parameter
+list. The body block is emitted at the next indent level, closed by 'end'.
 @End Reasoning
 Process called "generate_function" takes ctx as Integer, func_node as Integer:
-    Note: Save previous function context
-    Let prev_function be ctx.current_function
-    Set ctx.current_function to func_node
-
-    Note: Check for MATLAB multiple output parameters
-    Let output_params be proc hir_get_metadata from HIR with func_node, "matlab_output_params"
-    Let has_multiple_outputs be 0
-    If output_params is not equal to 0:
-        Set has_multiple_outputs to 1
-    End If
-
-    Note: Build function declaration
     Let func_line be "function "
 
-    Note: Add output parameters
-    If has_multiple_outputs is equal to 1:
-        Note: Multiple outputs: function [out1, out2] = func(...)
-        Set func_line to proc string_concat from StringCore with func_line, "["
-        Let output_count be proc list_length from ListCore with output_params
-        Let i be 0
-        While i is less than output_count:
-            Let output_name be proc list_get from ListCore with output_params, i
-            Set func_line to proc string_concat from StringCore with func_line, output_name
-            If i is less than output_count minus 1:
-                Set func_line to proc string_concat from StringCore with func_line, ", "
-            End If
-            Set i to i plus 1
-        End While
-        Set func_line to proc string_concat from StringCore with func_line, "] = "
+    Let output_params be proc metadata_value with func_node, "matlab_output_params"
+    Let single_output be proc metadata_value with func_node, "matlab_single_output"
+
+    If output_params is not equal to 0:
+        Set func_line to proc string_concat from StringPrim with func_line, "["
+        Set func_line to proc string_concat from StringPrim with func_line, output_params
+        Set func_line to proc string_concat from StringPrim with func_line, "] = "
     Otherwise:
-        Note: Single output or void
-        Let return_type be proc hir_get_return_type from HIR with func_node
-        If return_type is not equal to HIR.HIR_TYPE_VOID:
-            Note: Check for single output name
-            Let single_output be proc hir_get_metadata from HIR with func_node, "matlab_single_output"
-            If single_output is not equal to 0:
-                Set func_line to proc string_concat from StringCore with func_line, single_output
-                Set func_line to proc string_concat from StringCore with func_line, " = "
-            End If
+        If single_output is not equal to 0:
+            Set func_line to proc string_concat from StringPrim with func_line, single_output
+            Set func_line to proc string_concat from StringPrim with func_line, " = "
         End If
     End If
 
-    Note: Add function name
     Let func_name be proc hir_get_function_name from HIR with func_node
-    Set func_line to proc string_concat from StringCore with func_line, func_name
+    Set func_line to proc string_concat from StringPrim with func_line, func_name
+    Set func_line to proc string_concat from StringPrim with func_line, "("
 
-    Note: Add input parameters
-    Let params be proc hir_get_parameters from HIR with func_node
+    Let params_handle be proc hir_get_parameters from HIR with func_node
+    Let params be proc hir_get_parameter_list from HIR with params_handle
     Let param_count be proc list_length from ListCore with params
-    Set func_line to proc string_concat from StringCore with func_line, "("
-
-    If param_count is greater than 0:
-        Set i to 0
-        While i is less than param_count:
-            Let param be proc list_get from ListCore with params, i
-            Let param_name be proc hir_get_parameter_name from HIR with param
-            Set func_line to proc string_concat from StringCore with func_line, param_name
-            If i is less than param_count minus 1:
-                Set func_line to proc string_concat from StringCore with func_line, ", "
-            End If
-            Set i to i plus 1
-        End While
-    End If
-
-    Set func_line to proc string_concat from StringCore with func_line, ")"
+    Let i be 0
+    While i is less than param_count:
+        Let param be proc list_get from ListCore with params, i
+        Let param_name be proc hir_get_parameter_name from HIR with param
+        Set func_line to proc string_concat from StringPrim with func_line, param_name
+        Let last be param_count minus 1
+        If i is less than last:
+            Set func_line to proc string_concat from StringPrim with func_line, ", "
+        End If
+        Set i to i plus 1
+    End While
+    Set func_line to proc string_concat from StringPrim with func_line, ")"
     proc emit_line with ctx, func_line
 
-    Note: Generate function body
-    proc increase_indent from ctx
+    proc increase_indent with ctx
     Let body be proc hir_get_function_body from HIR with func_node
     If body is not equal to 0:
-        proc generate_statement with ctx, body
+        proc generate_block_inner with ctx, body
     End If
-    proc decrease_indent from ctx
+    proc decrease_indent with ctx
 
     proc emit_line with ctx, "end"
-
-    Note: Restore previous function context
-    Set ctx.current_function to prev_function
-End Process
-
-@Reasoning:
-Methods inside MATLAB classdefs share the same 'function' keyword as
-free-standing functions but live inside a methods block; the structural
-emission is therefore identical to generate_function except this routine
-is always invoked under the methods-block indent context established by
-generate_class. The first parameter convention in MATLAB methods is the
-object handle (typically 'obj') which the HIR already encodes as a normal
-parameter, so no special-casing is required here.
-@End Reasoning
-Process called "generate_method" takes ctx as Integer, method_node as Integer:
-    Note: Methods in MATLAB classes are similar to functions but inside methods block
-    Note: Reuse function generation logic
-
-    Note: Save previous function context
-    Let prev_function be ctx.current_function
-    Set ctx.current_function to method_node
-
-    Note: Check for MATLAB multiple output parameters
-    Let output_params be proc hir_get_metadata from HIR with method_node, "matlab_output_params"
-    Let has_multiple_outputs be 0
-    If output_params is not equal to 0:
-        Set has_multiple_outputs to 1
-    End If
-
-    Note: Build method declaration
-    Let method_line be "function "
-
-    Note: Add output parameters
-    If has_multiple_outputs is equal to 1:
-        Set method_line to proc string_concat from StringCore with method_line, "["
-        Let output_count be proc list_length from ListCore with output_params
-        Let i be 0
-        While i is less than output_count:
-            Let output_name be proc list_get from ListCore with output_params, i
-            Set method_line to proc string_concat from StringCore with method_line, output_name
-            If i is less than output_count minus 1:
-                Set method_line to proc string_concat from StringCore with method_line, ", "
-            End If
-            Set i to i plus 1
-        End While
-        Set method_line to proc string_concat from StringCore with method_line, "] = "
-    Otherwise:
-        Let return_type be proc hir_get_return_type from HIR with method_node
-        If return_type is not equal to HIR.HIR_TYPE_VOID:
-            Let single_output be proc hir_get_metadata from HIR with method_node, "matlab_single_output"
-            If single_output is not equal to 0:
-                Set method_line to proc string_concat from StringCore with method_line, single_output
-                Set method_line to proc string_concat from StringCore with method_line, " = "
-            End If
-        End If
-    End If
-
-    Note: Add method name
-    Let method_name be proc hir_get_method_name from HIR with method_node
-    Set method_line to proc string_concat from StringCore with method_line, method_name
-
-    Note: Add parameters (first parameter is typically 'obj' or 'this')
-    Let params be proc hir_get_parameters from HIR with method_node
-    Let param_count be proc list_length from ListCore with params
-    Set method_line to proc string_concat from StringCore with method_line, "("
-
-    If param_count is greater than 0:
-        Set i to 0
-        While i is less than param_count:
-            Let param be proc list_get from ListCore with params, i
-            Let param_name be proc hir_get_parameter_name from HIR with param
-            Set method_line to proc string_concat from StringCore with method_line, param_name
-            If i is less than param_count minus 1:
-                Set method_line to proc string_concat from StringCore with method_line, ", "
-            End If
-            Set i to i plus 1
-        End While
-    End If
-
-    Set method_line to proc string_concat from StringCore with method_line, ")"
-    proc emit_line with ctx, method_line
-
-    Note: Generate method body
-    proc increase_indent from ctx
-    Let body be proc hir_get_method_body from HIR with method_node
-    If body is not equal to 0:
-        proc generate_statement with ctx, body
-    End If
-    proc decrease_indent from ctx
-
-    proc emit_line with ctx, "end"
-
-    Note: Restore previous function context
-    Set ctx.current_function to prev_function
 End Process
 
 Note: ===================================================================
@@ -614,403 +403,370 @@ Note: STATEMENT GENERATION
 Note: ===================================================================
 
 @Reasoning:
-The dispatcher routes each HIR statement kind to its specialised emitter.
-Break and continue have no body, so they are emitted inline rather than
-delegating, keeping the noise low. Expression statements must always be
-terminated with a semicolon in MATLAB to suppress automatic echoing of
-the result to the command window, so they receive the trailing ';' here.
+Statement dispatcher. Blocks carry MATLAB-specific framing via metadata
+(spmd, try, global/persistent); assignment expression statements emit
+"lhs = rhs;"; control flow maps onto MATLAB if/for/while/switch; jumps emit
+their keyword; a plain expression statement emits "expr;".
 @End Reasoning
 Process called "generate_statement" takes ctx as Integer, stmt_node as Integer:
+    If stmt_node is equal to 0:
+        Return
+    End If
+
     Let stmt_type be proc hir_node_type from HIR with stmt_node
 
-    Note: Block statement
     If stmt_type is equal to HIR.HIR_BLOCK:
         proc generate_block_statement with ctx, stmt_node
-        Return 0
+        Return
     End If
-
-    Note: Let/variable declaration
-    If stmt_type is equal to HIR.HIR_LET_STATEMENT:
-        proc generate_let_statement with ctx, stmt_node
-        Return 0
-    End If
-
-    Note: Assignment statement
-    If stmt_type is equal to HIR.HIR_SET_STATEMENT:
-        proc generate_set_statement with ctx, stmt_node
-        Return 0
-    End If
-
-    Note: If statement
-    If stmt_type is equal to HIR.HIR_IF_STATEMENT:
+    If stmt_type is equal to HIR.HIR_IF:
         proc generate_if_statement with ctx, stmt_node
-        Return 0
+        Return
     End If
-
-    Note: While loop
-    If stmt_type is equal to HIR.HIR_WHILE_STATEMENT:
+    If stmt_type is equal to HIR.HIR_WHILE:
         proc generate_while_statement with ctx, stmt_node
-        Return 0
+        Return
     End If
-
-    Note: For loop
-    If stmt_type is equal to HIR.HIR_FOR_STATEMENT:
+    If stmt_type is equal to HIR.HIR_FOR_IN:
         proc generate_for_statement with ctx, stmt_node
-        Return 0
+        Return
     End If
-
-    Note: Match/switch statement
-    If stmt_type is equal to HIR.HIR_MATCH_STATEMENT:
-        proc generate_match_statement with ctx, stmt_node
-        Return 0
+    If stmt_type is equal to HIR.HIR_RETURN:
+        proc emit_line with ctx, "return"
+        Return
     End If
-
-    Note: Try statement
-    If stmt_type is equal to HIR.HIR_TRY_STATEMENT:
-        proc generate_try_statement with ctx, stmt_node
-        Return 0
-    End If
-
-    Note: Return statement
-    If stmt_type is equal to HIR.HIR_RETURN_STATEMENT:
-        proc generate_return_statement with ctx, stmt_node
-        Return 0
-    End If
-
-    Note: Break statement
-    If stmt_type is equal to HIR.HIR_BREAK_STATEMENT:
+    If stmt_type is equal to HIR.HIR_BREAK:
         proc emit_line with ctx, "break"
-        Return 0
+        Return
     End If
-
-    Note: Continue statement
-    If stmt_type is equal to HIR.HIR_CONTINUE_STATEMENT:
+    If stmt_type is equal to HIR.HIR_CONTINUE:
         proc emit_line with ctx, "continue"
-        Return 0
+        Return
+    End If
+    If stmt_type is equal to HIR.HIR_EXPR_STMT:
+        proc generate_expression_statement with ctx, stmt_node
+        Return
     End If
 
-    Note: Expression statement
-    If stmt_type is equal to HIR.HIR_EXPRESSION_STATEMENT:
-        Let expr be proc hir_get_expression from HIR with stmt_node
-        Let expr_str be proc generate_expression with ctx, expr
-        Let stmt_line be proc string_concat from StringCore with expr_str, ";"
-        proc emit_line with ctx, stmt_line
-        Return 0
-    End If
-
-    Return 0
+    Note: A bare expression node used as a statement.
+    Let expr_str be proc generate_expression with ctx, stmt_node
+    Let stmt_line be proc string_concat from StringPrim with expr_str, ";"
+    proc emit_line with ctx, stmt_line
 End Process
 
 @Reasoning:
-The matlab_spmd metadata maps HIR blocks onto MATLAB's Parallel Computing
-Toolbox 'spmd' construct, which runs the body across workers. The opening
-keyword and matching 'end' are inserted only when the metadata is present
-so vanilla blocks still flatten into the parent scope with no extra
-nesting (MATLAB has no anonymous block syntax).
+An expression statement holding a simple-assignment expression renders as
+"lhs = rhs;" (MATLAB has no let-declaration); any other expression renders
+as "expr;". The trailing ';' suppresses MATLAB's automatic echo.
 @End Reasoning
-Process called "generate_block_statement" takes ctx as Integer, block_node as Integer:
-    Note: Check for SPMD metadata
-    Let is_spmd be proc hir_get_metadata from HIR with block_node, "matlab_spmd"
-    If is_spmd is equal to 1:
-        proc emit_line with ctx, "spmd"
-        proc increase_indent from ctx
+Process called "generate_expression_statement" takes ctx as Integer, stmt_node as Integer:
+    Let expr be proc hir_get_expression_statement_expr from HIR with stmt_node
+    If expr is equal to 0:
+        Return
     End If
 
-    Let statements be proc hir_get_block_statements from HIR with block_node
-    Let stmt_count be proc list_length from ListCore with statements
-    Let i be 0
+    Let expr_type be proc hir_node_type from HIR with expr
+    If expr_type is equal to HIR.HIR_ASSIGN_EXPR:
+        Let lhs be proc hir_get_assign_lhs from HIR with expr
+        Let rhs be proc hir_get_assign_rhs from HIR with expr
+        Let lhs_str be proc generate_expression with ctx, lhs
+        Let rhs_str be proc generate_expression with ctx, rhs
+        Let assign_line be proc string_concat from StringPrim with lhs_str, " = "
+        Set assign_line to proc string_concat from StringPrim with assign_line, rhs_str
+        Set assign_line to proc string_concat from StringPrim with assign_line, ";"
+        proc emit_line with ctx, assign_line
+        Return
+    End If
 
-    While i is less than stmt_count:
+    Let expr_str be proc generate_expression with ctx, expr
+    Let line be proc string_concat from StringPrim with expr_str, ";"
+    proc emit_line with ctx, line
+End Process
+
+@Reasoning:
+Emits the statements of an HIR block inside the caller's indent context,
+without any opening/closing keyword. Used for function/script/branch bodies.
+@End Reasoning
+Process called "generate_block_inner" takes ctx as Integer, block_node as Integer:
+    Let statements be proc hir_get_block_statements from HIR with block_node
+    Let count be proc list_length from ListCore with statements
+    Let i be 0
+    While i is less than count:
         Let stmt be proc list_get from ListCore with statements, i
         proc generate_statement with ctx, stmt
         Set i to i plus 1
     End While
+End Process
 
-    Note: Close SPMD block if needed
+@Reasoning:
+A block reaching the statement dispatcher (rather than a body context) may
+carry MATLAB framing metadata. A spmd block is wrapped in "spmd ... end"; a
+global/persistent block re-emits the original "global a b c" line from its
+"matlab_decl_names" metadata; a try block re-emits the try/catch frame; an
+ordinary block flattens into the parent scope (MATLAB has no anonymous
+block).
+@End Reasoning
+Process called "generate_block_statement" takes ctx as Integer, block_node as Integer:
+    Let decl_names be proc metadata_value with block_node, "matlab_decl_names"
+    Let is_global be proc metadata_flag with block_node, "matlab_global"
+    Let is_persistent be proc metadata_flag with block_node, "matlab_persistent"
+
+    If is_global is equal to 1:
+        Let global_line be proc string_concat from StringPrim with "global ", decl_names
+        proc emit_line with ctx, global_line
+        Return
+    End If
+    If is_persistent is equal to 1:
+        Let persistent_line be proc string_concat from StringPrim with "persistent ", decl_names
+        proc emit_line with ctx, persistent_line
+        Return
+    End If
+
+    Let is_spmd be proc metadata_flag with block_node, "matlab_spmd"
     If is_spmd is equal to 1:
-        proc decrease_indent from ctx
+        proc emit_line with ctx, "spmd"
+        proc increase_indent with ctx
+        proc generate_block_inner with ctx, block_node
+        proc decrease_indent with ctx
         proc emit_line with ctx, "end"
+        Return
     End If
-End Process
 
-@Reasoning:
-MATLAB does not require variable declarations - a variable simply springs
-into existence on first assignment. Lets without an initializer therefore
-emit no MATLAB code; only initialised lets become 'var = expr;' lines.
-This matches MATLAB's runtime semantics and avoids producing dead
-assignments to placeholder values.
-@End Reasoning
-Process called "generate_let_statement" takes ctx as Integer, let_node as Integer:
-    Note: MATLAB doesn't require explicit variable declarations
-    Note: Generate assignment if there's an initializer
-    Let initializer be proc hir_get_let_initializer from HIR with let_node
-    If initializer is not equal to 0:
-        Let var_name be proc hir_get_let_variable_name from HIR with let_node
-        Let init_expr be proc generate_expression with ctx, initializer
-        Let let_line be proc string_concat from StringCore with var_name, " = "
-        Set let_line to proc string_concat from StringCore with let_line, init_expr
-        Set let_line to proc string_concat from StringCore with let_line, ";"
-        proc emit_line with ctx, let_line
+    Let is_try be proc metadata_flag with block_node, "matlab_try"
+    If is_try is equal to 1:
+        proc generate_try_block with ctx, block_node
+        Return
     End If
+
+    proc generate_block_inner with ctx, block_node
 End Process
 
 @Reasoning:
-Both the target and the value are arbitrary expressions because MATLAB
-supports complex lvalues (field access, indexed assignment, parenthesised
-deindex). Delegating to generate_expression for both sides lets the same
-indexing/member emitters be reused; the trailing ';' suppresses the
-implicit echo of the assigned value.
+A try-block carries its statements as: a "try" string marker, the try body
+block, then optionally a "catch" marker and the catch body block. The
+markers let the flat representation re-emit MATLAB's try / catch (var)? /
+end frame, with the optional exception variable from
+"matlab_catch_var" metadata.
 @End Reasoning
-Process called "generate_set_statement" takes ctx as Integer, set_node as Integer:
-    Let target be proc hir_get_set_target from HIR with set_node
-    Let value be proc hir_get_set_value from HIR with set_node
+Process called "generate_try_block" takes ctx as Integer, block_node as Integer:
+    Let catch_var be proc metadata_value with block_node, "matlab_catch_var"
 
-    Let target_expr be proc generate_expression with ctx, target
-    Let value_expr be proc generate_expression with ctx, value
+    Let statements be proc hir_get_block_statements from HIR with block_node
+    Let count be proc list_length from ListCore with statements
 
-    Let set_line be proc string_concat from StringCore with target_expr, " = "
-    Set set_line to proc string_concat from StringCore with set_line, value_expr
-    Set set_line to proc string_concat from StringCore with set_line, ";"
-    proc emit_line with ctx, set_line
+    proc emit_line with ctx, "try"
+    proc increase_indent with ctx
+
+    Note: statements layout: try-marker, try-body, [catch-marker, catch-body]
+    Let in_catch be 0
+    Let i be 0
+    While i is less than count:
+        Let stmt be proc list_get from ListCore with statements, i
+        Let marker_text be proc extract_string_marker with stmt
+        Let is_try_marker be proc string_equals from StringCore with marker_text, "try"
+        Let is_catch_marker be proc string_equals from StringCore with marker_text, "catch"
+
+        If is_try_marker is equal to 1:
+            Note: skip; frame already opened
+        Otherwise:
+            If is_catch_marker is equal to 1:
+                proc decrease_indent with ctx
+                Let catch_line be "catch"
+                If catch_var is not equal to 0:
+                    Set catch_line to proc string_concat from StringPrim with "catch ", catch_var
+                End If
+                proc emit_line with ctx, catch_line
+                proc increase_indent with ctx
+                Set in_catch to 1
+            Otherwise:
+                proc generate_statement with ctx, stmt
+            End If
+        End If
+        Set i to i plus 1
+    End While
+
+    proc decrease_indent with ctx
+    proc emit_line with ctx, "end"
 End Process
 
 @Reasoning:
-MATLAB's if/else uses 'else' (not 'elseif' for a separate-branch case) and
-requires a closing 'end'. The HIR's else-block is itself an If node when
-chained, so the recursive call into generate_statement on the else block
-naturally produces the cascaded 'else if ... end' shape mirroring HIR
-structure without dedicated elseif handling.
+Returns the literal text of an expression statement that wraps a string
+literal (the try/catch frame markers), or the empty string for any other
+statement. Lets generate_try_block recognise its frame markers structurally.
+@End Reasoning
+Process called "extract_string_marker" takes stmt as Integer returns Integer:
+    If stmt is equal to 0:
+        Return ""
+    End If
+    Let stmt_type be proc hir_node_type from HIR with stmt
+    If stmt_type is not equal to HIR.HIR_EXPR_STMT:
+        Return ""
+    End If
+    Let expr be proc hir_get_expression_statement_expr from HIR with stmt
+    If expr is equal to 0:
+        Return ""
+    End If
+    Let expr_type be proc hir_node_type from HIR with expr
+    If expr_type is not equal to HIR.HIR_STRING_LITERAL:
+        Return ""
+    End If
+    Return proc hir_get_string_literal_value from HIR with expr
+End Process
+
+@Reasoning:
+The HIR if-chain (with nested ifs in else slots) is re-emitted as MATLAB
+if / elseif / else / end. A "matlab_switch" flag on the head node selects
+switch re-emission instead, recovering the original switch/case form.
 @End Reasoning
 Process called "generate_if_statement" takes ctx as Integer, if_node as Integer:
+    Let is_switch be proc metadata_flag with if_node, "matlab_switch"
+    If is_switch is equal to 1:
+        proc generate_switch_statement with ctx, if_node
+        Return
+    End If
+
     Let condition be proc hir_get_if_condition from HIR with if_node
     Let then_block be proc hir_get_if_then from HIR with if_node
-    Let else_block be proc hir_get_if_else from HIR with if_node
-
-    Note: Generate if condition
     Let cond_expr be proc generate_expression with ctx, condition
-    Let if_line be proc string_concat from StringCore with "if ", cond_expr
+    Let if_line be proc string_concat from StringPrim with "if ", cond_expr
     proc emit_line with ctx, if_line
 
-    Note: Generate then block
-    proc increase_indent from ctx
+    proc increase_indent with ctx
     proc generate_statement with ctx, then_block
-    proc decrease_indent from ctx
+    proc decrease_indent with ctx
 
-    Note: Generate else block if present
-    If else_block is not equal to 0:
-        proc emit_line with ctx, "else"
-        proc increase_indent from ctx
-        proc generate_statement with ctx, else_block
-        proc decrease_indent from ctx
-    End If
+    proc generate_if_tail with ctx, if_node
 
     proc emit_line with ctx, "end"
 End Process
 
 @Reasoning:
-MATLAB's while loop syntax is 'while cond ... end'. There is no
-do-while construct, so HIR's HIR_DO_WHILE would have been rewritten by
-the lowering pass before reaching this emitter; only HIR_WHILE_STATEMENT
-arrives here and it maps one-to-one onto the MATLAB form.
+Walks the else chain. When the else slot holds a nested HIR if, it is
+re-emitted as MATLAB 'elseif cond' and recursion continues down its else;
+otherwise the else slot is an ordinary block re-emitted as 'else'. This
+flattens the nested HIR back into MATLAB's flat elseif/else form.
+@End Reasoning
+Process called "generate_if_tail" takes ctx as Integer, if_node as Integer:
+    Let else_block be proc hir_get_if_else from HIR with if_node
+    If else_block is equal to 0:
+        Return
+    End If
+
+    Let else_type be proc hir_node_type from HIR with else_block
+    If else_type is equal to HIR.HIR_IF:
+        Let condition be proc hir_get_if_condition from HIR with else_block
+        Let then_block be proc hir_get_if_then from HIR with else_block
+        Let cond_expr be proc generate_expression with ctx, condition
+        Let elseif_line be proc string_concat from StringPrim with "elseif ", cond_expr
+        proc emit_line with ctx, elseif_line
+
+        proc increase_indent with ctx
+        proc generate_statement with ctx, then_block
+        proc decrease_indent with ctx
+
+        proc generate_if_tail with ctx, else_block
+    Otherwise:
+        proc emit_line with ctx, "else"
+        proc increase_indent with ctx
+        proc generate_statement with ctx, else_block
+        proc decrease_indent with ctx
+    End If
+End Process
+
+@Reasoning:
+Re-emits the switch form from the if-chain the frontend built. The head if's
+condition is "scrut == case_val"; its left operand is the scrutinee
+(emitted once after 'switch') and the right operand is the first case value.
+Each nested if in the else slot contributes another 'case value'; a
+non-if else block is the 'otherwise' body.
+@End Reasoning
+Process called "generate_switch_statement" takes ctx as Integer, head_if as Integer:
+    Let head_cond be proc hir_get_if_condition from HIR with head_if
+    Let scrutinee be proc hir_get_binary_left from HIR with head_cond
+    Let scrut_expr be proc generate_expression with ctx, scrutinee
+    Let switch_line be proc string_concat from StringPrim with "switch ", scrut_expr
+    proc emit_line with ctx, switch_line
+    proc increase_indent with ctx
+
+    Let current be head_if
+    Let walking be 1
+    While walking is equal to 1:
+        Let cond be proc hir_get_if_condition from HIR with current
+        Let case_val be proc hir_get_binary_right from HIR with cond
+        Let case_val_expr be proc generate_expression with ctx, case_val
+        Let case_line be proc string_concat from StringPrim with "case ", case_val_expr
+        proc emit_line with ctx, case_line
+
+        Let case_body be proc hir_get_if_then from HIR with current
+        proc increase_indent with ctx
+        proc generate_statement with ctx, case_body
+        proc decrease_indent with ctx
+
+        Let else_slot be proc hir_get_if_else from HIR with current
+        If else_slot is equal to 0:
+            Set walking to 0
+        Otherwise:
+            Let else_type be proc hir_node_type from HIR with else_slot
+            If else_type is equal to HIR.HIR_IF:
+                Set current to else_slot
+            Otherwise:
+                proc emit_line with ctx, "otherwise"
+                proc increase_indent with ctx
+                proc generate_statement with ctx, else_slot
+                proc decrease_indent with ctx
+                Set walking to 0
+            End If
+        End If
+    End While
+
+    proc decrease_indent with ctx
+    proc emit_line with ctx, "end"
+End Process
+
+@Reasoning:
+"while cond ... end" emitted directly from the HIR while node.
 @End Reasoning
 Process called "generate_while_statement" takes ctx as Integer, while_node as Integer:
     Let condition be proc hir_get_while_condition from HIR with while_node
     Let body be proc hir_get_while_body from HIR with while_node
-
     Let cond_expr be proc generate_expression with ctx, condition
-    Let while_line be proc string_concat from StringCore with "while ", cond_expr
+    Let while_line be proc string_concat from StringPrim with "while ", cond_expr
     proc emit_line with ctx, while_line
 
-    proc increase_indent from ctx
+    proc increase_indent with ctx
     proc generate_statement with ctx, body
-    proc decrease_indent from ctx
+    proc decrease_indent with ctx
 
     proc emit_line with ctx, "end"
 End Process
 
 @Reasoning:
-The matlab_parfor metadata selects between sequential 'for' and Parallel
-Computing Toolbox 'parfor', which has identical syntax but different
-runtime semantics (independent iterations distributed across workers).
-MATLAB's for-each operates on the columns of the iterable, so the HIR
-iterable should already be lowered to a row vector or matrix shape by the
-frontend before reaching this emitter.
+"for var = iter ... end" emitted from the HIR for-in node; the
+"matlab_parfor" flag selects the parfor keyword.
 @End Reasoning
 Process called "generate_for_statement" takes ctx as Integer, for_node as Integer:
-    Let iterator_var be proc hir_get_for_iterator from HIR with for_node
-    Let iterable be proc hir_get_for_iterable from HIR with for_node
-    Let body be proc hir_get_for_body from HIR with for_node
+    Let var_name be proc hir_get_for_in_variable from HIR with for_node
+    Let iterable be proc hir_get_for_in_iterable from HIR with for_node
+    Let body be proc hir_get_for_in_body from HIR with for_node
 
-    Let var_name be proc hir_get_symbol_name from HIR with iterator_var
     Let iter_expr be proc generate_expression with ctx, iterable
 
-    Note: Check if this is a parallel for (parfor)
-    Let is_parfor be proc hir_get_metadata from HIR with for_node, "matlab_parfor"
-
+    Let is_parfor be proc metadata_flag with for_node, "matlab_parfor"
     Let for_line be ""
     If is_parfor is equal to 1:
-        Set for_line to proc string_concat from StringCore with "parfor ", var_name
+        Set for_line to proc string_concat from StringPrim with "parfor ", var_name
     Otherwise:
-        Set for_line to proc string_concat from StringCore with "for ", var_name
+        Set for_line to proc string_concat from StringPrim with "for ", var_name
     End If
-
-    Set for_line to proc string_concat from StringCore with for_line, " = "
-    Set for_line to proc string_concat from StringCore with for_line, iter_expr
+    Set for_line to proc string_concat from StringPrim with for_line, " = "
+    Set for_line to proc string_concat from StringPrim with for_line, iter_expr
     proc emit_line with ctx, for_line
 
-    proc increase_indent from ctx
+    proc increase_indent with ctx
     proc generate_statement with ctx, body
-    proc decrease_indent from ctx
+    proc decrease_indent with ctx
 
     proc emit_line with ctx, "end"
-End Process
-
-@Reasoning:
-HIR match is lowered to MATLAB switch, which supports literal cases and a
-catch-all 'otherwise' clause but not destructuring or guards. The frontend
-must have already simplified guard-bearing patterns into nested if/else
-chains before reaching this point; this emitter handles only the simple
-switch form.
-@End Reasoning
-Process called "generate_match_statement" takes ctx as Integer, match_node as Integer:
-    Note: HIR match maps to MATLAB switch
-    Let expression be proc hir_get_match_expression from HIR with match_node
-    Let arms be proc hir_get_match_arms from HIR with match_node
-
-    Let expr_str be proc generate_expression with ctx, expression
-    Let switch_line be proc string_concat from StringCore with "switch ", expr_str
-    proc emit_line with ctx, switch_line
-
-    proc increase_indent from ctx
-
-    Note: Generate case clauses
-    Let arm_count be proc list_length from ListCore with arms
-    Let i be 0
-
-    While i is less than arm_count:
-        Let when_clause be proc list_get from ListCore with arms, i
-        proc generate_when_clause with ctx, when_clause
-        Set i to i plus 1
-    End While
-
-    proc decrease_indent from ctx
-    proc emit_line with ctx, "end"
-End Process
-
-@Reasoning:
-Wildcard arms are emitted as MATLAB's 'otherwise' which must appear last
-in a switch block; the dispatcher in generate_match_statement is
-responsible for emitting arms in declaration order so the otherwise lands
-at the end. Non-wildcard patterns prefer pre-computed pattern_value
-strings for literal arms, falling back to a full expression render for
-complex patterns (cell arrays, ranges).
-@End Reasoning
-Process called "generate_when_clause" takes ctx as Integer, when_node as Integer:
-    Let pattern be proc hir_get_when_pattern from HIR with when_node
-    Let body be proc hir_get_when_body from HIR with when_node
-
-    Note: Check pattern type
-    Let pattern_type be proc hir_get_pattern_type from HIR with pattern
-
-    Note: Wildcard pattern = otherwise
-    If pattern_type is equal to HIR.HIR_PATTERN_WILDCARD:
-        proc emit_line with ctx, "otherwise"
-    Otherwise:
-        Note: Regular pattern = case
-        Note: Generate MATLAB case with pattern value (literal or complex)
-        Let case_line be "case "
-
-        Note: Extract pattern value - handles both literals and complex patterns
-        Let pattern_value be proc hir_get_pattern_value from HIR with pattern
-        If pattern_value is not equal to 0:
-            Note: Literal pattern - use direct value
-            Set case_line to proc string_concat from StringCore with case_line, pattern_value
-        Otherwise:
-            Note: Complex pattern (e.g., ranges, guards) - generate full expression
-            Let pattern_expr be proc generate_expression from ctx with pattern
-            Set case_line to proc string_concat from StringCore with case_line, pattern_expr
-        End If
-
-        proc emit_line with ctx, case_line
-    End If
-
-    proc increase_indent from ctx
-    proc generate_statement with ctx, body
-    proc decrease_indent from ctx
-End Process
-
-@Reasoning:
-MATLAB exception handling has only a single catch clause (no
-catch-by-type, no finally), so we collapse a multi-clause HIR catch chain
-into the first clause and ignore subsequent clauses. The exception
-variable, when bound, appears as an identifier following the catch
-keyword - MATLAB's 'catch err' form.
-@End Reasoning
-Process called "generate_try_statement" takes ctx as Integer, try_node as Integer:
-    Let try_block be proc hir_get_try_block from HIR with try_node
-    Let catch_clauses be proc hir_get_catch_clauses from HIR with try_node
-
-    proc emit_line with ctx, "try"
-    proc increase_indent from ctx
-    proc generate_statement with ctx, try_block
-    proc decrease_indent from ctx
-
-    Note: Generate catch clause (MATLAB has single catch)
-    Let catch_count be proc list_length from ListCore with catch_clauses
-    If catch_count is greater than 0:
-        Let catch_clause be proc list_get from ListCore with catch_clauses, 0
-        Let exception_var be proc hir_get_catch_exception_var from HIR with catch_clause
-        Let catch_body be proc hir_get_catch_body from HIR with catch_clause
-
-        Note: MATLAB catch with exception variable
-        Let catch_line be "catch"
-        If exception_var is not equal to 0:
-            Let var_name be proc hir_get_symbol_name from HIR with exception_var
-            Set catch_line to proc string_concat from StringCore with catch_line, " "
-            Set catch_line to proc string_concat from StringCore with catch_line, var_name
-        End If
-        proc emit_line with ctx, catch_line
-
-        proc increase_indent from ctx
-        proc generate_statement with ctx, catch_body
-        proc decrease_indent from ctx
-    End If
-
-    proc emit_line with ctx, "end"
-End Process
-
-@Reasoning:
-MATLAB's 'return' carries no expression - the function's output is
-whatever was last assigned to the declared output variables. When the
-HIR carries a return expression, we synthesise an assignment to the
-first output variable (resolved from the surrounding function's
-matlab_output_params metadata) before emitting the bare 'return', which
-preserves the source's intended return value through the universal
-translation round-trip.
-@End Reasoning
-Process called "generate_return_statement" takes ctx as Integer, return_node as Integer:
-    Note: MATLAB uses 'return' for early exit, actual return values are via output variables
-    Let return_expr be proc hir_get_return_expression from HIR with return_node
-
-    If return_expr is not equal to 0:
-        Note: If there's a return expression, assign to output variable first
-        Note: Proper handling assigns to output variables based on function metadata
-        Let output_vars be proc hir_get_metadata from HIR with ctx, "matlab_output_params"
-        Let expr_str be proc generate_expression with ctx, return_expr
-
-        If output_vars is not equal to 0 and length of output_vars is greater than 0:
-            Note: Assign to first output variable
-            Let first_output be output_vars at index 0
-            Let return_line be proc string_concat from StringCore with first_output, " = "
-            Set return_line to proc string_concat from StringCore with return_line, expr_str
-        Otherwise:
-            Note: No output variables - use comment to indicate return value
-            Set return_line to proc string_concat from StringCore with "% return ", expr_str
-        End If
-        proc emit_line with ctx, return_line
-    End If
-
-    proc emit_line with ctx, "return"
 End Process
 
 Note: ===================================================================
@@ -1018,185 +774,194 @@ Note: EXPRESSION GENERATION
 Note: ===================================================================
 
 @Reasoning:
-The dispatcher returns a string rather than emitting because expressions
-nest arbitrarily - they may be concatenated, embedded in conditions, or
-passed as arguments to other expressions. Returning "unknown_expr" rather
-than raising an error preserves emission stability for HIR shapes that
-the MATLAB backend has not yet been taught about, while still producing
-recognisable output for diagnostic inspection.
+Expression dispatcher returning a string. Literals, identifiers, list
+literals (matrix/cell), binary/unary operators, calls (including lambda and
+range encodings), index and member access are reconstructed. Unknown shapes
+return "unknown_expr" rather than aborting, preserving stability.
 @End Reasoning
 Process called "generate_expression" takes ctx as Integer, expr_node as Integer returns Integer:
+    If expr_node is equal to 0:
+        Return ""
+    End If
+
     Let expr_type be proc hir_node_type from HIR with expr_node
 
-    Note: Literal expressions
-    If expr_type is equal to HIR.HIR_NUMBER_LITERAL:
-        Let value be proc hir_get_literal_value from HIR with expr_node
-        Return value
+    If expr_type is equal to HIR.HIR_INT_LITERAL:
+        Return proc hir_get_int_literal_value from HIR with expr_node
     End If
-
+    If expr_type is equal to HIR.HIR_FLOAT_LITERAL:
+        Return proc hir_get_float_literal_value from HIR with expr_node
+    End If
     If expr_type is equal to HIR.HIR_STRING_LITERAL:
-        Set value to proc hir_get_literal_value from HIR with expr_node
-        Let quoted be proc string_concat from StringCore with "'", value
-        Set quoted to proc string_concat from StringCore with quoted, "'"
+        Let value be proc hir_get_string_literal_value from HIR with expr_node
+        Let quoted be proc string_concat from StringPrim with "'", value
+        Set quoted to proc string_concat from StringPrim with quoted, "'"
         Return quoted
     End If
-
-    If expr_type is equal to HIR.HIR_BOOLEAN_LITERAL:
-        Set value to proc hir_get_literal_value from HIR with expr_node
-        If value is equal to 1:
+    If expr_type is equal to HIR.HIR_BOOL_LITERAL:
+        Let bool_value be proc hir_get_bool_literal_value from HIR with expr_node
+        If bool_value is equal to 1:
             Return "true"
-        Otherwise:
-            Return "false"
         End If
+        Return "false"
     End If
-
-    Note: Identifier
     If expr_type is equal to HIR.HIR_IDENTIFIER:
-        Let id_name be proc hir_get_identifier_name from HIR with expr_node
-        Return id_name
+        Return proc generate_identifier with ctx, expr_node
     End If
-
-    Note: Array literal (matrix or cell)
-    If expr_type is equal to HIR.HIR_ARRAY_LITERAL:
-        Return proc generate_array_literal with ctx, expr_node
+    If expr_type is equal to HIR.HIR_LIST_LITERAL:
+        Return proc generate_list_literal with ctx, expr_node
     End If
-
-    Note: Binary expression
     If expr_type is equal to HIR.HIR_BINARY_EXPR:
         Return proc generate_binary_expression with ctx, expr_node
     End If
-
-    Note: Unary expression
     If expr_type is equal to HIR.HIR_UNARY_EXPR:
         Return proc generate_unary_expression with ctx, expr_node
     End If
-
-    Note: Call expression
     If expr_type is equal to HIR.HIR_CALL_EXPR:
         Return proc generate_call_expression with ctx, expr_node
     End If
-
-    Note: Index expression
     If expr_type is equal to HIR.HIR_INDEX_EXPR:
         Return proc generate_index_expression with ctx, expr_node
     End If
-
-    Note: Member expression
     If expr_type is equal to HIR.HIR_MEMBER_EXPR:
         Return proc generate_member_expression with ctx, expr_node
     End If
-
-    Note: Function pointer (function handle)
-    If expr_type is equal to HIR.HIR_FUNCTION_POINTER:
-        Return proc generate_function_pointer with ctx, expr_node
-    End If
-
-    Note: Lambda expression (anonymous function)
-    If expr_type is equal to HIR.HIR_LAMBDA_EXPR:
-        Return proc generate_lambda_expression with ctx, expr_node
-    End If
-
-    Note: Range expression (colon operator)
-    If expr_type is equal to HIR.HIR_RANGE_EXPR:
-        Return proc generate_range_expression with ctx, expr_node
+    If expr_type is equal to HIR.HIR_ASSIGN_EXPR:
+        Let lhs be proc hir_get_assign_lhs from HIR with expr_node
+        Let rhs be proc hir_get_assign_rhs from HIR with expr_node
+        Let lhs_str be proc generate_expression with ctx, lhs
+        Let rhs_str be proc generate_expression with ctx, rhs
+        Let assign be proc string_concat from StringPrim with lhs_str, " = "
+        Set assign to proc string_concat from StringPrim with assign, rhs_str
+        Return assign
     End If
 
     Return "unknown_expr"
 End Process
 
 @Reasoning:
-MATLAB has two distinct array literal forms: square brackets produce
-matrices/vectors with comma-or-space separated elements, while curly
-braces produce cell arrays for heterogeneous storage. The matlab_cell
-metadata selects between them; cell elements are comma-separated while
-matrix elements use spaces (mimicking MATLAB's standard formatting).
+An identifier carrying "matlab_func_handle" re-prepends '@'; one carrying
+"matlab_colon_all" is the bare ':'; otherwise the plain name is returned.
 @End Reasoning
-Process called "generate_array_literal" takes ctx as Integer, array_node as Integer returns Integer:
-    Let elements be proc hir_get_array_elements from HIR with array_node
+Process called "generate_identifier" takes ctx as Integer, id_node as Integer returns Integer:
+    Let is_colon_all be proc metadata_flag with id_node, "matlab_colon_all"
+    If is_colon_all is equal to 1:
+        Return ":"
+    End If
+
+    Let name be proc hir_get_identifier_name from HIR with id_node
+    Let is_handle be proc metadata_flag with id_node, "matlab_func_handle"
+    If is_handle is equal to 1:
+        Return proc string_concat from StringPrim with "@", name
+    End If
+    Return name
+End Process
+
+@Reasoning:
+A list literal flagged "matlab_cell" re-emits "{a, b}"; otherwise it is a
+matrix re-emitted as "[...]" with rows re-split using the per-row element
+counts stored in "matlab_matrix_rows" (semicolon-separated counts). Within a
+row, elements are space-separated and rows are joined with "; ".
+@End Reasoning
+Process called "generate_list_literal" takes ctx as Integer, list_node as Integer returns Integer:
+    Let elements be proc hir_get_list_elements from HIR with list_node
     Let elem_count be proc list_length from ListCore with elements
 
-    Note: Check if this is a MATLAB matrix or cell array
-    Let is_cell be proc hir_get_metadata from HIR with array_node, "matlab_cell"
-    Let is_matrix be proc hir_get_metadata from HIR with array_node, "matlab_matrix"
-
-    Let result be ""
-
+    Let is_cell be proc metadata_flag with list_node, "matlab_cell"
     If is_cell is equal to 1:
-        Note: Cell array: {elem1, elem2, ...}
-        Set result to "{"
+        Let cell_result be "{"
         Let i be 0
         While i is less than elem_count:
             Let elem be proc list_get from ListCore with elements, i
             Let elem_expr be proc generate_expression with ctx, elem
-            Set result to proc string_concat from StringCore with result, elem_expr
-            If i is less than elem_count minus 1:
-                Set result to proc string_concat from StringCore with result, ", "
+            Set cell_result to proc string_concat from StringPrim with cell_result, elem_expr
+            Let last be elem_count minus 1
+            If i is less than last:
+                Set cell_result to proc string_concat from StringPrim with cell_result, ", "
             End If
             Set i to i plus 1
         End While
-        Set result to proc string_concat from StringCore with result, "}"
-    Otherwise:
-        Note: Regular array/matrix: [elem1 elem2 ...]
-        Set result to "["
-        Set i to 0
-        While i is less than elem_count:
-            Set elem to proc list_get from ListCore with elements, i
-            Set elem_expr to proc generate_expression with ctx, elem
-            Set result to proc string_concat from StringCore with result, elem_expr
-            If i is less than elem_count minus 1:
-                Set result to proc string_concat from StringCore with result, " "
-            End If
-            Set i to i plus 1
-        End While
-        Set result to proc string_concat from StringCore with result, "]"
+        Set cell_result to proc string_concat from StringPrim with cell_result, "}"
+        Return cell_result
     End If
 
+    Note: Matrix: rebuild rows from "matlab_matrix_rows" element counts.
+    Let rows_meta be proc metadata_value with list_node, "matlab_matrix_rows"
+    Let result be "["
+    If rows_meta is equal to 0:
+        Note: No row metadata - emit a single row.
+        Let j be 0
+        While j is less than elem_count:
+            Let elem2 be proc list_get from ListCore with elements, j
+            Let elem2_expr be proc generate_expression with ctx, elem2
+            Set result to proc string_concat from StringPrim with result, elem2_expr
+            Let last2 be elem_count minus 1
+            If j is less than last2:
+                Set result to proc string_concat from StringPrim with result, " "
+            End If
+            Set j to j plus 1
+        End While
+    Otherwise:
+        Let row_counts be proc split_on_semicolon with rows_meta
+        Let row_total be proc list_length from ListCore with row_counts
+        Let elem_index be 0
+        Let r be 0
+        While r is less than row_total:
+            Let count_text be proc list_get from ListCore with row_counts, r
+            Let row_len be proc parse_decimal with count_text
+            If r is greater than 0:
+                Set result to proc string_concat from StringPrim with result, "; "
+            End If
+            Let c be 0
+            While c is less than row_len:
+                Let cell_elem be proc list_get from ListCore with elements, elem_index
+                Let cell_expr be proc generate_expression with ctx, cell_elem
+                Set result to proc string_concat from StringPrim with result, cell_expr
+                Let last_in_row be row_len minus 1
+                If c is less than last_in_row:
+                    Set result to proc string_concat from StringPrim with result, " "
+                End If
+                Set elem_index to elem_index plus 1
+                Set c to c plus 1
+            End While
+            Set r to r plus 1
+        End While
+    End If
+    Set result to proc string_concat from StringPrim with result, "]"
     Return result
 End Process
 
 @Reasoning:
-MATLAB distinguishes matrix and element-wise operators using a leading
-dot prefix (.* vs *, ./ vs /, .^ vs ^). The matlab_elementwise metadata
-selects the dot-prefixed form, which is essential for preserving the
-intended semantics across the round-trip: element-wise multiplication of
-two same-shape matrices is fundamentally different from matrix product.
+Binary expressions re-emit the exact MATLAB operator from the
+"matlab_operator" metadata (preserving '^', '.^', '\', matrix-vs-elementwise
+spellings) and fall back to mapping the HIR op enum when absent. Operands
+are space-padded around the operator.
 @End Reasoning
 Process called "generate_binary_expression" takes ctx as Integer, binary_node as Integer returns Integer:
-    Let operator be proc hir_get_binary_operator from HIR with binary_node
     Let left be proc hir_get_binary_left from HIR with binary_node
     Let right be proc hir_get_binary_right from HIR with binary_node
-
     Let left_expr be proc generate_expression with ctx, left
     Let right_expr be proc generate_expression with ctx, right
 
-    Note: Check if element-wise operation
-    Let is_elementwise be proc hir_get_metadata from HIR with binary_node, "matlab_elementwise"
+    Let op_str be proc metadata_value with binary_node, "matlab_operator"
+    If op_str is equal to 0:
+        Let hir_op be proc hir_get_binary_op from HIR with binary_node
+        Set op_str to proc map_hir_operator_to_matlab with hir_op
+    End If
 
-    Note: Map HIR operator to MATLAB operator
-    Let op_str be proc map_hir_operator_to_matlab with operator, is_elementwise
-
-    Let result be proc string_concat from StringCore with left_expr, " "
-    Set result to proc string_concat from StringCore with result, op_str
-    Set result to proc string_concat from StringCore with result, " "
-    Set result to proc string_concat from StringCore with result, right_expr
-
+    Let result be proc string_concat from StringPrim with left_expr, " "
+    Set result to proc string_concat from StringPrim with result, op_str
+    Set result to proc string_concat from StringPrim with result, " "
+    Set result to proc string_concat from StringPrim with result, right_expr
     Return result
 End Process
 
 @Reasoning:
-The mapping table embodies the v0.0.8.5 contract between HIR operator
-codes and MATLAB syntax: arithmetic ops branch on is_elementwise for
-matrix-vs-array semantics, relational ops are direct (with ~= for
-inequality rather than !=), and logical ops use the short-circuit
-&&/|| forms (which require scalar operands in MATLAB) versus the
-element-wise &/| forms. The default of "+" mirrors MATLAB's behaviour
-of treating unknown binary contexts as numeric addition rather than
-raising a compile error.
+Fallback HIR-op to MATLAB-operator map used only when no preserved spelling
+is available. Covers the arithmetic, relational and logical categories the
+HIR op enum represents.
 @End Reasoning
-Process called "map_hir_operator_to_matlab" takes operator as Integer, is_elementwise as Integer returns Integer:
-    Note: Map HIR operators to MATLAB operators
-
-    Note: Arithmetic operators
+Process called "map_hir_operator_to_matlab" takes operator as Integer returns Integer:
     If operator is equal to HIR.HIR_OP_ADD:
         Return "+"
     End If
@@ -1204,28 +969,11 @@ Process called "map_hir_operator_to_matlab" takes operator as Integer, is_elemen
         Return "-"
     End If
     If operator is equal to HIR.HIR_OP_MULTIPLY:
-        If is_elementwise is equal to 1:
-            Return ".*"
-        Otherwise:
-            Return "*"
-        End If
+        Return "*"
     End If
     If operator is equal to HIR.HIR_OP_DIVIDE:
-        If is_elementwise is equal to 1:
-            Return "./"
-        Otherwise:
-            Return "/"
-        End If
+        Return "/"
     End If
-    If operator is equal to HIR.HIR_OP_POWER:
-        If is_elementwise is equal to 1:
-            Return ".^"
-        Otherwise:
-            Return "^"
-        End If
-    End If
-
-    Note: Relational operators
     If operator is equal to HIR.HIR_OP_EQUAL:
         Return "=="
     End If
@@ -1244,8 +992,6 @@ Process called "map_hir_operator_to_matlab" takes operator as Integer, is_elemen
     If operator is equal to HIR.HIR_OP_GREATER_EQUAL:
         Return ">="
     End If
-
-    Note: Logical operators
     If operator is equal to HIR.HIR_OP_LOGICAL_AND:
         Return "&&"
     End If
@@ -1258,246 +1004,257 @@ Process called "map_hir_operator_to_matlab" takes operator as Integer, is_elemen
     If operator is equal to HIR.HIR_OP_BITWISE_OR:
         Return "|"
     End If
-
     Return "+"
 End Process
 
 @Reasoning:
-The transpose operator is the most subtle unary case: MATLAB uses ' for
-complex-conjugate transpose and .' for the plain transpose, which differ
-only when the operand has complex entries. The matlab_complex_conjugate
-metadata records which variant the source intended so we never silently
-swap a real-only transpose for the conjugate form, which would change
-results when the value type later became complex.
+A unary expression carrying "matlab_transpose" is a postfix transpose,
+re-emitted as "operand'" or "operand.'" from the preserved spelling. Other
+unary forms re-emit the preserved prefix operator (~, -, +) before the
+operand.
 @End Reasoning
 Process called "generate_unary_expression" takes ctx as Integer, unary_node as Integer returns Integer:
-    Let operator be proc hir_get_unary_operator from HIR with unary_node
     Let operand be proc hir_get_unary_operand from HIR with unary_node
-
     Let operand_expr be proc generate_expression with ctx, operand
 
-    Note: Check for transpose operator
-    If operator is equal to HIR.HIR_OP_TRANSPOSE:
-        Let is_complex be proc hir_get_metadata from HIR with unary_node, "matlab_complex_conjugate"
-        If is_complex is equal to 1:
-            Let result be proc string_concat from StringCore with operand_expr, "'"
-            Return result
-        Otherwise:
-            Set result to proc string_concat from StringCore with operand_expr, ".'"
-            Return result
-        End If
+    Let transpose be proc metadata_value with unary_node, "matlab_transpose"
+    If transpose is not equal to 0:
+        Return proc string_concat from StringPrim with operand_expr, transpose
     End If
 
-    Note: Other unary operators
-    Let op_str be "-"
-    If operator is equal to HIR.HIR_OP_LOGICAL_NOT:
-        Set op_str to "~"
+    Let op_str be proc metadata_value with unary_node, "matlab_operator"
+    If op_str is equal to 0:
+        Set op_str to "-"
     End If
-    If operator is equal to HIR.HIR_OP_PLUS:
-        Set op_str to "+"
-    End If
-
-    Set result to proc string_concat from StringCore with op_str, operand_expr
-    Return result
+    Return proc string_concat from StringPrim with op_str, operand_expr
 End Process
 
 @Reasoning:
-MATLAB call syntax uses parentheses for both function calls and array
-indexing - the distinction is resolved by the callee being a function
-handle or identifier vs. a variable. Since the HIR carries the
-distinction explicitly via the HIR_CALL vs HIR_INDEX nodes, the emitter
-only sees calls here and can use parentheses unambiguously.
+Call expressions reconstruct either an anonymous function (when flagged
+"matlab_lambda": "@(params) body") or an ordinary "callee(arg, ...)" call.
+The callee and each positional argument are rendered recursively.
 @End Reasoning
 Process called "generate_call_expression" takes ctx as Integer, call_node as Integer returns Integer:
-    Let callee be proc hir_get_call_callee from HIR with call_node
-    Let arguments be proc hir_get_call_arguments from HIR with call_node
+    Let is_lambda be proc metadata_flag with call_node, "matlab_lambda"
+    If is_lambda is equal to 1:
+        Return proc generate_lambda with ctx, call_node
+    End If
 
+    Let callee be proc hir_get_call_callee from HIR with call_node
     Let callee_expr be proc generate_expression with ctx, callee
 
-    Note: Generate arguments
-    Let arg_count be proc list_length from ListCore with arguments
-    Let args_str be ""
-    Let i be 0
+    Let args_handle be proc hir_get_call_arguments from HIR with call_node
+    Let args be proc hir_get_positional_args from HIR with args_handle
+    Let arg_count be proc list_length from ListCore with args
 
+    Let result be proc string_concat from StringPrim with callee_expr, "("
+    Let i be 0
     While i is less than arg_count:
-        Let arg be proc list_get from ListCore with arguments, i
+        Let arg be proc list_get from ListCore with args, i
         Let arg_expr be proc generate_expression with ctx, arg
-        Set args_str to proc string_concat from StringCore with args_str, arg_expr
-        If i is less than arg_count minus 1:
-            Set args_str to proc string_concat from StringCore with args_str, ", "
+        Set result to proc string_concat from StringPrim with result, arg_expr
+        Let last be arg_count minus 1
+        If i is less than last:
+            Set result to proc string_concat from StringPrim with result, ", "
         End If
         Set i to i plus 1
     End While
-
-    Let result be proc string_concat from StringCore with callee_expr, "("
-    Set result to proc string_concat from StringCore with result, args_str
-    Set result to proc string_concat from StringCore with result, ")"
-
+    Set result to proc string_concat from StringPrim with result, ")"
     Return result
 End Process
 
 @Reasoning:
-MATLAB indexing has three forms: parentheses (arrays/matrices), braces
-(cell unwrap), and dynamic field syntax obj.(expr) for runtime-computed
-field names on structs. The metadata flags resolve which form to emit;
-without them we default to parentheses since that is the most common
-indexing operation across MATLAB code.
+An anonymous function re-emits "@(params) body" using the joined parameter
+names from "matlab_lambda_params" metadata and the single body expression
+stored as the call's first positional argument.
+@End Reasoning
+Process called "generate_lambda" takes ctx as Integer, call_node as Integer returns Integer:
+    Let params be proc metadata_value with call_node, "matlab_lambda_params"
+    Let result be "@("
+    If params is not equal to 0:
+        Set result to proc string_concat from StringPrim with result, params
+    End If
+    Set result to proc string_concat from StringPrim with result, ") "
+
+    Let args_handle be proc hir_get_call_arguments from HIR with call_node
+    Let args be proc hir_get_positional_args from HIR with args_handle
+    Let arg_count be proc list_length from ListCore with args
+    If arg_count is greater than 0:
+        Let body be proc list_get from ListCore with args, 0
+        Let body_expr be proc generate_expression with ctx, body
+        Set result to proc string_concat from StringPrim with result, body_expr
+    End If
+    Return result
+End Process
+
+@Reasoning:
+Index expressions reconstruct MATLAB's three indexing forms from metadata:
+dynamic field access "obj.(expr)", a colon range "start:end" /
+"start:step:end", cell indexing "base{idx}", or array indexing "base(idx)".
 @End Reasoning
 Process called "generate_index_expression" takes ctx as Integer, index_node as Integer returns Integer:
     Let object be proc hir_get_index_object from HIR with index_node
-    Let index be proc hir_get_index_index from HIR with index_node
+    Let index be proc hir_get_index_value from HIR with index_node
+
+    Let is_dynamic be proc metadata_flag with index_node, "matlab_dynamic_field"
+    If is_dynamic is equal to 1:
+        Let obj_expr be proc generate_expression with ctx, object
+        Let field_expr be proc generate_expression with ctx, index
+        Let dyn be proc string_concat from StringPrim with obj_expr, ".("
+        Set dyn to proc string_concat from StringPrim with dyn, field_expr
+        Set dyn to proc string_concat from StringPrim with dyn, ")"
+        Return dyn
+    End If
+
+    Let range_kind be proc metadata_value with index_node, "matlab_range"
+    If range_kind is not equal to 0:
+        Return proc generate_range with ctx, index_node, range_kind
+    End If
 
     Let object_expr be proc generate_expression with ctx, object
     Let index_expr be proc generate_expression with ctx, index
 
-    Note: Check for MATLAB dynamic field access
-    Let is_dynamic_field be proc hir_get_metadata from HIR with index_node, "matlab_dynamic_field"
-    If is_dynamic_field is equal to 1:
-        Note: Generate obj.(field_expr) syntax
-        Let result be proc string_concat from StringCore with object_expr, ".("
-        Set result to proc string_concat from StringCore with result, index_expr
-        Set result to proc string_concat from StringCore with result, ")"
-        Return result
-    End If
-
-    Note: Check if cell indexing {braces} vs array indexing (parens)
-    Let is_cell be proc hir_get_metadata from HIR with index_node, "matlab_cell_indexing"
-
-    Set result to object_expr
+    Let is_cell be proc metadata_flag with index_node, "matlab_cell_indexing"
+    Let result be object_expr
     If is_cell is equal to 1:
-        Set result to proc string_concat from StringCore with result, "{"
-        Set result to proc string_concat from StringCore with result, index_expr
-        Set result to proc string_concat from StringCore with result, "}"
+        Set result to proc string_concat from StringPrim with result, "{"
+        Set result to proc string_concat from StringPrim with result, index_expr
+        Set result to proc string_concat from StringPrim with result, "}"
     Otherwise:
-        Set result to proc string_concat from StringCore with result, "("
-        Set result to proc string_concat from StringCore with result, index_expr
-        Set result to proc string_concat from StringCore with result, ")"
+        Set result to proc string_concat from StringPrim with result, "("
+        Set result to proc string_concat from StringPrim with result, index_expr
+        Set result to proc string_concat from StringPrim with result, ")"
     End If
-
     Return result
 End Process
 
 @Reasoning:
-Static dot-access lives in this dedicated emitter; the dynamic form is
-handled by generate_index_expression with the matlab_dynamic_field flag.
-The member name is taken verbatim from the HIR rather than resolved
-through any symbol table because MATLAB resolves struct fields at runtime
-- the emitter must not alter the spelling.
+Re-emits a colon range. A "2" kind is "start:end" (object=start,
+index=end). A "3" kind nests an inner "start:step" index inside the object
+slot with the outer index being the end value, reconstructed as
+"start:step:end".
+@End Reasoning
+Process called "generate_range" takes ctx as Integer, index_node as Integer, range_kind as Integer returns Integer:
+    Let is_three be proc string_equals from StringCore with range_kind, "3"
+    Let object be proc hir_get_index_object from HIR with index_node
+    Let end_val be proc hir_get_index_value from HIR with index_node
+
+    If is_three is equal to 1:
+        Note: object is the inner "start:step" index expression.
+        Let inner_start be proc hir_get_index_object from HIR with object
+        Let inner_step be proc hir_get_index_value from HIR with object
+        Let start_expr be proc generate_expression with ctx, inner_start
+        Let step_expr be proc generate_expression with ctx, inner_step
+        Let end_expr be proc generate_expression with ctx, end_val
+        Let three be proc string_concat from StringPrim with start_expr, ":"
+        Set three to proc string_concat from StringPrim with three, step_expr
+        Set three to proc string_concat from StringPrim with three, ":"
+        Set three to proc string_concat from StringPrim with three, end_expr
+        Return three
+    End If
+
+    Let start2 be proc generate_expression with ctx, object
+    Let end2 be proc generate_expression with ctx, end_val
+    Let two be proc string_concat from StringPrim with start2, ":"
+    Set two to proc string_concat from StringPrim with two, end2
+    Return two
+End Process
+
+@Reasoning:
+"obj.field" re-emitted from the HIR member expression's object subtree and
+static member name string.
 @End Reasoning
 Process called "generate_member_expression" takes ctx as Integer, member_node as Integer returns Integer:
     Let object be proc hir_get_member_object from HIR with member_node
     Let member_name be proc hir_get_member_name from HIR with member_node
-
     Let object_expr be proc generate_expression with ctx, object
-
-    Let result be proc string_concat from StringCore with object_expr, "."
-    Set result to proc string_concat from StringCore with result, member_name
-
+    Let result be proc string_concat from StringPrim with object_expr, "."
+    Set result to proc string_concat from StringPrim with result, member_name
     Return result
 End Process
 
-@Reasoning:
-MATLAB function handles use the '@' prefix syntax. This emitter assumes
-the function name is a simple identifier; package-qualified handles
-(e.g. @mypackage.myfunc) flow through the same path because the HIR
-already encodes the dotted name as the function pointer name.
-@End Reasoning
-Process called "generate_function_pointer" takes ctx as Integer, func_ptr_node as Integer returns Integer:
-    Note: MATLAB function handle: @functionName
-    Let func_name be proc hir_get_function_pointer_name from HIR with func_ptr_node
-
-    Let result be proc string_concat from StringCore with "@", func_name
-    Return result
-End Process
+Note: ===================================================================
+Note: STRING UTILITIES
+Note: ===================================================================
 
 @Reasoning:
-MATLAB anonymous functions use '@(params) expr' and are restricted to a
-single expression body; the HIR lowering pass must have already inlined
-multi-statement lambdas into helper functions before reaching this
-emitter. Parameter names are emitted verbatim from the HIR because
-MATLAB does not require declared types.
+Splits a string on ", " into a list of substrings. Used to recover the
+joined output-parameter / event name lists from metadata. A scan tracks
+segment boundaries and slices each piece via string_substring.
 @End Reasoning
-Process called "generate_lambda_expression" takes ctx as Integer, lambda_node as Integer returns Integer:
-    Note: MATLAB anonymous function: @(params) expression
-    Let parameters be proc hir_get_lambda_parameters from HIR with lambda_node
-    Let body be proc hir_get_lambda_body from HIR with lambda_node
-
-    Let result be "@("
-
-    Note: Generate parameter list
-    Let param_count be proc list_length from ListCore with parameters
+Process called "split_on_comma_space" takes text as Integer returns Integer:
+    Let parts be proc list_create from ListCore
+    Let length be proc string_length from StringCore with text
+    Let segment_start be 0
     Let i be 0
-    While i is less than param_count:
-        Let param be proc list_get from ListCore with parameters, i
-        Let param_name be proc hir_get_parameter_name from HIR with param
-        Set result to proc string_concat from StringCore with result, param_name
-        If i is less than param_count minus 1:
-            Set result to proc string_concat from StringCore with result, ", "
+    While i is less than length:
+        Let ch be proc string_char_at from StringCore with text, i
+        If ch is equal to 44:
+            Let seg_len be i minus segment_start
+            Let segment be proc string_substring from StringPrim with text, segment_start, seg_len
+            proc list_append from ListCore with parts, segment
+            Note: skip ", " (comma + space)
+            Set i to i plus 2
+            Set segment_start to i
+        Otherwise:
+            Set i to i plus 1
+        End If
+    End While
+    Let tail_len be length minus segment_start
+    If tail_len is greater than 0:
+        Let tail be proc string_substring from StringPrim with text, segment_start, tail_len
+        proc list_append from ListCore with parts, tail
+    End If
+    Return parts
+End Process
+
+@Reasoning:
+Splits a string on ';' into a list of substrings. Used to recover the
+per-row element counts from matrix metadata.
+@End Reasoning
+Process called "split_on_semicolon" takes text as Integer returns Integer:
+    Let parts be proc list_create from ListCore
+    Let length be proc string_length from StringCore with text
+    Let segment_start be 0
+    Let i be 0
+    While i is less than length:
+        Let ch be proc string_char_at from StringCore with text, i
+        If ch is equal to 59:
+            Let seg_len be i minus segment_start
+            Let segment be proc string_substring from StringPrim with text, segment_start, seg_len
+            proc list_append from ListCore with parts, segment
+            Set i to i plus 1
+            Set segment_start to i
+        Otherwise:
+            Set i to i plus 1
+        End If
+    End While
+    Let tail_len be length minus segment_start
+    If tail_len is greater than 0:
+        Let tail be proc string_substring from StringPrim with text, segment_start, tail_len
+        proc list_append from ListCore with parts, tail
+    End If
+    Return parts
+End Process
+
+@Reasoning:
+Parses a non-negative decimal string into an integer by accumulating each
+digit. Used to read the per-row element counts back from matrix metadata.
+@End Reasoning
+Process called "parse_decimal" takes text as Integer returns Integer:
+    Let length be proc string_length from StringCore with text
+    Let value be 0
+    Let i be 0
+    While i is less than length:
+        Let ch be proc string_char_at from StringCore with text, i
+        If ch is greater than or equal to 48:
+            If ch is less than or equal to 57:
+                Let digit be ch minus 48
+                Set value to value multiplied by 10
+                Set value to value plus digit
+            End If
         End If
         Set i to i plus 1
     End While
-
-    Set result to proc string_concat from StringCore with result, ") "
-
-    Note: Generate body expression
-    Let body_expr be proc generate_expression with ctx, body
-    Set result to proc string_concat from StringCore with result, body_expr
-
-    Return result
-End Process
-
-@Reasoning:
-The colon operator is overloaded in MATLAB: a bare ':' selects every
-element of an indexing dimension, 'a:b' creates a 1-step vector from a
-to b, and 'a:s:b' uses step s. The matlab_colon_all metadata recognises
-the bare-colon form so the emitter does not need a placeholder start/end
-pair. When step is null we omit it rather than emit '1:' which would
-add a redundant step.
-@End Reasoning
-Process called "generate_range_expression" takes ctx as Integer, range_node as Integer returns Integer:
-    Note: MATLAB colon operator: start:end or start:step:end
-    Let start be proc hir_get_range_start from HIR with range_node
-    Let end_val be proc hir_get_range_end from HIR with range_node
-    Let step be proc hir_get_range_step from HIR with range_node
-
-    Note: Check for special ":" (all elements)
-    Let is_colon_all be proc hir_get_metadata from HIR with range_node, "matlab_colon_all"
-    If is_colon_all is equal to 1:
-        Return ":"
-    End If
-
-    Let start_expr be proc generate_expression with ctx, start
-    Let end_expr be proc generate_expression with ctx, end_val
-
-    Let result be proc string_concat from StringCore with start_expr, ":"
-
-    Note: Add step if present
-    If step is not equal to 0:
-        Let step_expr be proc generate_expression with ctx, step
-        Set result to proc string_concat from StringCore with result, step_expr
-        Set result to proc string_concat from StringCore with result, ":"
-    End If
-
-    Set result to proc string_concat from StringCore with result, end_expr
-
-    Return result
-End Process
-
-@Reasoning:
-Returning "any" when the type id has no mapping reflects MATLAB's
-duck-typed reality - any unknown HIR type can hold any MATLAB value at
-runtime. The type string surfaces only in documentation comments and
-classdef inheritance clauses, so the fallback never causes runtime
-problems even when it loses precision relative to the HIR type.
-@End Reasoning
-Process called "generate_type" takes ctx as Integer, type_node as Integer returns Integer:
-    Note: MATLAB is dynamically typed, so types are mostly for comments
-    Let type_id be proc hir_get_type_id from HIR with type_node
-    Let type_str be proc dict_get from DictCore with ctx.type_map, proc int_to_string from StringCore with type_id
-
-    If type_str is equal to 0:
-        Return "any"
-    End If
-
-    Return type_str
+    Return value
 End Process

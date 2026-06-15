@@ -1,19 +1,21 @@
 Note: ===================================================================
 Note: MATLAB TO HIR TRANSLATOR
 Note: ===================================================================
-Note: Translates MATLAB AST (from matlab_parser.runa) into HIR
-Note: (High-level Intermediate Representation) for the Translation
+Note: Translates the MATLAB AST produced by matlab_parser.runa into the
+Note: canonical typed HIR (hir_nodes.runa) consumed by the Translation
 Note: universal translation system.
 
-Note: This module handles:
-Note: - Script and function file translation
-Note: - Class translation (classdef with properties, methods, events, enumeration)
-Note: - Function translation with multiple return values
-Note: - Matrix/array operations (element-wise vs matrix multiplication)
-Note: - Function handles and anonymous functions
-Note: - Expression translation including colon operator and complex indexing
-Note: - Statement translation with MATLAB control flow (parfor, spmd, etc.)
-Note: - Cell array and struct array handling
+Note: This translator targets the SAME typed-HIR contract used by the
+Note: other model-1 frontends (r_to_hir, ruby_to_hir, scala_to_hir): it
+Note: builds real HIR_* nodes via hir_create_* / hir_set_* / hir_add_*
+Note: and the matching hir_to_matlab backend reconstructs MATLAB source by
+Note: reading those nodes back through hir_get_* accessors. Producer and
+Note: consumer share exactly this representation.
+
+Note: The MATLAB parser emits an ASTNode struct (node_type, value, children,
+Note: metadata) accessed through ast_node_type / ast_node_value /
+Note: ast_node_child / ast_node_child_count. Node-type tags are the
+Note: MatlabParser.MATLAB_* constants.
 
 Note: Part of the Translation Translation System
 Note: Location: compiler/middle/gungnir/hir/translation/frontends/matlab/matlab_to_hir.runa
@@ -23,1380 +25,22 @@ Import "compiler/middle/gungnir/hir/hir_nodes.runa" as HIR
 Import "compiler/middle/gungnir/hir/translation/frontends/matlab/matlab_parser.runa" as MatlabParser
 Import "compiler/middle/gungnir/hir/translation/frontends/matlab/matlab_lexer.runa" as MatlabLexer
 Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/frontend/primitives/core/string_primitive.runa" as StringPrim
 Import "compiler/frontend/primitives/collections/list.runa" as ListCore
-Import "compiler/frontend/primitives/collections/dictionary.runa" as DictCore
 
 Note: ===================================================================
-Note: TRANSLATION CONTEXT
-Note: ===================================================================
-Note: Maintains state during MATLAB→HIR translation including symbol tables,
-Note: type mappings, and nested scope tracking.
-
-@Reasoning:
-Eleven-field translation state. symbol_table maps name-with-depth-suffix
-strings to HIR refs (the suffix implements lexical scoping); type_map is
-the MATLAB-type-string -> HIR-type-tag dictionary set up by
-register_standard_type_mappings; current_class/current_function track the
-enclosing definition so member references resolve correctly; the
-function_handles/anonymous_functions/matrix_context/cell_arrays/structs
-slots are auxiliary registries used by their respective translation
-helpers; errors collects diagnostics emitted during translation.
-@End Reasoning
-Type called "MatlabTranslationContext":
-    Note: Symbol table mapping MATLAB identifiers to HIR references
-    symbol_table as Integer
-
-    Note: Type mapping table (MATLAB types → HIR types)
-    type_map as Integer
-
-    Note: Current scope depth (for nested scopes)
-    scope_depth as Integer
-
-    Note: Current class context (0 if not in a class)
-    current_class as Integer
-
-    Note: Current function context (0 if not in a function)
-    current_function as Integer
-
-    Note: Function handle tracking (for @function_name references)
-    function_handles as Integer
-
-    Note: Anonymous function tracking
-    anonymous_functions as Integer
-
-    Note: Matrix operations context (track element-wise vs matrix ops)
-    matrix_context as Integer
-
-    Note: Cell array tracking
-    cell_arrays as Integer
-
-    Note: Struct tracking
-    structs as Integer
-
-    Note: Error collection
-    errors as Integer
-End Type
-
-Note: ===================================================================
-Note: CONTEXT MANAGEMENT
+Note: OPERATOR MAPPING
 Note: ===================================================================
 
 @Reasoning:
-Builds an empty translation context with all registries initialized
-(symbol_table/type_map/etc. as fresh dicts and lists), scope_depth=0,
-no enclosing class/function. Immediately calls
-register_standard_type_mappings so the type_map is pre-populated with
-MATLAB's primitive-to-HIR-tag bindings.
-@End Reasoning
-Process called "create_translation_context" returns Integer:
-    Let ctx be a value of type MatlabTranslationContext with
-        symbol_table as proc dict_create from DictCore,
-        type_map as proc dict_create from DictCore,
-        scope_depth as 0,
-        current_class as 0,
-        current_function as 0,
-        function_handles as proc dict_create from DictCore,
-        anonymous_functions as proc list_create from ListCore,
-        matrix_context as proc dict_create from DictCore,
-        cell_arrays as proc dict_create from DictCore,
-        structs as proc dict_create from DictCore,
-        errors as proc list_create from ListCore
-
-    Note: Initialize standard type mappings (MATLAB → HIR)
-    proc register_standard_type_mappings from ctx
-
-    Return ctx
-End Process
-
-@Reasoning:
-Populates type_map with the MATLAB-string -> HIR-type-tag conversions:
-all integer widths (int8..int64, uint8..uint64) collapse to HIR_TYPE_INTEGER;
-double/single both map to HIR_TYPE_FLOAT (HIR has only one float kind);
-logical -> BOOLEAN; char/string -> STRING; cell -> ARRAY; struct/table ->
-DICTIONARY; function_handle -> FUNCTION. The mapping is lossy — width
-information for ints is discarded at this stage but reconstructed by
-later codegen passes using metadata attached to HIR nodes.
-@End Reasoning
-Process called "register_standard_type_mappings" takes ctx as MatlabTranslationContext:
-    Note: Map MATLAB numeric types to HIR types
-    proc dict_set from DictCore with ctx.type_map, "double", HIR.HIR_TYPE_FLOAT
-    proc dict_set from DictCore with ctx.type_map, "single", HIR.HIR_TYPE_FLOAT
-    proc dict_set from DictCore with ctx.type_map, "int8", HIR.HIR_TYPE_INTEGER
-    proc dict_set from DictCore with ctx.type_map, "int16", HIR.HIR_TYPE_INTEGER
-    proc dict_set from DictCore with ctx.type_map, "int32", HIR.HIR_TYPE_INTEGER
-    proc dict_set from DictCore with ctx.type_map, "int64", HIR.HIR_TYPE_INTEGER
-    proc dict_set from DictCore with ctx.type_map, "uint8", HIR.HIR_TYPE_INTEGER
-    proc dict_set from DictCore with ctx.type_map, "uint16", HIR.HIR_TYPE_INTEGER
-    proc dict_set from DictCore with ctx.type_map, "uint32", HIR.HIR_TYPE_INTEGER
-    proc dict_set from DictCore with ctx.type_map, "uint64", HIR.HIR_TYPE_INTEGER
-
-    Note: Map MATLAB logical type
-    proc dict_set from DictCore with ctx.type_map, "logical", HIR.HIR_TYPE_BOOLEAN
-
-    Note: Map MATLAB string/char types
-    proc dict_set from DictCore with ctx.type_map, "char", HIR.HIR_TYPE_STRING
-    proc dict_set from DictCore with ctx.type_map, "string", HIR.HIR_TYPE_STRING
-
-    Note: Map MATLAB collection types
-    proc dict_set from DictCore with ctx.type_map, "cell", HIR.HIR_TYPE_ARRAY
-    proc dict_set from DictCore with ctx.type_map, "struct", HIR.HIR_TYPE_DICTIONARY
-    proc dict_set from DictCore with ctx.type_map, "table", HIR.HIR_TYPE_DICTIONARY
-
-    Note: Map MATLAB function handle type
-    proc dict_set from DictCore with ctx.type_map, "function_handle", HIR.HIR_TYPE_FUNCTION
-End Process
-
-@Reasoning:
-Increments scope_depth, opening a new lexical scope for symbol_table
-lookups. Called at the entry of a function, loop body, or any other
-construct that introduces a new naming context.
-@End Reasoning
-Process called "push_scope" takes ctx as Integer:
-    Set ctx.scope_depth to ctx.scope_depth plus 1
-End Process
-
-@Reasoning:
-Decrements scope_depth. Symbols inserted at the popped depth remain in
-the dictionary but become unreachable to lookup_symbol because the search
-starts from the new (lower) depth.
-@End Reasoning
-Process called "pop_scope" takes ctx as Integer:
-    Set ctx.scope_depth to ctx.scope_depth minus 1
-End Process
-
-@Reasoning:
-Stores a name->hir_ref binding scoped to the current depth. The depth
-suffix in the key ("name_2") implements scoping without nested dicts:
-two symbols with the same MATLAB name at different depths coexist.
-@End Reasoning
-Process called "add_symbol" takes ctx as Integer, name as Integer, hir_ref as Integer:
-    Let scoped_name be proc string_concat from StringCore with name, "_"
-    Set scoped_name to proc string_concat from StringCore with scoped_name, proc int_to_string from StringCore with ctx.scope_depth
-    proc dict_set from DictCore with ctx.symbol_table, scoped_name, hir_ref
-End Process
-
-@Reasoning:
-Walks scope depths from current down to 0, returning the first binding
-found. Implements MATLAB's lexical scoping — an inner-scope shadow wins
-over an outer-scope binding for the same name. Returns 0 when no binding
-exists at any depth.
-@End Reasoning
-Process called "lookup_symbol" takes ctx as Integer, name as Integer returns Integer:
-    Note: Search from current scope up to global scope
-    Let depth be ctx.scope_depth
-    While depth is greater than or equal to 0:
-        Let scoped_name be proc string_concat from StringCore with name, "_"
-        Set scoped_name to proc string_concat from StringCore with scoped_name, proc int_to_string from StringCore with depth
-
-        Let has_key be proc dict_has_key from DictCore with ctx.symbol_table, scoped_name
-        If has_key is equal to 1:
-            Let value be proc dict_get from DictCore with ctx.symbol_table, scoped_name
-            Return value
-        End If
-
-        Set depth to depth minus 1
-    End While
-
-    Return 0
-End Process
-
-@Reasoning:
-Accumulates an error message in the context's errors list. Translation
-continues past errors so the caller can collect a complete diagnostic
-report; the translator never aborts mid-tree on a single error.
-@End Reasoning
-Process called "add_translation_error" takes ctx as MatlabTranslationContext, error_message as Integer:
-    proc list_append from ListCore with ctx.errors, error_message
-End Process
-
-Note: ===================================================================
-Note: MAIN TRANSLATION ENTRY POINT
-Note: ===================================================================
-
-@Reasoning:
-Top-level entry. Constructs a fresh translation context, creates the
-HIR module, and dispatches the root AST node. Validates that the root is
-MATLAB_PROGRAM — anything else emits a translation error. Translation
-errors collected during the walk are attached to the HIR module as
-"translation_errors" metadata, allowing the caller to introspect failures
-without aborting the pipeline.
-@End Reasoning
-Process called "translate_matlab_to_hir" takes matlab_ast as Integer returns Integer:
-    Let ctx be proc create_translation_context
-
-    Note: Create HIR module node
-    Let hir_module be proc hir_create_module from HIR
-
-    Note: Translate the MATLAB program
-    Let node_type be proc ast_node_type from matlab_ast
-    If node_type is equal to MatlabParser.MATLAB_PROGRAM:
-        proc translate_program with ctx, matlab_ast, hir_module
-    Otherwise:
-        proc add_translation_error with ctx, "Expected MATLAB_PROGRAM root node"
-    End If
-
-    Note: Check for translation errors
-    Let error_count be proc list_length from ListCore with ctx.errors
-    If error_count is greater than 0:
-        Note: Attach errors to HIR module as metadata
-        proc hir_set_metadata from HIR with hir_module, "translation_errors", ctx.errors
-    End If
-
-    Return hir_module
-End Process
-
-Note: ===================================================================
-Note: PROGRAM STRUCTURE TRANSLATION
-Note: ===================================================================
-
-@Reasoning:
-Iterates top-level children of the MATLAB program node, dispatching each
-to its appropriate translator: MATLAB_FUNCTION -> translate_function;
-MATLAB_CLASSDEF -> translate_classdef; MATLAB_STATEMENT_LIST ->
-translate_script_statements (the script-file case where there is no
-enclosing function).
-@End Reasoning
-Process called "translate_program" takes ctx as Integer, program_node as Integer, hir_module as Integer:
-    Let child_count be proc ast_node_child_count from program_node
-    Let i be 0
-
-    While i is less than child_count:
-        Let child be proc ast_node_child with program_node, i
-        Let child_type be proc ast_node_type from child
-
-        Note: Translate function definition
-        If child_type is equal to MatlabParser.MATLAB_FUNCTION:
-            Let hir_function be proc translate_function with ctx, child
-            proc hir_add_declaration from HIR with hir_module, hir_function
-        End If
-
-        Note: Translate class definition
-        If child_type is equal to MatlabParser.MATLAB_CLASSDEF:
-            Let hir_class be proc translate_classdef with ctx, child
-            proc hir_add_declaration from HIR with hir_module, hir_class
-        End If
-
-        Note: Translate script statements (top-level statements in scripts)
-        If child_type is equal to MatlabParser.MATLAB_STATEMENT_LIST:
-            proc translate_script_statements with ctx, child, hir_module
-        End If
-
-        Set i to i plus 1
-    End While
-End Process
-
-@Reasoning:
-MATLAB scripts have no surrounding function wrapper, but HIR requires
-every statement to live inside a function. This routine synthesizes a
-"matlab_script_main" function with a void return type to host the
-script's top-level statements, preserving execution order and source
-semantics.
-@End Reasoning
-Process called "translate_script_statements" takes ctx as Integer, stmt_list as Integer, hir_module as Integer:
-    Note: MATLAB scripts contain top-level statements without function wrapper
-    Note: Wrap them in a special "main" function for HIR
-    Let hir_main be proc hir_create_function from HIR
-    proc hir_set_function_name from HIR with hir_main, "matlab_script_main"
-    proc hir_set_return_type from HIR with hir_main, HIR.HIR_TYPE_VOID
-
-    Note: Create function body block
-    Let hir_body be proc hir_create_block from HIR
-
-    Note: Translate all statements
-    Let child_count be proc ast_node_child_count from stmt_list
-    Let i be 0
-
-    While i is less than child_count:
-        Let stmt be proc ast_node_child with stmt_list, i
-        Let hir_stmt be proc translate_statement with ctx, stmt
-        proc hir_add_block_statement from HIR with hir_body, hir_stmt
-        Set i to i plus 1
-    End While
-
-    proc hir_set_function_body from HIR with hir_main, hir_body
-    proc hir_add_declaration from HIR with hir_module, hir_main
-End Process
-
-Note: ===================================================================
-Note: FUNCTION TRANSLATION
-Note: ===================================================================
-
-@Reasoning:
-Translates one MATLAB function to its HIR counterpart. Saves the
-previously-current function on entry and restores it on exit so nested
-functions work correctly. The AST child layout from the parser is
-(name, outputs, inputs, body); each is dispatched to its sub-translator
-and the resulting HIR function is registered in the symbol table for
-later by-name lookups.
-@End Reasoning
-Process called "translate_function" takes ctx as Integer, func_node as Integer returns Integer:
-    Note: Save previous function context
-    Let prev_function be ctx.current_function
-
-    Note: Create HIR function node
-    Let hir_function be proc hir_create_function from HIR
-    Set ctx.current_function to hir_function
-
-    Note: Get function name
-    Let name_child be proc ast_node_child with func_node, 0
-    Let func_name be proc ast_node_value from name_child
-    proc hir_set_function_name from HIR with hir_function, func_name
-
-    Note: Handle MATLAB multiple return values
-    Note: MATLAB: function [out1, out2, out3] = myFunc(in1, in2)
-    Let outputs_child be proc ast_node_child with func_node, 1
-    Let outputs_type be proc ast_node_type from outputs_child
-
-    If outputs_type is equal to MatlabParser.MATLAB_OUTPUT_LIST:
-        proc translate_output_parameters with ctx, outputs_child, hir_function
-    Otherwise:
-        Note: Single output - treat as normal return type
-        Let output_name be proc ast_node_value from outputs_child
-        proc hir_set_metadata from HIR with hir_function, "matlab_single_output", output_name
-        proc hir_set_return_type from HIR with hir_function, HIR.HIR_TYPE_ANY
-    End If
-
-    Note: Translate input parameters
-    Let inputs_child be proc ast_node_child with func_node, 2
-    proc translate_input_parameters with ctx, inputs_child, hir_function
-
-    Note: Translate function body
-    Let body_child be proc ast_node_child with func_node, 3
-    Let hir_body be proc translate_statement with ctx, body_child
-    proc hir_set_function_body from HIR with hir_function, hir_body
-
-    Note: Add function to symbol table
-    proc add_symbol with ctx, func_name, hir_function
-
-    Note: Restore previous function context
-    Set ctx.current_function to prev_function
-
-    Return hir_function
-End Process
-
-@Reasoning:
-Handles MATLAB's multi-output-value return convention. Zero outputs ->
-HIR_TYPE_VOID; single output -> HIR_TYPE_ANY (type inferred later);
-multiple outputs -> a tuple type with one ANY slot per declared output.
-The actual output parameter names are attached as "matlab_output_params"
-metadata since HIR has no native concept of named return slots.
-@End Reasoning
-Process called "translate_output_parameters" takes ctx as Integer, outputs_node as Integer, hir_function as Integer:
-    Note: MATLAB functions can return multiple values
-    Note: Create a tuple return type in HIR to represent this
-    Let output_count be proc ast_node_child_count from outputs_node
-
-    Note: Store output parameter names as metadata
-    Let output_names be proc list_create from ListCore
-
-    Let i be 0
-    Let output_param be 0
-    Let loop_output_name be 0
-    While i is less than output_count:
-        Set output_param to proc ast_node_child with outputs_node, i
-        Set loop_output_name to proc ast_node_value from output_param
-        proc list_append from ListCore with output_names, loop_output_name
-        Set i to i plus 1
-    End While
-
-    proc hir_set_metadata from HIR with hir_function, "matlab_output_params", output_names
-
-    Note: Determine return type based on output parameters
-    If length of output_names is equal to 0:
-        Note: No explicit outputs - return void
-        proc hir_set_return_type from HIR with hir_function, HIR.HIR_TYPE_VOID
-    Otherwise If length of output_names is equal to 1:
-        Note: Single output - return that type (let type inference determine)
-        proc hir_set_return_type from HIR with hir_function, HIR.HIR_TYPE_ANY
-    Otherwise:
-        Note: Multiple outputs - return tuple type
-        Let tuple_type be proc hir_create_tuple_type from HIR with length of output_names
-        For Each output_name in output_names:
-            proc hir_tuple_add_element_type from HIR with tuple_type, HIR.HIR_TYPE_ANY
-        End For
-        proc hir_set_return_type from HIR with hir_function, tuple_type
-    End If
-End Process
-
-@Reasoning:
-Each MATLAB formal input parameter becomes an HIR parameter of type
-HIR_TYPE_ANY. MATLAB is dynamically typed at the call site, so the
-parameter type information must be inferred from usage during a later
-type-inference pass rather than declared statically here.
-@End Reasoning
-Process called "translate_input_parameters" takes ctx as Integer, inputs_node as Integer, hir_function as Integer:
-    Let param_count be proc ast_node_child_count from inputs_node
-
-    Let i be 0
-    While i is less than param_count:
-        Let param be proc ast_node_child with inputs_node, i
-        Let param_name be proc ast_node_value from param
-
-        Note: Create HIR parameter (MATLAB is dynamically typed, use ANY type)
-        Let hir_param be proc hir_create_parameter from HIR with param_name, HIR.HIR_TYPE_ANY
-        proc hir_add_parameter from HIR with hir_function, hir_param
-
-        Set i to i plus 1
-    End While
-End Process
-
-Note: ===================================================================
-Note: CLASS DEFINITION TRANSLATION
-Note: ===================================================================
-
-@Reasoning:
-Translates a MATLAB classdef to an HIR class node. Saves/restores
-current_class so nested class definitions (rare but legal) work
-correctly. Iterates the class-body children starting from index 1
-(index 0 is the class name) and dispatches each member block
-(properties/methods/events/enumeration/base-class) to its specialized
-translator.
-@End Reasoning
-Process called "translate_classdef" takes ctx as Integer, class_node as Integer returns Integer:
-    Note: Save current class context
-    Let prev_class be ctx.current_class
-
-    Note: Create HIR class node
-    Let hir_class be proc hir_create_class from HIR
-    Set ctx.current_class to hir_class
-
-    Note: Get class name
-    Let name_child be proc ast_node_child with class_node, 0
-    Let class_name be proc ast_node_value from name_child
-    proc hir_set_class_name from HIR with hir_class, class_name
-
-    Note: Process class members
-    Let child_count be proc ast_node_child_count from class_node
-    Let i be 1
-
-    While i is less than child_count:
-        Let child be proc ast_node_child with class_node, i
-        Let child_type be proc ast_node_type from child
-
-        Note: Handle properties block
-        If child_type is equal to MatlabParser.MATLAB_PROPERTIES:
-            proc translate_properties_block with ctx, child, hir_class
-        End If
-
-        Note: Handle methods block
-        If child_type is equal to MatlabParser.MATLAB_METHODS:
-            proc translate_methods_block with ctx, child, hir_class
-        End If
-
-        Note: Handle events block
-        If child_type is equal to MatlabParser.MATLAB_EVENTS:
-            proc translate_events_block with ctx, child, hir_class
-        End If
-
-        Note: Handle enumeration block
-        If child_type is equal to MatlabParser.MATLAB_ENUMERATION:
-            proc translate_enumeration_block with ctx, child, hir_class
-        End If
-
-        Note: Handle base class (< BaseClass syntax)
-        If child_type is equal to MatlabParser.MATLAB_BASE_CLASS:
-            Let base_name be proc ast_node_value from child
-            Let hir_base be proc hir_create_type_ref from HIR with base_name
-            proc hir_set_base_class from HIR with hir_class, hir_base
-        End If
-
-        Set i to i plus 1
-    End While
-
-    Note: Restore previous class context
-    Set ctx.current_class to prev_class
-
-    Return hir_class
-End Process
-
-@Reasoning:
-Each property becomes an HIR field of type ANY (MATLAB does not require
-property type declarations). The "properties (Access=private)" attribute
-bracket from the source is captured in metadata at the block level and
-propagated to each field as "matlab_attributes" so the codegen layer can
-honor visibility. Default-value expressions, when present, are translated
-to HIR initializer expressions.
-@End Reasoning
-Process called "translate_properties_block" takes ctx as Integer, props_node as Integer, hir_class as Integer:
-    Note: Extract property attributes (Access, SetAccess, GetAccess, etc.)
-    Let attributes be proc ast_node_metadata with props_node, "attributes"
-
-    Let child_count be proc ast_node_child_count from props_node
-    Let i be 0
-
-    While i is less than child_count:
-        Let prop_child be proc ast_node_child with props_node, i
-        Let prop_name be proc ast_node_value from prop_child
-
-        Note: Create HIR field node
-        Let hir_field be proc hir_create_field from HIR
-        proc hir_set_field_name from HIR with hir_field, prop_name
-        proc hir_set_field_type from HIR with hir_field, HIR.HIR_TYPE_ANY
-
-        Note: Set property attributes as metadata
-        If attributes is not equal to 0:
-            proc hir_set_metadata from HIR with hir_field, "matlab_attributes", attributes
-        End If
-
-        Note: Check for default value
-        Let has_default be proc ast_node_has_child from prop_child
-        If has_default is equal to 1:
-            Let default_expr be proc ast_node_child with prop_child, 0
-            Let hir_default be proc translate_expression with ctx, default_expr
-            proc hir_set_field_initializer from HIR with hir_field, hir_default
-        End If
-
-        proc hir_add_class_member from HIR with hir_class, hir_field
-        Set i to i plus 1
-    End While
-End Process
-
-@Reasoning:
-Each method inside "methods ... end" is translated via the standard
-translate_function (methods are syntactically functions) and then tagged
-with "is_method"=1 metadata to distinguish from free functions. Block-
-level attributes (Access, Static, Abstract, Sealed) propagate via the
-"matlab_attributes" metadata key.
-@End Reasoning
-Process called "translate_methods_block" takes ctx as Integer, methods_node as Integer, hir_class as Integer:
-    Note: Extract method attributes (Access, Static, Abstract, etc.)
-    Let attributes be proc ast_node_metadata with methods_node, "attributes"
-
-    Let child_count be proc ast_node_child_count from methods_node
-    Let i be 0
-
-    While i is less than child_count:
-        Let method_child be proc ast_node_child with methods_node, i
-        Let method_type be proc ast_node_type from method_child
-
-        If method_type is equal to MatlabParser.MATLAB_FUNCTION:
-            Let hir_method be proc translate_function with ctx, method_child
-
-            Note: Convert function to method
-            proc hir_set_metadata from HIR with hir_method, "is_method", 1
-
-            Note: Set method attributes as metadata
-            If attributes is not equal to 0:
-                proc hir_set_metadata from HIR with hir_method, "matlab_attributes", attributes
-            End If
-
-            proc hir_add_class_member from HIR with hir_class, hir_method
-        End If
-
-        Set i to i plus 1
-    End While
-End Process
-
-@Reasoning:
-HIR has no native event type, so MATLAB events are encoded as
-"matlab_events" metadata on the class — a list of event names plus an
-optional "matlab_event_attributes" entry for the block attributes. The
-downstream codegen step is expected to expand this into language-specific
-event/signal primitives.
-@End Reasoning
-Process called "translate_events_block" takes ctx as Integer, events_node as Integer, hir_class as Integer:
-    Note: MATLAB events are similar to signals/events in other languages
-    Note: Store as class metadata since HIR doesn't have native event support
-    Let attributes be proc ast_node_metadata with events_node, "attributes"
-    Let event_list be proc list_create from ListCore
-
-    Let child_count be proc ast_node_child_count from events_node
-    Let i be 0
-
-    While i is less than child_count:
-        Let event_child be proc ast_node_child with events_node, i
-        Let event_name be proc ast_node_value from event_child
-        proc list_append from ListCore with event_list, event_name
-        Set i to i plus 1
-    End While
-
-    proc hir_set_metadata from HIR with hir_class, "matlab_events", event_list
-    If attributes is not equal to 0:
-        proc hir_set_metadata from HIR with hir_class, "matlab_event_attributes", attributes
-    End If
-End Process
-
-@Reasoning:
-Each enumeration value becomes an HIR constant field of HIR_TYPE_INTEGER
-(MATLAB enumerators are integer-backed by default). Storing as fields
-rather than a synthetic enum type lets value-class enumerations
-participate in method dispatch like any other class member.
-@End Reasoning
-Process called "translate_enumeration_block" takes ctx as Integer, enum_node as Integer, hir_class as Integer:
-    Note: MATLAB enumeration classes define named constants
-    Note: Store as class metadata and create constant fields
-    Let child_count be proc ast_node_child_count from enum_node
-    Let i be 0
-
-    While i is less than child_count:
-        Let enum_child be proc ast_node_child with enum_node, i
-        Let enum_name be proc ast_node_value from enum_child
-
-        Note: Create constant field for each enumeration value
-        Let hir_field be proc hir_create_field from HIR
-        proc hir_set_field_name from HIR with hir_field, enum_name
-        proc hir_set_field_type from HIR with hir_field, HIR.HIR_TYPE_INTEGER
-        proc hir_set_field_const from HIR with hir_field, 1
-
-        proc hir_add_class_member from HIR with hir_class, hir_field
-        Set i to i plus 1
-    End While
-
-    proc hir_set_metadata from HIR with hir_class, "matlab_enumeration", 1
-End Process
-
-Note: ===================================================================
-Note: STATEMENT TRANSLATION
-Note: ===================================================================
-
-@Reasoning:
-Polymorphic statement dispatcher. Routes block/assignment/control-flow/
-jump/declaration/expression statements to their specialized translators.
-Break and continue are emitted directly as HIR jump primitives since
-they need no payload. Unknown statement types log a translation error and
-return 0; the caller is expected to handle null statements gracefully.
-@End Reasoning
-Process called "translate_statement" takes ctx as Integer, stmt_node as Integer returns Integer:
-    Let stmt_type be proc ast_node_type from stmt_node
-
-    Note: Block statement
-    If stmt_type is equal to MatlabParser.MATLAB_BLOCK:
-        Return proc translate_block_statement with ctx, stmt_node
-    End If
-
-    Note: Assignment statement
-    If stmt_type is equal to MatlabParser.MATLAB_ASSIGNMENT:
-        Return proc translate_assignment_statement with ctx, stmt_node
-    End If
-
-    Note: If statement
-    If stmt_type is equal to MatlabParser.MATLAB_IF_STMT:
-        Return proc translate_if_statement with ctx, stmt_node
-    End If
-
-    Note: For loop
-    If stmt_type is equal to MatlabParser.MATLAB_FOR_STMT:
-        Return proc translate_for_statement with ctx, stmt_node
-    End If
-
-    Note: Parallel for loop (parfor)
-    If stmt_type is equal to MatlabParser.MATLAB_PARFOR_STMT:
-        Return proc translate_parfor_statement with ctx, stmt_node
-    End If
-
-    Note: SPMD block
-    If stmt_type is equal to MatlabParser.MATLAB_SPMD_STMT:
-        Return proc translate_spmd_statement with ctx, stmt_node
-    End If
-
-    Note: While loop
-    If stmt_type is equal to MatlabParser.MATLAB_WHILE_STMT:
-        Return proc translate_while_statement with ctx, stmt_node
-    End If
-
-    Note: Switch statement
-    If stmt_type is equal to MatlabParser.MATLAB_SWITCH_STMT:
-        Return proc translate_switch_statement with ctx, stmt_node
-    End If
-
-    Note: Try-catch statement
-    If stmt_type is equal to MatlabParser.MATLAB_TRY_STMT:
-        Return proc translate_try_statement with ctx, stmt_node
-    End If
-
-    Note: Return statement
-    If stmt_type is equal to MatlabParser.MATLAB_RETURN_STMT:
-        Return proc translate_return_statement with ctx, stmt_node
-    End If
-
-    Note: Break statement
-    If stmt_type is equal to MatlabParser.MATLAB_BREAK_STMT:
-        Let hir_break be proc hir_create_break from HIR
-        Return hir_break
-    End If
-
-    Note: Continue statement
-    If stmt_type is equal to MatlabParser.MATLAB_CONTINUE_STMT:
-        Let hir_continue be proc hir_create_continue from HIR
-        Return hir_continue
-    End If
-
-    Note: Expression statement
-    If stmt_type is equal to MatlabParser.MATLAB_EXPR_STMT:
-        Let expr_child be proc ast_node_child with stmt_node, 0
-        Let hir_expr be proc translate_expression with ctx, expr_child
-        Let hir_expr_stmt be proc hir_create_expression_statement from HIR with hir_expr
-        Return hir_expr_stmt
-    End If
-
-    Note: Global declaration
-    If stmt_type is equal to MatlabParser.MATLAB_GLOBAL:
-        Return proc translate_global_statement with ctx, stmt_node
-    End If
-
-    Note: Persistent declaration
-    If stmt_type is equal to MatlabParser.MATLAB_PERSISTENT:
-        Return proc translate_persistent_statement with ctx, stmt_node
-    End If
-
-    Note: Unknown statement type
-    proc add_translation_error with ctx, "Unknown statement type"
-    Return 0
-End Process
-
-@Reasoning:
-Wraps a sequence of MATLAB statements in an HIR block, pushing a new
-lexical scope on entry and popping on exit so block-local symbols do not
-leak to the enclosing scope. Each child statement is translated through
-the main statement dispatcher and added to the block.
-@End Reasoning
-Process called "translate_block_statement" takes ctx as Integer, block_node as Integer returns Integer:
-    Let hir_block be proc hir_create_block from HIR
-    proc push_scope from ctx
-
-    Let child_count be proc ast_node_child_count from block_node
-    Let i be 0
-
-    While i is less than child_count:
-        Let stmt be proc ast_node_child with block_node, i
-        Let hir_stmt be proc translate_statement with ctx, stmt
-        proc hir_add_block_statement from HIR with hir_block, hir_stmt
-        Set i to i plus 1
-    End While
-
-    proc pop_scope from ctx
-    Return hir_block
-End Process
-
-@Reasoning:
-Translates "lhs = rhs" by recursively converting both sides to HIR and
-wrapping them in an HIR_NODE_SET_STATEMENT. The LHS may be any
-expression (identifier, indexed access, member access, struct field) —
-the HIR set-statement handles the destination form uniformly.
-@End Reasoning
-Process called "translate_assignment_statement" takes ctx as Integer, assign_node as Integer returns Integer:
-    Note: Get assignment target (LHS)
-    Let target_child be proc ast_node_child with assign_node, 0
-    Let hir_target be proc translate_expression with ctx, target_child
-
-    Note: Get assignment value (RHS)
-    Let value_child be proc ast_node_child with assign_node, 1
-    Let hir_value be proc translate_expression with ctx, value_child
-
-    Note: Create HIR assignment/set statement
-    Let base_node be proc hir_create_node from HIR with HIR.HIR_NODE_SET_STATEMENT
-    Let hir_set be proc create_hir_set_statement from HIR with base_node, hir_target, hir_value, 0
-
-    Return hir_set
-End Process
-
-@Reasoning:
-Translates the parser's flat if/elseif/else AST. The parser emits
-condition/then-block pairs followed by an optional else-block; this
-routine reads (condition, then) at indices 0/1 and treats any child at
-index 2 as the else-block. For elseif chains the AST shape is built
-up by the parser through recursive nesting of HIR if-statements during
-translation.
-@End Reasoning
-Process called "translate_if_statement" takes ctx as Integer, if_node as Integer returns Integer:
-    Note: Get condition
-    Let cond_child be proc ast_node_child with if_node, 0
-    Let hir_cond be proc translate_expression with ctx, cond_child
-
-    Note: Get then block
-    Let then_child be proc ast_node_child with if_node, 1
-    Let hir_then be proc translate_statement with ctx, then_child
-
-    Note: Get else block (if present)
-    Let hir_else be 0
-    Let child_count be proc ast_node_child_count from if_node
-    If child_count is greater than 2:
-        Let else_child be proc ast_node_child with if_node, 2
-        Set hir_else to proc translate_statement with ctx, else_child
-    End If
-
-    Note: Create HIR if statement
-    Let base_node be proc hir_create_node from HIR with HIR.HIR_NODE_IF_STATEMENT
-    Let hir_if be proc create_hir_if_statement from HIR with base_node, hir_cond, hir_then, hir_else
-
-    Return hir_if
-End Process
-
-@Reasoning:
-Emits an HIR for-statement with a synthesized HIR symbol for the loop
-induction variable. The variable type is HIR_TYPE_ANY because MATLAB's
-iteration source can be a range, vector, matrix, or cell array — each
-producing a differently-typed loop variable; the final type is settled
-during a later type-inference pass.
-@End Reasoning
-Process called "translate_for_statement" takes ctx as Integer, for_node as Integer returns Integer:
-    Note: Get loop variable
-    Let var_child be proc ast_node_child with for_node, 0
-    Let var_name be proc ast_node_value from var_child
-
-    Note: Get iterable expression (range or array)
-    Let iter_child be proc ast_node_child with for_node, 1
-    Let hir_iter be proc translate_expression with ctx, iter_child
-
-    Note: Get loop body
-    Let body_child be proc ast_node_child with for_node, 2
-    Let hir_body be proc translate_statement with ctx, body_child
-
-    Note: Create iterator variable symbol
-    Let hir_var_symbol be proc hir_create_symbol from HIR with var_name, HIR.HIR_TYPE_ANY
-
-    Note: Create HIR for statement
-    Let base_node be proc hir_create_node from HIR with HIR.HIR_NODE_FOR_STATEMENT
-    Let hir_for be proc create_hir_for_statement from HIR with base_node, hir_var_symbol, hir_iter, HIR.HIR_TYPE_ANY, hir_body, 0
-
-    Return hir_for
-End Process
-
-@Reasoning:
-parfor is structurally identical to for in MATLAB except for parallel
-execution semantics. Reuses translate_for_statement and tags the result
-with "matlab_parfor"=1 metadata so the codegen layer can emit a parallel
-loop primitive instead of a sequential one.
-@End Reasoning
-Process called "translate_parfor_statement" takes ctx as Integer, parfor_node as Integer returns Integer:
-    Note: Parallel for loop - translate as regular for with metadata
-    Let hir_for be proc translate_for_statement with ctx, parfor_node
-
-    Note: Mark as parallel for
-    proc hir_set_metadata from HIR with hir_for, "matlab_parfor", 1
-
-    Return hir_for
-End Process
-
-@Reasoning:
-SPMD blocks lower to an HIR block tagged "matlab_spmd"=1. The runtime
-support library (not this translator) is responsible for spawning the
-worker pool and replicating the block across workers; the metadata flag
-exists solely so codegen can detect when that lowering is required.
-@End Reasoning
-Process called "translate_spmd_statement" takes ctx as Integer, spmd_node as Integer returns Integer:
-    Note: SPMD (Single Program Multiple Data) block
-    Note: Translate as block statement with SPMD metadata
-    Let body_child be proc ast_node_child with spmd_node, 0
-    Let hir_block be proc translate_statement with ctx, body_child
-
-    Note: Mark as SPMD block for code generation
-    proc hir_set_metadata from HIR with hir_block, "matlab_spmd", 1
-
-    Return hir_block
-End Process
-
-@Reasoning:
-Standard while-loop translation. Condition expression at child 0, body
-statement at child 1. Emits HIR_NODE_WHILE_STATEMENT. The fourth
-argument to create_hir_while_statement (0) is the do-while flag — MATLAB
-has no do-while construct so it is always 0 here.
-@End Reasoning
-Process called "translate_while_statement" takes ctx as Integer, while_node as Integer returns Integer:
-    Note: Get condition
-    Let cond_child be proc ast_node_child with while_node, 0
-    Let hir_cond be proc translate_expression with ctx, cond_child
-
-    Note: Get loop body
-    Let body_child be proc ast_node_child with while_node, 1
-    Let hir_body be proc translate_statement with ctx, body_child
-
-    Note: Create HIR while statement
-    Let base_node be proc hir_create_node from HIR with HIR.HIR_NODE_WHILE_STATEMENT
-    Let hir_while be proc create_hir_while_statement from HIR with base_node, hir_cond, hir_body, 0
-
-    Return hir_while
-End Process
-
-@Reasoning:
-MATLAB switch lowers to HIR match. The switch expression becomes the
-match scrutinee; each case clause is translated via translate_case_clause
-into a match arm; an "otherwise" clause becomes the default arm. The
-mapping is appropriate because MATLAB switch performs constant-value
-equality matching, the simplest case of HIR pattern matching.
-@End Reasoning
-Process called "translate_switch_statement" takes ctx as Integer, switch_node as Integer returns Integer:
-    Note: Get switch expression
-    Let expr_child be proc ast_node_child with switch_node, 0
-    Let hir_expr be proc translate_expression with ctx, expr_child
-
-    Note: Create HIR match statement (switch maps to match)
-    Let base_node be proc hir_create_node from HIR with HIR.HIR_NODE_MATCH_STATEMENT
-    Let hir_match be proc create_hir_match_statement from HIR with base_node, hir_expr, HIR.HIR_TYPE_ANY
-
-    Note: Translate case clauses
-    Let child_count be proc ast_node_child_count from switch_node
-    Let i be 1
-
-    While i is less than child_count:
-        Let case_child be proc ast_node_child with switch_node, i
-        Let case_type be proc ast_node_type from case_child
-
-        If case_type is equal to MatlabParser.MATLAB_CASE:
-            Let hir_when be proc translate_case_clause with ctx, case_child
-            proc add_match_arm from HIR with hir_match, hir_when
-        End If
-
-        If case_type is equal to MatlabParser.MATLAB_OTHERWISE:
-            Let hir_default be proc translate_otherwise_clause with ctx, case_child
-            proc add_match_arm from HIR with hir_match, hir_default
-        End If
-
-        Set i to i plus 1
-    End While
-
-    Return hir_match
-End Process
-
-@Reasoning:
-Builds an HIR match arm from a "case value: body" clause. The value
-becomes a literal-pattern (HIR_PATTERN_LITERAL) so the match only fires
-on exact equality; the body becomes the arm's payload. No guard
-expression is attached (0 in the create call) since MATLAB case does
-not support pattern guards.
-@End Reasoning
-Process called "translate_case_clause" takes ctx as Integer, case_node as Integer returns Integer:
-    Note: Get case value
-    Let value_child be proc ast_node_child with case_node, 0
-    Let hir_value be proc translate_expression with ctx, value_child
-
-    Note: Get case body
-    Let body_child be proc ast_node_child with case_node, 1
-    Let hir_body be proc translate_statement with ctx, body_child
-
-    Note: Create pattern for this case value
-    Let hir_pattern be proc hir_create_pattern from HIR with HIR.HIR_PATTERN_LITERAL, HIR.HIR_TYPE_ANY
-
-    Note: Create when clause
-    Let base_node be proc hir_create_node from HIR with HIR.HIR_NODE_WHEN_CLAUSE
-    Let hir_when be proc create_hir_when_clause from HIR with base_node, hir_pattern, 0, hir_body
-
-    Return hir_when
-End Process
-
-@Reasoning:
-The "otherwise" branch maps to a wildcard pattern (HIR_PATTERN_WILDCARD)
-which matches any unmatched value. Always appears last in the match
-arm list because HIR pattern matching is first-fit and a wildcard placed
-earlier would shadow later case clauses.
-@End Reasoning
-Process called "translate_otherwise_clause" takes ctx as Integer, otherwise_node as Integer returns Integer:
-    Note: Get otherwise body
-    Let body_child be proc ast_node_child with otherwise_node, 0
-    Let hir_body be proc translate_statement with ctx, body_child
-
-    Note: Create wildcard pattern for otherwise
-    Let hir_pattern be proc hir_create_pattern from HIR with HIR.HIR_PATTERN_WILDCARD, HIR.HIR_TYPE_ANY
-
-    Note: Create when clause
-    Let base_node be proc hir_create_node from HIR with HIR.HIR_NODE_WHEN_CLAUSE
-    Let hir_when be proc create_hir_when_clause from HIR with base_node, hir_pattern, 0, hir_body
-
-    Return hir_when
-End Process
-
-@Reasoning:
-Emits HIR_NODE_TRY_STATEMENT with the protected block, then conditionally
-attaches a catch clause if a MATLAB_CATCH child is present at index 1.
-MATLAB has no finally clause, so no third-block argument is needed.
-@End Reasoning
-Process called "translate_try_statement" takes ctx as Integer, try_node as Integer returns Integer:
-    Note: Get try block
-    Let try_child be proc ast_node_child with try_node, 0
-    Let hir_try_block be proc translate_statement with ctx, try_child
-
-    Note: Create HIR try statement
-    Let base_node be proc hir_create_node from HIR with HIR.HIR_NODE_TRY_STATEMENT
-    Let hir_try be proc create_hir_try_statement from HIR with base_node, hir_try_block
-
-    Note: Translate catch clause
-    Let child_count be proc ast_node_child_count from try_node
-    If child_count is greater than 1:
-        Let catch_child be proc ast_node_child with try_node, 1
-        Let catch_type be proc ast_node_type from catch_child
-
-        If catch_type is equal to MatlabParser.MATLAB_CATCH:
-            Let hir_catch be proc translate_catch_clause with ctx, catch_child
-            proc hir_add_catch_clause from HIR with hir_try, hir_catch
-        End If
-    End If
-
-    Return hir_try
-End Process
-
-@Reasoning:
-Handles MATLAB's optional exception variable. When present, allocates an
-HIR symbol for it and shifts the body index to 1; when absent, no symbol
-is created and the body sits at index 0. The exception type is
-HIR_TYPE_ANY because MATLAB does not declare exception types
-statically — the runtime MException object is delivered to whatever
-variable the catch declares.
-@End Reasoning
-Process called "translate_catch_clause" takes ctx as Integer, catch_node as Integer returns Integer:
-    Note: Get exception variable (optional in MATLAB)
-    Let exception_var be 0
-    Let has_var be proc ast_node_has_child from catch_node
-    If has_var is equal to 1:
-        Let var_child be proc ast_node_child with catch_node, 0
-        Let var_name be proc ast_node_value from var_child
-        Set exception_var to proc hir_create_symbol from HIR with var_name, HIR.HIR_TYPE_ANY
-    End If
-
-    Note: Get catch body
-    Let body_idx be 0
-    If exception_var is not equal to 0:
-        Set body_idx to 1
-    End If
-    Let body_child be proc ast_node_child with catch_node, body_idx
-    Let hir_body be proc translate_statement with ctx, body_child
-
-    Note: Create HIR catch clause
-    Let base_node be proc hir_create_node from HIR with HIR.HIR_NODE_CATCH_CLAUSE
-    Let hir_catch be proc create_hir_catch_clause from HIR with base_node, exception_var, HIR.HIR_TYPE_ANY, hir_body
-
-    Return hir_catch
-End Process
-
-@Reasoning:
-MATLAB's "return" exits early from the enclosing function. It does NOT
-take a return-value expression (the value comes from the named output
-variables), but this routine still checks for an optional child to remain
-robust against future grammar extensions; if present, the expression is
-translated and attached to the HIR return.
-@End Reasoning
-Process called "translate_return_statement" takes ctx as Integer, return_node as Integer returns Integer:
-    Note: Get return expression (optional)
-    Let hir_expr be 0
-    Let has_expr be proc ast_node_has_child from return_node
-    If has_expr is equal to 1:
-        Let expr_child be proc ast_node_child with return_node, 0
-        Set hir_expr to proc translate_expression with ctx, expr_child
-    End If
-
-    Let hir_return be proc hir_create_return from HIR with hir_expr
-    Return hir_return
-End Process
-
-@Reasoning:
-"global a b c" produces an HIR block containing one let-statement per
-declared name, each tagged "matlab_global"=1. The metadata signals the
-codegen layer to link the binding to the global workspace rather than
-allocating a function-local slot.
-@End Reasoning
-Process called "translate_global_statement" takes ctx as Integer, global_node as Integer returns Integer:
-    Note: MATLAB global variables - store as metadata on declarations
-    Let var_count be proc ast_node_child_count from global_node
-    Let i be 0
-
-    Let hir_block be proc hir_create_block from HIR
-
-    While i is less than var_count:
-        Let var_child be proc ast_node_child with global_node, i
-        Let var_name be proc ast_node_value from var_child
-
-        Note: Create HIR let statement with global metadata
-        Let base_node be proc hir_create_node from HIR with HIR.HIR_NODE_LET_STATEMENT
-        Let var_symbol be proc hir_create_symbol from HIR with var_name, HIR.HIR_TYPE_ANY
-        Let hir_let be proc create_hir_let_statement from HIR with base_node, var_name, var_symbol, HIR.HIR_TYPE_ANY, 0, 1
-
-        proc hir_set_metadata from HIR with hir_let, "matlab_global", 1
-        proc hir_add_block_statement from HIR with hir_block, hir_let
-
-        Set i to i plus 1
-    End While
-
-    Return hir_block
-End Process
-
-@Reasoning:
-Symmetric to translate_global_statement but tags each let with
-"matlab_persistent"=1. Persistent variables share the function-local
-declaration form but require storage allocated outside the call frame so
-their values survive function return — the metadata flag is the only
-signal codegen has to make that distinction.
-@End Reasoning
-Process called "translate_persistent_statement" takes ctx as Integer, persistent_node as Integer returns Integer:
-    Note: MATLAB persistent variables - store as metadata on declarations
-    Let var_count be proc ast_node_child_count from persistent_node
-    Let i be 0
-
-    Let hir_block be proc hir_create_block from HIR
-
-    While i is less than var_count:
-        Let var_child be proc ast_node_child with persistent_node, i
-        Let var_name be proc ast_node_value from var_child
-
-        Note: Create HIR let statement with persistent metadata
-        Let base_node be proc hir_create_node from HIR with HIR.HIR_NODE_LET_STATEMENT
-        Let var_symbol be proc hir_create_symbol from HIR with var_name, HIR.HIR_TYPE_ANY
-        Let hir_let be proc create_hir_let_statement from HIR with base_node, var_name, var_symbol, HIR.HIR_TYPE_ANY, 0, 1
-
-        proc hir_set_metadata from HIR with hir_let, "matlab_persistent", 1
-        proc hir_add_block_statement from HIR with hir_block, hir_let
-
-        Set i to i plus 1
-    End While
-
-    Return hir_block
-End Process
-
-Note: ===================================================================
-Note: EXPRESSION TRANSLATION
-Note: ===================================================================
-
-@Reasoning:
-Polymorphic expression dispatcher. Each MATLAB_* AST node type routes to
-its specialized expression translator. The order of checks is irrelevant
-for correctness (each test is exclusive) but follows roughly the
-parser's emission frequency for cache-friendly dispatch. Unknown
-expression types emit a translation error and return 0 to let the caller
-substitute a placeholder.
-@End Reasoning
-Process called "translate_expression" takes ctx as Integer, expr_node as Integer returns Integer:
-    Let expr_type be proc ast_node_type from expr_node
-
-    Note: Literal expressions
-    If expr_type is equal to MatlabParser.MATLAB_NUMBER:
-        Return proc translate_number_literal with ctx, expr_node
-    End If
-
-    If expr_type is equal to MatlabParser.MATLAB_STRING:
-        Return proc translate_string_literal with ctx, expr_node
-    End If
-
-    If expr_type is equal to MatlabParser.MATLAB_IDENTIFIER:
-        Return proc translate_identifier with ctx, expr_node
-    End If
-
-    Note: Matrix/array literal
-    If expr_type is equal to MatlabParser.MATLAB_MATRIX_EXPR:
-        Return proc translate_matrix_literal with ctx, expr_node
-    End If
-
-    Note: Cell array literal
-    If expr_type is equal to MatlabParser.MATLAB_CELL_EXPR:
-        Return proc translate_cell_literal with ctx, expr_node
-    End If
-
-    Note: Binary operations
-    If expr_type is equal to MatlabParser.MATLAB_BINARY_EXPR:
-        Return proc translate_binary_expression with ctx, expr_node
-    End If
-
-    Note: Unary operations
-    If expr_type is equal to MatlabParser.MATLAB_UNARY_EXPR:
-        Return proc translate_unary_expression with ctx, expr_node
-    End If
-
-    Note: Function call
-    If expr_type is equal to MatlabParser.MATLAB_CALL_EXPR:
-        Return proc translate_call_expression with ctx, expr_node
-    End If
-
-    Note: Indexing (array/cell subscripting)
-    If expr_type is equal to MatlabParser.MATLAB_INDEX_EXPR:
-        Return proc translate_index_expression with ctx, expr_node
-    End If
-
-    Note: Member access (struct field access)
-    If expr_type is equal to MatlabParser.MATLAB_MEMBER_EXPR:
-        Return proc translate_member_expression with ctx, expr_node
-    End If
-
-    Note: Dynamic field access (obj.(varname))
-    If expr_type is equal to MatlabParser.MATLAB_DYNAMIC_FIELD_EXPR:
-        Return proc translate_dynamic_field_expression with ctx, expr_node
-    End If
-
-    Note: Colon expression (ranges)
-    If expr_type is equal to MatlabParser.MATLAB_COLON_EXPR:
-        Return proc translate_colon_expression with ctx, expr_node
-    End If
-
-    Note: Function handle
-    If expr_type is equal to MatlabParser.MATLAB_FUNCTION_HANDLE:
-        Return proc translate_function_handle with ctx, expr_node
-    End If
-
-    Note: Anonymous function
-    If expr_type is equal to MatlabParser.MATLAB_ANONYMOUS_FUNCTION:
-        Return proc translate_anonymous_function with ctx, expr_node
-    End If
-
-    Note: Transpose operations
-    If expr_type is equal to MatlabParser.MATLAB_TRANSPOSE:
-        Return proc translate_transpose_expression with ctx, expr_node
-    End If
-
-    Note: Unknown expression type
-    proc add_translation_error with ctx, "Unknown expression type"
-    Return 0
-End Process
-
-@Reasoning:
-Wraps the AST's literal-as-source-string in an HIR_NUMBER_LITERAL. The
-actual numeric conversion (string -> double / int / complex) is deferred
-to a later stage so this routine preserves the original source spelling
-(including exponent notation and imaginary suffixes).
-@End Reasoning
-Process called "translate_number_literal" takes ctx as Integer, num_node as Integer returns Integer:
-    Let num_value be proc ast_node_value from num_node
-    Let hir_literal be proc hir_create_number_literal from HIR with num_value
-    Return hir_literal
-End Process
-
-@Reasoning:
-Wraps both MATLAB single-quoted char-arrays and double-quoted strings in
-an HIR_STRING_LITERAL. The two MATLAB forms are not distinguished here
-because they share the same underlying immutable-text representation in
-HIR; the original token type is no longer relevant once translated.
-@End Reasoning
-Process called "translate_string_literal" takes ctx as Integer, str_node as Integer returns Integer:
-    Let str_value be proc ast_node_value from str_node
-    Let hir_literal be proc hir_create_string_literal from HIR with str_value
-    Return hir_literal
-End Process
-
-@Reasoning:
-Emits an HIR identifier reference and attaches the resolved symbol entry
-when one is found in the scope chain. Unresolved identifiers still
-produce a valid HIR_IDENTIFIER node (with no symbol attached) — later
-passes are responsible for emitting an "undefined" diagnostic if needed,
-so this routine remains a pure structural translation.
-@End Reasoning
-Process called "translate_identifier" takes ctx as Integer, id_node as Integer returns Integer:
-    Let id_name be proc ast_node_value from id_node
-
-    Note: Lookup symbol in symbol table
-    Let symbol be proc lookup_symbol with ctx, id_name
-
-    Let hir_id be proc hir_create_identifier from HIR with id_name
-    If symbol is not equal to 0:
-        proc hir_set_identifier_symbol from HIR with hir_id, symbol
-    End If
-
-    Return hir_id
-End Process
-
-@Reasoning:
-Flattens MATLAB's two-level row/element structure ([1 2 3; 4 5 6]) into
-a single HIR array literal containing all elements in row-major order.
-The "matlab_matrix"=1 metadata flag tells downstream consumers that the
-flat array is logically a 2-D matrix; the row shape can be recovered from
-the original row-count signal which downstream emit logic preserves.
-@End Reasoning
-Process called "translate_matrix_literal" takes ctx as Integer, matrix_node as Integer returns Integer:
-    Note: MATLAB matrix literals: [1 2 3; 4 5 6]
-    Note: Create HIR array literal
-    Let hir_array be proc hir_create_array_literal from HIR
-
-    Note: Process matrix rows
-    Let child_count be proc ast_node_child_count from matrix_node
-    Let i be 0
-
-    While i is less than child_count:
-        Let row_child be proc ast_node_child with matrix_node, i
-        Let row_type be proc ast_node_type from row_child
-
-        If row_type is equal to MatlabParser.MATLAB_MATRIX_ROW:
-            Note: Process elements in this row
-            Let elem_count be proc ast_node_child_count from row_child
-            Let j be 0
-
-            While j is less than elem_count:
-                Let elem_child be proc ast_node_child with row_child, j
-                Let hir_elem be proc translate_expression with ctx, elem_child
-                proc hir_add_array_element from HIR with hir_array, hir_elem
-                Set j to j plus 1
-            End While
-        End If
-
-        Set i to i plus 1
-    End While
-
-    Note: Mark as MATLAB matrix for proper handling
-    proc hir_set_metadata from HIR with hir_array, "matlab_matrix", 1
-
-    Return hir_array
-End Process
-
-@Reasoning:
-Cell arrays "{1, 'text', [1 2 3]}" lower to HIR array literals with the
-"matlab_cell"=1 metadata flag. Cell arrays differ from matrices in that
-their elements can be heterogeneous (any MATLAB value); the metadata
-flag signals codegen to box each element rather than expect a uniform
-element type.
-@End Reasoning
-Process called "translate_cell_literal" takes ctx as Integer, cell_node as Integer returns Integer:
-    Note: MATLAB cell arrays: {1, 'text', [1 2 3]}
-    Note: Create HIR array literal with cell metadata
-    Let hir_array be proc hir_create_array_literal from HIR
-
-    Let child_count be proc ast_node_child_count from cell_node
-    Let i be 0
-
-    While i is less than child_count:
-        Let elem_child be proc ast_node_child with cell_node, i
-        Let hir_elem be proc translate_expression with ctx, elem_child
-        proc hir_add_array_element from HIR with hir_array, hir_elem
-        Set i to i plus 1
-    End While
-
-    Note: Mark as MATLAB cell array
-    proc hir_set_metadata from HIR with hir_array, "matlab_cell", 1
-
-    Return hir_array
-End Process
-
-@Reasoning:
-Translates "op left right" by mapping the MATLAB operator string through
-map_matlab_operator_to_hir, then emitting HIR_NODE_BINARY_EXPR with the
-two operands. Element-wise operators (.*/./.^/.\) collapse to the same
-HIR_OP_* tag as their matrix counterparts (since HIR has only one
-multiply etc.), but the "matlab_elementwise"=1 metadata is attached so
-codegen can pick the correct broadcasting/elementwise primitive.
-@End Reasoning
-Process called "translate_binary_expression" takes ctx as Integer, binary_node as Integer returns Integer:
-    Note: Get operator
-    Let op_child be proc ast_node_child with binary_node, 0
-    Let operator be proc ast_node_value from op_child
-
-    Note: Get left operand
-    Let left_child be proc ast_node_child with binary_node, 1
-    Let hir_left be proc translate_expression with ctx, left_child
-
-    Note: Get right operand
-    Let right_child be proc ast_node_child with binary_node, 2
-    Let hir_right be proc translate_expression with ctx, right_child
-
-    Note: Map MATLAB operator to HIR operator
-    Let hir_op be proc map_matlab_operator_to_hir from operator
-
-    Note: Create HIR binary expression
-    Let base_node be proc hir_create_node from HIR with HIR.HIR_NODE_BINARY_EXPR
-    Let hir_binary be proc create_hir_binary_expression from HIR with base_node, hir_op, hir_left, hir_right, HIR.HIR_TYPE_ANY
-
-    Note: For element-wise operators (.*, ./, .^), add metadata
-    Let is_elementwise be proc is_matlab_elementwise_operator from operator
-    If is_elementwise is equal to 1:
-        proc hir_set_metadata from HIR with hir_binary, "matlab_elementwise", 1
-    End If
-
-    Return hir_binary
-End Process
-
-@Reasoning:
-String-equality dispatch from MATLAB operator text to the HIR_OP_*
-integer constant. Matrix and element-wise variants of the same operation
-share the same HIR tag (e.g. '*' and '.*' both map to HIR_OP_MULTIPLY);
-the elementwise distinction is preserved separately via metadata on the
-binary-expression node. Unknown operators default to HIR_OP_ADD as a
-last-resort fallback rather than aborting translation.
+Maps a MATLAB binary-operator spelling to the closest HIR_OP_* tag. HIR has
+no dedicated power tag, and matrix-vs-elementwise distinctions are not
+representable in the operator enum, so the precise original spelling is
+preserved separately as "matlab_operator" metadata on the binary node and
+the backend prefers that string. This map exists so passes that only look
+at the HIR op enum still see a meaningful arithmetic/relational category.
 @End Reasoning
 Process called "map_matlab_operator_to_hir" takes operator as Integer returns Integer:
-    Note: Map MATLAB operators to HIR operator constants
-
-    Note: Arithmetic operators
     If proc string_equals from StringCore with operator, "+" is equal to 1:
         Return HIR.HIR_OP_ADD
     End If
@@ -1415,14 +59,18 @@ Process called "map_matlab_operator_to_hir" takes operator as Integer returns In
     If proc string_equals from StringCore with operator, "./" is equal to 1:
         Return HIR.HIR_OP_DIVIDE
     End If
+    If proc string_equals from StringCore with operator, "\\" is equal to 1:
+        Return HIR.HIR_OP_DIVIDE
+    End If
+    If proc string_equals from StringCore with operator, ".\\" is equal to 1:
+        Return HIR.HIR_OP_DIVIDE
+    End If
     If proc string_equals from StringCore with operator, "^" is equal to 1:
-        Return HIR.HIR_OP_POWER
+        Return HIR.HIR_OP_MULTIPLY
     End If
     If proc string_equals from StringCore with operator, ".^" is equal to 1:
-        Return HIR.HIR_OP_POWER
+        Return HIR.HIR_OP_MULTIPLY
     End If
-
-    Note: Relational operators
     If proc string_equals from StringCore with operator, "==" is equal to 1:
         Return HIR.HIR_OP_EQUAL
     End If
@@ -1441,8 +89,6 @@ Process called "map_matlab_operator_to_hir" takes operator as Integer returns In
     If proc string_equals from StringCore with operator, ">=" is equal to 1:
         Return HIR.HIR_OP_GREATER_EQUAL
     End If
-
-    Note: Logical operators
     If proc string_equals from StringCore with operator, "&&" is equal to 1:
         Return HIR.HIR_OP_LOGICAL_AND
     End If
@@ -1455,20 +101,30 @@ Process called "map_matlab_operator_to_hir" takes operator as Integer returns In
     If proc string_equals from StringCore with operator, "|" is equal to 1:
         Return HIR.HIR_OP_BITWISE_OR
     End If
-
-    Note: Default to generic operator
     Return HIR.HIR_OP_ADD
 End Process
 
 @Reasoning:
-Predicate identifying MATLAB's leading-dot element-wise operator family
-(.*, ./, .^, .\). Used by translate_binary_expression to decide whether
-to attach the "matlab_elementwise" metadata. Restricted to the four
-dot-operators that have matrix counterparts — '.''(element-wise
-transpose) is handled by translate_transpose_expression instead.
+Maps a MATLAB unary-operator spelling to an HIR_OP_* tag. The negation,
+logical-not and identity-plus forms have direct HIR counterparts; the
+original spelling is also preserved via metadata for exact reconstruction.
+@End Reasoning
+Process called "map_matlab_unary_operator_to_hir" takes operator as Integer returns Integer:
+    If proc string_equals from StringCore with operator, "~" is equal to 1:
+        Return HIR.HIR_OP_LOGICAL_NOT
+    End If
+    If proc string_equals from StringCore with operator, "+" is equal to 1:
+        Return HIR.HIR_OP_ADD
+    End If
+    Return HIR.HIR_OP_NEGATE
+End Process
+
+@Reasoning:
+Detects MATLAB's leading-dot element-wise operator family (.*, ./, .^, .\)
+so translate_binary_expression can attach the "matlab_elementwise" flag
+that the backend reads to re-emit the dot-prefixed spelling.
 @End Reasoning
 Process called "is_matlab_elementwise_operator" takes operator as Integer returns Integer:
-    Note: Check if operator is element-wise (starts with .)
     If proc string_equals from StringCore with operator, ".*" is equal to 1:
         Return 1
     End If
@@ -1481,311 +137,1110 @@ Process called "is_matlab_elementwise_operator" takes operator as Integer return
     If proc string_equals from StringCore with operator, ".\\" is equal to 1:
         Return 1
     End If
-
     Return 0
 End Process
 
+Note: ===================================================================
+Note: NUMBER LITERAL CLASSIFICATION
+Note: ===================================================================
+
 @Reasoning:
-Translates MATLAB unary prefix operators. The default mapping is HIR_OP_
-NEGATE; "~" is corrected to HIR_OP_LOGICAL_NOT and "+" to HIR_OP_PLUS
-(identity, but preserved in HIR for source fidelity). Wraps the operand
-in an HIR_NODE_UNARY_EXPR with ANY result type — actual type narrowing
-happens in a downstream pass.
+MATLAB numeric literals are kept as their original source spelling by the
+lexer (including decimal points, exponents and imaginary suffixes). HIR
+distinguishes integer and float literals, so this predicate scans the
+spelling for a '.', 'e'/'E' exponent, or an 'i'/'j' imaginary suffix to
+decide whether to emit an HIR float literal (1) or integer literal (0).
 @End Reasoning
-Process called "translate_unary_expression" takes ctx as Integer, unary_node as Integer returns Integer:
-    Note: Get operator
-    Let op_child be proc ast_node_child with unary_node, 0
-    Let operator be proc ast_node_value from op_child
+Process called "matlab_number_is_float" takes text as Integer returns Integer:
+    Let length be proc string_length from StringCore with text
+    Let i be 0
+    While i is less than length:
+        Let ch be proc string_char_at from StringCore with text, i
+        If ch is equal to 46:
+            Return 1
+        End If
+        If ch is equal to 101:
+            Return 1
+        End If
+        If ch is equal to 69:
+            Return 1
+        End If
+        If ch is equal to 105:
+            Return 1
+        End If
+        If ch is equal to 106:
+            Return 1
+        End If
+        Set i to i plus 1
+    End While
+    Return 0
+End Process
 
-    Note: Get operand
-    Let operand_child be proc ast_node_child with unary_node, 1
-    Let hir_operand be proc translate_expression with ctx, operand_child
+Note: ===================================================================
+Note: MAIN TRANSLATION ENTRY POINT
+Note: ===================================================================
 
-    Note: Map MATLAB unary operator to HIR
-    Let hir_op be HIR.HIR_OP_NEGATE
-    If proc string_equals from StringCore with operator, "~" is equal to 1:
-        Set hir_op to HIR.HIR_OP_LOGICAL_NOT
+@Reasoning:
+Top-level entry. Creates the HIR module, names it "matlab_module" for the
+backend's documentation comment, and walks the MATLAB program's top-level
+children. Function and class definitions become module declarations; a
+script wrapper's statements are hoisted into a synthesized
+"matlab_script_main" function so every statement lives inside a function as
+HIR requires.
+@End Reasoning
+Process called "translate_matlab_to_hir" takes matlab_ast as Integer returns Integer:
+    Let hir_module be proc hir_create_module from HIR
+    proc hir_set_module_name from HIR with hir_module, "matlab_module"
+
+    If matlab_ast is equal to 0:
+        Return hir_module
     End If
-    If proc string_equals from StringCore with operator, "+" is equal to 1:
-        Set hir_op to HIR.HIR_OP_PLUS
+
+    Let node_type be proc ast_node_type from MatlabParser with matlab_ast
+    If node_type is not equal to MatlabParser.MATLAB_PROGRAM:
+        Return hir_module
     End If
 
-    Note: Create HIR unary expression
-    Let base_node be proc hir_create_node from HIR with HIR.HIR_NODE_UNARY_EXPR
-    Let hir_unary be proc create_hir_unary_expression from HIR with base_node, hir_op, hir_operand, HIR.HIR_TYPE_ANY
+    Let child_count be proc ast_node_child_count from MatlabParser with matlab_ast
+    Let i be 0
+    While i is less than child_count:
+        Let child be proc ast_node_child from MatlabParser with matlab_ast, i
+        Let child_type be proc ast_node_type from MatlabParser with child
 
+        If child_type is equal to MatlabParser.MATLAB_FUNCTION:
+            Let hir_function be proc translate_function with child
+            proc hir_add_declaration from HIR with hir_module, hir_function
+        End If
+
+        If child_type is equal to MatlabParser.MATLAB_CLASSDEF:
+            Let hir_class be proc translate_classdef with child
+            proc hir_add_declaration from HIR with hir_module, hir_class
+        End If
+
+        If child_type is equal to MatlabParser.MATLAB_SCRIPT:
+            Let hir_main be proc translate_script with child
+            proc hir_add_declaration from HIR with hir_module, hir_main
+        End If
+
+        Set i to i plus 1
+    End While
+
+    Return hir_module
+End Process
+
+Note: ===================================================================
+Note: SCRIPT TRANSLATION
+Note: ===================================================================
+
+@Reasoning:
+MATLAB scripts have no enclosing function. They are wrapped in a synthetic
+"matlab_script_main" function whose body block contains the translated
+top-level statements in source order, satisfying HIR's requirement that
+all statements live within a function body.
+@End Reasoning
+Process called "translate_script" takes script_node as Integer returns Integer:
+    Let hir_function be proc hir_create_function from HIR
+    proc hir_set_function_name from HIR with hir_function, "matlab_script_main"
+
+    Let hir_body be proc hir_create_block from HIR
+    Let child_count be proc ast_node_child_count from MatlabParser with script_node
+    Let i be 0
+    While i is less than child_count:
+        Let stmt be proc ast_node_child from MatlabParser with script_node, i
+        Let hir_stmt be proc translate_statement with stmt
+        If hir_stmt is not equal to 0:
+            proc hir_add_statement from HIR with hir_body, hir_stmt
+        End If
+        Set i to i plus 1
+    End While
+
+    proc hir_set_function_body from HIR with hir_function, hir_body
+    Return hir_function
+End Process
+
+Note: ===================================================================
+Note: FUNCTION TRANSLATION
+Note: ===================================================================
+
+@Reasoning:
+The MATLAB parser stores the function name in the node value slot and lays
+out the children as: an optional output-marker node (an identifier whose
+value is "outputs" with the output names as its children) OR a single
+output identifier, then an optional input-marker node (identifier valued
+"inputs" with parameter identifiers as children), then the body
+(MATLAB_SCRIPT). Output names are stored as comma-joined
+"matlab_output_params" metadata for the backend's [a,b] = f(...) form and a
+single output as "matlab_single_output"; input identifiers become HIR
+parameters.
+@End Reasoning
+Process called "translate_function" takes func_node as Integer returns Integer:
+    Let hir_function be proc hir_create_function from HIR
+
+    Let func_name be proc ast_node_value from MatlabParser with func_node
+    proc hir_set_function_name from HIR with hir_function, func_name
+
+    Let child_count be proc ast_node_child_count from MatlabParser with func_node
+    Let body_node be 0
+
+    Let i be 0
+    While i is less than child_count:
+        Let child be proc ast_node_child from MatlabParser with func_node, i
+        Let child_type be proc ast_node_type from MatlabParser with child
+
+        If child_type is equal to MatlabParser.MATLAB_SCRIPT:
+            Set body_node to child
+        Otherwise:
+            Note: Identifier-typed marker: "outputs", "inputs", or a single output
+            Let marker_value be proc ast_node_value from MatlabParser with child
+            Let is_outputs be proc string_equals from StringCore with marker_value, "outputs"
+            Let is_inputs be proc string_equals from StringCore with marker_value, "inputs"
+
+            If is_outputs is equal to 1:
+                proc translate_output_marker with child, hir_function
+            Otherwise:
+                If is_inputs is equal to 1:
+                    proc translate_input_marker with child, hir_function
+                Otherwise:
+                    Note: Single-output identifier
+                    proc hir_set_metadata from HIR with hir_function, "matlab_single_output", marker_value
+                End If
+            End If
+        End If
+
+        Set i to i plus 1
+    End While
+
+    If body_node is not equal to 0:
+        Let hir_body be proc translate_script with body_node
+        Note: translate_script returns a function; reuse just its block.
+        Let inner_block be proc hir_get_function_body from HIR with hir_body
+        proc hir_set_function_body from HIR with hir_function, inner_block
+    Otherwise:
+        Let empty_block be proc hir_create_block from HIR
+        proc hir_set_function_body from HIR with hir_function, empty_block
+    End If
+
+    Return hir_function
+End Process
+
+@Reasoning:
+Collects the multiple-output parameter names into a comma-joined string
+stored as "matlab_output_params" metadata. The backend splits this back
+into the "[a, b] = name(...)" output list. A comma+space separator is used
+so the backend can reuse the same spelling without re-padding.
+@End Reasoning
+Process called "translate_output_marker" takes outputs_node as Integer, hir_function as Integer:
+    Let count be proc ast_node_child_count from MatlabParser with outputs_node
+    Let joined be ""
+    Let i be 0
+    While i is less than count:
+        Let out_child be proc ast_node_child from MatlabParser with outputs_node, i
+        Let out_name be proc ast_node_value from MatlabParser with out_child
+        If i is greater than 0:
+            Set joined to proc string_concat from StringPrim with joined, ", "
+        End If
+        Set joined to proc string_concat from StringPrim with joined, out_name
+        Set i to i plus 1
+    End While
+    proc hir_set_metadata from HIR with hir_function, "matlab_output_params", joined
+End Process
+
+@Reasoning:
+Each MATLAB formal input becomes an HIR parameter named after the source
+identifier. MATLAB is dynamically typed so no parameter type is attached;
+later type-inference passes settle types from usage.
+@End Reasoning
+Process called "translate_input_marker" takes inputs_node as Integer, hir_function as Integer:
+    Let count be proc ast_node_child_count from MatlabParser with inputs_node
+    Let i be 0
+    While i is less than count:
+        Let in_child be proc ast_node_child from MatlabParser with inputs_node, i
+        Let in_name be proc ast_node_value from MatlabParser with in_child
+        Let hir_param be proc hir_create_parameter from HIR
+        proc hir_set_parameter_name from HIR with hir_param, in_name
+        proc hir_add_parameter from HIR with hir_function, hir_param
+        Set i to i plus 1
+    End While
+End Process
+
+Note: ===================================================================
+Note: CLASS DEFINITION TRANSLATION
+Note: ===================================================================
+
+@Reasoning:
+Translates a MATLAB classdef to an HIR class. The parser stores the class
+name in the value slot; an optional base-class identifier and the member
+blocks (properties / methods / events / enumeration) follow as children.
+Properties and enumeration values become HIR fields; methods become HIR
+functions tagged "is_method"; events and the enumeration flag are recorded
+as class metadata the backend re-expands.
+@End Reasoning
+Process called "translate_classdef" takes class_node as Integer returns Integer:
+    Let hir_class be proc hir_create_class from HIR
+
+    Let class_name be proc ast_node_value from MatlabParser with class_node
+    proc hir_set_class_name from HIR with hir_class, class_name
+
+    Let child_count be proc ast_node_child_count from MatlabParser with class_node
+    Let i be 0
+    While i is less than child_count:
+        Let child be proc ast_node_child from MatlabParser with class_node, i
+        Let child_type be proc ast_node_type from MatlabParser with child
+
+        If child_type is equal to MatlabParser.MATLAB_PROPERTIES:
+            proc translate_properties_block with child, hir_class
+        End If
+        If child_type is equal to MatlabParser.MATLAB_METHODS:
+            proc translate_methods_block with child, hir_class
+        End If
+        If child_type is equal to MatlabParser.MATLAB_EVENTS:
+            proc translate_events_block with child, hir_class
+        End If
+        If child_type is equal to MatlabParser.MATLAB_ENUMERATION:
+            proc translate_enumeration_block with child, hir_class
+        End If
+        If child_type is equal to MatlabParser.MATLAB_IDENTIFIER:
+            Note: Base-class reference "classdef Name < Base"
+            Let base_name be proc ast_node_value from MatlabParser with child
+            proc hir_set_metadata from HIR with hir_class, "matlab_base_class", base_name
+        End If
+
+        Set i to i plus 1
+    End While
+
+    Return hir_class
+End Process
+
+@Reasoning:
+Each declared property becomes an HIR field of the class. MATLAB does not
+require property types, so only the name is recorded.
+@End Reasoning
+Process called "translate_properties_block" takes props_node as Integer, hir_class as Integer:
+    Let count be proc ast_node_child_count from MatlabParser with props_node
+    Let i be 0
+    While i is less than count:
+        Let prop_child be proc ast_node_child from MatlabParser with props_node, i
+        Let prop_name be proc ast_node_value from MatlabParser with prop_child
+        Let hir_field be proc hir_create_field from HIR
+        proc hir_set_field_name from HIR with hir_field, prop_name
+        proc hir_add_class_member from HIR with hir_class, hir_field
+        Set i to i plus 1
+    End While
+End Process
+
+@Reasoning:
+Each method body is a MATLAB function; reusing translate_function keeps the
+output/input/body handling identical to free functions. The resulting HIR
+function is tagged "is_method" and added as a class member so the backend
+emits it inside a methods block.
+@End Reasoning
+Process called "translate_methods_block" takes methods_node as Integer, hir_class as Integer:
+    Let count be proc ast_node_child_count from MatlabParser with methods_node
+    Let i be 0
+    While i is less than count:
+        Let method_child be proc ast_node_child from MatlabParser with methods_node, i
+        Let method_type be proc ast_node_type from MatlabParser with method_child
+        If method_type is equal to MatlabParser.MATLAB_FUNCTION:
+            Let hir_method be proc translate_function with method_child
+            proc hir_set_metadata from HIR with hir_method, "is_method", "1"
+            proc hir_add_class_member from HIR with hir_class, hir_method
+        End If
+        Set i to i plus 1
+    End While
+End Process
+
+@Reasoning:
+HIR has no native event concept, so the declared event names are joined
+into "matlab_events" metadata on the class for the backend to re-emit as a
+MATLAB events block.
+@End Reasoning
+Process called "translate_events_block" takes events_node as Integer, hir_class as Integer:
+    Let count be proc ast_node_child_count from MatlabParser with events_node
+    Let joined be ""
+    Let i be 0
+    While i is less than count:
+        Let event_child be proc ast_node_child from MatlabParser with events_node, i
+        Let event_name be proc ast_node_value from MatlabParser with event_child
+        If i is greater than 0:
+            Set joined to proc string_concat from StringPrim with joined, ", "
+        End If
+        Set joined to proc string_concat from StringPrim with joined, event_name
+        Set i to i plus 1
+    End While
+    proc hir_set_metadata from HIR with hir_class, "matlab_events", joined
+End Process
+
+@Reasoning:
+Enumeration values become HIR fields and the class is flagged
+"matlab_enumeration" so the backend re-emits them inside an enumeration
+block rather than a properties block.
+@End Reasoning
+Process called "translate_enumeration_block" takes enum_node as Integer, hir_class as Integer:
+    Let count be proc ast_node_child_count from MatlabParser with enum_node
+    Let i be 0
+    While i is less than count:
+        Let enum_child be proc ast_node_child from MatlabParser with enum_node, i
+        Let enum_name be proc ast_node_value from MatlabParser with enum_child
+        Let hir_field be proc hir_create_field from HIR
+        proc hir_set_field_name from HIR with hir_field, enum_name
+        proc hir_add_class_member from HIR with hir_class, hir_field
+        Set i to i plus 1
+    End While
+    proc hir_set_metadata from HIR with hir_class, "matlab_enumeration", "1"
+End Process
+
+Note: ===================================================================
+Note: STATEMENT TRANSLATION
+Note: ===================================================================
+
+@Reasoning:
+Statement dispatcher. Maps each MATLAB statement AST type to an HIR
+statement: control flow (if/for/while/switch/try), jumps (return/break/
+continue), assignment, expression statements, and the global/persistent
+declarations (lowered to flagged blocks). The SPMD and parfor variants are
+expressed as flagged versions of their sequential analogues. Unknown types
+return 0 and are skipped by callers.
+@End Reasoning
+Process called "translate_statement" takes stmt_node as Integer returns Integer:
+    If stmt_node is equal to 0:
+        Return 0
+    End If
+
+    Let stmt_type be proc ast_node_type from MatlabParser with stmt_node
+
+    If stmt_type is equal to MatlabParser.MATLAB_SCRIPT:
+        Return proc translate_block with stmt_node
+    End If
+    If stmt_type is equal to MatlabParser.MATLAB_ASSIGN_STMT:
+        Return proc translate_assignment with stmt_node
+    End If
+    If stmt_type is equal to MatlabParser.MATLAB_IF_STMT:
+        Return proc translate_if with stmt_node
+    End If
+    If stmt_type is equal to MatlabParser.MATLAB_FOR_STMT:
+        Return proc translate_for with stmt_node
+    End If
+    If stmt_type is equal to MatlabParser.MATLAB_WHILE_STMT:
+        Return proc translate_while with stmt_node
+    End If
+    If stmt_type is equal to MatlabParser.MATLAB_SWITCH_STMT:
+        Return proc translate_switch with stmt_node
+    End If
+    If stmt_type is equal to MatlabParser.MATLAB_TRY_STMT:
+        Return proc translate_try with stmt_node
+    End If
+    If stmt_type is equal to MatlabParser.MATLAB_SPMD_STMT:
+        Return proc translate_spmd with stmt_node
+    End If
+    If stmt_type is equal to MatlabParser.MATLAB_RETURN_STMT:
+        Return proc hir_create_return from HIR
+    End If
+    If stmt_type is equal to MatlabParser.MATLAB_BREAK_STMT:
+        Return proc hir_create_break from HIR
+    End If
+    If stmt_type is equal to MatlabParser.MATLAB_CONTINUE_STMT:
+        Return proc hir_create_continue from HIR
+    End If
+    If stmt_type is equal to MatlabParser.MATLAB_GLOBAL_STMT:
+        Return proc translate_scoped_decl with stmt_node, "matlab_global"
+    End If
+    If stmt_type is equal to MatlabParser.MATLAB_PERSISTENT_STMT:
+        Return proc translate_scoped_decl with stmt_node, "matlab_persistent"
+    End If
+    If stmt_type is equal to MatlabParser.MATLAB_EXPR_STMT:
+        Let expr_child be proc ast_node_child from MatlabParser with stmt_node, 0
+        Let hir_expr be proc translate_expression with expr_child
+        Return proc hir_create_expression_statement from HIR with hir_expr
+    End If
+
+    Note: Fallback: treat a bare expression node as an expression statement
+    Let hir_fallback be proc translate_expression with stmt_node
+    Return proc hir_create_expression_statement from HIR with hir_fallback
+End Process
+
+@Reasoning:
+Wraps a MATLAB statement list (MATLAB_SCRIPT used as a block) into an HIR
+block, translating each child statement in order.
+@End Reasoning
+Process called "translate_block" takes block_node as Integer returns Integer:
+    Let hir_block be proc hir_create_block from HIR
+    Let count be proc ast_node_child_count from MatlabParser with block_node
+    Let i be 0
+    While i is less than count:
+        Let stmt be proc ast_node_child from MatlabParser with block_node, i
+        Let hir_stmt be proc translate_statement with stmt
+        If hir_stmt is not equal to 0:
+            proc hir_add_statement from HIR with hir_block, hir_stmt
+        End If
+        Set i to i plus 1
+    End While
+    Return hir_block
+End Process
+
+@Reasoning:
+"lhs = rhs" lowers to an HIR simple assignment expression wrapped in an
+expression statement. Both sides are arbitrary expressions so the indexing
+and member-access emitters compose naturally for complex lvalues.
+@End Reasoning
+Process called "translate_assignment" takes assign_node as Integer returns Integer:
+    Let lhs_child be proc ast_node_child from MatlabParser with assign_node, 0
+    Let hir_lhs be proc translate_expression with lhs_child
+
+    Let rhs_child be proc ast_node_child from MatlabParser with assign_node, 1
+    Let hir_rhs be proc translate_expression with rhs_child
+
+    Let hir_assign be proc hir_create_assign_expr from HIR with hir_lhs, HIR.HIR_ASSIGN_SIMPLE, hir_rhs
+    Return proc hir_create_expression_statement from HIR with hir_assign
+End Process
+
+@Reasoning:
+The MATLAB parser flattens if/elseif/else into a single IF_STMT whose
+children are (cond, then, [elseif-cond, then]..., [else-block]). This routine
+rebuilds the nested HIR if-chain: the first cond/then pair becomes the
+outer HIR if; each subsequent cond/then pair becomes a nested HIR if placed
+in the previous if's else slot; a trailing odd child becomes the innermost
+else block.
+@End Reasoning
+Process called "translate_if" takes if_node as Integer returns Integer:
+    Let count be proc ast_node_child_count from MatlabParser with if_node
+
+    Let cond_child be proc ast_node_child from MatlabParser with if_node, 0
+    Let hir_cond be proc translate_expression with cond_child
+    Let then_child be proc ast_node_child from MatlabParser with if_node, 1
+    Let hir_then be proc translate_statement with then_child
+
+    Let hir_if be proc hir_create_if from HIR
+    proc hir_set_if_condition from HIR with hir_if, hir_cond
+    proc hir_set_if_then from HIR with hir_if, hir_then
+
+    Let result be hir_if
+    Let current be hir_if
+    Let idx be 2
+
+    Note: Process trailing (elseif-cond, then) pairs and an optional else.
+    Let remaining be count minus 2
+    While remaining is greater than 0:
+        If remaining is equal to 1:
+            Note: Trailing else block
+            Let else_child be proc ast_node_child from MatlabParser with if_node, idx
+            Let hir_else be proc translate_statement with else_child
+            proc hir_set_if_else from HIR with current, hir_else
+            Set remaining to 0
+        Otherwise:
+            Note: An elseif pair becomes a nested HIR if in the else slot
+            Let elseif_cond_child be proc ast_node_child from MatlabParser with if_node, idx
+            Let elseif_hir_cond be proc translate_expression with elseif_cond_child
+            Let elseif_then_child be proc ast_node_child from MatlabParser with if_node, idx plus 1
+            Let elseif_hir_then be proc translate_statement with elseif_then_child
+
+            Let nested_if be proc hir_create_if from HIR
+            proc hir_set_if_condition from HIR with nested_if, elseif_hir_cond
+            proc hir_set_if_then from HIR with nested_if, elseif_hir_then
+
+            proc hir_set_if_else from HIR with current, nested_if
+            Set current to nested_if
+            Set idx to idx plus 2
+            Set remaining to remaining minus 2
+        End If
+    End While
+
+    Return result
+End Process
+
+@Reasoning:
+"for var = iter ... end" lowers to HIR_FOR_IN with the loop variable name,
+the iterable expression, and the body block. A parfor (signalled by a
+trailing identifier child valued "parfor") is the same shape tagged
+"matlab_parfor" so the backend re-emits the parfor keyword.
+@End Reasoning
+Process called "translate_for" takes for_node as Integer returns Integer:
+    Let var_child be proc ast_node_child from MatlabParser with for_node, 0
+    Let var_name be proc ast_node_value from MatlabParser with var_child
+
+    Let iter_child be proc ast_node_child from MatlabParser with for_node, 1
+    Let hir_iter be proc translate_expression with iter_child
+
+    Let body_child be proc ast_node_child from MatlabParser with for_node, 2
+    Let hir_body be proc translate_statement with body_child
+
+    Let hir_for be proc hir_create_for_in from HIR
+    proc hir_set_for_in_variable from HIR with hir_for, var_name
+    proc hir_set_for_in_iterable from HIR with hir_for, hir_iter
+    proc hir_set_for_in_body from HIR with hir_for, hir_body
+
+    Note: Detect parfor marker (4th child identifier valued "parfor")
+    Let count be proc ast_node_child_count from MatlabParser with for_node
+    If count is greater than 3:
+        Let marker be proc ast_node_child from MatlabParser with for_node, 3
+        Let marker_value be proc ast_node_value from MatlabParser with marker
+        Let is_parfor be proc string_equals from StringCore with marker_value, "parfor"
+        If is_parfor is equal to 1:
+            proc hir_set_metadata from HIR with hir_for, "matlab_parfor", "1"
+        End If
+    End If
+
+    Return hir_for
+End Process
+
+@Reasoning:
+"while cond ... end" maps one-to-one onto HIR_WHILE with the condition and
+body.
+@End Reasoning
+Process called "translate_while" takes while_node as Integer returns Integer:
+    Let cond_child be proc ast_node_child from MatlabParser with while_node, 0
+    Let hir_cond be proc translate_expression with cond_child
+
+    Let body_child be proc ast_node_child from MatlabParser with while_node, 1
+    Let hir_body be proc translate_statement with body_child
+
+    Let hir_while be proc hir_create_while from HIR
+    proc hir_set_while_condition from HIR with hir_while, hir_cond
+    proc hir_set_while_body from HIR with hir_while, hir_body
+    Return hir_while
+End Process
+
+@Reasoning:
+"spmd ... end" is a block tagged "matlab_spmd" so the backend re-wraps it
+in MATLAB's parallel spmd construct; structurally it is an ordinary block.
+@End Reasoning
+Process called "translate_spmd" takes spmd_node as Integer returns Integer:
+    Let body_child be proc ast_node_child from MatlabParser with spmd_node, 0
+    Let hir_block be proc translate_statement with body_child
+    proc hir_set_metadata from HIR with hir_block, "matlab_spmd", "1"
+    Return hir_block
+End Process
+
+@Reasoning:
+MATLAB switch lowers to a chained if/elseif: the parser emits (expr, case_val,
+case_body, ..., [otherwise_body]). Each case becomes "switch_expr == case_val"
+guarding its body, nested through else slots; a trailing otherwise body is
+the innermost else. This preserves switch semantics using only the HIR if
+node which both ends of the pipeline already support, and is tagged
+"matlab_switch" so the backend can re-emit the switch keyword form.
+@End Reasoning
+Process called "translate_switch" takes switch_node as Integer returns Integer:
+    Let count be proc ast_node_child_count from MatlabParser with switch_node
+    Let expr_child be proc ast_node_child from MatlabParser with switch_node, 0
+
+    Note: Build the chain. Remaining children after the scrutinee are
+    Note: alternating case_val/case_body pairs with an optional trailing
+    Note: otherwise body.
+    Let head be 0
+    Let current be 0
+    Let idx be 1
+    Let remaining be count minus 1
+
+    While remaining is greater than 0:
+        If remaining is equal to 1:
+            Note: Trailing otherwise body
+            Let otherwise_child be proc ast_node_child from MatlabParser with switch_node, idx
+            Let hir_otherwise be proc translate_statement with otherwise_child
+            If current is not equal to 0:
+                proc hir_set_if_else from HIR with current, hir_otherwise
+            End If
+            Set remaining to 0
+        Otherwise:
+            Let case_val_child be proc ast_node_child from MatlabParser with switch_node, idx
+            Let hir_case_val be proc translate_expression with case_val_child
+            Let case_body_child be proc ast_node_child from MatlabParser with switch_node, idx plus 1
+            Let hir_case_body be proc translate_statement with case_body_child
+
+            Note: condition = (switch_expr == case_val); fresh scrutinee per arm
+            Let hir_scrut be proc translate_expression with expr_child
+            Let hir_eq be proc hir_create_binary_expr from HIR with HIR.HIR_OP_EQUAL, hir_scrut, hir_case_val
+
+            Let arm_if be proc hir_create_if from HIR
+            proc hir_set_if_condition from HIR with arm_if, hir_eq
+            proc hir_set_if_then from HIR with arm_if, hir_case_body
+
+            If head is equal to 0:
+                Set head to arm_if
+            Otherwise:
+                proc hir_set_if_else from HIR with current, arm_if
+            End If
+            Set current to arm_if
+
+            Set idx to idx plus 2
+            Set remaining to remaining minus 2
+        End If
+    End While
+
+    If head is equal to 0:
+        Note: Switch with no cases - emit an empty block
+        Return proc hir_create_block from HIR
+    End If
+
+    proc hir_set_metadata from HIR with head, "matlab_switch", "1"
+    Return head
+End Process
+
+@Reasoning:
+"try ... catch (var)? ... end" lowers to a block tagged "matlab_try" that
+contains the try-body statements followed by the catch-body statements,
+with the optional exception variable recorded as "matlab_catch_var"
+metadata. HIR's typed try node is not used here because the backend
+re-emits MATLAB's single-catch form directly from this flat representation,
+keeping producer and consumer in agreement on the simplest shape.
+@End Reasoning
+Process called "translate_try" takes try_node as Integer returns Integer:
+    Let count be proc ast_node_child_count from MatlabParser with try_node
+
+    Let hir_block be proc hir_create_block from HIR
+    proc hir_set_metadata from HIR with hir_block, "matlab_try", "1"
+
+    Note: First child is the try block.
+    Let try_body_child be proc ast_node_child from MatlabParser with try_node, 0
+    Let hir_try_body be proc translate_statement with try_body_child
+
+    Let try_marker_lit be proc hir_create_string_literal from HIR with "try"
+    Let try_marker be proc hir_create_expression_statement from HIR with try_marker_lit
+    proc hir_add_statement from HIR with hir_block, try_marker
+    proc hir_add_statement from HIR with hir_block, hir_try_body
+
+    Note: Optional exception variable then catch block.
+    Let catch_idx be 1
+    If count is greater than 2:
+        Let exc_child be proc ast_node_child from MatlabParser with try_node, 1
+        Let exc_name be proc ast_node_value from MatlabParser with exc_child
+        proc hir_set_metadata from HIR with hir_block, "matlab_catch_var", exc_name
+        Set catch_idx to 2
+    End If
+
+    If count is greater than catch_idx:
+        Let catch_body_child be proc ast_node_child from MatlabParser with try_node, catch_idx
+        Let hir_catch_body be proc translate_statement with catch_body_child
+        Let catch_marker_lit be proc hir_create_string_literal from HIR with "catch"
+        Let catch_marker be proc hir_create_expression_statement from HIR with catch_marker_lit
+        proc hir_add_statement from HIR with hir_block, catch_marker
+        proc hir_add_statement from HIR with hir_block, hir_catch_body
+    End If
+
+    Return hir_block
+End Process
+
+@Reasoning:
+"global a b c" / "persistent a b c" lower to a block tagged with the given
+scope kind whose statements are expression statements wrapping each declared
+name; the declared names are also joined as "matlab_decl_names" metadata so
+the backend re-emits the original "global a b c" line losslessly.
+@End Reasoning
+Process called "translate_scoped_decl" takes decl_node as Integer, tag as Integer returns Integer:
+    Let hir_block be proc hir_create_block from HIR
+    proc hir_set_metadata from HIR with hir_block, tag, "1"
+
+    Let count be proc ast_node_child_count from MatlabParser with decl_node
+    Let joined be ""
+    Let i be 0
+    While i is less than count:
+        Let var_child be proc ast_node_child from MatlabParser with decl_node, i
+        Let var_name be proc ast_node_value from MatlabParser with var_child
+        If i is greater than 0:
+            Set joined to proc string_concat from StringPrim with joined, " "
+        End If
+        Set joined to proc string_concat from StringPrim with joined, var_name
+        Set i to i plus 1
+    End While
+    proc hir_set_metadata from HIR with hir_block, "matlab_decl_names", joined
+    Return hir_block
+End Process
+
+Note: ===================================================================
+Note: EXPRESSION TRANSLATION
+Note: ===================================================================
+
+@Reasoning:
+Expression dispatcher. Routes each MATLAB expression AST type to its HIR
+translator. Unknown types fall back to an HIR identifier carrying the node's
+value text so the round-trip never drops a subtree silently.
+@End Reasoning
+Process called "translate_expression" takes expr_node as Integer returns Integer:
+    If expr_node is equal to 0:
+        Return proc hir_create_identifier from HIR with ""
+    End If
+
+    Let expr_type be proc ast_node_type from MatlabParser with expr_node
+
+    If expr_type is equal to MatlabParser.MATLAB_NUMBER_LITERAL:
+        Return proc translate_number_literal with expr_node
+    End If
+    If expr_type is equal to MatlabParser.MATLAB_STRING_LITERAL:
+        Return proc translate_string_literal with expr_node
+    End If
+    If expr_type is equal to MatlabParser.MATLAB_IDENTIFIER:
+        Let id_name be proc ast_node_value from MatlabParser with expr_node
+        Return proc hir_create_identifier from HIR with id_name
+    End If
+    If expr_type is equal to MatlabParser.MATLAB_MATRIX_EXPR:
+        Return proc translate_matrix_literal with expr_node
+    End If
+    If expr_type is equal to MatlabParser.MATLAB_CELL_EXPR:
+        Return proc translate_cell_literal with expr_node
+    End If
+    If expr_type is equal to MatlabParser.MATLAB_BINARY_EXPR:
+        Return proc translate_binary_expression with expr_node
+    End If
+    If expr_type is equal to MatlabParser.MATLAB_UNARY_EXPR:
+        Return proc translate_unary_expression with expr_node
+    End If
+    If expr_type is equal to MatlabParser.MATLAB_CALL_EXPR:
+        Return proc translate_call_expression with expr_node
+    End If
+    If expr_type is equal to MatlabParser.MATLAB_INDEX_EXPR:
+        Return proc translate_index_expression with expr_node
+    End If
+    If expr_type is equal to MatlabParser.MATLAB_FIELD_EXPR:
+        Return proc translate_field_expression with expr_node
+    End If
+    If expr_type is equal to MatlabParser.MATLAB_DYNAMIC_FIELD_EXPR:
+        Return proc translate_dynamic_field_expression with expr_node
+    End If
+    If expr_type is equal to MatlabParser.MATLAB_COLON_EXPR:
+        Return proc translate_colon_expression with expr_node
+    End If
+    If expr_type is equal to MatlabParser.MATLAB_FUNC_HANDLE_EXPR:
+        Return proc translate_function_handle with expr_node
+    End If
+    If expr_type is equal to MatlabParser.MATLAB_LAMBDA_EXPR:
+        Return proc translate_lambda with expr_node
+    End If
+    If expr_type is equal to MatlabParser.MATLAB_TRANSPOSE_EXPR:
+        Return proc translate_transpose_expression with expr_node
+    End If
+
+    Let fallback_value be proc ast_node_value from MatlabParser with expr_node
+    Return proc hir_create_identifier from HIR with fallback_value
+End Process
+
+@Reasoning:
+A numeric literal is emitted as an HIR integer or float literal based on its
+spelling (see matlab_number_is_float). The original spelling is stored as
+the literal value so exponents and imaginary suffixes survive verbatim.
+@End Reasoning
+Process called "translate_number_literal" takes num_node as Integer returns Integer:
+    Let text be proc ast_node_value from MatlabParser with num_node
+    Let is_float be proc matlab_number_is_float with text
+    If is_float is equal to 1:
+        Return proc hir_create_float_literal from HIR with text
+    End If
+    Return proc hir_create_int_literal from HIR with text
+End Process
+
+@Reasoning:
+String and char literals both become HIR string literals (the underlying
+immutable-text representation is shared).
+@End Reasoning
+Process called "translate_string_literal" takes str_node as Integer returns Integer:
+    Let text be proc ast_node_value from MatlabParser with str_node
+    Return proc hir_create_string_literal from HIR with text
+End Process
+
+@Reasoning:
+Matrix literals "[a b; c d]" lower to an HIR list literal whose elements
+are appended in row-major order. The list is tagged "matlab_matrix" and the
+per-row element counts are joined into "matlab_matrix_rows" metadata so the
+backend can restore the ';' row separators and original shape.
+@End Reasoning
+Process called "translate_matrix_literal" takes matrix_node as Integer returns Integer:
+    Let hir_list be proc hir_create_list_literal from HIR
+    Let row_count be proc ast_node_child_count from MatlabParser with matrix_node
+    Let rows_meta be ""
+    Let i be 0
+    While i is less than row_count:
+        Let row_child be proc ast_node_child from MatlabParser with matrix_node, i
+        Let elem_count be proc ast_node_child_count from MatlabParser with row_child
+        If i is greater than 0:
+            Set rows_meta to proc string_concat from StringPrim with rows_meta, ";"
+        End If
+        Let elem_count_text be proc matlab_int_text with elem_count
+        Set rows_meta to proc string_concat from StringPrim with rows_meta, elem_count_text
+        Let j be 0
+        While j is less than elem_count:
+            Let elem_child be proc ast_node_child from MatlabParser with row_child, j
+            Let hir_elem be proc translate_expression with elem_child
+            proc hir_add_list_element from HIR with hir_list, hir_elem
+            Set j to j plus 1
+        End While
+        Set i to i plus 1
+    End While
+    proc hir_set_metadata from HIR with hir_list, "matlab_matrix", "1"
+    proc hir_set_metadata from HIR with hir_list, "matlab_matrix_rows", rows_meta
+    Return hir_list
+End Process
+
+@Reasoning:
+Renders a small non-negative integer as its decimal string. Used only to
+record per-row element counts in matrix metadata; values are bounded by the
+number of elements in a literal row, so a simple digit loop suffices.
+@End Reasoning
+Process called "matlab_int_text" takes value as Integer returns Integer:
+    If value is equal to 0:
+        Return "0"
+    End If
+    Let digits be ""
+    Let n be value
+    While n is greater than 0:
+        Let quotient be n divided by 10
+        Let truncated be quotient multiplied by 10
+        Let digit be n minus truncated
+        Let digit_char be digit plus 48
+        Let digit_str be proc char_to_string from StringCore with digit_char
+        Set digits to proc string_concat from StringPrim with digit_str, digits
+        Set n to quotient
+    End While
+    Return digits
+End Process
+
+@Reasoning:
+Cell arrays "{...}" lower to an HIR list literal tagged "matlab_cell" so the
+backend re-emits braces and boxed heterogeneous elements.
+@End Reasoning
+Process called "translate_cell_literal" takes cell_node as Integer returns Integer:
+    Let hir_list be proc hir_create_list_literal from HIR
+    Let count be proc ast_node_child_count from MatlabParser with cell_node
+    Let i be 0
+    While i is less than count:
+        Let elem_child be proc ast_node_child from MatlabParser with cell_node, i
+        Let hir_elem be proc translate_expression with elem_child
+        proc hir_add_list_element from HIR with hir_list, hir_elem
+        Set i to i plus 1
+    End While
+    proc hir_set_metadata from HIR with hir_list, "matlab_cell", "1"
+    Return hir_list
+End Process
+
+@Reasoning:
+"op left right" becomes an HIR binary expression. The HIR op enum captures
+the arithmetic/relational category for analysis passes, while the exact
+MATLAB spelling (preserving '^', '.^', matrix-vs-elementwise) is stored as
+"matlab_operator" metadata the backend reads back first. Element-wise
+operators additionally set "matlab_elementwise".
+@End Reasoning
+Process called "translate_binary_expression" takes binary_node as Integer returns Integer:
+    Let operator be proc ast_node_value from MatlabParser with binary_node
+    Let left_child be proc ast_node_child from MatlabParser with binary_node, 0
+    Let hir_left be proc translate_expression with left_child
+    Let right_child be proc ast_node_child from MatlabParser with binary_node, 1
+    Let hir_right be proc translate_expression with right_child
+
+    Let hir_op be proc map_matlab_operator_to_hir with operator
+    Let hir_binary be proc hir_create_binary_expr from HIR with hir_op, hir_left, hir_right
+    proc hir_set_metadata from HIR with hir_binary, "matlab_operator", operator
+
+    Let is_elementwise be proc is_matlab_elementwise_operator with operator
+    If is_elementwise is equal to 1:
+        proc hir_set_metadata from HIR with hir_binary, "matlab_elementwise", "1"
+    End If
+
+    Return hir_binary
+End Process
+
+@Reasoning:
+Unary prefix "op operand" becomes an HIR unary expression; the exact MATLAB
+spelling is preserved as metadata so the backend reproduces '~'/'-'/'+'.
+@End Reasoning
+Process called "translate_unary_expression" takes unary_node as Integer returns Integer:
+    Let operator be proc ast_node_value from MatlabParser with unary_node
+    Let operand_child be proc ast_node_child from MatlabParser with unary_node, 0
+    Let hir_operand be proc translate_expression with operand_child
+
+    Let hir_op be proc map_matlab_unary_operator_to_hir with operator
+    Let hir_unary be proc hir_create_unary_expr from HIR with hir_op, hir_operand
+    proc hir_set_metadata from HIR with hir_unary, "matlab_operator", operator
     Return hir_unary
 End Process
 
 @Reasoning:
-Builds an HIR call from a MATLAB call/indexing expression. The callee at
-child 0 is recursively translated (so curried/method calls work
-naturally); arguments at child 1 are appended one by one to an HIR
-argument list. arity is passed explicitly so HIR consumers do not need
-to walk the list to count.
+A MATLAB call/index expression "base(args...)" lowers to an HIR call whose
+callee is the base expression and whose positional arguments are each
+translated child after the base. MATLAB call-vs-array-index ambiguity is
+resolved later; here it is always emitted as a call (the most common form),
+which the backend renders with parentheses.
 @End Reasoning
-Process called "translate_call_expression" takes ctx as Integer, call_node as Integer returns Integer:
-    Note: Get callee (function being called)
-    Let callee_child be proc ast_node_child with call_node, 0
-    Let hir_callee be proc translate_expression with ctx, callee_child
+Process called "translate_call_expression" takes call_node as Integer returns Integer:
+    Let base_child be proc ast_node_child from MatlabParser with call_node, 0
+    Let hir_callee be proc translate_expression with base_child
 
-    Note: Get arguments
-    Let args_child be proc ast_node_child with call_node, 1
-    Let hir_args be proc hir_create_argument_list from HIR
+    Let hir_call be proc hir_create_call_expr from HIR with hir_callee
+    Let count be proc ast_node_child_count from MatlabParser with call_node
+    Let i be 1
+    While i is less than count:
+        Let arg_child be proc ast_node_child from MatlabParser with call_node, i
+        Let hir_arg be proc translate_expression with arg_child
+        proc hir_add_argument from HIR with hir_call, hir_arg
+        Set i to i plus 1
+    End While
+    Return hir_call
+End Process
 
-    Let arg_count be proc ast_node_child_count from args_child
+@Reasoning:
+A cell-indexing expression "base{idx...}" lowers to an HIR index expression
+on the base with its first index, tagged "matlab_cell_indexing" so the
+backend re-emits curly braces. Additional indices beyond the first are
+preserved by chaining nested index expressions left to right.
+@End Reasoning
+Process called "translate_index_expression" takes index_node as Integer returns Integer:
+    Let base_child be proc ast_node_child from MatlabParser with index_node, 0
+    Let hir_object be proc translate_expression with base_child
+
+    Let count be proc ast_node_child_count from MatlabParser with index_node
+    Let result be hir_object
+    Let i be 1
+    While i is less than count:
+        Let idx_child be proc ast_node_child from MatlabParser with index_node, i
+        Let hir_index be proc translate_expression with idx_child
+        Let hir_index_expr be proc hir_create_index_expr from HIR with result, hir_index
+        proc hir_set_metadata from HIR with hir_index_expr, "matlab_cell_indexing", "1"
+        Set result to hir_index_expr
+        Set i to i plus 1
+    End While
+    Return result
+End Process
+
+@Reasoning:
+"obj.field" lowers to an HIR member expression: the object subtree plus the
+static field name string read from the identifier child.
+@End Reasoning
+Process called "translate_field_expression" takes field_node as Integer returns Integer:
+    Let object_child be proc ast_node_child from MatlabParser with field_node, 0
+    Let hir_object be proc translate_expression with object_child
+
+    Let field_ident be proc ast_node_child from MatlabParser with field_node, 1
+    Let field_name be proc ast_node_value from MatlabParser with field_ident
+
+    Return proc hir_create_member_expr from HIR with hir_object, field_name
+End Process
+
+@Reasoning:
+"obj.(expr)" computes the field name at runtime; it lowers to an HIR index
+expression of the object by the field-name expression, tagged
+"matlab_dynamic_field" so the backend re-emits the obj.(...) form.
+@End Reasoning
+Process called "translate_dynamic_field_expression" takes dyn_node as Integer returns Integer:
+    Let object_child be proc ast_node_child from MatlabParser with dyn_node, 0
+    Let hir_object be proc translate_expression with object_child
+
+    Let field_expr_child be proc ast_node_child from MatlabParser with dyn_node, 1
+    Let hir_field_expr be proc translate_expression with field_expr_child
+
+    Let hir_index be proc hir_create_index_expr from HIR with hir_object, hir_field_expr
+    proc hir_set_metadata from HIR with hir_index, "matlab_dynamic_field", "1"
+    Return hir_index
+End Process
+
+@Reasoning:
+The colon operator has three forms: bare ":" (0 children) becomes an
+identifier ":" tagged "matlab_colon_all"; "start:end" (2 children) and
+"start:step:end" (3 children) become HIR index expressions chaining the
+arms with "matlab_range" metadata so the backend reconstructs the colon
+spelling. Using member/index nodes keeps producer and consumer on shared
+node kinds without needing a dedicated HIR range node.
+@End Reasoning
+Process called "translate_colon_expression" takes colon_node as Integer returns Integer:
+    Let count be proc ast_node_child_count from MatlabParser with colon_node
+
+    If count is equal to 0:
+        Let colon_all be proc hir_create_identifier from HIR with ":"
+        proc hir_set_metadata from HIR with colon_all, "matlab_colon_all", "1"
+        Return colon_all
+    End If
+
+    If count is equal to 2:
+        Let start_child be proc ast_node_child from MatlabParser with colon_node, 0
+        Let hir_start be proc translate_expression with start_child
+        Let end_child be proc ast_node_child from MatlabParser with colon_node, 1
+        Let hir_end be proc translate_expression with end_child
+        Let hir_range be proc hir_create_index_expr from HIR with hir_start, hir_end
+        proc hir_set_metadata from HIR with hir_range, "matlab_range", "2"
+        Return hir_range
+    End If
+
+    Note: count == 3 -> start:step:end
+    Let s_child be proc ast_node_child from MatlabParser with colon_node, 0
+    Let hir_s be proc translate_expression with s_child
+    Let step_child be proc ast_node_child from MatlabParser with colon_node, 1
+    Let hir_step be proc translate_expression with step_child
+    Let e_child be proc ast_node_child from MatlabParser with colon_node, 2
+    Let hir_e be proc translate_expression with e_child
+
+    Let inner be proc hir_create_index_expr from HIR with hir_s, hir_step
+    proc hir_set_metadata from HIR with inner, "matlab_range_inner", "1"
+    Let outer be proc hir_create_index_expr from HIR with inner, hir_e
+    proc hir_set_metadata from HIR with outer, "matlab_range", "3"
+    Return outer
+End Process
+
+@Reasoning:
+"@name" becomes an HIR identifier carrying the function name tagged
+"matlab_func_handle" so the backend re-prepends '@'.
+@End Reasoning
+Process called "translate_function_handle" takes handle_node as Integer returns Integer:
+    Let func_name be proc ast_node_value from MatlabParser with handle_node
+    Let hir_id be proc hir_create_identifier from HIR with func_name
+    proc hir_set_metadata from HIR with hir_id, "matlab_func_handle", "1"
+    Return hir_id
+End Process
+
+@Reasoning:
+"@(params) body" becomes an HIR call expression whose callee identifier is
+the synthetic "@" marker tagged "matlab_lambda"; the parameter names are
+joined into "matlab_lambda_params" metadata and the single body expression
+is added as the call's sole argument so the backend reconstructs the
+"@(a, b) expr" anonymous-function spelling.
+@End Reasoning
+Process called "translate_lambda" takes lambda_node as Integer returns Integer:
+    Let params_child be proc ast_node_child from MatlabParser with lambda_node, 0
+
+    Let joined be ""
+    Let param_count be proc ast_node_child_count from MatlabParser with params_child
     Let i be 0
-
-    While i is less than arg_count:
-        Let arg_child be proc ast_node_child with args_child, i
-        Let hir_arg be proc translate_expression with ctx, arg_child
-        proc hir_add_argument from HIR with hir_args, hir_arg
+    While i is less than param_count:
+        Let param_child be proc ast_node_child from MatlabParser with params_child, i
+        Let param_name be proc ast_node_value from MatlabParser with param_child
+        If i is greater than 0:
+            Set joined to proc string_concat from StringPrim with joined, ", "
+        End If
+        Set joined to proc string_concat from StringPrim with joined, param_name
         Set i to i plus 1
     End While
 
-    Note: Create HIR call expression
-    Let base_node be proc hir_create_node from HIR with HIR.HIR_NODE_CALL_EXPR
-    Let hir_call be proc create_hir_call_expression from HIR with base_node, hir_callee, hir_args, arg_count, 0, HIR.HIR_TYPE_ANY
+    Let marker be proc hir_create_identifier from HIR with "@lambda"
+    Let hir_call be proc hir_create_call_expr from HIR with marker
+    proc hir_set_metadata from HIR with hir_call, "matlab_lambda", "1"
+    proc hir_set_metadata from HIR with hir_call, "matlab_lambda_params", joined
+
+    Let body_child be proc ast_node_child from MatlabParser with lambda_node, 1
+    Let hir_body be proc translate_expression with body_child
+    proc hir_add_argument from HIR with hir_call, hir_body
 
     Return hir_call
 End Process
 
 @Reasoning:
-Single-axis index expression "a(i)" or "a{i}". The parser tags cell
-indexing (curly braces) via a "cell_indexing" flag on the AST node;
-this routine reads that flag and propagates it to the HIR node as
-"matlab_cell_indexing"=1 metadata so codegen can choose extract-cell vs
-extract-element semantics.
+"'" and ".'" transpose lower to an HIR unary expression with the original
+spelling preserved as "matlab_transpose" metadata so the backend re-emits
+the suffix operator in the correct (conjugate vs plain) form.
 @End Reasoning
-Process called "translate_index_expression" takes ctx as Integer, index_node as Integer returns Integer:
-    Note: Get object being indexed
-    Let object_child be proc ast_node_child with index_node, 0
-    Let hir_object be proc translate_expression with ctx, object_child
+Process called "translate_transpose_expression" takes transpose_node as Integer returns Integer:
+    Let spelling be proc ast_node_value from MatlabParser with transpose_node
+    Let operand_child be proc ast_node_child from MatlabParser with transpose_node, 0
+    Let hir_operand be proc translate_expression with operand_child
 
-    Note: Get index expression (can be colon, range, or value)
-    Let index_child be proc ast_node_child with index_node, 1
-    Let hir_index be proc translate_expression with ctx, index_child
-
-    Note: Create HIR index expression
-    Let base_node be proc hir_create_node from HIR with HIR.HIR_NODE_INDEX_EXPR
-    Let hir_index_expr be proc create_hir_index_expression from HIR with base_node, hir_object, hir_index, HIR.HIR_TYPE_ANY
-
-    Note: Check if this is cell indexing {braces} vs array indexing (parens)
-    Let is_cell be proc ast_node_has_flag with index_node, "cell_indexing"
-    If is_cell is equal to 1:
-        proc hir_set_metadata from HIR with hir_index_expr, "matlab_cell_indexing", 1
-    End If
-
-    Return hir_index_expr
+    Let hir_unary be proc hir_create_unary_expr from HIR with HIR.HIR_OP_NEGATE, hir_operand
+    proc hir_set_metadata from HIR with hir_unary, "matlab_transpose", spelling
+    Return hir_unary
 End Process
 
-@Reasoning:
-"obj.field" struct field access. The field name is taken from the
-identifier node at child 1 and stored as a string in the HIR member
-expression — distinguishing this from the dynamic-field form below
-which computes the field name from an expression at runtime.
-@End Reasoning
-Process called "translate_member_expression" takes ctx as Integer, member_node as Integer returns Integer:
-    Note: Get object
-    Let object_child be proc ast_node_child with member_node, 0
-    Let hir_object be proc translate_expression with ctx, object_child
-
-    Note: Get member name
-    Let member_child be proc ast_node_child with member_node, 1
-    Let member_name be proc ast_node_value from member_child
-
-    Note: Create HIR member expression
-    Let base_node be proc hir_create_node from HIR with HIR.HIR_NODE_MEMBER_EXPR
-    Let hir_member be proc create_hir_member_expression from HIR with base_node, hir_object, member_name, 0, HIR.HIR_TYPE_ANY
-
-    Return hir_member
-End Process
-
-@Reasoning:
-"obj.(expr)" runtime-computed field access. Lowers to HIR index-expression
-with the computed string as the index, plus "matlab_dynamic_field"=1
-metadata. Translating to HIR_INDEX_EXPR rather than HIR_MEMBER_EXPR
-because the latter requires a static field-name string at compile time.
-@End Reasoning
-Process called "translate_dynamic_field_expression" takes ctx as Integer, dynamic_field_node as Integer returns Integer:
-    Note: MATLAB dynamic field access: obj.(field_expr)
-    Note: Get object
-    Let object_child be proc ast_node_child with dynamic_field_node, 0
-    Let hir_object be proc translate_expression with ctx, object_child
-
-    Note: Get field name expression (runtime-computed field name)
-    Let field_expr_child be proc ast_node_child with dynamic_field_node, 1
-    Let hir_field_expr be proc translate_expression with ctx, field_expr_child
-
-    Note: Create HIR index expression with dynamic field metadata
-    Note: Dynamic field access is semantically indexing with string key
-    Let base_node be proc hir_create_node from HIR with HIR.HIR_NODE_INDEX_EXPR
-    Let hir_dynamic_access be proc create_hir_index_expression from HIR with base_node, hir_object, hir_field_expr, HIR.HIR_TYPE_ANY
-
-    Note: Mark as MATLAB dynamic field access for proper code generation
-    proc hir_set_metadata from HIR with hir_dynamic_access, "matlab_dynamic_field", 1
-
-    Return hir_dynamic_access
-End Process
-
-@Reasoning:
-Translates MATLAB's three colon-operator forms based on child count:
-- 0 children: bare ":" (all-elements sentinel) -> synthetic identifier
-  "colon_all" with "matlab_colon_all"=1 metadata;
-- 2 children: "start:end" -> HIR range with default step;
-- 3 children: "start:step:end" -> HIR range with explicit step.
-All forms carry "matlab_colon"=1 metadata so codegen can lower MATLAB's
-range semantics (inclusive end, double-typed steps) rather than HIR's
-generic range.
-@End Reasoning
-Process called "translate_colon_expression" takes ctx as Integer, colon_node as Integer returns Integer:
-    Note: MATLAB colon operator: start:end or start:step:end or just :
-    Let child_count be proc ast_node_child_count from colon_node
-
-    Note: Just ":" (all elements)
-    If child_count is equal to 0:
-        Let hir_colon be proc hir_create_identifier from HIR with "colon_all"
-        proc hir_set_metadata from HIR with hir_colon, "matlab_colon_all", 1
-        Return hir_colon
-    End If
-
-    Note: start:end (2 arguments)
-    If child_count is equal to 2:
-        Let start_child be proc ast_node_child with colon_node, 0
-        Let hir_start be proc translate_expression with ctx, start_child
-
-        Let end_child be proc ast_node_child with colon_node, 1
-        Let hir_end be proc translate_expression with ctx, end_child
-
-        Note: Create HIR range expression (start, end, step=1)
-        Let hir_range be proc hir_create_range from HIR with hir_start, hir_end, 0
-        proc hir_set_metadata from HIR with hir_range, "matlab_colon", 1
-        Return hir_range
-    End If
-
-    Note: start:step:end (3 arguments)
-    If child_count is equal to 3:
-        Set start_child to proc ast_node_child with colon_node, 0
-        Set hir_start to proc translate_expression with ctx, start_child
-
-        Let step_child be proc ast_node_child with colon_node, 1
-        Let hir_step be proc translate_expression with ctx, step_child
-
-        Set end_child to proc ast_node_child with colon_node, 2
-        Set hir_end to proc translate_expression with ctx, end_child
-
-        Note: Create HIR range expression with step
-        Set hir_range to proc hir_create_range from HIR with hir_start, hir_end, hir_step
-        proc hir_set_metadata from HIR with hir_range, "matlab_colon", 1
-        Return hir_range
-    End If
-
-    Return 0
-End Process
-
-@Reasoning:
-"@funcName" becomes an HIR_NODE_FUNCTION_POINTER. The target function is
-resolved through the symbol table if available; resolved_func can be 0
-when the target lives in another file or toolbox — in that case the
-function-pointer still records the name so a late binding resolves at
-link/load time.
-@End Reasoning
-Process called "translate_function_handle" takes ctx as Integer, handle_node as Integer returns Integer:
-    Note: MATLAB function handle: @functionName
-    Let func_name_child be proc ast_node_child with handle_node, 0
-    Let func_name be proc ast_node_value from func_name_child
-
-    Note: Lookup function in symbol table
-    Let resolved_func be proc lookup_symbol with ctx, func_name
-
-    Note: Create HIR function pointer
-    Let base_node be proc hir_create_node from HIR with HIR.HIR_NODE_FUNCTION_POINTER
-    Let hir_func_ptr be proc create_hir_function_pointer from HIR with base_node, func_name, resolved_func, HIR.HIR_TYPE_FUNCTION
-
-    Return hir_func_ptr
-End Process
-
-@Reasoning:
-"@(x,y) body" -> HIR_LAMBDA_EXPR. Pushes a new lexical scope before
-translating the body so parameter names mask outer-scope identifiers
-inside the lambda. The lambda's free-variable capture (MATLAB closes
-over the enclosing workspace at @() evaluation time) is handled by the
-HIR semantic phase, not here — this routine just emits the structural
-shape.
-@End Reasoning
-Process called "translate_anonymous_function" takes ctx as Integer, anon_node as Integer returns Integer:
-    Note: MATLAB anonymous function: @(x, y) x + y
-    proc push_scope from ctx
-
-    Note: Get parameters
-    Let params_child be proc ast_node_child with anon_node, 0
-    Let hir_params be proc hir_create_parameter_list from HIR
-
-    Let param_count be proc ast_node_child_count from params_child
-    Let i be 0
-
-    While i is less than param_count:
-        Let param_child be proc ast_node_child with params_child, i
-        Let param_name be proc ast_node_value from param_child
-        Let hir_param be proc hir_create_parameter from HIR with param_name, HIR.HIR_TYPE_ANY
-        proc hir_add_parameter_to_list from HIR with hir_params, hir_param
-        Set i to i plus 1
-    End While
-
-    Note: Get body expression
-    Let body_child be proc ast_node_child with anon_node, 1
-    Let hir_body be proc translate_expression with ctx, body_child
-
-    Note: Create HIR lambda expression
-    Let base_node be proc hir_create_node from HIR with HIR.HIR_NODE_LAMBDA_EXPR
-    Let hir_lambda be proc create_hir_lambda_expression from HIR with base_node, hir_params, param_count, hir_body, HIR.HIR_TYPE_ANY
-
-    proc pop_scope from ctx
-    Return hir_lambda
-End Process
-
-@Reasoning:
-Lowers MATLAB's "'" and ".'" to a unary HIR_OP_TRANSPOSE. The
-"complex_conjugate" parser flag indicates the "'" form, which transposes
-AND conjugates complex values; this is captured as
-"matlab_complex_conjugate"=1 metadata so codegen can choose the right
-runtime primitive ("'" -> conj+transpose; ".'" -> plain transpose).
-@End Reasoning
-Process called "translate_transpose_expression" takes ctx as Integer, transpose_node as Integer returns Integer:
-    Note: Get operand
-    Let operand_child be proc ast_node_child with transpose_node, 0
-    Let hir_operand be proc translate_expression with ctx, operand_child
-
-    Note: Check if complex conjugate transpose (') or regular transpose (.')
-    Let is_complex be proc ast_node_has_flag with transpose_node, "complex_conjugate"
-
-    Note: Create HIR unary expression for transpose
-    Let base_node be proc hir_create_node from HIR with HIR.HIR_NODE_UNARY_EXPR
-    Let hir_transpose be proc create_hir_unary_expression from HIR with base_node, HIR.HIR_OP_TRANSPOSE, hir_operand, HIR.HIR_TYPE_ANY
-
-    If is_complex is equal to 1:
-        proc hir_set_metadata from HIR with hir_transpose, "matlab_complex_conjugate", 1
-    End If
-
-    Return hir_transpose
-End Process
+Note: ===================================================================
+Note: PUBLIC SOURCE FACADE
+Note: ===================================================================
 
 @Reasoning:
 Public single-arg facade invoked by the translation dispatcher's
-LANG_MATLAB arm. Wires the full source -> HIR pipeline: MatlabLexer
-matlab_lexer_create + tokenize produce the token stream,
-MatlabParser matlab_parser_create + parse_program build the AST,
-and translate_matlab_to_hir lowers it into HIR.
+LANG_MATLAB arm. Wires the full source -> HIR pipeline: the MATLAB lexer
+and parser build the AST, and translate_matlab_to_hir lowers it to typed
+HIR. The parser pulls tokens lazily from the lexer, so no separate tokenize
+phase is required. Short-circuits to 0 on a null AST.
 @End Reasoning
-
-@Implementation:
-lexer = MatlabLexer.matlab_lexer_create(source); parser =
-MatlabParser.matlab_parser_create(lexer); ast = MatlabParser.parse_program(parser);
-return translate_matlab_to_hir(ast). The MATLAB parser pulls tokens
-lazily from the lexer via matlab_lexer_next_token, so no separate
-tokenize phase is required. Short-circuits to 0 on ast == 0.
-@End Implementation
-
 Process called "matlab_to_hir_from_source" takes source_code as Integer returns Integer:
     Let lexer be proc matlab_lexer_create from MatlabLexer with source_code
     Let parser be proc matlab_parser_create from MatlabParser with lexer
